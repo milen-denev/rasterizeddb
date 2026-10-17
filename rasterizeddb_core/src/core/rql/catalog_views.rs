@@ -1216,7 +1216,7 @@ async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64
             data.io_pointers.clone(),
             table.io_schema.clone(),
             data.io_filters.clone(),
-            data.io_sequence.clone(),
+            data.ids.io.clone(),
         ]
     };
     let mut total = 0u64;
@@ -1292,7 +1292,7 @@ async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64)
         let data = table.data().map_err(|e| e.to_string())?;
         (
             data.io_pointers.clone(),
-            data.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
+            data.ids.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
 

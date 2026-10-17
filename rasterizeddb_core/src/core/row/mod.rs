@@ -12,3 +12,5 @@ pub mod table;
 mod write_path_tests;
 #[cfg(test)]
 mod seam_tests;
+#[cfg(test)]
+mod partition_seam_tests;

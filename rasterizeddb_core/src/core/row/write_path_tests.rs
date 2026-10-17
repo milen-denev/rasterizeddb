@@ -924,7 +924,7 @@ async fn updates_do_not_consume_row_ids() {
 
     let before = all_pointers(&t).await;
     let original = before.iter().find(|p| !p.deleted).unwrap().clone();
-    let after_inserts = t.data().unwrap().last_row_id.load(std::sync::atomic::Ordering::Relaxed);
+    let after_inserts = t.data().unwrap().ids.last_row_id.load(std::sync::atomic::Ordering::Relaxed);
 
     // Each label is longer than the last, so every one of these relocates
     // rather than overwriting the extent in place — the path that allocates.
@@ -940,7 +940,7 @@ async fn updates_do_not_consume_row_ids() {
     }
 
     assert_eq!(
-        t.data().unwrap().last_row_id.load(std::sync::atomic::Ordering::Relaxed),
+        t.data().unwrap().ids.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
         after_inserts,
         "ten updates drew ids from the sequence"
     );
@@ -4383,7 +4383,7 @@ async fn concurrent_keyed_inserts_never_outrun_the_id_reservation() {
         tasks.push(tokio::spawn(async move {
             for i in 0..300u64 {
                 insert(&t, task * 1_000_000 + i, 0, "s").await;
-                let handed_out = t.data().unwrap().last_row_id.load(std::sync::atomic::Ordering::Acquire);
+                let handed_out = t.data().unwrap().ids.last_row_id.load(std::sync::atomic::Ordering::Acquire);
                 // Raised only after the sequence is written, and only ever up.
                 let covered = t.ids_reserved_upto().unwrap();
                 assert!(
@@ -4410,10 +4410,10 @@ async fn two_inserts_at_the_reservation_boundary_are_both_covered() {
     insert(&t, 1, 0, "s").await;
     let reserved = t.ids_reserved_upto().unwrap();
     // The next id is the last one the reservation covers.
-    t.data().unwrap().last_row_id.store(reserved - 1, std::sync::atomic::Ordering::Release);
+    t.data().unwrap().ids.last_row_id.store(reserved - 1, std::sync::atomic::Ordering::Release);
     let first = t.reserve_insert_id().await.unwrap();
     let second = t.reserve_insert_id().await.unwrap();
-    let next = t.data().unwrap().last_row_id.load(std::sync::atomic::Ordering::Acquire);
+    let next = t.data().unwrap().ids.last_row_id.load(std::sync::atomic::Ordering::Acquire);
     // The two will take `next` and `next + 1`.
     assert!(
         t.ids_reserved_upto().unwrap() >= next + 2,

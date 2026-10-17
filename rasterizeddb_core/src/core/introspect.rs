@@ -454,7 +454,7 @@ async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Re
         pointers: data.io_pointers.get_len().await,
         schema: table.io_schema.get_len().await,
         filters: data.io_filters.get_len().await,
-        sequence: data.io_sequence.get_len().await,
+        sequence: data.ids.io.get_len().await,
     })
 }
 
@@ -1071,7 +1071,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "last_row_id",
-        data.last_row_id.load(Ordering::Relaxed).to_string(),
+        data.ids.last_row_id.load(Ordering::Relaxed).to_string(),
         "highest id handed out",
     );
 

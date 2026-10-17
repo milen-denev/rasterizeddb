@@ -45,9 +45,15 @@
 //!   evidence. The one module here that does IO, and its errors are
 //!   `io::Error`s.
 //!
+//! - [`guard::RangeGuard`] (§4.5, I4): `check_insert(&RowWrite)` errs when a
+//!   row's point lies outside the partition's range; `check_update(before,
+//!   after)` also refuses any change of point (0A000). Installed on a
+//!   partition `Table` by `Table::open_partition`.
+//!
 //! Errors are `String`s, like the rest of the engine's DDL paths.
 
 pub mod files;
+pub mod guard;
 pub mod key;
 pub mod log;
 pub mod map;

@@ -35,6 +35,8 @@ const SCHEMA_ONLY: &[&str] = &[
     "in_place_column_updates",
     "is_shell",
     "data",
+    // Test-only: the cache scope string and generation counter.
+    "cache_key",
 ];
 
 /// Every data method `a_shell_refuses_every_data_method` calls. The
@@ -68,12 +70,15 @@ const CALLED_ON_SHELL: &[&str] = &[
     "insert_row_in_txn",
     "query_row",
     "count_rows_in_txn",
+    "count_rows_with_visibility",
     "query_row_in_txn",
     "query_row_with_visibility",
+    "query_row_with_visibility_cached",
     "query_row_bytes",
     "query_row_bytes_in_txn",
     "query_row_bytes_reporting_in_txn",
     "query_row_bytes_with_visibility",
+    "query_row_bytes_reporting_with_visibility",
     "delete_rows",
     "delete_rows_in_txn",
     "delete_rows_as_of",
@@ -437,6 +442,10 @@ async fn a_shell_refuses_every_data_method() {
         unit(shell.count_rows_in_txn("", &fields, fetch(&shell), FROZEN_TX).await),
     );
     expect(
+        "count_rows_with_visibility",
+        unit(shell.count_rows_with_visibility("", &fields, fetch(&shell), vis(), false).await),
+    );
+    expect(
         "query_row_in_txn",
         unit(shell.query_row_in_txn("", &fields, fetch(&shell), fetch(&shell), None, None, FROZEN_TX).await),
     );
@@ -445,10 +454,26 @@ async fn a_shell_refuses_every_data_method() {
         unit(shell.query_row_with_visibility("", &fields, fetch(&shell), fetch(&shell), None, None, vis()).await),
     );
     expect(
+        "query_row_with_visibility_cached",
+        unit(
+            shell
+                .query_row_with_visibility_cached("", &fields, fetch(&shell), fetch(&shell), None, None, vis(), false)
+                .await,
+        ),
+    );
+    expect(
         "query_row_bytes_with_visibility",
         unit(
             shell
                 .query_row_bytes_with_visibility("", &fields, fetch(&shell), fetch(&shell), None, None, vis(), false)
+                .await,
+        ),
+    );
+    expect(
+        "query_row_bytes_reporting_with_visibility",
+        unit(
+            shell
+                .query_row_bytes_reporting_with_visibility("", &fields, fetch(&shell), fetch(&shell), None, None, vis(), true)
                 .await,
         ),
     );

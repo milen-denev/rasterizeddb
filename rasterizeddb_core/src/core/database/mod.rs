@@ -1866,7 +1866,7 @@ impl Database {
         data.io_filters.drop_io();
         // Including the id sequence: a table recreated under the same name would
         // otherwise inherit the old one's floor and start numbering from it.
-        data.io_sequence.drop_io();
+        data.ids.io.drop_io();
 
         // The five handles above are the five files a `Table` holds open. A
         // table owns ten: the `_schema_*` sidecars are opened lazily, so they

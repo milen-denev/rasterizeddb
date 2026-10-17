@@ -217,27 +217,15 @@ pub(crate) struct TableData<S: StorageIO> {
     pub(crate) io_rows: Arc<S>,
     /// Sidecar holding the persisted filter checkpoint.
     pub(crate) io_filters: Arc<S>,
-    /// Sidecar holding the row-id sequence.
-    ///
-    /// The id counter used to be recovered from the last pointer record, which
-    /// worked only while ids ascended with file order. They no longer do: a
-    /// relocated row keeps its id, so the largest id can sit anywhere. Reading
-    /// the last record would then hand out ids that are already in use.
-    pub(crate) io_sequence: Arc<S>,
-    /// Highest id reserved on disk. Ids past this need a fresh reservation
-    /// before they are handed out.
-    id_reserved_upto: CacheGuard<AtomicU64>,
-    /// Inserts between their reservation check and the id they take. Each
-    /// takes at most one, so the reservation must reach past the next id by
-    /// this many: two inserts checking at once both see the next id covered
-    /// and take it and the one after, and the second is not covered.
-    ids_in_flight: AtomicU64,
-    /// Serialises raising the reservation, so it only ever goes up: two
-    /// writers could otherwise leave the smaller of their values on disk and
-    /// the larger in memory.
-    reserving: tokio::sync::Mutex<()>,
+    /// Where row ids come from. A plain table's own; every partition of one
+    /// logical table holds the same one, so ids are unique across the whole
+    /// table (§3.5, I12), which `locate_row_by_id` and the unique check's
+    /// `exclude_id` rely on.
+    pub(crate) ids: StdArc<IdSource<S>>,
     pub(crate) len: CacheGuard<AtomicU64>,
-    pub(crate) last_row_id: CacheGuard<AtomicU64>,
+    /// A partition's range guard (§4.5); `None` on a plain table. Also what
+    /// marks a table as a partition.
+    pub(crate) guard: Option<crate::core::partition::guard::RangeGuard>,
     /// Bit-level filter index. `None` when disabled or when no column of this
     /// table has a filterable type.
     ///
@@ -256,6 +244,226 @@ pub(crate) struct TableData<S: StorageIO> {
     pub(crate) readers: StdArc<ReaderRegistry>,
     /// Running totals for the reclamation service.
     pub(crate) vacuum_stats: StdArc<VacuumStats>,
+}
+
+/// A row-id sequence: the counter ids are drawn from and its reservation on
+/// disk. A plain table owns one over its `_seq.db`; a partitioned table has
+/// one over `__pt_<uid>_ids.db`, shared by every partition (§3.5).
+///
+/// The counter used to be recovered from the last pointer record, which
+/// worked only while ids ascended with file order. They no longer do: a
+/// relocated row keeps its id, so the largest id can sit anywhere. Reading
+/// the last record would then hand out ids that are already in use.
+pub(crate) struct IdSource<S: StorageIO> {
+    /// The file holding the reservation: eight bytes, little-endian.
+    pub(crate) io: Arc<S>,
+    /// The next id to hand out.
+    pub(crate) last_row_id: CacheGuard<AtomicU64>,
+    /// Highest id reserved on disk. Ids past this need a fresh reservation
+    /// before they are handed out.
+    reserved_upto: CacheGuard<AtomicU64>,
+    /// Inserts between their reservation check and the id they take. Each
+    /// takes at most one, so the reservation must reach past the next id by
+    /// this many: two inserts checking at once both see the next id covered
+    /// and take it and the one after, and the second is not covered.
+    in_flight: AtomicU64,
+    /// Serialises raising the reservation, so it only ever goes up: two
+    /// writers could otherwise leave the smaller of their values on disk and
+    /// the larger in memory.
+    reserving: tokio::sync::Mutex<()>,
+}
+
+impl<S: StorageIO> IdSource<S> {
+    fn starting_at(io: Arc<S>, next: u64) -> Self {
+        IdSource {
+            io,
+            last_row_id: AtomicU64::new(next).into(),
+            // Everything up to the recovered value may already be in use, so
+            // the first insert reserves before it allocates.
+            reserved_upto: AtomicU64::new(next).into(),
+            in_flight: AtomicU64::new(0),
+            reserving: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A plain table's sequence, by the rules it has always had: the
+    /// persisted reservation if there is one, else the last pointer's id
+    /// (exact only for a table written before the sequence existed, when ids
+    /// still ascended with file order, and such a table has no reservation to
+    /// honour), else 0.
+    async fn legacy(io: Arc<S>, last_pointer: Option<&RowPointer>) -> Self {
+        let next = match Self::load(&io).await {
+            Some(reserved) => reserved,
+            None => last_pointer.map_or(0, |p| p.row_id()),
+        };
+        Self::starting_at(io, next)
+    }
+
+    /// A partitioned table's sequence. A short or unreadable file is an
+    /// error, never a fallback (§3.5, I12): no partition's last record says
+    /// anything about the ids the others took. A missing file has to be
+    /// refused before the provider is built, since providers create.
+    // Called from `PartitionedTable` (S3b) on; until then only tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_strict(io: Arc<S>) -> std::io::Result<Self> {
+        let len = io.get_len().await;
+        if len < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the row-id sequence {} holds {} bytes, not 8; refusing to open the table",
+                    io.get_name(),
+                    len
+                ),
+            ));
+        }
+        let mut buffer = [0u8; 8];
+        let mut position = 0u64;
+        io.read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("the row-id sequence {} cannot be read: {}", io.get_name(), e),
+                )
+            })?;
+        Ok(Self::starting_at(io, u64::from_le_bytes(buffer)))
+    }
+
+    /// A new partitioned table's sequence, starting at 0. Refuses a file that
+    /// already holds anything: a new table's ids file is new, and reusing one
+    /// could hand out ids already taken.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn create(io: Arc<S>) -> std::io::Result<Self> {
+        let len = io.get_len().await;
+        if len != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("the row-id sequence {} already holds {} bytes", io.get_name(), len),
+            ));
+        }
+        // Committed here rather than through `write_data`, which only logs a
+        // failed commit: the table would be reported created and then refused
+        // by `open_strict` at every start after.
+        let txn = io.begin_txn();
+        let token = io.write_data_txn(txn, 0, &0u64.to_le_bytes()).await;
+        io.commit_durable(token).await?;
+        Ok(Self::starting_at(io, 0))
+    }
+
+    /// Ids handed out so far: the next one to hand out.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn handed_out(&self) -> u64 {
+        self.last_row_id.load(AtomicOrdering::Acquire)
+    }
+
+    /// The persisted reservation, or `None` if there is none yet.
+    ///
+    /// For a plain table, a sidecar that is present but unreadable is treated
+    /// as absent: the caller's fallback is conservative, and refusing to open
+    /// a table because eight bytes went bad would be a worse answer than
+    /// handing out ids from a slightly higher floor.
+    async fn load(io: &Arc<S>) -> Option<u64> {
+        if io.get_len().await < 8 {
+            return None;
+        }
+        let mut buffer = [0u8; 8];
+        let mut position = 0u64;
+        match io.read_data_into_buffer(&mut position, &mut buffer).await {
+            Ok(()) => Some(u64::from_le_bytes(buffer)),
+            Err(e) => {
+                error!(
+                    "Could not read the id sequence ({}); recovering from the pointer file",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Reserves the next block of ids on disk.
+    ///
+    /// Written before any id in the block is used, so a crash can only ever skip
+    /// ids, never repeat one. Ids need to be unique, not gapless.
+    async fn reserve(&self, upto: u64) {
+        let _one = self.reserving.lock().await;
+        if upto <= self.reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.io.write_data(0, &upto.to_le_bytes()).await;
+        self.reserved_upto.store(upto, AtomicOrdering::Release);
+    }
+
+    /// Makes sure the sequence on disk covers the ids about to be handed out.
+    ///
+    /// Called before an update relocates, whose new versions draw from the
+    /// counter but keep their row's own id, so a gap there is harmless. An
+    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
+    async fn ensure_reserved(&self) {
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next < self.reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.reserve(next + ID_RESERVATION_CHUNK).await;
+    }
+
+    /// Covers on disk the id an insert is about to take, counting every other
+    /// insert that has checked but not yet taken one. Hold the guard until the
+    /// id is taken.
+    ///
+    /// Inserts used to take turns here under the table's one uniqueness lock;
+    /// with that lock striped by key, two of them check and allocate side by
+    /// side, and checking `next < reserved` alone let the second take an id the
+    /// disk did not cover, which a crash then handed out twice. Partitions
+    /// sharing this source are such inserts too, with no lock in common.
+    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
+        let in_flight = self.in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+        let guard = IdsInFlight(&self.in_flight);
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next + in_flight > self.reserved_upto.load(AtomicOrdering::Acquire) {
+            self.reserve(next + in_flight + ID_RESERVATION_CHUNK).await;
+        }
+        guard
+    }
+}
+
+/// What [`Table::open_partition`] builds a partition from (§3.4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PartitionOpen<S: StorageIO> {
+    /// `__pt_<uid:016x>_<pid:08x>`: the stem its three files hang off.
+    pub physical: String,
+    /// Opens `<physical>.db`, `_pointers.db` and `_flt.db` and nothing else.
+    /// The caller has already checked they exist (I9): providers create.
+    pub seed: Arc<S>,
+    /// The shell's schema provider. Shared, never written through here: the
+    /// partition has no schema file of its own.
+    pub io_schema: Arc<S>,
+    /// A clone of the shell's schema, so write orders agree across
+    /// partitions; `name` stays the logical name.
+    pub schema: TableSchema,
+    /// The logical table's one sequence (§3.5).
+    pub ids: StdArc<IdSource<S>>,
+    pub guard: crate::core::partition::guard::RangeGuard,
+    /// `"<db_id>\0<physical>"` (I20). Derived from the shared `schema.name`,
+    /// one partition's cached rows would answer for another's.
+    pub cache_scope: String,
+}
+
+/// What [`Table::assemble`] finishes a table from.
+struct Assembly<'a, S: StorageIO> {
+    /// The name filter settings are looked up under: the logical name.
+    settings_name: &'a str,
+    schema: TableSchema,
+    schema_unreadable: bool,
+    io_schema: Arc<S>,
+    io_pointers: Arc<S>,
+    io_rows: Arc<S>,
+    io_filters: Arc<S>,
+    ids: StdArc<IdSource<S>>,
+    table_length: u64,
+    guard: Option<crate::core::partition::guard::RangeGuard>,
+    cache_scope: String,
+    maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
 }
 
 /// The `ErrorKind` and text a partition shell refuses data access with. The
@@ -302,9 +510,9 @@ impl<S: StorageIO> Table<S> {
         Ok(&self.data()?.io_filters)
     }
 
-    /// The row-id sequence sidecar.
+    /// The row-id sequence file: a plain table's own, a partition's shared one.
     pub fn io_sequence(&self) -> std::io::Result<&Arc<S>> {
-        Ok(&self.data()?.io_sequence)
+        Ok(&self.data()?.ids.io)
     }
 
     /// The filter index, `Ok(None)` when the table has none.
@@ -321,7 +529,7 @@ impl<S: StorageIO> Table<S> {
 
     /// The row-id counter: the next id to hand out.
     pub fn last_row_id(&self) -> std::io::Result<&CacheGuard<AtomicU64>> {
-        Ok(&self.data()?.last_row_id)
+        Ok(&self.data()?.ids.last_row_id)
     }
 }
 
@@ -528,50 +736,6 @@ impl<S: StorageIO> TableData<S> {
         self.filters.is_some() || self.indexes.is_some()
     }
 
-    /// Reserves the next block of ids on disk.
-    ///
-    /// Written before any id in the block is used, so a crash can only ever skip
-    /// ids, never repeat one. Ids need to be unique, not gapless.
-    async fn reserve_ids(&self, upto: u64) {
-        let _one = self.reserving.lock().await;
-        if upto <= self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        self.io_sequence.write_data(0, &upto.to_le_bytes()).await;
-        self.id_reserved_upto.store(upto, AtomicOrdering::Release);
-    }
-
-    /// Makes sure the sequence on disk covers the ids about to be handed out.
-    ///
-    /// Called before an update relocates, whose new versions draw from the
-    /// counter but keep their row's own id, so a gap there is harmless. An
-    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
-    async fn ensure_ids_reserved(&self) {
-        let next = self.last_row_id.load(AtomicOrdering::Acquire);
-        if next < self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        self.reserve_ids(next + ID_RESERVATION_CHUNK).await;
-    }
-
-    /// Covers on disk the id an insert is about to take, counting every other
-    /// insert that has checked but not yet taken one. Hold the guard until the
-    /// id is taken.
-    ///
-    /// Inserts used to take turns here under the table's one uniqueness lock;
-    /// with that lock striped by key, two of them check and allocate side by
-    /// side, and checking `next < reserved` alone let the second take an id the
-    /// disk did not cover, which a crash then handed out twice.
-    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
-        let in_flight = self.ids_in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
-        let guard = IdsInFlight(&self.ids_in_flight);
-        let next = self.last_row_id.load(AtomicOrdering::Acquire);
-        if next + in_flight > self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            self.reserve_ids(next + in_flight + ID_RESERVATION_CHUNK).await;
-        }
-        guard
-    }
-
     /// Registers this read with the epoch registry, so reclamation cannot hand
     /// out an extent the read is about to fetch from.
     ///
@@ -617,11 +781,30 @@ impl<S: StorageIO> Table<S> {
         self.write_generation.load(AtomicOrdering::Acquire)
     }
 
+    /// The query-cache scope and current generation: what an entry this
+    /// table stores is keyed and stamped with.
+    #[cfg(test)]
+    pub(crate) fn cache_key(&self) -> (&str, u64) {
+        (&self.cache_scope, self.cache_generation())
+    }
+
     /// Qualifies this table's query-cache key with the database that owns it.
     ///
     /// Called once, by [`crate::core::database::Database`], before the table is
     /// shared. See [`Table::cache_scope`] for why the cache needs it.
+    ///
+    /// A partition keeps the scope [`Table::open_partition`] gave it: its
+    /// `schema.name` is the logical table's, shared by every partition, so a
+    /// scope derived from it would let one partition's cached rows answer for
+    /// another's (I20).
     pub fn scope_cache_to_database(&mut self, database_id: u64) {
+        if self.data.as_ref().is_some_and(|d| d.guard.is_some()) {
+            log::warn!(
+                "scope_cache_to_database called on partition scope {:?}; keeping it",
+                self.cache_scope
+            );
+            return;
+        }
         // A separator that cannot occur in an identifier, so `1` + `x_y` and
         // `1_x` + `y` cannot produce the same key.
         self.cache_scope = format!("{}\u{0}{}", database_id, self.schema.name);
@@ -770,63 +953,176 @@ impl<S: StorageIO> Table<S> {
                 // must not replace them with an empty one.
                 TableSchema::new(table_name.to_string(), false)
             } else {
-                let mut schema = TableSchema::new(table_name.to_string(), false);
-
-                schema
-                    .save(io_schema.clone())
+                Self::create_schema_files(io_schema.clone(), table_name, columns, unique_columns)
                     .await
-                    .expect("Failed to save initial schema");
-
-                for column in columns {
-                    let is_unique = unique_columns
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.name));
-                    schema
-                        .add_field(io_schema.clone(), column.name, column.data_type, is_unique)
-                        .await;
-                }
-
-                schema
+                    .expect("Failed to save initial schema")
             }
         };
 
         info!("Loaded schema: {:?}", schema);
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
+        let last_pointer = pointer_iterator.read_last().await;
+        let ids = StdArc::new(IdSource::legacy(io_sequence, last_pointer.as_ref()).await);
+        let table_length = Self::recovered_length(last_pointer.as_ref(), &io_rows).await;
+        let cache_scope = schema.name.clone();
 
-        let (atomic_last_id, atomic_table_length) = if let Some(row_pointer) =
-            pointer_iterator.read_last().await
-        {
-            // The persisted sequence is the authority. Falling back to the
-            // last record is only correct for a table written before the
-            // sequence existed, when ids still ascended with file order —
-            // and such a table has no reservation to honour, so the fallback
-            // is exact rather than merely safe.
-            let atomic_last_id = AtomicU64::new(match Self::load_id_sequence(&io_sequence).await {
-                Some(reserved) => reserved,
-                None => row_pointer.row_id(),
-            });
+        Self::assemble(Assembly {
+            settings_name: table_name,
+            schema,
+            schema_unreadable,
+            io_schema,
+            io_pointers,
+            io_rows,
+            io_filters,
+            ids,
+            table_length,
+            guard: None,
+            cache_scope,
+            maintenance_alive,
+        })
+        .await
+    }
 
+    /// A partition of a partitioned table (§3.4): a `Table` over the
+    /// partition's three files, with the logical table's schema and id
+    /// sequence, its range guard installed and its own cache scope.
+    ///
+    /// Loads no schema file and no `_seq.db`: the schema is the shell's clone
+    /// and the ids are the logical table's. Spawns the services of the three
+    /// providers it opens and, as a plain table does, its own filter, index
+    /// and reclamation tasks; shared maintenance is phase 3's. A pointer file
+    /// it cannot read is an error rather than a panic.
+    // Called from `PartitionedTable` (S3b) on; until then only tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_partition(p: PartitionOpen<S>) -> std::io::Result<Self> {
+        let PartitionOpen {
+            physical,
+            seed,
+            io_schema,
+            schema,
+            ids,
+            guard,
+            cache_scope,
+        } = p;
+        let io_pointers = Arc::new(seed.create_new(format!("{}_pointers.db", physical)).await);
+        let io_rows = Arc::new(seed.create_new(format!("{}.db", physical)).await);
+        let io_filters = Arc::new(seed.create_new(format!("{}_flt.db", physical)).await);
+
+        let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
+        let services_alive = maintenance_alive.clone();
+        let (rows_task, pointers_task, filters_task) = (io_rows.clone(), io_pointers.clone(), io_filters.clone());
+        // As in `new_with_constraints`: watches the drop signal so the task
+        // does not hold the providers for the life of the process.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = async {
+                    tokio::join!(
+                        rows_task.start_service(),
+                        pointers_task.start_service(),
+                        filters_task.start_service()
+                    );
+                } => {}
+                _ = async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if !services_alive.load(AtomicOrdering::Relaxed) {
+                            break;
+                        }
+                    }
+                } => {}
+            }
+        });
+
+        #[cfg(test)]
+        let opened = if partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.replace(false)) {
+            Err(std::io::Error::other("injected pointer-file read failure"))
+        } else {
+            RowPointerIterator::new(io_pointers.clone()).await.map_err(std::io::Error::from)
+        };
+        #[cfg(not(test))]
+        let opened = RowPointerIterator::new(io_pointers.clone()).await.map_err(std::io::Error::from);
+        // No `Table` is built on this path, so no `Drop` stops the service
+        // task: left `true`, it would hold the three providers for good.
+        let mut pointer_iterator = match opened {
+            Ok(iterator) => iterator,
+            Err(e) => {
+                maintenance_alive.store(false, AtomicOrdering::Relaxed);
+                return Err(e);
+            }
+        };
+        let last_pointer = pointer_iterator.read_last().await;
+        let table_length = Self::recovered_length(last_pointer.as_ref(), &io_rows).await;
+        // Filter settings are per logical table, like the schema.
+        let settings_name = schema.name.clone();
+
+        Ok(Self::assemble(Assembly {
+            settings_name: &settings_name,
+            schema,
+            schema_unreadable: false,
+            io_schema,
+            io_pointers,
+            io_rows,
+            io_filters,
+            ids,
+            table_length,
+            guard: Some(guard),
+            cache_scope,
+            maintenance_alive,
+        })
+        .await)
+    }
+
+    /// Writes a new table's schema and its fields to `io_schema`.
+    pub(crate) async fn create_schema_files(
+        io_schema: Arc<S>,
+        name: &str,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+    ) -> std::io::Result<TableSchema> {
+        let mut schema = TableSchema::new(name.to_string(), false);
+        schema.save(io_schema.clone()).await?;
+        for column in columns {
+            let is_unique = unique_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name));
+            schema
+                .add_field(io_schema.clone(), column.name, column.data_type, is_unique)
+                .await;
+        }
+        Ok(schema)
+    }
+
+    /// The rows file's high-water mark as an open finds it.
+    async fn recovered_length(last_pointer: Option<&RowPointer>, io_rows: &Arc<S>) -> u64 {
+        match last_pointer {
             // End of the last row, not its start — the start would place the
             // high-water mark inside a row that already exists. The rows
             // file's own length is the floor: a row written into a
             // reclaimed extent sits below the frontier, so the last pointer
             // on its own no longer bounds the file.
-            let table_length =
-                (row_pointer.position + row_pointer.length as u64).max(io_rows.get_len().await);
-            let atomic_table_length = AtomicU64::new(table_length);
+            Some(row_pointer) => (row_pointer.position + row_pointer.length as u64).max(io_rows.get_len().await),
+            None => 0,
+        }
+    }
 
-            (atomic_last_id, atomic_table_length)
-        } else {
-            let atomic_last_id =
-                AtomicU64::new(Self::load_id_sequence(&io_sequence).await.unwrap_or(0));
-            let atomic_table_length = AtomicU64::new(0);
-            (atomic_last_id, atomic_table_length)
-        };
-
-        // Everything up to the recovered value may already be in use, so the
-        // first insert reserves before it allocates.
-        let id_reserved_upto = AtomicU64::new(atomic_last_id.load(AtomicOrdering::Acquire));
+    /// The part of opening a table that is the same for a plain table and a
+    /// partition: everything after the providers, the schema and the ids.
+    async fn assemble(a: Assembly<'_, S>) -> Self {
+        let Assembly {
+            settings_name: table_name,
+            schema,
+            schema_unreadable,
+            io_schema,
+            io_pointers,
+            io_rows,
+            io_filters,
+            ids,
+            table_length,
+            guard,
+            cache_scope,
+            maintenance_alive,
+        } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
@@ -999,7 +1295,6 @@ impl<S: StorageIO> Table<S> {
             || !schema.unique_keys.is_empty();
         let cache_generation =
             StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
-        let schema_name_for_cache = schema.name.clone();
         let write_lock = StdArc::new(tokio::sync::RwLock::new(()));
         let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
         let forget = StdArc::new(std::sync::OnceLock::new());
@@ -1041,12 +1336,9 @@ impl<S: StorageIO> Table<S> {
                 io_pointers,
                 io_rows,
                 io_filters,
-                io_sequence,
-                id_reserved_upto: id_reserved_upto.into(),
-                ids_in_flight: AtomicU64::new(0),
-                reserving: tokio::sync::Mutex::new(()),
-                len: atomic_table_length.into(),
-                last_row_id: atomic_last_id.into(),
+                ids,
+                len: AtomicU64::new(table_length).into(),
+                guard,
                 filters,
                 indexes,
                 free_space,
@@ -1059,7 +1351,7 @@ impl<S: StorageIO> Table<S> {
             in_place_column_updates: AtomicU64::new(0).into(),
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),
-            cache_scope: schema_name_for_cache,
+            cache_scope,
             write_lock,
             unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
             compaction_gate,
@@ -1072,42 +1364,15 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
-    /// Reads the persisted id reservation, or `None` if there is none yet.
-    ///
-    /// A sidecar that is present but unreadable is treated as absent: the
-    /// caller's fallback is conservative, and refusing to open a table because
-    /// eight bytes went bad would be a worse answer than handing out ids from a
-    /// slightly higher floor.
-    async fn load_id_sequence(io_sequence: &Arc<S>) -> Option<u64> {
-        if io_sequence.get_len().await < 8 {
-            return None;
-        }
-        let mut buffer = [0u8; 8];
-        let mut position = 0u64;
-        match io_sequence
-            .read_data_into_buffer(&mut position, &mut buffer)
-            .await
-        {
-            Ok(()) => Some(u64::from_le_bytes(buffer)),
-            Err(e) => {
-                error!(
-                    "Could not read the id sequence ({}); recovering from the pointer file",
-                    e
-                );
-                None
-            }
-        }
-    }
-
     /// The highest id the sequence reservation covers, for tests.
     #[cfg(test)]
     pub(crate) fn ids_reserved_upto(&self) -> Result<u64> {
-        Ok(self.data()?.id_reserved_upto.load(AtomicOrdering::Acquire))
+        Ok(self.data()?.ids.reserved_upto.load(AtomicOrdering::Acquire))
     }
 
     /// See [`TableData::reserve_insert_id`].
     pub(crate) async fn reserve_insert_id(&self) -> Result<IdsInFlight<'_>> {
-        Ok(self.data()?.reserve_insert_id().await)
+        Ok(self.data()?.ids.reserve_insert_id().await)
     }
 
     /// Puts this table under MVCC.
@@ -1666,7 +1931,8 @@ impl<S: StorageIO> Table<S> {
         // The high-water mark and the id sequence both described the old layout.
         d.len.store(compacted_rows_len, AtomicOrdering::Release);
         if let Some(last) = pointers.last() {
-            d.last_row_id
+            d.ids
+                .last_row_id
                 .fetch_max(last.pointer.row_id(), AtomicOrdering::AcqRel);
         }
 
@@ -3285,6 +3551,13 @@ impl<S: StorageIO> Table<S> {
         // holds the gate too. It is shared, so concurrent inserts still run.
         let _gate = self.compaction_gate.read().await;
 
+        // A partition stores only rows of its own range (§4.5): a row routed
+        // here by mistake fails the statement instead of landing where no
+        // routed query looks. Before anything is locked or written.
+        if let Some(guard) = d.guard.as_ref() {
+            guard.check_insert(&row_write)?;
+        }
+
         self.note_write(written_by);
 
         // A uniqueness check that is not atomic with the write it guards is not
@@ -3310,7 +3583,7 @@ impl<S: StorageIO> Table<S> {
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
-        let _id = d.reserve_insert_id().await;
+        let _id = d.ids.reserve_insert_id().await;
 
         info!(
             "Inserting row with {} columns",
@@ -3320,7 +3593,7 @@ impl<S: StorageIO> Table<S> {
         let result = RowPointer::write_row_with_pointer_record_pos(
             d.io_pointers.clone(),
             d.io_rows.clone(),
-            &d.last_row_id,
+            &d.ids.last_row_id,
             &d.len,
             // Clustering is not implemented; every row goes to cluster 0.
             #[cfg(feature = "enable_long_row")]
@@ -3412,8 +3685,25 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         reader: TxId,
     ) -> Result<u64> {
-        let d = self.data()?;
+        self.data()?;
         let visibility = self.read_visibility_for(reader);
+        self.count_rows_with_visibility(query, schema_fields, query_row_fetch, visibility, true)
+            .await
+    }
+
+    /// [`Self::count_rows_in_txn`] under a rule the caller took, so a
+    /// statement reading several partitions sees them all through one
+    /// snapshot (§4.4, §8). `cache == false` neither reads nor fills the
+    /// query cache.
+    pub async fn count_rows_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<u64> {
+        let d = self.data()?;
 
         // The same two guards the row path takes, for the same reason:
         // reclamation may not hand out an extent while a pointer into it is
@@ -3437,7 +3727,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                cache_generation_for(&visibility, generation),
+                cache.then(|| cache_generation_for(&visibility, generation)).flatten(),
                 visibility,
             )
             .await
@@ -3482,6 +3772,35 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
         visibility: Visibility,
+    ) -> Result<Vec<Row>> {
+        self.data()?;
+        self.query_row_with_visibility_cached(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            visibility,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::query_row_with_visibility`], saying whether the scan may read
+    /// and fill the query cache. A fan-out over many partitions passes
+    /// `false`, so it cannot flush the cache (§8).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_row_with_visibility_cached(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+        cache: bool,
     ) -> Result<Vec<Row>> {
         let d = self.data()?;
         // Implementation for querying a row from the table
@@ -3539,7 +3858,7 @@ impl<S: StorageIO> Table<S> {
                     &mut iterator,
                     limit,
                     order_by.clone(),
-                    cache_generation_for(&visibility, generation),
+                    cache.then(|| cache_generation_for(&visibility, generation)).flatten(),
                     visibility.clone(),
                 )
                 .await?;
@@ -3686,6 +4005,38 @@ impl<S: StorageIO> Table<S> {
         .map(|(bytes, _)| bytes)
     }
 
+    /// [`Self::query_row_bytes_with_visibility`], also reporting over-fetch
+    /// as [`Self::query_row_bytes_reporting_in_txn`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_row_bytes_reporting_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        self.data()?;
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            FROZEN_TX,
+            Some(visibility),
+            cache,
+        )
+        .await
+    }
+
+    /// The one bytes-mode read: as `reader`, whose snapshot is taken once the
+    /// read holds its guards, or under `visibility` when the caller took one.
+    #[allow(clippy::too_many_arguments)]
     async fn query_row_bytes_reporting(
         &self,
         query: &str,
@@ -4208,6 +4559,16 @@ impl<S: StorageIO> Table<S> {
         // failure there would leave the new bytes standing in a statement
         // reported as failed. Such a statement always writes a new version.
         let may_fail_after_write = visibility.is_some();
+        // The range guard can refuse a later row after earlier ones are
+        // written, and an aborted statement cannot undo an in-place overwrite.
+        // So a statement assigning a partition key writes new versions only.
+        // An expression leaves a placeholder in `updates`, so this sees it too.
+        let assigns_key = d.guard.as_ref().is_some_and(|g| {
+            g.spec()
+                .levels()
+                .iter()
+                .any(|l| updates.iter().any(|u| u.write_order == l.write_order))
+        });
 
         self.note_write(written_by);
 
@@ -4309,7 +4670,7 @@ impl<S: StorageIO> Table<S> {
 
         // A relocation allocates from the id counter even though it hands the
         // row back its own id, so the reservation on disk has to cover it.
-        d.ensure_ids_reserved().await;
+        d.ids.ensure_reserved().await;
 
         // One transaction for the statement, subject to the memory bound below.
         let mut txn = d.io_pointers.begin_txn();
@@ -4363,6 +4724,10 @@ impl<S: StorageIO> Table<S> {
             // The version's index keys as it stands, before the assignments:
             // an in-place overwrite has to take the slot out from under them.
             let old_keys = d.indexes.as_ref().map(|ix| ix.keys_of(&row_write));
+
+            // A partition's point for the version as it stands, checked
+            // against the merged row below.
+            let point_before = d.guard.as_ref().map(|g| g.point_of_write(&row_write));
 
             // Apply updates in-place in the RowWrite payloads.
             for upd in updates.iter() {
@@ -4495,6 +4860,33 @@ impl<S: StorageIO> Table<S> {
                 }
             }
 
+            // The range guard (§4.5), on the merged row and ahead of every
+            // write branch below. Two of them never relocate (the fixed-width
+            // fast path, taken whenever nothing else runs, and the in-place
+            // overwrite), so a guard on the relocating branch alone would let
+            // `SET tenant_id = 43` overwrite a row in tenant 42's partition,
+            // report success, and hide it from routed queries. Assigning the
+            // value a key already holds keeps the point and passes.
+            if let (Some(guard), Some(before)) = (d.guard.as_ref(), point_before) {
+                let checked = before
+                    .map_err(std::io::Error::other)
+                    .and_then(|before| guard.check_update_from(before, &row_write));
+                if let Err(e) = checked {
+                    // As for a unique violation below: earlier rows of this
+                    // statement are made durable before it fails, and nothing
+                    // is marked retryable, since a retry fails the same way.
+                    d.io_pointers.commit_durable(txn).await?;
+                    d.apply_pending_filters(&mut pending_filters);
+                    self.dead_stamps
+                        .fetch_add(updated_count, AtomicOrdering::Relaxed);
+                    self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
+                    if updated_count > 0 {
+                        self.invalidate_query_caches();
+                    }
+                    return Err(e);
+                }
+            }
+
             // The row keeps the value it already holds, so it is excluded from
             // its own check.
             let assigned: std::collections::HashSet<u32> =
@@ -4564,6 +4956,7 @@ impl<S: StorageIO> Table<S> {
             // needs nothing from it that the general path does not.
             if !updates.is_empty()
                 && !may_fail_after_write
+                && !assigns_key
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
                     .write_columns_in_place(d, &pointer, updates, txn, written_by)
@@ -4594,7 +4987,7 @@ impl<S: StorageIO> Table<S> {
                     d.io_pointers.clone(),
                     d.io_rows.clone(),
                     record_pos,
-                    &d.last_row_id,
+                    &d.ids.last_row_id,
                     &d.len,
                     // Clustering is not implemented; every row goes to cluster 0.
                     #[cfg(feature = "enable_long_row")]
@@ -4674,7 +5067,7 @@ impl<S: StorageIO> Table<S> {
     }
 }
 
-/// One insert counted in `Table::ids_in_flight` until its id is taken.
+/// One insert counted in `IdSource::in_flight` until its id is taken.
 pub(crate) struct IdsInFlight<'a>(&'a AtomicU64);
 
 impl Drop for IdsInFlight<'_> {
@@ -4910,6 +5303,16 @@ pub(crate) mod compact_test_hooks {
                 p.store(state, std::sync::atomic::Ordering::Release);
             }
         });
+    }
+}
+
+/// Failures no file can be made to produce on demand. Thread-local, so set
+/// them from a current-thread runtime.
+#[cfg(test)]
+pub(crate) mod partition_test_hooks {
+    thread_local! {
+        /// The next `open_partition` fails reading its pointer file.
+        pub(crate) static FAIL_POINTER_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 

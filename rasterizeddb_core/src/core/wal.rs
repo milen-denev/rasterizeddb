@@ -4102,7 +4102,7 @@ mod tests {
                 t.io_pointers().unwrap().clone(),
                 t.io_rows().unwrap().clone(),
                 pos,
-                t.last_row_id().unwrap(),
+                &t.data().unwrap().ids.last_row_id,
                 &t.data().unwrap().len,
                 #[cfg(feature = "enable_long_row")]
                 0,
