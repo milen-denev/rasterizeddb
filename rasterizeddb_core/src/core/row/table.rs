@@ -2699,7 +2699,10 @@ impl<S: StorageIO> Table<S> {
         // Sampled before the index is asked. A version appended after this
         // sits at or past `n_slots`, which the bitmap counts as a candidate;
         // one appended before it was indexed by its writer before it could
-        // commit, so a snapshot that can see it finds it here.
+        // commit, so a snapshot that can see it finds it here — provided the
+        // caller took that snapshot BEFORE calling this. A snapshot taken
+        // after can see a commit whose entry this lookup missed; every caller
+        // of `build_candidates` takes its snapshot first for that reason.
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         let scales = self.decimal_scales();
         let cap = crate::core::index::candidate_cap(n_slots);
@@ -2769,6 +2772,20 @@ impl<S: StorageIO> Table<S> {
     /// invisible in query results by design, since both fail open to a full
     /// scan, so nothing outside this method can tell whether they ran.
     pub(crate) async fn build_candidates(
+        &self,
+        where_clause: &str,
+        limit: Option<u64>,
+    ) -> Option<Arc<CandidateBitmap>> {
+        let candidates = self.build_candidates_inner(where_clause, limit).await;
+        // Test-only: parks the statement once the index and the filter have
+        // been asked, on every return path — the window between that lookup
+        // and anything the caller does next, a snapshot included.
+        #[cfg(test)]
+        snapshot_order_tests::candidates_built(&self.schema.name).await;
+        candidates
+    }
+
+    async fn build_candidates_inner(
         &self,
         where_clause: &str,
         limit: Option<u64>,
@@ -3395,6 +3412,16 @@ impl<S: StorageIO> Table<S> {
         // neither rewrites an existing record, and neither takes this lock.
         let _write = self.write_lock.write().await;
 
+        // The snapshot is taken BEFORE the candidates are built, as every read
+        // path takes it. A writer appends its version, then indexes it, then
+        // commits; candidates built first could sample a length that includes
+        // the new slot, ask the index before its entry lands and leave the slot
+        // out, and a snapshot taken after that could then see the committed
+        // row: a visible matching row silently not deleted. Taken first, the
+        // snapshot either predates the commit, so the row is invisible and
+        // leaving it out is right, or follows it, so its entry landed first.
+        let visibility = visibility.unwrap_or_else(|| self.visibility_for(deleted_by));
+
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
@@ -3418,7 +3445,7 @@ impl<S: StorageIO> Table<S> {
                 limit,
                 // A statement may only remove rows it can see. Without this a
                 // DELETE would match another transaction's uncommitted rows.
-                visibility.unwrap_or_else(|| self.visibility_for(deleted_by)),
+                visibility,
             )
             .await?;
 
@@ -3703,6 +3730,16 @@ impl<S: StorageIO> Table<S> {
             None => None,
         };
 
+        // The snapshot is taken BEFORE the candidates are built, as every read
+        // path takes it. A writer appends its version, then indexes it, then
+        // commits; candidates built first could sample a length that includes
+        // the new slot, ask the index before its entry lands and leave the slot
+        // out, and a snapshot taken after that could then see the committed
+        // row: a visible matching row silently not updated. Taken first, the
+        // snapshot either predates the commit, so the row is invisible and
+        // leaving it out is right, or follows it, so its entry landed first.
+        let visibility = visibility.unwrap_or_else(|| self.visibility_for(written_by));
+
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
@@ -3724,7 +3761,7 @@ impl<S: StorageIO> Table<S> {
                 limit,
                 // As in `delete_rows_in_txn`: a statement may only change rows
                 // it can see.
-                visibility.unwrap_or_else(|| self.visibility_for(written_by)),
+                visibility,
             )
             .await?;
 
@@ -4388,3 +4425,7 @@ mod candidate_mask_tests {
         assert!(mask_is_worth_using(0.99, 0.5, 10_000, 10_000, true));
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_order_tests.rs"]
+mod snapshot_order_tests;
