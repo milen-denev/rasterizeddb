@@ -3187,10 +3187,19 @@ pub(crate) async fn describe_query(
                     let columns = widen_union_fields(database, &def.body, &relations, columns).await?;
                     relations.push((def.name.clone(), scratch_fields(&columns)));
                 }
-                // A body this cannot resolve leaves the rest unresolvable too.
-                // The outer statement is still tried below: it may not read the
-                // CTE at all, which is the shape that always worked.
-                None => break,
+                // A body of named constants has no relation to resolve; it is
+                // described by the same reading that materialises it.
+                None => match crate::core::rql::cte::constant_body(&def.body) {
+                    Some(constants) => {
+                        let columns: Vec<(String, DbType)> =
+                            constants.into_iter().map(|c| (c.label, c.db_type)).collect();
+                        relations.push((def.name.clone(), scratch_fields(&columns)));
+                    }
+                    // A body this cannot resolve leaves the rest unresolvable
+                    // too. The outer statement is still tried below: it may not
+                    // read the CTE at all, which is the shape that always worked.
+                    None => break,
+                },
             }
         }
         if let Some((fields, true)) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
@@ -4583,6 +4592,17 @@ where
         uncommented.as_str()
     } else {
         stmt
+    };
+
+    // `INSERT INTO t WITH … SELECT …` puts its CTEs after the target; they are
+    // moved to the front, where everything below expects a `WITH` to be.
+    let hoisted;
+    let stmt = match crate::core::rql::cte::hoist_insert_with(stmt) {
+        Some(rewritten) => {
+            hoisted = rewritten;
+            hoisted.as_str()
+        }
+        None => stmt,
     };
 
     // A data-modifying CTE and the statement it feeds are one statement, so

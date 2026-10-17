@@ -400,3 +400,64 @@ async fn nested_derived_tables_are_materialised() {
     let tables = rows(&pool, "SELECT count(*) FROM pg_class WHERE relname LIKE '__cte_%'").await;
     assert_eq!(tables.as_deref().ok(), Some(&["0".to_string()][..]), "{tables:?}");
 }
+
+/// #20: an INSERT whose row source is a `WITH` query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_takes_its_rows_from_a_with_query() {
+    let server = TestServer::start().await.expect("start");
+    let pool = server.connect_sqlx().await.expect("connect");
+    digits(&pool).await;
+    run(&pool, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)").await;
+    let mut wrong = Wrong::default();
+    for (sql, want) in [
+        ("INSERT INTO t (a, b) WITH w AS (SELECT 50 AS a, 'x' AS b) SELECT a, b FROM w", &[][..]),
+        ("INSERT INTO t WITH w AS (SELECT n AS a FROM digit WHERE n < 3) SELECT a, 'd' || a FROM w", &[]),
+        (
+            "INSERT INTO t (a, b) WITH w AS (SELECT n FROM digit WHERE n BETWEEN 1 AND 4) \
+             SELECT n, 'up' FROM w ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b RETURNING a, b",
+            &["1|up", "2|up", "3|up", "4|up"],
+        ),
+        (
+            "INSERT INTO t (a, b) WITH w AS (SELECT n FROM digit WHERE n > 7) \
+             SELECT n, 'nine' FROM w ON CONFLICT DO NOTHING RETURNING a",
+            &["8", "9"],
+        ),
+        (
+            "INSERT INTO t (a, b) WITH v AS (SELECT n FROM digit WHERE n = 8), w AS (SELECT n FROM v) \
+             SELECT n, 'dup' FROM w ON CONFLICT (a) DO NOTHING RETURNING a",
+            &[],
+        ),
+        (
+            "SELECT a, b FROM t ORDER BY a",
+            &["0|d0", "1|up", "2|up", "3|up", "4|up", "8|nine", "9|nine", "50|x"],
+        ),
+        // A body of named constants is a relation of one row on its own.
+        (
+            "WITH w AS (SELECT 50 AS a, 'x' AS b, NULL AS c, true AS d, 1.5 AS e, 3000000000 AS f) \
+             SELECT a, b, c, d, e, f FROM w",
+            &["50|x|NULL|t|1.5|3000000000"],
+        ),
+    ] {
+        wrong.check(&pool, sql, want).await;
+    }
+    wrong.assert_none();
+
+    // Over the extended protocol a constant body is described with the types
+    // it is materialised with.
+    let row = sqlx::query("WITH w AS (SELECT 50 AS a, 'x' AS b, 1.5 AS e) SELECT a, b, e FROM w")
+        .fetch_one(&pool)
+        .await
+        .expect("extended constant body");
+    assert_eq!(row.get::<i32, _>(0), 50);
+    assert_eq!(row.get::<String, _>(1), "x");
+
+    // The extended protocol describes the RETURNING columns of the same shape.
+    let returned: Vec<(i32, String)> = sqlx::query_as(
+        "INSERT INTO t (a, b) WITH w AS (SELECT n FROM digit WHERE n = 7) \
+         SELECT n, 'seven' FROM w RETURNING a, b",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("extended insert with a WITH source");
+    assert_eq!(returned, vec![(7, "seven".to_string())]);
+}

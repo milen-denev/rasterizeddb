@@ -250,6 +250,87 @@ fn returning_constants(body: &str) -> Option<Vec<String>> {
     Some(literals)
 }
 
+/// One column of a body made of named constants; see [`constant_body`].
+pub(crate) struct ConstantColumn {
+    pub label: String,
+    pub db_type: DbType,
+    /// What the materialised relation declares the column as.
+    pub sql_type: String,
+    /// The literal as written.
+    pub value: String,
+}
+
+/// A body with no `FROM` whose items are all named literals —
+/// `SELECT 50 AS a, 'x' AS b` — as its columns and their one row of values.
+/// `None` for anything else, which then runs as a query.
+///
+/// Such a body names no relation, so the query path cannot run it and
+/// refused it as "cannot parse subquery". It is one row of constants, which
+/// is exactly what a `VALUES` tuple is. Each type is the one PostgreSQL gives
+/// the literal: an integer that fits is `int4`, then `int8`, then `numeric`,
+/// a decimal is `numeric`, and a string is `text`. Shared with the describe
+/// path, so the client is told the types the relation is built with.
+pub(crate) fn constant_body(body: &str) -> Option<Vec<ConstantColumn>> {
+    let trimmed = body.trim().trim_end_matches(';').trim_end();
+    if trimmed.len() < "SELECT".len() || !trimmed[.."SELECT".len()].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    let list = &trimmed["SELECT".len()..];
+    if !list.starts_with(char::is_whitespace) {
+        return None;
+    }
+    for keyword in ["FROM", "WHERE", "UNION", "GROUP", "ORDER", "LIMIT", "OFFSET"] {
+        if crate::core::rql::join::find_keyword(list, keyword, 0).is_some() {
+            return None;
+        }
+    }
+    let mut columns = Vec::new();
+    for item in crate::core::rql::lexer_ct::split_definitions(list) {
+        let (expression, alias) = split_alias(item.trim());
+        let label = alias?.to_string();
+        let value = expression.trim();
+        let (db_type, sql_type) = if value.eq_ignore_ascii_case("NULL") {
+            (DbType::STRING, "TEXT".to_string())
+        } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
+            (DbType::BOOL, "BOOLEAN".to_string())
+        } else if value.len() >= 2
+            && value.starts_with('\'')
+            && value.ends_with('\'')
+            && !value[1..value.len() - 1].replace("''", "").contains('\'')
+        {
+            (DbType::STRING, "TEXT".to_string())
+        } else if let Ok(n) = value.parse::<i64>() {
+            if i32::try_from(n).is_ok() {
+                (DbType::I32, "INTEGER".to_string())
+            } else {
+                (DbType::I64, "BIGINT".to_string())
+            }
+        } else if value.parse::<f64>().is_ok()
+            && value.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
+        {
+            // A numeric literal keeps the places it was written with, as
+            // PostgreSQL's does: `1.5` prints as 1.5, not at the engine's nine.
+            let places = value.split_once('.').map_or(0, |(_, places)| places.len());
+            if places > crate::core::rql::type_modifier::MAX_DECIMAL_SCALE as usize {
+                return None;
+            }
+            (DbType::DECIMAL, format!("NUMERIC(38,{})", places))
+        } else {
+            return None;
+        };
+        columns.push(ConstantColumn {
+            label,
+            db_type,
+            sql_type,
+            value: value.to_string(),
+        });
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(columns)
+}
+
 /// The output names of a `SELECT` that is about to be materialised.
 ///
 /// Each item's own name, as PostgreSQL gives it. A list holding a `*` has
@@ -715,6 +796,31 @@ pub fn has_with_clause(sql: &str) -> bool {
         && trimmed[4..].starts_with(|c: char| c.is_whitespace() || c == '(')
 }
 
+/// `INSERT INTO t [(cols)] WITH a AS (…) SELECT …` rewritten as
+/// `WITH a AS (…) INSERT INTO t [(cols)] SELECT …`, and `None` for any other
+/// statement.
+///
+/// The two mean the same thing in PostgreSQL: a non-recursive CTE is visible
+/// to the query it is attached to, and here that query is the whole row
+/// source. Only the leading form was recognised, so the trailing one reached
+/// the insert path with its `WITH` intact and ran the CTE body as if it were
+/// the row source — "cannot parse subquery", or "a subquery used as a value
+/// returned 2 rows". Moving the clause to the front hands it to the
+/// materialisation every other CTE goes through, `ON CONFLICT` and
+/// `RETURNING` included, since they stay where they were.
+pub fn hoist_insert_with(sql: &str) -> Option<String> {
+    let (head, source) = crate::core::rql::lexer_ir::insert_select_source(sql)?;
+    if !starts_with_with(source) {
+        return None;
+    }
+    let (defs, rest) = split_with(source).ok()??;
+    let clauses: Vec<String> = defs
+        .iter()
+        .map(|def| format!("{} AS ({})", def.name, def.body))
+        .collect();
+    Some(format!("WITH {} {} {}", clauses.join(", "), head, rest))
+}
+
 pub async fn materialize(
     sql: &str,
     database: &Arc<Database>,
@@ -833,6 +939,44 @@ async fn materialize_inner(
                 rewritten = replace_relation_references(&rewritten, &def.name, &temp);
                 // Registered by name so a later CTE referencing this one finds
                 // it, exactly as the ordinary path does.
+                published.push((def.name.clone(), temp));
+                continue;
+            }
+        }
+
+        // A body of named constants is one `VALUES` row, with no query to run.
+        if !modifies {
+            if let Some(constants) = constant_body(&body) {
+                let temp = temp_name(&def.name, sql, index);
+                let columns: Vec<String> = constants
+                    .iter()
+                    .map(|c| format!("{} {}", c.label, c.sql_type))
+                    .collect();
+                let labels: Vec<&str> = constants.iter().map(|c| c.label.as_str()).collect();
+                let values: Vec<&str> = constants.iter().map(|c| c.value.as_str()).collect();
+                crate::core::rql::executor::run_statement(
+                    &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+                    database,
+                    tx,
+                )
+                .await
+                .map_err(|e| {
+                    format!("could not materialise the WITH clause '{}': {}", def.name, e)
+                })?;
+                temps.push(temp.clone());
+                crate::core::rql::executor::run_statement(
+                    &format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        temp,
+                        labels.join(", "),
+                        values.join(", ")
+                    ),
+                    database,
+                    tx,
+                )
+                .await
+                .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
+                rewritten = replace_relation_references(&rewritten, &def.name, &temp);
                 published.push((def.name.clone(), temp));
                 continue;
             }
@@ -1394,6 +1538,50 @@ mod tests {
         // with "Table not found".
         let one = "WITH roles AS (SELECT 1) SELECT 1";
         assert_ne!(temp_name("roles", one, 0), temp_name("roles", one, 0));
+    }
+
+    #[test]
+    fn a_with_clause_after_the_insert_target_is_moved_to_the_front() {
+        assert_eq!(
+            hoist_insert_with(
+                "INSERT INTO t (a, b) WITH w AS (SELECT n FROM d) SELECT n, 'x' FROM w \
+                 ON CONFLICT (a) DO NOTHING RETURNING a"
+            )
+            .as_deref(),
+            Some(
+                "WITH w AS (SELECT n FROM d) INSERT INTO t (a, b) SELECT n, 'x' FROM w \
+                 ON CONFLICT (a) DO NOTHING RETURNING a"
+            )
+        );
+        // No column list, and several definitions.
+        assert_eq!(
+            hoist_insert_with("INSERT INTO t WITH v AS (SELECT 1 AS a), w AS (SELECT a FROM v) SELECT a FROM w")
+                .as_deref(),
+            Some("WITH v AS (SELECT 1 AS a), w AS (SELECT a FROM v) INSERT INTO t SELECT a FROM w")
+        );
+        // Everything else is left as written.
+        assert!(hoist_insert_with("INSERT INTO t (a) SELECT a FROM w").is_none());
+        assert!(hoist_insert_with("INSERT INTO t (a) VALUES (1)").is_none());
+        assert!(hoist_insert_with("WITH w AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM w").is_none());
+        assert!(hoist_insert_with("INSERT INTO withdrawals SELECT a FROM w").is_none());
+    }
+
+    #[test]
+    fn a_body_of_named_constants_is_one_typed_row() {
+        let columns =
+            constant_body("SELECT 50 AS a, 'it''s' AS b, NULL AS c, true AS d, 1.50 AS e, 3000000000 AS f")
+                .expect("constant");
+        let labels: Vec<&str> = columns.iter().map(|c| c.label.as_str()).collect();
+        let types: Vec<&str> = columns.iter().map(|c| c.sql_type.as_str()).collect();
+        assert_eq!(labels, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(types, ["INTEGER", "TEXT", "TEXT", "BOOLEAN", "NUMERIC(38,2)", "BIGINT"]);
+        assert_eq!(columns[1].value, "'it''s'");
+        assert_eq!(columns[4].db_type, DbType::DECIMAL);
+        // A column, a relation or an unnamed item is a query, not a constant row.
+        assert!(constant_body("SELECT n AS a").is_none());
+        assert!(constant_body("SELECT 1 AS a FROM t").is_none());
+        assert!(constant_body("SELECT 1").is_none());
+        assert!(constant_body("SELECT 'a' || 'b' AS c").is_none());
     }
 
     #[test]
