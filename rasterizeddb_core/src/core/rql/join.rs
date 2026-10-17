@@ -297,7 +297,13 @@ impl JoinPlan {
         self.items
             .iter()
             .map(|i| {
-                if i.expr.is_some() || i.literal.is_some() || i.scalar.is_some() {
+                if let Some(expr) = i.expr.as_ref() {
+                    // At the scale PostgreSQL displays it at, as a single
+                    // table's select list sends it: `gross - qty * price` over
+                    // NUMERIC(14,2) and NUMERIC(12,2) is 0.00, not 0.000000000.
+                    // The projector rounds the value to the same scale.
+                    crate::core::rql::expr::display_scale(expr).unwrap_or(engine)
+                } else if i.literal.is_some() || i.scalar.is_some() {
                     engine
                 } else {
                     i.field.scale.unwrap_or(engine)
@@ -1181,6 +1187,9 @@ pub struct Projector<'p> {
     /// which is the first thing that has columns from both sides — built per
     /// tuple only when something needs it.
     wants_combined: bool,
+    /// Each expression item's display scale ([`JoinPlan::output_scales`]),
+    /// which its NUMERIC value is rounded to, found once per statement.
+    display_scales: Vec<Option<u32>>,
     layout_companions: Option<Companions>,
     /// The first expression failure, reported once by [`Projector::report`].
     expression_failure: Option<String>,
@@ -1213,6 +1222,11 @@ impl<'p> Projector<'p> {
             plan,
             item_flags,
             wants_combined: plan.items.iter().any(|i| i.expr.is_some()),
+            display_scales: plan
+                .items
+                .iter()
+                .map(|i| i.expr.as_ref().and_then(crate::core::rql::expr::display_scale))
+                .collect(),
             layout_companions: plan
                 .order_layout
                 .as_ref()
@@ -1257,7 +1271,13 @@ impl<'p> Projector<'p> {
                                     Ok(value)
                                 } else {
                                     crate::core::rql::expr::cast(value, &declared)
-                                };
+                                }
+                                .and_then(|value| {
+                                    crate::core::rql::expr::at_display_scale(
+                                        value,
+                                        self.display_scales[i],
+                                    )
+                                });
                                 match coerced {
                                     Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {
                                         (bytes, db_type)

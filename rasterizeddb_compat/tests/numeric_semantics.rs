@@ -902,3 +902,76 @@ async fn integer_operands_are_promoted_to_numeric_in_where() {
     }
     verdict(wrong);
 }
+
+// ---------------------------------------------------------------- bug #26
+
+/// A NUMERIC expression in a join's select list is sent at the scale
+/// PostgreSQL displays it at, as a single table's already was:
+/// `rk.gross - rk.qty * rk.unit_price` over NUMERIC(14,2), INT and
+/// NUMERIC(12,2) rendered 0.000000000 where PostgreSQL renders 0.00. The row
+/// description and the value both said nine places.
+#[tokio::test(flavor = "multi_thread")]
+async fn join_expressions_keep_the_display_scale() {
+    let mut db = db(&[
+        "CREATE TABLE rk (id INT, pid INT, qty INT, unit_price NUMERIC(12,2), gross NUMERIC(14,2), rate NUMERIC(6,4))",
+        "CREATE TABLE pr (pid INT, name TEXT, list NUMERIC(10,3), f FLOAT8)",
+        "INSERT INTO rk VALUES (1, 1, 5, 10.25, 51.25, 0.0750), (2, 2, 3, 1.10, 3.40, 0.1250), (3, 1, 2, 0.05, NULL, 1.0000)",
+        "INSERT INTO pr VALUES (1, 'a', 10.500, 1.5), (2, 'b', 1.125, 2.25)",
+        "CREATE TABLE px (pid INT, list NUMERIC(10,3))",
+        "INSERT INTO px VALUES (2, 1.125)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // The report's statement.
+            (
+                "SELECT rk.id, rk.gross - rk.qty * rk.unit_price FROM rk JOIN pr ON pr.pid = rk.pid ORDER BY rk.id",
+                &["1|0.00", "2|0.10", "3|NULL"],
+            ),
+            // Sums take the larger scale, products the sum of the two, from
+            // either side of the join.
+            (
+                "SELECT rk.id, rk.qty * rk.unit_price, rk.unit_price * 2, rk.unit_price + pr.list, \
+                 pr.list - rk.unit_price, rk.qty * pr.list FROM rk JOIN pr ON pr.pid = rk.pid ORDER BY rk.id",
+                &["1|51.25|20.50|20.750|0.250|52.500", "2|3.30|2.20|2.225|0.025|3.375", "3|0.10|0.10|10.550|10.450|21.000"],
+            ),
+            (
+                "SELECT rk.id, rk.unit_price * rk.rate, rk.gross * pr.list, abs(rk.unit_price - pr.list) \
+                 FROM rk JOIN pr ON pr.pid = rk.pid ORDER BY rk.id",
+                &["1|0.768750|538.12500|0.250", "2|0.137500|3.82500|0.025", "3|0.050000|NULL|10.450"],
+            ),
+            (
+                "SELECT rk.id, (rk.unit_price * 3)::numeric(10,1), rk.qty + 0.5, rk.qty * 1.25 \
+                 FROM rk JOIN pr ON pr.pid = rk.pid ORDER BY rk.id",
+                &["1|30.8|5.5|6.25", "2|3.3|3.5|3.75", "3|0.2|2.5|2.50"],
+            ),
+            // An outer join's missing side, a self-join, and an alias.
+            (
+                "SELECT rk.id, px.list * 2, rk.gross - rk.qty * rk.unit_price AS diff \
+                 FROM rk LEFT JOIN px ON px.pid = rk.pid ORDER BY rk.id",
+                &["1|NULL|0.00", "2|2.250|0.10", "3|NULL|NULL"],
+            ),
+            (
+                "SELECT a.id, b.id, a.unit_price + b.unit_price FROM rk a JOIN rk b ON b.pid = a.pid \
+                 WHERE a.id < b.id ORDER BY a.id",
+                &["1|3|10.30"],
+            ),
+            // Through a CTE and a derived table, which read the join's
+            // scales to bring its rows back to the engine scale.
+            (
+                "WITH c AS (SELECT rk.id, rk.gross - rk.qty * rk.unit_price AS d FROM rk JOIN pr ON pr.pid = rk.pid) \
+                 SELECT id, d FROM c ORDER BY id",
+                &["1|0.00", "2|0.10", "3|NULL"],
+            ),
+            (
+                "SELECT x.id, x.d FROM (SELECT rk.id, rk.qty * rk.unit_price AS d FROM rk JOIN pr ON pr.pid = rk.pid) x ORDER BY x.id",
+                &["1|51.25", "2|3.30", "3|0.10"],
+            ),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}
