@@ -165,6 +165,62 @@ pub fn expression_for<'a>(column: &str, generated: &'a [GeneratedColumn]) -> Opt
         .map(|g| g.expression.as_str())
 }
 
+/// The literal an input column will actually hold once stored, for a
+/// generation expression to read.
+///
+/// PostgreSQL computes a generated column after the row's other values have
+/// been coerced to their columns' types, so the expression sees what is
+/// stored. This read the literal the client wrote: `p NUMERIC(12,2)` given
+/// 20.169 stored 20.17 while `g = p * 15` was computed from 20.169 — 302.54,
+/// not 302.55 — and `WHERE g <> p * 15` found the row.
+///
+/// Only numbers are brought to their column here, a NUMERIC to its declared
+/// scale (rounded) and an integer to a whole number (rounded); every other
+/// type is stored as written, so its literal already is the stored value.
+/// Text that does not evaluate is left for the insert to refuse in its own
+/// words.
+pub fn as_stored(literal: &str, field: &crate::core::row::schema::SchemaField) -> String {
+    use crate::core::db_type::DbType;
+    use crate::core::rql::expr::{self, Value};
+    let numeric = matches!(
+        field.db_type,
+        DbType::I8
+            | DbType::I16
+            | DbType::I32
+            | DbType::I64
+            | DbType::U8
+            | DbType::U16
+            | DbType::U32
+            | DbType::U64
+            | DbType::DECIMAL
+    );
+    let text = literal.trim();
+    if !numeric || text.eq_ignore_ascii_case("NULL") {
+        return literal.to_string();
+    }
+    let unquoted = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).unwrap_or(text);
+    let empty = crate::core::row::row::Row::default();
+    let Ok(Value::Data { bytes, db_type }) = expr::parse(unquoted, &[])
+        .and_then(|e| expr::eval(&e, &empty, &[]))
+        .and_then(|v| expr::from_engine_scale(v, field))
+    else {
+        return literal.to_string();
+    };
+    match db_type {
+        // `from_engine_scale` leaves it at the column's own scale, which the
+        // engine-scale renderer would read a power of ten wrong.
+        DbType::DECIMAL => match <[u8; 16]>::try_from(bytes.as_slice()) {
+            Ok(raw) => crate::core::value_codec::format_decimal_scaled(
+                i128::from_le_bytes(raw),
+                field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+            ),
+            Err(_) => literal.to_string(),
+        },
+        other => crate::core::rql::subquery::value_to_literal(&other, &bytes)
+            .unwrap_or_else(|| literal.to_string()),
+    }
+}
+
 /// Reads a `GENERATED ALWAYS AS (…) STORED` clause out of a column definition,
 /// returning the definition with the clause removed and the expression.
 ///

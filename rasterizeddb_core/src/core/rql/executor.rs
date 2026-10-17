@@ -5442,6 +5442,13 @@ async fn supply_generated_values(
             .unwrap_or_else(|| "NULL".to_string());
         values.push((field.name.clone(), literal));
     }
+    // The expression reads each input as stored, after it is coerced to its
+    // column's type, as PostgreSQL computes it.
+    for (name, literal) in values.iter_mut() {
+        if let Some(field) = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name)) {
+            *literal = crate::core::rql::generated::as_stored(literal, field);
+        }
+    }
 
     let mut computed: Vec<(String, String)> = Vec::with_capacity(generated.len());
     for g in &generated {

@@ -17,6 +17,7 @@ mod raw_wire;
 
 use rasterizeddb_compat::TestServer;
 use raw_wire::RawConn;
+use rust_decimal::Decimal;
 use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo};
 
 struct Db {
@@ -334,4 +335,94 @@ async fn numeric_assignment_rounds_and_checks_precision() {
     )
     .await;
     verdict(wrong);
+}
+
+// ---------------------------------------------------------------- bug #5
+
+/// A generated column reads its inputs as stored, after they are rounded to
+/// their own columns' types.
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_columns_read_the_rounded_inputs() {
+    let mut db = db(&[
+        "CREATE TABLE gen (id INT, p NUMERIC(12,2), g NUMERIC(14,2) GENERATED ALWAYS AS (p * 15) STORED)",
+        "INSERT INTO gen (id, p) VALUES (1, 20.169), (2, 20.165), (3, 0.333)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // g was 302.53, computed from 20.169 while p stored 20.16.
+            ("SELECT id, p, g FROM gen ORDER BY id", &["1|20.17|302.55", "2|20.17|302.55", "3|0.33|4.95"]),
+            ("SELECT id FROM gen WHERE g <> p * 15", &[]),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}
+
+/// The reporter's shape at scale: 1,000 random three-place prices, each of
+/// which has to round, into `NUMERIC(12,2)` beside a generated `p * 15`. Not
+/// one row may disagree with its own inputs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thousand_generated_rows_agree_with_their_inputs() {
+    let db = db(&[
+        "CREATE TABLE stress (id INT, p NUMERIC(12,2), g NUMERIC(14,2) GENERATED ALWAYS AS (p * 15) STORED)",
+    ])
+    .await;
+    // A fixed-seed LCG: the same thousand values every run.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    let mut written: Vec<(i32, Decimal)> = Vec::with_capacity(1000);
+    for batch in 0..10 {
+        let mut values = Vec::with_capacity(100);
+        for k in 0..100 {
+            let id = batch * 100 + k;
+            // -99999.999 ..= 99999.999, three places so most values round.
+            let thousandths = (next() % 200_000_000) as i64 - 99_999_999;
+            let p = Decimal::new(thousandths, 3);
+            written.push((id, p));
+            values.push(format!("({}, {})", id, p));
+        }
+        let sql = format!("INSERT INTO stress (id, p) VALUES {}", values.join(", "));
+        db.pool
+            .execute(AssertSqlSafe(sql))
+            .await
+            .unwrap_or_else(|e| panic!("batch {} failed: {}", batch, e));
+    }
+
+    let disagreeing = sqlx::query("SELECT id FROM stress WHERE g <> p * 15")
+        .fetch_all(&db.pool)
+        .await
+        .expect("WHERE g <> p * 15");
+    assert!(
+        disagreeing.is_empty(),
+        "{} of 1000 rows have g <> p * 15, first id {}",
+        disagreeing.len(),
+        disagreeing[0].get::<i32, _>(0)
+    );
+
+    // And each stored pair is PostgreSQL's: p rounded half away from zero, g
+    // exactly fifteen times that.
+    let rows = sqlx::query("SELECT id, p, g FROM stress ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .expect("read back");
+    assert_eq!(rows.len(), 1000);
+    let mut wrong = Vec::new();
+    for (row, (id, written)) in rows.iter().zip(&written) {
+        let p: Decimal = row.get(1);
+        let g: Decimal = row.get(2);
+        let want_p =
+            written.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+        let want_g = want_p * Decimal::from(15);
+        if row.get::<i32, _>(0) != *id || p != want_p || g != want_g {
+            wrong.push(format!("id {}: wrote {}, stored p={} g={}, want p={} g={}", id, written, p, g, want_p, want_g));
+        }
+    }
+    assert!(wrong.is_empty(), "{} rows stored wrongly:\n{}", wrong.len(), wrong.join("\n"));
 }
