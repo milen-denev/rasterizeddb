@@ -251,3 +251,36 @@ async fn a_multi_column_check_is_not_enforced_on_a_partial_update() {
         .await
         .expect_err("both columns assigned, so the check applies");
 }
+
+/// A check on a column assigned an expression of the row, `SET q = q + 1`.
+/// The update plan holds an empty placeholder for such a column until the row
+/// is read, and judging the check against that refused every one of them. It
+/// is judged against each row's new value instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_on_a_column_assigned_an_expression_is_judged_per_row() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE e (id INTEGER NOT NULL, q INTEGER CHECK (q >= 0))")
+        .await
+        .expect("create");
+    run(&pool, "INSERT INTO e (id, q) VALUES (1, 3)").await.expect("insert 1");
+    run(&pool, "INSERT INTO e (id, q) VALUES (2, 8)").await.expect("insert 2");
+
+    // PG 17: UPDATE 2, then an error for row 1 (-1) that leaves row 2 alone.
+    run(&pool, "UPDATE e SET q = q + 1").await.expect("both rows stay valid");
+    let error = run(&pool, "UPDATE e SET q = q - 5")
+        .await
+        .expect_err("row 1 would hold -1");
+    assert!(error.contains("violates check constraint"), "unexpected error: {}", error);
+    run(&pool, "UPDATE e SET q = COALESCE(q, 0) - 4 WHERE id = 1")
+        .await
+        .expect("row 1 holds 0");
+
+    let rows: Vec<(i32, i32)> = sqlx::query(AssertSqlSafe("SELECT id, q FROM e ORDER BY id"))
+        .fetch_all(&pool)
+        .await
+        .expect("select")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(rows, vec![(1, 0), (2, 9)]);
+}

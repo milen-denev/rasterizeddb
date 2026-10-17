@@ -7000,6 +7000,12 @@ fn check_constraints_hold_for_update(
 
     let assigned: std::collections::HashSet<u64> =
         plan.updates.iter().map(|p| p.write_order as u64).collect();
+    // A column assigned an expression of the row, `q = q + 1` or a recomputed
+    // generated column, holds an empty placeholder in the plan. Its value
+    // exists only once the row is read, so a check reading it is judged by the
+    // write instead; see `UpdateRowChecks`.
+    let computed: std::collections::HashSet<u64> =
+        plan.expressions.iter().map(|(wo, _)| *wo as u64).collect();
 
     let mut candidate = crate::core::row::row::Row::default();
     for payload in &plan.updates {
@@ -7033,6 +7039,9 @@ fn check_constraints_hold_for_update(
         if columns.is_empty() || !columns.iter().all(|f| assigned.contains(&f.write_order)) {
             continue;
         }
+        if columns.iter().any(|f| computed.contains(&f.write_order)) {
+            continue;
+        }
 
         if let Ok(false) = crate::core::rql::expr::eval_cond(&condition, &candidate, &visible) {
             return Err(format!(
@@ -7042,6 +7051,121 @@ fn check_constraints_hold_for_update(
         }
     }
     Ok(())
+}
+
+/// The `CHECK`s an `UPDATE` can only judge row by row, compiled once for the
+/// statement and judged by the write against each row as it will be stored.
+///
+/// These are the checks [`check_constraints_hold_for_update`] leaves out
+/// because a column they read is assigned an expression of the row. The rule
+/// for which checks are enforced on update is otherwise the same: every column
+/// a check reads has to be assigned, so `CHECK (lo < hi)` under `SET lo = lo
+/// + 1` is still not judged. A generated column the statement recomputes
+/// counts as assigned, which is what makes `CHECK (tot >= 0)` on `tot = q * p`
+/// enforceable under `SET q = 5`.
+pub(crate) struct UpdateRowChecks {
+    visible: Vec<crate::core::row::schema::SchemaField>,
+    /// Each check's name, its condition, and whether it tests for NULL itself.
+    checks: Vec<(String, crate::core::rql::expr::Cond, bool)>,
+}
+
+impl UpdateRowChecks {
+    /// Empty, at the cost of two `is_empty`s, unless the table has checks and
+    /// the statement assigns an expression.
+    pub(crate) fn compile(
+        schema: &crate::core::row::schema::TableSchema,
+        updates: &[crate::core::row::row::ColumnWritePayload],
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+    ) -> Self {
+        let mut out = UpdateRowChecks {
+            visible: Vec::new(),
+            checks: Vec::new(),
+        };
+        if schema.checks.is_empty() || expressions.is_empty() {
+            return out;
+        }
+        out.visible = crate::core::rql::nullable::visible_fields(&schema.fields);
+        let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+            out.visible.iter().cloned().collect();
+
+        for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
+            // Compiled as `check_constraints_hold_for_update` compiles it, so
+            // the two agree on which checks each one judges.
+            let Ok(lowered) = crate::core::tokenizer::predicate_rewrite::rewrite_where(
+                &constraint.expression,
+                &visible_sv,
+            ) else {
+                continue;
+            };
+            let Ok(condition) = crate::core::rql::expr::parse_cond(&lowered, &out.visible) else {
+                continue;
+            };
+            let mut columns = Vec::new();
+            collect_condition_columns(&condition, &mut columns);
+            let assigned = |wo: u64| updates.iter().any(|u| u.write_order as u64 == wo);
+            let computed = |wo: u64| expressions.iter().any(|(e, _)| *e as u64 == wo);
+            if columns.is_empty()
+                || !columns.iter().all(|f| assigned(f.write_order))
+                || !columns.iter().any(|f| computed(f.write_order))
+            {
+                continue;
+            }
+            let upper = constraint.expression.to_ascii_uppercase();
+            let tests_null = upper.contains("IS NULL") || upper.contains("IS NOT NULL");
+            out.checks.push((constraint.name.clone(), condition, tests_null));
+        }
+        out
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+    }
+
+    /// Refuses a row, given as the payloads about to be written, that one of
+    /// the checks finds false. NULL is handled as `check_constraints_hold`
+    /// handles it on insert: a check whose inputs include a NULL passes.
+    pub(crate) fn hold(
+        &self,
+        table_name: &str,
+        fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+        payloads: &[crate::core::row::row::ColumnWritePayload],
+    ) -> Result<(), String> {
+        if self.checks.is_empty() {
+            return Ok(());
+        }
+        let mut row = crate::core::row::row::Row::default();
+        for payload in payloads {
+            row.columns.push(crate::core::row::row::Column {
+                schema_id: crate::core::row::row::schema_id_of(payload.write_order as u64),
+                data: payload.data.clone(),
+                column_type: payload.column_type.clone(),
+            });
+        }
+        for (name, condition, tests_null) in &self.checks {
+            if !tests_null && condition_reads_a_null(condition, fields, &row) {
+                continue;
+            }
+            match crate::core::rql::expr::eval_cond(condition, &row, &self.visible) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "new row for relation \"{}\" violates check constraint \"{}\"",
+                        table_name, name
+                    ));
+                }
+                Err(reason) => {
+                    log::error!(
+                        "check constraint '{}' on '{}' could not be evaluated and is not being \
+                         enforced for this row: {}",
+                        name,
+                        table_name,
+                        reason
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Every column a condition tree reads.

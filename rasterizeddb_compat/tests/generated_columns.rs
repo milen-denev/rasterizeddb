@@ -777,3 +777,59 @@ async fn strict_functions_of_a_null_input_store_null() {
     assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE lc IS NULL").await, 2);
     assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE tv IS NULL").await, 2);
 }
+
+type CheckedRow = (i32, Option<i32>, Option<i32>, Option<i32>);
+
+async fn checked_rows(pool: &sqlx::PgPool) -> Vec<CheckedRow> {
+    let mut v: Vec<CheckedRow> = fetch(pool, "SELECT id, q, p, tot FROM gc_chk")
+        .await
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// A `CHECK` that reads only the generated column, on an `UPDATE` of an input.
+/// The statement-level check judged it against the recompute's empty
+/// placeholder and refused every such update. It has to be judged against the
+/// value each row is given, so a row that does break it is still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_on_a_generated_column_is_judged_on_the_recomputed_value() {
+    let (_s, pool) = server().await;
+    run(
+        &pool,
+        "CREATE TABLE gc_chk (id INT, q INT, p INT,
+            tot INT NOT NULL GENERATED ALWAYS AS (q * p) STORED CHECK (tot >= 0))",
+    )
+    .await
+    .expect("create");
+    run(&pool, "INSERT INTO gc_chk (id, q, p) VALUES (1, 2, 3)").await.expect("insert 1");
+    run(&pool, "INSERT INTO gc_chk (id, q, p) VALUES (2, 1, 1)").await.expect("insert 2");
+
+    // PG 17: UPDATE 1 with tot 15, then UPDATE 1 again for the DEFAULT.
+    let row = fetch(&pool, "UPDATE gc_chk SET q = 5 WHERE id = 1 RETURNING id, q, p, tot").await;
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].get::<Option<i32>, _>(3), Some(15));
+    run(&pool, "UPDATE gc_chk SET tot = DEFAULT WHERE id = 1").await.expect("SET tot = DEFAULT");
+    let unchanged = vec![(1, Some(5), Some(3), Some(15)), (2, Some(1), Some(1), Some(1))];
+    assert_eq!(checked_rows(&pool).await, unchanged);
+
+    // PG 17 refuses both: -15 for the one row, and -2 for row 2 of an update
+    // whose row 1 (6) is fine. Neither statement changes anything.
+    for sql in ["UPDATE gc_chk SET q = -5 WHERE id = 1", "UPDATE gc_chk SET q = q - 3"] {
+        let error = run(&pool, sql).await.expect_err(sql);
+        assert!(error.contains("violates check constraint"), "{}: {}", sql, error);
+    }
+    assert_eq!(checked_rows(&pool).await, unchanged);
+
+    // Both inputs at once.
+    let row =
+        fetch(&pool, "UPDATE gc_chk SET q = 4, p = 2 WHERE id = 2 RETURNING id, q, p, tot").await;
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].get::<Option<i32>, _>(3), Some(8));
+    assert_eq!(
+        checked_rows(&pool).await,
+        vec![(1, Some(5), Some(3), Some(15)), (2, Some(4), Some(2), Some(8))]
+    );
+}

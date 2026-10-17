@@ -3783,6 +3783,10 @@ impl<S: StorageIO> Table<S> {
         let mut row = Row::default();
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
+        // The checks that read an expression's result, which the statement
+        // could not judge before the rows were read.
+        let row_checks =
+            crate::core::rql::executor::UpdateRowChecks::compile(&self.schema, updates, expressions);
 
         for pwo in matches.into_iter() {
             if pwo.pointer.deleted {
@@ -3941,6 +3945,19 @@ impl<S: StorageIO> Table<S> {
                 let n = bytes.len().min(slot.len());
                 slot[..n].copy_from_slice(&bytes[..n]);
                 row_write.columns_writing_data[slot_index].data = mb;
+            }
+
+            // Refused as an expression that fails to evaluate is refused: the
+            // statement's writes so far are abandoned with it.
+            if !row_checks.is_empty() {
+                if let Err(e) = row_checks.hold(
+                    &self.schema.name,
+                    &self.schema.fields,
+                    &row_write.columns_writing_data,
+                ) {
+                    self.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
+                }
             }
 
             // The row keeps the value it already holds, so it is excluded from
