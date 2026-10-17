@@ -79,21 +79,35 @@ impl<'a, 'b> QueryParser<'a, 'b> {
     /// Whether a literal holds no more decimal places than `scale`, so that
     /// re-encoding it there loses nothing. Anything that is not a numeric
     /// literal answers `true`, leaving it to the paths that handled it before.
+    ///
+    /// A quoted number counts as well as a bare one: `v = '2.251'` is how a
+    /// client that binds numerics as text writes it, and it was truncated to
+    /// the column's two places and matched 2.25.
     fn literal_exact_at(literal: &ComparisonOperand, from: &DbType, scale: u32) -> bool {
         let ComparisonOperand::Direct(mb) = literal else {
             return true;
         };
-        if !matches!(from, DbType::F32 | DbType::F64) {
+        if !matches!(from, DbType::F32 | DbType::F64 | DbType::STRING) {
             return true;
         }
         let Some(text) = crate::core::rql::subquery::value_to_literal(from, mb.into_slice()) else {
             return true;
         };
-        let places = text
-            .split_once('.')
-            .map(|(_, fraction)| fraction.trim_end_matches('0').len())
-            .unwrap_or(0);
-        places as u32 <= scale
+        let text = crate::core::value_codec::unquote_sql(&text);
+        if crate::core::value_codec::parse_decimal_scaled(&text, scale).is_none() {
+            // Not a number: the paths below say so in their own words.
+            return true;
+        }
+        // The places the value needs: the fraction's digits up to its last
+        // non-zero one, less the exponent's shift. `2.2500` needs two, and
+        // `1.5e-7` eight.
+        let trimmed = text.trim();
+        let at = trimmed.find(['e', 'E']).unwrap_or(trimmed.len());
+        let Ok(exponent) = trimmed.get(at + 1..).filter(|e| !e.is_empty()).map_or(Ok(0), str::parse::<i64>) else {
+            return true;
+        };
+        let fraction = trimmed[..at].split_once('.').map_or("", |(_, f)| f).trim_end_matches('0');
+        (fraction.len() as i64 - exponent) <= i64::from(scale)
     }
 
     /// Re-encodes a literal at the scale the column it is compared against
@@ -155,7 +169,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 | DbType::F64
         );
         match operand {
-            ComparisonOperand::Direct(_) if numeric => {
+            // A quoted number too: `v = '2.251'` over a `NUMERIC(10,2)` comes
+            // here when the column's scale cannot hold it.
+            ComparisonOperand::Direct(_) if numeric || *db_type == DbType::STRING => {
                 let rescaled = Self::rescale_decimal_literal(
                     &operand,
                     db_type,

@@ -739,3 +739,33 @@ async fn date_trunc_and_epoch_take_a_date() {
     .await;
     verdict(wrong);
 }
+
+/// A quoted literal with more places than a `NUMERIC(p, s)` column compares
+/// exactly, as the unquoted one does. Clients that bind numerics as text send
+/// this spelling, and it was truncated to the column's scale: `v = '2.251'`
+/// matched 2.25.
+#[tokio::test(flavor = "multi_thread")]
+async fn quoted_literals_with_extra_places_compare_exactly() {
+    let mut db = db(&[
+        "CREATE TABLE nqs (id INT, v NUMERIC(10,2))",
+        "INSERT INTO nqs (id, v) VALUES (1, 1.10), (2, 2.25), (3, 0.30)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            ("SELECT id FROM nqs WHERE v = '2.251'", &[]),
+            ("SELECT id FROM nqs WHERE v < '2.251' ORDER BY id", &["1", "2", "3"]),
+            ("SELECT id FROM nqs WHERE v > '2.249' ORDER BY id", &["2"]),
+            ("SELECT id FROM nqs WHERE v <= '2.2500001' ORDER BY id", &["1", "2", "3"]),
+            ("SELECT id FROM nqs WHERE '2.251' > v ORDER BY id", &["1", "2", "3"]),
+            // A literal the column's scale holds exactly keeps the old path.
+            ("SELECT id FROM nqs WHERE v = '2.250'", &["2"]),
+            ("SELECT id FROM nqs WHERE v = '2.25'", &["2"]),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}
