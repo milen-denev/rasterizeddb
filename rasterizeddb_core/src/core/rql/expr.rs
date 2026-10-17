@@ -176,6 +176,8 @@ pub enum TextFunc {
     Length,
     /// `octet_length` — bytes in the stored value.
     OctetLength,
+    /// `abs(x)` — the magnitude, in `x`'s own type.
+    Abs,
 }
 
 /// How many elements an array's text form `{a,b,"c,d"}` holds.
@@ -485,6 +487,19 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 Box::new(parse(rhs, schema)?),
             )));
         }
+
+        // No binary operator is left at the top, so a leading sign is unary:
+        // `-n`, `-(a + b)`. It binds looser than a cast, as PostgreSQL's does —
+        // `-n::bigint` negates the cast value. `-n` used to reach the column
+        // resolver whole and be refused as an unknown column.
+        if let Some(rest) = text.strip_prefix('+') {
+            return parse(rest, schema);
+        }
+        if let Some(rest) = text.strip_prefix('-') {
+            if !rest.trim_start().starts_with('-') {
+                return negate(parse(rest, schema)?);
+            }
+        }
     }
 
     // A trailing cast binds loosest, so it is peeled first — but not one
@@ -531,11 +546,21 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         });
     }
 
-    // A number.
+    // A number. An integer constant is `int4` when it fits and `int8` when it
+    // does not, as PostgreSQL types it. Every one used to be `int8`, and the
+    // arithmetic over it then disagreed with the type the result was described
+    // as: `n * 3000000000` was announced as `int4`, computed in `int8`, and
+    // sent as the low four bytes of the product.
     if let Ok(v) = text.parse::<i64>() {
-        return Ok(Expr::Literal {
-            bytes: v.to_le_bytes().to_vec(),
-            db_type: DbType::I64,
+        return Ok(match i32::try_from(v) {
+            Ok(narrow) => Expr::Literal {
+                bytes: narrow.to_le_bytes().to_vec(),
+                db_type: DbType::I32,
+            },
+            Err(_) => Expr::Literal {
+                bytes: v.to_le_bytes().to_vec(),
+                db_type: DbType::I64,
+            },
         });
     }
     if let Ok(v) = text.parse::<f64>() {
@@ -838,6 +863,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err(format!("{} takes exactly one argument", upper_name));
                     }
                     Ok(Expr::Call(TextFunc::RelationSize, args))
+                }
+                "ABS" => {
+                    if args.len() != 1 {
+                        return Err("abs takes exactly one argument".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::Abs, args))
                 }
                 "MOD" => {
                     if args.len() != 2 {
@@ -1464,6 +1495,8 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::UuidExtractVersion, _) => DbType::I16,
         // `integer`, as PostgreSQL's length family returns.
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
+        // The argument's own type, as PostgreSQL's `abs` family returns.
+        Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
         // `select_common_type` does — see `common_type`.
@@ -1494,36 +1527,14 @@ pub fn static_type(expr: &Expr) -> DbType {
                 DbType::I32 | DbType::U32 => 3,
                 _ => 4,
             };
-            // A written integer constant does not widen the result. Every
-            // integer literal parses as `I64` — there is nothing in `5` to say
-            // otherwise — so `counter - 1` on an `int4` column came out
-            // `bigint`, and a client that asked for `Option<i32>` refused the
-            // value it was handed. PostgreSQL types such a literal from its
-            // context, and the arithmetic below is done in `i64` and fitted to
-            // the result type either way, so taking the column's rank is both
-            // Postgres-shaped and safe.
-            let int_literal = |e: &Expr| {
-                matches!(
-                    e,
-                    Expr::Literal {
-                        db_type: DbType::I64,
-                        ..
-                    }
-                )
-            };
-            let rank = |e: &Expr| -> u8 {
-                if int_literal(e) {
-                    // Rank of the *other* operand, so a literal never decides.
-                    let other = if std::ptr::eq(e, &**lhs) {
-                        &**rhs
-                    } else {
-                        &**lhs
-                    };
-                    if int_literal(other) { 4 } else { rank(other) }
-                } else {
-                    rank(e)
-                }
-            };
+            // An integer literal carries PostgreSQL's own type — `int4` when it
+            // fits, `int8` when it does not — so the plain ranks give
+            // PostgreSQL's answer: `counter - 1` over an `int4` stays `int4`,
+            // `smallint * 2` is `int4`, and `n * 3000000000` is `int8`. A
+            // literal used to take the other operand's rank whatever its
+            // value, which described that last product as `int4`; `eval`
+            // computed it in `int8`, and the row went out as its low four
+            // bytes.
             if timestamp(lhs) && timestamp(rhs) && matches!(op, ArithOp::Sub) {
                 // The difference of two instants is a span, not a bigint. It
                 // was described as `int8` before the type existed, and a client
@@ -1723,8 +1734,15 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let (Some(x), Some(y)) = (as_i64(a), as_i64(b)) else {
         return Err(format!("'{}' needs numeric operands", op.symbol()));
     };
+    // PostgreSQL keeps the wider of the two operand types rather than widening
+    // everything to `bigint`. Reporting `int8` for `int4 + int4` is rejected
+    // outright by a typed client — the values are right, the declared type is
+    // not.
+    let db_type = wider_integer(a, b);
     // Overflow is an error, not a wrap: a silently wrapped total is exactly the
-    // wrong answer reported as success.
+    // wrong answer reported as success. It is PostgreSQL's error, naming the
+    // result type, so the wire layer reports 22003.
+    let out_of_range = || integer_out_of_range(&db_type);
     let value = match op {
         ArithOp::Add => x.checked_add(y),
         ArithOp::Sub => x.checked_sub(y),
@@ -1739,21 +1757,27 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
             if y == 0 {
                 return Err("division by zero".to_string());
             }
-            x.checked_rem(y)
+            // `MIN % -1` is 0 in PostgreSQL; only the quotient overflows.
+            if y == -1 { Some(0) } else { x.checked_rem(y) }
         }
     }
-    .ok_or_else(|| format!("integer overflow in '{}'", op.symbol()))?;
+    .ok_or_else(out_of_range)?;
 
-    // PostgreSQL keeps the wider of the two operand types rather than widening
-    // everything to `bigint`. Reporting `int8` for `int4 + int4` is rejected
-    // outright by a typed client — the values are right, the declared type is
-    // not.
-    let db_type = wider_integer(a, b);
-    let bytes = match narrow_integer(value, &db_type) {
-        Some(bytes) => bytes,
-        None => return Err(format!("value {} is out of range for {}", value, db_type)),
-    };
+    let bytes = narrow_integer(value, &db_type).ok_or_else(out_of_range)?;
     Ok(Value::Data { bytes, db_type })
+}
+
+/// PostgreSQL's error for an integer result its type cannot hold:
+/// `integer out of range`, and likewise for `smallint` and `bigint`.
+pub(crate) fn integer_out_of_range(db_type: &DbType) -> String {
+    format!(
+        "{} out of range",
+        match db_type {
+            DbType::I8 | DbType::U8 | DbType::I16 | DbType::U16 => "smallint",
+            DbType::I32 | DbType::U32 => "integer",
+            _ => "bigint",
+        }
+    )
 }
 
 /// Renders a value as the text SQL would print.
@@ -1966,6 +1990,48 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             Value::Data {
                 bytes: (n as i32).to_le_bytes().to_vec(),
                 db_type: DbType::I32,
+            }
+        }
+        // Checked like every other integer result: the magnitude of the
+        // smallest value of a type is one past its largest.
+        TextFunc::Abs => {
+            let value = &args[0];
+            let Value::Data { bytes, db_type } = value else {
+                return Ok(Value::Null);
+            };
+            match db_type {
+                DbType::DECIMAL => {
+                    let raw = i128::from_le_bytes(
+                        bytes.as_slice().try_into().map_err(|_| "a numeric could not be read".to_string())?,
+                    );
+                    Value::Data {
+                        bytes: raw
+                            .checked_abs()
+                            .ok_or_else(|| "value overflows numeric format".to_string())?
+                            .to_le_bytes()
+                            .to_vec(),
+                        db_type: DbType::DECIMAL,
+                    }
+                }
+                DbType::F32 => Value::Data {
+                    bytes: as_f64(value).map(|f| (f.abs() as f32).to_le_bytes().to_vec()).unwrap_or_default(),
+                    db_type: DbType::F32,
+                },
+                DbType::F64 => Value::Data {
+                    bytes: as_f64(value).map(|f| f.abs().to_le_bytes().to_vec()).unwrap_or_default(),
+                    db_type: DbType::F64,
+                },
+                _ => {
+                    let n = as_i64(value)
+                        .filter(|_| *db_type != DbType::DATETIME)
+                        .ok_or_else(|| format!("abs is not defined for {}", db_type))?;
+                    let ty = wider_integer(value, value);
+                    let magnitude = n.checked_abs().ok_or_else(|| integer_out_of_range(&ty))?;
+                    Value::Data {
+                        bytes: narrow_integer(magnitude, &ty).ok_or_else(|| integer_out_of_range(&ty))?,
+                        db_type: ty,
+                    }
+                }
             }
         }
         TextFunc::ArrayNdims => {
@@ -2307,12 +2373,21 @@ pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value
     }
 }
 
-/// The inverse of [`to_engine_scale`], for an expression result about to be
-/// stored in a `NUMERIC(p, s)` column: `UPDATE … SET v = v + 1`.
+/// An expression result about to be stored in `field`, in the column's own
+/// type: the inverse of [`to_engine_scale`] for a `NUMERIC(p, s)` column —
+/// `UPDATE … SET v = v + 1` — and PostgreSQL's assignment cast for an integer
+/// one.
+///
+/// The write path copies the bytes it is given into the column's slot, so a
+/// value wider than the column lost its high bytes: `SET i = i * 1000000000`
+/// on an `int4` stored 705032704, and `SET s = s + 1` at 32767 stored -32768,
+/// both reported as success. An integer that does not fit is PostgreSQL's
+/// `integer out of range`; a fraction assigned to an integer rounds half away
+/// from zero, as its `numeric → int` cast does.
 pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
     if field.db_type != DbType::DECIMAL {
-        return Ok(value);
+        return to_integer_column(value, &field.db_type);
     }
     let Some(scale) = field.scale.filter(|s| *s != DECIMAL_SCALE) else {
         return Ok(value);
@@ -2335,6 +2410,99 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
     }
 }
 
+/// A number assigned to an integer column, at that column's width or refused.
+/// Any other target takes the value unchanged.
+pub(crate) fn to_integer_column(value: Value, target: &DbType) -> Result<Value, String> {
+    if !matches!(
+        target,
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+    ) {
+        return Ok(value);
+    }
+    let whole: i128 = match &value {
+        Value::Null => return Ok(Value::Null),
+        Value::Data {
+            bytes,
+            db_type: DbType::DECIMAL,
+        } => {
+            let raw = i128::from_le_bytes(
+                bytes.as_slice().try_into().map_err(|_| "a numeric could not be read".to_string())?,
+            );
+            round_decimal(raw, crate::core::value_codec::DECIMAL_SCALE, 0)
+                .ok_or_else(|| integer_out_of_range(target))?
+        }
+        Value::Data {
+            db_type: DbType::F32 | DbType::F64,
+            ..
+        } => {
+            let f = as_f64(&value).unwrap_or(f64::NAN);
+            // `f64::round` is half away from zero, which is PostgreSQL's rule
+            // for a float assigned to an integer too.
+            if !f.is_finite() || f.round().abs() >= 1.7e38 {
+                return Err(integer_out_of_range(target));
+            }
+            f.round() as i128
+        }
+        Value::Data { db_type, .. }
+            if matches!(
+                db_type,
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+            ) =>
+        {
+            as_i64(&value).ok_or_else(|| integer_out_of_range(target))? as i128
+        }
+        // Anything else is not a number this conversion knows; it is left as
+        // it was, which is what this did for every type before.
+        _ => return Ok(value),
+    };
+    let (min, max): (i128, i128) = match target {
+        DbType::I8 => (i8::MIN.into(), i8::MAX.into()),
+        DbType::I16 => (i16::MIN.into(), i16::MAX.into()),
+        DbType::I32 => (i32::MIN.into(), i32::MAX.into()),
+        DbType::U8 => (0, u8::MAX.into()),
+        DbType::U16 => (0, u16::MAX.into()),
+        DbType::U32 => (0, u32::MAX.into()),
+        DbType::U64 => (0, u64::MAX.into()),
+        _ => (i64::MIN.into(), i64::MAX.into()),
+    };
+    if whole < min || whole > max {
+        return Err(integer_out_of_range(target));
+    }
+    let bytes = match target {
+        DbType::I8 => (whole as i8).to_le_bytes().to_vec(),
+        DbType::I16 => (whole as i16).to_le_bytes().to_vec(),
+        DbType::I32 => (whole as i32).to_le_bytes().to_vec(),
+        DbType::U8 => (whole as u8).to_le_bytes().to_vec(),
+        DbType::U16 => (whole as u16).to_le_bytes().to_vec(),
+        DbType::U32 => (whole as u32).to_le_bytes().to_vec(),
+        DbType::U64 => (whole as u64).to_le_bytes().to_vec(),
+        _ => (whole as i64).to_le_bytes().to_vec(),
+    };
+    Ok(Value::Data {
+        bytes,
+        db_type: target.clone(),
+    })
+}
+
+/// Moves a scaled integer to a smaller scale rounding half away from zero, as
+/// PostgreSQL rounds a value into a declared scale; upward it is exact, as in
+/// [`rescale_decimal`]. `None` on overflow.
+pub(crate) fn round_decimal(raw: i128, from: u32, to: u32) -> Option<i128> {
+    if from <= to {
+        return rescale_decimal(raw, from, to);
+    }
+    let divisor = 10i128.checked_pow(from - to)?;
+    let quotient = raw / divisor;
+    let remainder = raw % divisor;
+    // `|remainder| >= divisor / 2`, without doubling a remainder near the top
+    // of the range.
+    if remainder.unsigned_abs() >= divisor.unsigned_abs() - remainder.unsigned_abs() {
+        quotient.checked_add(raw.signum())
+    } else {
+        Some(quotient)
+    }
+}
+
 /// Moves a scaled integer from one scale to another: exact upward (or `None`
 /// on overflow), truncated toward zero downward, as a declared scale truncates.
 pub(crate) fn rescale_decimal(raw: i128, from: u32, to: u32) -> Option<i128> {
@@ -2344,6 +2512,39 @@ pub(crate) fn rescale_decimal(raw: i128, from: u32, to: u32) -> Option<i128> {
         Ordering::Less => raw.checked_mul(10i128.checked_pow(to - from)?),
         Ordering::Greater => Some(raw / 10i128.checked_pow(from - to)?),
     }
+}
+
+/// Unary minus, as `0 - x` with the zero typed like `x`, so the result keeps
+/// `x`'s type and its overflow check: `-(-2147483648)` is `integer out of
+/// range`, as it is in PostgreSQL, rather than a wider integer.
+fn negate(inner: Expr) -> Result<Expr, String> {
+    if matches!(inner, Expr::Null) {
+        return Ok(Expr::Null);
+    }
+    let zero = match static_type(&inner) {
+        DbType::I8 | DbType::U8 | DbType::I16 | DbType::U16 => (0i16.to_le_bytes().to_vec(), DbType::I16),
+        DbType::I32 | DbType::U32 => (0i32.to_le_bytes().to_vec(), DbType::I32),
+        DbType::I64 | DbType::U64 => (0i64.to_le_bytes().to_vec(), DbType::I64),
+        DbType::DECIMAL => (0i128.to_le_bytes().to_vec(), DbType::DECIMAL),
+        DbType::F32 | DbType::F64 => (0f64.to_le_bytes().to_vec(), DbType::F64),
+        DbType::INTERVAL => (
+            crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            }),
+            DbType::INTERVAL,
+        ),
+        other => return Err(format!("operator does not exist: - {}", other)),
+    };
+    Ok(Expr::Arith(
+        Box::new(Expr::Literal {
+            bytes: zero.0,
+            db_type: zero.1,
+        }),
+        ArithOp::Sub,
+        Box::new(inner),
+    ))
 }
 
 /// The type an integer result takes: the wider of the two operands.
@@ -3250,6 +3451,21 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         db_type: db_type.clone(),
     };
     if let Some(n) = as_i64(&value) {
+        // A narrowing that does not fit is PostgreSQL's `integer out of range`,
+        // never the low bytes: `3000000000::bigint::int` was -1294967296.
+        let fits = |ok: bool| -> Result<(), String> {
+            if ok { Ok(()) } else { Err(integer_out_of_range(target)) }
+        };
+        match target {
+            DbType::I8 => fits(i8::try_from(n).is_ok())?,
+            DbType::I16 => fits(i16::try_from(n).is_ok())?,
+            DbType::I32 => fits(i32::try_from(n).is_ok())?,
+            DbType::U8 => fits(u8::try_from(n).is_ok())?,
+            DbType::U16 => fits(u16::try_from(n).is_ok())?,
+            DbType::U32 => fits(u32::try_from(n).is_ok())?,
+            DbType::U64 => fits(n >= 0)?,
+            _ => {}
+        }
         let encoded = match target {
             DbType::I8 => Some((n as i8).to_le_bytes().to_vec()),
             DbType::I16 => Some((n as i16).to_le_bytes().to_vec()),
@@ -3594,8 +3810,17 @@ mod tests {
         // SMALLINT as int4.
         let s = schema();
         let r = row_with(Some(5), "");
+        // `1` is an `int4` constant, as in PostgreSQL, so `v + 1` stays I32;
+        // a constant past `int4` is `int8`, and widens the result.
         let v = eval(&parse("v + 1", &s).unwrap(), &r, &s).unwrap();
-        // `v` is I32 and `1` parses as I64, so this is the widening case.
+        assert!(matches!(
+            v,
+            Value::Data {
+                db_type: DbType::I32,
+                ..
+            }
+        ));
+        let v = eval(&parse("v + 3000000000", &s).unwrap(), &r, &s).unwrap();
         assert!(matches!(
             v,
             Value::Data {

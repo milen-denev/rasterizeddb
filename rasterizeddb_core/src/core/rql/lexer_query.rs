@@ -705,6 +705,15 @@ fn rewrite_row_size(item: &str, schema: &SmallVec<[SchemaField; 20]>) -> String 
 /// `needs_evaluation` only recognises calls and casts, so a bare `a + b` needs
 /// its own test: an operator at the top level is one.
 pub(crate) fn looks_like_row_expression(text: &str) -> bool {
+    // A leading minus on anything but a number is unary negation — `-n`,
+    // `-(a + b)` — which no operator test below can see, since nothing
+    // precedes it. It was handed to the column resolver as the name `-n`.
+    if let Some(rest) = text.trim_start().strip_prefix('-') {
+        let rest = rest.trim();
+        if !rest.is_empty() && rest.parse::<f64>().is_err() {
+            return true;
+        }
+    }
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;

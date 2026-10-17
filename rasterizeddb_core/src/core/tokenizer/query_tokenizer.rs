@@ -867,6 +867,20 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
     if integer && value_str.contains('.') {
         return parse_default(value_str);
     }
+    // An integer the column's type cannot hold keeps its own type — `int4`
+    // or `int8`, as PostgreSQL types the constant — and the planner meets the
+    // two at a common type. Refusing it made `n * 3000000000 > 20000000000`
+    // an error over an `int4` column, where PostgreSQL answers it, and the
+    // comparison `age > 300` over a one-byte column is simply false there.
+    // What must never happen is the literal read as the column's zero, which
+    // this does not do.
+    if integer
+        && !matches!(db_type, DbType::I128 | DbType::U128)
+        && value_str.parse::<i64>().is_ok()
+        && !fits_integer_type(value_str, db_type)
+    {
+        return parse_default(value_str);
+    }
     Ok(match db_type {
         DbType::I8 => NumericValue::I8(parse(value_str, db_type)?),
         DbType::I16 => NumericValue::I16(parse(value_str, db_type)?),
@@ -882,6 +896,21 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
         DbType::F64 => NumericValue::F64(parse(value_str, db_type)?),
         _ => return parse_default(value_str),
     })
+}
+
+/// Whether an integer literal parses as `db_type` itself.
+fn fits_integer_type(value_str: &str, db_type: &DbType) -> bool {
+    match db_type {
+        DbType::I8 => value_str.parse::<i8>().is_ok(),
+        DbType::I16 => value_str.parse::<i16>().is_ok(),
+        DbType::I32 => value_str.parse::<i32>().is_ok(),
+        DbType::I64 => value_str.parse::<i64>().is_ok(),
+        DbType::U8 => value_str.parse::<u8>().is_ok(),
+        DbType::U16 => value_str.parse::<u16>().is_ok(),
+        DbType::U32 => value_str.parse::<u32>().is_ok(),
+        DbType::U64 => value_str.parse::<u64>().is_ok(),
+        _ => true,
+    }
 }
 
 #[inline(always)]
@@ -1032,15 +1061,19 @@ mod tests {
     }
 
     /// A literal the column's type cannot hold used to parse as that type's
-    /// default, so `age > 300` on a `U8` column returned every row.
+    /// default, so `age > 300` on a `U8` column returned every row. It keeps
+    /// its own integer type now, as PostgreSQL's constant does, rather than
+    /// being refused — and never becomes the column's zero.
     #[test]
-    fn an_out_of_range_literal_is_refused_rather_than_read_as_zero() {
+    fn an_out_of_range_literal_keeps_its_own_type_rather_than_read_as_zero() {
         let schema = create_schema_2();
-        let err = tokenize_inner("age > 300", &schema).expect_err("300 does not fit a U8");
-        assert!(err.contains("out of range"), "{err}");
-        let err = tokenize_inner("age = -1", &schema).expect_err("-1 does not fit a U8");
-        assert!(err.contains("out of range"), "{err}");
-        assert!(tokenize_inner("age > 200", &schema).is_ok());
+        let toks = tokenize_inner("age > 300", &schema).expect("300 is an int4");
+        assert!(toks.contains(&Token::Number(NumericValue::I32(300))), "{toks:?}");
+        let toks = tokenize_inner("age = -1", &schema).expect("-1 is an int4");
+        assert!(toks.contains(&Token::Number(NumericValue::I32(-1))), "{toks:?}");
+        let toks = tokenize_inner("age > 200", &schema).expect("200 fits a U8");
+        assert!(toks.contains(&Token::Number(NumericValue::U8(200))), "{toks:?}");
+        assert!(tokenize_inner("age > 99999999999999999999", &schema).is_err());
     }
 
     fn create_schema_2() -> SmallVec<[SchemaField; 20]> {

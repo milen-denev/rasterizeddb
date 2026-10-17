@@ -1134,23 +1134,35 @@ pub fn insert_row_with_defaults(
             // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
             // and reported success.
             let value_owned;
-            let value = if crate::core::rql::expr::needs_evaluation(value) {
+            // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
+            // neither parentheses nor a cast, and was handed to the column's
+            // literal reader whole, which refused it as unreadable text.
+            let value = if crate::core::rql::expr::needs_evaluation(value)
+                || crate::core::rql::lexer_query::looks_like_row_expression(value)
+            {
                 // There is no row yet, so only a constant-foldable expression
-                // has meaning here — a nullary function or a literal.
-                let expr = crate::core::rql::expr::parse(value, &[])
-                    .map_err(|e| {
-                        error!("INSERT parse failed: {}", e);
-                    })
-                    .ok()?;
+                // has meaning here — a nullary function or a literal. Its
+                // failure is the statement's answer, carried to the client as
+                // the refusal: `integer out of range` is 22003, not a schema
+                // mismatch.
+                let refuse = |e: String| {
+                    error!("INSERT parse failed: {}", e);
+                    REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+                };
+                let expr = crate::core::rql::expr::parse(value, &[]).map_err(refuse).ok()?;
                 let empty = crate::core::row::row::Row {
                     position: 0,
                     length: 0,
                     columns: smallvec::SmallVec::new(),
                 };
+                // An integer column takes the value at its own width here, as
+                // an assignment does, so one it cannot hold is refused instead
+                // of keeping its low bytes. A decimal stays at the engine scale:
+                // it is rendered as text below and read at the column's scale
+                // by the literal reader.
                 let evaluated = crate::core::rql::expr::eval(&expr, &empty, &[])
-                    .map_err(|e| {
-                        error!("INSERT parse failed: {}", e);
-                    })
+                    .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type))
+                    .map_err(refuse)
                     .ok()?;
                 value_owned = match evaluated {
                     crate::core::rql::expr::Value::Null => "NULL".to_string(),

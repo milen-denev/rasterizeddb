@@ -18,6 +18,9 @@ pub trait CheckedArith: Sized {
     fn arith_add(self, rhs: Self) -> Option<Self>;
     fn arith_sub(self, rhs: Self) -> Option<Self>;
     fn arith_mul(self, rhs: Self) -> Option<Self>;
+    /// The caller has refused a zero divisor; what is left to refuse is the
+    /// one quotient that does not fit, `MIN / -1`.
+    fn arith_div(self, rhs: Self) -> Option<Self>;
 }
 
 macro_rules! impl_checked_arith_int {
@@ -30,6 +33,8 @@ macro_rules! impl_checked_arith_int {
                 fn arith_sub(self, rhs: Self) -> Option<Self> { self.checked_sub(rhs) }
                 #[inline(always)]
                 fn arith_mul(self, rhs: Self) -> Option<Self> { self.checked_mul(rhs) }
+                #[inline(always)]
+                fn arith_div(self, rhs: Self) -> Option<Self> { self.checked_div(rhs) }
             }
         )*
     };
@@ -45,6 +50,8 @@ macro_rules! impl_checked_arith_float {
                 fn arith_sub(self, rhs: Self) -> Option<Self> { Some(self - rhs) }
                 #[inline(always)]
                 fn arith_mul(self, rhs: Self) -> Option<Self> { Some(self * rhs) }
+                #[inline(always)]
+                fn arith_div(self, rhs: Self) -> Option<Self> { Some(self / rhs) }
             }
         )*
     };
@@ -217,7 +224,10 @@ where
             if num2 == T::default() {
                 return Err(EvalError::DivisionByZero);
             }
-            num1 / num2
+            // `-2147483648 / -1` panics in every build profile, and took the
+            // scan worker down with it; PostgreSQL answers it with
+            // `integer out of range`.
+            num1.arith_div(num2).ok_or(EvalError::ArithmeticOverflow)?
         }
         // Answered before the type dispatch, so reaching them here means the
         // planner paired a temporal operation with a numeric column.
