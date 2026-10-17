@@ -677,6 +677,7 @@ fn expand_not<'c>(
                 pos: i,
                 end: toks.len(),
                 schema,
+                depth: 0,
             };
             let node = parser.not()?;
             out.push(node.render(true, schema)?);
@@ -698,20 +699,31 @@ fn expand_not<'c>(
 /// after `(`, a connective or a prefix `NOT`. A `NOT` anywhere else is part
 /// of `NOT IN`, `NOT LIKE`, `IS NOT` and the like.
 fn starts_term(toks: &[Tok], at: usize) -> bool {
-    at == 0
-        || matches!(toks[at - 1], Tok::LPar)
-        || toks[at - 1].is_keyword("and")
-        || toks[at - 1].is_keyword("or")
-        || (toks[at - 1].is_keyword("not") && starts_term(toks, at - 1))
+    // Back over a run of prefix `NOT`s first, in a loop: asked once per `NOT`
+    // and recursing once per `NOT` before it, a long run was quadratic and
+    // deep enough to overflow the stack.
+    let mut at = at;
+    while at > 0 && toks[at - 1].is_keyword("not") {
+        at -= 1;
+    }
+    at == 0 || matches!(toks[at - 1], Tok::LPar) || toks[at - 1].is_keyword("and") || toks[at - 1].is_keyword("or")
 }
+
+/// How deeply parentheses may nest under a `NOT`. Each level is a frame of
+/// the parser and of the render, so without a bound one statement of
+/// opening parentheses could overflow the stack and take the server down.
+const MAX_NOT_NESTING: usize = 256;
 
 /// A condition under a `NOT`, as far as negating it needs: its connectives,
 /// and its comparisons as they were written.
+///
+/// `AND` and `OR` hold their terms as lists rather than as nested pairs: a
+/// chain of terms is then one level deep, not one level per term.
 enum NotNode {
     Atom(Vec<Tok>),
     Not(Box<NotNode>),
-    And(Box<NotNode>, Box<NotNode>),
-    Or(Box<NotNode>, Box<NotNode>),
+    And(Vec<NotNode>),
+    Or(Vec<NotNode>),
 }
 
 impl NotNode {
@@ -722,12 +734,13 @@ impl NotNode {
             NotNode::Atom(toks) if holds => render_tokens(toks),
             NotNode::Atom(toks) => negate_atom(toks, schema)?,
             NotNode::Not(inner) => inner.render(!holds, schema)?,
-            NotNode::And(a, b) | NotNode::Or(a, b) => {
+            NotNode::And(terms) | NotNode::Or(terms) => {
                 let joiner = match (self, holds) {
-                    (NotNode::And(..), true) | (NotNode::Or(..), false) => "AND",
-                    _ => "OR",
+                    (NotNode::And(..), true) | (NotNode::Or(..), false) => " AND ",
+                    _ => " OR ",
                 };
-                format!("( {} {} {} )", a.render(holds, schema)?, joiner, b.render(holds, schema)?)
+                let rendered = terms.iter().map(|t| t.render(holds, schema)).collect::<Result<Vec<_>, _>>()?;
+                format!("( {} )", rendered.join(joiner))
             }
         })
     }
@@ -742,31 +755,41 @@ struct NotParser<'a> {
     /// The end of the group being read.
     end: usize,
     schema: &'a SmallVec<[SchemaField; 20]>,
+    /// Parentheses entered to reach this group; see [`MAX_NOT_NESTING`].
+    depth: usize,
 }
 
 impl NotParser<'_> {
     fn or(&mut self) -> Result<NotNode, String> {
-        let mut left = self.and()?;
+        let mut terms = vec![self.and()?];
         while self.pos < self.end && self.toks[self.pos].is_keyword("or") {
             self.pos += 1;
-            left = NotNode::Or(Box::new(left), Box::new(self.and()?));
+            terms.push(self.and()?);
         }
-        Ok(left)
+        Ok(if terms.len() == 1 { terms.pop().expect("one term") } else { NotNode::Or(terms) })
     }
 
     fn and(&mut self) -> Result<NotNode, String> {
-        let mut left = self.not()?;
+        let mut terms = vec![self.not()?];
         while self.pos < self.end && self.toks[self.pos].is_keyword("and") {
             self.pos += 1;
-            left = NotNode::And(Box::new(left), Box::new(self.not()?));
+            terms.push(self.not()?);
         }
-        Ok(left)
+        Ok(if terms.len() == 1 { terms.pop().expect("one term") } else { NotNode::And(terms) })
     }
 
     fn not(&mut self) -> Result<NotNode, String> {
-        if self.pos < self.end && self.toks[self.pos].is_keyword("not") {
+        // A run of `NOT`s is read in a loop, and only its parity is kept:
+        // `NOT NOT x` is `x`. One frame per `NOT` overflowed the stack on a
+        // long run.
+        let mut negations = 0usize;
+        while self.pos < self.end && self.toks[self.pos].is_keyword("not") {
             self.pos += 1;
-            return Ok(NotNode::Not(Box::new(self.not()?)));
+            negations += 1;
+        }
+        if negations > 0 {
+            let operand = self.not()?;
+            return Ok(if negations % 2 == 1 { NotNode::Not(Box::new(operand)) } else { operand });
         }
         // A parenthesis opening a condition, rather than an operand: one
         // whose group is followed by nothing a comparison could continue with.
@@ -778,11 +801,17 @@ impl NotParser<'_> {
                 Some(t) => t.is_keyword("and") || t.is_keyword("or"),
             };
             if condition {
+                if self.depth >= MAX_NOT_NESTING {
+                    return Err(format!(
+                        "NOT over conditions nested more than {MAX_NOT_NESTING} parentheses deep is not supported"
+                    ));
+                }
                 let mut inner = NotParser {
                     toks: self.toks,
                     pos: self.pos + 1,
                     end: close,
                     schema: self.schema,
+                    depth: self.depth + 1,
                 };
                 let node = inner.or()?;
                 if inner.pos != close {
@@ -3887,5 +3916,59 @@ mod operand_guard_tests {
     #[test]
     fn a_column_as_a_like_pattern_is_refused() {
         assert!(rewrite_where("x LIKE y", &schema()).unwrap_err().contains("pattern"));
+    }
+}
+
+#[cfg(test)]
+mod not_depth_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s = SmallVec::new();
+        s.push(SchemaField::new("id".to_string(), DbType::I32, DbType::I32.get_size(), 0, 0, false));
+        s
+    }
+
+    /// Runs `f` on a thread with a deliberately small stack, so a rewrite that
+    /// recursed once per `NOT` or per term fails here rather than fitting in
+    /// the server's 32 MB.
+    fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("the rewrite overflowed a 1 MiB stack")
+    }
+
+    #[test]
+    fn a_long_run_of_nots_keeps_only_its_parity() {
+        for n in [1usize, 2, 7, 20_000, 20_001] {
+            let clause = format!("{}id = 1", "NOT ".repeat(n));
+            let out = on_small_stack(move || expand_not(&clause, &schema()).map(|c| c.into_owned()));
+            let out = out.unwrap_or_else(|e| panic!("{n} NOTs: {e}"));
+            let want = if n % 2 == 1 { "id != 1" } else { "id = 1" };
+            assert_eq!(out.trim(), want, "{n} NOTs");
+        }
+    }
+
+    #[test]
+    fn a_long_conjunction_under_not_is_one_level() {
+        let terms: Vec<String> = (0..50_000).map(|i| format!("id = {i}")).collect();
+        let clause = format!("NOT ({})", terms.join(" AND "));
+        let out = on_small_stack(move || expand_not(&clause, &schema()).map(|c| c.into_owned())).expect("rewrites");
+        assert_eq!(out.matches(" OR ").count(), 49_999);
+        assert!(out.contains("id != 0") && out.contains("id != 49999"));
+    }
+
+    #[test]
+    fn deep_parentheses_under_not_are_refused_not_a_crash() {
+        let deep = |n: usize| format!("NOT {}id = 1{}", "(".repeat(n), ")".repeat(n));
+        let ok = deep(MAX_NOT_NESTING);
+        assert!(on_small_stack(move || expand_not(&ok, &schema()).is_ok()));
+        let too_deep = deep(100_000);
+        let e = on_small_stack(move || expand_not(&too_deep, &schema()).map(|c| c.into_owned())).unwrap_err();
+        assert!(e.contains("nested more than"), "{e}");
     }
 }
