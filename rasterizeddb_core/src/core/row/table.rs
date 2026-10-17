@@ -371,6 +371,19 @@ fn cache_generation_for(_visibility: &Visibility, generation: u64) -> Option<u64
     Some(generation)
 }
 
+/// Whether a stored value is the one a unique check is looking for. Bytes,
+/// except for a document, which is the same value as `=` says: `{"a":1}` and
+/// `{"a":1.0}` collide in PostgreSQL's unique index, and the hash index and
+/// key stripe a check goes through already key them alike.
+#[inline]
+fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
+    if *db_type == DbType::JSONB {
+        crate::core::jsonb::values_equal(stored, value).unwrap_or_else(|| stored == value)
+    } else {
+        stored == value
+    }
+}
+
 /// A filter-index change staged until the write it describes is durable.
 ///
 /// The index used to be mutated inside the write loop, before
@@ -1947,9 +1960,10 @@ impl<S: StorageIO> Table<S> {
         for (field, _) in tuple.iter() {
             let (column_offset, schema_id) =
                 calc.calculate_schema_offset(&field.name, &self.schema.fields);
+            // By the stored type, as in `find_row_with_value`.
             columns_fetching_data.push(ColumnFetchingData {
                 column_offset,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id,
             });
@@ -2029,11 +2043,13 @@ impl<S: StorageIO> Table<S> {
                     .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
             });
             let all_match = !stored_null
-                && tuple.iter().zip(schema_ids.iter()).all(|((_, value), id)| {
+                && tuple.iter().zip(schema_ids.iter()).all(|((field, value), id)| {
                     row.columns
                         .iter()
                         .find(|c| u64::from(c.schema_id) == *id)
-                        .is_some_and(|c| c.data.into_slice() == *value)
+                        .is_some_and(|c| {
+                            same_unique_value(&field.db_type, c.data.into_slice(), value)
+                        })
                 });
             if all_match {
                 return Ok(Some((pointer.row_id(), in_flight)));
@@ -2320,10 +2336,14 @@ impl<S: StorageIO> Table<S> {
         let calc = SchemaCalculator;
         let (column_offset, schema_id) =
             calc.calculate_schema_offset(&field.name, &self.schema.fields);
+        // Fetched by the type it is stored as, as every scan fetches it. The
+        // declared type read a document (or any value stored like text) as
+        // something else, so no stored row ever matched and a UNIQUE `jsonb`
+        // column accepted the same document twice.
         let mut columns_fetching_data: SmallVec<[ColumnFetchingData; 32]> =
             smallvec::smallvec![ColumnFetchingData {
                 column_offset,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id,
             }];
@@ -2431,7 +2451,9 @@ impl<S: StorageIO> Table<S> {
                     .columns
                     .iter()
                     .find(|c| u64::from(c.schema_id) == schema_id)
-                    .is_some_and(|column| column.data.into_slice() == value)
+                    .is_some_and(|column| {
+                        same_unique_value(&field.db_type, column.data.into_slice(), value)
+                    })
             {
                 return Ok(Some((pointer.row_id(), in_flight)));
             }

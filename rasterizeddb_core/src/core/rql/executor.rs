@@ -7065,6 +7065,11 @@ async fn existing_rows_break_unique(
                 has_null = true;
                 break;
             }
+            // A document by its value, as the insert-time check compares it.
+            if field.db_type == crate::core::db_type::DbType::JSONB {
+                crate::core::jsonb::push_group_key(bytes, &mut encoded);
+                continue;
+            }
             encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             encoded.extend_from_slice(bytes);
         }
