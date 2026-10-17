@@ -993,11 +993,12 @@ impl StorageManager {
 /// good by consulting the thing it was supposed to be a copy of.
 ///
 /// The source root becomes `target`. Any other location is dropped, along with
-/// the tables placed on it: those files are on another disk, and a snapshot
-/// only ever walks the database directory, so they are not in the backup under
-/// any reading. Dropping them makes the restored database resolve those tables
-/// to its own root and report them as missing — which is loud, where reading
-/// the source's copy is not.
+/// the tables placed on it: a snapshot taken before storage locations were
+/// captured walked only the database directory, so those files are not in it
+/// under any reading. Dropping them makes the restored database resolve those
+/// tables to its own root and report them as missing — which is loud, where
+/// reading the source's copy is not. A snapshot that did capture them restores
+/// through [`repoint_restored_pool`] instead.
 ///
 /// `written_in` is the directory holding the file — a restore stages its work
 /// in a sibling and renames it into place — and `final_root` is where that
@@ -1012,6 +1013,27 @@ pub fn repoint_pool_config(
     written_in: &Path,
     final_root: &Path,
     source_root: Option<&str>,
+) -> io::Result<Vec<String>> {
+    repoint_restored_pool(written_in, final_root, source_root, &[])
+}
+
+/// [`repoint_pool_config`] for a snapshot that also carried storage locations
+/// outside the database directory.
+///
+/// `locations` pairs each such location's source path with the directory its
+/// files were restored into. Those locations, and the tables on them, are
+/// rewritten rather than dropped. So is anything under the source root: a
+/// database created with `CREATE DATABASE` is a subdirectory with a pool file of
+/// its own, and that file names the subdirectory by an absolute path too.
+/// Missing that, a restored sub-database read the source's files.
+///
+/// `final_root` and `source_root` are always the roots of the whole backup,
+/// even when `written_in` is a sub-database's directory.
+pub fn repoint_restored_pool(
+    written_in: &Path,
+    final_root: &Path,
+    source_root: Option<&str>,
+    locations: &[(String, String)],
 ) -> io::Result<Vec<String>> {
     let path = written_in.join(POOL_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -1039,6 +1061,25 @@ pub fn repoint_pool_config(
         return Ok(Vec::new());
     }
 
+    // Where a source path is in the restored copy, or `None` when no snapshot
+    // copied what is there.
+    let map = |at: &str| -> Option<String> {
+        let at = normalize(at);
+        if at == old_root {
+            return Some(target_path.clone());
+        }
+        if contains_path(&old_root, &at) {
+            let rest = Path::new(&at).strip_prefix(&old_root).ok()?;
+            return Some(normalize(
+                &Path::new(&target_path).join(rest).to_string_lossy(),
+            ));
+        }
+        locations
+            .iter()
+            .find(|(source, _)| normalize(source) == at)
+            .map(|(_, restored)| normalize(restored))
+    };
+
     let mut out = String::new();
     let mut dropped = Vec::new();
     for line in text.lines() {
@@ -1050,20 +1091,22 @@ pub fn repoint_pool_config(
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["location", role, weight, enabled, path] => {
-                if normalize(path) == old_root {
+                // A backup location is never carried: the snapshot copied the
+                // primary its files mirror, and a clone mirroring into the
+                // source's backup disk would write over it.
+                let carried = LocationRole::parse(role) == Some(LocationRole::Primary)
+                    || normalize(path) == old_root;
+                if let Some(restored) = map(path).filter(|_| carried) {
                     out.push_str(&format!(
-                        "location\t{role}\t{weight}\t{enabled}\t{target_path}\n"
+                        "location\t{role}\t{weight}\t{enabled}\t{restored}\n"
                     ));
                 }
                 // Any other disk: dropped, and its tables with it below.
             }
-            ["table", at, table] => {
-                if normalize(at) == old_root {
-                    out.push_str(&format!("table\t{target_path}\t{table}\n"));
-                } else {
-                    dropped.push((*table).to_string());
-                }
-            }
+            ["table", at, table] => match map(at) {
+                Some(restored) => out.push_str(&format!("table\t{restored}\t{table}\n")),
+                None => dropped.push((*table).to_string()),
+            },
             _ => {
                 out.push_str(line);
                 out.push('\n');
@@ -1133,6 +1176,65 @@ fn warn_if_written_elsewhere(text: &str, root: &str, path: &Path) {
         path.display(),
         root
     );
+}
+
+/// The directories other than `db_dir` that the pool file in `db_dir` keeps
+/// table files in, sorted. Empty when there is no pool file.
+///
+/// Every primary location, and every directory a placement names: a table
+/// whose location was dropped from the file still opens from where its line
+/// says (see [`parse_into`]), so its files are still live. Backup locations
+/// are left out — they hold mirrored copies of files a primary already has.
+///
+/// Read from the file rather than from a live pool, for the backup service,
+/// which has no `Database` and must not trigger [`StorageManager::open`]'s
+/// side effects. A file that cannot be parsed is an error rather than "no
+/// locations": the caller is deciding what a backup leaves out.
+pub fn data_locations(db_dir: &Path) -> io::Result<Vec<String>> {
+    let path = db_dir.join(POOL_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let root = normalize(&db_dir.to_string_lossy());
+    let mut state = PoolState {
+        policy: PlacementPolicy::Primary,
+        min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+        locations: Vec::new(),
+        placements: HashMap::new(),
+    };
+    parse_into(&text, &root, &mut state).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} cannot be parsed ({e}), so which directories hold its tables is unknown",
+                path.display()
+            ),
+        )
+    })?;
+
+    let mut out: Vec<String> = state
+        .locations
+        .iter()
+        .filter(|l| l.role == LocationRole::Primary)
+        .map(|l| l.path.clone())
+        .chain(
+            state
+                .placements
+                .values()
+                .filter_map(|spec| TableBackend::parse(spec).directory().map(str::to_string)),
+        )
+        .filter(|at| *at != root)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The root a pool file was written for: its first `location` line.
+pub fn pool_file_root(db_dir: &Path) -> Option<String> {
+    first_location(&std::fs::read_to_string(db_dir.join(POOL_FILE)).ok()?)
 }
 
 /// The path on the first `location` line, which is the root the file was

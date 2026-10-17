@@ -128,7 +128,20 @@ pub async fn run(
     }
     let mut cleanup = CleanupOnDrop::arm(&staging);
 
-    let report = build(client, config, &staging, target, target_dir).await?;
+    let (report, in_place_locations) = build(client, config, &staging, target, target_dir).await?;
+
+    // An in-place restore puts each storage location's files back where they
+    // came from — another disk, so a copy rather than the rename the root
+    // gets. Before that rename: a root that appears is a database that opens,
+    // and its tables on these locations must be there when it does. Undone if
+    // any fails, so a retry finds them as empty as this one did.
+    let mut published = PublishedLocations::default();
+    for (staged, destination) in &in_place_locations {
+        published.publish(staged, destination)?;
+        // Out of the root before it is renamed into place, or the database
+        // directory would carry a second copy of every one of these files.
+        std::fs::remove_dir_all(staged)?;
+    }
 
     std::fs::create_dir_all(
         target_dir
@@ -141,6 +154,7 @@ pub async fn run(
     let _ = std::fs::remove_dir(target_dir);
     std::fs::rename(&staging, target_dir)?;
     cleanup.disarm();
+    published.keep();
     crate::core::wal::sync_parent_dir(target_dir)?;
 
     Ok(report)
@@ -188,17 +202,127 @@ impl Drop for CleanupOnDrop {
     }
 }
 
+/// Files copied into storage locations by an in-place restore, removed again
+/// unless the restore completes.
+#[derive(Default)]
+struct PublishedLocations {
+    files: Vec<PathBuf>,
+    kept: bool,
+}
+
+impl PublishedLocations {
+    /// Copies every file of `staged` into `destination`, which must be empty.
+    fn publish(&mut self, staged: &Path, destination: &Path) -> io::Result<()> {
+        // Checked again here, not only before the download: a restore can run
+        // for hours, and merging into files that appeared meanwhile would
+        // leave a location that is neither the backup nor what was there.
+        if !is_empty_or_missing(destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "storage location {} is no longer empty; the restore will not merge into it",
+                    destination.display()
+                ),
+            ));
+        }
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(staged)?.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let to = destination.join(entry.file_name());
+            self.files.push(to.clone());
+            std::fs::copy(entry.path(), &to)?;
+            std::fs::File::open(&to)?.sync_all()?;
+        }
+        // The entries, not only the bytes: a crash after the root is renamed
+        // into place must not leave it naming files the directory lost.
+        #[cfg(unix)]
+        std::fs::File::open(destination)?.sync_all()?;
+        Ok(())
+    }
+
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for PublishedLocations {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        for file in &self.files {
+            if let Err(e) = std::fs::remove_file(file) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    warn!(
+                        "Could not remove {} after a failed restore: {}",
+                        file.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn is_empty_or_missing(dir: &Path) -> io::Result<bool> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Where each storage location a snapshot carried is restored to.
+///
+/// In place, its own path: every path in the pool file is still true there,
+/// and the location is the disk the operator gave those tables. Anywhere else,
+/// a subdirectory of the restored database — the source's location is still
+/// the source's, and a clone writing into it would overwrite live tables.
+fn location_destinations(
+    snapshot: &SnapshotEntry,
+    final_dir: &Path,
+    in_place: bool,
+) -> Vec<(manifest::PoolLocation, PathBuf)> {
+    snapshot
+        .locations
+        .iter()
+        .map(|location| {
+            let destination = if in_place {
+                PathBuf::from(&location.path)
+            } else {
+                final_dir.join(restored_location_dir(&location.key))
+            };
+            (location.clone(), destination)
+        })
+        .collect()
+}
+
+/// The subdirectory a restore into a new directory gives a location's files.
+fn restored_location_dir(key: &str) -> String {
+    format!(
+        "{}{}",
+        super::RESTORED_LOCATION_PREFIX,
+        key.strip_prefix(super::LOCATION_KEY_PREFIX).unwrap_or(key)
+    )
+}
+
 /// Assembles the restore in `target_dir`, which is the staging directory.
 ///
 /// `final_dir` is only used for messages, so they name the place the operator
-/// asked for rather than the scratch directory they never see.
+/// asked for rather than the scratch directory they never see — and for the
+/// paths the restored pool files name, which must be true after the rename.
+///
+/// Returns, with the report, the storage locations an in-place restore still
+/// has to copy into place: `(staged directory, destination)`.
 async fn build(
     client: &S3Client,
     config: &BackupConfig,
     target_dir: &Path,
     target: RecoveryTarget,
     final_dir: &Path,
-) -> io::Result<RestoreReport> {
+) -> io::Result<(RestoreReport, Vec<(PathBuf, PathBuf)>)> {
     // One GET decides the whole plan: which snapshot, which segments, where to
     // stop. This is what the manifest exists for.
     let manifest_key = config.key(manifest::MANIFEST_KEY);
@@ -223,7 +347,29 @@ async fn build(
             describe_no_snapshot(&manifest, &target),
         )
     })?;
-    let ceiling = target.resolve_lsn(&manifest, snapshot);
+    // Refused before anything is downloaded or deleted: these become paths a
+    // restore writes into, copies out of and removes.
+    validate_locations(snapshot)?;
+
+    // With a storage location, every log stops at one cut; see `LogCut`.
+    let cut = target.resolve_cut(&manifest, snapshot)?;
+    if let Some(cut) = &cut {
+        verify_cut_is_archived(&manifest, snapshot, cut)?;
+        if manifest.cuts.last().is_some_and(|newest| newest != cut)
+            && matches!(target, RecoveryTarget::Latest)
+        {
+            warn!(
+                "The newest restore point in the catalogue cannot serve snapshot {}; restoring \
+                 to an earlier one. Commits after it are not in this restore.",
+                snapshot.id
+            );
+        }
+    }
+    let ceiling_for = |database: &str| match &cut {
+        Some(cut) => cut.ceiling_for(database),
+        None => target.resolve_lsn_for(&manifest, snapshot, database),
+    };
+    let ceiling = ceiling_for("");
 
     info!(
         "Restoring snapshot {} (taken {}, LSN {}..{}) into {}",
@@ -233,6 +379,32 @@ async fn build(
         snapshot.end_lsn,
         final_dir.display()
     );
+
+    // In place when it lands on the directory the backup came from — the
+    // CLI's `--restore-from-s3` — which is the one case a location's files go
+    // back to the location itself. That must not merge into whatever is there
+    // now, so it is checked before anything is downloaded.
+    let source_root = Some(manifest.source_location.as_str()).filter(|s| !s.is_empty());
+    let in_place = source_root.is_some_and(|root| {
+        crate::core::storage::normalize(root)
+            == crate::core::storage::normalize(&final_dir.to_string_lossy())
+    });
+    let destinations = location_destinations(snapshot, final_dir, in_place);
+    if in_place {
+        for (location, destination) in &destinations {
+            if !is_empty_or_missing(destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "storage location {} is not empty. An in-place restore puts the tables \
+                         snapshot {} kept there back into it, and will not merge them with what \
+                         is there now; move it aside first.",
+                        location.path, snapshot.id
+                    ),
+                ));
+            }
+        }
+    }
 
     std::fs::create_dir_all(target_dir)?;
     let mut bytes_restored = download_snapshot(client, snapshot, target_dir).await?;
@@ -267,25 +439,50 @@ async fn build(
     // restored directory as a database.
     // Repointed at `final_dir`, not at the staging directory this is being
     // built in: the paths have to be true after the rename that publishes it.
-    let source_root = Some(manifest.source_location.as_str()).filter(|s| !s.is_empty());
-    match crate::core::storage::repoint_pool_config(target_dir, final_dir, source_root) {
-        Ok(dropped) if !dropped.is_empty() => warn!(
-            "The source placed {} on storage locations outside its database directory, which no \
-             snapshot copies. Those tables are not in this backup and will read as missing: {}",
+    // Every pool file, the root's and each created database's: each names its
+    // own directory by an absolute path.
+    let moved: Vec<(String, String)> = destinations
+        .iter()
+        .map(|(location, destination)| {
+            (
+                location.path.clone(),
+                destination.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut repoint_failed = None;
+    for (written_in, final_root, root) in pool_files(target_dir, final_dir, source_root) {
+        match crate::core::storage::repoint_restored_pool(
+            &written_in,
+            &final_root,
+            root.as_deref(),
+            &moved,
+        ) {
+            Ok(names) => dropped.extend(names),
+            Err(e) => repoint_failed = Some(e),
+        }
+    }
+    if !dropped.is_empty() {
+        warn!(
+            "The source placed {} on storage locations this snapshot did not copy (it predates \
+             copying them, or they are backup locations). Those tables are not in this backup \
+             and will read as missing: {}",
             if dropped.len() == 1 {
                 "a table"
             } else {
                 "tables"
             },
             dropped.join(", ")
-        ),
-        Ok(_) => {}
-        // Not fatal: the restored copy is complete either way, and refusing
-        // here would turn a placement problem into no restore at all.
-        Err(e) => warn!(
+        );
+    }
+    // Not fatal: the restored copy is complete either way, and refusing here
+    // would turn a placement problem into no restore at all.
+    if let Some(e) = repoint_failed {
+        warn!(
             "Could not repoint the storage pool of the restored copy ({e}); if it names another \
              directory, queries against this copy may read that one instead"
-        ),
+        );
     }
 
     // Checked before anything is downloaded, so a restore that cannot succeed
@@ -314,8 +511,7 @@ async fn build(
 
         let window = snapshot.window_for(&database);
         if count > 0 {
-            let ceiling = target.resolve_lsn_for(&manifest, snapshot, &database);
-            let applied = replay(&replay_path, &into, ceiling)?;
+            let applied = replay(&replay_path, &into, ceiling_for(&database))?;
             stats.applied += applied.applied;
             stats.rolled_back += applied.rolled_back;
             stats.unresolved += applied.unresolved;
@@ -340,6 +536,31 @@ async fn build(
         // the directory would have the next start-up replay it a second time.
         let _ = std::fs::remove_file(&replay_path);
         let _ = std::fs::remove_file(into.join(crate::core::wal::DEFAULT_WAL_NAME));
+    }
+
+    // Each location's files were unpacked and replayed under its stream key;
+    // now they go where its pool lines say. A location's log archived without
+    // the location being in this snapshot — one added after it — has nothing
+    // of its own to restore into, and its records were counted as unresolved.
+    let mut in_place_locations = Vec::new();
+    for (location, destination) in &destinations {
+        let staged = target_dir.join(&location.key);
+        std::fs::create_dir_all(&staged)?;
+        if in_place {
+            in_place_locations.push((staged, destination.clone()));
+        } else {
+            std::fs::rename(
+                &staged,
+                target_dir.join(restored_location_dir(&location.key)),
+            )?;
+        }
+    }
+    for entry in std::fs::read_dir(target_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let carried = destinations.iter().any(|(l, _)| l.key == name && in_place);
+        if name.starts_with(super::LOCATION_KEY_PREFIX) && !carried {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 
     let _ = std::fs::remove_dir_all(target_dir.join(super::STAGING_DIR));
@@ -384,7 +605,47 @@ async fn build(
             .unwrap_or_else(|| "end of archive".to_string()),
     );
 
-    Ok(report)
+    Ok((report, in_place_locations))
+}
+
+/// Every pool file in a restored tree: `(directory, its final root, its source
+/// root)` for each.
+///
+/// The roots are the whole backup's when the catalogue recorded where it was
+/// taken from, so a path anywhere under the source maps to the same place
+/// under the restore. Without that record each file falls back to its own
+/// first `location` line, as [`crate::core::storage::repoint_pool_config`]
+/// always did — which is only right relative to that file's own directory.
+fn pool_files(
+    target_dir: &Path,
+    final_dir: &Path,
+    source_root: Option<&str>,
+) -> Vec<(PathBuf, PathBuf, Option<String>)> {
+    let mut out = vec![(
+        target_dir.to_path_buf(),
+        final_dir.to_path_buf(),
+        source_root.map(str::to_string),
+    )];
+    let Ok(entries) = std::fs::read_dir(target_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(super::LOCATION_KEY_PREFIX)
+            || !entry.path().join(crate::core::storage::POOL_FILE).is_file()
+        {
+            continue;
+        }
+        out.push(match source_root {
+            Some(root) => (
+                entry.path(),
+                final_dir.to_path_buf(),
+                Some(root.to_string()),
+            ),
+            None => (entry.path(), final_dir.join(&name), None),
+        });
+    }
+    out
 }
 
 /// Refuses a restore whose snapshot has no log to make it consistent.
@@ -441,6 +702,89 @@ fn verify_archive_covers(manifest: &Manifest, snapshot: &SnapshotEntry) -> io::R
                 archived_through
             ),
         ));
+    }
+    Ok(())
+}
+
+/// Refuses a catalogue whose storage locations are not what a backup writes.
+///
+/// A location's key names a directory inside the restore that is renamed,
+/// copied from and deleted, and its path is where an in-place restore writes.
+/// Archive entries and object names are checked for the same reason
+/// ([`archive::is_safe_name`]); a corrupt or hostile catalogue must not choose
+/// what a restore removes or where it writes.
+fn validate_locations(snapshot: &SnapshotEntry) -> io::Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for location in &snapshot.locations {
+        let hex = location.key.strip_prefix(super::LOCATION_KEY_PREFIX);
+        let well_formed = hex.is_some_and(|hex| {
+            hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        let path = Path::new(&location.path);
+        let plain_path = path.is_absolute()
+            && path.components().all(|c| {
+                matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))
+            });
+        if !well_formed
+            || !plain_path
+            || location.key != super::location_key(&location.path)
+            || seen.contains(&location.key.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the backup catalogue names storage location {:?} at {:?} in snapshot {}, \
+                     which is not one a backup writes; refusing to restore from it",
+                    location.key, location.path, snapshot.id
+                ),
+            ));
+        }
+        seen.push(&location.key);
+    }
+    Ok(())
+}
+
+/// Refuses a cut whose logs the catalogue does not reach.
+///
+/// Recorded only after its bundles were, but bundles can go — retention, a
+/// hand-deleted object — and replaying short of a cut is the half-a-transaction
+/// restore cuts exist to prevent. Only the logs the snapshot has a window for:
+/// another may have archived nothing since the snapshot, with the cut naming
+/// where its log already stood.
+fn verify_cut_is_archived(
+    manifest: &Manifest,
+    snapshot: &SnapshotEntry,
+    cut: &manifest::LogCut,
+) -> io::Result<()> {
+    for window in &snapshot.windows {
+        let Some(lsn) = cut.ceiling_for(&window.database) else {
+            continue;
+        };
+        if lsn <= window.end_lsn {
+            continue;
+        }
+        let archived_through = manifest
+            .segments_for(&window.database)
+            .into_iter()
+            .filter(|s| manifest::segment_needed_by(snapshot, s))
+            .map(|s| s.last_lsn)
+            .max()
+            .unwrap_or(0);
+        if archived_through < lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the restore point for snapshot {} needs the log of {} through LSN {lsn}, \
+                     but the catalogue only reaches LSN {archived_through}",
+                    snapshot.id,
+                    if window.database.is_empty() {
+                        "the default database"
+                    } else {
+                        window.database.as_str()
+                    }
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -800,6 +1144,7 @@ mod tests {
             compression_level: 3,
             files: Vec::new(),
             objects: Vec::new(),
+            locations: Vec::new(),
         }
     }
 
@@ -871,5 +1216,128 @@ mod tests {
         let empty = dir.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         ensure_usable_target(&empty).unwrap();
+    }
+
+    // ---- storage locations --------------------------------------------------
+
+    fn location(key: &str, path: &str) -> manifest::PoolLocation {
+        manifest::PoolLocation {
+            key: key.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    /// A catalogue's location key becomes a directory the restore renames and
+    /// deletes, and its path a place an in-place restore writes. Neither may be
+    /// anything a backup would not have written.
+    #[test]
+    fn a_location_that_could_name_any_path_is_refused() {
+        let good_key = super::super::location_key("/mnt/disk2");
+        let mut s = entry(0, 0);
+        s.locations = vec![location(&good_key, "/mnt/disk2")];
+        validate_locations(&s).expect("what a backup writes");
+
+        let other_key = super::super::location_key("/mnt/elsewhere");
+        for (key, path) in [
+            ("/tmp/x", "/mnt/disk2"),
+            ("../x", "/mnt/disk2"),
+            ("~loc-../../../../x", "/mnt/disk2"),
+            ("~loc-ABCDEF0123456789", "/mnt/disk2"),
+            (other_key.as_str(), "/mnt/disk2"),
+            (good_key.as_str(), "relative/disk2"),
+            (good_key.as_str(), "/mnt/../disk2"),
+        ] {
+            s.locations = vec![location(key, path)];
+            let err = validate_locations(&s).expect_err(&format!("{key:?} at {path:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        }
+
+        s.locations = vec![location(&good_key, "/mnt/disk2"), location(&good_key, "/mnt/disk2")];
+        validate_locations(&s).expect_err("one key twice");
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn staged_location(dir: &Path, name: &str) -> PathBuf {
+        let staged = dir.join(name);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("t.db"), b"rows").unwrap();
+        std::fs::write(staged.join("t_pointers.db"), b"pointers").unwrap();
+        staged
+    }
+
+    /// A failed in-place restore must take back what it copied into the
+    /// operator's location: left behind, a retry is refused as "not empty", or
+    /// merges with whatever appears there next.
+    #[test]
+    fn published_location_files_are_removed_unless_the_restore_completes() {
+        let dir = temp_testdir::TempDir::default();
+        let staged = staged_location(&dir, "staged");
+        let destination = dir.join("disk2");
+
+        {
+            let mut published = PublishedLocations::default();
+            published.publish(&staged, &destination).unwrap();
+            assert_eq!(files_in(&destination), vec!["t.db", "t_pointers.db"]);
+        }
+        assert!(
+            files_in(&destination).is_empty(),
+            "a restore that did not complete left files in the location"
+        );
+
+        {
+            let mut published = PublishedLocations::default();
+            published.publish(&staged, &destination).unwrap();
+            published.keep();
+        }
+        assert_eq!(files_in(&destination), vec!["t.db", "t_pointers.db"]);
+    }
+
+    /// Checked again at publish time, not only before the download: something
+    /// that appeared meanwhile is neither merged with nor removed.
+    #[test]
+    fn a_location_that_filled_up_meanwhile_is_left_alone() {
+        let dir = temp_testdir::TempDir::default();
+        let staged = staged_location(&dir, "staged");
+        let destination = dir.join("disk2");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("theirs.db"), b"not from the backup").unwrap();
+
+        let mut published = PublishedLocations::default();
+        let err = published.publish(&staged, &destination).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("no longer empty"), "{err}");
+        drop(published);
+        assert_eq!(files_in(&destination), vec!["theirs.db"]);
+    }
+
+    /// The first location published, the second refused: the first is undone
+    /// too, so a retry finds both as they were.
+    #[test]
+    fn a_later_location_failing_undoes_an_earlier_one() {
+        let dir = temp_testdir::TempDir::default();
+        let first = staged_location(&dir, "first");
+        let second = staged_location(&dir, "second");
+        let (to_first, to_second) = (dir.join("disk2"), dir.join("disk3"));
+        std::fs::create_dir_all(&to_second).unwrap();
+        std::fs::write(to_second.join("theirs.db"), b"x").unwrap();
+
+        {
+            let mut published = PublishedLocations::default();
+            published.publish(&first, &to_first).unwrap();
+            published.publish(&second, &to_second).unwrap_err();
+        }
+        assert!(files_in(&to_first).is_empty(), "{:?}", files_in(&to_first));
+        assert_eq!(files_in(&to_second), vec!["theirs.db"]);
     }
 }

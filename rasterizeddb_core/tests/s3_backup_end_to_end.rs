@@ -1248,6 +1248,18 @@ e2e_test!(a_created_database_is_archived_and_restored, config, {
         .await
         .expect("restore");
 
+    // Each created database has a pool file of its own, naming its directory
+    // by an absolute path. Left naming the source, the restored database reads
+    // the source's files — and the counts below would pass by consulting them.
+    for database in ["early", "late"] {
+        let pool = std::fs::read_to_string(target.join(database).join("db_storage.cfg"))
+            .expect("a created database with a table has a pool file");
+        assert!(
+            !pool.contains(&live_str),
+            "the restored pool file of {database} still names the source:\n{pool}"
+        );
+    }
+
     // Each database is opened from its own directory, which is where a restore
     // has to put it for the catalogue to find it again.
     assert_eq!(count_in_restored(&target, "SELECT * FROM ledger").await, 2);
@@ -1868,4 +1880,448 @@ e2e_test!(a_restore_reproduces_every_state_file, config, {
         .await
         .expect("restore rollover");
     assert_restores_faithfully(&database, &expected, &source_outcomes, &target).await;
+});
+
+// ---- storage-pool locations ------------------------------------------------
+
+/// A database with one table placed on a second storage location and one in
+/// its own directory, each holding `rows` rows.
+async fn pooled_source(live: &Path, disk2: &Path, rows: usize) -> Arc<Database> {
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(
+        &database,
+        &format!("STORAGE ADD LOCATION '{}'", disk2.display()),
+    )
+    .await;
+    run(
+        &database,
+        &format!("STORAGE PLACE TABLE far AT '{}'", disk2.display()),
+    )
+    .await;
+    run(&database, "CREATE TABLE far (id INT, note STRING)").await;
+    run(&database, "CREATE TABLE near (id INT, note STRING)").await;
+    for i in 0..rows {
+        run(
+            &database,
+            &format!("INSERT INTO far (id, note) VALUES ({i}, 'far')"),
+        )
+        .await;
+        run(
+            &database,
+            &format!("INSERT INTO near (id, note) VALUES ({i}, 'near')"),
+        )
+        .await;
+    }
+    assert!(
+        disk2.join("far.db").exists(),
+        "the table was not placed on the second location: the test proves nothing"
+    );
+    database
+}
+
+/// Forgets the logs a closed source left registered, so a database reopened at
+/// the same paths installs fresh ones rather than writing into handles on
+/// files that were moved aside.
+fn forget_logs(dirs: &[&Path]) {
+    for dir in dirs {
+        rasterizeddb_core::core::wal::remove_for(dir.to_str().unwrap());
+    }
+}
+
+e2e_test!(a_table_on_another_storage_location_survives_a_restore, config, {
+    // Snapshots walked only the database directory and the archive took only
+    // the logs under it, so a table placed on a second disk was in neither —
+    // and the backup reported success. The restore then came back without it,
+    // which is the worst moment to find out.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    let disk2 = root.join("disk2");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&disk2).unwrap();
+    let database = pooled_source(&live, &disk2, 30).await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    // After the snapshot: these exist only in the second location's log, so
+    // the archive has to carry that log as well as the root's.
+    for i in 30..45 {
+        run(
+            &database,
+            &format!("INSERT INTO far (id, note) VALUES ({i}, 'after')"),
+        )
+        .await;
+    }
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+
+    // Nothing may point back at either source directory.
+    let pool = std::fs::read_to_string(target.join("db_storage.cfg")).unwrap_or_default();
+    for source in [&live, &disk2] {
+        assert!(
+            !pool.contains(source.to_str().unwrap()),
+            "the restored storage pool still names {}:\n{pool}",
+            source.display()
+        );
+    }
+
+    // The copy has to stand on its own with both sources gone.
+    drop(service);
+    drop(database);
+    std::fs::remove_dir_all(&live).expect("remove the source");
+    std::fs::remove_dir_all(&disk2).expect("remove the second location");
+    forget_logs(&[&live, &disk2]);
+
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM near").await,
+        30,
+        "the table in the database directory"
+    );
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM far").await,
+        45,
+        "the table on the second location, including the writes after the snapshot"
+    );
+});
+
+e2e_test!(an_in_place_restore_puts_a_location_back_on_its_own_disk, config, {
+    // `--restore-from-s3` onto the directory the backup came from: the second
+    // location's tables go back to the second location, not onto the root's
+    // disk — and never into a location that still holds something.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    let disk2 = root.join("disk2");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&disk2).unwrap();
+    let database = pooled_source(&live, &disk2, 12).await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+    for i in 12..20 {
+        run(
+            &database,
+            &format!("INSERT INTO far (id, note) VALUES ({i}, 'after')"),
+        )
+        .await;
+    }
+    service.archive_wal_now().await.expect("archive");
+
+    // The host is lost; the second disk comes back with something on it.
+    drop(service);
+    drop(database);
+    std::fs::remove_dir_all(&live).unwrap();
+    std::fs::remove_dir_all(&disk2).unwrap();
+    forget_logs(&[&live, &disk2]);
+    std::fs::create_dir_all(&disk2).unwrap();
+    std::fs::write(disk2.join("stray.db"), b"not from the backup").unwrap();
+
+    let refused =
+        rasterizeddb_core::core::backup::restore_from(&config, &live, RecoveryTarget::Latest)
+            .await
+            .expect_err("a restore must not merge into a location that holds files");
+    assert!(refused.to_string().contains("not empty"), "{refused}");
+    assert!(
+        !live.exists() || std::fs::read_dir(&live).unwrap().next().is_none(),
+        "a refused restore left a database behind"
+    );
+    assert_eq!(
+        std::fs::read_dir(&disk2).unwrap().count(),
+        1,
+        "a refused restore wrote into the location"
+    );
+
+    std::fs::remove_file(disk2.join("stray.db")).unwrap();
+    rasterizeddb_core::core::backup::restore_from(&config, &live, RecoveryTarget::Latest)
+        .await
+        .expect("restore in place");
+
+    assert!(disk2.join("far.db").exists(), "the location's files did not go back to it");
+    assert!(
+        !std::fs::read_dir(&live)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("~loc-")
+                || e.file_name().to_string_lossy().starts_with("pool-location-")),
+        "an in-place restore left the location's files inside the database directory too"
+    );
+    assert_eq!(count_in_restored(&live, "SELECT * FROM near").await, 12);
+    assert_eq!(
+        count_in_restored(&live, "SELECT * FROM far").await,
+        20,
+        "the location's table, including the writes after the snapshot"
+    );
+});
+
+e2e_test!(a_catalogue_without_locations_keeps_the_shape_older_builds_read, config, {
+    // Nothing on another disk: the catalogue must be byte-for-byte the shape
+    // an older build wrote and reads, and restore exactly as before.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE plain (id INT)").await;
+    run(&database, "INSERT INTO plain (id) VALUES (1)").await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    let (bytes, manifest) = read_manifest(&config).await;
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("\"locations\""),
+        "a catalogue with no location names the field anyway"
+    );
+    assert!(manifest.version <= 2, "version {}", manifest.version);
+    rasterizeddb_core::core::backup::manifest::Manifest::decode_understanding(&bytes, 2)
+        .expect("a build that predates locations must still read it");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    assert_eq!(count_in_restored(&target, "SELECT * FROM plain").await, 1);
+});
+
+e2e_test!(a_location_that_becomes_primary_later_is_archived_from_then_on, config, {
+    // The install hook sees a location's log once, when it is opened. Added as
+    // a backup, the location is not a stream then; turned primary afterwards,
+    // nothing re-attached it, its checkpoints discarded what the archive
+    // needed, and every snapshot was refused for want of it.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    let disk2 = root.join("disk2");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&disk2).unwrap();
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+
+    run(
+        &database,
+        &format!(
+            "STORAGE ADD LOCATION '{}' WITH (ROLE = 'backup')",
+            disk2.display()
+        ),
+    )
+    .await;
+    run(
+        &database,
+        &format!(
+            "STORAGE ALTER LOCATION '{}' SET ROLE = 'primary'",
+            disk2.display()
+        ),
+    )
+    .await;
+    run(
+        &database,
+        &format!("STORAGE PLACE TABLE far AT '{}'", disk2.display()),
+    )
+    .await;
+    run(&database, "CREATE TABLE far (id INT, note STRING)").await;
+    for i in 0..10 {
+        run(
+            &database,
+            &format!("INSERT INTO far (id, note) VALUES ({i}, 'before')"),
+        )
+        .await;
+    }
+    assert!(disk2.join("far.db").exists(), "the test proves nothing");
+
+    service.snapshot_now().await.expect("snapshot");
+    for i in 10..15 {
+        run(
+            &database,
+            &format!("INSERT INTO far (id, note) VALUES ({i}, 'after')"),
+        )
+        .await;
+    }
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    drop(service);
+    drop(database);
+    std::fs::remove_dir_all(&live).unwrap();
+    std::fs::remove_dir_all(&disk2).unwrap();
+    forget_logs(&[&live, &disk2]);
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM far").await,
+        15,
+        "the writes after the snapshot exist only in the location's archived log"
+    );
+});
+
+e2e_test!(a_size_triggered_upload_never_archives_an_outcome_without_its_rows, config, {
+    // A transaction on a location table logs its rows in the location's log
+    // and its outcome in the database's. The database's log checkpoints on its
+    // own, and the size-triggered uploader sent what that staged without
+    // cutting the location's log: the restore held T2 and not T1, which
+    // committed before it — a state the database was never in, reported as a
+    // successful restore.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    let disk2 = root.join("disk2");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&disk2).unwrap();
+    let database = pooled_source(&live, &disk2, 1).await;
+
+    let mut config = config;
+    config.wal_bundle_bytes = 1;
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+    let (_, manifest) = read_manifest(&config).await;
+    let bundles_before = manifest.segments.len();
+
+    run(&database, "INSERT INTO far (id, note) VALUES (100, 'T1')").await;
+    run(&database, "INSERT INTO near (id, note) VALUES (100, 'T2')").await;
+    // The database's log crossing its threshold by itself.
+    let root_log = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("a log");
+    assert!(root_log.checkpoint().expect("checkpoint"), "the checkpoint declined");
+    assert!(service.staged_bytes() > 0, "nothing staged: the test proves nothing");
+
+    // Nothing is flushed by hand: the size trigger has to do it.
+    service.spawn_background();
+    let mut uploaded = false;
+    for _ in 0..240 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let (_, manifest) = read_manifest(&config).await;
+        if service.staged_bytes() == 0 && manifest.segments.len() > bundles_before {
+            uploaded = true;
+            break;
+        }
+    }
+    assert!(uploaded, "the size-triggered upload never ran");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    service.shutdown().await;
+    drop(service);
+    drop(root_log);
+    drop(database);
+    std::fs::remove_dir_all(&live).unwrap();
+    std::fs::remove_dir_all(&disk2).unwrap();
+    forget_logs(&[&live, &disk2]);
+
+    let far = count_in_restored(&target, "SELECT * FROM far").await;
+    let near = count_in_restored(&target, "SELECT * FROM near").await;
+    assert_eq!(
+        (far, near),
+        (2, 2),
+        "T1 (far) committed before T2 (near): a restore holding T2 must hold T1"
+    );
+});
+
+e2e_test!(a_created_database_keeps_its_tables_on_other_locations, config, {
+    // Each database made with `CREATE DATABASE` has a pool file of its own.
+    // Read only the root's, and a snapshot leaves out the sub-database's
+    // tables on other disks and still reports success; the restore then drops
+    // them with a warning. `disk2` is the sub-database's alone, so only its
+    // pool file names it; `disk3` it shares with the default database, so the
+    // location is listed once for both.
+    use rasterizeddb_core::core::database::catalog::DatabaseCatalog;
+
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    let disk2 = root.join("disk2");
+    let disk3 = root.join("disk3");
+    for dir in [&live, &disk2, &disk3] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let live_str = live.to_str().unwrap().to_string();
+
+    let catalogue = DatabaseCatalog::open(Some(&live_str), "master")
+        .await
+        .expect("catalogue");
+    let master = catalogue.get("master").expect("the default database");
+    let shop = catalogue.create("shop").await.expect("create shop");
+    for (database, table, disk) in [
+        (&shop, "carts", &disk2),
+        (&shop, "orders", &disk3),
+        (&master, "ledger", &disk3),
+    ] {
+        run(
+            database,
+            &format!("STORAGE ADD LOCATION '{}'", disk.display()),
+        )
+        .await;
+        run(
+            database,
+            &format!("STORAGE PLACE TABLE {table} AT '{}'", disk.display()),
+        )
+        .await;
+        run(database, &format!("CREATE TABLE {table} (id INT)")).await;
+        for i in 0..6 {
+            run(database, &format!("INSERT INTO {table} (id) VALUES ({i})")).await;
+        }
+    }
+    assert!(
+        disk2.join("carts.db").exists()
+            && disk3.join("orders.db").exists()
+            && disk3.join("ledger.db").exists(),
+        "the tables were not placed on the other locations: the test proves nothing"
+    );
+
+    let service = BackupService::connect(config.clone(), &live_str)
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+    let manifest = service.manifest_snapshot().await;
+    assert_eq!(
+        manifest.snapshots_newest_first()[0].locations.len(),
+        2,
+        "each location exactly once, the shared one included"
+    );
+
+    for i in 6..10 {
+        run(&shop, &format!("INSERT INTO carts (id) VALUES ({i})")).await;
+        run(&shop, &format!("INSERT INTO orders (id) VALUES ({i})")).await;
+    }
+    run(&master, "INSERT INTO ledger (id) VALUES (6)").await;
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    drop(service);
+    drop(shop);
+    drop(master);
+    drop(catalogue);
+    for dir in [&live, &disk2, &disk3] {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    forget_logs(&[&live, &live.join("shop"), &disk2, &disk3]);
+
+    let restored_shop = target.join("shop");
+    assert_eq!(
+        count_in_restored(&restored_shop, "SELECT * FROM carts").await,
+        10,
+        "the created database's table on its own location, writes after the snapshot included"
+    );
+    assert_eq!(
+        count_in_restored(&restored_shop, "SELECT * FROM orders").await,
+        10,
+        "the created database's table on the shared location"
+    );
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM ledger").await,
+        7,
+        "the default database's table on the shared location"
+    );
 });

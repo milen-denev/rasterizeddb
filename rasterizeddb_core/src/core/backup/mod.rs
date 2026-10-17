@@ -101,6 +101,27 @@ pub const STAGING_DIR: &str = "wal_archive";
 /// File holding this database's backup identity.
 const INSTANCE_FILE: &str = "backup_instance.id";
 
+/// Stream key, and archive directory, of a storage location outside the
+/// backed-up directory: this followed by a hash of the location's path.
+///
+/// Not a path relative to the directory, so it cannot collide with the stream
+/// of a database created inside it — the restore puts such a location's files
+/// somewhere under a different name ([`RESTORED_LOCATION_PREFIX`]).
+pub const LOCATION_KEY_PREFIX: &str = "~loc-";
+
+/// What a restore into a new directory names the subdirectory a location's
+/// files are placed in. They cannot go back where they came from: that is the
+/// source's disk, still in use.
+pub const RESTORED_LOCATION_PREFIX: &str = "pool-location-";
+
+/// The stream key of the storage location at `path`.
+fn location_key(path: &str) -> String {
+    format!(
+        "{LOCATION_KEY_PREFIX}{:016x}",
+        crate::core::wal::file_id_for_name(&crate::core::wal::dir_key(path))
+    )
+}
+
 /// Files never captured in a snapshot.
 ///
 /// The live log is excluded because it is replayed *into* a restore rather than
@@ -297,6 +318,11 @@ pub struct BackupService {
     /// Set when the staging directory hit its ceiling and checkpoints were told
     /// to stop handing over segments. Cleared once it drains.
     archiving_suspended: CacheGuard<AtomicBool>,
+    /// Every log this service pointed at its staging directory. Suspension
+    /// detaches these as well as the logs it can name now: a location whose
+    /// pool file stopped parsing cannot be named, and its log kept staging
+    /// past the ceiling that exists to protect the disk.
+    attached: std::sync::Mutex<Vec<std::sync::Weak<crate::core::wal::Wal>>>,
 }
 
 impl BackupService {
@@ -366,6 +392,7 @@ impl BackupService {
             archive_lock: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false).into(),
             archiving_suspended: AtomicBool::new(false).into(),
+            attached: std::sync::Mutex::new(Vec::new()),
         });
 
         // Sweep first, then hook, and the order is load-bearing rather than
@@ -429,17 +456,159 @@ impl BackupService {
     /// *table name*: two databases each holding `users` name it identically,
     /// and a merged replay would write one's records into the other's file.
     ///
-    /// Logs registered for storage locations *outside* this directory are not
-    /// streams: their files are on another disk and no snapshot copies them, so
-    /// archiving their records would produce a log with nothing to replay into.
+    /// A storage location *outside* this directory that holds tables is a
+    /// stream too, keyed by [`location_key`]: the snapshot copies its files, so
+    /// its records have somewhere to replay into. Any other log outside it —
+    /// another installation's, a backup location's — is not.
     fn log_streams(&self) -> Vec<(String, Arc<crate::core::wal::Wal>)> {
+        let (streams, problems) = self.log_streams_checked();
+        for problem in &problems {
+            error!("Backup of {}: {problem}", self.location);
+        }
+        streams
+    }
+
+    /// [`Self::log_streams`], with what kept a log from being named.
+    ///
+    /// Degrades per database: a pool file that cannot be parsed costs that
+    /// database's locations, never the root's log or anyone else's. Failing
+    /// the whole list stopped every cut, every suspension at the staging
+    /// ceiling and every resume, for every database, over one file. A snapshot
+    /// is still refused while any problem stands — it would leave out tables.
+    fn log_streams_checked(&self) -> (Vec<(String, Arc<crate::core::wal::Wal>)>, Vec<String>) {
         let root = crate::core::wal::dir_key(&self.location);
+        let (locations, mut problems) = self.pool_locations();
         let mut streams: Vec<(String, Arc<crate::core::wal::Wal>)> = crate::core::wal::registered()
             .into_iter()
-            .filter_map(|(dir, wal)| stream_key(&root, &dir).map(|key| (key, wal)))
+            .filter_map(|(dir, wal)| {
+                stream_key(&root, &dir)
+                    .or_else(|| {
+                        locations
+                            .iter()
+                            .find(|(_, path)| crate::core::wal::dir_key(path) == dir)
+                            .map(|(key, _)| key.clone())
+                    })
+                    .map(|key| (key, wal))
+            })
             .collect();
         streams.sort_by(|a, b| a.0.cmp(&b.0));
-        streams
+        // Two logs under one key would share a staging directory and a bundle
+        // stream, and a restore would replay one's records into the other's
+        // files. Neither is archived.
+        let mut clashing: Vec<String> = streams
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0.clone())
+            .collect();
+        clashing.dedup();
+        for key in &clashing {
+            problems.push(format!(
+                "two write-ahead logs map to the backup stream {key:?}; neither is archived"
+            ));
+        }
+        streams.retain(|(key, _)| !clashing.contains(key));
+        (streams, problems)
+    }
+
+    /// The storage locations outside this directory that hold tables, as
+    /// `(stream key, path)` sorted by key, and what could not be read.
+    ///
+    /// Read from the pool file of every database here — the one at the
+    /// location itself and each created with `CREATE DATABASE`, which has its
+    /// own. Snapshots walked only this directory and these locations were left
+    /// out of every one of them, silently; a restore came back without the
+    /// tables on them. A location inside this directory is not listed: the
+    /// walk already copies it and its log is already a stream.
+    ///
+    /// A location two databases share is listed once. Its whole directory is
+    /// copied, flat, so whatever else is kept there comes along: files cannot
+    /// be told apart by table without a list of suffixes, and a list is how
+    /// sidecars get missed (`RENAMED_SUFFIXES` has been short twice).
+    ///
+    /// A pool file that cannot be read skips that database's locations only.
+    fn pool_locations(&self) -> (Vec<(String, String)>, Vec<String>) {
+        let root = Path::new(&self.location);
+        let root_key = crate::core::wal::dir_key(&self.location);
+        let mut problems: Vec<String> = Vec::new();
+        let mut databases = vec![root.to_path_buf()];
+        match std::fs::read_dir(root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    if EXCLUDED.contains(&name.as_str())
+                        || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if entry.path().join(crate::core::storage::POOL_FILE).is_file() {
+                        databases.push(entry.path());
+                    }
+                }
+            }
+            Err(e) => problems.push(format!(
+                "{} cannot be listed ({e}), so its created databases' storage locations are unknown",
+                self.location
+            )),
+        }
+
+        let mut out: Vec<(String, String)> = Vec::new();
+        for database in databases {
+            let paths = match crate::core::storage::data_locations(&database) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    problems.push(e.to_string());
+                    continue;
+                }
+            };
+            for path in paths {
+                if stream_key(&root_key, &path).is_some() {
+                    continue;
+                }
+                let key = location_key(&path);
+                match out.iter().find(|(k, _)| *k == key) {
+                    Some((_, seen))
+                        if crate::core::wal::dir_key(seen) == crate::core::wal::dir_key(&path) => {}
+                    Some((_, seen)) => problems.push(format!(
+                        "storage locations {seen} and {path} hash to the same backup key {key}; \
+                         this backup cannot tell their files apart"
+                    )),
+                    None => out.push((key, path)),
+                }
+            }
+        }
+        out.sort();
+        (out, problems)
+    }
+
+    /// [`Self::pool_locations`] for a snapshot, which must not leave any out.
+    fn pool_locations_for_snapshot(&self) -> io::Result<Vec<(String, String)>> {
+        let (locations, problems) = self.pool_locations();
+        if problems.is_empty() {
+            Ok(locations)
+        } else {
+            Err(io::Error::other(format!(
+                "a snapshot of {} would leave out tables kept on other disks: {}",
+                self.location,
+                problems.join("; ")
+            )))
+        }
+    }
+
+    /// Points `wal`'s checkpoints at `key`'s staging directory, and remembers
+    /// it for suspension.
+    fn archive_log(&self, key: &str, wal: &Arc<crate::core::wal::Wal>) -> io::Result<()> {
+        wal.set_archive_dir(Some(self.staging_dir_for(key)))?;
+        let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+        attached.retain(|w| w.strong_count() > 0);
+        if !attached
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(wal)))
+        {
+            attached.push(Arc::downgrade(wal));
+        }
+        Ok(())
     }
 
     /// Points every log's checkpoints at its staging directory, so the records
@@ -460,7 +629,7 @@ impl BackupService {
             );
         }
         for (key, wal) in streams {
-            wal.set_archive_dir(Some(self.staging_dir_for(&key)))?;
+            self.archive_log(&key, &wal)?;
             if !key.is_empty() {
                 debug!(
                     "Archiving the log of database {} under {}",
@@ -480,17 +649,38 @@ impl BackupService {
     /// backup reports success over what is left.
     fn attach_new_log(&self, dir: &str, wal: &Arc<crate::core::wal::Wal>) {
         let root = crate::core::wal::dir_key(&self.location);
-        let Some(key) = stream_key(&root, dir) else {
-            // A log outside this location: another installation's, or a
-            // storage location on a disk no snapshot copies.
-            return;
+        let key = match stream_key(&root, dir) {
+            Some(key) => key,
+            // `STORAGE ADD LOCATION` records the location before it opens the
+            // log, so the pool files already name it by the time this runs.
+            None => {
+                let (locations, problems) = self.pool_locations();
+                match locations
+                    .into_iter()
+                    .find(|(_, path)| crate::core::wal::dir_key(path) == dir)
+                {
+                    Some((key, _)) => key,
+                    // Another installation's log, or a backup location's.
+                    None if problems.is_empty() => return,
+                    None => {
+                        error!(
+                            "Could not tell whether the log in {dir} belongs to a storage \
+                             location of {}: {}. Snapshots will refuse to run until the pool \
+                             file can be read.",
+                            self.location,
+                            problems.join("; ")
+                        );
+                        return;
+                    }
+                }
+            }
         };
         if self.archiving_suspended.load(Ordering::Acquire) {
             // Staging is over its ceiling and nothing is being staged; the
             // resume path attaches every stream, this one included.
             return;
         }
-        match wal.set_archive_dir(Some(self.staging_dir_for(&key))) {
+        match self.archive_log(&key, wal) {
             Ok(()) => info!(
                 "Archiving the log of {} under {}",
                 if key.is_empty() {
@@ -501,6 +691,39 @@ impl BackupService {
                 self.location
             ),
             Err(e) => error!("Could not archive the log of database {}: {}", key, e),
+        }
+    }
+
+    /// Starts archiving any storage location's log nothing attached yet, ahead
+    /// of its cut.
+    ///
+    /// The install hook only sees a log the moment it is installed. Whether a
+    /// location is a stream can change after that — a backup location turned
+    /// primary — and without this its checkpoints would keep discarding records
+    /// the archive needs. Attached before the cut, so the window opens on an
+    /// archived log.
+    ///
+    /// Locations only. A log under this directory is a stream from the moment
+    /// it exists, so the sweep and the hook already cover it, and one found
+    /// detached was detached on purpose: re-attaching it here would hide that
+    /// from `verify_log_is_archived`, which is what must notice.
+    fn attach_unattached(&self, streams: &[(String, Arc<crate::core::wal::Wal>)]) {
+        for (key, wal) in streams {
+            if !key.starts_with(LOCATION_KEY_PREFIX)
+                || wal.is_archiving()
+                || self.archiving_suspended.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            if let Err(e) = self.archive_log(key, wal) {
+                error!("Could not archive the log of {key}: {e}");
+                continue;
+            }
+            // Suspension may have landed in between; it detaches every
+            // stream, and this one must not be the exception.
+            if self.archiving_suspended.load(Ordering::Acquire) {
+                let _ = wal.set_archive_dir(None);
+            }
         }
     }
 
@@ -567,6 +790,9 @@ impl BackupService {
         // effects replay cannot reconstruct.
         let _no_compaction = compaction_gate().write().await;
 
+        // Before the first cut, so each location's log is a stream of this
+        // snapshot and its window opens with the copy's.
+        let locations = self.pool_locations_for_snapshot()?;
         let streams = self.log_streams();
 
         // Read before the log is cut, so every bundle this snapshot's window
@@ -600,7 +826,7 @@ impl BackupService {
             .collect();
         let start_lsn = opened_at.get("").copied().unwrap_or(0);
 
-        let files = self.snapshot_file_list()?;
+        let files = self.snapshot_file_list(&locations)?;
         if files.is_empty() {
             return Err(io::Error::other(format!(
                 "{} holds no database files to snapshot",
@@ -623,7 +849,7 @@ impl BackupService {
             start_lsn
         );
 
-        let staged_before = self.staged_lengths()?;
+        let staged_before = self.staged_lengths(&locations)?;
         // Large files first, as objects of their own (or references to ones an
         // earlier snapshot stored); the rest into this snapshot's archive.
         let (archived, objects, objects_uncompressed, objects_compressed) =
@@ -635,7 +861,25 @@ impl BackupService {
         let (uncompressed, compressed) = self.upload_snapshot(&key, &archived).await?;
         let (uncompressed, compressed) =
             (uncompressed + objects_uncompressed, compressed + objects_compressed);
-        self.check_staged_appends(&staged_before)?;
+        self.check_staged_appends(&staged_before, &locations)?;
+
+        // A location that started holding tables while the copy ran is in
+        // neither the copy nor this snapshot's list, and a restore would read
+        // its tables as missing. Rare — it takes `STORAGE ADD LOCATION` or a
+        // placement mid-copy — and refused rather than recorded.
+        let appeared: Vec<String> = self
+            .pool_locations_for_snapshot()?
+            .into_iter()
+            .filter(|location| !locations.contains(location))
+            .map(|(_, path)| path)
+            .collect();
+        if !appeared.is_empty() {
+            return Err(io::Error::other(format!(
+                "storage location(s) {} started holding tables while snapshot {id} was being \
+                 copied, so their files are not in it. Discarding it; retry the backup.",
+                appeared.join(", ")
+            )));
+        }
 
         // Cut the logs again. Everything written while the copy ran is now in a
         // staged segment, and each window's `end_lsn` is the point a restore
@@ -645,13 +889,20 @@ impl BackupService {
         // the copy ran has a log of its own that nothing has cut yet, and
         // leaving it would strand those records. Its window opens at 0, which
         // is the truth — every record it has ever written is in the archive.
+        //
+        // The ends are read before that cut, together (see `read_cut`): with a
+        // location, they are where a restore of this snapshot stops every log,
+        // and read one log at a time they could pair a database's outcome with
+        // a location log that does not yet hold its rows. The cut then stages
+        // everything through them.
+        let ending = self.log_streams();
+        let ends = read_cut(&ending)?;
         self.checkpoint_all_logs().await?;
-        let windows: Vec<manifest::LogWindow> = self
-            .log_streams()
+        let windows: Vec<manifest::LogWindow> = ends
             .into_iter()
-            .map(|(key, wal)| manifest::LogWindow {
+            .map(|(key, end_lsn)| manifest::LogWindow {
                 start_lsn: opened_at.get(&key).copied().unwrap_or(0),
-                end_lsn: wal.commit_lsn(),
+                end_lsn,
                 database: key,
             })
             .collect();
@@ -665,7 +916,7 @@ impl BackupService {
         // log records that filled it are. Naming it here lets a restore create
         // it empty so replay has somewhere to land.
         let mut names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
-        for (name, _) in self.snapshot_file_list()? {
+        for (name, _) in self.snapshot_file_list(&locations)? {
             if !names.contains(&name) {
                 debug!(
                     "{} appeared during snapshot {}; it will be rebuilt from the log",
@@ -691,6 +942,13 @@ impl BackupService {
             compression_level: self.config.snapshot_level,
             files: names,
             objects,
+            locations: locations
+                .iter()
+                .map(|(key, path)| manifest::PoolLocation {
+                    key: key.clone(),
+                    path: path.clone(),
+                })
+                .collect(),
         };
 
         // Released before the archive flush: that is network work and holding
@@ -789,12 +1047,20 @@ impl BackupService {
             return;
         };
 
+        let streams = self.log_streams();
         if suspend {
-            for (_, wal) in self.log_streams() {
-                if let Err(e) = wal.set_archive_dir(None) {
-                    error!("Could not suspend log archiving: {e}");
-                    return;
-                }
+            // Every log that can be named, and every one this service ever
+            // attached: one it can no longer name would otherwise go on
+            // filling the disk this exists to protect. Detaching cannot fail.
+            let attached: Vec<Arc<crate::core::wal::Wal>> = self
+                .attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for wal in streams.iter().map(|(_, wal)| wal).chain(attached.iter()) {
+                let _ = wal.set_archive_dir(None);
             }
             self.archiving_suspended.store(true, Ordering::Release);
             error!(
@@ -808,8 +1074,8 @@ impl BackupService {
                 ceiling / 2
             );
         } else {
-            for (key, wal) in self.log_streams() {
-                if let Err(e) = wal.set_archive_dir(Some(self.staging_dir_for(&key))) {
+            for (key, wal) in &streams {
+                if let Err(e) = self.archive_log(key, wal) {
                     error!("Could not resume log archiving: {e}");
                     return;
                 }
@@ -823,39 +1089,10 @@ impl BackupService {
         }
     }
 
-    /// Length of every staged-append sidecar in the database directory.
-    fn staged_lengths(&self) -> io::Result<HashMap<String, u64>> {
-        fn walk(dir: &Path, prefix: &str, lengths: &mut HashMap<String, u64>) -> io::Result<()> {
-            for entry in std::fs::read_dir(dir)?.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-
-                // Sub-databases have sidecars of their own, and a fold racing
-                // the copy is exactly as undetectable there as at the root.
-                if file_type.is_dir() {
-                    if EXCLUDED.contains(&name) {
-                        continue;
-                    }
-                    walk(&entry.path(), &format!("{prefix}{name}/"), lengths)?;
-                    continue;
-                }
-                if !name.ends_with(".tmp") {
-                    continue;
-                }
-                lengths.insert(
-                    format!("{prefix}{name}"),
-                    entry.metadata().map(|m| m.len()).unwrap_or(0),
-                );
-            }
-            Ok(())
-        }
-
-        let mut lengths = HashMap::new();
-        walk(Path::new(&self.location), "", &mut lengths)?;
-        Ok(lengths)
+    /// Length of every staged-append sidecar in the database directory and in
+    /// the storage locations a snapshot copies.
+    fn staged_lengths(&self, locations: &[(String, String)]) -> io::Result<HashMap<String, u64>> {
+        staged_lengths_in(Path::new(&self.location), locations)
     }
 
     /// Fails the snapshot if a staged-append fold landed while the copy ran.
@@ -869,21 +1106,9 @@ impl BackupService {
     fn check_staged_appends(
         &self,
         before: &std::collections::HashMap<String, u64>,
+        locations: &[(String, String)],
     ) -> io::Result<()> {
-        let after = self.staged_lengths()?;
-        for (name, was) in before {
-            if *was == 0 {
-                continue;
-            }
-            let now = after.get(name).copied().unwrap_or(0);
-            if now < *was {
-                return Err(io::Error::other(format!(
-                    "{name} was folded into its main file while the snapshot was being copied,                      so up to {} bytes are in neither the copy nor the log. Discarding this                      snapshot; retry it.",
-                    was - now
-                )));
-            }
-        }
-        Ok(())
+        folded_while_copying(before, &self.staged_lengths(locations)?)
     }
 
     /// Confirms the log covering a snapshot has actually reached S3.
@@ -1019,8 +1244,12 @@ impl BackupService {
     fn warn_about_excluded_tables(&self) {}
 
     /// Names are relative paths with `/` separators, so a restore rebuilds the
-    /// same shape.
-    fn snapshot_file_list(&self) -> io::Result<Vec<(String, PathBuf)>> {
+    /// same shape. A storage location's files are named under its stream key,
+    /// which a restore maps back to a directory (see [`restore`]).
+    fn snapshot_file_list(
+        &self,
+        locations: &[(String, String)],
+    ) -> io::Result<Vec<(String, PathBuf)>> {
         fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -1056,6 +1285,29 @@ impl BackupService {
 
         let mut files = Vec::new();
         walk(Path::new(&self.location), "", &mut files)?;
+        // Flat: tables sit directly in a location, and a recursive walk would
+        // take in whatever else is kept beneath it — another database's
+        // location, say, which that database's own entry already covers.
+        for (key, path) in locations {
+            let entries = std::fs::read_dir(path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("storage location {path} cannot be read for the snapshot: {e}"),
+                )
+            })?;
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    || EXCLUDED.contains(&name.as_str())
+                    || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
+                {
+                    continue;
+                }
+                files.push((format!("{key}/{name}"), entry.path()));
+            }
+        }
         // Deterministic order, so two snapshots of an unchanged database
         // produce byte-identical archives and are trivially comparable.
         files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1370,9 +1622,13 @@ impl BackupService {
     /// that failed. Returning at the first one left every log sorted after it
     /// uncut, so a single poisoned sub-database stopped the archiving of every
     /// healthy database beside it until the process restarted.
+    ///
+    /// A log that cannot be named — its database's pool file does not parse —
+    /// is reported the same way, after every other log has been cut.
     async fn checkpoint_all_logs(self: &Arc<Self>) -> io::Result<()> {
-        let mut failed: Vec<String> = Vec::new();
-        for (key, wal) in self.log_streams() {
+        let (streams, mut failed) = self.log_streams_checked();
+        self.attach_unattached(&streams);
+        for (key, wal) in streams {
             let w = wal.clone();
             let outcome = tokio::task::spawn_blocking(move || w.checkpoint())
                 .await
@@ -1400,13 +1656,22 @@ impl BackupService {
     ///
     /// Used by the background task, which does not want to force a checkpoint —
     /// and its fsync of every data file — on a schedule of its own.
+    ///
+    /// Except while a database keeps tables on a storage location: then every
+    /// log is cut behind one [`read_cut`] first, and the cut is recorded once
+    /// the bundles holding it are. Uploading what a database's log staged on
+    /// its own put a transaction's outcome in the archive without the rows its
+    /// location's log still held, and a restore came back with a later commit
+    /// and without an earlier one.
     async fn flush_staged_segments(self: &Arc<Self>) -> io::Result<ArchiveReport> {
         let _one_at_a_time = self.archive_lock.lock().await;
 
+        let cut = self.cut_together().await;
         let staged = self.staged_by_stream()?;
-        if staged.iter().all(|(_, paths)| paths.is_empty()) {
+        if cut.is_none() && staged.iter().all(|(_, paths)| paths.is_empty()) {
             return Ok(ArchiveReport::default());
         }
+        let staged_names: Vec<String> = staged.iter().map(|(name, _)| name.clone()).collect();
 
         let mut report = ArchiveReport::default();
 
@@ -1509,11 +1774,17 @@ impl BackupService {
             }
         }
 
+        // Only now: every bundle holding records through the cut is recorded.
+        let recorded = match cut {
+            Some(lsns) => self.record_cut(lsns, &staged_names).await,
+            None => false,
+        };
+
         // Checked after every flush, successful or not: this is the only place
         // that observes whether uploads are keeping up with checkpoints.
         self.enforce_staging_ceiling();
 
-        if report.bundles > 0 {
+        if report.bundles > 0 || recorded {
             self.publish_manifest().await?;
             info!(
                 "Archived {} log segments in {} bundle(s), {} -> {} bytes, through LSN {}",
@@ -1525,6 +1796,110 @@ impl BackupService {
             );
         }
         Ok(report)
+    }
+
+    /// Reads a [`read_cut`] across every log and cuts them all behind it, when
+    /// some database keeps tables on a storage location. `None` when none does,
+    /// or when this pass cannot produce a cut — the next pass tries again, and
+    /// a restore stops at the newest cut recorded meanwhile.
+    async fn cut_together(self: &Arc<Self>) -> Option<Vec<manifest::CutLsn>> {
+        if self.archiving_suspended.load(Ordering::Acquire) {
+            return None;
+        }
+        let (streams, problems) = self.log_streams_checked();
+        if !streams.iter().any(|(key, _)| key.starts_with(LOCATION_KEY_PREFIX)) {
+            return None;
+        }
+        if !problems.is_empty() {
+            // A log nobody can name is in no cut, and its database's outcomes
+            // would be cut without it.
+            warn!(
+                "Backup of {}: no restore point this pass: {}",
+                self.location,
+                problems.join("; ")
+            );
+            return None;
+        }
+        let lsns = match read_cut(&streams) {
+            Ok(lsns) => lsns,
+            Err(e) => {
+                warn!("Backup of {}: no restore point this pass: {e}", self.location);
+                return None;
+            }
+        };
+        if let Err(e) = self.checkpoint_all_logs().await {
+            warn!("Backup of {}: {e}", self.location);
+        }
+        // A cut is only a restore point once everything through it is staged:
+        // a checkpoint declines while another runs or an in-place write is
+        // pending. `staged_covers` also asks whether anything after its first
+        // argument was dropped unstaged — a snapshot window's question, so it
+        // is passed the largest value and answers only the first.
+        if let Some(((key, _), _)) = streams
+            .iter()
+            .zip(&lsns)
+            .find(|((_, wal), (_, lsn))| !wal.staged_covers(u64::MAX, *lsn))
+        {
+            debug!(
+                "Backup of {}: the log of {key:?} is not staged through the cut; no restore \
+                 point this pass",
+                self.location
+            );
+            return None;
+        }
+        Some(
+            lsns.into_iter()
+                .map(|(database, lsn)| manifest::CutLsn {
+                    database,
+                    lsn: Some(lsn),
+                })
+                .collect(),
+        )
+    }
+
+    /// Records a cut whose bundles are all in the catalogue. Returns whether
+    /// the catalogue changed.
+    ///
+    /// A log the catalogue knows that was not open at the cut wrote nothing
+    /// then, so all of it is before the cut. One that was not
+    /// open then but is now opened during this pass: what it logged since is
+    /// after the cut and what it archived before is not, which one number
+    /// cannot say — so no cut this pass.
+    async fn record_cut(&self, mut lsns: Vec<manifest::CutLsn>, staged: &[String]) -> bool {
+        let open_now: Vec<String> = self.log_streams().into_iter().map(|(key, _)| key).collect();
+        let mut manifest = self.manifest.lock().await;
+        // Every log a snapshot window names too: a cut that leaves one out
+        // cannot serve that snapshot, and its restores would stop at the copy.
+        let mut history = manifest.databases_with_segments();
+        history.extend(staged.iter().cloned());
+        for snapshot in &manifest.snapshots {
+            history.extend(snapshot.windows.iter().map(|w| w.database.clone()));
+        }
+        history.sort();
+        history.dedup();
+        for database in history {
+            if lsns.iter().any(|l| l.database == database) {
+                continue;
+            }
+            if open_now.contains(&database) {
+                debug!(
+                    "Backup of {}: {database:?} opened during the cut; no restore point this pass",
+                    self.location
+                );
+                return false;
+            }
+            lsns.push(manifest::CutLsn {
+                database,
+                lsn: None,
+            });
+        }
+        lsns.sort_by(|a, b| a.database.cmp(&b.database));
+        let segment_sequence = manifest.next_segment_sequence();
+        manifest.record_cut(manifest::LogCut {
+            segment_sequence,
+            archived_at: timeutil::now_unix(),
+            lsns,
+        })
     }
 
     /// Staged segments, one entry per log, each in log order.
@@ -1884,6 +2259,138 @@ impl BackupService {
             error!("Final log archive on shutdown failed: {e}");
         }
     }
+}
+
+/// How often [`read_cut`] tries before giving up on a busy server.
+const CUT_ATTEMPTS: u32 = 10_000;
+
+/// Every log's commit sequence, all at one instant, as `(stream key, LSN)` in
+/// the order of `streams`.
+///
+/// Without a storage location there is nothing to pair — each database has its
+/// own status — and one read of each log is the cut. With one, the rows of a
+/// transaction are in the location's log and its outcome in its database's,
+/// and two independent reads can pair an outcome with a location log that
+/// does not hold its rows yet. So the databases are read first and the
+/// locations after: rows are logged before their outcome, so every outcome the
+/// first read takes in has its rows in the second. The databases are then read
+/// again, and the whole read repeated if any moved: nothing a location logged
+/// between the reads can then rest on an outcome the cut leaves out, since
+/// whatever acts on an outcome — vacuum freeing a deleted version, say — runs
+/// only once that outcome is logged. What a location holds past its read is
+/// rows of transactions still in flight at the cut, as after a crash there.
+fn read_cut(streams: &[(String, Arc<crate::core::wal::Wal>)]) -> io::Result<Vec<(String, u64)>> {
+    let is_location = |key: &str| key.starts_with(LOCATION_KEY_PREFIX);
+    if !streams.iter().any(|(key, _)| is_location(key)) {
+        return Ok(streams
+            .iter()
+            .map(|(key, wal)| (key.clone(), wal.commit_lsn()))
+            .collect());
+    }
+    let read = |locations: bool| -> Vec<u64> {
+        streams
+            .iter()
+            .filter(|(key, _)| is_location(key) == locations)
+            .map(|(_, wal)| wal.commit_lsn())
+            .collect()
+    };
+    for attempt in 0..CUT_ATTEMPTS {
+        let databases = read(false);
+        let locations = read(true);
+        if read(false) == databases {
+            let (mut databases, mut locations) = (databases.into_iter(), locations.into_iter());
+            return Ok(streams
+                .iter()
+                .map(|(key, _)| {
+                    let lsn = if is_location(key) {
+                        locations.next()
+                    } else {
+                        databases.next()
+                    };
+                    (key.clone(), lsn.expect("one reading per log"))
+                })
+                .collect());
+        }
+        if attempt % 64 == 63 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    Err(io::Error::other(format!(
+        "could not read the logs at one instant: a database committed during each of \
+         {CUT_ATTEMPTS} attempts"
+    )))
+}
+
+/// See [`BackupService::staged_lengths`]: keyed by the name the snapshot gives
+/// the sidecar, a location's under its stream key.
+fn staged_lengths_in(
+    root: &Path,
+    locations: &[(String, String)],
+) -> io::Result<HashMap<String, u64>> {
+    fn walk(dir: &Path, prefix: &str, lengths: &mut HashMap<String, u64>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            // Sub-databases have sidecars of their own, and a fold racing
+            // the copy is exactly as undetectable there as at the root.
+            if file_type.is_dir() {
+                if EXCLUDED.contains(&name) {
+                    continue;
+                }
+                walk(&entry.path(), &format!("{prefix}{name}/"), lengths)?;
+                continue;
+            }
+            if !name.ends_with(".tmp") {
+                continue;
+            }
+            lengths.insert(
+                format!("{prefix}{name}"),
+                entry.metadata().map(|m| m.len()).unwrap_or(0),
+            );
+        }
+        Ok(())
+    }
+
+    let mut lengths = HashMap::new();
+    walk(root, "", &mut lengths)?;
+    // Flat, as the copy is; see `snapshot_file_list`.
+    for (key, path) in locations {
+        for entry in std::fs::read_dir(path)?.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            {
+                lengths.insert(
+                    format!("{key}/{name}"),
+                    entry.metadata().map(|m| m.len()).unwrap_or(0),
+                );
+            }
+        }
+    }
+    Ok(lengths)
+}
+
+/// See [`BackupService::check_staged_appends`].
+fn folded_while_copying(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> io::Result<()> {
+    for (name, was) in before {
+        if *was == 0 {
+            continue;
+        }
+        let now = after.get(name).copied().unwrap_or(0);
+        if now < *was {
+            return Err(io::Error::other(format!(
+                "{name} was folded into its main file while the snapshot was being copied,                      so up to {} bytes are in neither the copy nor the log. Discarding this                      snapshot; retry it.",
+                was - now
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Where `dir` sits relative to a backup location, as a stream key.
@@ -2486,13 +2993,20 @@ mod tests {
     }
 
     #[test]
-    fn a_storage_location_on_another_disk_is_not_a_stream() {
+    fn a_storage_location_on_another_disk_is_not_a_relative_stream() {
         // Placement can put a table's files outside the backed-up directory,
-        // and those get a log of their own. No snapshot copies them, so
-        // archiving their records would produce a log with nothing to replay
-        // into — worse than not archiving it, because the catalogue would
-        // claim coverage it does not have.
+        // and those get a log of their own. It is a stream, but under its own
+        // key from `pool_locations`, never as a path under the location: that
+        // would name a directory inside the restore that the files are not in.
         assert_eq!(stream_key("/var/lib/rdb", "/mnt/fast/rdb"), None);
+        let key = location_key("/mnt/fast/rdb");
+        assert!(key.starts_with(LOCATION_KEY_PREFIX), "{key}");
+        assert_eq!(
+            key,
+            location_key("/mnt/fast/rdb/"),
+            "a trailing separator is the same place"
+        );
+        assert_ne!(key, location_key("/mnt/fast/rdb2"));
     }
 
     /// An S3 stand-in on loopback: answers every request with an empty `200`
@@ -2611,6 +3125,7 @@ mod tests {
             archive_lock: tokio::sync::Mutex::new(()),
             shutting_down: CacheGuard::new(AtomicBool::new(false)),
             archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
+            attached: std::sync::Mutex::new(Vec::new()),
         });
         service.attach_to_logs().unwrap();
 
@@ -2652,5 +3167,173 @@ mod tests {
             "no segment of the healthy database reached the bucket: {:?}",
             requests
         );
+    }
+
+    /// A service over `location` that never reaches its bucket.
+    fn offline_service(location: &str, config: BackupConfig) -> Arc<BackupService> {
+        let client = Arc::new(
+            S3Client::new(S3Config {
+                endpoint: config.endpoint.clone(),
+                region: config.region.clone(),
+                bucket: config.bucket.clone(),
+                credentials: config.credentials.clone(),
+                path_style: config.path_style,
+                max_attempts: config.max_attempts,
+            })
+            .unwrap(),
+        );
+        Arc::new(BackupService {
+            config,
+            client,
+            location: location.to_string(),
+            instance_id: "rdb-test".to_string(),
+            manifest: tokio::sync::Mutex::new(Manifest::new("rdb-test".to_string())),
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            archive_lock: tokio::sync::Mutex::new(()),
+            shutting_down: CacheGuard::new(AtomicBool::new(false)),
+            archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
+            attached: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Unregisters logs a test installed, however it ends.
+    struct Installed(Vec<String>);
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                crate::core::wal::remove_for(dir);
+            }
+        }
+    }
+
+    fn install_log(dir: &Path, installed: &mut Installed) -> Arc<crate::core::wal::Wal> {
+        let wal = Arc::new(
+            crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+        );
+        crate::core::wal::install_for(dir.to_str().unwrap(), wal.clone());
+        installed.0.push(dir.to_str().unwrap().to_string());
+        wal
+    }
+
+    fn commit(wal: &crate::core::wal::Wal, bytes: &[u8]) {
+        let txn = wal.begin();
+        wal.log(txn, 7, 0, bytes).unwrap();
+        wal.commit_txn(txn).unwrap();
+    }
+
+    /// A staged append moving into place inside a storage location while the
+    /// copy runs is as torn as one in the database directory, and must refuse
+    /// the snapshot the same way.
+    #[test]
+    fn a_fold_in_a_storage_location_is_seen() {
+        let root = tempfile::tempdir().unwrap();
+        let disk2 = tempfile::tempdir().unwrap();
+        let path = disk2.path().to_str().unwrap().to_string();
+        let key = location_key(&path);
+        let locations = vec![(key.clone(), path)];
+        std::fs::write(disk2.path().join("t.db.tmp"), vec![1u8; 64]).unwrap();
+        std::fs::write(disk2.path().join("t.db"), b"main").unwrap();
+
+        let before = staged_lengths_in(root.path(), &locations).unwrap();
+        assert_eq!(before.get(&format!("{key}/t.db.tmp")), Some(&64), "{before:?}");
+        assert!(!before.contains_key(&format!("{key}/t.db")), "{before:?}");
+
+        // Untouched: nothing to refuse.
+        let same = staged_lengths_in(root.path(), &locations).unwrap();
+        folded_while_copying(&before, &same).unwrap();
+
+        std::fs::write(disk2.path().join("t.db.tmp"), vec![1u8; 8]).unwrap();
+        let shrunk = staged_lengths_in(root.path(), &locations).unwrap();
+        let err = folded_while_copying(&before, &shrunk).unwrap_err();
+        assert!(err.to_string().contains("t.db.tmp"), "{err}");
+
+        std::fs::remove_file(disk2.path().join("t.db.tmp")).unwrap();
+        let gone = staged_lengths_in(root.path(), &locations).unwrap();
+        folded_while_copying(&before, &gone).unwrap_err();
+    }
+
+    /// One database's unparsable pool file costs that database's locations and
+    /// nothing else: the root's log is still cut, a snapshot is refused rather
+    /// than taken without those tables, and the staging ceiling still detaches
+    /// every log — the one that can no longer be named included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unparsable_pool_file_costs_only_its_own_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let disk2 = tempfile::tempdir().unwrap();
+        let location = root.path().to_str().unwrap().to_string();
+        let shop = root.path().join("shop");
+        std::fs::create_dir(&shop).unwrap();
+        std::fs::write(
+            shop.join(crate::core::storage::POOL_FILE),
+            format!(
+                "version\t1\nlocation\tprimary\t1\tenabled\t{}\n",
+                disk2.path().display()
+            ),
+        )
+        .unwrap();
+
+        let mut installed = Installed(Vec::new());
+        let root_log = install_log(root.path(), &mut installed);
+        let location_log = install_log(disk2.path(), &mut installed);
+
+        let mut config = test_config();
+        config.staging_max_bytes = 1;
+        let service = offline_service(&location, config);
+        service.attach_to_logs().unwrap();
+        assert!(location_log.is_archiving(), "the test proves nothing");
+
+        std::fs::write(shop.join(crate::core::storage::POOL_FILE), "location\tprimary\n").unwrap();
+        commit(&root_log, b"root");
+
+        let err = service
+            .checkpoint_all_logs()
+            .await
+            .expect_err("a database whose locations are unknown must be reported");
+        assert!(err.to_string().contains("shop"), "{err}");
+        assert_eq!(
+            root_log.bytes_since_checkpoint(),
+            0,
+            "the root's log was not cut because another database's pool file is unreadable"
+        );
+        assert!(service.pool_locations_for_snapshot().is_err());
+
+        // The root's staged segment is over the 1-byte ceiling.
+        service.enforce_staging_ceiling();
+        assert!(service.archiving_is_suspended());
+        assert!(!root_log.is_archiving());
+        assert!(
+            !location_log.is_archiving(),
+            "a log this service attached kept staging past the ceiling"
+        );
+    }
+
+    /// A cut is each log's commit sequence; with a location it is read in
+    /// the order that keeps it consistent, and the reading is per log.
+    #[test]
+    fn a_cut_names_every_log_at_its_commit_sequence() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let open = |dir: &Path| {
+            Arc::new(
+                crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+            )
+        };
+        let (root, far) = (open(a.path()), open(b.path()));
+        commit(&root, b"one");
+        commit(&root, b"two");
+        commit(&far, b"three");
+        let streams = vec![
+            (String::new(), root.clone()),
+            ("~loc-00000000000000ff".to_string(), far.clone()),
+        ];
+        let cut = read_cut(&streams).unwrap();
+        assert_eq!(
+            cut,
+            vec![
+                (String::new(), root.commit_lsn()),
+                ("~loc-00000000000000ff".to_string(), far.commit_lsn()),
+            ]
+        );
+        assert_ne!(root.commit_lsn(), far.commit_lsn(), "the readings must not be mixed up");
     }
 }

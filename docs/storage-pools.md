@@ -149,6 +149,18 @@ already open are mirrored from the next restart — their providers were built
 before the location existed and cannot be swapped underneath a live table. The
 `STORAGE ADD LOCATION` output says so.
 
+## S3 backups
+
+Snapshots and the archived log cover every primary location, not only the
+database directory — each location's files are copied flat and its log is
+archived as a stream of its own. A restore onto the source directory puts each
+location's files back on its own disk (which must be empty); a restore anywhere
+else puts them in `pool-location-<hash>` inside the restored directory, because
+the source's disks are still the source's. Backup locations are not copied: they
+mirror a primary that is. See [s3-backup.md §10.13](s3-backup.md). Snapshots
+taken before this (2026-10) hold only the database directory, and their
+restores drop the tables on other disks, with a warning naming them.
+
 ## Moving tables
 
 `STORAGE MOVE TABLE <name> TO '<spec>'` copies, flips the placement, then

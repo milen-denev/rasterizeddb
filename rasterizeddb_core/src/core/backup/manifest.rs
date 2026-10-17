@@ -33,7 +33,12 @@ use serde::{Deserialize, Serialize};
 /// those files out — so a catalogue that uses them is written as version 2,
 /// which such a reader refuses, and one that does not stays at 1 and remains
 /// readable by older builds. See [`Manifest::required_version`].
-pub const MANIFEST_VERSION: u32 = 2;
+///
+/// 3: a snapshot may carry storage locations outside the database directory
+/// ([`SnapshotEntry::locations`]). A version-2 reader would unpack their files
+/// into a stray directory and restore a database whose tables on those
+/// locations read as missing — reported as a warning, not as a failure.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Key of the catalogue within the configured prefix.
 pub const MANIFEST_KEY: &str = "MANIFEST.json";
@@ -80,6 +85,11 @@ pub struct Manifest {
     pub snapshots: Vec<SnapshotEntry>,
     #[serde(default)]
     pub segments: Vec<SegmentEntry>,
+    /// Points at which every log was read at one instant, oldest first. Only
+    /// recorded while some database keeps tables on a storage location; see
+    /// [`LogCut`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<LogCut>,
 }
 
 impl Manifest {
@@ -93,7 +103,18 @@ impl Manifest {
             segment_sequence_high: 0,
             snapshots: Vec::new(),
             segments: Vec::new(),
+            cuts: Vec::new(),
         }
+    }
+
+    /// Records a cut, unless it says nothing the newest one does not. Returns
+    /// whether it did.
+    pub fn record_cut(&mut self, cut: LogCut) -> bool {
+        if self.cuts.last().is_some_and(|last| last.lsns == cut.lsns) {
+            return false;
+        }
+        self.cuts.push(cut);
+        true
     }
 
     pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
@@ -119,7 +140,9 @@ impl Manifest {
     /// never takes an incremental snapshot keeps writing catalogues an older
     /// build can still restore from.
     pub fn required_version(&self) -> u32 {
-        if self.snapshots.iter().any(|s| !s.objects.is_empty()) {
+        if self.snapshots.iter().any(|s| !s.locations.is_empty()) || !self.cuts.is_empty() {
+            3
+        } else if self.snapshots.iter().any(|s| !s.objects.is_empty()) {
             2
         } else {
             1
@@ -319,6 +342,28 @@ pub struct SnapshotEntry {
     /// every snapshot written before this existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<FileObject>,
+    /// Storage locations outside the database directory that this snapshot
+    /// copied, because tables were placed on them.
+    ///
+    /// Each location's files are named `<key>/<file>` in [`Self::files`] and in
+    /// the archive, and its log is the stream `key` in [`Self::windows`] and
+    /// [`SegmentEntry::database`]. Empty for a snapshot of a database with no
+    /// such location, and for every snapshot written before they were copied
+    /// — whose restores drop those tables, loudly, as they always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<PoolLocation>,
+}
+
+/// A storage location outside the database directory, as a snapshot carried it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolLocation {
+    /// Stream key and archive directory: `~loc-` and a hash of `path`. Never a
+    /// relative path, so it cannot be mistaken for a database created inside
+    /// the directory.
+    pub key: String,
+    /// The location's absolute path at the source, which is where an in-place
+    /// restore puts its files back.
+    pub path: String,
 }
 
 /// One file of a snapshot stored as its own compressed object.
@@ -344,6 +389,75 @@ pub struct LogWindow {
     /// through `end_lsn` is what makes this database's files consistent.
     pub start_lsn: u64,
     pub end_lsn: u64,
+}
+
+/// Every log's commit sequence at one instant.
+///
+/// A transaction that writes a table on a storage location logs its rows in
+/// the location's log and its outcome in its database's log. Replayed each to
+/// its own end, the two can disagree: an outcome whose rows are missing, or
+/// rows under an id the restored status never recorded — which the restored
+/// database can hand out again, and a commit under it would make those rows
+/// visible. A snapshot carrying locations therefore stops every log at one cut
+/// (see [`RecoveryTarget::resolve_cut`]). How one is read is in
+/// `BackupService::read_cut`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogCut {
+    /// Recorded only once every bundle holding records through the cut was,
+    /// and those all have a lower sequence than this.
+    pub segment_sequence: u64,
+    /// Unix seconds it was recorded: what `AT TIME` resolves against.
+    pub archived_at: u64,
+    pub lsns: Vec<CutLsn>,
+}
+
+/// One log's place in a [`LogCut`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CutLsn {
+    /// As in [`SegmentEntry::database`].
+    pub database: String,
+    /// `None` for a log that was not open at the cut: nothing was being written
+    /// to it, so everything it archived is before the cut.
+    pub lsn: Option<u64>,
+}
+
+impl LogCut {
+    /// The snapshot's own window ends, which `take_snapshot` reads as a cut.
+    pub fn from_windows(snapshot: &SnapshotEntry) -> Self {
+        LogCut {
+            segment_sequence: snapshot.first_segment_sequence.unwrap_or(0),
+            archived_at: snapshot.finished_at,
+            lsns: snapshot
+                .windows
+                .iter()
+                .map(|w| CutLsn {
+                    database: w.database.clone(),
+                    lsn: Some(w.end_lsn),
+                })
+                .collect(),
+        }
+    }
+
+    /// Where one log's replay stops at this cut. A log the cut does not name
+    /// did not exist yet, so none of it is before the cut.
+    pub fn ceiling_for(&self, database: &str) -> Option<u64> {
+        match self.lsns.iter().find(|l| l.database == database) {
+            Some(l) => l.lsn,
+            None => Some(0),
+        }
+    }
+
+    /// Whether `snapshot` can be replayed to this cut: taken after it, and at
+    /// or past every window end, below which its copy is not yet consistent.
+    pub fn serves(&self, snapshot: &SnapshotEntry) -> bool {
+        self.segment_sequence >= snapshot.first_segment_sequence.unwrap_or(0)
+            && snapshot.windows.iter().all(|w| {
+                self.lsns
+                    .iter()
+                    .find(|l| l.database == w.database)
+                    .is_some_and(|l| l.lsn.is_none_or(|lsn| lsn >= w.end_lsn))
+            })
+    }
 }
 
 /// A bundle of archived log segments in a single compressed object.
@@ -408,6 +522,8 @@ pub struct RetentionPlan {
     pub snapshots: Vec<SnapshotEntry>,
     /// Segment bundles to keep, in log order.
     pub segments: Vec<SegmentEntry>,
+    /// Cuts a surviving snapshot can still be restored to.
+    pub cuts: Vec<LogCut>,
     /// Object keys to delete.
     pub doomed: Vec<String>,
 }
@@ -434,6 +550,7 @@ impl Manifest {
             return RetentionPlan {
                 snapshots: ordered,
                 segments: self.segments_ordered().into_iter().cloned().collect(),
+                cuts: self.cuts.clone(),
                 doomed: Vec::new(),
             };
         }
@@ -474,9 +591,23 @@ impl Manifest {
 
         doomed.extend(dropped.into_iter().map(|s| s.key));
 
+        // A cut no survivor can reach names bundles that just went.
+        let cuts = self
+            .cuts
+            .iter()
+            .filter(|cut| {
+                survivors.iter().any(|s| {
+                    s.first_segment_sequence
+                        .is_none_or(|floor| cut.segment_sequence >= floor)
+                })
+            })
+            .cloned()
+            .collect();
+
         RetentionPlan {
             snapshots: survivors,
             segments,
+            cuts,
             doomed,
         }
     }
@@ -596,6 +727,54 @@ impl RecoveryTarget {
             }
         }
     }
+
+    /// The one cut every log of `snapshot` is replayed to, when they have to
+    /// stop together: `None` when each can be resolved on its own, because the
+    /// snapshot carries no storage location.
+    ///
+    /// The databases under a location are independent of each other — each
+    /// has its own status and its own ids — but a location's log is not: the
+    /// outcome of every transaction that wrote there is in its database's log.
+    /// See [`LogCut`].
+    ///
+    /// `AT LSN` is refused: it names a commit of one log, and no cut was read
+    /// at exactly that commit, so honouring it would replay that log past the
+    /// point the others stop at — the inconsistency this exists to prevent —
+    /// and stopping short instead would leave out commits the operator asked
+    /// for.
+    pub fn resolve_cut(
+        &self,
+        manifest: &Manifest,
+        snapshot: &SnapshotEntry,
+    ) -> std::io::Result<Option<LogCut>> {
+        if snapshot.locations.is_empty() {
+            return Ok(None);
+        }
+        let own = LogCut::from_windows(snapshot);
+        let serving = manifest.cuts.iter().filter(|cut| cut.serves(snapshot));
+        let chosen = match self {
+            RecoveryTarget::Snapshot(_) => own,
+            RecoveryTarget::Latest => serving.last().cloned().unwrap_or(own),
+            RecoveryTarget::Time(unix) => serving
+                .filter(|cut| cut.archived_at <= *unix)
+                .last()
+                .cloned()
+                .unwrap_or(own),
+            RecoveryTarget::Lsn(lsn) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "snapshot {} keeps tables on storage locations, whose logs can only be \
+                         stopped together at the points the archive recorded; a restore to LSN \
+                         {lsn} of one log cannot be made consistent. Restore to a time or to a \
+                         snapshot instead.",
+                        snapshot.id
+                    ),
+                ));
+            }
+        };
+        Ok(Some(chosen))
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +800,7 @@ mod tests {
             compression_level: 10,
             files: Vec::new(),
             objects: Vec::new(),
+            locations: Vec::new(),
         }
     }
 
@@ -671,6 +851,52 @@ mod tests {
         assert!(err.to_string().contains("version 2"), "{err}");
         let back = Manifest::decode(&bytes).unwrap();
         assert_eq!(back.snapshots[0].objects, m.snapshots[0].objects);
+    }
+
+    /// A catalogue carrying a storage location must be refused by a reader
+    /// that would restore it without that location's tables. One without stays
+    /// at the version it was before, and does not even mention the field.
+    #[test]
+    fn a_reader_that_predates_locations_refuses_a_catalogue_that_has_them() {
+        let mut m = manifest();
+        let plain = m.encode();
+        assert!(!String::from_utf8_lossy(&plain).contains("locations"));
+        assert!(Manifest::decode_understanding(&plain, 2).is_ok());
+
+        m.snapshots[0].locations = vec![PoolLocation {
+            key: "~loc-00000000000000ff".to_string(),
+            path: "/mnt/disk2".to_string(),
+        }];
+        let bytes = m.encode();
+        let err = Manifest::decode_understanding(&bytes, 2).unwrap_err();
+        assert!(err.to_string().contains("version 3"), "{err}");
+        let back = Manifest::decode(&bytes).unwrap();
+        assert_eq!(back.snapshots[0].locations, m.snapshots[0].locations);
+    }
+
+    /// What a build before locations wrote, verbatim in shape: it must still
+    /// decode, with no locations, so its snapshots restore as they always did.
+    #[test]
+    fn a_catalogue_written_before_locations_still_decodes() {
+        let json = br#"{
+            "version": 2,
+            "instance_id": "rdb-old",
+            "source_location": "/srv/live",
+            "updated_at": 7,
+            "snapshots": [{
+                "id": "snap-old", "sequence": 0, "key": "snapshots/snap-old.rdba.zst",
+                "started_at": 1, "finished_at": 2, "start_lsn": 0, "end_lsn": 0,
+                "first_segment_sequence": 0,
+                "windows": [{"database": "", "start_lsn": 0, "end_lsn": 0}],
+                "compressed_bytes": 1, "uncompressed_bytes": 1, "file_count": 1,
+                "compression_level": 3, "files": ["t.db"],
+                "objects": [{"name": "big.db", "len": 1, "sha256": "x", "key": "k"}]
+            }],
+            "segments": []
+        }"#;
+        let m = Manifest::decode(json).unwrap();
+        assert!(m.snapshots[0].locations.is_empty());
+        assert_eq!(m.required_version(), 2);
     }
 
     fn manifest() -> Manifest {
@@ -1258,5 +1484,153 @@ mod tests {
         );
         assert!(plan.doomed.contains(&"wal/0.zst".to_string()));
         assert!(plan.doomed.contains(&"wal/shop/1.zst".to_string()));
+    }
+
+    // ---- cuts ---------------------------------------------------------------
+
+    fn cut(segment_sequence: u64, archived_at: u64, lsns: &[(&str, Option<u64>)]) -> LogCut {
+        LogCut {
+            segment_sequence,
+            archived_at,
+            lsns: lsns
+                .iter()
+                .map(|(database, lsn)| CutLsn {
+                    database: database.to_string(),
+                    lsn: *lsn,
+                })
+                .collect(),
+        }
+    }
+
+    /// A snapshot of a root with one location, both windows ending at `end`.
+    fn located(first_segment: u64, finished_at: u64, end: u64) -> SnapshotEntry {
+        let mut s = sequenced("located", finished_at, first_segment);
+        s.windows = vec![
+            LogWindow {
+                database: String::new(),
+                start_lsn: 1,
+                end_lsn: end,
+            },
+            LogWindow {
+                database: "~loc-00000000000000ff".to_string(),
+                start_lsn: 1,
+                end_lsn: end,
+            },
+        ];
+        s.locations = vec![PoolLocation {
+            key: "~loc-00000000000000ff".to_string(),
+            path: "/mnt/disk2".to_string(),
+        }];
+        s
+    }
+
+    /// Without a location every log is a database of its own and resolves on
+    /// its own, exactly as before cuts existed.
+    #[test]
+    fn a_snapshot_without_locations_has_no_cut() {
+        let mut m = manifest();
+        m.cuts = vec![cut(5, 9_000, &[("", Some(500))])];
+        let s = sequenced("plain", 1_000, 0);
+        for target in [
+            RecoveryTarget::Latest,
+            RecoveryTarget::Lsn(7),
+            RecoveryTarget::Time(9_999),
+            RecoveryTarget::Snapshot("plain".to_string()),
+        ] {
+            assert_eq!(target.resolve_cut(&m, &s).unwrap(), None, "{target:?}");
+        }
+    }
+
+    /// The failure this pins: each log replayed to its own end put the root's
+    /// later commit in and the location's earlier one out. Every log has to
+    /// stop at the newest cut that can serve the snapshot — never at the end of
+    /// its own archive.
+    #[test]
+    fn latest_stops_every_log_at_the_newest_cut_that_serves_the_snapshot() {
+        let mut m = manifest();
+        let s = located(3, 1_000, 40);
+        m.cuts = vec![
+            // Before the snapshot: its copy is not consistent there.
+            cut(2, 900, &[("", Some(30)), ("~loc-00000000000000ff", Some(30))]),
+            cut(4, 1_100, &[("", Some(60)), ("~loc-00000000000000ff", Some(55))]),
+            cut(6, 1_200, &[("", Some(90)), ("~loc-00000000000000ff", Some(70))]),
+            // Names no location, so it cannot say where that log stops.
+            cut(7, 1_300, &[("", Some(95))]),
+        ];
+        let chosen = RecoveryTarget::Latest.resolve_cut(&m, &s).unwrap().unwrap();
+        assert_eq!(chosen.ceiling_for(""), Some(90));
+        assert_eq!(chosen.ceiling_for("~loc-00000000000000ff"), Some(70));
+        // A log that did not exist at the cut has nothing before it.
+        assert_eq!(chosen.ceiling_for("shop"), Some(0));
+
+        // With no recorded cut at all, the snapshot's own window ends are one.
+        m.cuts.clear();
+        let own = RecoveryTarget::Latest.resolve_cut(&m, &s).unwrap().unwrap();
+        assert_eq!(own.ceiling_for(""), Some(40));
+        assert_eq!(own.ceiling_for("~loc-00000000000000ff"), Some(40));
+    }
+
+    #[test]
+    fn a_time_stops_at_the_newest_cut_recorded_by_then() {
+        let mut m = manifest();
+        let s = located(3, 1_000, 40);
+        m.cuts = vec![
+            cut(4, 1_100, &[("", Some(60)), ("~loc-00000000000000ff", Some(55))]),
+            cut(6, 1_200, &[("", Some(90)), ("~loc-00000000000000ff", Some(70))]),
+        ];
+        let at = |unix| {
+            RecoveryTarget::Time(unix)
+                .resolve_cut(&m, &s)
+                .unwrap()
+                .unwrap()
+                .ceiling_for("~loc-00000000000000ff")
+        };
+        assert_eq!(at(1_150), Some(55));
+        assert_eq!(at(1_200), Some(70));
+        assert_eq!(at(1_050), Some(40), "before any cut: the snapshot's own");
+
+        let exact = RecoveryTarget::Snapshot("located".to_string())
+            .resolve_cut(&m, &s)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.ceiling_for(""), Some(40));
+    }
+
+    #[test]
+    fn an_lsn_target_is_refused_for_a_snapshot_with_locations() {
+        let m = manifest();
+        let err = RecoveryTarget::Lsn(50)
+            .resolve_cut(&m, &located(3, 1_000, 40))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A log that was closed at the cut wrote nothing then: all of it is
+    /// before the cut, and it serves any window it names.
+    #[test]
+    fn a_log_closed_at_the_cut_replays_everything_it_archived() {
+        let s = located(3, 1_000, 40);
+        let c = cut(4, 1_100, &[("", Some(60)), ("~loc-00000000000000ff", None)]);
+        assert!(c.serves(&s));
+        assert_eq!(c.ceiling_for("~loc-00000000000000ff"), None);
+    }
+
+    #[test]
+    fn a_repeated_cut_is_recorded_once_and_retention_drops_unreachable_ones() {
+        let mut m = manifest();
+        m.record_cut(cut(1, 10, &[("", Some(5))]));
+        m.record_cut(cut(2, 20, &[("", Some(5))]));
+        assert_eq!(m.cuts.len(), 1, "nothing moved, so nothing new to say");
+        m.record_cut(cut(3, 30, &[("", Some(9))]));
+        assert_eq!(m.cuts.len(), 2);
+        assert_eq!(m.required_version(), 3);
+
+        m.snapshots = vec![sequenced("old", 1_000, 0), sequenced("fresh", 3_000, 2)];
+        let plan = m.plan_retention(1);
+        assert_eq!(
+            plan.cuts.iter().map(|c| c.segment_sequence).collect::<Vec<_>>(),
+            vec![3],
+            "a cut below the surviving snapshot names bundles that are gone"
+        );
     }
 }

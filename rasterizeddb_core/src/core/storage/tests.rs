@@ -516,6 +516,101 @@ fn a_restore_names_the_directory_it_will_be_published_into() {
 }
 
 #[test]
+fn a_location_the_snapshot_carried_is_repointed_rather_than_dropped() {
+    let target = std::path::PathBuf::from(temp_root("repoint_carried"));
+    std::fs::write(
+        target.join(POOL_FILE),
+        "version\t1\nlocation\tprimary\t1\tenabled\t/srv/live\n\
+         location\tprimary\t2\tenabled\t/mnt/fast\n\
+         location\tbackup\t1\tenabled\t/mnt/mirror\n\
+         table\t/srv/live\torders\ntable\t/mnt/fast\tevents\n",
+    )
+    .unwrap();
+
+    let dropped = repoint_restored_pool(
+        &target,
+        &target,
+        Some("/srv/live"),
+        &[(
+            "/mnt/fast".to_string(),
+            "/restored/pool-location-1".to_string(),
+        )],
+    )
+    .unwrap();
+
+    assert!(dropped.is_empty(), "{dropped:?}");
+    let text = std::fs::read_to_string(target.join(POOL_FILE)).unwrap();
+    assert!(
+        text.contains("location\tprimary\t2\tenabled\t/restored/pool-location-1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("table\t/restored/pool-location-1\tevents\n"),
+        "{text}"
+    );
+    // Neither source disk, and not the source's mirror: a clone mirroring into
+    // it would write over the backup of the live database.
+    for gone in ["/mnt/fast", "/mnt/mirror", "/srv/live"] {
+        assert!(!text.contains(gone), "{gone} survived:\n{text}");
+    }
+}
+
+#[test]
+fn a_created_databases_pool_file_follows_the_restore_too() {
+    // A sub-database's pool file names its own directory under the source
+    // root; it must land under the restore root, not stay on the source.
+    let staging = std::path::PathBuf::from(temp_root("repoint_sub"));
+    std::fs::write(
+        staging.join(POOL_FILE),
+        "version\t1\nlocation\tprimary\t1\tenabled\t/srv/live/shop\n\
+         table\t/srv/live/shop\tcarts\n",
+    )
+    .unwrap();
+
+    let dropped =
+        repoint_restored_pool(&staging, Path::new("/restored"), Some("/srv/live"), &[]).unwrap();
+
+    assert!(dropped.is_empty(), "{dropped:?}");
+    let text = std::fs::read_to_string(staging.join(POOL_FILE)).unwrap();
+    assert!(text.contains("table\t/restored/shop\tcarts\n"), "{text}");
+    assert!(!text.contains("/srv/live"), "{text}");
+}
+
+#[test]
+fn data_locations_are_the_primaries_and_placed_directories_but_not_the_root() {
+    let root = temp_root("data_locations");
+    std::fs::write(
+        Path::new(&root).join(POOL_FILE),
+        format!(
+            "version\t1\nlocation\tprimary\t1\tenabled\t{root}\n\
+             location\tprimary\t1\tdisabled\t/mnt/drained\n\
+             location\tbackup\t1\tenabled\t/mnt/mirror\n\
+             table\t{root}\tusers\ntable\t/mnt/dropped\torphaned\n\
+             table\tkv:main\tremote\n"
+        ),
+    )
+    .unwrap();
+
+    // A disabled primary still holds its tables, and a table whose location
+    // was dropped from the file still opens from where its line says.
+    assert_eq!(
+        data_locations(Path::new(&root)).unwrap(),
+        vec!["/mnt/drained".to_string(), "/mnt/dropped".to_string()]
+    );
+    assert!(
+        data_locations(Path::new(&temp_root("data_locations_none")))
+            .unwrap()
+            .is_empty()
+    );
+
+    std::fs::write(Path::new(&root).join(POOL_FILE), "location\tprimary\n").unwrap();
+    assert!(
+        data_locations(Path::new(&root)).is_err(),
+        "an unreadable pool file must not read as having no locations"
+    );
+}
+
+#[test]
 fn a_pool_file_copied_from_another_directory_is_still_read() {
     // The warning path: a mirrored directory opened as a database carries the
     // original's pool file. Opening must not fail — the copy is usable, and the

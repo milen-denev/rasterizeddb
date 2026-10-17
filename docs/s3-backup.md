@@ -555,8 +555,8 @@ streams stay separate the whole way:
 `stream_key` decides what "inside its location" means, and refuses two cases on
 purpose: a sibling directory whose path merely starts with the same characters
 (`/var/lib/rasterizeddb2` next to `/var/lib/rasterizeddb`), and a storage
-location on another disk — no snapshot copies those files, so archiving their
-records would claim a coverage the catalogue does not have.
+location on another disk. The second is still a stream, but under a key of its
+own rather than a relative path — see §10.13.
 
 #### What `AT LSN` means with more than one log
 
@@ -589,12 +589,19 @@ directory is ever opened as a database:
 * the source root becomes the directory this restore is being published into —
   the final one, not the sibling it is staged in, because the paths have to be
   true after the rename;
-* any other storage location is dropped, along with the tables placed on it.
-  Those files are on another disk, and a snapshot only ever walks the database
-  directory, so they were never in the backup under any reading. A restored
-  database that resolves them to its own root and reports them missing is loud;
-  one that reads the source's disk is not. The restore logs which tables those
-  were;
+* every database created with `CREATE DATABASE` has a pool file of its own,
+  naming its own subdirectory by an absolute path, and is rewritten the same
+  way — anything under the source root maps to the same place under the
+  restore. Until 2026-10 only the root's file was, so a restored sub-database
+  read the source's files;
+* a storage location the snapshot carried (§10.13) is rewritten to wherever its
+  files were restored;
+* any other storage location is dropped, along with the tables placed on it: a
+  backup location, whose files mirror a primary the snapshot already has, or
+  any location of a snapshot taken before locations were copied. A restored
+  database that resolves those tables to its own root and reports them missing
+  is loud; one that reads the source's disk is not. The restore logs which
+  tables those were;
 * an **in-place** restore — the CLI's `--restore-from-s3`, landing on the
   directory the backup came from — is left alone. Every path in the file is
   still true there, and rewriting would drop placements that host can still
@@ -605,6 +612,50 @@ refreshed on every publish, so a database directory that moves does not leave a
 restore repointing at a path this installation no longer uses. A catalogue
 written before that field falls back to the first `location` line, which
 `Pool::render` always writes as the root.
+
+### 10.13 Storage locations on other disks
+
+A table can be placed on a storage location outside the database directory
+([storage-pools.md](storage-pools.md)). Until 2026-10 the snapshot walked only
+the database directory and the archive took only the logs under it, so such a
+table was in neither — and the backup reported success. Now:
+
+* **Which locations.** Every primary location named by a pool file under the
+  backed-up directory — the root's and each created database's — plus any
+  directory a placement names. Read from the files, so the service still has no
+  dependency on a live `Database`. A location shared by two databases is copied
+  once. Backup locations are not copied: they mirror a primary that is. A
+  location inside the backed-up directory is not listed either; the walk
+  already takes it.
+* **Keys.** Each is identified by `~loc-` and a hash of its path. That is its
+  stream key (staging subdirectory, `SegmentEntry.database`,
+  `LogWindow.database`) and the directory its files are named under in the
+  archive. Never a relative path, so it cannot collide with a database created
+  inside the directory. `SnapshotEntry.locations` maps each key back to the
+  path.
+* **The copy** is flat: tables sit directly in a location, and a recursive walk
+  would take in whatever else is kept beneath it. The whole directory is taken,
+  not a list of a table's files — the suffix list has been short twice.
+* **The log.** Each location has its own log (§10.11's reasons apply: file ids
+  are names), checkpointed around the copy with every other. A location that
+  starts holding tables later is attached at the next cut, since the install
+  hook only saw its log while it held nothing. A location that appears *while*
+  a copy runs fails that snapshot rather than being recorded without it.
+* **Restore in place** (`--restore-from-s3` onto the source directory) copies
+  each location's files back to its own path — another disk, so a copy, done
+  before the root is renamed into place and undone if any fails. The location
+  must be empty or absent; a restore never merges into what is there, and says
+  so before downloading anything. Move it aside first.
+* **Restore elsewhere** puts each location's files in
+  `<target>/pool-location-<hash>` and repoints the pool file there. The source's
+  location is still the source's, and a clone writing into it would overwrite
+  live tables. The clone therefore holds everything on one disk; move tables
+  back out with `STORAGE MOVE TABLE` once it is verified.
+* **Format.** A catalogue with any such snapshot is written as version 3, which
+  an older build refuses: it would unpack the locations into stray directories
+  and restore a database whose tables on them read as missing. A catalogue
+  without one stays at the version it was, and snapshots taken before this
+  restore exactly as they did.
 
 ## 11. Tests
 
