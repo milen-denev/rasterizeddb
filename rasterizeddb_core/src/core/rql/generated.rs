@@ -655,8 +655,10 @@ fn test_of_predicate(
 
 fn starts_with_word(text: &str, word: &str) -> bool {
     let text = text.trim_start();
+    // Compared as bytes: slicing the text at the word's length panicked inside
+    // a multi-byte character, as in `naïve * 2` against `NOT`.
     text.len() > word.len()
-        && text[..word.len()].eq_ignore_ascii_case(word)
+        && text.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
         && (text.as_bytes()[word.len()].is_ascii_whitespace() || text.as_bytes()[word.len()] == b'(')
 }
 

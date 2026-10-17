@@ -3834,15 +3834,21 @@ fn column_references(text: &str) -> Vec<String> {
 
 /// Replaces a qualified name with another, matching whole identifiers only and
 /// skipping string literals.
+///
+/// Copied byte for byte. It pushed each byte as a `char`, which re-encoded
+/// every byte of a multi-byte character on its own: `'é'` came out as `'Ã©'`,
+/// so a join's `a.t || 'é'` returned the wrong text, and the next pass over it
+/// sliced inside the `©` and panicked, closing the connection.
 fn replace_qualified(sql: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
     let bytes = sql.as_bytes();
+    let from_bytes = from.as_bytes();
     let mut i = 0usize;
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
-            out.push(c as char);
+            out.push(c);
             if c == q {
                 quote = None;
             }
@@ -3851,26 +3857,30 @@ fn replace_qualified(sql: &str, from: &str, to: &str) -> String {
         }
         if c == b'\'' || c == b'"' {
             quote = Some(c);
-            out.push(c as char);
+            out.push(c);
             i += 1;
             continue;
         }
-        if sql[i..].len() >= from.len() && sql[i..i + from.len()].eq_ignore_ascii_case(from) {
+        if bytes[i..].len() >= from_bytes.len()
+            && bytes[i..i + from_bytes.len()].eq_ignore_ascii_case(from_bytes)
+        {
             let before_ok =
                 i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            let after = i + from.len();
+            let after = i + from_bytes.len();
             let after_ok = after >= bytes.len()
                 || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
             if before_ok && after_ok {
-                out.push_str(to);
+                out.extend_from_slice(to.as_bytes());
                 i = after;
                 continue;
             }
         }
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    // A match starts on a character's first byte, since `from` is text, so
+    // what is copied around it is whole characters in their order.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Builds the fold that runs over the projected join rows, or `None` when the

@@ -5848,8 +5848,10 @@ fn expression_columns(
     expression: &str,
     fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
 ) -> Vec<String> {
+    // A byte of a multi-byte character is part of a name, as it is to the
+    // parser: `naïve` is one column, not `na` and `ve`.
     fn is_word_byte(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || b == b'_'
+        b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
     }
     let bytes = expression.as_bytes();
     let mut out: Vec<String> = Vec::new();
@@ -5884,8 +5886,11 @@ fn expression_columns(
 /// arithmetic over a fragment — the same prefix-matching mistake that once
 /// deleted a column and a predicate elsewhere in this parser.
 fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<String, String> {
+    // A byte of a multi-byte character is part of a name, so `naïve` is found
+    // whole. It was not, and each of its bytes outside a word was pushed as a
+    // `char` of its own, turning `naïve * 2` into `naÃ¯ve * 2`.
     fn is_word_byte(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || b == b'_'
+        b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
     }
 
     let bytes = expression.as_bytes();

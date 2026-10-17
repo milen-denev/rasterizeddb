@@ -771,7 +771,10 @@ fn temp_name(cte: &str, statement: &str, index: usize) -> String {
 /// qualifies something (`domain_id.id`). A name *preceded* by a dot is a column
 /// of something else and is left as it is.
 fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+    // Bytes, not `char`s: pushing a byte of a multi-byte character as a
+    // `char` re-encoded it on its own, so `t = 'é'` in a statement over a CTE
+    // compared against `'Ã©'` and matched nothing.
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -790,7 +793,7 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
-            out.push(c as char);
+            out.push(c);
             if c == q {
                 quote = None;
             }
@@ -799,7 +802,7 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
         }
         if c == b'\'' || c == b'"' {
             quote = Some(c);
-            out.push(c as char);
+            out.push(c);
             i += 1;
             continue;
         }
@@ -823,9 +826,9 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
                 && !preceded_by_dot
                 && (qualifies || after_relation_keyword || relation_position)
             {
-                out.push_str(to);
+                out.extend_from_slice(to.as_bytes());
             } else {
-                out.push_str(word);
+                out.extend_from_slice(word.as_bytes());
             }
             previous_word = upper[start..i].to_string();
 
@@ -843,10 +846,12 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
         if c == b',' && in_from {
             relation_position = true;
         }
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    // Every byte is copied in order and only whole ASCII words are replaced,
+    // by text, so the result is the input's characters.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Runs each CTE, stores it in a temporary table, and rewrites the statement to

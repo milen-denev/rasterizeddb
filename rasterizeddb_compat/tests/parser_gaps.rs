@@ -905,3 +905,41 @@ async fn rewrites_keep_what_the_first_lex_read() {
     let err = run(&pool, "INSERT INTO ck VALUES (2, 5)").await.expect_err("5 / 2.0 is 2.5");
     assert!(err.contains("violates check constraint"), "{err}");
 }
+
+/// Text the join, CTE and generated-column rewrites copy into a new statement
+/// keeps its multi-byte characters. Each copied the statement a byte at a
+/// time and pushed every byte as a `char` of its own, so `'é'` arrived as
+/// `'Ã©'`: through a CTE `t = 'é'` matched nothing and `t || 'ß'` returned
+/// `éÃ\u{9f}`, a join's second pass sliced inside the mangled character and
+/// closed the connection, and a generated column over `naïve` panicked.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_ascii_text_survives_the_rewrites() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE ux (id INT NOT NULL, t TEXT, n INT)").await.unwrap();
+    run(&pool, "INSERT INTO ux VALUES (1, 'é', 1), (2, 'naïve', 2), (3, 'x', 3)").await.unwrap();
+    let cases: &[(&str, &str)] = &[
+        ("SELECT a.t || 'é' FROM ux a JOIN ux b ON b.id = a.id ORDER BY a.id", "éé,naïveé,xé"),
+        ("SELECT a.id FROM ux a JOIN ux b ON b.id = a.id WHERE a.t = 'é' ORDER BY a.id", "1"),
+        ("SELECT a.id FROM ux a JOIN ux b ON b.id = a.id WHERE a.t || b.t = 'éé' ORDER BY a.id", "1"),
+        (
+            "SELECT CASE WHEN a.t = 'naïve' THEN 'ü' ELSE 'ö' END FROM ux a JOIN ux b ON b.id = a.id ORDER BY a.id",
+            "ö,ü,ö",
+        ),
+        ("WITH c AS (SELECT id, t FROM ux WHERE t = 'naïve') SELECT t FROM c", "naïve"),
+        ("WITH c AS (SELECT id, t FROM ux) SELECT id FROM c WHERE t = 'é'", "1"),
+        ("WITH c AS (SELECT id, t FROM ux) SELECT c.t || 'ß' FROM c ORDER BY c.id", "éß,naïveß,xß"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    run(
+        &pool,
+        "CREATE TABLE gn (id INT, naïve INT, g INT GENERATED ALWAYS AS (naïve * 2) STORED, \
+         s TEXT GENERATED ALWAYS AS ('é' || naïve) STORED)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(run(&pool, "INSERT INTO gn (id, naïve) VALUES (1, 21)").await, Ok(1));
+    assert_eq!(joined(&pool, "SELECT g FROM gn").await.unwrap(), "42");
+    assert_eq!(joined(&pool, "SELECT s FROM gn").await.unwrap(), "é21");
+}
