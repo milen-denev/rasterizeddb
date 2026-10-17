@@ -4928,7 +4928,22 @@ where
                 // the rows' sync covers it as well: they are records in one
                 // log, appended rows-first, and replay stops at the first one
                 // it cannot read whole.
-                let family = database.commit_transaction(tx);
+                //
+                // Rows on the other storage locations are synced before the
+                // commit, so no session's root flush can carry the outcome to
+                // disk ahead of them: `Database::commit_written_transaction`.
+                let family = match database.commit_written_transaction(tx) {
+                    Ok(family) => family,
+                    Err(e) => {
+                        log::error!("Could not make the written rows durable: {}", e);
+                        database.abort_transaction(tx);
+                        flush_outcomes(database);
+                        return Err(io::Error::other(format!(
+                            "could not commit: the rows written could not be made durable ({})",
+                            e
+                        )));
+                    }
+                };
                 if let Err(e) = database.transactions.flush_deferred() {
                     log::error!("Could not record the transaction outcome: {}", e);
                     database.abort_transaction(tx);
@@ -4938,7 +4953,7 @@ where
                     )));
                 }
                 if state.synchronous_commit() {
-                    if let Err(e) = database.sync_durable() {
+                    if let Err(e) = database.sync_own_location() {
                         log::error!("Could not make the written rows durable: {}", e);
                         database.abort_transaction(tx);
                         flush_outcomes(database);
@@ -6068,7 +6083,30 @@ where
                     return Ok(true);
                 }
 
-                let family = database.commit_transaction(t.id);
+                // The block's rows on the other storage locations are synced
+                // before the commit: once committed, any session's root flush
+                // can carry the outcome to disk, and it must not get there
+                // ahead of them. See `Database::commit_written_transaction`.
+                let family = match database.commit_written_transaction(t.id) {
+                    Ok(family) => family,
+                    Err(e) => {
+                        log::error!("Could not make the block's rows durable: {}", e);
+                        database.abort_transaction(t.id);
+                        flush_outcomes(database);
+                        send_error_response(
+                            stream,
+                            "58030",
+                            &format!(
+                                "could not commit: the rows written could not be made durable ({})",
+                                e
+                            ),
+                        )
+                        .await?;
+                        state.transaction = None;
+                        state.statement_failed = false;
+                        return Ok(true);
+                    }
+                };
 
                 // The outcome record goes into the log without a sync of its
                 // own, and the sync below covers it along with the block's
@@ -6105,7 +6143,7 @@ where
                 // case the promise was never made: the records are in the log
                 // and the log writer syncs them within `wal_writer_delay_ms`.
                 if state.synchronous_commit() {
-                    if let Err(e) = database.sync_durable() {
+                    if let Err(e) = database.sync_own_location() {
                         log::error!("Could not make the block's rows durable: {}", e);
                         database.abort_transaction(t.id);
                         flush_outcomes(database);
@@ -9829,5 +9867,220 @@ mod union_widening_tests {
                 .expect("a UNION");
         let widened = crate::core::rql::set_ops::widened_branch_integers(&branches, &db, &[]);
         assert!(widened.iter().all(Option::is_none), "{widened:?}");
+    }
+}
+
+#[cfg(all(test, feature = "storage_pools"))]
+mod cross_dir_commit_order_tests {
+    use super::*;
+    use crate::core::storage::LocationRole;
+    use crate::core::sync_audit;
+
+    async fn run<S: AsyncRead + AsyncWrite + Unpin>(
+        db: &Arc<Database>,
+        state: &mut SessionState,
+        stream: &mut S,
+        sql: &str,
+    ) {
+        Box::pin(execute_single_statement(db, state, stream, sql, &[], false))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Reruns allowed when the log writer's round takes a commit's sync.
+    const MAX_ATTEMPTS: usize = 5;
+
+    /// Log syncs of `watch`'s directory since the last call: those issued
+    /// from this thread, and those from any other.
+    fn log_syncs(watch: &sync_audit::Watch) -> (usize, usize) {
+        let me = std::thread::current().id();
+        let logs: Vec<_> = watch
+            .take_events()
+            .into_iter()
+            .filter(|e| e.tag == "wal.log")
+            .collect();
+        let here = logs.iter().filter(|e| e.thread == me).count();
+        (here, logs.len() - here)
+    }
+
+    /// Whether a commit's sync of `watch`'s log was seen on this thread.
+    /// `None` when it was not but another thread synced that log in the
+    /// window — the log writer, whose round leaves the commit's sync nothing
+    /// to do and so records nothing: inconclusive, to be rerun. Panics with
+    /// `what` when nothing synced it at all.
+    fn commit_synced_here(
+        watch: &sync_audit::Watch,
+        earlier_foreign: usize,
+        what: &str,
+    ) -> Option<()> {
+        let (here, elsewhere) = log_syncs(watch);
+        if here > 0 {
+            return Some(());
+        }
+        assert!(earlier_foreign + elsewhere > 0, "{what}");
+        None
+    }
+
+    /// `COMMIT` and an autocommit statement whose CTE writes both sync the
+    /// other storage locations before the commit, also under
+    /// `synchronous_commit = off`. Nothing else on the session's thread syncs
+    /// those logs in that mode (the root's sync is skipped, which is checked at
+    /// `COMMIT`), so a sync seen here can only be
+    /// `commit_written_transaction`'s. Once
+    /// committed, any session's root flush can make the outcome durable, and it
+    /// must not get there ahead of the rows: the crash-image tests in
+    /// `core::database::cross_dir_commit_tests` show what this order buys.
+    ///
+    /// The process-wide log writer syncs every log on a timer. A round landing
+    /// between a write and its commit makes the commit's sync a no-op, which
+    /// records nothing, so such an attempt is rerun instead of being read as a
+    /// missing sync; if every attempt is disturbed the test proves nothing and
+    /// says so rather than failing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commits_sync_other_locations_first_without_waiting() {
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(10_000);
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let disk = base.path().join("disk");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&disk).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let disk_s = disk.to_string_lossy().into_owned();
+
+        let db = Arc::new(Database::new_named(&root_s, false, "pgcrossdir").await);
+        db.storage
+            .add_location(&disk_s, LocationRole::Primary, 1, true)
+            .unwrap();
+        db.storage.pin("pg_disk", &disk_s).unwrap();
+
+        let catalog = DatabaseCatalog::single(db.clone());
+        let auth = AuthConfig {
+            method: crate::auth::AuthMethod::Trust,
+            ..AuthConfig::default()
+        };
+        let principal = Principal {
+            name: "rasterized".to_string(),
+            superuser: false,
+            authenticated: false,
+        };
+        let mut state = SessionState::new(
+            catalog,
+            db.name.clone(),
+            auth,
+            principal,
+            ConnectionLimits::default(),
+        );
+        // Large enough for every reply, so nothing has to drain it meanwhile.
+        let (mut server, mut client) = tokio::io::duplex(1 << 20);
+
+        run(&db, &mut state, &mut server, "CREATE TABLE pg_disk (id INT, label TEXT)").await;
+        assert!(
+            disk.join("pg_disk.db").exists(),
+            "the table is not on the second location, so there is nothing to test"
+        );
+        // Reserves a chunk of row ids now, a write that syncs the second
+        // location's log by itself and would otherwise land inside a statement
+        // below and pass for the commit's sync.
+        run(&db, &mut state, &mut server, "INSERT INTO pg_disk (id, label) VALUES (0, 'warm_disk')").await;
+        state.synchronous_commit = Some(false);
+        let root_watch = sync_audit::watch(&root);
+        let disk_watch = sync_audit::watch(&disk);
+
+        // An explicit block. A foreign sync during the INSERT counts too: it
+        // may land after the row and before COMMIT.
+        let mut confirmed = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let _ = (log_syncs(&root_watch), log_syncs(&disk_watch));
+            run(&db, &mut state, &mut server, "BEGIN").await;
+            let insert =
+                format!("INSERT INTO pg_disk (id, label) VALUES ({attempt}, 'block_disk')");
+            run(&db, &mut state, &mut server, &insert).await;
+            let _ = log_syncs(&root_watch);
+            let (_, during_insert) = log_syncs(&disk_watch);
+            run(&db, &mut state, &mut server, "COMMIT").await;
+            assert_eq!(
+                log_syncs(&root_watch).0,
+                0,
+                "synchronous_commit = off still synced the root log at COMMIT, so this \
+                 test cannot tell the pre-commit sync from the post-commit one"
+            );
+            if commit_synced_here(
+                &disk_watch,
+                during_insert,
+                "COMMIT committed a write to the second location without syncing that \
+                 location's log first",
+            )
+            .is_some()
+            {
+                confirmed = true;
+                break;
+            }
+            eprintln!("COMMIT: attempt {attempt} disturbed by a background sync");
+        }
+        if !confirmed {
+            eprintln!("COMMIT: every attempt was disturbed by a background sync");
+        }
+
+        // An autocommit statement that writes through a CTE, which pgwire
+        // commits itself rather than through the executor. The root is not
+        // checked here: dropping the CTE's temporary relation syncs the root's
+        // catalogue whatever the commit does.
+        let mut confirmed = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let _ = log_syncs(&disk_watch);
+            let cte = format!(
+                "WITH d AS (INSERT INTO pg_disk (id, label) VALUES ({}, 'cte_disk') \
+                 RETURNING id) SELECT id FROM d",
+                100 + attempt
+            );
+            run(&db, &mut state, &mut server, &cte).await;
+            if commit_synced_here(
+                &disk_watch,
+                0,
+                "a writing CTE committed to the second location without syncing that \
+                 location's log first",
+            )
+            .is_some()
+            {
+                confirmed = true;
+                break;
+            }
+            eprintln!("CTE: attempt {attempt} disturbed by a background sync");
+        }
+        if !confirmed {
+            eprintln!("CTE: every attempt was disturbed by a background sync");
+        }
+
+        // Both statements really committed and none failed.
+        run(&db, &mut state, &mut server, "SELECT label FROM pg_disk").await;
+        drop(state);
+        drop(server);
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut bytes)
+            .await
+            .unwrap();
+        let mut rest = &bytes[..];
+        while rest.len() >= 5 {
+            let len = i32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+            assert_ne!(
+                rest[0],
+                b'E',
+                "a statement failed: {}",
+                String::from_utf8_lossy(&rest[5..1 + len])
+            );
+            rest = &rest[1 + len..];
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("block_disk") && text.contains("cte_disk"),
+            "a commit did not take effect"
+        );
+
+        drop(root_watch);
+        drop(disk_watch);
+        drop(db);
+        crate::core::wal::remove_for(&root_s);
+        crate::core::wal::remove_for(&disk_s);
     }
 }

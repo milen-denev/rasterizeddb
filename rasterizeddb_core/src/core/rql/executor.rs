@@ -10635,10 +10635,13 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
 ///
 /// `wait` is the effective `synchronous_commit` — the server default unless the
 /// session has set its own. Passing `false` does not skip the outcome record,
-/// only the `fdatasync`: the records are in the log either way, and
-/// [`crate::core::log_writer`] takes the sync within
+/// only the `fdatasync` of the database's own log: the records are in the log
+/// either way, and [`crate::core::log_writer`] takes the sync within
 /// [`crate::wal_writer_delay_ms`]. A crash in that window loses whole
-/// transactions off the end of the log and never part of one.
+/// transactions off the end of the log and never part of one. A writing
+/// statement still syncs every *other* storage location holding unsynced
+/// writes before it commits, whichever transaction wrote them — that is what
+/// keeps it whole across disks (`Database::commit_written_transaction`).
 pub async fn execute_with_sync(
     query: QueryPurpose,
     database: Arc<Database>,
@@ -10831,7 +10834,27 @@ pub async fn execute_with_sync(
         return response;
     }
 
-    let family = database.commit_transaction(tx);
+    // Rows on every other storage location are made durable before the
+    // commit, not after: once committed, any session's root flush can carry
+    // this outcome to disk, and it must not get there ahead of them. In both
+    // `wait` modes — see `Database::commit_written_transaction`.
+    let family = match database.commit_written_transaction(tx) {
+        Ok(family) => family,
+        Err(e) => {
+            error!("Could not make the written rows durable: {}", e);
+            database.abort_transaction(tx);
+            let _ = database.transactions.flush();
+            let mut failed = vec![3u8];
+            failed.extend_from_slice(
+                format!(
+                    "could not commit: the rows written could not be made durable ({})",
+                    e
+                )
+                .as_bytes(),
+            );
+            return failed;
+        }
+    };
 
     // The outcome record goes into the log without a sync of its own, and the
     // sync below covers it along with the rows. They are records in the same
@@ -10863,7 +10886,9 @@ pub async fn execute_with_sync(
     // in the same order and replay still stops at the first record it cannot
     // read whole.
     if wait {
-        if let Err(e) = database.sync_durable() {
+        // The database's own log only: the other locations were synced before
+        // the commit.
+        if let Err(e) = database.sync_own_location() {
             error!("Could not make the written rows durable: {}", e);
             // Back to aborted, which is what a restart would conclude anyway, so
             // the client and the disk agree instead of the client holding a

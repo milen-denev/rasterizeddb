@@ -451,13 +451,41 @@ async fn apply_record(
         return refuse(&record, ApplyStatus::Conflict, message);
     }
 
-    database.transactions.commit(tx);
+    // Through the same path as a client's commit: rows applied to a table on
+    // another storage location are in that location's log, and they have to
+    // be durable before the outcome exists for any root flush to carry to
+    // disk. The bare commit left them to the log writer, and a power cut in
+    // between kept this transaction's root half and lost the rest.
+    if let Err(e) = database.commit_written_transaction(tx) {
+        database.abort_transaction(tx);
+        if let Err(e) = database.transactions.flush() {
+            warn!("Could not make the aborted outcome durable: {}", e);
+        }
+        // Not recorded as applied, so the record comes again and is applied
+        // then, instead of being skipped for good.
+        return refuse(
+            &record,
+            ApplyStatus::Failed,
+            format!("the applied rows could not be made durable: {}", e),
+        );
+    }
     if let Err(e) = database.transactions.flush() {
-        warn!("Could not make the transaction outcome durable: {}", e);
+        // Back to aborted, which is what a restart would conclude anyway, and
+        // not recorded as applied: recording it would skip a transaction this
+        // node may not have, which is permanent divergence.
+        database.abort_transaction(tx);
+        if let Err(e) = database.transactions.flush() {
+            warn!("Could not make the aborted outcome durable: {}", e);
+        }
+        return refuse(
+            &record,
+            ApplyStatus::Failed,
+            format!("the transaction outcome could not be made durable: {}", e),
+        );
     }
 
-    // Recorded after the commit: a crash in the window between them replays
-    // this transaction rather than losing it. See `super::log`.
+    // Recorded after the commit is durable: a crash in the window between them
+    // replays this transaction rather than losing it. See `super::log`.
     if let Err(e) = applied.record(record.origin, record.seq) {
         warn!("Could not record the applied position: {}", e);
     }

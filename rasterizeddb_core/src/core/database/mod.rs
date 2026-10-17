@@ -7,6 +7,8 @@ mod rename_tests;
 mod recovery_refusal_tests;
 #[cfg(test)]
 mod drop_recreate_replay_tests;
+#[cfg(all(test, feature = "storage_pools"))]
+mod cross_dir_commit_tests;
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
@@ -14,6 +16,16 @@ pub(crate) mod test_hooks {
         /// Fails the next catalogue tombstone on this thread before it is
         /// written: the first step of a drop failing.
         pub static FAIL_TOMBSTONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Runs inside `Database::sync_durable` on this thread, after every
+        /// non-root location's log is synced and before the root's: the window
+        /// another session's commit can fall into.
+        pub static AFTER_POOL_SYNC: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Fails the next sync of a non-root location's log on this thread, as
+        /// a device error would, without poisoning the shared log: the error
+        /// paths of every committer that syncs those logs before committing.
+        pub static FAIL_POOL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
@@ -1100,10 +1112,6 @@ impl Database {
     /// A failure here means the writes are *not* durable, so the caller has to
     /// report the statement as failed rather than swallow it.
     pub fn sync_durable(&self) -> std::io::Result<()> {
-        let Some(location) = self.location.as_deref() else {
-            return Ok(()); // in-memory: nothing to sync
-        };
-
         // Every directory this database writes into, not just its own. A
         // statement that touched a table on a second disk logged that write to
         // *that* directory's log, and the root's `sync_pending` knows nothing
@@ -1111,25 +1119,59 @@ impl Database {
         // report durability for bytes still in the page cache.
         //
         // The other directories go first and the root goes last, because the
-        // root's log is also where the transaction *outcome* record lives. An
-        // outcome that reached the disk before the rows it validates would,
-        // after a crash in between, name a transaction as committed whose rows
-        // are missing — a write reported as successful that silently is not
-        // there. Within one log the records are already in that order, and
-        // replay stops at the first one it cannot read whole, so a torn tail
-        // can only ever lose the outcome and never keep it.
+        // root's log is also where the transaction *outcome* record lives.
+        // That order is only enough for this caller's own outcome: other
+        // sessions append to the other directories and stage outcomes between
+        // the two halves, which is why a writing transaction also syncs the
+        // other directories *before* it commits — see
+        // [`Database::commit_written_transaction`].
         //
-        // The first failure is returned and the rest are still attempted:
-        // stopping early would leave logs unflushed on directories that were
-        // fine, and the caller's answer is the same either way.
-        let mut outcome = Ok(());
+        // Both halves run even when the first fails: stopping early would leave
+        // the root unflushed when it was fine, and the caller's answer is the
+        // same either way.
+        let mut outcome = self.sync_other_locations();
 
+        #[cfg(test)]
+        test_hooks::AFTER_POOL_SYNC.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f();
+            }
+        });
+
+        let own = self.sync_own_log();
+        if outcome.is_ok() {
+            outcome = own;
+        }
+        if outcome.is_ok() {
+            outcome = self.apply_staged_outcomes();
+        }
+        outcome
+    }
+
+    /// Syncs the log of every storage location except the database's own.
+    ///
+    /// The first failure is returned and the rest are still attempted:
+    /// stopping early would leave logs unflushed on directories that were
+    /// fine, and the caller's answer is the same either way.
+    fn sync_other_locations(&self) -> std::io::Result<()> {
+        let Some(location) = self.location.as_deref() else {
+            return Ok(()); // in-memory: nothing to sync
+        };
+        let mut outcome = Ok(());
         for path in pool_paths(&self.storage) {
             if path == location {
                 continue;
             }
             if let Some(wal) = crate::core::wal::wal_for(&path) {
-                if let Err(e) = wal.sync_pending() {
+                #[cfg(test)]
+                let synced = if test_hooks::FAIL_POOL_SYNC.with(|f| f.replace(false)) {
+                    Err(io::Error::other("injected failure to sync another location's log"))
+                } else {
+                    wal.sync_pending()
+                };
+                #[cfg(not(test))]
+                let synced = wal.sync_pending();
+                if let Err(e) = synced {
                     error!("storage location {} could not be flushed: {}", path, e);
                     if outcome.is_ok() {
                         outcome = Err(e);
@@ -1137,33 +1179,86 @@ impl Database {
                 }
             }
         }
+        outcome
+    }
 
-        if let Some(wal) = crate::core::wal::wal_for(location) {
-            if let Err(e) = wal.sync_pending() {
-                error!("storage location {} could not be flushed: {}", location, e);
-                if outcome.is_ok() {
-                    outcome = Err(e);
-                }
-            }
+    /// Syncs the database's own log — rows written to root-located tables and
+    /// the outcome records — then copies the staged outcomes into the status
+    /// file.
+    ///
+    /// The second half of [`Database::sync_durable`]. On its own it is the
+    /// whole post-commit sync for a transaction that went through
+    /// [`Database::commit_written_transaction`], which has already made its
+    /// rows on every other location durable.
+    pub fn sync_own_location(&self) -> std::io::Result<()> {
+        self.sync_own_log()?;
+        self.apply_staged_outcomes()
+    }
+
+    fn apply_staged_outcomes(&self) -> std::io::Result<()> {
+        if self.location.is_none() {
+            return Ok(()); // in-memory: no status file
         }
-
         // Outcome bytes that `flush_deferred` staged may be copied into the
         // status file now, and not before: the log record justifying them is
         // durable as of the sync above. The file is never fsynced here — the
         // log is what makes it recoverable — so a copy taken any earlier could
         // reach the disk on its own and outlive the rows it speaks for.
-        if outcome.is_ok() {
-            if let Err(e) = self.transactions.apply_staged() {
-                error!(
-                    "transaction outcomes could not be written to the status file: {}",
-                    e
-                );
-                outcome = Err(e);
-            }
+        if let Err(e) = self.transactions.apply_staged() {
+            error!(
+                "transaction outcomes could not be written to the status file: {}",
+                e
+            );
+            return Err(e);
         }
-
-        outcome
+        Ok(())
     }
+
+    /// Commits a transaction that wrote, once its rows on every storage
+    /// location other than the database's own are durable.
+    ///
+    /// The order is the point. `commit_transaction` records the outcome in
+    /// memory, and from then on *anyone's* flush can put it in the root log
+    /// and make it durable: `StatusLog::stage` writes the whole dirty range,
+    /// other transactions' bits included, and a ROLLBACK, a failed statement,
+    /// the outcome fold, another session's `sync_durable` or the log writer
+    /// then syncs the root log with no thought for a second disk. A crash
+    /// after that and before this transaction's own sync came back with its
+    /// root rows committed and its rows on the other disk gone — a torn
+    /// transaction reported as a success (`cross_dir_commit_tests`). Rows are
+    /// all appended before the commit, so syncing the other locations here
+    /// means no outcome of a transaction committed *through this method* can
+    /// become durable ahead of them, whoever stages it. Within the root's own
+    /// log rows already precede their outcome. Every committer of a writing
+    /// transaction has to come through here: the executor, pgwire and
+    /// replication apply do. The PostgreSQL import does not — it commits
+    /// batches in memory into a database nobody has been handed yet and
+    /// makes all of it durable once, at the end (`migrate::run::finish`).
+    ///
+    /// Not an extra sync in the common case: these logs used to be synced by
+    /// `sync_durable` right after the commit, and the caller now follows with
+    /// [`Database::sync_own_location`] instead. A database with no second
+    /// location, or none with unsynced writes, pays nothing. Otherwise every
+    /// location with unsynced writes is synced, *anyone's* writes, including
+    /// for a transaction that never wrote there: which logs a transaction
+    /// wrote is not tracked. So under `synchronous_commit = off` it is a sync
+    /// that was not there before, and in both modes `tx` holds its row locks
+    /// and stays running for it, which widens the window in which a
+    /// concurrent writer of the same rows gets `40001`. That mode gives up
+    /// the newest transactions on an OS crash, not their atomicity, and
+    /// keeping the atomicity without this sync would need the per-transaction
+    /// record of written logs and their positions.
+    ///
+    /// On failure nothing has been committed. The caller aborts `tx` and
+    /// reports the statement as failed.
+    pub fn commit_written_transaction(
+        &self,
+        tx: crate::core::mvcc::TxId,
+    ) -> std::io::Result<TransactionFamily> {
+        self.sync_other_locations()?;
+        Ok(self.commit_transaction(tx))
+    }
+
     pub fn commit_transaction(&self, tx: crate::core::mvcc::TxId) -> TransactionFamily {
         // Read *before* the commit. A rolled-back savepoint already resolves as
         // aborted while its parent runs, so the answer is correct here — and

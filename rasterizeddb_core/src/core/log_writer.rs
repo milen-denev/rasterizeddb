@@ -100,6 +100,13 @@ fn spawn_once() {
 /// the round at once, whatever order they are visited in: rows-before-outcome
 /// is the safe direction, and only the reverse has to be prevented.
 ///
+/// The order covers only what was written before the round started. Sessions
+/// keep appending to the other logs and staging outcomes between its two
+/// halves, so it is not what keeps a transaction's outcome behind its rows on
+/// another disk: `Database::commit_written_transaction` is, by syncing those
+/// rows before the outcome exists to be staged — in `synchronous_commit = off`
+/// too, which is the mode that leans on this round.
+///
 /// Errors are swallowed deliberately. Nothing is waiting on this round, a
 /// failed flush leaves the records exactly where they were, and a log that
 /// cannot be flushed has already poisoned itself so the next statement to ask
