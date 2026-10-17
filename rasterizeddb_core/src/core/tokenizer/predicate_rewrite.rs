@@ -1483,6 +1483,19 @@ fn bound_at(toks: &[Tok], at: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Whether a word that is not a column leaves a comparison NULL whenever one
+/// of its operands is: a number, a boolean, or a comparison keyword. Anything
+/// else — a function name, `IS`, `ESCAPE` — may turn a NULL into a value.
+fn is_plain_operand_word(word: &str) -> bool {
+    word.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'-' || b == b'.')
+        || [
+            "true", "false", "like", "ilike", "similarto", "contains", "startswith", "endswith",
+            "icontains", "istartswith", "iendswith", "iequals",
+        ]
+        .iter()
+        .any(|kw| word.eq_ignore_ascii_case(kw))
+}
+
 /// Renders one value token, folding boolean keywords into the 1/0 the engine
 /// stores. `NULL` is passed through for the caller to reject in context.
 fn render_value(tok: &Tok) -> String {
@@ -2178,6 +2191,40 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                             continue;
                         }
 
+                        // The value may be a nullable column itself, whose NULL
+                        // is as much a value here as the column's: two NULLs
+                        // are not distinct, and a NULL is distinct from any
+                        // value. Read as its zeroes, it was neither.
+                        let other = resolve_column(&value, schema).and_then(|c| {
+                            nullable::flag_field(&c, schema).map(|f| (c, f.name.clone()))
+                        });
+                        if let Some((value, other_flag)) = other {
+                            let fragment = match nullable::flag_field(&col, schema) {
+                                Some(flag) if negated => format!(
+                                    "(({f} = 1 AND {g} = 1) OR ({f} = 0 AND {g} = 0 AND {c} = {v}))",
+                                    f = flag.name,
+                                    g = other_flag,
+                                    c = col,
+                                    v = value
+                                ),
+                                Some(flag) => format!(
+                                    "(({f} = 1 AND {g} = 0) OR ({f} = 0 AND {g} = 1) \
+                                     OR ({f} = 0 AND {g} = 0 AND {c} != {v}))",
+                                    f = flag.name,
+                                    g = other_flag,
+                                    c = col,
+                                    v = value
+                                ),
+                                None if negated => {
+                                    format!("({} = 0 AND {} = {})", other_flag, col, value)
+                                }
+                                None => format!("({} = 1 OR {} != {})", other_flag, col, value),
+                            };
+                            out.push(fragment);
+                            i = value_at + 1;
+                            continue;
+                        }
+
                         out.push(match nullable::flag_field(&col, schema) {
                             Some(flag) if negated => {
                                 format!("({} = 0 AND {} = {})", flag.name, col, value)
@@ -2288,9 +2335,15 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
 
                     let joiner = if negated { " AND " } else { " OR " };
                     let op = if negated { "!=" } else { "=" };
+                    // A column in the list is an operand like any other, with
+                    // its own guard: `a IN (b, c)` is `a = b OR a = c`, and a
+                    // NULL `b` leaves its part unknown, not `a = 0`.
                     let parts: Vec<String> = values
                         .iter()
-                        .map(|v| format!("{} {} {}", col, op, v))
+                        .map(|v| match resolve_column(v, schema) {
+                            Some(c) => guard(&c, &format!("{} {} {}", col, op, c), schema),
+                            None => format!("{} {} {}", col, op, v),
+                        })
                         .collect();
                     out.push(guard(
                         &col,
@@ -2321,10 +2374,18 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     // `NOT BETWEEN` is the complement: outside the range on
                     // either side, which is a disjunction rather than a
                     // conjunction.
+                    //
+                    // A bound that is a nullable column guards its own half:
+                    // `a NOT BETWEEN b AND c` holds where `a < b` does even if
+                    // `c` is NULL, and `a BETWEEN b AND c` never does then.
+                    let half = |op: &str, bound: &str| match resolve_column(bound, schema) {
+                        Some(c) => guard(&c, &format!("{} {} {}", col, op, c), schema),
+                        None => format!("{} {} {}", col, op, bound),
+                    };
                     let fragment = if negated {
-                        format!("({} < {} OR {} > {})", col, lo, col, hi)
+                        format!("({} OR {})", half("<", &lo), half(">", &hi))
                     } else {
-                        format!("({} >= {} AND {} <= {})", col, lo, col, hi)
+                        format!("({} AND {})", half(">=", &lo), half("<=", &hi))
                     };
                     out.push(guard(&col, &fragment, schema));
                     i = after_hi;
@@ -2396,6 +2457,16 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         .unwrap_or(false);
                 if is_like {
                     let pattern = toks.get(kw_at + 1).ok_or("LIKE is missing its pattern")?;
+                    // A column as the pattern would be read as the text of its
+                    // own name, and `a LIKE b` would match nothing, silently.
+                    if let Tok::Word(w) = pattern {
+                        if resolve_column(w, schema).is_some() {
+                            return Err(format!(
+                                "LIKE with a column ('{}') as its pattern is not supported yet",
+                                w
+                            ));
+                        }
+                    }
                     // `ESCAPE 'c'` picks the escape character; `ESCAPE ''`
                     // turns escaping off. The default is a backslash.
                     let mut next = kw_at + 2;
@@ -2485,6 +2556,23 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         let fragment = format!("{} {} {}", lhs, op, operand);
                         out.push(guard(&col, &fragment, schema));
                     } else {
+                        // A longer left side, as in `id + 1 > b`: the guard
+                        // goes in front of the term, as for a column inside
+                        // arithmetic, since `AND` binds tighter than `OR`.
+                        // Only after a comparison operator — anything else
+                        // here is arithmetic, which the branch above took.
+                        let after_comparison = matches!(
+                            toks.get(i - 1),
+                            Some(Tok::Sym(sym)) if negated_operator(sym).is_some()
+                        );
+                        if after_comparison {
+                            if let Some(flag) =
+                                nullable::flag_field(&col, schema).filter(|_| guarding)
+                            {
+                                let at = term_start.min(out.len());
+                                out.insert(at, format!("{} = 0 AND", flag.name));
+                            }
+                        }
                         out.push(operand);
                     }
                     i = operand_end;
@@ -2555,17 +2643,45 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         continue;
                     }
 
+                    // The other columns the comparison reads need guards of
+                    // their own. Consumed here, they never pass through the
+                    // right-operand guard below, so `a = b` with both
+                    // nullable compared `b`'s NULL as its zeroes: `a <> b`
+                    // kept the row, and so did `NOT (a = b)`, which becomes
+                    // it. Only a run of plain operands gets them: inside a
+                    // call such as `COALESCE(b, 0)` or a test such as `IS NOT
+                    // TRUE` a NULL `b` does not make the comparison NULL.
+                    let mut operands: Vec<String> = Vec::new();
+                    let mut plain = true;
                     let mut fragment = vec![col.clone()];
                     for tok in &toks[i + 1..end] {
                         fragment.push(match tok {
                             Tok::Word(w) => match resolve_column(w, schema) {
-                                Some(c) => c,
-                                None => render_value(tok),
+                                Some(c) => {
+                                    if c != col && !operands.contains(&c) {
+                                        operands.push(c.clone());
+                                    }
+                                    c
+                                }
+                                None => {
+                                    plain &= is_plain_operand_word(w);
+                                    render_value(tok)
+                                }
                             },
+                            Tok::LPar | Tok::RPar | Tok::Comma => {
+                                plain = false;
+                                tok.render()
+                            }
                             other => other.render(),
                         });
                     }
-                    out.push(guard(&col, &fragment.join(" "), schema));
+                    let mut guarded = fragment.join(" ");
+                    if plain {
+                        for other in &operands {
+                            guarded = guard(other, &guarded, schema);
+                        }
+                    }
+                    out.push(guard(&col, &guarded, schema));
                     i = end;
                     continue;
                 }
@@ -3691,5 +3807,85 @@ mod any_all_tests {
             "{}",
             out
         );
+    }
+}
+
+#[cfg(test)]
+mod operand_guard_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    /// `x` and `y` are nullable, `z` is not.
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        for (i, (name, ty)) in [
+            ("id", DbType::I32),
+            ("x", DbType::I32),
+            ("__null_x", DbType::BOOL),
+            ("y", DbType::I32),
+            ("__null_y", DbType::BOOL),
+            ("z", DbType::I32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.push(SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, i as u64, false));
+        }
+        s
+    }
+
+    fn rw(clause: &str) -> String {
+        rewrite_where(clause, &schema()).unwrap_or_else(|e| panic!("{clause}: {e}"))
+    }
+
+    /// Every nullable column a comparison reads is guarded, not only the one
+    /// it starts with. With only `x` guarded, a NULL `y` read as its zeroes,
+    /// so `x <> y` and `NOT (x = y)` kept rows PostgreSQL drops.
+    #[test]
+    fn a_nullable_column_on_the_right_is_guarded_too() {
+        assert_eq!(rw("x = y"), "(__null_x = 0 AND (__null_y = 0 AND x = y))");
+        assert_eq!(rw("NOT (x = y)"), "(__null_x = 0 AND (__null_y = 0 AND x != y))");
+        assert_eq!(rw("x + 1 > y"), "(__null_x = 0 AND (__null_y = 0 AND x + 1 > y))");
+        assert_eq!(rw("z = y"), "(__null_y = 0 AND z = y)");
+        assert_eq!(rw("z + 1 > y"), "__null_y = 0 AND z + 1 > y");
+        assert_eq!(rw("x = y OR id = 1"), "(__null_x = 0 AND (__null_y = 0 AND x = y)) OR id = 1");
+    }
+
+    /// A call can turn a NULL into a value, so a column inside one gets no
+    /// guard of its own.
+    #[test]
+    fn a_column_inside_a_call_is_not_guarded() {
+        assert_eq!(rw("x = COALESCE(y, 0)"), "(__null_x = 0 AND x = COALESCE ( y , 0 ))");
+    }
+
+    /// In a list or a range, each comparison is guarded by its own operand.
+    #[test]
+    fn list_and_range_operands_guard_their_own_comparison() {
+        assert_eq!(rw("x IN (y, z)"), "(__null_x = 0 AND ((__null_y = 0 AND x = y) OR x = z))");
+        assert_eq!(rw("x NOT IN (y, 1)"), "(__null_x = 0 AND ((__null_y = 0 AND x != y) AND x != 1))");
+        assert_eq!(rw("z BETWEEN x AND y"), "((__null_x = 0 AND z >= x) AND (__null_y = 0 AND z <= y))");
+        assert_eq!(rw("NOT (z BETWEEN x AND y)"), "((__null_x = 0 AND z < x) OR (__null_y = 0 AND z > y))");
+    }
+
+    /// `IS [NOT] DISTINCT FROM` a nullable column compares the two NULLs.
+    #[test]
+    fn distinct_from_a_nullable_column_reads_its_null() {
+        assert_eq!(
+            rw("x IS DISTINCT FROM y"),
+            "((__null_x = 1 AND __null_y = 0) OR (__null_x = 0 AND __null_y = 1) \
+             OR (__null_x = 0 AND __null_y = 0 AND x != y))"
+        );
+        assert_eq!(
+            rw("x IS NOT DISTINCT FROM y"),
+            "((__null_x = 1 AND __null_y = 1) OR (__null_x = 0 AND __null_y = 0 AND x = y))"
+        );
+        assert_eq!(rw("z IS NOT DISTINCT FROM y"), "(__null_y = 0 AND z = y)");
+        assert_eq!(rw("z IS DISTINCT FROM y"), "(__null_y = 1 OR z != y)");
+    }
+
+    /// A column as a LIKE pattern was read as the text of its name.
+    #[test]
+    fn a_column_as_a_like_pattern_is_refused() {
+        assert!(rewrite_where("x LIKE y", &schema()).unwrap_err().contains("pattern"));
     }
 }

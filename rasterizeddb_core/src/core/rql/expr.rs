@@ -2491,13 +2491,13 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
         // A cell carrying `NULL` as its type *is* a NULL.
         //
         // The companion lookup above finds one by name, which works while the
-        // schema is a table's own. It cannot work on a synthetic schema: a
-        // combined join row renames `last_queried_at` to `s__last_queried_at`
-        // and its companion to `s____null_last_queried_at`, and the name the
-        // lookup derives — `__null_s__last_queried_at` — is neither. So a NULL
-        // reaching a post-join predicate was read as a present value holding
-        // its type's zeroes, and `COALESCE(a, b)` returned those zeroes rather
-        // than falling through to `b`.
+        // schema is a table's own, and on a combined join row now that its
+        // companion is renamed `__null_s__last_queried_at` with the column's
+        // `s__last_queried_at`. It was once `s____null_last_queried_at`, which
+        // the lookup could not find, so a NULL reaching a post-join predicate
+        // was read as a present value holding its type's zeroes, and
+        // `COALESCE(a, b)` returned those zeroes rather than falling through
+        // to `b`.
         //
         // The type marker is the other half of the same fact and does not
         // depend on names, so honouring it covers the case the lookup cannot

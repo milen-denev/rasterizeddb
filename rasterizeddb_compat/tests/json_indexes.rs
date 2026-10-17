@@ -86,7 +86,7 @@ fn document(r: &mut Lcg) -> String {
 /// alike, since they are equal).
 fn predicate(r: &mut Lcg) -> String {
     fn atom(r: &mut Lcg) -> String {
-        match r.below(24) {
+        match r.below(28) {
             14 => format!("NOT ({})", atom(r)),
             15 => format!(
                 "doc->>'status' {}IN ('{}', '{}')",
@@ -106,6 +106,15 @@ fn predicate(r: &mut Lcg) -> String {
             21 => "doc->>'status' BETWEEN 'd' AND 'p'".into(),
             22 => format!("doc->>'status' NOT LIKE '{}%'", &STATUSES[r.below(5) as usize][..1]),
             23 => format!("NOT doc->>'status' = '{}'", STATUSES[r.below(5) as usize]),
+            // A column on both sides, or in the list or the range: each one is
+            // guarded for NULL, and none is a key an index can look up.
+            24 => format!("doc IS {}DISTINCT FROM doc", if r.below(2) == 0 { "NOT " } else { "" }),
+            25 => format!(
+                "{}(doc->>'status' = doc->>'status')",
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
+            26 => format!("id {}IN (id, {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
+            27 => format!("{}(id BETWEEN id AND {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
             _ => old_atom(r),
         }
     }

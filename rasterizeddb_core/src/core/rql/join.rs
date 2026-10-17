@@ -3287,7 +3287,18 @@ pub fn combined_layout(relations: &[Relation]) -> CombinedLayout {
         let mut mapping = Vec::with_capacity(relation.fetch_columns.len());
         for field in &relation.fetch_columns {
             let write_order = schema.len() as u64;
-            let name = format!("{}__{}", relation.label, field.name);
+            // A NULL companion keeps its prefix in front, as `__null_b__v`,
+            // so it is still the companion of `b__v` to every lookup that
+            // derives one name from the other. Named `b____null_v`, it was the
+            // companion of nothing: the tokenizer put no NULL guard on a
+            // post-join term, and a NULL cell, which holds its type's zeroes,
+            // compared as zero — `a.v <> b.v` kept a row where `b.v` was NULL.
+            let prefix = crate::core::rql::nullable::NULL_FLAG_PREFIX;
+            let name = if crate::core::rql::nullable::is_hidden(&field.name) {
+                format!("{}{}__{}", prefix, relation.label, &field.name[prefix.len()..])
+            } else {
+                format!("{}__{}", relation.label, field.name)
+            };
             renames.push((format!("{}.{}", relation.label, field.name), name.clone()));
             if !relation.table.eq_ignore_ascii_case(&relation.label) {
                 renames.push((format!("{}.{}", relation.table, field.name), name.clone()));
