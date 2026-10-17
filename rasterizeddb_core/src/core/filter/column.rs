@@ -540,6 +540,19 @@ impl ColumnFilter {
         self.unknown_below = 0;
     }
 
+    /// Stops vouching for slots `[0, slots)` on a column that was indexing
+    /// them: they are about to be renumbered. Unlike
+    /// [`Self::set_unindexed_prefix`] the frontier is left alone, since
+    /// everything at or past it is a candidate already, and the prefix never
+    /// shrinks. The next checkpoint rewrites from zone 0, so the file stops
+    /// vouching for those slots too.
+    pub fn demote_below(&mut self, slots: u64) {
+        self.unknown_below = self.unknown_below.max(slots);
+        if slots > 0 {
+            self.touched_min = 0;
+        }
+    }
+
     #[inline]
     pub fn current_f(&self) -> u8 {
         self.next_f

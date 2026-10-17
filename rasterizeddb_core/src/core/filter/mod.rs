@@ -36,6 +36,8 @@ mod tests;
 mod integration_tests;
 #[cfg(test)]
 mod nan_bounds_tests;
+#[cfg(test)]
+mod compact_failure_tests;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -409,6 +411,14 @@ pub struct TableFilters {
     /// sound), but it silently throws away a checkpoint, and the fix is one
     /// uncontended lock per checkpoint.
     write_gate: tokio::sync::Mutex<()>,
+    /// Bumped when slot numbers start changing under the filter and again
+    /// when they stop (`Table::compact` phase 2; see
+    /// [`TableFilters::begin_renumbering`]). Work that reads slots and then
+    /// writes what it learned into the planes (a backfill, vacuum's clears)
+    /// reads this first and writes only if it is unchanged, checked under the
+    /// column's lock, so nothing learned under one numbering lands under
+    /// another.
+    renumber_epoch: AtomicU64,
 }
 
 impl TableFilters {
@@ -475,6 +485,7 @@ impl TableFilters {
             disk_len: AtomicU64::new(0),
             deltas_since_base: AtomicU32::new(0),
             write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
         }
     }
 
@@ -527,6 +538,7 @@ impl TableFilters {
             disk_len: AtomicU64::new(loaded.valid_len),
             deltas_since_base: AtomicU32::new(deltas),
             write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
         })
     }
 
@@ -657,6 +669,9 @@ impl TableFilters {
         // Planning and writing have to be one step: see `write_gate`.
         let _gate = self.write_gate.lock().await;
         if let Some((offset, bytes, _is_base)) = self.plan(n_slots) {
+            // Test-only: parks a planned checkpoint before its write.
+            #[cfg(test)]
+            checkpoint_test_hooks::planned(self).await;
             io.write_data(offset, &bytes).await;
         }
         self.writes_since_checkpoint.store(0, Ordering::Relaxed);
@@ -794,6 +809,73 @@ impl TableFilters {
         for c in &self.columns {
             c.write().clear_unindexed_prefix();
         }
+    }
+
+    /// See [`TableFilters::begin_renumbering`].
+    #[inline]
+    pub fn renumber_epoch(&self) -> u64 {
+        self.renumber_epoch.load(Ordering::Acquire)
+    }
+
+    /// Called before the first slot is renumbered. Every slot below `n_slots`
+    /// becomes a candidate again, in memory and in every checkpoint written
+    /// from here on (the prefix is persisted, so a reopened table backfills
+    /// it), until a backfill under the new numbering clears it with
+    /// [`TableFilters::clear_unindexed_prefix_at`]. A renumbering that fails
+    /// part-way therefore leaves the filter demoted rather than answering by
+    /// slot numbers that moved.
+    ///
+    /// The epoch is bumped before the columns are demoted, and each column's
+    /// lock is taken after the bump, so an epoch-checked write that saw the
+    /// old epoch has landed before the demotion and before any slot moves.
+    pub fn begin_renumbering(&self, n_slots: u64) {
+        self.renumber_epoch.fetch_add(1, Ordering::AcqRel);
+        for c in &self.columns {
+            c.write().demote_below(n_slots);
+        }
+    }
+
+    /// [`TableFilters::begin_renumbering`], ordered against checkpoints, with
+    /// the sidecar's dirty byte written whatever the in-memory flag says.
+    ///
+    /// Under `write_gate`, so a checkpoint planned before this (a base image
+    /// of the old numbering, which then clears `disk_dirty`) has landed before
+    /// the byte is written, and one planned after it sees the demotion and
+    /// persists it. Without the gate the flag can read true while such a
+    /// checkpoint is about to clear it, which is the case
+    /// [`TableFilters::mark_disk_dirty`]'s fast path skips; the byte is
+    /// written unconditionally here so this does not lean on the flag. A crash
+    /// part-way through the renumbering then reopens to a sidecar that is
+    /// either rejected or demoted, never one that trusts the old numbering.
+    pub async fn begin_renumbering_on_disk<S: StorageIO>(&self, io: &S, n_slots: u64) {
+        let _gate = self.write_gate.lock().await;
+        self.begin_renumbering(n_slots);
+        if self.has_checkpoint.load(Ordering::Acquire) {
+            let _marking = self.dirty_marking.lock().await;
+            persist::mark_dirty_on_disk(io).await;
+            self.disk_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Called once slot numbers have stopped changing, whether the
+    /// renumbering finished or failed: work that read its epoch during it
+    /// read a mix of both numberings.
+    pub fn end_renumbering(&self) {
+        self.renumber_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// [`TableFilters::clear_unindexed_prefix`], unless the slots were
+    /// renumbered since `epoch` was read. Returns whether every column was
+    /// cleared.
+    pub fn clear_unindexed_prefix_at(&self, epoch: u64) -> bool {
+        for c in &self.columns {
+            let mut g = c.write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
+            g.clear_unindexed_prefix();
+        }
+        true
     }
 
     pub fn is_complete(&self) -> bool {
@@ -1092,11 +1174,21 @@ impl TableFilters {
     /// is the one place where lock acquisitions dominate rather than merely
     /// appear — see [`Self::on_insert_batch`] for the measurement.
     pub fn backfill_batch(&self, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
+        self.backfill_batch_at(self.renumber_epoch(), rows);
+    }
+
+    /// [`TableFilters::backfill_batch`], unless the slots were renumbered
+    /// since `epoch` was read: rows read under one numbering must not be
+    /// written under another. Returns whether the batch was applied.
+    pub fn backfill_batch_at(&self, epoch: u64, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) -> bool {
         if rows.is_empty() {
-            return;
+            return self.renumber_epoch() == epoch;
         }
         for (i, m) in self.meta.iter().enumerate() {
             let mut f = self.columns[i].write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
             for (slot, columns) in rows {
                 let bytes = columns
                     .iter()
@@ -1105,6 +1197,7 @@ impl TableFilters {
                 f.set_reindex(*slot, bytes);
             }
         }
+        true
     }
 }
 
@@ -1129,6 +1222,44 @@ fn in_list_column(branches: &[sarg::MaskExpr]) -> Option<u32> {
         column = Some(p.write_order);
     }
     column
+}
+
+/// Parks one planned checkpoint of a chosen `TableFilters` between its plan
+/// and its write, for tests that need something to happen in that window.
+#[cfg(test)]
+pub(crate) mod checkpoint_test_hooks {
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the checkpoint has planned and is parked.
+        pub planned: tokio::sync::Notify,
+        /// Notify to let it write.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(usize, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Parks the next checkpoint of `filters` that has something to write.
+    pub(crate) fn arm(filters: &super::TableFilters) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((filters as *const _ as usize, park.clone()));
+        park
+    }
+
+    pub(super) async fn planned(filters: &super::TableFilters) {
+        let park = {
+            let mut g = PARK.lock();
+            match g.as_ref() {
+                Some((at, _)) if *at == filters as *const _ as usize => g.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.planned.notify_one();
+            park.release.notified().await;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -224,6 +224,11 @@ pub struct FreeSpace {
     /// while disabled, so a wait for readers to drain proves nothing across a
     /// toggle; the forget sweep compares this before and after.
     toggles: AtomicU64,
+    /// Bumped by [`FreeSpace::begin_relayout`] (`VACUUM FULL`, before any row
+    /// moves), under the `state` lock. A sweep reads it before its scan and
+    /// publishes or quarantines only if it is unchanged: extents computed from
+    /// the old row layout name bytes that live rows have since moved into.
+    layout: AtomicU64,
 }
 
 impl FreeSpace {
@@ -238,7 +243,27 @@ impl FreeSpace {
             leaked_loans: AtomicU64::new(0),
             enabled: AtomicBool::new(enabled).into(),
             toggles: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
         }
+    }
+
+    /// See the `layout` field.
+    pub fn layout(&self) -> u64 {
+        self.layout.load(Ordering::Acquire)
+    }
+
+    /// Called before rows move to new positions: drops the list and every
+    /// quarantined batch, and fences off any sweep that read the old layout.
+    /// Loans are left alone, as in [`FreeSpace::clear`].
+    pub fn begin_relayout(&self) {
+        {
+            let _state = self.state.lock();
+            self.layout.fetch_add(1, Ordering::AcqRel);
+        }
+        self.clear();
+        // After the bump: a quarantine that checked the layout before it has
+        // already pushed, and is dropped here; one after it sees the bump.
+        self.quarantined.lock().clear();
     }
 
     /// How many times reclamation has been switched on or off.
@@ -377,11 +402,21 @@ impl FreeSpace {
     /// run does not have to rediscover it, and — more to the point — that a
     /// table with a query always in flight still reclaims, one run behind,
     /// rather than never.
+    #[cfg(test)]
     fn quarantine(&self, candidates: Vec<Extent>, barrier: u64) {
+        self.quarantine_at(candidates, barrier, self.layout());
+    }
+
+    /// [`FreeSpace::quarantine`], unless the rows were moved since the sweep
+    /// read `layout`: see the `layout` field.
+    fn quarantine_at(&self, candidates: Vec<Extent>, barrier: u64, layout: u64) {
         if candidates.is_empty() {
             return;
         }
         let mut quarantined = self.quarantined.lock();
+        if self.layout() != layout {
+            return;
+        }
         // One batch per barrier is enough: a later run's findings supersede an
         // earlier one's, since both derive from the same authoritative sweep.
         quarantined.clear();
@@ -416,9 +451,19 @@ impl FreeSpace {
     /// A full replacement rather than a merge: the scan derives the list from
     /// authoritative storage, so anything it did not find is either live or
     /// on loan, and either way must not stay on the list.
-    fn publish(&self, mut candidates: Vec<Extent>) {
+    #[cfg(test)]
+    fn publish(&self, candidates: Vec<Extent>) {
+        self.publish_at(candidates, self.layout());
+    }
+
+    /// [`FreeSpace::publish`], unless the rows were moved since the sweep read
+    /// `layout`: see the `layout` field.
+    fn publish_at(&self, mut candidates: Vec<Extent>, layout: u64) {
         // Both halves under one lock. See `FreeState`.
         let state = &mut *self.state.lock();
+        if self.layout() != layout {
+            return;
+        }
 
         if !state.in_flight.is_empty() {
             let loans: Vec<Extent> = state
@@ -650,6 +695,12 @@ pub struct ReclaimContext<'a> {
     /// sweep finds reclaimable, and the fetch that reads such a version's key
     /// columns back from its row before the space is handed out.
     pub indexes: Option<(&'a crate::core::index::TableIndexes, &'a crate::core::row::row::RowFetch)>,
+    /// The table's compaction gate, held shared from before the sweep reads
+    /// a slot until the indexes have forgotten what it found. `VACUUM FULL`
+    /// renumbers slots and moves rows under it, and a sweep that overlapped
+    /// one would forget index entries by slot numbers and row positions that
+    /// now belong to live rows. `None` only for a table that never compacts.
+    pub compaction_gate: Option<&'a tokio::sync::RwLock<()>>,
 }
 
 impl ReclaimContext<'_> {
@@ -1329,6 +1380,16 @@ pub async fn run_once<S: StorageIO>(
     force: bool,
 ) -> std::io::Result<VacuumReport> {
     let horizon = ctx.horizon;
+    // Held until the indexes have forgotten what the sweep found: see
+    // `ReclaimContext::compaction_gate`. Released before the drain wait, so a
+    // compaction does not queue behind a slow query and stall every new one;
+    // what is published after that is fenced by `layout` instead.
+    let gate = match ctx.compaction_gate {
+        Some(gate) => Some(gate.read().await),
+        None => None,
+    };
+    // Under the gate: a compaction that ran before this has finished.
+    let layout = free_space.layout();
     // Read before the pointer sweep. A row appended during the scan lands past
     // this, so clamping to it can only ever exclude bytes, never include ones a
     // pointer has since claimed.
@@ -1341,6 +1402,9 @@ pub async fn run_once<S: StorageIO>(
         ctx,
     )
     .await?;
+    #[cfg(test)]
+    run_once_test_hooks::reached(free_space, run_once_test_hooks::AFTER_SCAN).await;
+
 
     // Only after the sweep has finished, so a crash part-way leaves the bound
     // where it was and the next run re-clears rather than skipping.
@@ -1353,6 +1417,7 @@ pub async fn run_once<S: StorageIO>(
     if let Some((indexes, fetch)) = ctx.indexes {
         forget_reclaimed(indexes, fetch, io_rows, &scan.index_dead).await;
     }
+    drop(gate);
     let live_bytes = scan.live_bytes;
 
     let candidates = if scan.live_map_dropped {
@@ -1403,6 +1468,9 @@ pub async fn run_once<S: StorageIO>(
         }
     }
 
+    #[cfg(test)]
+    run_once_test_hooks::reached(free_space, run_once_test_hooks::BEFORE_PUBLISH).await;
+
     // Stamped after the scan: a query holding a ticket at or beyond this one
     // started after every tombstone the scan relied on was durable, so it
     // cannot be holding a pointer into any of these extents.
@@ -1435,7 +1503,7 @@ pub async fn run_once<S: StorageIO>(
                 barrier,
                 dead_bytes
             );
-            free_space.quarantine(candidates, barrier);
+            free_space.quarantine_at(candidates, barrier, layout);
             return Ok(report);
         }
 
@@ -1445,8 +1513,8 @@ pub async fn run_once<S: StorageIO>(
             ready.len(),
             barrier
         );
-        free_space.publish(ready);
-        free_space.quarantine(candidates, barrier);
+        free_space.publish_at(ready, layout);
+        free_space.quarantine_at(candidates, barrier, layout);
         report.reclaimed_bytes = free_space.free_bytes();
         report.extents = free_space.len() as u64;
         return Ok(report);
@@ -1456,10 +1524,54 @@ pub async fn run_once<S: StorageIO>(
     // barrier is at least as recent as theirs.
     let mut candidates = candidates;
     candidates.extend(free_space.take_matured(readers));
-    free_space.publish(candidates);
+    free_space.publish_at(candidates, layout);
     report.reclaimed_bytes = free_space.free_bytes();
     report.extents = free_space.len() as u64;
     Ok(report)
+}
+
+/// Parks one `run_once` of a chosen table (named by its `FreeSpace`) at a
+/// chosen point, for tests that need something to happen there.
+#[cfg(test)]
+pub(crate) mod run_once_test_hooks {
+    use std::sync::Arc;
+
+    /// Once the pointer sweep has finished, before anything acts on it.
+    pub(crate) const AFTER_SCAN: u8 = 1;
+    /// Before the drain wait and the publish.
+    pub(crate) const BEFORE_PUBLISH: u8 = 2;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once a run is parked.
+        pub parked: tokio::sync::Notify,
+        /// Notify to let it continue.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(usize, u8, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    pub(crate) fn arm(free_space: &super::FreeSpace, point: u8) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((free_space as *const _ as usize, point, park.clone()));
+        park
+    }
+
+    pub(super) async fn reached(free_space: &super::FreeSpace, point: u8) {
+        let park = {
+            let mut g = PARK.lock();
+            match g.as_ref() {
+                Some((at, p, _)) if *at == free_space as *const _ as usize && *p == point => {
+                    g.take().map(|(_, _, park)| park)
+                }
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.parked.notify_one();
+            park.release.notified().await;
+        }
+    }
 }
 
 /// Everything the per-table reclamation service needs to run.
@@ -1668,6 +1780,7 @@ impl<S: StorageIO> VacuumService<S> {
             filters: self.filters.as_deref(),
             cleared_below: &self.cleared_below,
             indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
+            compaction_gate: Some(&self.compaction_gate),
         };
 
         match run_once(

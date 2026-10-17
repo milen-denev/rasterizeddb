@@ -55,7 +55,7 @@ pub mod key;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::RandomState;
 use parking_lot::RwLock;
@@ -662,7 +662,13 @@ pub struct TableIndexes {
     /// Set once the build that follows open (or compaction) has finished.
     /// Until then a lookup would miss rows the build has not reached, so
     /// queries do not ask, and scan instead.
-    ready: AtomicBool,
+    ///
+    /// Bit 0 is that flag; the rest is the renumbering epoch, which
+    /// [`TableIndexes::invalidate`] bumps when slot numbers start and stop
+    /// changing. One word, so a build that read its epoch before a
+    /// renumbering can never publish ready after it: see
+    /// [`TableIndexes::set_ready_at`].
+    state: AtomicU64,
 }
 
 /// The `write_order`s handed to the virtual key columns of path indexes,
@@ -678,7 +684,7 @@ impl TableIndexes {
         TableIndexes {
             list,
             gin,
-            ready: AtomicBool::new(false),
+            state: AtomicU64::new(0),
         }
     }
 
@@ -701,11 +707,40 @@ impl TableIndexes {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & 1 == 1
     }
 
     pub fn set_ready(&self, ready: bool) {
-        self.ready.store(ready, Ordering::Release);
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !1) | ready as u64));
+    }
+
+    /// The renumbering epoch. A build reads it before its first slot and
+    /// publishes with [`TableIndexes::set_ready_at`].
+    pub fn epoch(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
+    /// Marks the indexes unready and starts a new epoch, in one step. Called
+    /// when slot numbers start changing (`Table::compact` phase 2) and again
+    /// when they stop, so any build that overlapped the renumbering, or read
+    /// its epoch before it, cannot mark ready a structure keyed by slots
+    /// that moved. Returns the new epoch.
+    pub fn invalidate(&self) -> u64 {
+        let prev = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(((s >> 1) + 1) << 1))
+            .unwrap_or_else(|s| s);
+        (prev >> 1) + 1
+    }
+
+    /// Marks ready, but only if the epoch is still `epoch`: no renumbering
+    /// began or ended since the caller read it. Returns whether it did.
+    pub fn set_ready_at(&self, epoch: u64) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| (s >> 1 == epoch).then_some(s | 1))
+            .is_ok()
     }
 
     /// The index whose key is exactly these columns, in any order, once built.

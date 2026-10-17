@@ -694,15 +694,22 @@ impl<S: StorageIO> Table<S> {
             let readers_task = readers.clone();
             let alive = maintenance_alive.clone();
             let table_name_task = table_name.to_string();
+            // Read now, before any compaction can start: the build reads rows
+            // without the compaction gate, so it may mark the indexes ready
+            // only if no renumbering began or ended while it ran.
+            let epoch = indexes.epoch();
             tokio::spawn(async move {
                 if !alive.load(AtomicOrdering::Relaxed) {
                     return;
                 }
                 match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
-                    Ok(n) => {
-                        indexes.set_ready(true);
+                    Ok(n) if indexes.set_ready_at(epoch) => {
                         info!("Built {} index(es) on {} over {} rows", indexes.len(), table_name_task, n);
                     }
+                    Ok(_) => info!(
+                        "Index build on {} overlapped a compaction; its result is not used",
+                        table_name_task
+                    ),
                     Err(e) => error!(
                         "Index build on {} failed; queries scan instead: {}",
                         table_name_task, e
@@ -738,6 +745,10 @@ impl<S: StorageIO> Table<S> {
             // another row's bytes would not fail — it would silently build a
             // filter that prunes rows that do match.
             let readers_task = readers.clone();
+            // Read now, before any compaction can start. One that runs after
+            // this demotes the filter, and only its own rebuild, or the next
+            // open's backfill, may report it ready again.
+            let epoch_at_open = filters.renumber_epoch();
 
             tokio::spawn(async move {
                 if needs_backfill {
@@ -767,7 +778,9 @@ impl<S: StorageIO> Table<S> {
                     }
                 }
                 // Queries before this point are correct, just unfiltered.
-                ready.store(true, AtomicOrdering::Release);
+                if filters.renumber_epoch() == epoch_at_open {
+                    ready.store(true, AtomicOrdering::Release);
+                }
 
                 loop {
                     // Re-read each tick, so `SET FILTER checkpoint_interval_secs`
@@ -1123,6 +1136,7 @@ impl<S: StorageIO> Table<S> {
             filters: self.filters.as_deref(),
             cleared_below: &self.cleared_below,
             indexes: self.indexes.as_deref().zip(index_fetch.as_ref()),
+            compaction_gate: Some(&self.compaction_gate),
         };
         let report = crate::core::vacuum::run_once(
             &*self.io_pointers,
@@ -1187,19 +1201,38 @@ impl<S: StorageIO> Table<S> {
 
         // Exclusive: rows are about to move, so nothing may be holding a pointer
         // to one. Every read and write path takes this shared.
+        #[cfg(test)]
+        compact_test_hooks::gate_point(1);
         let _gate = self.compaction_gate.write().await;
+        #[cfg(test)]
+        compact_test_hooks::gate_point(2);
 
         // Nothing on the free list survives compaction — every extent it names
-        // is about to be somewhere else.
-        self.free_space.clear();
+        // is about to be somewhere else. Quarantined batches go too, and a
+        // vacuum sweep that computed extents from the old layout (it releases
+        // this gate before publishing) publishes nothing.
+        self.free_space.begin_relayout();
 
+        // From here rows move (phase 1) and slots are renumbered (phase 2), so
+        // everything keyed by slot stops being trusted now, not only once the
+        // rebuild at the end starts: a failure part-way through phase 2 leaves
+        // rows at new slots, and an index or filter still answering by the old
+        // numbering prunes them silently. Both stay demoted until a rebuild
+        // under the new numbering completes; a failed compaction leaves them
+        // demoted (the filter's demotion is persisted with its checkpoints, so
+        // a reopened table backfills it, and the indexes are rebuilt at open).
+        // Phase 1 is included because the open-time build and backfill read
+        // rows by pointer without this gate: their epoch check is what stops
+        // anything they read while rows moved from being published.
+        //
         // The checkpoint on disk describes a slot layout that is about to stop
-        // existing. Marking it dirty first means a crash mid-compaction leaves a
-        // sidecar that is rejected and rebuilt, rather than one that confidently
-        // indexes rows by their former addresses.
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
-        }
+        // existing, so this also marks the sidecar dirty, ordered against any
+        // checkpoint already in flight (see
+        // `TableFilters::begin_renumbering_on_disk`): a crash mid-compaction
+        // leaves a sidecar that is rejected and rebuilt, rather than one that
+        // confidently indexes rows by their former addresses.
+        let n_slots_before = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let renumbering = self.begin_renumbering(n_slots_before).await;
 
         let rows_len = self.io_rows.get_len().await;
         let (live, dead_rows) =
@@ -1338,6 +1371,17 @@ impl<S: StorageIO> Table<S> {
             target_slot += 1;
             report.slots_moved += 1;
 
+            // Test-only: the moves so far commit as a batch, and the next batch
+            // fails, as an ENOSPC part-way through phase 2 would.
+            #[cfg(test)]
+            if compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.get())
+                == Some(report.slots_moved)
+            {
+                compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(None));
+                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+                return Err(std::io::Error::other("injected failure part-way through phase 2"));
+            }
+
             if crate::core::wal::should_break_transaction(&*self.io_pointers) {
                 or_abort!(self.io_pointers.commit_durable(txn).await, txn);
                 txn = self.io_pointers.begin_txn();
@@ -1345,6 +1389,10 @@ impl<S: StorageIO> Table<S> {
         }
         // Nothing is truncated past this point unless every move is durable.
         or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+        // Slot numbers have stopped changing. Ending the renumbering here (and
+        // on every early return above, by drop) starts the epoch the rebuild
+        // below runs in.
+        drop(renumbering);
 
         // --- Phase 3: give the tails back ---
         //
@@ -1438,12 +1486,16 @@ impl<S: StorageIO> Table<S> {
         // past the new end keep stale bits, but a query bounds itself by the
         // pointer file's length and never reads them, and a later insert that
         // reaches one overwrites it.
+        //
+        // The filter has been demoted since the renumbering began. Only a
+        // backfill that completes restores it: one that fails leaves the
+        // prefix untrusted, and the checkpoint records that, rather than
+        // reporting ready over planes that still hold the old numbering.
         if self.filters.is_some() {
-            self.filters_ready.store(false, AtomicOrdering::Release);
-            if let Err(e) = self.backfill_filters_from(0).await {
-                error!("Compaction could not rebuild the filter: {}", e);
+            match self.backfill_filters_from(0).await {
+                Ok(_) => self.filters_ready.store(true, AtomicOrdering::Release),
+                Err(e) => error!("Compaction could not rebuild the filter; it stays unused: {}", e),
             }
-            self.filters_ready.store(true, AtomicOrdering::Release);
             self.checkpoint_filters().await;
         }
 
@@ -1452,6 +1504,9 @@ impl<S: StorageIO> Table<S> {
         // half-built index; one that fails to rebuild stays unready, and
         // queries scan rather than trust slot numbers that no longer exist.
         if let Some(indexes) = self.indexes.as_ref() {
+            // Unready since the renumbering began; this epoch is the one it
+            // ended in, so only this build can mark them ready again.
+            let epoch = indexes.epoch();
             indexes.set_ready(false);
             indexes.clear();
             match build_indexes(
@@ -1463,7 +1518,9 @@ impl<S: StorageIO> Table<S> {
             )
             .await
             {
-                Ok(_) => indexes.set_ready(true),
+                Ok(_) => {
+                    indexes.set_ready_at(epoch);
+                }
                 Err(e) => error!("Compaction could not rebuild the indexes; queries scan: {}", e),
             }
         }
@@ -1489,6 +1546,34 @@ impl<S: StorageIO> Table<S> {
         );
 
         Ok(report)
+    }
+
+    /// Demotes everything keyed by slot number before `compact` moves rows
+    /// and renumbers slots: the filter stops vouching for `[0, n_slots)`
+    /// under a new epoch, in memory and in the sidecar, and the indexes go
+    /// unready. The guard ends the renumbering when dropped, starting another
+    /// epoch, so work that read slots at any point during it cannot publish
+    /// what it read.
+    ///
+    /// The filter's begin-time epoch is the one that matters: without it a
+    /// backfill that started before the compaction could clear the demotion.
+    /// For the indexes it is the guard's drop-time invalidate that keeps a
+    /// failed or overlapping compaction from leaving them ready (queries
+    /// cannot run while `compact` holds its gate, and an open-time build that
+    /// publishes ready meanwhile is made unready by the drop); the begin-time
+    /// one here is defence in depth.
+    async fn begin_renumbering(&self, n_slots: u64) -> RenumberingGuard<'_> {
+        self.filters_ready.store(false, AtomicOrdering::Release);
+        if let Some(filters) = self.filters.as_ref() {
+            filters.begin_renumbering_on_disk(&*self.io_filters, n_slots).await;
+        }
+        if let Some(indexes) = self.indexes.as_ref() {
+            indexes.invalidate();
+        }
+        RenumberingGuard {
+            filters: self.filters.as_deref(),
+            indexes: self.indexes.as_deref(),
+        }
     }
 
     /// Shortens one file, tolerating a provider that cannot.
@@ -4209,10 +4294,17 @@ async fn backfill_into<S: StorageIO>(
         None => ReadTicket::inert(),
     };
 
+    // Read before the first slot: a batch is written, and the prefix cleared,
+    // only if no renumbering (`Table::compact`, which this does not wait for)
+    // began or ended since, or rows read under one numbering would be indexed
+    // under another.
+    let epoch = filters.renumber_epoch();
+    let renumbered = || std::io::Error::other("slots were renumbered under the filter backfill");
+
     let fetch = Table::<S>::build_indexed_row_fetch(fields);
     if fetch.columns_fetching_data.is_empty() {
-        if start_slot == 0 {
-            filters.clear_unindexed_prefix();
+        if start_slot == 0 && !filters.clear_unindexed_prefix_at(epoch) {
+            return Err(renumbered());
         }
         return Ok(0);
     }
@@ -4262,16 +4354,20 @@ async fn backfill_into<S: StorageIO>(
 
         pending.push((offset / ROW_POINTER_RECORD_LEN as u64, cols));
         if pending.len() == BACKFILL_BATCH {
-            filters.backfill_batch(&pending);
+            if !filters.backfill_batch_at(epoch, &pending) {
+                return Err(renumbered());
+            }
             pending.clear();
         }
         indexed += 1;
     }
-    filters.backfill_batch(&pending);
+    if !filters.backfill_batch_at(epoch, &pending) {
+        return Err(renumbered());
+    }
 
     // Only a scan that started at the beginning can vouch for the prefix.
-    if start_slot == 0 {
-        filters.clear_unindexed_prefix();
+    if start_slot == 0 && !filters.clear_unindexed_prefix_at(epoch) {
+        return Err(renumbered());
     }
     info!(
         "Filter backfill indexed {} rows from slot {}",
@@ -4334,6 +4430,54 @@ async fn build_indexes<S: StorageIO>(
         built += 1;
     }
     Ok(built)
+}
+
+/// Ends a renumbering that [`Table::compact`] began, on every way out of it.
+struct RenumberingGuard<'a> {
+    filters: Option<&'a TableFilters>,
+    indexes: Option<&'a crate::core::index::TableIndexes>,
+}
+
+impl Drop for RenumberingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(filters) = self.filters {
+            filters.end_renumbering();
+            // A compaction that fails from here on leaves the filter demoted
+            // in memory and the sidecar marked dirty; this persists the
+            // demotion at the next maintenance tick instead of whenever
+            // something unrelated asks. A compaction that succeeds checkpoints
+            // after its rebuild, which clears the request.
+            filters.request_checkpoint();
+        }
+        if let Some(indexes) = self.indexes {
+            indexes.invalidate();
+        }
+    }
+}
+
+/// Failpoints inside [`Table::compact`], for the tests that need it to fail
+/// at a chosen point. Thread-local: the caller runs `compact` on its own task.
+#[cfg(test)]
+pub(crate) mod compact_test_hooks {
+    thread_local! {
+        /// Fails `compact` once this many pointer records have moved in phase
+        /// 2, after committing those moves.
+        pub static FAIL_PHASE2_AFTER_SLOT_MOVES: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by `compact` to 1 when it starts waiting for the compaction
+        /// gate and to 2 once it holds it, so a test can tell a compaction
+        /// that is blocked on the gate from one that is running.
+        pub static GATE_PROBE: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn gate_point(state: u8) {
+        GATE_PROBE.with(|p| {
+            if let Some(p) = p.borrow().as_ref() {
+                p.store(state, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
