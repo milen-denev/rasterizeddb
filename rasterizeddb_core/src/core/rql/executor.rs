@@ -743,7 +743,11 @@ pub async fn substitute_in_subqueries(
         };
         // Two rows are enough to raise "more than one row".
         let rows = run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Scalar).await?;
-        let literal = subquery::rows_to_scalar(&rows)?;
+        let document = crate::core::rql::cte::document_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let literal = subquery::rows_to_scalar(&rows, document)?;
         current = format!(
             "{}{}{}",
             &current[..found.start],
@@ -4218,7 +4222,7 @@ async fn update_from_join(
                     Some(value) => value.clone(),
                     None => {
                         let produced = run_subquery(&resolved, database, tx).await?;
-                        let value = crate::core::rql::subquery::rows_to_scalar(&produced)?;
+                        let value = crate::core::rql::subquery::rows_to_scalar(&produced, false)?;
                         answers.insert(resolved, value.clone());
                         value
                     }

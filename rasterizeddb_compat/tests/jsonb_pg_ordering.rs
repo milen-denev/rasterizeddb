@@ -578,3 +578,45 @@ async fn an_alias_named_like_a_document_column_is_not_a_document() {
     }
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// A scalar subquery that returns a document, compared against one or
+/// selected. PostgreSQL 17's answers.
+///
+/// A scan reports a stored document as text, so the subquery's value was
+/// substituted as a text literal of the encoded bytes: no document parses
+/// from that, so the comparison was refused, and in a select list the client
+/// was handed the bytes. It is substituted as the document it is, as the
+/// `IN (subquery)` path already did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scalar_subquery_returning_a_document_is_a_document() {
+    let (_s, pool) = server().await;
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 101) ORDER BY id", "1,2"),
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 104) ORDER BY id", "15,16"),
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 102) ORDER BY id", "6,7"),
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 105) ORDER BY id", "18"),
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 109) ORDER BY id", "24,25"),
+        // A NULL document, and no row at all, match nothing.
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 108) ORDER BY id", ""),
+        ("SELECT id FROM d WHERE doc = (SELECT doc FROM e WHERE id = 999) ORDER BY id", ""),
+        (
+            "SELECT id FROM d WHERE doc <> (SELECT doc FROM e WHERE id = 103) AND id < 12 ORDER BY id",
+            "1,2,3,4,5,6,7,8,11",
+        ),
+        ("SELECT id FROM d WHERE doc > (SELECT doc FROM e WHERE id = 101) ORDER BY id", "3,4,5,15,16,19,21"),
+        ("SELECT id FROM d WHERE (SELECT doc FROM e WHERE id = 103) = doc ORDER BY id", "9,10"),
+        ("SELECT id FROM d WHERE doc->'a' = (SELECT doc FROM e WHERE id = 103) ORDER BY id", "1,2"),
+        // A computed document, which the subquery already reports as one.
+        ("SELECT id FROM d WHERE doc->'a' = (SELECT doc->'a' FROM e WHERE id = 104) ORDER BY id", "15,16"),
+        // In a select list it is printed as the document.
+        ("SELECT id, (SELECT doc FROM e WHERE id = 104) FROM d WHERE id = 1", r#"1:{"a": {"b": 1.0}, "c": 2}"#),
+        ("SELECT id, (SELECT doc FROM e WHERE id = 105) FROM d WHERE id = 1", r#"1:"é""#),
+    ] {
+        let got = flat(&pool, sql, false).await;
+        if got.as_deref() != Ok(want) {
+            wrong.push(format!("{sql}\n    want {want}\n    got  {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

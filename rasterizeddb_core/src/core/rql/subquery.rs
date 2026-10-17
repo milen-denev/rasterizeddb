@@ -320,7 +320,12 @@ pub fn is_correlated(inner_sql: &str) -> bool {
 ///
 /// A subquery in value position must yield at most one row of one column;
 /// Postgres raises an error otherwise rather than picking one arbitrarily.
-pub fn rows_to_scalar(rows: &[Row]) -> Result<String, String> {
+///
+/// `document` says the column is a stored document, as for
+/// [`rows_to_value_list`]: a scan reports one as text, and rendered as text
+/// its encoded bytes were refused as a constant, or compared against `doc` as
+/// a literal no document parses from.
+pub fn rows_to_scalar(rows: &[Row], document: bool) -> Result<String, String> {
     match rows.len() {
         // No rows makes the expression NULL, and NULL is what it becomes.
         // It used to be an empty string, which is a *value*: `WHERE id = ''`
@@ -334,10 +339,15 @@ pub fn rows_to_scalar(rows: &[Row]) -> Result<String, String> {
                 return Err("a subquery used as a value must select exactly one column".to_string());
             }
             let column = &row.columns[0];
-            value_to_literal(&column.column_type, column.data.into_slice()).ok_or_else(|| {
+            let db_type = if document && column.column_type == DbType::STRING {
+                DbType::JSONB
+            } else {
+                column.column_type.clone()
+            };
+            value_to_literal(&db_type, column.data.into_slice()).ok_or_else(|| {
                 format!(
                     "subquery returned a {} value that cannot be used as a constant",
-                    column.column_type
+                    db_type
                 )
             })
         }
