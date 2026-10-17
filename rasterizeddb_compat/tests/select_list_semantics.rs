@@ -1,12 +1,16 @@
 //! What a select list evaluates to, item by item, against PostgreSQL 17.
 //!
-//! A silent wrong answer lived here:
+//! Two silent wrong answers lived here:
 //!
 //! 1. An expression in a join's select list returned its first operand.
 //!    `a.n * 10 + b.n AS k` came back as `a.n`, labelled `*`: the item was
 //!    split on whitespace, so the column before the operator was read as the
 //!    item and the operator as its alias. `INSERT … SELECT` over a join stored
 //!    those values and reported success.
+//! 2. A `NULL` written in a select list came back as an empty string. The
+//!    constant was stored as empty text, which is a value, so the client saw
+//!    `''` where PostgreSQL sends NULL. A scalar subquery that found no row,
+//!    or found a NULL, is substituted as the same constant.
 //!
 //! Every answer below is PostgreSQL 17's, labels and announced types included:
 //! the description is what a client decodes by, so a right value under a wrong
@@ -303,6 +307,79 @@ async fn insert_select_over_a_join_stores_the_computed_values() {
                 &["1|35|xp", "2|<N>|<N>"],
             ),
         ],
+    )
+    .await;
+}
+
+/// Bug 2: a NULL in a select list is a NULL, however it is written and
+/// whichever path answers the statement. A bare NULL is described as `text`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_in_a_select_list_is_null() {
+    let (_s, pool) = server().await;
+    setup(&pool).await;
+    check(
+        &pool,
+        &[
+            ("SELECT id, NULL FROM d ORDER BY id", "id:INT4|?column?:TEXT", &["1|<N>", "2|<N>"]),
+            (
+                "SELECT id, NULL AS z, NULL::int AS ni, CAST(NULL AS text) AS nt FROM d ORDER BY id",
+                "id:INT4|z:TEXT|ni:INT4|nt:TEXT",
+                &["1|<N>|<N>|<N>", "2|<N>|<N>|<N>"],
+            ),
+            // Over a join.
+            (
+                "SELECT a.id, NULL AS z, NULL FROM d a JOIN d b ON b.id = a.id ORDER BY a.id",
+                "id:INT4|z:TEXT|?column?:TEXT",
+                &["1|<N>|<N>", "2|<N>|<N>"],
+            ),
+            // Through a CTE, written inside it and outside it.
+            (
+                "WITH c AS (SELECT id, NULL AS z FROM d) SELECT id, z FROM c ORDER BY id",
+                "id:INT4|z:TEXT",
+                &["1|<N>", "2|<N>"],
+            ),
+            (
+                "WITH c AS (SELECT id FROM d) SELECT id, NULL AS z FROM c ORDER BY id",
+                "id:INT4|z:TEXT",
+                &["1|<N>", "2|<N>"],
+            ),
+            // A column whose first row is NULL types the CTE by a later one.
+            (
+                "WITH c AS (SELECT id, v FROM d ORDER BY id DESC) SELECT id, v FROM c ORDER BY id",
+                "id:INT4|v:TEXT",
+                &["1|a", "2|<N>"],
+            ),
+            // Each branch of a UNION, and a NULL meeting a NULL column.
+            (
+                "SELECT id, NULL AS z FROM d WHERE id = 1 UNION ALL SELECT id, NULL FROM d WHERE id = 2 ORDER BY id",
+                "id:INT4|z:TEXT",
+                &["1|<N>", "2|<N>"],
+            ),
+            (
+                "SELECT id, NULL AS z FROM d WHERE id = 1 UNION ALL SELECT id, v FROM d WHERE id = 2 ORDER BY id",
+                "id:INT4|z:TEXT",
+                &["1|<N>", "2|<N>"],
+            ),
+            // Grouped, and de-duplicated.
+            ("SELECT NULL AS z, count(*) AS c FROM d", "z:TEXT|c:INT8", &["<N>|2"]),
+            ("SELECT DISTINCT NULL AS z FROM d", "z:TEXT", &["<N>"]),
+            // An empty string is still a value, not a NULL.
+            ("SELECT id, '' AS e FROM d ORDER BY id", "id:INT4|e:TEXT", &["1|", "2|"]),
+        ],
+    )
+    .await;
+    // A scalar subquery with no row, and one whose row holds NULL. Simple
+    // protocol only: over the extended one a select-list scalar subquery is
+    // described with no columns at all, whatever it returns — a separate
+    // fault in the describe path, not this one.
+    check_over(
+        &pool,
+        &[(
+            "SELECT id, (SELECT v FROM d WHERE id = 99) AS sq, (SELECT v FROM d WHERE id = 2) AS sn FROM d ORDER BY id",
+            "id:INT4|sq:TEXT|sn:TEXT",
+            &["1|<N>|<N>", "2|<N>|<N>"],
+        )],
+        &[true],
     )
     .await;
 }

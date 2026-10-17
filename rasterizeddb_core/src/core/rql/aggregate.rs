@@ -176,7 +176,9 @@ pub enum SelectItem {
         arg_expr: Option<ArgExpression>,
     },
     /// A constant: `SELECT 1`, or the value a scalar subquery resolved to. It
-    /// reads no column, and is the same in every row.
+    /// reads no column, and is the same in every row. A `NULL` has no bytes
+    /// and `db_type` `DbType::NULL`; read its described type from
+    /// [`SelectItem::result_type`].
     Literal {
         bytes: Vec<u8>,
         db_type: DbType,
@@ -411,6 +413,13 @@ impl SelectItem {
             SelectItem::Aggregate { func, arg, .. } => {
                 func.result_type(arg.as_ref().map(|f| &f.db_type))
             }
+            // A `NULL` constant's bytes are typed `NULL` so every cell made
+            // from them is one; what it is described as is PostgreSQL's type
+            // for an untyped NULL, which is text.
+            SelectItem::Literal {
+                db_type: DbType::NULL,
+                ..
+            } => DbType::STRING,
             SelectItem::Literal { db_type, .. } => db_type.clone(),
             SelectItem::Scalar { db_type, .. } => db_type.clone(),
             SelectItem::Computed { db_type, .. } => db_type.clone(),

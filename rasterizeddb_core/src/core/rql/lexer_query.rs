@@ -1144,11 +1144,16 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
         return None;
     }
 
-    // `NULL` is stored as an empty value, the way every other NULL is here.
     // Without this a bare NULL in a select list was read as a column name and
     // reported as "column 'NULL' not found in schema".
+    //
+    // Typed `NULL`, which is what marks a cell as one; the item still
+    // describes itself as text (`SelectItem::result_type`), as PostgreSQL
+    // does. Typed as text it went out as empty bytes of text — the empty
+    // string, a value — so `SELECT id, NULL` answered `''`, and so did a
+    // scalar subquery that found no row, which is substituted as `NULL`.
     if text.eq_ignore_ascii_case("NULL") {
-        return Some((Vec::new(), DbType::STRING));
+        return Some((Vec::new(), DbType::NULL));
     }
     if text.eq_ignore_ascii_case("TRUE") {
         return Some((vec![1u8], DbType::BOOL));
