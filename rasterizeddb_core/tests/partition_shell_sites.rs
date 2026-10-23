@@ -30,7 +30,9 @@ const TWIN: &str = "site_q";
 const DDL: &str = "(tenant_id BIGINT NOT NULL, asset_group_id INT NOT NULL, asset_id INT NOT NULL, n INT, \
                    label TEXT, PRIMARY KEY (tenant_id, asset_group_id, asset_id))";
 const PARTITIONS: u32 = 8;
-const PK_INDEX: &str = "site_p_tenant_id_asset_group_id_asset_id_key";
+// PostgreSQL's name for a primary key's index, as upstream gives it since
+// fec2dd9 (it was `<table>_<columns>_key`).
+const PK_INDEX: &str = "site_p_pkey";
 
 /// What a site must do.
 #[derive(Clone, Copy)]
@@ -243,7 +245,8 @@ const SITES: &[Site] = &[
     site("COPY site_p TO STDOUT", Expect::LikeTwin, "no COPY here"),
     site("COPY site_p (tenant_id, n) TO STDOUT", Expect::LikeTwin, "no COPY here"),
     site("COPY site_p FROM STDIN", Expect::LikeTwin, "no COPY here"),
-    site("COPY (SELECT * FROM site_p) TO STDOUT", Expect::LikeTwin, "no COPY here"),
+    // Its query reads site_p, which refuses (S10) before COPY can fail.
+    site("COPY (SELECT * FROM site_p) TO STDOUT", Expect::Refused, "no COPY here; S10"),
     // Storage.
     site("STORAGE MOVE TABLE site_p TO '/nonexistent'", Expect::Refused, "a partition moves with MOVE PARTITION"),
     site("STORAGE REBALANCE DRY RUN", Expect::Check(rebalance), "never proposes the shell"),
@@ -303,7 +306,9 @@ const SITES: &[Site] = &[
     // The data statements, through each front door.
     site("SELECT * FROM site_p", Expect::Refused, "S10"),
     site("SELECT COUNT(*) FROM site_p", Expect::Refused, "S10"),
-    site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::Error("42601"), "F3; S10"),
+    // Finding F3 (a refusal in a subquery reported as 42601) is fixed
+    // upstream (fec2dd9: a subquery keeps its error code).
+    site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::Refused, "S10"),
     site("SELECT n FROM site_p UNION SELECT id FROM site_parent", Expect::Refused, "S10"),
     // A duplicate of a setup row: 23505 on both since S9.
     site("INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1)", Expect::LikeTwin, "S9"),

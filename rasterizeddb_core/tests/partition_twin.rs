@@ -251,22 +251,21 @@ const REFUSED: &[Refusal] = &[
     refused(Join, "phase 2b"),
     refused(LeftJoin, "phase 2b"),
     refused(SelfJoin, "phase 2b"),
-    // S10. Finding F3: a refusal inside an `IN (SELECT …)` subquery is
-    // reported as 42601 (syntax error), not 0A000.
-    Refusal { kind: InSubquery, code: "42601", lifted_by: "S10", or_like_twin: None },
-    Refusal { kind: UpdateDimViaSubquery, code: "42601", lifted_by: "S10", or_like_twin: None },
+    // S10. Finding F3 (a refusal inside an `IN (SELECT …)` subquery was
+    // reported as 42601) is fixed upstream (fec2dd9: a subquery keeps its
+    // error code), so these refuse with 0A000 like the rest.
+    refused(InSubquery, "S10"),
+    refused(UpdateDimViaSubquery, "S10"),
 ];
 
 /// Allowed kinds whose answers differ today, each with the finding that
 /// explains it. A difference in one of these is recorded, not failed; a run
 /// in which one of them never differs fails, so the entry goes with the fix.
-const KNOWN_DIVERGENCES: &[(Kind, &str)] = &[(
-    CatalogIndexes,
-    "F1: until its first reopen, pg_indexes lists no implicit index for a plain table whose only \
-     uniqueness is a composite PRIMARY KEY or UNIQUE, or a CREATE INDEX (index_set reads the plain \
-     table's live index set); the partitioned table lists it from its schema at once. The twins \
-     agree after the restart",
-)];
+///
+/// Empty since F1 (pg_indexes listed no implicit index for a plain table's
+/// composite key until its first reopen) was fixed upstream by fec2dd9 (a
+/// composite key is indexed and named from creation).
+const KNOWN_DIVERGENCES: &[(Kind, &str)] = &[];
 
 fn refusal(kind: Kind) -> Option<&'static Refusal> {
     REFUSED.iter().find(|r| r.kind == kind)
