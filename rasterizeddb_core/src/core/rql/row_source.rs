@@ -1,0 +1,405 @@
+//! Where a single-table `SELECT`'s rows come from: one table, or the
+//! partitions of a partitioned one (`docs/partitioning.md` §4, §8).
+//!
+//! **The contract:** for the same arguments a source returns the multiset of
+//! rows one table holding all of them would return, so everything the
+//! executor does after the scan (the fold, `DISTINCT`, windows, expression
+//! sorts, paging) runs unchanged over it. A partitioned source keeps it by:
+//!
+//! - **One snapshot.** [`FanOut::plan`] takes the statement's `Visibility`
+//!   first (the statement's shared one, when it has one), then the map epoch,
+//!   then which partitions are materialized (§4.4), and every partition is
+//!   read under that one `Visibility` through the `_with_visibility` entry
+//!   points. A snapshot per partition would let a transaction that committed
+//!   between two partition reads show in one and not the other: a transfer
+//!   across tenants seen half applied (I7).
+//! - **Pruning only on proof** (I3). The route is `route_where` on the exact
+//!   `WHERE` text the partitions' scans evaluate: `extract_gated`, never the
+//!   path-aware variant, and zero partitions only for a constant-false
+//!   clause. An unmaterialized partition holds no row (§4.3) and is skipped.
+//! - **Merging like one scan.** Unordered results concatenate; a `LIMIT`
+//!   without `ORDER BY` stops launching partitions once enough rows are in
+//!   and cuts the concatenation. `ORDER BY [… LIMIT k]` asks every partition
+//!   for its own sorted top `k` (the scan's `limit` already includes
+//!   `OFFSET`), then sorts the union with the scan's own final step
+//!   (`ConcurrentProcessor::sort_rows_for_merge`) and cuts it to `k`. That is
+//!   correct and simple; S12 replaces it with a streaming merge under one
+//!   statement-wide worker budget.
+//! - **An empty route still answers.** No partition yields no bytes, no rows
+//!   and a count of 0, and the executor's pipeline runs over that, so
+//!   `COUNT(*)` gives one row of 0 and `MAX(x)` one row of NULL (§8).
+//!
+//! At most [`FANOUT_IN_FLIGHT`] partitions are read at once, in pid order,
+//! each a whole scan before the next group starts: a partition future is
+//! never dropped mid-scan, so no worker outlives the statement it served.
+//! Only a statement reaching at most [`CACHE_MAX_PARTITIONS`] partitions
+//! reads or fills the query cache, each partition under its own scope, so a
+//! wide fan-out cannot flush it.
+
+use std::io;
+use std::sync::Arc as StdArc;
+
+use rclite::Arc;
+
+use crate::core::database::Relation;
+use crate::core::mvcc::Visibility;
+use crate::core::mvcc::transaction::TxId;
+use crate::core::partition::table::{MapEpoch, PartitionedTable};
+use crate::core::processor::concurrent_processor::ConcurrentProcessor;
+use crate::core::row::row::{Row, RowFetch};
+use crate::core::row::schema::{SchemaField, TableSchema};
+use crate::core::row::table::Table;
+use crate::core::storage_providers::backend::DbStorageProvider;
+
+type PartTable = Table<DbStorageProvider>;
+
+/// Partitions one statement reads at once (§8). The scans' own workers are
+/// not yet drawn from a statement-wide budget; that is S12.
+pub(crate) const FANOUT_IN_FLIGHT: usize = 8;
+
+/// A statement reaching more partitions than this neither reads nor fills
+/// the query cache (§8).
+pub(crate) const CACHE_MAX_PARTITIONS: usize = 4;
+
+/// What a `SELECT` reads.
+pub(crate) enum RowSource {
+    /// A plain table, read exactly as before partitioning existed.
+    Single(Arc<PartTable>),
+    /// The routed, materialized partitions of a partitioned table, under one
+    /// snapshot.
+    Partitioned(Box<FanOut>),
+}
+
+/// A partitioned read's plan, fixed before the first partition is read.
+pub(crate) struct FanOut {
+    table: Arc<PartitionedTable>,
+    /// Taken first (§4.4) and held until the last partition call returns, so
+    /// its snapshot stays registered for the whole statement.
+    visibility: Visibility,
+    /// The map epoch the route was computed under, counted (`load_full`) and
+    /// held for the statement, so a reshape's reclamation waits for it.
+    _epoch: StdArc<MapEpoch>,
+    /// The routed partitions that are materialized, by ascending pid.
+    parts: Vec<(u32, Arc<PartTable>)>,
+    cache: bool,
+}
+
+impl RowSource {
+    /// The source for a `SELECT` on `relation` whose scan evaluates
+    /// `where_clause`, read as `tx`.
+    pub(crate) fn for_select(relation: Relation, where_clause: &str, tx: TxId) -> io::Result<Self> {
+        match relation {
+            Relation::Plain(table) => Ok(RowSource::Single(table)),
+            Relation::Partitioned(table) => Ok(RowSource::Partitioned(Box::new(FanOut::plan(table, where_clause, tx)?))),
+        }
+    }
+
+    /// The declared schema: the plain table's, or the partitioned table's
+    /// shell's, which every partition's is a clone of.
+    pub(crate) fn schema(&self) -> &TableSchema {
+        match self {
+            RowSource::Single(table) => &table.schema,
+            RowSource::Partitioned(fan) => &fan.table.shell().schema,
+        }
+    }
+
+    /// `Table::count_rows_in_txn`.
+    pub(crate) async fn count(
+        &self,
+        where_clause: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        tx: TxId,
+    ) -> io::Result<u64> {
+        match self {
+            RowSource::Single(table) => table.count_rows_in_txn(where_clause, schema_fields, query_row_fetch, tx).await,
+            RowSource::Partitioned(fan) => {
+                let counts = fan
+                    .each(
+                        |_| false,
+                        |part, visibility, cache| {
+                            let fetch = query_row_fetch.clone();
+                            async move {
+                                part.count_rows_with_visibility(where_clause, schema_fields, fetch, visibility, cache)
+                                    .await
+                            }
+                        },
+                    )
+                    .await?;
+                Ok(counts.into_iter().sum())
+            }
+        }
+    }
+
+    /// `Table::query_row_in_txn`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_rows(
+        &self,
+        where_clause: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        tx: TxId,
+    ) -> io::Result<Vec<Row>> {
+        match self {
+            RowSource::Single(table) => {
+                table
+                    .query_row_in_txn(
+                        where_clause,
+                        schema_fields,
+                        query_row_fetch,
+                        requested_row_fetch,
+                        limit,
+                        order_by,
+                        tx,
+                    )
+                    .await
+            }
+            RowSource::Partitioned(fan) => {
+                let enough = |got: &[Vec<Row>]| {
+                    order_by.is_none() && limit.is_some_and(|k| got.iter().map(Vec::len).sum::<usize>() as u64 >= k)
+                };
+                let parts = fan
+                    .each(enough, |part, visibility, cache| {
+                        let (qf, rf, order_by) = (query_row_fetch.clone(), requested_row_fetch.clone(), order_by.clone());
+                        async move {
+                            part.query_row_with_visibility_cached(
+                                where_clause,
+                                schema_fields,
+                                qf,
+                                rf,
+                                limit,
+                                order_by,
+                                visibility,
+                                cache,
+                            )
+                            .await
+                        }
+                    })
+                    .await?;
+                let mut rows: Vec<Row> = parts.into_iter().flatten().collect();
+                if fan.parts.len() > 1 {
+                    // Sorts by `order_by` when there is one, and cuts to `limit`.
+                    ConcurrentProcessor::sort_rows_for_merge(&mut rows, schema_fields, &order_by, limit);
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    /// `Table::query_row_bytes_in_txn`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_bytes(
+        &self,
+        where_clause: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        tx: TxId,
+    ) -> io::Result<Vec<u8>> {
+        self.query_bytes_reporting(
+            where_clause,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            tx,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    /// `Table::query_row_bytes_reporting_in_txn`: the serialized rows, and
+    /// whether any may carry columns beyond `requested_row_fetch` (true when
+    /// any partition's may, and after a merge sort, which decodes rows).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_bytes_reporting(
+        &self,
+        where_clause: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        tx: TxId,
+    ) -> io::Result<(Vec<u8>, bool)> {
+        let fan = match self {
+            RowSource::Single(table) => {
+                return table
+                    .query_row_bytes_reporting_in_txn(
+                        where_clause,
+                        schema_fields,
+                        query_row_fetch,
+                        requested_row_fetch,
+                        limit,
+                        order_by,
+                        tx,
+                    )
+                    .await;
+            }
+            RowSource::Partitioned(fan) => fan,
+        };
+        let ordered = order_by.is_some();
+        let enough = |got: &[(Vec<u8>, bool)]| {
+            !ordered
+                && limit.is_some_and(|k| {
+                    got.iter().map(|(b, _)| crate::core::row::row::count_serialized_rows(b)).sum::<u64>() >= k
+                })
+        };
+        let parts = fan
+            .each(enough, |part, visibility, cache| {
+                let (qf, rf, order_by) = (query_row_fetch.clone(), requested_row_fetch.clone(), order_by.clone());
+                async move {
+                    part.query_row_bytes_reporting_with_visibility(
+                        where_clause,
+                        schema_fields,
+                        qf,
+                        rf,
+                        limit,
+                        order_by,
+                        visibility,
+                        cache,
+                    )
+                    .await
+                }
+            })
+            .await?;
+        if parts.len() <= 1 {
+            // One partition's answer is already one table's.
+            return Ok(parts.into_iter().next().unwrap_or_default());
+        }
+        if ordered {
+            // Every partition sorted its own top `limit`; the union is sorted
+            // and cut by the scan's own final step. Correct, not yet cheap:
+            // S12 streams a k-way merge instead of decoding every row.
+            let mut rows = Vec::new();
+            for (bytes, _) in &parts {
+                rows.extend(crate::core::row::row::vec_into_rows(bytes)?);
+            }
+            ConcurrentProcessor::sort_rows_for_merge(&mut rows, schema_fields, &order_by, limit);
+            return Ok((crate::core::row::row::rows_into_vec(rows), true));
+        }
+        let overfetched = parts.iter().any(|(_, over)| *over);
+        let mut out = Vec::with_capacity(parts.iter().map(|(b, _)| b.len()).sum());
+        for (bytes, _) in &parts {
+            out.extend_from_slice(bytes);
+        }
+        if let Some(k) = limit {
+            // Each partition stopped at `k`; the concatenation may hold more.
+            let rest = crate::core::row::row::skip_serialized_rows(&out, k)?.len();
+            out.truncate(out.len() - rest);
+        }
+        Ok((out, overfetched))
+    }
+}
+
+impl FanOut {
+    /// §4.4's order: the statement's `Visibility`, then the map epoch, then
+    /// the route and the materialized flags. A row a reader's snapshot can see
+    /// was committed after its partition was materialized, and the flags are
+    /// read after the snapshot, so an unmaterialized partition skipped here
+    /// holds nothing this statement may see (§4.3).
+    fn plan(table: Arc<PartitionedTable>, where_clause: &str, tx: TxId) -> io::Result<FanOut> {
+        table.check()?;
+        // The statement's one snapshot when it has one (a read-only
+        // statement's subqueries, CTEs and relations share it), else one
+        // taken now; either way every partition is read under this value.
+        let visibility = crate::core::rql::statement_snapshot::get_or_take(|| table.visibility_for(tx));
+        let epoch = table.epoch()?;
+        let route = table.route_where(where_clause)?;
+        let parts = table.materialized(&epoch, &route)?;
+        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+        Ok(FanOut { table, visibility, _epoch: epoch, parts, cache })
+    }
+
+    /// Runs `read` on every planned partition, at most [`FANOUT_IN_FLIGHT`]
+    /// at once, and returns the answers by ascending pid. Stops launching
+    /// partitions once `enough` holds over the answers so far.
+    async fn each<T, F, Fut>(&self, enough: impl Fn(&[T]) -> bool, read: F) -> io::Result<Vec<T>>
+    where
+        F: Fn(Arc<PartTable>, Visibility, bool) -> Fut,
+        Fut: std::future::Future<Output = io::Result<T>>,
+    {
+        let mut out: Vec<T> = Vec::with_capacity(self.parts.len());
+        #[cfg(test)]
+        let hook = test_hooks::after_first(self.table.uid());
+        #[cfg(test)]
+        let width = if hook.is_some() { 1 } else { FANOUT_IN_FLIGHT };
+        #[cfg(not(test))]
+        let width = FANOUT_IN_FLIGHT;
+        for (group, chunk) in self.parts.chunks(width).enumerate() {
+            if enough(&out) {
+                break;
+            }
+            #[cfg(test)]
+            test_hooks::note_reads(self.table.uid(), chunk.iter().map(|(pid, _)| *pid));
+            let reads = chunk.iter().map(|(_, part)| read(part.clone(), self.visibility.clone(), self.cache));
+            for answer in futures::future::join_all(reads).await {
+                out.push(answer?);
+            }
+            #[cfg(test)]
+            if group == 0 {
+                if let Some(hook) = &hook {
+                    hook().await;
+                }
+            }
+            #[cfg(not(test))]
+            let _ = group;
+        }
+        Ok(out)
+    }
+}
+
+/// Test-only observation points in the fan-out, keyed by the partitioned
+/// table's uid so tests running at once never see each other's.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) type Hook =
+        Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<u64, Hook>> {
+        static H: OnceLock<Mutex<HashMap<u64, Hook>>> = OnceLock::new();
+        H.get_or_init(Default::default)
+    }
+
+    fn reads() -> &'static Mutex<HashMap<u64, Vec<u32>>> {
+        static R: OnceLock<Mutex<HashMap<u64, Vec<u32>>>> = OnceLock::new();
+        R.get_or_init(Default::default)
+    }
+
+    /// Runs `hook` after the first partition of every fan-out over table
+    /// `uid` has been read, and reads that table's partitions one at a time
+    /// while it is installed, so the hook falls between two partition reads.
+    pub(crate) fn set_after_first(uid: u64, hook: Option<Hook>) {
+        let mut map = hooks().lock().unwrap();
+        match hook {
+            Some(h) => map.insert(uid, h),
+            None => map.remove(&uid),
+        };
+    }
+
+    pub(crate) fn after_first(uid: u64) -> Option<Hook> {
+        hooks().lock().unwrap().get(&uid).cloned()
+    }
+
+    pub(crate) fn note_reads(uid: u64, pids: impl Iterator<Item = u32>) {
+        reads().lock().unwrap().entry(uid).or_default().extend(pids);
+    }
+
+    /// The partitions read for table `uid` since the last call, in order.
+    pub(crate) fn take_reads(uid: u64) -> Vec<u32> {
+        reads().lock().unwrap().remove(&uid).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "row_source_tests.rs"]
+mod tests;

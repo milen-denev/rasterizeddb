@@ -1,6 +1,8 @@
 //! The logical partitioned table (§1.1, §3, §4.3, §4.4): its map, one slot per
 //! partition, lazy materialization, routing, and the shared row-id source.
-//! SQL `INSERT` routes through it (S9); every other statement still refuses.
+//! SQL `INSERT` routes through it (S9), and `SELECT` and `COUNT` read its
+//! partitions under one snapshot (S10, `rql::row_source`); every other
+//! statement still refuses.
 //!
 //! # What it holds
 //!

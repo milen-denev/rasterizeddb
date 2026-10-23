@@ -212,50 +212,15 @@ const REFUSED: &[Refusal] = &[
     refused(DeleteUsing, "phase 3"),
     refused(ForUpdate, "phase 3"),
     refused(SkipLocked, "phase 3"),
-    // S10: single-snapshot fan-out SELECT and COUNT.
-    refused(SelectAll, "S10"),
-    refused(SelectByKey, "S10"),
-    refused(SelectByPartitionKey, "S10"),
-    refused(SelectByPrefix, "S10"),
-    refused(SelectIn, "S10"),
-    refused(SelectInComposite, "S10"),
-    refused(SelectOr, "S10"),
-    refused(SelectOrUnconstrained, "S10"),
-    refused(SelectRange, "S10"),
-    refused(SelectNonKeyRange, "S10"),
-    refused(SelectRowValue, "S10"),
-    refused(SelectSpellings, "S10"),
-    refused(SelectNonKey, "S10"),
-    refused(SelectLimitZero, "S10"),
-    refused(CountAll, "S10"),
-    refused(CountByPrefix, "S10"),
-    refused(Aggregates, "S10"),
-    refused(GroupBy, "S10"),
-    refused(GroupByOrdered, "S10 (S12 for a multi-partition ORDER BY)"),
-    refused(Distinct, "S10"),
-    refused(CountDistinct, "S10"),
-    refused(Window, "S10"),
-    refused(Cte, "S10"),
-    refused(Union, "S10"),
-    refused(PreparedSelect, "S10"),
-    refused(PreparedCount, "S10"),
-    refused(InsertIntoSinkFromT, "S10"),
-    refused(EmptyRouteCount, "S10"),
-    refused(EmptyRouteMax, "S10"),
-    refused(EmptyRouteAggregates, "S10"),
-    refused(EmptyRouteContradiction, "S10"),
-    refused(EmptyRouteContradictionRows, "S10"),
-    // S12: ORDER BY across partitions.
-    refused(OrderByLimit, "S12"),
+    // S10 (single-snapshot fan-out SELECT and COUNT) is built: every read
+    // kind is compared with the twin, ORDER BY across partitions included
+    // (correct by sorting the partitions' top-N together; S12 makes it
+    // cheap), and so are the reads inside INSERT … SELECT, IN (SELECT …),
+    // UNION and CTEs, the empty routes, and prepared SELECT and COUNT.
     // 2b: joins.
     refused(Join, "phase 2b"),
     refused(LeftJoin, "phase 2b"),
     refused(SelfJoin, "phase 2b"),
-    // S10. Finding F3 (a refusal inside an `IN (SELECT …)` subquery was
-    // reported as 42601) is fixed upstream (fec2dd9: a subquery keeps its
-    // error code), so these refuse with 0A000 like the rest.
-    refused(InSubquery, "S10"),
-    refused(UpdateDimViaSubquery, "S10"),
 ];
 
 /// Allowed kinds whose answers differ today, each with the finding that
@@ -937,6 +902,9 @@ impl Twin {
                 rows.sort();
             }
             let tags: Vec<String> = r.tags.iter().map(|t| unrender(t)).collect();
+            // Names and types both: Describe and payload share one source,
+            // and a wrong type is a wrongly decoded value.
+            let cols: Vec<String> = cols.iter().zip(&r.types).map(|(c, t)| format!("{c}:{t}")).collect();
             (cols, rows, tags)
         };
         let (a, b) = (norm(p, op.ordered), norm(q, op.ordered));
@@ -1026,9 +994,9 @@ impl Twin {
 
     /// What both tables store, read through the API, must be the same rows,
     /// and every partitioned row must sit in the partition owning its point
-    /// (I4). Until S10 the partitioned side's `SELECT` is refused, so this is
-    /// how a write that answered like the twin's but stored something else
-    /// (a lost row, a duplicate, a wrong value, a misrouted row) is caught.
+    /// (I4). Read below SQL, so a write that answered like the twin's but
+    /// stored something else (a lost row, a duplicate, a wrong value, a
+    /// misrouted row) is caught even where a read path would hide it.
     fn compare_storage(&mut self, at: usize, kind: Kind) {
         let db = self.server.as_ref().unwrap().db.clone();
         let p = stored_rows(&db, PART);

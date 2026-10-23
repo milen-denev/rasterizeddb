@@ -50,6 +50,9 @@ pub mod generated;
 pub mod lexer_alter;
 pub mod nullable;
 pub mod row_lock;
+/// What a single-table `SELECT` reads: one table, or a partitioned table's
+/// partitions under one snapshot.
+pub(crate) mod row_source;
 pub mod sequence;
 /// Combining the branches of a `UNION`.
 pub mod set_ops;

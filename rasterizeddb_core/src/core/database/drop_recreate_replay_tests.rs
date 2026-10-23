@@ -490,7 +490,7 @@ impl Scenario {
         for (seed, img) in images {
             let db = open(&img).await;
             let seen = if db.partitioned.contains_key(table) {
-                // Its `SELECT` is refused until S10: read through the API.
+                // Read through the API, partition by partition, below SQL.
                 partitioned::labels_of(&db, table, candidates).await
             } else if db.tables.contains_key(table) {
                 labels_of(&db, table, candidates).await
@@ -2442,7 +2442,7 @@ mod partitioned {
     }
 
     /// [`super::labels_of`] for a partitioned table, read through the API
-    /// (its `SELECT` is refused until S10): every stored label that is one of
+    /// below SQL (written when its `SELECT` was refused): every stored label that is one of
     /// `candidates`, as often as stored, and any other label too, marked, so
     /// replayed garbage fails the comparison.
     pub(super) async fn labels_of(db: &Arc<Database>, table: &str, candidates: &[String]) -> Vec<String> {

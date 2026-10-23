@@ -151,6 +151,9 @@ impl std::fmt::Display for WireError {
 pub struct Reply {
     /// Column names of the last row description.
     pub columns: Vec<String>,
+    /// Each of those columns' type OID, from the same description: what a
+    /// client decodes the values by (one source with the payload).
+    pub types: Vec<u32>,
     pub rows: Vec<Vec<Option<String>>>,
     /// Every CommandComplete tag, in order.
     pub tags: Vec<String>,
@@ -241,11 +244,15 @@ impl Client {
             match tag {
                 b'T' => {
                     reply.columns.clear();
+                    reply.types.clear();
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     let mut at = 2;
                     for _ in 0..n {
                         let end = at + body[at..].iter().position(|b| *b == 0).unwrap();
                         reply.columns.push(String::from_utf8_lossy(&body[at..end]).into_owned());
+                        // Table OID (4), attribute number (2), then the type OID.
+                        let oid = end + 1 + 6;
+                        reply.types.push(u32::from_be_bytes(body[oid..oid + 4].try_into().unwrap()));
                         at = end + 1 + 18;
                     }
                 }
@@ -551,9 +558,8 @@ pub type StoredRow = Vec<(String, Vec<u8>)>;
 /// Every row `table` stores, read through the engine's API rather than SQL,
 /// visible to a fresh snapshot, sorted: for a partitioned table every
 /// materialized partition's, for a plain table its own. What the twin
-/// compares while the partitioned side's `SELECT` is refused (until S10),
-/// so a write that answered like the twin's but stored something else, or
-/// stored it twice, still fails.
+/// compares below SQL, so a write that answered like the twin's but stored
+/// something else, or stored it twice, fails whatever `SELECT` answers.
 pub fn stored_rows(db: &Arc<Database>, table: &str) -> Vec<StoredRow> {
     let mut rows: Vec<StoredRow> =
         stored_rows_by_partition(db, table).into_iter().flat_map(|(_, rows)| rows).collect();

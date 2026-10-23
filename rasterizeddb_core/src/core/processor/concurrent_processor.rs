@@ -1763,6 +1763,21 @@ impl ConcurrentProcessor {
         Ordering::Equal
     }
 
+    /// Orders and caps rows gathered from several scans of one schema (a
+    /// partitioned table's partitions, `docs/partitioning.md` §8) by the very
+    /// step that ends one scan: the same key resolution, comparator and cap,
+    /// so a merged answer can never order differently from a single table's.
+    /// Each input scan was given the same `order_by` and `limit`, so the rows
+    /// it returned carry every column and NULL companion the keys read.
+    pub(crate) fn sort_rows_for_merge(
+        rows: &mut Vec<Row>,
+        table_schema: &[SchemaField],
+        order_by: &Option<String>,
+        limit: Option<u64>,
+    ) {
+        Self::sort_rows_off_the_runtime(rows, &Self::schema_arc(table_schema), order_by, limit);
+    }
+
     /// [`Self::sort_rows_if_needed`], with a large sort taken off the async
     /// worker it is running on.
     ///

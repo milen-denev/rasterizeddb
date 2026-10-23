@@ -6,7 +6,7 @@
 //! is still refused writes nothing and materializes nothing.
 //!
 //! What the partitioned table stores is read through the engine's API
-//! (`stored_rows`), since its `SELECT` is refused until S10.
+//! (`stored_rows`), below SQL, so a read path cannot hide a wrong write.
 
 mod partition_wire;
 

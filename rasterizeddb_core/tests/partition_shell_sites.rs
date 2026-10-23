@@ -13,8 +13,8 @@
 //! answers exactly what it answers on `site_q`, a plain table with the same
 //! columns, constraints and rows, or fails with the same SQLSTATE. The twin
 //! is given the same rows (INSERT routes since S9), so the data-reading
-//! sites compare over rows. A site that reads rows is `Refused` today; S10
-//! and S11 move theirs to `LikeTwin`.
+//! sites compare over rows. The reading sites are `LikeTwin` since S10; the
+//! writing ones S11 moves there.
 
 mod partition_wire;
 
@@ -245,8 +245,8 @@ const SITES: &[Site] = &[
     site("COPY site_p TO STDOUT", Expect::LikeTwin, "no COPY here"),
     site("COPY site_p (tenant_id, n) TO STDOUT", Expect::LikeTwin, "no COPY here"),
     site("COPY site_p FROM STDIN", Expect::LikeTwin, "no COPY here"),
-    // Its query reads site_p, which refuses (S10) before COPY can fail.
-    site("COPY (SELECT * FROM site_p) TO STDOUT", Expect::Refused, "no COPY here; S10"),
+    // Its query reads site_p (S10); COPY then answers as on the twin.
+    site("COPY (SELECT * FROM site_p) TO STDOUT", Expect::LikeTwin, "S10"),
     // Storage.
     site("STORAGE MOVE TABLE site_p TO '/nonexistent'", Expect::Refused, "a partition moves with MOVE PARTITION"),
     site("STORAGE REBALANCE DRY RUN", Expect::Check(rebalance), "never proposes the shell"),
@@ -304,12 +304,20 @@ const SITES: &[Site] = &[
         "FKs from a partitioned table: refused in 2a",
     ),
     // The data statements, through each front door.
-    site("SELECT * FROM site_p", Expect::Refused, "S10"),
-    site("SELECT COUNT(*) FROM site_p", Expect::Refused, "S10"),
-    // Finding F3 (a refusal in a subquery reported as 42601) is fixed
-    // upstream (fec2dd9: a subquery keeps its error code).
-    site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::Refused, "S10"),
-    site("SELECT n FROM site_p UNION SELECT id FROM site_parent", Expect::Refused, "S10"),
+    site("SELECT * FROM site_p", Expect::LikeTwin, "S10: a fan-out"),
+    site("SELECT * FROM site_p WHERE tenant_id = 1 AND asset_group_id = 2", Expect::LikeTwin, "S10: routed"),
+    site("SELECT * FROM site_p WHERE tenant_id = 99 AND asset_group_id = 1", Expect::LikeTwin, "S10: an empty route"),
+    site("SELECT COUNT(*) FROM site_p", Expect::LikeTwin, "S10"),
+    site("SELECT MAX(n) FROM site_p WHERE tenant_id = 1 AND tenant_id = 2", Expect::LikeTwin, "S10: constant false"),
+    site("SELECT * FROM site_p ORDER BY n DESC, asset_id LIMIT 2 OFFSET 1", Expect::LikeTwin, "S10; S12 makes it cheap"),
+    site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::LikeTwin, "S10"),
+    site("SELECT n FROM site_p UNION SELECT id FROM site_parent", Expect::LikeTwin, "S10"),
+    site("WITH x AS (SELECT n FROM site_p) SELECT COUNT(*), SUM(n) FROM x", Expect::LikeTwin, "S10"),
+    site(
+        "SELECT p.n, s.id FROM site_p p JOIN site_parent s ON p.asset_id = s.id",
+        Expect::Refused,
+        "joins: phase 2b",
+    ),
     // A duplicate of a setup row: 23505 on both since S9.
     site("INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1)", Expect::LikeTwin, "S9"),
     in_block(
@@ -317,15 +325,19 @@ const SITES: &[Site] = &[
         Expect::LikeTwin,
         "S9: a routed multi-row insert, rolled back by the block",
     ),
-    site("INSERT INTO site_parent (id) SELECT asset_id FROM site_p", Expect::Refused, "S10"),
+    site(
+        "INSERT INTO site_parent (id) SELECT asset_id FROM site_p",
+        Expect::LikeTwin,
+        "S10: 23505 on both (site_parent holds ids 1 to 3), nothing written",
+    ),
     site("UPDATE site_p SET n = 1 WHERE tenant_id = 1", Expect::Refused, "S11"),
     site("DELETE FROM site_p WHERE tenant_id = 1", Expect::Refused, "S11"),
     site("DELETE FROM site_p", Expect::Refused, "S11 (upstream now runs a DELETE with no WHERE)"),
     site("DELETE FROM site_p WHERE n IS NULL OR n IS NOT NULL", Expect::Refused, "S11"),
-    in_block("SELECT * FROM site_p WHERE tenant_id = 1", Expect::Refused, "S10"),
+    in_block("SELECT * FROM site_p WHERE tenant_id = 1", Expect::LikeTwin, "S10"),
     Site {
         sql: "SELECT * FROM site_p WHERE tenant_id = 1",
-        expect: Expect::Refused,
+        expect: Expect::LikeTwin,
         around: Some(("BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK")),
         note: "S10",
     },
@@ -384,12 +396,34 @@ fn same_outcome(p: &Outcome, q: &Outcome) -> bool {
                 v
             };
             a.columns == b.columns
+                && a.types == b.types
                 && rows(a) == rows(b)
                 && a.tags.iter().map(|t| unname(&t.to_ascii_lowercase())).collect::<Vec<_>>()
                     == b.tags.iter().map(|t| unname(&t.to_ascii_lowercase())).collect::<Vec<_>>()
         }
         _ => false,
     }
+}
+
+/// `sql` with the partitioned table's name, as a whole word, replaced by the
+/// twin's: `site_parent` starts with `site_p` and must stay itself.
+fn to_twin(sql: &str) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(T) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + T.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        if before.is_some_and(word) || after.is_some_and(word) {
+            out.push_str(T);
+        } else {
+            out.push_str(TWIN);
+        }
+        rest = &rest[at + T.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Runs `sql` (and its `around`) on a session.
@@ -448,7 +482,7 @@ fn every_site_is_correct_or_an_error() {
                 Err(e) => Err(format!("failed: {e}")),
             },
             Expect::LikeTwin => {
-                let twin_sql = site.sql.replace(T, TWIN);
+                let twin_sql = to_twin(site.sql);
                 let q = run_site(&mut cq, site, &twin_sql);
                 if same_outcome(&p, &q) {
                     Ok(())

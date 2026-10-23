@@ -38,6 +38,15 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
     };
 
+    // A join reading a partitioned table is phase 2b (§8): refused before
+    // any relation is scanned, rather than left to its shell's refusal
+    // after the relations ahead of it were read.
+    if let Some(relation) = plan.relations.iter().find(|r| database.partitioned.contains_key(&r.table)) {
+        let e = format!("JOIN on partitioned table \"{}\" is not supported yet", relation.table);
+        error!("{}", e);
+        return error(&e);
+    }
+
     // Each relation is kept as the scan's serialized rows: a decoded `Row` is
     // ~1.5 KB whatever it holds. `RDB_JOIN_ROWS=1` scans into `Vec<Row>`
     // instead, the path this replaced, for A/B measurement.
@@ -11328,13 +11337,26 @@ async fn execute_prepared_rows(
     need: SubqueryNeed,
 ) -> Vec<u8> {
     let prepared = *prepared;
+    // A partitioned table's SELECT marks itself rewritten, so pgwire never
+    // learns a parse for it (I11) and this cannot happen. Should it, the
+    // shell under that name would answer as an empty table; the error says
+    // the cache, not the table, is wrong.
+    if database.partitioned.contains_key(&prepared.table_name) {
+        let e = format!(
+            "internal error: a stale prepared plan reached partitioned table \"{}\"; prepared statements on it \
+             run from their text",
+            prepared.table_name
+        );
+        error!("{}", e);
+        return ddl_error(&e);
+    }
     let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
     let Some(table) = table else {
         return ddl_error("Table not found");
     };
     let mut query_row = prepared.query_row;
     apply_subquery_need(&mut query_row, need);
-    execute_query_rows(query_row, table, &database, tx).await
+    execute_query_rows(query_row, crate::core::rql::row_source::RowSource::Single(table), &database, tx).await
 }
 
 /// [`execute_with_context`] for a statement whose caller needs only part of
@@ -12744,6 +12766,14 @@ pub(crate) async fn execute_with_need(
             // Handle query rows
             let table_name = &query_rows.table_name;
             debug!("Query rows from table: {}", table_name);
+
+            // A partitioned table's rows are in its partitions: read under one
+            // snapshot, routed only on proof (§4, §8). Its shell, which `tables`
+            // holds under this name, has the schema and no rows.
+            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(table_name) {
+                return Box::pin(execute_partitioned_select(&query, pt, &database, tx, need)).await;
+            }
+
             let table_ref = database.tables.get(table_name);
             let table_clone = table_ref.as_ref().clone();
             let table = if let Some(table) = table_clone {
@@ -12779,9 +12809,60 @@ pub(crate) async fn execute_with_need(
             };
 
             crate::core::rql::prepared::note_plain(table_name, &query_row);
-            Box::pin(execute_query_rows(query_row, table.value().clone(), &database, tx)).await
+            let source = crate::core::rql::row_source::RowSource::Single(table.value().clone());
+            Box::pin(execute_query_rows(query_row, source, &database, tx)).await
         }
     }
+}
+
+/// A single-table `SELECT` on a partitioned table (`docs/partitioning.md`
+/// §4, §8, S10): parsed against the shell's schema, then read through a
+/// [`RowSource`](crate::core::rql::row_source::RowSource) that routes the
+/// parse's own `WHERE` clause and reads every reached partition under one
+/// snapshot. Everything after the scan is the plain table's path.
+///
+/// A prepared statement on it never learns a parse (I11): the statement is
+/// marked rewritten, so pgwire keeps it on the text path, which routes each
+/// execution's rendered values afresh. Row locks are refused before any
+/// read, as phase 3 builds them.
+async fn execute_partitioned_select(
+    query: &QueryPurpose,
+    pt: Arc<crate::core::partition::table::PartitionedTable>,
+    database: &Arc<Database>,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> Vec<u8> {
+    crate::core::rql::prepared::note_rewritten();
+    let name = pt.name().to_string();
+    let query_row = match row_fetch_from_select_query(query, &pt.shell().schema.fields) {
+        Ok(mut q) => {
+            apply_subquery_need(&mut q, need);
+            q
+        }
+        Err(e) => {
+            error!("Cannot query rows: {}", e);
+            let mut result = vec![3u8];
+            result.extend_from_slice(e.as_bytes());
+            return result;
+        }
+    };
+    if query_row.row_lock.is_some() {
+        let e = format!("SELECT … FOR UPDATE/SHARE on partitioned table \"{name}\" is not supported yet");
+        error!("{}", e);
+        return ddl_error(&e);
+    }
+    let source = match crate::core::rql::row_source::RowSource::for_select(
+        crate::core::database::Relation::Partitioned(pt),
+        &query_row.where_clause,
+        tx,
+    ) {
+        Ok(source) => source,
+        Err(e) => {
+            error!("Cannot read partitioned table {}: {}", name, e);
+            return ddl_error(&e.to_string());
+        }
+    };
+    execute_query_rows(query_row, source, database, tx).await
 }
 
 /// A parsed single-table `SELECT`, run: the half of the `QueryRows` arm that
@@ -12789,11 +12870,11 @@ pub(crate) async fn execute_with_need(
 /// enters here with a parse it cached at its first execution.
 pub(crate) async fn execute_query_rows(
     query_row: crate::core::rql::lexer_query::QueryRows,
-    table: Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>>,
+    source: crate::core::rql::row_source::RowSource,
     database: &Arc<Database>,
     tx: TxId,
 ) -> Vec<u8> {
-    let schema = &table.schema;
+    let schema = source.schema();
     // An aggregate query folds the scanned rows into groups, so it
     // takes the row-mode path: the bytes path never materialises a
     // `Vec<Row>` for the fold to read.
@@ -12809,8 +12890,8 @@ pub(crate) async fn execute_query_rows(
         // exactly like a bare `COUNT(*)` and which would otherwise be
         // answered with the unfiltered count.
         if crate::core::rql::aggregate::is_row_count_only(&plan) {
-            match table
-                .count_rows_in_txn(
+            match source
+                .count(
                     &query_row.where_clause,
                     &schema.fields.to_vec(),
                     query_row.query_row_fetch,
@@ -12866,8 +12947,8 @@ pub(crate) async fn execute_query_rows(
         // that path, because its documents are hydrated (async, per
         // row) before grouping. `RDB_FOLD_ROWS=1` forces it, for A/B.
         if schema.json_columns.is_empty() && !legacy_row_fold() {
-            let folded = match table
-                .query_row_bytes_in_txn(
+            let folded = match source
+                .query_bytes(
                     &query_row.where_clause,
                     &schema.fields,
                     query_row.query_row_fetch.clone(),
@@ -12895,8 +12976,8 @@ pub(crate) async fn execute_query_rows(
                 }
             };
         }
-        match table
-            .query_row_in_txn(
+        match source
+            .query_rows(
                 &query_row.where_clause,
                 &schema.fields.to_vec(),
                 query_row.query_row_fetch,
@@ -12966,7 +13047,7 @@ pub(crate) async fn execute_query_rows(
     let order_exprs = query_row.order_expressions.clone();
     let has_order_exprs = !order_exprs.is_empty();
     let row_lock = query_row.row_lock;
-    let lock_table_name = table.schema.name.clone();
+    let lock_table_name = schema.name.clone();
     let skip_locked = matches!(
         row_lock,
         Some(crate::core::rql::row_lock::RowLock {
@@ -13063,8 +13144,8 @@ pub(crate) async fn execute_query_rows(
         .collect();
 
     {
-        match table
-            .query_row_bytes_reporting_in_txn(
+        match source
+            .query_bytes_reporting(
                 &query_row.where_clause,
                 slot_schema,
                 query_row.query_row_fetch,
