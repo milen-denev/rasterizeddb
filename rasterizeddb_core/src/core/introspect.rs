@@ -5,6 +5,7 @@
 //! SHOW DATABASE STATS          -- one metric per row, for the whole database
 //! SHOW TABLES                  -- a row per table, with its sizes
 //! SHOW TABLE STATS <table>     -- one metric per row, for one table
+//! SHOW PARTITIONS <table>      -- a row per partition of a partitioned table
 //! SHOW COLUMNS FROM <table>    -- a row per column  (also: DESCRIBE <table>)
 //! SHOW QUERIES [n]             -- the last n statements, newest first
 //! SHOW QUERY STATS             -- one row per statement shape, with its totals
@@ -45,6 +46,7 @@ use rclite::Arc;
 use smallvec::SmallVec;
 
 use crate::core::database::Database;
+use crate::core::database::relation::Relation;
 use crate::core::db_type::DbType;
 use crate::core::row::row::{Column, Row};
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
@@ -57,6 +59,8 @@ pub enum Introspect {
     DatabaseStats,
     Tables,
     TableStats(String),
+    /// One row per partition of a partitioned table.
+    Partitions(String),
     Columns(String),
     SchemaMap,
     BackupStatus,
@@ -174,6 +178,13 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             }
             Some(_) => Some(Err("SHOW TABLE STATS takes one table name".to_string())),
             None => Some(Err("SHOW TABLE STATS names no table".to_string())),
+        },
+        Some("PARTITIONS") => match original.get(2) {
+            Some(name) if original.len() == 3 => {
+                Some(Ok(Introspect::Partitions(normalize_name(name))))
+            }
+            Some(_) => Some(Err("SHOW PARTITIONS takes one table name".to_string())),
+            None => Some(Err("SHOW PARTITIONS names no table".to_string())),
         },
         Some("COLUMNS") => {
             // `SHOW COLUMNS FROM t`, and the bare `SHOW COLUMNS t`.
@@ -303,6 +314,18 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
             flag("immutable"),
             text("primary_key"),
         ],
+        // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
+        // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
+        // read as negative. Hex, as the map log and the design write them.
+        Introspect::Partitions(_) => vec![
+            number("pid"),
+            text("lo"),
+            text("hi"),
+            text("location"),
+            text("state"),
+            number("row_slots"),
+            number("total_bytes"),
+        ],
         Introspect::Columns(_) => vec![
             number("position"),
             text("column_name"),
@@ -397,11 +420,18 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Ok(r) => rows(r),
             Err(e) => failure(&e),
         },
+        Introspect::Partitions(name) => match partitions(database, name).await {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::Columns(name) => match columns(database, name) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
         },
-        Introspect::SchemaMap => rows(schema_map(database)),
+        Introspect::SchemaMap => match schema_map(database) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::RecentQueries(limit) => match recent_queries(*limit) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -425,17 +455,20 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
 }
 
 /// Every file a table owns, and how large each is.
+#[derive(Default)]
 struct TableSizes {
     data: u64,
     pointers: u64,
     schema: u64,
     filters: u64,
     sequence: u64,
+    /// A partitioned table's map log; 0 for a plain table.
+    map: u64,
 }
 
 impl TableSizes {
     fn total(&self) -> u64 {
-        self.data + self.pointers + self.schema + self.filters + self.sequence
+        self.data + self.pointers + self.schema + self.filters + self.sequence + self.map
     }
 
     /// Pointer records written, which bounds the live rows from above. See the
@@ -446,7 +479,6 @@ impl TableSizes {
 }
 
 /// Errs on a partition shell, whose files are its partitions'.
-/// PARTITION-TODO(S8): sum the partitions instead.
 async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Result<TableSizes, String> {
     let data = table.data().map_err(|e| e.to_string())?;
     Ok(TableSizes {
@@ -455,7 +487,181 @@ async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Re
         schema: table.io_schema.get_len().await,
         filters: data.io_filters.get_len().await,
         sequence: data.ids.io.get_len().await,
+        map: 0,
     })
+}
+
+/// Every table's name: those in `tables`, and any partitioned table whose
+/// schema could not be read, which has no shell there. Leaving it out would
+/// list a subset; listed, its figures refuse with the reason.
+fn table_names(database: &Database) -> Vec<String> {
+    let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
+    for entry in database.partitioned.iter() {
+        if !database.tables.contains_key(entry.key()) {
+            names.push(entry.key().clone());
+        }
+    }
+    names
+}
+
+type DbTable = crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>;
+
+/// What the reclamation service has done, summed over a partitioned table's
+/// partitions. Each `last_*` is then the sum of every partition's own most
+/// recent run.
+#[derive(Default)]
+struct VacuumFigures {
+    runs: u64,
+    compactions: u64,
+    deferrals: u64,
+    full_untruncated: u64,
+    last_live_bytes: u64,
+    last_dead_bytes: u64,
+    last_reclaimed_bytes: u64,
+    total_reclaimed_bytes: u64,
+    panics: u64,
+}
+
+impl VacuumFigures {
+    fn add(&mut self, stats: &crate::core::vacuum::VacuumStats) {
+        self.runs += stats.runs.load(Ordering::Relaxed);
+        self.compactions += stats.compactions.load(Ordering::Relaxed);
+        self.deferrals += stats.deferrals.load(Ordering::Relaxed);
+        self.full_untruncated += stats.full_untruncated.load(Ordering::Relaxed);
+        self.last_live_bytes += stats.last_live_bytes.load(Ordering::Relaxed);
+        self.last_dead_bytes += stats.last_dead_bytes.load(Ordering::Relaxed);
+        self.last_reclaimed_bytes += stats.last_reclaimed_bytes.load(Ordering::Relaxed);
+        self.total_reclaimed_bytes += stats.total_reclaimed_bytes.load(Ordering::Relaxed);
+        self.panics += stats.panics.load(Ordering::Relaxed);
+    }
+}
+
+/// A partitioned table's own figures, for `SHOW TABLE STATS`.
+struct PartitionFigures {
+    key: Vec<String>,
+    declared: u32,
+    materialized: u32,
+    epoch: u64,
+    route_v: u16,
+}
+
+/// Where a table's rows are and what they cost: a plain table's own files
+/// and counters, or a partitioned table's summed over its materialized
+/// partitions, with its parent files counted once. These are phase 2a's
+/// running totals: one atomic load per file per partition, never a scan.
+struct RowFigures {
+    sizes: TableSizes,
+    kind: String,
+    location: String,
+    last_row_id: u64,
+    reclaimable: u64,
+    filters_ready: bool,
+    vacuum_enabled: bool,
+    vacuum: VacuumFigures,
+    in_place_updates: u64,
+    /// A compaction holds the table, or for a partitioned table any partition.
+    hard_locked: bool,
+    /// A plain table's rows provider, for what only a provider can say (its
+    /// key/value family, its mirrors). `None` for a partitioned table.
+    plain_rows: Option<Arc<crate::core::storage_providers::backend::DbStorageProvider>>,
+    partitioned: Option<PartitionFigures>,
+}
+
+/// The figures of `relation`. Errs when it cannot serve data (a broken
+/// partitioned table, or a shell with no partitioned entry) rather than
+/// reporting it empty.
+async fn figures(relation: &Relation) -> Result<RowFigures, String> {
+    let e = |e: std::io::Error| e.to_string();
+    match relation {
+        Relation::Plain(table) => {
+            let sizes = sizes_of(table).await?;
+            let data = table.data().map_err(e)?;
+            let mut vacuum = VacuumFigures::default();
+            vacuum.add(&data.vacuum_stats);
+            Ok(RowFigures {
+                sizes,
+                kind: data.io_rows.kind().to_string(),
+                location: data.io_rows.location(),
+                last_row_id: data.ids.last_row_id.load(Ordering::Relaxed),
+                reclaimable: data.free_space.free_bytes(),
+                filters_ready: table.filters_ready().map_err(e)?,
+                vacuum_enabled: data.free_space.is_enabled(),
+                vacuum,
+                in_place_updates: table.in_place_column_updates(),
+                hard_locked: table.hard_locked.load(Ordering::Relaxed),
+                plain_rows: Some(data.io_rows.clone()),
+                partitioned: None,
+            })
+        }
+        Relation::Partitioned(table) => {
+            let totals = table.totals().await.map_err(e)?;
+            let epoch = table.epoch().map_err(e)?;
+            let parts = table
+                .materialized(&epoch, &crate::core::partition::Route::All)
+                .map_err(e)?;
+            let mut reclaimable = 0;
+            let mut filters_ready = true;
+            let mut vacuum_enabled = true;
+            let mut vacuum = VacuumFigures::default();
+            let mut in_place_updates = 0;
+            let mut hard_locked = false;
+            for (_, part) in &parts {
+                in_place_updates += part.in_place_column_updates();
+                hard_locked |= part.hard_locked.load(Ordering::Relaxed);
+                reclaimable += part.reclaimable_bytes().map_err(e)?;
+                filters_ready &= part.filters_ready().map_err(e)?;
+                vacuum_enabled &= part.vacuum_enabled().map_err(e)?;
+                vacuum.add(part.vacuum_stats().map_err(e)?);
+            }
+            if parts.is_empty() {
+                // What a partition materialized now would get.
+                vacuum_enabled = crate::vacuum_enabled();
+            }
+            let schema = &table.shell().schema;
+            let key = table
+                .spec()
+                .map_err(e)?
+                .levels()
+                .iter()
+                .map(|level| {
+                    schema
+                        .fields
+                        .iter()
+                        .find(|f| !f.is_deleted && f.write_order as u32 == level.write_order)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_else(|| format!("#{}", level.write_order))
+                })
+                .collect();
+            let io_schema = &table.shell().io_schema;
+            Ok(RowFigures {
+                sizes: TableSizes {
+                    data: totals.data,
+                    pointers: totals.pointers,
+                    schema: totals.schema,
+                    filters: totals.filters,
+                    sequence: totals.ids,
+                    map: totals.map,
+                },
+                kind: io_schema.kind().to_string(),
+                location: io_schema.location(),
+                last_row_id: totals.ids_handed_out,
+                reclaimable,
+                filters_ready,
+                vacuum_enabled,
+                vacuum,
+                in_place_updates,
+                hard_locked,
+                plain_rows: None,
+                partitioned: Some(PartitionFigures {
+                    key,
+                    declared: totals.declared,
+                    materialized: totals.materialized,
+                    epoch: epoch.epoch,
+                    route_v: table.route_v().await.map_err(e)?,
+                }),
+            })
+        }
+    }
 }
 
 async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
@@ -468,22 +674,21 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     // anybody wrote or can use. Listed, they appeared and vanished between
     // refreshes of a client's table list, and a client that clicked one
     // queried a table that was already gone.
-    let mut names: Vec<String> = database
-        .tables
-        .iter()
-        .map(|e| e.key().clone())
+    let mut names: Vec<String> = table_names(database)
+        .into_iter()
         .filter(|name| !name.starts_with("__"))
         .collect();
     names.sort();
 
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        let Some(table) = database.tables.get(&name).map(|t| t.value().clone()) else {
+        let Some(relation) = database.relation(&name) else {
             continue;
         };
-        let sizes = sizes_of(&table).await?;
-        let visible = table
-            .schema
+        let figures = figures(&relation).await?;
+        let sizes = &figures.sizes;
+        let schema = relation.schema();
+        let visible = schema
             .fields
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -494,17 +699,17 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             // The backend holding the row data. Every file of a table is opened
             // from one seed, so this is the table's answer and not just this
             // file's — `SHOW TABLE STATS` reports where it is.
-            Cell::Text(table.io_rows().map_err(|e| e.to_string())?.kind().to_string()),
+            Cell::Text(figures.kind.clone()),
             Cell::Number(sizes.row_slots()),
             Cell::Number(visible as u64),
             Cell::Number(sizes.data),
             Cell::Number(sizes.pointers),
             Cell::Number(sizes.filters),
             Cell::Number(sizes.total()),
-            Cell::Number(table.reclaimable_bytes().map_err(|e| e.to_string())?),
-            Cell::Flag(table.filters_ready().map_err(|e| e.to_string())?),
-            Cell::Flag(table.schema.is_immutable),
-            Cell::Text(table.schema.primary_key.clone().unwrap_or_default()),
+            Cell::Number(figures.reclaimable),
+            Cell::Flag(figures.filters_ready),
+            Cell::Flag(schema.is_immutable),
+            Cell::Text(schema.primary_key.clone().unwrap_or_default()),
         ]));
     }
     Ok(out)
@@ -534,16 +739,10 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
 /// included. That is what the disk actually holds, and a size that left them
 /// out would be wrong in the direction that matters.
 async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
-    let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
+    let mut names: Vec<String> = table_names(database);
     names.sort();
 
-    let mut total = TableSizes {
-        data: 0,
-        pointers: 0,
-        schema: 0,
-        filters: 0,
-        sequence: 0,
-    };
+    let mut total = TableSizes::default();
     let mut reclaimable = 0u64;
     let mut vacuum_panics = 0u64;
     let mut foreign_keys = 0usize;
@@ -553,10 +752,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut table_count = 0usize;
 
     for name in &names {
-        let Some(table) = database.tables.get(name).map(|t| t.value().clone()) else {
+        let Some(relation) = database.relation(name) else {
             continue;
         };
-        let sizes = sizes_of(&table).await?;
+        let figures = figures(&relation).await?;
+        let sizes = &figures.sizes;
         // Bytes are counted for every table; the countable *things* are counted
         // only for the ones a client can name. See the note above the function.
         total.data += sizes.data;
@@ -564,37 +764,31 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         total.schema += sizes.schema;
         total.filters += sizes.filters;
         total.sequence += sizes.sequence;
-        reclaimable += table.reclaimable_bytes().map_err(|e| e.to_string())?;
-        vacuum_panics += table
-            .vacuum_stats()
-            .map_err(|e| e.to_string())?
-            .panics
-            .load(Ordering::Relaxed);
+        total.map += sizes.map;
+        reclaimable += figures.reclaimable;
+        vacuum_panics += figures.vacuum.panics;
 
         if name.starts_with("__") {
             continue;
         }
+        let schema = relation.schema();
         table_count += 1;
-        foreign_keys += table
-            .schema
+        foreign_keys += schema
             .foreign_keys
             .iter()
             .filter(|f| !f.is_deleted)
             .count();
-        unique_keys += table
-            .schema
+        unique_keys += schema
             .unique_keys
             .iter()
             .filter(|k| !k.is_deleted)
             .count();
-        json_columns += table
-            .schema
+        json_columns += schema
             .json_columns
             .iter()
             .filter(|c| !c.is_deleted)
             .count();
-        column_count += table
-            .schema
+        column_count += schema
             .fields
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -677,6 +871,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "sequence_bytes",
         total.sequence.to_string(),
         "row-id sequences",
+    );
+    push(
+        "partition_map_bytes",
+        total.map.to_string(),
+        "partitioned tables' map logs",
     );
     push(
         "total_bytes",
@@ -947,17 +1146,19 @@ fn durability_metrics(locations: &[String]) -> Vec<(String, String, String)> {
 }
 
 async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
-    let table = database
-        .tables
-        .get(name)
-        .map(|t| t.value().clone())
+    let relation = database
+        .relation(name)
         .ok_or_else(|| format!("relation `{}` does not exist", name))?;
-
-    let sizes = sizes_of(&table).await?;
+    // A partitioned table's shell carries the schema and the per-table
+    // counters below that are not about rows.
+    let table = match &relation {
+        Relation::Plain(table) => table.clone(),
+        Relation::Partitioned(table) => table.shell().clone(),
+    };
+    let figures = figures(&relation).await?;
+    let sizes = &figures.sizes;
     let schema = &table.schema;
-    // PARTITION-TODO(S8): a shell errs here rather than reporting zeroes.
-    let data = table.data().map_err(|e| e.to_string())?;
-    let vacuum = &data.vacuum_stats;
+    let vacuum = &figures.vacuum;
 
     let mut out = Vec::new();
     let mut push = |metric: &str, value: String, detail: &str| {
@@ -985,14 +1186,29 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // bill, and a memory-backed one does not survive a restart at all.
     push(
         "storage",
-        data.io_rows.kind().to_string(),
+        figures.kind.clone(),
         "memory | file | mirrored | s3 | kv-directory | kv-memory",
     );
     push(
         "storage_location",
-        data.io_rows.location(),
+        figures.location.clone(),
         "where those bytes actually are",
     );
+    if let Some(p) = &figures.partitioned {
+        push("partition_key", p.key.join(", "), "PARTITION BY HASH columns");
+        push(
+            "partitions_declared",
+            p.declared.to_string(),
+            "partitions the map declares",
+        );
+        push(
+            "partitions_materialized",
+            p.materialized.to_string(),
+            "partitions with files; the figures below sum these",
+        );
+        push("map_epoch", p.epoch.to_string(), "the partition map's current epoch");
+        push("route_v", p.route_v.to_string(), "the routing hash's version");
+    }
     // The page cache in front of the store, reported here as well as on the
     // database because a table can be placed on a key/value store while the
     // database it belongs to is on files — `STORAGE PLACE TABLE t AT
@@ -1000,7 +1216,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // counters are the store's, shared by every table placed on it, and the
     // detail says so rather than letting them read as this table's own.
     #[cfg(feature = "kv_storage")]
-    if let Some(family) = data.io_rows.kv_family() {
+    if let Some(family) = figures.plain_rows.as_ref().and_then(|rows| rows.kv_family()) {
         let (hits, misses, resident) = family.cache_stats();
         push(
             "kv_store",
@@ -1024,8 +1240,8 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         );
     }
     #[cfg(feature = "storage_pools")]
-    {
-        let copies = data.io_rows.backup_count();
+    if let Some(rows) = &figures.plain_rows {
+        let copies = rows.backup_count();
         if copies > 0 {
             push(
                 "backup_copies",
@@ -1071,7 +1287,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "last_row_id",
-        data.ids.last_row_id.load(Ordering::Relaxed).to_string(),
+        figures.last_row_id.to_string(),
         "highest id handed out",
     );
 
@@ -1105,6 +1321,9 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         sizes.sequence.to_string(),
         "row-id sequence",
     );
+    if figures.partitioned.is_some() {
+        push("partition_map_bytes", sizes.map.to_string(), "the partition map log");
+    }
     push(
         "total_bytes",
         sizes.total().to_string(),
@@ -1112,7 +1331,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "reclaimable_bytes",
-        data.free_space.free_bytes().to_string(),
+        figures.reclaimable.to_string(),
         "dead space a VACUUM would return",
     );
     // The ratio rather than the two figures, because the decision it informs —
@@ -1121,70 +1340,64 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // a two-gigabyte table is half the disk.
     push(
         "dead_ratio",
-        format!("{:.1}%", percent(data.free_space.free_bytes(), sizes.data)),
+        format!("{:.1}%", percent(figures.reclaimable, sizes.data)),
         "reclaimable against row data",
     );
 
     push(
         "vacuum_enabled",
-        data.free_space.is_enabled().to_string(),
+        figures.vacuum_enabled.to_string(),
         "reclamation runs for this table; SHOW CONFIG can only say `per table`",
     );
     push(
         "vacuum_runs",
-        vacuum.runs.load(Ordering::Relaxed).to_string(),
+        vacuum.runs.to_string(),
         "",
     );
     push(
         "vacuum_compactions",
-        vacuum.compactions.load(Ordering::Relaxed).to_string(),
+        vacuum.compactions.to_string(),
         "runs that actually reclaimed something",
     );
     push(
         "vacuum_deferrals",
-        vacuum.deferrals.load(Ordering::Relaxed).to_string(),
+        vacuum.deferrals.to_string(),
         "runs held off by an open snapshot",
     );
     push(
         "vacuum_full_untruncated",
-        vacuum.full_untruncated.load(Ordering::Relaxed).to_string(),
+        vacuum.full_untruncated.to_string(),
         "VACUUM FULL runs that compacted but could not return space (log busy)",
     );
     push(
         "vacuum_last_live_bytes",
-        vacuum.last_live_bytes.load(Ordering::Relaxed).to_string(),
+        vacuum.last_live_bytes.to_string(),
         "",
     );
     push(
         "vacuum_last_dead_bytes",
-        vacuum.last_dead_bytes.load(Ordering::Relaxed).to_string(),
+        vacuum.last_dead_bytes.to_string(),
         "",
     );
     push(
         "vacuum_last_reclaimed_bytes",
-        vacuum
-            .last_reclaimed_bytes
-            .load(Ordering::Relaxed)
-            .to_string(),
+        vacuum.last_reclaimed_bytes.to_string(),
         "what the most recent run actually returned",
     );
     push(
         "vacuum_total_reclaimed_bytes",
-        vacuum
-            .total_reclaimed_bytes
-            .load(Ordering::Relaxed)
-            .to_string(),
+        vacuum.total_reclaimed_bytes.to_string(),
         "",
     );
     push(
         "vacuum_panics",
-        vacuum.panics.load(Ordering::Relaxed).to_string(),
+        vacuum.panics.to_string(),
         "background ticks that panicked and were caught",
     );
 
     push(
         "filters_ready",
-        table.filters_ready().map_err(|e| e.to_string())?.to_string(),
+        figures.filters_ready.to_string(),
         "the index has caught up with the rows",
     );
     push(
@@ -1196,12 +1409,12 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "in_place_column_updates",
-        table.in_place_column_updates().to_string(),
+        figures.in_place_updates.to_string(),
         "updates that rewrote only the assigned columns",
     );
     push(
         "hard_locked",
-        table.hard_locked.load(Ordering::Relaxed).to_string(),
+        figures.hard_locked.to_string(),
         "a compaction holds the table",
     );
     push("immutable", schema.is_immutable.to_string(), "");
@@ -1300,12 +1513,44 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     Ok(out)
 }
 
+/// `SHOW PARTITIONS t`: one row per declared partition, by pid, with its
+/// `[lo, hi)` range of the hash space, where its files are, whether it has
+/// any, and its sizes (zero until it is materialized). Refused for a plain
+/// table, and for a partitioned table that cannot be opened.
+async fn partitions(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
+    let table = match database.relation(name) {
+        None => return Err(format!("relation `{}` does not exist", name)),
+        Some(Relation::Plain(_)) => return Err(format!("table `{}` is not partitioned", name)),
+        Some(Relation::Partitioned(table)) => table,
+    };
+    let infos = table.partitions().await.map_err(|e| e.to_string())?;
+    Ok(infos
+        .into_iter()
+        .map(|p| {
+            row(&[
+                Cell::Number(p.pid as u64),
+                Cell::Text(format!("{:#018x}", p.lo)),
+                Cell::Text(format!("{:#018x}", p.hi)),
+                Cell::Text(p.location.unwrap_or_default()),
+                Cell::Text(p.state.to_string()),
+                Cell::Number(p.slots),
+                Cell::Number(p.bytes),
+            ])
+        })
+        .collect())
+}
+
 fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let table = database
         .tables
         .get(name)
         .map(|t| t.value().clone())
-        .ok_or_else(|| format!("relation `{}` does not exist", name))?;
+        .ok_or_else(|| match database.relation(name) {
+            // Its schema could not be read; an empty column list would be a
+            // wrong answer.
+            Some(Relation::Partitioned(t)) => t.broken().unwrap_or("its schema is unavailable").to_string(),
+            _ => format!("relation `{}` does not exist", name),
+        })?;
     let schema = &table.schema;
     let settings = crate::filter_settings();
 
@@ -1380,13 +1625,19 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
 /// edge points a column at the shadow table its documents are mapped onto —
 /// which is a real relationship here, not an implementation detail, because
 /// that table is where a document's fields are queried from.
-fn schema_map(database: &Arc<Database>) -> Vec<Row> {
-    let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
+///
+/// Errs on a partitioned table whose schema could not be read: its edges are
+/// unknown, and leaving them out would draw a map with them missing.
+fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    let mut names: Vec<String> = table_names(database);
     names.sort();
 
     let mut out = Vec::new();
     for name in names {
         let Some(table) = database.tables.get(&name).map(|t| t.value().clone()) else {
+            if let Some(Relation::Partitioned(t)) = database.relation(&name) {
+                return Err(t.broken().unwrap_or("its schema is unavailable").to_string());
+            }
             continue;
         };
         let schema = &table.schema;
@@ -1417,7 +1668,7 @@ fn schema_map(database: &Arc<Database>) -> Vec<Row> {
             ]));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Whether this server can back up at all, where it backs up to, and whether
@@ -2050,22 +2301,48 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         }
         "vacuum" => {
             let enabled = parse_bool(value)?;
+            // Every target is found before any is changed: a table that cannot
+            // serve data refuses the whole statement rather than leave it
+            // reported applied to rows it never reached. A partitioned table's
+            // targets are its materialized partitions; one materialized later
+            // takes the server default, as a table created later does.
+            let names = table_names(database);
+            let mut targets: Vec<Arc<DbTable>> = Vec::new();
             let mut touched = 0usize;
-            // PARTITION-TODO(S8): a shell's partitions are not in `tables`, so
-            // refuse before touching any table rather than report the setting
-            // applied to rows it never reached.
-            for entry in database.tables.iter() {
-                entry.value().data().map_err(|e| e.to_string())?;
-            }
-            for entry in database.tables.iter() {
-                entry.value().set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            let mut partitions = 0usize;
+            for name in names {
+                match database.relation(&name) {
+                    None => continue,
+                    Some(Relation::Plain(table)) => {
+                        table.data().map_err(|e| e.to_string())?;
+                        targets.push(table);
+                    }
+                    Some(Relation::Partitioned(table)) => {
+                        let epoch = table.epoch().map_err(|e| e.to_string())?;
+                        for (_, part) in table
+                            .materialized(&epoch, &crate::core::partition::Route::All)
+                            .map_err(|e| e.to_string())?
+                        {
+                            targets.push(part);
+                            partitions += 1;
+                        }
+                    }
+                }
                 touched += 1;
             }
+            for table in &targets {
+                table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
             Ok(format!(
-                "background reclamation {} for {} table{}",
+                "background reclamation {} for {} table{}{}",
                 if enabled { "enabled" } else { "disabled" },
                 touched,
-                if touched == 1 { "" } else { "s" }
+                if touched == 1 { "" } else { "s" },
+                if partitions > 0 {
+                    format!(" ({} partition{})", partitions, if partitions == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                }
             ))
         }
         _ => Err(format!("`{}` has no live setter", key)),

@@ -18,6 +18,7 @@
 use rclite::Arc;
 
 use crate::core::database::Database;
+use crate::core::database::relation::Relation;
 use crate::core::db_type::DbType;
 use crate::core::row::schema::SchemaField;
 use crate::core::rql::cte::Materialized;
@@ -729,13 +730,21 @@ async fn build(
 ) -> Result<String, String> {
     let temp = temp_name(view, database);
 
-    // Names are collected first so no map guard is held across an await.
-    let tables: Vec<String> = database
+    // Names are collected first so no map guard is held across an await. A
+    // partitioned table whose schema could not be read has no shell in
+    // `tables`; it is listed too, so a view that needs its data or schema
+    // refuses rather than answering without it.
+    let mut tables: Vec<String> = database
         .tables
         .iter()
         .map(|entry| entry.key().clone())
         .filter(|name| !is_internal(name))
         .collect();
+    for entry in database.partitioned.iter() {
+        if !database.tables.contains_key(entry.key()) && !is_internal(entry.key()) {
+            tables.push(entry.key().clone());
+        }
+    }
 
     let (create, inserts) = match view {
         "pg_namespace" => (
@@ -782,6 +791,9 @@ async fn build(
             let mut rows = Vec::new();
             for name in &tables {
                 let Some(table) = database.tables.get(name) else {
+                    if let Some(Relation::Partitioned(t)) = database.relation(name) {
+                        return Err(t.broken().unwrap_or("its schema is unavailable").to_string());
+                    }
                     continue;
                 };
                 let mut fields: Vec<_> = table
@@ -926,11 +938,6 @@ async fn build(
                 rows,
             )
         }
-        // Table inheritance and declarative partitioning do not exist here, so
-        // nothing inherits from anything. The relation is produced empty rather
-        // than refused: a query that joins or anti-joins against it — which is
-        // how a caller excludes partitions — then gets the right answer instead
-        // of an error about a relation it only mentions in passing.
         // Empty, and honestly so: this engine replicates statements between
         // its own nodes and has no PostgreSQL replication slots to report.
         // A monitor asking after one gets "there is no such slot" instead of
@@ -954,16 +961,17 @@ async fn build(
         "pg_index" => {
             let mut rows = Vec::new();
             for name in &tables {
-                let Some(table) = database.tables.get(name) else {
+                let Some(relation) = database.relation(name) else {
                     continue;
                 };
+                let schema = relation.schema();
                 let relid = oid_of(name);
 
                 let mut keys: Vec<(String, bool, bool)> = Vec::new();
-                if let Some(primary) = table.schema.primary_key.as_deref() {
+                if let Some(primary) = schema.primary_key.as_deref() {
                     keys.push((primary.to_string(), true, true));
                 }
-                for field in table.schema.fields.iter() {
+                for field in schema.fields.iter() {
                     if field.is_unique
                         && !field.is_deleted
                         && !keys
@@ -976,7 +984,7 @@ async fn build(
                 // A partial key is unique only under its predicate, and this
                 // view lists each column as unique outright, so it is left out
                 // rather than reported as a guarantee it does not give.
-                for key in table.schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
+                for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
                     if key.columns.len() == 1
                         && !keys
                             .iter()
@@ -987,10 +995,11 @@ async fn build(
                 }
 
                 // Indexes `CREATE INDEX` declared, each with its own
-                // identity and its column count. A shell errs rather than
-                // reading as "no indexes" (PARTITION-TODO(S8)): a migration
-                // tool would re-issue every CREATE INDEX.
-                if let Some(indexes) = table.indexes().map_err(|e| e.to_string())? {
+                // identity and its column count. Never "no indexes" for a
+                // table whose indexes cannot be read: a migration tool would
+                // re-issue every CREATE INDEX.
+                if let Some((owned, ready)) = index_set(&relation)? {
+                    let indexes = owned.view();
                     let declared = indexes
                         .list()
                         .iter()
@@ -1007,7 +1016,7 @@ async fn build(
                             oid_of(&format!("{}.{}", name, index_name)),
                             relid,
                             columns,
-                            if indexes.is_ready() { "t" } else { "f" },
+                            if ready { "t" } else { "f" },
                         ));
                     }
                 }
@@ -1052,16 +1061,16 @@ async fn build(
         "pg_indexes" => {
             let mut rows = Vec::new();
             for name in &tables {
-                let Some(table) = database.tables.get(name) else {
+                let Some(relation) = database.relation(name) else {
                     continue;
                 };
-                // PARTITION-TODO(S8): a shell errs, never "no indexes".
-                let Some(indexes) = table.indexes().map_err(|e| e.to_string())? else {
+                let Some((owned, _)) = index_set(&relation)? else {
                     continue;
                 };
+                let indexes = owned.view();
+                let schema = relation.schema();
                 let column_name = |wo: u32| {
-                    table
-                        .schema
+                    schema
                         .fields
                         .iter()
                         .find(|f| f.write_order as u32 == wo && !f.is_deleted)
@@ -1082,8 +1091,7 @@ async fn build(
                     // A partial unique index is listed with its predicate, as
                     // PostgreSQL lists it. The index underneath holds every
                     // row; only the uniqueness is partial.
-                    let predicate = table
-                        .schema
+                    let predicate = schema
                         .unique_keys
                         .iter()
                         .find(|k| index.decl.unique && !k.is_deleted && k.name.eq_ignore_ascii_case(&index.decl.name))
@@ -1170,6 +1178,11 @@ async fn build(
                 rows,
             )
         }
+        // Nothing inherits from anything here. A partitioned table is one
+        // relation (relkind 'r' above) whose partitions no client can name, so
+        // they are not children either. Produced empty rather than refused: a
+        // query that anti-joins against it, which is how a caller excludes
+        // partitions, then gets the right answer.
         "pg_inherits" => (
             format!(
                 "CREATE TABLE {} (inhrelid BIGINT, inhparent BIGINT, inhseqno BIGINT)",
@@ -1203,12 +1216,20 @@ async fn build(
 /// filter checkpoint and sequence — which is what `pg_total_relation_size`
 /// means: the relation and everything stored with it.
 ///
-/// Errs on a partition shell rather than reporting it empty.
-/// PARTITION-TODO(S8): sum its partitions.
+/// A partitioned table's figure is the running total over its materialized
+/// partitions plus its parent files (schema, map log, ids): one length load
+/// per file, never a scan. A table that cannot serve data (a broken
+/// partitioned table, or a shell with no partitioned entry) errs rather than
+/// reporting itself empty.
 async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64), String> {
     let ios = {
-        let Some(table) = database.tables.get(name) else {
-            return Ok((0, 0));
+        let table = match database.relation(name) {
+            None => return Ok((0, 0)),
+            Some(Relation::Partitioned(t)) => {
+                let totals = t.totals().await.map_err(|e| e.to_string())?;
+                return Ok((totals.bytes, live_and_dead(totals.ids_handed_out, totals.slots).0));
+            }
+            Some(Relation::Plain(t)) => t,
         };
         let data = table.data().map_err(|e| e.to_string())?;
         [
@@ -1283,11 +1304,19 @@ async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64
 /// Without it, `live` exceeds `slots` and `dead` goes negative, which the
 /// consumers of these two columns render as a negative dead-tuple count.
 ///
-/// Errs on a partition shell. PARTITION-TODO(S8): sum its partitions.
+/// A partitioned table applies the same formula to its totals: slots summed
+/// over the materialized partitions, and the ids its one shared sequence has
+/// handed out, so it reports what a plain table with the same writes would.
+/// Errs on a table that cannot serve data, never `(0, 0)`.
 async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64), String> {
     let (pointers_io, ids_handed_out) = {
-        let Some(table) = database.tables.get(name) else {
-            return Ok((0, 0));
+        let table = match database.relation(name) {
+            None => return Ok((0, 0)),
+            Some(Relation::Partitioned(t)) => {
+                let totals = t.totals().await.map_err(|e| e.to_string())?;
+                return Ok(live_and_dead(totals.ids_handed_out, totals.slots));
+            }
+            Some(Relation::Plain(t)) => t,
         };
         let data = table.data().map_err(|e| e.to_string())?;
         (
@@ -1296,10 +1325,56 @@ async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64)
         )
     };
 
-    let slots = (pointers_io.get_len().await
-        / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64) as i64;
+    let slots = pointers_io.get_len().await / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+    Ok(live_and_dead(ids_handed_out, slots))
+}
+
+/// `live = min(ids handed out, slots)` and `dead = slots - live`; see
+/// [`tuple_counts`] for why, and why the clamp is load-bearing.
+fn live_and_dead(ids_handed_out: u64, slots: u64) -> (i64, i64) {
+    let slots = slots as i64;
     let live = (ids_handed_out as i64).clamp(0, slots);
-    Ok((live, slots - live))
+    (live, slots - live)
+}
+
+/// The indexes a table has and whether they are ready, or `None` when it has
+/// none. A plain table's are its live ones. A partitioned table's are built
+/// from its shell's schema (its declarations, and the implicit ones of its
+/// `PRIMARY KEY` and `UNIQUE` constraints), since every partition builds its
+/// own from the same schema and the shell builds none; they are ready once
+/// every materialized partition's are. Errs on a table that cannot serve
+/// data: "no indexes" would make a migration tool re-issue every one.
+fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::index::TableIndexes>, bool)>, String> {
+    match relation {
+        Relation::Plain(table) => Ok(table
+            .data()
+            .map_err(|e| e.to_string())?
+            .indexes
+            .clone()
+            .map(|indexes| {
+                let ready = indexes.is_ready();
+                (indexes, ready)
+            })),
+        Relation::Partitioned(table) => {
+            table.check().map_err(|e| e.to_string())?;
+            let indexes = crate::core::index::for_schema(&table.shell().schema);
+            if indexes.is_empty() {
+                return Ok(None);
+            }
+            let epoch = table.epoch().map_err(|e| e.to_string())?;
+            let mut ready = true;
+            for (_, partition) in table
+                .materialized(&epoch, &crate::core::partition::Route::All)
+                .map_err(|e| e.to_string())?
+            {
+                ready &= partition
+                    .indexes()
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|i| i.is_ready());
+            }
+            Ok(Some((std::sync::Arc::new(indexes), ready)))
+        }
+    }
 }
 
 /// A stable identifier for a name, standing in for PostgreSQL's OID.
@@ -1338,6 +1413,10 @@ fn ms(micros: f64) -> String {
 fn escape(text: &str) -> String {
     text.replace('\'', "''")
 }
+
+#[cfg(test)]
+#[path = "catalog_partition_tests.rs"]
+mod catalog_partition_tests;
 
 #[cfg(test)]
 mod tests {
