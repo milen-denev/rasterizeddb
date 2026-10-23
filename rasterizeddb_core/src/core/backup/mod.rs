@@ -124,6 +124,9 @@ fn location_key(path: &str) -> String {
     )
 }
 
+/// `rasterized.wal.floors`: see [`crate::core::torn_tail::Floors`].
+const FLOORS_FILE: &str = "rasterized.wal.floors";
+
 /// Files never captured in a snapshot.
 ///
 /// The live log is excluded because it is replayed *into* a restore rather than
@@ -132,6 +135,9 @@ fn location_key(path: &str) -> String {
 /// id belongs to the database that made the backup, not the one restoring it.
 const EXCLUDED: &[&str] = &[
     crate::core::wal::DEFAULT_WAL_NAME,
+    // The durable floors name the source's files by inode; a restore's are
+    // new files, and its first open records their own.
+    FLOORS_FILE,
     INSTANCE_FILE,
     "temp.db",
     // Holds copies of what is being uploaded, one subdirectory per log.

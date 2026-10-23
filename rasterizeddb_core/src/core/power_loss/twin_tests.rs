@@ -1046,14 +1046,12 @@ struct ReservationTally {
     page_dropped: usize,
     /// Images whose mark the log's replay raised.
     replay_raised: usize,
-    /// Images where the write after the restart was acknowledged and is not
-    /// there, because the image's pointer file ended inside a record and the
-    /// append landed after it, out of step with every reader. Not this
-    /// test's property, and not a state a power cut leaves: the harness picks
-    /// a data file's length at any byte between its synced and current ones,
-    /// while each append is one whole-record `write(2)`. Counted, so the
-    /// check stays exact for every other image.
-    probe_lost_to_torn_tail: usize,
+    /// Images whose pointer file ended inside a record before the open: a
+    /// power cut can leave that, since a whole-record `write(2)` is not
+    /// atomic across one. The open cuts it back before replay
+    /// (`core::torn_tail`), and every check below holds for them as for the
+    /// rest; counted to show the harness reaches the case.
+    torn_pointer_tails: usize,
     marks_crossed: u64,
 }
 
@@ -1071,6 +1069,9 @@ async fn check_reservation_image(
 ) {
     let status = img.join(STATUS_FILE);
     let imaged = read_reservation(&status).unwrap_or(0);
+    // Read before the replay below, which cuts a torn tail back.
+    tally.torn_pointer_tails += std::fs::metadata(img.join(format!("{TABLE}_pointers.db")))
+        .is_ok_and(|m| m.len() % ROW_POINTER_RECORD_LEN as u64 != 0) as usize;
     tally.page_dropped += (imaged < point.live_mark) as usize;
     // Replayed alone first, so the status file reads as the crash left it
     // plus its log, before an open records anything of its own.
@@ -1082,9 +1083,6 @@ async fn check_reservation_image(
         }
     }
     let replayed = read_reservation(&status).unwrap_or(0);
-    // A pointer file cut inside a record (see `probe_lost_to_torn_tail`).
-    let torn_pointer_tail = std::fs::metadata(img.join(format!("{TABLE}_pointers.db")))
-        .is_ok_and(|m| m.len() % ROW_POINTER_RECORD_LEN as u64 != 0);
     tally.replay_raised += (replayed > imaged) as usize;
     let in_status = highest_with_outcome(&status);
     let db = match open(img, name).await {
@@ -1144,20 +1142,16 @@ async fn check_reservation_image(
                     ));
                 }
                 if !after.contains(&PROBE_ROW) {
-                    if torn_pointer_tail {
-                        tally.probe_lost_to_torn_tail += 1;
-                    } else {
-                        problems.push(format!("{label}: (d) the write after the restart is not there ({marks})"));
-                    }
+                    problems.push(format!("{label}: (d) the write after the restart is not there ({marks})"));
                 }
             }
             Err(e) => problems.push(format!("{label}: (d) reading the rows after the write: {e}")),
         }
     }
     // The write's own version, read back: stamped above everything that was
-    // on disk. Unreadable when the append landed after a partial record.
+    // on disk.
     match stamped(&db).await {
-        Ok(after) if !torn_pointer_tail => {
+        Ok(after) => {
             let old: std::collections::HashSet<u64> = before.iter().map(|(o, _, _)| *o).collect();
             let new: Vec<&(u64, u64, u64)> = after.iter().filter(|(o, _, _)| !old.contains(o)).collect();
             if new.is_empty() {
@@ -1172,7 +1166,6 @@ async fn check_reservation_image(
                 }
             }
         }
-        Ok(_) => {}
         Err(e) => problems.push(format!("{label}: reading the row pointers after the write: {e}")),
     }
     close(img, db);
@@ -1415,7 +1408,7 @@ async fn a_lost_reservation_page_never_reissues_an_id() {
         total.page_dropped += t.page_dropped;
         total.replay_raised += t.replay_raised;
         total.marks_crossed += t.marks_crossed;
-        total.probe_lost_to_torn_tail += t.probe_lost_to_torn_tail;
+        total.torn_pointer_tails += t.torn_pointer_tails;
         total.disturbed += t.disturbed;
     }
     eprintln!("lost reservation, {runs} runs of {seeds} seeds: {total:?}");
@@ -1429,4 +1422,5 @@ async fn a_lost_reservation_page_never_reissues_an_id() {
     assert!(total.writer_open >= runs, "no cut held an open writer ({total:?})");
     assert!(total.page_dropped >= runs, "no image dropped the reservation file's page ({total:?})");
     assert!(total.replay_raised >= runs, "no image needed the log to restore the mark ({total:?})");
+    assert!(total.torn_pointer_tails >= runs, "no image tore the pointer file inside a record ({total:?})");
 }

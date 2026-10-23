@@ -10,7 +10,7 @@ use crate::{
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
 
-const SCHEMA_FIELD_SIZE: u64 = 129 + // up to 128 ascii chars for name + null terminator
+pub(crate) const SCHEMA_FIELD_SIZE: u64 = 129 + // up to 128 ascii chars for name + null terminator
     2 + // db_type u16,
     4 + // size u32,
     8 + // offset u64,

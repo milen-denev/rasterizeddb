@@ -478,6 +478,10 @@ pub struct Wal {
     /// [`Wal::dropped_after`]). Trimmed by [`Wal::forget_drops_through`] as
     /// each snapshot starts.
     dropped_at: Mutex<HashMap<u64, u64>>,
+    /// The durable floor of each fixed-record file a checkpoint synced, as
+    /// last stored beside the log (see [`crate::core::torn_tail`]). Written
+    /// by checkpoints and by in-place shrinks; read at open, before replay.
+    floors: Mutex<crate::core::torn_tail::Floors>,
     /// Times the sync handle had to be opened lazily, which only a test that
     /// clears it should ever cause: `Wal::open` opens it and a keep-tail
     /// checkpoint installs the new file's.
@@ -616,6 +620,8 @@ impl Wal {
             }
         };
 
+        let floors = crate::core::torn_tail::Floors::load(&crate::core::torn_tail::Floors::path_for(&path));
+
         Ok(Self {
             path,
             writer: Mutex::new(writer),
@@ -649,6 +655,7 @@ impl Wal {
             last_dirty: AtomicU64::new(u64::MAX),
             fences: parking_lot::RwLock::new(HashMap::new()),
             dropped_at: Mutex::new(HashMap::new()),
+            floors: Mutex::new(floors),
             #[cfg(test)]
             lazy_opens: AtomicU64::new(0),
             #[cfg(test)]
@@ -2092,9 +2099,23 @@ impl Wal {
                 taken.ids.iter().filter_map(|id| files.get(id).cloned()).collect()
             }
         };
+        // Each fixed-record file's whole-record length as its sync is issued:
+        // durable once the sync returns, and recorded as its floor only once
+        // every sync of the pass has.
+        let mut floors: Vec<(crate::core::torn_tail::FileIdentity, String, u64)> = Vec::new();
         for path in paths {
             match File::options().read(true).write(true).open(&path) {
                 Ok(f) => {
+                    if let Some(kind) = crate::core::torn_tail::classify_path(&path)
+                        && let Ok(meta) = f.metadata()
+                    {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        floors.push((
+                            crate::core::torn_tail::FileIdentity::of(&meta),
+                            name.into_owned(),
+                            kind.whole(meta.len()),
+                        ));
+                    }
                     #[cfg(test)]
                     test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(n.get() + 1));
                     crate::core::sync_audit::note("wal.checkpoint.data_file", &path);
@@ -2121,6 +2142,8 @@ impl Wal {
                 Err(e) => return Err(e),
             }
         }
+
+        self.record_floors(floors);
 
         #[cfg(test)]
         test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| {
@@ -2182,6 +2205,51 @@ impl Wal {
             restore.taken = None;
         }
         dropped.map(|()| true)
+    }
+
+    /// Records the floors a checkpoint's sync pass made durable, and stores
+    /// them before the pass's records are dropped.
+    ///
+    /// Best-effort, as the commit-sequence mark is: a floor only ever
+    /// refuses, so one that does not land costs a check at the next open,
+    /// while failing the checkpoint would let the log grow without bound. The
+    /// floors already stored are no higher than the truth, since every
+    /// in-place shrink lowers them durably first.
+    fn record_floors(&self, synced: Vec<(crate::core::torn_tail::FileIdentity, String, u64)>) {
+        if synced.is_empty() {
+            return;
+        }
+        let mut floors = self.floors.lock();
+        let mut changed = false;
+        for (id, name, floor) in synced {
+            changed |= floors.set(id, &name, floor);
+        }
+        if changed {
+            let at = crate::core::torn_tail::Floors::path_for(&self.path);
+            if let Err(e) = floors.store(&at) {
+                log::error!(
+                    "Could not record the durable floors in {}: {}. The next open checks \
+                     torn files against older floors; durability is not affected.",
+                    at.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Lowers the floor of `path` to `len`, durably, for a shrink in place.
+    /// Called before the file is shortened, so no floor on disk is ever above
+    /// a file's synced length, and again after, to undo a checkpoint that
+    /// sampled the old length in between.
+    pub fn lower_floor(&self, path: &Path, len: u64) -> io::Result<()> {
+        let mut floors = self.floors.lock();
+        crate::core::torn_tail::lower_floor_in(&mut floors, &self.path, path, len)
+    }
+
+    /// The floors as stored, for a test.
+    #[cfg(test)]
+    pub(crate) fn floors(&self) -> crate::core::torn_tail::Floors {
+        self.floors.lock().clone()
     }
 
     /// Replaces the log with its records from `from` to `end`, the ones a
@@ -3079,6 +3147,11 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
     register_directory(dir, &wal)?;
     refuse_ambiguous_replay(dir, &wal)?;
 
+    // Before replay, never after: replay then rewrites every committed byte
+    // past each cut, and a fragment a replayed record lands beyond cannot
+    // survive inside the record slot it tore. See `crate::core::torn_tail`.
+    cut_torn_tails_before_replay(dir, &wal)?;
+
     let files = wal.clone();
     let stats = Wal::recover(&wal_path, move |id| files.resolve_for_replay(id))?;
 
@@ -3113,6 +3186,34 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
     }
 
     Ok((wal, stats))
+}
+
+/// Cuts each fixed-record file in `dir` back to whole records, refusing below
+/// a durable floor, then clamps the floors to what is there.
+fn cut_torn_tails_before_replay(dir: &str, wal: &Wal) -> io::Result<()> {
+    let mut floors = wal.floors.lock();
+    crate::core::torn_tail::cut_torn_tails(Path::new(dir), &floors)?;
+    if floors.reconcile(Path::new(dir)) {
+        let at = crate::core::torn_tail::Floors::path_for(&wal.path);
+        if let Err(e) = floors.store(&at) {
+            log::error!("Could not update the durable floors in {}: {}", at.display(), e);
+        }
+    }
+    Ok(())
+}
+
+/// [`Wal::lower_floor`] on the log of `dir`; with none installed (logging
+/// switched off), on the floors a past run stored there, which nothing else
+/// would lower before the next open reads them.
+pub fn lower_floor_for(dir: &str, path: &Path, len: u64) -> io::Result<()> {
+    with_wal_for(dir, |w| match w {
+        Some(w) => w.lower_floor(path, len),
+        None => crate::core::torn_tail::lower_floor_on_disk(
+            &Path::new(dir).join(DEFAULT_WAL_NAME),
+            path,
+            len,
+        ),
+    })
 }
 
 /// What a stretch of log bytes covers, without replaying it.

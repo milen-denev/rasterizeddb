@@ -1786,6 +1786,11 @@ impl StorageIO for LocalStorageProvider {
         }
         let _unblock = Unblock(&self.append_blocked);
 
+        // A fixed-record file's durable floor must never be above what it
+        // holds, or a torn tail after this would refuse the next open: lowered
+        // durably before the cut, and again after it, past any checkpoint that
+        // sampled the old length in between (see `crate::core::torn_tail`).
+        crate::core::wal::lower_floor_for(&self.location, Path::new(&self.file_str), len)?;
         {
             let file = self.write_file.write();
             file.set_len(len)?;
@@ -1793,6 +1798,11 @@ impl StorageIO for LocalStorageProvider {
             file.sync_all()?;
         }
         let _ = crate::core::wal::sync_parent_dir(Path::new(&self.file_str));
+        if let Err(e) =
+            crate::core::wal::lower_floor_for(&self.location, Path::new(&self.file_str), len)
+        {
+            log::error!("{}: could not lower its durable floor after a cut: {}", self.file_str, e);
+        }
 
         self.file_len.store(len, Ordering::Release);
 

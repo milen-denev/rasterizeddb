@@ -82,6 +82,8 @@ pub(crate) fn temp_synced_for(tag: &str, path: &Path) -> Option<PathBuf> {
         }
         // `Wal::keep_tail_locked`.
         "wal.keep_tail" => Some(path.with_extension("ckpt")),
+        // `torn_tail::Floors::store`.
+        "wal.floors" => Some(path.with_extension(crate::core::torn_tail::FLOORS_PARTIAL_EXTENSION)),
         _ => None,
     }
 }
@@ -108,4 +110,10 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `IdReservation` without a log: a temporary file, a rename and a
     // directory sync.
     ("mvcc.id_reservation", true),
+    // `torn_tail::truncate_to_whole_records`: the cut of a torn record, at
+    // open, before replay.
+    ("torn_tail.cut", true),
+    // `torn_tail::Floors::store`: a temporary file, a rename and a directory
+    // sync.
+    ("wal.floors", true),
 ];

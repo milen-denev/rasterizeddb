@@ -51,6 +51,8 @@ pub mod storage;
 pub mod storage_providers;
 pub mod support_types;
 pub mod text_search;
+/// A fixed-record file torn by a power cut is cut back before the log replays.
+pub mod torn_tail;
 pub mod tokenizer;
 pub mod vacuum;
 pub mod value_codec;

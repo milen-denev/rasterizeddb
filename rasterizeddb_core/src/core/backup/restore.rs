@@ -1059,6 +1059,12 @@ pub(super) fn replay(
         resolver.insert(crate::core::wal::file_id_for_name(&name), entry.path());
     }
 
+    // A file the snapshot copied mid-append can end inside a record. Cut back
+    // before the log replays, as an open does, so the records it rewrites are
+    // not appended after a fragment. A restored file has no durable floor:
+    // what the copy holds past its last whole record is what the log replays.
+    crate::core::torn_tail::cut_torn_tails(target_dir, &Default::default())?;
+
     crate::core::wal::Wal::recover_restoring(
         replay_path,
         |id| resolver.get(&id).cloned(),
