@@ -642,3 +642,64 @@ async fn a_stale_generated_record_under_the_target_does_not_capture_the_renamed_
     assert!(schema_of(&db, "g").generated.is_empty());
 }
 
+
+// ---------------------------------------------------------------------------
+// A partial unique key's predicate.
+// ---------------------------------------------------------------------------
+
+/// (`CREATE UNIQUE INDEX … WHERE` reaches the executor as the `ADD CONSTRAINT`
+/// form below; pgwire rewrites it.)
+///
+/// `RENAME COLUMN` of the column a partial index's predicate reads rewrites
+/// the predicate record, which follows the key's own record in the sidecar.
+/// Left naming the old column the predicate stopped compiling, and a key that
+/// cannot read its predicate is not enforced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_keys_predicate_follows_a_rename_of_the_column_it_reads() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+
+    ok(&db, "CREATE TABLE p (k INT, email TEXT, deleted_at TEXT)").await;
+    ok(&db, "ALTER TABLE p ADD CONSTRAINT p_live UNIQUE (email) WHERE deleted_at IS NULL").await;
+    ok(&db, "INSERT INTO p (k, email) VALUES (1, 'a')").await;
+    ok(&db, "ALTER TABLE p RENAME COLUMN deleted_at TO gone_at").await;
+    let key = schema_of(&db, "p").unique_keys[0].clone();
+    assert_eq!(key.predicate.as_deref(), Some("gone_at IS NULL"));
+    refused(&db, "INSERT INTO p (k, email) VALUES (2, 'a')").await;
+    ok(&db, "INSERT INTO p (k, email, gone_at) VALUES (3, 'a', 'x')").await;
+
+    drop(db);
+    let db = open(dir.path()).await;
+    let key = schema_of(&db, "p").unique_keys[0].clone();
+    assert_eq!(key.predicate.as_deref(), Some("gone_at IS NULL"));
+    refused(&db, "INSERT INTO p (k, email) VALUES (4, 'a')").await;
+    assert_eq!(ints(&db, "SELECT k FROM p ORDER BY k").await, vec![Some(1), Some(3)]);
+}
+
+/// A rename that would grow a predicate past what its record holds is refused
+/// whole, as an over-long CHECK or generation expression is: storing it cut
+/// short would change what the index covers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_that_overflows_a_partial_keys_predicate_is_refused() {
+    use crate::core::rql::unique_key::MAX_PREDICATE_LEN;
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+
+    let predicate = vec!["d IS NULL"; 60].join(" AND ");
+    assert!(predicate.len() <= MAX_PREDICATE_LEN);
+    ok(&db, "CREATE TABLE q (k INT, email TEXT, d TEXT)").await;
+    ok(&db, &format!("ALTER TABLE q ADD CONSTRAINT q_live UNIQUE (email) WHERE {predicate}")).await;
+    let long = "x".repeat(100);
+    let error = refused(&db, &format!("ALTER TABLE q RENAME COLUMN d TO {long}")).await;
+    assert!(
+        error.contains("the predicate of unique index q_live would exceed"),
+        "{error}"
+    );
+    let schema = schema_of(&db, "q");
+    assert!(schema.fields.iter().any(|f| f.name == "d" && !f.is_deleted));
+    assert_eq!(schema.unique_keys[0].predicate.as_deref(), Some(predicate.as_str()));
+    ok(&db, "INSERT INTO q (k, email) VALUES (1, 'a')").await;
+    refused(&db, "INSERT INTO q (k, email) VALUES (2, 'a')").await;
+}

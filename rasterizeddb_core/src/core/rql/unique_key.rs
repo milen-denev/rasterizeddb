@@ -443,7 +443,7 @@ impl UniqueKey {
 
     /// The record holding a partial key's predicate, which follows the key's
     /// own record. `None` for an ordinary key.
-    fn predicate_record(&self) -> Option<Vec<u8>> {
+    pub(crate) fn predicate_record(&self) -> Option<Vec<u8>> {
         let text = self.predicate.as_deref()?;
         let mut out = vec![0u8; UNIQUE_KEY_SIZE as usize];
         write_name(&mut out, 0, &self.name);
@@ -518,6 +518,22 @@ fn decode(raw: &[u8]) -> Result<Record, String> {
         predicate: (flag == FLAG_PARTIAL).then(String::new),
         compiled: CompiledPredicate::default(),
     }))
+}
+
+/// The text of `raw` when it is the predicate record of the partial key
+/// `name`, paired as [`load`] pairs them: the record right after the key,
+/// under its name, holding a non-empty predicate. A caller editing records in
+/// place reads a partial key's predicate through this, since the key's own
+/// record carries only the flag.
+pub(crate) fn paired_predicate(raw: &[u8], name: &str) -> Option<String> {
+    match decode(raw) {
+        Ok(Record::Predicate { name: owner, text })
+            if owner.eq_ignore_ascii_case(name) && !text.trim().is_empty() =>
+        {
+            Some(text)
+        }
+        _ => None,
+    }
 }
 
 /// Reads a table's unique constraints.

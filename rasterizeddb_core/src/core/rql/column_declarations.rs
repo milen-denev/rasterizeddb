@@ -254,11 +254,35 @@ struct Listed<T> {
 impl Listed<unique_key::UniqueKey> {
     async fn read(io_schema: &Arc<DbStorageProvider>) -> Self {
         let file = Sidecar::read(io_schema, "UK.db", unique_key::UNIQUE_KEY_SIZE).await;
-        let records = file.raw.iter().map(|r| unique_key::UniqueKey::from_vec(r).ok()).collect();
+        let mut records: Vec<Option<unique_key::UniqueKey>> =
+            file.raw.iter().map(|r| unique_key::UniqueKey::from_vec(r).ok()).collect();
+        // A partial key's own record holds only its flag (`predicate:
+        // Some("")`); the text is the record after it. Read here, so a rename
+        // can rewrite the text and `put` can write it back there.
+        for i in 0..records.len() {
+            if let Some(k) = records[i].as_mut()
+                && k.predicate.as_deref() == Some("")
+                && let Some(text) = file
+                    .raw
+                    .get(i + 1)
+                    .and_then(|r| unique_key::paired_predicate(r, &k.name))
+            {
+                k.predicate = Some(text);
+            }
+        }
         Listed { file, records }
     }
     fn put(&mut self, i: usize, record: unique_key::UniqueKey) {
         self.file.set(i, record.into_vec());
+        // Only a key whose predicate `read` paired carries text, so the
+        // record after it is that predicate's. An unpaired one keeps
+        // `Some("")` and nothing else is written.
+        if record.predicate.as_deref().is_some_and(|p| !p.is_empty())
+            && i + 1 < self.file.raw.len()
+            && let Some(bytes) = record.predicate_record()
+        {
+            self.file.set(i + 1, bytes);
+        }
         self.records[i] = Some(record);
     }
 }
@@ -756,19 +780,35 @@ pub(crate) async fn rename_column(
     decl.modifiers.move_key(from, to);
     decl.json.move_key(from, to);
 
-    // Everything else that mentions it is rewritten.
+    // Everything else that mentions it is rewritten. A partial index's
+    // predicate names columns too: left naming `from`, it no longer compiled,
+    // and a key that cannot read its predicate is not enforced, so renaming
+    // `deleted_at` let every live duplicate in. The clone's compiled
+    // predicate starts empty, so the rewritten text is what gets compiled.
     for i in 0..decl.unique.records.len() {
-        if let Some(mut k) = decl.unique.records[i].clone()
-            && !k.is_deleted
-            && k.columns.iter().any(|c| named(c, from))
-        {
-            for c in k.columns.iter_mut() {
-                if named(c, from) {
-                    *c = to.to_string();
-                }
-            }
-            decl.unique.put(i, k);
+        let Some(mut k) = decl.unique.records[i].clone() else { continue };
+        if k.is_deleted {
+            continue;
         }
+        let predicate = k.predicate.as_deref().map(|p| rewrite(p));
+        if !k.columns.iter().any(|c| named(c, from)) && predicate.as_deref() == k.predicate.as_deref() {
+            continue;
+        }
+        if predicate.as_ref().is_some_and(|p| p.len() > unique_key::MAX_PREDICATE_LEN) {
+            return Err(format!(
+                "cannot rename column {from} to {to}: the predicate of unique index {} would \
+                 exceed {} characters",
+                k.name,
+                unique_key::MAX_PREDICATE_LEN
+            ));
+        }
+        for c in k.columns.iter_mut() {
+            if named(c, from) {
+                *c = to.to_string();
+            }
+        }
+        k.predicate = predicate;
+        decl.unique.put(i, k);
     }
     let follow = |fk: &mut foreign_key::ForeignKey, owner_is_table: bool| -> bool {
         let mut moved = false;
