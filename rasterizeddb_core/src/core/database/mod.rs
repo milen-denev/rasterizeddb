@@ -9,6 +9,8 @@ mod recovery_refusal_tests;
 mod drop_recreate_replay_tests;
 #[cfg(all(test, feature = "storage_pools"))]
 mod cross_dir_commit_tests;
+#[cfg(test)]
+mod txid_reuse_tests;
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
@@ -1249,12 +1251,18 @@ impl Database {
     /// keeping the atomicity without this sync would need the per-transaction
     /// record of written logs and their positions.
     ///
+    /// It is also where a write is refused under an id the transaction-id
+    /// reservation does not cover, because writing the reservation failed
+    /// (see [`crate::core::mvcc::TransactionManager::check_ids_reserved`]).
+    /// The error's kind is `StorageFull` when the disk is full.
+    ///
     /// On failure nothing has been committed. The caller aborts `tx` and
     /// reports the statement as failed.
     pub fn commit_written_transaction(
         &self,
         tx: crate::core::mvcc::TxId,
     ) -> std::io::Result<TransactionFamily> {
+        self.transactions.check_ids_reserved(tx)?;
         self.sync_other_locations()?;
         Ok(self.commit_transaction(tx))
     }

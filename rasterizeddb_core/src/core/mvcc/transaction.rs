@@ -8,7 +8,7 @@ use cacheguard::CacheGuard;
 
 use parking_lot::RwLock;
 
-use super::status::StatusLog;
+use super::status::{IdReservation, StatusLog};
 
 /// A transaction identifier.
 ///
@@ -346,6 +346,42 @@ pub struct TransactionManager {
     /// Which aborted ids every table has been proven free of. See
     /// [`ForgetRegistry`].
     forget: Arc<ForgetRegistry>,
+    /// The durable mark every id handed out stays below. Taken by `begin`
+    /// between the in-place latch and `inner`, and by nothing else. See
+    /// [`IdReservation`].
+    reservation: parking_lot::Mutex<IdReservation>,
+    /// The mark ids stopped being reserved at, while raising it fails:
+    /// `TxId::MAX` when it does not. A transaction at or above it may not
+    /// commit a write (see [`TransactionManager::check_ids_reserved`]). Set and
+    /// cleared under `reservation`, by the `begin` whose raise failed or
+    /// succeeded; read by every writing commit, so an atomic.
+    unreserved_from: AtomicU64,
+    /// Why the last raise failed, for the error a refused commit reports.
+    reservation_failure: parking_lot::Mutex<Option<ReservationFailure>>,
+}
+
+/// A failed raise of the id reservation (see [`IdReservation::cover`]).
+#[derive(Clone, Debug)]
+struct ReservationFailure {
+    /// The reservation file.
+    path: String,
+    /// The disk is full, which clients are told as `53100 disk_full`.
+    disk_full: bool,
+    /// The error, as written.
+    detail: String,
+}
+
+impl ReservationFailure {
+    fn of(reservation: &IdReservation, e: &std::io::Error) -> Self {
+        ReservationFailure {
+            path: reservation
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            disk_full: e.kind() == std::io::ErrorKind::StorageFull,
+            detail: e.to_string(),
+        }
+    }
 }
 
 /// Every versioned table's *forget horizon*: the id below which vacuum has
@@ -518,7 +554,55 @@ impl TransactionManager {
     pub fn new(status: StatusLog) -> Self {
         // Ids resume above anything the previous run assigned, so an id is never
         // reused with a different meaning.
-        let next_id = status.highest_recorded().max(FIRST_TX - 1) + 1;
+        //
+        // The highest recorded outcome is not that bound on its own: `begin`
+        // records nothing durable and an abort's outcome is not synced, so a
+        // writer whose rows reached the disk can sit above it. Handed out
+        // again, its id made a new transaction read those rows as its own
+        // writes and commit them. The reservation is: every id any run handed
+        // out is below it.
+        let mut reservation = IdReservation::open_for(&status);
+        let recorded = status.highest_recorded().max(FIRST_TX - 1) + 1;
+        let next_id = if reservation.is_durable() {
+            recorded.max(reservation.reserved())
+        } else {
+            recorded
+        };
+
+        // Every id between the last recorded outcome and `next_id` may have
+        // been handed out and none of them committed: record them as the
+        // aborts they are. Not needed to keep them invisible — no `Committed`
+        // record means not committed, and settling and forgetting treat an
+        // unrecorded id below the bound as final — but without it they read as
+        // *in progress* once this run's records grow the bitmap over them,
+        // and a row one stamped looks like a live writer's for good. See
+        // `StatusLog::record_unfinished_as_aborted`. At most about a block of
+        // ids (plus read-only ids whose outcome was never flushed), recorded a
+        // byte at a time, and made durable here once rather than left to ride
+        // on the first commit.
+        if reservation.is_durable() && next_id > recorded {
+            status.record_unfinished_as_aborted(recorded, next_id);
+            if let Err(e) = status.flush() {
+                // Liveness only, as above: the next flush writes them.
+                log::warn!(
+                    "Could not record ids {}..{} of the previous run as aborted: {}",
+                    recorded,
+                    next_id,
+                    e
+                );
+            }
+        }
+        // Reserved now rather than by the first `begin`, so opening pays for
+        // it and the first statement does not. A failure here fails writes
+        // closed until a `begin` raises the mark, as one in `begin` does.
+        let covered = reservation.cover(next_id, status.wal().as_ref());
+        let failure = covered.err().map(|e| ReservationFailure::of(&reservation, &e));
+        let unreserved_from = if failure.is_some() {
+            reservation.reserved()
+        } else {
+            TxId::MAX
+        };
+
         TransactionManager {
             inner: RwLock::new(Inner {
                 next_id,
@@ -541,7 +625,99 @@ impl TransactionManager {
             settle_window: AtomicU64::new(super::status::DEFAULT_SETTLE_WINDOW),
             settling: std::sync::atomic::AtomicBool::new(false),
             forget: Arc::new(ForgetRegistry::default()),
+            reservation: parking_lot::Mutex::new(reservation),
+            unreserved_from: AtomicU64::new(unreserved_from),
+            reservation_failure: parking_lot::Mutex::new(failure),
         }
+    }
+
+    /// Refuses to let `tx` commit a write when it, or a savepoint under it,
+    /// holds an id the reservation does not cover.
+    ///
+    /// A raise of the reservation that failed leaves the mark where it was,
+    /// and `begin` hands out ids above it anyway, so reads go on. A write
+    /// under such an id must not commit: a restart resumes at the mark and
+    /// hands the id out again, and its new owner reads the committed rows as
+    /// its own uncommitted writes. A disk that cannot take the reservation
+    /// usually cannot take the outcome either, so the rows reach the log, the
+    /// outcome does not, and nothing but a log line would say so. Refused, the
+    /// caller rolls the transaction back.
+    ///
+    /// Every writing commit passes here, through
+    /// `Database::commit_written_transaction`; a read-only one never does,
+    /// and needs no reservation, since nothing durable carries its id. One
+    /// atomic load while the reservation is healthy.
+    ///
+    /// An id below the mark is never refused, even one handed out while a
+    /// raise was failing: once a later raise succeeds, the mark on disk is
+    /// above it and a restart cannot reissue it.
+    pub fn check_ids_reserved(&self, tx: TxId) -> std::io::Result<()> {
+        let from = self.unreserved_from.load(Ordering::Acquire);
+        if from == TxId::MAX {
+            return Ok(());
+        }
+        let highest = self.family_of(tx).into_iter().max().unwrap_or(tx).max(tx);
+        if highest < from {
+            return Ok(());
+        }
+        // Read again with the failure: a raise since the load may have put
+        // the mark above this id (and a later failure may have set a new
+        // one). Both are written failure first, mark second, under
+        // `reservation`, so the pair read here is one that was set together
+        // or a newer mark.
+        let failure = self.reservation_failure.lock().clone();
+        let from = self.unreserved_from.load(Ordering::Acquire);
+        let Some(failure) = failure.filter(|_| from != TxId::MAX && highest >= from) else {
+            return Ok(());
+        };
+        let kind = if failure.disk_full {
+            std::io::ErrorKind::StorageFull
+        } else {
+            std::io::ErrorKind::Other
+        };
+        Err(std::io::Error::new(
+            kind,
+            format!(
+                "could not reserve transaction ids from {} in {}{}: {}. Transaction {} was \
+                 rolled back: committed under an id that is not reserved, its rows would be \
+                 taken as another transaction's after a restart",
+                from,
+                failure.path,
+                if failure.disk_full { " (the disk is full)" } else { "" },
+                failure.detail,
+                tx
+            ),
+        ))
+    }
+
+    /// Records how a raise of the reservation went. Called under
+    /// `reservation`, so a failure and the success after it are seen in order.
+    fn note_reservation(&self, reservation: &IdReservation, covered: std::io::Result<()>) {
+        match covered {
+            Ok(()) => {
+                if self.unreserved_from.load(Ordering::Acquire) != TxId::MAX {
+                    self.unreserved_from.store(TxId::MAX, Ordering::Release);
+                    *self.reservation_failure.lock() = None;
+                }
+            }
+            Err(e) => {
+                *self.reservation_failure.lock() = Some(ReservationFailure::of(reservation, &e));
+                self.unreserved_from
+                    .store(reservation.reserved(), Ordering::Release);
+            }
+        }
+    }
+
+    /// The durable reservation mark. Diagnostic; `TxId::MAX` when nothing is
+    /// persisted.
+    pub fn reserved_ids_below(&self) -> TxId {
+        self.reservation.lock().reserved()
+    }
+
+    /// Shrinks the reservation block, so tests can cross many marks.
+    #[cfg(test)]
+    pub(crate) fn set_reservation_block(&self, ids: u64) {
+        self.reservation.lock().set_block(ids);
     }
 
     /// A manager with no durable record, for tests and in-memory databases.
@@ -826,8 +1002,23 @@ impl TransactionManager {
         // observe an empty `running` set that this call is about to fill.
         let _latched = in_place;
 
+        // The id is made durable as reserved *before* it is handed out, and
+        // with no lock a reader needs: the write is a sync, once a block.
+        // Holding `reservation` through the hand-out below is what makes the
+        // check exact: every write of `next_id` happens under it, so the value
+        // read here is the id `inner` gives out.
+        let mut reservation = self.reservation.lock();
+        let next = self.next_id.load(Ordering::Acquire);
+        if next >= reservation.reserved() {
+            // Retried by every `begin` while it fails: the mark stays below
+            // `next` until one succeeds.
+            let covered = reservation.cover(next, self.status.wal().as_ref());
+            self.note_reservation(&reservation, covered);
+        }
+
         let mut inner = self.inner.write();
         let id = inner.next_id;
+        debug_assert_eq!(id, next, "an id was handed out outside the reservation lock");
         inner.next_id += 1;
         inner.running.insert(id);
         if statement_scoped {
@@ -1813,6 +2004,186 @@ mod savepoint_durability {
             TxOutcome::Aborted,
             "a rolled-back savepoint came back after a restart"
         );
+    }
+}
+
+#[cfg(test)]
+mod id_reservation {
+    use super::*;
+    use crate::core::mvcc::status::read_reservation;
+
+    fn status_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("db_transactions.status")
+    }
+
+    /// The property the whole mechanism rests on: when `begin` returns an id,
+    /// the mark *on disk* is already above it. Checked after every `begin`
+    /// across many small blocks, so an implementation that hands the id out
+    /// first and raises the mark afterwards fails at the first crossing.
+    #[test]
+    fn every_id_is_reserved_on_disk_before_it_is_handed_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+        m.set_reservation_block(8);
+        // Use up the block the open reserved at full size.
+        assert!(read_reservation(&path).expect("reserved at open") > m.next_id());
+        while m.next_id() < m.reserved_ids_below() {
+            let id = m.begin();
+            m.abort(id);
+        }
+        let mut crossings = 0;
+        let mut last_mark = read_reservation(&path).expect("reserved at open");
+        for _ in 0..100 {
+            let id = m.begin();
+            let mark = read_reservation(&path).expect("a valid mark");
+            assert!(id < mark, "id {id} was handed out with only {mark} reserved on disk");
+            if mark != last_mark {
+                crossings += 1;
+                last_mark = mark;
+            }
+            m.abort(id);
+        }
+        assert!(crossings >= 10, "only {crossings} reservations were written");
+    }
+
+    /// An open resumes at or above the mark, even when no outcome above the
+    /// last one was ever recorded: the ids in between were handed out.
+    #[test]
+    fn a_reopen_never_reissues_an_id_with_no_recorded_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let committed;
+        let mut issued = Vec::new();
+        {
+            let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+            committed = m.begin();
+            m.commit(committed);
+            m.flush().expect("flush");
+            // Writers that never record an outcome: rolled back in memory
+            // only, or still running when the process stops.
+            for _ in 0..5 {
+                issued.push(m.begin());
+            }
+            let rolled_back = m.begin();
+            m.abort(rolled_back);
+            issued.push(rolled_back);
+        }
+        let m = TransactionManager::new(StatusLog::open(&path).expect("reopen"));
+        let next = m.begin();
+        let highest = *issued.iter().max().unwrap();
+        assert!(
+            next > highest,
+            "id {next} handed out again after a restart (ids up to {highest} were issued)"
+        );
+        // And every id the last run left unfinished reads as aborted, not as
+        // a writer still in flight.
+        for id in issued {
+            assert_eq!(m.outcome(id), TxOutcome::Aborted, "id {id}");
+        }
+        assert_eq!(m.outcome(committed), TxOutcome::Committed);
+    }
+
+    /// The same across many restarts that each leave unfinished ids behind,
+    /// including restarts that cross several blocks.
+    #[test]
+    fn ids_only_move_forward_across_many_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let mut highest = 0;
+        for round in 0..20u64 {
+            let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+            m.set_reservation_block(4);
+            for k in 0..(round % 7) * 3 + 1 {
+                let id = m.begin();
+                assert!(id > highest, "round {round}: id {id} reissued (had {highest})");
+                highest = id;
+                // Some commits, but never the last id of a round: that
+                // one is left with no outcome, as a rolled-back block is.
+                if k % 3 == 1 {
+                    m.commit(id);
+                    m.flush().expect("flush");
+                }
+            }
+        }
+    }
+
+    /// Concurrent `begin`s never share an id and never get ahead of the mark.
+    #[test]
+    fn concurrent_begins_stay_unique_and_reserved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = Arc::new(TransactionManager::new(StatusLog::open(&path).expect("open")));
+        m.set_reservation_block(16);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let m = Arc::clone(&m);
+                std::thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    for _ in 0..300 {
+                        let id = m.begin();
+                        assert!(id < m.reserved_ids_below());
+                        ids.push(id);
+                        m.abort(id);
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let mut all: Vec<TxId> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "two begins got the same id");
+        let mark = read_reservation(&path).expect("a valid mark");
+        assert!(*all.last().unwrap() < mark);
+    }
+
+    /// Through a write-ahead log, the mark is a logged write: if the file's
+    /// own bytes never reach the disk, replay puts them back. This is also
+    /// what carries the mark through a point-in-time restore.
+    #[test]
+    fn a_logged_mark_is_restored_by_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mark = {
+            let wal = Arc::new(
+                crate::core::wal::Wal::open(dir.path().join(crate::core::wal::DEFAULT_WAL_NAME))
+                    .expect("wal"),
+            );
+            let status = StatusLog::open(&path).expect("open");
+            status.attach_wal(wal).unwrap();
+            let m = TransactionManager::new(status);
+            m.set_reservation_block(8);
+            for _ in 0..30 {
+                let id = m.begin();
+                m.abort(id);
+            }
+            m.reserved_ids_below()
+        };
+        assert_eq!(read_reservation(&path), Some(mark));
+        // The file's write lost, as an unsynced page can be.
+        let file = crate::core::mvcc::status::reservation_path(&path);
+        std::fs::write(&file, [0u8; 20]).unwrap();
+        assert_eq!(read_reservation(&path), None);
+
+        let (_wal, stats) = crate::core::wal::open_and_recover(&dir_str).expect("recover");
+        assert!(stats.applied > 0, "nothing was replayed");
+        assert_eq!(read_reservation(&path), Some(mark), "replay did not restore the mark");
+        let m = TransactionManager::new(StatusLog::open(&path).expect("reopen"));
+        assert!(m.begin() >= mark);
+    }
+
+    /// An in-memory manager writes no file and never blocks on one.
+    #[test]
+    fn an_in_memory_manager_reserves_nothing() {
+        let m = TransactionManager::in_memory();
+        assert_eq!(m.reserved_ids_below(), TxId::MAX);
+        for _ in 0..1000 {
+            let id = m.begin();
+            m.commit(id);
+        }
     }
 }
 

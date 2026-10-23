@@ -821,6 +821,339 @@ impl StatusLog {
     }
 }
 
+impl StatusLog {
+    /// Records every id in `[from, to)` that has no outcome yet as aborted.
+    /// Returns how many it recorded.
+    ///
+    /// For the ids a previous run may have handed out without ever recording
+    /// how they ended — its reserved-but-unrecorded tail. None of them is
+    /// running now, and none committed (a commit is recorded durably before it
+    /// is acknowledged), so aborted is the truth. Left unrecorded they would
+    /// read as *in progress* once this run's records grow the bitmap over
+    /// them, and a row one of them stamped would look like another
+    /// transaction's unfinished write for good: a uniqueness check reports it
+    /// as a retryable conflict on every attempt, and reclamation never frees
+    /// it.
+    ///
+    /// A byte at a time under one acquisition of the lock, so the cost is the
+    /// range over four, not one locked record per id. An id that already has
+    /// an outcome keeps it.
+    pub fn record_unfinished_as_aborted(&self, from: TxId, to: TxId) -> u64 {
+        if from >= to {
+            return 0;
+        }
+        let mut inner = self.inner.lock();
+        let view = self.view.load();
+        assert!(
+            from >= view.below(),
+            "transaction {} is settled (below {}) and cannot be recorded again",
+            from,
+            view.below()
+        );
+        let first = (from / ENTRIES_PER_BYTE) as usize;
+        let last = ((to - 1) / ENTRIES_PER_BYTE) as usize;
+        if last >= view.bits.len() {
+            view.bits.grow_to((last + 1).next_multiple_of(GROWTH_CHUNK));
+        }
+        let mut recorded = 0;
+        for index in first..=last {
+            let byte = view.bits.load_for_update(index);
+            let mut next = byte;
+            for slot in 0..ENTRIES_PER_BYTE {
+                let tx = index as u64 * ENTRIES_PER_BYTE + slot;
+                let shift = slot * 2;
+                if tx >= from && tx < to && (byte >> shift) & 0b11 == BITS_IN_PROGRESS {
+                    next |= BITS_ABORTED << shift;
+                    recorded += 1;
+                }
+            }
+            if next != byte {
+                view.bits.store(index, next);
+            }
+        }
+        if to - 1 > inner.highest {
+            inner.highest = to - 1;
+        }
+        let dirty = match inner.dirty {
+            Some((low, high)) => (low.min(first), high.max(last + 1)),
+            None => (first, last + 1),
+        };
+        inner.dirty = Some(dirty);
+        self.dirty_bytes.store(dirty.1 - dirty.0, Ordering::Relaxed);
+        recorded
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Id reservation: the ids a run may have handed out, durable before it does
+// ---------------------------------------------------------------------------
+
+/// How many ids one durable reservation covers.
+///
+/// The trade-off is one durable write per block of transactions against up to
+/// a block of ids skipped at every open. A write is a log sync (or, with no
+/// log, a file write, `fsync`, rename and directory `fsync`) taken by the one
+/// `begin` that crosses the mark, with every other `begin` waiting behind it:
+/// at 65 536 it is about one per second at 65 000 transactions a second, which
+/// is not measurable. Skipped ids cost two bits each in the status file and in
+/// the settled record (16 KiB a restart), and nothing else: ids are `u64`.
+pub const ID_RESERVATION_BLOCK: u64 = 1 << 16;
+
+/// File content: magic, the mark, and a CRC over both.
+const RESERVATION_MAGIC: &[u8; 8] = b"RDBTXNH1";
+const RESERVATION_LEN: usize = 8 + 8 + 4;
+
+/// The file beside `status_path` that holds its reservation mark: for
+/// `db_transactions.status`, `db_transactions.next`. Per database directory,
+/// because the status file is.
+pub fn reservation_path(status_path: &Path) -> PathBuf {
+    status_path.with_extension("next")
+}
+
+fn encode_reservation(mark: TxId) -> [u8; RESERVATION_LEN] {
+    let mut out = [0u8; RESERVATION_LEN];
+    out[..8].copy_from_slice(RESERVATION_MAGIC);
+    out[8..16].copy_from_slice(&mark.to_le_bytes());
+    let crc = super::super::storage_providers::CRC.checksum(&out[..16]);
+    out[16..].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn decode_reservation(bytes: &[u8]) -> Option<TxId> {
+    if bytes.len() < RESERVATION_LEN || &bytes[..8] != RESERVATION_MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    if super::super::storage_providers::CRC.checksum(&bytes[..16]) != crc {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes[8..16].try_into().ok()?))
+}
+
+/// The mark persisted beside `status_path`, or `None` if there is no valid
+/// one. For tests and diagnostics; an open goes through
+/// [`IdReservation::open_for`].
+pub fn read_reservation(status_path: &Path) -> Option<TxId> {
+    decode_reservation(&std::fs::read(reservation_path(status_path)).ok()?)
+}
+
+/// The durable high-water mark of transaction ids: every id a run may have
+/// handed out is below it.
+///
+/// The status log alone cannot say where ids should resume. It knows the
+/// highest id with a recorded outcome, but `begin` records nothing durable and
+/// an abort's outcome is not synced, so a writer whose rows reached the disk
+/// can sit above every outcome. Resuming at the highest outcome handed that
+/// id out again, and its new owner read the old rows as its own writes and
+/// committed them. With a mark, an id is handed out only below it, the mark is
+/// raised durably *before* any id above the old one is, and an open resumes at
+/// or above it.
+///
+/// Written through the status log's write-ahead log when it has one, so a
+/// point-in-time restore replays the mark along with the rows: a restored
+/// database resumes above every id its replayed rows can carry. The file is
+/// written first and the record second, the order every logged write keeps,
+/// so a checkpoint that flushes the file before discarding the record
+/// covers it; a mark on disk that is *higher* than the record is harmless.
+/// Without a log: temporary file, `fsync`, rename, directory `fsync`.
+///
+/// Monotonic in every path: each write carries a larger value than the last,
+/// replay applies records in order, and a log is replayed and emptied at open
+/// before the mark is read.
+pub struct IdReservation {
+    /// `None` for an in-memory log: nothing outlives the process.
+    path: Option<PathBuf>,
+    /// The mark on disk. `TxId::MAX` when there is no file, so the check in
+    /// `begin` never fires.
+    reserved: TxId,
+    /// Ids per raise. [`ID_RESERVATION_BLOCK`] unless a test shrank it.
+    block: u64,
+    /// The last raise failed; logged once until one succeeds.
+    failing: bool,
+}
+
+impl std::fmt::Debug for IdReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdReservation")
+            .field("path", &self.path)
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+impl IdReservation {
+    /// The reservation beside `status`'s file, read from disk. A missing or
+    /// unreadable file reads as 0: nothing reserved, so ids resume above the
+    /// status log alone, as before the file existed.
+    pub fn open_for(status: &StatusLog) -> IdReservation {
+        let Some(status_path) = status.path() else {
+            return IdReservation {
+                path: None,
+                reserved: TxId::MAX,
+                block: ID_RESERVATION_BLOCK,
+                failing: false,
+            };
+        };
+        let path = reservation_path(&status_path);
+        let reserved = match std::fs::read(&path) {
+            Ok(bytes) => decode_reservation(&bytes).unwrap_or_else(|| {
+                log::error!(
+                    "{} does not hold a transaction id reservation; ids resume above the \
+                     status log alone, which can reissue the id of a writer whose outcome \
+                     was never recorded",
+                    path.display()
+                );
+                0
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                log::error!("Could not read {}: {}", path.display(), e);
+                0
+            }
+        };
+        IdReservation {
+            path: Some(path),
+            reserved,
+            block: ID_RESERVATION_BLOCK,
+            failing: false,
+        }
+    }
+
+    /// The mark: no id at or above it has been handed out, by any run.
+    /// `TxId::MAX` when nothing is persisted.
+    #[inline]
+    pub fn reserved(&self) -> TxId {
+        self.reserved
+    }
+
+    /// Whether the mark is persisted at all.
+    pub fn is_durable(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// The file the mark is persisted in; `None` for an in-memory log.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn set_block(&mut self, ids: u64) {
+        self.block = ids.max(1);
+    }
+
+    /// Makes `id` handable: raises the mark durably past it, by a block, if it
+    /// is not below it already. `log` is the status log's write-ahead log.
+    ///
+    /// On failure the mark is unchanged and the error is returned. The caller
+    /// still hands the id out, so reads go on, but no transaction at or above
+    /// the mark may commit a write until a later call succeeds (see
+    /// `TransactionManager::check_ids_reserved`): a restart resumes at the
+    /// mark, hands the id out again, and its new owner would adopt the rows.
+    /// The next `begin` past the mark tries again.
+    pub fn cover(&mut self, id: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        if id < self.reserved {
+            return Ok(());
+        }
+        let mark = id.saturating_add(self.block);
+        match self.write(mark, log) {
+            Ok(()) => {
+                self.reserved = mark;
+                if self.failing {
+                    log::info!("transaction id reservation is being written again");
+                    self.failing = false;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !self.failing {
+                    log::error!(
+                        "Could not reserve transaction ids through {}: {}. Transactions that \
+                         write are refused at commit until this succeeds; reads go on.",
+                        id.saturating_add(self.block),
+                        e
+                    );
+                    self.failing = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn write(&self, mark: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if reservation_test_hooks::fails(path) {
+            // What a full disk answers.
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        let bytes = encode_reservation(mark);
+        if let Some(wal) = log {
+            use std::os::unix::fs::FileExt;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| io::Error::other("reservation path has no file name"))?;
+            let file_id = crate::core::wal::file_id_for_name(name);
+            // The file has to exist durably before a record names it: replay
+            // only writes into files it finds in the directory.
+            let existed = path.exists();
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            if !existed {
+                file.sync_all()?;
+                crate::core::wal::sync_parent_dir(path)?;
+            }
+            wal.register_file(file_id, path)?;
+            // File first, then the record: see the type's documentation.
+            file.write_all_at(&bytes, 0)?;
+            return wal.log_and_commit(file_id, 0, &bytes);
+        }
+        let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+        temp_name.push(".partial");
+        let temp = path.with_file_name(temp_name);
+        {
+            let mut file = File::create(&temp)?;
+            file.write_all(&bytes)?;
+            crate::core::sync_audit::note("mvcc.id_reservation", path);
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, path)?;
+        crate::core::wal::sync_parent_dir(path)
+    }
+}
+
+/// Fails the reservation writes of chosen databases, as a full disk would.
+///
+/// Keyed by directory rather than by thread: `begin` runs on whichever worker
+/// thread the statement landed on.
+#[cfg(test)]
+pub(crate) mod reservation_test_hooks {
+    use std::path::{Path, PathBuf};
+
+    static FAILING: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Every reservation write in `dir` fails from now until [`heal`].
+    pub(crate) fn fail_in(dir: &Path) {
+        FAILING.lock().push(dir.to_path_buf());
+    }
+
+    pub(crate) fn heal(dir: &Path) {
+        FAILING.lock().retain(|d| d != dir);
+    }
+
+    pub(super) fn fails(path: &Path) -> bool {
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        FAILING.lock().iter().any(|d| d == dir)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settling: answering long-finished transactions without a bitmap
 // ---------------------------------------------------------------------------
@@ -2102,6 +2435,11 @@ mod tests {
         let end = random_run(&StatusLog::open_with(&path, false).unwrap(), 2, 20_000, &mut rng, true);
 
         let on = TransactionManager::new(StatusLog::open_with(&path, true).unwrap());
+        // Two live managers over one file is this test's device, not a real
+        // state: the second would resume above the first's id reservation
+        // (and record the first's reserved block as aborted). Each must start
+        // from the file as the run left it.
+        std::fs::remove_file(reservation_path(&path)).unwrap();
         let off = TransactionManager::new(StatusLog::open_with(&path, false).unwrap());
         assert!(on.status().settled_below() > 0, "the run settled something");
         assert_eq!(on.next_id(), off.next_id());

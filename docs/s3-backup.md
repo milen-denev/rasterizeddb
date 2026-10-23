@@ -314,6 +314,18 @@ a rolled-back one — and the rows would still be physically present, so it woul
 look fine. The file is an ordinary member of the database directory and is
 captured like any other; `transaction_outcomes_survive_a_restore` pins it.
 
+Its neighbour `db_transactions.next` holds the transaction-id reservation: no
+id at or above it has been handed out, and an open resumes there. Without it a
+restored database could hand out again the id of a writer whose rows the
+replay brought back but whose outcome it did not, and its new owner would
+adopt those rows. Each raise of the mark is a logged write, so the replay that
+restores the rows restores the mark past them;
+`a_restore_resumes_transaction_ids_past_every_one_the_window_issued` pins it.
+While the mark cannot be raised (a full disk), ids are still handed out so
+reads go on, but a transaction that wrote under an id at or above the mark is
+refused at commit and rolled back, as `53100 disk_full` when the disk is full
+and `58030 io_error` otherwise, until a later `begin` raises it.
+
 
 ### 10.1 Compaction
 

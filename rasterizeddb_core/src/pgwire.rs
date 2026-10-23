@@ -5617,6 +5617,14 @@ fn sqlstate_for(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
     let has = |needle: &str| m.contains(needle);
 
+    // A write refused at commit because its transaction id could not be
+    // reserved (`TransactionManager::check_ids_reserved`). Decided first: the
+    // message quotes an operating-system error, whose words could steer the
+    // branches below. `disk_full` when the disk is, `io_error` otherwise.
+    if has("could not reserve transaction ids") {
+        return if has("(the disk is full)") { "53100" } else { "58030" };
+    }
+
     // A literal that is not JSON. Decided first, because the message quotes
     // the literal and the parser's reason, and either can contain the words
     // the branches below look for: `'{"relation x does not exist":'` would
@@ -6133,15 +6141,17 @@ where
                         log::error!("Could not make the block's rows durable: {}", e);
                         database.abort_transaction(t.id);
                         flush_outcomes(database);
-                        send_error_response(
-                            stream,
-                            "58030",
-                            &format!(
-                                "could not commit: the rows written could not be made durable ({})",
-                                e
-                            ),
-                        )
-                        .await?;
+                        let message = format!(
+                            "could not commit: the rows written could not be made durable ({})",
+                            e
+                        );
+                        // 58030 unless the message names a better code: a
+                        // refused id reservation on a full disk is 53100.
+                        let code = match sqlstate_for(&message) {
+                            "XX000" => "58030",
+                            code => code,
+                        };
+                        send_error_response(stream, code, &message).await?;
                         state.transaction = None;
                         state.statement_failed = false;
                         return Ok(true);
@@ -9395,6 +9405,19 @@ mod sqlstate_tests {
                 "42601",
             ),
             ("something nobody anticipated", "XX000"),
+            (
+                "could not commit: the rows written could not be made durable (could not \
+                 reserve transaction ids from 9 in /d/db_transactions.next (the disk is full): \
+                 No space left on device (os error 28). Transaction 9 was rolled back: \
+                 committed under an id that is not reserved, its rows would be taken as \
+                 another transaction's after a restart)",
+                "53100",
+            ),
+            (
+                "could not reserve transaction ids from 9 in /d/db_transactions.next: \
+                 Input/output error (os error 5). Transaction 9 was rolled back",
+                "58030",
+            ),
         ] {
             assert_eq!(sqlstate_for(message), code, "{message:?}");
         }

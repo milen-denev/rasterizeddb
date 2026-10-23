@@ -730,3 +730,71 @@ fn a_barrier_that_never_committed_is_not_committed_by_an_earlier_runs_marker() {
         "a barrier that never committed emptied the table or voided its records at the restore"
     );
 }
+
+/// A restored database must not hand out an id the source already had: the
+/// rows replayed into it can carry any id the source issued up to the
+/// recovery point, and a reissued one makes its new owner adopt them. The id
+/// reservation is a logged write, so the replay that brings the rows also
+/// brings the mark past them, even when the copy caught an older mark.
+#[test]
+fn a_restore_resumes_transaction_ids_past_every_one_the_window_issued() {
+    use crate::core::mvcc::status::{StatusLog, read_reservation, reservation_path};
+    use crate::core::mvcc::transaction::TransactionManager;
+
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal = std::sync::Arc::new(Wal::open(live.join("rasterized.wal")).unwrap());
+    wal.set_archive_dir(Some(staging.clone())).unwrap();
+
+    let status_path = live.join("db_transactions.status");
+    let status = StatusLog::open(&status_path).unwrap();
+    status.attach_wal(wal.clone()).unwrap();
+    let manager = TransactionManager::new(status);
+    manager.set_reservation_block(8);
+    // Past the block the open reserved at full size, so the window below
+    // crosses several small ones.
+    while manager.next_id() < manager.reserved_ids_below() {
+        let id = manager.begin();
+        manager.abort(id);
+    }
+    manager.flush().unwrap();
+    wal.checkpoint().unwrap();
+
+    // The snapshot copies the status file and the mark here.
+    let names = ["db_transactions.status", "db_transactions.next"];
+    let copied: Vec<(String, Vec<u8>)> = names
+        .iter()
+        .map(|n| (n.to_string(), std::fs::read(live.join(n)).unwrap()))
+        .collect();
+    let copied_mark = read_reservation(&status_path).unwrap();
+
+    // Writers during the window, none with a durable outcome: their rows
+    // would be in the replayed log, their outcomes not.
+    let mut highest = 0;
+    for _ in 0..40 {
+        highest = manager.begin();
+    }
+    assert!(highest >= copied_mark, "the window never passed the copied mark");
+    wal.checkpoint().unwrap();
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    for (name, bytes) in &copied {
+        std::fs::write(target.join(name), bytes).unwrap();
+    }
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    let resolver = resolver_for(&target, &names);
+    Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), None).unwrap();
+
+    let restored_status = target.join("db_transactions.status");
+    assert!(reservation_path(&restored_status).exists());
+    let restored = TransactionManager::new(StatusLog::open(&restored_status).unwrap());
+    let next = restored.begin();
+    assert!(
+        next > highest,
+        "the restored database handed out {next}; the source had issued up to {highest}"
+    );
+}

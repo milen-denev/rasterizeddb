@@ -923,6 +923,12 @@ e2e_test!(transaction_outcomes_survive_a_restore, config, {
         target.join("db_transactions.status").exists(),
         "the transaction status log must be part of the snapshot"
     );
+    // And the id reservation beside it, or the restored database can hand
+    // out an id a restored row already carries.
+    assert!(
+        target.join("db_transactions.next").exists(),
+        "the transaction id reservation must be part of the snapshot"
+    );
     assert_eq!(
         count_in_restored(&target, "SELECT * FROM ledger").await,
         10,
@@ -1988,6 +1994,13 @@ e2e_test!(a_restore_reproduces_every_state_file, config, {
             *answer = "forgotten".to_string();
         }
     }
+    // The `SELECT`s `fingerprint` just ran committed in memory only: a
+    // statement that wrote nothing has no durable outcome, and a copy reads
+    // its id as aborted, which is right — nothing carries it. Made durable
+    // here so the comparison above can ask about every id. (It used to pass
+    // without this only because the restored copy handed those same ids out
+    // again to its own `SELECT`s, which committed them.)
+    database.transactions.flush().unwrap();
 
     // 1. A full snapshot.
     let service = BackupService::connect(config.clone(), live.to_str().unwrap())
