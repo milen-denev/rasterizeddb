@@ -5598,7 +5598,7 @@ fn read_only_message(verb: &str) -> String {
 /// application cannot tell from a crash. Classified here, at the one place the
 /// engine's answer is turned into a wire message, by the phrases the engine
 /// uses — which are PostgreSQL's own where the condition has one.
-fn sqlstate_for(message: &str) -> &'static str {
+pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
     let has = |needle: &str| m.contains(needle);
 

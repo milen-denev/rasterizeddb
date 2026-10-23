@@ -5,6 +5,10 @@ mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
 #[cfg(test)]
+mod name_guard_tests;
+#[cfg(test)]
+mod sidecar_clash_tests;
+#[cfg(test)]
 mod rename_tests;
 #[cfg(test)]
 mod recovery_refusal_tests;
@@ -219,6 +223,13 @@ impl TransactionFamily {
 /// sat outside this list that way — a rename dropped a table's CHECK
 /// constraints, its generated columns and its JSON path indexes, and left the
 /// files under the old name for the next table to inherit.
+///
+/// It is also the one list of every file a table can own, which is what the
+/// name guard reads: two tables share a file exactly when one's name plus one
+/// suffix is the other's plus another (`x_pointers` + `.db` is `x` +
+/// `_pointers.db`), so a suffix missing here is a pair of names the guard lets
+/// through. `sidecar_clash_tests` reads every `.db` name built anywhere in
+/// `src/` and fails on one whose suffix is not listed.
 const RENAMED_SUFFIXES: &[&str] = &[
     // Row data. First deliberately: it is the one whose absence is silent.
     ".db",
@@ -253,6 +264,283 @@ fn table_file_names(name: &str) -> impl Iterator<Item = String> + '_ {
 
 /// Name of the marker recording a rename that has begun but not finished.
 const RENAME_INTENT_FILE: &str = "__rename.intent";
+
+/// The catalogue's own files, in the same directory as the root's tables.
+const CATALOGUE_POINTERS_FILE: &str = "db_data_pointers.db";
+const CATALOGUE_ROWS_FILE: &str = "db_data_rows.db";
+const CATALOGUE_SCHEMA_FILE: &str = "db_data_schema.db";
+
+/// The stem the catalogue's files hang off, as if it were a table of that
+/// name. Treating it as one reserves its schema sidecars (`db_data_schema_*`)
+/// as well as the three files above, which a list of names would miss the
+/// first time a sidecar is loaded for it.
+const CATALOGUE_STEM: &str = "db_data";
+
+/// The scratch file a file provider compacts into, beside the tables it
+/// compacts (`LocalStorageProvider::create_temp`). Truncated on every use, and
+/// left out of every S3 snapshot by name — so a table called `temp` would have
+/// its rows file emptied by a compaction and missing from every backup.
+pub(crate) const COMPACTION_SCRATCH_FILE: &str = "temp.db";
+
+/// Files the engine keeps in a table directory under fixed names, with what
+/// owns each. A table whose files include one of these would share it.
+const RESERVED_FILES: &[(&str, &str)] = &[
+    (CATALOGUE_POINTERS_FILE, "the database catalogue"),
+    (CATALOGUE_ROWS_FILE, "the database catalogue"),
+    (CATALOGUE_SCHEMA_FILE, "the database catalogue"),
+    (COMPACTION_SCRATCH_FILE, "the engine's compaction scratch"),
+    // What a file provider opened without a name creates, with `File::create`.
+    ("CONFIG_TABLE.db", "the engine's configuration file"),
+];
+
+/// The longest table name, in bytes: what the schema record holds
+/// (`schema.rs` truncates past it). Well inside a file name's 255-byte limit
+/// once the longest suffix and `.tmp` are added — the bound that matters,
+/// because a name past it panicked opening its files after the catalogue row
+/// was written, and every later open of the database panicked the same way.
+const MAX_TABLE_NAME_BYTES: usize = 128;
+
+/// Prefix of the files a hash-partitioned table keeps (`docs/partitioning.md`).
+///
+/// Partition files are never created through `add_table`, so nothing in the
+/// live map owns them: a user table of such a name would be created over a
+/// partition's bytes, or be swept along with the partitioned table it shadows.
+pub(crate) const PARTITION_FILE_PREFIX: &str = "__pt_";
+
+/// Why `name` cannot be a table's name, or `None` when it can.
+///
+/// A table's name is a file name with a suffix glued on, and each refusal
+/// here is a way that stops being true. A path separator puts the files in
+/// some other directory — another database's, or none. `.db` anywhere in the
+/// name breaks the sidecars: they are named from the schema file with every
+/// `.db` stripped (`schema.rs`), so `x.db`'s columns land in `x`'s
+/// `_schema_FIELDS.db` and both tables read the union.
+fn table_name_refusal(name: &str) -> Option<String> {
+    if name.len() > MAX_TABLE_NAME_BYTES {
+        return Some(format!(
+            "table names are limited to {} bytes, which is what the schema record holds",
+            MAX_TABLE_NAME_BYTES
+        ));
+    }
+    if name.starts_with(PARTITION_FILE_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the files of partitioned tables",
+            PARTITION_FILE_PREFIX
+        ));
+    }
+    table_stem_refusal(name)
+}
+
+/// The part of [`table_name_refusal`] that is about finding the files again:
+/// what a rename checks on the name it moves *from*. A legacy table under a
+/// reserved prefix or an over-long name has ordinary files, and a rename is the
+/// only way off that name; one whose name is not a plain stem does not, and a
+/// suffix copy of it would arrive short.
+fn table_stem_refusal(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a table name cannot be empty".to_string());
+    }
+    if name.contains(['/', '\\', '\0']) {
+        return Some(format!(
+            "table name \"{}\" names a file, so it cannot contain a path separator",
+            name
+        ));
+    }
+    if name.contains(".db") {
+        return Some(format!(
+            "table name \"{}\" cannot contain \".db\": its schema sidecars would be \
+             named after another table's",
+            name
+        ));
+    }
+    None
+}
+
+/// The table a file belongs to, for each suffix it could be read as ending in,
+/// with that suffix.
+///
+/// `foo_seq.db` is `foo`'s sequence and `foo_seq`'s rows. That is the whole
+/// collision: every suffix ends in `.db`, so a name that is another's plus a
+/// suffix stem shares a file with it.
+///
+/// The suffix is matched ignoring ASCII case, as [`same_file_name`] compares.
+/// Every suffix is ASCII and starts with `_` or `.`, so the cut it makes is a
+/// character boundary whatever the name holds.
+fn possible_owners(file: &str) -> impl Iterator<Item = (&str, &'static str)> + '_ {
+    RENAMED_SUFFIXES.iter().filter_map(move |suffix| {
+        let cut = file.len().checked_sub(suffix.len())?;
+        file.as_bytes()[cut..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
+            .then(|| (&file[..cut], *suffix))
+    })
+}
+
+/// Whether two file names name one file on some filesystem a database
+/// directory can be kept on.
+///
+/// Table names keep their case (`CREATE TABLE X` makes `X.db`), and the default
+/// filesystems of Windows and macOS fold ASCII case, so `X.db` and `x.db` are
+/// one file there: the second create opens the first table's rows. A directory
+/// is not tied to the filesystem it was made on — a backup restores anywhere —
+/// so the guard folds case everywhere rather than asking this one.
+fn same_file_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// What owns `file` when the engine does, not a table: the catalogue (whose
+/// stem is reserved whole, sidecars included) or one of [`RESERVED_FILES`].
+///
+/// Every other file the engine keeps beside the tables (`db_transactions.*`,
+/// `rasterized.wal*`, `db_storage.cfg`, `__rename.intent`,
+/// `incompat_features`) ends in no table suffix, so no table name reaches it;
+/// `sidecar_clash_tests` lists a fresh directory to hold that true.
+fn reserved_file_owner(file: &str) -> Option<&'static str> {
+    if possible_owners(file).any(|(stem, _)| same_file_name(stem, CATALOGUE_STEM)) {
+        return Some("the database catalogue");
+    }
+    RESERVED_FILES
+        .iter()
+        .find(|(reserved, _)| same_file_name(reserved, file))
+        .map(|(_, owner)| *owner)
+}
+
+/// A file two tables would share: what [`shared_table_file`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFile {
+    /// The file as the table being named would call it.
+    file: String,
+    /// The table that already has it.
+    owner: String,
+    /// The same file as `owner` calls it, which differs from `file` only in
+    /// case when it differs at all.
+    owner_file: String,
+}
+
+impl SharedFile {
+    /// Why `name` is refused. Phrased with "relation … already exists" so the
+    /// wire reports `42P07`, as PostgreSQL does for a name that is taken.
+    fn refusal(&self, name: &str) -> String {
+        // The same name in another case. Names are matched exactly here, so
+        // `x` beside `X` would be a second table, not this one: an
+        // `IF NOT EXISTS` that skipped would tell the caller `x` exists while
+        // every later statement on `x` says it does not.
+        if name.eq_ignore_ascii_case(&self.owner) {
+            return format!(
+                "relation \"{}\" already exists as table \"{}\": names are matched exactly, so \
+                 they would be two tables sharing the file {} ({}) on a case-insensitive filesystem",
+                name, self.owner, self.file, self.owner_file
+            );
+        }
+        let case = if self.owner_file == self.file {
+            String::new()
+        } else {
+            format!(
+                " (its {}: file names are compared ignoring case, as the Windows and macOS \
+                 filesystems do)",
+                self.owner_file
+            )
+        };
+        format!(
+            "relation \"{}\" would share the file {} with table \"{}\"{}, which already exists",
+            name, self.file, self.owner, case
+        )
+    }
+}
+
+/// The first file a table named `name` would share with one of `others`.
+///
+/// Name arithmetic only. Two names share a file exactly when `a + s1` and
+/// `b + s2` are the same file name for some suffixes `s1`, `s2`; then `b` is
+/// that file with `s2` cut off. So reading each of `name`'s files back through
+/// every suffix finds every name it collides with, in both directions at once:
+/// `x_pointers` finds `x` (its `x_pointers.db` is `x`'s pointers) and `x` finds
+/// `x_pointers` (its pointers are `x_pointers`'s rows). `others` equal to
+/// `name` byte for byte are skipped, so a table can be checked against a list
+/// that holds it. The guard runs the same pass over the live map, with
+/// [`file_shared_with`] per table; this is that pass over a plain list.
+#[cfg(test)]
+fn shared_table_file<'a>(
+    name: &str,
+    others: impl IntoIterator<Item = &'a str>,
+) -> Option<SharedFile> {
+    let readings = file_readings(name);
+    others
+        .into_iter()
+        .find_map(|other| file_shared_with(name, &readings, other))
+}
+
+/// The file `name` (read as `readings`, from [`file_readings`]) shares with
+/// the table `other`, if any. Lengths are compared before case-folded bytes,
+/// so a pass over many tables mostly costs a length check each.
+fn file_shared_with(
+    name: &str,
+    readings: &[(String, String, &'static str)],
+    other: &str,
+) -> Option<SharedFile> {
+    if other == name {
+        return None;
+    }
+    readings
+        .iter()
+        .find(|(_, stem, _)| stem.len() == other.len() && same_file_name(stem, other))
+        .map(|(file, _, suffix)| SharedFile {
+            file: file.clone(),
+            owner: other.to_string(),
+            owner_file: format!("{}{}", other, suffix),
+        })
+}
+
+/// Each of `name`'s files, with every stem it can be read as belonging to and
+/// the suffix that reading cuts off: `(file, stem, suffix)`. Its own reading
+/// (`name`, the suffix it was built with) is among them. A few per file.
+fn file_readings(name: &str) -> Vec<(String, String, &'static str)> {
+    let mut readings = Vec::new();
+    for file in table_file_names(name) {
+        for (stem, suffix) in possible_owners(&file) {
+            readings.push((file.clone(), stem.to_string(), suffix));
+        }
+    }
+    readings
+}
+
+/// Every pair of `names` whose tables share a file, each pair once.
+///
+/// What an open reports about a catalogue an older build filled: those builds
+/// let `x` and `x_pointers` both be created, and the pair can only be warned
+/// about, not separated, since their bytes are already mixed. A map from the
+/// case-folded name keeps it linear in the number of tables.
+fn shared_file_pairs(names: &[String]) -> Vec<(String, SharedFile)> {
+    let mut by_folded: std::collections::HashMap<String, Vec<&str>> =
+        std::collections::HashMap::new();
+    for name in names {
+        by_folded
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(name.as_str());
+    }
+    let mut pairs: Vec<(String, SharedFile)> = Vec::new();
+    for name in names {
+        for (file, stem, suffix) in file_readings(name) {
+            let Some(owners) = by_folded.get(&stem.to_ascii_lowercase()) else {
+                continue;
+            };
+            // `<` so each pair is reported once, from its smaller name.
+            for owner in owners.iter().filter(|owner| name.as_str() < **owner) {
+                pairs.push((
+                    name.clone(),
+                    SharedFile {
+                        file: file.clone(),
+                        owner: owner.to_string(),
+                        owner_file: format!("{}{}", owner, suffix),
+                    },
+                ));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| (&a.0, &a.1.owner, &a.1.file).cmp(&(&b.0, &b.1.owner, &b.1.file)));
+    pairs.dedup_by(|a, b| a.0 == b.0 && a.1.owner == b.1.owner);
+    pairs
+}
 
 // ---------------------------------------------------------------------------
 // Storage placement
@@ -706,6 +994,36 @@ fn pool_paths(_pool: &StoragePool) -> Vec<String> {
     Vec::new()
 }
 
+/// Every directory a table's own files can be in: the primaries, enabled or
+/// not. Backups never hold a table (`set_role` refuses one that does), and a
+/// copy in one is never inherited — opening a mirrored file resyncs it from the
+/// primary. They also outlive a drop when disabled, since the drop sweeps only
+/// the enabled ones, so counting them refused the create an ALTER rewrite
+/// makes right after its drop, and the table was gone.
+#[cfg(feature = "storage_pools")]
+fn pool_table_paths(pool: &StoragePool) -> Vec<String> {
+    pool.all_paths()
+        .into_iter()
+        .filter(|path| pool.role_of(path) != Some(crate::core::storage::LocationRole::Backup))
+        .collect()
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_table_paths(_pool: &StoragePool) -> Vec<String> {
+    Vec::new()
+}
+
+/// The directory `table_name` is placed in, or `None` for the database's own.
+#[cfg(feature = "storage_pools")]
+fn pool_location_of(pool: &StoragePool, table_name: &str) -> Option<String> {
+    pool.location_of(table_name)
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
+    None
+}
+
 pub struct Database {
     pub tables: DashMap<String, Arc<Table<DbStorageProvider>>, ahash::RandomState>,
     pub db_io_pointers: Arc<DbStorageProvider>,
@@ -897,21 +1215,21 @@ impl Database {
         let open_root = async |name: &str| open_root_file(location, &backups, name).await;
 
         let io_pointers = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_pointers.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_POINTERS_FILE))
         } else {
-            Arc::new(open_root("db_data_pointers.db").await)
+            Arc::new(open_root(CATALOGUE_POINTERS_FILE).await)
         };
 
         let io_rows = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_rows.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_ROWS_FILE))
         } else {
-            Arc::new(open_root("db_data_rows.db").await)
+            Arc::new(open_root(CATALOGUE_ROWS_FILE).await)
         };
 
         let io_schema = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_schema.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_SCHEMA_FILE))
         } else {
-            Arc::new(open_root("db_data_schema.db").await)
+            Arc::new(open_root(CATALOGUE_SCHEMA_FILE).await)
         };
 
         let io_pointers_clone = io_pointers.clone();
@@ -1064,6 +1382,23 @@ impl Database {
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
             tables.insert(table_name, Arc::new(table));
+        }
+
+        // Builds before the name guard let two tables share a file (`x` and
+        // `x_pointers`). Both are opened as they always were: refusing would
+        // take away the rows that still read correctly, and nothing here can
+        // tell whose bytes are whose. Each such pair is named instead, so the
+        // operator learns why one of them reads wrong. A rewriting ALTER on
+        // either is refused (`check_recreatable`) before its drop; a plain DROP
+        // or RENAME of either still deletes the shared file, as it always did.
+        let names: Vec<String> = tables.iter().map(|entry| entry.key().clone()).collect();
+        for (name, shared) in shared_file_pairs(&names) {
+            warn!(
+                "tables \"{}\" and \"{}\" share the file {} (created by a build without the \
+                 name guard): writes to either can damage the other, and dropping or renaming \
+                 either deletes it; copy out what reads correctly from both before dropping them",
+                name, shared.owner, shared.file
+            );
         }
 
         Ok(Database {
@@ -1652,56 +1987,6 @@ impl Database {
         Ok(())
     }
 
-    /// Refuses `name` when a directory of this database already holds a
-    /// non-empty file the new table would take as its own.
-    ///
-    /// A drop's unlinks reach the disk only with a later directory sync (see
-    /// [`sweep_files_durably`]), so a power cut just after a drop can bring the
-    /// dropped table's files back while its catalogue row and the log's
-    /// barrier stay gone. A table created under the name opened them and
-    /// showed the dropped rows. The same holds for the files a rename that
-    /// could not finish leaves. Empty files are reused: a sweep creates each
-    /// missing file before deleting it, and an empty one holds nothing.
-    fn refuse_leftover_files(&self, name: &str) -> io::Result<()> {
-        // A statement-scoped relation lives in memory, and is created often.
-        if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
-            return Ok(());
-        }
-        let mut directories = pool_paths(&self.storage);
-        directories.extend(self.location.clone());
-        directories.sort();
-        directories.dedup();
-        for directory in &directories {
-            for file in table_file_names(name) {
-                for candidate in [file.clone(), format!("{file}.tmp")] {
-                    let path = std::path::Path::new(directory).join(&candidate);
-                    match std::fs::symlink_metadata(&path) {
-                        Ok(meta) if meta.len() == 0 && meta.is_file() => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Ok(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                format!(
-                                    "table \"{name}\" would take over {}, which already exists \
-                                     and belongs to no table (left by a dropped or renamed one \
-                                     after a crash?); move it aside if it is not needed",
-                                    path.display()
-                                ),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(io::Error::other(format!(
-                                "table \"{name}\" cannot be checked for leftover files at {}: {e}",
-                                path.display()
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Refuses `name` while files kept under it still have live log records
     /// (see `held_names`).
     fn refuse_held_name(&self, name: &str) -> io::Result<()> {
@@ -1810,6 +2095,14 @@ impl Database {
                 "that prefix is reserved for tables backing JSON columns",
             ));
         }
+        // The old name only as far as the copy below needs: a name that is not
+        // a plain stem has files it cannot find by suffix. A reserved prefix is
+        // refused only as a destination — renaming a legacy table off it is
+        // the one way to move it.
+        if let Some(reason) = table_name_refusal(new_name).or_else(|| table_stem_refusal(old_name))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
         if !self.tables.contains_key(old_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
@@ -1820,7 +2113,6 @@ impl Database {
             ));
         }
         self.refuse_held_name(new_name)?;
-        self.refuse_leftover_files(new_name)?;
         // A rename whose old files are kept still has its intent on disk, and
         // the next open finishes it from there; a new intent would replace it.
         if let Some(held) = self.held_names.lock().first() {
@@ -1828,6 +2120,12 @@ impl Database {
                 "an earlier rename has not finished (the files of \"{held}\" are kept until \
                  the next open discards them); restart before renaming again"
             )));
+        }
+        // The old table is counted among the owners, deliberately: renaming
+        // `foo` to `foo_seq` copies `foo.db` onto `foo_seq.db`, which is `foo`'s
+        // own sequence file and a source the copy has not reached yet.
+        if let Some(reason) = self.table_files_conflict(new_name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
         }
 
         // Recorded before anything moves, so a crash anywhere below is
@@ -2070,9 +2368,41 @@ impl Database {
         )
         .await;
         let mut total = 0u64;
-        for suffix in RENAMED_SUFFIXES {
-            let io = seed.create_new(format!("{}{}", table_name, suffix)).await;
-            total = total.saturating_add(io.get_len().await);
+        // Read-only. Opening each file to ask its length — what this used to
+        // do — creates every sidecar the table never had, each with a `.tmp`
+        // and a directory fsync, so a `DRY RUN` wrote to the disk it was
+        // planning for; it also flushed the live table's staged bytes from a
+        // second handle. The stat sums what an open would have reported: the
+        // file plus its staged `.tmp`.
+        if let Some(directory) = seed.get_location() {
+            let directory = std::path::Path::new(&directory);
+            for file in table_file_names(table_name) {
+                for on_disk in [
+                    directory.join(&file),
+                    directory.join(format!("{}.tmp", file)),
+                ] {
+                    if let Ok(meta) = std::fs::metadata(&on_disk) {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+            }
+            return total;
+        }
+        match &*seed {
+            DbStorageProvider::Memory(memory) => {
+                for file in table_file_names(table_name) {
+                    total = total.saturating_add(memory.stored_len(&file).unwrap_or(0));
+                }
+            }
+            // A key/value store has no length query short of opening the file.
+            // Opening reads the store and writes nothing to it; it does register
+            // the name with the family, which is in-process only.
+            _ => {
+                for file in table_file_names(table_name) {
+                    let io = seed.create_new(file).await;
+                    total = total.saturating_add(io.get_len().await);
+                }
+            }
         }
         total
     }
@@ -2474,6 +2804,133 @@ impl Database {
         Ok(copied)
     }
 
+    /// Why a table named `name` cannot be created (or renamed to), when its
+    /// files would not be its own.
+    ///
+    /// Nothing else stops it, and nothing downstream notices: `foo_schema`'s
+    /// rows file is `foo`'s schema, so creating one corrupts the other and
+    /// dropping either deletes the other's file. Three ways a file can be
+    /// taken, checked in this order:
+    ///
+    /// * a live table owns it — read through every suffix, so this is a fixed
+    ///   number of map lookups however many tables there are;
+    /// * the catalogue owns it (`db_data` takes the catalogue's schema);
+    /// * it is on disk and nothing owns it — a dropped table's leftovers, which
+    ///   the new table would open and append to as though they were its own.
+    ///   Every directory of the pool is checked, not only the one the table
+    ///   will be placed in: placement is decided after this, and a move later
+    ///   copies onto whatever is there.
+    ///
+    /// Key/value stores are not scanned for leftovers: there is no read-only way
+    /// to ask one whether an object exists short of opening the file.
+    fn table_files_conflict(&self, name: &str) -> Option<String> {
+        self.table_files_conflict_beside(name, None)
+    }
+
+    /// Whether the live table `name` could be dropped and created again under
+    /// the same name — what an `ALTER` rewrite does — or why not.
+    ///
+    /// Ask *before* the drop. `add_table` refuses names that older builds
+    /// accepted (`.db` in them, the `__pt_` prefix, a pair sharing a file), and
+    /// a refusal after the drop has already released every row. The table's
+    /// own directory is not scanned for leftovers: its files are there now and
+    /// the drop sweeps them, so the create after it does not find them.
+    pub fn check_recreatable(&self, name: &str) -> io::Result<()> {
+        if let Some(reason) = table_name_refusal(name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        let own = pool_location_of(&self.storage, name).or_else(|| self.db_io_pointers.get_location());
+        if let Some(reason) = self.table_files_conflict_beside(name, own.as_deref()) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
+        }
+        Ok(())
+    }
+
+    /// [`Self::table_files_conflict`], not scanning `skip` for leftovers.
+    fn table_files_conflict_beside(&self, name: &str, skip: Option<&str>) -> Option<String> {
+        // A statement-scoped relation lives in memory, apart from every table on
+        // disk, and it is created often enough that a pass over the map each
+        // time would show. Two of them cannot share a file either: each name
+        // ends in a lower-case hex tag, and no suffix stem does.
+        if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            return None;
+        }
+        // Every live table, and every name a rename still holds files under
+        // until the next open. One pass, comparing ignoring case, so this is
+        // linear in the tables, not in the directory.
+        let readings = file_readings(name);
+        let shared = self
+            .tables
+            .iter()
+            .find_map(|entry| file_shared_with(name, &readings, entry.key()))
+            .or_else(|| {
+                let held = self.held_names.lock();
+                held.iter().find_map(|other| file_shared_with(name, &readings, other))
+            });
+        if let Some(shared) = shared {
+            return Some(shared.refusal(name));
+        }
+        for file in table_file_names(name) {
+            if let Some(owner) = reserved_file_owner(&file) {
+                return Some(format!(
+                    "relation \"{}\" would share the file {} with {}, which already exists",
+                    name, file, owner
+                ));
+            }
+        }
+
+        let mut directories = pool_table_paths(&self.storage);
+        if let Some(root) = self.db_io_pointers.get_location() {
+            directories.push(root);
+        }
+        for directory in &directories {
+            let directory = std::path::Path::new(directory);
+            // Component-wise, so a trailing separator is not a second directory.
+            if skip.is_some_and(|skip| std::path::Path::new(skip) == directory) {
+                continue;
+            }
+            for file in table_file_names(name) {
+                for candidate in [file.clone(), format!("{}.tmp", file)] {
+                    let path = directory.join(&candidate);
+                    // `symlink_metadata`: a dangling link is still a name taken.
+                    //
+                    // A drop's unlinks reach the disk only with a later
+                    // directory sync (see `sweep_files_durably`), so a power
+                    // cut just after a drop can bring the dropped table's files
+                    // back while its catalogue row and the log's barrier stay
+                    // gone; a rename that could not finish leaves files too.
+                    // Empty regular files are reused: a sweep creates each
+                    // missing file before deleting it, and an empty one holds
+                    // nothing.
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.len() == 0 && meta.is_file() => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Ok(_) => {
+                            return Some(format!(
+                                "table \"{}\" would take over {}, which already exists and \
+                                 belongs to no table (left by a dropped or failed one?); move \
+                                 it aside if it is not needed",
+                                name,
+                                path.display()
+                            ));
+                        }
+                        // Not "absent": a name the filesystem cannot even look up
+                        // is one the create would fail on after its catalogue row.
+                        Err(e) => {
+                            return Some(format!(
+                                "table \"{}\" cannot be checked for leftover files at {}: {}",
+                                name,
+                                path.display(),
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Releases every file derived from `name`, and says whether they went
     /// (see [`discard_files`]).
     ///
@@ -2653,8 +3110,6 @@ impl Database {
         let _changed =
             SchemaChanged::unless_internal(&self.schema_generation, &create_table.table_name);
         let table_name = &create_table.table_name;
-        let columns = create_table.columns;
-        let unique_columns = create_table.unique_columns;
 
         if self.tables.contains_key(table_name) {
             return Err(io::Error::new(
@@ -2662,10 +3117,26 @@ impl Database {
                 "Table already exists",
             ));
         }
+        // Before the catalogue row: a refusal after it would leave a row naming
+        // a table that was never built.
+        if let Some(reason) = table_name_refusal(table_name) {
+            warn!("CREATE TABLE refused: {}", reason);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
         self.refuse_held_name(table_name)?;
-        // Before the catalogue row: a refusal after it would leave a row
-        // naming a table that was never built.
-        self.refuse_leftover_files(table_name)?;
+        if let Some(reason) = self.table_files_conflict(table_name) {
+            warn!("CREATE TABLE refused: {}", reason);
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
+        }
+        self.add_table_unguarded(create_table).await
+    }
+
+    /// `add_table` past its name checks. Separate so a test can make the
+    /// tables older builds allowed, which the guards exist to keep out.
+    async fn add_table_unguarded(&self, create_table: CreateTable) -> io::Result<()> {
+        let table_name = &create_table.table_name;
+        let columns = create_table.columns;
+        let unique_columns = create_table.unique_columns;
 
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         let name_data = name_mb.into_slice_mut();

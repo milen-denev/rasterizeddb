@@ -2221,6 +2221,13 @@ async fn rewrite_table_with_columns(
 ) -> Result<(), String> {
     use crate::core::rql::lexer_ct::{CreateColumnData, CreateTable};
 
+    // The rewrite drops the table and creates it again under the same name. A
+    // name older builds accepted can be refused by the create; asked after the
+    // drop, that refusal would lose every row.
+    database
+        .check_recreatable(table_name)
+        .map_err(|e| format!("cannot rewrite '{}': {}", table_name, e))?;
+
     let (
         existing_columns,
         foreign_keys,
@@ -3192,6 +3199,11 @@ async fn retype_column(
     tx: TxId,
 ) -> Result<(), String> {
     use crate::core::rql::json_map;
+
+    // Dropped and created again below; refuse up front, as the rewrite does.
+    database
+        .check_recreatable(table_name)
+        .map_err(|e| format!("cannot retype '{}': {}", table_name, e))?;
 
     // Read every row as the documents they represent, so the conversion goes
     // through one representation rather than a matrix of type pairs.
@@ -11320,7 +11332,19 @@ pub(crate) async fn execute_with_need(
                             return ddl_error(&e);
                         }
                     };
-                if database.add_table(create_table).await.is_ok() {
+                let added = database.add_table(create_table).await;
+                if let Err(e) = &added {
+                    // The guards in `add_table` say why a name is refused; a
+                    // generic message would leave the client guessing.
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists
+                    ) {
+                        error!("Failed to add table: {}", e);
+                        return ddl_error(&e.to_string());
+                    }
+                }
+                if added.is_ok() {
                     info!("Table created successfully");
                     // No table name is attached to schema changes: the
                     // last-writer-wins comparison is about row data, and a

@@ -96,6 +96,14 @@ impl MemoryStorageProvider {
         }
         self.buf.read()
     }
+
+    /// The length of `name` in this provider's registry, without creating it.
+    ///
+    /// `create_new` registers an empty buffer for a name it has not seen, so
+    /// asking that way leaves an entry behind for every file a table never had.
+    pub(crate) fn stored_len(&self, name: &str) -> Option<u64> {
+        self.registry.get(name).map(|buf| buf.read().len() as u64)
+    }
 }
 
 impl StorageIO for MemoryStorageProvider {
