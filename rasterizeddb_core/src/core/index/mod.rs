@@ -64,6 +64,7 @@ use smallvec::SmallVec;
 use crate::core::db_type::DbType;
 use crate::core::filter::SargOp;
 use crate::core::filter::sarg::{MaskExpr, SargPredicate};
+use crate::core::index_store::gate::Proof;
 use crate::core::row::row::RowWrite;
 use crate::core::row::schema::SchemaField;
 
@@ -244,7 +245,7 @@ impl LiveIndex {
     }
 
     /// Adds `slot` under `key`, or to the unkeyed list when there is no key.
-    pub fn insert(&self, slot: u64, key: Option<KeyBuf>) {
+    pub fn insert(&self, _proof: Proof<'_>, slot: u64, key: Option<KeyBuf>) {
         match key {
             None => {
                 let mut unkeyed = self.unkeyed.write();
@@ -262,7 +263,7 @@ impl LiveIndex {
 
     /// Removes `slot` from under `key`. Removing a pair that is not there is a
     /// no-op, which is what makes a late or repeated removal harmless.
-    pub fn remove(&self, slot: u64, key: &[u8]) {
+    pub fn remove(&self, _proof: Proof<'_>, slot: u64, key: &[u8]) {
         fn drop_slot<M: MapLike>(map: &mut M, key: &[u8], slot: u64) {
             let empty = match map.slots_mut(key) {
                 Some(slots) => {
@@ -285,15 +286,15 @@ impl LiveIndex {
 
     /// Forgets a slot that is gone for everyone: under `key` (read back from
     /// the row before its space was freed) and from the unkeyed list.
-    pub fn forget(&self, slot: u64, key: Option<&[u8]>) {
+    pub fn forget(&self, proof: Proof<'_>, slot: u64, key: Option<&[u8]>) {
         if let Some(key) = key {
-            self.remove(slot, key);
+            self.remove(proof, slot, key);
         }
         self.unkeyed.write().retain(|s| *s != slot);
         self.set_present(slot, false);
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, _proof: Proof<'_>) {
         match &self.data {
             Data::BTree(map) => map.write().clear(),
             Data::Hash(shards, _) => shards.iter().for_each(|s| s.write().clear()),
@@ -691,6 +692,31 @@ pub struct TableIndexes {
     state: AtomicU64,
 }
 
+/// A table's indexes, read-only: what a reader (the catalog views) is given,
+/// so it never holds what the mutators are called on and never needs a proof
+/// (`core::index_store::gate`).
+#[derive(Clone, Copy)]
+pub struct IndexView<'a> {
+    indexes: &'a TableIndexes,
+}
+
+impl<'a> IndexView<'a> {
+    /// The B-tree and hash indexes.
+    pub fn list(&self) -> &'a [Arc<LiveIndex>] {
+        &self.indexes.list
+    }
+
+    /// The inverted indexes.
+    pub fn gin(&self) -> &'a [Arc<gin::GinIndex>] {
+        &self.indexes.gin
+    }
+
+    /// See [`TableIndexes::is_ready`].
+    pub fn is_ready(&self) -> bool {
+        self.indexes.is_ready()
+    }
+}
+
 /// The `write_order`s handed to the virtual key columns of path indexes,
 /// counting down from here. No table has that many columns.
 const FIRST_PATH_COLUMN: u32 = u32::MAX - 1;
@@ -710,6 +736,11 @@ impl TableIndexes {
 
     pub fn is_empty(&self) -> bool {
         self.list.is_empty() && self.gin.is_empty()
+    }
+
+    /// These indexes, read-only.
+    pub fn view(&self) -> IndexView<'_> {
+        IndexView { indexes: self }
     }
 
     /// How many indexes there are, of either kind.
@@ -845,7 +876,7 @@ impl TableIndexes {
         self.state.load(Ordering::Acquire) & 1 == 1
     }
 
-    pub fn set_ready(&self, ready: bool) {
+    pub fn set_ready(&self, _proof: Proof<'_>, ready: bool) {
         let _ = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !1) | ready as u64));
@@ -862,7 +893,7 @@ impl TableIndexes {
     /// when they stop, so any build that overlapped the renumbering, or read
     /// its epoch before it, cannot mark ready a structure keyed by slots
     /// that moved. Returns the new epoch.
-    pub fn invalidate(&self) -> u64 {
+    pub fn invalidate(&self, _proof: Proof<'_>) -> u64 {
         let prev = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(((s >> 1) + 1) << 1))
@@ -872,7 +903,7 @@ impl TableIndexes {
 
     /// Marks ready, but only if the epoch is still `epoch`: no renumbering
     /// began or ended since the caller read it. Returns whether it did.
-    pub fn set_ready_at(&self, epoch: u64) -> bool {
+    pub fn set_ready_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| (s >> 1 == epoch).then_some(s | 1))
             .is_ok()
@@ -911,32 +942,37 @@ impl TableIndexes {
     }
 
     /// Indexes a freshly written version.
-    pub fn on_insert(&self, slot: u64, row: &RowWrite) {
+    pub fn on_insert(&self, proof: Proof<'_>, slot: u64, row: &RowWrite) {
         for index in &self.list {
-            index.insert(slot, index.key_of_row(row));
+            index.insert(proof, slot, index.key_of_row(row));
         }
         for g in &self.gin {
-            g.insert(slot, document_of(row, g.column));
+            g.insert(proof, slot, document_of(row, g.column));
         }
     }
 
     /// Indexes a version read back from the table (the build).
-    pub fn index_row<'a>(&self, slot: u64, get: &dyn Fn(u32) -> Option<&'a [u8]>) {
+    pub fn index_row<'a>(
+        &self,
+        proof: Proof<'_>,
+        slot: u64,
+        get: &dyn Fn(u32) -> Option<&'a [u8]>,
+    ) {
         for index in &self.list {
-            index.insert(slot, index.key_of(get));
+            index.insert(proof, slot, index.key_of(get));
         }
         for g in &self.gin {
-            g.insert(slot, get(g.column));
+            g.insert(proof, slot, get(g.column));
         }
     }
 
     /// A version whose columns could not be read: a candidate everywhere.
-    pub fn index_unreadable(&self, slot: u64) {
+    pub fn index_unreadable(&self, proof: Proof<'_>, slot: u64) {
         for index in &self.list {
-            index.insert(slot, None);
+            index.insert(proof, slot, None);
         }
         for g in &self.gin {
-            g.insert(slot, None);
+            g.insert(proof, slot, None);
         }
     }
 
@@ -947,23 +983,23 @@ impl TableIndexes {
 
     /// An in-place overwrite, now durable: the slot moves from its old keys
     /// to its new ones.
-    pub fn on_replace(&self, slot: u64, old: &[Option<KeyBuf>], row: &RowWrite) {
+    pub fn on_replace(&self, proof: Proof<'_>, slot: u64, old: &[Option<KeyBuf>], row: &RowWrite) {
         for (i, index) in self.list.iter().enumerate() {
             let new = index.key_of_row(row);
             let old = old.get(i).cloned().flatten();
             if old.as_deref() != new.as_deref() {
-                index.insert(slot, new);
+                index.insert(proof, slot, new);
                 if let Some(old) = old {
-                    index.remove(slot, &old);
+                    index.remove(proof, slot, &old);
                 }
             } else {
-                index.insert(slot, new);
+                index.insert(proof, slot, new);
             }
         }
         // The new document's items are added; the old ones stay, a stale
         // candidate rather than a missed row (see `gin`).
         for g in &self.gin {
-            g.insert(slot, document_of(row, g.column));
+            g.insert(proof, slot, document_of(row, g.column));
         }
     }
 
@@ -975,19 +1011,24 @@ impl TableIndexes {
     /// Forgets a reclaimed slot, given its column bytes read back from the row
     /// (or `None` when they could not be read, which removes only what needs
     /// no key).
-    pub fn forget<'a>(&self, slot: u64, get: Option<&dyn Fn(u32) -> Option<&'a [u8]>>) {
+    pub fn forget<'a>(
+        &self,
+        proof: Proof<'_>,
+        slot: u64,
+        get: Option<&dyn Fn(u32) -> Option<&'a [u8]>>,
+    ) {
         for index in &self.list {
             let key = get.and_then(|g| index.key_of(g));
-            index.forget(slot, key.as_deref());
+            index.forget(proof, slot, key.as_deref());
         }
         for g in &self.gin {
-            g.forget(slot);
+            g.forget(proof, slot);
         }
     }
 
-    pub fn clear(&self) {
-        self.list.iter().for_each(|i| i.clear());
-        self.gin.iter().for_each(|g| g.clear());
+    pub fn clear(&self, proof: Proof<'_>) {
+        self.list.iter().for_each(|i| i.clear(proof));
+        self.gin.iter().for_each(|g| g.clear(proof));
     }
 
     /// Candidate slots for a predicate tree, sorted and distinct, or `None`

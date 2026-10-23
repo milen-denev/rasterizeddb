@@ -55,6 +55,7 @@ use log::info;
 use parking_lot::Mutex;
 
 use crate::core::filter::TableFilters;
+use crate::core::index_store::gate::{self, Proof};
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
 use crate::core::mvcc::visibility::Visibility;
 use crate::core::mvcc::{TransactionManager, TxId, TxOutcome};
@@ -1052,6 +1053,7 @@ async fn forget_reclaimed<S: StorageIO>(
     dead: &[(u64, crate::core::row::row_pointer::RowPointer)],
 ) {
     let mut row = crate::core::row::row::Row::default();
+    let ticket = gate::ticket();
     for (slot, pointer) in dead {
         if pointer.fetch_row_reuse_async(io_rows, fetch, &mut row).await.is_ok() {
             let get = |wo: u32| {
@@ -1060,9 +1062,9 @@ async fn forget_reclaimed<S: StorageIO>(
                     .find(|c| c.schema_id as u32 == wo)
                     .map(|c| c.data.into_slice())
             };
-            indexes.forget(*slot, Some(&get));
+            indexes.forget(Proof::Ticket(&ticket), *slot, Some(&get));
         } else {
-            indexes.forget(*slot, None);
+            indexes.forget(Proof::Ticket(&ticket), *slot, None);
         }
     }
 }
@@ -1324,7 +1326,12 @@ pub(crate) mod barrier_test_hooks {
 fn apply_filter_clears(ctx: &ReclaimContext<'_>, epoch: Option<u64>, runs: &[(u64, u64)]) -> Option<u64> {
     let n: u64 = runs.iter().map(|r| r.1).sum();
     match (ctx.filters, epoch) {
-        (Some(filters), Some(epoch)) if n > 0 => filters.on_delete_runs_at(epoch, runs).then_some(n),
+        (Some(filters), Some(epoch)) if n > 0 => {
+            let ticket = gate::ticket();
+            filters
+                .on_delete_runs_at(Proof::Ticket(&ticket), epoch, runs)
+                .then_some(n)
+        }
         _ => Some(0),
     }
 }

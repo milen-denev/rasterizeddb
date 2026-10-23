@@ -10,6 +10,7 @@ use rasterizeddb_core::core::filter::hash::HashSeed;
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_filter_tests::*;
 
@@ -286,6 +287,8 @@ fn floats_including_every_special_value() {
 
 #[test]
 fn width_adapts_as_a_column_grows_and_old_rows_stay_findable() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let c = FilterConfig { min_f: 4, default_f: 4, max_f: 16, ..Default::default() };
     let fields = fields_of(&[("id", DbType::U64)]);
     let f = TableFilters::new(&fields, c);
@@ -296,7 +299,7 @@ fn width_adapts_as_a_column_grows_and_old_rows_stay_findable() {
     for slot in 0..n {
         let sv: smallvec::SmallVec<[(u32, Vec<u8>); 32]> =
             smallvec::smallvec![(0u32, vals[slot as usize].to_le_bytes().to_vec())];
-        f.backfill_row(slot, &sv);
+        f.backfill_row(proof, slot, &sv);
         if slot % 8000 == 0 {
             widths.push(f.stats()[0].1);
         }

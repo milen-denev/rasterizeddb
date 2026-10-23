@@ -15,6 +15,7 @@ use rasterizeddb_core::core::filter::hash::{HashSeed, canonical_hash, is_indexab
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::{SargOp, ordered_width};
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::row::RowWrite;
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_core::core::value_codec;
@@ -263,6 +264,8 @@ fn datetime_ranges_have_no_false_negatives_out_of_order() {
 
 #[test]
 fn native_types_survive_a_checkpoint() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 5000u64;
     let fields = fields_of(&[
         ("uid", DbType::UUID),
@@ -286,7 +289,7 @@ fn native_types_survive_a_checkpoint() {
             ]
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =

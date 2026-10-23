@@ -988,13 +988,13 @@ async fn build(
 
                 // Indexes `CREATE INDEX` declared, each with its own
                 // identity and its column count.
-                if let Some(indexes) = table.indexes.as_ref() {
+                if let Some(indexes) = table.indexes() {
                     let declared = indexes
-                        .list
+                        .list()
                         .iter()
                         .filter(|i| !i.implicit)
                         .map(|i| (i.decl.name.clone(), i.columns.len()))
-                        .chain(indexes.gin.iter().map(|g| (g.decl.name.clone(), 1)));
+                        .chain(indexes.gin().iter().map(|g| (g.decl.name.clone(), 1)));
                     for (index_name, columns) in declared {
                         rows.push(format!(
                             "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
@@ -1053,7 +1053,7 @@ async fn build(
                 let Some(table) = database.tables.get(name) else {
                     continue;
                 };
-                let Some(indexes) = table.indexes.as_ref() else {
+                let Some(indexes) = table.indexes() else {
                     continue;
                 };
                 let column_name = |wo: u32| {
@@ -1065,7 +1065,7 @@ async fn build(
                         .map(|f| f.name.clone())
                 };
                 let mut defs: Vec<(String, String)> = Vec::new();
-                for index in indexes.list.iter() {
+                for index in indexes.list().iter() {
                     let columns: Vec<String> = match &index.path {
                         // An index over `doc->>'k'`, written as PostgreSQL
                         // writes an expression index: the expression in its
@@ -1099,7 +1099,7 @@ async fn build(
                         ),
                     ));
                 }
-                for g in indexes.gin.iter() {
+                for g in indexes.gin().iter() {
                     let class = match g.opclass {
                         crate::core::jsonb::GinOpclass::Ops => "",
                         crate::core::jsonb::GinOpclass::PathOps => " jsonb_path_ops",

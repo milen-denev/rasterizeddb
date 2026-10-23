@@ -11,6 +11,7 @@
 use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::row::RowWrite;
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_filter_tests::*;
@@ -165,6 +166,8 @@ async fn concurrent_deletes_and_queries_stay_consistent() {
 
 #[test]
 fn concurrent_probes_against_a_shared_catalog_agree() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // `TableFilters` is shared across worker threads; a probe must not observe
     // a torn view of a column's planes.
     let fields = fields_of(&[("id", DbType::U64)]);
@@ -175,7 +178,7 @@ fn concurrent_probes_against_a_shared_catalog_agree() {
     for slot in 0..n {
         let sv: SmallVec<[(u32, Vec<u8>); 32]> =
             smallvec::smallvec![(0u32, vals[slot as usize].to_le_bytes().to_vec())];
-        f.backfill_row(slot, &sv);
+        f.backfill_row(proof, slot, &sv);
     }
 
     let mut handles = Vec::new();
@@ -209,10 +212,12 @@ fn concurrent_writes_and_probes_never_lose_an_indexed_row() {
     let writer = {
         let f = f.clone();
         std::thread::spawn(move || {
+            let ticket = test_mint();
+            let proof = Proof::Ticket(&ticket);
             for slot in 0..n {
                 let sv: SmallVec<[(u32, Vec<u8>); 32]> =
                     smallvec::smallvec![(0u32, slot.to_le_bytes().to_vec())];
-                f.backfill_row(slot, &sv);
+                f.backfill_row(proof, slot, &sv);
             }
         })
     };

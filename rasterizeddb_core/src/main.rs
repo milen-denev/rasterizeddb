@@ -731,6 +731,18 @@ fn main() -> std::io::Result<()> {
     // 32 MiB
     const STACK_SIZE: usize = 32 * 1024 * 1024;
 
+    // `test_tokens` lets any caller mint a write ticket, which only tests and
+    // benches may (docs/persistent-indexes.md §2). Feature unification can
+    // still build this binary with it (`cargo bench --features test_tokens`,
+    // `cargo test --workspace`), so it refuses here rather than at compile
+    // time, which would break those builds.
+    if cfg!(feature = "test_tokens") {
+        eprintln!(
+            "this server was built with the test-only `test_tokens` feature and will not start; rebuild without it"
+        );
+        std::process::exit(2);
+    }
+
     // Parse command line arguments with clap
     let args = Args::parse();
 

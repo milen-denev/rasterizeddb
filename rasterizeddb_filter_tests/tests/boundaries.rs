@@ -7,6 +7,7 @@ use rasterizeddb_core::core::filter::hash::HashSeed;
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::row::RowWrite;
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_filter_tests::*;
@@ -138,12 +139,14 @@ fn an_unindexed_prefix_at_any_offset_stays_candidate() {
 
 #[test]
 fn checkpoints_round_trip_at_every_boundary_size() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     for &n in SIZES {
         let fields = fields_of(&[("id", DbType::U64)]);
         let f = TableFilters::new(&fields, FilterConfig::default());
         let rows: Vec<Vec<(u32, Vec<u8>)>> =
             (0..n as usize).map(|i| vec![(0u32, (i as u64).to_le_bytes().to_vec())]).collect();
-        backfill_all(&f, &rows);
+        backfill_all(proof, &f, &rows);
 
         let bytes = f.checkpoint_bytes(n);
         let restored =
@@ -181,6 +184,8 @@ fn a_table_with_no_indexable_columns_is_inert() {
 
 #[test]
 fn a_bool_column_is_indexed_for_its_bounds_alone() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // BOOL earns no fingerprints — two distinct values can never clear the
     // selectivity gate — but two bytes per 512-row zone is a fiftieth of that
     // cost and prunes a *sparse* flag almost perfectly. That case arrives on
@@ -195,7 +200,7 @@ fn a_bool_column_is_indexed_for_its_bounds_alone() {
     let rows: Vec<Vec<(u32, Vec<u8>)>> = (0..n as usize)
         .map(|i| vec![(0u32, vec![u8::from(i % 1000 == 0)])])
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let p = sarg::extract(&tokenize("flag = 1", &fields), &f).expect("BOOL = 1 is sargable");
     let bm = f.evaluate(&p, n).expect("a sparse flag should prune");
@@ -215,6 +220,8 @@ fn a_bool_column_is_indexed_for_its_bounds_alone() {
 
 #[test]
 fn many_columns_are_all_independently_indexed() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let spec: Vec<(String, DbType)> = (0..20)
         .map(|i| (format!("c{}", i), if i % 2 == 0 { DbType::U64 } else { DbType::I32 }))
         .collect();
@@ -237,7 +244,7 @@ fn many_columns_are_all_independently_indexed() {
                 .collect()
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     for c in 0..20u32 {
         assert!(f.indexes(c), "column {} not indexed", c);

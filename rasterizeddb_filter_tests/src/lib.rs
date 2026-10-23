@@ -9,6 +9,7 @@
 
 use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::Proof;
 use rasterizeddb_core::core::row::row::{
     ColumnFetchingData, ColumnWritePayload, Row, RowFetch, RowWrite,
 };
@@ -229,10 +230,13 @@ pub fn filters_for(spec: &[(&str, DbType)]) -> (SmallVec<[SchemaField; 20]>, Tab
 }
 
 /// Index `rows[slot]` = list of `(write_order, bytes)`.
-pub fn backfill_all(filters: &TableFilters, rows: &[Vec<(u32, Vec<u8>)>]) {
+///
+/// Takes the proof rather than minting one, so this library builds without
+/// `test_tokens`; the tests, which enable it, mint.
+pub fn backfill_all(proof: Proof<'_>, filters: &TableFilters, rows: &[Vec<(u32, Vec<u8>)>]) {
     for (slot, cols) in rows.iter().enumerate() {
         let sv: SmallVec<[(u32, Vec<u8>); 32]> = cols.iter().cloned().collect();
-        filters.backfill_row(slot as u64, &sv);
+        filters.backfill_row(proof, slot as u64, &sv);
     }
 }
 

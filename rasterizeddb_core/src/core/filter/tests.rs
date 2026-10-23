@@ -7,6 +7,7 @@ use super::sarg;
 use super::zonemap::{SargOp, ZoneMap};
 use super::*;
 use crate::core::db_type::DbType;
+use crate::core::index_store::gate::{Proof, test_mint};
 use crate::core::processor::transformer::ComparerOperation;
 use crate::core::row::logical::perform_comparison_operation;
 use crate::core::row::schema::SchemaField;
@@ -620,6 +621,8 @@ fn sarg_refuses_inequality() {
 
 #[test]
 fn table_filters_conjunction_compounds() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let f = filters();
     let n = 4000u64;
 
@@ -629,7 +632,7 @@ fn table_filters_conjunction_compounds() {
             (0u32, slot.to_le_bytes().to_vec()),
             (2u32, ((slot % 10) as i32).to_le_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     let p = sarg::extract(&toks("id = 1234 AND age = 4"), &f).unwrap();
@@ -647,6 +650,8 @@ fn table_filters_conjunction_compounds() {
 
 #[test]
 fn table_filters_never_prune_a_true_match() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let f = filters();
     let n = 3000u64;
     let names: Vec<String> = (0..n).map(|i| format!("user{}", i)).collect();
@@ -656,7 +661,7 @@ fn table_filters_never_prune_a_true_match() {
             (0u32, slot.to_le_bytes().to_vec()),
             (1u32, names[slot as usize].as_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     for slot in (0..n).step_by(7) {
@@ -687,6 +692,8 @@ fn persist_schema() -> SmallVec<[SchemaField; 20]> {
 }
 
 fn filled_filters(n: u64) -> (TableFilters, Vec<u64>) {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let f = TableFilters::new(&persist_schema(), FilterConfig::default());
     let vals: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     for slot in 0..n {
@@ -694,7 +701,7 @@ fn filled_filters(n: u64) -> (TableFilters, Vec<u64>) {
             (0u32, vals[slot as usize].to_le_bytes().to_vec()),
             (2u32, ((slot % 97) as i32).to_le_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
     (f, vals)
 }
@@ -744,12 +751,14 @@ fn checkpoint_preserves_pruning_power() {
 
 #[test]
 fn modification_after_checkpoint_pulls_the_frontier_back() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 4000u64;
     let (f, _) = filled_filters(n);
     let _ = f.checkpoint_bytes(n);
 
     // Simulate a delete of an already-indexed row *after* the checkpoint.
-    f.on_delete(1500);
+    f.on_delete(proof, 1500);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
@@ -874,6 +883,8 @@ fn schema_change_rejects_the_checkpoint() {
 
 #[test]
 fn checkpoint_survives_generation_boundaries() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // Force several generations, then confirm all of them serialize and reload.
     let mut cfg = FilterConfig::default();
     cfg.min_f = 4;
@@ -886,7 +897,7 @@ fn checkpoint_survives_generation_boundaries() {
     for slot in 0..n {
         let cols: SmallVec<[(u32, Vec<u8>); 32]> =
             smallvec::smallvec![(0u32, vals[slot as usize].to_le_bytes().to_vec())];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
     assert!(f.stats()[0].1 > 4, "expected f to have grown");
 
@@ -1171,6 +1182,8 @@ fn bounds_widen_on_update_and_never_shrink_on_delete() {
 
 #[test]
 fn zonemap_survives_checkpoint() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let fields: SmallVec<[SchemaField; 20]> = smallvec::smallvec![
         SchemaField::new("id".into(), DbType::U64, 8, 0, 0, false),
         SchemaField::new("age".into(), DbType::I32, 4, 0, 1, false),
@@ -1182,7 +1195,7 @@ fn zonemap_survives_checkpoint() {
             (0u32, slot.to_le_bytes().to_vec()),
             (1u32, (slot as i32).to_le_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     let bytes = f.checkpoint_bytes(n);
@@ -1285,6 +1298,8 @@ fn sarg_bails_when_any_or_branch_is_unusable() {
 /// grouping mistake shows up here as a row that matches but was pruned.
 #[test]
 fn masks_are_supersets_of_truth() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let fields = persist_schema();
     let f = TableFilters::new(&fields, FilterConfig::default());
 
@@ -1296,7 +1311,7 @@ fn masks_are_supersets_of_truth() {
             (0u32, ids[slot as usize].to_le_bytes().to_vec()),
             (2u32, ages[slot as usize].to_le_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     #[derive(Clone)]

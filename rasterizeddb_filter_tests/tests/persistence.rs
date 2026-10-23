@@ -9,6 +9,7 @@ use rasterizeddb_core::core::filter::persist::{self, LoadReject};
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::schema::SchemaField;
 use rasterizeddb_core::core::tokenizer::query_tokenizer::{Token, tokenize};
 use rasterizeddb_filter_tests::*;
@@ -24,6 +25,8 @@ fn spec() -> Vec<(&'static str, DbType)> {
 }
 
 fn filled(n: u64) -> (SmallVec<[SchemaField; 20]>, TableFilters, Vec<u64>, Vec<Vec<u8>>) {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (fields, f) = filters_for(&spec());
     let ids: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     let uids: Vec<Vec<u8>> = (0..n).map(|_| uuid_v4()).collect();
@@ -37,7 +40,7 @@ fn filled(n: u64) -> (SmallVec<[SchemaField; 20]>, TableFilters, Vec<u64>, Vec<V
             ]
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
     (fields, f, ids, uids)
 }
 
@@ -83,12 +86,14 @@ fn round_trip_preserves_pruning_power() {
 
 #[test]
 fn round_trip_preserves_zone_bounds() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // Bounds live alongside the fingerprints and must survive too.
     let n = 6000u64;
     let (fields, f) = filters_for(&[("id", DbType::U64)]);
     let rows: Vec<Vec<(u32, Vec<u8>)>> =
         (0..n as usize).map(|i| vec![(0u32, (i as u64).to_le_bytes().to_vec())]).collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
@@ -104,6 +109,8 @@ fn round_trip_preserves_zone_bounds() {
 
 #[test]
 fn round_trip_survives_generation_boundaries() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let cfg = FilterConfig { min_f: 4, default_f: 4, max_f: 16, ..Default::default() };
     let fields = fields_of(&[("id", DbType::U64)]);
     let f = TableFilters::new(&fields, cfg);
@@ -111,7 +118,7 @@ fn round_trip_survives_generation_boundaries() {
     let ids: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     let rows: Vec<Vec<(u32, Vec<u8>)>> =
         (0..n as usize).map(|i| vec![(0u32, ids[i].to_le_bytes().to_vec())]).collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
     assert!(f.stats()[0].1 > 4, "f should have grown");
 
     let bytes = f.checkpoint_bytes(n);
@@ -124,12 +131,14 @@ fn round_trip_survives_generation_boundaries() {
 
 #[test]
 fn a_modification_after_a_checkpoint_pulls_the_frontier_back() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // The checkpoint's bytes for that region could be stale, so it must not
     // claim to cover it.
     let n = 4000u64;
     let (fields, f, _, _) = filled(n);
     let _ = f.checkpoint_bytes(n);
-    f.on_delete(1500);
+    f.on_delete(proof, 1500);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
@@ -601,6 +610,8 @@ async fn garbage_after_the_base_stops_the_replay() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_rewrites_the_base_rather_than_appending() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // A delete invalidates slots near the start, so the "tail" that would have
     // to be re-sent is the whole file. Folding it into a fresh base costs the
     // same and leaves nothing to replay.
@@ -617,7 +628,7 @@ async fn a_delete_rewrites_the_base_rather_than_appending() {
     assert_eq!(f.deltas_since_base(), 1, "an append is a delta");
 
     // Touching slot 3 drags the re-send point back to the first zone.
-    f.on_delete(3);
+    f.on_delete(proof, 3);
     t.checkpoint_filters().await;
     assert_eq!(f.deltas_since_base(), 0, "a low-slot write forces a base rewrite");
 
@@ -634,6 +645,8 @@ async fn a_delete_rewrites_the_base_rather_than_appending() {
 
 #[test]
 fn a_checkpoint_remembers_its_unindexed_prefix() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // Rows that predate the filter are candidates until a backfill indexes
     // them, and a checkpoint taken before that has to say so. Reloading one that
     // claimed the prefix was indexed would prune rows nothing had ever looked
@@ -644,7 +657,7 @@ fn a_checkpoint_remembers_its_unindexed_prefix() {
     let n = 3000u64;
     let prefix = 1000u64;
 
-    f.set_unindexed_prefix(prefix);
+    f.set_unindexed_prefix(proof, prefix);
     for slot in prefix..n {
         let cols: SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, slot.to_le_bytes().to_vec()),
@@ -652,7 +665,7 @@ fn a_checkpoint_remembers_its_unindexed_prefix() {
             (2u32, ((slot % 97) as i32).to_le_bytes().to_vec()),
             (3u32, uuid_ordered(slot)),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     let bytes = f.checkpoint_bytes(n);

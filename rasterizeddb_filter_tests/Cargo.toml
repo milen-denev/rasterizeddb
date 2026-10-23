@@ -13,6 +13,12 @@ tokio = { version = "1", features = ["full"] }
 fastrand = "2.3"
 tempfile = "3"
 
+[dev-dependencies]
+# The tests mint the write tickets the filter's mutators take
+# (`index_store::gate::test_mint`). Only the tests: the library takes them as
+# parameters, so it builds without the feature.
+rasterizeddb_core = { path = "../rasterizeddb_core", features = ["test_tokens"] }
+
 [features]
 # Mirrors the core flag so the whole suite can be run against the long-row
 # pointer layout, which changes ROW_POINTER_RECORD_LEN and therefore the

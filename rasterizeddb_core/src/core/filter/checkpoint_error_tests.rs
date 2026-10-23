@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 use super::persist::LoadReject;
 use super::{FilterConfig, TableFilters, sarg};
 use crate::core::db_type::DbType;
+use crate::core::index_store::gate::{Proof, test_mint};
 use crate::core::row::schema::SchemaField;
 use crate::core::storage_providers::traits::{IOResult, StorageIO};
 
@@ -179,12 +180,14 @@ fn value(slot: u64) -> u64 {
 }
 
 fn index(f: &TableFilters, slots: std::ops::Range<u64>) {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     for slot in slots {
         let cols: SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, value(slot).to_le_bytes().to_vec()),
             (1u32, ((slot % 97) as i32).to_le_bytes().to_vec()),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 }
 
@@ -207,6 +210,8 @@ fn finds(f: &TableFilters, slot: u64, n: u64) -> bool {
 /// next checkpoint rewrites the sidecar with every delete since in it.
 #[tokio::test]
 async fn a_failed_base_image_is_reported_and_rewritten() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -215,7 +220,7 @@ async fn a_failed_base_image_is_reported_and_rewritten() {
     assert!(load(&io, n).is_ok(), "the first checkpoint did not load");
 
     f.mark_disk_dirty(&io).await;
-    f.on_delete(7);
+    f.on_delete(proof, 7);
     assert!(f.disk_dirty.load(Ordering::Acquire));
 
     io.fail_next_write();
@@ -228,7 +233,7 @@ async fn a_failed_base_image_is_reported_and_rewritten() {
     assert_eq!(load(&io, n).err(), Some(LoadReject::Dirty));
 
     f.mark_disk_dirty(&io).await;
-    f.on_delete(8);
+    f.on_delete(proof, 8);
     assert_eq!(
         load(&io, n).err(),
         Some(LoadReject::Dirty),
@@ -252,6 +257,8 @@ async fn a_failed_base_image_is_reported_and_rewritten() {
 /// that clean sidecar and prunes the row the delete changed.
 #[tokio::test]
 async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -259,7 +266,7 @@ async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete(
     assert!(f.try_checkpoint(&io, n).await.is_ok());
 
     f.mark_disk_dirty(&io).await;
-    f.on_delete(7);
+    f.on_delete(proof, 7);
 
     io.fail_next_write_after_landing();
     assert!(f.try_checkpoint(&io, n).await.is_err());
@@ -267,7 +274,7 @@ async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete(
     assert!(load(&io, n).is_ok());
 
     f.mark_disk_dirty(&io).await;
-    f.on_delete(8);
+    f.on_delete(proof, 8);
     assert_eq!(
         load(&io, n).err(),
         Some(LoadReject::Dirty),
@@ -285,6 +292,8 @@ async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete(
 /// `mark_disk_dirty` consults.
 #[tokio::test]
 async fn a_first_checkpoint_that_landed_but_failed_is_marked_dirty_by_the_next_delete() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -295,7 +304,7 @@ async fn a_first_checkpoint_that_landed_but_failed_is_marked_dirty_by_the_next_d
     assert!(load(&io, n).is_ok(), "precondition: the failed first checkpoint is on disk");
 
     f.mark_disk_dirty(&io).await;
-    f.on_delete(7);
+    f.on_delete(proof, 7);
     assert_eq!(
         load(&io, n).err(),
         Some(LoadReject::Dirty),
@@ -307,6 +316,8 @@ async fn a_first_checkpoint_that_landed_but_failed_is_marked_dirty_by_the_next_d
 /// trust, and the dirty byte the next delete writes does not make one.
 #[tokio::test]
 async fn a_first_checkpoint_that_failed_leaves_nothing_to_trust() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -315,7 +326,7 @@ async fn a_first_checkpoint_that_failed_leaves_nothing_to_trust() {
     io.fail_next_write();
     assert!(f.try_checkpoint(&io, n).await.is_err());
     f.mark_disk_dirty(&io).await;
-    f.on_delete(7);
+    f.on_delete(proof, 7);
     assert!(load(&io, n).is_err(), "a sidecar nobody finished writing was trusted");
 
     assert!(f.try_checkpoint(&io, n).await.is_ok());
@@ -394,6 +405,8 @@ async fn a_delta_that_landed_but_failed_is_overwritten_by_the_next_record() {
 #[tokio::test]
 async fn a_kv_sidecar_checkpoints_and_reopens() {
     use crate::core::storage_providers::kv::{KvConfig, KvFamily, KvStorageProvider, KvStore, MemoryKvStore};
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
 
     async fn open(store: &Arc<dyn KvStore>) -> KvStorageProvider {
         let mut config = KvConfig::new("t");
@@ -419,7 +432,7 @@ async fn a_kv_sidecar_checkpoints_and_reopens() {
         let io = open(&store).await;
         assert!(f.try_checkpoint(&io, n0).await.is_ok());
         f.mark_disk_dirty(&io).await;
-        f.on_delete(7);
+        f.on_delete(proof, 7);
     }
     assert_eq!(reload(&store, n0).await.err(), Some(LoadReject::Dirty));
     {

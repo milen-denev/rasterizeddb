@@ -7,6 +7,7 @@ use rasterizeddb_core::core::filter::column::{ColumnFilter, bitmap_words};
 use rasterizeddb_core::core::filter::hash::{HashSeed, canonical_hash, fingerprint};
 use rasterizeddb_core::core::filter::kernels::*;
 use rasterizeddb_core::core::filter::{FilterConfig, SargOp, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::schema::SchemaField;
 
 /// One zone probe = 512 rows. Reported as rows/second.
@@ -179,6 +180,8 @@ fn report_insert_contention(_c: &mut Criterion) {
         })
         .collect();
     let prebuilt = &prebuilt;
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
 
     for batch in [1usize, 64] {
         for threads in [1usize, 2, 4, 8] {
@@ -192,17 +195,17 @@ fn report_insert_contention(_c: &mut Criterion) {
                         for i in 0..PER_THREAD {
                             let slot = (t as u64) * PER_THREAD + i;
                             if batch == 1 {
-                                filters.on_insert(slot, &prebuilt[(i % 64) as usize]);
+                                filters.on_insert(proof, slot, &prebuilt[(i % 64) as usize]);
                             } else {
                                 run.push((slot, &prebuilt[(i % 64) as usize]));
                                 if run.len() == batch {
-                                    filters.on_insert_batch(&run);
+                                    filters.on_insert_batch(proof, &run);
                                     run.clear();
                                 }
                             }
                         }
                         if !run.is_empty() {
-                            filters.on_insert_batch(&run);
+                            filters.on_insert_batch(proof, &run);
                         }
                     });
                 }
@@ -332,12 +335,14 @@ fn bench_checkpoint(c: &mut Criterion) {
         SchemaField::new("k".into(), Ty::I32, 4, 0, 1, false),
     ];
     let filters = TableFilters::new(&fields, FilterConfig::default());
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     for slot in 0..N {
         let cols: smallvec::SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, fastrand::u64(..).to_le_bytes().to_vec()),
             (1u32, (fastrand::i32(..)).to_le_bytes().to_vec()),
         ];
-        filters.backfill_row(slot, &cols);
+        filters.backfill_row(proof, slot, &cols);
     }
 
     let bytes = filters.checkpoint_bytes(N);

@@ -40,6 +40,8 @@ pub mod similar_to;
 /// The shared quote-aware scanner, and escape/dollar-string normalisation.
 pub mod sql_scan;
 pub mod index;
+/// Persistent indexes; phase 0 has only the write gate's proofs.
+pub mod index_store;
 #[cfg(feature = "kv_cache")]
 pub mod kv_cache;
 /// Several storage directories for one database, behind the `storage_pools`

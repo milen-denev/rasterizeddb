@@ -48,6 +48,7 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use crate::core::index::IndexDecl;
+use crate::core::index_store::gate::Proof;
 use crate::core::jsonb::{self, GinOpclass};
 
 const SHARDS: usize = 64;
@@ -173,7 +174,7 @@ impl GinIndex {
     }
 
     /// Indexes the document a version holds (its bytes; empty for `NULL`).
-    pub fn insert(&self, slot: u64, document: Option<&[u8]>) {
+    pub fn insert(&self, _proof: Proof<'_>, slot: u64, document: Option<&[u8]>) {
         let mut items = Vec::new();
         match document.map(|d| jsonb::gin_items(d, self.opclass, &mut items)) {
             Some(Some(())) => {}
@@ -213,7 +214,7 @@ impl GinIndex {
 
     /// Forgets a reclaimed slot. See the module notes on why the lists keep
     /// it until a compaction.
-    pub fn forget(&self, slot: u64) {
+    pub fn forget(&self, proof: Proof<'_>, slot: u64) {
         if !self.holds(slot) {
             return;
         }
@@ -231,7 +232,7 @@ impl GinIndex {
         // so their lists grew until a rebuild.
         let held = self.live.load(Ordering::Relaxed) + forgotten;
         if forgotten.saturating_mul(4) > held.max(512) {
-            self.compact();
+            self.compact(proof);
         }
     }
 
@@ -240,7 +241,7 @@ impl GinIndex {
     /// Only those slots: a clear presence bit does not mean forgotten, it is
     /// also a slot whose insert has written its entries and not yet set its
     /// bit, and removing those would drop a live row from every answer.
-    pub fn compact(&self) {
+    pub fn compact(&self, _proof: Proof<'_>) {
         let gone = std::mem::take(&mut *self.forgotten_slots.lock());
         let Some(&max) = gone.iter().max() else {
             return;
@@ -269,7 +270,7 @@ impl GinIndex {
         sub(&self.forgotten, gone.len() as u64);
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self, _proof: Proof<'_>) {
         for shard in self.shards.iter() {
             shard.write().clear();
         }
@@ -715,6 +716,7 @@ impl GinIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::index_store::gate::test_mint;
 
     fn decl(name: &str) -> IndexDecl {
         IndexDecl {
@@ -732,6 +734,8 @@ mod tests {
 
     #[test]
     fn lookups_find_every_containing_document() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("g"), 0, opclass);
             let docs = [
@@ -742,10 +746,10 @@ mod tests {
                 r#""k""#,
             ];
             for (slot, d) in docs.iter().enumerate() {
-                g.insert(slot as u64, Some(&doc(d)));
+                g.insert(proof, slot as u64, Some(&doc(d)));
             }
-            g.insert(5, None); // unreadable: always a candidate
-            g.insert(6, Some(&[])); // NULL: never
+            g.insert(proof, 5, None); // unreadable: always a candidate
+            g.insert(proof, 6, Some(&[])); // NULL: never
             let ask = |q: &str| g.lookup(&contains_query(&doc(q), opclass).unwrap(), usize::MAX);
             for (q, want) in [
                 (r#"{"a":1}"#, vec![0, 1]),
@@ -763,18 +767,18 @@ mod tests {
             // Nothing to narrow by: declined, not answered with everything.
             assert_eq!(ask("{}"), None);
             // A forgotten slot stops being returned, compaction or not.
-            g.forget(0);
+            g.forget(proof, 0);
             assert!(!ask(r#"{"a":1}"#).unwrap().contains(&0));
-            g.compact();
+            g.compact(proof);
             assert!(!ask(r#"{"a":1}"#).unwrap().contains(&0));
             assert!(ask(r#"{"a":1}"#).unwrap().contains(&1));
         }
         // `?` under jsonb_ops: top-level keys, string elements, a bare string.
         let g = GinIndex::new(decl("k"), 0, GinOpclass::Ops);
-        g.insert(1, Some(&doc(r#"{"k":1}"#)));
-        g.insert(2, Some(&doc(r#"["k"]"#)));
-        g.insert(3, Some(&doc(r#""k""#)));
-        g.insert(4, Some(&doc(r#"{"other":1}"#)));
+        g.insert(proof, 1, Some(&doc(r#"{"k":1}"#)));
+        g.insert(proof, 2, Some(&doc(r#"["k"]"#)));
+        g.insert(proof, 3, Some(&doc(r#""k""#)));
+        g.insert(proof, 4, Some(&doc(r#"{"other":1}"#)));
         let got = g.lookup(&keys_query(&["k".into()], true), usize::MAX).unwrap();
         assert_eq!(got, vec![1, 2, 3]);
         let any = g.lookup(&keys_query(&["k".into(), "other".into()], false), usize::MAX).unwrap();
@@ -814,6 +818,8 @@ mod tests {
     /// an estimate that is not a bound makes the order meaningless.
     #[test]
     fn an_estimate_bounds_its_lookup() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("e"), 0, opclass);
             for slot in 0..300u64 {
@@ -823,10 +829,10 @@ mod tests {
                     slot % 5,
                     slot % 3
                 );
-                g.insert(slot, Some(&doc(&d)));
+                g.insert(proof, slot, Some(&doc(&d)));
             }
-            g.insert(300, None);
-            g.forget(7);
+            g.insert(proof, 300, None);
+            g.forget(proof, 7);
             for q in [r#"{"user":{"id":3}}"#, r#"{"status":"s1","tags":["t2"]}"#, r#"{"user":{}}"#, r#"{"nope":1}"#] {
                 let query = contains_query(&doc(q), opclass).unwrap();
                 let got = g.lookup(&query, usize::MAX).map_or(0, |a| a.len());
@@ -864,17 +870,19 @@ mod tests {
     /// unreadable, some `NULL`, and some forgotten. Returns the documents
     /// by slot, `None` where nothing can match.
     fn random_index(r: &mut Rng, opclass: GinOpclass, n: u64) -> (GinIndex, Vec<Option<Vec<u8>>>) {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         let g = GinIndex::new(decl("r"), 0, opclass);
         let mut docs = Vec::new();
         for slot in 0..n {
             let d = match r.below(40) {
                 0 => {
-                    g.insert(slot, None);
+                    g.insert(proof, slot, None);
                     docs.push(None);
                     continue;
                 }
                 1 => {
-                    g.insert(slot, Some(&[]));
+                    g.insert(proof, slot, Some(&[]));
                     docs.push(None);
                     continue;
                 }
@@ -888,12 +896,12 @@ mod tests {
                 ),
             };
             let bytes = doc(&d);
-            g.insert(slot, Some(&bytes));
+            g.insert(proof, slot, Some(&bytes));
             docs.push(Some(bytes));
         }
         for _ in 0..n / 20 {
             let slot = r.below(n);
-            g.forget(slot);
+            g.forget(proof, slot);
             docs[slot as usize] = None;
         }
         (g, docs)
@@ -1037,6 +1045,8 @@ mod tests {
     /// passes a cap the intersection fits under.
     #[test]
     fn forgotten_entries_do_not_make_a_list_look_universal() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("u"), 0, opclass);
             let d = |status: &str, region: &str, n: u64| {
@@ -1046,14 +1056,14 @@ mod tests {
             };
             // 300 old versions, all paid in eu.
             for slot in 0..300u64 {
-                g.insert(slot, Some(&d("paid", "eu", slot)));
+                g.insert(proof, slot, Some(&d("paid", "eu", slot)));
             }
             // 1000 live rows: paid where slot % 10 < 7, eu where >= 3.
             let mut want = Vec::new();
             for slot in 300..1300u64 {
                 let paid = slot % 10 < 7;
                 let eu = slot % 10 >= 3;
-                g.insert(slot, Some(&d(if paid { "paid" } else { "open" }, if eu { "eu" } else { "us" }, slot)));
+                g.insert(proof, slot, Some(&d(if paid { "paid" } else { "open" }, if eu { "eu" } else { "us" }, slot)));
                 if paid && eu {
                     want.push(slot);
                 }
@@ -1061,7 +1071,7 @@ mod tests {
             assert_eq!(want.len(), 400);
             // Vacuum forgets the old versions.
             for slot in 0..300u64 {
-                g.forget(slot);
+                g.forget(proof, slot);
             }
             assert_eq!(g.forgotten.load(Ordering::Relaxed), 300, "no compaction ran");
             let query = contains_query(&doc(r#"{"status":"paid","region":"eu"}"#), opclass).unwrap();
@@ -1090,6 +1100,8 @@ mod tests {
     /// third of the live slots, and every live document is still found.
     #[test]
     fn many_item_documents_are_compacted() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         let g = GinIndex::new(decl("c"), 0, GinOpclass::Ops);
         let d = |n: u64| {
             doc(&format!(
@@ -1099,13 +1111,13 @@ mod tests {
             ))
         };
         for slot in 0..4000u64 {
-            g.insert(slot, Some(&d(slot)));
+            g.insert(proof, slot, Some(&d(slot)));
         }
         let (_, full) = g.sizes();
         assert!(full >= 4000 * 9, "{full} entries: fewer items than this test means");
         // Every slot but each fourth, as vacuum reclaims old versions.
         for slot in (0..4000u64).filter(|s| s % 4 != 0) {
-            g.forget(slot);
+            g.forget(proof, slot);
         }
         let live = 1000u64;
         let forgotten = g.forgotten.load(Ordering::Relaxed);
@@ -1125,20 +1137,22 @@ mod tests {
     /// is live, and off its lists it would be dropped from every answer.
     #[test]
     fn a_compaction_keeps_a_slot_whose_insert_is_under_way() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("w"), 0, opclass);
             let d = doc(r#"{"k":1}"#);
             for slot in 0..10u64 {
-                g.insert(slot, Some(&d));
+                g.insert(proof, slot, Some(&d));
             }
-            g.forget(3);
+            g.forget(proof, 3);
             // Slot 10's insert, stopped after its entries are written.
             let mut items = Vec::new();
             jsonb::gin_items(&d, opclass, &mut items).unwrap();
             for item in &items {
                 g.shards[GinIndex::shard(*item)].write().entry(*item).or_default().push(10);
             }
-            g.compact();
+            g.compact(proof);
             // The insert finishes.
             g.set_present(10, true);
             let q = contains_query(&d, opclass).unwrap();
@@ -1152,28 +1166,34 @@ mod tests {
     #[test]
     fn compactions_beside_inserts_drop_no_live_slot() {
         use std::sync::Arc;
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         for round in 0..8 {
             let g = Arc::new(GinIndex::new(decl("t"), 0, GinOpclass::PathOps));
             let d = doc(r#"{"k":1}"#);
             for slot in 0..2000u64 {
-                g.insert(slot, Some(&d));
+                g.insert(proof, slot, Some(&d));
             }
             let writer = {
                 let (g, d) = (g.clone(), d.clone());
                 std::thread::spawn(move || {
+                    let ticket = test_mint();
+                    let proof = Proof::Ticket(&ticket);
                     for slot in 10_000..30_000u64 {
-                        g.insert(slot, Some(&d));
+                        g.insert(proof, slot, Some(&d));
                     }
                 })
             };
             let vacuum = {
                 let g = g.clone();
                 std::thread::spawn(move || {
+                    let ticket = test_mint();
+                    let proof = Proof::Ticket(&ticket);
                     for slot in 0..2000u64 {
-                        g.forget(slot);
+                        g.forget(proof, slot);
                     }
                     for _ in 0..100 {
-                        g.compact();
+                        g.compact(proof);
                     }
                 })
             };

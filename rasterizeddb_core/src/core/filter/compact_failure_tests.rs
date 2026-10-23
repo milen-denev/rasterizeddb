@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use rclite::Arc;
 
 use crate::core::database::Database;
+use crate::core::index_store::gate::{Proof, test_mint};
 use crate::core::row::table::compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES;
 
 /// Rows per table. Over the filter's default `min_table_rows` (4096), so a
@@ -206,10 +207,12 @@ fn x_filter(n: u64) -> (crate::core::filter::TableFilters, Vec<crate::core::row:
     use crate::core::db_type::DbType;
     use crate::core::filter::{FilterConfig, TableFilters};
     use crate::core::row::schema::SchemaField;
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let fields = vec![SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false)];
     let f = TableFilters::new(&fields, FilterConfig::default());
-    f.backfill_batch(&rows(n));
-    f.clear_unindexed_prefix();
+    f.backfill_batch(proof, &rows(n));
+    f.clear_unindexed_prefix(proof);
     (f, fields)
 }
 
@@ -225,17 +228,19 @@ fn rows(n: u64) -> Vec<(u64, smallvec::SmallVec<[(u32, Vec<u8>); 32]>)> {
 
 #[test]
 fn a_renumbering_fences_off_work_that_read_slots_before_or_during_it() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (f, fields) = x_filter(100);
     assert!(f.is_complete());
     let before = f.renumber_epoch();
 
-    f.begin_renumbering(100);
+    f.begin_renumbering(proof, 100);
     assert!(!f.is_complete(), "the filter still vouches for slots being renumbered");
     assert_eq!(f.resume_slot(), 0);
     let during = f.renumber_epoch();
-    assert!(!f.backfill_batch_at(before, &rows(10)), "a stale backfill batch was applied");
-    assert!(!f.clear_unindexed_prefix_at(before), "a stale backfill cleared the prefix");
-    assert!(!f.on_delete_runs_at(before, &[(3, 2)]), "a stale vacuum clear was applied");
+    assert!(!f.backfill_batch_at(proof, before, &rows(10)), "a stale backfill batch was applied");
+    assert!(!f.clear_unindexed_prefix_at(proof, before), "a stale backfill cleared the prefix");
+    assert!(!f.on_delete_runs_at(proof, before, &[(3, 2)]), "a stale vacuum clear was applied");
     assert!(!f.is_complete());
 
     // A checkpoint taken now does not vouch for the renumbered slots.
@@ -250,26 +255,28 @@ fn a_renumbering_fences_off_work_that_read_slots_before_or_during_it() {
     assert!(!loaded.is_complete(), "a checkpoint of a demoted filter came back trusted");
     assert_eq!(loaded.resume_slot(), 0, "a reopened table would not backfill the demoted prefix");
 
-    f.end_renumbering();
-    assert!(!f.clear_unindexed_prefix_at(during), "work that overlapped the renumbering cleared the prefix");
+    f.end_renumbering(proof);
+    assert!(!f.clear_unindexed_prefix_at(proof, during), "work that overlapped the renumbering cleared the prefix");
     let after = f.renumber_epoch();
-    assert!(f.backfill_batch_at(after, &rows(100)));
-    assert!(f.clear_unindexed_prefix_at(after));
+    assert!(f.backfill_batch_at(proof, after, &rows(100)));
+    assert!(f.clear_unindexed_prefix_at(proof, after));
     assert!(f.is_complete());
 }
 
 #[test]
 fn an_index_build_from_before_a_renumbering_cannot_mark_it_ready() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let ix = crate::core::index::TableIndexes::new(Vec::new());
     let before = ix.epoch();
-    ix.set_ready(true);
-    let during = ix.invalidate();
+    ix.set_ready(proof, true);
+    let during = ix.invalidate(proof);
     assert!(!ix.is_ready(), "invalidate left the indexes ready");
-    assert!(!ix.set_ready_at(before), "a build from before the renumbering marked ready");
-    let after = ix.invalidate();
-    assert!(!ix.set_ready_at(during), "a build that overlapped the renumbering marked ready");
+    assert!(!ix.set_ready_at(proof, before), "a build from before the renumbering marked ready");
+    let after = ix.invalidate(proof);
+    assert!(!ix.set_ready_at(proof, during), "a build that overlapped the renumbering marked ready");
     assert!(!ix.is_ready());
-    assert!(ix.set_ready_at(after));
+    assert!(ix.set_ready_at(proof, after));
     assert!(ix.is_ready());
     assert_eq!(ix.epoch(), after, "marking ready changed the epoch");
 }
@@ -457,6 +464,8 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
     use crate::core::db_type::DbType;
     use crate::core::filter::{FilterConfig, TableFilters};
     use crate::core::row::schema::SchemaField;
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     const N: u64 = 10_000;
     // A text column: fingerprinted, so a cleared slot changes its plane.
     let fields = vec![SchemaField::new("s".to_string(), DbType::STRING, 12, 0, 0, false)];
@@ -468,8 +477,8 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
             (slot, c)
         })
         .collect();
-    f.backfill_batch(&text_rows);
-    f.clear_unindexed_prefix();
+    f.backfill_batch(proof, &text_rows);
+    f.clear_unindexed_prefix(proof);
     let image = f.checkpoint_bytes(N);
     let load = || TableFilters::from_checkpoint(&image, &fields, FilterConfig::default(), N).unwrap();
     let (one_by_one, in_runs, one_short) = (load(), load(), load());
@@ -480,9 +489,9 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
     assert!(runs.iter().map(|r| r.1).sum::<u64>() > 2 * 4096, "the runs no longer cross two boundaries");
     for &(first, count) in &runs {
         for slot in first..first + count {
-            one_by_one.on_delete(slot);
+            one_by_one.on_delete(proof, slot);
             if slot != 4104 {
-                one_short.on_delete(slot);
+                one_short.on_delete(proof, slot);
             }
         }
     }
@@ -490,7 +499,7 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
         one_by_one.checkpoint_bytes(N) != one_short.checkpoint_bytes(N),
         "one slot's clear does not show in the checkpoint, so the comparison proves nothing"
     );
-    assert!(in_runs.on_delete_runs_at(in_runs.renumber_epoch(), &runs));
+    assert!(in_runs.on_delete_runs_at(proof, in_runs.renumber_epoch(), &runs));
     assert!(
         one_by_one.checkpoint_bytes(N) == in_runs.checkpoint_bytes(N),
         "clearing in chunked runs cleared different slots than clearing one at a time"
@@ -628,27 +637,29 @@ async fn a_failed_compaction_retires_cached_row_pointers() {
 /// began while another had not ended must still read as running.
 #[test]
 fn the_renumber_epoch_is_odd_exactly_while_renumbering() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     use crate::core::filter::renumbering;
     let (f, _) = x_filter(100);
     let mut seen = vec![f.renumber_epoch()];
     assert!(!renumbering(seen[0]), "a fresh filter reads as renumbering");
     for cycle in 0..2 {
-        f.begin_renumbering(100);
+        f.begin_renumbering(proof, 100);
         assert!(renumbering(f.renumber_epoch()), "cycle {cycle}: not renumbering after a begin");
         seen.push(f.renumber_epoch());
-        f.end_renumbering();
+        f.end_renumbering(proof);
         assert!(!renumbering(f.renumber_epoch()), "cycle {cycle}: still renumbering after an end");
         seen.push(f.renumber_epoch());
     }
-    f.end_renumbering();
+    f.end_renumbering(proof);
     assert!(!renumbering(f.renumber_epoch()), "an end with no begin left the epoch renumbering");
     seen.push(f.renumber_epoch());
-    f.begin_renumbering(100);
+    f.begin_renumbering(proof, 100);
     seen.push(f.renumber_epoch());
-    f.begin_renumbering(100);
+    f.begin_renumbering(proof, 100);
     assert!(renumbering(f.renumber_epoch()), "a begin during a renumbering ended it");
     seen.push(f.renumber_epoch());
-    f.end_renumbering();
+    f.end_renumbering(proof);
     assert!(!renumbering(f.renumber_epoch()));
     seen.push(f.renumber_epoch());
     assert!(
@@ -709,18 +720,20 @@ async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
 /// prefix clear then outlives a compaction that fails part-way.
 #[test]
 fn work_that_read_the_epoch_during_a_renumbering_cannot_publish() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (f, _) = x_filter(100);
-    f.begin_renumbering(100);
+    f.begin_renumbering(proof, 100);
     let during = f.renumber_epoch();
-    assert!(!f.backfill_batch_at(during, &rows(10)), "a batch read mid-renumbering was applied");
-    assert!(!f.on_delete_runs_at(during, &[(3, 2)]), "a clear read mid-renumbering was applied");
-    assert!(!f.clear_unindexed_prefix_at(during), "a backfill mid-renumbering cleared the prefix");
+    assert!(!f.backfill_batch_at(proof, during, &rows(10)), "a batch read mid-renumbering was applied");
+    assert!(!f.on_delete_runs_at(proof, during, &[(3, 2)]), "a clear read mid-renumbering was applied");
+    assert!(!f.clear_unindexed_prefix_at(proof, during), "a backfill mid-renumbering cleared the prefix");
     assert!(!f.is_complete(), "the demotion was cleared while slots were still moving");
-    f.end_renumbering();
+    f.end_renumbering(proof);
     let after = f.renumber_epoch();
     assert_ne!(after, during);
-    assert!(f.backfill_batch_at(after, &rows(100)));
-    assert!(f.clear_unindexed_prefix_at(after));
+    assert!(f.backfill_batch_at(proof, after, &rows(100)));
+    assert!(f.clear_unindexed_prefix_at(proof, after));
     assert!(f.is_complete());
 }
 
@@ -731,6 +744,8 @@ fn work_that_read_the_epoch_during_a_renumbering_cannot_publish() {
 /// trusting slots that hold moved rows it never indexed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
     use crate::core::storage_providers::traits::StorageIO;
     let base = tempfile::tempdir().unwrap();
@@ -742,14 +757,14 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
     let n_slots = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
     // What `compact` does before its first move; it is still running.
-    filters.begin_renumbering(n_slots);
+    filters.begin_renumbering(proof, n_slots);
     assert!(!filters.is_complete());
     let _ = t.backfill_filters_from(0).await;
     assert!(
         !filters.is_complete(),
         "a backfill that read slots while they moved cleared the renumbering's demotion"
     );
-    filters.end_renumbering();
+    filters.end_renumbering(proof);
 
     drop(filters);
     drop(t);
@@ -761,9 +776,11 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
 /// the `ORDER BY … LIMIT` slot ceiling. The frontier is left where it was.
 #[test]
 fn a_demoted_column_is_not_reported_monotonic() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (f, _) = x_filter(2048);
     assert!(f.column_is_monotonic(0, 2048), "the fixture is not monotonic, so this proves nothing");
-    f.begin_renumbering(2048);
+    f.begin_renumbering(proof, 2048);
     assert!(!f.column_is_monotonic(0, 2048), "a demoted column still licenses the slot ceiling");
 }
 

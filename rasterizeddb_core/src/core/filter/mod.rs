@@ -52,6 +52,7 @@ use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::core::db_type::DbType;
+use crate::core::index_store::gate::Proof;
 use crate::core::row::row::RowWrite;
 use crate::core::row::schema::SchemaField;
 use crate::core::storage_providers::traits::StorageIO;
@@ -857,13 +858,13 @@ impl TableFilters {
 
     /// Mark slots `[0, slots)` as predating the filter. They stay candidates
     /// until [`Self::clear_unindexed_prefix`] follows a backfill.
-    pub fn set_unindexed_prefix(&self, slots: u64) {
+    pub fn set_unindexed_prefix(&self, _proof: Proof<'_>, slots: u64) {
         for c in &self.columns {
             c.write().set_unindexed_prefix(slots);
         }
     }
 
-    pub fn clear_unindexed_prefix(&self) {
+    pub fn clear_unindexed_prefix(&self, _proof: Proof<'_>) {
         for c in &self.columns {
             c.write().clear_unindexed_prefix();
         }
@@ -886,7 +887,7 @@ impl TableFilters {
     /// The epoch is bumped before the columns are demoted, and each column's
     /// lock is taken after the bump, so an epoch-checked write that saw the
     /// old epoch has landed before the demotion and before any slot moves.
-    pub fn begin_renumbering(&self, n_slots: u64) {
+    pub fn begin_renumbering(&self, _proof: Proof<'_>, n_slots: u64) {
         // To the next odd value: always a change, always "running".
         let _ = self
             .renumber_epoch
@@ -908,9 +909,14 @@ impl TableFilters {
     /// written unconditionally here so this does not lean on the flag. A crash
     /// part-way through the renumbering then reopens to a sidecar that is
     /// either rejected or demoted, never one that trusts the old numbering.
-    pub async fn begin_renumbering_on_disk<S: StorageIO>(&self, io: &S, n_slots: u64) {
+    pub async fn begin_renumbering_on_disk<S: StorageIO>(
+        &self,
+        proof: Proof<'_>,
+        io: &S,
+        n_slots: u64,
+    ) {
         let _gate = self.write_gate.lock().await;
-        self.begin_renumbering(n_slots);
+        self.begin_renumbering(proof, n_slots);
         if self.has_checkpoint.load(Ordering::Acquire) {
             let _marking = self.dirty_marking.lock().await;
             persist::mark_dirty_on_disk(io).await;
@@ -921,7 +927,7 @@ impl TableFilters {
     /// Called once slot numbers have stopped changing, whether the
     /// renumbering finished or failed: work that read its epoch during it
     /// read a mix of both numberings.
-    pub fn end_renumbering(&self) {
+    pub fn end_renumbering(&self, _proof: Proof<'_>) {
         // To the next even value: always a change, never "running".
         let _ = self
             .renumber_epoch
@@ -931,7 +937,7 @@ impl TableFilters {
     /// [`TableFilters::clear_unindexed_prefix`], unless the slots were
     /// renumbered since `epoch` was read. Returns whether every column was
     /// cleared.
-    pub fn clear_unindexed_prefix_at(&self, epoch: u64) -> bool {
+    pub fn clear_unindexed_prefix_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
         if renumbering(epoch) {
             return false;
         }
@@ -956,7 +962,7 @@ impl TableFilters {
     /// clears applied before a `false` return are still sound: each chunk was
     /// checked under the numbering it was written in, and the caller re-clears
     /// on the next sweep.
-    pub fn on_delete_runs_at(&self, epoch: u64, runs: &[(u64, u64)]) -> bool {
+    pub fn on_delete_runs_at(&self, _proof: Proof<'_>, epoch: u64, runs: &[(u64, u64)]) -> bool {
         if renumbering(epoch) {
             return false;
         }
@@ -999,7 +1005,7 @@ impl TableFilters {
     /// Columns absent from `row_write` are explicitly cleared rather than left
     /// alone: a slot that is reused by a relocating update must not keep the
     /// previous occupant's fingerprint.
-    pub fn on_insert(&self, slot: u64, row_write: &RowWrite) {
+    pub fn on_insert(&self, _proof: Proof<'_>, slot: u64, row_write: &RowWrite) {
         for (i, m) in self.meta.iter().enumerate() {
             // Both of these used to run inside the lock. Finding the payload is
             // a scan of the row's columns, which made maintenance quadratic in
@@ -1044,7 +1050,7 @@ impl TableFilters {
     /// immutable, and here they are not. `UPDATE`, `DELETE`, backfill and
     /// reclamation all write into zones long past the frontier, so there is no
     /// immutable tail to publish by pointer swap.
-    pub fn on_insert_batch(&self, rows: &[(u64, &RowWrite)]) {
+    pub fn on_insert_batch(&self, _proof: Proof<'_>, rows: &[(u64, &RowWrite)]) {
         if rows.is_empty() {
             return;
         }
@@ -1076,7 +1082,7 @@ impl TableFilters {
 
     /// Clear every column at `slot`. Exact — unlike a Bloom filter, deleting
     /// *improves* the false-positive rate rather than degrading it.
-    pub fn on_delete(&self, slot: u64) {
+    pub fn on_delete(&self, _proof: Proof<'_>, slot: u64) {
         for cell in &self.columns {
             cell.write().set(slot, None);
         }
@@ -1270,7 +1276,12 @@ impl TableFilters {
 
     /// Index a row read back from storage, for backfill. `columns` are
     /// `(write_order, bytes)` pairs.
-    pub fn backfill_row(&self, slot: u64, columns: &SmallVec<[(u32, Vec<u8>); 32]>) {
+    pub fn backfill_row(
+        &self,
+        _proof: Proof<'_>,
+        slot: u64,
+        columns: &SmallVec<[(u32, Vec<u8>); 32]>,
+    ) {
         for (i, m) in self.meta.iter().enumerate() {
             let bytes = columns
                 .iter()
@@ -1285,14 +1296,19 @@ impl TableFilters {
     /// A whole-table backfill is the largest batch the engine ever has, and it
     /// is the one place where lock acquisitions dominate rather than merely
     /// appear — see [`Self::on_insert_batch`] for the measurement.
-    pub fn backfill_batch(&self, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
-        self.backfill_batch_at(self.renumber_epoch(), rows);
+    pub fn backfill_batch(&self, proof: Proof<'_>, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
+        self.backfill_batch_at(proof, self.renumber_epoch(), rows);
     }
 
     /// [`TableFilters::backfill_batch`], unless the slots were renumbered
     /// since `epoch` was read: rows read under one numbering must not be
     /// written under another. Returns whether the batch was applied.
-    pub fn backfill_batch_at(&self, epoch: u64, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) -> bool {
+    pub fn backfill_batch_at(
+        &self,
+        _proof: Proof<'_>,
+        epoch: u64,
+        rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)],
+    ) -> bool {
         if renumbering(epoch) {
             return false;
         }
@@ -1490,6 +1506,7 @@ mod leading_mask_tests {
 #[cfg(test)]
 mod in_list_mask_bench {
     use super::*;
+    use crate::core::index_store::gate::test_mint;
     use smallvec::SmallVec;
 
     impl TableFilters {
@@ -1516,6 +1533,8 @@ mod in_list_mask_bench {
     #[test]
     #[ignore]
     fn in_list_mask_bench() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         const N: u64 = 1_000_000;
         let field = SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false);
         let filters = TableFilters::new(&[field], FilterConfig::default());
@@ -1527,8 +1546,8 @@ mod in_list_mask_bench {
                 (slot, c)
             })
             .collect();
-        filters.backfill_batch(&rows);
-        filters.clear_unindexed_prefix();
+        filters.backfill_batch(proof, &rows);
+        filters.clear_unindexed_prefix(proof);
         for n in [10usize, 1_000, 50_000] {
             // Values spread over a tenth of the table.
             let branches: Vec<sarg::MaskExpr> = (0..n)

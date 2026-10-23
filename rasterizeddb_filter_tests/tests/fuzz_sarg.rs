@@ -8,6 +8,7 @@ use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::tokenizer::query_tokenizer::{NumericValue, Token};
 use rasterizeddb_filter_tests::*;
 use smallvec::SmallVec;
@@ -117,6 +118,8 @@ fn deeply_nested_parens_are_handled_without_stack_trouble() {
 
 #[test]
 fn very_wide_disjunctions_are_handled() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // An ORM `IN` list can be long; the desugared form is a wide OR.
     let (fields, f) = catalog();
     for width in [2usize, 16, 128, 512] {
@@ -133,7 +136,7 @@ fn very_wide_disjunctions_are_handled() {
         let rows: Vec<Vec<(u32, Vec<u8>)>> =
             (0..n as usize).map(|i| vec![(0u32, (i as u64).to_le_bytes().to_vec())]).collect();
         let f2 = TableFilters::new(&fields, FilterConfig::default());
-        backfill_all(&f2, &rows);
+        backfill_all(proof, &f2, &rows);
         let p2 = sarg::extract(&toks, &f2).unwrap();
         let bm = f2.evaluate(&p2, n).expect("bitmap");
         for i in 0..width as u64 {

@@ -13,6 +13,7 @@ use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::settings::settings;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_filter_tests::*;
 
@@ -172,6 +173,8 @@ fn a_saturated_column_still_answers_correctly() {
 
 #[test]
 fn the_summary_is_reachable_through_settings() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
 
@@ -187,8 +190,8 @@ fn the_summary_is_reachable_through_settings() {
             ]
         })
         .collect();
-    backfill_all(&on, &rows);
-    backfill_all(&off, &rows);
+    backfill_all(proof, &on, &rows);
+    backfill_all(proof, &off, &rows);
 
     assert!(on.bytes() > off.bytes(), "the summary should cost storage");
 
@@ -209,6 +212,8 @@ fn the_summary_is_reachable_through_settings() {
 
 #[test]
 fn the_summary_survives_a_checkpoint() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("id", DbType::U64)]);
     run_sql("SET FILTER bloom = on FOR COLUMN ckpt_sum.id").unwrap();
@@ -218,7 +223,7 @@ fn the_summary_survives_a_checkpoint() {
     let rows: Vec<Vec<(u32, Vec<u8>)>> = (0..n as usize)
         .map(|i| vec![(0u32, ((i % 250) as u64).to_le_bytes().to_vec())])
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let bytes = f.checkpoint_bytes(n);
     let restored = TableFilters::from_checkpoint(&bytes, &fields, FilterConfig::default(), n)

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::*;
 use crate::core::filter::SargOp;
 use crate::core::filter::sarg::{MaskExpr, SargPredicate};
+use crate::core::index_store::gate::{Proof, test_mint};
 use crate::core::processor::transformer::ComparerOperation;
 use crate::core::row::logical::perform_comparison_operation;
 use crate::core::row::schema::SchemaField;
@@ -115,6 +116,8 @@ fn index(name: &str, method: Method, columns: &[u32]) -> Arc<LiveIndex> {
 
 #[test]
 fn candidates_are_always_a_superset_of_the_matches() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let schema: Vec<SchemaField> = fields();
     let mut r = Rng(0xDEAD_BEEF);
     // Several index layouts, so every planner branch is reached: whole-key
@@ -148,7 +151,7 @@ fn candidates_are_always_a_superset_of_the_matches() {
             let row = &rows[slot];
             for ix in &indexes.list {
                 let key = if r.below(20) == 0 { None } else { ix.key_of(|wo| Some(row[wo as usize].as_slice())) };
-                ix.insert(slot as u64, key);
+                ix.insert(proof, slot as u64, key);
             }
         }
         let mut used = 0;
@@ -176,6 +179,8 @@ fn candidates_are_always_a_superset_of_the_matches() {
 
 #[test]
 fn removal_and_replacement_keep_the_superset() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
     let key = |v: i64| {
@@ -190,35 +195,37 @@ fn removal_and_replacement_keep_the_superset() {
         })
     };
     let schema = fields();
-    ix.insert(1, Some(key(5)));
-    ix.insert(2, Some(key(5)));
+    ix.insert(proof, 1, Some(key(5)));
+    ix.insert(proof, 2, Some(key(5)));
     assert_eq!(indexes.plan(&eq(5), &schema, 100), Some(vec![1, 2]));
     // In place, 5 -> 7: slot 1 moves.
-    ix.insert(1, Some(key(7)));
-    ix.remove(1, &key(5));
+    ix.insert(proof, 1, Some(key(7)));
+    ix.remove(proof, 1, &key(5));
     assert_eq!(indexes.plan(&eq(5), &schema, 100), Some(vec![2]));
     assert_eq!(indexes.plan(&eq(7), &schema, 100), Some(vec![1]));
     // Removing a pair that is not there is a no-op (a late, repeated forget).
-    ix.remove(2, &key(7));
+    ix.remove(proof, 2, &key(7));
     assert_eq!(indexes.plan(&eq(5), &schema, 100), Some(vec![2]));
     // Vacuum forgets a reclaimed slot entirely.
     assert!(ix.holds(2));
-    ix.forget(2, Some(&key(5)));
+    ix.forget(proof, 2, Some(&key(5)));
     assert!(!ix.holds(2));
     assert_eq!(indexes.plan(&eq(5), &schema, 100), Some(vec![]));
     // A version with no key is a candidate for every lookup.
-    ix.insert(9, None);
+    ix.insert(proof, 9, None);
     assert_eq!(indexes.plan(&eq(5), &schema, 100), Some(vec![9]));
     assert_eq!(indexes.plan(&eq(7), &schema, 100), Some(vec![1, 9]));
 }
 
 #[test]
 fn a_broad_answer_is_declined() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
     for slot in 0..1000u64 {
         let bytes = (slot as i64).to_le_bytes();
-        ix.insert(slot, ix.key_of(|_| Some(&bytes[..])));
+        ix.insert(proof, slot, ix.key_of(|_| Some(&bytes[..])));
     }
     let gt = MaskExpr::Pred(SargPredicate {
         write_order: 0,
@@ -231,9 +238,11 @@ fn a_broad_answer_is_declined() {
 
 #[test]
 fn hash_answers_only_equality_on_its_whole_key() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let ix = index("ns", Method::Hash, &[0, 1]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
-    ix.insert(3, ix.key_of(|wo| Some(if wo == 0 { &[1, 0, 0, 0, 0, 0, 0, 0][..] } else { b"x" })));
+    ix.insert(proof, 3, ix.key_of(|wo| Some(if wo == 0 { &[1, 0, 0, 0, 0, 0, 0, 0][..] } else { b"x" })));
     let p = |wo: u32, op: SargOp, v: &[u8]| {
         MaskExpr::Pred(SargPredicate {
             write_order: wo,
@@ -268,6 +277,8 @@ fn method_choice() {
 
 #[test]
 fn a_composite_btree_ranges_inside_its_equality_prefix() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let strings = ["a", "b", "b\0", "c", "d"];
     let slot_of = |n: i64, j: usize| (n as u64) * strings.len() as u64 + j as u64;
     for (name, cols) in [("ns", [0u32, 1]), ("sn", [1, 0])] {
@@ -277,7 +288,7 @@ fn a_composite_btree_ranges_inside_its_equality_prefix() {
             for (j, s) in strings.iter().enumerate() {
                 let nb = n.to_le_bytes();
                 let key = ix.key_of(|wo| Some(if wo == 0 { &nb[..] } else { s.as_bytes() }));
-                ix.insert(slot_of(n, j), key);
+                ix.insert(proof, slot_of(n, j), key);
             }
         }
         let p = |wo: u32, op: SargOp, v: &[u8]| {
@@ -314,14 +325,16 @@ fn a_composite_btree_ranges_inside_its_equality_prefix() {
 /// smaller answer wins, whether or not the broad one fits under the cap.
 #[test]
 fn a_broad_whole_key_loses_to_a_narrow_range() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let by_n = index("n", Method::BTree, &[0]);
     let by_s = index("s", Method::BTree, &[1]);
     let indexes = TableIndexes::new(vec![by_n.clone(), by_s.clone()]);
     for slot in 0..1000u64 {
         let nb = (slot as i64).to_le_bytes();
-        by_n.insert(slot, by_n.key_of(|_| Some(&nb[..])));
+        by_n.insert(proof, slot, by_n.key_of(|_| Some(&nb[..])));
         let s: &[u8] = if slot % 5 == 0 { b"paid" } else { b"new" };
-        by_s.insert(slot, by_s.key_of(|_| Some(s)));
+        by_s.insert(proof, slot, by_s.key_of(|_| Some(s)));
     }
     let p = |wo: u32, op: SargOp, v: &[u8]| {
         MaskExpr::Pred(SargPredicate {
@@ -341,7 +354,7 @@ fn a_broad_whole_key_loses_to_a_narrow_range() {
     assert_eq!(indexes.plan(&both, &fields(), 100), Some(want.clone()));
     // A slot whose key could not be built may hold anything: the filter
     // keeps it.
-    by_s.insert(7, None);
+    by_s.insert(proof, 7, None);
     let mut with_unkeyed = want.clone();
     with_unkeyed.push(7);
     with_unkeyed.sort_unstable();
@@ -362,6 +375,8 @@ fn a_broad_whole_key_loses_to_a_narrow_range() {
 /// and a removal finds its slot by search.
 #[test]
 fn posting_lists_stay_sorted_and_distinct() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let hx = index("h", Method::Hash, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
@@ -372,12 +387,12 @@ fn posting_lists_stay_sorted_and_distinct() {
     for _ in 0..2000 {
         let slot = r.below(500);
         if r.below(4) == 0 {
-            ix.remove(slot, &ix.key_of(|_| Some(&seven[..])).unwrap());
-            hx.remove(slot, &hx.key_of(|_| Some(&seven[..])).unwrap());
+            ix.remove(proof, slot, &ix.key_of(|_| Some(&seven[..])).unwrap());
+            hx.remove(proof, slot, &hx.key_of(|_| Some(&seven[..])).unwrap());
             model.remove(&slot);
         } else {
-            ix.insert(slot, ix.key_of(|_| Some(&seven[..])));
-            hx.insert(slot, hx.key_of(|_| Some(&seven[..])));
+            ix.insert(proof, slot, ix.key_of(|_| Some(&seven[..])));
+            hx.insert(proof, slot, hx.key_of(|_| Some(&seven[..])));
             model.insert(slot);
         }
     }
@@ -414,6 +429,8 @@ fn galloping_finds_what_a_binary_search_finds() {
 }
 
 fn gin_pair() -> (Arc<gin::GinIndex>, Arc<gin::GinIndex>, TableIndexes) {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let decl = |name: &str, method| IndexDecl {
         name: name.into(),
         method,
@@ -426,7 +443,7 @@ fn gin_pair() -> (Arc<gin::GinIndex>, Arc<gin::GinIndex>, TableIndexes) {
     // `jsonb_ops` declared first, so a stable sort on the estimate alone
     // would ask it first on a tie.
     let indexes = TableIndexes::with_gin(Vec::new(), vec![ops.clone(), path.clone()]);
-    indexes.set_ready(true);
+    indexes.set_ready(proof, true);
     (ops, path, indexes)
 }
 
@@ -442,11 +459,13 @@ fn contains_leaf(q: &str) -> gin::JsonExpr {
 /// on. Between equal bounds the index with less to read is asked first.
 #[test]
 fn ties_go_to_the_index_with_less_to_read() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (_, _, indexes) = gin_pair();
     for slot in 0..500u64 {
         let d = format!(r#"{{"status":"{}","n":{}}}"#, ["paid", "new", "shipped"][(slot % 3) as usize], slot);
         let bytes = crate::core::jsonb::encode_text(&d).unwrap();
-        indexes.index_row(slot, &|_| Some(&bytes[..]));
+        indexes.index_row(proof, slot, &|_| Some(&bytes[..]));
     }
     let gin::JsonExpr::Leaf { op, .. } = contains_leaf(r#"{"status":"paid"}"#) else { unreachable!() };
     let order = indexes.ask_order(0, &op);
@@ -460,6 +479,8 @@ fn ties_go_to_the_index_with_less_to_read() {
 /// shape is one the bitmap path does not take.
 #[test]
 fn broad_gin_answers_come_back_as_bitmaps() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let (_, _, indexes) = gin_pair();
     let n = 2_000u64;
     let mut docs = Vec::new();
@@ -476,9 +497,9 @@ fn broad_gin_answers_come_back_as_bitmaps() {
         match &d {
             Some(d) => {
                 let bytes = crate::core::jsonb::encode_text(d).unwrap();
-                indexes.index_row(slot, &|_| Some(&bytes[..]));
+                indexes.index_row(proof, slot, &|_| Some(&bytes[..]));
             }
-            None => indexes.index_unreadable(slot),
+            None => indexes.index_unreadable(proof, slot),
         }
         docs.push(d);
     }
@@ -756,12 +777,14 @@ fn the_shape_hash_sees_what_keys_rows_and_no_name() {
 /// and gin counters, so a test can tell an index was consulted.
 #[test]
 fn a_column_index_answer_is_counted() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let indexes = TableIndexes::new(vec![index("n_bt", Method::BTree, &[0]), index("s_hash", Method::Hash, &[1])]);
     for slot in 0..64u64 {
         let row = [(slot as i64).to_le_bytes().to_vec(), vec![b'a' + (slot % 7) as u8]];
-        indexes.index_row(slot, &|wo| row.get(wo as usize).map(|v| v.as_slice()));
+        indexes.index_row(proof, slot, &|wo| row.get(wo as usize).map(|v| v.as_slice()));
     }
-    indexes.set_ready(true);
+    indexes.set_ready(proof, true);
     let pred = |write_order: u32, op: SargOp, value: Vec<u8>| MaskExpr::Pred(SargPredicate { write_order, op, value });
     let cases = [
         (pred(0, SargOp::Eq, 5i64.to_le_bytes().to_vec()), vec![5]),

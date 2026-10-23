@@ -85,6 +85,10 @@ webpki-roots = { version = "1", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8" }
 tempfile = "3"
+# The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
+quote = "1"
 
 [[bench]]
 name = "string_instructions_benchmarks"
@@ -125,6 +129,9 @@ harness = false
 [[bench]]
 name = "filter_benchmarks"
 harness = false
+# It mutates a filter, which takes a proof only `test_tokens` can mint here:
+# `cargo bench --features test_tokens`.
+required-features = ["test_tokens"]
 
 [[bench]]
 name = "mmap_scan_benchmarks"
@@ -152,6 +159,12 @@ enable_long_row = []
 persistent_indexes = []
 enable_data_verification = []
 memory_pool_reuse = []
+
+# `index_store::gate::test_mint`: a write ticket for callers that link the
+# library without `cfg(test)` (doctests, `benches/filter_benchmarks.rs`,
+# `rasterizeddb_filter_tests`). Never in a server build: the binary refuses to
+# start with it (docs/persistent-indexes.md §2).
+test_tokens = []
 
 # Compressed transaction exchange between replicating instances.
 #

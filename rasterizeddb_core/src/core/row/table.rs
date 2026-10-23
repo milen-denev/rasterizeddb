@@ -25,6 +25,7 @@ use crate::core::tokenizer::query_tokenizer::Token;
 
 use crate::core::db_type::DbType;
 use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
+use crate::core::index_store::gate::{self, Proof};
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
@@ -416,23 +417,26 @@ impl<S: StorageIO> Table<S> {
         if pending.is_empty() {
             return;
         }
+        let ticket = gate::ticket();
         for op in pending.drain(..) {
             match op {
                 PendingFilterOp::Delete(slot) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_delete(slot);
+                        filters.on_delete(Proof::Ticket(&ticket), slot);
                     }
                     // A secondary index keeps the slot: vacuum forgets it once
                     // nothing can reach the version, reading its key back then.
                 }
                 PendingFilterOp::Insert(slot, row_write, old_keys) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_insert(slot, &row_write);
+                        filters.on_insert(Proof::Ticket(&ticket), slot, &row_write);
                     }
                     if let Some(indexes) = self.indexes.as_ref() {
                         match old_keys {
-                            Some(old) => indexes.on_replace(slot, &old, &row_write),
-                            None => indexes.on_insert(slot, &row_write),
+                            Some(old) => {
+                                indexes.on_replace(Proof::Ticket(&ticket), slot, &old, &row_write)
+                            }
+                            None => indexes.on_insert(Proof::Ticket(&ticket), slot, &row_write),
                         }
                     }
                 }
@@ -444,6 +448,12 @@ impl<S: StorageIO> Table<S> {
     #[inline]
     fn maintains_indexes(&self) -> bool {
         self.filters.is_some() || self.indexes.is_some()
+    }
+
+    /// The secondary indexes, read-only, for readers such as the catalog
+    /// views. `None` when the table has none.
+    pub fn indexes(&self) -> Option<crate::core::index::IndexView<'_>> {
+        self.indexes.as_deref().map(crate::core::index::TableIndexes::view)
     }
 }
 
@@ -672,7 +682,8 @@ impl<S: StorageIO> Table<S> {
                         // Rows already on disk predate the filter, so they stay
                         // candidates until a backfill indexes them. Correct from
                         // the first query; just not yet selective.
-                        f.set_unindexed_prefix(existing_slots);
+                        let build = gate::build_token();
+                        f.set_unindexed_prefix(Proof::Build(&build), existing_slots);
                         Some(StdArc::new(f))
                     }
                 }
@@ -708,8 +719,9 @@ impl<S: StorageIO> Table<S> {
                 if !alive.load(AtomicOrdering::Relaxed) {
                     return;
                 }
+                let build = gate::build_token();
                 match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
-                    Ok(n) if indexes.set_ready_at(epoch) => {
+                    Ok(n) if indexes.set_ready_at(Proof::Build(&build), epoch) => {
                         info!("Built {} index(es) on {} over {} rows", indexes.len(), table_name_task, n);
                     }
                     Ok(_) => info!(
@@ -1560,8 +1572,9 @@ impl<S: StorageIO> Table<S> {
             // Unready since the renumbering began; this epoch is the one it
             // ended in, so only this build can mark them ready again.
             let epoch = indexes.epoch();
-            indexes.set_ready(false);
-            indexes.clear();
+            let build = gate::build_token();
+            indexes.set_ready(Proof::Build(&build), false);
+            indexes.clear(Proof::Build(&build));
             match build_indexes(
                 indexes,
                 &self.io_pointers,
@@ -1572,7 +1585,7 @@ impl<S: StorageIO> Table<S> {
             .await
             {
                 Ok(_) => {
-                    indexes.set_ready_at(epoch);
+                    indexes.set_ready_at(Proof::Build(&build), epoch);
                 }
                 Err(e) => error!("Compaction could not rebuild the indexes; queries scan: {}", e),
             }
@@ -1629,11 +1642,14 @@ impl<S: StorageIO> Table<S> {
             filters: self.filters.as_deref(),
             indexes: self.indexes.as_deref(),
         };
+        let ticket = gate::ticket();
         if let Some(filters) = self.filters.as_ref() {
-            filters.begin_renumbering_on_disk(&*self.io_filters, n_slots).await;
+            filters
+                .begin_renumbering_on_disk(Proof::Ticket(&ticket), &*self.io_filters, n_slots)
+                .await;
         }
         if let Some(indexes) = self.indexes.as_ref() {
-            indexes.invalidate();
+            indexes.invalidate(Proof::Ticket(&ticket));
         }
         guard
     }
@@ -3173,13 +3189,22 @@ impl<S: StorageIO> Table<S> {
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
+        let ticket = gate::ticket();
         if let Some(filters) = self.filters.as_ref() {
-            filters.on_insert(record_pos / ROW_POINTER_RECORD_LEN as u64, &row_write);
+            filters.on_insert(
+                Proof::Ticket(&ticket),
+                record_pos / ROW_POINTER_RECORD_LEN as u64,
+                &row_write,
+            );
         }
         // Before this returns, and so before the inserting transaction can
         // commit: no snapshot can see the row without its index entry.
         if let Some(indexes) = self.indexes.as_ref() {
-            indexes.on_insert(record_pos / ROW_POINTER_RECORD_LEN as u64, &row_write);
+            indexes.on_insert(
+                Proof::Ticket(&ticket),
+                record_pos / ROW_POINTER_RECORD_LEN as u64,
+                &row_write,
+            );
         }
 
         self.invalidate_query_caches();
@@ -4515,6 +4540,7 @@ async fn backfill_into<S: StorageIO>(
         Some(readers) => readers.enter(),
         None => ReadTicket::inert(),
     };
+    let build = gate::build_token();
 
     // Read before the first slot: a batch is written, and the prefix cleared,
     // only if no renumbering (`Table::compact`, which this does not wait for)
@@ -4532,7 +4558,7 @@ async fn backfill_into<S: StorageIO>(
 
     let fetch = Table::<S>::build_indexed_row_fetch(fields);
     if fetch.columns_fetching_data.is_empty() {
-        if start_slot == 0 && !filters.clear_unindexed_prefix_at(epoch) {
+        if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::Build(&build), epoch) {
             return Err(renumbered());
         }
         return Ok(0);
@@ -4583,19 +4609,19 @@ async fn backfill_into<S: StorageIO>(
 
         pending.push((offset / ROW_POINTER_RECORD_LEN as u64, cols));
         if pending.len() == BACKFILL_BATCH {
-            if !filters.backfill_batch_at(epoch, &pending) {
+            if !filters.backfill_batch_at(Proof::Build(&build), epoch, &pending) {
                 return Err(renumbered());
             }
             pending.clear();
         }
         indexed += 1;
     }
-    if !filters.backfill_batch_at(epoch, &pending) {
+    if !filters.backfill_batch_at(Proof::Build(&build), epoch, &pending) {
         return Err(renumbered());
     }
 
     // Only a scan that started at the beginning can vouch for the prefix.
-    if start_slot == 0 && !filters.clear_unindexed_prefix_at(epoch) {
+    if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::Build(&build), epoch) {
         return Err(renumbered());
     }
     info!(
@@ -4627,6 +4653,7 @@ async fn build_indexes<S: StorageIO>(
         Some(readers) => readers.enter(),
         None => ReadTicket::inert(),
     };
+    let build = gate::build_token();
     let fetch = Table::<S>::build_fetch_for(fields, &indexes.columns());
     let mut iterator = RowPointerIterator::new(io_pointers.clone())
         .await
@@ -4647,10 +4674,10 @@ async fn build_indexes<S: StorageIO>(
         {
             // Unreadable here is not unreadable to the query, which may
             // succeed later: kept as a candidate in every index.
-            indexes.index_unreadable(slot);
+            indexes.index_unreadable(Proof::Build(&build), slot);
             continue;
         }
-        indexes.index_row(slot, &|wo| {
+        indexes.index_row(Proof::Build(&build), slot, &|wo| {
             row.columns
                 .iter()
                 .find(|c| c.schema_id as u32 == wo)
@@ -4669,8 +4696,9 @@ struct RenumberingGuard<'a> {
 
 impl Drop for RenumberingGuard<'_> {
     fn drop(&mut self) {
+        let ticket = gate::ticket();
         if let Some(filters) = self.filters {
-            filters.end_renumbering();
+            filters.end_renumbering(Proof::Ticket(&ticket));
             // A compaction that fails from here on leaves the filter demoted
             // in memory and the sidecar marked dirty; this persists the
             // demotion at the next maintenance tick instead of whenever
@@ -4679,7 +4707,7 @@ impl Drop for RenumberingGuard<'_> {
             filters.request_checkpoint();
         }
         if let Some(indexes) = self.indexes {
-            indexes.invalidate();
+            indexes.invalidate(Proof::Ticket(&ticket));
         }
     }
 }

@@ -10,6 +10,7 @@ use rasterizeddb_core::core::filter::hash::HashSeed;
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_filter_tests::*;
 use smallvec::SmallVec;
@@ -71,6 +72,8 @@ fn truth(e: &Expr, id: u64, cat: i32) -> bool {
 
 #[test]
 fn masks_are_supersets_of_truth_over_random_boolean_trees() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
     let f = TableFilters::new(&fields, FilterConfig::default());
 
@@ -85,7 +88,7 @@ fn masks_are_supersets_of_truth_over_random_boolean_trees() {
             ]
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let mut filtered_any = false;
     for _ in 0..600 {
@@ -106,6 +109,8 @@ fn masks_are_supersets_of_truth_over_random_boolean_trees() {
 
 #[test]
 fn masks_survive_a_random_mutation_workload() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     // Interleaved inserts, updates and deletes, then every live value must
     // still be findable and every deleted one must be gone from its slot.
     let fields = fields_of(&[("id", DbType::U64)]);
@@ -118,7 +123,7 @@ fn masks_survive_a_random_mutation_workload() {
         let v = fastrand::u64(..);
         let sv: SmallVec<[(u32, Vec<u8>); 32]> =
             smallvec::smallvec![(0u32, v.to_le_bytes().to_vec())];
-        f.backfill_row(slot as u64, &sv);
+        f.backfill_row(proof, slot as u64, &sv);
         live[slot] = Some(v);
     }
 
@@ -126,14 +131,14 @@ fn masks_survive_a_random_mutation_workload() {
         let slot = fastrand::usize(0..n);
         match fastrand::usize(0..3) {
             0 => {
-                f.on_delete(slot as u64);
+                f.on_delete(proof, slot as u64);
                 live[slot] = None;
             }
             _ => {
                 let v = fastrand::u64(..);
                 let sv: SmallVec<[(u32, Vec<u8>); 32]> =
                     smallvec::smallvec![(0u32, v.to_le_bytes().to_vec())];
-                f.backfill_row(slot as u64, &sv);
+                f.backfill_row(proof, slot as u64, &sv);
                 live[slot] = Some(v);
             }
         }
@@ -197,6 +202,8 @@ fn range_masks_are_supersets_for_every_ordered_type() {
 
 #[test]
 fn checkpoint_round_trips_under_random_workloads() {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     for _ in 0..12 {
         let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
         let f = TableFilters::new(&fields, FilterConfig::default());
@@ -209,7 +216,7 @@ fn checkpoint_round_trips_under_random_workloads() {
                 (0u32, a.to_le_bytes().to_vec()),
                 (1u32, b.to_le_bytes().to_vec())
             ];
-            f.backfill_row(slot as u64, &sv);
+            f.backfill_row(proof, slot as u64, &sv);
             live[slot] = Some((a, b));
         }
 

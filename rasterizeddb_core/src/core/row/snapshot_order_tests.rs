@@ -45,6 +45,7 @@ use smallvec::SmallVec;
 use tokio::sync::oneshot;
 
 use crate::core::db_type::DbType;
+use crate::core::index_store::gate::{Proof, test_mint};
 use crate::core::mvcc::TransactionManager;
 use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite};
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
@@ -351,6 +352,8 @@ async fn interleave_unseen(
     subject: bool,
     k: u64,
 ) -> (Answer, Vec<(u64, i32)>) {
+    let ticket = test_mint();
+    let proof = Proof::Ticket(&ticket);
     let writer = manager.begin();
     t.insert_row_in_txn(row(k, 7), writer).await.unwrap();
     let slot = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64 - 1;
@@ -368,7 +371,7 @@ async fn interleave_unseen(
                     .find(|c| c.write_order == wo)
                     .map(|c| c.data.into_slice())
             };
-            ix.forget(slot, Some(&get));
+            ix.forget(proof, slot, Some(&get));
             assert!(!ix.holds(slot), "the entry is withdrawn");
             Withdrawn::Index(ix)
         }
@@ -377,7 +380,7 @@ async fn interleave_unseen(
             let w = clause(stmt, k);
             let before = t.build_candidates(&w, None).await.expect("the filter masks this clause");
             assert!(before.get(slot), "the insert fingerprinted the slot it appended");
-            f.on_delete(slot);
+            f.on_delete(proof, slot);
             let after = t.build_candidates(&w, None).await.expect("the filter masks this clause");
             assert!(
                 !after.get(slot),
@@ -406,8 +409,8 @@ async fn interleave_unseen(
     // `insert_row_in_txn` orders them.
     match withdrawn {
         Withdrawn::Nothing => {}
-        Withdrawn::Index(ix) => ix.on_insert(slot, &row(k, 7)),
-        Withdrawn::Filter(f) => f.on_insert(slot, &row(k, 7)),
+        Withdrawn::Index(ix) => ix.on_insert(proof, slot, &row(k, 7)),
+        Withdrawn::Filter(f) => f.on_insert(proof, slot, &row(k, 7)),
     }
     manager.commit(writer);
     release.send(()).unwrap();

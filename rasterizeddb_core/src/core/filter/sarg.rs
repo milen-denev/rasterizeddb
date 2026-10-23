@@ -871,11 +871,14 @@ mod pattern_ops_are_not_sargable {
 mod float_nan_is_never_pruned {
     use super::*;
     use crate::core::filter::column::FilterConfig;
+    use crate::core::index_store::gate::{Proof, test_mint};
     use crate::core::row::schema::SchemaField;
     use smallvec::SmallVec;
 
     #[test]
     fn a_nan_row_survives_every_predicate_it_satisfies() {
+        let ticket = test_mint();
+        let proof = Proof::Ticket(&ticket);
         let field = SchemaField::new("f".to_string(), DbType::F64, 8, 0, 0, false);
         let schema: SmallVec<[SchemaField; 20]> = smallvec::smallvec![field.clone()];
         let filters = TableFilters::new(&[field], FilterConfig::default());
@@ -890,9 +893,9 @@ mod float_nan_is_never_pruned {
             let v = if is_nan(slot) { f64::NAN } else { value(slot) };
             let mut cols: SmallVec<[(u32, Vec<u8>); 32]> = SmallVec::new();
             cols.push((0, v.to_le_bytes().to_vec()));
-            filters.backfill_row(slot, &cols);
+            filters.backfill_row(proof, slot, &cols);
         }
-        filters.clear_unindexed_prefix();
+        filters.clear_unindexed_prefix(proof);
 
         let mut pruned = 0;
         for (clause, matches) in [
