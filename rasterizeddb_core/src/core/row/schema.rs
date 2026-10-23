@@ -26,6 +26,60 @@ const BATCH_SIZE: usize = 100;
 
 const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator and primary key + null terminator
 
+/// Opens the incarnation record that follows the header in `_schema.db`.
+///
+/// The first byte is one a header cannot start with — a header starts with the
+/// table name, filtered to `[A-Za-z0-9_]`, or with the `0` of an empty one — so
+/// a reader walking several headers ([`TableSchemaIterator`]) can tell the two
+/// apart. Version 1 in the last byte.
+const INCARNATION_MAGIC: [u8; 8] = [0xFF, b'R', b'Z', b'I', b'N', b'C', 0, 1];
+
+/// The incarnation record: [`INCARNATION_MAGIC`], the incarnation as a
+/// little-endian `u128`, and a CRC-32 of those 24 bytes, little-endian.
+///
+/// After the header, because the header is fixed-width and every binary,
+/// older ones included, reads exactly [`TABLE_SIZE`] bytes of it and nothing
+/// further: an older binary opens a file with the record exactly as it opened
+/// one without. Header rewrites write over the header only, so they keep it.
+const INCARNATION_LEN: usize = INCARNATION_MAGIC.len() + 16 + 4;
+
+/// The incarnation record for `incarnation`.
+fn incarnation_record(incarnation: u128) -> [u8; INCARNATION_LEN] {
+    let mut record = [0u8; INCARNATION_LEN];
+    record[..8].copy_from_slice(&INCARNATION_MAGIC);
+    record[8..24].copy_from_slice(&incarnation.to_le_bytes());
+    let crc = crc32fast::hash(&record[..24]);
+    record[24..].copy_from_slice(&crc.to_le_bytes());
+    record
+}
+
+/// The incarnation `bytes` records, or `None` if they are not a whole,
+/// verifying record of a non-zero incarnation.
+fn parse_incarnation(bytes: &[u8]) -> Option<u128> {
+    let record = bytes.get(..INCARNATION_LEN)?;
+    if record[..8] != INCARNATION_MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(record[24..].try_into().expect("four bytes"));
+    if crc32fast::hash(&record[..24]) != crc {
+        return None;
+    }
+    let incarnation = u128::from_le_bytes(record[8..24].try_into().expect("sixteen bytes"));
+    (incarnation != 0).then_some(incarnation)
+}
+
+/// A new, random, non-zero incarnation.
+pub fn mint_incarnation() -> u128 {
+    loop {
+        let mut bytes = [0u8; 16];
+        rand::fill(&mut bytes);
+        let incarnation = u128::from_le_bytes(bytes);
+        if incarnation != 0 {
+            return incarnation;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SchemaField {
     pub name: String,
@@ -411,6 +465,18 @@ pub struct TableSchema {
     /// Separate from `defaults` because the two differ in when they apply — see
     /// [`crate::core::rql::generated`].
     pub generated: Vec<crate::core::rql::generated::GeneratedColumn>,
+    /// Which incarnation of the table under this name this is (C7): random,
+    /// minted by [`TableSchema::new`], so a table created — or dropped and
+    /// created again, which an `ALTER` rewrite does — gets a new one, and kept
+    /// by every rewrite of the header (`RENAME`, `PRIMARY KEY`).
+    ///
+    /// Recorded after the header in `_schema.db` (see [`INCARNATION_LEN`]),
+    /// where a binary that predates it never reads. `0` means none is
+    /// recorded: a file written before it existed, or one whose record does not
+    /// verify. Anything derived from the table and kept on disk (an index
+    /// snapshot) records the incarnation it was taken from and is trusted only
+    /// while it matches, and `0` never does.
+    pub incarnation: u128,
 }
 
 
@@ -430,6 +496,7 @@ impl TableSchema {
             type_modifiers: Vec::new(),
             generated: Vec::new(),
             checks: Vec::new(),
+            incarnation: mint_incarnation(),
         }
     }
 
@@ -453,6 +520,19 @@ impl TableSchema {
             Ok(s) => s,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         };
+        // The incarnation record after the header, if the file has one. A
+        // record that is missing, short, unreadable or does not verify leaves
+        // `0`, which nothing derived from the table is ever trusted against.
+        if schema_len >= (TABLE_SIZE + INCARNATION_LEN) as u64 {
+            let mut record = [0u8; INCARNATION_LEN];
+            if schema_io
+                .read_data_into_buffer(&mut (TABLE_SIZE as u64), &mut record)
+                .await
+                .is_ok()
+            {
+                table_schema.incarnation = parse_incarnation(&record).unwrap_or(0);
+            }
+        }
         let mut field_io = schema_io
             .create_new(format!(
                 "{}_{}",
@@ -621,11 +701,18 @@ impl TableSchema {
             type_modifiers: Vec::new(),
             generated: Vec::new(),
             checks: Vec::new(),
+            // Not part of the header; `load` reads it from the record after.
+            incarnation: 0,
         })
     }
 
     pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
-        let data = self.into_vec();
+        let mut data = self.into_vec();
+        // In the same append as the header, so a schema file never holds a
+        // header whose record is still to come.
+        if self.incarnation != 0 {
+            data.extend_from_slice(&incarnation_record(self.incarnation));
+        }
         // Schema is small and critical; persist immediately so CREATE TABLE is durable
         // even if the process crashes before any background flush runs.
         schema_io.append_data(&data, true).await;
@@ -638,7 +725,7 @@ impl TableSchema {
     /// every time after: the file is a `TABLE_SIZE` header followed by field
     /// records, so a second append would be read back as a malformed field. The
     /// header is fixed-width and lives at offset zero, so writing over it is
-    /// exact.
+    /// exact, and leaves the incarnation record after it as it was.
     pub async fn rewrite_header<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
         schema_io.write_data(0, &data).await;
@@ -968,22 +1055,34 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             return Ok(None);
         }
 
-        // If we've reached the end of the current buffer, load the next chunk
-        if self.buffer_index >= self.buffer_valid_length {
+        // A header and the incarnation record after it are read from one
+        // buffer. Records put headers off the chunk grid, so when this buffer
+        // holds less than both and the file has more, the next chunk starts at
+        // the first unread byte rather than past the end of this buffer, which
+        // would cut whatever straddles the boundary.
+        if self.buffer_index + TABLE_SIZE + INCARNATION_LEN > self.buffer_valid_length
+            && self.position < self.total_length as u64
+        {
+            self.position -= (self.buffer_valid_length - self.buffer_index) as u64;
             self.load_next_chunk().await?;
-
-            // If loading the next chunk reached the end of data, return None
             if self.end_of_data {
                 return Ok(None);
             }
         }
 
-        // If the remaining buffer is smaller than a single table schema, load the next chunk
+        // A record this buffer holds without its header (one that did not
+        // verify after it) is stepped over; no header starts with that byte.
+        if self.buffer.into_slice()[..self.buffer_valid_length].get(self.buffer_index)
+            == Some(&INCARNATION_MAGIC[0])
+        {
+            self.buffer_index =
+                (self.buffer_index + INCARNATION_LEN).min(self.buffer_valid_length);
+        }
+
+        // Fewer bytes than a header left in the file: the end.
         if self.buffer_index + TABLE_SIZE > self.buffer_valid_length {
-            self.load_next_chunk().await?;
-            if self.end_of_data {
-                return Ok(None);
-            }
+            self.end_of_data = true;
+            return Ok(None);
         }
 
         // Extract the table schema data from the buffer
@@ -1041,8 +1140,15 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             }
         }
 
-        // Advance the buffer index
+        // Advance the buffer index, past the incarnation record too if one
+        // follows.
         self.buffer_index += TABLE_SIZE;
+        if let Some(incarnation) = parse_incarnation(
+            &self.buffer.into_slice()[self.buffer_index..self.buffer_valid_length],
+        ) {
+            table_schema.incarnation = incarnation;
+            self.buffer_index += INCARNATION_LEN;
+        }
 
         Ok(Some(table_schema))
     }
@@ -1059,11 +1165,12 @@ mod tests {
 
     /// One `TableSchema` per open table, and one more in every clone. With
     /// nine inline `SmallVec`s of declarations it was 3720 bytes, about 2.4 KB
-    /// of that empty slots, since almost no table declares any of them.
+    /// of that empty slots, since almost no table declares any of them. 1408
+    /// before the 16-byte incarnation.
     #[test]
     fn table_schema_stays_small() {
         let size = std::mem::size_of::<TableSchema>();
-        assert!(size <= 1408, "TableSchema grew to {size} bytes");
+        assert!(size <= 1424, "TableSchema grew to {size} bytes");
     }
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
     use std::{fs, io, path::Path};
@@ -2063,5 +2170,111 @@ mod tests {
             field.write_order > dead_order,
             "the load kept the older record; the live one is always the newer"
         );
+    }
+
+    async fn incarnation_provider(dir: &tempfile::TempDir) -> Arc<LocalStorageProvider> {
+        Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("inc_schema.db")).await)
+    }
+
+    /// C7: every new schema gets its own non-zero incarnation; `save` records
+    /// it and `load` reads it back; a header rewrite (`PRIMARY KEY`, `RENAME`)
+    /// keeps it.
+    #[tokio::test]
+    async fn a_saved_schema_keeps_its_incarnation_across_loads_and_header_rewrites() {
+        let a = TableSchema::new("inc".into(), false);
+        let b = TableSchema::new("inc".into(), false);
+        assert_ne!(a.incarnation, 0);
+        assert_ne!(a.incarnation, b.incarnation, "two creations of one name share an incarnation");
+
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let mut schema = a.clone();
+        schema.save(io.clone()).await.unwrap();
+        schema
+            .add_field(io.clone(), "id".into(), DbType::I64, true)
+            .await;
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.incarnation, a.incarnation, "the incarnation did not survive a load");
+        assert_eq!(loaded.fields.len(), 1);
+
+        schema.set_primary_key("id".into());
+        schema.name = "renamed".into();
+        schema.rewrite_header(io.clone()).await.unwrap();
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.primary_key.as_deref(), Some("id"));
+        assert_eq!(loaded.name, "renamed");
+        assert_eq!(loaded.incarnation, a.incarnation, "a header rewrite lost the incarnation");
+    }
+
+    /// A `_schema.db` written before incarnations existed is the header alone:
+    /// it loads exactly as before, with none recorded. A record that does not
+    /// verify reads as none too, never as some other incarnation.
+    #[tokio::test]
+    async fn a_schema_without_a_verifying_incarnation_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let schema = TableSchema::new("legacy".into(), true);
+        io.append_data(&schema.into_vec(), true).await;
+        let loaded = TableSchema::load(io.clone()).await.expect("a legacy schema must load");
+        assert_eq!(loaded.name, "legacy");
+        assert!(loaded.is_immutable);
+        assert_eq!(loaded.incarnation, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        schema.save(io.clone()).await.unwrap();
+        assert_eq!(TableSchema::load(io.clone()).await.unwrap().incarnation, schema.incarnation);
+        // One bit of the incarnation flipped: the CRC no longer verifies.
+        let mut record = incarnation_record(schema.incarnation);
+        record[10] ^= 0x01;
+        io.write_data(TABLE_SIZE as u64, &record).await;
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.name, "legacy");
+        assert_eq!(loaded.incarnation, 0, "a corrupt record was trusted");
+
+        // And a record of incarnation zero is none, however well it verifies.
+        assert_eq!(parse_incarnation(&incarnation_record(0)), None);
+        assert_eq!(parse_incarnation(&incarnation_record(7)), Some(7));
+        assert_eq!(parse_incarnation(&incarnation_record(7)[..INCARNATION_LEN - 1]), None);
+    }
+
+    /// The record's first byte is one no header can start with, whatever the
+    /// table's name: names are filtered to `[A-Za-z0-9_]`, or empty.
+    #[test]
+    fn no_header_starts_like_an_incarnation_record() {
+        for name in ["", "a", "Z9", "_x", "weird-name.with dots", "\u{ff}x"] {
+            let header = TableSchema::new(name.into(), false).into_vec();
+            assert_ne!(header[0], INCARNATION_MAGIC[0], "{name:?}");
+        }
+    }
+
+    /// Several schemas saved into one file, each followed by its record, still
+    /// iterate one by one with their own incarnations, including across the
+    /// iterator's chunk boundary, which records no longer align with.
+    #[tokio::test]
+    async fn the_schema_iterator_steps_over_incarnation_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let schemas: Vec<TableSchema> = (0..150)
+            .map(|i| TableSchema::new(format!("t{i}"), i % 2 == 0))
+            .collect();
+        for schema in &schemas {
+            schema.save(io.clone()).await.unwrap();
+        }
+        let mut iterator = TableSchemaIterator::new(io.clone()).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(schema) = iterator.next_table_schema().await.unwrap() {
+            seen.push((schema.name, schema.is_immutable, schema.incarnation));
+        }
+        let expected: Vec<(String, bool, u128)> = schemas
+            .iter()
+            .map(|s| (s.name.clone(), s.is_immutable, s.incarnation))
+            .collect();
+        assert_eq!(seen.len(), expected.len(), "the iterator lost or invented schemas");
+        for (got, want) in seen.iter().zip(&expected) {
+            assert_eq!(got.0, want.0);
+            assert_eq!(got.1, want.1, "{}", want.0);
+            assert_eq!(got.2, want.2, "{}: the wrong incarnation", want.0);
+        }
     }
 }

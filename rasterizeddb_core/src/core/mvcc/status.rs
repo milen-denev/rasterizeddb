@@ -258,6 +258,29 @@ pub struct StatusLog {
     dirty_bytes: CacheGuard<AtomicUsize>,
 }
 
+/// See [`outcome_revocations`].
+static OUTCOME_REVOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times, since the process started, a transaction recorded
+/// `Committed` was then recorded `Aborted` (N26).
+///
+/// The commit path records `Committed` before its last durability steps, and a
+/// failure in one of them records `Aborted` over it. Anything decided on the
+/// in-memory outcome in between — a vacuum forget, a filter clear — removed a
+/// version that is visible again. Restart heals that today, because every
+/// index and the filter are rebuilt from rows; a persisted snapshot taken in
+/// the window would not be. So a snapshot is refused if this moved since the
+/// partition opened and again just before it is published.
+pub fn outcome_revocations() -> u64 {
+    OUTCOME_REVOCATIONS.load(Ordering::Acquire)
+}
+
+/// Whether writing outcome bits `new` over `old` revokes a commit.
+#[inline]
+fn revokes_a_commit(old: u8, new: u8) -> bool {
+    old == BITS_COMMITTED && new == BITS_ABORTED
+}
+
 /// Ids for [`StatusLog::id`].
 static NEXT_LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -458,6 +481,9 @@ impl StatusLog {
     }
 
     /// Records how `tx` ended.
+    ///
+    /// An `Aborted` written over `Committed` is counted in
+    /// [`outcome_revocations`].
     pub fn record(&self, tx: TxId, outcome: TxOutcome) {
         let bits = match outcome {
             TxOutcome::InProgress => BITS_IN_PROGRESS,
@@ -490,6 +516,14 @@ impl StatusLog {
 
         let shift = (tx % ENTRIES_PER_BYTE) * 2;
         let byte = view.bits.load_for_update(index);
+        if revokes_a_commit((byte >> shift) & 0b11, bits) {
+            OUTCOME_REVOCATIONS.fetch_add(1, Ordering::AcqRel);
+            log::warn!(
+                "transaction {} was recorded committed and is now recorded aborted; \
+                 work decided on the committed outcome in between is healed by a restart",
+                tx
+            );
+        }
         view.bits
             .store(index, (byte & !(0b11 << shift)) | (bits << shift));
 
@@ -1987,6 +2021,33 @@ impl StatusLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N26: an `Aborted` recorded over `Committed` is counted, process-wide,
+    /// for the snapshot that must not publish across it. Nothing else counts:
+    /// an abort of a running or never-recorded id is the ordinary case.
+    #[test]
+    fn a_committed_outcome_rewritten_as_aborted_is_counted() {
+        let log = StatusLog::in_memory();
+        let before = outcome_revocations();
+        log.record(5, TxOutcome::Committed);
+        log.record(5, TxOutcome::Aborted);
+        assert_eq!(log.outcome(5), TxOutcome::Aborted);
+        assert!(
+            outcome_revocations() > before,
+            "a Committed outcome was revoked and nothing counted it"
+        );
+
+        for (old, new, revokes) in [
+            (BITS_COMMITTED, BITS_ABORTED, true),
+            (BITS_IN_PROGRESS, BITS_ABORTED, false),
+            (BITS_ABORTED, BITS_ABORTED, false),
+            (BITS_IN_PROGRESS, BITS_COMMITTED, false),
+            (BITS_COMMITTED, BITS_COMMITTED, false),
+            (BITS_IN_PROGRESS, BITS_IN_PROGRESS, false),
+        ] {
+            assert_eq!(revokes_a_commit(old, new), revokes, "{old:#04b} -> {new:#04b}");
+        }
+    }
 
     /// The bitmap grows in doubling levels, so an id can land in a level that
     /// did not exist when its neighbour was recorded. Every byte has to survive

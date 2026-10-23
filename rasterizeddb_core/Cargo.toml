@@ -139,8 +139,17 @@ name = "vacuum_benchmarks"
 harness = false
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes"]
 enable_long_row = []
+
+# Indexes and the filter persisted as snapshots taken at clean points, loaded
+# at open instead of rebuilt (docs/persistent-indexes.md).
+#
+# On by default. A directory that has used them carries `index_store_v1` in
+# its `incompat_features` file, and a build without this feature refuses that
+# directory rather than open files it would not keep correct. It adds no crate
+# of its own.
+persistent_indexes = []
 enable_data_verification = []
 memory_pool_reuse = []
 

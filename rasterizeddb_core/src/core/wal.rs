@@ -478,6 +478,15 @@ pub struct Wal {
     /// [`Wal::dropped_after`]). Trimmed by [`Wal::forget_drops_through`] as
     /// each snapshot starts.
     dropped_at: Mutex<HashMap<u64, u64>>,
+    /// Times the sync handle had to be opened lazily, which only a test that
+    /// clears it should ever cause: `Wal::open` opens it and a keep-tail
+    /// checkpoint installs the new file's.
+    #[cfg(test)]
+    lazy_opens: AtomicU64,
+    /// Callers of [`Wal::commit_through`] past its poison check and about to
+    /// wait for the sync gate, so a test can tell one is queued there.
+    #[cfg(test)]
+    gate_arrivals: AtomicU64,
 }
 
 /// One file id's fences: [`Incarnation`]s taken by [`Wal::forget_files`]
@@ -582,6 +591,10 @@ impl Wal {
 
         let end = writer.seek(SeekFrom::End(0))?;
 
+        // Opened now rather than at the first sync, so no commit's sync can
+        // fail at an `open` after its marker is already in the file (R7).
+        let sync_handle = Arc::new(writer.try_clone()?);
+
         // Whatever the last truncation recorded. Recovery raises it further
         // from the records still in the log; this is only the floor beneath
         // them, and it is all a cleanly checkpointed log leaves behind.
@@ -610,7 +623,7 @@ impl Wal {
             write_pos: AtomicU64::new(end),
             durable: AtomicU64::new(0),
             gate: Mutex::new(()),
-            sync_handle: Mutex::new(None),
+            sync_handle: Mutex::new(Some(sync_handle)),
             next_txn: AtomicU64::new(resume_txn),
             commit_lsn: AtomicU64::new(resume_lsn),
             bytes_since_checkpoint: AtomicU64::new(end),
@@ -636,6 +649,10 @@ impl Wal {
             last_dirty: AtomicU64::new(u64::MAX),
             fences: parking_lot::RwLock::new(HashMap::new()),
             dropped_at: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            lazy_opens: AtomicU64::new(0),
+            #[cfg(test)]
+            gate_arrivals: AtomicU64::new(0),
         })
     }
 
@@ -707,6 +724,19 @@ impl Wal {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(self.poisoned_error());
         }
+        Ok(())
+    }
+
+    /// A failure injected at `step` by [`test_hooks::FAIL_WAL_STEP`], for the
+    /// steps no real file fails on demand. Always `Ok` outside tests.
+    #[inline]
+    fn injected(step: &'static str) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::FAIL_WAL_STEP.with(|s| s.get() == Some(step)) {
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(None));
+            return Err(io::Error::other(format!("injected failure at {step}")));
+        }
+        let _ = step;
         Ok(())
     }
 
@@ -1222,17 +1252,38 @@ impl Wal {
         // a runtime worker, that parked the worker and every task queued on
         // it: with as many concurrent committers as workers, reads stalled for
         // whole syncs. See [`blocking_io`].
-        blocking_io(|| self.commit_through_slow(seq))
+        let synced = blocking_io(|| self.commit_through_slow(seq));
+        // Every error is a poisoned log (V4). An error that left the log
+        // unpoisoned leaves a commit marker in the file that the next
+        // committer's sync makes durable, so replay applies a write its caller
+        // was told failed — and a snapshot barrier that trusts an `Ok` after
+        // it would capture memory that never saw that write.
+        debug_assert!(
+            synced.is_ok() || self.is_poisoned(),
+            "commit_through returned an error without poisoning the log: {:?}",
+            synced
+        );
+        synced
     }
 
     /// The part of [`Wal::commit_through`] that may block: waiting for the
     /// gate, and the flush itself. Order and protocol are exactly the ones
     /// `commit_through` always had; only the thread it blocks changed.
     fn commit_through_slow(&self, seq: u64) -> io::Result<()> {
+        #[cfg(test)]
+        self.gate_arrivals.fetch_add(1, Ordering::AcqRel);
         let _gate = self.gate.lock();
 
         if self.durable.load(Ordering::Acquire) >= seq {
             return Ok(()); // covered while we waited for the gate
+        }
+        // Checked again under the gate: the leader this caller queued behind
+        // may have failed its sync and poisoned the log after the check in
+        // `commit_through`. A second sync could then return `Ok` over pages the
+        // kernel dropped with that error, acknowledging a commit on a log in
+        // an unknown state (V4).
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
         }
 
         let covered = self.issued.load(Ordering::Acquire);
@@ -1242,14 +1293,19 @@ impl Wal {
             match &*slot {
                 Some(h) => h.clone(),
                 None => {
+                    // A fallback only: `Wal::open` and every keep-tail
+                    // checkpoint install the handle (R7), so only a test that
+                    // clears it gets here.
+                    //
                     // Fails as a sync does, by poisoning. Whoever waits here
                     // already has its commit marker in the file, and the next
                     // sync anyone takes makes it durable: returning the error
                     // alone told the committer its transaction failed (a
                     // drop, that its barrier could never commit, so it put
                     // the table back) while a crash then replayed it as
-                    // committed. Reached after every keep-tail checkpoint,
-                    // which drops the handle, so `EMFILE` is enough.
+                    // committed.
+                    #[cfg(test)]
+                    self.lazy_opens.fetch_add(1, Ordering::Relaxed);
                     #[cfg(test)]
                     let opened = if test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false)) {
                         Err(io::Error::other("injected failure to open the log's sync handle"))
@@ -1279,7 +1335,14 @@ impl Wal {
         // while the data is gone. Poisoning instead makes every later commit
         // fail loudly rather than silently downgrading durability.
         crate::core::sync_audit::note("wal.log", &self.path);
-        if let Err(e) = handle.sync_data() {
+        #[cfg(test)]
+        let synced = match test_hooks::FAIL_LOG_SYNC.with(|f| f.take()) {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => handle.sync_data(),
+        };
+        #[cfg(not(test))]
+        let synced = handle.sync_data();
+        if let Err(e) = synced {
             self.poison(format!("fdatasync of the log failed: {}", e));
             return Err(e);
         }
@@ -1744,18 +1807,32 @@ impl Wal {
         self.write_lsn_mark_best_effort();
 
         file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        crate::core::sync_audit::note("wal.truncate", &self.path);
-        file.sync_all()?;
-        // The append point moves back with the file. The writer is not in
-        // append mode — records are placed at `write_pos` explicitly — so
-        // leaving it at its pre-truncation value made every later record report
-        // a `log_offset` far past the real end of the log. Appends never notice,
-        // because nothing reads them back; an in-place overwrite reads its
-        // payload from that offset at commit and got "failed to fill whole
+        // The append point moves back with the file, at once (Q19). The writer
+        // is not in append mode — records are placed at `write_pos` explicitly
+        // — so leaving it at its pre-truncation value made every later record
+        // report a `log_offset` far past the real end of the log. Appends never
+        // notice, because nothing reads them back; an in-place overwrite reads
+        // its payload from that offset at commit and got "failed to fill whole
         // buffer" every time. Deterministic after any checkpoint, not a race.
+        // And not after the sync below: a failure there left it stale, and a
+        // later cut-back to it would leave a zero gap that replay stops at.
         self.write_pos.store(0, Ordering::Relaxed);
         self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+        // From here whether the truncation reached the disk is unknown if
+        // anything fails (fsyncgate): records written from offset zero over a
+        // log the disk may still hold could replay ahead of older ones. So a
+        // failure poisons.
+        let synced = (|| -> io::Result<()> {
+            Self::injected("truncate_seek")?;
+            file.seek(SeekFrom::Start(0))?;
+            crate::core::sync_audit::note("wal.truncate", &self.path);
+            Self::injected("truncate_sync")?;
+            file.sync_all()
+        })();
+        if let Err(e) = synced {
+            self.poison(format!("truncating the log failed after it was cut: {}", e));
+            return Err(e);
+        }
         // Everything issued so far is now vacuously durable.
         let issued = self.issued.load(Ordering::Acquire);
         self.durable.fetch_max(issued, Ordering::AcqRel);
@@ -2116,7 +2193,8 @@ impl Wal {
     /// its already-flushed head applies again harmlessly), and after it the
     /// tail alone. Shifting in place would, for a moment, put a torn record at
     /// offset 0, and replay stops at the first one — taking the tail with it.
-    /// The sync handle is dropped so the next sync opens the new file.
+    /// The new file becomes both the writer and the sync handle before this
+    /// returns; a failure after the rename poisons the log.
     fn keep_tail_locked(
         &self,
         file: &mut File,
@@ -2147,12 +2225,33 @@ impl Wal {
             target.sync_data()?;
         }
         std::fs::rename(&temp, &self.path)?;
-        sync_parent_dir(&self.path)?;
 
-        let mut reopened = File::options().read(true).write(true).open(&self.path)?;
-        reopened.seek(SeekFrom::Start(tail_len))?;
-        *file = reopened;
-        *self.sync_handle.lock() = None;
+        // From here the log's path names the new file while the writer and
+        // the sync handle are still on the old, now unlinked, inode. Any
+        // failure before both are replaced poisons (Q13): left alone, the next
+        // commit would be written and fsynced into a file nothing replays, and
+        // acknowledged. Both are replaced under the writer lock the caller
+        // holds, so no record or sync falls between them.
+        let installed = (|| -> io::Result<()> {
+            Self::injected("rename_dir_sync")?;
+            sync_parent_dir(&self.path)?;
+            Self::injected("rename_open")?;
+            let mut reopened = File::options().read(true).write(true).open(&self.path)?;
+            Self::injected("rename_seek")?;
+            reopened.seek(SeekFrom::Start(tail_len))?;
+            Self::injected("rename_clone")?;
+            let handle = Arc::new(reopened.try_clone()?);
+            *file = reopened;
+            *self.sync_handle.lock() = Some(handle);
+            Ok(())
+        })();
+        if let Err(e) = installed {
+            self.poison(format!(
+                "a checkpoint replaced the log but could not move onto the new file: {}",
+                e
+            ));
+            return Err(e);
+        }
 
         self.write_pos.store(tail_len, Ordering::Relaxed);
         self.bytes_since_checkpoint.store(tail_len, Ordering::Relaxed);
@@ -2645,6 +2744,19 @@ pub(crate) mod test_hooks {
         pub static FORCED_FILE_IDS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
 
+        /// Makes the next log `fdatasync` on this thread fail with this OS
+        /// error, as a writeback error (`EIO`) or a delayed allocation that
+        /// finds the disk full (`ENOSPC`) does.
+        pub static FAIL_LOG_SYNC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+
+        /// Makes the named step of the next keep-tail checkpoint or
+        /// truncation on this thread fail: `rename_dir_sync`, `rename_open`,
+        /// `rename_seek` and `rename_clone` come after the keep-tail rename
+        /// returned `Ok`; `truncate_seek` and `truncate_sync` after
+        /// `set_len(0)` did. See `Wal::injected`.
+        pub static FAIL_WAL_STEP: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+
         /// Data files a checkpoint on this thread has synced.
         pub static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
@@ -2661,8 +2773,9 @@ pub(crate) mod test_hooks {
             const { std::cell::RefCell::new(None) };
 
         /// Makes the next opening of a log's sync handle on this thread fail,
-        /// as `EMFILE` would: the reopen every sync after a keep-tail
-        /// checkpoint does, and the first sync of a newly opened log.
+        /// as `EMFILE` would. `Wal::open` and every keep-tail checkpoint
+        /// install the handle, so a sync opens one only after a test clears
+        /// `sync_handle`; this fails that lazy open.
         pub static FAIL_SYNC_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
@@ -3583,11 +3696,13 @@ mod tests {
         let wal = Wal::open(&wal_path).unwrap();
         wal.register_file(id, &data).unwrap();
         let born = Incarnation::new();
-        // Deferred, so the sync handle is not opened before the barrier's.
         let txn = wal.begin();
         wal.log_from(txn, id, 4, b"live", born).unwrap();
         wal.commit_txn_deferred(txn).unwrap();
 
+        // `Wal::open` installed the sync handle (R7); cleared, the barrier's
+        // sync opens it lazily, and that open is what fails.
+        *wal.sync_handle.lock() = None;
         test_hooks::FAIL_SYNC_OPEN.with(|f| f.set(true));
         let forgot = wal.forget_files(&[id]);
         let fired = !test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false));
@@ -5202,6 +5317,257 @@ mod tests {
         wal.log(txn, 1, 2, b"more").unwrap();
         assert!(wal.commit_txn(txn).is_err());
         assert!(wal.is_poisoned());
+    }
+
+    /// A log with one committed record and a registered data file, for the
+    /// failure tests below.
+    fn log_with_data(dir: &tempfile::TempDir) -> (Arc<Wal>, PathBuf, PathBuf, u64) {
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("data.db");
+        std::fs::write(&data, vec![0u8; 64]).unwrap();
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        let id = file_id_for_name("data.db");
+        wal.register_file(id, &data).unwrap();
+        wal.log_and_commit(id, 0, b"EARLY").unwrap();
+        (wal, wal_path, data, id)
+    }
+
+    /// What a poisoned log must refuse after the failure that poisoned it: a
+    /// later commit, whose sync would otherwise make the failed commit's
+    /// marker durable behind its caller's back, and a checkpoint, which would
+    /// drop records the data files may not hold. And the refused commit
+    /// leaves the file at the log's path exactly as it was.
+    fn assert_refuses_everything_after(wal: &Wal, wal_path: &Path, id: u64, what: &str) {
+        assert!(wal.is_poisoned(), "{what}: the error left the log unpoisoned");
+        let before = read_file(wal_path);
+        assert!(wal.log_and_commit(id, 40, b"AFTER").is_err(), "{what}: a later commit succeeded");
+        let t = wal.begin();
+        assert!(wal.commit_txn(t).is_err(), "{what}: a later commit succeeded");
+        assert!(wal.checkpoint().is_err(), "{what}: a checkpoint ran on a poisoned log");
+        assert_eq!(read_file(wal_path), before, "{what}: a refused commit reached the log");
+    }
+
+    /// V4: a failed log `fdatasync` poisons, whatever the error. Linux may
+    /// drop the dirty pages after reporting `EIO`, and a delayed allocation
+    /// reports `ENOSPC` at the sync, so a retry could succeed over bytes that
+    /// are gone.
+    #[test]
+    fn every_log_sync_failure_poisons_the_log() {
+        for errno in [libc::EIO, libc::ENOSPC] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            test_hooks::FAIL_LOG_SYNC.with(|f| f.set(Some(errno)));
+            let failed = wal.log_and_commit(id, 8, b"LOST");
+            test_hooks::FAIL_LOG_SYNC.with(|f| f.set(None));
+            assert!(failed.is_err(), "errno {errno}: the injected failure was swallowed");
+            assert!(
+                wal.poison_reason().is_some_and(|r| r.contains("fdatasync")),
+                "errno {errno}: {:?}",
+                wal.poison_reason()
+            );
+            assert_refuses_everything_after(&wal, &wal_path, id, &format!("errno {errno}"));
+        }
+    }
+
+    /// V4 (R7): the lazy open of the sync handle is a `commit_through` error
+    /// like any other, after the commit marker is in the file. Unpoisoned, the
+    /// next committer's sync made that marker durable, so replay applied a
+    /// write its caller was told had failed, and memory never saw it.
+    #[test]
+    fn a_failed_lazy_open_of_the_sync_handle_poisons_the_log() {
+        for site in ["in-place commit", "record and marker"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            let lazy_before = wal.lazy_opens.load(Ordering::Relaxed);
+            // `Wal::open` installed the handle; only a cleared one is opened
+            // lazily, and `FAIL_SYNC_OPEN` fails that open.
+            let fail_next_open = || {
+                *wal.sync_handle.lock() = None;
+                test_hooks::FAIL_SYNC_OPEN.with(|f| f.set(true));
+            };
+            let failed = if site == "in-place commit" {
+                let t = wal.begin();
+                wal.log_in_place(t, id, 0, b"NEWKEY").unwrap();
+                fail_next_open();
+                wal.commit_txn(t)
+            } else {
+                fail_next_open();
+                wal.log_and_commit(id, 8, b"NEWKEY")
+            };
+            let fired = !test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false));
+            assert!(fired, "{site}: the injected open failure never fired");
+            assert!(failed.is_err(), "{site}: the injected failure was swallowed");
+            assert_eq!(
+                wal.lazy_opens.load(Ordering::Relaxed),
+                lazy_before + 1,
+                "{site}: the hook did not reach the lazy open"
+            );
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// V4: a committer queued on the sync gate behind a leader whose sync
+    /// failed is refused, not synced. It passed the poison check before the
+    /// leader failed; syncing anyway could return `Ok` over pages the kernel
+    /// dropped with the leader's `EIO`, so a commit on a log in an unknown
+    /// state would be acknowledged.
+    #[test]
+    fn a_committer_queued_behind_a_failed_sync_is_refused() {
+        let dir = temp_dir();
+        let (wal, wal_path, _data, id) = log_with_data(&dir);
+        let t = wal.begin();
+        wal.log(t, id, 8, b"QUEUED").unwrap();
+        let seq = wal.commit_txn_deferred_seq(t).unwrap();
+        let durable_before = wal.durable.load(Ordering::Acquire);
+        assert!(durable_before < seq, "nothing is owed, so nothing would queue");
+
+        // The leader's sync is in progress: it holds the gate.
+        let leader = wal.gate.lock();
+        let arrived = wal.gate_arrivals.load(Ordering::Acquire);
+        let follower = {
+            let wal = wal.clone();
+            std::thread::spawn(move || wal.commit_through(seq))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wal.gate_arrivals.load(Ordering::Acquire) == arrived {
+            assert!(std::time::Instant::now() < deadline, "the follower never reached the gate");
+            std::thread::yield_now();
+        }
+        // The leader's fdatasync fails, as `commit_through_slow` handles it.
+        wal.poison("fdatasync of the log failed: injected EIO in the leader".into());
+        drop(leader);
+
+        let outcome = follower.join().unwrap();
+        assert!(outcome.is_err(), "a commit queued behind a failed sync was acknowledged");
+        assert_eq!(
+            wal.durable.load(Ordering::Acquire),
+            durable_before,
+            "a sync after the failure claimed records durable"
+        );
+        assert_refuses_everything_after(&wal, &wal_path, id, "queued behind a failed sync");
+    }
+
+    /// V4: a partial `writev` whose cut-back fails leaves a torn record in a
+    /// live log, so the log is poisoned, and nothing after it proceeds: no
+    /// commit, no checkpoint. (One that was cut back leaves the log exactly as
+    /// it was and fails only its statement; see
+    /// `a_failed_write_leaves_the_log_as_it_was`.)
+    #[test]
+    fn a_torn_write_refuses_every_later_commit_and_checkpoint() {
+        for site in ["record", "commit marker", "record and marker"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            let t = wal.begin();
+            if site == "commit marker" {
+                wal.log(t, id, 0, &[2u8; 30]).unwrap();
+            }
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+            let failed = match site {
+                "record" => wal.log(t, id, 0, &[2u8; 300]).map(|_| ()),
+                "commit marker" => wal.commit_txn(t),
+                _ => wal.log_and_commit(id, 0, &[2u8; 300]),
+            };
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+            assert!(failed.is_err(), "{site}: the injected failure was swallowed");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// A keep-tail checkpoint on `wal`: a record is logged during its sync
+    /// pass, so it keeps that record and renames a new log over the old.
+    /// Returns the late record's commit sequence and the checkpoint's result.
+    fn keep_tail_checkpoint(wal: &Arc<Wal>, id: u64) -> (u64, io::Result<bool>) {
+        let late_marker = Arc::new(AtomicU64::new(0));
+        {
+            let wal = wal.clone();
+            let late_marker = late_marker.clone();
+            test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let t = wal.begin();
+                    wal.log(t, id, 32, b"LATE").unwrap();
+                    late_marker.store(wal.commit_txn_deferred_seq(t).unwrap(), Ordering::SeqCst);
+                }));
+            });
+        }
+        let outcome = wal.checkpoint();
+        test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| *hook.borrow_mut() = None);
+        (late_marker.load(Ordering::SeqCst), outcome)
+    }
+
+    /// V4 (Q13): once the keep-tail rename has returned `Ok`, the log's path
+    /// names the new file, and any failure before the writer and the sync
+    /// handle both reach it poisons. Otherwise the writer, the handle or both
+    /// stay on the unlinked old inode, and a later commit is fsynced, and
+    /// acknowledged, in a file nothing will ever replay.
+    #[test]
+    fn a_failure_after_the_keep_tail_rename_poisons_the_log() {
+        for site in ["rename_dir_sync", "rename_open", "rename_seek", "rename_clone"] {
+            let dir = temp_dir();
+            let (wal, wal_path, data, id) = log_with_data(&dir);
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(Some(site)));
+            let (late, outcome) = keep_tail_checkpoint(&wal, id);
+            let fired = test_hooks::FAIL_WAL_STEP.with(|s| s.replace(None)).is_none();
+            assert!(late > 0, "{site}: no record was logged during the sync pass");
+            assert!(fired, "{site}: the checkpoint never reached the step");
+            assert!(outcome.is_err(), "{site}: the checkpoint reported success");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+
+            // The renamed log holds the tail, and replay restores it.
+            drop(wal);
+            let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+            assert_eq!(stats.applied, 1, "{site}");
+            assert_eq!(&read_file(&data)[32..36], b"LATE", "{site}");
+        }
+    }
+
+    /// V4 (Q19): once `set_len(0)` has succeeded the log is empty, so the
+    /// append point is reset at once, and a failed seek or `sync_all` after
+    /// it poisons: whether the truncation reached the disk is unknown
+    /// (fsyncgate), and new records written over a log the disk may still
+    /// hold would replay after older ones.
+    #[test]
+    fn a_failure_after_truncation_poisons_the_log_and_resets_the_append_point() {
+        for site in ["truncate_seek", "truncate_sync"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(Some(site)));
+            let outcome = wal.checkpoint();
+            let fired = test_hooks::FAIL_WAL_STEP.with(|s| s.replace(None)).is_none();
+            assert!(fired, "{site}: the checkpoint never reached the step");
+            assert!(outcome.is_err(), "{site}: the checkpoint reported success");
+            assert_eq!(wal.write_pos.load(Ordering::Relaxed), 0, "{site}: stale append point");
+            assert_eq!(wal.bytes_since_checkpoint(), 0, "{site}");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// The sync handle is opened with the log, and a keep-tail checkpoint
+    /// installs the new file as both writer and sync handle before it lets go
+    /// of the writer lock. A handle left to a lazy open made the first sync
+    /// after every such checkpoint a fresh `open` that could fail (`EMFILE`)
+    /// after a commit marker was already written.
+    #[cfg(unix)]
+    #[test]
+    fn a_keep_tail_checkpoint_installs_the_new_log_as_writer_and_sync_handle() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp_dir();
+        let (wal, wal_path, _data, id) = log_with_data(&dir);
+        let (late, outcome) = keep_tail_checkpoint(&wal, id);
+        assert!(outcome.unwrap(), "checkpoint declined");
+        let on_disk = std::fs::metadata(&wal_path).unwrap().ino();
+        let writer = wal.writer.lock().metadata().unwrap().ino();
+        let handle = wal
+            .sync_handle
+            .lock()
+            .as_ref()
+            .map(|h| h.metadata().unwrap().ino());
+        assert_eq!(writer, on_disk, "the writer is not on the renamed log");
+        assert_eq!(handle, Some(on_disk), "the sync handle is not on the renamed log");
+        wal.commit_through(late).unwrap();
+        wal.log_and_commit(id, 40, b"AFTER").unwrap();
+        assert_eq!(wal.lazy_opens.load(Ordering::Relaxed), 0, "a sync opened its handle lazily");
     }
 
     /// `block_in_place` panics on a current-thread runtime; the commit path

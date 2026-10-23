@@ -130,3 +130,35 @@ async fn a_head_build_refuses_this_builds_filter_sidecar() {
     assert_ne!(version, 3, "HEAD would read this sidecar as its own format");
     let _ = crate::core::wal::remove_for(&dir_str);
 }
+
+/// `HEAD`'s `TableSchema::load` reads the `_schema.db` header and nothing after
+/// it: "if schema_len < TABLE_SIZE as u64 { … NotFound … }", then
+/// `read_data_into_buffer` of exactly `TABLE_SIZE` (`129 * 2 + 1`) bytes at
+/// offset 0 into `TableSchema::from_vec`. So the incarnation record this build
+/// appends after the header (C7) is invisible to it, and it reads the header
+/// exactly as written.
+#[tokio::test]
+async fn a_head_build_reads_a_schema_file_with_an_incarnation_record() {
+    use crate::core::row::schema::TableSchema;
+    use crate::core::storage_providers::file_sync::LocalStorageProvider;
+    use crate::core::storage_providers::traits::StorageIO;
+    const HEAD_TABLE_SIZE: usize = 129 * 2 + 1;
+
+    let dir = tempfile::tempdir().unwrap();
+    let io = rclite::Arc::new(
+        LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("down_schema.db")).await,
+    );
+    let mut schema = TableSchema::new("down".into(), true);
+    schema.set_primary_key("id".into());
+    schema.save(io.clone()).await.unwrap();
+
+    let len = io.get_len().await as usize;
+    assert!(len > HEAD_TABLE_SIZE, "no incarnation record was written; nothing to test");
+    let mut bytes = vec![0u8; len];
+    io.read_data_into_buffer(&mut 0, &mut bytes).await.unwrap();
+
+    let head = TableSchema::from_vec(&bytes[..HEAD_TABLE_SIZE]).expect("HEAD reads the header");
+    assert_eq!(head.name, "down");
+    assert_eq!(head.primary_key.as_deref(), Some("id"));
+    assert!(head.is_immutable);
+}

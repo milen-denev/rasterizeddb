@@ -1,4 +1,7 @@
 pub mod catalog;
+pub mod incompat;
+#[cfg(test)]
+mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
 #[cfg(test)]
@@ -824,6 +827,14 @@ impl Database {
 
             if !dir_exists {
                 tokio::fs::create_dir_all(location).await.unwrap();
+            }
+
+            // Before anything is replayed, opened or created: a directory using
+            // an on-disk format this build does not support is refused whole,
+            // since writing to it would leave files that format describes
+            // wrong for the build that wrote them (V14).
+            if let Err(e) = incompat::check(std::path::Path::new(location)) {
+                return Err(format!("refusing to open the database at {location}: {e}"));
             }
 
             // Replay before anything opens a table. A log on disk means writes
