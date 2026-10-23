@@ -65,6 +65,7 @@ fn sorted(item: Item) -> Vec<Vec<u8>> {
 
 #[test]
 fn strings() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["GET", "k"]), Item::Null);
     assert_eq!(run(&s, &["SET", "k", "v"]), ok());
@@ -97,6 +98,7 @@ fn strings() {
 
 #[test]
 fn counters() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["INCR", "n"]), Item::Int(1));
     assert_eq!(run(&s, &["INCRBY", "n", "41"]), Item::Int(42));
@@ -121,6 +123,7 @@ fn counters() {
 
 #[test]
 fn lifetimes() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["TTL", "k"]), Item::Int(-2));
     run(&s, &["SET", "k", "v"]);
@@ -162,6 +165,7 @@ fn lifetimes() {
 
 #[test]
 fn a_budgeted_sweep_reaches_every_shard() {
+    let _settings = default_settings();
     // Enough expired keys that one pass cannot finish; repeated passes must
     // still reach the last shard rather than restarting at the first.
     let s = KvCache::new(0);
@@ -180,6 +184,7 @@ fn a_budgeted_sweep_reaches_every_shard() {
 
 #[test]
 fn keys_and_rename() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     for k in ["user:1", "user:2", "order:1"] {
         run(&s, &["SET", k, "x"]);
@@ -227,6 +232,7 @@ fn keys_and_rename() {
 
 #[test]
 fn hashes() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["HSET", "h", "a", "1", "b", "2"]), Item::Int(2));
     assert_eq!(run(&s, &["HSET", "h", "a", "9", "c", "3"]), Item::Int(1));
@@ -251,6 +257,7 @@ fn hashes() {
 
 #[test]
 fn lists() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["LPUSH", "l", "a", "b"]), Item::Int(2));
     assert_eq!(run(&s, &["RPUSH", "l", "c"]), Item::Int(3));
@@ -287,6 +294,7 @@ fn lists() {
 
 #[test]
 fn sets() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["SADD", "a", "1", "2", "3", "3"]), Item::Int(3));
     run(&s, &["SADD", "b", "2", "3", "4"]);
@@ -319,6 +327,7 @@ fn sets() {
 
 #[test]
 fn sorted_sets() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     assert_eq!(run(&s, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]), Item::Int(3));
     assert_eq!(run(&s, &["ZADD", "z", "XX", "CH", "5", "a", "9", "nope"]), Item::Int(1));
@@ -373,6 +382,7 @@ fn sorted_sets() {
 
 #[test]
 fn every_command_runs_inside_a_transaction() {
+    let _settings = default_settings();
     // Each needs only what its key spec locks; a wrong spec panics.
     let s = KvCache::new(0);
     let script: &[&[&str]] = &[
@@ -415,8 +425,7 @@ fn every_command_runs_inside_a_transaction() {
 
 #[test]
 fn eviction_keeps_the_store_under_its_bound() {
-    // The settings are process-wide; this test owns them for its duration.
-    let _guard = SETTINGS.lock();
+    let _settings = OwnedSettings::take();
     let s = KvCache::new(0);
     super::set_max_memory(4 * 1024 * 1024);
     super::set_eviction_policy(EvictionPolicy::AllKeysLru);
@@ -437,13 +446,41 @@ fn eviction_keeps_the_store_under_its_bound() {
         }
     }
     assert!(refused > 0);
-    super::set_max_memory(0);
 }
 
-static SETTINGS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+/// The store's settings (`maxmemory`, the eviction policy) are process-wide,
+/// and every test here runs a store under them. A test that changes them
+/// takes this for writing, through [`OwnedSettings`]; every other test takes
+/// it for reading, so none runs under another's bound: a 4 MiB `maxmemory`
+/// is 4 KiB a shard, and a concurrent multi-megabyte `SET` was refused with
+/// `OOM`, or a concurrent test's keys evicted, depending on the policy.
+static SETTINGS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// The process-wide settings at their defaults, for this test's duration.
+fn default_settings() -> parking_lot::RwLockReadGuard<'static, ()> {
+    SETTINGS.read()
+}
+
+/// The process-wide settings, owned by one test and put back to their
+/// defaults when it ends, panicking or not.
+struct OwnedSettings(#[allow(dead_code)] parking_lot::RwLockWriteGuard<'static, ()>);
+
+impl OwnedSettings {
+    fn take() -> OwnedSettings {
+        OwnedSettings(SETTINGS.write())
+    }
+}
+
+impl Drop for OwnedSettings {
+    fn drop(&mut self) {
+        super::set_max_memory(0);
+        super::set_eviction_policy(EvictionPolicy::NoEviction);
+    }
+}
 
 #[test]
 fn memory_accounting_returns_to_zero() {
+    let _settings = default_settings();
     let s = KvCache::new(0);
     for i in 0..1000 {
         let k = format!("k{i}");
@@ -473,6 +510,7 @@ fn memory_accounting_returns_to_zero() {
 
 #[test]
 fn concurrent_increments_and_moves_are_atomic() {
+    let _settings = default_settings();
     let s = Arc::new(KvCache::new(0));
     let threads = 8;
     let per = 20_000;
@@ -505,6 +543,7 @@ fn concurrent_increments_and_moves_are_atomic() {
 
 #[test]
 fn snapshot_round_trips_every_type() {
+    let _settings = default_settings();
     let dir = tempfile::tempdir().expect("tempdir");
     let handle = KvCacheHandle::new(Some(dir.path().to_str().unwrap()));
     let s = handle.db(0).clone();
@@ -549,6 +588,7 @@ fn snapshot_round_trips_every_type() {
 
 #[test]
 fn sql_rows_have_the_described_shape() {
+    let _settings = default_settings();
     use super::sql::{Cell, rows_for_test};
     let rows = rows_for_test(
         Item::Map(vec![(bulk("f"), bulk("v"))]),
@@ -687,6 +727,7 @@ async fn start_server() -> (u16, KvCacheHandle) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_pipelining_transactions_pubsub_and_blocking() {
+    let _settings = default_settings();
     let (port, _handle) = start_server().await;
     let mut c = Client::connect(port).await;
     assert_eq!(c.call(&["PING"]).await, "+PONG");
@@ -798,6 +839,7 @@ async fn tcp_pipelining_transactions_pubsub_and_blocking() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_large_values_and_many_clients() {
+    let _settings = default_settings();
     let (port, _handle) = start_server().await;
     // A value larger than any one read.
     let mut c = Client::connect(port).await;
@@ -828,6 +870,7 @@ async fn tcp_large_values_and_many_clients() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trust_is_refused_on_a_public_address() {
+    let _settings = default_settings();
     let config = super::resp::RespConfig {
         addr: "0.0.0.0".into(),
         port: 0,
