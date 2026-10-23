@@ -1081,6 +1081,18 @@ fn read_u32(bytes: &[u8], at: usize) -> Result<u32, String> {
 // navigation
 // ---------------------------------------------------------------------------
 
+/// The version of what a path index keys a document under: the text `->>`
+/// reads at a path. Bump it with any change that moves one such key: to
+/// [`as_text`], [`render_text_into`] (numbers, escapes, spacing, key order),
+/// or navigation ([`get_path`], [`get_key`], [`get_index`], `Step` parsing,
+/// `Step::Either`'s integer reading). A persisted path index records it and
+/// is rebuilt when it differs. The `(doc, steps) → key` vectors in
+/// `core::index::vectors` fail on such a change: freeze the new keys as the
+/// next set, raise this and append that set's row, leaving the old set and
+/// row as they are. Vectors that only add coverage go in `PATHS_ADDED`, with
+/// no bump.
+pub const TEXT_RENDER_VERSION: u32 = 1;
+
 /// The bytes of the value at `path`, without decoding anything else.
 ///
 /// This is what makes the blob worth more than the text it came from: reaching
@@ -2064,11 +2076,16 @@ const ITEM_KEY: u8 = 1;
 const ITEM_VALUE: u8 = 2;
 const ITEM_PATH: u8 = 3;
 
-fn item_hasher() -> impl std::hash::Hasher {
-    use std::hash::BuildHasher;
-    // Fixed seeds: an item must hash the same in every process, since a query
-    // built here is matched against items built when the rows were indexed.
-    ahash::RandomState::with_seeds(0x6a73_6f6e, 0x6769_6e00, 0x7061_7468, 0x6f70_7300).build_hasher()
+/// The seed every item is hashed under. Part of the derivation that
+/// `gin::ITEM_DERIVE_VERSION` versions.
+const ITEM_SEED: u64 = 0x6a73_6f6e_6769_6e00;
+
+fn item_hasher() -> crate::core::hash::ItemFeed {
+    // A fixed seed and a frozen hash (`core::hash`), fed fixed-width
+    // little-endian fields: an item must hash the same in every process and
+    // every build, since a query built here is matched against items built
+    // when the rows were indexed.
+    crate::core::hash::ItemFeed::new(ITEM_SEED)
 }
 
 /// Feeds a scalar into `h` in a form two scalars [`scalar_eq`] calls equal
@@ -2078,37 +2095,37 @@ fn item_hasher() -> impl std::hash::Hasher {
 /// every zero is the same zero, exactly as `numbers_equal` decides. A number
 /// whose text does not parse is equal only to the same text, so its text is
 /// hashed as it stands, under a different class.
-fn hash_scalar(bytes: &[u8], h: &mut impl std::hash::Hasher) -> Option<()> {
+fn hash_scalar(bytes: &[u8], h: &mut crate::core::hash::ItemFeed) -> Option<()> {
     match *bytes.first()? {
-        TAG_NULL => h.write_u8(0),
-        TAG_FALSE => h.write_u8(1),
-        TAG_TRUE => h.write_u8(2),
+        TAG_NULL => h.u8(0),
+        TAG_FALSE => h.u8(1),
+        TAG_TRUE => h.u8(2),
         TAG_INT | TAG_NUM => {
             let mut buf = [0u8; 20];
             let text = number_text(bytes, &mut buf)?;
             match NumberParts::parse(text) {
-                Some(parts) if parts.len == 0 => h.write_u8(3),
+                Some(parts) if parts.len == 0 => h.u8(3),
                 Some(parts) => {
-                    h.write_u8(4);
-                    h.write_u8(parts.negative as u8);
-                    h.write_i64(parts.point);
+                    h.u8(4);
+                    h.u8(parts.negative as u8);
+                    h.i64_le(parts.point);
                     for d in parts.digits() {
-                        h.write_u8(d);
+                        h.u8(d);
                     }
-                    h.write_usize(parts.len);
+                    h.u64_le(parts.len as u64);
                 }
                 None => {
-                    h.write_u8(5);
-                    h.write(text);
-                    h.write_usize(text.len());
+                    h.u8(5);
+                    h.bytes(text);
+                    h.u64_le(text.len() as u64);
                 }
             }
         }
         TAG_STR => {
             let (raw, _) = read_len_prefixed(bytes).ok()?;
-            h.write_u8(6);
-            h.write(raw);
-            h.write_usize(raw.len());
+            h.u8(6);
+            h.bytes(raw);
+            h.u64_le(raw.len() as u64);
         }
         _ => return None,
     }
@@ -2118,11 +2135,10 @@ fn hash_scalar(bytes: &[u8], h: &mut impl std::hash::Hasher) -> Option<()> {
 /// The key item for `key`: an object key, a string array element, or the
 /// operand of `?`.
 pub fn gin_key_item(key: &[u8]) -> u64 {
-    use std::hash::Hasher;
     let mut h = item_hasher();
-    h.write_u8(ITEM_KEY);
-    h.write(key);
-    h.write_usize(key.len());
+    h.u8(ITEM_KEY);
+    h.bytes(key);
+    h.u64_le(key.len() as u64);
     h.finish()
 }
 
@@ -2155,7 +2171,6 @@ fn gin_walk<'a>(
     top: bool,
     out: &mut Vec<u64>,
 ) -> Option<()> {
-    use std::hash::Hasher;
     match *bytes.first()? {
         TAG_OBJ => {
             let o = Composite::of(bytes, OBJ_ENTRY)?;
@@ -2184,18 +2199,18 @@ fn gin_walk<'a>(
             let mut h = item_hasher();
             match opclass {
                 GinOpclass::Ops => {
-                    h.write_u8(ITEM_VALUE);
+                    h.u8(ITEM_VALUE);
                     // A document that is one string answers `?` for it.
                     if top && tag == TAG_STR {
                         out.push(gin_key_item(read_len_prefixed(bytes).ok()?.0));
                     }
                 }
                 GinOpclass::PathOps => {
-                    h.write_u8(ITEM_PATH);
-                    h.write_usize(path.len());
+                    h.u8(ITEM_PATH);
+                    h.u64_le(path.len() as u64);
                     for step in path.iter() {
-                        h.write(step);
-                        h.write_usize(step.len());
+                        h.bytes(step);
+                        h.u64_le(step.len() as u64);
                     }
                 }
             }
@@ -4188,7 +4203,6 @@ mod gin_item_tests {
             out
         }
         let hash = |bytes: &[u8]| {
-            use std::hash::Hasher;
             let mut h = item_hasher();
             hash_scalar(bytes, &mut h).unwrap();
             h.finish()
@@ -4229,6 +4243,144 @@ mod gin_item_tests {
         let mut out = Vec::new();
         gin_items(&[], GinOpclass::Ops, &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// The exact byte feed behind each kind of item, rebuilt by hand and
+    /// hashed in one piece: fixed-width little-endian fields, nothing
+    /// native-endian or pointer-sized, under `ITEM_SEED`.
+    #[test]
+    fn items_are_xxh64_of_their_documented_feed() {
+        use crate::core::hash::xxh64;
+        let le = |n: u64| n.to_le_bytes();
+        let item = |parts: &[&[u8]]| xxh64(&parts.concat(), ITEM_SEED);
+        let sorted = |mut v: Vec<u64>| {
+            v.sort_unstable();
+            v
+        };
+        // Key: tag, bytes, length.
+        assert_eq!(gin_key_item(b"key"), item(&[&[ITEM_KEY], b"key", &le(3)]));
+        // Values: tag, then the scalar's class and body.
+        let ops = |t: &str| sorted(items(&encode_text(t).unwrap(), GinOpclass::Ops).into_iter().collect());
+        assert_eq!(ops("null"), [item(&[&[ITEM_VALUE, 0]])]);
+        assert_eq!(ops("false"), [item(&[&[ITEM_VALUE, 1]])]);
+        assert_eq!(ops("true"), [item(&[&[ITEM_VALUE, 2]])]);
+        assert_eq!(ops("-0.0"), [item(&[&[ITEM_VALUE, 3]])]);
+        // 1.50 = 0.15 × 10^1: sign, point, significant digits, their count.
+        let number = item(&[&[ITEM_VALUE, 4, 0], &1i64.to_le_bytes(), b"15", &le(2)]);
+        assert_eq!(ops("1.50"), [number]);
+        assert_eq!(ops("15e-1"), [number]);
+        // -0.0125 = -0.125 × 10^-1.
+        assert_eq!(ops("-0.0125"), [item(&[&[ITEM_VALUE, 4, 1], &(-1i64).to_le_bytes(), b"125", &le(3)])]);
+        // A top-level string is a value and a key.
+        assert_eq!(
+            ops(r#""s""#),
+            sorted(vec![item(&[&[ITEM_VALUE, 6], b"s", &le(1)]), item(&[&[ITEM_KEY], b"s", &le(1)])])
+        );
+        // A number whose text does not parse (an old build's stored text) is
+        // hashed as that text, under its own class.
+        let mut legacy = vec![TAG_NUM];
+        write_len_prefixed(&mut legacy, b"1x");
+        assert_eq!(
+            items(&legacy, GinOpclass::Ops).into_iter().collect::<Vec<_>>(),
+            [item(&[&[ITEM_VALUE, 5], b"1x", &le(2)])]
+        );
+        // Path: tag, step count, each step and its length, then the scalar.
+        let path_ops = |t: &str| sorted(items(&encode_text(t).unwrap(), GinOpclass::PathOps).into_iter().collect());
+        assert_eq!(
+            path_ops(r#"{"ab":{"c":null}}"#),
+            [item(&[&[ITEM_PATH], &le(2), b"ab", &le(2), b"c", &le(1), &[0]])]
+        );
+        assert_eq!(path_ops("[true]"), [item(&[&[ITEM_PATH], &le(0), &[2]])]);
+    }
+
+    /// `(opclass, document, its distinct items, ascending)`, frozen under
+    /// `gin::ITEM_DERIVE_VERSION` 1 with `KEY_ITEM_VECTORS`: never edited (see
+    /// `core::index::vectors` for the rules). A change that moves one item
+    /// fails here; new coverage goes in `ITEM_VECTORS_ADDED`.
+    const ITEM_VECTORS: &[(GinOpclass, &str, &[u64])] = &[
+        (GinOpclass::Ops, r#"{}"#, &[]),
+        (GinOpclass::Ops, r#"[]"#, &[]),
+        (GinOpclass::Ops, r#"null"#, &[0x744f_d8f0_cf2d_32de]),
+        (GinOpclass::Ops, r#""status""#, &[0x3e39_538e_a8a1_0ef6, 0xe238_3808_e95b_d89c]),
+        (GinOpclass::Ops, r#"1"#, &[0x4884_043b_279a_501f]),
+        (GinOpclass::Ops, r#"1.0"#, &[0x4884_043b_279a_501f]),
+        (GinOpclass::Ops, r#"-2.5e3"#, &[0x734e_ad60_fea1_253c]),
+        (GinOpclass::Ops, r#"123456789012345678901234567890"#, &[0x1cd2_849a_39f5_5782]),
+        (GinOpclass::Ops, r#"{"status":"shipped","n":1}"#, &[0x4884_043b_279a_501f, 0x7e7e_ed42_0f0b_c6bf, 0xd321_6ad7_32bc_e8ec, 0xe238_3808_e95b_d89c]),
+        (GinOpclass::Ops, r#"{"a":{"b":[1,"x",null,true,false]}}"#, &[0x4286_86ea_aafd_4bf4, 0x4884_043b_279a_501f, 0x659c_879f_5315_3cab, 0x72e1_ac71_1c0e_69f0, 0x744f_d8f0_cf2d_32de, 0x8ce3_7163_819f_5bf7, 0xa1e0_15d1_e9c0_17ee, 0xd15b_6338_9761_ccce]),
+        (GinOpclass::Ops, r#"["k",2,{"k":"v"}]"#, &[0x2cd8_70b7_c77e_1a0d, 0x33aa_256e_c3e9_7241, 0xaf8c_cf16_d1b9_cae2, 0xfa20_760b_ced1_068c]),
+        (GinOpclass::Ops, r#"{"tags":["red","blue"],"e":"é\n"}"#, &[0x01ba_7a79_a2dc_179c, 0x04e4_dbce_6c77_3510, 0x0b25_d6c1_8639_b78e, 0x1c62_961b_dba3_fefa, 0x434e_7852_9baa_354c, 0xd71e_2877_9db6_b1a0, 0xf66f_07e3_9c67_673a]),
+        (GinOpclass::PathOps, r#"{}"#, &[]),
+        (GinOpclass::PathOps, r#"[]"#, &[]),
+        (GinOpclass::PathOps, r#"null"#, &[0xb5ce_d300_f353_dd14]),
+        (GinOpclass::PathOps, r#""status""#, &[0x430a_bf19_adb0_ac2e]),
+        (GinOpclass::PathOps, r#"1"#, &[0x06f4_9ec3_b242_a367]),
+        (GinOpclass::PathOps, r#"1.0"#, &[0x06f4_9ec3_b242_a367]),
+        (GinOpclass::PathOps, r#"-2.5e3"#, &[0xde8c_4c3e_79e7_ed7c]),
+        (GinOpclass::PathOps, r#"123456789012345678901234567890"#, &[0x7ec0_bd25_6bf3_1f20]),
+        (GinOpclass::PathOps, r#"{"status":"shipped","n":1}"#, &[0xc11a_37e5_46bd_faee, 0xcfa1_fcab_e6cb_b2c6]),
+        (GinOpclass::PathOps, r#"{"a":{"b":[1,"x",null,true,false]}}"#, &[0x6804_e07e_9517_99e3, 0x7aa7_6949_b3dd_7e2e, 0x86a5_8d01_419a_eee5, 0xb768_af45_f562_27b8, 0xba37_7b7b_44f4_144f]),
+        (GinOpclass::PathOps, r#"["k",2,{"k":"v"}]"#, &[0x20c5_4933_c2d4_2314, 0x4f5f_9fde_3a1a_6820, 0xaebe_da39_95c0_ecef]),
+        (GinOpclass::PathOps, r#"{"tags":["red","blue"],"e":"é\n"}"#, &[0x58f7_8b48_b2a0_d17d, 0x84d0_8ea3_e01a_3901, 0xdc37_ee62_d124_71ff]),
+    ];
+
+    /// `(key, gin_key_item(key))`, frozen with `ITEM_VECTORS`.
+    const KEY_ITEM_VECTORS: &[(&str, u64)] = &[
+        ("", 0x0f8d_e01b_9755_4cd4),
+        ("a", 0xd15b_6338_9761_ccce),
+        ("status", 0xe238_3808_e95b_d89c),
+        ("日本", 0x5b4c_a201_3ad7_68d5),
+    ];
+
+    /// Item coverage added since the frozen set: checked, not pinned, so no
+    /// version moves. Folded into the next frozen set when the version is
+    /// raised.
+    const ITEM_VECTORS_ADDED: &[(GinOpclass, &str, &[u64])] = &[];
+    const KEY_ITEM_VECTORS_ADDED: &[(&str, u64)] = &[];
+
+    /// `ITEM_DERIVE_VERSION`'s frozen sets, oldest first.
+    const ITEM_HISTORY: &[crate::core::index::vectors::HistoryRow] = &[(1, item_v1_digest, 0x368b_a24f_6265_f8ec)];
+
+    /// A digest of the item vectors frozen under version 1, as written.
+    fn item_v1_digest() -> u64 {
+        let mut digest = crate::core::hash::ItemFeed::new(0);
+        for (opclass, doc, want) in ITEM_VECTORS {
+            digest.u8(match opclass {
+                GinOpclass::Ops => 1,
+                GinOpclass::PathOps => 2,
+            });
+            digest.u64_le(doc.len() as u64);
+            digest.bytes(doc.as_bytes());
+            digest.u64_le(want.len() as u64);
+            for i in want.iter() {
+                digest.u64_le(*i);
+            }
+        }
+        for (key, want) in KEY_ITEM_VECTORS {
+            digest.u64_le(key.len() as u64);
+            digest.bytes(key.as_bytes());
+            digest.u64_le(*want);
+        }
+        digest.finish()
+    }
+
+    fn item_vector(opclass: GinOpclass, doc: &str) -> Vec<u64> {
+        let mut v: Vec<u64> = items(&encode_text(doc).unwrap(), opclass).into_iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn items_are_their_vectors_under_item_derive_version() {
+        use crate::core::index::gin::{GIN_HASHER_ID, ITEM_DERIVE_VERSION};
+        assert_eq!(GIN_HASHER_ID, 1, "the vectors below are XXH64's");
+        for (opclass, doc, want) in ITEM_VECTORS.iter().chain(ITEM_VECTORS_ADDED) {
+            assert_eq!(item_vector(*opclass, doc), *want, "{doc} under {opclass:?}: items moved");
+        }
+        for (key, want) in KEY_ITEM_VECTORS.iter().chain(KEY_ITEM_VECTORS_ADDED) {
+            assert_eq!(gin_key_item(key.as_bytes()), *want, "the key item for {key:?} moved");
+        }
+        crate::core::index::vectors::check_history("gin::ITEM_DERIVE_VERSION", ITEM_HISTORY, ITEM_DERIVE_VERSION);
     }
 
     /// `v` written out again with each number spelled another way it can be

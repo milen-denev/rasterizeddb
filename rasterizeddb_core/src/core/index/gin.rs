@@ -52,6 +52,22 @@ use crate::core::jsonb::{self, GinOpclass};
 
 const SHARDS: usize = 64;
 
+/// The version of how a document becomes items: [`jsonb::gin_items`] and
+/// [`jsonb::gin_key_item`], meaning the item tags, the number
+/// canonicalisation in `hash_scalar`, `jsonb_path_ops` folding, the seed and
+/// the byte feed. A persisted inverted index records it and is rebuilt when
+/// it differs. Bump it with any change that moves one item: the item vectors
+/// in `jsonb`'s tests fail on such a change; freeze the new items as the next
+/// set, raise this and append that set's row, leaving the old set and row as
+/// they are. Vectors that only add coverage go in the `*_ADDED` tables there,
+/// with no bump.
+pub const ITEM_DERIVE_VERSION: u32 = 1;
+
+/// The hash under the items. 1: the in-tree XXH64 (`core::hash`), fed
+/// through `ItemFeed`, in memory and on disk alike, since a lookup probes
+/// every structure with one set of query items.
+pub const GIN_HASHER_ID: u32 = 1;
+
 pub struct GinIndex {
     pub decl: IndexDecl,
     /// The document column's `write_order`.
@@ -100,6 +116,25 @@ impl GinIndex {
             forgotten_slots: Mutex::new(Vec::new()),
             live: AtomicU64::new(0),
         }
+    }
+
+    /// What decides this index's entries, for `TableIndexes::shape_hash`.
+    /// Destructured whole, so a new field does not compile until it is placed
+    /// on one side or the other; the rest is the entries themselves.
+    pub(super) fn shape(&self) -> (&IndexDecl, u32, GinOpclass) {
+        let GinIndex {
+            decl,
+            column,
+            opclass,
+            shards: _,
+            present: _,
+            unkeyed: _,
+            entries: _,
+            forgotten: _,
+            forgotten_slots: _,
+            live: _,
+        } = self;
+        (decl, *column, *opclass)
     }
 
     #[inline]

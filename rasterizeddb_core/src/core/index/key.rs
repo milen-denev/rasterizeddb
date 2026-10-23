@@ -50,6 +50,21 @@
 
 use crate::core::db_type::DbType;
 
+/// The version of the bytes [`encode_ordered`] and [`encode_canonical`]
+/// produce, `jsonb::canonical_key` included. A persisted index records it and
+/// is rebuilt when it differs.
+///
+/// Bump rule: any change that moves one output byte for any input, a
+/// composite key's composition included, bumps this. The golden vectors in
+/// `core::index::vectors` fail on such a change; freeze the new outputs as
+/// the next set, raise this constant and append that set's history row,
+/// leaving the old set and its row as they are (the module doc there has the
+/// steps). Vectors that only add coverage go in its `*_ADDED` tables with no
+/// bump. A type newly supported by [`btree_supported`] or [`hash_supported`]
+/// needs vectors and a property test against the evaluator before the
+/// coverage test passes.
+pub const ENCODING_VERSION: u32 = 1;
+
 /// Types a B-tree can order: those with a proven order-preserving encoding.
 pub fn btree_supported(t: &DbType) -> bool {
     matches!(
@@ -358,6 +373,17 @@ mod tests {
             DbType::INET => r.bytes(crate::core::value_codec::INET_LEN),
             DbType::MACADDR => r.bytes(6),
             DbType::MACADDR8 => r.bytes(8),
+            // A code point, little-endian: mostly from a few, so equal pairs
+            // are common, otherwise any four bytes (the evaluator compares
+            // the `u32`, valid character or not).
+            DbType::CHAR => {
+                if r.next() % 2 == 0 {
+                    let pick = [0u32, 'a' as u32, 'b' as u32, 'é' as u32, 0x10_FFFF];
+                    pick[(r.next() % pick.len() as u64) as usize].to_le_bytes().to_vec()
+                } else {
+                    fixed(4, r)
+                }
+            }
             DbType::STRING => {
                 // Short strings over a tiny alphabet with 0x00 and 0xFF in it,
                 // so prefixes, equal values and escapes all occur often.
@@ -392,6 +418,73 @@ mod tests {
         DbType::MACADDR8,
         DbType::STRING,
     ];
+
+    /// Hash-only types, property-tested by
+    /// `canonical_encoding_is_equal_exactly_when_the_evaluator_says_equal`.
+    const CANONICAL_ONLY: &[DbType] = &[DbType::CHAR];
+
+    /// Supported types whose evaluator agreement is proven elsewhere: JSONB's
+    /// canonical key by `jsonb`'s
+    /// `document_equality_is_value_equality_and_keys_agree_with_it`.
+    const PROPERTY_TESTED_ELSEWHERE: &[DbType] = &[DbType::JSONB];
+
+    /// Every `DbType`. The match is exhaustive, so a new variant does not
+    /// compile until it is listed here, and listing it puts it through the
+    /// coverage test below.
+    macro_rules! every_type {
+        ($($v:ident),* $(,)?) => {{
+            fn exhaustive(t: &DbType) {
+                match t {
+                    $(DbType::$v)|* => {}
+                }
+            }
+            let _ = exhaustive;
+            [$(DbType::$v),*]
+        }};
+    }
+
+    /// Owner's invariant 5, made a gate: a type an index may key must have
+    /// golden vectors (so its bytes cannot move unnoticed) and a property test
+    /// against the evaluator (so they are right). `CHAR` lacked the second.
+    #[test]
+    fn every_supported_type_has_vectors_and_a_property_test() {
+        use crate::core::index::vectors;
+        let all = every_type!(
+            I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, F32, F64, BOOL, CHAR, STRING, DATETIME, UUID, INET,
+            BYTEA, ARRAY, DECIMAL, JSON, JSONB, INTERVAL, MACADDR, MACADDR8, BIT, VARBIT, DATE, TIME, TIMETZ, POINT,
+            LINE, LSEG, BOX, PATH, POLYGON, CIRCLE, INT4RANGE, INT8RANGE, NUMRANGE, TSRANGE, TSTZRANGE, DATERANGE,
+            UNKNOWN, NULL, START, END,
+        );
+        let mut checked = 0;
+        for t in &all {
+            if btree_supported(t) {
+                assert!(ORDERED.contains(t), "{t:?} is btree_supported with no ordering property test");
+                assert!(
+                    vectors::ORDERED.iter().chain(vectors::ORDERED_ADDED).any(|(v, ..)| v == t),
+                    "{t:?} is btree_supported with no encode_ordered vectors"
+                );
+                checked += 1;
+            }
+            if hash_supported(t) {
+                assert!(
+                    ORDERED.contains(t) || CANONICAL_ONLY.contains(t) || PROPERTY_TESTED_ELSEWHERE.contains(t),
+                    "{t:?} is hash_supported with no canonical property test"
+                );
+                let vectored = if *t == DbType::JSONB {
+                    !vectors::JSONB_CANONICAL.is_empty() || !vectors::JSONB_CANONICAL_ADDED.is_empty()
+                } else {
+                    vectors::CANONICAL.iter().chain(vectors::CANONICAL_ADDED).any(|(v, ..)| v == t)
+                };
+                assert!(vectored, "{t:?} is hash_supported with no encode_canonical vectors");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 46, "the walk checked {checked}");
+        // The lists name only supported types, so none hides a stale entry.
+        for t in CANONICAL_ONLY.iter().chain(PROPERTY_TESTED_ELSEWHERE) {
+            assert!(hash_supported(t) && !btree_supported(t), "{t:?}");
+        }
+    }
 
     #[test]
     fn every_ordered_type_is_listed_and_supported() {
@@ -447,7 +540,7 @@ mod tests {
     #[test]
     fn canonical_encoding_is_equal_exactly_when_the_evaluator_says_equal() {
         let mut r = Rng(7);
-        for t in ORDERED {
+        for t in ORDERED.iter().chain(CANONICAL_ONLY) {
             for _ in 0..20_000 {
                 let (a, b) = (sample(t, &mut r), sample(t, &mut r));
                 let (mut ea, mut eb) = (Vec::new(), Vec::new());

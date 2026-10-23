@@ -9,6 +9,8 @@ mod downgrade_tests;
 pub mod database;
 pub mod db_type;
 pub mod filter;
+/// Frozen hashes for anything persisted (in-tree XXH64).
+pub mod hash;
 pub mod helpers;
 pub mod introspect;
 pub mod jsonb;

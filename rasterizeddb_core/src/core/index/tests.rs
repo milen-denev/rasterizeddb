@@ -564,3 +564,217 @@ fn a_path_index_over_an_either_step_is_built() {
     assert_eq!(built(&key), 1, "declared as {}", key);
     assert_eq!(built("doc->'a'#>'2'"), 1, "a record in the old form");
 }
+
+/// A table with one index of every kind the shape covers: an implicit
+/// primary key, an implicit unique column, a NUMERIC(10,2) column under a
+/// composite B-tree, a hash index, both gin operator classes, and paths with
+/// `Key` and `Index` steps. A second document column has no index, for a gin
+/// index to move onto. No `#>>` path: since `for_schema` builds one (see
+/// [`a_path_index_over_an_either_step_is_built`]) it could be declared here,
+/// but the pinned value predates that, and `Either` is covered by
+/// [`the_shape_hash_sees_an_either_steps_text`] and
+/// [`a_built_either_path_has_the_shape_of_its_steps`] instead.
+fn shape_schema() -> crate::core::row::schema::TableSchema {
+    use crate::core::row::schema::TableSchema;
+    let mut s = TableSchema::new("orders".into(), false);
+    let mut price = SchemaField::new("price".into(), DbType::DECIMAL, 16, 8, 1, false);
+    price.scale = Some(2);
+    s.fields.push(SchemaField::new("id".into(), DbType::I64, 8, 0, 0, false));
+    s.fields.push(price);
+    s.fields.push(SchemaField::new("email".into(), DbType::STRING, 12, 24, 2, true));
+    s.fields.push(SchemaField::new("token".into(), DbType::UUID, 16, 36, 3, false));
+    s.fields.push(SchemaField::new("doc".into(), DbType::JSONB, 12, 52, 4, false));
+    s.fields.push(SchemaField::new("doc2".into(), DbType::JSONB, 12, 64, 5, false));
+    s.primary_key = Some("id".into());
+    let decl = |name: &str, method: Method, columns: &[u32]| IndexDecl {
+        name: name.into(),
+        method,
+        unique: false,
+        columns: columns.to_vec(),
+        is_deleted: false,
+    };
+    s.secondary_indexes = vec![
+        decl("by_price_email", Method::BTree, &[1, 2]),
+        decl("by_token", Method::Hash, &[3]),
+        decl("doc_ops", Method::GinOps, &[4]),
+        decl("doc_path_ops", Method::GinPathOps, &[4]),
+    ];
+    let path = |name: &str, expr: &str| crate::core::rql::path_index::PathIndex {
+        name: name.into(),
+        path: crate::core::jsonb::parse_path_expression(expr).unwrap().index_key(),
+        is_deleted: false,
+    };
+    s.path_indexes = vec![
+        path("by_k", "doc->'a'->>'k'"),
+        path("by_i", "doc->'a'->>1"),
+    ];
+    s
+}
+
+fn shape(s: &crate::core::row::schema::TableSchema) -> u64 {
+    shape_of(s)
+}
+
+fn path_steps(expr: &str) -> String {
+    crate::core::jsonb::parse_path_expression(expr).unwrap().index_key()
+}
+
+/// The shape is persisted beside a snapshot, so its value is frozen: a
+/// change here is a format change.
+#[test]
+fn the_shape_hash_is_pinned() {
+    let s = shape_schema();
+    let built = for_schema(&s);
+    assert_eq!((built.list.len(), built.gin.len()), (6, 2), "every kind is in the shape");
+    let steps: Vec<_> = built.list.iter().filter_map(|i| i.path.as_ref()).flat_map(|p| p.1.clone()).collect();
+    use crate::core::jsonb::Step;
+    assert!(steps.iter().any(|s| matches!(s, Step::Key(_))), "{steps:?}");
+    assert!(steps.iter().any(|s| matches!(s, Step::Index(_))), "{steps:?}");
+    assert_eq!(shape(&s), 0x7dd7_75ac_cf81_1956, "shape_hash moved");
+    assert_eq!(either_shape(Step::Either("2".into())), 0x09d8_3f82_d852_b42f, "shape_hash moved");
+}
+
+/// The shape of one path index over `doc->'a'` then `last`, built directly so
+/// the step's kind can be chosen freely; a declared `#>>` path builds the same
+/// index (see [`a_built_either_path_has_the_shape_of_its_steps`]).
+fn either_shape(last: crate::core::jsonb::Step) -> u64 {
+    let decl = IndexDecl {
+        name: "p".into(),
+        method: Method::BTree,
+        unique: false,
+        columns: vec![FIRST_PATH_COLUMN],
+        is_deleted: false,
+    };
+    let steps = vec![crate::core::jsonb::Step::Key("a".into()), last];
+    let index = LiveIndex::over_path(decl, FIRST_PATH_COLUMN, 4, steps);
+    TableIndexes::new(vec![Arc::new(index)]).shape_hash(&shape_schema().fields)
+}
+
+/// A declared `#>>` path is built, and with the shape of the same steps built
+/// directly: an `Either` step reaches the shape through `for_schema` too.
+#[test]
+fn a_built_either_path_has_the_shape_of_its_steps() {
+    use crate::core::jsonb::Step;
+    let mut s = shape_schema();
+    s.primary_key = None;
+    s.fields[2].is_unique = false;
+    s.secondary_indexes.clear();
+    s.path_indexes = vec![crate::core::rql::path_index::PathIndex {
+        name: "p".into(),
+        path: path_steps("doc#>>'{a,2}'"),
+        is_deleted: false,
+    }];
+    let built = for_schema(&s);
+    assert_eq!((built.list.len(), built.gin.len()), (1, 0), "only the path index is built");
+    assert_eq!(shape(&s), either_shape(Step::Either("2".into())));
+}
+
+/// An `Either` step's text decides which value is keyed, and so does its
+/// kind: `#>>'{a,2}'` is neither `->'a'->>'2'` nor `->'a'->>2`.
+#[test]
+fn the_shape_hash_sees_an_either_steps_text() {
+    use crate::core::jsonb::Step;
+    let base = either_shape(Step::Either("2".into()));
+    for (what, other) in [
+        ("either text", Step::Either("3".into())),
+        ("key of the same text", Step::Key("2".into())),
+        ("index of the same value", Step::Index(2)),
+    ] {
+        assert_ne!(either_shape(other), base, "{what} did not move the shape");
+    }
+}
+
+/// Everything that decides an index's entries moves the shape; a name, which
+/// decides none, does not.
+#[test]
+fn the_shape_hash_sees_what_keys_rows_and_no_name() {
+    let base = shape(&shape_schema());
+    let changed = |what: &str, edit: &dyn Fn(&mut crate::core::row::schema::TableSchema)| {
+        let mut s = shape_schema();
+        edit(&mut s);
+        (what.to_string(), shape(&s))
+    };
+    let same = [
+        changed("table renamed", &|s| s.name = "renamed".into()),
+        changed("index renamed", &|s| s.secondary_indexes[1].name = "other".into()),
+        changed("path index renamed", &|s| s.path_indexes[0].name = "other".into()),
+        changed("column renamed with its key", &|s| {
+            s.fields[0].name = "ident".into();
+            s.primary_key = Some("ident".into());
+        }),
+        changed("unindexed column added", &|s| {
+            s.fields.push(SchemaField::new("note".into(), DbType::STRING, 12, 76, 6, false))
+        }),
+    ];
+    for (what, h) in same {
+        assert_eq!(h, base, "{what} moved the shape");
+    }
+    let differ = [
+        changed("scale", &|s| s.fields[1].scale = Some(3)),
+        changed("scale to default", &|s| s.fields[1].scale = None),
+        changed("type", &|s| s.fields[0].db_type = DbType::I32),
+        changed("method", &|s| s.secondary_indexes[0].method = Method::Hash),
+        changed("unique", &|s| s.secondary_indexes[0].unique = true),
+        changed("column", &|s| s.secondary_indexes[0].columns = vec![1, 0]),
+        changed("order", &|s| s.secondary_indexes.swap(0, 1)),
+        changed("opclass", &|s| s.secondary_indexes[3].method = Method::GinOps),
+        changed("path step", &|s| s.path_indexes[0].path = path_steps("doc->'a'->>'j'")),
+        changed("path step kind", &|s| s.path_indexes[0].path = path_steps("doc->'a'->>0")),
+        // `doc->'a'->>1` against `->>0` above: an index's value, not only
+        // its kind.
+        changed("path index value", &|s| s.path_indexes[1].path = path_steps("doc->'a'->>2")),
+        changed("path document column", &|s| s.path_indexes[0].path = path_steps("doc2->'a'->>'k'")),
+        changed("gin column", &|s| s.secondary_indexes[2].columns = vec![5]),
+        changed("implicit unique column", &|s| s.fields[2].is_unique = false),
+        // A declared index over the key column survives the dedup and the
+        // implicit one does not: same columns and method, not implicit, not
+        // unique.
+        changed("dedup survivor", &|s| {
+            s.secondary_indexes.insert(
+                0,
+                IndexDecl {
+                    name: "by_id".into(),
+                    method: Method::BTree,
+                    unique: false,
+                    columns: vec![0],
+                    is_deleted: false,
+                },
+            )
+        }),
+        changed("dropped index", &|s| {
+            s.secondary_indexes.remove(1);
+        }),
+    ];
+    let mut seen = vec![base];
+    for (what, h) in differ {
+        assert!(!seen.contains(&h), "{what} did not move the shape");
+        seen.push(h);
+    }
+}
+
+/// `KEY_LOOKUPS` counts a lookup a column index answered, beside the path
+/// and gin counters, so a test can tell an index was consulted.
+#[test]
+fn a_column_index_answer_is_counted() {
+    let indexes = TableIndexes::new(vec![index("n_bt", Method::BTree, &[0]), index("s_hash", Method::Hash, &[1])]);
+    for slot in 0..64u64 {
+        let row = [(slot as i64).to_le_bytes().to_vec(), vec![b'a' + (slot % 7) as u8]];
+        indexes.index_row(slot, &|wo| row.get(wo as usize).map(|v| v.as_slice()));
+    }
+    indexes.set_ready(true);
+    let pred = |write_order: u32, op: SargOp, value: Vec<u8>| MaskExpr::Pred(SargPredicate { write_order, op, value });
+    let cases = [
+        (pred(0, SargOp::Eq, 5i64.to_le_bytes().to_vec()), vec![5]),
+        (pred(1, SargOp::Eq, vec![b'a']), (0..64).step_by(7).collect()),
+        (pred(0, SargOp::Lt, 3i64.to_le_bytes().to_vec()), vec![0, 1, 2]),
+    ];
+    for (expr, want) in cases {
+        let before = KEY_LOOKUPS.load(Ordering::Relaxed);
+        let here = KEY_LOOKUPS_HERE.with(|n| n.get());
+        assert_eq!(indexes.plan(&expr, &fields(), 4096), Some(want), "{expr:?}");
+        // The process-wide count is shared with every other test; this
+        // thread's shadow of it sees only this lookup.
+        assert_eq!(KEY_LOOKUPS_HERE.with(|n| n.get()), here + 1, "{expr:?} was not counted once");
+        assert!(KEY_LOOKUPS.load(Ordering::Relaxed) > before, "{expr:?} missed the process-wide count");
+    }
+}

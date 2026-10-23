@@ -624,6 +624,20 @@ pub static GIN_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static PATH_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Of `GIN_LOOKUPS`, those answered as a bitmap (see [`dense_cap`]).
 pub static GIN_DENSE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lookups a B-tree or hash index over columns (not a path) answered.
+pub static KEY_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    /// `KEY_LOOKUPS` counted on this thread only, so a test's check is not
+    /// passed by another test's lookup landing in between.
+    pub(crate) static KEY_LOOKUPS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_key_lookup() {
+    KEY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    KEY_LOOKUPS_HERE.with(|n| n.set(n.get() + 1));
+}
 
 /// The slots in both sorted, distinct lists.
 pub fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
@@ -695,6 +709,121 @@ impl TableIndexes {
     /// How many indexes there are, of either kind.
     pub fn len(&self) -> usize {
         self.list.len() + self.gin.len()
+    }
+
+    /// What these indexes are, as one number a persisted snapshot records and
+    /// is checked against: equal shapes key every row under equal entries.
+    /// Reached through [`shape_of`], which builds the indexes from the same
+    /// schema whose fields it passes, so the two cannot come from different
+    /// schemas.
+    ///
+    /// Per index, in this order (which [`for_schema`] fixes, dedup survivor
+    /// included): kind, method, uniqueness, implicitness, and per key column
+    /// its `write_order`, type and NUMERIC scale; a path index's document
+    /// column and steps; a gin index's column and operator class. Never a
+    /// name, which keys nothing. `fields` gives the scales, which the planner
+    /// encodes literals at. Frozen like the keys (`core::hash`), since it is
+    /// persisted. Every struct is destructured whole: a new field does not
+    /// compile until it is hashed here or excluded with its reason.
+    fn shape_hash(&self, fields: &[SchemaField]) -> u64 {
+        use crate::core::jsonb::{GinOpclass, Step};
+        let method = |m: Method| match m {
+            Method::BTree => 1u8,
+            Method::Hash => 2,
+            Method::GinOps => 3,
+            Method::GinPathOps => 4,
+        };
+        // `state` is readiness and the renumbering epoch, not what is keyed.
+        let TableIndexes { list, gin, state: _ } = self;
+        let mut h = crate::core::hash::ItemFeed::new(0);
+        h.u64_le(list.len() as u64);
+        for index in list {
+            // The entries themselves are not the shape; `decl.columns` is
+            // `columns` without the types.
+            let LiveIndex {
+                decl,
+                columns,
+                implicit,
+                path,
+                data: _,
+                present: _,
+                unkeyed: _,
+            } = &**index;
+            let IndexDecl {
+                name: _,
+                method: m,
+                unique,
+                columns: _,
+                is_deleted: _,
+            } = decl;
+            h.u8(1);
+            h.u8(method(*m));
+            h.u8(*unique as u8);
+            h.u8(*implicit as u8);
+            h.u64_le(columns.len() as u64);
+            for (wo, ty) in columns {
+                h.u64_le(*wo as u64);
+                h.u8(ty.to_byte());
+                let scale = fields
+                    .iter()
+                    .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
+                    .and_then(|f| f.scale);
+                match scale {
+                    None => h.u8(0),
+                    Some(s) => {
+                        h.u8(1);
+                        h.u64_le(s as u64);
+                    }
+                }
+            }
+            match path {
+                None => h.u8(0),
+                Some((document, steps)) => {
+                    h.u8(1);
+                    h.u64_le(*document as u64);
+                    h.u64_le(steps.len() as u64);
+                    for step in steps {
+                        match step {
+                            Step::Key(k) => {
+                                h.u8(1);
+                                h.u64_le(k.len() as u64);
+                                h.bytes(k.as_bytes());
+                            }
+                            Step::Index(n) => {
+                                h.u8(2);
+                                h.i64_le(*n);
+                            }
+                            Step::Either(t) => {
+                                h.u8(3);
+                                h.u64_le(t.len() as u64);
+                                h.bytes(t.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        h.u64_le(gin.len() as u64);
+        for g in gin {
+            let (decl, column, opclass) = g.shape();
+            // `decl.columns` is `[column]`.
+            let IndexDecl {
+                name: _,
+                method: m,
+                unique,
+                columns: _,
+                is_deleted: _,
+            } = decl;
+            h.u8(2);
+            h.u8(method(*m));
+            h.u8(*unique as u8);
+            h.u64_le(column as u64);
+            h.u8(match opclass {
+                GinOpclass::Ops => 1,
+                GinOpclass::PathOps => 2,
+            });
+        }
+        h.finish()
     }
 
     /// The virtual column a path index keys `doc->>…` under, when one
@@ -1062,6 +1191,8 @@ impl TableIndexes {
                 index.append_unkeyed(&mut out);
                 if index.path.is_some() {
                     PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    count_key_lookup();
                 }
                 best = Some(out);
                 best_from = Some(i);
@@ -1119,6 +1250,8 @@ impl TableIndexes {
             if best.as_ref().is_none_or(|b| out.len() < b.len()) {
                 if index.path.is_some() {
                     PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    count_key_lookup();
                 }
                 best = Some(out);
                 best_from = None;
@@ -1167,6 +1300,13 @@ impl TableIndexes {
 /// A declaration whose column has since been dropped, or whose types no
 /// longer allow its method, is left out with a warning rather than built
 /// wrongly.
+/// The shape ([`TableIndexes::shape_hash`]) of the indexes [`for_schema`]
+/// builds for `schema`: what a persisted snapshot records, and what it is
+/// checked against at open.
+pub fn shape_of(schema: &crate::core::row::schema::TableSchema) -> u64 {
+    for_schema(schema).shape_hash(&schema.fields)
+}
+
 pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexes {
     let live = |wo: u32| {
         schema
@@ -1353,3 +1493,5 @@ pub fn choose_method(requested: Option<Method>, types: &[DbType]) -> Result<Meth
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod vectors;
