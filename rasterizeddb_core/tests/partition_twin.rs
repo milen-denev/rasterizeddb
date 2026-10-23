@@ -17,7 +17,8 @@
 //!   so does the reverse;
 //! - a statement that fails on the partitioned side for a reason other than
 //!   the refusal (a duplicate key, say) runs on the twin, which must fail the
-//!   same way, whether or not the kind is refused.
+//!   same way, whether or not the kind is refused. Only a write may do that:
+//!   a read kind that failed on both compared nothing, and fails the run.
 //!
 //! Inside a transaction block any failure ends the block: both sides roll
 //! back, so a refused write never reaches the twin.
@@ -63,6 +64,7 @@ enum Kind {
     UpdateByPartitionKey,
     UpdateByPrefix,
     UpdateByNonKey,
+    UpdateByFunction,
     UpdateRelocating,
     UpdateKeySameValue,
     UpdateKeyChange,
@@ -71,6 +73,7 @@ enum Kind {
     DeleteByKey,
     DeleteByPrefix,
     DeleteByNonKey,
+    DeleteByFunction,
     DeleteIn,
     DeleteReturning,
     DeleteUsing,
@@ -95,6 +98,7 @@ enum Kind {
     SelectRowValue,
     SelectSpellings,
     SelectNonKey,
+    SelectFunctionWhere,
     SelectLimitZero,
     CountAll,
     CountByPrefix,
@@ -102,6 +106,7 @@ enum Kind {
     GroupBy,
     GroupByOrdered,
     OrderByLimit,
+    OrderByExpr,
     Distinct,
     CountDistinct,
     Window,
@@ -147,12 +152,14 @@ use Kind::*;
 const ALL_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertNulls, InsertQuotedKey, InsertSelect, InsertOnConflictNothing,
     InsertOnConflictUpdate, InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
-    UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateFrom, DeleteByKey,
-    DeleteByPrefix, DeleteByNonKey, DeleteIn, DeleteReturning, DeleteUsing, InsertIntoSinkFromT,
+    UpdateByFunction, UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateFrom,
+    DeleteByKey, DeleteByPrefix, DeleteByNonKey, DeleteByFunction, DeleteIn, DeleteReturning, DeleteUsing,
+    InsertIntoSinkFromT,
     UpdateDimViaSubquery, Vacuum, VacuumFull, Analyze, SelectAll, SelectByKey, SelectByPartitionKey,
     SelectByPrefix, SelectIn, SelectInComposite, SelectOr, SelectOrUnconstrained, SelectRange,
-    SelectNonKeyRange, SelectRowValue, SelectSpellings, SelectNonKey, SelectLimitZero, CountAll, CountByPrefix,
-    Aggregates, GroupBy, GroupByOrdered, OrderByLimit, Distinct, CountDistinct, Window, Join, LeftJoin,
+    SelectNonKeyRange, SelectRowValue, SelectSpellings, SelectNonKey, SelectFunctionWhere, SelectLimitZero,
+    CountAll, CountByPrefix, Aggregates, GroupBy, GroupByOrdered, OrderByLimit, OrderByExpr, Distinct,
+    CountDistinct, Window, Join, LeftJoin,
     SelfJoin, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedInsert, PreparedUpdate, PreparedDelete,
@@ -327,7 +334,10 @@ impl Gen {
         if self.rng.u8(..10) == 0 { "NULL".into() } else { format!("{}", self.rng.i32(-40..40) as f64 * 0.25) }
     }
     fn row(&mut self) -> String {
-        let (t, g, i) = (self.tenant(), self.grp(), self.id());
+        // One row in eight under a negative tenant, so a function of the key
+        // (`ABS(tenant_id) = t`) matches rows in two partitions.
+        let t = if self.rng.u8(..8) == 0 { -self.tenant() } else { self.tenant() };
+        let (g, i) = (self.grp(), self.id());
         let (n, s, f) = (self.n(), self.s(), self.f());
         format!("({t}, {g}, {i}, {n}, {s}, {f})")
     }
@@ -437,6 +447,18 @@ impl Gen {
                 let v = self.rng.i32(-50..100);
                 self.simple(kind, format!("UPDATE {{t}} SET n = n + 2 WHERE n > {v}"))
             }
+            UpdateByFunction => {
+                let t = self.tenant();
+                let v = self.rng.i32(-50..100);
+                let w = WORDS[self.rng.usize(..4)];
+                let clause = match self.rng.u8(..4) {
+                    0 => format!("ABS(tenant_id) = {t}"),
+                    1 => format!("UPPER(s) = '{}'", w.to_ascii_uppercase()),
+                    2 => format!("COALESCE(n, 0) > {v} AND tenant_id = {t}"),
+                    _ => format!("LOWER(s) = '{w}' OR COALESCE(tenant_id, 0) = {t}"),
+                };
+                self.simple(kind, format!("UPDATE {{t}} SET n = COALESCE(n, 0) + 3 WHERE {clause}"))
+            }
             UpdateRelocating => {
                 let (t, g) = (self.tenant(), self.grp());
                 let long = "z".repeat(self.rng.usize(40..200));
@@ -482,6 +504,16 @@ impl Gen {
             DeleteByNonKey => {
                 let v = self.rng.i32(-60..-20);
                 self.simple(kind, format!("DELETE FROM {{t}} WHERE n < {v}"))
+            }
+            DeleteByFunction => {
+                let t = self.tenant();
+                let w = WORDS[self.rng.usize(..4)];
+                let clause = match self.rng.u8(..3) {
+                    0 => format!("ABS(tenant_id) = {t} AND LOWER(s) = '{w}'"),
+                    1 => format!("COALESCE(n, 0) < -45 OR UPPER(s) = '{}'", w.to_ascii_uppercase()),
+                    _ => format!("tenant_id = {t} AND COALESCE(s, '') = ''"),
+                };
+                self.simple(kind, format!("DELETE FROM {{t}} WHERE {clause}"))
             }
             DeleteIn => {
                 let l = self.tenant_list();
@@ -586,6 +618,24 @@ impl Gen {
                 let s = WORDS[self.rng.usize(..4)];
                 self.simple(kind, format!("SELECT * FROM {{t}} WHERE s = '{s}' OR n IS NULL"))
             }
+            SelectFunctionWhere => {
+                // Upstream's 4301045 evaluates these; none proves the key,
+                // wrapping it or not, so each fans out (I3) unless a key
+                // equality beside it routes.
+                let t = self.tenant();
+                let v = self.rng.i32(-50..100);
+                let w = WORDS[self.rng.usize(..4)];
+                let clause = match self.rng.u8(..7) {
+                    0 => format!("ABS(tenant_id) = {t}"),
+                    1 => format!("COALESCE(tenant_id, 0) = {t}"),
+                    2 => format!("COALESCE(n, -1) > {v}"),
+                    3 => format!("UPPER(s) = '{}'", w.to_ascii_uppercase()),
+                    4 => format!("LOWER(s) = '{w}' OR tenant_id = {t}"),
+                    5 => format!("tenant_id = {t} AND COALESCE(s, 'none') <> 'none'"),
+                    _ => format!("ABS(n) < {} AND ABS(tenant_id) IN ({}, {})", v.abs(), self.tenant(), self.tenant()),
+                };
+                self.simple(kind, format!("SELECT * FROM {{t}} WHERE {clause}"))
+            }
             SelectLimitZero => self.simple(kind, "SELECT * FROM {t} LIMIT 0".into()),
             CountAll => self.simple(kind, "SELECT COUNT(*) FROM {t}".into()),
             CountByPrefix => {
@@ -618,8 +668,36 @@ impl Gen {
                     format!("SELECT tenant_id, grp, id, n FROM {{t}}{w} ORDER BY n DESC, {KEY_ORDER} LIMIT {k} OFFSET {o}"),
                 )
             }
+            OrderByExpr => {
+                // Unparenthesised since 4301045. The key breaks every tie; a
+                // NULL n sorts by the engine's rule on both sides alike.
+                let k = self.rng.usize(1..=6);
+                let w = if self.rng.bool() { format!(" WHERE tenant_id = {}", self.tenant()) } else { String::new() };
+                let dir = if self.rng.bool() { " DESC" } else { "" };
+                self.ordered(
+                    kind,
+                    format!(
+                        "SELECT tenant_id, grp, id, n * 2 + 1 AS x FROM {{t}}{w} ORDER BY n * 2 + 1{dir}, {KEY_ORDER} LIMIT {k}"
+                    ),
+                )
+            }
             Distinct => self.simple(kind, "SELECT DISTINCT grp, s FROM {t}".into()),
-            CountDistinct => self.simple(kind, "SELECT COUNT(DISTINCT tenant_id), COUNT(DISTINCT s) FROM {t}".into()),
+            // Several DISTINCT aggregates in one SELECT, mixed with plain ones
+            // and grouped: native in the fold since 4301045. Before it, every
+            // one of these failed on both tables alike, so the kind was never
+            // compared; the end-of-run check now fails a read that does that.
+            CountDistinct => {
+                let sql = match self.rng.u8(..4) {
+                    0 => "SELECT COUNT(DISTINCT tenant_id), COUNT(DISTINCT s) FROM {t}".to_string(),
+                    1 => "SELECT COUNT(DISTINCT grp), COUNT(DISTINCT n), COUNT(*), SUM(n), MAX(s) FROM {t}".to_string(),
+                    2 => "SELECT grp, COUNT(DISTINCT tenant_id), COUNT(DISTINCT s) FROM {t} GROUP BY grp".to_string(),
+                    _ => format!(
+                        "SELECT COUNT(DISTINCT s), COUNT(DISTINCT f), AVG(f) FROM {{t}} WHERE tenant_id IN ({})",
+                        self.tenant_list()
+                    ),
+                };
+                self.simple(kind, sql)
+            }
             Window => self.simple(
                 kind,
                 "SELECT tenant_id, grp, id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY grp, id) FROM {t}".into(),
@@ -773,7 +851,8 @@ impl Gen {
 /// nested block, no restart.
 const BLOCK_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertSelect, InsertOnConflictUpdate, UpdateByKey, UpdateByPrefix, UpdateRelocating,
-    UpdateByNonKey, UpdateKeySameValue, DeleteByKey, DeleteByNonKey, DeleteIn, SelectByPrefix, CountAll,
+    UpdateByNonKey, UpdateByFunction, UpdateKeySameValue, DeleteByKey, DeleteByNonKey, DeleteIn, SelectByPrefix,
+    SelectFunctionWhere, CountAll,
     Aggregates, ForUpdate, SkipLocked, PreparedInsert, PreparedSelect, PreparedUpdate, InsertIntoSinkFromT,
     ReadSinkAndDim,
 ];
@@ -834,6 +913,7 @@ fn writes_t(kind: Kind) -> bool {
             | UpdateByPartitionKey
             | UpdateByPrefix
             | UpdateByNonKey
+            | UpdateByFunction
             | UpdateRelocating
             | UpdateKeySameValue
             | UpdateKeyChange
@@ -842,6 +922,7 @@ fn writes_t(kind: Kind) -> bool {
             | DeleteByKey
             | DeleteByPrefix
             | DeleteByNonKey
+            | DeleteByFunction
             | DeleteIn
             | DeleteReturning
             | DeleteUsing
@@ -856,6 +937,13 @@ fn writes_t(kind: Kind) -> bool {
             | TxRollback
             | Restart
     )
+}
+
+/// Kinds that may fail on both tables alike and still have compared
+/// something: writes, which can hit a duplicate key on both, and blocks,
+/// which end when one does.
+fn may_fail_on_both(kind: Kind) -> bool {
+    writes_t(kind) || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery)
 }
 
 /// What an operation came to.
@@ -1293,6 +1381,19 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     for (kind, t) in &twin.tally {
         if refusal(*kind).is_none() {
             assert_eq!(t.refused, 0, "{label}: {kind:?} counted a refusal while not in REFUSED");
+        }
+    }
+    // A read that fails on both tables alike compared nothing: CountDistinct
+    // did that, unnoticed, until upstream's 4301045. Only a write may (a
+    // duplicate key on both); a read kind not in REFUSED must answer.
+    for (kind, t) in &twin.tally {
+        if refusal(*kind).is_none() && !may_fail_on_both(*kind) {
+            assert_eq!(
+                t.both_failed, 0,
+                "{label} seed {seed:#x}: {kind:?} failed on both tables {} time(s) and agreed {}, so those runs \
+                 compared nothing",
+                t.both_failed, t.agreed
+            );
         }
     }
 
