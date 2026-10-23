@@ -183,6 +183,23 @@ pub fn parse_name(name: &str) -> Option<PartFile> {
     lower_hex(pid, 8).map(|pid| PartFile::Data { uid, pid: pid as u32 })
 }
 
+/// The schema file that owns `name` when it is a partition's pointer file,
+/// `__pt_<u>_<pid>_pointers.db`: the table's one shared schema
+/// `__pt_<u>_schema.db`, since a partition has no schema of its own. `None`
+/// for every other name, its `.tmp` sibling included.
+///
+/// The torn-tail cutter (`torn_tail::classify`) counts a pointer file only
+/// when its schema sits beside it, and looks for `<stem>_schema.db`, which a
+/// partition never has; without this its pointers were never cut back after
+/// a power cut, and the next insert landed inside the torn record.
+pub fn pointers_schema(name: &str) -> Option<String> {
+    let stem = name.strip_suffix("_pointers.db")?;
+    match parse_name(name)? {
+        PartFile::Data { uid, pid } if stem == data_stem(uid, pid) => Some(format!("{}.db", schema_stem(uid))),
+        _ => None,
+    }
+}
+
 /// Every uid with any file in `dir`, by the loose prefix test.
 fn uids_in(dir: &Path) -> io::Result<HashSet<u64>> {
     let mut seen = HashSet::new();

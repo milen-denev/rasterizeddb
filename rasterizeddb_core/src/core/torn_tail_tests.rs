@@ -659,3 +659,210 @@ async fn a_shrink_in_place_lowers_the_floor_first() {
     close(&dir, db);
     assert_eq!(len(&file), 4 * stride);
 }
+
+// ---------------------------------------------------------------------------
+// Partitions
+// ---------------------------------------------------------------------------
+
+/// The pointer files of `dir`'s partitions, by name, with their lengths.
+fn partition_pointer_files(dir: &Path) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (name.starts_with(crate::core::partition::files::PREFIX) && name.ends_with("_pointers.db"))
+                .then(|| (name, e.metadata().unwrap().len()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A partition's pointers are `__pt_<u>_<pid>_pointers.db`, beside the
+/// table's one shared schema `__pt_<u>_schema.db` rather than a schema of
+/// their own; its sidecars are `__pt_<u>_schema_<SIDECAR>.db`. Each is the
+/// fixed-record file it is, and nothing else under the prefix is one.
+#[test]
+fn a_partitions_pointers_and_its_tables_sidecars_are_fixed_record_files() {
+    use crate::core::partition::files;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let uid = 0x0123_4567_89ab_cdef;
+    let pointers = format!("{}_pointers.db", files::data_stem(uid, 7));
+    let rows = format!("{}.db", files::data_stem(uid, 7));
+    let filter = format!("{}_flt.db", files::data_stem(uid, 7));
+    let fields = format!("{}_FIELDS.db", files::schema_stem(uid));
+    let others = [rows.clone(), filter.clone(), files::map_file(uid, 0), files::ids_file(uid), files::seq_file(uid)];
+    for name in others.iter().chain([&pointers, &fields]) {
+        std::fs::write(d.join(name), b"").unwrap();
+    }
+    // No schema yet: nothing is anyone's.
+    assert_eq!(classify(d, &pointers), None);
+    assert_eq!(classify(d, &fields), None);
+    std::fs::write(d.join(format!("{}.db", files::schema_stem(uid))), b"").unwrap();
+    assert_eq!(classify(d, &pointers).map(|k| k.stride), Some(ROW_POINTER_RECORD_LEN as u64));
+    assert_eq!(classify(d, &fields).map(|k| k.stride), Some(crate::core::row::schema::SCHEMA_FIELD_SIZE));
+    for name in &others {
+        assert_eq!(classify(d, name), None, "{name} taken for a fixed-record file");
+    }
+    // Another table's schema does not make a partition's pointers fixed-record.
+    let stranger = format!("{}_pointers.db", files::data_stem(uid + 1, 7));
+    std::fs::write(d.join(&stranger), b"").unwrap();
+    assert_eq!(classify(d, &stranger), None);
+    // Nor a name only shaped like one: a pid that is not eight hex digits.
+    let misshapen = format!("{}{uid:016x}_7_pointers.db", files::PREFIX);
+    std::fs::write(d.join(&misshapen), b"").unwrap();
+    assert_eq!(classify(d, &misshapen), None);
+}
+
+/// A partition's pointer file torn by a power cut is cut back at the open
+/// like a plain table's, so the insert after it lands on a record boundary:
+/// for each torn length, the database opens, takes an insert routed to that
+/// partition, restarts, and shows exactly what an untorn copy shows.
+#[tokio::test]
+async fn torn_partition_pointers_are_cut_before_the_next_insert() {
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("base");
+    let stride = ROW_POINTER_RECORD_LEN as u64;
+    let db = open(&src).await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT NOT NULL, a INTEGER) PARTITION BY HASH (id) PARTITIONS 4")
+        .await
+        .unwrap();
+    for i in 1..=12 {
+        exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
+    }
+    checkpoint(&src);
+    close(&src, db);
+    let before = partition_pointer_files(&src);
+    assert!(before.len() > 1, "twelve rows reached one partition: {before:?}");
+
+    // The untorn copy: which partition id 100 goes to, and the record it
+    // appends there.
+    let control = base.path().join("control");
+    copy_db(&src, &control);
+    let db = open(&control).await.unwrap();
+    exec(&db, "INSERT INTO t (id, a) VALUES (100, 100)").await.unwrap();
+    close(&control, db);
+    let after = partition_pointer_files(&control);
+    let grown: Vec<_> = after.iter().filter(|f| !before.contains(f)).collect();
+    assert_eq!(grown.len(), 1, "one partition takes the row: {before:?} -> {after:?}");
+    let name = grown[0].0.clone();
+    let whole = before.iter().find(|(n, _)| *n == name).map_or(0, |(_, l)| *l);
+    assert!(whole > 0 && whole % stride == 0, "{name}: {whole} bytes is not whole records");
+    let db = open(&control).await.unwrap();
+    let want_ids = ids(&db).await;
+    close(&control, db);
+    let want_file = std::fs::read(control.join(&name)).unwrap();
+    assert_eq!(want_file.len() as u64, whole + stride);
+    let record = want_file[whole as usize..].to_vec();
+    assert_eq!(want_ids, (1..=12).chain([100]).collect::<Vec<i64>>());
+
+    let work = base.path().join("work");
+    for torn in 1..stride {
+        copy_db(&src, &work);
+        let file = work.join(&name);
+        {
+            let mut f = File::options().append(true).open(&file).unwrap();
+            f.write_all(&record[..torn as usize]).unwrap();
+        }
+        let db = open(&work).await.unwrap_or_else(|e| panic!("{name}, {torn} bytes torn: {e}"));
+        assert_eq!(len(&file), whole, "{name}, {torn} bytes torn: the open did not cut it back");
+        exec(&db, "INSERT INTO t (id, a) VALUES (100, 100)").await.unwrap();
+        close(&work, db);
+        let db = open(&work).await.unwrap();
+        let got_ids = ids(&db).await;
+        close(&work, db);
+        assert_eq!(got_ids, want_ids, "{name}, {torn} bytes torn: the rows after a write and a restart");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            want_file,
+            "{name}, {torn} bytes torn: the pointer file differs from an untorn copy's"
+        );
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+}
+
+/// A checkpoint records a partition's pointer file's floor like any other
+/// fixed-record file's, keyed by its identity, so a partition that lost
+/// synced bytes refuses to open rather than being cut below them.
+#[tokio::test]
+async fn a_partitions_pointers_get_a_durable_floor() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let stride = ROW_POINTER_RECORD_LEN as u64;
+    let db = open(&dir).await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT NOT NULL, a INTEGER) PARTITION BY HASH (id) PARTITIONS 2")
+        .await
+        .unwrap();
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
+    }
+    checkpoint(&dir);
+    let files = partition_pointer_files(&dir);
+    let (name, whole) = files.iter().max_by_key(|(_, l)| *l).cloned().unwrap();
+    assert!(whole >= 2 * stride, "{files:?}");
+    let file = dir.join(&name);
+    let floor = crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap());
+    assert_eq!(floor, whole, "{name}: the checkpoint recorded no floor");
+    close(&dir, db);
+    // Lose a synced record and tear the one before it: below the floor.
+    let f = File::options().write(true).open(&file).unwrap();
+    f.set_len(whole - stride - 3).unwrap();
+    drop(f);
+    let e = match open(&dir).await {
+        Ok(db) => {
+            close(&dir, db);
+            panic!("{name}: a partition's pointers cut below their durable floor opened");
+        }
+        Err(e) => e,
+    };
+    crate::core::wal::remove_for(&path_str(&dir));
+    assert!(e.contains(&name) && e.contains("durable floor"), "{e}");
+    assert_eq!(len(&file), whole - stride - 3, "the refused open changed the file");
+}
+
+/// A partition's pointer file shrunk in place lowers its floor through the
+/// database's log, as a plain table's does: its provider is in the root, so
+/// `lower_floor_for` reaches the log whose checkpoint recorded the floor. A
+/// torn append after the shrink then opens.
+#[tokio::test]
+async fn a_partitions_shrink_in_place_lowers_its_floor() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let stride = ROW_POINTER_RECORD_LEN as u64;
+    let db = open(&dir).await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT NOT NULL, a INTEGER) PARTITION BY HASH (id) PARTITIONS 2")
+        .await
+        .unwrap();
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
+    }
+    checkpoint(&dir);
+    let pt = db.partitioned.get("t").unwrap().value().clone();
+    let epoch = pt.epoch().unwrap();
+    let (pid, part) = pt
+        .materialized(&epoch, &crate::core::partition::Route::All)
+        .unwrap()
+        .into_iter()
+        .max_by_key(|(_, p)| p.data().unwrap().len.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap();
+    let file = dir.join(format!("{}_pointers.db", crate::core::partition::files::data_stem(pt.uid(), pid)));
+    let whole = len(&file);
+    assert!(whole >= 2 * stride, "{}: {whole} bytes", file.display());
+    let floor = || {
+        crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap())
+    };
+    assert_eq!(floor(), whole, "the checkpoint recorded no floor for the partition");
+    let io = part.io_pointers().unwrap().clone();
+    crate::core::storage_providers::traits::StorageIO::truncate(&*io, stride).await.unwrap();
+    assert_eq!(floor(), stride, "the shrink left the partition's floor above its file");
+    drop((io, part, epoch, pt));
+    close(&dir, db);
+    let mut f = File::options().append(true).open(&file).unwrap();
+    f.write_all(&[0x5A; 9]).unwrap();
+    drop(f);
+    let db = open(&dir).await.unwrap();
+    close(&dir, db);
+    assert_eq!(len(&file), stride);
+}

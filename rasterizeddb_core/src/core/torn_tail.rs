@@ -75,6 +75,15 @@
 //! mistaken for another table's sidecar. Cutting a variable-length file to a
 //! multiple of an unrelated stride would destroy committed bytes.
 //!
+//! A partitioned table's files are in the same directory (`partition::files`):
+//! its schema and sidecars are `__pt_<u>_schema.db` and
+//! `__pt_<u>_schema_<SIDECAR>.db`, the rule above for the table `__pt_<u>`.
+//! Each partition's pointers, `__pt_<u>_<pid>_pointers.db`, have no schema of
+//! their own; they count when the table's shared one sits beside them
+//! (`partition::files::pointers_schema`). The rest under the prefix (rows,
+//! filters, the map log, which cuts its own torn tail at open, the ids and
+//! sequence files) are none of these.
+//!
 //! Left alone, each for a reason:
 //! - `<t>.db`, the row data: variable-length records addressed by the
 //!   absolute offsets pointer records hold, so a torn tail is bytes no pointer
@@ -148,7 +157,7 @@ pub fn classify(dir: &Path, name: &str) -> Option<FixedRecordFile> {
         let Some(table) = name.strip_suffix(suffix) else {
             continue;
         };
-        if table.is_empty() || !dir.join(format!("{table}_schema.db")).is_file() {
+        if table.is_empty() || !(dir.join(format!("{table}_schema.db")).is_file() || partition_pointers(dir, name)) {
             return None;
         }
         return Some(FixedRecordFile {
@@ -158,6 +167,19 @@ pub fn classify(dir: &Path, name: &str) -> Option<FixedRecordFile> {
         });
     }
     None
+}
+
+/// Whether `name` is a partition's pointer file whose table's shared schema
+/// sits beside it ([`crate::core::partition::files::pointers_schema`]), and
+/// not the row data of a plain table that an older build let take a name
+/// under the partition prefix (`<name less .db>_schema.db` beside it).
+fn partition_pointers(dir: &Path, name: &str) -> bool {
+    crate::core::partition::files::pointers_schema(name).is_some_and(|schema| {
+        dir.join(schema).is_file()
+            && !dir
+                .join(format!("{}_schema.db", name.trim_end_matches(".db")))
+                .is_file()
+    })
 }
 
 /// [`classify`] for a full path.
