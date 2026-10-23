@@ -3296,6 +3296,11 @@ async fn recover_interrupted_rename(
                 {
                     return held();
                 }
+                // As a rename that finishes at once forgets it: left, the old
+                // name's placement outlives its files, and the next table
+                // created under the name inherits it (`place` keeps a
+                // recorded one).
+                pool_forget(pool, old_name);
                 clear_intent(io_pointers).await;
             }
         }
@@ -3311,6 +3316,7 @@ async fn recover_interrupted_rename(
             {
                 return held();
             }
+            pool_forget(pool, old_name);
             clear_intent(io_pointers).await;
         }
         // Never committed: the catalogue still names only the original, so
@@ -3330,6 +3336,9 @@ async fn recover_interrupted_rename(
             {
                 return held();
             }
+            // The placement the rename pinned for the copy, as `abandon_copy`
+            // forgets it.
+            pool_forget(pool, new_name);
             clear_intent(io_pointers).await;
         }
         // Neither: nothing to reconcile against, so the safest act is none.

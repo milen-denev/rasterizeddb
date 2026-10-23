@@ -2347,4 +2347,67 @@ mod pools {
         crate::core::wal::remove_for(&path_str(&disk));
         drop(base);
     }
+
+    /// How far an interrupted rename got before the crash.
+    #[derive(Clone, Copy, PartialEq)]
+    enum RenameStage {
+        /// The intent and the copy: the next open abandons the copy.
+        Copied,
+        /// The new catalogue row too: the next open finishes the rename.
+        NewRow,
+        /// The old row tombstoned as well: only the old files remain.
+        OldRowGone,
+    }
+
+    /// A rename interrupted at `stage`, settled by the next open, forgets the
+    /// placement of the name whose files it discards: the old name once it
+    /// finishes the rename, the copy's name once it abandons it. Left
+    /// recorded, the placement outlives its table, and the next table created
+    /// under that name inherits it, since `place` keeps a recorded placement.
+    async fn interrupted_rename_forgets_the_discarded_placement(stage: RenameStage) {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = open(&root).await;
+        db.add_table(create_statement("src_t")).await.unwrap();
+        insert_into(&db, "src_t", 1, "old_00").await;
+        db.record_rename_intent("src_t", TABLE).await.unwrap();
+        super::super::pool_rename(&db.storage, "src_t", TABLE);
+        db.copy_table_files("src_t", TABLE).await.unwrap();
+        if stage != RenameStage::Copied {
+            db.remember_in_catalogue(TABLE).await.unwrap();
+        }
+        if stage == RenameStage::OldRowGone {
+            assert!(db.forget_in_catalogue("src_t").await.unwrap(), "no src_t row to tombstone");
+        }
+        assert!(
+            db.storage.spec_of("src_t").is_some() && db.storage.spec_of(TABLE).is_some(),
+            "both names should have a placement before the reopen, or this tests nothing"
+        );
+        db.sync_durable().unwrap();
+        close(&root, db);
+
+        let db = open(&root).await;
+        let (freed, kept) = if stage == RenameStage::Copied { (TABLE, "src_t") } else { ("src_t", TABLE) };
+        assert!(!db.tables.contains_key(freed), "{freed} is still a table");
+        assert!(db.tables.contains_key(kept), "{kept} is gone");
+        assert_eq!(db.storage.spec_of(freed), None, "the settled rename kept {freed}'s placement");
+        assert!(db.storage.spec_of(kept).is_some(), "the settled rename forgot {kept}'s placement");
+        close(&root, db);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_interrupted_rename_forgets_the_copys_placement() {
+        interrupted_rename_forgets_the_discarded_placement(RenameStage::Copied).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_finished_interrupted_rename_forgets_the_old_names_placement() {
+        interrupted_rename_forgets_the_discarded_placement(RenameStage::NewRow).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_interrupted_rename_past_its_tombstone_forgets_the_old_names_placement() {
+        interrupted_rename_forgets_the_discarded_placement(RenameStage::OldRowGone).await;
+    }
 }
