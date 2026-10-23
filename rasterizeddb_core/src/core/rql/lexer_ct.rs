@@ -516,11 +516,19 @@ enum TopLevel {
 /// top-level is a guess — a `(` it counted that PostgreSQL would not hides the
 /// whole trailer — so the caller must not read "no trailer" from it.
 fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
+    let (spans, balanced) = top_level_spans(sql);
+    (spans.into_iter().map(|(piece, _)| piece).collect(), balanced)
+}
+
+/// [`top_level_pieces`] with each piece's byte range in `sql`. A group's
+/// range runs from its `(` through its `)`.
+fn top_level_spans(sql: &str) -> (Vec<(TopLevel, std::ops::Range<usize>)>, bool) {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut balanced = true;
     let mut i = 0usize;
+    let mut group_open = 0usize;
     // Bytes rather than chars: every delimiter is ASCII, and UTF-8 never puts
     // an ASCII byte inside a multi-byte sequence, so the word slices below
     // always fall on character boundaries.
@@ -529,6 +537,7 @@ fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
     // is one identifier.
     let starts_word = |at: usize| at == 0 || !is_word_byte(bytes[at - 1]);
     while i < bytes.len() {
+        let at = i;
         let c = bytes[i];
         if c == b'\'' || c == b'"' {
             // `E'…'`, the E a word of its own: `typE'…'` is a type and a
@@ -555,11 +564,12 @@ fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
             balanced &= closed;
             i += 1;
             if depth == 0 {
-                out.push(if c == b'"' {
+                let piece = if c == b'"' {
                     TopLevel::Quoted
                 } else {
                     TopLevel::Str
-                });
+                };
+                out.push((piece, at..i.min(bytes.len())));
             }
         } else if let Some(tag_len) = (c == b'$' && starts_word(i))
             .then(|| dollar_tag_len(&bytes[i..]))
@@ -575,7 +585,7 @@ fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
                 }
             }
             if depth == 0 {
-                out.push(TopLevel::Str);
+                out.push((TopLevel::Str, at..i));
             }
         } else if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
             while i < bytes.len() && bytes[i] != b'\n' {
@@ -600,15 +610,18 @@ fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
             }
             balanced &= nest == 0;
         } else if c == b'(' {
+            if depth == 0 {
+                group_open = at;
+            }
             depth += 1;
             i += 1;
         } else if c == b')' {
             match depth {
                 0 => {
                     balanced = false;
-                    out.push(TopLevel::Punct(c));
+                    out.push((TopLevel::Punct(c), at..at + 1));
                 }
-                1 => out.push(TopLevel::Group),
+                1 => out.push((TopLevel::Group, group_open..at + 1)),
                 _ => {}
             }
             depth = depth.saturating_sub(1);
@@ -620,9 +633,9 @@ fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
             while i < bytes.len() && is_word_byte(bytes[i]) {
                 i += 1;
             }
-            out.push(TopLevel::Word(sql[start..i].to_ascii_uppercase()));
+            out.push((TopLevel::Word(sql[start..i].to_ascii_uppercase()), start..i));
         } else {
-            out.push(TopLevel::Punct(c));
+            out.push((TopLevel::Punct(c), at..at + 1));
             i += 1;
         }
     }
@@ -688,6 +701,336 @@ fn partitioning_refusal(sql: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `PARTITION BY HASH (c1 [, c2 [, c3]]) [PARTITIONS n]` on a `CREATE TABLE`
+/// (`docs/partitioning.md` §2). Parsed beside [`CreateTable`], not as a field
+/// of it: other crates build `CreateTable` literals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionClause {
+    /// The key columns as written, unquoted, leading column first.
+    pub columns: Vec<String>,
+    /// `PARTITIONS n`, or `None` when the statement names no count.
+    pub partitions: Option<u32>,
+}
+
+impl PartitionClause {
+    /// The partitions to declare: the statement's count or the default.
+    pub fn partitions_or_default(&self) -> u32 {
+        self.partitions
+            .unwrap_or(crate::core::partition::table::DEFAULT_PARTITIONS)
+    }
+}
+
+/// The `CREATE TABLE` arm's parse: the table, its partition clause when it
+/// has the one supported shape, or why it is refused.
+///
+/// [`create_table_with_reason`] keeps refusing every partitioning trailer:
+/// its other callers cannot create a partitioned table, and taking the body
+/// to the last `)` is what once swallowed this clause. Here the clause is cut
+/// off at the column list's own `)` and the rest parses as a plain table, so
+/// the two schemas come from one parser.
+///
+/// Only checks the statement alone can answer are made here (the shape, the
+/// key's columns and their declared types, [`partition_key_refusal`]). What
+/// depends on the database (nullability, uniqueness, foreign keys, the cap,
+/// the storage) is `Database::create_partitioned_table`'s, for every caller.
+pub fn create_table_with_partition(
+    qp: &QueryPurpose,
+) -> (Option<CreateTable>, Option<PartitionClause>, Option<String>) {
+    let QueryPurpose::CreateTable(sql) = qp else {
+        return (None, None, None);
+    };
+    match hash_partition_clause(sql) {
+        Ok(None) => {
+            let (parsed, rejection) = create_table_with_reason(qp);
+            (parsed, None, rejection)
+        }
+        Err(reason) => (None, None, Some(reason)),
+        Ok(Some((clause, head_end, name))) => {
+            let head = QueryPurpose::CreateTable(sql[..head_end].to_string());
+            let (parsed, rejection) = create_table_with_reason(&head);
+            let Some(ct) = parsed else {
+                return (None, None, rejection);
+            };
+            if rejection.is_some() {
+                return (None, None, rejection);
+            }
+            // The plain parser reads the name its own way (up to a space or
+            // `(`); a table must not be created under a name other than the
+            // one the shape check saw.
+            if ct.table_name != name {
+                return (
+                    None,
+                    None,
+                    Some(partition_shape_refusal(&format!(
+                        "on the table name {name:?}, which reads back as {:?},",
+                        ct.table_name
+                    ))),
+                );
+            }
+            if let Err(reason) = partition_key_refusal(&ct, &clause, sql) {
+                return (None, None, Some(reason));
+            }
+            (Some(ct), Some(clause), None)
+        }
+    }
+}
+
+/// What a refused partitioned `CREATE TABLE` says. "not supported" makes the
+/// wire report 0A000.
+fn partition_shape_refusal(detail: &str) -> String {
+    format!(
+        "CREATE TABLE ... PARTITION BY {detail} is not supported: only CREATE TABLE name (columns) \
+         PARTITION BY HASH (c1 [, c2 [, c3]]) [PARTITIONS n] is"
+    )
+}
+
+/// Finds `PARTITION BY HASH (…) [PARTITIONS n]` straight after the column
+/// list and nothing after it but an optional `;`. Returns the clause and the
+/// byte offset just past the column list's `)` and the table's name, unquoted,
+/// or `None` when the statement has no top-level `PARTITION BY` (the plain
+/// path then refuses `PARTITION OF` and `INHERITS` itself). Any other statement with a `PARTITION BY` is
+/// refused here, so none reaches a parser that would read the trailer as
+/// part of the body.
+fn hash_partition_clause(sql: &str) -> Result<Option<(PartitionClause, usize, String)>, String> {
+    let (pieces, balanced) = top_level_spans(sql);
+    if !balanced {
+        // The plain path reports the syntax error.
+        return Ok(None);
+    }
+    let word = |at: usize, w: &str| matches!(pieces.get(at), Some((TopLevel::Word(x), _)) if x == w);
+    let Some(by) = (2..pieces.len()).find(|&at| word(at, "PARTITION") && word(at + 1, "BY")) else {
+        return Ok(None);
+    };
+    // Inheritance or a partition of a parent, wherever they sit, keep their
+    // own reasons.
+    if let Some(reason) = partitioning_refusal(sql).filter(|r| !r.contains("PARTITION BY")) {
+        return Err(reason);
+    }
+    if !(word(0, "CREATE") && word(1, "TABLE")) {
+        return Err(partition_shape_refusal("on anything but a plain CREATE TABLE"));
+    }
+    let name_at = if word(2, "IF") && word(3, "NOT") && word(4, "EXISTS") {
+        5
+    } else {
+        2
+    };
+    let name_ok = matches!(pieces.get(name_at), Some((TopLevel::Word(_) | TopLevel::Quoted, _)));
+    let list_at = name_at + 1;
+    let name = pieces
+        .get(name_at)
+        .map(|(_, span)| sql[span.clone()].trim_matches('"').to_string())
+        .unwrap_or_default();
+    let list = match pieces.get(list_at) {
+        Some((TopLevel::Group, span)) if name_ok => span.clone(),
+        _ => {
+            return Err(partition_shape_refusal(
+                "on a table name that is not one plain or quoted identifier followed by its column list",
+            ));
+        }
+    };
+    if by != list_at + 1 {
+        return Err(partition_shape_refusal("after anything but the column list"));
+    }
+    match pieces.get(by + 2) {
+        Some((TopLevel::Word(w), _)) if w == "HASH" => {}
+        Some((TopLevel::Word(w), _)) if w == "RANGE" || w == "LIST" => {
+            return Err(format!(
+                "CREATE TABLE ... PARTITION BY {w} is not supported: RasterizedDB partitions tables only by HASH"
+            ));
+        }
+        _ => return Err(partition_shape_refusal("without HASH")),
+    }
+    let key = match pieces.get(by + 3) {
+        Some((TopLevel::Group, span)) => &sql[span.start + 1..span.end - 1],
+        _ => return Err(partition_shape_refusal("HASH without a parenthesised column list")),
+    };
+    let columns = key_columns(key)?;
+
+    let mut at = by + 4;
+    let mut partitions = None;
+    if word(at, "PARTITIONS") {
+        let count = match pieces.get(at + 1) {
+            Some((TopLevel::Word(n), _)) if n.bytes().all(|b| b.is_ascii_digit()) => n.parse::<u32>().ok(),
+            _ => None,
+        };
+        let max = crate::core::partition::table::MAX_DECLARED_PER_DATABASE;
+        match count {
+            Some(n) if (1..=max).contains(&n) => partitions = Some(n),
+            _ => {
+                let written = pieces
+                    .get(at + 1)
+                    .map(|(_, span)| &sql[span.clone()])
+                    .unwrap_or("");
+                return Err(format!(
+                    "PARTITIONS {written} is not supported: a partitioned table takes a whole number of \
+                     partitions from 1 to {max}"
+                ));
+            }
+        }
+        at += 2;
+    }
+    if matches!(pieces.get(at), Some((TopLevel::Punct(b';'), _))) {
+        at += 1;
+    }
+    if let Some((piece, span)) = pieces.get(at) {
+        let text = &sql[span.clone()];
+        return Err(match piece {
+            TopLevel::Word(w) if w == "COLOCATE" => {
+                "CREATE TABLE ... PARTITION BY HASH (...) COLOCATE WITH is not supported yet".to_string()
+            }
+            _ => partition_shape_refusal(&format!("HASH (...) followed by {text}")),
+        });
+    }
+    Ok(Some((PartitionClause { columns, partitions }, list.end, name)))
+}
+
+/// The column names in `PARTITION BY HASH (…)`. Only bare or double-quoted
+/// identifiers: PostgreSQL also takes expressions, operator classes and
+/// `COLLATE` there, and each would hash something other than the column.
+fn key_columns(key: &str) -> Result<Vec<String>, String> {
+    let mut columns = Vec::new();
+    for piece in split_definitions(key) {
+        let piece = piece.trim();
+        let quoted = piece.len() >= 2
+            && piece.starts_with('"')
+            && piece.ends_with('"')
+            && !piece[1..piece.len() - 1].contains('"');
+        let bare = piece
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b >= 0x80)
+            && piece
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80);
+        if !(quoted || bare) {
+            return Err(format!(
+                "partition key element {piece:?} is not supported: a partition key is a list of column \
+                 names, without expressions, operator classes or COLLATE"
+            ));
+        }
+        columns.push(piece.trim_matches('"').to_string());
+    }
+    // A trailing or doubled comma leaves an empty piece out of the split.
+    if columns.is_empty() || key.split(',').count() != columns.len() {
+        return Err(partition_shape_refusal("HASH with an empty column in its list"));
+    }
+    Ok(columns)
+}
+
+/// Why `clause` cannot key `ct`, from what only the statement knows: which
+/// columns exist, their declared types, and the declared type *text*, which
+/// is gone once the table is created (§1.4). TEXT and VARCHAR are `STRING`,
+/// but so are CITEXT, BPCHAR, CHARACTER, CHAR(n > 1) and NAME, without the
+/// case folding, padding or truncation their equality has in PostgreSQL; so
+/// a `STRING` key is allowed only when declared TEXT or VARCHAR, and never
+/// with a `COLLATE`.
+///
+/// `sql` is the whole statement. Everything that depends on the database or
+/// on the table's other declarations is `Database::create_partitioned_table`'s.
+pub fn partition_key_refusal(ct: &CreateTable, clause: &PartitionClause, sql: &str) -> Result<(), String> {
+    use crate::core::partition::key::{MAX_ARITY, family_of};
+    use crate::core::rql::nullable;
+
+    let key = &clause.columns;
+    if key.is_empty() || key.len() > MAX_ARITY {
+        return Err(format!(
+            "a partition key of {} columns is not supported; it takes 1 to {MAX_ARITY}",
+            key.len()
+        ));
+    }
+    for (i, column) in key.iter().enumerate() {
+        if key[..i].iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            return Err(format!(
+                "partition key column \"{column}\" is named twice, which is not supported"
+            ));
+        }
+    }
+    let definitions = column_definitions(sql);
+    for column in key {
+        let Some(field) = ct
+            .columns
+            .iter()
+            .find(|c| !nullable::is_hidden(&c.name) && c.name.eq_ignore_ascii_case(column))
+        else {
+            return Err(format!("partition key column \"{column}\" does not exist"));
+        };
+        // A shredded JSON column is declared UUID, which the allowlist takes.
+        if ct.json_columns.iter().any(|j| j.column.eq_ignore_ascii_case(column)) {
+            return Err(format!(
+                "partition key column \"{column}\" is a JSON column, which is not supported as a partition key"
+            ));
+        }
+        if let Err(why) = family_of(&field.data_type) {
+            return Err(format!("partition key column \"{column}\" is not supported: {why}"));
+        }
+        let Some((type_phrase, rest)) = definitions
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, t, r)| (t.as_str(), r.as_slice()))
+        else {
+            return Err(format!(
+                "partition key column \"{column}\" has a declaration that could not be read back, so its \
+                 type cannot be checked; this is not supported"
+            ));
+        };
+        if rest.iter().any(|t| t.eq_ignore_ascii_case("COLLATE")) {
+            return Err(format!(
+                "a COLLATE on partition key column \"{column}\" is not supported: rows are placed by \
+                 their bytes, which a collation's equality does not follow"
+            ));
+        }
+        if field.data_type == DbType::STRING {
+            let base = type_phrase.split('(').next().unwrap_or(type_phrase);
+            if !matches!(base, "TEXT" | "VARCHAR" | "CHARACTER VARYING") {
+                return Err(format!(
+                    "partition key column \"{column}\" is declared {type_phrase}, which is not supported as a \
+                     partition key: it is stored as text without its PostgreSQL equality (case folding, \
+                     blank padding or truncation); declare it TEXT or VARCHAR"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Each column definition in a `CREATE TABLE`'s column list: its unquoted
+/// name, its type phrase as [`parse_type_phrase`] reads it (uppercased,
+/// modifier kept), and the tokens after the type, with the CHECK, GENERATED
+/// and DEFAULT expressions taken out first, as the parser does.
+fn column_definitions(sql: &str) -> Vec<(String, String, Vec<String>)> {
+    let (pieces, _) = top_level_spans(sql);
+    let Some(list) = pieces
+        .iter()
+        .find(|(p, _)| *p == TopLevel::Group)
+        .map(|(_, span)| span.clone())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for def in split_definitions(&sql[list.start + 1..list.end - 1]) {
+        let def = def.trim();
+        if def.is_empty() || is_table_constraint(def) {
+            continue;
+        }
+        let (def, _) = crate::core::rql::check::split_clause(def);
+        let (def, _) = crate::core::rql::generated::split_clause(&def);
+        let (def, _) = crate::core::rql::column_default::split_clause(&def);
+        let tokens: Vec<&str> = def.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let Some((phrase, used)) = parse_type_phrase(&tokens[1..]) else {
+            continue;
+        };
+        out.push((
+            tokens[0].trim_matches('"').to_string(),
+            phrase,
+            tokens[1 + used..].iter().map(|t| t.to_string()).collect(),
+        ));
+    }
+    out
 }
 
 /// Splits a `CREATE TABLE` body on commas that separate definitions, ignoring
@@ -1533,5 +1876,224 @@ mod partitioning_refusal_tests {
             columns("CREATE TABLE t(id INT)"),
             ["id:I32", "__null_id:BOOL"]
         );
+    }
+}
+
+#[cfg(test)]
+mod hash_partition_clause_tests {
+    use super::*;
+
+    fn parse(sql: &str) -> (Option<CreateTable>, Option<PartitionClause>, Option<String>) {
+        create_table_with_partition(&QueryPurpose::CreateTable(sql.to_string()))
+    }
+
+    fn accepted(sql: &str) -> (CreateTable, PartitionClause) {
+        match parse(sql) {
+            (Some(ct), Some(clause), None) => (ct, clause),
+            (_, clause, rejection) => panic!("{sql} was not accepted: {clause:?} {rejection:?}"),
+        }
+    }
+
+    fn refused(sql: &str) -> String {
+        let (ct, clause, rejection) = parse(sql);
+        assert!(ct.is_none() && clause.is_none(), "{sql} produced a table");
+        rejection.unwrap_or_else(|| panic!("{sql} was refused without a reason"))
+    }
+
+    /// The supported shape, spelled every way a client writes it. The body
+    /// is the plain parser's, so the columns match the same table without
+    /// the clause, companions included.
+    #[test]
+    fn the_supported_shape_parses_to_a_clause_and_the_plain_body() {
+        for (sql, key, partitions) in [
+            (
+                "CREATE TABLE t (tenant_id BIGINT NOT NULL, n INT) PARTITION BY HASH (tenant_id)",
+                vec!["tenant_id"],
+                None,
+            ),
+            (
+                "create table t (tenant_id bigint not null, g int not null, n int) \
+                 partition by hash (tenant_id, g) partitions 16",
+                vec!["tenant_id", "g"],
+                Some(16),
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS t (a INT NOT NULL, b UUID NOT NULL, c TEXT NOT NULL)\n\
+                 PARTITION\n BY HASH(a,b , \"c\")PARTITIONS 2048;",
+                vec!["a", "b", "c"],
+                Some(2048),
+            ),
+            (
+                "CREATE TABLE \"t\" (k VARCHAR(10) NOT NULL, s TEXT DEFAULT ')', CHECK (k <> '(')) \
+                 PARTITION BY HASH (k) PARTITIONS 1",
+                vec!["k"],
+                Some(1),
+            ),
+        ] {
+            let (ct, clause) = accepted(sql);
+            assert_eq!(ct.table_name, "t", "{sql}");
+            assert_eq!(clause.columns, key, "{sql}");
+            assert_eq!(clause.partitions, partitions, "{sql}");
+            let head_end = sql.to_ascii_uppercase().find("PARTITION").unwrap();
+            let (plain, _) = create_table_with_reason(&QueryPurpose::CreateTable(sql[..head_end].to_string()));
+            let plain = plain.expect("the body parses as a plain table");
+            let shape = |c: &CreateTable| {
+                c.columns.iter().map(|c| format!("{}:{:?}", c.name, c.data_type)).collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&ct), shape(&plain), "{sql}");
+        }
+        assert_eq!(
+            accepted("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k)").1.partitions_or_default(),
+            crate::core::partition::table::DEFAULT_PARTITIONS
+        );
+        assert_eq!(crate::core::partition::table::DEFAULT_PARTITIONS, 64);
+    }
+
+    /// The parser every other caller uses still refuses the clause: it takes
+    /// the body to the last `)`, and only the CREATE arm creates partitions.
+    #[test]
+    fn the_other_callers_still_refuse_partition_by() {
+        let (ct, reason) = create_table_with_reason(&QueryPurpose::CreateTable(
+            "CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
+        ));
+        assert!(ct.is_none());
+        assert!(reason.is_some_and(|r| r.contains("PARTITION BY") && r.contains("not supported")));
+    }
+
+    /// Every partitioning shape but the one is refused, worded "not
+    /// supported" (0A000), and names what it refused.
+    #[test]
+    fn every_other_partitioning_shape_is_refused_with_its_reason() {
+        for (sql, names) in [
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY RANGE (k)", "RANGE"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY LIST (k)", "LIST"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH k", "parenthesised"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY (k)", "without HASH"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) COLOCATE WITH u", "COLOCATE WITH"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) WITH (fillfactor = 70)", "WITH"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) TABLESPACE fast", "TABLESPACE"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 4 PARTITIONS 8", "PARTITIONS"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITION BY HASH (k)", "PARTITION"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k); DROP TABLE u", "DROP"),
+            ("CREATE TABLE t (k INT NOT NULL) WITH (fillfactor = 70) PARTITION BY HASH (k)", "column list"),
+            ("CREATE TABLE t (k INT NOT NULL) USING heap PARTITION BY HASH (k)", "column list"),
+            ("CREATE TABLE t (k INT NOT NULL) INHERITS (p) PARTITION BY HASH (k)", "INHERITS"),
+            (
+                "CREATE TABLE c PARTITION OF p FOR VALUES WITH (MODULUS 2, REMAINDER 0) PARTITION BY HASH (k)",
+                "PARTITION OF",
+            ),
+            ("CREATE TABLE a.t (k INT NOT NULL) PARTITION BY HASH (k)", "table name"),
+            ("CREATE TABLE t-1 (k INT NOT NULL) PARTITION BY HASH (k)", "table name"),
+            ("CREATE TABLE 't' (k INT NOT NULL) PARTITION BY HASH (k)", "table name"),
+            ("CREATE TABLE \"my t\" (k INT NOT NULL) PARTITION BY HASH (k)", "table name"),
+            ("CREATE TABLE t PARTITION BY HASH (k)", "table name"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 0", "PARTITIONS 0"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 2049", "PARTITIONS 2049"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 99999999999", "PARTITIONS"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS many", "PARTITIONS many"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS", "PARTITIONS"),
+            // Expressions, operator classes, COLLATE and empty elements.
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH ((k + 1))", "column names"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (lower(k))", "column names"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k int4_ops)", "column names"),
+            ("CREATE TABLE t (k TEXT NOT NULL) PARTITION BY HASH (k COLLATE \"C\")", "column names"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH ()", "empty"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k,)", "empty"),
+            ("CREATE TABLE t (k INT NOT NULL, j INT NOT NULL) PARTITION BY HASH (k,,j)", "column names"),
+        ] {
+            let reason = refused(sql);
+            assert!(
+                reason.contains("not supported") && reason.contains(names),
+                "{sql} was refused for the wrong reason: {reason}"
+            );
+        }
+    }
+
+    /// The key's columns: they exist, each once, at most three, and of a
+    /// type on the allowlist (§1.4).
+    #[test]
+    fn key_columns_must_exist_once_and_be_allowed() {
+        for (sql, names) in [
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (nope)", "does not exist"),
+            // A nullability companion is the engine's column, not the user's.
+            ("CREATE TABLE t (k INT) PARTITION BY HASH (__null_k)", "does not exist"),
+            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k, K)", "twice"),
+            (
+                "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, d INT NOT NULL) \
+                 PARTITION BY HASH (a, b, c, d)",
+                "4 columns",
+            ),
+            ("CREATE TABLE t (k DOUBLE PRECISION NOT NULL) PARTITION BY HASH (k)", "F64"),
+            ("CREATE TABLE t (k NUMERIC(10, 2) NOT NULL) PARTITION BY HASH (k)", "NUMERIC"),
+            ("CREATE TABLE t (k BOOLEAN NOT NULL) PARTITION BY HASH (k)", "BOOL"),
+            ("CREATE TABLE t (k JSONB NOT NULL) PARTITION BY HASH (k)", "JSON"),
+            ("CREATE TABLE t (k INT[] NOT NULL) PARTITION BY HASH (k)", "ARRAY"),
+            ("CREATE TABLE t (k TIMESTAMP NOT NULL) PARTITION BY HASH (k)", "not supported"),
+            ("CREATE TABLE t (k BYTEA NOT NULL) PARTITION BY HASH (k)", "not supported"),
+            ("CREATE TABLE t (k CHAR NOT NULL) PARTITION BY HASH (k)", "CHAR"),
+        ] {
+            let reason = refused(sql);
+            assert!(reason.contains(names), "{sql} was refused for the wrong reason: {reason}");
+            if names != "does not exist" {
+                assert!(reason.contains("not supported"), "{sql}: {reason}");
+            }
+        }
+    }
+
+    /// TEXT and VARCHAR are `STRING`, and so are the aliases whose PostgreSQL
+    /// equality is not byte equality. Only the declared text tells them
+    /// apart, and only at CREATE (§1.4).
+    #[test]
+    fn text_keys_are_allowed_only_as_text_or_varchar() {
+        for ty in ["TEXT", "text", "VARCHAR", "VARCHAR(10)", "varchar (10)", "CHARACTER VARYING(10)"] {
+            let sql = format!("CREATE TABLE t (k {ty} NOT NULL) PARTITION BY HASH (k)");
+            let (ct, _) = accepted(&sql);
+            assert_eq!(ct.columns[0].data_type, DbType::STRING, "{sql}");
+        }
+        for (ty, names) in [
+            ("CITEXT", "CITEXT"),
+            ("BPCHAR", "BPCHAR"),
+            ("NAME", "NAME"),
+            ("CHARACTER(5)", "CHARACTER(5)"),
+            ("CHAR(5)", "CHAR(5)"),
+            ("VARCHAR(10) COLLATE \"C\"", "COLLATE"),
+            // Not `COLLATE "default"`: the DEFAULT-clause split finds the
+            // word inside the quotes, and the plain parser refuses it.
+            ("TEXT COLLATE \"POSIX\"", "COLLATE"),
+            ("text collate \"en_US\"", "COLLATE"),
+        ] {
+            let sql = format!("CREATE TABLE t (k {ty} NOT NULL) PARTITION BY HASH (k)");
+            let (plain, _) = create_table_with_reason(&QueryPurpose::CreateTable(format!(
+                "CREATE TABLE t (k {ty} NOT NULL)"
+            )));
+            // Each is accepted as a plain table, so only the alias scan stops it.
+            assert!(plain.is_some(), "{ty} is not a type the plain parser takes");
+            let reason = refused(&sql);
+            assert!(
+                reason.contains(names) && reason.contains("not supported"),
+                "{sql} was refused for the wrong reason: {reason}"
+            );
+        }
+        // A COLLATE on another column, or in a string, is not the key's.
+        accepted("CREATE TABLE t (k TEXT NOT NULL, s TEXT COLLATE \"C\") PARTITION BY HASH (k)");
+        accepted("CREATE TABLE t (k TEXT NOT NULL DEFAULT 'collate') PARTITION BY HASH (k)");
+    }
+
+    /// A shredded JSON column is declared UUID, which the allowlist takes;
+    /// the JSON record is what refuses it.
+    #[test]
+    fn a_shredded_json_column_is_not_a_key() {
+        let mut ct = accepted("CREATE TABLE t (k UUID NOT NULL) PARTITION BY HASH (k)").0;
+        ct.json_columns.push(crate::core::rql::json_map::JsonColumn {
+            column: "k".to_string(),
+            shadow_table: "t__k".to_string(),
+            is_deleted: false,
+        });
+        let clause = PartitionClause {
+            columns: vec!["k".to_string()],
+            partitions: None,
+        };
+        let reason = partition_key_refusal(&ct, &clause, "CREATE TABLE t (k UUID NOT NULL)").unwrap_err();
+        assert!(reason.contains("JSON") && reason.contains("not supported"), "{reason}");
     }
 }

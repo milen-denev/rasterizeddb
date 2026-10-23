@@ -6510,7 +6510,10 @@ fn create_table_already_satisfied(
     if !create_table.if_not_exists {
         return false;
     }
-    let exists = database.tables.contains_key(&create_table.table_name);
+    // A partitioned table that could not be opened has no shell in `tables`,
+    // but it exists: a CREATE would only be refused with "already exists".
+    let exists = database.tables.contains_key(&create_table.table_name)
+        || database.partitioned.contains_key(&create_table.table_name);
     if exists {
         info!(
             "Table '{}' already exists; IF NOT EXISTS makes that success",
@@ -6518,6 +6521,76 @@ fn create_table_already_satisfied(
         );
     }
     exists
+}
+
+/// `CREATE TABLE … PARTITION BY HASH`. The database makes every check that
+/// depends on it (nullability, uniqueness, foreign keys, the cap, the
+/// storage); replicated as the statement text, like a plain CREATE, so a
+/// replica re-runs those same checks on the same replicated state.
+async fn execute_create_partitioned(
+    database: &Arc<Database>,
+    create_table: crate::core::rql::lexer_ct::CreateTable,
+    clause: crate::core::rql::lexer_ct::PartitionClause,
+    tx: TxId,
+    depth: usize,
+    query: &QueryPurpose,
+) -> Vec<u8> {
+    let name = create_table.table_name.clone();
+    let key: Vec<&str> = clause.columns.iter().map(String::as_str).collect();
+    match database
+        .create_partitioned_table(create_table, &key, clause.partitions_or_default())
+        .await
+    {
+        Ok(()) => {
+            info!("Partitioned table {} created", name);
+            note_write(database, tx, depth, &query_sql(query), None);
+            vec![0u8]
+        }
+        Err(e) => {
+            error!("Cannot create partitioned table {}: {}", name, e);
+            ddl_error(&partitioned_ddl_message(&e))
+        }
+    }
+}
+
+/// An error from partitioned DDL, worded so the wire reports what its kind
+/// says: an `Unsupported` refusal whose text lacks "not supported" (the
+/// nullability and uniqueness refusals) would otherwise reach the client as
+/// XX000, an internal error, rather than 0A000.
+fn partitioned_ddl_message(e: &std::io::Error) -> String {
+    let message = e.to_string();
+    if e.kind() == std::io::ErrorKind::Unsupported
+        && !message.to_ascii_lowercase().contains("not supported")
+    {
+        format!("{message} (not supported on a partitioned table)")
+    } else {
+        message
+    }
+}
+
+/// Refuses DDL that would change a partitioned table's schema, indexes or
+/// constraints: those live in its partitions as well as its shell, and phase
+/// 2a's DDL reaches neither (`docs/partitioning.md` §11). Called before
+/// anything is written, so a refusal leaves the shell's sidecars as they
+/// were. Consults `partitioned` first: a table that could not be opened has
+/// no shell in `tables` but is still partitioned.
+fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result<(), String> {
+    let shell = database.tables.get(table).is_some_and(|t| t.is_shell());
+    if database.partitioned.contains_key(table) || shell {
+        return Err(format!(
+            "{what} on partitioned table \"{table}\" is not supported yet"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `parent` names a partitioned table, compared as the database's
+/// own FK check compares it.
+fn is_partitioned_parent(database: &Database, parent: &str) -> bool {
+    database
+        .partitioned
+        .iter()
+        .any(|p| p.key().eq_ignore_ascii_case(parent))
 }
 
 /// Rewrites every JSON column's default in a `CREATE TABLE` into the reference
@@ -7886,6 +7959,20 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
         }
     };
 
+    // Before `IF EXISTS`: a partitioned table that could not be opened is
+    // absent from `tables` yet exists. Every action is checked before the
+    // first runs, since each writes its sidecar before it reloads.
+    for plan in &plans {
+        if let Err(e) = refuse_if_partitioned(database, &plan.table_name, "ALTER TABLE") {
+            return ddl_error(&e);
+        }
+        if let lexer_alter::AlterAction::RenameTable { to } = &plan.action {
+            if let Err(e) = refuse_if_partitioned(database, to, "ALTER TABLE ... RENAME TO") {
+                return ddl_error(&e);
+            }
+        }
+    }
+
     // `ALTER TABLE IF EXISTS …` on a missing relation is a notice on
     // PostgreSQL, not an error. With non-transactional DDL every replayed
     // migration depends on that tolerance: a retry runs its statements over
@@ -9004,6 +9091,15 @@ async fn execute_alter_table_action(
                     Ok(fk) => fk,
                     Err(e) => return ddl_error(&e),
                 };
+                // Before the sidecar is written, as `add_table` refuses it at
+                // CREATE: the check would read the parent through its shell.
+                if is_partitioned_parent(database, &fk.parent_table) {
+                    return ddl_error(&format!(
+                        "FOREIGN KEY {} references the partitioned table \"{}\"; a partitioned table as the \
+                         parent of a FOREIGN KEY is not supported yet",
+                        fk.name, fk.parent_table
+                    ));
+                }
                 if !schema
                     .fields
                     .iter()
@@ -9334,16 +9430,16 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         None => return ddl_error("this is not an index over a document path"),
     };
 
+    // Before the declaration is written: a partitioned table's indexes live
+    // in its partitions.
+    if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
+        return ddl_error(&e);
+    }
     let (io_schema, declared, column_is_a_document) = {
         let entry = database.tables.get(&statement.table);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
-        // Before the declaration is written: a partitioned table's indexes
-        // live in its partitions. PARTITION-TODO(S6): `refuse_if_partitioned`.
-        if let Err(e) = table.data() {
-            return ddl_error(&e.to_string());
-        }
         let is_document = table.schema.fields.iter().any(|f| {
             f.name.eq_ignore_ascii_case(&statement.path.column)
                 && !f.is_deleted
@@ -9433,16 +9529,16 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     };
     let name = statement.name_or_default();
 
+    // Before the declaration is written: a partitioned table's indexes live
+    // in its partitions.
+    if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
+        return ddl_error(&e);
+    }
     let (io_schema, columns, types) = {
         let entry = database.tables.get(&statement.table);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
-        // Before the declaration is written: a partitioned table's indexes
-        // live in its partitions. PARTITION-TODO(S6): `refuse_if_partitioned`.
-        if let Err(e) = table.data() {
-            return ddl_error(&e.to_string());
-        }
         let mut columns = Vec::new();
         let mut types = Vec::new();
         for column in &statement.columns {
@@ -9512,10 +9608,10 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
             .find(|i| i.name.eq_ignore_ascii_case(&name))
             .map(|d| (entry.key().clone(), entry.value().io_schema.clone(), d.clone()))
     })?;
-    // PARTITION-TODO(S6): `refuse_if_partitioned`. Before the tombstone is
-    // written, so a refused drop leaves the declaration as it was.
-    if let Some(Err(e)) = database.tables.get(&table_name).map(|t| t.data().map(|_| ())) {
-        return Some(ddl_error(&e.to_string()));
+    // Before the tombstone is written, so a refused drop leaves the
+    // declaration as it was.
+    if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
+        return Some(ddl_error(&e));
     }
     let tombstone = crate::core::index::IndexDecl {
         is_deleted: true,
@@ -9601,6 +9697,11 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
         return ddl_ok(0);
     };
 
+    // Before the tombstone, so a refused drop leaves the declaration; and
+    // before the map guard below, which this would take a second time.
+    if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
+        return ddl_error(&e);
+    }
     let io_schema = {
         let entry = database.tables.get(&table_name);
         let Some(table) = entry.as_ref().clone() else {
@@ -9610,10 +9711,6 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
                 ddl_error("relation vanished")
             };
         };
-        // PARTITION-TODO(S6): `refuse_if_partitioned`, before the tombstone.
-        if let Err(e) = table.data() {
-            return ddl_error(&e.to_string());
-        }
         table.io_schema.clone()
     };
 
@@ -11324,7 +11421,8 @@ pub(crate) async fn execute_with_need(
         }
         QueryPurpose::CreateTable(_) => {
             // Handle create table
-            let (parsed, rejection) = crate::core::rql::lexer_ct::create_table_with_reason(&query);
+            let (parsed, partition, rejection) =
+                crate::core::rql::lexer_ct::create_table_with_partition(&query);
             if let Some(reason) = rejection {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
@@ -11345,6 +11443,17 @@ pub(crate) async fn execute_with_need(
                 // table. Anything new in this function belongs behind a call.
                 if create_table_already_satisfied(&create_table, &database) {
                     return ddl_ok(0);
+                }
+                if let Some(clause) = partition {
+                    return Box::pin(execute_create_partitioned(
+                        &database,
+                        create_table,
+                        clause,
+                        tx,
+                        depth,
+                        &query,
+                    ))
+                    .await;
                 }
                 // A JSON column's DEFAULT is a document, and the column holds a
                 // reference. Resolved before the table is registered, so the

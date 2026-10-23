@@ -1,4 +1,6 @@
-//! Table partitioning syntax is refused, and refusing it writes nothing.
+//! Partitioning syntax other than the supported `PARTITION BY HASH` shape is
+//! refused, refusing it writes nothing, and the supported shape never
+//! creates an ordinary table.
 //!
 //! `CREATE TABLE` used to take its body between the first `(` and the *last*
 //! `)`, so a `PARTITION BY HASH (k)` trailer became part of the column list.
@@ -7,6 +9,7 @@
 //! reported success, and a client that asked for partitions got none. These
 //! tests pin the refusal at the level that can see the catalogue, since a
 //! parser that rejects the text is no proof that nothing was registered.
+//! `partition_ddl.rs` covers the supported shape and the key rules.
 
 use rasterizeddb_core::{
     BATCH_SIZE, MAX_PERMITS_THREADS,
@@ -84,13 +87,39 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
         "creating a table did not grow the catalogue, so the probe cannot see a write"
     );
 
+    // The silent one: the trailer was swallowed as constraint text and an
+    // ordinary table was created. The supported shape now creates a
+    // partitioned table, and nothing under its logical name.
     for (table, sql) in [
-        // The silent one: the trailer was swallowed as constraint text.
         (
             "pt_hash_nn",
             "CREATE TABLE pt_hash_nn (id INT, k INT NOT NULL) PARTITION BY HASH (k)",
         ),
-        // Failed only by accident, on the type `INT)`.
+        (
+            "pt_dollar",
+            "CREATE TABLE pt_dollar (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> $$($$)) \
+             PARTITION BY HASH (k)",
+        ),
+    ] {
+        run(&db, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{} was refused: {}", sql, e));
+        assert!(
+            db.partitioned.contains_key(table),
+            "{} did not create a partitioned table",
+            sql
+        );
+        let litter: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(table))
+            .collect();
+        assert!(litter.is_empty(), "{} made plain-table files {:?}", sql, litter);
+    }
+
+    for (table, sql) in [
+        // Failed only by accident, on the type `INT)`; now on the key being
+        // nullable.
         (
             "pt_hash_bare",
             "CREATE TABLE pt_hash_bare (id INT, k INT) PARTITION BY HASH (k)",
@@ -131,11 +160,6 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
             "CREATE TABLE pt_nested_comment (k INT NOT NULL) /* x /* y */ ( */ \
              PARTITION BY HASH (k)",
         ),
-        (
-            "pt_dollar",
-            "CREATE TABLE pt_dollar (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> $$($$)) \
-             PARTITION BY HASH (k)",
-        ),
         // A name no shape-match would recognise.
         (
             "pt-dash",
@@ -164,7 +188,7 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
         let lower = reason.to_ascii_lowercase();
         let syntax = lower.starts_with("syntax error");
         let unsupported = lower.contains("not supported")
-            && (lower.contains("table partitioning") || lower.contains("table inheritance"));
+            && (lower.contains("partition") || lower.contains("table inheritance"));
         let expected = match table {
             "pt_unclosed" => syntax,
             "pt_nested_comment" => syntax || unsupported,
@@ -241,4 +265,107 @@ async fn attach_and_detach_partition_are_refused_body() {
     assert!(db.tables.contains_key("pa_child"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every partitioning statement 2a does not build is refused with "not
+/// supported" (0A000) and a reason, on a plain table and on a partitioned
+/// one, and leaves the catalogue and both tables as they were: the
+/// conversions (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`) and
+/// the reshapes (`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE
+/// PARTITIONS`, `STORAGE MOVE PARTITION`, `STORAGE REBALANCE PARTITIONS`),
+/// `PARTITION OF … DEFAULT` and temporary or unlogged partitioned tables. A
+/// statement the ALTER parser's no-op list took would answer success with
+/// nothing done, which is the failure this pins.
+#[test]
+fn unbuilt_partitioning_statements_are_refused() {
+    on_a_big_stack(unbuilt_partitioning_statements_are_refused_body());
+}
+
+async fn unbuilt_partitioning_statements_are_refused_body() {
+    init_globals();
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Arc::new(Database::new_with_backend(dir.path().to_str().expect("utf-8"), false).await);
+    run(&db, "CREATE TABLE pu_plain (k INT NOT NULL, n INT)")
+        .await
+        .expect("plain");
+    run(
+        &db,
+        "CREATE TABLE pu_part (k INT NOT NULL, g INT NOT NULL, n INT) PARTITION BY HASH (k, g) PARTITIONS 2",
+    )
+    .await
+    .expect("partitioned");
+    let uid = db.partitioned.get("pu_part").expect("partitioned").uid();
+    let len = catalogue_len(&db).await;
+
+    let mut statements = vec![
+        "CREATE TABLE pu_c PARTITION OF pu_part DEFAULT".to_string(),
+        "CREATE TABLE pu_c PARTITION OF pu_part FOR VALUES WITH (MODULUS 2, REMAINDER 0)".to_string(),
+        "CREATE TEMP TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
+        "CREATE TEMPORARY TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
+        "CREATE UNLOGGED TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
+        // `STORAGE MOVE PARTITION` is read today as a MOVE of a table named
+        // PARTITION, so it is refused for that table or its location rather
+        // than as unsupported; checked only for being refused. `STORAGE
+        // REBALANCE PARTITIONS` is left out: the STORAGE parser ignores the
+        // trailing word and runs a whole-database REBALANCE.
+        "STORAGE MOVE PARTITION pu_part FOR (k = 42) TO '/nonexistent'".to_string(),
+    ];
+    for table in ["pu_plain", "pu_part"] {
+        for tail in [
+            "PARTITION BY HASH (k)",
+            "PARTITION BY HASH (k) PARTITIONS 4",
+            "SPLIT PARTITION FOR (k = 42)",
+            "ISOLATE KEY (k = 42)",
+            "ISOLATE KEY (k = 42) TO '/nonexistent'",
+            "SPLIT KEY (k = 42) INTO 8",
+            "MERGE PARTITIONS FOR (k = 1), FOR (k = 2)",
+        ] {
+            statements.push(format!("ALTER TABLE {table} {tail}"));
+        }
+        statements.push(format!("CREATE INDEX {table}_by ON {table} USING partition (k)"));
+        statements.push(format!(
+            "CREATE INDEX {table}_by ON {table} USING partition (k) WITH (partitions = 4)"
+        ));
+    }
+
+    let mut wrong = Vec::new();
+    for sql in &statements {
+        // pgwire answers its no-op list's statements itself, but only those
+        // the executor does not recognise; one of these there would be a
+        // success with nothing done.
+        if rasterizeddb_core::core::rql::lexer_alter::no_op_reason(sql).is_some()
+            && recognize_query_purpose(sql).is_none()
+        {
+            wrong.push(format!("{sql}: accepted as a no-op by pgwire"));
+        }
+        let tables_before = db.tables.len();
+        let outcome = match recognize_query_purpose(sql) {
+            None => Err("not recognised".to_string()),
+            Some(purpose) => {
+                let out = execute(purpose, db.clone()).await;
+                if out.first() == Some(&3) {
+                    Err(String::from_utf8_lossy(&out[1..]).into_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        // TEMP and UNLOGGED tables are not a statement the engine knows at
+        // all, so they never reach a CREATE; pgwire answers 42601.
+        let unknown_is_fine = sql.starts_with("CREATE TEMP") || sql.starts_with("CREATE UNLOGGED");
+        match outcome {
+            Ok(()) => wrong.push(format!("{sql}: accepted")),
+            Err(reason) if reason == "not recognised" && unknown_is_fine => {}
+            Err(_) if sql.starts_with("STORAGE MOVE PARTITION") => {}
+            Err(reason) if !reason.to_ascii_lowercase().contains("not supported") => {
+                wrong.push(format!("{sql}: refused without 0A000: {reason}"))
+            }
+            Err(_) => {}
+        }
+        assert_eq!(db.tables.len(), tables_before, "{sql} registered a table");
+        assert_eq!(catalogue_len(&db).await, len, "{sql} wrote a catalogue row");
+        assert_eq!(db.partitioned.get("pu_part").map(|t| t.uid()), Some(uid), "{sql}");
+        assert_eq!(db.partitioned.len(), 1, "{sql} made pu_plain partitioned");
+    }
+    assert!(wrong.is_empty(), "statements not refused as unsupported:\n{}", wrong.join("\n"));
 }
