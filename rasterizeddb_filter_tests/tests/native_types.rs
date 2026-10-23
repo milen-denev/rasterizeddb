@@ -265,7 +265,7 @@ fn datetime_ranges_have_no_false_negatives_out_of_order() {
 #[test]
 fn native_types_survive_a_checkpoint() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let n = 5000u64;
     let fields = fields_of(&[
         ("uid", DbType::UUID),

@@ -1062,9 +1062,9 @@ async fn forget_reclaimed<S: StorageIO>(
                     .find(|c| c.schema_id as u32 == wo)
                     .map(|c| c.data.into_slice())
             };
-            indexes.forget(Proof::Ticket(&ticket), *slot, Some(&get));
+            indexes.forget(Proof::from(&ticket), *slot, Some(&get));
         } else {
-            indexes.forget(Proof::Ticket(&ticket), *slot, None);
+            indexes.forget(Proof::from(&ticket), *slot, None);
         }
     }
 }
@@ -1329,7 +1329,7 @@ fn apply_filter_clears(ctx: &ReclaimContext<'_>, epoch: Option<u64>, runs: &[(u6
         (Some(filters), Some(epoch)) if n > 0 => {
             let ticket = gate::ticket();
             filters
-                .on_delete_runs_at(Proof::Ticket(&ticket), epoch, runs)
+                .on_delete_runs_at(Proof::from(&ticket), epoch, runs)
                 .then_some(n)
         }
         _ => Some(0),

@@ -73,7 +73,7 @@ fn truth(e: &Expr, id: u64, cat: i32) -> bool {
 #[test]
 fn masks_are_supersets_of_truth_over_random_boolean_trees() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
     let f = TableFilters::new(&fields, FilterConfig::default());
 
@@ -110,7 +110,7 @@ fn masks_are_supersets_of_truth_over_random_boolean_trees() {
 #[test]
 fn masks_survive_a_random_mutation_workload() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // Interleaved inserts, updates and deletes, then every live value must
     // still be findable and every deleted one must be gone from its slot.
     let fields = fields_of(&[("id", DbType::U64)]);
@@ -203,7 +203,7 @@ fn range_masks_are_supersets_for_every_ordered_type() {
 #[test]
 fn checkpoint_round_trips_under_random_workloads() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     for _ in 0..12 {
         let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
         let f = TableFilters::new(&fields, FilterConfig::default());

@@ -26,7 +26,7 @@ fn spec() -> Vec<(&'static str, DbType)> {
 
 fn filled(n: u64) -> (SmallVec<[SchemaField; 20]>, TableFilters, Vec<u64>, Vec<Vec<u8>>) {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (fields, f) = filters_for(&spec());
     let ids: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     let uids: Vec<Vec<u8>> = (0..n).map(|_| uuid_v4()).collect();
@@ -87,7 +87,7 @@ fn round_trip_preserves_pruning_power() {
 #[test]
 fn round_trip_preserves_zone_bounds() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // Bounds live alongside the fingerprints and must survive too.
     let n = 6000u64;
     let (fields, f) = filters_for(&[("id", DbType::U64)]);
@@ -110,7 +110,7 @@ fn round_trip_preserves_zone_bounds() {
 #[test]
 fn round_trip_survives_generation_boundaries() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let cfg = FilterConfig { min_f: 4, default_f: 4, max_f: 16, ..Default::default() };
     let fields = fields_of(&[("id", DbType::U64)]);
     let f = TableFilters::new(&fields, cfg);
@@ -132,7 +132,7 @@ fn round_trip_survives_generation_boundaries() {
 #[test]
 fn a_modification_after_a_checkpoint_pulls_the_frontier_back() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // The checkpoint's bytes for that region could be stale, so it must not
     // claim to cover it.
     let n = 4000u64;
@@ -611,7 +611,7 @@ async fn garbage_after_the_base_stops_the_replay() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_rewrites_the_base_rather_than_appending() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // A delete invalidates slots near the start, so the "tail" that would have
     // to be re-sent is the whole file. Folding it into a fresh base costs the
     // same and leaves nothing to replay.
@@ -646,7 +646,7 @@ async fn a_delete_rewrites_the_base_rather_than_appending() {
 #[test]
 fn a_checkpoint_remembers_its_unindexed_prefix() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // Rows that predate the filter are candidates until a backfill indexes
     // them, and a checkpoint taken before that has to say so. Reloading one that
     // claimed the prefix was indexed would prune rows nothing had ever looked

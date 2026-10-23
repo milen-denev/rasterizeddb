@@ -293,8 +293,18 @@ and every ancestor that compiles admits `vacuum.rs`, `database/*` and
 `TableIndexes` and `TableFilters` takes a proof (P14):
 
 ```rust
-pub enum Proof<'a> { Ticket(&'a WriteTicket), Build(&'a BuildToken) }
+pub struct Proof<'a> { kind: ProofKind, _borrow: PhantomData<&'a ()> }
+pub enum ProofKind { Ticket, Build }
+impl<'a> From<&'a WriteTicket> for Proof<'a> { … }
+impl<'a> From<&'a BuildToken> for Proof<'a> { … }
 ```
+
+One byte, `Copy` and passed by value; the lifetime keeps the token borrowed
+while the proof lives, and phase 1 needs only the kind. With no address in
+it, a forged kind is a forged proof, so its fields are private, the two
+`From<&token>` impls are its only constructors, and neither `Proof` nor
+`ProofKind` implements `Default` or any conversion from a kind (the source
+test pins all three).
 
 `WriteTicket` and `BuildToken` have private fields and are defined in
 `core::index_store::gate`. Neither implements `Clone`, `Copy`, `Default` or
@@ -325,7 +335,7 @@ Pinned by:
   scans the tokens for `WriteTicket`, `BuildToken` and `Proof` anywhere, and
   for `unsafe`, `forget`, `ManuallyDrop` and `leak` inside the fns the
   no-`unsafe` rule below covers. It fails unless the invocation is on a short
-  allowlist (`matches!(p, Proof::Ticket(_))`). It also runs the full
+  allowlist (`matches!`). It also runs the full
   visitor on whatever parses as a `Block` or a comma-separated expression
   list. **Names are pinned**: no `type` alias names `WriteTicket`,
   `BuildToken` or `Proof`, no `use … as` renames them, and no re-export gives
@@ -388,7 +398,7 @@ Pinned by:
   these are signature checks: a `compile_fail` call of a mutator without its
   proof, and a twin that compiles and differs only in that line, taking the
   proof as a function parameter (`fn _f(ix: &LiveIndex, t: &WriteTicket) {
-  ix.insert(Proof::Ticket(t), …) }`), so it needs no mint. Stable rustdoc does
+  ix.insert(Proof::from(t), …) }`), so it needs no mint. Stable rustdoc does
   not check `compile_fail,E…` codes (checked); the twin catches a doctest
   failing for another reason, such as a path that stopped resolving, so
   `index_store` and `gate` stay `pub mod`. There is no "token built outside
@@ -1983,7 +1993,7 @@ change, in the owner's style, reviewed hunk by hunk:
 |---|---|---|
 | C5 | `key::ENCODING_VERSION`, golden vectors, coverage test, bump rule for `key.rs` and `canonical_key`; `TEXT_RENDER_VERSION` (rendering and navigation) and `ITEM_DERIVE_VERSION` with document vectors; gin items through `ItemFeed` (fixed-width LE, no `Hasher` impl) into xxh64 in the in-memory `GinIndex`, `GIN_HASHER_ID` (touches `jsonb.rs`, its own commit); `KEY_LOOKUPS` | 0 |
 | C6 | `TableIndexes::shape_hash()` (§4) | 0 |
-| C10 | Signatures: every `LiveIndex`, `GinIndex` and `TableIndexes` mutator, `load_sorted` included, takes `Proof<'_>` (an enum over `&WriteTicket` and `&BuildToken`, minted only in `core::index_store::gate`, no `Clone`/`Copy`/`Default`/`From`); test callers use `test_mint` (`cfg(test)` or the dev-only `test_tokens` feature); the three-part source test (`ColumnFilter` included); a read-only `IndexView` for `indexes()` and the catalog views (§2). Not a visibility change: `pub(in crate::core::row)` is E0742 | 0 |
+| C10 | Signatures: every `LiveIndex`, `GinIndex` and `TableIndexes` mutator, `load_sorted` included, takes `Proof<'_>` (a one-byte `Copy` struct of a private `ProofKind`, built only by `From<&WriteTicket>`/`From<&BuildToken>`, no `Default` or conversion from a kind; the tokens, minted only in `core::index_store::gate`, have no `Clone`/`Copy`/`Default`/`From`); test callers use `test_mint` (`cfg(test)` or the dev-only `test_tokens` feature); the three-part source test (`ColumnFilter` included); a read-only `IndexView` for `indexes()` and the catalog views (§2). Not a visibility change: `pub(in crate::core::row)` is E0742 | 0 |
 | C3 | `for_each_sorted` on `LiveIndex` and `GinIndex`: entries, `UNKEYED`, `PRESENT`; gin drops exactly `forgotten_slots`; no presence filtering | 2 (gin 3) |
 | C9 | `load_sorted` on `LiveIndex` and `GinIndex`: build from a sorted stream, refuse a non-increasing slot, restore present bits; gin recomputes `live` and `entries`, `forgotten = 0`, `forgotten_slots` empty (§4) | 2 (gin 3) |
 | C11 | `resident_bytes()`: an O(1) atomic byte counter on `LiveIndex` and `GinIndex`, maintained on insert, replace, forget, clear and load (§9) | 4 |

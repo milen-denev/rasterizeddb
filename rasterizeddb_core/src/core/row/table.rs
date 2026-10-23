@@ -422,21 +422,21 @@ impl<S: StorageIO> Table<S> {
             match op {
                 PendingFilterOp::Delete(slot) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_delete(Proof::Ticket(&ticket), slot);
+                        filters.on_delete(Proof::from(&ticket), slot);
                     }
                     // A secondary index keeps the slot: vacuum forgets it once
                     // nothing can reach the version, reading its key back then.
                 }
                 PendingFilterOp::Insert(slot, row_write, old_keys) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_insert(Proof::Ticket(&ticket), slot, &row_write);
+                        filters.on_insert(Proof::from(&ticket), slot, &row_write);
                     }
                     if let Some(indexes) = self.indexes.as_ref() {
                         match old_keys {
                             Some(old) => {
-                                indexes.on_replace(Proof::Ticket(&ticket), slot, &old, &row_write)
+                                indexes.on_replace(Proof::from(&ticket), slot, &old, &row_write)
                             }
-                            None => indexes.on_insert(Proof::Ticket(&ticket), slot, &row_write),
+                            None => indexes.on_insert(Proof::from(&ticket), slot, &row_write),
                         }
                     }
                 }
@@ -683,7 +683,7 @@ impl<S: StorageIO> Table<S> {
                         // candidates until a backfill indexes them. Correct from
                         // the first query; just not yet selective.
                         let build = gate::build_token();
-                        f.set_unindexed_prefix(Proof::Build(&build), existing_slots);
+                        f.set_unindexed_prefix(Proof::from(&build), existing_slots);
                         Some(StdArc::new(f))
                     }
                 }
@@ -721,7 +721,7 @@ impl<S: StorageIO> Table<S> {
                 }
                 let build = gate::build_token();
                 match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
-                    Ok(n) if indexes.set_ready_at(Proof::Build(&build), epoch) => {
+                    Ok(n) if indexes.set_ready_at(Proof::from(&build), epoch) => {
                         info!("Built {} index(es) on {} over {} rows", indexes.len(), table_name_task, n);
                     }
                     Ok(_) => info!(
@@ -1573,8 +1573,8 @@ impl<S: StorageIO> Table<S> {
             // ended in, so only this build can mark them ready again.
             let epoch = indexes.epoch();
             let build = gate::build_token();
-            indexes.set_ready(Proof::Build(&build), false);
-            indexes.clear(Proof::Build(&build));
+            indexes.set_ready(Proof::from(&build), false);
+            indexes.clear(Proof::from(&build));
             match build_indexes(
                 indexes,
                 &self.io_pointers,
@@ -1585,7 +1585,7 @@ impl<S: StorageIO> Table<S> {
             .await
             {
                 Ok(_) => {
-                    indexes.set_ready_at(Proof::Build(&build), epoch);
+                    indexes.set_ready_at(Proof::from(&build), epoch);
                 }
                 Err(e) => error!("Compaction could not rebuild the indexes; queries scan: {}", e),
             }
@@ -1645,11 +1645,11 @@ impl<S: StorageIO> Table<S> {
         let ticket = gate::ticket();
         if let Some(filters) = self.filters.as_ref() {
             filters
-                .begin_renumbering_on_disk(Proof::Ticket(&ticket), &*self.io_filters, n_slots)
+                .begin_renumbering_on_disk(Proof::from(&ticket), &*self.io_filters, n_slots)
                 .await;
         }
         if let Some(indexes) = self.indexes.as_ref() {
-            indexes.invalidate(Proof::Ticket(&ticket));
+            indexes.invalidate(Proof::from(&ticket));
         }
         guard
     }
@@ -3192,7 +3192,7 @@ impl<S: StorageIO> Table<S> {
         let ticket = gate::ticket();
         if let Some(filters) = self.filters.as_ref() {
             filters.on_insert(
-                Proof::Ticket(&ticket),
+                Proof::from(&ticket),
                 record_pos / ROW_POINTER_RECORD_LEN as u64,
                 &row_write,
             );
@@ -3201,7 +3201,7 @@ impl<S: StorageIO> Table<S> {
         // commit: no snapshot can see the row without its index entry.
         if let Some(indexes) = self.indexes.as_ref() {
             indexes.on_insert(
-                Proof::Ticket(&ticket),
+                Proof::from(&ticket),
                 record_pos / ROW_POINTER_RECORD_LEN as u64,
                 &row_write,
             );
@@ -4558,7 +4558,7 @@ async fn backfill_into<S: StorageIO>(
 
     let fetch = Table::<S>::build_indexed_row_fetch(fields);
     if fetch.columns_fetching_data.is_empty() {
-        if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::Build(&build), epoch) {
+        if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
             return Err(renumbered());
         }
         return Ok(0);
@@ -4609,19 +4609,19 @@ async fn backfill_into<S: StorageIO>(
 
         pending.push((offset / ROW_POINTER_RECORD_LEN as u64, cols));
         if pending.len() == BACKFILL_BATCH {
-            if !filters.backfill_batch_at(Proof::Build(&build), epoch, &pending) {
+            if !filters.backfill_batch_at(Proof::from(&build), epoch, &pending) {
                 return Err(renumbered());
             }
             pending.clear();
         }
         indexed += 1;
     }
-    if !filters.backfill_batch_at(Proof::Build(&build), epoch, &pending) {
+    if !filters.backfill_batch_at(Proof::from(&build), epoch, &pending) {
         return Err(renumbered());
     }
 
     // Only a scan that started at the beginning can vouch for the prefix.
-    if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::Build(&build), epoch) {
+    if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
         return Err(renumbered());
     }
     info!(
@@ -4674,10 +4674,10 @@ async fn build_indexes<S: StorageIO>(
         {
             // Unreadable here is not unreadable to the query, which may
             // succeed later: kept as a candidate in every index.
-            indexes.index_unreadable(Proof::Build(&build), slot);
+            indexes.index_unreadable(Proof::from(&build), slot);
             continue;
         }
-        indexes.index_row(Proof::Build(&build), slot, &|wo| {
+        indexes.index_row(Proof::from(&build), slot, &|wo| {
             row.columns
                 .iter()
                 .find(|c| c.schema_id as u32 == wo)
@@ -4698,7 +4698,7 @@ impl Drop for RenumberingGuard<'_> {
     fn drop(&mut self) {
         let ticket = gate::ticket();
         if let Some(filters) = self.filters {
-            filters.end_renumbering(Proof::Ticket(&ticket));
+            filters.end_renumbering(Proof::from(&ticket));
             // A compaction that fails from here on leaves the filter demoted
             // in memory and the sidecar marked dirty; this persists the
             // demotion at the next maintenance tick instead of whenever
@@ -4707,7 +4707,7 @@ impl Drop for RenumberingGuard<'_> {
             filters.request_checkpoint();
         }
         if let Some(indexes) = self.indexes {
-            indexes.invalidate(Proof::Ticket(&ticket));
+            indexes.invalidate(Proof::from(&ticket));
         }
     }
 }

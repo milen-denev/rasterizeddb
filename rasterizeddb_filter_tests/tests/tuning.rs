@@ -233,7 +233,7 @@ fn invalid_widths_are_clamped_not_inverted() {
 #[test]
 fn a_width_override_changes_the_fingerprints_built() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     run_sql("SET FILTER min_f = 6 FOR COLUMN tune.id").unwrap();
     run_sql("SET FILTER max_f = 6 FOR COLUMN tune.id").unwrap();
@@ -296,7 +296,7 @@ fn excluding_a_column_stops_it_being_indexed() {
 #[test]
 fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     run_sql("SET FILTER zone_bounds = off FOR COLUMN tune3.v").unwrap();
 
@@ -336,7 +336,7 @@ fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
 #[test]
 fn a_stricter_selectivity_gate_declines_more_columns() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("v", DbType::U64)]);
     let n = 3000u64;
@@ -472,7 +472,7 @@ fn the_pruning_ratio_default_is_the_measured_one() {
 #[test]
 fn a_moderately_selective_mask_is_now_kept() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("v", DbType::U64)]);
     let n = 4096u64;

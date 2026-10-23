@@ -878,7 +878,7 @@ mod float_nan_is_never_pruned {
     #[test]
     fn a_nan_row_survives_every_predicate_it_satisfies() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         let field = SchemaField::new("f".to_string(), DbType::F64, 8, 0, 0, false);
         let schema: SmallVec<[SchemaField; 20]> = smallvec::smallvec![field.clone()];
         let filters = TableFilters::new(&[field], FilterConfig::default());

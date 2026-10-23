@@ -119,7 +119,7 @@ fn deeply_nested_parens_are_handled_without_stack_trouble() {
 #[test]
 fn very_wide_disjunctions_are_handled() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // An ORM `IN` list can be long; the desugared form is a wide OR.
     let (fields, f) = catalog();
     for width in [2usize, 16, 128, 512] {

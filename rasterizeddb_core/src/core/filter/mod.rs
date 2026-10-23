@@ -1537,7 +1537,7 @@ mod in_list_mask_bench {
     #[ignore]
     fn in_list_mask_bench() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         const N: u64 = 1_000_000;
         let field = SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false);
         let filters = TableFilters::new(&[field], FilterConfig::default());

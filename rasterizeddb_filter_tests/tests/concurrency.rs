@@ -167,7 +167,7 @@ async fn concurrent_deletes_and_queries_stay_consistent() {
 #[test]
 fn concurrent_probes_against_a_shared_catalog_agree() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // `TableFilters` is shared across worker threads; a probe must not observe
     // a torn view of a column's planes.
     let fields = fields_of(&[("id", DbType::U64)]);
@@ -213,7 +213,7 @@ fn concurrent_writes_and_probes_never_lose_an_indexed_row() {
         let f = f.clone();
         std::thread::spawn(move || {
             let ticket = test_mint();
-            let proof = Proof::Ticket(&ticket);
+            let proof = Proof::from(&ticket);
             for slot in 0..n {
                 let sv: SmallVec<[(u32, Vec<u8>); 32]> =
                     smallvec::smallvec![(0u32, slot.to_le_bytes().to_vec())];

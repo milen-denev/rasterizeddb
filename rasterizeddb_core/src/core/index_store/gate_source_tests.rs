@@ -14,7 +14,12 @@
 //!    type, an `Fn*` bound, an associated type, a `static`, a `const`, a field
 //!    or a `macro_rules!` body; no `type` alias or `use … as` renames a token
 //!    or `Proof`; neither token implements `Clone`, `Copy`, `Default`, `From`
-//!    or anything else but `Drop`, nor derives anything but `Debug`. The
+//!    or anything else but `Drop`, nor derives anything but `Debug`.
+//!    `Proof` is gate.rs's struct of a private `ProofKind` and a borrow, built
+//!    (a literal, or `Self` returned from its impls) only by its two
+//!    `From<&token>` impls, its fields touched only there and in `kind`;
+//!    neither it nor `ProofKind` implements or derives `Default` or any other
+//!    trait than those, and no other impl names either in its trait. The
 //!    `BuildToken` mint is called only from the named rebuild paths, and
 //!    `test_mint` only from `cfg(test)` or `test_tokens` code. No `unsafe`
 //!    anywhere in `index_store`, and none, nor `forget`, `ManuallyDrop` or
@@ -49,6 +54,13 @@ use syn::visit::{self, Visit};
 const TOKENS: [&str; 2] = ["WriteTicket", "BuildToken"];
 /// The names no alias, rename, return type, bound or field may carry.
 const NAMES: [&str; 3] = ["WriteTicket", "BuildToken", "Proof"];
+/// `Proof`'s fields, the only ones a forger could set.
+const PROOF_FIELDS: [&str; 2] = ["kind", "_borrow"];
+/// The traits `Proof` implements by hand: `From` a borrowed token, nothing else.
+const PROOF_FROM: [&str; 2] = ["From < & 'a WriteTicket >", "From < & 'a BuildToken >"];
+/// What `Proof` and `ProofKind` may derive. Never `Default`.
+const PROOF_DERIVES: [&str; 3] = ["Debug", "Clone", "Copy"];
+const PROOF_KIND_DERIVES: [&str; 5] = ["Debug", "Clone", "Copy", "PartialEq", "Eq"];
 /// Where the tokens live, relative to `src/`.
 const GATE: &str = "core/index_store/gate.rs";
 /// The mints, the only fns that may build a token: `(fn, the token it builds)`.
@@ -70,7 +82,7 @@ const BUILD_TOKEN_CALLERS: [(&str, &str); 4] = [
     // The index build.
     ("core/row/table.rs", "build_indexes"),
 ];
-/// Macros that may name `Proof` (never a token): `matches!(p, Proof::Ticket(_))`.
+/// Macros that may name `Proof` (never a token).
 const MACROS_NAMING_PROOF: [&str; 1] = ["matches"];
 /// Fields that may store a token or a `Proof`: `(struct, field)`. Phase 1
 /// adds the family's lock-owner record (§2, Ticket ownership).
@@ -488,6 +500,8 @@ struct Scan<'a> {
     test: Vec<bool>,
     fns: Vec<FnCtx>,
     impls: Vec<String>,
+    /// Each entry of `impls`'s trait, `""` for an inherent impl.
+    impl_traits: Vec<String>,
     mods: usize,
     token_defs: &'a mut BTreeMap<String, usize>,
 }
@@ -512,6 +526,33 @@ impl Scan<'_> {
     /// The innermost named fn; closures and blocks are its body.
     fn current_fn(&self) -> Option<&FnCtx> {
         self.fns.last()
+    }
+
+    /// Whether the innermost fn is `from` of one of `Proof`'s two `From`
+    /// impls at the top of `gate.rs`: the only place a `Proof` is built.
+    fn in_proof_from(&self) -> bool {
+        self.rel == GATE
+            && self.mods == 0
+            && self.impls.len() == 1
+            && self.impls[0] == "Proof"
+            && PROOF_FROM.contains(&self.impl_traits[0].as_str())
+            && self.fns.len() == 1
+            && self.fns[0].name == "from"
+    }
+
+    /// The derives and other attributes of `Proof` or `ProofKind`.
+    fn check_proof_attrs(&mut self, name: &str, attrs: &[syn::Attribute], allowed: &[&str]) {
+        for a in attrs {
+            let ids = idents(&a.meta);
+            if ids.contains("Default") {
+                self.fail(format!("{name} has a Default: {}", short(&a.meta)));
+            }
+            if a.path().is_ident("derive")
+                && let Some(d) = ids.iter().find(|d| *d != "derive" && !allowed.contains(&d.as_str()))
+            {
+                self.fail(format!("{name} derives {d}"));
+            }
+        }
     }
 
     /// Whether the innermost fn is a free fn at the top of `gate.rs` named `name`.
@@ -554,6 +595,20 @@ impl Scan<'_> {
             }
             if mentions(&**ty, &["Proof"]) {
                 self.fail(format!("fn {name} returns a Proof: {}", short(&**ty)));
+            }
+            // `fn from(_: &'a WriteTicket) -> Self` is checked once this fn is
+            // pushed; any other fn returning `Self` from `Proof`'s impls forges.
+            let from_ok = self.rel == GATE
+                && self.mods == 0
+                && self.fns.is_empty()
+                && name == "from"
+                && self.impl_traits.len() == 1
+                && PROOF_FROM.contains(&self.impl_traits[0].as_str());
+            if self.impls.last().is_some_and(|t| t == "Proof" || t == "ProofKind")
+                && mentions(&**ty, &["Self"])
+                && !from_ok
+            {
+                self.fail(format!("fn {name} returns Self from {}'s impl", self.impls.last().unwrap()));
             }
         }
         if (names_gate || self.in_index_store())
@@ -755,10 +810,31 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                 ));
             }
         }
+        let tr = i
+            .trait_
+            .as_ref()
+            .and_then(|(_, tr, _)| tr.segments.last())
+            .map(short)
+            .unwrap_or_default();
+        let proof_from = self.rel == GATE
+            && self.mods == 0
+            && self_ty == "Proof"
+            && PROOF_FROM.contains(&tr.as_str());
+        if (self_ty == "Proof" || self_ty == "ProofKind") && !tr.is_empty() && !proof_from {
+            self.fail(format!("impl {tr} for {self_ty}: Proof implements only From<&token>"));
+        }
+        if let Some((_, path, _)) = &i.trait_
+            && mentions(path, &["Proof", "ProofKind"])
+            && !proof_from
+        {
+            self.fail(format!("impl {tr} for {self_ty} names Proof in its trait"));
+        }
         let test = is_test_only(&i.attrs);
         self.test.push(self.in_test() || test);
         self.impls.push(self_ty);
+        self.impl_traits.push(tr);
         visit::visit_item_impl(self, i);
+        self.impl_traits.pop();
         self.impls.pop();
         self.test.pop();
     }
@@ -794,6 +870,23 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                     }
                 }
             }
+        } else if name == "Proof" {
+            *self.token_defs.entry(name.clone()).or_default() += 1;
+            let shape: Vec<String> = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let vis = if matches!(f.vis, syn::Visibility::Inherited) { "" } else { "pub " };
+                    format!("{vis}{}: {}", f.ident.as_ref().map_or(String::new(), |i| i.to_string()), short(&f.ty))
+                })
+                .collect();
+            let want = ["kind: ProofKind", "_borrow: PhantomData < & 'a () >"];
+            if self.rel != GATE || self.mods != 0 || shape != want {
+                self.fail(format!(
+                    "struct Proof is not gate.rs's private kind and borrow: {shape:?}"
+                ));
+            }
+            self.check_proof_attrs(&name, &s.attrs, &PROOF_DERIVES);
         } else {
             self.check_fields(&name, &s.fields);
         }
@@ -804,17 +897,20 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         let name = e.ident.to_string();
         if name == "Proof" {
             *self.token_defs.entry(name.clone()).or_default() += 1;
+            self.fail("enum Proof: Proof is gate.rs's struct".into());
+        } else if name == "ProofKind" {
+            *self.token_defs.entry(name.clone()).or_default() += 1;
             let shape: Vec<String> = e
                 .variants
                 .iter()
-                .map(|v| format!("{} {}", v.ident, short(&v.fields)))
+                .map(|v| format!("{}{}", v.ident, short(&v.fields)))
                 .collect();
-            let want = ["Ticket (& 'a WriteTicket)", "Build (& 'a BuildToken)"];
-            if self.rel != GATE || self.mods != 0 || shape != want {
+            if self.rel != GATE || self.mods != 0 || shape != ["Ticket", "Build"] {
                 self.fail(format!(
-                    "enum Proof is not gate.rs's two borrowed variants: {shape:?}"
+                    "enum ProofKind is not gate.rs's two unit variants: {shape:?}"
                 ));
             }
+            self.check_proof_attrs(&name, &e.attrs, &PROOF_KIND_DERIVES);
         } else {
             for v in &e.variants {
                 self.check_fields(&format!("{name}::{}", v.ident), &v.fields);
@@ -929,6 +1025,9 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         } else {
             last.clone()
         };
+        if ty == "Proof" && !self.in_proof_from() {
+            self.fail("builds a Proof outside its From<&token> impls".into());
+        }
         if TOKENS.contains(&ty.as_str()) {
             if last == "Self" {
                 self.fail(format!("builds {ty} as Self {{ .. }} in its impl"));
@@ -940,6 +1039,23 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             }
         }
         visit::visit_expr_struct(self, e);
+    }
+
+    fn visit_expr_field(&mut self, e: &'ast syn::ExprField) {
+        // Only `gate`'s module can reach `Proof`'s private fields at all.
+        if let syn::Member::Named(m) = &e.member
+            && self.rel.starts_with("core/index_store/gate")
+            && !self.rel.contains("source_tests")
+            && PROOF_FIELDS.contains(&m.to_string().as_str())
+        {
+            let getter = self.impls.last().is_some_and(|t| t == "Proof")
+                && self.fns.len() == 1
+                && self.fns[0].name == "kind";
+            if !getter {
+                self.fail(format!("touches Proof's field {m} outside Proof::kind"));
+            }
+        }
+        visit::visit_expr_field(self, e);
     }
 
     fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
@@ -1004,6 +1120,7 @@ fn scan_crate() -> (BTreeSet<String>, Census, BTreeMap<String, usize>) {
             test: vec![s.test],
             fns: Vec::new(),
             impls: Vec::new(),
+            impl_traits: Vec::new(),
             mods: 0,
             token_defs: &mut token_defs,
         };
@@ -1015,11 +1132,11 @@ fn scan_crate() -> (BTreeSet<String>, Census, BTreeMap<String, usize>) {
 #[test]
 fn only_the_mints_build_a_token_and_nothing_else_reaches_one() {
     let (mut problems, _, defs) = scan_crate();
-    for name in NAMES {
-        if defs.get(name) != Some(&1) {
+    for name in NAMES.iter().chain(&["ProofKind"]) {
+        if defs.get(*name) != Some(&1) {
             problems.insert(format!(
                 "{name} is defined {} times, not once",
-                defs.get(name).unwrap_or(&0)
+                defs.get(*name).unwrap_or(&0)
             ));
         }
     }

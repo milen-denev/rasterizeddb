@@ -48,7 +48,7 @@
 //! use rasterizeddb_core::core::index_store::gate::{Proof, WriteTicket};
 //! fn _f(ix: &LiveIndex, t: &WriteTicket) {
 //!     let _ = &t;
-//!     ix.insert(Proof::Ticket(t), 7, None); // the line
+//!     ix.insert(Proof::from(t), 7, None); // the line
 //! }
 //! ```
 //!
@@ -59,7 +59,7 @@
 //! use rasterizeddb_core::core::index_store::gate::{BuildToken, Proof};
 //! fn _f(tf: &TableFilters, b: &BuildToken) {
 //!     let b = &BuildToken { _private: () }; // the line
-//!     tf.set_unindexed_prefix(Proof::Build(b), 7);
+//!     tf.set_unindexed_prefix(Proof::from(b), 7);
 //! }
 //! ```
 //!
@@ -70,7 +70,7 @@
 //! use rasterizeddb_core::core::index_store::gate::{BuildToken, Proof};
 //! fn _f(tf: &TableFilters, b: &BuildToken) {
 //!     let b = &rasterizeddb_core::core::index_store::gate::build_token(); // the line
-//!     tf.set_unindexed_prefix(Proof::Build(b), 7);
+//!     tf.set_unindexed_prefix(Proof::from(b), 7);
 //! }
 //! ```
 //!
@@ -81,7 +81,33 @@
 //! use rasterizeddb_core::core::index_store::gate::{BuildToken, Proof};
 //! fn _f(tf: &TableFilters, b: &BuildToken) {
 //!     let b = b; // the line
-//!     tf.set_unindexed_prefix(Proof::Build(b), 7);
+//!     tf.set_unindexed_prefix(Proof::from(b), 7);
+//! }
+//! ```
+//!
+//! A proof cannot be built from its kind, without a token:
+//!
+//! ```compile_fail
+//! use rasterizeddb_core::core::filter::TableFilters;
+//! use rasterizeddb_core::core::index_store::gate::{BuildToken, Proof, ProofKind};
+//! use std::marker::PhantomData;
+//! fn _f(tf: &TableFilters, b: &BuildToken) {
+//!     let _ = (&b, ProofKind::Build, PhantomData::<()>);
+//!     let p = Proof { kind: ProofKind::Build, _borrow: PhantomData }; // the line
+//!     tf.set_unindexed_prefix(p, 7);
+//! }
+//! ```
+//!
+//! Its twin, from the token:
+//!
+//! ```
+//! use rasterizeddb_core::core::filter::TableFilters;
+//! use rasterizeddb_core::core::index_store::gate::{BuildToken, Proof, ProofKind};
+//! use std::marker::PhantomData;
+//! fn _f(tf: &TableFilters, b: &BuildToken) {
+//!     let _ = (&b, ProofKind::Build, PhantomData::<()>);
+//!     let p = Proof::from(b); // the line
+//!     tf.set_unindexed_prefix(p, 7);
 //! }
 //! ```
 //!
@@ -89,6 +115,8 @@
 //! [`GinIndex`]: crate::core::index::gin::GinIndex
 //! [`TableIndexes`]: crate::core::index::TableIndexes
 //! [`TableFilters`]: crate::core::filter::TableFilters
+
+use std::marker::PhantomData;
 
 /// Held by a write path while it mutates an index or a filter.
 ///
@@ -106,15 +134,58 @@ pub struct BuildToken {
     _private: (),
 }
 
-/// What a mutator is handed: the caller holds one of the two tokens.
+/// What a mutator is handed: the caller holds one of the two tokens, and
+/// which. One byte, passed by value.
+///
+/// Built only by the two `From` impls below, from a borrowed token, which the
+/// lifetime keeps borrowed while the proof lives. With no address in it, a
+/// forged kind would be a forged proof, so the fields are private and neither
+/// this nor [`ProofKind`] implements `Default` or any conversion from a kind;
+/// `gate_source_tests.rs` pins that.
 ///
 /// It proves that the caller holds *a* token, not that it is this structure's
 /// gate's; that is the census's job (§13 V3).
 #[derive(Debug, Clone, Copy)]
-pub enum Proof<'a> {
-    Ticket(&'a WriteTicket),
-    Build(&'a BuildToken),
+pub struct Proof<'a> {
+    kind: ProofKind,
+    _borrow: PhantomData<&'a ()>,
 }
+
+/// Which token a [`Proof`] was made from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofKind {
+    Ticket,
+    Build,
+}
+
+impl Proof<'_> {
+    /// Which token this proof was made from.
+    pub fn kind(self) -> ProofKind {
+        self.kind
+    }
+}
+
+impl<'a> From<&'a WriteTicket> for Proof<'a> {
+    fn from(_: &'a WriteTicket) -> Self {
+        Proof {
+            kind: ProofKind::Ticket,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl<'a> From<&'a BuildToken> for Proof<'a> {
+    fn from(_: &'a BuildToken) -> Self {
+        Proof {
+            kind: ProofKind::Build,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+// The size the mutators are passed by value at.
+const PROOF_SIZE: usize = std::mem::size_of::<Proof<'static>>();
+const _: () = assert!(PROOF_SIZE == 1);
 
 /// A ticket for one write path's mutations. Phase 0: checks nothing.
 pub(crate) fn ticket() -> WriteTicket {

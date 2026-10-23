@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn lookups_find_every_containing_document() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("g"), 0, opclass);
             let docs = [
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn an_estimate_bounds_its_lookup() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("e"), 0, opclass);
             for slot in 0..300u64 {
@@ -871,7 +871,7 @@ mod tests {
     /// by slot, `None` where nothing can match.
     fn random_index(r: &mut Rng, opclass: GinOpclass, n: u64) -> (GinIndex, Vec<Option<Vec<u8>>>) {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         let g = GinIndex::new(decl("r"), 0, opclass);
         let mut docs = Vec::new();
         for slot in 0..n {
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn forgotten_entries_do_not_make_a_list_look_universal() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("u"), 0, opclass);
             let d = |status: &str, region: &str, n: u64| {
@@ -1101,7 +1101,7 @@ mod tests {
     #[test]
     fn many_item_documents_are_compacted() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         let g = GinIndex::new(decl("c"), 0, GinOpclass::Ops);
         let d = |n: u64| {
             doc(&format!(
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn a_compaction_keeps_a_slot_whose_insert_is_under_way() {
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
             let g = GinIndex::new(decl("w"), 0, opclass);
             let d = doc(r#"{"k":1}"#);
@@ -1167,7 +1167,7 @@ mod tests {
     fn compactions_beside_inserts_drop_no_live_slot() {
         use std::sync::Arc;
         let ticket = test_mint();
-        let proof = Proof::Ticket(&ticket);
+        let proof = Proof::from(&ticket);
         for round in 0..8 {
             let g = Arc::new(GinIndex::new(decl("t"), 0, GinOpclass::PathOps));
             let d = doc(r#"{"k":1}"#);
@@ -1178,7 +1178,7 @@ mod tests {
                 let (g, d) = (g.clone(), d.clone());
                 std::thread::spawn(move || {
                     let ticket = test_mint();
-                    let proof = Proof::Ticket(&ticket);
+                    let proof = Proof::from(&ticket);
                     for slot in 10_000..30_000u64 {
                         g.insert(proof, slot, Some(&d));
                     }
@@ -1188,7 +1188,7 @@ mod tests {
                 let g = g.clone();
                 std::thread::spawn(move || {
                     let ticket = test_mint();
-                    let proof = Proof::Ticket(&ticket);
+                    let proof = Proof::from(&ticket);
                     for slot in 0..2000u64 {
                         g.forget(proof, slot);
                     }

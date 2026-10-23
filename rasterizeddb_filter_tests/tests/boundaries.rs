@@ -140,7 +140,7 @@ fn an_unindexed_prefix_at_any_offset_stays_candidate() {
 #[test]
 fn checkpoints_round_trip_at_every_boundary_size() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     for &n in SIZES {
         let fields = fields_of(&[("id", DbType::U64)]);
         let f = TableFilters::new(&fields, FilterConfig::default());
@@ -185,7 +185,7 @@ fn a_table_with_no_indexable_columns_is_inert() {
 #[test]
 fn a_bool_column_is_indexed_for_its_bounds_alone() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     // BOOL earns no fingerprints — two distinct values can never clear the
     // selectivity gate — but two bytes per 512-row zone is a fiftieth of that
     // cost and prunes a *sparse* flag almost perfectly. That case arrives on
@@ -221,7 +221,7 @@ fn a_bool_column_is_indexed_for_its_bounds_alone() {
 #[test]
 fn many_columns_are_all_independently_indexed() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let spec: Vec<(String, DbType)> = (0..20)
         .map(|i| (format!("c{}", i), if i % 2 == 0 { DbType::U64 } else { DbType::I32 }))
         .collect();

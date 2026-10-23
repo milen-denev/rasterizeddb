@@ -181,7 +181,7 @@ fn value(slot: u64) -> u64 {
 
 fn index(f: &TableFilters, slots: std::ops::Range<u64>) {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     for slot in slots {
         let cols: SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, value(slot).to_le_bytes().to_vec()),
@@ -211,7 +211,7 @@ fn finds(f: &TableFilters, slot: u64, n: u64) -> bool {
 #[tokio::test]
 async fn a_failed_base_image_is_reported_and_rewritten() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -258,7 +258,7 @@ async fn a_failed_base_image_is_reported_and_rewritten() {
 #[tokio::test]
 async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -293,7 +293,7 @@ async fn a_base_image_that_landed_but_failed_is_marked_dirty_by_the_next_delete(
 #[tokio::test]
 async fn a_first_checkpoint_that_landed_but_failed_is_marked_dirty_by_the_next_delete() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -317,7 +317,7 @@ async fn a_first_checkpoint_that_landed_but_failed_is_marked_dirty_by_the_next_d
 #[tokio::test]
 async fn a_first_checkpoint_that_failed_leaves_nothing_to_trust() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let n = 2_000u64;
     let f = TableFilters::new(&schema(), FilterConfig::default());
     index(&f, 0..n);
@@ -406,7 +406,7 @@ async fn a_delta_that_landed_but_failed_is_overwritten_by_the_next_record() {
 async fn a_kv_sidecar_checkpoints_and_reopens() {
     use crate::core::storage_providers::kv::{KvConfig, KvFamily, KvStorageProvider, KvStore, MemoryKvStore};
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
 
     async fn open(store: &Arc<dyn KvStore>) -> KvStorageProvider {
         let mut config = KvConfig::new("t");

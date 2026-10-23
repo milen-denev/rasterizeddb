@@ -208,7 +208,7 @@ fn x_filter(n: u64) -> (crate::core::filter::TableFilters, Vec<crate::core::row:
     use crate::core::filter::{FilterConfig, TableFilters};
     use crate::core::row::schema::SchemaField;
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let fields = vec![SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false)];
     let f = TableFilters::new(&fields, FilterConfig::default());
     f.backfill_batch(proof, &rows(n));
@@ -229,7 +229,7 @@ fn rows(n: u64) -> Vec<(u64, smallvec::SmallVec<[(u32, Vec<u8>); 32]>)> {
 #[test]
 fn a_renumbering_fences_off_work_that_read_slots_before_or_during_it() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (f, fields) = x_filter(100);
     assert!(f.is_complete());
     let before = f.renumber_epoch();
@@ -266,7 +266,7 @@ fn a_renumbering_fences_off_work_that_read_slots_before_or_during_it() {
 #[test]
 fn an_index_build_from_before_a_renumbering_cannot_mark_it_ready() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let ix = crate::core::index::TableIndexes::new(Vec::new());
     let before = ix.epoch();
     ix.set_ready(proof, true);
@@ -465,7 +465,7 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
     use crate::core::filter::{FilterConfig, TableFilters};
     use crate::core::row::schema::SchemaField;
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     const N: u64 = 10_000;
     // A text column: fingerprinted, so a cleared slot changes its plane.
     let fields = vec![SchemaField::new("s".to_string(), DbType::STRING, 12, 0, 0, false)];
@@ -638,7 +638,7 @@ async fn a_failed_compaction_retires_cached_row_pointers() {
 #[test]
 fn the_renumber_epoch_is_odd_exactly_while_renumbering() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     use crate::core::filter::renumbering;
     let (f, _) = x_filter(100);
     let mut seen = vec![f.renumber_epoch()];
@@ -721,7 +721,7 @@ async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
 #[test]
 fn work_that_read_the_epoch_during_a_renumbering_cannot_publish() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (f, _) = x_filter(100);
     f.begin_renumbering(proof, 100);
     let during = f.renumber_epoch();
@@ -745,7 +745,7 @@ fn work_that_read_the_epoch_during_a_renumbering_cannot_publish() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
     use crate::core::storage_providers::traits::StorageIO;
     let base = tempfile::tempdir().unwrap();
@@ -777,7 +777,7 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
 #[test]
 fn a_demoted_column_is_not_reported_monotonic() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (f, _) = x_filter(2048);
     assert!(f.column_is_monotonic(0, 2048), "the fixture is not monotonic, so this proves nothing");
     f.begin_renumbering(proof, 2048);

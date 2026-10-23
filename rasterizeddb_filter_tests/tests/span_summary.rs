@@ -174,7 +174,7 @@ fn a_saturated_column_still_answers_correctly() {
 #[test]
 fn the_summary_is_reachable_through_settings() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("id", DbType::U64), ("cat", DbType::I32)]);
 
@@ -213,7 +213,7 @@ fn the_summary_is_reachable_through_settings() {
 #[test]
 fn the_summary_survives_a_checkpoint() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("id", DbType::U64)]);
     run_sql("SET FILTER bloom = on FOR COLUMN ckpt_sum.id").unwrap();

@@ -117,7 +117,7 @@ fn index(name: &str, method: Method, columns: &[u32]) -> Arc<LiveIndex> {
 #[test]
 fn candidates_are_always_a_superset_of_the_matches() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let schema: Vec<SchemaField> = fields();
     let mut r = Rng(0xDEAD_BEEF);
     // Several index layouts, so every planner branch is reached: whole-key
@@ -180,7 +180,7 @@ fn candidates_are_always_a_superset_of_the_matches() {
 #[test]
 fn removal_and_replacement_keep_the_superset() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
     let key = |v: i64| {
@@ -220,7 +220,7 @@ fn removal_and_replacement_keep_the_superset() {
 #[test]
 fn a_broad_answer_is_declined() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
     for slot in 0..1000u64 {
@@ -239,7 +239,7 @@ fn a_broad_answer_is_declined() {
 #[test]
 fn hash_answers_only_equality_on_its_whole_key() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let ix = index("ns", Method::Hash, &[0, 1]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
     ix.insert(proof, 3, ix.key_of(|wo| Some(if wo == 0 { &[1, 0, 0, 0, 0, 0, 0, 0][..] } else { b"x" })));
@@ -278,7 +278,7 @@ fn method_choice() {
 #[test]
 fn a_composite_btree_ranges_inside_its_equality_prefix() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let strings = ["a", "b", "b\0", "c", "d"];
     let slot_of = |n: i64, j: usize| (n as u64) * strings.len() as u64 + j as u64;
     for (name, cols) in [("ns", [0u32, 1]), ("sn", [1, 0])] {
@@ -326,7 +326,7 @@ fn a_composite_btree_ranges_inside_its_equality_prefix() {
 #[test]
 fn a_broad_whole_key_loses_to_a_narrow_range() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let by_n = index("n", Method::BTree, &[0]);
     let by_s = index("s", Method::BTree, &[1]);
     let indexes = TableIndexes::new(vec![by_n.clone(), by_s.clone()]);
@@ -376,7 +376,7 @@ fn a_broad_whole_key_loses_to_a_narrow_range() {
 #[test]
 fn posting_lists_stay_sorted_and_distinct() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let ix = index("n", Method::BTree, &[0]);
     let hx = index("h", Method::Hash, &[0]);
     let indexes = TableIndexes::new(vec![ix.clone()]);
@@ -430,7 +430,7 @@ fn galloping_finds_what_a_binary_search_finds() {
 
 fn gin_pair() -> (Arc<gin::GinIndex>, Arc<gin::GinIndex>, TableIndexes) {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let decl = |name: &str, method| IndexDecl {
         name: name.into(),
         method,
@@ -460,7 +460,7 @@ fn contains_leaf(q: &str) -> gin::JsonExpr {
 #[test]
 fn ties_go_to_the_index_with_less_to_read() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (_, _, indexes) = gin_pair();
     for slot in 0..500u64 {
         let d = format!(r#"{{"status":"{}","n":{}}}"#, ["paid", "new", "shipped"][(slot % 3) as usize], slot);
@@ -480,7 +480,7 @@ fn ties_go_to_the_index_with_less_to_read() {
 #[test]
 fn broad_gin_answers_come_back_as_bitmaps() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let (_, _, indexes) = gin_pair();
     let n = 2_000u64;
     let mut docs = Vec::new();
@@ -778,7 +778,7 @@ fn the_shape_hash_sees_what_keys_rows_and_no_name() {
 #[test]
 fn a_column_index_answer_is_counted() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let indexes = TableIndexes::new(vec![index("n_bt", Method::BTree, &[0]), index("s_hash", Method::Hash, &[1])]);
     for slot in 0..64u64 {
         let row = [(slot as i64).to_le_bytes().to_vec(), vec![b'a' + (slot % 7) as u8]];

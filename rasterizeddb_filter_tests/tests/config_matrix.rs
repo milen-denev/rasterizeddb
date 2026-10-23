@@ -288,7 +288,7 @@ fn floats_including_every_special_value() {
 #[test]
 fn width_adapts_as_a_column_grows_and_old_rows_stay_findable() {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let c = FilterConfig { min_f: 4, default_f: 4, max_f: 16, ..Default::default() };
     let fields = fields_of(&[("id", DbType::U64)]);
     let f = TableFilters::new(&fields, c);

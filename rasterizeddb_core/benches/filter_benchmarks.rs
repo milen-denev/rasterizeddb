@@ -181,7 +181,7 @@ fn report_insert_contention(_c: &mut Criterion) {
         .collect();
     let prebuilt = &prebuilt;
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
 
     for batch in [1usize, 64] {
         for threads in [1usize, 2, 4, 8] {
@@ -336,7 +336,7 @@ fn bench_checkpoint(c: &mut Criterion) {
     ];
     let filters = TableFilters::new(&fields, FilterConfig::default());
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     for slot in 0..N {
         let cols: smallvec::SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, fastrand::u64(..).to_le_bytes().to_vec()),

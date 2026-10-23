@@ -353,7 +353,7 @@ async fn interleave_unseen(
     k: u64,
 ) -> (Answer, Vec<(u64, i32)>) {
     let ticket = test_mint();
-    let proof = Proof::Ticket(&ticket);
+    let proof = Proof::from(&ticket);
     let writer = manager.begin();
     t.insert_row_in_txn(row(k, 7), writer).await.unwrap();
     let slot = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64 - 1;
