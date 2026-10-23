@@ -3398,6 +3398,7 @@ impl<S: StorageIO> Table<S> {
             order_by,
             reader,
             None,
+            true,
         )
         .await
     }
@@ -3407,6 +3408,8 @@ impl<S: StorageIO> Table<S> {
     /// For a statement reading several relations, which must read them all
     /// as of one moment: a join that took a snapshot per relation could show
     /// one table from before a transaction committed and another from after.
+    /// `cache: false` skips the query cache, for a fan-out read whose pieces
+    /// are not worth an entry each.
     pub async fn query_row_bytes_with_visibility(
         &self,
         query: &str,
@@ -3416,6 +3419,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
         visibility: Visibility,
+        cache: bool,
     ) -> Result<Vec<u8>> {
         self.query_row_bytes_reporting(
             query,
@@ -3426,6 +3430,7 @@ impl<S: StorageIO> Table<S> {
             order_by,
             FROZEN_TX,
             Some(visibility),
+            cache,
         )
         .await
         .map(|(bytes, _)| bytes)
@@ -3441,6 +3446,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
         visibility: Option<Visibility>,
+        cache: bool,
     ) -> Result<(Vec<u8>, bool)> {
         info!("Querying row (bytes mode)");
 
@@ -3483,7 +3489,7 @@ impl<S: StorageIO> Table<S> {
                 &mut iterator,
                 limit,
                 order_by,
-                cache_generation_for(&visibility, generation),
+                cache_generation_for(&visibility, generation).filter(|_| cache),
                 visibility,
             )
             .await?;

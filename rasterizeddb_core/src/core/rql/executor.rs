@@ -106,6 +106,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
                     None,
                     None,
                     visibility,
+                    true,
                 )
                 .await
                 .map_err(|e| e.to_string())
