@@ -470,6 +470,14 @@ pub struct Wal {
     /// readers must not queue behind each other's system calls. Never
     /// shrinks below one entry per name ever deleted.
     fences: parking_lot::RwLock<HashMap<u64, Fence>>,
+    /// `file_id` -> the commit sequence of the latest barrier a `DROP` logged
+    /// for it and committed (see [`Wal::forget_dropped_files`]). Kept only
+    /// while checkpoints archive, for the one reader there is: a snapshot
+    /// whose copy finds a listed file gone, which may leave the file out only
+    /// when a `DROP` committed past its start deleted it (see
+    /// [`Wal::dropped_after`]). Trimmed by [`Wal::forget_drops_through`] as
+    /// each snapshot starts.
+    dropped_at: Mutex<HashMap<u64, u64>>,
 }
 
 /// One file id's fences: [`Incarnation`]s taken by [`Wal::forget_files`]
@@ -627,6 +635,7 @@ impl Wal {
             dirty: Mutex::new(dirty),
             last_dirty: AtomicU64::new(u64::MAX),
             fences: parking_lot::RwLock::new(HashMap::new()),
+            dropped_at: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1373,7 +1382,13 @@ impl Wal {
 
     /// Writes the zero-payload record that marks `txn` as committed.
     fn log_commit_marker(&self, txn: u64) -> io::Result<u64> {
-        let seq = {
+        self.log_commit_marker_at(txn).map(|(seq, _)| seq)
+    }
+
+    /// [`Wal::log_commit_marker`], with the commit sequence the marker carries
+    /// as well: `(sync sequence, commit LSN)`.
+    fn log_commit_marker_at(&self, txn: u64) -> io::Result<(u64, u64)> {
+        let (seq, lsn) = {
             let mut file = self.writer.lock();
             // Assigned under the writer lock, so commit sequences reach the
             // file in order and `commit_lsn` read under that lock names every
@@ -1396,13 +1411,13 @@ impl Wal {
             }
             self.write_pos
                 .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
-            self.issued.fetch_add(1, Ordering::AcqRel) + 1
+            (self.issued.fetch_add(1, Ordering::AcqRel) + 1, lsn)
         };
 
         self.bytes_since_checkpoint
             .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
 
-        Ok(seq)
+        Ok((seq, lsn))
     }
 
     /// Logs a single self-contained write and makes it durable.
@@ -1524,6 +1539,38 @@ impl Wal {
     /// caller that needs an earlier record of this log durable first (a
     /// catalogue tombstone) owes no sync of its own.
     pub fn forget_files(&self, file_ids: &[u64]) -> io::Result<()> {
+        self.forget(file_ids, false)
+    }
+
+    /// [`Wal::forget_files`] for a `DROP`, whose barrier is also remembered
+    /// for [`Wal::dropped_after`] once it commits.
+    ///
+    /// Only a drop: a snapshot whose copy finds a file gone may leave it out
+    /// when a drop deleted it after the copy began, because a restore empties
+    /// that file at the barrier anyway. A rename or a move copies its files
+    /// without a log record, so a file one of them took away is in no log to
+    /// rebuild it from; it must fail the snapshot rather than vanish from it.
+    pub fn forget_dropped_files(&self, file_ids: &[u64]) -> io::Result<()> {
+        self.forget(file_ids, true)
+    }
+
+    /// Whether a `DROP` barrier for `file_id` committed past commit sequence
+    /// `lsn` (see [`Wal::forget_dropped_files`]). Answered only while
+    /// checkpoints archive; `false` otherwise.
+    pub fn dropped_after(&self, file_id: u64, lsn: u64) -> bool {
+        self.dropped_at
+            .lock()
+            .get(&file_id)
+            .is_some_and(|&at| at > lsn)
+    }
+
+    /// Forgets the drops committed at or before `lsn`: a snapshot starting
+    /// there, and every later one, never asks about them.
+    pub fn forget_drops_through(&self, lsn: u64) {
+        self.dropped_at.lock().retain(|_, at| *at > lsn);
+    }
+
+    fn forget(&self, file_ids: &[u64], dropped: bool) -> io::Result<()> {
         if file_ids.is_empty() {
             return Ok(());
         }
@@ -1600,8 +1647,8 @@ impl Wal {
         // before them, would otherwise have every record refused until a
         // restart. Fences of earlier, committed barriers for the same ids
         // stay.
-        let seq = match self.log_commit_marker(txn) {
-            Ok(seq) => seq,
+        let (seq, lsn) = match self.log_commit_marker_at(txn) {
+            Ok(at) => at,
             Err(e) => {
                 self.settle_fences(file_ids, fence, false);
                 return Err(e);
@@ -1612,6 +1659,14 @@ impl Wal {
         // fails then poisons the log (see `commit_through_slow`), which is
         // what tells the caller the barrier may be durable.
         self.settle_fences(file_ids, fence, true);
+        // Before the caller deletes anything, as the fences are: a snapshot
+        // asks only once it has found the file gone.
+        if dropped && self.is_archiving() {
+            let mut at = self.dropped_at.lock();
+            for id in file_ids {
+                at.insert(*id, lsn);
+            }
+        }
         #[cfg(test)]
         if test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false)) {
             self.poison("injected fdatasync failure".to_string());

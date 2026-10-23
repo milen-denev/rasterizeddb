@@ -85,6 +85,8 @@ pub mod archive;
 pub mod manifest;
 #[cfg(test)]
 mod pitr_tests;
+#[cfg(test)]
+mod upload_window_tests;
 pub mod restore;
 pub mod s3;
 /// An in-process S3 for tests; see its module docs.
@@ -282,6 +284,32 @@ fn deletion_gate() -> &'static RwLock<()> {
 /// voided; see [`DELETION_GATE`].
 pub async fn deletion_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
     deletion_gate().read().await
+}
+
+/// Keeps a rename and a move from running while a snapshot copies files.
+///
+/// Both copy a table's files to new ones with no log record behind the
+/// copy, then delete the old ones. During a snapshot's upload the old files
+/// are ones it listed, and the new ones are not in it: the copy failed on
+/// the first missing file, and could not leave it out, because nothing but
+/// that file holds its bytes, not the log a restore replays, so the table
+/// would be missing from the snapshot and every point-in-time restore after
+/// it. A `DROP` is different and does not wait (see [`DELETION_GATE`]).
+///
+/// A snapshot takes it exclusively first, before the compaction gate, and
+/// holds it until it has listed its files again after the copy; a rename or
+/// a move holds it shared from start to finish, and takes the deletion gate
+/// inside it, so the order is the same on both sides.
+static RELOCATION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+
+fn relocation_gate() -> &'static RwLock<()> {
+    RELOCATION_GATE.get_or_init(|| RwLock::new(()))
+}
+
+/// Held shared by a rename or a move for its whole run; see
+/// [`RELOCATION_GATE`].
+pub async fn relocation_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    relocation_gate().read().await
 }
 
 /// The deletion gate as a snapshot holds it while it fixes where its copy
@@ -828,6 +856,8 @@ impl BackupService {
         let started = std::time::Instant::now();
         let started_at = timeutil::now_unix();
 
+        // Exclusive for the whole copy, and first: see `RELOCATION_GATE`.
+        let no_relocation = relocation_gate().write().await;
         // Exclusive for the whole copy: compaction is the one writer whose
         // effects replay cannot reconstruct.
         let _no_compaction = compaction_gate().write().await;
@@ -870,6 +900,11 @@ impl BackupService {
             .map(|(key, wal)| (key.clone(), wal.commit_lsn()))
             .collect();
         let start_lsn = opened_at.get("").copied().unwrap_or(0);
+        // No snapshot from here on asks about a drop at or before its window.
+        for (key, wal) in &streams {
+            wal.forget_drops_through(opened_at.get(key).copied().unwrap_or(0));
+        }
+        let dropped = DroppedDuringCopy::new(&streams, &opened_at);
         // Each window's start is fixed: a barrier from here commits past it,
         // and its deletion follows it.
         drop(no_deletion);
@@ -881,6 +916,8 @@ impl BackupService {
                 self.location
             )));
         }
+        #[cfg(test)]
+        upload_hooks::parked_here(&self.location).await;
 
         let id = format!(
             "snap-{}-{:08x}",
@@ -902,13 +939,23 @@ impl BackupService {
         // earlier snapshot stored); the rest into this snapshot's archive.
         let (archived, objects, objects_uncompressed, objects_compressed) =
             if !full && self.config.incremental_min_bytes > 0 {
-                self.store_large_files(&id, &files).await?
+                self.store_large_files(&id, &files, &dropped).await?
             } else {
                 (files.clone(), Vec::new(), 0, 0)
             };
-        let (uncompressed, compressed) = self.upload_snapshot(&key, &archived).await?;
+        let (uncompressed, compressed) = self.upload_snapshot(&key, &archived, &dropped).await?;
         let (uncompressed, compressed) =
             (uncompressed + objects_uncompressed, compressed + objects_compressed);
+        // A dropped table's sidecar is gone, not folded: whatever it staged
+        // went with the table (see `DroppedDuringCopy`).
+        let staged_before: HashMap<String, u64> = staged_before
+            .into_iter()
+            .filter(|(name, _)| {
+                !files
+                    .iter()
+                    .any(|(listed, path)| listed == name && !path.exists() && dropped.explains(path))
+            })
+            .collect();
         self.check_staged_appends(&staged_before, &locations)?;
 
         // A location that started holding tables while the copy ran is in
@@ -1000,8 +1047,10 @@ impl BackupService {
         };
 
         // Released before the archive flush: that is network work and holding
-        // compaction off for it buys nothing.
+        // compaction off for it buys nothing. A rename or a move after this
+        // point is past the window's end and in no file this snapshot names.
         drop(_no_compaction);
+        drop(no_relocation);
 
         // Upload the window's log immediately. Until it is up there the
         // snapshot object exists but cannot be restored from.
@@ -1372,6 +1421,7 @@ impl BackupService {
         self: &Arc<Self>,
         key: &str,
         files: &[(String, PathBuf)],
+        dropped: &DroppedDuringCopy,
     ) -> io::Result<(u64, u64)> {
         let part_size = self.part_size_for(files);
         let (tx, rx) = kanal::bounded::<Vec<u8>>(2);
@@ -1380,6 +1430,7 @@ impl BackupService {
         let threads = self.compression_threads();
         let long_range = self.config.long_range;
         let owned: Vec<(String, PathBuf)> = files.to_vec();
+        let dropped = dropped.clone();
 
         let producer = tokio::task::spawn_blocking(move || -> io::Result<u64> {
             let sink = PartSink::new(tx, part_size);
@@ -1388,7 +1439,15 @@ impl BackupService {
             let mut writer = archive::ArchiveWriter::new(&mut encoder, owned.len() as u32)?;
             let mut total = 0u64;
             for (name, path) in &owned {
-                total += writer.add_file(name, path)?;
+                match std::fs::File::open(path) {
+                    Ok(file) => total += writer.add_open_file(name, file)?,
+                    Err(e) => {
+                        dropped.leave_out(path, e)?;
+                        // The header already counts it. Empty is what a
+                        // restore leaves of it at its barrier anyway.
+                        writer.add_reader(name, 0, &mut io::empty())?;
+                    }
+                }
             }
             writer.finish()?;
 
@@ -1426,6 +1485,7 @@ impl BackupService {
         self: &Arc<Self>,
         id: &str,
         files: &[(String, PathBuf)],
+        dropped: &DroppedDuringCopy,
     ) -> io::Result<(Vec<(String, PathBuf)>, Vec<manifest::FileObject>, u64, u64)> {
         let reusable = self.manifest.lock().await.reusable_objects();
         let mut archived = Vec::new();
@@ -1433,15 +1493,30 @@ impl BackupService {
         let (mut uncompressed, mut compressed) = (0u64, 0u64);
 
         for (index, (name, path)) in files.iter().enumerate() {
-            let len = std::fs::metadata(path)?.len();
+            // A file left out here is in neither the archive nor an object,
+            // so a restore creates it empty, as its barrier leaves it.
+            let len = match std::fs::metadata(path) {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    dropped.leave_out(path, e)?;
+                    continue;
+                }
+            };
             if len < self.config.incremental_min_bytes {
                 archived.push((name.clone(), path.clone()));
                 continue;
             }
             let hashed_path = path.clone();
-            let sha256 = tokio::task::spawn_blocking(move || hash_prefix(&hashed_path, len))
+            let hashed = tokio::task::spawn_blocking(move || hash_prefix(&hashed_path, len))
                 .await
-                .map_err(|e| io::Error::other(format!("snapshot hasher panicked: {e}")))??;
+                .map_err(|e| io::Error::other(format!("snapshot hasher panicked: {e}")))?;
+            let sha256 = match hashed {
+                Ok(sha256) => sha256,
+                Err(e) => {
+                    dropped.leave_out(path, e)?;
+                    continue;
+                }
+            };
             uncompressed += len;
 
             if let Some(key) = reusable.get(&(sha256.clone(), len)) {
@@ -1455,7 +1530,11 @@ impl BackupService {
             }
 
             let key = self.config.key(&format!("snapshots/{id}/{index:06}.zst"));
-            let (sha256, stored) = self.upload_file_object(&key, path, len).await?;
+            let Some((sha256, stored)) = self.upload_file_object(&key, path, len, dropped).await?
+            else {
+                uncompressed -= len;
+                continue;
+            };
             compressed += stored;
             objects.push(manifest::FileObject {
                 name: name.clone(),
@@ -1468,26 +1547,39 @@ impl BackupService {
     }
 
     /// Compresses the first `len` bytes of `path` into `key`, hashing exactly
-    /// what it compresses. Returns the hash and the compressed size.
+    /// what it compresses. Returns the hash and the compressed size, or
+    /// `None`, with nothing uploaded, for a file a `DROP` took away first
+    /// (see [`DroppedDuringCopy`]).
     async fn upload_file_object(
         self: &Arc<Self>,
         key: &str,
         path: &Path,
         len: u64,
-    ) -> io::Result<(String, u64)> {
+        dropped: &DroppedDuringCopy,
+    ) -> io::Result<Option<(String, u64)>> {
         let part_size = self.config.part_size.max(5 * 1024 * 1024);
         let (tx, rx) = kanal::bounded::<Vec<u8>>(2);
         let level = self.config.snapshot_level;
         let threads = self.compression_threads();
         let long_range = self.config.long_range;
         let path = path.to_path_buf();
+        let dropped = dropped.clone();
 
-        let producer = tokio::task::spawn_blocking(move || -> io::Result<String> {
+        let producer = tokio::task::spawn_blocking(move || -> io::Result<Option<String>> {
             use sha2::Digest;
+            // Opened before anything reaches the sink: a file left out sends
+            // no part, and the upload below then writes no object.
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    dropped.leave_out(&path, e)?;
+                    return Ok(None);
+                }
+            };
             let sink = PartSink::new(tx, part_size);
             let mut encoder = new_encoder(sink, level, threads, long_range)?;
             encoder.set_pledged_src_size(Some(len))?;
-            let mut file = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(&path)?);
+            let mut file = std::io::BufReader::with_capacity(256 * 1024, file);
             let mut digest = sha2::Sha256::new();
             let mut chunk = vec![0u8; 1024 * 1024];
             let mut remaining = len;
@@ -1502,15 +1594,18 @@ impl BackupService {
                 remaining -= want as u64;
             }
             encoder.finish()?.finish()?;
-            Ok(to_hex(&digest.finalize()))
+            Ok(Some(to_hex(&digest.finalize())))
         });
 
         let uploaded = self.upload_parts(key.to_string(), rx.to_async()).await;
         let produced = producer
             .await
             .map_err(|e| io::Error::other(format!("snapshot compressor panicked: {e}")))?;
-        let sha256 = produced?;
-        Ok((sha256, uploaded?))
+        let Some(sha256) = produced? else {
+            uploaded?;
+            return Ok(None);
+        };
+        Ok(Some((sha256, uploaded?)))
     }
 
     /// Part size that keeps a snapshot inside S3's 10 000-part ceiling.
@@ -2439,6 +2534,133 @@ fn folded_while_copying(before: &HashMap<String, u64>, after: &HashMap<String, u
         }
     }
     Ok(())
+}
+
+/// What a snapshot's copy may find gone: a file a `DROP` deleted after the
+/// copy began.
+///
+/// The deletion gate is held only while a snapshot fixes where its copy
+/// begins, so a `DROP` during the upload deletes files the snapshot already
+/// listed. Such a file needs no copy: its barrier committed past the
+/// window's start, and a restore empties the file there whatever the copy
+/// held (see [`crate::core::wal::Wal::recover_restoring`]). Anything else
+/// gone is not explained and fails the snapshot. A rename or a move is the
+/// case that matters: their copies write no log record, so a file one of
+/// them took away would vanish from the snapshot and from every restore
+/// after it; they wait for the upload instead (see [`RELOCATION_GATE`]).
+#[derive(Clone)]
+struct DroppedDuringCopy {
+    /// Each stream's directory, as [`crate::core::wal::dir_key`] spells it,
+    /// with its log and the start of its window: the database directories
+    /// here and the storage locations outside them alike.
+    windows: Arc<HashMap<String, (Arc<crate::core::wal::Wal>, u64)>>,
+}
+
+impl DroppedDuringCopy {
+    fn new(
+        streams: &[(String, Arc<crate::core::wal::Wal>)],
+        opened_at: &HashMap<String, u64>,
+    ) -> Self {
+        let windows = streams
+            .iter()
+            .filter_map(|(key, wal)| {
+                let dir = wal.path().parent()?.to_str()?;
+                let start = opened_at.get(key).copied().unwrap_or(0);
+                Some((crate::core::wal::dir_key(dir), (wal.clone(), start)))
+            })
+            .collect();
+        DroppedDuringCopy {
+            windows: Arc::new(windows),
+        }
+    }
+
+    /// Whether a `DROP` barrier for `path` committed past the start of the
+    /// window of the directory it is in.
+    fn explains(&self, path: &Path) -> bool {
+        let (Some(dir), Some(name)) = (
+            path.parent().and_then(Path::to_str),
+            path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return false;
+        };
+        // A table file's `.tmp` staging sibling has no log record and no
+        // barrier of its own; the drop deletes it with the file it stages
+        // for, and is that file's barrier.
+        let name = name.strip_suffix(".tmp").unwrap_or(name);
+        let id = crate::core::wal::file_id_for_name(name);
+        match self.windows.get(&crate::core::wal::dir_key(dir)) {
+            Some((wal, start)) => wal.dropped_after(id, *start),
+            // A database created during the copy: its window opens at 0, as
+            // the catalogue records it.
+            None => crate::core::wal::wal_for(dir).is_some_and(|wal| wal.dropped_after(id, 0)),
+        }
+    }
+
+    /// `Ok` when the copy may leave `path` out after reaching it failed with
+    /// `error`; the error otherwise, a missing file's naming the file.
+    fn leave_out(&self, path: &Path, error: io::Error) -> io::Result<()> {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+        if self.explains(path) {
+            info!(
+                "{} was dropped while the snapshot copied it; left out, as a restore empties \
+                 it at the drop",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} was listed for the snapshot and is gone, and no DROP committed during the \
+                 copy explains it: {error}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+/// A snapshot parked between listing its files and copying them, for tests.
+#[cfg(test)]
+pub(crate) mod upload_hooks {
+    use tokio::sync::oneshot;
+
+    struct Park {
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static PARKS: parking_lot::Mutex<Vec<(String, Park)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Parks the next snapshot of `location` once it has listed its files.
+    /// The first receiver fires when it is parked; the sender releases it.
+    pub(crate) fn park_next(location: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, parked) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        PARKS.lock().push((
+            location.to_string(),
+            Park {
+                reached,
+                release: released,
+            },
+        ));
+        (parked, release)
+    }
+
+    pub(super) async fn parked_here(location: &str) {
+        let park = {
+            let mut parks = PARKS.lock();
+            parks
+                .iter()
+                .position(|(at, _)| at == location)
+                .map(|i| parks.swap_remove(i).1)
+        };
+        if let Some(park) = park {
+            let _ = park.reached.send(());
+            let _ = park.release.await;
+        }
+    }
 }
 
 /// Where `dir` sits relative to a backup location, as a stream key.

@@ -64,7 +64,12 @@ impl<W: Write> ArchiveWriter<W> {
     /// everything written after that. Reading to EOF instead would record a
     /// length that no longer matched the bytes already declared.
     pub fn add_file(&mut self, name: &str, path: &Path) -> io::Result<u64> {
-        let file = File::open(path)?;
+        self.add_open_file(name, File::open(path)?)
+    }
+
+    /// [`ArchiveWriter::add_file`] for a file the caller opened, so it can
+    /// tell a file that is gone from a failure to copy one that is there.
+    pub fn add_open_file(&mut self, name: &str, file: File) -> io::Result<u64> {
         let len = file.metadata()?.len();
         self.add_reader(name, len, &mut BufReader::with_capacity(256 * 1024, file))
     }

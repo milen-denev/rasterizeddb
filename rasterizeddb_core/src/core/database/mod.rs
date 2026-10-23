@@ -1617,7 +1617,7 @@ impl Database {
                 maybe_logged: false,
             })?;
         }
-        forget_logged_files(&logs, table_name)
+        forget_logged_files(&logs, table_name, Barrier::Drop)
     }
 
     /// Whether the first of `logs` is the database's own log, whose barrier
@@ -1774,6 +1774,10 @@ impl Database {
     /// no more correct and briefly much less so. The names read as stale; the
     /// data resolves.
     pub async fn rename_table(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // For the whole rename, before anything is checked or paused: a
+        // snapshot uploading now listed the old files and holds none of the
+        // new ones (see `relocation_permit`).
+        let _relocating = relocation_permit(self.location.is_some(), old_name).await;
         // The table's handle is dropped before the reopened one registers;
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.
@@ -2109,6 +2113,8 @@ impl Database {
         destination: &crate::core::storage::TableBackend,
     ) -> io::Result<u64> {
         use crate::core::storage::{LocationRole, TableBackend};
+        // For the whole move, as a rename: see `relocation_permit`.
+        let _relocating = relocation_permit(self.location.is_some(), table_name).await;
         // The table's handle is dropped before the reopened one registers;
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.
@@ -2241,7 +2247,9 @@ impl Database {
             let destination_logs =
                 logs_holding(&to.without_backups(), &self.storage, self.location.as_deref());
             let _snapshot_gate = deletion_permit(&destination_logs).await;
-            if let Err(failure) = forget_logged_files(&destination_logs, table_name) {
+            if let Err(failure) =
+                forget_logged_files(&destination_logs, table_name, Barrier::Relocation)
+            {
                 if let Some(table) = table {
                     self.tables.insert(table_name.to_string(), table);
                 }
@@ -3580,6 +3588,78 @@ async fn deletion_permit(_logs: &[StdArc<crate::core::wal::Wal>]) -> Option<()> 
     None
 }
 
+/// Held by a rename or a move of `table` from start to finish, when the
+/// database is file-backed: it waits for a snapshot in progress to finish
+/// its upload (see [`crate::core::backup::relocation_permit`]).
+///
+/// A drop needs only [`deletion_permit`]: a file it deletes after a
+/// snapshot listed it is emptied by a restore at its barrier, so the copy
+/// may leave it out. A rename or a move deletes files whose bytes went on in
+/// a copy no log record describes, and creates files the snapshot does not
+/// hold. Either during the upload failed the snapshot on the missing file,
+/// and leaving such a file out would lose the table from the snapshot and
+/// from every point-in-time restore after it.
+#[cfg(feature = "s3_backup")]
+async fn relocation_permit(
+    file_backed: bool,
+    table: &str,
+) -> Option<tokio::sync::RwLockReadGuard<'static, ()>> {
+    if !file_backed {
+        return None;
+    }
+    #[cfg(test)]
+    let _parked = ParkedRelocation::new(table);
+    #[cfg(not(test))]
+    let _ = table;
+    Some(crate::core::backup::relocation_permit().await)
+}
+
+#[cfg(not(feature = "s3_backup"))]
+async fn relocation_permit(_file_backed: bool, _table: &str) -> Option<()> {
+    None
+}
+
+/// The table of every [`relocation_permit`] waiting for its permit, so a test
+/// holding a snapshot knows the rename or move reached it.
+#[cfg(all(test, feature = "s3_backup"))]
+pub(crate) static PARKED_RELOCATIONS: parking_lot::Mutex<Vec<String>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "s3_backup"))]
+struct ParkedRelocation(String);
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl ParkedRelocation {
+    fn new(table: &str) -> Self {
+        PARKED_RELOCATIONS.lock().push(table.to_string());
+        ParkedRelocation(table.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl Drop for ParkedRelocation {
+    fn drop(&mut self) {
+        let mut parked = PARKED_RELOCATIONS.lock();
+        if let Some(at) = parked.iter().position(|p| *p == self.0) {
+            parked.swap_remove(at);
+        }
+    }
+}
+
+/// Why a table's files are about to go, as their barrier tells a snapshot.
+#[derive(Clone, Copy)]
+enum Barrier {
+    /// `DROP TABLE`, and the drops an `ALTER` rewrite makes. A snapshot whose
+    /// copy finds one of these files gone may leave it out: a restore empties
+    /// it at the barrier anyway (see `crate::core::wal::Wal::dropped_after`).
+    Drop,
+    /// A rename's or a move's old files, and the destination's stale
+    /// records a move voids. Their bytes went on in a copy that wrote no log
+    /// record, so a snapshot must never leave them out; those paths wait for
+    /// a snapshot's whole upload instead (see [`relocation_permit`]).
+    Relocation,
+}
+
 /// Voids the records for every file a table of `name` owns in each of
 /// `logs` (see [`logs_holding`]), durably, in order. See
 /// [`crate::core::wal::Wal::forget_files`].
@@ -3594,6 +3674,7 @@ async fn deletion_permit(_logs: &[StdArc<crate::core::wal::Wal>]) -> Option<()> 
 fn forget_logged_files(
     logs: &[StdArc<crate::core::wal::Wal>],
     name: &str,
+    barrier: Barrier,
 ) -> Result<(), ForgetFailure> {
     let ids: Vec<u64> = table_file_names(name)
         .map(|file| crate::core::wal::file_id_for_name(&file))
@@ -3601,7 +3682,11 @@ fn forget_logged_files(
     let mut logged = false;
     for wal in logs {
         let was_poisoned = wal.is_poisoned();
-        if let Err(error) = wal.forget_files(&ids) {
+        let forgotten = match barrier {
+            Barrier::Drop => wal.forget_dropped_files(&ids),
+            Barrier::Relocation => wal.forget_files(&ids),
+        };
+        if let Err(error) = forgotten {
             // Poisoned by this call means it failed past the append, at the
             // marker or the sync, and the barrier may be durable. Either
             // other failure leaves nothing that can commit.
@@ -3633,7 +3718,7 @@ async fn discard_files(
 ) -> bool {
     let logs = logs_holding(io_pointers, pool, own);
     let _snapshot_gate = deletion_permit(&logs).await;
-    if let Err(failure) = forget_logged_files(&logs, name) {
+    if let Err(failure) = forget_logged_files(&logs, name, Barrier::Relocation) {
         error!(
             "Could not void the log's records for {}'s files, so they were kept: {}",
             name, failure.error
