@@ -185,6 +185,17 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p ALTER COLUMN n SET STATISTICS 100", Expect::Refused, "a no-op on a plain table"),
     site("ALTER TABLE site_p ADD CONSTRAINT site_p_u UNIQUE (tenant_id, asset_group_id, n)", Expect::Refused, "§11"),
     site("ALTER TABLE site_p ADD CONSTRAINT site_p_c CHECK (n > 0)", Expect::Refused, "§11"),
+    // The forms upstream's 4566347 made real on a plain table (an enforced
+    // CHECK, a NUMERIC scale, a computed GENERATED column, a CHECK's DROP):
+    // each writes a sidecar of the shell alone, so still refused first.
+    site("ALTER TABLE site_p ADD CHECK (n > 0)", Expect::Refused, "§11; enforced on a plain table since 4566347"),
+    site("ALTER TABLE site_p ADD COLUMN m NUMERIC(12, 3)", Expect::Refused, "§11, phase 3"),
+    site(
+        "ALTER TABLE site_p ADD COLUMN g INT GENERATED ALWAYS AS (n + 1) STORED",
+        Expect::Refused,
+        "§11, phase 3; computed for existing rows on a plain table since 4566347",
+    ),
+    site("ALTER TABLE site_p DROP CONSTRAINT site_p_c", Expect::Refused, "§11; retires a CHECK since 4566347"),
     site(
         "ALTER TABLE site_p ADD CONSTRAINT site_p_fk FOREIGN KEY (n) REFERENCES site_parent(id)",
         Expect::Refused,
