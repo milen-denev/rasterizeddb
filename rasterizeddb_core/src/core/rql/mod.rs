@@ -53,6 +53,7 @@ pub mod row_lock;
 pub mod sequence;
 /// Combining the branches of a `UNION`.
 pub mod set_ops;
+pub mod statement_snapshot;
 pub mod subquery;
 pub mod type_modifier;
 /// Table-level and composite `UNIQUE` constraints.

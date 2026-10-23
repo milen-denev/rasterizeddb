@@ -4484,6 +4484,19 @@ where
 {
     match prepared {
         Some(run) => execute_prepared(database, state, stream, stmt, run, result_formats, omit_description).await,
+        // A read-only statement's subqueries, CTEs and relations are read under
+        // one snapshot, as PostgreSQL reads a statement; see `statement_snapshot`.
+        None if crate::core::rql::statement_snapshot::is_read_only(stmt) => {
+            crate::core::rql::statement_snapshot::scope(execute_single_statement(
+                database,
+                state,
+                stream,
+                stmt,
+                result_formats,
+                omit_description,
+            ))
+            .await
+        }
         None => execute_single_statement(database, state, stream, stmt, result_formats, omit_description).await,
     }
 }

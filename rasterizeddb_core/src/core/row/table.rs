@@ -1096,6 +1096,17 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
+    /// [`Table::visibility_for`] for a query: inside a read-only statement,
+    /// the snapshot every read of that statement shares
+    /// ([`crate::core::rql::statement_snapshot`]). An unversioned table reads
+    /// everything, whatever the statement holds.
+    pub fn read_visibility_for(&self, tx: TxId) -> Visibility {
+        if self.versions.load().is_none() {
+            return Visibility::All;
+        }
+        crate::core::rql::statement_snapshot::get_or_take(|| self.visibility_for(tx))
+    }
+
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned.
     ///
     /// For a rewrite of the table rather than a query of it: every row that is
@@ -3169,7 +3180,7 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         reader: TxId,
     ) -> Result<u64> {
-        let visibility = self.visibility_for(reader);
+        let visibility = self.read_visibility_for(reader);
 
         // The same two guards the row path takes, for the same reason:
         // reclamation may not hand out an extent while a pointer into it is
@@ -3209,7 +3220,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<Row>> {
-        let visibility = self.visibility_for(reader);
+        let visibility = self.read_visibility_for(reader);
         self.query_row_with_visibility(
             query,
             schema_fields,
@@ -3469,7 +3480,7 @@ impl<S: StorageIO> Table<S> {
         // in the set, or the entry has been retired and the scan runs for
         // real. Still read before the scan, so an entry this query stamps is
         // retired by a mutation that lands while it runs.
-        let visibility = visibility.unwrap_or_else(|| self.visibility_for(reader));
+        let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
 
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())

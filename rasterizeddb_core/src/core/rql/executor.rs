@@ -75,7 +75,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
         let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
 
-        let visibility = match table.visibility_for(tx) {
+        let visibility = match table.read_visibility_for(tx) {
             crate::core::mvcc::Visibility::All => crate::core::mvcc::Visibility::All,
             own => statement_snapshot.get_or_insert(own).clone(),
         };
