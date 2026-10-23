@@ -18,7 +18,10 @@ use dashmap::mapref::entry::Entry;
 use log::{error, info, warn};
 use rclite::Arc;
 
-use super::{Barrier, Database, SchemaChanged, forget_logged_ids, logs_holding, pool_mirrors, table_name_refusal};
+use super::{
+    Barrier, Database, ForgetFailure, SchemaChanged, forget_logged_ids, logs_holding, pool_mirrors,
+    table_name_refusal,
+};
 use crate::core::partition::files;
 use crate::core::partition::key::KeySpec;
 use crate::core::partition::route::Route;
@@ -41,6 +44,32 @@ pub(crate) struct NameClaim<'a> {
 impl Drop for NameClaim<'_> {
     fn drop(&mut self) {
         self.claims.remove(&self.name);
+    }
+}
+
+/// Why [`Database::discard_uid_files`] kept a uid's files: the barrier
+/// voiding their records failed (kept, since deleted with live records a
+/// replay would write them back), or deleting them did.
+enum DiscardFailure {
+    Void(ForgetFailure),
+    Delete(io::Error),
+}
+
+impl DiscardFailure {
+    fn into_error(self) -> io::Error {
+        match self {
+            DiscardFailure::Void(f) => f.error,
+            DiscardFailure::Delete(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for DiscardFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscardFailure::Void(v) => write!(f, "voiding their log records: {}", v.error),
+            DiscardFailure::Delete(e) => write!(f, "deleting them: {e}"),
+        }
     }
 }
 
@@ -267,6 +296,10 @@ impl Database {
         if let Some(reason) = table_name_refusal(name) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
+        // As a plain CREATE: kept files under the name still have live log
+        // records, and the next open settles them by the names the catalogue
+        // holds, this one included.
+        self.refuse_held_name(name)?;
         if let Some(reason) = self.table_files_conflict(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
         }
@@ -456,30 +489,39 @@ impl Database {
         Ok((io_schema, schema))
     }
 
-    /// Voids every log record for `uid`'s files, then deletes them. A void
-    /// that fails keeps the files: deleted with live records, a replay would
-    /// write them back as orphans. Either way nothing names the uid.
-    fn discard_uid_files(&self, root: &Path, uid: u64) -> io::Result<()> {
-        let names = uid_file_names(root, uid)?;
+    /// Voids every log record for `uid`'s files, then deletes them, the
+    /// deletions synced (`remove_all`). The void is the plain DROP's
+    /// ([`Database::forget_dropped_ids`]): the database's own log synced
+    /// first, so the catalogue change ahead of it is durable, then a barrier
+    /// in every log the root reaches, whose fence refuses any later record
+    /// from a writer that opened these files before it (a statement still
+    /// holding a partition). A void that fails keeps the files: deleted with
+    /// live records, a replay would write them back as orphans. Either way
+    /// nothing names the uid, and the startup reaper finishes the job.
+    fn discard_uid_files(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
+        let names = uid_file_names(root, uid).map_err(DiscardFailure::Delete)?;
         if names.is_empty() {
             return Ok(());
         }
-        let logs = logs_holding(&self.db_io_pointers, &self.storage, self.location.as_deref());
-        if !logs.is_empty() && !self.leads_with_own_log(&logs) {
-            self.sync_own_log()?;
-        }
         let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
-        forget_logged_ids(&logs, &ids, Barrier::Drop).map_err(|f| f.error)?;
-        files::remove_all(root, uid).map(|_| ())
+        self.forget_dropped_ids(&self.db_io_pointers, &ids).map_err(DiscardFailure::Void)?;
+        files::remove_all(root, uid).map(|_| ()).map_err(DiscardFailure::Delete)
     }
 
     /// DROP of a partitioned table (§12's DROP order): the catalogue
-    /// tombstone is the commit point; then both maps, `DROPPED`, and the
-    /// files, partitions first and parent files last. Works on a broken table.
-    /// `Ok(false)` when no partitioned table has the name (a concurrent DROP
-    /// won). A failure after the commit point is logged and leaves files with
-    /// no catalogue row, which the startup reaper deletes; the table is gone,
-    /// so the DROP reports success.
+    /// tombstone is the commit point; then both maps, `DROPPED`, the barrier
+    /// voiding the files' records, and the files, partitions first and parent
+    /// files last. Works on a broken table. `Ok(false)` when no partitioned
+    /// table has the name (a concurrent DROP won).
+    ///
+    /// A failure after the commit point leaves files with no catalogue row,
+    /// which the startup reaper voids and deletes; the table is gone, so the
+    /// DROP reports success, as a plain DROP whose barrier may be durable
+    /// does. Unless the database's own log is poisoned: then not even the
+    /// tombstone is known to be durable, and the DROP reports the error, as a
+    /// plain DROP does. Unlike a plain DROP it never puts the table back: by
+    /// then `DROPPED` is durable in its map log. A successor under the name
+    /// takes a new uid, so no record of these files can replay into it.
     pub(super) async fn drop_partitioned(&self, name: &str) -> io::Result<bool> {
         let _ddl = self.partition_ddl.lock().await;
         let _claim = self.claim_name(name)?;
@@ -494,24 +536,27 @@ impl Database {
         self.tables.remove_if(name, |_, t| Arc::ptr_eq(t, table.shell()));
 
         let uid = table.uid();
-        let kept = |what: &str, e: io::Error| {
+        let kept = |what: &str, e: &dyn std::fmt::Display| {
             error!(
                 "Dropped partitioned table {name} ({uid:016x}), but {what} failed, so its files were kept for \
                  the startup reaper: {e}"
             );
         };
+        let unconfirmed = |e: io::Error| -> io::Result<bool> {
+            if self.own_log_poisoned() { Err(e) } else { Ok(true) }
+        };
         if let Err(e) = table.mark_dropped().await {
-            kept("appending DROPPED to its map log", e);
-            return Ok(true);
+            kept("appending DROPPED to its map log", &e);
+            return unconfirmed(e);
         }
         match self.partition_root() {
             Ok(root) => {
-                if let Err(e) = self.discard_uid_files(&root, uid) {
-                    kept("deleting its files", e);
-                    return Ok(true);
+                if let Err(failure) = self.discard_uid_files(&root, uid) {
+                    kept("voiding its log records or deleting its files", &failure);
+                    return unconfirmed(failure.into_error());
                 }
             }
-            Err(e) => kept("finding its directory", e),
+            Err(e) => kept("finding its directory", &e),
         }
         info!("Dropped partitioned table {name} ({uid:016x})");
         Ok(true)

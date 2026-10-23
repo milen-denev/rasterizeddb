@@ -2054,6 +2054,17 @@ impl Database {
         io: &DbStorageProvider,
         table_name: &str,
     ) -> Result<(), ForgetFailure> {
+        let ids: Vec<u64> = table_file_names(table_name)
+            .map(|file| crate::core::wal::file_id_for_name(&file))
+            .collect();
+        self.forget_dropped_ids(io, &ids)
+    }
+
+    /// [`Self::forget_dropped_files`] for files named by their log ids: a
+    /// partitioned table's `__pt_<uid>_*` files, which no table name derives.
+    /// One order for both drops: the catalogue tombstone durable first, then
+    /// a [`Barrier::Drop`] barrier, in every log `io` reaches.
+    fn forget_dropped_ids(&self, io: &DbStorageProvider, ids: &[u64]) -> Result<(), ForgetFailure> {
         let logs = logs_holding(io, &self.storage, self.location.as_deref());
         if logs.is_empty() {
             return Ok(());
@@ -2064,7 +2075,7 @@ impl Database {
                 maybe_logged: false,
             })?;
         }
-        forget_logged_files(&logs, table_name, Barrier::Drop)
+        forget_logged_ids(&logs, ids, Barrier::Drop)
     }
 
     /// Whether the first of `logs` is the database's own log, whose barrier

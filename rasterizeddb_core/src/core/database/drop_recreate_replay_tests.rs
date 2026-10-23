@@ -489,7 +489,10 @@ impl Scenario {
         let mut out = Vec::new();
         for (seed, img) in images {
             let db = open(&img).await;
-            let seen = if db.tables.contains_key(table) {
+            let seen = if db.partitioned.contains_key(table) {
+                // Its `SELECT` is refused until S10: read through the API.
+                partitioned::labels_of(&db, table, candidates).await
+            } else if db.tables.contains_key(table) {
                 labels_of(&db, table, candidates).await
             } else {
                 vec![format!("<no table {table}>")]
@@ -2409,5 +2412,471 @@ mod pools {
     #[tokio::test(flavor = "current_thread")]
     async fn an_interrupted_rename_past_its_tombstone_forgets_the_old_names_placement() {
         interrupted_rename_forgets_the_discarded_placement(RenameStage::OldRowGone).await;
+    }
+}
+
+/// The same questions for a partitioned table (`docs/partitioning.md` §12):
+/// dropped and created again under its name, as a partitioned or a plain
+/// table, after a clean reopen and in every crash image, the new table holds
+/// only its own rows; and a transaction writing several partitions is whole
+/// in every crash image.
+///
+/// A partitioned table's files are `__pt_<uid>_*`, and a new table takes a new
+/// uid, so its files never share a log id with the dropped one's. What can
+/// still go wrong is the drop's own order: the barrier voiding the old
+/// files' records, the deletion and its directory sync, and late writes
+/// through a partition handle a statement still holds, which must be refused
+/// rather than replayed into anything.
+mod partitioned {
+    use super::*;
+    use crate::core::partition::Route;
+    use crate::core::partition::files::PREFIX;
+
+    const PARTITIONS: u32 = 8;
+
+    async fn create_partitioned(db: &Arc<Database>) -> u64 {
+        db.create_partitioned_table(create_statement(TABLE), &["id"], PARTITIONS)
+            .await
+            .unwrap_or_else(|e| panic!("creating partitioned {TABLE}: {e}"));
+        db.partitioned.get(TABLE).expect("partitioned").uid()
+    }
+
+    /// [`super::labels_of`] for a partitioned table, read through the API
+    /// (its `SELECT` is refused until S10): every stored label that is one of
+    /// `candidates`, as often as stored, and any other label too, marked, so
+    /// replayed garbage fails the comparison.
+    pub(super) async fn labels_of(db: &Arc<Database>, table: &str, candidates: &[String]) -> Vec<String> {
+        let pt = db.partitioned.get(table).expect("partitioned").value().clone();
+        let schema = pt.shell().schema.clone();
+        let label = schema.fields.iter().find(|f| f.name == "label").expect("a label column").clone();
+        let fetch = crate::core::rql::join::fetch_for(&[label], &schema.fields);
+        let empty = crate::core::rql::join::fetch_for(&[], &schema.fields);
+        let epoch = pt.epoch().expect("the table opens");
+        let mut seen = Vec::new();
+        for (pid, p) in pt.materialized(&epoch, &Route::All).expect("its partitions") {
+            let rows = p
+                .query_row("", &schema.fields.to_vec(), empty.clone(), fetch.clone(), None, None)
+                .await
+                .unwrap_or_else(|e| panic!("reading partition {pid}: {e}"));
+            for row in rows {
+                for c in row.columns.iter() {
+                    let text = String::from_utf8_lossy(c.data.into_slice()).into_owned();
+                    if candidates.contains(&text) {
+                        seen.push(text);
+                    } else {
+                        seen.push(format!("<unexpected {text:?}>"));
+                    }
+                }
+            }
+        }
+        seen.sort();
+        seen
+    }
+
+    /// A partitioned [`TABLE`] of `old` durable rows labelled `old_<n>`,
+    /// written through SQL.
+    async fn scenario(old: usize) -> (Scenario, u64) {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let watch = sync_audit::watch(&root);
+        let db = open(&root).await;
+        assert!(crate::core::wal::wal_for(&path_str(&root)).is_some(), "no log, nothing to replay");
+        let uid = create_partitioned(&db).await;
+        for n in 0..old {
+            insert(&db, n as i32, &format!("old_{n:02}")).await;
+        }
+        db.sync_durable().unwrap();
+        assert_eq!(labels_of(&db, TABLE, &names("old", old)).await, names("old", old));
+        let old_log = std::fs::read(root.join(DEFAULT_WAL_NAME)).unwrap();
+        let baseline = durable_baseline(&root);
+        let _ = watch.take_events();
+        (
+            Scenario {
+                base,
+                root,
+                db,
+                watch,
+                old_log,
+                baseline,
+            },
+            uid,
+        )
+    }
+
+    fn files_of_uid(dir: &Path, uid: u64) -> Vec<String> {
+        let prefix = format!("{PREFIX}{uid:016x}_");
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Any file in `dir` holding a late write's marker.
+    fn ghosts(dir: &Path) -> Vec<String> {
+        regular_files(dir)
+            .into_iter()
+            .filter(|p| std::fs::read(p).unwrap_or_default().windows(6).any(|w| w == b"GHOST-"))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `old_*` and `new_*` labels, sorted as the readers return them.
+    fn all(old: usize, new: usize) -> Vec<String> {
+        let mut out: Vec<String> = names("old", old).into_iter().chain(names("new", new)).collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recreated_partitioned_table_holds_only_its_rows_after_a_clean_reopen() {
+        let (sc, old_uid) = scenario(12).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap(), "the drop found no table");
+        assert_eq!(files_of_uid(&sc.root, old_uid), Vec::<String>::new(), "the dropped files are still there");
+        let new_uid = create_partitioned(&db).await;
+        assert_ne!(new_uid, old_uid);
+        insert(&db, 100, "new_00").await;
+        let candidates = all(12, 1);
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1), "the live table is wrong");
+        drop(db);
+
+        let (_base, root, db) = sc.reopen().await;
+        assert_eq!(
+            labels_of(&db, TABLE, &candidates).await,
+            names("new", 1),
+            "after a clean reopen the recreated partitioned table shows rows the dropped one held"
+        );
+        assert_eq!(db.partitioned.get(TABLE).map(|t| t.uid()), Some(new_uid));
+        assert_eq!(files_of_uid(&root, old_uid), Vec::<String>::new(), "the dropped files came back");
+        close(&root, db);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partitioned_table_recreated_twice_holds_only_the_last_rows_after_a_clean_reopen() {
+        let (sc, _) = scenario(10).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap());
+        create_partitioned(&db).await;
+        for n in 0..6 {
+            insert(&db, 50 + n, &format!("mid_{n:02}")).await;
+        }
+        assert!(db.drop_table(TABLE).await.unwrap());
+        create_partitioned(&db).await;
+        insert(&db, 100, "new_00").await;
+        let mut candidates = all(10, 1);
+        candidates.extend(names("mid", 6));
+        drop(db);
+
+        let (_base, root, db) = sc.reopen().await;
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1));
+        close(&root, db);
+    }
+
+    /// Dropped and created again under the same name, with fewer rows than the
+    /// old table had: the new table holds exactly its rows in every image.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recreated_partitioned_table_does_not_take_the_dropped_tables_rows() {
+        let (sc, _) = scenario(12).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap());
+        create_partitioned(&db).await;
+        insert(&db, 100, "new_00").await;
+        db.sync_durable().unwrap();
+        drop(db);
+        let seen = sc.crash_and_recover_all(TABLE, &all(12, 1)).await;
+        assert_every_seed(&seen, &names("new", 1), "after the crash the recreated table shows dropped rows");
+    }
+
+    /// Cut off right after the drop returns: the old uid's files are gone once
+    /// the image opens (deleted durably, or reaped as no table's), the name is
+    /// free, and a partitioned table created under it holds only its rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_partitioned_tables_files_stay_deleted_after_a_crash() {
+        let (sc, old_uid) = scenario(8).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap());
+        db.sync_durable().unwrap();
+        drop(db);
+        let candidates = all(8, 1);
+        for_each_image(sc, async |seed, db, img| {
+            assert_eq!(files_of_uid(img, old_uid), Vec::<String>::new(), "seed {seed}: the dropped files survived");
+            assert!(!db.tables.contains_key(TABLE) && !db.partitioned.contains_key(TABLE), "seed {seed}");
+            create_partitioned(db).await;
+            insert(db, 100, "new_00").await;
+            assert_eq!(labels_of(db, TABLE, &candidates).await, names("new", 1), "seed {seed}");
+        })
+        .await;
+    }
+
+    /// A plain table dropped and created again as a partitioned one, and the
+    /// reverse: each successor holds only its own rows in every image, and no
+    /// file under the logical name serves the partitioned one (I8).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_table_recreated_as_partitioned_holds_only_its_rows_after_a_crash() {
+        let sc = Scenario::new(12).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap());
+        create_partitioned(&db).await;
+        insert(&db, 100, "new_00").await;
+        db.sync_durable().unwrap();
+        drop(db);
+        let candidates = all(12, 1);
+        for_each_image(sc, async |seed, db, img| {
+            assert_eq!(leftovers(img, TABLE), Vec::<String>::new(), "seed {seed}: plain files under the name");
+            assert_eq!(labels_of(db, TABLE, &candidates).await, names("new", 1), "seed {seed}");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partitioned_table_recreated_as_plain_holds_only_its_rows_after_a_crash() {
+        let (sc, old_uid) = scenario(12).await;
+        let db = sc.db.clone();
+        assert!(db.drop_table(TABLE).await.unwrap());
+        db.add_table(create_statement(TABLE)).await.unwrap();
+        insert(&db, 100, "new_00").await;
+        db.sync_durable().unwrap();
+        drop(db);
+        let candidates = all(12, 1);
+        for_each_image(sc, async |seed, db, img| {
+            assert!(!db.partitioned.contains_key(TABLE), "seed {seed}: the partitioned table came back");
+            assert_eq!(files_of_uid(img, old_uid), Vec::<String>::new(), "seed {seed}");
+            assert_eq!(super::labels_of(db, TABLE, &candidates).await, names("new", 1), "seed {seed}");
+        })
+        .await;
+    }
+
+    /// A statement still holding a partition of the dropped table writes after
+    /// the drop, before and after the name is taken again: the log refuses
+    /// those records (the barrier's fence), so nothing replays them, and no
+    /// file anywhere holds them after a reopen or in any crash image.
+    async fn late_writes_through_a_dropped_partition() -> (Scenario, Vec<String>) {
+        use crate::core::storage_providers::traits::StorageIO;
+        let (sc, _) = scenario(6).await;
+        let db = sc.db.clone();
+        let held = {
+            let pt = db.partitioned.get(TABLE).unwrap().value().clone();
+            let epoch = pt.epoch().unwrap();
+            let (_, p) = pt.materialized(&epoch, &Route::All).unwrap().into_iter().next().expect("a partition");
+            p
+        };
+        assert!(db.drop_table(TABLE).await.unwrap());
+        held.io_rows().unwrap().append_data(b"GHOST-APPEND-BEFORE", true).await;
+        held.io_rows().unwrap().write_data(0, b"GHOST-INPLACE-BEFORE").await;
+        create_partitioned(&db).await;
+        insert(&db, 100, "new_00").await;
+        held.io_rows().unwrap().append_data(b"GHOST-APPEND-AFTER", true).await;
+        held.io_rows().unwrap().write_data(0, b"GHOST-INPLACE-AFTER").await;
+        drop(held);
+        insert(&db, 101, "new_01").await;
+        db.sync_durable().unwrap();
+        drop(db);
+        (sc, all(6, 2))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_partitions_late_writes_do_not_reach_anything_on_a_reopen() {
+        let (sc, candidates) = late_writes_through_a_dropped_partition().await;
+        let (_base, root, db) = sc.reopen().await;
+        assert_eq!(ghosts(&root), Vec::<String>::new(), "a late write replayed into a file");
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 2));
+        close(&root, db);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_partitions_late_writes_do_not_reach_anything_after_a_crash() {
+        let (sc, candidates) = late_writes_through_a_dropped_partition().await;
+        for_each_image(sc, async |seed, db, img| {
+            assert_eq!(ghosts(img), Vec::<String>::new(), "seed {seed}: a late write replayed into a file");
+            assert_eq!(labels_of(db, TABLE, &candidates).await, names("new", 2), "seed {seed}");
+        })
+        .await;
+    }
+
+    /// A name a rename still holds (its old files kept, their records live)
+    /// is refused to a partitioned CREATE as to a plain one, for that reason,
+    /// and is free once the next open has settled the rename; the partitioned
+    /// table created then holds only its own rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_name_is_refused_to_a_partitioned_create_until_the_next_open() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = open(&root).await;
+        db.add_table(create_statement(TABLE)).await.unwrap();
+        insert(&db, 1, "old_00").await;
+        crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.set(true));
+        db.rename_table(TABLE, "moved_away").await.unwrap();
+        let reached = !crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.replace(false));
+        assert!(reached, "the rename never logged a barrier");
+
+        let e = db
+            .create_partitioned_table(create_statement(TABLE), &["id"], PARTITIONS)
+            .await
+            .expect_err("a partitioned table was created under a held name");
+        assert!(e.to_string().contains("formerly named"), "refused for another reason: {e}");
+        assert!(!db.partitioned.contains_key(TABLE));
+        db.sync_durable().unwrap();
+        close(&root, db);
+
+        let db = open(&root).await;
+        create_partitioned(&db).await;
+        insert(&db, 100, "new_00").await;
+        assert_eq!(labels_of(&db, TABLE, &all(1, 1)).await, names("new", 1));
+        close(&root, db);
+    }
+
+    /// A rename interrupted with `stage` done, settled by the next open: the
+    /// name whose files it discarded is free for a partitioned CREATE, so its
+    /// placement went with them. `committed`: both catalogue rows were
+    /// written (the open finishes the rename and frees the old name); else
+    /// only the intent and the copy (it abandons the copy, freeing the new).
+    async fn interrupted_rename_frees_the_discarded_name(committed: bool) {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = open(&root).await;
+        db.add_table(create_statement("src_t")).await.unwrap();
+        insert_into(&db, "src_t", 1, "old_00").await;
+        db.record_rename_intent("src_t", TABLE).await.unwrap();
+        super::super::pool_rename(&db.storage, "src_t", TABLE);
+        db.copy_table_files("src_t", TABLE).await.unwrap();
+        if committed {
+            db.remember_in_catalogue(TABLE).await.unwrap();
+        }
+        db.sync_durable().unwrap();
+        close(&root, db);
+
+        let db = open(&root).await;
+        let freed = if committed { "src_t" } else { TABLE };
+        assert!(!db.tables.contains_key(freed), "{freed} is still a table");
+        let mut ct = create_statement(freed);
+        ct.table_name = freed.to_string();
+        db.create_partitioned_table(ct, &["id"], PARTITIONS)
+            .await
+            .unwrap_or_else(|e| panic!("the settled rename kept {freed} from a partitioned CREATE: {e}"));
+        close(&root, db);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_finished_interrupted_rename_frees_the_old_name() {
+        interrupted_rename_frees_the_discarded_name(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_interrupted_rename_frees_the_copys_name() {
+        interrupted_rename_frees_the_discarded_name(false).await;
+    }
+
+    /// A partitioned drop whose barrier cannot be logged is past its commit
+    /// point (the tombstone, then `DROPPED`), so the table stays dropped and
+    /// the DROP reports success, as a plain drop whose barrier may be durable
+    /// does: the database's own log is healthy. Its files are kept with their
+    /// records live, the name is free (a successor takes a new uid), and the
+    /// next start voids and deletes them. The successor holds only its rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partitioned_drop_that_cannot_void_the_log_is_finished_at_the_next_start() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = open(&root).await;
+        let old_uid = create_partitioned(&db).await;
+        for n in 0..4 {
+            insert(&db, n, &format!("old_{n:02}")).await;
+        }
+        let candidates = all(4, 1);
+
+        crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.set(true));
+        let dropped = db.drop_table(TABLE).await;
+        let reached = !crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.replace(false));
+        assert!(reached, "the drop never logged a barrier");
+        assert!(dropped.unwrap(), "the drop past its commit point reported failure");
+        assert!(!db.partitioned.contains_key(TABLE) && !db.tables.contains_key(TABLE));
+        assert!(!files_of_uid(&root, old_uid).is_empty(), "files with live records were deleted");
+
+        let new_uid = create_partitioned(&db).await;
+        assert_ne!(new_uid, old_uid, "the kept files' uid was reused");
+        insert(&db, 100, "new_00").await;
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1));
+        close(&root, db);
+
+        let db = open(&root).await;
+        assert_eq!(files_of_uid(&root, old_uid), Vec::<String>::new(), "the next start kept the dropped files");
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1), "the successor took dropped rows");
+        close(&root, db);
+        let db = open(&root).await;
+        assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1));
+        close(&root, db);
+    }
+
+    /// A partitioned drop whose barrier failed after reaching the log (its
+    /// sync failed, the database's own log is poisoned) reports the error, as
+    /// a plain drop does: not even the tombstone is known to be durable. The
+    /// table does not come back, and from both outcomes of a power cut (the
+    /// barrier lost, the barrier kept) a table created under the name holds
+    /// only its own rows, through a second restart too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partitioned_drop_whose_barrier_may_be_durable_reports_it() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let watch = sync_audit::watch(&root);
+        let db = open(&root).await;
+        let old_uid = create_partitioned(&db).await;
+        for n in 0..6 {
+            insert(&db, n, &format!("old_{n:02}")).await;
+        }
+        db.sync_durable().unwrap();
+
+        crate::core::wal::test_hooks::FAIL_BARRIER_SYNC.with(|f| f.set(true));
+        let dropped = db.drop_table(TABLE).await;
+        let reached = !crate::core::wal::test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false));
+        assert!(reached, "the drop never logged a barrier");
+        assert!(dropped.is_err(), "a drop whose catalogue log failed its sync reported success");
+        assert!(!db.partitioned.contains_key(TABLE) && !db.tables.contains_key(TABLE), "the table came back");
+
+        let events = watch.take_events();
+        drop(watch);
+        let wal_path = root.join(DEFAULT_WAL_NAME);
+        let current = std::fs::read(&wal_path).unwrap();
+        let synced = synced_log_len(&events, &wal_path, current.len());
+        assert!(synced < current.len(), "the barrier was synced, so nothing is undecided");
+        let mut images = Vec::new();
+        for (tag, cut) in [("lost", synced), ("kept", current.len())] {
+            let img = base.path().join(format!("img_{tag}"));
+            std::fs::create_dir_all(&img).unwrap();
+            for path in regular_files(&root) {
+                let name = path.file_name().unwrap();
+                if name == DEFAULT_WAL_NAME {
+                    std::fs::write(img.join(name), &current[..cut]).unwrap();
+                } else {
+                    std::fs::copy(&path, img.join(name)).unwrap();
+                }
+            }
+            images.push((tag, img));
+        }
+        close(&root, db);
+
+        let candidates = all(6, 1);
+        for (tag, img) in images {
+            let db = open(&img).await;
+            assert!(!db.partitioned.contains_key(TABLE), "barrier {tag}: the dropped table is back");
+            assert_eq!(files_of_uid(&img, old_uid), Vec::<String>::new(), "barrier {tag}: dropped files kept");
+            create_partitioned(&db).await;
+            insert(&db, 100, "new_00").await;
+            assert_eq!(labels_of(&db, TABLE, &candidates).await, names("new", 1), "barrier {tag}: live");
+            close(&img, db);
+            let db = open(&img).await;
+            assert_eq!(
+                labels_of(&db, TABLE, &candidates).await,
+                names("new", 1),
+                "barrier {tag}: a table created after the failed drop took the dropped rows"
+            );
+            close(&img, db);
+        }
     }
 }
