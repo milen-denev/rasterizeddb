@@ -4355,9 +4355,17 @@ mod tests {
         let out = exec_sql(&db, "VACUUM FULL s0;").await;
         assert_eq!(out[0], 0, "{}", String::from_utf8_lossy(&out[1..]));
         let seen = watch.take();
+        // The transaction status and id-reservation files belong to the
+        // database, not to any table: a reservation crossing a block during
+        // this window syncs them legitimately (7ae0f93), and counting them as
+        // another table's made the bound below fail under load.
         let data_syncs: Vec<_> = seen
             .iter()
             .filter(|(tag, _)| *tag == "wal.checkpoint.data_file")
+            .filter(|(_, p)| {
+                !p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("db_transactions"))
+            })
             .collect();
         eprintln!("{} registered; syncs by site: {:?}", registered, {
             let mut c = std::collections::BTreeMap::new();
