@@ -624,7 +624,10 @@ pub static GIN_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static PATH_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Of `GIN_LOOKUPS`, those answered as a bitmap (see [`dense_cap`]).
 pub static GIN_DENSE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Lookups a B-tree or hash index over columns (not a path) answered.
+/// Lookups a B-tree or hash index over columns (not a path) answered. Test
+/// builds only: it sits on every point lookup, and a process-wide counter
+/// nothing reads would be one contended cache line per lookup.
+#[cfg(test)]
 pub static KEY_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -633,10 +636,13 @@ thread_local! {
     pub(crate) static KEY_LOOKUPS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[inline(always)]
 fn count_key_lookup() {
-    KEY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]
-    KEY_LOOKUPS_HERE.with(|n| n.set(n.get() + 1));
+    {
+        KEY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        KEY_LOOKUPS_HERE.with(|n| n.set(n.get() + 1));
+    }
 }
 
 /// The slots in both sorted, distinct lists.

@@ -950,7 +950,12 @@ checkpoints on a threshold or request. Three paths break that trust:
   writes old-numbered planes as clean (N5).
 - **The checkpoint error bug:** the checkpoint writes through `write_data`,
   then clears `disk_dirty` and sets `has_checkpoint` whatever happened
-  (`filter/mod.rs:656-667`).
+  (`filter/mod.rs:656-667`). Fixed in phase 0 (`try_checkpoint`).
+
+Until v1 replaces it, the runtime checkpoint logs its whole base image as one
+WAL record, so a sidecar over the WAL's 256 MiB `MAX_RECORD_PAYLOAD`
+(`wal.rs:144`) fails every checkpoint and is rebuilt at each open. That limit
+predates phase 0; `.ixs` sections are not written through the WAL.
 
 v1 makes the filter an `.ixs` section under the one rule. It is written only
 at a clean point after seal and barrier, which closes (c) and (d)
