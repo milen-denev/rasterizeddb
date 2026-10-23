@@ -1,6 +1,6 @@
 //! The logical partitioned table (§1.1, §3, §4.3, §4.4): its map, one slot per
 //! partition, lazy materialization, routing, and the shared row-id source.
-//! Driven by Rust callers only; no SQL reaches it yet.
+//! SQL `INSERT` routes through it (S9); every other statement still refuses.
 //!
 //! # What it holds
 //!
@@ -22,8 +22,10 @@
 //! A partition's first write, inside its slot's `OnceCell` initialisation so
 //! one runs per pid: delete any leftover files and create the three files
 //! exclusively (one directory fsync); append `MATERIALIZE` with its WAL record
-//! issued at append time, in the root log the first row's outcome will follow;
-//! open the partition and register it for versioning; set the cell. Leftover
+//! issued at append time, in the root log the first row's outcome will follow,
+//! and sync that log (one fsync per partition, ever: otherwise a crash could
+//! keep the first rows' pages without the record, which the open refuses as
+//! unexplained data under a torn map); open the partition and register it for versioning; set the cell. Leftover
 //! files are never reused, and a file with no `MATERIALIZE` is never read.
 //! While the map log is torn, a non-empty leftover is refused instead, at
 //! open and at materialize: the lost tail may have been its `MATERIALIZE`.
@@ -712,7 +714,12 @@ impl PartitionedTable {
                 let mut state = live.state.lock().await;
                 let mut next = state.clone();
                 next.apply(&rec).map_err(invalid)?;
-                live.log.append(&rec).await?;
+                // Durable before any row reaches the partition's files, once
+                // per partition. Left to the rows' own sync, a crash could
+                // lose the record while writeback kept row pages in the new
+                // files, and with the map's tail torn the open refuses the
+                // whole table for unexplained data (`refuse_torn_leftovers`).
+                live.log.append_durable(&rec).await?;
                 *state = next;
             }
         }

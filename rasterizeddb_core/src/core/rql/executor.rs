@@ -6584,6 +6584,29 @@ fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result
     Ok(())
 }
 
+/// Refuses the `INSERT` clauses phase 2a does not route on a partitioned
+/// table (`docs/partitioning.md` §15, phase 2b): `ON CONFLICT` in either form
+/// and `RETURNING`. Checked before the statement does anything at all, so a
+/// refused multi-row or `INSERT … SELECT` statement writes no row and runs no
+/// source query. A plain table passes.
+fn refuse_partitioned_insert_clauses(
+    database: &Database,
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+) -> Result<(), String> {
+    let table = &row_data.table_name;
+    if !database.partitioned.contains_key(table) {
+        return Ok(());
+    }
+    let clause = if row_data.on_conflict_do_nothing || row_data.on_conflict_update.is_some() {
+        "INSERT … ON CONFLICT"
+    } else if crate::core::rql::lexer_ir::returning_split(&row_data.query).is_some() {
+        "INSERT … RETURNING"
+    } else {
+        return Ok(());
+    };
+    Err(format!("{clause} on partitioned table \"{table}\" is not supported yet"))
+}
+
 /// Whether `parent` names a partitioned table, compared as the database's
 /// own FK check compares it.
 fn is_partitioned_parent(database: &Database, parent: &str) -> bool {
@@ -7731,12 +7754,19 @@ fn condition_reads_a_null(
 /// Costs one scan of the table, and only on the first insert into it in this
 /// process, and only for a table that actually declares a serial column. A
 /// table with none returns before reading anything.
-async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
-    let table = {
-        let Some(entry) = database.tables.get(table_name) else {
-            return;
-        };
-        entry.value().clone()
+///
+/// A partitioned table's sequence is the logical table's, one for all its
+/// partitions (§10), so it is seeded from the maximum over every materialized
+/// partition; an unmaterialized one holds no row. Read through the shell, the
+/// scan failed and left the sequence unseeded, and a `SERIAL` restarted at 1
+/// after every restart: a silent duplicate on a column with no unique key.
+/// So a partitioned table that cannot be read is an error here, which the
+/// insert reports; a plain table's failure is only logged, as it always was.
+async fn seed_sequences(database: &Arc<Database>, table_name: &str) -> Result<(), String> {
+    let (table, partitioned) = match database.relation(table_name) {
+        Some(crate::core::database::Relation::Plain(table)) => (table, None),
+        Some(crate::core::database::Relation::Partitioned(pt)) => (pt.shell().clone(), Some(pt)),
+        None => return Ok(()),
     };
 
     // Which columns are serial, and which of their sequences still need a seed.
@@ -7755,7 +7785,7 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
         }
     }
     if wanted.is_empty() {
-        return;
+        return Ok(());
     }
 
     let schema = &table.schema.fields;
@@ -7763,6 +7793,32 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
         wanted.iter().map(|(_, f)| f.clone()).collect();
     let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
     let empty = crate::core::rql::join::fetch_for(&[], schema);
+    if let Some(pt) = partitioned {
+        let mut rows = Vec::new();
+        let partitions = pt
+            .epoch()
+            .and_then(|epoch| pt.materialized(&epoch, &crate::core::partition::Route::All))
+            .map_err(|e| format!("could not read '{}' to seed its sequences: {}", table_name, e))?;
+        for (pid, partition) in partitions {
+            let found = partition
+                .query_row("", &schema.to_vec(), empty.clone(), fetch.clone(), None, None)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not read partition {} of '{}' to seed its sequences: {}",
+                        pid, table_name, e
+                    )
+                })?;
+            rows.extend(found);
+        }
+        for (name, field) in wanted {
+            let last =
+                crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
+                    .unwrap_or(0);
+            crate::core::rql::sequence::seed(database.id, &name, last);
+        }
+        return Ok(());
+    }
     let rows = match table
         .query_row("", &schema.to_vec(), empty, fetch, None, None)
         .await
@@ -7777,7 +7833,7 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
                 table_name,
                 e
             );
-            return;
+            return Ok(());
         }
     };
 
@@ -7787,6 +7843,7 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
                 .unwrap_or(0);
         crate::core::rql::sequence::seed(database.id, &name, last);
     }
+    Ok(())
 }
 
 async fn existing_rows_break_unique(
@@ -11004,7 +11061,11 @@ pub(crate) async fn insert_loaded_row(
     sql: &str,
     tx: TxId,
 ) -> Option<()> {
-    Box::pin(seed_sequences(database, table_name)).await;
+    // A partitioned table takes the statement path, which routes the row.
+    if database.partitioned.contains_key(table_name) {
+        return None;
+    }
+    Box::pin(seed_sequences(database, table_name)).await.ok()?;
     let table = database.tables.get(table_name)?.value().clone();
     let schema = &table.schema;
     if !schema.json_columns.is_empty() {
@@ -11556,11 +11617,22 @@ pub(crate) async fn execute_with_need(
             response
         }
         QueryPurpose::InsertRow(row_data) => {
+            // A partitioned table refuses what phase 2a does not route yet
+            // before anything runs: the source of an `INSERT … SELECT`, a
+            // default's sequence, or the first row of a multi-row insert.
+            if let Err(e) = refuse_partitioned_insert_clauses(&database, row_data) {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
+
             // Before anything reads a default: a `SERIAL` column's counter is
             // in memory and a reopened database has not yet learned what the
             // table already holds. Returns immediately for a table with no
             // serial column, and after the first insert for one that has.
-            Box::pin(seed_sequences(&database, &row_data.table_name)).await;
+            if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name)).await {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
 
             // `INSERT INTO t VALUES (…)` names no columns, so the list is
             // supplied from the schema and the statement re-dispatched in the
@@ -11658,14 +11730,26 @@ pub(crate) async fn execute_with_need(
             // different place each run while every test in it passed alone.
             //
             // Cloning the `Arc` costs a refcount and owes nothing to the map.
-            let table = {
-                let Some(entry) = database.tables.get(table_name) else {
+            //
+            // A partitioned table's rows go to its partitions (§9), so `table`
+            // is then its shell: the schema every check below reads, never the
+            // writer. Resolved through `relation`, as a shell found in `tables`
+            // by name refuses every write.
+            let (table, partitioned) = match database.relation(table_name) {
+                Some(crate::core::database::Relation::Plain(table)) => (table, None),
+                Some(crate::core::database::Relation::Partitioned(pt)) => {
+                    if let Err(e) = pt.check() {
+                        error!("Cannot insert into {}: {}", table_name, e);
+                        return ddl_error(&e.to_string());
+                    }
+                    (pt.shell().clone(), Some(pt))
+                }
+                None => {
                     error!("Table not found");
                     let mut result = vec![3u8];
                     result.extend_from_slice("Table not found".as_bytes());
                     return result;
-                };
-                entry.value().clone()
+                }
             };
 
             let schema = &table.schema;
@@ -11834,7 +11918,15 @@ pub(crate) async fn execute_with_need(
                     }
                 });
 
-                let outcome = table.insert_row_in_txn(insert_row, tx).await;
+                // A partitioned table routes the final row, defaults and
+                // generated values included, to its partition, materializing
+                // it on first write; the partition's own unique check is exact
+                // because every unique key holds every key column (§1b). Boxed:
+                // routing adds a materialization to this arm's future.
+                let outcome = match &partitioned {
+                    Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
+                    None => table.insert_row_in_txn(insert_row, tx).await,
+                };
                 if outcome.is_ok() {
                     // Recorded here, with the statement as it actually ran: by
                     // this point a JSON rewrite has already happened and its

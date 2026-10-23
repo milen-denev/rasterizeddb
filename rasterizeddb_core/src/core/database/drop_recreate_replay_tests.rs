@@ -2879,4 +2879,94 @@ mod partitioned {
             close(&img, db);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // S9: one transaction across partitions is whole in every crash image.
+    // -----------------------------------------------------------------------
+
+    /// Six rows, one per id, inserted under one transaction id; the ids reach
+    /// several partitions.
+    async fn insert_in_one_transaction(db: &Arc<Database>) -> crate::core::mvcc::TxId {
+        let tx = db.transactions.begin();
+        for n in 0..6 {
+            let sql = format!("INSERT INTO {TABLE} (id, label) VALUES ({}, 'new_{n:02}')", 100 + n * 7);
+            let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql).unwrap();
+            let out = crate::core::rql::executor::execute_in_txn(purpose, db.clone(), tx).await;
+            assert!(!out.is_empty() && out[0] != 3, "{sql}: {}", String::from_utf8_lossy(&out));
+        }
+        let pt = db.partitioned.get(TABLE).unwrap().value().clone();
+        let epoch = pt.epoch().unwrap();
+        let reached: std::collections::BTreeSet<u32> = (0..6i32)
+            .map(|n| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&(100 + n * 7).to_le_bytes()[..]]).unwrap()))
+            .collect();
+        assert!(reached.len() > 1, "the transaction reaches one partition only: {reached:?}");
+        tx
+    }
+
+    /// Never committed: no image shows any of its rows, nor loses an old one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uncommitted_transaction_across_partitions_leaves_nothing_after_a_crash() {
+        let (sc, _) = scenario(4).await;
+        let db = sc.db.clone();
+        let _tx = insert_in_one_transaction(&db).await;
+        db.sync_durable().unwrap();
+        drop(db);
+        let seen = sc.crash_and_recover_all(TABLE, &all(4, 6)).await;
+        assert_every_seed(&seen, &names("old", 4), "an uncommitted transaction left rows");
+    }
+
+    /// Committed and synced: every image shows all of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committed_transaction_across_partitions_is_whole_after_a_crash() {
+        let (sc, _) = scenario(4).await;
+        let db = sc.db.clone();
+        let tx = insert_in_one_transaction(&db).await;
+        // As a COMMIT does: the rows on other locations, the commit, then the
+        // outcome record, which rides on the next sync of the log.
+        db.commit_written_transaction(tx).unwrap();
+        db.transactions.flush_deferred().unwrap();
+        db.sync_durable().unwrap();
+        drop(db);
+        let seen = sc.crash_and_recover_all(TABLE, &all(4, 6)).await;
+        assert_every_seed(&seen, &all(4, 6), "a committed transaction lost rows");
+    }
+
+    /// Cut off before anything synced the transaction: an image may keep it
+    /// or lose it, never part of it, and the table opens either way. With
+    /// `commit`, the commit and its outcome record were written (as under
+    /// `synchronous_commit = off`); without, the crash came mid-transaction.
+    ///
+    /// The transaction's first write materialized partitions. Had their
+    /// `MATERIALIZE` records waited on the log's next sync like the rows, an
+    /// image could lose them while the new partitions' files kept row pages
+    /// the kernel wrote back, and the open would refuse the whole table as a
+    /// torn map with unexplained data (`refuse_torn_leftovers`), until an
+    /// operator removed the evidence.
+    async fn unsynced_transaction_is_all_or_nothing(commit: bool) {
+        let (sc, _) = scenario(4).await;
+        let db = sc.db.clone();
+        let tx = insert_in_one_transaction(&db).await;
+        if commit {
+            db.commit_written_transaction(tx).unwrap();
+            db.transactions.flush_deferred().unwrap();
+        }
+        drop(db);
+        let seen = sc.crash_and_recover_all(TABLE, &all(4, 6)).await;
+        for (seed, labels) in seen {
+            assert!(
+                labels == names("old", 4) || labels == all(4, 6),
+                "seed {seed}: part of a transaction survived: {labels:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsynced_commit_across_partitions_is_all_or_nothing_after_a_crash() {
+        unsynced_transaction_is_all_or_nothing(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_mid_transaction_across_new_partitions_leaves_the_table_whole() {
+        unsynced_transaction_is_all_or_nothing(false).await;
+    }
 }

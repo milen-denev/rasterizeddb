@@ -440,20 +440,32 @@ sharding's cluster map reuses with records of its own
 | `HEADER` | `uid`, `route_v`, key `(write_order, family)` list, widths, co-location group | fsync |
 | `LOCATIONS` | interned location paths, so removing a location cannot shift indices | fsync |
 | `PLACE` | `[(pid, lo)]`: one record per `CREATE` or reshape. No location: an unwritten partition has none (§6.1). | fsync |
-| `MATERIALIZE` | `(pid, floor, loc_idx)`: the files exist at that location; the forget floor at that moment (§7.2) | WAL record at append; group commit |
+| `MATERIALIZE` | `(pid, floor, loc_idx)`: the files exist at that location; the forget floor at that moment (§7.2) | WAL record at append; fsync, once per partition |
 | `DIRTY` | `(pid, floor)`: a clean partition is about to take its first stamp (§7.2) | root log durable before the stamp |
 | `SWEPT` | `(pid, swept_to, clean)`, appended after the sweep's writes are durable | group commit |
 | `STATS` | `(pid, rows, bytes)`, after vacuum and on a close that wrote something | group commit |
 | `RESHAPE_BEGIN` / `_COMMIT` / `_ABORT` | sources and new entries, with targets' locations | fsync |
 | `RETIRED_GONE`, `DROPPED` | pids / none | group commit / fsync |
 
-**`MATERIALIZE` needs no fsync of its own.** Order: delete leftover
+**`MATERIALIZE` is fsynced, once per partition.** Order: delete leftover
 `__pt_<uid>_<pid>*` files (§12), create the files exclusively, fsync the
-directory once; append `MATERIALIZE` with its WAL record; write the first row;
-at commit, append its outcome to the same log. Replay stops at the first torn
-record, so a durable outcome implies a durable `MATERIALIZE` (consequences:
-§12). `bulk_load` takes no WAL records (`file_sync.rs:1523-1528`); there a load
-that dies is discarded whole, that mode's existing contract.
+directory once; append `MATERIALIZE` with its WAL record and sync the root log
+(`append_durable`); write the first row; at commit, append its outcome to the
+same log. Replay stops at the first torn record, so a durable outcome implies a
+durable `MATERIALIZE` (consequences: §12). `bulk_load` takes no WAL records
+(`file_sync.rs:1523-1528`); there a load that dies is discarded whole, that
+mode's existing contract.
+
+An earlier draft of this section left `MATERIALIZE` to group commit, reasoning
+from the outcome alone. That misses a crash before *anything* synced: the
+partition's files are written through the page cache, so writeback can keep the
+first rows' pages while the log loses the record. The map's tail is then torn
+and a new partition's files hold data no record explains, which the open must
+refuse rather than guess at (`refuse_torn_leftovers`, §12), so the whole table
+stays closed until an operator removes the evidence. The crash model in
+`drop_recreate_replay_tests` (a transaction across new partitions, cut off
+before any sync) hit that in 40 of 40 images. The price is one fsync per
+partition, ever: a partition materializes once.
 
 **Materializing cost is unmeasured.** `create_new` fsyncs the directory per
 file and per `.tmp` (`file_sync.rs:2077-2111`), `LocalStorageProvider::new`

@@ -12,10 +12,9 @@
 //! Each site names its expected outcome. "Like the twin" means the statement
 //! answers exactly what it answers on `site_q`, a plain table with the same
 //! columns, constraints and rows, or fails with the same SQLSTATE. The twin
-//! is given the rows the partitioned table accepts: none until S9 builds
-//! INSERT, after which the data-reading sites are compared with rows in
-//! them. A site that reads rows is `Refused` today; S10 and S11 move theirs
-//! to `LikeTwin`.
+//! is given the same rows (INSERT routes since S9), so the data-reading
+//! sites compare over rows. A site that reads rows is `Refused` today; S10
+//! and S11 move theirs to `LikeTwin`.
 
 mod partition_wire;
 
@@ -306,7 +305,13 @@ const SITES: &[Site] = &[
     site("SELECT COUNT(*) FROM site_p", Expect::Refused, "S10"),
     site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::Error("42601"), "F3; S10"),
     site("SELECT n FROM site_p UNION SELECT id FROM site_parent", Expect::Refused, "S10"),
-    site("INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1)", Expect::Refused, "S9"),
+    // A duplicate of a setup row: 23505 on both since S9.
+    site("INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1)", Expect::LikeTwin, "S9"),
+    in_block(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (9, 9, 9, 1), (8, 1, 1, 2)",
+        Expect::LikeTwin,
+        "S9: a routed multi-row insert, rolled back by the block",
+    ),
     site("INSERT INTO site_parent (id) SELECT asset_id FROM site_p", Expect::Refused, "S10"),
     site("UPDATE site_p SET n = 1 WHERE tenant_id = 1", Expect::Refused, "S11"),
     site("DELETE FROM site_p WHERE tenant_id = 1", Expect::Refused, "S11"),
@@ -405,15 +410,10 @@ fn every_site_is_correct_or_an_error() {
         c.ok(&format!("CREATE TABLE {TWIN} {DDL}"));
         c.ok("CREATE TABLE site_parent (id INT NOT NULL PRIMARY KEY)");
         c.ok("INSERT INTO site_parent (id) VALUES (1), (2), (3)");
-        // The same rows into both, as far as the partitioned table takes them.
+        // The same rows into both.
         for row in ["(1, 1, 1, 10, 'a')", "(1, 2, 2, 20, 'b')", "(2, 1, 3, NULL, NULL)", "(7, 3, 4, 40, 'd')"] {
-            let sql = format!("INSERT INTO {T} (tenant_id, asset_group_id, asset_id, n, label) VALUES {row}");
-            match c.simple(&sql) {
-                Ok(_) => {
-                    c.ok(&format!("INSERT INTO {TWIN} (tenant_id, asset_group_id, asset_id, n, label) VALUES {row}"));
-                }
-                Err(e) => assert!(e.is_unsupported(), "{sql}: {e}"),
-            }
+            c.ok(&format!("INSERT INTO {T} (tenant_id, asset_group_id, asset_id, n, label) VALUES {row}"));
+            c.ok(&format!("INSERT INTO {TWIN} (tenant_id, asset_group_id, asset_id, n, label) VALUES {row}"));
         }
     }
     let db = server.db.clone();
@@ -462,6 +462,8 @@ fn every_site_is_correct_or_an_error() {
         check_invariant(&rt, &db, dir.path(), &inv, site.sql);
     }
     assert!(wrong.is_empty(), "sites that answered wrongly:\n  {}", wrong.join("\n  "));
+    // What the LikeTwin writes stored is the twin's, row for row.
+    assert_eq!(stored_rows(&db, T), stored_rows(&db, TWIN), "the partitioned table stores other rows");
 
     // Across a restart (the startup path, `seed_sequences`, the reaper) the
     // partitioned table is the same one.
@@ -475,10 +477,10 @@ fn every_site_is_correct_or_an_error() {
     drop(server);
 }
 
-/// `seed_sequences` runs at startup over every table. On a shell it cannot
-/// read a maximum (plan §0.5); the table must still open as the partitioned
-/// table it is, and a SERIAL insert is refused, not numbered from 1, until S9
-/// fans the seeding out.
+/// `seed_sequences` on a partitioned table (plan fact 5): the sequence is
+/// the logical table's, seeded from every partition. Through the shell it
+/// read nothing, so the first insert after a restart took `id` 1 again; on
+/// this table, keyed and unique on `id`, that is a duplicate-key failure.
 #[test]
 fn a_serial_partitioned_table_survives_seed_sequences() {
     let dir = tempfile::tempdir().expect("dir");
@@ -486,14 +488,23 @@ fn a_serial_partitioned_table_survives_seed_sequences() {
     {
         let mut c = server.connect();
         c.ok("CREATE TABLE site_serial (id BIGSERIAL PRIMARY KEY, body TEXT) PARTITION BY HASH (id) PARTITIONS 4");
+        c.ok("INSERT INTO site_serial (body) VALUES ('a'), ('b')");
     }
     let uid = server.db.partitioned.get("site_serial").expect("partitioned").uid();
     server = server.restart();
     assert_eq!(server.db.partitioned.get("site_serial").map(|t| t.uid()), Some(uid));
     assert!(server.db.tables.get("site_serial").is_some_and(|t| t.io_rows().is_err()), "the shell");
     let mut c = server.connect();
-    let e = c.simple("INSERT INTO site_serial (body) VALUES ('x')").expect_err("S9 builds INSERT");
-    assert!(e.is_unsupported(), "{e}");
+    c.ok("INSERT INTO site_serial (body) VALUES ('c')");
+    let mut ids: Vec<i64> = stored_rows(&server.db, "site_serial")
+        .iter()
+        .map(|r| {
+            let id = &r.iter().find(|(n, _)| n == "id").expect("id").1;
+            i64::from_le_bytes(id.as_slice().try_into().unwrap())
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3]);
     assert_eq!(files_of_table(dir.path(), "site_serial"), Vec::<String>::new());
     drop(c);
     drop(server);

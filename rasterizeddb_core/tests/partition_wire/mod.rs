@@ -405,6 +405,52 @@ impl Client {
         self.until_ready()
     }
 
+    /// Parse a named statement with its parameter types given as OIDs.
+    pub fn prepare_typed(&mut self, name: &str, sql: &str, oids: &[u32]) -> Outcome {
+        let mut buf = Vec::new();
+        let mut parse = Vec::new();
+        cstr(&mut parse, name);
+        cstr(&mut parse, sql);
+        parse.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+        for oid in oids {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        frame(&mut buf, b'P', &parse);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// Bind `params` in the binary format (`None` is NULL) to a named
+    /// statement, execute the unnamed portal, sync.
+    pub fn execute_binary(&mut self, name: &str, params: &[Option<Vec<u8>>]) -> Outcome {
+        let mut buf = Vec::new();
+        let mut bind = Vec::new();
+        cstr(&mut bind, "");
+        cstr(&mut bind, name);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes()); // every parameter binary
+        bind.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for p in params {
+            match p {
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(v) => {
+                    bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(v);
+                }
+            }
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes()); // results all text
+        frame(&mut buf, b'B', &bind);
+        let mut execute = Vec::new();
+        cstr(&mut execute, "");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        frame(&mut buf, b'E', &execute);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
     /// Close a named statement.
     pub fn close_prepared(&mut self, name: &str) {
         let mut buf = Vec::new();
@@ -469,8 +515,7 @@ pub fn block_on_big<T: Send + 'static>(body: impl std::future::Future<Output = T
 
 /// Writes rows straight into a partitioned table's partitions, under the
 /// frozen transaction (visible to every snapshot), the way the catalog tests
-/// do: `INSERT` statements are refused until S9, and a twin whose two sides
-/// are both empty cannot tell an empty answer from a right one. `inserts`
+/// do, bypassing the SQL `INSERT` path (which routes since S9). `inserts`
 /// are whole `INSERT INTO <table> (…) VALUES (…)` statements, one row each.
 pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
     use rasterizeddb_core::core::mvcc::transaction::FROZEN_TX;
@@ -496,4 +541,122 @@ pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
             pt.insert_row_in_txn(row, FROZEN_TX).await.unwrap_or_else(|e| panic!("{query}: {e}"));
         }
     });
+}
+
+/// One stored row: each column's name and stored bytes, by name. NULL
+/// companions (`__null_<col>`) are columns like any other, so a NULL and a
+/// stored zero differ.
+pub type StoredRow = Vec<(String, Vec<u8>)>;
+
+/// Every row `table` stores, read through the engine's API rather than SQL,
+/// visible to a fresh snapshot, sorted: for a partitioned table every
+/// materialized partition's, for a plain table its own. What the twin
+/// compares while the partitioned side's `SELECT` is refused (until S10),
+/// so a write that answered like the twin's but stored something else, or
+/// stored it twice, still fails.
+pub fn stored_rows(db: &Arc<Database>, table: &str) -> Vec<StoredRow> {
+    let mut rows: Vec<StoredRow> =
+        stored_rows_by_partition(db, table).into_iter().flat_map(|(_, rows)| rows).collect();
+    rows.sort();
+    rows
+}
+
+/// [`stored_rows`] per partition, by pid (a plain table is one entry, pid 0).
+pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Vec<StoredRow>)> {
+    use rasterizeddb_core::core::partition::Route;
+    use rasterizeddb_core::core::row::row::schema_id_of;
+    use rasterizeddb_core::core::row::schema::SchemaField;
+    use rasterizeddb_core::core::rql::join::fetch_for;
+    let db = db.clone();
+    let table = table.to_string();
+    block_on_big(async move {
+        let (schema, parts) = match db.partitioned.get(&table).map(|t| t.value().clone()) {
+            Some(pt) => {
+                let epoch = pt.epoch().expect("the partitioned table opens");
+                let parts = pt.materialized(&epoch, &Route::All).expect("its partitions");
+                (pt.shell().schema.clone(), parts)
+            }
+            None => {
+                let t = db.tables.get(&table).unwrap_or_else(|| panic!("no table {table}")).value().clone();
+                (t.schema.clone(), vec![(0, t)])
+            }
+        };
+        let fields: Vec<SchemaField> = schema.fields.iter().filter(|f| !f.is_deleted).cloned().collect();
+        let fetch = fetch_for(&fields, &schema.fields);
+        let empty = fetch_for(&[], &schema.fields);
+        let mut out = Vec::new();
+        for (pid, t) in parts {
+            let rows = t
+                .query_row("", &schema.fields.to_vec(), empty.clone(), fetch.clone(), None, None)
+                .await
+                .unwrap_or_else(|e| panic!("reading {table} partition {pid}: {e}"));
+            let mut stored: Vec<StoredRow> = rows
+                .iter()
+                .map(|row| {
+                    let mut cols: StoredRow = row
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            let name = fields
+                                .iter()
+                                .find(|f| schema_id_of(f.write_order) == c.schema_id)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_else(|| format!("#{}", c.schema_id));
+                            (name, c.data.into_slice().to_vec())
+                        })
+                        .collect();
+                    cols.sort();
+                    cols
+                })
+                .collect();
+            stored.sort();
+            out.push((pid, stored));
+        }
+        out
+    })
+}
+
+/// Rows of a partitioned table stored in a partition whose `[lo, hi)` does
+/// not hold their point (I4), each described; empty when every row is home.
+/// The point is the key columns' stored bytes hashed with the table's key.
+pub fn misplaced_rows(db: &Arc<Database>, table: &str) -> Vec<String> {
+    use rasterizeddb_core::core::row::schema::SchemaField;
+    let pt = db.partitioned.get(table).expect("a partitioned table").value().clone();
+    let spec = pt.spec().expect("the table opens").clone();
+    let key_names: Vec<String> = spec
+        .levels()
+        .iter()
+        .map(|l| {
+            let f: &SchemaField = pt
+                .shell()
+                .schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.write_order as u32 == l.write_order)
+                .expect("a key column");
+            f.name.clone()
+        })
+        .collect();
+    let ranges: std::collections::HashMap<u32, (u64, u128)> = {
+        let pt = pt.clone();
+        block_on_big(async move { pt.partitions().await.expect("its partitions") })
+            .into_iter()
+            .map(|p| (p.pid, (p.lo, p.hi)))
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (pid, rows) in stored_rows_by_partition(db, table) {
+        let (lo, hi) = ranges[&pid];
+        for row in rows {
+            let key: Vec<&[u8]> = key_names
+                .iter()
+                .map(|k| row.iter().find(|(n, _)| n == k).map(|(_, b)| b.as_slice()).expect("a key value"))
+                .collect();
+            match spec.point_of(&key) {
+                Ok(point) if point >= lo && (point as u128) < hi => {}
+                other => wrong.push(format!("partition {pid} [{lo:#x}, {hi:#x}) holds {row:?} at {other:?}")),
+            }
+        }
+    }
+    wrong
 }

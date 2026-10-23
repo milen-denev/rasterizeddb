@@ -179,21 +179,9 @@ const fn refused(kind: Kind, lifted_by: &'static str) -> Refusal {
 /// A slice that builds a kind removes its entry; the twin then compares that
 /// kind's answers instead of demanding a refusal.
 const REFUSED: &[Refusal] = &[
-    // S9: routed INSERT.
-    refused(InsertOne, "S9"),
-    refused(InsertMulti, "S9"),
-    refused(InsertNulls, "S9"),
-    refused(InsertQuotedKey, "S9"),
-    Refusal {
-        kind: InsertSelect,
-        code: "0A000",
-        lifted_by: "S9",
-        or_like_twin: Some(
-            "F4: the refusal is per row, so an INSERT … SELECT whose SELECT finds nothing answers \
-             INSERT 0 0 instead of refusing",
-        ),
-    },
-    refused(PreparedInsert, "S9"),
+    // S9 (routed INSERT) is built: InsertOne, InsertMulti, InsertNulls,
+    // InsertQuotedKey, InsertSelect and PreparedInsert are compared with the
+    // twin, and so is what they store (`Twin::compare_storage`).
     // 2b: ON CONFLICT and RETURNING on partitioned tables (§15).
     refused(InsertOnConflictNothing, "phase 2b"),
     refused(InsertOnConflictUpdate, "phase 2b"),
@@ -868,6 +856,49 @@ struct Twin {
     uid: u64,
     log: Vec<String>,
     tally: BTreeMap<Kind, Tally>,
+    /// How many times [`Twin::compare_storage`] ran.
+    storage_checks: usize,
+}
+
+/// Kinds that can change what `{t}` stores: the storage comparison runs
+/// after each.
+fn writes_t(kind: Kind) -> bool {
+    matches!(
+        kind,
+        InsertOne
+            | InsertMulti
+            | InsertNulls
+            | InsertQuotedKey
+            | InsertSelect
+            | InsertOnConflictNothing
+            | InsertOnConflictUpdate
+            | InsertReturning
+            | UpdateByKey
+            | UpdateByPartitionKey
+            | UpdateByPrefix
+            | UpdateByNonKey
+            | UpdateRelocating
+            | UpdateKeySameValue
+            | UpdateKeyChange
+            | UpdateReturning
+            | UpdateFrom
+            | DeleteByKey
+            | DeleteByPrefix
+            | DeleteByNonKey
+            | DeleteIn
+            | DeleteReturning
+            | DeleteUsing
+            | EmptyRouteUpdateReturning
+            | EmptyRouteDeleteReturning
+            | PreparedInsert
+            | PreparedUpdate
+            | PreparedDelete
+            | Vacuum
+            | VacuumFull
+            | TxCommit
+            | TxRollback
+            | Restart
+    )
 }
 
 /// What an operation came to.
@@ -992,6 +1023,36 @@ impl Twin {
                 }
             },
         }
+    }
+
+    /// What both tables store, read through the API, must be the same rows,
+    /// and every partitioned row must sit in the partition owning its point
+    /// (I4). Until S10 the partitioned side's `SELECT` is refused, so this is
+    /// how a write that answered like the twin's but stored something else
+    /// (a lost row, a duplicate, a wrong value, a misrouted row) is caught.
+    fn compare_storage(&mut self, at: usize, kind: Kind) {
+        let db = self.server.as_ref().unwrap().db.clone();
+        let p = stored_rows(&db, PART);
+        let q = stored_rows(&db, PLAIN);
+        if p != q {
+            let only_p: Vec<_> = p.iter().filter(|r| !q.contains(r)).take(5).collect();
+            let only_q: Vec<_> = q.iter().filter(|r| !p.contains(r)).take(5).collect();
+            self.fail(
+                at,
+                kind,
+                format!(
+                    "the tables store different rows: partitioned {} rows, twin {}\n  only partitioned: {only_p:?}\n  \
+                     only twin: {only_q:?}",
+                    p.len(),
+                    q.len()
+                ),
+            );
+        }
+        let misplaced = misplaced_rows(&db, PART);
+        if !misplaced.is_empty() {
+            self.fail(at, kind, format!("rows outside their partition's range: {misplaced:?}"));
+        }
+        self.storage_checks += 1;
     }
 
     fn note(&mut self, kind: Kind, verdict: &Verdict) {
@@ -1154,10 +1215,9 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     for chunk in stage_rows.chunks(100) {
         setup.ok(&format!("INSERT INTO stage (tenant_id, grp, id, n, s, f) VALUES {}", chunk.join(", ")));
     }
-    // Both tables start with the same rows, the partitioned one's written
-    // under the SQL front door (see `seed_partitioned`), so that while reads
-    // are refused the catalogs still compare over real rows, and once a
-    // slice lifts a read an empty answer cannot pass for a right one. Every
+    // Both tables start with the same rows, written through SQL (routed
+    // INSERT, S9), so the catalogs compare over real rows and an empty
+    // answer cannot pass for a right one once a slice lifts a read. Every
     // tenant but one gets rows; `NEVER` gets none.
     let mut seed_rng = fastrand::Rng::with_seed(seed ^ 0xa5a5);
     let mut keys = BTreeSet::new();
@@ -1174,8 +1234,8 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         .collect();
     for sql in &inserts {
         setup.ok(&sql.replace(PART, PLAIN));
+        setup.ok(sql);
     }
-    seed_partitioned(&server.db, PART, inserts);
     drop(setup);
     let uid = server.db.partitioned.get(PART).expect("the partitioned table").uid();
 
@@ -1188,7 +1248,10 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         uid,
         log: Vec::new(),
         tally: BTreeMap::new(),
+        storage_checks: 0,
     };
+    // The seeded rows, before anything else runs.
+    twin.compare_storage(0, Restart);
     let mut generator = Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key };
 
     // First every kind once, in a seeded order; then weighted draws.
@@ -1220,6 +1283,9 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         };
         let op = generator.op(kind);
         twin.run(at, &op);
+        if writes_t(kind) {
+            twin.compare_storage(at, kind);
+        }
         assert!(
             started.elapsed() < Duration::from_secs(600),
             "{label} seed {seed:#x}: over the wall-clock cap at op {at}"
@@ -1228,6 +1294,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     // The last word: both tables in full.
     let last = generator.op(SelectAll);
     twin.run(ops, &last);
+    twin.compare_storage(ops, SelectAll);
 
     // Every kind was exercised, and every known divergence still diverges.
     for kind in ALL_KINDS {
@@ -1263,9 +1330,10 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         .map(|(k, t)| format!("{k:?}: refused {} agreed {} both-failed {} known-diverged {}", t.refused, t.agreed, t.both_failed, t.diverged_known))
         .collect();
     eprintln!(
-        "{label} seed {seed:#x}: {ops} ops in {:.1}s, {} bytes\n  {}",
+        "{label} seed {seed:#x}: {ops} ops in {:.1}s, {} bytes, {} storage comparisons\n  {}",
         started.elapsed().as_secs_f64(),
         bytes,
+        twin.storage_checks,
         summary.join("\n  ")
     );
     twin.cp = None;
