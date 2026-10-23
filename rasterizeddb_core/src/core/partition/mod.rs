@@ -4,8 +4,8 @@
 //!
 //! API summary:
 //!
-//! - [`xxh64::xxh64`]`(input, seed) -> u64`: in-tree XXH64, pinned to the C
-//!   reference.
+//! - [`crate::core::hash::xxh64`]`(input, seed) -> u64`: the engine's in-tree
+//!   XXH64, pinned to the C reference (it lived here as `partition::xxh64`).
 //! - [`key::family_of`]`(&DbType) -> Result<KeyFamily, String>`: the §1.4
 //!   allowlist (integer `0x01`, uuid `0x02`, text `0x03`), refusing all else
 //!   with its reason. It takes the declared type, never `physical()` or a
@@ -67,6 +67,8 @@
 
 pub mod files;
 pub mod guard;
+#[cfg(test)]
+mod hash_source_tests;
 pub mod key;
 pub mod log;
 pub mod map;

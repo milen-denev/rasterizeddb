@@ -149,10 +149,12 @@ point, 3 col = top48(H_0) << 16 | top8(H_1) << 8 | top8(H_2)
 - **XXH64 is in-tree**, about 80 lines, so no crate update can move data,
   pinned by reference vectors and framed golden vectors per family and level:
   `0`, `-1`, `i64::MIN`, `u64::MAX`, `''`, non-ASCII text, a fixed UUID. It is
-  `core/partition/xxh64.rs` today; persistent indexes move it to a neutral
-  `core/hash/xxh64.rs` (persistent-indexes §8, §15) so their gin item hash and
-  sharding's digests use it without depending on `core/partition`. The move
-  changes no output, and the same reference vectors (I1) pin it.
+  `core/hash/xxh64.rs` (persistent-indexes §8, §15), neutral ground so their
+  gin item hash and sharding's digests use it without depending on
+  `core/partition`; it started as `core/partition/xxh64.rs`, and the move
+  changed no output (the same reference vectors, I1, and the route_v1 golden
+  vectors pin it). `core/partition/hash_source_tests.rs` refuses any other
+  hash on the routing path, rapidhash included.
 - **Not ahash**, which `KeyLocks::stripe_of` (`core/row/key_locks.rs:53-62`)
   uses with `write_usize`: its output can change with crate version, target
   features and pointer width, harmless for lock stripes, catastrophic for
