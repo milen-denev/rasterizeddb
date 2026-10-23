@@ -365,7 +365,7 @@ async fn native_types_work_end_to_end_through_a_real_table() {
     assert_eq!(u64s(&rows, 0), (0..=4).collect::<Vec<_>>(), "timestamp range");
 
     // And the timestamp range must actually prune, not just answer correctly.
-    let filters = t.filters.as_ref().unwrap();
+    let filters = t.filters().unwrap().as_ref().unwrap();
     let p = sarg::extract(&tokenize(&format!("ts > {}", cut), &t.schema.fields), filters)
         .expect("timestamp range should be sargable");
     let bm = filters.evaluate(&p, n).expect("timestamp range should prune");

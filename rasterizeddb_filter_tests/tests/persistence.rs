@@ -420,7 +420,7 @@ async fn a_recreated_table_does_not_inherit_the_old_checkpoint() {
     {
         let t = open_table(dir.path(), "recreated", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
 
     // Truncate the pointer file to a third of its rows, leaving the sidecar
@@ -432,7 +432,7 @@ async fn a_recreated_table_does_not_inherit_the_old_checkpoint() {
     std::fs::write(&ptr, &bytes[..keep]).unwrap();
 
     let t = open_table(dir.path(), "recreated", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     let rows = run(&t, "").await;
     assert_eq!(rows.len(), keep / rec, "row count should match the truncated file");
@@ -501,16 +501,16 @@ fn every_id_survives(bytes: &[u8], fields: &SmallVec<[SchemaField; 20]>, n: u64)
 async fn a_second_checkpoint_appends_instead_of_rewriting() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_append").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 8000).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     let base_len = f.sidecar_len();
     assert_eq!(f.deltas_since_base(), 0, "the first write is a base image");
     assert!(base_len > 0);
 
     append_rows(&t, 8000, 8600).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     assert_eq!(f.deltas_since_base(), 1, "the second write should be a delta");
 
     let grew = f.sidecar_len() - base_len;
@@ -528,13 +528,13 @@ async fn a_second_checkpoint_appends_instead_of_rewriting() {
 async fn a_chain_of_deltas_replays_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_chain").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     for round in 0..6u64 {
         append_rows(&t, 6000 + round * 600, 6600 + round * 600).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
     assert_eq!(f.deltas_since_base(), 6, "each round should have appended");
 
@@ -549,14 +549,14 @@ async fn a_torn_delta_falls_back_to_the_state_before_it() {
     // were appended after it — so it must load, not be rejected.
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_torn").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     let after_base = f.sidecar_len();
 
     append_rows(&t, 6000, 6600).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     let full = sidecar_bytes(dir.path(), "inc_torn");
     let after_delta = f.sidecar_len() as usize;
 
@@ -589,10 +589,10 @@ async fn garbage_after_the_base_stops_the_replay() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_garbage").await;
     append_rows(&t, 0, 4000).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
 
     let mut bytes = sidecar_bytes(dir.path(), "inc_garbage");
-    let base_len = t.filters.as_ref().unwrap().sidecar_len() as usize;
+    let base_len = t.filters().unwrap().as_ref().unwrap().sidecar_len() as usize;
     bytes.truncate(base_len);
     for _ in 0..4096 {
         bytes.push(fastrand::u8(..));
@@ -617,19 +617,19 @@ async fn a_delete_rewrites_the_base_rather_than_appending() {
     // same and leaves nothing to replay.
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_delete").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     assert_eq!(f.deltas_since_base(), 0);
 
     append_rows(&t, 6000, 6100).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     assert_eq!(f.deltas_since_base(), 1, "an append is a delta");
 
     // Touching slot 3 drags the re-send point back to the first zone.
     f.on_delete(proof, 3);
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     assert_eq!(f.deltas_since_base(), 0, "a low-slot write forces a base rewrite");
 
     let bytes = sidecar_bytes(dir.path(), "inc_delete");

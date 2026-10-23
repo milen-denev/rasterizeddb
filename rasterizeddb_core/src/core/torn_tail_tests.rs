@@ -644,7 +644,7 @@ async fn a_shrink_in_place_lowers_the_floor_first() {
         crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap())
     };
     assert_eq!(floor(&db), 10 * stride);
-    let io = db.tables.get("t").unwrap().io_pointers.clone();
+    let io = db.tables.get("t").unwrap().io_pointers().unwrap().clone();
     crate::core::storage_providers::traits::StorageIO::truncate(&*io, 4 * stride).await.unwrap();
     assert_eq!(floor(&db), 4 * stride, "the shrink left the floor above the file");
     // And on disk, where the next open reads it.

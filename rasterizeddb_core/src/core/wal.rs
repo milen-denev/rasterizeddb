@@ -4061,12 +4061,12 @@ mod tests {
         use crate::core::row::row_pointer::RowPointerIterator;
         let dir = temp_dir();
         let (t, wal) = logged_table(dir.path(), 4).await;
-        let mut it = RowPointerIterator::new(t.io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(t.io_pointers().unwrap().clone()).await.unwrap();
         let (pos, mut pointer) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
 
         test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
         let outcome = pointer
-            .delete(t.io_pointers.clone(), pos, None, crate::core::mvcc::transaction::FROZEN_TX)
+            .delete(t.io_pointers().unwrap().clone(), pos, None, crate::core::mvcc::transaction::FROZEN_TX)
             .await;
         test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
         assert!(outcome.is_err(), "the injected commit failure was swallowed");
@@ -4082,7 +4082,7 @@ mod tests {
         use crate::core::row::row_pointer::RowPointerIterator;
         let dir = temp_dir();
         let (t, wal) = logged_table(dir.path(), 4).await;
-        let mut it = RowPointerIterator::new(t.io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(t.io_pointers().unwrap().clone()).await.unwrap();
         let (pos, mut pointer) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
         // Same length, outside any transaction: the in-place path.
         let mut rw = RowWrite { columns_writing_data: smallvec::SmallVec::new() };
@@ -4099,11 +4099,11 @@ mod tests {
         test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
         let outcome = pointer
             .update_with_pointer_record_pos(
-                t.io_pointers.clone(),
-                t.io_rows.clone(),
+                t.io_pointers().unwrap().clone(),
+                t.io_rows().unwrap().clone(),
                 pos,
-                &t.last_row_id,
-                &t.len,
+                t.last_row_id().unwrap(),
+                &t.data().unwrap().len,
                 #[cfg(feature = "enable_long_row")]
                 0,
                 &rw,
@@ -4587,7 +4587,7 @@ mod tests {
         assert_eq!((notices[0].severity, notices[0].sqlstate), ("WARNING", "01000"));
         assert!(notices[0].message.contains("could not return the space"), "{:?}", notices[0]);
         let table = db.tables.get("t").unwrap().value().clone();
-        assert_eq!(table.vacuum_stats().full_untruncated.load(Ordering::Relaxed), 1);
+        assert_eq!(table.vacuum_stats().unwrap().full_untruncated.load(Ordering::Relaxed), 1);
         // The data is intact.
         let rows = exec_sql(&db, "SELECT id FROM t WHERE id > 0").await;
         assert_eq!(crate::core::row::row::vec_into_rows(&rows[1..]).unwrap().len(), 20);
@@ -4601,7 +4601,7 @@ mod tests {
         })
         .await;
         assert!(notices.is_empty(), "{notices:?}");
-        assert_eq!(table.vacuum_stats().full_untruncated.load(Ordering::Relaxed), 1);
+        assert_eq!(table.vacuum_stats().unwrap().full_untruncated.load(Ordering::Relaxed), 1);
     }
 
     /// A checkpoint syncs the files the log's records describe, not every

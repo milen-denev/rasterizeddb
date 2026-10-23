@@ -145,7 +145,7 @@ fn ids_of(rows: &[Row]) -> Vec<u64> {
 #[tokio::test(flavor = "multi_thread")]
 async fn point_lookup_returns_exactly_the_match() {
     let (_dir, table) = build_table("flt_point").await;
-    assert!(table.filters.is_some(), "filters should be active");
+    assert!(table.data().unwrap().filters.is_some(), "filters should be active");
 
     for target in [0u64, 1, 511, 512, 1234, N - 1] {
         let rows = run(&table, &format!("id = {}", target)).await;
@@ -271,7 +271,7 @@ async fn updates_are_reflected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn filter_actually_prunes() {
     let (_dir, table) = build_table("flt_prune").await;
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
 
     // A unique-column point lookup should leave a tiny candidate set.
     let program = super::sarg::extract(
@@ -295,7 +295,7 @@ async fn filter_actually_prunes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_indexes_preexisting_rows() {
     let (_dir, table) = build_table("flt_backfill").await;
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
     assert!(filters.is_complete());
 
     // Re-running a backfill over an already-complete filter must be a no-op
@@ -319,12 +319,12 @@ async fn reopen_reuses_the_checkpoint() {
     {
         let table = open_table(dir.path(), "flt_reopen").await;
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
     }
 
     let table = open_table(dir.path(), "flt_reopen").await;
-    table.wait_filters_ready().await;
-    let filters = table.filters.as_ref().expect("filters should be active");
+    table.wait_filters_ready().await.unwrap();
+    let filters = table.data().unwrap().filters.as_ref().expect("filters should be active");
 
     // The checkpoint covered every row, so nothing needed rescanning.
     assert_eq!(
@@ -347,9 +347,9 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_delta").await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
 
         // Rows appended with no checkpoint after them: the sidecar knows
         // nothing about these.
@@ -370,7 +370,7 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
 
     // Open runs a delta backfill from the checkpoint frontier.
     let table = open_table(dir.path(), "flt_delta").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     for target in [5u64, N - 1, N, N + 150, N + 299] {
         let rows = run(&table, &format!("id = {}", target)).await;
         assert_eq!(
@@ -389,9 +389,9 @@ async fn reopen_after_delete_is_still_correct() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_reopen_del").await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
         // A delete marks the sidecar dirty; delete_rows re-checkpoints after.
         table
             .delete_rows("id = 1234", full_fetch(&table.schema.fields), None)
@@ -400,7 +400,7 @@ async fn reopen_after_delete_is_still_correct() {
     }
 
     let table = open_table(dir.path(), "flt_reopen_del").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     let rows = run(&table, "id = 1234").await;
     assert!(rows.is_empty(), "deleted row reappeared after reopen");
 
@@ -419,9 +419,9 @@ async fn reopen_after_update_finds_the_new_value() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_reopen_upd").await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
 
         let updates: SmallVec<[ColumnWritePayload; 32]> =
             smallvec::smallvec![payload(&424242u64.to_le_bytes(), 0, DbType::U64)];
@@ -432,7 +432,7 @@ async fn reopen_after_update_finds_the_new_value() {
     }
 
     let table = open_table(dir.path(), "flt_reopen_upd").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     let rows = run(&table, "id = 424242").await;
     assert_eq!(rows.len(), 1, "updated value not findable after reopen");
     let rows = run(&table, "id = 900").await;
@@ -444,9 +444,9 @@ async fn corrupt_sidecar_falls_back_to_a_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_corrupt").await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
     }
 
     // Scribble over the magic. A rejected sidecar must cost a rebuild, never
@@ -458,7 +458,7 @@ async fn corrupt_sidecar_falls_back_to_a_rebuild() {
     std::fs::write(&path, &bytes).unwrap();
 
     let table = open_table(dir.path(), "flt_corrupt").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     for target in [0u64, 1234, N - 1] {
         let rows = run(&table, &format!("id = {}", target)).await;
         assert_eq!(
@@ -544,18 +544,18 @@ async fn range_prunes_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_range_reopen").await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await;
+        table.checkpoint_filters().await.unwrap();
     }
 
     let table = open_table(dir.path(), "flt_range_reopen").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     let rows = run(&table, "id > 1990").await;
     assert_eq!(ids_of(&rows), (1991..N).collect::<Vec<_>>());
 
     // Bounds must have survived the checkpoint, not just the fingerprints.
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
     let program = super::sarg::extract(
         &crate::core::tokenizer::query_tokenizer::tokenize("id > 1990", &table.schema.fields),
         filters,
@@ -626,7 +626,7 @@ async fn or_mixing_ranges_and_equality_is_exact() {
 #[tokio::test(flavor = "multi_thread")]
 async fn or_still_prunes() {
     let (_dir, table) = build_table("flt_or_prune").await;
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
 
     let program = super::sarg::extract(
         &crate::core::tokenizer::query_tokenizer::tokenize(
@@ -661,7 +661,7 @@ async fn mutation_marks_the_sidecar_dirty_on_disk() {
 
     let table = open_table(dir.path(), "flt_dirty").await;
     fill(&table).await;
-    table.checkpoint_filters().await;
+    table.checkpoint_filters().await.unwrap();
     assert_eq!(
         std::fs::read(&path).unwrap()[13],
         0,
@@ -712,7 +712,7 @@ async fn maintenance_runs_without_any_explicit_checkpoint() {
     }
 
     let table = open_table(dir.path(), "flt_svc").await;
-    table.wait_filters_ready().await;
+    table.wait_filters_ready().await.unwrap();
     let rows = run(&table, "id = 42").await;
     assert!(rows.is_empty(), "deleted row came back");
     let rows = run(&table, "id = 43").await;
@@ -743,7 +743,7 @@ async fn in_lists_are_exact_and_filtered() {
 
     // The desugared form is `(id = 5 OR id = 9 OR id = 1999)`; parenthesised, so
     // it used to be refused outright and scanned in full.
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
     let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(
         "id IN (5, 9, 1999)",
         &table.schema.fields,
@@ -778,7 +778,7 @@ async fn between_is_exact_and_filtered() {
 
     // Desugars to `(id >= lo AND id <= hi)` — two range predicates the zone
     // bounds can act on.
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
     let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(
         "id BETWEEN 10 AND 20",
         &table.schema.fields,
@@ -866,7 +866,7 @@ async fn not_in_declines_rather_than_narrowing() {
     // The soundness point, asserted on the mask itself rather than only on the
     // result set: a conjunction of inequalities must yield no program at all.
     let (_dir, table) = build_table("flt_notin_mask").await;
-    let filters = table.filters.as_ref().unwrap();
+    let filters = table.data().unwrap().filters.as_ref().unwrap();
 
     let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(
         "id NOT IN (5, 9)",

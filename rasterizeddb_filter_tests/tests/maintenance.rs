@@ -22,8 +22,8 @@ async fn a_fresh_table_is_ready_immediately() {
     // Nothing predates the filter, so there is nothing to backfill.
     let dir = tempfile::tempdir().unwrap();
     let t = open_table(dir.path(), "mnt_fresh", &std_columns()).await;
-    assert!(t.filters_ready(), "a fresh table should need no backfill");
-    assert!(t.filters.as_ref().unwrap().is_complete());
+    assert!(t.filters_ready().unwrap(), "a fresh table should need no backfill");
+    assert!(t.filters().unwrap().as_ref().unwrap().is_complete());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -52,8 +52,8 @@ async fn queries_are_correct_before_the_backfill_finishes() {
     assert_eq!(u64s(&run(&t, "id = 1999").await, 0), vec![1999]);
 
     // After readiness — same answers, now narrowed.
-    t.wait_filters_ready().await;
-    assert!(t.filters.as_ref().unwrap().is_complete());
+    t.wait_filters_ready().await.unwrap();
+    assert!(t.filters().unwrap().as_ref().unwrap().is_complete());
     assert_eq!(u64s(&run(&t, "id = 1234").await, 0), vec![1234]);
     assert_eq!(run(&t, "").await.len() as u64, N);
 }
@@ -90,7 +90,7 @@ async fn the_service_checkpoints_without_being_asked() {
     }
 
     let t = open_table(dir.path(), "mnt_service", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert!(run(&t, "id = 42").await.is_empty(), "deleted row came back");
     assert_eq!(u64s(&run(&t, "id = 43").await, 0), vec![43]);
 }
@@ -124,15 +124,15 @@ async fn a_checkpoint_taken_during_writes_is_still_loadable() {
         // Checkpoint repeatedly while the writer runs. A checkpoint may cover
         // fewer slots than exist, but must never be unloadable.
         for _ in 0..6 {
-            t.checkpoint_filters().await;
+            t.checkpoint_filters().await.unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         writer.await.unwrap();
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
 
     let t = open_table(dir.path(), "mnt_concurrent_cp", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert_eq!(run(&t, "").await.len() as u64, N + 600);
     for target in [0u64, N - 1, N, N + 599] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
@@ -147,7 +147,7 @@ async fn a_checkpoint_covering_fewer_slots_than_exist_is_safe() {
     {
         let t = open_table(dir.path(), "mnt_partial", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         for i in N..N + 900 {
             let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
             rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
@@ -162,7 +162,7 @@ async fn a_checkpoint_covering_fewer_slots_than_exist_is_safe() {
     }
 
     let t = open_table(dir.path(), "mnt_partial", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     for target in [0u64, N - 1, N, N + 450, N + 899] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
     }
@@ -227,7 +227,7 @@ async fn dropping_a_table_stops_its_maintenance_task() {
         {
             let t = open_table(dir.path(), "mnt_drop", &std_columns()).await;
             fill_std(&t).await;
-            t.checkpoint_filters().await;
+            t.checkpoint_filters().await.unwrap();
             assert_eq!(run(&t, "id = 5").await.len(), 1, "round {}", round);
         }
         // The table is gone; give any surviving task a chance to misbehave.
@@ -245,7 +245,7 @@ async fn an_explicit_checkpoint_is_idempotent_and_stays_loadable() {
 
     let mut sizes = Vec::new();
     for _ in 0..5 {
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         sizes.push(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
     }
     assert!(sizes.windows(2).all(|w| w[0] == w[1]), "checkpoint size drifted: {:?}", sizes);

@@ -24,7 +24,7 @@ async fn no_filters_are_built_at_all() {
     disable();
     let (_d, t) = std_table("dis_none").await;
     assert!(
-        t.filters.is_none(),
+        t.filters().unwrap().is_none(),
         "FILTER_ENABLED = false must build no filter catalog"
     );
 }
@@ -126,7 +126,7 @@ async fn no_sidecar_is_written_when_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let t = open_table(dir.path(), "dis_sidecar", &std_columns()).await;
     fill_std(&t).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
 
     let path = dir.path().join("dis_sidecar_flt.db");
     let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -142,8 +142,8 @@ async fn reopening_without_filters_is_correct() {
         fill_std(&t).await;
     }
     let t = open_table(dir.path(), "dis_reopen", &std_columns()).await;
-    t.wait_filters_ready().await;
-    assert!(t.filters.is_none());
+    t.wait_filters_ready().await.unwrap();
+    assert!(t.filters().unwrap().is_none());
     for target in [0u64, 1234, N - 1] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
     }

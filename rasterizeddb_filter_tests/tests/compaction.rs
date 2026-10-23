@@ -214,7 +214,7 @@ async fn a_checkpoint_from_before_compaction_is_rejected_on_reopen() {
     {
         let t = open_table(dir.path(), "cmp_stale_cp", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
 
         for id in (0..N).filter(|i| i % 4 == 3) {
             t.delete_rows(&format!("id = {}", id), full_fetch(&t.schema.fields), None)
@@ -225,7 +225,7 @@ async fn a_checkpoint_from_before_compaction_is_rejected_on_reopen() {
     }
 
     let t = open_table(dir.path(), "cmp_stale_cp", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     let survivors: Vec<u64> = (0..N).filter(|i| i % 4 != 3).collect();
     assert_eq!(run(&t, "").await.len(), survivors.len());
@@ -256,8 +256,8 @@ async fn compaction_leaves_the_filter_complete_and_checkpointed() {
     }
     t.compact().await.unwrap();
 
-    assert!(t.filters_ready(), "compaction must leave the filter ready");
-    let f = t.filters.as_ref().expect("filters active");
+    assert!(t.filters_ready().unwrap(), "compaction must leave the filter ready");
+    let f = t.filters().unwrap().as_ref().expect("filters active");
     assert!(f.is_complete(), "compaction must leave no unindexed prefix");
 
     // The rebuilt catalog still prunes, rather than degrading to all-candidates.

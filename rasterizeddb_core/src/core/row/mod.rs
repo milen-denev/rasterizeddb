@@ -10,3 +10,5 @@ pub mod schema;
 pub mod table;
 #[cfg(test)]
 mod write_path_tests;
+#[cfg(test)]
+mod seam_tests;

@@ -522,13 +522,14 @@ async fn apply(db: &Arc<Database>, stmt: &Stmt) -> Result<(), String> {
 /// Every row a fresh snapshot sees, under its key in every index (or
 /// unkeyed), and found by a gin lookup of its own document.
 async fn containment(t: &Table<DbStorageProvider>) -> Result<Vec<String>, String> {
-    let Some(ix) = t.indexes.as_ref() else {
+    let d = t.data().map_err(|e| e.to_string())?;
+    let Some(ix) = d.indexes.as_ref() else {
         return Err("the table has no indexes".into());
     };
-    let _read = t.readers.enter();
+    let _read = d.readers.enter();
     let visibility = t.visibility_for(FROZEN_TX);
     let fetch = Table::<DbStorageProvider>::build_fetch_for(&t.schema.fields, &ix.columns());
-    let mut it = RowPointerIterator::new(t.io_pointers.clone()).await.map_err(|e| format!("{e:?}"))?;
+    let mut it = RowPointerIterator::new(d.io_pointers.clone()).await.map_err(|e| format!("{e:?}"))?;
     let mut row = Row::default();
     let mut problems = Vec::new();
     let mut seen = 0usize;
@@ -537,7 +538,7 @@ async fn containment(t: &Table<DbStorageProvider>) -> Result<Vec<String>, String
             continue;
         }
         let slot = offset / ROW_POINTER_RECORD_LEN as u64;
-        if pointer.fetch_row_reuse_async(&*t.io_rows, &fetch, &mut row).await.is_err() {
+        if pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await.is_err() {
             problems.push(format!("visible slot {slot} could not be read"));
             continue;
         }
@@ -575,7 +576,7 @@ async fn check(db: &Arc<Database>, w: &Workload, label: &str, states: &[&Expect]
         return 0;
     };
     let start = std::time::Instant::now();
-    while !t.indexes.as_ref().is_some_and(|i| i.is_ready()) {
+    while !t.data().is_ok_and(|d| d.indexes.as_ref().is_some_and(|i| i.is_ready())) {
         if start.elapsed() > READY_TIMEOUT {
             problems.push(format!("{label}: the indexes never became ready"));
             return 0;
@@ -614,7 +615,7 @@ async fn check(db: &Arc<Database>, w: &Workload, label: &str, states: &[&Expect]
             Ok(got) => problems.push(format!("{label}: WHERE {p}: indexed {got:?}, twin {want:?}")),
             Err(e) => problems.push(format!("{label}: WHERE {p}: {e}")),
         }
-        if t.build_candidates(p, None).await.is_some_and(|c| !c.is_nothing()) {
+        if t.build_candidates(p, None).await.ok().flatten().is_some_and(|c| !c.is_nothing()) {
             narrowed += 1;
         }
     }
@@ -1009,7 +1010,7 @@ fn highest_with_outcome(status: &Path) -> u64 {
 /// are skipped; nothing here vacuums.)
 async fn stamped(db: &Arc<Database>) -> Result<Vec<(u64, u64, u64)>, String> {
     let t = db.tables.get(TABLE).map(|t| t.clone()).ok_or("the table is gone")?;
-    let mut it = RowPointerIterator::new(t.io_pointers.clone()).await.map_err(|e| format!("{e:?}"))?;
+    let mut it = RowPointerIterator::new(t.io_pointers().map_err(|e| format!("{e:?}"))?.clone()).await.map_err(|e| format!("{e:?}"))?;
     let mut out = Vec::new();
     while let Some((offset, p)) = it.next_row_pointer_with_offset().await.map_err(|e| format!("{e:?}"))? {
         out.push((offset, p.xmin, p.xmax));

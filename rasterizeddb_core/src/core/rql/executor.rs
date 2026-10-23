@@ -8369,12 +8369,18 @@ async fn execute_alter_table_action(
         let Some(table) = table_ref.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", plan.table_name));
         };
+        // A partitioned table's rows are in its partitions, which this does
+        // not reach: refused rather than altering the shell alone.
+        let data = match table.data() {
+            Ok(data) => data,
+            Err(e) => return ddl_error(&e.to_string()),
+        };
         // A schema change is written to storage and the table handle rebuilt
         // from it, because `Table` owns its schema by value.
         (
             table.schema.clone(),
             table.io_schema.clone(),
-            table.len.load(std::sync::atomic::Ordering::Relaxed),
+            data.len.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
 
@@ -9333,6 +9339,11 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
+        // Before the declaration is written: a partitioned table's indexes
+        // live in its partitions. PARTITION-TODO(S6): `refuse_if_partitioned`.
+        if let Err(e) = table.data() {
+            return ddl_error(&e.to_string());
+        }
         let is_document = table.schema.fields.iter().any(|f| {
             f.name.eq_ignore_ascii_case(&statement.path.column)
                 && !f.is_deleted
@@ -9427,6 +9438,11 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
+        // Before the declaration is written: a partitioned table's indexes
+        // live in its partitions. PARTITION-TODO(S6): `refuse_if_partitioned`.
+        if let Err(e) = table.data() {
+            return ddl_error(&e.to_string());
+        }
         let mut columns = Vec::new();
         let mut types = Vec::new();
         for column in &statement.columns {
@@ -9496,6 +9512,11 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
             .find(|i| i.name.eq_ignore_ascii_case(&name))
             .map(|d| (entry.key().clone(), entry.value().io_schema.clone(), d.clone()))
     })?;
+    // PARTITION-TODO(S6): `refuse_if_partitioned`. Before the tombstone is
+    // written, so a refused drop leaves the declaration as it was.
+    if let Some(Err(e)) = database.tables.get(&table_name).map(|t| t.data().map(|_| ())) {
+        return Some(ddl_error(&e.to_string()));
+    }
     let tombstone = crate::core::index::IndexDecl {
         is_deleted: true,
         ..decl
@@ -9589,6 +9610,10 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
                 ddl_error("relation vanished")
             };
         };
+        // PARTITION-TODO(S6): `refuse_if_partitioned`, before the tombstone.
+        if let Err(e) = table.data() {
+            return ddl_error(&e.to_string());
+        }
         table.io_schema.clone()
     };
 

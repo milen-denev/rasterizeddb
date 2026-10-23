@@ -298,9 +298,9 @@ async fn read_mode(db: &Arc<Database>, args: &Args) {
     // Touch the table once so the file-open cost is not in the first sample.
     let _ = exec(db, &format!("SELECT id FROM {} WHERE id = 1", args.table)).await;
     if let Some(t) = db.tables.get(&args.table).map(|t| t.value().clone()) {
-        let slots = t.io_pointers.get_len().await
+        let slots = t.io_pointers().unwrap().get_len().await
             / rasterizeddb_core::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
-        let rows_len = t.io_rows.get_len().await;
+        let rows_len = t.io_rows().unwrap().get_len().await;
         eprintln!("table {} slots={} rows_file_bytes={}", args.table, slots, rows_len);
     }
     let hwm_open = proc_kb("VmHWM");

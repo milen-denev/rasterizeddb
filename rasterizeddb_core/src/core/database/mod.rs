@@ -1777,15 +1777,23 @@ impl Database {
                  restart before dropping it"
             )));
         }
+        // PARTITION-TODO(S5): a partitioned table drops through its
+        // partitions. Refused before the map is touched: taking the entry out
+        // and putting it back would let a concurrent statement see no table,
+        // or a concurrent CREATE of the same name slip in between.
+        self.refuse_shell(table_name)?;
         // Through the sweep below: see `deletion_permit`. Taken before the
         // table leaves the map and the catalogue: a drop waiting for it with
         // the table half gone hid the table, files still on disk, and a
         // `CREATE TABLE` of the name was refused for those files.
         let Some(logs) = self.tables.get(table_name).map(|table| {
-            logs_holding(&table.io_rows, &self.storage, self.location.as_deref())
+            table
+                .io_rows()
+                .map(|io| logs_holding(io, &self.storage, self.location.as_deref()))
         }) else {
             return Ok(false);
         };
+        let logs = logs?;
         let snapshot_gate = deletion_permit(&logs).await;
         drop(logs);
         let Some((_, table)) = self.tables.remove(table_name) else {
@@ -1806,7 +1814,7 @@ impl Database {
         // name, so the next table of this name would otherwise have this one's
         // records replayed into it at the next open, crash or not.
         let mut unconfirmed = None;
-        if let Err(failure) = self.forget_dropped_files(&table.io_rows, table_name) {
+        if let Err(failure) = self.forget_dropped_files(table.io_rows()?, table_name) {
             if !failure.maybe_logged {
                 // No barrier reached any log: the row goes back, so a failed
                 // drop leaves the table as it was.
@@ -1851,13 +1859,14 @@ impl Database {
             }
         }
 
-        table.io_rows.drop_io();
-        table.io_pointers.drop_io();
+        let data = table.data()?;
+        data.io_rows.drop_io();
+        data.io_pointers.drop_io();
         table.io_schema.drop_io();
-        table.io_filters.drop_io();
+        data.io_filters.drop_io();
         // Including the id sequence: a table recreated under the same name would
         // otherwise inherit the old one's floor and start numbering from it.
-        table.io_sequence.drop_io();
+        data.io_sequence.drop_io();
 
         // The five handles above are the five files a `Table` holds open. A
         // table owns ten: the `_schema_*` sidecars are opened lazily, so they
@@ -1934,6 +1943,20 @@ impl Database {
             .as_deref()
             .and_then(crate::core::wal::wal_for)
             .is_some_and(|wal| wal.is_poisoned())
+    }
+
+    /// Errs if `name` is a partitioned table's shell.
+    ///
+    /// For the name-keyed methods that work from file names and rebuild the
+    /// map entry with `Table::new`, so never reach `Table::data`: on a shell
+    /// that would replace the partitioned table with an empty plain one. Called
+    /// before the entry is removed, and the map guard is released on return.
+    // PARTITION-TODO(S5): replaced by dispatch on `relation()`.
+    fn refuse_shell(&self, name: &str) -> io::Result<()> {
+        match self.tables.get(name) {
+            Some(table) => table.data().map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// [`forget_logged_files`] for a table being dropped, once its catalogue
@@ -2106,6 +2129,9 @@ impl Database {
         if !self.tables.contains_key(old_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
+        // Both names: a shell renamed would be reopened as a plain table.
+        self.refuse_shell(old_name)?;
+        self.refuse_shell(new_name)?;
         if self.tables.contains_key(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -2460,6 +2486,8 @@ impl Database {
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.
         let _forget_pause = self.transactions.forget_pause();
+        // Before anything: the move reopens the table with `Table::new`.
+        self.refuse_shell(table_name)?;
 
         let root = self
             .storage
@@ -3542,6 +3570,8 @@ impl Database {
         if !self.tables.contains_key(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
+        // Before the entry is removed: the reopen below builds a plain table.
+        self.refuse_shell(table_name)?;
         let _changed = SchemaChanged(&self.schema_generation);
         // Every schema change comes through here, so this is where a client's
         // cached column list becomes stale. See `schema_generation`.

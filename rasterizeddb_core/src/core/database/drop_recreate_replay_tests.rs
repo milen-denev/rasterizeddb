@@ -1134,12 +1134,12 @@ async fn late_writes_through_a_dropped_handle() -> (Scenario, Vec<String>) {
     let db = sc.db.clone();
     let held = db.tables.get(TABLE).unwrap().value().clone();
     assert!(db.drop_table(TABLE).await.unwrap());
-    held.io_rows.append_data(b"GHOST-APPEND-BEFORE", true).await;
-    held.io_rows.write_data(0, b"GHOST-INPLACE-BEFORE").await;
+    held.io_rows().unwrap().append_data(b"GHOST-APPEND-BEFORE", true).await;
+    held.io_rows().unwrap().write_data(0, b"GHOST-INPLACE-BEFORE").await;
     db.add_table(create_statement(TABLE)).await.unwrap();
     insert(&db, 100, "new_00").await;
-    held.io_rows.append_data(b"GHOST-APPEND-AFTER", true).await;
-    held.io_rows.write_data(0, b"GHOST-INPLACE-AFTER").await;
+    held.io_rows().unwrap().append_data(b"GHOST-APPEND-AFTER", true).await;
+    held.io_rows().unwrap().write_data(0, b"GHOST-INPLACE-AFTER").await;
     drop(held);
     insert(&db, 101, "new_01").await;
     db.sync_durable().unwrap();
@@ -1185,13 +1185,13 @@ async fn a_dropped_tables_held_write_does_not_reach_its_successor() {
     let sc = Scenario::new(6).await;
     let db = sc.db.clone();
     let held = db.tables.get(TABLE).unwrap().value().clone();
-    let txn = held.io_rows.begin_txn();
+    let txn = held.io_rows().unwrap().begin_txn();
     assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
-    held.io_rows.write_data_txn(txn, 0, b"GHOST-HELD").await;
+    held.io_rows().unwrap().write_data_txn(txn, 0, b"GHOST-HELD").await;
     assert!(db.drop_table(TABLE).await.unwrap());
     db.add_table(create_statement(TABLE)).await.unwrap();
     insert(&db, 100, "new_00").await;
-    let committed = held.io_rows.commit_durable(txn).await;
+    let committed = held.io_rows().unwrap().commit_durable(txn).await;
     assert!(!ghosts_in(&sc.root), "a held write reached the recreated table's file");
     assert!(
         committed.is_err(),
@@ -1216,11 +1216,11 @@ async fn a_dropped_tables_held_write_does_not_bring_its_file_back() {
     let sc = Scenario::new(3).await;
     let db = sc.db.clone();
     let held = db.tables.get(TABLE).unwrap().value().clone();
-    let txn = held.io_rows.begin_txn();
+    let txn = held.io_rows().unwrap().begin_txn();
     assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
-    held.io_rows.write_data_txn(txn, 0, b"GHOST-HELD").await;
+    held.io_rows().unwrap().write_data_txn(txn, 0, b"GHOST-HELD").await;
     assert!(db.drop_table(TABLE).await.unwrap());
-    let _ = held.io_rows.commit_durable(txn).await;
+    let _ = held.io_rows().unwrap().commit_durable(txn).await;
     drop(held);
     assert!(
         !sc.root.join(format!("{TABLE}.db")).exists(),

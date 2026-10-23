@@ -1057,7 +1057,7 @@ mod engine {
             }
             // What a clean shutdown owes the store: the writes that were never
             // part of a transaction.
-            table.io_rows.family().flush_all().await.unwrap();
+            table.data().unwrap().io_rows.family().flush_all().await.unwrap();
         }
 
         let table = open_table(store).await;
@@ -1110,7 +1110,7 @@ mod engine {
                 insert(&table, id, (id % 5) as i32, &format!("label-{id:08}")).await;
             }
             family.flush_all().await.unwrap();
-            for io in [&table.io_rows, &table.io_pointers] {
+            for io in [&table.data().unwrap().io_rows, &table.data().unwrap().io_pointers] {
                 io.compact_now().await.unwrap();
             }
             family.flush_all().await.unwrap();

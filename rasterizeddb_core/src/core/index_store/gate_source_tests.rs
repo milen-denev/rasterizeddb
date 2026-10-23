@@ -72,9 +72,10 @@ const MINTS: [(&str, &str); 3] = [
 /// The rebuild paths that may mint a `BuildToken`: `(file, fn)`. Each builds
 /// or clears a structure that is not ready (§2, `BuildToken`).
 const BUILD_TOKEN_CALLERS: [(&str, &str); 4] = [
-    // The open path: the unindexed prefix on a filter not yet installed, and
-    // the open-time index build's readiness.
-    ("core/row/table.rs", "new_with_constraints"),
+    // The open path, shared by a plain table and a partition: the unindexed
+    // prefix on a filter not yet installed, and the open-time index build's
+    // readiness.
+    ("core/row/table.rs", "assemble"),
     // VACUUM FULL's rebuild of the indexes it made unready.
     ("core/row/table.rs", "compact"),
     // The filter backfill.

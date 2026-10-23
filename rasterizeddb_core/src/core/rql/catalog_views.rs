@@ -754,7 +754,7 @@ async fn build(
                 // `pg_total_relation_size(c.oid)` is rewritten into a reference
                 // to this column, so the figure comes from a `stat` rather than
                 // from a function the row evaluator could not answer.
-                let (bytes, tuples) = relation_size(database, name).await;
+                let (bytes, tuples) = relation_size(database, name).await?;
                 rows.push(format!(
                     "INSERT INTO {} (oid, relname, relnamespace, relkind, relsize, reltuples) \
                      VALUES ({}, '{}', {}, 'r', {}, {})",
@@ -905,7 +905,7 @@ async fn build(
         "pg_stat_user_tables" => {
             let mut rows = Vec::with_capacity(tables.len());
             for name in &tables {
-                let (live, dead) = tuple_counts(database, name).await;
+                let (live, dead) = tuple_counts(database, name).await?;
                 rows.push(format!(
                     "INSERT INTO {} (relid, schemaname, relname, n_live_tup, n_dead_tup) \
                      VALUES ({}, '{}', '{}', {}, {})",
@@ -987,8 +987,10 @@ async fn build(
                 }
 
                 // Indexes `CREATE INDEX` declared, each with its own
-                // identity and its column count.
-                if let Some(indexes) = table.indexes() {
+                // identity and its column count. A shell errs rather than
+                // reading as "no indexes" (PARTITION-TODO(S8)): a migration
+                // tool would re-issue every CREATE INDEX.
+                if let Some(indexes) = table.indexes().map_err(|e| e.to_string())? {
                     let declared = indexes
                         .list()
                         .iter()
@@ -1053,7 +1055,8 @@ async fn build(
                 let Some(table) = database.tables.get(name) else {
                     continue;
                 };
-                let Some(indexes) = table.indexes() else {
+                // PARTITION-TODO(S8): a shell errs, never "no indexes".
+                let Some(indexes) = table.indexes().map_err(|e| e.to_string())? else {
                     continue;
                 };
                 let column_name = |wo: u32| {
@@ -1199,25 +1202,29 @@ async fn build(
 /// Every file the table owns is counted — rows, pointers, schema sidecar,
 /// filter checkpoint and sequence — which is what `pg_total_relation_size`
 /// means: the relation and everything stored with it.
-async fn relation_size(database: &Arc<Database>, name: &str) -> (u64, i64) {
+///
+/// Errs on a partition shell rather than reporting it empty.
+/// PARTITION-TODO(S8): sum its partitions.
+async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64), String> {
     let ios = {
         let Some(table) = database.tables.get(name) else {
-            return (0, 0);
+            return Ok((0, 0));
         };
+        let data = table.data().map_err(|e| e.to_string())?;
         [
-            table.io_rows.clone(),
-            table.io_pointers.clone(),
+            data.io_rows.clone(),
+            data.io_pointers.clone(),
             table.io_schema.clone(),
-            table.io_filters.clone(),
-            table.io_sequence.clone(),
+            data.io_filters.clone(),
+            data.io_sequence.clone(),
         ]
     };
     let mut total = 0u64;
     for io in ios {
         total += io.get_len().await;
     }
-    let (live, _) = tuple_counts(database, name).await;
-    (total, live)
+    let (live, _) = tuple_counts(database, name).await?;
+    Ok((total, live))
 }
 
 /// Live and dead tuple counts for one table.
@@ -1275,21 +1282,24 @@ async fn relation_size(database: &Arc<Database>, name: &str) -> (u64, i64) {
 ///
 /// Without it, `live` exceeds `slots` and `dead` goes negative, which the
 /// consumers of these two columns render as a negative dead-tuple count.
-async fn tuple_counts(database: &Arc<Database>, name: &str) -> (i64, i64) {
+///
+/// Errs on a partition shell. PARTITION-TODO(S8): sum its partitions.
+async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64), String> {
     let (pointers_io, ids_handed_out) = {
         let Some(table) = database.tables.get(name) else {
-            return (0, 0);
+            return Ok((0, 0));
         };
+        let data = table.data().map_err(|e| e.to_string())?;
         (
-            table.io_pointers.clone(),
-            table.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
+            data.io_pointers.clone(),
+            data.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
 
     let slots = (pointers_io.get_len().await
         / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64) as i64;
     let live = (ids_handed_out as i64).clamp(0, slots);
-    (live, slots - live)
+    Ok((live, slots - live))
 }
 
 /// A stable identifier for a name, standing in for PostgreSQL's OID.

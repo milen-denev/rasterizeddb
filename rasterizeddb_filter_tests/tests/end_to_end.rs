@@ -18,7 +18,7 @@ fn all_ids() -> Vec<u64> {
 #[tokio::test(flavor = "multi_thread")]
 async fn point_lookups_return_exactly_the_match() {
     let (_d, t) = std_table("e2e_point").await;
-    assert!(t.filters.is_some(), "filters should be active");
+    assert!(t.filters().unwrap().is_some(), "filters should be active");
     for target in [0u64, 1, 511, 512, 513, 1023, 1024, 1234, N - 1] {
         let rows = run(&t, &format!("id = {}", target)).await;
         assert_eq!(u64s(&rows, 0), vec![target], "id = {}", target);
@@ -210,7 +210,7 @@ async fn negated_forms_are_exact() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_filter_actually_prunes() {
     let (_d, t) = std_table("e2e_prunes").await;
-    let filters = t.filters.as_ref().unwrap();
+    let filters = t.filters().unwrap().as_ref().unwrap();
 
     for (q, ceiling) in [
         ("id = 1234", N / 10),
@@ -304,11 +304,11 @@ async fn reopen_reuses_the_checkpoint() {
     {
         let t = open_table(dir.path(), "e2e_reopen", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
     let t = open_table(dir.path(), "e2e_reopen", &std_columns()).await;
-    t.wait_filters_ready().await;
-    let f = t.filters.as_ref().unwrap();
+    t.wait_filters_ready().await.unwrap();
+    let f = t.filters().unwrap().as_ref().unwrap();
     assert_eq!(f.resume_slot(), N, "checkpoint did not cover the table");
     assert!(f.is_complete());
 
@@ -323,7 +323,7 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
     {
         let t = open_table(dir.path(), "e2e_delta", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         for i in N..N + 300 {
             let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
             rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
@@ -337,7 +337,7 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
         }
     }
     let t = open_table(dir.path(), "e2e_delta", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     for target in [5u64, N - 1, N, N + 150, N + 299] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
     }
@@ -352,7 +352,7 @@ async fn reopen_after_update_finds_the_new_value() {
     {
         let t = open_table(dir.path(), "e2e_reopen_upd", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         let updates: SmallVec<[ColumnWritePayload; 32]> =
             smallvec::smallvec![payload(&424242u64.to_le_bytes(), 0, DbType::U64)];
         t.update_rows("id = 900", full_fetch(&t.schema.fields), updates, None)
@@ -360,7 +360,7 @@ async fn reopen_after_update_finds_the_new_value() {
             .unwrap();
     }
     let t = open_table(dir.path(), "e2e_reopen_upd", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert_eq!(run(&t, "id = 424242").await.len(), 1, "updated value lost after reopen");
     assert!(run(&t, "id = 900").await.is_empty(), "stale value still findable");
 }
@@ -371,13 +371,13 @@ async fn reopen_after_delete_is_still_correct() {
     {
         let t = open_table(dir.path(), "e2e_reopen_del", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         t.delete_rows("id = 1234", full_fetch(&t.schema.fields), None)
             .await
             .unwrap();
     }
     let t = open_table(dir.path(), "e2e_reopen_del", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert!(run(&t, "id = 1234").await.is_empty(), "deleted row reappeared");
     assert_eq!(run(&t, "").await.len() as u64, N - 1);
 }
@@ -391,7 +391,7 @@ async fn a_mutation_marks_the_sidecar_dirty_on_disk() {
     let path = dir.path().join("e2e_dirty_flt.db");
     let t = open_table(dir.path(), "e2e_dirty", &std_columns()).await;
     fill_std(&t).await;
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     assert_eq!(std::fs::read(&path).unwrap()[13], 0, "fresh checkpoint should be clean");
 
     t.delete_rows("id = 42", full_fetch(&t.schema.fields), None).await.unwrap();
@@ -408,7 +408,7 @@ async fn a_corrupt_sidecar_falls_back_to_a_rebuild() {
     {
         let t = open_table(dir.path(), "e2e_corrupt", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
     let path = dir.path().join("e2e_corrupt_flt.db");
     let mut bytes = std::fs::read(&path).unwrap();
@@ -416,7 +416,7 @@ async fn a_corrupt_sidecar_falls_back_to_a_rebuild() {
     std::fs::write(&path, &bytes).unwrap();
 
     let t = open_table(dir.path(), "e2e_corrupt", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     for target in [0u64, 1234, N - 1] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
     }
@@ -428,14 +428,14 @@ async fn a_truncated_sidecar_falls_back_to_a_rebuild() {
     {
         let t = open_table(dir.path(), "e2e_trunc", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
     let path = dir.path().join("e2e_trunc_flt.db");
     let bytes = std::fs::read(&path).unwrap();
     std::fs::write(&path, &bytes[..bytes.len() / 3]).unwrap();
 
     let t = open_table(dir.path(), "e2e_trunc", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert_eq!(u64s(&run(&t, "id = 1234").await, 0), vec![1234]);
     assert_eq!(run(&t, "").await.len() as u64, N);
 }
@@ -446,12 +446,12 @@ async fn a_missing_sidecar_is_rebuilt() {
     {
         let t = open_table(dir.path(), "e2e_gone", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
     let _ = std::fs::remove_file(dir.path().join("e2e_gone_flt.db"));
 
     let t = open_table(dir.path(), "e2e_gone", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     assert_eq!(u64s(&run(&t, "id = 7").await, 0), vec![7]);
     assert_eq!(run(&t, "").await.len() as u64, N);
 }
@@ -459,7 +459,7 @@ async fn a_missing_sidecar_is_rebuilt() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_explicit_backfill_is_idempotent() {
     let (_d, t) = std_table("e2e_backfill").await;
-    assert!(t.filters.as_ref().unwrap().is_complete());
+    assert!(t.filters().unwrap().as_ref().unwrap().is_complete());
     assert_eq!(t.backfill_filters().await.unwrap(), N);
     assert_eq!(t.backfill_filters().await.unwrap(), N);
     for target in [0u64, 1234, N - 1] {
@@ -565,7 +565,7 @@ async fn the_null_flag_actually_prunes() {
     // The point of indexing BOOL at all. Without it `IS NULL` would be a full
     // scan; with it, every zone holding no NULL is skipped outright.
     let (_d, t) = nullable_table("e2e_null_prunes").await;
-    let filters = t.filters.as_ref().expect("filters active");
+    let filters = t.filters().unwrap().as_ref().expect("filters active");
     let n = NULL_N;
     let toks = tokenize("__null_country = 1", &t.schema.fields);
     let p = sarg::extract(&toks, filters).expect("the flag column is sargable");
@@ -678,7 +678,7 @@ async fn a_prefix_match_actually_prunes() {
         t.insert_row(rw).await.unwrap();
     }
 
-    let filters = t.filters.as_ref().expect("filters active");
+    let filters = t.filters().unwrap().as_ref().expect("filters active");
     let toks = tokenize("label STARTSWITH 'k0017'", &t.schema.fields);
     let p = sarg::extract(&toks, filters).expect("STARTSWITH is sargable");
     let bm = filters.evaluate(&p, n).expect("a prefix should prune");
@@ -712,7 +712,7 @@ async fn a_range_mask_excludes_the_whole_dead_prefix() {
     // the property the filter owes it: the mask really does exclude the prefix,
     // down to zone granularity, so a leading-run test has something to find.
     let (_d, t) = std_table("e2e_dead_prefix").await;
-    let filters = t.filters.as_ref().expect("filters active");
+    let filters = t.filters().unwrap().as_ref().expect("filters active");
 
     for pivot in [512u64, 1000, 1536, N / 2] {
         let toks = tokenize(&format!("id >= {}", pivot), &t.schema.fields);

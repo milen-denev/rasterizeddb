@@ -120,7 +120,7 @@ fn audit_a_reclaimable_gate_hides_a_visible_old_version() {
         let a = manager.begin_autocommit();
         t.insert_row_in_txn(row_write(1, 7, "start"), a).await.unwrap();
         manager.commit(a);
-        t.wait_filters_ready().await;
+        t.wait_filters_ready().await.unwrap();
 
         // T relocates the row (versioned update always relocates).
         let tx_t = manager.begin_autocommit();

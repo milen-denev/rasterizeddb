@@ -206,7 +206,7 @@ async fn open(
     }
     t.wait_filters_ready().await;
     if unique {
-        let ix = t.indexes.as_ref().expect("a UNIQUE column is indexed");
+        let ix = t.data().unwrap().indexes.as_ref().expect("a UNIQUE column is indexed");
         let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !ix.is_ready() {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -215,14 +215,14 @@ async fn open(
         .await;
         assert!(ready.is_ok(), "index build never finished");
     } else {
-        assert!(t.indexes.is_none(), "{name}: no UNIQUE key, so no index");
+        assert!(t.indexes().unwrap().is_none(), "{name}: no UNIQUE key, so no index");
     }
     match filters {
         Some(true) => {
-            let f = t.filters.as_ref().expect("filters on");
+            let f = t.filters().unwrap().as_ref().expect("filters on");
             assert_eq!(f.config().min_table_rows, 0, "{name}: the size gate is lifted");
         }
-        Some(false) => assert!(t.filters.is_none(), "{name}: the filter is off"),
+        Some(false) => assert!(t.filters().unwrap().is_none(), "{name}: the filter is off"),
         None => {}
     }
     (StdArc::new(t), manager)
@@ -356,13 +356,13 @@ async fn interleave_unseen(
     let proof = Proof::from(&ticket);
     let writer = manager.begin();
     t.insert_row_in_txn(row(k, 7), writer).await.unwrap();
-    let slot = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64 - 1;
+    let slot = t.io_pointers().unwrap().get_len().await / ROW_POINTER_RECORD_LEN as u64 - 1;
 
     // The state between the writer's append and its index update.
     let withdrawn = match (subject, mode) {
         (false, _) => Withdrawn::Nothing,
         (true, Mode::Index) => {
-            let ix = t.indexes.clone().expect("indexed");
+            let ix = t.data().unwrap().indexes.clone().expect("indexed");
             let rw = row(k, 7);
             assert!(ix.holds(slot), "the insert indexed the slot it appended");
             let get = |wo: u32| {
@@ -376,12 +376,12 @@ async fn interleave_unseen(
             Withdrawn::Index(ix)
         }
         (true, Mode::Filter) => {
-            let f = t.filters.clone().expect("filtered");
+            let f = t.filters().unwrap().clone().expect("filtered");
             let w = clause(stmt, k);
-            let before = t.build_candidates(&w, None).await.expect("the filter masks this clause");
+            let before = t.build_candidates(&w, None).await.unwrap().expect("the filter masks this clause");
             assert!(before.get(slot), "the insert fingerprinted the slot it appended");
             f.on_delete(proof, slot);
-            let after = t.build_candidates(&w, None).await.expect("the filter masks this clause");
+            let after = t.build_candidates(&w, None).await.unwrap().expect("the filter masks this clause");
             assert!(
                 !after.get(slot),
                 "{stmt:?}: with its fingerprint withdrawn the mask leaves the slot out, \

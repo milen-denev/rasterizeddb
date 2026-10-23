@@ -417,8 +417,8 @@ async fn disabling_the_filter_by_sql_still_answers_correctly() {
     // Turn it off, reopen: no catalog is built, and results are unchanged.
     sql::execute("SET FILTER enabled = off").unwrap();
     let t = open_table(dir.path(), "sqloff", &std_columns()).await;
-    t.wait_filters_ready().await;
-    assert!(t.filters.is_none(), "disabled by SQL should build no catalog");
+    t.wait_filters_ready().await.unwrap();
+    assert!(t.filters().unwrap().is_none(), "disabled by SQL should build no catalog");
     assert_eq!(u64s(&run(&t, "id = 1234").await, 0), vec![1234]);
     assert_eq!(run(&t, "").await.len() as u64, STD_N);
 }
@@ -431,13 +431,13 @@ async fn a_per_table_exclusion_applies_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let t = open_table(dir.path(), "excluded", &std_columns()).await;
     fill_std(&t).await;
-    assert!(t.filters.is_none(), "an excluded table should build no catalog");
+    assert!(t.filters().unwrap().is_none(), "an excluded table should build no catalog");
     // Still correct, just unfiltered.
     assert_eq!(u64s(&run(&t, "id = 7").await, 0), vec![7]);
 
     // A different table is unaffected.
     let other = open_table(dir.path(), "included", &std_columns()).await;
-    assert!(other.filters.is_some(), "the exclusion must not leak to other tables");
+    assert!(other.filters().unwrap().is_some(), "the exclusion must not leak to other tables");
 }
 
 /// The default is a measured number, not a taste, so it gets pinned like one.

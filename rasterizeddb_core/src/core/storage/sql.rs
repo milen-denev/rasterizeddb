@@ -887,7 +887,7 @@ pub fn execute_structured(sql: &str, database: &Arc<Database>) -> Result<Vec<u8>
         Structured::Stats => stats_rows(pool, database),
         Structured::Locations => location_rows(pool, database),
         Structured::Stores => store_rows(database),
-        Structured::Placements => placement_rows(pool, database),
+        Structured::Placements => placement_rows(pool, database)?,
     };
 
     let mut out = vec![2u8];
@@ -1075,7 +1075,7 @@ fn store_rows(_database: &Arc<Database>) -> Vec<Row> {
     Vec::new()
 }
 
-fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Vec<Row> {
+fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let root = pool.root().unwrap_or("").to_string();
     let placed: std::collections::HashMap<String, String> = pool.placements().into_iter().collect();
 
@@ -1102,10 +1102,12 @@ fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Vec<Row> {
         .map(|name| {
             let at = placed.get(&name).cloned().unwrap_or_else(|| root.clone());
             let mirrored = match database.tables.get(&name) {
-                Some(table) => table.io_rows.backup_count() > 0,
+                // PARTITION-TODO(S8): a shell errs rather than reading as
+                // unmirrored; its partitions hold the files.
+                Some(table) => table.io_rows().map_err(|e| e.to_string())?.backup_count() > 0,
                 None => intended,
             };
-            structured_row(&[Cell::Text(name), Cell::Text(at), Cell::Flag(mirrored)])
+            Ok(structured_row(&[Cell::Text(name), Cell::Text(at), Cell::Flag(mirrored)]))
         })
         .collect()
 }

@@ -149,7 +149,7 @@ async fn a_failed_compaction_leaves_queries_answering_by_the_new_slots() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_a", true).await;
     let t = db.tables.get("cf_a").unwrap().clone();
-    let ix = t.indexes.clone().expect("the CREATE INDEX gave the table an index");
+    let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
     t.wait_filters_ready().await;
     drop(t);
@@ -334,7 +334,7 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
     // Marks the sidecar dirty, so the next checkpoint plans a base image.
     run(&db, &format!("DELETE FROM cf_e WHERE id = {}", ROWS - 1)).await;
 
-    let filters = t.filters.clone().expect("the table has a filter");
+    let filters = t.filters().unwrap().clone().expect("the table has a filter");
     let park = crate::core::filter::checkpoint_test_hooks::arm(&filters);
     let cp_table = t.clone();
     let checkpoint = tokio::spawn(async move { cp_table.checkpoint_filters().await });
@@ -375,7 +375,7 @@ async fn vacuum_overlapping_compaction(db: &Arc<Database>, table: &str, point: u
     use crate::core::row::table::compact_test_hooks::GATE_PROBE;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     let t = db.tables.get(table).unwrap().clone();
-    let park = crate::core::vacuum::run_once_test_hooks::arm(&t.free_space, point);
+    let park = crate::core::vacuum::run_once_test_hooks::arm(&t.data().unwrap().free_space, point);
     let vt = t.clone();
     let sweep = tokio::spawn(async move { vt.vacuum_now().await.map(|r| r.dead_rows) });
     tokio::time::timeout(Duration::from_secs(30), park.parked.notified())
@@ -410,7 +410,7 @@ async fn a_vacuum_sweep_overlapping_a_compaction_leaves_the_index_whole() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_v", true).await;
     let t = db.tables.get("cf_v").unwrap().clone();
-    let ix = t.indexes.clone().expect("the CREATE INDEX gave the table an index");
+    let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
     t.wait_filters_ready().await;
     drop(t);
@@ -525,7 +525,8 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
     t.wait_filters_ready().await;
 
     // Stands in for a query that started before the sweep and is still running.
-    let ticket = t.readers.enter();
+    let d = t.data().unwrap();
+    let ticket = d.readers.enter();
     let config = VacuumConfig {
         drain_timeout: Duration::from_millis(50),
         ..Default::default()
@@ -540,10 +541,10 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
         compaction_gate: None,
     };
     let report = crate::core::vacuum::run_once(
-        &*t.io_pointers,
-        &*t.io_rows,
-        &t.free_space,
-        &t.readers,
+        &*d.io_pointers,
+        &*d.io_rows,
+        &d.free_space,
+        &d.readers,
         &ctx,
         &config,
         true,
@@ -552,7 +553,7 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
     .unwrap();
     assert!(report.deferred, "the sweep published while an older read was live");
     assert!(
-        t.free_space.quarantined_extents() > 0,
+        d.free_space.quarantined_extents() > 0,
         "nothing was quarantined, so the case tests nothing: {report:?}"
     );
     drop(ticket);
@@ -682,7 +683,7 @@ async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
     t.wait_filters_ready().await;
     // A checkpoint exists, so the renumbering writes the dirty mark.
     t.checkpoint_filters().await;
-    let filters = t.filters.clone().expect("the table has a filter");
+    let filters = t.filters().unwrap().clone().expect("the table has a filter");
 
     let marking = filters.dirty_marking.lock().await;
     let mut compaction = Box::pin(t.compact());
@@ -753,8 +754,8 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
     create_and_fill(&db, "cf_b", false).await;
     let t = db.tables.get("cf_b").unwrap().clone();
     t.wait_filters_ready().await;
-    let filters = t.filters.clone().expect("the table has a filter");
-    let n_slots = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+    let filters = t.filters().unwrap().clone().expect("the table has a filter");
+    let n_slots = t.io_pointers().unwrap().get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
     // What `compact` does before its first move; it is still running.
     filters.begin_renumbering(proof, n_slots);
@@ -847,7 +848,7 @@ async fn order_by_limit_after_a_failed_compaction_matches_a_full_sort() {
     assert_eq!(top_20().await, want, "wrong before the compaction");
 
     // Otherwise the slot ceiling never applies and the case proves nothing.
-    let filters = t.filters.clone().expect("the table has a filter");
+    let filters = t.filters().unwrap().clone().expect("the table has a filter");
     assert!(
         filters.column_is_monotonic(v, N as u64),
         "the zone map does not license the slot ceiling for `v`, so this tests nothing"

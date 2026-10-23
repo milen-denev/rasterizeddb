@@ -117,8 +117,8 @@ async fn a_head_build_refuses_this_builds_filter_sidecar() {
         crate::core::rql::executor::execute(purpose, db.clone()).await;
     }
     let table = db.tables.get("f").unwrap().value().clone();
-    table.wait_filters_ready().await;
-    table.checkpoint_filters().await;
+    table.wait_filters_ready().await.unwrap();
+    table.checkpoint_filters().await.unwrap();
     let flt = std::fs::read_dir(dir.path())
         .unwrap()
         .flatten()

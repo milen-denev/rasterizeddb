@@ -60,11 +60,13 @@ pub struct Table<S: StorageIO> {
     /// the same reason and with the same remedy — leave it out, and let the
     /// query say the table does not exist.
     pub schema_unreadable: bool,
-    pub io_pointers: Arc<S>,
-    pub io_rows: Arc<S>,
     pub io_schema: Arc<S>,
-    /// Sidecar holding the persisted filter checkpoint.
-    pub io_filters: Arc<S>,
+    /// Everything that reads or writes rows. `None` on a partition shell
+    /// ([`Table::partition_shell`]), whose rows live in its partitions: every
+    /// data method goes through [`Table::data`], which refuses there, so a
+    /// path not yet taught about partitioning fails instead of answering from
+    /// an empty table.
+    data: Option<TableData<S>>,
     /// Updates that wrote only the assigned columns rather than re-encoding the
     /// whole row. Diagnostic: the ratio against rows updated says how much of a
     /// workload the cheap path is actually reaching.
@@ -92,28 +94,7 @@ pub struct Table<S: StorageIO> {
     /// are table-level would otherwise run the check outside the lock — two
     /// concurrent inserts would each look, each find nothing, and each write.
     has_unique: bool,
-    /// Sidecar holding the row-id sequence.
-    ///
-    /// The id counter used to be recovered from the last pointer record, which
-    /// worked only while ids ascended with file order. They no longer do: a
-    /// relocated row keeps its id, so the largest id can sit anywhere. Reading
-    /// the last record would then hand out ids that are already in use.
-    pub io_sequence: Arc<S>,
-    /// Highest id reserved on disk. Ids past this need a fresh reservation
-    /// before they are handed out.
-    id_reserved_upto: CacheGuard<AtomicU64>,
-    /// Inserts between their reservation check and the id they take. Each
-    /// takes at most one, so the reservation must reach past the next id by
-    /// this many: two inserts checking at once both see the next id covered
-    /// and take it and the one after, and the second is not covered.
-    ids_in_flight: AtomicU64,
-    /// Serialises raising the reservation, so it only ever goes up: two
-    /// writers could otherwise leave the smaller of their values on disk and
-    /// the larger in memory.
-    reserving: tokio::sync::Mutex<()>,
     pub hard_locked: CacheGuard<AtomicBool>,
-    pub len: CacheGuard<AtomicU64>,
-    pub last_row_id: CacheGuard<AtomicU64>,
     pub concurrent_processor: ConcurrentProcessor,
     /// Name this table answers to in the process-wide query cache.
     ///
@@ -127,24 +108,6 @@ pub struct Table<S: StorageIO> {
     /// Unqualified until [`Table::scope_cache_to_database`] says otherwise, so a
     /// table built outside a `Database` — tests, benchmarks — is unaffected.
     cache_scope: String,
-    /// Bit-level filter index. `None` when disabled or when no column of this
-    /// table has a filterable type.
-    ///
-    /// Shared with the maintenance task, which owns backfilling and
-    /// checkpointing so neither ever runs on a caller's thread.
-    pub filters: Option<StdArc<TableFilters>>,
-    /// Secondary indexes: those `CREATE INDEX` declared, and the implicit ones
-    /// of `PRIMARY KEY` and `UNIQUE`. `None` when the table has none. See
-    /// [`crate::core::index`] for why they may only ever over-report.
-    pub indexes: Option<StdArc<crate::core::index::TableIndexes>>,
-    /// Byte ranges of the rows file that deleted or relocated rows left behind
-    /// and the write path may reuse. Populated by the reclamation service.
-    pub free_space: StdArc<FreeSpace>,
-    /// Epoch tickets for in-flight reads, so reclamation can tell which queries
-    /// predate a batch of freed extents.
-    pub readers: StdArc<ReaderRegistry>,
-    /// Running totals for the reclamation service.
-    pub vacuum_stats: StdArc<VacuumStats>,
     /// Serializes the mutating half of `DELETE` and `UPDATE`.
     ///
     /// Both statements scan for matches and then rewrite the pointer records
@@ -245,6 +208,121 @@ pub struct Table<S: StorageIO> {
     filters_ready: StdArc<CacheGuard<AtomicBool>>,
     /// Drop signal for the maintenance task.
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+}
+
+/// A table's row storage and what indexes it: the part a partition shell does
+/// not have. Reached only through [`Table::data`].
+pub(crate) struct TableData<S: StorageIO> {
+    pub(crate) io_pointers: Arc<S>,
+    pub(crate) io_rows: Arc<S>,
+    /// Sidecar holding the persisted filter checkpoint.
+    pub(crate) io_filters: Arc<S>,
+    /// Sidecar holding the row-id sequence.
+    ///
+    /// The id counter used to be recovered from the last pointer record, which
+    /// worked only while ids ascended with file order. They no longer do: a
+    /// relocated row keeps its id, so the largest id can sit anywhere. Reading
+    /// the last record would then hand out ids that are already in use.
+    pub(crate) io_sequence: Arc<S>,
+    /// Highest id reserved on disk. Ids past this need a fresh reservation
+    /// before they are handed out.
+    id_reserved_upto: CacheGuard<AtomicU64>,
+    /// Inserts between their reservation check and the id they take. Each
+    /// takes at most one, so the reservation must reach past the next id by
+    /// this many: two inserts checking at once both see the next id covered
+    /// and take it and the one after, and the second is not covered.
+    ids_in_flight: AtomicU64,
+    /// Serialises raising the reservation, so it only ever goes up: two
+    /// writers could otherwise leave the smaller of their values on disk and
+    /// the larger in memory.
+    reserving: tokio::sync::Mutex<()>,
+    pub(crate) len: CacheGuard<AtomicU64>,
+    pub(crate) last_row_id: CacheGuard<AtomicU64>,
+    /// Bit-level filter index. `None` when disabled or when no column of this
+    /// table has a filterable type.
+    ///
+    /// Shared with the maintenance task, which owns backfilling and
+    /// checkpointing so neither ever runs on a caller's thread.
+    pub(crate) filters: Option<StdArc<TableFilters>>,
+    /// Secondary indexes: those `CREATE INDEX` declared, and the implicit ones
+    /// of `PRIMARY KEY` and `UNIQUE`. `None` when the table has none. See
+    /// [`crate::core::index`] for why they may only ever over-report.
+    pub(crate) indexes: Option<StdArc<crate::core::index::TableIndexes>>,
+    /// Byte ranges of the rows file that deleted or relocated rows left behind
+    /// and the write path may reuse. Populated by the reclamation service.
+    pub(crate) free_space: StdArc<FreeSpace>,
+    /// Epoch tickets for in-flight reads, so reclamation can tell which queries
+    /// predate a batch of freed extents.
+    pub(crate) readers: StdArc<ReaderRegistry>,
+    /// Running totals for the reclamation service.
+    pub(crate) vacuum_stats: StdArc<VacuumStats>,
+}
+
+/// The `ErrorKind` and text a partition shell refuses data access with. The
+/// text says "not supported", which pgwire reports as 0A000.
+fn shell_refusal(name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "relation \"{}\" is partitioned; this operation is not supported on partitioned tables yet",
+            name
+        ),
+    )
+}
+
+impl<S: StorageIO> Table<S> {
+    /// The table's row storage, or an error on a partition shell.
+    ///
+    /// Every data method starts here (`seam_tests` checks it), so a caller
+    /// that has not learned to dispatch to the partitions gets an error rather
+    /// than the empty answer a table with no rows would give.
+    #[inline]
+    pub(crate) fn data(&self) -> std::io::Result<&TableData<S>> {
+        self.data.as_ref().ok_or_else(|| shell_refusal(&self.schema.name))
+    }
+
+    /// Whether this is a partitioned table's shell: schema only, no rows.
+    #[inline]
+    pub(crate) fn is_shell(&self) -> bool {
+        self.data.is_none()
+    }
+
+    /// The rows file.
+    pub fn io_rows(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_rows)
+    }
+
+    /// The pointer file.
+    pub fn io_pointers(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_pointers)
+    }
+
+    /// The filter checkpoint sidecar.
+    pub fn io_filters(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_filters)
+    }
+
+    /// The row-id sequence sidecar.
+    pub fn io_sequence(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_sequence)
+    }
+
+    /// The filter index, `Ok(None)` when the table has none.
+    pub fn filters(&self) -> std::io::Result<&Option<StdArc<TableFilters>>> {
+        Ok(&self.data()?.filters)
+    }
+
+    /// The secondary indexes, read-only, for readers such as the catalog
+    /// views. `Ok(None)` when the table has none; a shell errs, never reading
+    /// as "no indexes".
+    pub fn indexes(&self) -> std::io::Result<Option<crate::core::index::IndexView<'_>>> {
+        Ok(self.data()?.indexes.as_deref().map(crate::core::index::TableIndexes::view))
+    }
+
+    /// The row-id counter: the next id to hand out.
+    pub fn last_row_id(&self) -> std::io::Result<&CacheGuard<AtomicU64>> {
+        Ok(&self.data()?.last_row_id)
+    }
 }
 
 impl<S: StorageIO> Drop for Table<S> {
@@ -409,7 +487,7 @@ enum PendingFilterOp {
     Insert(u64, RowWrite, Option<Vec<Option<crate::core::index::KeyBuf>>>),
 }
 
-impl<S: StorageIO> Table<S> {
+impl<S: StorageIO> TableData<S> {
     /// Applies filter-index changes staged during a batch, now that the batch's
     /// `commit_durable` has made the writes they describe durable. A no-op with
     /// no filter index, and it always empties `pending`.
@@ -450,10 +528,62 @@ impl<S: StorageIO> Table<S> {
         self.filters.is_some() || self.indexes.is_some()
     }
 
-    /// The secondary indexes, read-only, for readers such as the catalog
-    /// views. `None` when the table has none.
-    pub fn indexes(&self) -> Option<crate::core::index::IndexView<'_>> {
-        self.indexes.as_deref().map(crate::core::index::TableIndexes::view)
+    /// Reserves the next block of ids on disk.
+    ///
+    /// Written before any id in the block is used, so a crash can only ever skip
+    /// ids, never repeat one. Ids need to be unique, not gapless.
+    async fn reserve_ids(&self, upto: u64) {
+        let _one = self.reserving.lock().await;
+        if upto <= self.id_reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.io_sequence.write_data(0, &upto.to_le_bytes()).await;
+        self.id_reserved_upto.store(upto, AtomicOrdering::Release);
+    }
+
+    /// Makes sure the sequence on disk covers the ids about to be handed out.
+    ///
+    /// Called before an update relocates, whose new versions draw from the
+    /// counter but keep their row's own id, so a gap there is harmless. An
+    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
+    async fn ensure_ids_reserved(&self) {
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next < self.id_reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.reserve_ids(next + ID_RESERVATION_CHUNK).await;
+    }
+
+    /// Covers on disk the id an insert is about to take, counting every other
+    /// insert that has checked but not yet taken one. Hold the guard until the
+    /// id is taken.
+    ///
+    /// Inserts used to take turns here under the table's one uniqueness lock;
+    /// with that lock striped by key, two of them check and allocate side by
+    /// side, and checking `next < reserved` alone let the second take an id the
+    /// disk did not cover, which a crash then handed out twice.
+    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
+        let in_flight = self.ids_in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+        let guard = IdsInFlight(&self.ids_in_flight);
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next + in_flight > self.id_reserved_upto.load(AtomicOrdering::Acquire) {
+            self.reserve_ids(next + in_flight + ID_RESERVATION_CHUNK).await;
+        }
+        guard
+    }
+
+    /// Registers this read with the epoch registry, so reclamation cannot hand
+    /// out an extent the read is about to fetch from.
+    ///
+    /// Inert when reclamation is off: nothing ever moves, so there is nothing
+    /// to shield against and no reason to pay for the bookkeeping.
+    #[inline]
+    fn read_guard(&self) -> ReadTicket {
+        if self.free_space.is_enabled() {
+            self.readers.enter()
+        } else {
+            ReadTicket::inert()
+        }
     }
 }
 
@@ -499,6 +629,43 @@ impl<S: StorageIO> Table<S> {
 
     pub async fn new(table_name: &str, initial_io: Arc<S>, columns: Vec<CreateColumnData>) -> Self {
         Self::new_with_constraints(table_name, initial_io, columns, &[]).await
+    }
+
+    /// A partitioned table's shell: its schema and nothing else.
+    ///
+    /// It opens no row, pointer, filter or sequence file, spawns no task and
+    /// takes no place in the forget registry (see `enable_versioning`).
+    /// Schema-only callers (describe, parameter inference, index and
+    /// foreign-key lookups) work on it; every data method refuses with an
+    /// error saying the table is partitioned. `io_schema`'s service is the
+    /// caller's to run, as the shell owns no task to run it on.
+    pub fn partition_shell(io_schema: Arc<S>, schema: TableSchema) -> Self {
+        let has_unique = schema.fields.iter().any(|f| f.is_unique && !f.is_deleted)
+            || !schema.unique_keys.is_empty();
+        let cache_scope = schema.name.clone();
+        Self {
+            schema,
+            schema_unreadable: false,
+            io_schema,
+            data: None,
+            in_place_column_updates: AtomicU64::new(0).into(),
+            versions: StdArc::new(ArcSwapOption::empty()),
+            cleared_below: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
+            has_unique,
+            hard_locked: AtomicBool::new(false).into(),
+            concurrent_processor: ConcurrentProcessor::new(),
+            cache_scope,
+            write_lock: StdArc::new(tokio::sync::RwLock::new(())),
+            unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
+            compaction_gate: StdArc::new(tokio::sync::RwLock::new(())),
+            forget: StdArc::new(std::sync::OnceLock::new()),
+            write_generation: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
+            dead_stamps: StdArc::new(AtomicU64::new(0)),
+            cache_generation: StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation()))),
+            filters_ready: StdArc::new(CacheGuard::new(AtomicBool::new(true))),
+            // Nothing watches it: the shell spawns no task.
+            maintenance_alive: StdArc::new(CacheGuard::new(AtomicBool::new(false))),
+        }
     }
 
     /// As [`Table::new`], but marks the named columns `UNIQUE`.
@@ -869,28 +1036,30 @@ impl<S: StorageIO> Table<S> {
         Self {
             schema,
             schema_unreadable,
-            io_pointers,
-            io_rows,
             io_schema,
-            io_filters,
-            io_sequence,
+            data: Some(TableData {
+                io_pointers,
+                io_rows,
+                io_filters,
+                io_sequence,
+                id_reserved_upto: id_reserved_upto.into(),
+                ids_in_flight: AtomicU64::new(0),
+                reserving: tokio::sync::Mutex::new(()),
+                len: atomic_table_length.into(),
+                last_row_id: atomic_last_id.into(),
+                filters,
+                indexes,
+                free_space,
+                readers,
+                vacuum_stats,
+            }),
             versions,
             cleared_below,
             has_unique,
             in_place_column_updates: AtomicU64::new(0).into(),
-            id_reserved_upto: id_reserved_upto.into(),
-            ids_in_flight: AtomicU64::new(0),
-            reserving: tokio::sync::Mutex::new(()),
             hard_locked: AtomicBool::new(false).into(),
-            len: atomic_table_length.into(),
-            last_row_id: atomic_last_id.into(),
             concurrent_processor: ConcurrentProcessor::new(),
             cache_scope: schema_name_for_cache,
-            filters,
-            indexes,
-            free_space,
-            readers,
-            vacuum_stats,
             write_lock,
             unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
             compaction_gate,
@@ -930,68 +1099,15 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
-    /// Reserves the next block of ids on disk.
-    ///
-    /// Written before any id in the block is used, so a crash can only ever skip
-    /// ids, never repeat one. Ids need to be unique, not gapless.
-    async fn reserve_ids(&self, upto: u64) {
-        let _one = self.reserving.lock().await;
-        if upto <= self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        self.io_sequence.write_data(0, &upto.to_le_bytes()).await;
-        self.id_reserved_upto.store(upto, AtomicOrdering::Release);
-    }
-
-    /// Makes sure the sequence on disk covers the ids about to be handed out.
-    ///
-    /// Called before an update relocates, whose new versions draw from the
-    /// counter but keep their row's own id, so a gap there is harmless. An
-    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
-    async fn ensure_ids_reserved(&self) {
-        let next = self.last_row_id.load(AtomicOrdering::Acquire);
-        if next < self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        self.reserve_ids(next + ID_RESERVATION_CHUNK).await;
-    }
-
     /// The highest id the sequence reservation covers, for tests.
     #[cfg(test)]
-    pub(crate) fn ids_reserved_upto(&self) -> u64 {
-        self.id_reserved_upto.load(AtomicOrdering::Acquire)
+    pub(crate) fn ids_reserved_upto(&self) -> Result<u64> {
+        Ok(self.data()?.id_reserved_upto.load(AtomicOrdering::Acquire))
     }
 
-    /// Covers on disk the id an insert is about to take, counting every other
-    /// insert that has checked but not yet taken one. Hold the guard until the
-    /// id is taken.
-    ///
-    /// Inserts used to take turns here under the table's one uniqueness lock;
-    /// with that lock striped by key, two of them check and allocate side by
-    /// side, and checking `next < reserved` alone let the second take an id the
-    /// disk did not cover, which a crash then handed out twice.
-    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
-        let in_flight = self.ids_in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
-        let guard = IdsInFlight(&self.ids_in_flight);
-        let next = self.last_row_id.load(AtomicOrdering::Acquire);
-        if next + in_flight > self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            self.reserve_ids(next + in_flight + ID_RESERVATION_CHUNK).await;
-        }
-        guard
-    }
-
-    /// Registers this read with the epoch registry, so reclamation cannot hand
-    /// out an extent the read is about to fetch from.
-    ///
-    /// Inert when reclamation is off: nothing ever moves, so there is nothing
-    /// to shield against and no reason to pay for the bookkeeping.
-    #[inline]
-    fn read_guard(&self) -> ReadTicket {
-        if self.free_space.is_enabled() {
-            self.readers.enter()
-        } else {
-            ReadTicket::inert()
-        }
+    /// See [`TableData::reserve_insert_id`].
+    pub(crate) async fn reserve_insert_id(&self) -> Result<IdsInFlight<'_>> {
+        Ok(self.data()?.reserve_insert_id().await)
     }
 
     /// Puts this table under MVCC.
@@ -1011,7 +1127,14 @@ impl<S: StorageIO> Table<S> {
         // forgotten — which the files this table opens satisfy, having been
         // part of a registered table when that horizon was reached. Once per
         // table object: a second call would register a second handle.
-        let _ = self.forget.set(manager.register_table());
+        //
+        // Not for a shell. It has no rows, so no sweep ever advances its
+        // handle, and a handle that never advances holds the database's
+        // forget horizon down for good: the status bitmap would then grow
+        // without limit. Its partitions register for themselves.
+        if !self.is_shell() {
+            let _ = self.forget.set(manager.register_table());
+        }
         self.versions.store(Some(manager));
     }
 
@@ -1022,15 +1145,16 @@ impl<S: StorageIO> Table<S> {
 
     /// Runs a forget sweep now. See [`crate::core::vacuum::neutralize_aborted`].
     pub async fn neutralize_aborted_now(&self) -> std::io::Result<crate::core::vacuum::NeutralizeReport> {
+        let d = self.data()?;
         let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) else {
             return Ok(Default::default());
         };
         let parts = crate::core::vacuum::NeutralizeParts {
-            io_pointers: &*self.io_pointers,
+            io_pointers: &*d.io_pointers,
             write_lock: &self.write_lock,
             compaction_gate: &self.compaction_gate,
-            readers: &self.readers,
-            free_space: &self.free_space,
+            readers: &d.readers,
+            free_space: &d.free_space,
             cache_generation: &self.cache_generation,
             dead_stamps: &self.dead_stamps,
             drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
@@ -1154,24 +1278,25 @@ impl<S: StorageIO> Table<S> {
     /// they do not within the configured drain timeout the report comes back
     /// with `deferred` set and nothing is published.
     pub async fn vacuum_now(&self) -> Result<VacuumReport> {
+        let d = self.data()?;
         let config = VacuumConfig::default();
         let horizon = self.version_horizon();
-        let index_fetch = self
+        let index_fetch = d
             .indexes
             .as_ref()
             .map(|ix| Self::build_fetch_for(&self.schema.fields, &ix.columns()));
         let ctx = crate::core::vacuum::ReclaimContext {
             horizon: &horizon,
-            filters: self.filters.as_deref(),
+            filters: d.filters.as_deref(),
             cleared_below: &self.cleared_below,
-            indexes: self.indexes.as_deref().zip(index_fetch.as_ref()),
+            indexes: d.indexes.as_deref().zip(index_fetch.as_ref()),
             compaction_gate: Some(&self.compaction_gate),
         };
         let report = crate::core::vacuum::run_once(
-            &*self.io_pointers,
-            &*self.io_rows,
-            &self.free_space,
-            &self.readers,
+            &*d.io_pointers,
+            &*d.io_rows,
+            &d.free_space,
+            &d.readers,
             &ctx,
             &config,
             true,
@@ -1179,7 +1304,7 @@ impl<S: StorageIO> Table<S> {
         .await?;
 
         if report.fingerprints_cleared > 0 {
-            if let Some(filters) = self.filters.as_ref() {
+            if let Some(filters) = d.filters.as_ref() {
                 filters.request_checkpoint();
             }
         }
@@ -1221,6 +1346,7 @@ impl<S: StorageIO> Table<S> {
     /// that cannot truncate reports `truncation_unsupported` and keeps the
     /// tail — the space is reusable either way, just not returned.
     pub async fn compact(&self) -> Result<CompactReport> {
+        let d = self.data()?;
         // Compaction is the one writer whose effects the log cannot describe:
         // it moves rows and then shortens the file, and a truncation has no
         // redo record. A backup's fuzzy copy is only made consistent by replay,
@@ -1246,7 +1372,7 @@ impl<S: StorageIO> Table<S> {
         // before its sync) is not on disk yet, and a power cut would undo the
         // delete while the row's bytes already belong to another row. So the
         // outcomes are made durable first, and nothing moves if they cannot be.
-        if let Err(e) = crate::core::vacuum::outcome_barrier(&*self.io_pointers, &horizon) {
+        if let Err(e) = crate::core::vacuum::outcome_barrier(&*d.io_pointers, &horizon) {
             error!(
                 "Compaction of {}: the outcomes of the deleted rows could not be made durable \
                  ({}); nothing was moved",
@@ -1259,7 +1385,7 @@ impl<S: StorageIO> Table<S> {
         // is about to be somewhere else. Quarantined batches go too, and a
         // vacuum sweep that computed extents from the old layout (it releases
         // this gate before publishing) publishes nothing.
-        self.free_space.begin_relayout();
+        d.free_space.begin_relayout();
 
         // Cached answers hold row pointers, and rows are about to move. Retired
         // now rather than only on success: a compaction that fails part-way has
@@ -1288,11 +1414,11 @@ impl<S: StorageIO> Table<S> {
         // `TableFilters::begin_renumbering_on_disk`): a crash mid-compaction
         // leaves a sidecar that is rejected and rebuilt, rather than one that
         // confidently indexes rows by their former addresses.
-        let n_slots_before = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        let renumbering = self.begin_renumbering(n_slots_before).await;
+        let n_slots_before = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let renumbering = self.begin_renumbering(d, n_slots_before).await;
 
-        let rows_len = self.io_rows.get_len().await;
-        let (live, dead_rows) = collect_live(&*self.io_pointers, rows_len, &horizon).await?;
+        let rows_len = d.io_rows.get_len().await;
+        let (live, dead_rows) = collect_live(&*d.io_pointers, rows_len, &horizon).await?;
 
         let mut report = CompactReport {
             live_rows: live.len() as u64,
@@ -1312,7 +1438,7 @@ impl<S: StorageIO> Table<S> {
                 match $result {
                     Ok(value) => value,
                     Err(e) => {
-                        self.io_pointers.abort_txn($txn).await;
+                        d.io_pointers.abort_txn($txn).await;
                         return Err(e.into());
                     }
                 }
@@ -1321,7 +1447,7 @@ impl<S: StorageIO> Table<S> {
 
         // --- Phase 1: pack the row bytes ---
         let mut buffer: Vec<u8> = Vec::new();
-        let mut txn = self.io_rows.begin_txn();
+        let mut txn = d.io_rows.begin_txn();
 
         for (index, target) in moves {
             let record = &mut pointers[index];
@@ -1330,7 +1456,7 @@ impl<S: StorageIO> Table<S> {
             buffer.clear();
             buffer.resize(length, 0);
             let mut read_at = record.pointer.position;
-            if let Err(e) = self
+            if let Err(e) = d
                 .io_rows
                 .read_data_into_buffer(&mut read_at, &mut buffer)
                 .await
@@ -1344,13 +1470,13 @@ impl<S: StorageIO> Table<S> {
 
             // Bytes and pointer in one transaction: a pointer that survived
             // without its bytes would name someone else's row.
-            let _ = self.io_rows.write_data_txn(txn, target, &buffer).await;
+            let _ = d.io_rows.write_data_txn(txn, target, &buffer).await;
             record.pointer.position = target;
             let token = or_abort!(
                 record
                     .pointer
                     .save_at_in_txn(
-                        &*self.io_pointers,
+                        &*d.io_pointers,
                         record.slot * ROW_POINTER_RECORD_LEN as u64,
                         txn,
                     )
@@ -1366,7 +1492,7 @@ impl<S: StorageIO> Table<S> {
             #[cfg(test)]
             if compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.get()) == Some(report.rows_moved) {
                 compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(None));
-                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
                 return Err(std::io::Error::other("injected failure part-way through phase 1"));
             }
 
@@ -1376,12 +1502,12 @@ impl<S: StorageIO> Table<S> {
             // this batch is not durable and the next one is, a restart finds a
             // pointer naming bytes that were overwritten. Interrupting is safe;
             // continuing past a failure is not.
-            if crate::core::wal::should_break_transaction(&*self.io_rows) {
-                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
-                txn = self.io_rows.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_rows) {
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                txn = d.io_rows.begin_txn();
             }
         }
-        or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+        or_abort!(d.io_pointers.commit_durable(txn).await, txn);
 
         // --- Phase 2: pack the pointer records ---
         //
@@ -1393,7 +1519,7 @@ impl<S: StorageIO> Table<S> {
         // The filter is not updated per move — every slot address changes, so it
         // is rebuilt wholesale at the end. That renumbering is exactly why this
         // cannot run incrementally in the background alongside a live filter.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
         let mut target_slot = 0u64;
 
         for record in pointers.iter_mut() {
@@ -1414,7 +1540,7 @@ impl<S: StorageIO> Table<S> {
             let _ = or_abort!(
                 record
                     .pointer
-                    .save_at_in_txn(&*self.io_pointers, destination, txn)
+                    .save_at_in_txn(&*d.io_pointers, destination, txn)
                     .await,
                 txn
             );
@@ -1427,7 +1553,7 @@ impl<S: StorageIO> Table<S> {
             }
             let _ = or_abort!(
                 tombstone
-                    .save_at_in_txn(&*self.io_pointers, source, txn)
+                    .save_at_in_txn(&*d.io_pointers, source, txn)
                     .await,
                 txn
             );
@@ -1443,17 +1569,17 @@ impl<S: StorageIO> Table<S> {
                 == Some(report.slots_moved)
             {
                 compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(None));
-                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
                 return Err(std::io::Error::other("injected failure part-way through phase 2"));
             }
 
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
-                txn = self.io_pointers.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                txn = d.io_pointers.begin_txn();
             }
         }
         // Nothing is truncated past this point unless every move is durable.
-        or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+        or_abort!(d.io_pointers.commit_durable(txn).await, txn);
         // Slot numbers have stopped changing. Ending the renumbering here (and
         // on every early return above, by drop) starts the epoch the rebuild
         // below runs in.
@@ -1463,7 +1589,7 @@ impl<S: StorageIO> Table<S> {
         //
         // After the log is checkpointed, so no unreplayed record can re-extend
         // a file past the point we are about to cut it at.
-        if let Some(wal) = self
+        if let Some(wal) = d
             .io_pointers
             .get_location()
             .and_then(|location| crate::core::wal::wal_for(&location))
@@ -1524,23 +1650,23 @@ impl<S: StorageIO> Table<S> {
         if report.truncation_skipped.is_some() {
             // Counted where `SHOW TABLE STATS` reads it: the statement reports
             // it too, but a scheduled run has no client to tell.
-            self.vacuum_stats
+            d.vacuum_stats
                 .full_untruncated
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
         if !report.truncation_unsupported {
             report.rows_bytes_freed = self
-                .truncate_tail(&self.io_rows, compacted_rows_len, &mut report)
+                .truncate_tail(&d.io_rows, compacted_rows_len, &mut report)
                 .await;
             report.pointer_bytes_freed = self
-                .truncate_tail(&self.io_pointers, compacted_pointer_len, &mut report)
+                .truncate_tail(&d.io_pointers, compacted_pointer_len, &mut report)
                 .await;
         }
 
         // The high-water mark and the id sequence both described the old layout.
-        self.len.store(compacted_rows_len, AtomicOrdering::Release);
+        d.len.store(compacted_rows_len, AtomicOrdering::Release);
         if let Some(last) = pointers.last() {
-            self.last_row_id
+            d.last_row_id
                 .fetch_max(last.pointer.row_id(), AtomicOrdering::AcqRel);
         }
 
@@ -1556,19 +1682,19 @@ impl<S: StorageIO> Table<S> {
         // backfill that completes restores it: one that fails leaves the
         // prefix untrusted, and the checkpoint records that, rather than
         // reporting ready over planes that still hold the old numbering.
-        if self.filters.is_some() {
+        if d.filters.is_some() {
             match self.backfill_filters_from(0).await {
                 Ok(_) => self.filters_ready.store(true, AtomicOrdering::Release),
                 Err(e) => error!("Compaction could not rebuild the filter; it stays unused: {}", e),
             }
-            self.checkpoint_filters().await;
+            self.checkpoint_filters().await?;
         }
 
         // The secondary indexes name slots too, every one of which moved.
         // Rebuilt under the same exclusive gate, so no query can ask a
         // half-built index; one that fails to rebuild stays unready, and
         // queries scan rather than trust slot numbers that no longer exist.
-        if let Some(indexes) = self.indexes.as_ref() {
+        if let Some(indexes) = d.indexes.as_ref() {
             // Unready since the renumbering began; this epoch is the one it
             // ended in, so only this build can mark them ready again.
             let epoch = indexes.epoch();
@@ -1577,10 +1703,10 @@ impl<S: StorageIO> Table<S> {
             indexes.clear(Proof::from(&build));
             match build_indexes(
                 indexes,
-                &self.io_pointers,
-                &self.io_rows,
+                &d.io_pointers,
+                &d.io_rows,
                 &self.schema.fields,
-                self.free_space.is_enabled().then_some(&self.readers),
+                d.free_space.is_enabled().then_some(&d.readers),
             )
             .await
             {
@@ -1628,7 +1754,7 @@ impl<S: StorageIO> Table<S> {
     /// cannot run while `compact` holds its gate, and an open-time build that
     /// publishes ready meanwhile is made unready by the drop); the begin-time
     /// one here is defence in depth.
-    async fn begin_renumbering(&self, n_slots: u64) -> RenumberingGuard<'_> {
+    async fn begin_renumbering<'a>(&'a self, d: &'a TableData<S>, n_slots: u64) -> RenumberingGuard<'a> {
         self.filters_ready.store(false, AtomicOrdering::Release);
         // Built before the first await, not after: `begin_renumbering_on_disk`
         // makes the epoch odd and then waits on the sidecar's dirty mark, and
@@ -1639,16 +1765,16 @@ impl<S: StorageIO> Table<S> {
         // only moves the epoch to the next even value, which costs whatever
         // work was in flight a retry.
         let guard = RenumberingGuard {
-            filters: self.filters.as_deref(),
-            indexes: self.indexes.as_deref(),
+            filters: d.filters.as_deref(),
+            indexes: d.indexes.as_deref(),
         };
         let ticket = gate::ticket();
-        if let Some(filters) = self.filters.as_ref() {
+        if let Some(filters) = d.filters.as_ref() {
             filters
-                .begin_renumbering_on_disk(Proof::from(&ticket), &*self.io_filters, n_slots)
+                .begin_renumbering_on_disk(Proof::from(&ticket), &*d.io_filters, n_slots)
                 .await;
         }
-        if let Some(indexes) = self.indexes.as_ref() {
+        if let Some(indexes) = d.indexes.as_ref() {
             indexes.invalidate(Proof::from(&ticket));
         }
         guard
@@ -1675,8 +1801,8 @@ impl<S: StorageIO> Table<S> {
 
     /// Cumulative reclamation counters for this table.
     #[inline]
-    pub fn vacuum_stats(&self) -> &VacuumStats {
-        &self.vacuum_stats
+    pub fn vacuum_stats(&self) -> Result<&VacuumStats> {
+        Ok(&self.data()?.vacuum_stats)
     }
 
     /// Row versions the write path has stamped dead since the table opened.
@@ -1691,8 +1817,8 @@ impl<S: StorageIO> Table<S> {
     /// no writer has claimed since. Dead space that a scan has not reached, or
     /// withheld because an older query was running, is not included.
     #[inline]
-    pub fn reclaimable_bytes(&self) -> u64 {
-        self.free_space.free_bytes()
+    pub fn reclaimable_bytes(&self) -> Result<u64> {
+        Ok(self.data()?.free_space.free_bytes())
     }
 
     /// Whether reclamation is running for this table.
@@ -1700,8 +1826,8 @@ impl<S: StorageIO> Table<S> {
     /// Per table rather than per database, which is why it is reported per
     /// table: `SHOW CONFIG` can only answer "per table" for `vacuum.enabled`,
     /// and without this there was nowhere to find out which tables that meant.
-    pub fn vacuum_enabled(&self) -> bool {
-        self.free_space.is_enabled()
+    pub fn vacuum_enabled(&self) -> Result<bool> {
+        Ok(self.data()?.free_space.is_enabled())
     }
 
     /// Turns reclamation on or off for this table without restarting.
@@ -1709,8 +1835,9 @@ impl<S: StorageIO> Table<S> {
     /// Switching off drops the free list, so nothing further is handed out, and
     /// queries stop registering epochs from their next call. Switching back on
     /// starts from an empty list; the next scan repopulates it.
-    pub fn set_vacuum_enabled(&self, enabled: bool) {
-        self.free_space.set_enabled(enabled);
+    pub fn set_vacuum_enabled(&self, enabled: bool) -> Result<()> {
+        self.data()?.free_space.set_enabled(enabled);
+        Ok(())
     }
 
     /// Writes just the assigned columns' bytes, leaving the rest of the row
@@ -1724,6 +1851,7 @@ impl<S: StorageIO> Table<S> {
     /// general path — declining is always safe, taking it wrongly is not.
     async fn write_columns_in_place(
         &self,
+        d: &TableData<S>,
         pointer: &RowPointer,
         updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
         txn: u64,
@@ -1791,7 +1919,7 @@ impl<S: StorageIO> Table<S> {
         }
 
         for (position, bytes) in writes {
-            let _ = self.io_rows.write_data_txn(txn, position, bytes).await;
+            let _ = d.io_rows.write_data_txn(txn, position, bytes).await;
         }
         self.in_place_column_updates
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -2093,17 +2221,18 @@ impl<S: StorageIO> Table<S> {
         // when the predicate holds for it too.
         predicate: Option<&crate::core::rql::expr::Cond>,
     ) -> Result<Option<(u64, bool)>> {
+        let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
 
         // An index over exactly these columns names the candidate slots; the
         // iterator then reads only the chunks holding them, and anything
         // appended since the sample is a candidate by the list's own rule.
-        let from_index = match self.index_probe(tuple).await {
+        let from_index = match self.index_probe(d, tuple).await {
             Some((slots, n_slots)) => {
                 let slots: Vec<u64> = slots.into_iter().filter(|s| *s < n_slots).collect();
                 iterator.set_candidates(Some(Arc::new(CandidateBitmap::sparse(slots, n_slots))));
@@ -2112,7 +2241,7 @@ impl<S: StorageIO> Table<S> {
             None => false,
         };
 
-        if let (false, Some(filters)) = (from_index, self.filters.as_ref()) {
+        if let (false, Some(filters)) = (from_index, d.filters.as_ref()) {
             match tuple
                 .iter()
                 .find(|(field, _)| filters.indexes(field.write_order as u32))
@@ -2125,7 +2254,7 @@ impl<S: StorageIO> Table<S> {
                             value: value.to_vec(),
                         }),
                     };
-                    let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                     if let Some(bitmap) = filters.evaluate(&program, n_slots) {
                         iterator.set_candidates(Some(Arc::new(bitmap)));
                     }
@@ -2228,7 +2357,7 @@ impl<S: StorageIO> Table<S> {
                 }
             };
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
@@ -2278,11 +2407,11 @@ impl<S: StorageIO> Table<S> {
     /// stripe of `unique_lock`, as does every write that could put that key
     /// under these columns: an earlier writer has finished, its index entry
     /// included, before this one looks.
-    async fn index_probe(&self, columns: &[(&SchemaField, &[u8])]) -> Option<(Vec<u64>, u64)> {
-        let indexes = self.indexes.as_ref()?;
+    async fn index_probe(&self, d: &TableData<S>, columns: &[(&SchemaField, &[u8])]) -> Option<(Vec<u64>, u64)> {
+        let indexes = d.indexes.as_ref()?;
         let wos: SmallVec<[u32; 4]> = columns.iter().map(|(f, _)| f.write_order as u32).collect();
         let index = indexes.exact(&wos)?;
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         let key = index.key_of(|wo| {
             columns
                 .iter()
@@ -2471,10 +2600,11 @@ impl<S: StorageIO> Table<S> {
         // database with no transaction manager wants.
         written_by: TxId,
     ) -> Result<Option<(u64, bool)>> {
+        let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new(d.io_pointers.clone())
             .await
             .map_err(std::io::Error::from)?;
 
@@ -2495,8 +2625,8 @@ impl<S: StorageIO> Table<S> {
         // descent rather than a pass over a bitmap of the whole table, so an
         // insert into a table with a primary key costs the same at a million
         // rows as at a thousand.
-        if let Some((slots, n_slots)) = self.index_probe(&[(field, value)]).await {
-            let now = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        if let Some((slots, n_slots)) = self.index_probe(d, &[(field, value)]).await {
+            let now = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
             let mut slots = slots;
             slots.extend(n_slots..now);
             probe_slots = Some(slots.into_iter());
@@ -2504,7 +2634,7 @@ impl<S: StorageIO> Table<S> {
 
         // The mask is a superset, so a slot it clears genuinely cannot hold the
         // value; every slot it keeps is still compared byte for byte below.
-        if let (None, Some(filters)) = (probe_slots.as_ref(), self.filters.as_ref()) {
+        if let (None, Some(filters)) = (probe_slots.as_ref(), d.filters.as_ref()) {
             if filters.indexes(field.write_order as u32) {
                 let program = SargProgram {
                     root: MaskExpr::Pred(SargPredicate {
@@ -2513,11 +2643,11 @@ impl<S: StorageIO> Table<S> {
                         value: value.to_vec(),
                     }),
                 };
-                let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                 if let Some(bitmap) = filters.evaluate(&program, n_slots) {
                     // Past `n_slots` the bitmap says nothing, so every slot
                     // appended since it was sampled is a candidate too.
-                    let now = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let now = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                     let mut slots: Vec<u64> = Vec::new();
                     if !bitmap.is_nothing() {
                         for (w, &word) in bitmap.words().iter().enumerate() {
@@ -2588,7 +2718,7 @@ impl<S: StorageIO> Table<S> {
                 Some(slots) => {
                     let Some(slot) = slots.next() else { break };
                     let mut at = slot * ROW_POINTER_RECORD_LEN as u64;
-                    match self.io_pointers.read_data_into_buffer(&mut at, &mut record).await {
+                    match d.io_pointers.read_data_into_buffer(&mut at, &mut record).await {
                         Ok(()) => {}
                         // A slot past the end: an append reserved it and has
                         // not written it yet, exactly what the sequential walk
@@ -2653,7 +2783,7 @@ impl<S: StorageIO> Table<S> {
                 }
             };
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
@@ -2691,20 +2821,21 @@ impl<S: StorageIO> Table<S> {
     ///
     /// Linear in the pointer file. Intended for resolving a handle, not for
     /// query execution, which goes through the filter index.
-    pub async fn locate_row_by_id(&self, id: u64) -> Option<(u64, RowPointer)> {
+    pub async fn locate_row_by_id(&self, id: u64) -> Result<Option<(u64, RowPointer)>> {
+        let d = self.data()?;
         const RECORD: usize = ROW_POINTER_RECORD_LEN;
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
-        let len = self.io_pointers.get_len().await;
+        let len = d.io_pointers.get_len().await;
         let end = len - (len % RECORD as u64);
         let mut position = 0u64;
 
         let mut buffer = [0u8; RECORD];
         while position + RECORD as u64 <= end {
             let mut read_at = position;
-            if self
+            if d
                 .io_pointers
                 .read_data_into_buffer(&mut read_at, &mut buffer)
                 .await
@@ -2716,25 +2847,28 @@ impl<S: StorageIO> Table<S> {
             // At most one live pointer carries a given id, so the first live
             // match is the answer however many times the row has moved.
             if !candidate.deleted && candidate.row_id() == id {
-                return Some((position, candidate));
+                return Ok(Some((position, candidate)));
             }
             position += RECORD as u64;
         }
-        None
+        Ok(None)
     }
 
     /// True once the maintenance task has finished its initial backfill.
     #[inline]
-    pub fn filters_ready(&self) -> bool {
-        self.filters_ready.load(AtomicOrdering::Acquire)
+    pub fn filters_ready(&self) -> Result<bool> {
+        self.data()?;
+        Ok(self.filters_ready.load(AtomicOrdering::Acquire))
     }
 
     /// Await the initial backfill. Queries before it completes are correct —
     /// just not yet narrowed by the filter.
-    pub async fn wait_filters_ready(&self) {
-        while !self.filters_ready() {
+    pub async fn wait_filters_ready(&self) -> Result<()> {
+        self.data()?;
+        while !self.filters_ready.load(AtomicOrdering::Acquire) {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
+        Ok(())
     }
 
     /// Read and validate the sidecar. Any problem returns `None` and the caller
@@ -2797,6 +2931,7 @@ impl<S: StorageIO> Table<S> {
     /// their slots stay all-zero — which reads as "matches nothing" and lets the
     /// filter prune tombstoned rows before their pointer is even decoded.
     pub async fn backfill_filters(&self) -> Result<u64> {
+        self.data()?;
         self.backfill_filters_from(0).await
     }
 
@@ -2804,16 +2939,17 @@ impl<S: StorageIO> Table<S> {
     /// frontier makes reopening cost work proportional to what was written
     /// since, not to the size of the table.
     pub async fn backfill_filters_from(&self, start_slot: u64) -> Result<u64> {
-        let Some(filters) = self.filters.as_ref() else {
+        let d = self.data()?;
+        let Some(filters) = d.filters.as_ref() else {
             return Ok(0);
         };
         backfill_into(
             filters,
-            &self.io_pointers,
-            &self.io_rows,
+            &d.io_pointers,
+            &d.io_rows,
             &self.schema.fields,
             start_slot,
-            self.free_space.is_enabled().then_some(&self.readers),
+            d.free_space.is_enabled().then_some(&d.readers),
         )
         .await
     }
@@ -2821,12 +2957,14 @@ impl<S: StorageIO> Table<S> {
     /// Persist the current filter state. Normally the maintenance task does
     /// this; call it directly when a checkpoint must be on disk before some
     /// specific point, such as a controlled shutdown.
-    pub async fn checkpoint_filters(&self) {
-        let Some(filters) = self.filters.as_ref() else {
-            return;
+    pub async fn checkpoint_filters(&self) -> Result<()> {
+        let d = self.data()?;
+        let Some(filters) = d.filters.as_ref() else {
+            return Ok(());
         };
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        filters.checkpoint(&*self.io_filters, n_slots).await;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        filters.checkpoint(&*d.io_filters, n_slots).await;
+        Ok(())
     }
 
     /// The slot ceiling that answers `ORDER BY … LIMIT k` from the leading
@@ -2848,6 +2986,7 @@ impl<S: StorageIO> Table<S> {
     /// rows, which the caller detects and widens.
     async fn monotonic_scan_ceiling(
         &self,
+        d: &TableData<S>,
         order_by: &Option<String>,
         limit: Option<u64>,
         n_slots: u64,
@@ -2856,7 +2995,7 @@ impl<S: StorageIO> Table<S> {
         if wanted == 0 || n_slots == 0 {
             return None;
         }
-        let filters = self.filters.as_ref()?;
+        let filters = d.filters.as_ref()?;
         let spec = order_by.as_ref()?;
 
         let mut keys = crate::core::rql::order_by::parse_spec(spec).into_iter();
@@ -2910,8 +3049,8 @@ impl<S: StorageIO> Table<S> {
 
     /// The candidate slots a secondary index gives for a tokenized WHERE
     /// clause, or `None` when no index can narrow it, or none is built yet.
-    pub(crate) async fn index_candidates(&self, tokens: &[Token]) -> Option<Arc<CandidateBitmap>> {
-        let indexes = self.indexes.as_ref().filter(|i| i.is_ready())?;
+    async fn index_candidates(&self, d: &TableData<S>, tokens: &[Token]) -> Option<Arc<CandidateBitmap>> {
+        let indexes = d.indexes.as_ref().filter(|i| i.is_ready())?;
         if tokens.is_empty() {
             return None;
         }
@@ -2922,7 +3061,7 @@ impl<S: StorageIO> Table<S> {
         // caller took that snapshot BEFORE calling this. A snapshot taken
         // after can see a commit whose entry this lookup missed; every caller
         // of `build_candidates` takes its snapshot first for that reason.
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         let scales = self.decimal_scales();
         let cap = crate::core::index::candidate_cap(n_slots);
         // Key indexes, with `doc->>'k'` read as the virtual column of a path
@@ -2966,8 +3105,8 @@ impl<S: StorageIO> Table<S> {
     /// The filter index's mask for a clause, and the table length it covers:
     /// every slot that may match, before any judgement of whether a scan is
     /// better off with it.
-    async fn filter_mask(&self, tokens: &[Token]) -> Option<(CandidateBitmap, u64)> {
-        let filters = self.filters.as_ref()?;
+    async fn filter_mask(&self, d: &TableData<S>, tokens: &[Token]) -> Option<(CandidateBitmap, u64)> {
+        let filters = d.filters.as_ref()?;
         if tokens.is_empty() {
             return None;
         }
@@ -2975,7 +3114,7 @@ impl<S: StorageIO> Table<S> {
         // the column stores it — see `sarg::extract_with_scales`.
         let scales = self.decimal_scales();
         let program = sarg::extract_with_scales(tokens, filters, &scales)?;
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         if n_slots == 0 {
             return None;
         }
@@ -2984,18 +3123,31 @@ impl<S: StorageIO> Table<S> {
     }
 
 
-    /// Build a candidate mask for a WHERE clause, or `None` to scan normally.
+    /// Build a candidate mask for a WHERE clause, or `Ok(None)` to scan
+    /// normally.
     ///
     /// `pub(crate)` only so `write_path_tests` can assert on what it declines.
-    /// The decisions here — the size gate and the ratio test below — are
-    /// invisible in query results by design, since both fail open to a full
-    /// scan, so nothing outside this method can tell whether they ran.
+    /// The decisions in [`Self::candidates_for`] — the size gate and the ratio
+    /// test — are invisible in query results by design, since both fail open
+    /// to a full scan, so nothing outside it can tell whether they ran.
     pub(crate) async fn build_candidates(
         &self,
         where_clause: &str,
         limit: Option<u64>,
+    ) -> Result<Option<Arc<CandidateBitmap>>> {
+        let d = self.data()?;
+        Ok(self.candidates_for(d, where_clause, limit).await)
+    }
+
+    /// The body of [`Self::build_candidates`], for a caller that already
+    /// holds the table's data.
+    async fn candidates_for(
+        &self,
+        d: &TableData<S>,
+        where_clause: &str,
+        limit: Option<u64>,
     ) -> Option<Arc<CandidateBitmap>> {
-        let candidates = self.build_candidates_inner(where_clause, limit).await;
+        let candidates = self.build_candidates_inner(d, where_clause, limit).await;
         // Test-only: parks the statement once the index and the filter have
         // been asked, on every return path — the window between that lookup
         // and anything the caller does next, a snapshot included.
@@ -3006,6 +3158,7 @@ impl<S: StorageIO> Table<S> {
 
     async fn build_candidates_inner(
         &self,
+        d: &TableData<S>,
         where_clause: &str,
         limit: Option<u64>,
     ) -> Option<Arc<CandidateBitmap>> {
@@ -3019,8 +3172,8 @@ impl<S: StorageIO> Table<S> {
             return None;
         }
         let judge_constant = sarg::worth_judging_constant(where_clause);
-        let indexes_ready = self.indexes.as_ref().is_some_and(|i| i.is_ready());
-        if !judge_constant && !indexes_ready && self.filters.is_none() {
+        let indexes_ready = d.indexes.as_ref().is_some_and(|i| i.is_ready());
+        if !judge_constant && !indexes_ready && d.filters.is_none() {
             return None;
         }
         let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
@@ -3039,12 +3192,12 @@ impl<S: StorageIO> Table<S> {
         // price > 990` without a range on `price` names every `cat = 5` row,
         // while the filter's mask already excludes most of them on `price`.
         // Both are supersets of the matches, so their intersection is too.
-        let from_index = self.index_candidates(&tokens).await;
+        let from_index = self.index_candidates(d, &tokens).await;
         if let Some(found) = &from_index {
-            if found.count() <= INDEX_ANSWER_TAKEN_AS_IS || self.filters.is_none() {
+            if found.count() <= INDEX_ANSWER_TAKEN_AS_IS || d.filters.is_none() {
                 return from_index;
             }
-            let Some((mask, _)) = self.filter_mask(&tokens).await else {
+            let Some((mask, _)) = self.filter_mask(d, &tokens).await else {
                 return from_index;
             };
             // Two bitmaps intersect word by word, and a slot past the
@@ -3059,8 +3212,8 @@ impl<S: StorageIO> Table<S> {
             info!("Filter narrowed {} index candidates to {}", found.count(), narrowed.count());
             return Some(Arc::new(narrowed));
         }
-        let filters = self.filters.as_ref()?;
-        let (bitmap, n_slots) = self.filter_mask(&tokens).await?;
+        let filters = d.filters.as_ref()?;
+        let (bitmap, n_slots) = self.filter_mask(d, &tokens).await?;
 
         // A table small enough to scan outright gains nothing from a mask: the
         // bitmap test per record costs more than the fetches it saves, and
@@ -3120,12 +3273,14 @@ impl<S: StorageIO> Table<S> {
 
     /// Inserts outside any transaction, visible immediately.
     pub async fn insert_row(&self, row_write: RowWrite) -> Result<()> {
+        self.data()?;
         self.insert_row_in_txn(row_write, FROZEN_TX).await
     }
 
     /// Inserts a row belonging to `written_by`, visible to nobody else until it
     /// commits.
     pub async fn insert_row_in_txn(&self, row_write: RowWrite, written_by: TxId) -> Result<()> {
+        let d = self.data()?;
         // Compaction relies on the live set not changing under it, so an insert
         // holds the gate too. It is shared, so concurrent inserts still run.
         let _gate = self.compaction_gate.read().await;
@@ -3155,7 +3310,7 @@ impl<S: StorageIO> Table<S> {
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
-        let _id = self.reserve_insert_id().await;
+        let _id = d.reserve_insert_id().await;
 
         info!(
             "Inserting row with {} columns",
@@ -3163,16 +3318,16 @@ impl<S: StorageIO> Table<S> {
         );
 
         let result = RowPointer::write_row_with_pointer_record_pos(
-            self.io_pointers.clone(),
-            self.io_rows.clone(),
-            &self.last_row_id,
-            &self.len,
+            d.io_pointers.clone(),
+            d.io_rows.clone(),
+            &d.last_row_id,
+            &d.len,
             // Clustering is not implemented; every row goes to cluster 0.
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
             None,
-            Some(&self.free_space),
+            Some(&d.free_space),
             None,
             written_by,
         )
@@ -3190,7 +3345,7 @@ impl<S: StorageIO> Table<S> {
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
         let ticket = gate::ticket();
-        if let Some(filters) = self.filters.as_ref() {
+        if let Some(filters) = d.filters.as_ref() {
             filters.on_insert(
                 Proof::from(&ticket),
                 record_pos / ROW_POINTER_RECORD_LEN as u64,
@@ -3199,7 +3354,7 @@ impl<S: StorageIO> Table<S> {
         }
         // Before this returns, and so before the inserting transaction can
         // commit: no snapshot can see the row without its index entry.
-        if let Some(indexes) = self.indexes.as_ref() {
+        if let Some(indexes) = d.indexes.as_ref() {
             indexes.on_insert(
                 Proof::from(&ticket),
                 record_pos / ROW_POINTER_RECORD_LEN as u64,
@@ -3224,6 +3379,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
     ) -> Result<Vec<Row>> {
+        self.data()?;
         self.query_row_in_txn(
             query,
             schema_fields,
@@ -3256,18 +3412,19 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         reader: TxId,
     ) -> Result<u64> {
+        let d = self.data()?;
         let visibility = self.read_visibility_for(reader);
 
         // The same two guards the row path takes, for the same reason:
         // reclamation may not hand out an extent while a pointer into it is
         // still in play, even though this path never dereferences one.
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         let generation = self.cache_generation();
-        let base_candidates = self.build_candidates(query, None).await;
+        let base_candidates = self.candidates_for(d, query, None).await;
 
-        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
         iterator.set_candidates(base_candidates);
@@ -3278,7 +3435,7 @@ impl<S: StorageIO> Table<S> {
                 query,
                 query_row_fetch,
                 schema_fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 cache_generation_for(&visibility, generation),
                 visibility,
@@ -3296,6 +3453,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<Row>> {
+        self.data()?;
         let visibility = self.read_visibility_for(reader);
         self.query_row_with_visibility(
             query,
@@ -3325,6 +3483,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         visibility: Visibility,
     ) -> Result<Vec<Row>> {
+        let d = self.data()?;
         // Implementation for querying a row from the table
 
         info!("Querying row");
@@ -3332,14 +3491,14 @@ impl<S: StorageIO> Table<S> {
         // Held for the whole query, worker fetches included: reclamation may
         // not hand out an extent while a pointer into it is still in play.
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Read before the scan, so a mutation that commits while it runs leaves
         // this query's cache entry stamped with a generation nobody will match.
         let generation = self.cache_generation();
 
-        let base_candidates = self.build_candidates(query, limit).await;
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let base_candidates = self.candidates_for(d, query, limit).await;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
         // `ORDER BY` on a column that already ascends with slot position does
         // not need the table ordered: the first `k` rows by slot *are* the
@@ -3351,10 +3510,10 @@ impl<S: StorageIO> Table<S> {
         // after `k` rows have been collected could return slots 0–50 and
         // 1500–1650 rather than the first 200 — the right number of rows and
         // the wrong ones.
-        let mut ceiling = self.monotonic_scan_ceiling(&order_by, limit, n_slots).await;
+        let mut ceiling = self.monotonic_scan_ceiling(d, &order_by, limit, n_slots).await;
 
         let rows = loop {
-            let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+            let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
                 .await
                 .unwrap();
             iterator.set_candidates(match ceiling {
@@ -3376,7 +3535,7 @@ impl<S: StorageIO> Table<S> {
                     query_row_fetch.clone(),
                     requested_row_fetch.clone(),
                     schema_fields,
-                    self.io_rows.clone(),
+                    d.io_rows.clone(),
                     &mut iterator,
                     limit,
                     order_by.clone(),
@@ -3425,6 +3584,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
     ) -> Result<Vec<u8>> {
+        self.data()?;
         self.query_row_bytes_in_txn(
             query,
             schema_fields,
@@ -3448,6 +3608,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<u8>> {
+        self.data()?;
         self.query_row_bytes_reporting_in_txn(
             query,
             schema_fields,
@@ -3476,6 +3637,7 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<(Vec<u8>, bool)> {
+        self.data()?;
         self.query_row_bytes_reporting(
             query,
             schema_fields,
@@ -3508,6 +3670,7 @@ impl<S: StorageIO> Table<S> {
         visibility: Visibility,
         cache: bool,
     ) -> Result<Vec<u8>> {
+        self.data()?;
         self.query_row_bytes_reporting(
             query,
             schema_fields,
@@ -3535,10 +3698,11 @@ impl<S: StorageIO> Table<S> {
         visibility: Option<Visibility>,
         cache: bool,
     ) -> Result<(Vec<u8>, bool)> {
+        let d = self.data()?;
         info!("Querying row (bytes mode)");
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // The SNAPSHOT is taken first, then the generation — that order is
         // load-bearing, and the row-mode path already had it by construction.
@@ -3559,10 +3723,10 @@ impl<S: StorageIO> Table<S> {
         let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
 
-        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(query, limit).await);
+        iterator.set_candidates(self.candidates_for(d, query, limit).await);
 
         let (bytes, overfetched) = self
             .concurrent_processor
@@ -3572,7 +3736,7 @@ impl<S: StorageIO> Table<S> {
                 query_row_fetch,
                 requested_row_fetch,
                 schema_fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 order_by,
@@ -3644,6 +3808,7 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         limit: Option<u64>,
     ) -> Result<u64> {
+        self.data()?;
         self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX)
             .await
     }
@@ -3656,6 +3821,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         deleted_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
         self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None, None)
             .await
     }
@@ -3682,12 +3848,13 @@ impl<S: StorageIO> Table<S> {
         visibility: Option<Visibility>,
         mut collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
+        let d = self.data()?;
         info!("Deleting rows");
 
         self.note_write(deleted_by);
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Taken *before* the scan, not between the scan and the rewrite.
         //
@@ -3714,15 +3881,15 @@ impl<S: StorageIO> Table<S> {
         // leaving it out is right, or follows it, so its entry landed first.
         let visibility = visibility.unwrap_or_else(|| self.visibility_for(deleted_by));
 
-        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(where_clause, limit).await);
+        iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
 
         // The checkpoint on disk is about to describe rows that no longer exist.
         // One byte, once per statement, and never on the insert path.
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
+        if let Some(filters) = d.filters.as_ref() {
+            filters.mark_disk_dirty(&*d.io_filters).await;
         }
 
         let matches = self
@@ -3732,7 +3899,7 @@ impl<S: StorageIO> Table<S> {
                 where_clause,
                 query_row_fetch,
                 &self.schema.fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 // A statement may only remove rows it can see. Without this a
@@ -3743,7 +3910,7 @@ impl<S: StorageIO> Table<S> {
 
         // One transaction for the whole statement: every tombstone lands or
         // none does, and the flush is paid once rather than once per row.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
         let mut deleted_count: u64 = 0;
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
@@ -3766,7 +3933,7 @@ impl<S: StorageIO> Table<S> {
                 // logged an in-place stamp and never commits holds the log's
                 // pending count up, and the log cannot be checkpointed again
                 // for the life of the process.
-                self.io_pointers.abort_txn(txn).await;
+                d.io_pointers.abort_txn(txn).await;
                 return Err(if deleted_count == 0 {
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -3783,9 +3950,9 @@ impl<S: StorageIO> Table<S> {
                 Some(_) => {
                     let mut row = Row::default();
                     let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
-                    if let Err(e) = pointer.fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row).await {
+                    if let Err(e) = pointer.fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row).await {
                         // Given up, not left open, as on a conflict above.
-                        self.io_pointers.abort_txn(txn).await;
+                        d.io_pointers.abort_txn(txn).await;
                         return Err(std::io::Error::other(format!(
                             "could not read a deleted row for RETURNING: {}",
                             e
@@ -3798,7 +3965,7 @@ impl<S: StorageIO> Table<S> {
             };
 
             if let Err(e) = pointer
-                .delete(self.io_pointers.clone(), record_pos, Some(txn), deleted_by)
+                .delete(d.io_pointers.clone(), record_pos, Some(txn), deleted_by)
                 .await
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
@@ -3816,7 +3983,7 @@ impl<S: StorageIO> Table<S> {
             // DELETE stamps `xmax` and leaves the version readable by older
             // snapshots; pruning its slot would hide it from them. Staged until
             // the tombstone is durable — see `PendingFilterOp`.
-            if deleted_by == FROZEN_TX && self.filters.is_some() {
+            if deleted_by == FROZEN_TX && d.filters.is_some() {
                 pending_filters.push(PendingFilterOp::Delete(
                     record_pos / ROW_POINTER_RECORD_LEN as u64,
                 ));
@@ -3828,10 +3995,10 @@ impl<S: StorageIO> Table<S> {
             // millions of rows would grow the log without bound — the same
             // reason UPDATE breaks its own. Batching costs the statement its
             // all-or-nothing property, which is the price of a reclaimable log.
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
-                txn = self.io_pointers.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&mut pending_filters);
+                txn = d.io_pointers.begin_txn();
             }
         }
 
@@ -3841,8 +4008,8 @@ impl<S: StorageIO> Table<S> {
         // Failing the statement rather than reporting rows affected: a tombstone
         // that is not durable is a row that comes back, and telling the caller
         // otherwise is the difference between a failed delete and a silent one.
-        self.io_pointers.commit_durable(txn).await?;
-        self.apply_pending_filters(&mut pending_filters);
+        d.io_pointers.commit_durable(txn).await?;
+        d.apply_pending_filters(&mut pending_filters);
 
         // Published before the lock is released, so anyone who takes it next
         // sees a generation that already accounts for everything above.
@@ -3854,7 +4021,7 @@ impl<S: StorageIO> Table<S> {
             self.invalidate_query_caches();
             // Ask the maintenance task to clear the dirty flag. Rewriting the
             // blob here would make a one-row DELETE pay for the whole index.
-            if let Some(filters) = self.filters.as_ref() {
+            if let Some(filters) = d.filters.as_ref() {
                 filters.request_checkpoint();
             }
         }
@@ -3871,6 +4038,7 @@ impl<S: StorageIO> Table<S> {
         updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
         limit: Option<u64>,
     ) -> Result<u64> {
+        self.data()?;
         self.update_rows_in_txn(where_clause, query_row_fetch, updates, limit, FROZEN_TX)
             .await
     }
@@ -3884,6 +4052,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
         self.update_rows_with_expressions(
             where_clause,
             query_row_fetch,
@@ -3911,6 +4080,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
         self.update_rows_as_of(
             where_clause,
             query_row_fetch,
@@ -3941,6 +4111,7 @@ impl<S: StorageIO> Table<S> {
         visibility: Option<Visibility>,
         mut collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
+        self.data()?;
         info!("Updating rows");
 
         // A statement naming its row by a unique key tries the point path
@@ -4030,6 +4201,7 @@ impl<S: StorageIO> Table<S> {
         point: Option<usize>,
         mut collect: Option<&mut Vec<Row>>,
     ) -> Result<Option<u64>> {
+        let d = self.data()?;
         // A caller that brings its own snapshot is a statement with work left
         // to do after this write — foreign-key actions — and that work can
         // fail it. An in-place overwrite keeps no previous version, so a
@@ -4040,7 +4212,7 @@ impl<S: StorageIO> Table<S> {
         self.note_write(written_by);
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Before the scan. See the note in `delete_rows`: a relocation by a
         // concurrent statement leaves nothing at the old record for a later
@@ -4066,13 +4238,13 @@ impl<S: StorageIO> Table<S> {
         // leaving it out is right, or follows it, so its entry landed first.
         let visibility = visibility.unwrap_or_else(|| self.visibility_for(written_by));
 
-        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(where_clause, limit).await);
+        iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
 
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
+        if let Some(filters) = d.filters.as_ref() {
+            filters.mark_disk_dirty(&*d.io_filters).await;
         }
 
         let matches = self
@@ -4082,7 +4254,7 @@ impl<S: StorageIO> Table<S> {
                 where_clause,
                 query_row_fetch,
                 &self.schema.fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 // As in `delete_rows_in_txn`: a statement may only change rows
@@ -4120,7 +4292,7 @@ impl<S: StorageIO> Table<S> {
                     for pwo in matches.iter().filter(|m| !m.pointer.deleted) {
                         if pwo
                             .pointer
-                            .fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row)
+                            .fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row)
                             .await
                             .is_ok()
                         {
@@ -4137,10 +4309,10 @@ impl<S: StorageIO> Table<S> {
 
         // A relocation allocates from the id counter even though it hands the
         // row back its own id, so the reservation on disk has to cover it.
-        self.ensure_ids_reserved().await;
+        d.ensure_ids_reserved().await;
 
         // One transaction for the statement, subject to the memory bound below.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
 
         let mut updated_count: u64 = 0;
         let mut row = Row::default();
@@ -4164,7 +4336,7 @@ impl<S: StorageIO> Table<S> {
             if let Err(e) = self.check_write_conflict(&pointer, written_by) {
                 // As in the DELETE: an abandoned storage transaction would hold
                 // the log's checkpoint off for good.
-                self.io_pointers.abort_txn(txn).await;
+                d.io_pointers.abort_txn(txn).await;
                 return Err(if updated_count == 0 {
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -4178,7 +4350,7 @@ impl<S: StorageIO> Table<S> {
 
             // Load full row so we can merge updates.
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row)
                 .await
                 .is_err()
             {
@@ -4190,7 +4362,7 @@ impl<S: StorageIO> Table<S> {
 
             // The version's index keys as it stands, before the assignments:
             // an in-place overwrite has to take the slot out from under them.
-            let old_keys = self.indexes.as_ref().map(|ix| ix.keys_of(&row_write));
+            let old_keys = d.indexes.as_ref().map(|ix| ix.keys_of(&row_write));
 
             // Apply updates in-place in the RowWrite payloads.
             for upd in updates.iter() {
@@ -4231,7 +4403,7 @@ impl<S: StorageIO> Table<S> {
                         }) {
                         Ok(value) => value,
                         Err(e) => {
-                            self.io_pointers.abort_txn(txn).await;
+                            d.io_pointers.abort_txn(txn).await;
                             return Err(
                                 std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into()
                             );
@@ -4318,7 +4490,7 @@ impl<S: StorageIO> Table<S> {
                     &self.schema.fields,
                     &row_write.columns_writing_data,
                 ) {
-                    self.io_pointers.abort_txn(txn).await;
+                    d.io_pointers.abort_txn(txn).await;
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
                 }
             }
@@ -4340,8 +4512,8 @@ impl<S: StorageIO> Table<S> {
                 // Durability outranks the constraint violation as the thing to
                 // report: the caller can retry a rejected UPDATE, but it cannot
                 // do anything about rows it was told had landed and had not.
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&mut pending_filters);
                 self.dead_stamps
                     .fetch_add(updated_count, AtomicOrdering::Relaxed);
                 self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
@@ -4394,10 +4566,10 @@ impl<S: StorageIO> Table<S> {
                 && !may_fail_after_write
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
-                    .write_columns_in_place(&pointer, updates, txn, written_by)
+                    .write_columns_in_place(d, &pointer, updates, txn, written_by)
                     .await
             {
-                if self.maintains_indexes() {
+                if d.maintains_indexes() {
                     pending_filters.push(PendingFilterOp::Insert(
                         record_pos / ROW_POINTER_RECORD_LEN as u64,
                         row_write,
@@ -4409,33 +4581,33 @@ impl<S: StorageIO> Table<S> {
                     collect.push(row.clone());
                 }
 
-                if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                    self.io_pointers.commit_durable(txn).await?;
-                    self.apply_pending_filters(&mut pending_filters);
-                    txn = self.io_pointers.begin_txn();
+                if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                    d.io_pointers.commit_durable(txn).await?;
+                    d.apply_pending_filters(&mut pending_filters);
+                    txn = d.io_pointers.begin_txn();
                 }
                 continue;
             }
 
             let update_result = pointer
                 .update_with_pointer_record_pos(
-                    self.io_pointers.clone(),
-                    self.io_rows.clone(),
+                    d.io_pointers.clone(),
+                    d.io_rows.clone(),
                     record_pos,
-                    &self.last_row_id,
-                    &self.len,
+                    &d.last_row_id,
+                    &d.len,
                     // Clustering is not implemented; every row goes to cluster 0.
                     #[cfg(feature = "enable_long_row")]
                     0u32,
                     &row_write,
                     Some(txn),
-                    Some(&self.free_space),
+                    Some(&d.free_space),
                     written_by,
                 )
                 .await;
 
             if let Ok((_, relocated)) = &update_result {
-                if self.maintains_indexes() {
+                if d.maintains_indexes() {
                     let old_slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
                     match relocated {
                         // A fresh pointer was appended for the new version.
@@ -4478,22 +4650,22 @@ impl<S: StorageIO> Table<S> {
             // into batches once the log is due for a checkpoint: the statement
             // is then atomic per batch rather than as a whole, which is the
             // price of a reclaimable log.
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
-                txn = self.io_pointers.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&mut pending_filters);
+                txn = d.io_pointers.begin_txn();
             }
         }
 
-        self.io_pointers.commit_durable(txn).await?;
-        self.apply_pending_filters(&mut pending_filters);
+        d.io_pointers.commit_durable(txn).await?;
+        d.apply_pending_filters(&mut pending_filters);
         self.dead_stamps
             .fetch_add(updated_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if updated_count > 0 {
             self.invalidate_query_caches();
-            if let Some(filters) = self.filters.as_ref() {
+            if let Some(filters) = d.filters.as_ref() {
                 filters.request_checkpoint();
             }
         }

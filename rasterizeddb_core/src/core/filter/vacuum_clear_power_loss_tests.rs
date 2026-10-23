@@ -903,7 +903,7 @@ async fn a_barrier_that_cannot_sync_the_tables_log_acts_on_nothing() {
     assert!(swept.dead_rows >= 50, "the sweep found nothing reclaimable: {swept:?}");
     assert!(swept.deferred, "a sweep whose barrier failed was not deferred: {swept:?}");
     assert_eq!(swept.fingerprints_cleared, 0, "a sweep whose barrier failed cleared fingerprints");
-    assert_eq!(t.reclaimable_bytes(), 0, "a sweep whose barrier failed published free space");
+    assert_eq!(t.reclaimable_bytes().unwrap(), 0, "a sweep whose barrier failed published free space");
     assert!(compacted.is_err(), "a compaction whose barrier failed went ahead");
 
     let all = labels_in(&run(&db, &format!("SELECT label FROM {TABLE}")).await);

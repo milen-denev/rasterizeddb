@@ -385,8 +385,14 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
 
 pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8> {
     match statement {
-        Introspect::DatabaseStats => rows(database_stats(database).await),
-        Introspect::Tables => rows(tables(database).await),
+        Introspect::DatabaseStats => match database_stats(database).await {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::Tables => match tables(database).await {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::TableStats(name) => match table_stats(database, name).await {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -439,17 +445,20 @@ impl TableSizes {
     }
 }
 
-async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> TableSizes {
-    TableSizes {
-        data: table.io_rows.get_len().await,
-        pointers: table.io_pointers.get_len().await,
+/// Errs on a partition shell, whose files are its partitions'.
+/// PARTITION-TODO(S8): sum the partitions instead.
+async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Result<TableSizes, String> {
+    let data = table.data().map_err(|e| e.to_string())?;
+    Ok(TableSizes {
+        data: data.io_rows.get_len().await,
+        pointers: data.io_pointers.get_len().await,
         schema: table.io_schema.get_len().await,
-        filters: table.io_filters.get_len().await,
-        sequence: table.io_sequence.get_len().await,
-    }
+        filters: data.io_filters.get_len().await,
+        sequence: data.io_sequence.get_len().await,
+    })
 }
 
-async fn tables(database: &Arc<Database>) -> Vec<Row> {
+async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     // Names are copied out first so no shard guard is held across the awaits
     // below: a `get_len` on a slow filesystem would otherwise block every
     // CREATE/DROP that hashes to the same shard for as long as it takes.
@@ -472,7 +481,7 @@ async fn tables(database: &Arc<Database>) -> Vec<Row> {
         let Some(table) = database.tables.get(&name).map(|t| t.value().clone()) else {
             continue;
         };
-        let sizes = sizes_of(&table).await;
+        let sizes = sizes_of(&table).await?;
         let visible = table
             .schema
             .fields
@@ -485,20 +494,20 @@ async fn tables(database: &Arc<Database>) -> Vec<Row> {
             // The backend holding the row data. Every file of a table is opened
             // from one seed, so this is the table's answer and not just this
             // file's — `SHOW TABLE STATS` reports where it is.
-            Cell::Text(table.io_rows.kind().to_string()),
+            Cell::Text(table.io_rows().map_err(|e| e.to_string())?.kind().to_string()),
             Cell::Number(sizes.row_slots()),
             Cell::Number(visible as u64),
             Cell::Number(sizes.data),
             Cell::Number(sizes.pointers),
             Cell::Number(sizes.filters),
             Cell::Number(sizes.total()),
-            Cell::Number(table.reclaimable_bytes()),
-            Cell::Flag(table.filters_ready()),
+            Cell::Number(table.reclaimable_bytes().map_err(|e| e.to_string())?),
+            Cell::Flag(table.filters_ready().map_err(|e| e.to_string())?),
             Cell::Flag(table.schema.is_immutable),
             Cell::Text(table.schema.primary_key.clone().unwrap_or_default()),
         ]));
     }
-    out
+    Ok(out)
 }
 
 /// The whole database, as one metric per row.
@@ -524,7 +533,7 @@ async fn tables(database: &Arc<Database>) -> Vec<Row> {
 /// The byte totals still cover **every** file the database owns, shadow tables
 /// included. That is what the disk actually holds, and a size that left them
 /// out would be wrong in the direction that matters.
-async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
+async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
     names.sort();
 
@@ -547,7 +556,7 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         let Some(table) = database.tables.get(name).map(|t| t.value().clone()) else {
             continue;
         };
-        let sizes = sizes_of(&table).await;
+        let sizes = sizes_of(&table).await?;
         // Bytes are counted for every table; the countable *things* are counted
         // only for the ones a client can name. See the note above the function.
         total.data += sizes.data;
@@ -555,8 +564,12 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         total.schema += sizes.schema;
         total.filters += sizes.filters;
         total.sequence += sizes.sequence;
-        reclaimable += table.reclaimable_bytes();
-        vacuum_panics += table.vacuum_stats().panics.load(Ordering::Relaxed);
+        reclaimable += table.reclaimable_bytes().map_err(|e| e.to_string())?;
+        vacuum_panics += table
+            .vacuum_stats()
+            .map_err(|e| e.to_string())?
+            .panics
+            .load(Ordering::Relaxed);
 
         if name.starts_with("__") {
             continue;
@@ -791,7 +804,7 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         "peers this node ships transactions to",
     );
 
-    out
+    Ok(out)
 }
 
 /// Every directory with a write-ahead log of its own, root first.
@@ -940,9 +953,11 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         .map(|t| t.value().clone())
         .ok_or_else(|| format!("relation `{}` does not exist", name))?;
 
-    let sizes = sizes_of(&table).await;
+    let sizes = sizes_of(&table).await?;
     let schema = &table.schema;
-    let vacuum = table.vacuum_stats();
+    // PARTITION-TODO(S8): a shell errs here rather than reporting zeroes.
+    let data = table.data().map_err(|e| e.to_string())?;
+    let vacuum = &data.vacuum_stats;
 
     let mut out = Vec::new();
     let mut push = |metric: &str, value: String, detail: &str| {
@@ -970,12 +985,12 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // bill, and a memory-backed one does not survive a restart at all.
     push(
         "storage",
-        table.io_rows.kind().to_string(),
+        data.io_rows.kind().to_string(),
         "memory | file | mirrored | s3 | kv-directory | kv-memory",
     );
     push(
         "storage_location",
-        table.io_rows.location(),
+        data.io_rows.location(),
         "where those bytes actually are",
     );
     // The page cache in front of the store, reported here as well as on the
@@ -985,7 +1000,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // counters are the store's, shared by every table placed on it, and the
     // detail says so rather than letting them read as this table's own.
     #[cfg(feature = "kv_storage")]
-    if let Some(family) = table.io_rows.kv_family() {
+    if let Some(family) = data.io_rows.kv_family() {
         let (hits, misses, resident) = family.cache_stats();
         push(
             "kv_store",
@@ -1010,7 +1025,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     }
     #[cfg(feature = "storage_pools")]
     {
-        let copies = table.io_rows.backup_count();
+        let copies = data.io_rows.backup_count();
         if copies > 0 {
             push(
                 "backup_copies",
@@ -1056,7 +1071,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "last_row_id",
-        table.last_row_id.load(Ordering::Relaxed).to_string(),
+        data.last_row_id.load(Ordering::Relaxed).to_string(),
         "highest id handed out",
     );
 
@@ -1097,7 +1112,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
     push(
         "reclaimable_bytes",
-        table.reclaimable_bytes().to_string(),
+        data.free_space.free_bytes().to_string(),
         "dead space a VACUUM would return",
     );
     // The ratio rather than the two figures, because the decision it informs —
@@ -1106,13 +1121,13 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     // a two-gigabyte table is half the disk.
     push(
         "dead_ratio",
-        format!("{:.1}%", percent(table.reclaimable_bytes(), sizes.data)),
+        format!("{:.1}%", percent(data.free_space.free_bytes(), sizes.data)),
         "reclaimable against row data",
     );
 
     push(
         "vacuum_enabled",
-        table.vacuum_enabled().to_string(),
+        data.free_space.is_enabled().to_string(),
         "reclamation runs for this table; SHOW CONFIG can only say `per table`",
     );
     push(
@@ -1169,7 +1184,7 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 
     push(
         "filters_ready",
-        table.filters_ready().to_string(),
+        table.filters_ready().map_err(|e| e.to_string())?.to_string(),
         "the index has caught up with the rows",
     );
     push(
@@ -2036,8 +2051,14 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         "vacuum" => {
             let enabled = parse_bool(value)?;
             let mut touched = 0usize;
+            // PARTITION-TODO(S8): a shell's partitions are not in `tables`, so
+            // refuse before touching any table rather than report the setting
+            // applied to rows it never reached.
             for entry in database.tables.iter() {
-                entry.value().set_vacuum_enabled(enabled);
+                entry.value().data().map_err(|e| e.to_string())?;
+            }
+            for entry in database.tables.iter() {
+                entry.value().set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
                 touched += 1;
             }
             Ok(format!(
@@ -2437,6 +2458,7 @@ mod tests {
     async fn metrics(database: &Arc<Database>) -> Vec<String> {
         database_stats(database)
             .await
+            .expect("database stats")
             .iter()
             .map(|row| {
                 String::from_utf8(row.columns[0].data.into_slice().to_vec())
@@ -2528,7 +2550,7 @@ mod tests {
             assert_ne!(response.first(), Some(&3u8), "{sql} failed");
         }
 
-        let stats = database_stats(&database).await;
+        let stats = database_stats(&database).await.expect("database stats");
         let value_of = |metric: &str| -> String {
             let index = stats
                 .iter()
@@ -2736,7 +2758,7 @@ mod tests {
         wal.log(wal.begin(), 0xDEAD_BEEF, 0, b"x").unwrap();
         assert!(wal.checkpoint().is_err());
 
-        let stats = database_stats(&database).await;
+        let stats = database_stats(&database).await.expect("database stats");
         let names: Vec<String> = stats
             .iter()
             .map(|row| String::from_utf8(row.columns[0].data.into_slice().to_vec()).unwrap())
@@ -2806,7 +2828,7 @@ mod tests {
         assert_eq!(durability_locations(&database).len(), 2);
 
         let stats = || async {
-            let stats = database_stats(&database).await;
+            let stats = database_stats(&database).await.expect("database stats");
             move |metric: &str| -> String {
                 let index = stats
                     .iter()

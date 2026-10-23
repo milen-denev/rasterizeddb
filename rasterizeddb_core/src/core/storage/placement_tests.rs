@@ -145,12 +145,12 @@ async fn a_placed_table_still_holds_its_rows_after_a_restart() {
         .expect("the table should be in the catalogue")
         .clone();
     assert_eq!(
-        StorageIO::get_location(&*table.io_rows).as_deref(),
+        StorageIO::get_location(&*table.data().unwrap().io_rows).as_deref(),
         Some(second_path.as_str()),
         "the reopened table must read from the directory its files are in"
     );
     assert!(
-        StorageIO::get_len(&*table.io_rows).await > 0,
+        StorageIO::get_len(&*table.data().unwrap().io_rows).await > 0,
         "the reopened table read an empty row file, which is what a lost placement looks like"
     );
 }
@@ -239,7 +239,8 @@ async fn a_backup_added_at_runtime_covers_the_next_table() {
         db.tables
             .get("before_backup")
             .unwrap()
-            .io_rows
+            .io_rows()
+            .unwrap()
             .backup_count(),
         0,
         "a table already open cannot have acquired a backup copy"
@@ -248,7 +249,8 @@ async fn a_backup_added_at_runtime_covers_the_next_table() {
         db.tables
             .get("after_backup")
             .unwrap()
-            .io_rows
+            .io_rows()
+            .unwrap()
             .backup_count()
             > 0,
         "a table created after the backup was added should have one"
@@ -284,7 +286,7 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
         .get("survivor")
         .expect("the backup copy should list the table");
     assert!(
-        StorageIO::get_len(&*table.io_rows).await > 0,
+        StorageIO::get_len(&*table.data().unwrap().io_rows).await > 0,
         "the backup copy lists the table but holds none of its rows"
     );
 }
@@ -332,7 +334,7 @@ async fn moving_a_table_takes_its_files_with_it() {
     insert(&db, "travelling", 2, "after").await;
     let table = db.tables.get("travelling").unwrap().clone();
     assert_eq!(
-        StorageIO::get_location(&*table.io_rows).as_deref(),
+        StorageIO::get_location(&*table.data().unwrap().io_rows).as_deref(),
         Some(second_path.as_str())
     );
 }

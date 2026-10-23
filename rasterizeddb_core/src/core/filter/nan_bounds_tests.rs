@@ -184,7 +184,7 @@ async fn float_predicates_never_lose_a_row_to_the_index() {
         let mut got = query(&table, clause, None, None).await;
         got.sort();
         // The index has to have pruned something, or this proves nothing.
-        if let Some(filters) = table.filters.as_ref() {
+        if let Some(filters) = table.data().unwrap().filters.as_ref() {
             let tokens = crate::core::tokenizer::query_tokenizer::tokenize(clause, &table.schema.fields);
             if let Some(program) = super::sarg::extract(&tokens, filters) {
                 if let Some(mask) = filters.evaluate(&program, N as u64) {
