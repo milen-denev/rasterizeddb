@@ -7931,121 +7931,6 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
-/// Moves a column's by-name declarations — its `DEFAULT`, its generation
-/// expression and its NUMERIC scale — from `from` to `to`, or retires them when
-/// `to` is `None` (the column was dropped).
-///
-/// Each lives in an append-only sidecar where the newest record for a name
-/// wins, so moving is two appends: the declaration under the new name, then a
-/// tombstone under the old. A declaration still filed under `to` with nothing
-/// to replace it — left by a dropped column before drops retired theirs — is
-/// tombstoned too, so the renamed column does not inherit it.
-///
-/// `schema` is the table as loaded, whose lists hold only live records.
-/// Returns whether anything was written.
-async fn move_column_declarations<S: crate::core::storage_providers::traits::StorageIO>(
-    schema: &crate::core::row::schema::TableSchema,
-    from: &str,
-    to: Option<&str>,
-    io_schema: Arc<S>,
-) -> Result<bool, String> {
-    use crate::core::rql::{column_default, generated, type_modifier};
-    let named = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-
-    let default_of = |name: &str| schema.defaults.iter().find(|d| named(&d.column, name));
-    let mut defaults = Vec::new();
-    if let Some(to) = to {
-        match default_of(from) {
-            Some(d) => defaults.push(column_default::ColumnDefault {
-                column: to.to_string(),
-                expression: d.expression.clone(),
-                is_deleted: false,
-            }),
-            None if default_of(to).is_some() => defaults.push(column_default::ColumnDefault {
-                column: to.to_string(),
-                expression: String::new(),
-                is_deleted: true,
-            }),
-            None => {}
-        }
-    }
-    if default_of(from).is_some() {
-        defaults.push(column_default::ColumnDefault {
-            column: from.to_string(),
-            expression: String::new(),
-            is_deleted: true,
-        });
-    }
-    for entry in &defaults {
-        column_default::append(io_schema.clone(), entry)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    let generated_of = |name: &str| schema.generated.iter().find(|g| named(&g.column, name));
-    let mut gens = Vec::new();
-    if let Some(to) = to {
-        match generated_of(from) {
-            Some(g) => gens.push(generated::GeneratedColumn {
-                column: to.to_string(),
-                expression: g.expression.clone(),
-                is_deleted: false,
-            }),
-            None if generated_of(to).is_some() => gens.push(generated::GeneratedColumn {
-                column: to.to_string(),
-                expression: String::new(),
-                is_deleted: true,
-            }),
-            None => {}
-        }
-    }
-    if generated_of(from).is_some() {
-        gens.push(generated::GeneratedColumn {
-            column: from.to_string(),
-            expression: String::new(),
-            is_deleted: true,
-        });
-    }
-    for entry in &gens {
-        generated::append(io_schema.clone(), entry)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    let modifier_of = |name: &str| {
-        schema
-            .type_modifiers
-            .iter()
-            .find(|m| named(&m.column, name) && !m.is_deleted)
-    };
-    let retired = |column: &str| type_modifier::TypeModifier {
-        column: column.to_string(),
-        precision: 0,
-        scale: 0,
-        is_deleted: true,
-    };
-    let mut modifiers = Vec::new();
-    if let Some(to) = to {
-        match modifier_of(from) {
-            Some(m) => modifiers.push(type_modifier::TypeModifier {
-                column: to.to_string(),
-                ..m.clone()
-            }),
-            None if modifier_of(to).is_some() => modifiers.push(retired(to)),
-            None => {}
-        }
-    }
-    if modifier_of(from).is_some() {
-        modifiers.push(retired(from));
-    }
-    for entry in &modifiers {
-        type_modifier::append(io_schema.clone(), entry)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(!(defaults.is_empty() && gens.is_empty() && modifiers.is_empty()))
-}
-
 /// `ALTER COLUMN … TYPE` naming the type a column already has, with what it
 /// says about a NUMERIC column's `(precision, scale)`.
 ///
@@ -8120,8 +8005,12 @@ async fn retype_numeric_modifier<S: crate::core::storage_providers::traits::Stor
 /// copied untouched, so `CHECK (a <> 'a')` keeps its value. A quoted
 /// identifier is compared by its content. And a matching word is a column
 /// reference only when it is not a function name (followed by `(`), a cast's
-/// type (after `::`) or a qualifier (followed by `.`); after a `.` it is one
-/// only when the qualifier is the table itself.
+/// type (after `::`, or after `AS` in `CAST(x AS text)`), a typed literal's
+/// type or a literal's prefix (followed by a string: `date '2000-01-01'`,
+/// `X'00'`, `B'01'`, `N'…'`, `U&'…'`), `EXTRACT`'s field (`EXTRACT(epoch
+/// FROM ts)`) or a qualifier (followed by `.`); after a `.` it is one only
+/// when the qualifier is the table itself. Renaming any of those rewrote a
+/// type or keyword, and the check stopped compiling and was skipped.
 pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str, to: &str) -> String {
     let chars: Vec<char> = expression.chars().collect();
     let len = chars.len();
@@ -8174,6 +8063,8 @@ pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str
     let mut prev = Prev::Other;
     // The identifier just before, which a following `.` makes a qualifier.
     let mut last_word: Option<String> = None;
+    // Just past `EXTRACT (`, where the next word is the field to extract.
+    let mut extract_field = false;
     let mut out = String::with_capacity(expression.len());
     let mut i = 0;
     while i < len {
@@ -8203,6 +8094,7 @@ pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str
             }
             continue;
         }
+        let in_extract_field = std::mem::take(&mut extract_field);
         if c == '\'' {
             i = copy_literal(i, false, &mut out);
             prev = Prev::Other;
@@ -8272,11 +8164,23 @@ pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str
         };
         if let Some((text, end, was_quoted)) = word {
             let after = next_significant(end);
+            let after_as = last_word
+                .as_deref()
+                .is_some_and(|w| w.eq_ignore_ascii_case("as"));
+            // `U&'…'`: the prefix runs straight into `&'`.
+            let unicode_prefix = !was_quoted
+                && text.eq_ignore_ascii_case("u")
+                && chars.get(end) == Some(&'&')
+                && chars.get(end + 1) == Some(&'\'');
             let is_reference = text.eq_ignore_ascii_case(from)
                 && prev != Prev::Cast
                 && after != Some('(')
                 && after != Some('.')
-                && prev != Prev::Dot(false);
+                && prev != Prev::Dot(false)
+                && !(after == Some('\'') && !was_quoted)
+                && !unicode_prefix
+                && !after_as
+                && !in_extract_field;
             if is_reference {
                 out.push_str(if plain && !was_quoted { to } else { &quoted });
             } else {
@@ -8314,193 +8218,13 @@ pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str
             );
             continue;
         }
+        extract_field = c == '(' && last_word.as_deref().is_some_and(|w| w.eq_ignore_ascii_case("extract"));
         out.push(c);
         i += 1;
         prev = Prev::Other;
         last_word = None;
     }
     out
-}
-
-/// The constraint records `RENAME COLUMN` has to rewrite: every by-name record
-/// outside the column's own declarations that mentions it.
-///
-/// Planned before the rename writes anything, so a rewrite that cannot be
-/// stored — an expression grown past its sidecar's limit — refuses the
-/// statement instead of leaving it half done.
-struct ColumnReferences {
-    unique_keys: Vec<crate::core::rql::unique_key::UniqueKey>,
-    /// `(table, io, record)` for each foreign key that names the column, on
-    /// this table as the child or on any table with this one as the parent.
-    foreign_keys: Vec<(
-        String,
-        Arc<crate::core::storage_providers::backend::DbStorageProvider>,
-        crate::core::rql::foreign_key::ForeignKey,
-    )>,
-    checks: Vec<crate::core::rql::check::CheckConstraint>,
-    generated: Vec<crate::core::rql::generated::GeneratedColumn>,
-}
-
-fn plan_column_references(
-    database: &Arc<Database>,
-    table: &str,
-    schema: &crate::core::row::schema::TableSchema,
-    from: &str,
-    to: &str,
-) -> Result<ColumnReferences, String> {
-    use crate::core::rql::{check, generated, unique_key};
-    let named = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-
-    // A partial index's predicate names columns too. Left naming `from`, it
-    // no longer compiled, and a key that cannot read its predicate is not
-    // enforced: renaming `deleted_at` let every live duplicate in.
-    let mut unique_keys = Vec::new();
-    for k in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
-        let predicate = k
-            .predicate
-            .as_deref()
-            .map(|p| rename_column_references(p, table, from, to));
-        if !k.columns.iter().any(|c| named(c, from)) && predicate.as_deref() == k.predicate.as_deref() {
-            continue;
-        }
-        if predicate
-            .as_ref()
-            .is_some_and(|p| p.len() > unique_key::MAX_PREDICATE_LEN)
-        {
-            return Err(format!(
-                "cannot rename column {} to {}: the predicate of unique index {} would exceed {} characters",
-                from,
-                to,
-                k.name,
-                unique_key::MAX_PREDICATE_LEN
-            ));
-        }
-        unique_keys.push(unique_key::UniqueKey {
-            columns: k
-                .columns
-                .iter()
-                .map(|c| if named(c, from) { to.to_string() } else { c.clone() })
-                .collect(),
-            predicate,
-            ..k.clone()
-        });
-    }
-
-    // Every table's, since a parent's column is named in its children's
-    // sidecars. Collected before anything awaits: no map guard is held then.
-    let mut foreign_keys = Vec::new();
-    for entry in database.tables.iter() {
-        let owner = entry.key();
-        for fk in entry.value().schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
-            let child_side = named(owner, table) && named(&fk.column, from);
-            let parent_side = named(&fk.parent_table, table) && named(&fk.parent_column, from);
-            if !(child_side || parent_side) {
-                continue;
-            }
-            let mut moved = fk.clone();
-            if child_side {
-                moved.column = to.to_string();
-            }
-            if parent_side {
-                moved.parent_column = to.to_string();
-            }
-            foreign_keys.push((owner.clone(), entry.value().io_schema.clone(), moved));
-        }
-    }
-
-    let mut checks = Vec::new();
-    for c in schema.checks.iter().filter(|c| !c.is_deleted) {
-        let expression = rename_column_references(&c.expression, table, from, to);
-        if expression == c.expression {
-            continue;
-        }
-        if expression.len() > check::MAX_EXPRESSION_LEN {
-            return Err(format!(
-                "cannot rename column {} to {}: check constraint {} would exceed {} characters",
-                from,
-                to,
-                c.name,
-                check::MAX_EXPRESSION_LEN
-            ));
-        }
-        checks.push(check::CheckConstraint {
-            name: c.name.clone(),
-            expression,
-            is_deleted: false,
-        });
-    }
-
-    let mut gens = Vec::new();
-    for g in schema.generated.iter().filter(|g| !g.is_deleted) {
-        let expression = rename_column_references(&g.expression, table, from, to);
-        if expression == g.expression {
-            continue;
-        }
-        if expression.len() > generated::MAX_EXPRESSION_LEN {
-            return Err(format!(
-                "cannot rename column {} to {}: the expression of generated column {} would \
-                 exceed {} characters",
-                from,
-                to,
-                g.column,
-                generated::MAX_EXPRESSION_LEN
-            ));
-        }
-        gens.push(generated::GeneratedColumn {
-            column: g.column.clone(),
-            expression,
-            is_deleted: false,
-        });
-    }
-
-    Ok(ColumnReferences {
-        unique_keys,
-        foreign_keys,
-        checks,
-        generated: gens,
-    })
-}
-
-/// Writes what [`plan_column_references`] planned, and returns the *other*
-/// tables whose sidecars changed, which the caller reopens.
-///
-/// A unique key or foreign key moves as an append of the renamed copy, then a
-/// tombstone on the original (the first live record of that name, which the
-/// copy is not). In that order a crash between the two leaves the original
-/// naming a column that no longer exists, which enforcement skips, rather
-/// than no record at all. A check or generation expression is superseded by
-/// appending, the newest record of its name winning.
-///
-/// `generated` is written after the column's own declarations moved, and none
-/// of it is filed under the renamed column itself, whose expression cannot
-/// read itself.
-async fn write_column_references(
-    references: ColumnReferences,
-    table: &str,
-    io_schema: Arc<crate::core::storage_providers::backend::DbStorageProvider>,
-) -> Result<Vec<String>, String> {
-    use crate::core::rql::{check, foreign_key, generated, unique_key};
-    let failed = |e: std::io::Error| e.to_string();
-
-    for key in &references.unique_keys {
-        unique_key::append(io_schema.clone(), key).await.map_err(failed)?;
-        unique_key::remove(io_schema.clone(), &key.name).await.map_err(failed)?;
-    }
-    let mut others = Vec::new();
-    for (owner, io, fk) in &references.foreign_keys {
-        foreign_key::append(io.clone(), fk).await.map_err(failed)?;
-        foreign_key::remove(io.clone(), &fk.name).await.map_err(failed)?;
-        if !owner.eq_ignore_ascii_case(table) && !others.contains(owner) {
-            others.push(owner.clone());
-        }
-    }
-    for c in &references.checks {
-        check::append(io_schema.clone(), c).await.map_err(failed)?;
-    }
-    for g in &references.generated {
-        generated::append(io_schema.clone(), g).await.map_err(failed)?;
-    }
-    Ok(others)
 }
 
 /// Every sequence a `nextval` default of a table in `database` other than
@@ -8606,19 +8330,34 @@ async fn execute_alter_table_action(
                 .map(|e| !e.trim().eq_ignore_ascii_case("NULL"))
                 .unwrap_or(false);
 
-            // A declaration still filed under the name — a dead column's,
-            // from before drops retired theirs or from a power loss between a
-            // drop's separately durable writes — is retired first. Left, the
-            // new column inherited it: the old DEFAULT, or a generation
-            // expression, or a NUMERIC scale it silently rounded to.
-            match move_column_declarations(&schema, &name, None, io_schema.clone()).await {
-                // The rewrite below reads the open table's declarations.
-                Ok(true) if row_count > 0 => {
-                    if let Err(e) = database.reload_table(&plan.table_name).await {
-                        return ddl_error(&e.to_string());
+            // A declaration still filed under the name — a dead column's, from
+            // before drops retired theirs — is retired first. Left, the new
+            // column inherited it: the old DEFAULT, generation expression or
+            // NUMERIC scale, a JSON registration, or a composite UNIQUE key,
+            // foreign key or CHECK that then bound the new column (a dropped
+            // `ON DELETE CASCADE` key deleting rows by its values).
+            match crate::core::rql::column_declarations::retire_for_new_column(
+                database,
+                &plan.table_name,
+                &schema,
+                &io_schema,
+                &name,
+            )
+            .await
+            {
+                Ok((wrote, others)) => {
+                    for other in others {
+                        if let Err(e) = database.reload_table(&other).await {
+                            return ddl_error(&e.to_string());
+                        }
+                    }
+                    // The rewrite below reads the open table's declarations.
+                    if wrote && row_count > 0 {
+                        if let Err(e) = database.reload_table(&plan.table_name).await {
+                            return ddl_error(&e.to_string());
+                        }
                     }
                 }
-                Ok(_) => {}
                 Err(e) => return ddl_error(&e),
             }
 
@@ -8783,17 +8522,21 @@ async fn execute_alter_table_action(
             }
         }
         AlterAction::DropColumn { name, if_exists } => {
-            let Some(field) = schema
+            // The live column of the name: a dropped one holding it is not a
+            // column, and re-tombstoning it left the live column standing.
+            let field = match schema
                 .fields
                 .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(&name))
-                .cloned()
-            else {
-                return if if_exists {
-                    ddl_ok(0)
-                } else {
-                    ddl_error(&format!("column '{}' does not exist", name))
-                };
+                .find(|f| f.name.eq_ignore_ascii_case(&name) && !f.is_deleted)
+            {
+                Some(field) if !nullable::is_hidden(&name) => field.clone(),
+                _ => {
+                    return if if_exists {
+                        ddl_ok(0)
+                    } else {
+                        ddl_error(&format!("column '{}' does not exist", name))
+                    };
+                }
             };
 
             // A partial unique index whose predicate reads the column goes
@@ -8812,24 +8555,29 @@ async fn execute_alter_table_action(
 
             // The column keeps its slot in the row layout and is marked
             // deleted: reclaiming the bytes would move every column after it,
-            // which is the same rewrite `ADD COLUMN` needs.
-            schema
-                .mark_field_as_deleted(&field.name, io_schema.clone())
-                .await;
-            // Its by-name declarations go with it. Left behind, they were
-            // picked up by the next column to take the name — the retype
-            // dance's renamed temporary, or a plain re-`ADD` — which then
-            // defaulted to the *dropped* column's value.
-            if let Err(e) =
-                move_column_declarations(&schema, &field.name, None, io_schema.clone()).await
+            // which is the same rewrite `ADD COLUMN` needs. Its companion and
+            // every declaration filed under its name go with it, in one
+            // transaction. Left behind, they were picked up by the next column
+            // to take the name — the retype dance's renamed temporary, or a
+            // plain re-`ADD` — which then defaulted to the dropped column's
+            // value, or was bound by its foreign key, UNIQUE key or CHECK.
+            match crate::core::rql::column_declarations::drop_column(
+                database,
+                &plan.table_name,
+                &schema,
+                &io_schema,
+                &name,
+            )
+            .await
             {
-                return ddl_error(&e);
-            }
-            if let Some(flag) = nullable::flag_field(&field.name, &schema.fields) {
-                let flag_name = flag.name.clone();
-                schema
-                    .mark_field_as_deleted(&flag_name, io_schema.clone())
-                    .await;
+                Ok(others) => {
+                    for other in others {
+                        if let Err(e) = database.reload_table(&other).await {
+                            return ddl_error(&e.to_string());
+                        }
+                    }
+                }
+                Err(e) => return ddl_error(&e),
             }
         }
         AlterAction::RenameColumn { from, to } => {
@@ -8857,54 +8605,35 @@ async fn execute_alter_table_action(
                 return ddl_error(&format!("column '{}' already exists", to));
             }
 
-            // The constraints that name the column — composite UNIQUE keys,
-            // foreign keys on either side, CHECK and generation expressions —
-            // are by-name records too. Left naming `from`, each silently
-            // stopped being enforced (a parent's renamed key instead failed
-            // every DELETE from it). Planned here, before anything is written.
-            let references =
-                match plan_column_references(database, &plan.table_name, &schema, &from, &to) {
-                    Ok(references) => references,
-                    Err(e) => return ddl_error(&e),
-                };
-
-            // A tombstone still holding the target name is retired first.
+            // One transaction: the field and its NULL companion, the column's
+            // DEFAULT, generation expression, NUMERIC scale and JSON
+            // registration, and every UNIQUE key, foreign key (either side),
+            // CHECK, generation expression, path index and the PRIMARY KEY
+            // header that mention it. A dropped column still holding `to` gives
+            // the name up, and whatever is still filed under `to` is retired
+            // rather than inherited. Renaming touches no row bytes: the layout
+            // is keyed by write order.
             //
-            // Renaming *onto* a dropped column's name leaves two fields called
-            // `to` — one dead, one live — and every by-name lookup in the
-            // engine takes the first it finds, which is the dead one at the old
-            // offset with the old type. The retype dance (add temp, copy, drop
-            // original, rename temp to the original name) does exactly this, so
-            // `payload_format` came back holding the *pre-migration* value and
-            // the statement reported success. `TableSchema::load` then keeps
-            // the lowest write_order per name, which makes it survive a
-            // restart.
-            //
-            // A dropped column can never be named again, so its name is free to
-            // give up. Retiring it keeps every name in the schema unique, which
-            // is what the lookups have always assumed.
-            if let Err(e) = retire_tombstoned_name(&mut schema, &to, io_schema.clone()).await {
-                return ddl_error(&e);
-            }
-
-            // Renaming touches no row bytes: the name is metadata, and the
-            // layout is keyed by write order.
-            if let Err(e) = schema.rename_field(&from, &to, io_schema.clone()).await {
-                return ddl_error(&e);
-            }
-
-            // The column's DEFAULT, generation expression and NUMERIC scale
-            // are filed by name, so they follow it. Left under `from`, the
-            // renamed column silently lost all three — an omitted value stored
-            // NULL instead of its default, and every decimal was read at the
-            // engine's scale rather than its own.
-            if let Err(e) = move_column_declarations(&schema, &from, Some(&to), io_schema.clone()).await
+            // Each of these used to be its own durable write. A power cut
+            // between two left the field renamed without its companion (every
+            // NULL read as 0) or constraints naming a column that no longer
+            // existed, skipped as "not enforced" for good.
+            match crate::core::rql::column_declarations::rename_column(
+                database,
+                &plan.table_name,
+                &schema,
+                &io_schema,
+                &from,
+                &to,
+            )
+            .await
             {
-                return ddl_error(&e);
-            }
-            match write_column_references(references, &plan.table_name, io_schema.clone()).await {
                 Ok(others) => {
-                    // This table is reopened below; a child whose foreign key
+                    crate::core::rql::column_declarations::crash_points::reached(
+                        &plan.table_name,
+                        "rename.after_commit",
+                    );
+                    // This table is reopened below; a table whose foreign key
                     // named the renamed parent column is reopened here.
                     for other in others {
                         if let Err(e) = database.reload_table(&other).await {
@@ -8913,32 +8642,6 @@ async fn execute_alter_table_action(
                     }
                 }
                 Err(e) => return ddl_error(&e),
-            }
-
-            // The NULL companion is named after its column, so it has to move
-            // too. Left behind, the renamed column had no companion — it could
-            // no longer be NULL — and an orphan `__null_<old>` stayed in the
-            // table for good. The retype dance (add temp, copy, drop, rename)
-            // does this on every nullable column, so the orphans accumulate.
-            let old_flag = nullable::flag_column_name(&from);
-            if schema
-                .fields
-                .iter()
-                .any(|f| f.name.eq_ignore_ascii_case(&old_flag) && !f.is_deleted)
-            {
-                let new_flag = nullable::flag_column_name(&to);
-                // The companion collides the same way its column does.
-                if let Err(e) =
-                    retire_tombstoned_name(&mut schema, &new_flag, io_schema.clone()).await
-                {
-                    return ddl_error(&e);
-                }
-                if let Err(e) = schema
-                    .rename_field(&old_flag, &new_flag, io_schema.clone())
-                    .await
-                {
-                    return ddl_error(&e);
-                }
             }
         }
         AlterAction::RenameTable { to } => {
@@ -8963,6 +8666,33 @@ async fn execute_alter_table_action(
                     "could not rename {} to {}: {}",
                     plan.table_name, to, e
                 ));
+            }
+            // Every foreign key naming the table as its parent — the
+            // children's, and its own self-references, which moved with its
+            // files — names the new one. Left naming the old name, a delete
+            // from the renamed parent found no referencing key and orphaned
+            // the children, and a table later created under the old name
+            // became their parent: checked against, and cascaded from.
+            match crate::core::rql::column_declarations::retarget_parent(
+                database,
+                &plan.table_name,
+                &to,
+            )
+            .await
+            {
+                Ok(changed) => {
+                    for table in changed {
+                        if let Err(e) = database.reload_table(&table).await {
+                            return ddl_error(&e.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    return ddl_error(&format!(
+                        "renamed {} to {}, but {}",
+                        plan.table_name, to, e
+                    ));
+                }
             }
             if followed.is_empty() {
                 return ddl_ok(0);

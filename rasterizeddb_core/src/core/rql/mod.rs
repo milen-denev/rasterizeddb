@@ -64,6 +64,14 @@ pub mod window;
 #[cfg(test)]
 mod rename_column_tests;
 
+#[cfg(test)]
+mod alter_declaration_tests;
+
+#[cfg(test)]
+mod rename_column_crash_tests;
+
+pub(crate) mod column_declarations;
+
 #[cfg(feature = "s3_backup")]
 pub mod backup_exec;
 /// `BACKUP`, `RESTORE` and `SHOW BACKUPS`, behind the `s3_backup` feature.
