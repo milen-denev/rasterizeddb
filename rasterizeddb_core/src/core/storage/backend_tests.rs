@@ -1483,3 +1483,24 @@ async fn altering_one_size_is_judged_against_the_other() {
     // A page size that does divide it is accepted.
     storage(&db, "STORAGE ALTER STORE paired SET PAGE_SIZE = '128KiB'").await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_storage_statements_are_refused_not_misread() {
+    // `REBALANCE PARTITIONS` used to run a whole-database REBALANCE and report
+    // success, and `MOVE PARTITION t …` read as a table named "PARTITION".
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path()).await;
+    for sql in [
+        "STORAGE REBALANCE PARTITIONS",
+        "STORAGE REBALANCE PARTITIONS DRY RUN",
+        "STORAGE MOVE PARTITION t FOR (k = 42) TO '/nonexistent'",
+    ] {
+        let error = super::sql::execute(sql, &db)
+            .await
+            .expect_err(&format!("{sql} was accepted"));
+        assert!(error.contains("not supported"), "{sql}: {error}");
+    }
+    super::sql::execute("STORAGE REBALANCE DRY RUN", &db)
+        .await
+        .expect("a plain dry run still works");
+}

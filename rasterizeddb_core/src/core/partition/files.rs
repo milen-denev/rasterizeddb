@@ -352,6 +352,172 @@ pub(crate) fn remove_all(dir: &Path, uid: u64) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// What the startup reaper did (§12).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReapReport {
+    /// The file names deleted.
+    pub deleted: Vec<String>,
+    /// Why some or all reapable files were kept, when they were: reaping
+    /// was off for this start, or a step failed.
+    pub kept: Option<String>,
+}
+
+/// A live table's map log as the reaper reads it: the generation-0 file
+/// (the only one phase 2a writes), read without building a provider, so
+/// nothing is created or cut. `Err` with why it cannot be relied on to say
+/// which partitions are materialized: missing, staged bytes in its `.tmp`,
+/// a torn tail or [`TORN`] evidence, a replay error, another table's uid, a
+/// `DROPPED` record, or a shape this version cannot open (reshaped, retired
+/// partitions, a partition off the root). Any of these turns reaping off.
+pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<log::MapState, String> {
+    let name = map_file(uid, 0);
+    let path = root.join(&name);
+    let buf = std::fs::read(&path).map_err(|e| format!("its map log {} cannot be read: {e}", path.display()))?;
+    // Map appends go through the log, never the staging file; bytes there
+    // would be records this read misses.
+    match std::fs::metadata(root.join(format!("{name}{TMP}"))) {
+        Ok(m) if m.len() > 0 => return Err(format!("its map log {name} has {} staged bytes", m.len())),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("the staging file of its map log {name} cannot be checked: {e}")),
+    }
+    // An unanswerable check counts as present: the safe side.
+    if root.join(format!("{name}{TORN}")).try_exists().unwrap_or(true) {
+        return Err(format!("its map log {name} had a torn tail cut into {name}{TORN}, not yet examined"));
+    }
+    let replay = log::replay(&buf).map_err(|e| format!("its map log {name}: {e}"))?;
+    if let Some(t) = &replay.torn {
+        return Err(format!("its map log {name} has a torn tail at byte {}: {}", t.offset, t.reason));
+    }
+    let state = replay.state;
+    if state.header().uid != uid {
+        return Err(format!("its map log {name} belongs to table {:016x}", state.header().uid));
+    }
+    if state.dropped() {
+        return Err(format!("its map log {name} says it was dropped, but its catalogue row is live"));
+    }
+    let map = state.map();
+    let dense = map.entries().iter().enumerate().all(|(i, &(_, pid))| pid as usize == i);
+    if !dense
+        || state.next_pid() != map.len() as u64
+        || state.reshapes().next().is_some()
+        || state.parts().any(|(_, p)| p.retired || p.location.is_some_and(|l| l != 0))
+    {
+        return Err(format!("its map log {name} describes a reshaped or spread map, which this version cannot read"));
+    }
+    Ok(state)
+}
+
+/// The names in `root` the reaper deletes (§12), ordered partitions first and
+/// map logs last as [`remove_all`] orders them, or why it deletes none.
+///
+/// A name is deleted only if [`parse_name`] reads it and either its uid is
+/// not in `live` (no catalogue row holds it), or it is a partition file
+/// whose pid the live map never materialized. A live uid's schema, ids, seq
+/// and generation-0 map are kept. Nothing is deleted if any live map is
+/// `Err`, or a live uid has a map generation other than 0, which only a
+/// later version writes and this one cannot tell live from stale.
+fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<log::MapState, String>>) -> io::Result<Result<Vec<String>, String>> {
+    let mut failed: Vec<(&u64, &String)> = live.iter().filter_map(|(u, m)| m.as_ref().err().map(|e| (u, e))).collect();
+    if !failed.is_empty() {
+        failed.sort();
+        let (uid, why) = failed[0];
+        return Ok(Err(format!(
+            "partitioned table {uid:016x}'s map cannot be relied on ({why}){}",
+            if failed.len() > 1 { format!(", and {} more", failed.len() - 1) } else { String::new() }
+        )));
+    }
+    let mut doomed: Vec<(u8, String)> = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        let Some(file) = parse_name(&name) else {
+            continue;
+        };
+        let rank = match file {
+            PartFile::Data { .. } => 0,
+            PartFile::Seq { .. } | PartFile::Ids { .. } | PartFile::Schema { .. } => 1,
+            PartFile::Map { .. } => 2,
+        };
+        let Some(state) = live.get(&file.uid()) else {
+            doomed.push((rank, name));
+            continue;
+        };
+        let state = state.as_ref().expect("an Err map returned above");
+        match file {
+            PartFile::Data { pid, .. } => {
+                if state.part(pid).and_then(|p| p.location).is_none() {
+                    doomed.push((rank, name));
+                }
+            }
+            PartFile::Map { generation, .. } if generation != 0 => {
+                return Ok(Err(format!(
+                    "partitioned table {:016x} has map generation {generation} ({name}), which only a later \
+                     version writes",
+                    file.uid()
+                )));
+            }
+            _ => {}
+        }
+    }
+    doomed.sort();
+    Ok(Ok(doomed.into_iter().map(|(_, n)| n).collect()))
+}
+
+/// Runs the startup reaper over `root` (§12): finds what [`reapable`]
+/// allows, hands the names to `void` (which voids the logs' records for
+/// them; a failure keeps every file, since deleted files with live records
+/// would be written back by a replay), deletes them and fsyncs `root`.
+/// Never errs: a step that fails is reported in [`ReapReport::kept`] and
+/// the files stay, a leak the next start retries.
+pub(crate) fn reap(
+    root: &Path,
+    live: &std::collections::HashMap<u64, Result<log::MapState, String>>,
+    void: impl FnOnce(&[String]) -> io::Result<()>,
+) -> ReapReport {
+    let names = match reapable(root, live) {
+        Ok(Ok(names)) => names,
+        Ok(Err(why)) => {
+            return ReapReport {
+                deleted: Vec::new(),
+                kept: Some(why),
+            };
+        }
+        Err(e) => {
+            return ReapReport {
+                deleted: Vec::new(),
+                kept: Some(format!("{} cannot be listed: {e}", root.display())),
+            };
+        }
+    };
+    if names.is_empty() {
+        return ReapReport::default();
+    }
+    if let Err(e) = void(&names) {
+        return ReapReport {
+            deleted: Vec::new(),
+            kept: Some(format!("the logs' records for {} file(s) could not be voided: {e}", names.len())),
+        };
+    }
+    let mut report = ReapReport::default();
+    for name in names {
+        match std::fs::remove_file(root.join(&name)) {
+            Ok(()) => report.deleted.push(name),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                report.kept.get_or_insert_with(|| format!("deleting {name}: {e}"));
+            }
+        }
+    }
+    if !report.deleted.is_empty()
+        && let Err(e) = sync_dir(root)
+    {
+        report.kept.get_or_insert_with(|| format!("syncing {} after deleting: {e}", root.display()));
+    }
+    report
+}
+
 /// The map log's file (§3.2). Appends are serialised by its lock, and each
 /// issues its WAL record at append time, so a transaction outcome logged
 /// after it can never replay without it.

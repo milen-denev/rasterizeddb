@@ -95,7 +95,7 @@ const CALLED_ON_SHELL: &[&str] = &[
 /// `src` with comments removed and string and char literal contents blanked,
 /// byte for byte the same length, so braces and `fn` inside them are not
 /// mistaken for code.
-fn strip(src: &str) -> String {
+pub(crate) fn strip(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = b.to_vec();
     let mut i = 0;
@@ -157,7 +157,7 @@ fn strip(src: &str) -> String {
 }
 
 /// The index of the bracket closing the one at `open`.
-fn matching(code: &[u8], open: usize) -> usize {
+pub(crate) fn matching(code: &[u8], open: usize) -> usize {
     let (o, c) = (code[open], if code[open] == b'{' { b'}' } else { b')' });
     let mut depth = 0usize;
     for (k, &ch) in code.iter().enumerate().skip(open) {

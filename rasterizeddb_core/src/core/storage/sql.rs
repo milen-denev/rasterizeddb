@@ -522,6 +522,12 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
     let pool = pool(database)?;
     let backend = super::TableBackend::parse(&target);
 
+    // A partitioned table never takes a placement (§3.1): its partitions
+    // open from their map entries. Refused for one whose schema could not be
+    // read too, which has no shell in `tables`.
+    database
+        .refuse_partitioned(&table, "STORAGE PLACE TABLE")
+        .map_err(|e| e.to_string())?;
     if database.tables.contains_key(&table) {
         // Reported from the backend rather than the directory: `location_of`
         // is `None` for a table that is not in one, and falling back to the
@@ -600,8 +606,19 @@ fn check_kv_store(_database: &Arc<Database>, store: &str) -> Result<(), String> 
 /// `normalize` is a path function, and running it over `kv:archive` would turn
 /// a store name into a relative directory.
 async fn move_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
+    // Refused by name: read as a table, `MOVE PARTITION t FOR (…)` would name a
+    // table called "PARTITION" and fail for a reason that says nothing.
+    if tokens
+        .get(2)
+        .is_some_and(|word| word.eq_ignore_ascii_case("PARTITION"))
+    {
+        return Err("STORAGE MOVE PARTITION is not supported yet: partitions move with reshaping, in a later version".to_string());
+    }
     let (table, target) = table_and_path(tokens, "TO")?;
     let destination = super::TableBackend::parse(&target);
+    database
+        .refuse_partitioned(&table, "STORAGE MOVE TABLE (a partition moves with MOVE PARTITION, in a later version)")
+        .map_err(|e| e.to_string())?;
 
     // Checked here for the same reason `PLACE` checks it: this is where the
     // operator can still do something about a store that is not configured, and
@@ -616,6 +633,15 @@ async fn move_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<S
 
 /// `STORAGE REBALANCE [DRY RUN]`
 async fn rebalance(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
+    // `REBALANCE PARTITIONS` used to run a whole-database rebalance and report
+    // success, the extra word ignored.
+    if tokens
+        .iter()
+        .skip(2)
+        .any(|word| word.eq_ignore_ascii_case("PARTITIONS") || word.eq_ignore_ascii_case("PARTITION"))
+    {
+        return Err("STORAGE REBALANCE PARTITIONS is not supported yet: partitions move with reshaping, in a later version".to_string());
+    }
     let dry = tokens
         .iter()
         .skip(2)
@@ -740,6 +766,17 @@ fn table_counts(
             .cloned()
             .unwrap_or_else(|| root.clone());
         *counts.entry(at).or_insert(0u64) += 1;
+    }
+    // A partitioned table counts once, at the root where phase 2a keeps all
+    // its files, whether or not its shell is in `tables` (a broken one's may
+    // not be).
+    let unshelled = database
+        .partitioned
+        .iter()
+        .filter(|entry| !database.tables.contains_key(entry.key()))
+        .count() as u64;
+    if unshelled > 0 {
+        *counts.entry(root).or_insert(0u64) += unshelled;
     }
     counts
 }
@@ -1080,6 +1117,13 @@ fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Result<Vec
     let placed: std::collections::HashMap<String, String> = pool.placements().into_iter().collect();
 
     let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
+    // A partitioned table whose schema could not be read has no shell in
+    // `tables`; it is still a table, at the root.
+    for entry in database.partitioned.iter() {
+        if !names.contains(entry.key()) {
+            names.push(entry.key().clone());
+        }
+    }
     // Placements for tables that do not exist are worth showing rather than
     // hiding: a pinned name is how `STORAGE PLACE TABLE` works before the table
     // is created, and a leftover entry is something an operator wants to see.
@@ -1101,10 +1145,14 @@ fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Result<Vec
         .into_iter()
         .map(|name| {
             let at = placed.get(&name).cloned().unwrap_or_else(|| root.clone());
-            let mirrored = match database.tables.get(&name) {
-                // PARTITION-TODO(S8): a shell errs rather than reading as
-                // unmirrored; its partitions hold the files.
-                Some(table) => table.io_rows().map_err(|e| e.to_string())?.backup_count() > 0,
+            let mirrored = match database.relation(&name) {
+                // Never mirrored: a pool with mirrors refuses partitioned
+                // tables, and its partitions' files are in the root (§3.1).
+                Some(crate::core::database::Relation::Partitioned(_)) => false,
+                // An orphan shell errs rather than reading as unmirrored.
+                Some(crate::core::database::Relation::Plain(table)) => {
+                    table.io_rows().map_err(|e| e.to_string())?.backup_count() > 0
+                }
                 None => intended,
             };
             Ok(structured_row(&[Cell::Text(name), Cell::Text(at), Cell::Flag(mirrored)]))

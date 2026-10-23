@@ -21,6 +21,7 @@ use rclite::Arc;
 use super::{Barrier, Database, SchemaChanged, forget_logged_ids, logs_holding, pool_mirrors, table_name_refusal};
 use crate::core::partition::files;
 use crate::core::partition::key::KeySpec;
+use crate::core::partition::route::Route;
 use crate::core::partition::table::{
     MAX_DECLARED_PER_DATABASE, MirrorsConfigured, OpenCtx, PartitionedTable, check_declared_cap, declared_in,
 };
@@ -29,6 +30,7 @@ use crate::core::row::table::Table;
 use crate::core::rql::lexer_ct::CreateTable;
 use crate::core::storage_providers::backend::DbStorageProvider;
 use crate::core::storage_providers::traits::StorageIO;
+use crate::core::vacuum::VacuumReport;
 
 /// A table name held by one CREATE or DROP while it runs. Released on drop.
 pub(crate) struct NameClaim<'a> {
@@ -103,6 +105,91 @@ pub(super) fn catalogue_duplicates(rows: &[(String, u64)]) -> Result<(), String>
          partitioned tables can create a plain table over one. Nothing was opened or changed.",
         refusals.join("; ")
     ))
+}
+
+/// `VACUUM` of a partitioned table: [`Table::vacuum_now`] on every
+/// materialized partition, summed into one report. An unmaterialized one
+/// holds no row. A partition's failure fails the whole call, as a broken
+/// table does: a sum that skipped one would read as the table vacuumed.
+pub(super) async fn vacuum_partitions(table: &PartitionedTable) -> io::Result<VacuumReport> {
+    use crate::core::mvcc::transaction::NO_TX;
+    let epoch = table.epoch()?;
+    let mut sum = VacuumReport {
+        held_min_xmax: NO_TX,
+        ..VacuumReport::default()
+    };
+    for (pid, partition) in table.materialized(&epoch, &Route::All)? {
+        let r = partition
+            .vacuum_now()
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("partition {pid}: {e}")))?;
+        sum.slots += r.slots;
+        sum.live_rows += r.live_rows;
+        sum.dead_rows += r.dead_rows;
+        sum.live_bytes += r.live_bytes;
+        sum.dead_bytes += r.dead_bytes;
+        sum.reclaimed_bytes += r.reclaimed_bytes;
+        sum.extents += r.extents;
+        sum.deferred |= r.deferred;
+        sum.fingerprints_cleared += r.fingerprints_cleared;
+        sum.held_rows += r.held_rows;
+        if r.held_min_xmax != NO_TX && (sum.held_min_xmax == NO_TX || r.held_min_xmax < sum.held_min_xmax) {
+            sum.held_min_xmax = r.held_min_xmax;
+        }
+    }
+    Ok(sum)
+}
+
+/// The startup reaper (§12) for the database at `location`, run after WAL
+/// recovery and the catalogue read and before any table opens, so before
+/// forgetting resumes. Deletes the `__pt_` files of uids no catalogue row
+/// holds and of partitions their map never materialized, after voiding the
+/// logs' records for them, so a later replay cannot write them back into a
+/// partition materialized again under the same name.
+///
+/// Deletes nothing when any reason to doubt the catalogue or a map exists:
+/// a live map that is missing, torn or not fully understood, or a plain
+/// table whose name starts with `__pt_` (older builds allowed it), whose
+/// files the pattern could match (I15).
+pub(super) fn reap_at_startup(
+    location: &str,
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &super::StoragePool,
+    rows: &[(String, u64)],
+) -> files::ReapReport {
+    let root = Path::new(location);
+    if let Some((name, _)) = rows.iter().find(|(name, c)| *c == 0 && name.starts_with(files::PREFIX)) {
+        let why = format!(
+            "plain table \"{name}\" has a name under the partition prefix {}, so its files could \
+             look like a partitioned table's",
+            files::PREFIX
+        );
+        warn!("Partition file reaping is off for this start: {why}");
+        return files::ReapReport {
+            deleted: Vec::new(),
+            kept: Some(why),
+        };
+    }
+    let live: HashMap<u64, Result<crate::core::partition::log::MapState, String>> = rows
+        .iter()
+        .filter(|(_, c)| *c != 0)
+        .map(|(_, uid)| (*uid, files::read_live_map(root, *uid)))
+        .collect();
+    let report = files::reap(root, &live, |names| {
+        let logs = logs_holding(io_pointers, pool, Some(location));
+        let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
+        forget_logged_ids(&logs, &ids, Barrier::Drop).map_err(|f| f.error)
+    });
+    if let Some(why) = &report.kept {
+        warn!("Partition file reaping deleted nothing this start: {why}");
+    } else if !report.deleted.is_empty() {
+        info!(
+            "Reaped {} partition file(s) no table holds: {}",
+            report.deleted.len(),
+            report.deleted.join(", ")
+        );
+    }
+    report
 }
 
 /// Every file name in `dir` under `uid`: what [`files::remove_all`] deletes,

@@ -65,6 +65,11 @@ pub async fn move_table(
 ) -> Result<Vec<String>, String> {
     let pool = &database.storage;
     let root = pool.root().ok_or("this database is in memory")?.to_string();
+    // Before "already there": a partitioned table is in no placement, so the
+    // root would read as where it is and the statement as done.
+    database
+        .refuse_partitioned(table, "STORAGE MOVE TABLE")
+        .map_err(|e| e.to_string())?;
 
     let current = pool
         .backend_of(table)
@@ -213,6 +218,13 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     let mut tables: Vec<(String, String, u64)> = Vec::new();
     for entry in database.tables.iter() {
         let name = entry.key().clone();
+        // A partitioned table's shell has no files of its own, so it would
+        // sort as the smallest table and be picked first, and its partitions
+        // are not in the placement map. They rebalance with REBALANCE
+        // PARTITIONS, a later version's.
+        if database.partitioned.contains_key(&name) || entry.value().is_shell() {
+            continue;
+        }
         let at = match placements.get(&name) {
             // Only a directory placement is a rebalance candidate: the others
             // occupy no disk the policy is balancing and cannot be moved onto

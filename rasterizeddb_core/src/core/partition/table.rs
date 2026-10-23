@@ -120,11 +120,24 @@ struct Slot {
     open: tokio::sync::OnceCell<Arc<Table<DbStorageProvider>>>,
 }
 
-/// Running totals over the materialized partitions.
+/// Running totals over the materialized partitions, plus the parent files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
-    /// Rows, pointer and filter files together.
+    /// Every file of the table: the partitions' three each, and the parent
+    /// files (schema, map log, ids) once.
     pub bytes: u64,
+    /// The partitions' rows files.
+    pub data: u64,
+    /// The partitions' pointer files.
+    pub pointers: u64,
+    /// The partitions' filter checkpoints.
+    pub filters: u64,
+    /// The schema file, read through the shell's provider.
+    pub schema: u64,
+    /// The map log.
+    pub map: u64,
+    /// The row-id reservation every partition shares, counted once.
+    pub ids: u64,
     /// Pointer records, live and dead.
     pub slots: u64,
     pub ids_handed_out: u64,
@@ -726,30 +739,49 @@ impl PartitionedTable {
         self.declared
     }
 
-    async fn sizes(table: &Table<DbStorageProvider>) -> io::Result<(u64, u64)> {
-        let pointers = table.io_pointers()?.get_len().await;
-        let bytes = table.io_rows()?.get_len().await + pointers + table.io_filters()?.get_len().await;
-        Ok((pointers / ROW_POINTER_RECORD_LEN as u64, bytes))
+    /// A partition's (rows, pointers, filters) file lengths.
+    async fn file_lens(table: &Table<DbStorageProvider>) -> io::Result<(u64, u64, u64)> {
+        Ok((
+            table.io_rows()?.get_len().await,
+            table.io_pointers()?.get_len().await,
+            table.io_filters()?.get_len().await,
+        ))
     }
 
-    /// Totals over the materialized partitions. Lengths are atomics on local
-    /// storage, so this reads no file metadata.
+    async fn sizes(table: &Table<DbStorageProvider>) -> io::Result<(u64, u64)> {
+        let (rows, pointers, filters) = Self::file_lens(table).await?;
+        Ok((pointers / ROW_POINTER_RECORD_LEN as u64, rows + pointers + filters))
+    }
+
+    /// Totals over the materialized partitions, and the parent files. Lengths
+    /// are atomics on local storage, so this reads no file metadata.
     pub async fn totals(&self) -> io::Result<Totals> {
         let live = self.live()?;
         let mut t = Totals {
             ids_handed_out: live.ids.handed_out(),
             declared: live.slots.len() as u32,
+            schema: self.shell.io_schema.get_len().await,
+            map: live.log.io().get_len().await,
+            ids: live.ids.io.get_len().await,
             ..Totals::default()
         };
         for slot in live.slots.iter() {
             if let Some(table) = slot.open.get() {
-                let (slots, bytes) = Self::sizes(table).await?;
+                let (rows, pointers, filters) = Self::file_lens(table).await?;
                 t.materialized += 1;
-                t.slots += slots;
-                t.bytes += bytes;
+                t.slots += pointers / ROW_POINTER_RECORD_LEN as u64;
+                t.data += rows;
+                t.pointers += pointers;
+                t.filters += filters;
             }
         }
+        t.bytes = t.data + t.pointers + t.filters + t.schema + t.map + t.ids;
         Ok(t)
+    }
+
+    /// The map header's routing version (§4.1), as replayed.
+    pub async fn route_v(&self) -> io::Result<u16> {
+        Ok(self.live()?.state.lock().await.header().route_v)
     }
 
     /// Every declared partition, by pid.

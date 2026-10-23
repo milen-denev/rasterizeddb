@@ -21,6 +21,10 @@ mod txid_reuse_tests;
 mod partitioned;
 #[cfg(test)]
 mod partitioned_tests;
+#[cfg(test)]
+mod relation_dispatch_tests;
+#[cfg(test)]
+mod reaper_tests;
 pub mod relation;
 
 pub use relation::Relation;
@@ -1323,6 +1327,14 @@ impl Database {
             return Err(format!("refusing to open the database at {location}: {e}"));
         }
 
+        // After WAL recovery and the catalogue read, before any table opens
+        // and so before forgetting resumes: partition files without
+        // MATERIALIZE may hold rows of a transaction whose outcome was lost,
+        // and must go before the forget horizon can pass it (§12).
+        if !in_memory {
+            partitioned::reap_at_startup(location, &io_pointers, &storage, &tables_names);
+        }
+
         let tables = DashMap::with_hasher(ahash::RandomState::new());
 
         // Outcomes are durable for a file-backed database and need not be for
@@ -1836,28 +1848,32 @@ impl Database {
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
     async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
-        // A held rename's intent names this table, and the next open settles
-        // the kept files by which of its two names the catalogue still holds.
-        // Dropped now, it would hold neither, the open would leave the kept
-        // files, and a table created under their name would take their rows.
-        if self.tables.contains_key(table_name) && self.held_names.lock().iter().any(|h| h == table_name) {
-            return Err(io::Error::other(format!(
-                "\"{table_name}\" is part of a rename whose old files could not be released yet; \
-                 restart before dropping it"
-            )));
-        }
-
         // A partitioned table drops through its own order. Resolved before
         // `tables` is touched: its shell is there too, and the plain path
         // below would sweep `<name>*` files it never had.
-        if let Some(Relation::Partitioned(_)) = self.relation(table_name) {
-            return self.drop_partitioned(table_name).await;
-        }
+        //
         // A shell with no partitioned table behind it is refused before the
         // map is touched: taking the entry out and putting it back would let
         // a concurrent statement see no table, or a concurrent CREATE of the
         // same name slip in between.
-        self.refuse_shell(table_name)?;
+        match self.relation(table_name) {
+            Some(Relation::Partitioned(_)) => return self.drop_partitioned(table_name).await,
+            Some(Relation::Plain(table)) => {
+                table.data()?;
+                // A held rename's intent names this table, and the next open
+                // settles the kept files by which of its two names the
+                // catalogue still holds. Dropped now, it would hold neither,
+                // the open would leave the kept files, and a table created
+                // under their name would take their rows.
+                if self.held_names.lock().iter().any(|h| h == table_name) {
+                    return Err(io::Error::other(format!(
+                        "\"{table_name}\" is part of a rename whose old files could not be released yet; \
+                         restart before dropping it"
+                    )));
+                }
+            }
+            None => {}
+        }
         // Through the sweep below: see `deletion_permit`. Taken before the
         // table leaves the map and the catalogue: a drop waiting for it with
         // the table half gone hid the table, files still on disk, and a
@@ -2019,31 +2035,6 @@ impl Database {
             .as_deref()
             .and_then(crate::core::wal::wal_for)
             .is_some_and(|wal| wal.is_poisoned())
-    }
-
-    /// Errs if `name` is a partitioned table's shell.
-    ///
-    /// For the name-keyed methods that work from file names and rebuild the
-    /// map entry with `Table::new`, so never reach `Table::data`: on a shell
-    /// that would replace the partitioned table with an empty plain one. Called
-    /// before the entry is removed, and the map guard is released on return.
-    /// Also errs for a partitioned table whose schema could not be read,
-    /// which has no shell in `tables`.
-    // PARTITION-TODO(S5): replaced by dispatch on `relation()`.
-    fn refuse_shell(&self, name: &str) -> io::Result<()> {
-        if self.partitioned.contains_key(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "relation \"{}\" is partitioned; this operation is not supported on partitioned tables yet",
-                    name
-                ),
-            ));
-        }
-        match self.tables.get(name) {
-            Some(table) => table.data().map(|_| ()),
-            None => Ok(()),
-        }
     }
 
     /// [`forget_logged_files`] for a table being dropped, once its catalogue
@@ -2219,12 +2210,16 @@ impl Database {
         // to find), and the old name leaves `tables` while its row is live.
         let _new_claim = self.claim_name(new_name)?;
         let _old_claim = self.claim_name(old_name)?;
+        // Both names, before `tables`: a partitioned table renamed this way
+        // would be reopened as a plain one with `clusters = 0`, and its
+        // `__pt_<uid>_*` files reaped at the next start (§3.1). One with no
+        // shell in `tables` (its schema unreadable) is refused too, rather
+        // than reported missing. PARTITION-TODO(rename): §3.1's rename.
+        self.refuse_partitioned(old_name, "RENAME")?;
+        self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
         if !self.tables.contains_key(old_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
-        // Both names: a shell renamed would be reopened as a plain table.
-        self.refuse_shell(old_name)?;
-        self.refuse_shell(new_name)?;
         if self.tables.contains_key(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -2400,12 +2395,17 @@ impl Database {
             }
         }
     }
+
     /// Copies every file derived from `old_name` to one derived from `new_name`.
     ///
     /// A file that does not exist copies as a no-op: the sidecars are created
     /// lazily, so a table with no foreign keys has no `_FK.db` and that is not
     /// an error.
     async fn copy_table_files(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // A partitioned table has no `<name>*` files: copying would find none
+        // and report a rename that moved nothing.
+        self.refuse_partitioned(old_name, "copying a table's files")?;
+        self.refuse_partitioned(new_name, "copying a table's files")?;
         // A rename does not move a table, so both names resolve to the same
         // directory — but they are resolved separately rather than assumed
         // equal, because that assumption is only true while `pool_rename` runs
@@ -2476,8 +2476,26 @@ impl Database {
     ///
     /// What a rebalance sorts on: moving the largest table off a full disk
     /// frees the most space for the fewest copies.
+    ///
+    /// A partitioned table is its partitions' running totals (§14): it has no
+    /// `<name>*` files, so the file sum below would report 0, and on a
+    /// key/value seed its opens would create them. A broken one reports 0,
+    /// loudly; a shell with nothing behind it holds no bytes.
     #[cfg(feature = "storage_pools")]
     pub async fn table_bytes(&self, table_name: &str) -> u64 {
+        match self.relation(table_name) {
+            Some(Relation::Partitioned(table)) => {
+                return match table.totals().await {
+                    Ok(totals) => totals.bytes,
+                    Err(e) => {
+                        error!("the size of partitioned table {} is unknown: {}", table_name, e);
+                        0
+                    }
+                };
+            }
+            Some(Relation::Plain(table)) if table.is_shell() => return 0,
+            _ => {}
+        }
         let seed = seed_in(
             &self.db_io_pointers,
             &self.storage,
@@ -2561,6 +2579,8 @@ impl Database {
     /// before anything is copied.
     #[cfg(feature = "storage_pools")]
     pub async fn move_table_to(&self, table_name: &str, destination: &str) -> io::Result<u64> {
+        // Before the destination is parsed, so the refusal names the table.
+        self.refuse_partitioned(table_name, "STORAGE MOVE TABLE")?;
         let backend = crate::core::storage::TableBackend::parse(destination);
         self.move_table_to_backend(table_name, &backend).await
     }
@@ -2579,8 +2599,13 @@ impl Database {
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.
         let _forget_pause = self.transactions.forget_pause();
-        // Before anything: the move reopens the table with `Table::new`.
-        self.refuse_shell(table_name)?;
+        // Before anything: the move reopens the table with `Table::new`, and a
+        // partitioned table's partitions are not in the placement map at all
+        // (§3.1). Moving one partition is a later phase's MOVE PARTITION.
+        self.refuse_partitioned(
+            table_name,
+            "STORAGE MOVE TABLE (a partition moves with MOVE PARTITION, in a later version)",
+        )?;
 
         let root = self
             .storage
@@ -2958,7 +2983,7 @@ impl Database {
     /// the drop sweeps them, so the create after it does not find them.
     pub fn check_recreatable(&self, name: &str) -> io::Result<()> {
         // The rewrite drops it and creates a plain table in its place.
-        self.refuse_shell(name)?;
+        self.refuse_partitioned(name, "a rewriting ALTER TABLE")?;
         if let Some(reason) = table_name_refusal(name) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
@@ -2978,14 +3003,22 @@ impl Database {
         if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
             return None;
         }
-        // Every live table, and every name a rename still holds files under
-        // until the next open. One pass, comparing ignoring case, so this is
-        // linear in the tables, not in the directory.
+        // Every live table, every partitioned table (whose shell may be
+        // missing from `tables` when its schema could not be read, while an
+        // older binary would still read `<name>_schema.db` as that schema),
+        // and every name a rename still holds files under until the next
+        // open. One pass, comparing ignoring case, so this is linear in the
+        // tables, not in the directory.
         let readings = file_readings(name);
         let shared = self
             .tables
             .iter()
             .find_map(|entry| file_shared_with(name, &readings, entry.key()))
+            .or_else(|| {
+                self.partitioned
+                    .iter()
+                    .find_map(|entry| file_shared_with(name, &readings, entry.key()))
+            })
             .or_else(|| {
                 let held = self.held_names.lock();
                 held.iter().find_map(|other| file_shared_with(name, &readings, other))
@@ -3060,6 +3093,13 @@ impl Database {
     /// Used both to clean up a failed copy and to drop the original once the
     /// rename has committed, so it must tolerate files that are not there.
     async fn discard_table_files(&self, name: &str) -> bool {
+        // A partitioned name owns no `<name>*` files, and sweeping them
+        // creates each before deleting it. Reported as kept, so a caller
+        // leaves its intent for the next open rather than clearing it.
+        if let Err(e) = self.refuse_partitioned(name, "discarding a table's files") {
+            error!("{}", e);
+            return false;
+        }
         discard_files(
             &seed_in(
                 &self.db_io_pointers,
@@ -3085,6 +3125,9 @@ impl Database {
     /// `schema.name` into its cache scope, so two tables would end up sharing
     /// a cache namespace.
     async fn rewrite_schema_name(&self, new_name: &str) -> io::Result<()> {
+        // A partitioned table's schema is `__pt_<uid>_schema.db`; the file
+        // below would be created empty under the logical name.
+        self.refuse_partitioned(new_name, "rewriting a table's schema name")?;
         let schema_io = Arc::new(
             seed_in(
                 &self.db_io_pointers,
@@ -3114,6 +3157,12 @@ impl Database {
 
     /// Opens the renamed table and puts it in the live map under its new name.
     async fn open_renamed_table(&self, new_name: &str) {
+        // `Table::new` below would replace a partitioned table's shell with
+        // an empty plain table, and create `<name>*` files for it.
+        if let Err(e) = self.refuse_partitioned(new_name, "reopening a renamed table") {
+            error!("renamed table '{}' is left unopened: {}", new_name, e);
+            return;
+        }
         let seed = seed_in(
             &self.db_io_pointers,
             &self.storage,
@@ -3217,6 +3266,11 @@ impl Database {
     }
 
     async fn record_rename_intent(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // Recovery acts on the intent by `<name>*` files and plain rows, so
+        // one naming a partitioned table would lead it to sweep or reopen it
+        // as plain.
+        self.refuse_partitioned(old_name, "RENAME")?;
+        self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
         let io = self
             .db_io_pointers
             .create_new(RENAME_INTENT_FILE.to_string())
@@ -3335,24 +3389,41 @@ impl Database {
     /// Reclaims dead space across every open table, now rather than at the
     /// background service's next tick.
     ///
-    /// Returns one report per table, named. A table whose report has `deferred`
-    /// set had a query older than the scan still running and published nothing;
-    /// the next run picks it up.
-    pub async fn vacuum_all(&self) -> Vec<(String, crate::core::vacuum::VacuumReport)> {
-        let tables: Vec<_> = self
-            .tables
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect();
-
-        let mut reports = Vec::with_capacity(tables.len());
-        for (name, table) in tables {
-            match table.vacuum_now().await {
-                Ok(report) => reports.push((name, report)),
-                Err(e) => error!("Vacuum failed for {}: {}", name, e),
+    /// Returns one report per table, named; a partitioned table is one report
+    /// under its logical name, summed over its materialized partitions. A
+    /// table whose report has `deferred` set had a query older than the scan
+    /// still running and published nothing; the next run picks it up.
+    ///
+    /// Any table's failure fails the call, naming it. Logging it and returning
+    /// the rest read as a complete vacuum to a caller that cannot see the log,
+    /// and a partitioned table's shell or a broken one always fails.
+    pub async fn vacuum_all(&self) -> io::Result<Vec<(String, crate::core::vacuum::VacuumReport)>> {
+        let mut names: Vec<String> = self.tables.iter().map(|entry| entry.key().clone()).collect();
+        // A broken partitioned table may have no shell in `tables`.
+        for entry in self.partitioned.iter() {
+            if !names.contains(entry.key()) {
+                names.push(entry.key().clone());
             }
         }
-        reports
+        names.sort_unstable();
+
+        let mut reports = Vec::with_capacity(names.len());
+        for name in names {
+            let report = match self.relation(&name) {
+                Some(Relation::Partitioned(table)) => partitioned::vacuum_partitions(&table).await,
+                Some(Relation::Plain(table)) => table.vacuum_now().await,
+                // Dropped since the names were read.
+                None => continue,
+            };
+            match report {
+                Ok(report) => reports.push((name, report)),
+                Err(e) => {
+                    error!("Vacuum failed for {}: {}", name, e);
+                    return Err(io::Error::new(e.kind(), format!("VACUUM failed for {}: {}", name, e)));
+                }
+            }
+        }
+        Ok(reports)
     }
 
     /// Serves the native protocol, with authentication configured by default.
@@ -3493,11 +3564,13 @@ impl Database {
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.
         let _forget_pause = self.transactions.forget_pause();
+        // Before the entry is removed, and before `tables` is asked: the
+        // reopen below builds a plain table, and a partitioned one with no
+        // shell must not read as missing (ALTER and CREATE INDEX reach here).
+        self.refuse_partitioned(table_name, "reloading a table's schema")?;
         if !self.tables.contains_key(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
-        // Before the entry is removed: the reopen below builds a plain table.
-        self.refuse_shell(table_name)?;
         let _changed = SchemaChanged(&self.schema_generation);
         // Every schema change comes through here, so this is where a client's
         // cached column list becomes stale. See `schema_generation`.

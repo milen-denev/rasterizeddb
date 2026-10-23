@@ -7,6 +7,8 @@
 //! data, and a path that rebuilt the entry from `<name>*` files would replace
 //! the partitioned table with an empty plain one.
 
+use std::io;
+
 use rclite::Arc;
 
 use super::Database;
@@ -45,5 +47,23 @@ impl Database {
         self.tables
             .get(name)
             .map(|table| Relation::Plain(table.value().clone()))
+    }
+
+    /// Errs when `name` is a partitioned table, for the name-keyed paths
+    /// that work from `<name>*` files or rebuild the map entry with
+    /// `Table::new`: on a partitioned name they would find no files and put
+    /// an empty plain table in its place. `what` names the operation in the
+    /// refusal. A shell with no partitioned table behind it errs too, with
+    /// `Table::data`'s refusal. Called before the map entry is touched; the
+    /// map guard is released on return.
+    pub(crate) fn refuse_partitioned(&self, name: &str, what: &str) -> io::Result<()> {
+        match self.relation(name) {
+            Some(Relation::Partitioned(_)) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{what} is not supported on partitioned table \"{name}\" yet"),
+            )),
+            Some(Relation::Plain(table)) => table.data().map(|_| ()),
+            None => Ok(()),
+        }
     }
 }
