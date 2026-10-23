@@ -26,7 +26,7 @@
 
 use crate::core::db_type::DbType;
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-use crate::core::storage_providers::traits::StorageIO;
+use crate::core::storage_providers::traits::{IOResult, StorageIO};
 
 use super::bloom::SuperBloom;
 use super::column::{ColumnDelta, ColumnFilter, Generation, Hll};
@@ -47,9 +47,45 @@ const MAGIC: &[u8; 8] = b"RDBFLT01";
 // count. A v4 file has none, so it reads exactly as before and is accepted —
 // an upgrade costs nothing. A v4 reader refuses a v5 file by its version and
 // rebuilds, which is the safe direction.
-const FORMAT_VER: u16 = 5;
+pub(super) const FORMAT_VER: u16 = 5;
 /// The oldest version this reader accepts unchanged.
-const OLDEST_READABLE_VER: u16 = 4;
+pub(super) const OLDEST_READABLE_VER: u16 = 4;
+
+/// Version of everything a persisted filter's *contents* are derived by, as
+/// opposed to how they are laid out ([`FORMAT_VER`]).
+///
+/// A persisted filter is trusted at open, so a change to any of these, made
+/// without a bump, prunes matching rows from then on with no error anywhere:
+///
+/// - `hash::canonical_hash` with its ±0.0, NaN-payload and string handling,
+///   the `mix` and `hash_bytes` it uses, and `HashSeed::default`;
+/// - `hash::fingerprint` and the reserved codes `CODE_EMPTY`, `CODE_NULL`,
+///   `CODE_FIRST`;
+/// - the zone bounds: which value `ZoneMap::observe` keeps as min and max,
+///   which is `perform_comparison_operation`'s order (NaN above +Infinity, as
+///   PostgreSQL has it), the padded and truncated string encoding,
+///   `STRING_BOUND_PREFIX`, `round_up`, `successor`, the `UNBOUNDED` sentinel,
+///   and what `zone_may_match` keeps for each `SargOp`;
+/// - the span summary: `SuperBloom`'s `SALT`, `bloom_hash`, the sub-block
+///   formula and the superzone geometry;
+/// - the plane layout `kernels::write_slot` writes and every `probe_fn`
+///   kernel reads (bit `j` of slot `local` at word `j * ZONE_WORDS +
+///   local / 64`, bit `local % 64`), and `ZONE_ROWS`.
+///
+/// `filter::derive_vectors_tests` pins each of them to golden outputs. A
+/// change that moves one fails there.
+///
+/// Nothing on disk records this yet, so a bump on its own rejects no sidecar.
+/// Until it is part of a persisted identity, a derivation change must also
+/// bump [`FORMAT_VER`] and raise [`OLDEST_READABLE_VER`] to it: that is what
+/// makes every sidecar the previous derivation wrote fail to load and be
+/// rebuilt. The golden test holds the three together.
+///
+/// `choose_f` and the HLL are outside it: they pick future zones' widths, so a
+/// change to them costs pruning, never rows. So is a `NUMERIC(p, s)` column's
+/// scale: it is the column's, and the query side's rescaling to it is pinned
+/// by the vectors as well.
+pub const FILTER_DERIVE_VERSION: u32 = 1;
 
 /// Fixed-size superblock. `dirty` lives at a known offset so it can be flipped
 /// with an 8-byte positioned write, without rewriting anything else.
@@ -732,4 +768,25 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
 /// invalidate; see `TableFilters::mark_disk_dirty`.
 pub async fn mark_dirty_on_disk<S: StorageIO>(io: &S) {
     io.write_data(DIRTY_OFFSET, &[1u8]).await;
+}
+
+/// Write `bytes` at `offset` as one transaction, returning `Ok` once its
+/// commit reports it durable.
+///
+/// `StorageIO::write_data` cannot report a failure: the provider logs it and
+/// returns, which is how a checkpoint used to clear `disk_dirty` over a write
+/// that never landed. The transactional form reports it at `commit_durable`.
+/// For the file provider that is the same I/O `write_data` did: a logged one
+/// syncs the record and applies it at commit, and a log-less one overwrites
+/// and flushes. For the KV provider it is a family transaction where
+/// `write_data` was an untransacted flush, and for a mirror the backups are
+/// written before the primary commits.
+///
+/// An `Err` does not mean nothing landed: a KV commit can be in doubt, a
+/// mirror's backups already hold the bytes, and a log-less file has them when
+/// its flush fails. Callers must treat what is on disk as unknown.
+pub async fn write_durably<S: StorageIO>(io: &S, offset: u64, bytes: &[u8]) -> IOResult<()> {
+    let txn = io.begin_txn();
+    let token = io.write_data_txn(txn, offset, bytes).await;
+    io.commit_durable(token).await
 }

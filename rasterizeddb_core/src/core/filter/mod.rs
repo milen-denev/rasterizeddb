@@ -42,6 +42,10 @@ mod compact_failure_tests;
 mod vacuum_clear_power_loss_tests;
 #[cfg(test)]
 mod vacuum_clear_runs_tests;
+#[cfg(test)]
+mod checkpoint_error_tests;
+#[cfg(test)]
+mod derive_vectors_tests;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -679,19 +683,51 @@ impl TableFilters {
     /// replay. A `DELETE` reaches that last case by construction: it invalidates
     /// slots near the start, so its "tail" is the whole file.
     pub async fn checkpoint<S: StorageIO>(&self, io: &S, n_slots: u64) {
+        if let Err(e) = self.try_checkpoint(io, n_slots).await {
+            log::error!(
+                "filter checkpoint failed; the next mutation marks the sidecar dirty and the next checkpoint rewrites it: {}",
+                e
+            );
+        }
+    }
+
+    /// [`TableFilters::checkpoint`], returning the write's error.
+    ///
+    /// A checkpoint is reported done only once its record is durable. A failed
+    /// one may still have landed, or may land later: the KV provider reports a
+    /// put that may yet arrive, a mirror has written its backups before the
+    /// primary's commit fails, and a log-less file has the bytes when its
+    /// flush fails. So after a failure the dirty byte on disk is unknown, not
+    /// unchanged, and the next mutation has to write it: `has_checkpoint` is
+    /// set and `disk_dirty` cleared, as after a success. The pending request
+    /// stays, so the next tick tries again.
+    pub async fn try_checkpoint<S: StorageIO>(&self, io: &S, n_slots: u64) -> std::io::Result<()> {
         // Planning and writing have to be one step: see `write_gate`.
         let _gate = self.write_gate.lock().await;
         if let Some((offset, bytes, _is_base)) = self.plan(n_slots) {
             // Test-only: parks a planned checkpoint before its write.
             #[cfg(test)]
             checkpoint_test_hooks::planned(self).await;
-            io.write_data(offset, &bytes).await;
+            if let Err(e) = persist::write_durably(io, offset, &bytes).await {
+                // `plan` already counted this record as written: the columns
+                // are marked checkpointed and `disk_len` is past it. A delta
+                // planned from there would land beyond bytes that never did,
+                // or inside older records, so the next record is a base image.
+                self.disk_len.store(0, Ordering::Relaxed);
+                // What landed is unknown: a clean base image may be on disk.
+                // These make `mark_disk_dirty` write the byte again before the
+                // next mutation changes a row.
+                self.disk_dirty.store(false, Ordering::Relaxed);
+                self.has_checkpoint.store(true, Ordering::Release);
+                return Err(e);
+            }
         }
         self.writes_since_checkpoint.store(0, Ordering::Relaxed);
         self.slots_at_checkpoint.store(n_slots, Ordering::Relaxed);
         self.disk_dirty.store(false, Ordering::Relaxed);
         self.checkpoint_requested.store(false, Ordering::Relaxed);
         self.has_checkpoint.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Mark the on-disk copy stale before mutating already-checkpointed rows.

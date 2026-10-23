@@ -54,7 +54,7 @@ pub const BLOCK_BITS: usize = 4096;
 
 /// `u32` lanes in a split-block. One bit is set per lane, so a probe is eight
 /// bit tests and the false-positive rate is `fill^8`.
-const LANES: usize = 8;
+pub(super) const LANES: usize = 8;
 
 /// Words in one superzone's block.
 const BLOCK_WORDS: usize = BLOCK_BITS / 32;
@@ -66,7 +66,7 @@ const SUB_BLOCKS: usize = BLOCK_WORDS / LANES;
 ///
 /// Each maps the key's low bits to a different bit position, and being odd each
 /// is invertible, so no two lanes collapse onto the same bit for all keys.
-const SALT: [u32; LANES] = [
+pub(super) const SALT: [u32; LANES] = [
     0x47b6_137b,
     0x4497_4d91,
     0x8824_ad5b,

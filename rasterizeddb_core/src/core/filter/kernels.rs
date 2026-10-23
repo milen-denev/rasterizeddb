@@ -152,6 +152,23 @@ pub fn probe_fn() -> ProbeFn {
     })
 }
 
+/// Every kernel this CPU can run, by name, so tests can hold each one to the
+/// same answers rather than only the one [`probe_fn`] picks.
+#[cfg(test)]
+pub(super) fn runnable_kernels() -> Vec<(&'static str, ProbeFn)> {
+    let mut kernels = vec![("scalar", probe_zone_scalar as ProbeFn)];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            kernels.push(("avx2", probe_avx2_shim as ProbeFn));
+        }
+        if is_x86_feature_detected!("avx512f") {
+            kernels.push(("avx512f", probe_avx512_shim as ProbeFn));
+        }
+    }
+    kernels
+}
+
 /// Name of the active kernel. For benchmarks and diagnostics.
 pub fn active_kernel() -> &'static str {
     #[cfg(target_arch = "x86_64")]
