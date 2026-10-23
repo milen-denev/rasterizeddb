@@ -180,6 +180,12 @@ pub(super) async fn vacuum_partitions(table: &PartitionedTable) -> io::Result<Va
 /// a live map that is missing, torn or not fully understood, or a plain
 /// table whose name starts with `__pt_` (older builds allowed it), whose
 /// files the pattern could match (I15).
+///
+/// It deliberately takes no deletion gate (`backup::deletion_permit`),
+/// unlike a DROP: it runs inside `Database::new`, before any backup service
+/// can exist on this database, so there is no snapshot for the gate to
+/// protect, and taking it there is unnecessary and risks a deadlock with a
+/// service of another database already holding it.
 pub(super) fn reap_at_startup(
     location: &str,
     io_pointers: &Arc<DbStorageProvider>,
