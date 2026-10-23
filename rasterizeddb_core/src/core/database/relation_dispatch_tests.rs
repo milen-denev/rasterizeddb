@@ -166,6 +166,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("forget_dropped_files", "the WAL barrier for the plain table drop_table_to_depth already resolved and removed"),
     ("abandon_copy", "delegates to discard_table_files, which dispatches"),
     ("table_files_conflict", "delegates to table_files_conflict_beside"),
+    ("table_files_conflict_beside", "the name guard: a pass over every relation, plain and partitioned, by design"),
     ("remember_in_catalogue", "a row write; rename dispatches before it"),
     ("write_catalogue_row", "a row write with the cluster value its caller chose"),
     ("catalogue_contains", "test-only catalogue read"),

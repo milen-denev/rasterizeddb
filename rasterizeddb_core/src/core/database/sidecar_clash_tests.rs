@@ -609,6 +609,15 @@ fn every_db_file_name_built_in_src_is_listed() {
             if !shape.ends_with(".db") {
                 continue;
             }
+            // A partitioned table's own files (`__pt_<uid>_ids.db`, its map
+            // log, its partitions' rows) live in the `__pt_` namespace, which
+            // `table_name_refusal` refuses as a table name: no table can be
+            // named onto them, and partition code renames and drops them, not
+            // RENAMED_SUFFIXES. Only the prefixed literals: anything else in
+            // core/partition is scanned like the rest.
+            if shape.starts_with("{PREFIX}") {
+                continue;
+            }
             match implied_suffix(&literal) {
                 Ok(suffix) if RENAMED_SUFFIXES.contains(&suffix.as_str()) => {
                     suffixes_built.push(suffix);
@@ -666,4 +675,23 @@ fn the_source_scan_reads_the_shapes_it_must() {
     )
     .unwrap();
     assert_eq!(literals(&file), vec!["{}_kept.db".to_string()]);
+}
+
+/// A partitioned table holds its name's files even when its shell is not in
+/// `tables` (its schema could not be read at open): an older binary would
+/// read `<name>_schema.db` as that schema, so `acct_schema` or
+/// `acct_pointers` must still be refused beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_without_its_shell_still_holds_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = rclite::Arc::new(open_db(dir.path()).await);
+    let (status, text) =
+        sql(&db, "CREATE TABLE acct (tenant_id BIGINT NOT NULL, n INT) PARTITION BY HASH (tenant_id)").await;
+    assert_eq!(status, 0, "{text}");
+    assert!(db.partitioned.contains_key("acct"));
+    db.tables.remove("acct");
+    for newcomer in ["acct_schema", "acct_pointers", "ACCT_schema_FIELDS"] {
+        let err = db.add_table(create_stmt(newcomer)).await.unwrap_err();
+        assert_names_the_file(&err.to_string(), newcomer, "acct", newcomer);
+    }
 }
