@@ -125,6 +125,12 @@ async fn truth_tests_over_general_expressions() {
         // b = 3 is false there, which decides the AND.
         ("(b = 2 AND a <> NULL) IS NOT UNKNOWN", vec![]),
         ("(b = 3 AND a <> NULL) IS NOT UNKNOWN", vec![1, 2, 3, 5]),
+        // A function call is evaluated, as in the select list: |a| is 1, 3,
+        // NULL, 1, 2, so the NULL row is unknown, not false.
+        ("(abs(a) = 1) IS TRUE", vec![1, 4]),
+        ("(abs(a) = 1) IS FALSE", vec![2, 5]),
+        ("(abs(a) = 1) IS UNKNOWN", vec![3]),
+        ("(abs(a) = 1) IS NOT TRUE", vec![2, 3, 5]),
     ] {
         let got = sqlx::query(AssertSqlSafe(format!("SELECT id FROM e WHERE {predicate} ORDER BY id")))
             .fetch_all(&pool)
@@ -139,7 +145,7 @@ async fn truth_tests_over_general_expressions() {
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 
     // What the expansion cannot express is refused, never approximated.
-    for predicate in ["(abs(a) = 1) IS TRUE", "(a IN (1, 2)) IS TRUE", "(a LIKE 'x%') IS FALSE"] {
+    for predicate in ["(a IN (1, 2)) IS TRUE", "(a LIKE 'x%') IS FALSE"] {
         let got = sqlx::query(AssertSqlSafe(format!("SELECT id FROM e WHERE {predicate}")))
             .fetch_all(&pool)
             .await;

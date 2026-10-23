@@ -2386,6 +2386,10 @@ fn needs_evaluator(text: &str) -> bool {
                     // `CAST(qty AS bigint)`, the standard spelling of a cast,
                     // which the rewrite has no form for.
                     || word.eq_ignore_ascii_case("CAST") && text[end..].trim_start().starts_with('(')
+                    // `COALESCE(s, 'z')`, `UPPER(name)`: a call only the
+                    // evaluator knows, refused as an unknown column before.
+                    || crate::core::rql::expr::FUNCTIONS.iter().any(|f| word.eq_ignore_ascii_case(f))
+                        && text[end..].trim_start().starts_with('(')
                     || word.bytes().all(|b| b.is_ascii_digit() || b == b'.')
                         && literal_cast_in_arithmetic(text, i, end)
                 {

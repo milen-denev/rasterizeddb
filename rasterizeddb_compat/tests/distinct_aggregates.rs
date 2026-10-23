@@ -51,13 +51,61 @@ async fn distinct_aggregates_answer_as_postgresql_does() {
     assert_eq!(rows[0].get::<i64, _>(0), 3);
 }
 
+/// Several aggregates, over DISTINCT values of different expressions and
+/// beside plain ones, in one statement: the fold keeps a set per item.
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_and_plain_aggregates_mix() {
+    let (_server, pool) = setup().await;
+    let row = sqlx::query("SELECT COUNT(DISTINCT g), COUNT(DISTINCT x), COUNT(*), COUNT(x), SUM(DISTINCT x), SUM(x) FROM t")
+        .fetch_one(&pool)
+        .await
+        .expect("mixed");
+    let got: (i64, i64, i64, i64, i64, i64) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
+    assert_eq!(got, (3, 3, 7, 5, 60, 100));
+
+    let grouped: Vec<(i32, i64, i64)> =
+        sqlx::query("SELECT g, COUNT(DISTINCT x), COUNT(*) FROM t GROUP BY g ORDER BY g")
+            .fetch_all(&pool)
+            .await
+            .expect("grouped mix")
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+    assert_eq!(grouped, vec![(1, 2, 3), (2, 1, 3), (3, 0, 1)]);
+
+    // HAVING over the same aggregate the select list holds.
+    let having: Vec<(i32, i64)> =
+        sqlx::query("SELECT g, COUNT(DISTINCT x) FROM t GROUP BY g HAVING COUNT(DISTINCT x) > 1 ORDER BY g")
+            .fetch_all(&pool)
+            .await
+            .expect("having")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+    assert_eq!(having, vec![(1, 2)]);
+    // And a DISTINCT aggregate that only HAVING names: answered, or refused
+    // as unsupported, never answered as though DISTINCT were not there.
+    match sqlx::query("SELECT g FROM t GROUP BY g HAVING COUNT(DISTINCT x) > 1 ORDER BY g").fetch_all(&pool).await {
+        Ok(rows) => assert_eq!(rows.iter().map(|r| r.get::<i32, _>(0)).collect::<Vec<_>>(), vec![1]),
+        Err(e) => assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("0A000"), "{e}"),
+    }
+
+    // `ALL` is the default spelled out.
+    let all: i64 = sqlx::query("SELECT COUNT(ALL x) FROM t").fetch_one(&pool).await.expect("all").get(0);
+    assert_eq!(all, 5);
+
+    // -0.0 and 0.0 are one value.
+    pool.execute(sqlx::raw_sql("CREATE TABLE f (v DOUBLE PRECISION); INSERT INTO f VALUES (0.0), (-0.0), (1.5);"))
+        .await
+        .expect("floats");
+    let n: i64 = sqlx::query("SELECT COUNT(DISTINCT v) FROM f").fetch_one(&pool).await.expect("floats").get(0);
+    assert_eq!(n, 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shapes_it_cannot_answer_are_refused_as_unsupported() {
     let (_server, pool) = setup().await;
-    for sql in [
-        "SELECT COUNT(DISTINCT x), COUNT(*) FROM t",
-        "SELECT g, COUNT(DISTINCT x) FROM t GROUP BY g HAVING COUNT(DISTINCT x) > 1",
-    ] {
+    for sql in ["SELECT COUNT(DISTINCT x) + 1 FROM t"] {
         let e = sqlx::query(sql).fetch_all(&pool).await.expect_err(sql);
         assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("0A000"), "{sql}: {e}");
     }

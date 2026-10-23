@@ -561,6 +561,18 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
         .map(|(_, e, _)| *e)
 }
 
+/// Every function [`parse`] evaluates from arguments: the names its call
+/// dispatch matches on. A `WHERE` hands an operand calling one of them to this
+/// evaluator (`predicate_rewrite::lift_evaluated_operands`), as it does a
+/// `CASE`; the predicate tokenizer has no functions of its own, and refused
+/// `COALESCE(s, 'z') = 'z'` as an unknown column. Kept beside the dispatch, and
+/// held to it by `every_listed_function_is_evaluated`.
+pub const FUNCTIONS: &[&str] = &[
+    "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
+    "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD",
+];
+
 /// Parses one expression against `schema`.
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
@@ -4161,6 +4173,21 @@ mod tests {
     use super::*;
     use crate::core::row::row::Column;
     use crate::memory_pool::MEMORY_POOL;
+
+    /// Each name in [`FUNCTIONS`] reaches the call dispatch: a wrong argument
+    /// count or type may be refused, but never as a function this does not
+    /// know, which is what a `WHERE` lifting it would then report.
+    #[test]
+    fn every_listed_function_is_evaluated() {
+        let schema = vec![field("s", DbType::STRING, 0)];
+        for name in FUNCTIONS {
+            for args in ["s", "s, s", "s, s, s"] {
+                if let Err(e) = parse(&format!("{name}({args})"), &schema) {
+                    assert!(!e.contains("is not supported yet"), "{name}({args}): {e}");
+                }
+            }
+        }
+    }
 
     fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
         SchemaField::new(

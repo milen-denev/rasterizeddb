@@ -307,7 +307,7 @@ impl Having {
         op: HavingOp,
         literal: &str,
     ) -> Result<Having, String> {
-        let item = SelectItem::Aggregate {
+        let item = SelectItem::Aggregate { distinct: false,
             func,
             arg,
             label: func.name().to_string(),
@@ -1149,7 +1149,7 @@ mod tests {
                         .ok_or_else(|| format!("no column {}", arg))?,
                 )
             };
-            Ok(SelectItem::Aggregate {
+            Ok(SelectItem::Aggregate { distinct: false,
                 func,
                 arg,
                 label: call.to_string(),

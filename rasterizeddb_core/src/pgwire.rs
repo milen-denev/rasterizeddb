@@ -3215,12 +3215,6 @@ pub(crate) async fn describe_query(
     if stmt.is_empty() {
         return Ok(None);
     }
-    // Described as it runs: an aggregate over DISTINCT values reads a derived
-    // table, which is described below like any other. The original text has
-    // no column the describer can name, so it described as no columns at all.
-    let distinct_rewritten = crate::core::rql::distinct_aggregate::rewrite(stmt).ok().flatten();
-    let stmt = distinct_rewritten.as_deref().unwrap_or(stmt);
-
     // A `WITH` prefix is stripped and the statement it introduces is described
     // instead — but the outer query usually reads a CTE *as its source
     // relation*, and that name is not in `database.tables`. Describing the
@@ -3982,6 +3976,11 @@ where
         "22025"
     } else if message.starts_with("invalid escape string") {
         "22019"
+    } else if message.ends_with(" is not supported") {
+        // A shape the planner recognised and refuses, such as an aggregate
+        // over DISTINCT values inside an expression: feature_not_supported,
+        // not a syntax error.
+        "0A000"
     } else if message.contains(" types ") && message.ends_with(" cannot be matched") {
         // `CASE types integer and text cannot be matched` — PostgreSQL's
         // datatype_mismatch.
@@ -4815,20 +4814,6 @@ where
         .as_ref()
         .map(|m| m.rewritten.as_str())
         .unwrap_or(stmt);
-
-    // `COUNT(DISTINCT x)` and its kin become a plain aggregate over a derived
-    // table that has removed the duplicates, materialised just below.
-    let distinct_rewritten = match crate::core::rql::distinct_aggregate::rewrite(after_cte) {
-        Ok(rewritten) => rewritten,
-        Err(e) => {
-            if let Some(m) = &materialized {
-                crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
-            }
-            fail_statement(state, stream, "0A000", &e).await?;
-            return Ok(());
-        }
-    };
-    let after_cte = distinct_rewritten.as_deref().unwrap_or(after_cte);
 
     // A derived table — `FROM (SELECT …) alias` — becomes a temporary relation
     // the same way a CTE does, and for the same reason: the scan reads one

@@ -174,6 +174,8 @@ pub enum SelectItem {
         /// type is decided the same way for both — and unlike the join planner,
         /// that type is known here at parse time, because the schema is.
         arg_expr: Option<ArgExpression>,
+        /// `COUNT(DISTINCT x)`: each value counts once ([`Acc::Distinct`]).
+        distinct: bool,
     },
     /// A constant: `SELECT 1`, or the value a scalar subquery resolved to. It
     /// reads no column, and is the same in every row. A `NULL` has no bytes
@@ -712,9 +714,48 @@ pub(crate) enum Acc {
         ty: DbType,
         want_max: bool,
     },
+    /// An aggregate over DISTINCT values: the set of values seen, and the
+    /// accumulator of the function it feeds them into once each.
+    ///
+    /// A fold split across workers cannot add partial results of a DISTINCT
+    /// aggregate, since a value two workers both saw counts once; the sets
+    /// merge instead, and the function runs over the union at the end. NULL is
+    /// never kept: every aggregate skips it, DISTINCT or not.
+    Distinct {
+        seen: std::collections::HashSet<Vec<u8>>,
+        template: Box<Acc>,
+        ty: DbType,
+    },
 }
 
 impl Acc {
+    /// The accumulator for one select item: [`Acc::new`], over DISTINCT values
+    /// when the item says so.
+    pub(crate) fn for_item(func: AggFunc, arg: Option<&SchemaField>, distinct: bool) -> Self {
+        let plain = Acc::new(func, arg);
+        match (distinct, arg) {
+            (true, Some(field)) => Acc::Distinct {
+                seen: std::collections::HashSet::new(),
+                template: Box::new(plain),
+                ty: field.db_type.clone(),
+            },
+            _ => plain,
+        }
+    }
+
+    /// The function's own accumulator over the distinct values, for a
+    /// [`Acc::Distinct`]; `None` for every other kind.
+    fn resolve(&self) -> Option<Acc> {
+        let Acc::Distinct { seen, template, ty } = self else {
+            return None;
+        };
+        let mut acc = (**template).clone();
+        for value in seen {
+            acc.accumulate(Some(value), Some(ty));
+        }
+        Some(acc)
+    }
+
     pub(crate) fn new(func: AggFunc, arg: Option<&SchemaField>) -> Self {
         match func {
             AggFunc::Count => Acc::Count(0),
@@ -743,7 +784,29 @@ impl Acc {
     }
 
     pub(crate) fn accumulate(&mut self, bytes: Option<&[u8]>, ty: Option<&DbType>) {
+        if let Acc::Distinct { seen, ty: own, .. } = self {
+            if let Some(value) = bytes {
+                // -0.0 and 0.0 are one value to `=`, and so to DISTINCT.
+                let zero = match own {
+                    DbType::F64 if value.len() == 8 && f64::from_le_bytes(value.try_into().unwrap()) == 0.0 => {
+                        Some(0f64.to_le_bytes().to_vec())
+                    }
+                    DbType::F32 if value.len() == 4 && f32::from_le_bytes(value.try_into().unwrap()) == 0.0 => {
+                        Some(0f32.to_le_bytes().to_vec())
+                    }
+                    _ => None,
+                };
+                match zero {
+                    Some(canonical) => seen.insert(canonical),
+                    None if !seen.contains(value) => seen.insert(value.to_vec()),
+                    None => false,
+                };
+            }
+            return;
+        }
         match self {
+            // Kept as a set, before this match.
+            Acc::Distinct { .. } => {}
             // `COUNT(*)` counts rows; `COUNT(col)` counts rows where the column
             // has a value.
             Acc::Count(n) => {
@@ -850,6 +913,10 @@ impl Acc {
     /// Exact totals add checked, as `accumulate` does: an overflow in either
     /// part, or in the sum of the two, is reported by `finish`.
     pub(crate) fn merge(&mut self, other: &Acc) {
+        if let (Acc::Distinct { seen, .. }, Acc::Distinct { seen: theirs, .. }) = (&mut *self, other) {
+            seen.extend(theirs.iter().cloned());
+            return;
+        }
         match (self, other) {
             (Acc::Count(a), Acc::Count(b)) => *a += *b,
             (
@@ -915,6 +982,9 @@ impl Acc {
     /// really is zero. Only the computed-expression path uses this; the existing
     /// aggregate output keeps its current shape.
     pub(crate) fn finish_nullable(&self, func: AggFunc, result_type: &DbType) -> Result<Option<Vec<u8>>, String> {
+        if let Some(resolved) = self.resolve() {
+            return resolved.finish_nullable(func, result_type);
+        }
         match self {
             Acc::Extreme { best: None, .. } => Ok(None),
             // SUM and AVG over no rows at all are NULL in SQL; COUNT is not.
@@ -944,6 +1014,9 @@ impl Acc {
     /// capped at 38 and lowered further while the rounded quotient does not
     /// fit — an average below ~10⁻²² prints fewer places than PostgreSQL's.
     pub(crate) fn pg_avg(&self) -> Result<Option<(i128, u32)>, String> {
+        if let Some(resolved) = self.resolve() {
+            return resolved.pg_avg();
+        }
         let Acc::ExactSum {
             total,
             n,
@@ -990,7 +1063,12 @@ impl Acc {
     /// `-9223372036854775808`, and any `I128` total past `i64` lost its high
     /// half — wrong numbers, reported as success.
     fn finish(&self, func: AggFunc, result_type: &DbType) -> Result<Vec<u8>, String> {
+        if let Some(resolved) = self.resolve() {
+            return resolved.finish(func, result_type);
+        }
         Ok(match self {
+            // Resolved into its function's accumulator before this match.
+            Acc::Distinct { .. } => return Err("a DISTINCT aggregate reached finish unresolved".to_string()),
             Acc::Count(n) => n.to_le_bytes().to_vec(),
             Acc::ExactSum {
                 total,
@@ -1427,7 +1505,7 @@ impl<'p> Folder<'p> {
             .items
             .iter()
             .map(|item| match item {
-                SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                 // A grouping column or a constant needs no accumulator; a
                 // placeholder keeps the run index-aligned with the items.
                 SelectItem::Column { .. }
@@ -1968,7 +2046,7 @@ fn having_template(plan: &AggregatePlan) -> Vec<Acc> {
             h.aggregates
                 .iter()
                 .map(|item| match item {
-                    SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                    SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                     // The parser records aggregates only; a placeholder keeps
                     // the indices aligned if that ever changes.
                     _ => Acc::Count(0),
@@ -2281,7 +2359,7 @@ mod fold_previous {
             .items
             .iter()
             .map(|item| match item {
-                SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                 // A grouping column or a constant needs no accumulator; a
                 // placeholder keeps the two vectors index-aligned.
                 SelectItem::Column { .. }
@@ -2641,7 +2719,7 @@ mod fold_previous {
                 h.aggregates
                     .iter()
                     .map(|item| match item {
-                        SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                        SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                         // The parser records aggregates only; a placeholder keeps
                         // the indices aligned if that ever changes.
                         _ => Acc::Count(0),
@@ -2725,7 +2803,7 @@ mod fold_bench {
         let which = std::env::var("FOLD_BENCH_IMPL").unwrap_or_else(|_| "new".into());
         let k = SchemaField::new("k".into(), DbType::I64, 8, 0, 0, false);
         let v = SchemaField::new("v".into(), DbType::I64, 8, 0, 1, false);
-        let agg = |func, arg: Option<SchemaField>| SelectItem::Aggregate {
+        let agg = |func, arg: Option<SchemaField>| SelectItem::Aggregate { distinct: false,
             func,
             arg,
             label: "a".into(),
@@ -2866,7 +2944,7 @@ mod tests {
     }
 
     fn agg(func: AggFunc, arg: Option<SchemaField>) -> SelectItem {
-        SelectItem::Aggregate {
+        SelectItem::Aggregate { distinct: false,
             func,
             arg,
             label: func.name().to_string(),
@@ -2948,7 +3026,7 @@ mod tests {
                 label,
                 arg_expr,
                 ..
-            } => SelectItem::Aggregate {
+            } => SelectItem::Aggregate { distinct: false,
                 func,
                 arg,
                 label,
@@ -3797,7 +3875,7 @@ mod fold_reference {
                     .items
                     .iter()
                     .map(|item| match item {
-                        SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                        SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                         // A grouping column or a constant needs no accumulator; a
                         // placeholder keeps the two vectors index-aligned.
                         SelectItem::Column { .. }
@@ -3939,7 +4017,7 @@ mod fold_reference {
                 .items
                 .iter()
                 .map(|item| match item {
-                    SelectItem::Aggregate { func, arg, .. } => Acc::new(*func, arg.as_ref()),
+                    SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
                     SelectItem::Column { .. }
                     | SelectItem::Literal { .. }
                     | SelectItem::Scalar { .. }
@@ -4242,7 +4320,7 @@ mod fold_equivalence {
     }
 
     fn agg(func: AggFunc, arg: Option<SchemaField>, label: &str) -> SelectItem {
-        SelectItem::Aggregate {
+        SelectItem::Aggregate { distinct: false,
             func,
             arg,
             label: label.to_string(),
@@ -4419,7 +4497,7 @@ mod fold_equivalence {
                 db_type: DbType::I64,
                 label: "k2p1".into(),
             },
-            SelectItem::Aggregate {
+            SelectItem::Aggregate { distinct: false,
                 func: AggFunc::Sum,
                 arg: Some(v.clone()),
                 label: "pos".into(),

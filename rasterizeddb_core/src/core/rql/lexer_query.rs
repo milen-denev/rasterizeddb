@@ -202,6 +202,13 @@ pub(crate) fn split_aggregate_filter(item: &str) -> (Option<String>, Option<Stri
     (None, None)
 }
 
+/// `text` past a leading `word` and the space after it, ignoring case.
+fn leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let head = text.get(..word.len())?;
+    let rest = &text[word.len()..];
+    (head.eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
 fn parse_aggregate_call(
     call: &str,
     schema: &SmallVec<[SchemaField; 20]>,
@@ -216,6 +223,9 @@ fn parse_aggregate_call(
     let func =
         AggFunc::parse(name).ok_or_else(|| format!("function '{}' is not supported yet", name))?;
     let arg_text = call[open + 1..close].trim();
+    if leading_word(arg_text, "DISTINCT").is_some() {
+        return Err("an aggregate over DISTINCT values inside an expression is not supported".to_string());
+    }
 
     if arg_text == "*" {
         if func != AggFunc::Count {
@@ -561,6 +571,16 @@ fn parse_select_items(
                 .rfind(')')
                 .ok_or_else(|| format!("unterminated function call in '{}'", item))?;
             let arg_text = expr[open + 1..close].trim();
+            // `COUNT(DISTINCT x)` counts each value once; `ALL` is the default
+            // spelled out. Read as part of the argument, DISTINCT became a
+            // column named `DISTINCT x` and the statement a 42601.
+            let (distinct, arg_text) = match leading_word(arg_text, "DISTINCT") {
+                Some(rest) => (true, rest),
+                None => (false, leading_word(arg_text, "ALL").unwrap_or(arg_text)),
+            };
+            if distinct && arg_text == "*" {
+                return Err(format!("{}(DISTINCT *) is not valid", func_name.to_uppercase()));
+            }
 
             let mut argument_expression: Option<crate::core::rql::aggregate::ArgExpression> = None;
             let arg = if arg_text == "*" {
@@ -612,6 +632,7 @@ fn parse_select_items(
                 label: alias.unwrap_or_else(|| func.name().to_string()),
                 filter: aggregate_filter,
                 arg_expr: argument_expression,
+                distinct,
             });
             continue;
         }

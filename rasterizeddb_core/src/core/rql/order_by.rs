@@ -116,6 +116,49 @@ fn split_term(term: &str) -> (&str, &str) {
     (term, "")
 }
 
+/// `raw` split into an expression key and its trailing modifiers, when an
+/// arithmetic operator joins its first word to what follows; `None` for a
+/// plain key, which keeps reading the words after it as modifiers.
+fn unparenthesised_expression<'a>(raw: &'a str, first: &str, rest: &str) -> Option<(&'a str, &'a str)> {
+    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '|'];
+    if !(rest.starts_with(OPERATORS) || first.ends_with(OPERATORS)) {
+        return None;
+    }
+    // Top-level words and where each starts, outside quotes and parentheses.
+    let mut starts: Vec<usize> = Vec::new();
+    let (mut depth, mut quote, mut in_word) = (0usize, None::<char>, false);
+    for (i, c) in raw.char_indices() {
+        if !in_word && !c.is_whitespace() && depth == 0 && quote.is_none() {
+            starts.push(i);
+        }
+        match c {
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            c if Some(c) == quote => quote = None,
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        in_word = !(c.is_whitespace() && depth == 0 && quote.is_none());
+    }
+    let word = |k: usize| {
+        let end = starts.get(k + 1).copied().unwrap_or(raw.len());
+        raw[starts[k]..end].trim()
+    };
+    let mut cut = starts.len();
+    if cut >= 2
+        && word(cut - 2).eq_ignore_ascii_case("NULLS")
+        && (word(cut - 1).eq_ignore_ascii_case("FIRST") || word(cut - 1).eq_ignore_ascii_case("LAST"))
+    {
+        cut -= 2;
+    }
+    if cut >= 1 && (word(cut - 1).eq_ignore_ascii_case("ASC") || word(cut - 1).eq_ignore_ascii_case("DESC")) {
+        cut -= 1;
+    }
+    let at = starts.get(cut).copied().unwrap_or(raw.len());
+    let expression = raw[..at].trim();
+    (!expression.is_empty()).then(|| (expression, raw[at..].trim()))
+}
+
 /// End index (exclusive) of the `CASE … END` block opening at the start of
 /// `term`, counting nested blocks. A CASE keeps its arms at paren depth zero,
 /// so the whitespace splitter below would otherwise cut it at its first space.
@@ -158,13 +201,24 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
         if raw.is_empty() {
             return Err("ORDER BY has an empty sort key".to_string());
         }
+        let parenthesised;
         let (token, rest) = if raw.to_ascii_uppercase().starts_with("CASE ") {
             match case_block_end(raw) {
                 Some(end) => (&raw[..end], raw[end..].trim()),
                 None => return Err("ORDER BY has a CASE with no END".to_string()),
             }
         } else {
-            split_term(raw)
+            let (first, rest) = split_term(raw);
+            match unparenthesised_expression(raw, first, rest) {
+                // `n * 2 + 1 DESC` is the key `n * 2 + 1`, sorted the way
+                // its parenthesised form already was. Split at the first
+                // space it was `n`, then "expects ASC or DESC, found '*'".
+                Some((expression, modifiers)) => {
+                    parenthesised = format!("({})", expression);
+                    (parenthesised.as_str(), modifiers)
+                }
+                None => (first, rest),
+            }
         };
         if token.is_empty() {
             return Err("ORDER BY has an empty sort key".to_string());
@@ -317,6 +371,18 @@ mod tests {
                 .unwrap_err()
                 .contains("FIRST or LAST")
         );
+    }
+
+    /// An expression needs no parentheses: its modifiers are read from the
+    /// end, and the key is the parenthesised form the sort already knows.
+    #[test]
+    fn an_unparenthesised_expression_is_one_key() {
+        assert_eq!(keys("n * 2 + 1"), vec![("(n * 2 + 1)".to_string(), false)]);
+        assert_eq!(keys("n * 2 + 1 DESC, id"), vec![("(n * 2 + 1)".to_string(), true), ("id".to_string(), false)]);
+        let t = parse("a - b DESC NULLS LAST").unwrap();
+        assert_eq!((t[0].token.as_str(), t[0].descending, t[0].nulls_first), ("(a - b)", true, Some(false)));
+        assert_eq!(keys("price*qty"), vec![("price*qty".to_string(), false)]);
+        assert_eq!(keys("lower(name) || 'x' ASC"), vec![("(lower(name) || 'x')".to_string(), false)]);
     }
 
     #[test]

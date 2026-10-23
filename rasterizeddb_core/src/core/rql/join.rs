@@ -4227,7 +4227,7 @@ fn build_aggregate_stage(
                 Some(text) => Some(filter_over_join(text, items)?),
                 None => None,
             };
-            fold_items.push(SelectItem::Aggregate {
+            fold_items.push(SelectItem::Aggregate { distinct: false,
                 func,
                 arg,
                 label: alias.unwrap_or_else(|| func.name().to_string()),
@@ -4313,7 +4313,7 @@ fn build_aggregate_stage(
                     Some(text) => Some(filter_over_join(text, items)?),
                     None => None,
                 };
-                Ok(SelectItem::Aggregate {
+                Ok(SelectItem::Aggregate { distinct: false,
                     func,
                     arg,
                     label: func.name().to_string(),
