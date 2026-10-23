@@ -943,3 +943,45 @@ async fn non_ascii_text_survives_the_rewrites() {
     assert_eq!(joined(&pool, "SELECT g FROM gn").await.unwrap(), "42");
     assert_eq!(joined(&pool, "SELECT s FROM gn").await.unwrap(), "é21");
 }
+
+/// A correlated `EXISTS` over the outer query's own table, its relation
+/// aliased: `FROM ev e2 WHERE e2.id = ev.id`. The rewrite counted `ev` among
+/// the subquery's own names as well as `e2`, so `ev.id` read as the inner
+/// row's, the `EXISTS` as uncorrelated, and it held for every row. An alias
+/// hides its table's name, as PostgreSQL scopes it. An outer column compared
+/// by anything but `=` was left inside the subquery the rewrite runs once,
+/// and matched nothing; it is refused until it can be answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_exists_over_its_own_table() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE ev (id INT NOT NULL, k TEXT, v INT, t TEXT)").await.unwrap();
+    run(
+        &pool,
+        r#"INSERT INTO ev VALUES (1, 'a', 10, E'x\ny'), (2, 'a', 20, 'p'), (3, 'b', 5, 'q'), (4, 'c', 7, 'r'), (5, 'c', 9, NULL)"#,
+    )
+    .await
+    .unwrap();
+    let cases: &[(&str, &str)] = &[
+        ("SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.id = ev.id AND e2.k = 'c') ORDER BY id", "4,5"),
+        ("SELECT id FROM ev WHERE NOT EXISTS (SELECT 1 FROM ev e2 WHERE e2.id = ev.id AND e2.k = 'c') ORDER BY id", "1,2,3"),
+        (
+            "SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev AS e2 WHERE ev.id = e2.id AND e2.v > 8) ORDER BY id",
+            "1,2,5",
+        ),
+        (
+            r#"SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.id = ev.id AND e2.t = E'x\ny') ORDER BY id"#,
+            "1",
+        ),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // PostgreSQL's answers are 1,4 and 1,2,4,5.
+    for sql in [
+        "SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = ev.k AND e2.v > ev.v) ORDER BY id",
+        "SELECT o.id FROM ev o WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = o.k AND e2.id <> o.id) ORDER BY o.id",
+    ] {
+        let err = joined(&pool, sql).await.expect_err(sql);
+        assert!(err.contains("not supported yet"), "{sql}: {err}");
+    }
+}

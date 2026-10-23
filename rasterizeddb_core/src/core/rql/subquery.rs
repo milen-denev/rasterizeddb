@@ -638,6 +638,17 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
         return Ok(uncorrelated_exists_predicate(clause.negated, true).to_string());
     }
 
+    // An outer column anywhere but an equality — `e2.v > ev.v` — would be
+    // left inside the subquery the rewrite runs once, where it names no row
+    // of its own: the EXISTS matched nothing and reported success. Refused
+    // until it can be answered.
+    if let Some(term) = rest.iter().find(|t| names_outer_column(t, &inner, outer_relations)) {
+        return Err(format!(
+            "a correlated EXISTS can compare an outer column only with `=` so far; '{}' is not supported yet",
+            term
+        ));
+    }
+
     // More than one correlation cannot be expressed as `outer IN (SELECT inner)`,
     // which carries exactly one column — and `x IN (SELECT a) AND y IN (SELECT b)`
     // is a different, weaker question, since different inner rows may satisfy
@@ -955,14 +966,48 @@ fn inner_names(relation_text: &str) -> Vec<String> {
                 "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" | "AS"
             )
         });
+        // An aliased relation is named by its alias alone, as SQL scopes it:
+        // in `FROM sv s2 WHERE s2.id = sv.id` the `sv` is the outer query's.
+        // Counted as the subquery's own, that correlation read as `s2.id =
+        // s2.id`, the EXISTS as uncorrelated, and it held for every row.
         if let Some(table) = tokens.next() {
-            names.push(table.trim_matches('"').to_string());
-            if let Some(alias) = tokens.next() {
-                names.push(alias.trim_matches('"').to_string());
-            }
+            let name = tokens.next().unwrap_or(table);
+            names.push(name.trim_matches('"').to_string());
         }
     }
     names
+}
+
+/// Whether `term` reads a column qualified by one of the outer relations, a
+/// name the subquery does not give its own relations. Quoted text is skipped.
+fn names_outer_column(term: &str, inner: &[String], outer_relations: &[String]) -> bool {
+    let bytes = term.as_bytes();
+    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'"' || !b.is_ascii();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if is_name(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && (is_name(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+            if matches!(qualifier_of(&term[start..i], inner, outer_relations), Side::Outer)
+                && term[start..i].contains('.')
+            {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -> Side {
