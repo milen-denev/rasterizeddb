@@ -41,6 +41,9 @@ enum Expect {
     Refused,
     /// The same outcome as on the twin: equal answers, or the same SQLSTATE.
     LikeTwin,
+    /// [`Expect::LikeTwin`], and the twin succeeded with a row (or a write's
+    /// tag): a statement that fails on both tables alike compares nothing.
+    LikeTwinAnswered,
     /// Fails with this SQLSTATE (the statement is wrong on any table).
     Error(&'static str),
     /// Succeeds; the check reads the answer.
@@ -324,6 +327,33 @@ const SITES: &[Site] = &[
     site("SELECT * FROM site_parent WHERE id IN (SELECT n FROM site_p)", Expect::LikeTwin, "S10"),
     site("SELECT n FROM site_p UNION SELECT id FROM site_parent", Expect::LikeTwin, "S10"),
     site("WITH x AS (SELECT n FROM site_p) SELECT COUNT(*), SUM(n) FROM x", Expect::LikeTwin, "S10"),
+    // What upstream's 4301045 made work on a plain table, which failed on
+    // both before and so compared nothing: several DISTINCT aggregates, a
+    // function call in WHERE (wrapping a key column too: no proof), and an
+    // unparenthesised ORDER BY expression.
+    site(
+        "SELECT COUNT(DISTINCT tenant_id), COUNT(DISTINCT label), COUNT(*) FROM site_p",
+        Expect::LikeTwinAnswered,
+        "S10; native in the fold since 4301045",
+    ),
+    site("SELECT * FROM site_p WHERE COALESCE(n, 0) > 15", Expect::LikeTwinAnswered, "S10: a fan-out"),
+    site("SELECT * FROM site_p WHERE UPPER(label) = 'B'", Expect::LikeTwinAnswered, "S10: a fan-out"),
+    site("SELECT * FROM site_p WHERE ABS(tenant_id) = 1 AND ABS(asset_group_id) = 2", Expect::LikeTwinAnswered, "S10: no proof"),
+    site(
+        "SELECT * FROM site_p WHERE tenant_id = 1 AND asset_group_id = 2 AND COALESCE(label, '') = 'b'",
+        Expect::LikeTwinAnswered,
+        "S10: routed, the call still applied",
+    ),
+    site(
+        "SELECT tenant_id, asset_id, n * 2 + 1 FROM site_p ORDER BY n * 2 + 1 DESC, asset_id",
+        Expect::LikeTwinAnswered,
+        "S10; unparenthesised since 4301045",
+    ),
+    in_block(
+        "UPDATE site_p SET n = n + 1 WHERE LOWER(label) = 'a' OR ABS(tenant_id) = 7",
+        Expect::LikeTwinAnswered,
+        "S11: a fan-out, rolled back by the block",
+    ),
     site(
         "SELECT p.n, s.id FROM site_p p JOIN site_parent s ON p.asset_id = s.id",
         Expect::Refused,
@@ -519,13 +549,19 @@ fn every_site_is_correct_or_an_error() {
                 Ok(reply) => check(reply, &db),
                 Err(e) => Err(format!("failed: {e}")),
             },
-            Expect::LikeTwin => {
+            Expect::LikeTwin | Expect::LikeTwinAnswered => {
                 let twin_sql = to_twin(site.sql);
                 let q = run_site(&mut cq, site, &twin_sql);
-                if same_outcome(&p, &q) {
-                    Ok(())
-                } else {
+                let answered = match &q {
+                    Ok(r) => r.columns.is_empty() || !r.rows.is_empty(),
+                    Err(_) => false,
+                };
+                if !same_outcome(&p, &q) {
                     Err(format!("differs from the twin:\n    partitioned: {p:?}\n    twin:        {q:?}"))
+                } else if matches!(site.expect, Expect::LikeTwinAnswered) && !answered {
+                    Err(format!("the twin answered nothing, so nothing was compared: {q:?}"))
+                } else {
+                    Ok(())
                 }
             }
         };

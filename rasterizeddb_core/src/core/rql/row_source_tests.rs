@@ -226,6 +226,57 @@ async fn a_routed_read_touches_only_its_partitions() {
     close(db, dir.path());
 }
 
+/// I3 for a function call in WHERE, which the evaluator computes since
+/// upstream's 4301045 (it was refused as an unknown column): alone it proves
+/// nothing, so every materialized partition is read and the answer is
+/// right. `ABS(tenant_id) = 5` also matches tenant -5, which lives in
+/// another partition; a router that read it as `tenant_id = 5` would lose
+/// that row. A key equality beside one still routes on the equality, and
+/// still applies the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_function_call_in_where_routes_only_on_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "fanout_fn").await;
+    let pt = ledger(&db, "fnw", 64).await;
+    let uid = pt.uid();
+    exec_ok(&db, "INSERT INTO fnw (tenant_id, seq, amt, note) VALUES (-5, 0, 7, 'neg'), (7, 1, -3, NULL)").await;
+    assert_ne!(pid_of(&pt, 5), pid_of(&pt, -5), "5 and -5 share a partition; the ABS case proves nothing");
+    let parts = materialized(&pt);
+    test_hooks::take_reads(uid);
+
+    // (clause, matching rows): no proof, so every materialized partition.
+    for (clause, want) in [
+        ("ABS(tenant_id) = 5", 2),
+        ("ABS(tenant_id) = 5 OR tenant_id = 5", 2),
+        ("COALESCE(tenant_id, 0) = 7", 2),
+        ("UPPER(note) = 'OPENING'", TENANTS),
+        ("LOWER(note) = 'neg' OR tenant_id = 3", 2),
+        ("COALESCE(note, 'none') = 'none'", 1),
+        ("ABS(amt) = 3", 1),
+    ] {
+        assert_eq!(ints(&db, &format!("SELECT COUNT(*) FROM fnw WHERE {clause}")).await, vec![want], "{clause}");
+        assert_eq!(test_hooks::take_reads(uid), parts, "{clause}: pruned without proof");
+        assert_eq!(rows(&db, &format!("SELECT * FROM fnw WHERE {clause}")).await.len() as i64, want, "{clause} (rows)");
+        assert_eq!(test_hooks::take_reads(uid), parts, "{clause} (rows): pruned without proof");
+    }
+
+    // A key equality in a conjunction proves its partition; the call beside
+    // it still filters.
+    for (clause, want) in [
+        ("tenant_id = 7 AND COALESCE(note, 'none') = 'none'", 1),
+        ("tenant_id = 7 AND UPPER(note) = 'OPENING'", 1),
+        ("tenant_id = -5 AND ABS(tenant_id) = 5", 1),
+        ("tenant_id = 5 AND ABS(amt) = 3", 0),
+    ] {
+        assert_eq!(ints(&db, &format!("SELECT COUNT(*) FROM fnw WHERE {clause}")).await, vec![want], "{clause}");
+        let reads = test_hooks::take_reads(uid);
+        let key: i64 = clause["tenant_id = ".len()..].split(' ').next().unwrap().parse().unwrap();
+        assert!(reads.contains(&pid_of(&pt, key)), "{clause}: its own partition unread: {reads:?}");
+    }
+    drop(pt);
+    close(db, dir.path());
+}
+
 /// I3, at the router: predicates that prove nothing about the key route to
 /// every partition. Each would prune a matching row if read as a key
 /// equality: a key compared with another column or an expression, through a

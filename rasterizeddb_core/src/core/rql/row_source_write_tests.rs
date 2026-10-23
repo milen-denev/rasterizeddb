@@ -280,6 +280,19 @@ async fn a_routed_write_touches_only_its_partitions() {
         exec_ok(&db, sql).await;
         assert_eq!(test_hooks::take_writes(uid), parts, "{sql}");
     }
+
+    // A function call in WHERE (evaluated since upstream's 4301045) proves
+    // nothing about the key, even wrapping it: every partition, and the
+    // rows it matches. Tenants 3 and 9 were deleted above; 5's note is 'x'.
+    for (sql, want) in [
+        ("UPDATE wide SET amt = amt + 1 WHERE ABS(tenant_id) = 5", 1),
+        ("UPDATE wide SET amt = amt + 1 WHERE COALESCE(tenant_id, 0) = 6", 1),
+        ("UPDATE wide SET amt = amt + 1 WHERE UPPER(note) = 'X'", 1),
+        ("DELETE FROM wide WHERE LOWER(note) = 'nothing' OR ABS(tenant_id) = 7", 1),
+    ] {
+        assert_eq!(affected(&exec(&db, sql).await, sql), want, "{sql}");
+        assert_eq!(test_hooks::take_writes(uid), parts, "{sql}: pruned without proof");
+    }
     assert_eq!(materialized(&pt), parts, "a write materialized a partition");
     drop(pt);
     close(db, dir.path());

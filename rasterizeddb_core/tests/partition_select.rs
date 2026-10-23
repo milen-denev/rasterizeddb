@@ -150,6 +150,19 @@ fn predicates_without_proof_fan_out_and_answer_like_the_twin() {
     let server = Server::start(dir.path().to_str().unwrap());
     let mut c = server.connect();
     twins(&mut c, "np_p", "np_q", 16);
+    // A negative tenant for every positive one, so a function of the key
+    // (`ABS(tenant_id) = 5`) matches rows in two partitions.
+    let negatives: Vec<String> = (1..=12i64).map(|t| format!("(-{t}, 1, 1, {t}, 'neg', 0.5)")).collect();
+    for t in ["np_p", "np_q"] {
+        c.ok(&format!("INSERT INTO {t} (tenant_id, grp, id, n, s, f) VALUES {}", negatives.join(", ")));
+    }
+    let pt = server.db.partitioned.get("np_p").unwrap().value().clone();
+    let epoch = pt.epoch().unwrap();
+    let pid = |t: i64| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&t.to_le_bytes()[..]]).unwrap());
+    let split = (1..=12i64).find(|t| pid(*t) != pid(-*t)).expect("a tenant and its negative in two partitions");
+    drop(pt);
+    let abs_clause = format!("ABS(tenant_id) = {split}");
+    let abs_or_clause = format!("ABS(tenant_id) = {split} OR tenant_id = {split}");
     for clause in [
         "tenant_id = grp",
         "tenant_id = grp + 2",
@@ -170,6 +183,20 @@ fn predicates_without_proof_fan_out_and_answer_like_the_twin() {
         "tenant_id < 2 OR tenant_id = 7",
         "(tenant_id, grp) > (7, 2)",
         "tenant_id IN (3, 4) OR tenant_id >= 12",
+        // A function call (evaluated since upstream's 4301045), alone, in an
+        // OR, and wrapping the key: none is a proof. Each `ABS` case matches
+        // a tenant and its negative, in two partitions.
+        "COALESCE(n, 0) > 40",
+        "COALESCE(tenant_id, 0) = 3",
+        "UPPER(s) = 'ALPHA'",
+        "LOWER(s) = 'neg' OR tenant_id = 3",
+        "UPPER(s) = 'T3' OR n IS NULL",
+        abs_clause.as_str(),
+        abs_or_clause.as_str(),
+        "ABS(tenant_id) IN (2, 7)",
+        // Beside a key equality, which routes; the call still filters.
+        "tenant_id = 3 AND COALESCE(s, 'none') <> 'none'",
+        "tenant_id = -4 AND ABS(tenant_id) = 4",
     ] {
         let r = like_twin(&mut c, &format!("SELECT * FROM {{t}} WHERE {clause}"), "np_p", "np_q", false);
         assert!(!r.rows.is_empty(), "`{clause}` matched nothing on either table; the comparison proves nothing");
@@ -338,12 +365,26 @@ fn aggregates_over_partitions_answer_like_the_twin() {
     for (sql, ordered) in [
         ("SELECT COUNT(DISTINCT s) FROM {t}", false),
         ("SELECT COUNT(DISTINCT grp) FROM {t} WHERE tenant_id IN (2, 5, 9)", false),
+        // Several DISTINCT aggregates in one SELECT, and mixed with plain
+        // ones: native in the fold since upstream's 4301045, where the
+        // derived-table rewrite refused them on both tables alike.
+        ("SELECT COUNT(DISTINCT tenant_id), COUNT(DISTINCT s) FROM {t}", false),
+        ("SELECT COUNT(DISTINCT s), COUNT(DISTINCT n), COUNT(*), SUM(n), AVG(f) FROM {t}", false),
+        ("SELECT grp, COUNT(DISTINCT tenant_id), COUNT(DISTINCT s) FROM {t} GROUP BY grp ORDER BY grp", true),
+        ("SELECT tenant_id, COUNT(DISTINCT s) FROM {t} GROUP BY tenant_id HAVING COUNT(DISTINCT n) > 1 ORDER BY tenant_id", true),
         ("SELECT AVG(n), AVG(f), SUM(n), COUNT(n), COUNT(*) FROM {t}", false),
         ("SELECT grp, AVG(n), MIN(s), MAX(s) FROM {t} GROUP BY grp ORDER BY grp", true),
         ("SELECT tenant_id, COUNT(*) FROM {t} GROUP BY tenant_id HAVING SUM(n) > 100 ORDER BY tenant_id DESC LIMIT 4 OFFSET 1", true),
         ("SELECT DISTINCT s FROM {t} ORDER BY s LIMIT 3", true),
         ("SELECT tenant_id, id, n FROM {t} ORDER BY n, tenant_id, grp, id LIMIT 7 OFFSET 5", true),
         ("SELECT tenant_id, grp, id, n * 2 + 1 AS x FROM {t} ORDER BY (n * 2 + 1) DESC, tenant_id, grp, id LIMIT 5", true),
+        // Unparenthesised: sorted by the expression since 4301045.
+        ("SELECT tenant_id, grp, id, n * 2 + 1 AS x FROM {t} ORDER BY n * 2 + 1 DESC, tenant_id, grp, id LIMIT 5", true),
+        ("SELECT tenant_id, grp, id, n FROM {t} ORDER BY n * 2 + 1, tenant_id, grp, id LIMIT 6 OFFSET 2", true),
+        // A function call in WHERE, evaluated since 4301045, under the fold.
+        ("SELECT COUNT(*), SUM(n), MAX(s) FROM {t} WHERE COALESCE(n, 0) > 40", false),
+        ("SELECT grp, COUNT(*) FROM {t} WHERE UPPER(s) = 'ALPHA' GROUP BY grp ORDER BY grp", true),
+        ("SELECT tenant_id, grp, id FROM {t} WHERE LOWER(s) LIKE 't1%' ORDER BY tenant_id, grp, id", true),
         ("SELECT tenant_id, SUM(n) OVER (PARTITION BY tenant_id) FROM {t} WHERE grp = 2", false),
         ("SELECT SUM(price), AVG(price), MIN(price), MAX(price), COUNT(price) FROM {t}_m", false),
         ("SELECT tenant_id, SUM(price), AVG(price) FROM {t}_m GROUP BY tenant_id ORDER BY tenant_id", true),
