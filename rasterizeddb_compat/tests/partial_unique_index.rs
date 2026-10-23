@@ -593,3 +593,143 @@ async fn update_from_does_not_write_back_by_a_partial_key() {
         owned(&[(1, Some("canceled")), (2, Some(expected)), (3, Some("canceled")), (4, Some("active"))])
     );
 }
+
+/// `DROP INDEX` outlives a restart. The key went into its sidecar as a logged
+/// append and the drop overwrote it in place without a log record, so the
+/// replay at the next open wrote the key back, and the dropped index refused
+/// duplicates it no longer governs.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_index_survives_a_restart() {
+    let root = format!("/var/tmp/partial_unique_drop_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&root);
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    {
+        let server = TestServer::start_file_backed(&root).await.expect("server");
+        let pool = server.connect_sqlx().await.expect("connect");
+        exec(&pool, "CREATE TABLE acct (id INT, email TEXT, deleted_at TIMESTAMPTZ)").await;
+        exec(&pool, "CREATE UNIQUE INDEX acct_live ON acct (email) WHERE deleted_at IS NULL").await;
+        exec(&pool, "DROP INDEX acct_live").await;
+        pool.close().await;
+        drop(server);
+    }
+    let server = TestServer::start_file_backed(&root).await.expect("restart");
+    let pool = server.connect_sqlx().await.expect("connect");
+    // PostgreSQL: INSERT 0 2, and pg_indexes no longer lists acct_live.
+    assert_eq!(exec(&pool, "INSERT INTO acct VALUES (1, 'x', NULL), (2, 'x', NULL)").await, 2);
+    let listed: i64 = sqlx::query("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'acct_live'")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(listed, 0);
+}
+
+async fn listed(pool: &sqlx::PgPool, name: &str) -> i64 {
+    sqlx::query(AssertSqlSafe(format!("SELECT COUNT(*) FROM pg_indexes WHERE indexname = '{name}'")))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .get(0)
+}
+
+/// Dropping a column the predicate reads drops the index, as in PostgreSQL.
+///
+/// The key used to stay behind, listed and unenforced. A column of the same
+/// name added later brought it back over the new, all-NULL values, so the
+/// soft-deleted row became a live duplicate: the `ADD COLUMN` rewrite failed
+/// on it after dropping the table, and lost it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_predicate_column_drops_the_index() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE users (id INT, email TEXT, deleted_at TIMESTAMPTZ)").await;
+    exec(&pool, "INSERT INTO users VALUES (1, 'a', NULL), (2, 'a', '2024-01-01 00:00:00+00')").await;
+    exec(&pool, "CREATE UNIQUE INDEX live ON users (email) WHERE deleted_at IS NULL").await;
+    exec(&pool, "ALTER TABLE users DROP COLUMN deleted_at").await;
+    // PostgreSQL: 0, and the insert succeeds.
+    assert_eq!(listed(&pool, "live").await, 0);
+    exec(&pool, "INSERT INTO users VALUES (3, 'a')").await;
+    exec(&pool, "ALTER TABLE users ADD COLUMN deleted_at TIMESTAMPTZ").await;
+    exec(&pool, "INSERT INTO users VALUES (4, 'a', NULL)").await;
+    // PostgreSQL: 1|a  2|a  3|a  4|a, every deleted_at NULL.
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM users WHERE deleted_at IS NULL ORDER BY id").await,
+        owned(&[(1, Some("a")), (2, Some("a")), (3, Some("a")), (4, Some("a"))])
+    );
+
+    // The retype dance: add a temporary column, copy, drop the original,
+    // rename the temporary one back. The index goes with the original.
+    exec(&pool, "CREATE TABLE acct (id INT, email TEXT, deleted_at TIMESTAMPTZ)").await;
+    exec(&pool, "INSERT INTO acct VALUES (1, 'x', NULL), (2, 'x', '2024-01-01 00:00:00+00')").await;
+    exec(&pool, "CREATE UNIQUE INDEX acct_live ON acct (email) WHERE deleted_at IS NULL").await;
+    exec(&pool, "ALTER TABLE acct ADD COLUMN tmp TIMESTAMPTZ").await;
+    exec(&pool, "UPDATE acct SET tmp = deleted_at").await;
+    exec(&pool, "ALTER TABLE acct DROP COLUMN deleted_at").await;
+    exec(&pool, "INSERT INTO acct VALUES (3, 'x', NULL)").await;
+    exec(&pool, "ALTER TABLE acct RENAME COLUMN tmp TO deleted_at").await;
+    exec(&pool, "INSERT INTO acct VALUES (4, 'x', NULL)").await;
+    assert_eq!(listed(&pool, "acct_live").await, 0);
+    // PostgreSQL: 1|x|  2|x|2024-01-01 00:00:00+00  3|x|  4|x|
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM acct WHERE deleted_at IS NULL ORDER BY id").await,
+        owned(&[(1, Some("x")), (3, Some("x")), (4, Some("x"))])
+    );
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM acct WHERE deleted_at = '2024-01-01 00:00:00+00' ORDER BY id").await,
+        owned(&[(2, Some("x"))])
+    );
+
+    // Any column the predicate reads takes it, not only the first.
+    exec(&pool, "CREATE TABLE p (id INT, slug TEXT, active BOOLEAN, archived BOOLEAN)").await;
+    exec(&pool, "CREATE UNIQUE INDEX p_slug ON p (slug) WHERE active AND NOT archived").await;
+    exec(&pool, "ALTER TABLE p DROP COLUMN archived").await;
+    assert_eq!(listed(&pool, "p_slug").await, 0);
+
+    // A column the predicate does not read leaves the index alone.
+    exec(&pool, "CREATE TABLE q (id INT, slug TEXT, active BOOLEAN, note TEXT)").await;
+    exec(&pool, "CREATE UNIQUE INDEX q_slug ON q (slug) WHERE active").await;
+    exec(&pool, "ALTER TABLE q DROP COLUMN note").await;
+    assert_eq!(listed(&pool, "q_slug").await, 1);
+    exec(&pool, "INSERT INTO q VALUES (1, 's', true)").await;
+    // PostgreSQL: ERROR 23505 duplicate key value violates unique constraint "q_slug"
+    refused(&pool, "INSERT INTO q VALUES (2, 's', true)").await;
+}
+
+/// An `ALTER` rewrite carries only the keys the rows were checked under.
+///
+/// A predicate that no longer compiles has not been enforced. A rewrite that
+/// adds the column it names would compile it against the new column, and
+/// reinserting the old rows under that key failed partway, after the table
+/// was dropped, which lost the rows not yet written back. Renaming a
+/// predicate column leaves exactly that behind, because the predicate text
+/// is not renamed with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewrite_does_not_revive_an_unenforced_key() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE users (id INT, email TEXT, deleted_at TIMESTAMPTZ)").await;
+    exec(&pool, "INSERT INTO users VALUES (1, 'a', NULL), (2, 'a', '2024-01-01 00:00:00+00')").await;
+    exec(&pool, "CREATE UNIQUE INDEX live ON users (email) WHERE deleted_at IS NULL").await;
+    exec(&pool, "ALTER TABLE users RENAME COLUMN deleted_at TO removed_at").await;
+    // PostgreSQL: the ALTER succeeds, and both rows are kept, with the new
+    // column NULL in each: 1|  2|2024-01-01 00:00:00+00 for removed_at.
+    exec(&pool, "ALTER TABLE users ADD COLUMN deleted_at TIMESTAMPTZ").await;
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM users WHERE deleted_at IS NULL AND removed_at IS NULL ORDER BY id").await,
+        owned(&[(1, Some("a"))])
+    );
+    assert_eq!(
+        pairs(
+            &pool,
+            "SELECT id, email FROM users WHERE deleted_at IS NULL AND removed_at = '2024-01-01 00:00:00+00' ORDER BY id"
+        )
+        .await,
+        owned(&[(2, Some("a"))])
+    );
+}

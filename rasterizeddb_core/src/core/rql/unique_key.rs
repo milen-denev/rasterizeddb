@@ -98,8 +98,22 @@ pub struct UniqueKey {
 /// whose columns are numbered differently (an `ALTER` rewrite does exactly
 /// that). Compiling again there costs one parse; sharing would read the wrong
 /// columns.
+///
+/// The flag records that a predicate which does not compile has been reported.
+/// The check runs on every write, and a warning per row buried the one line
+/// that mattered.
 #[derive(Default)]
-pub struct CompiledPredicate(std::sync::OnceLock<Result<crate::core::rql::expr::Cond, String>>);
+pub struct CompiledPredicate(
+    std::sync::OnceLock<Result<crate::core::rql::expr::Cond, String>>,
+    std::sync::atomic::AtomicBool,
+);
+
+impl CompiledPredicate {
+    /// True the first time it is asked, and false from then on.
+    fn first_report(&self) -> bool {
+        !self.1.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 impl Clone for CompiledPredicate {
     fn clone(&self) -> Self {
@@ -253,11 +267,13 @@ pub fn partial_check<'k>(
         Ok(None) => return Ok(Some((None, smallvec::SmallVec::new()))),
         Ok(Some(condition)) => condition,
         Err(e) => {
-            log::warn!(
-                "unique index {} has a predicate that no longer compiles ({}); not enforced",
-                key.describe(),
-                e
-            );
+            if key.compiled.first_report() {
+                log::warn!(
+                    "unique index {} has a predicate that no longer compiles ({}); not enforced",
+                    key.describe(),
+                    e
+                );
+            }
             return Ok(None);
         }
     };
@@ -271,6 +287,58 @@ pub fn partial_check<'k>(
             e
         )),
     }
+}
+
+/// The partial keys that `DROP COLUMN column` takes with it: those whose
+/// predicate reads the column. PostgreSQL drops such an index along with the
+/// column.
+///
+/// Left in place, the key went unenforced while `pg_indexes` still listed it,
+/// and a column of the same name added later brought it back over values its
+/// rows were never checked against. An `ADD COLUMN` rewrite then failed on
+/// the first duplicate after the table had been dropped.
+///
+/// A key reads the column when the compiled predicate names it or its NULL
+/// flag, or when the predicate stops compiling without it, which also
+/// catches a reference the lowered condition does not keep. A predicate that
+/// already fails to compile is left alone: it is not enforced now, and this
+/// drop does not change what it reads.
+pub fn dropped_with_column(
+    keys: &[UniqueKey],
+    fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+    column: &str,
+) -> Vec<String> {
+    let dropped: smallvec::SmallVec<[u64; 2]> = fields
+        .iter()
+        .filter(|f| {
+            !f.is_deleted
+                && (f.name.eq_ignore_ascii_case(column)
+                    || crate::core::rql::nullable::is_flag_name_of(&f.name, column))
+        })
+        .map(|f| f.write_order)
+        .collect();
+    let mut without = fields.clone();
+    for f in without.iter_mut() {
+        if dropped.contains(&f.write_order) {
+            f.is_deleted = true;
+        }
+    }
+    keys.iter()
+        .filter(|k| !k.is_deleted)
+        .filter(|k| {
+            let Some(text) = k.predicate.as_deref() else {
+                return false;
+            };
+            let Ok(cond) = compile_predicate(text, fields) else {
+                return false;
+            };
+            crate::core::rql::expr::cond_columns(&cond)
+                .iter()
+                .any(|f| dropped.contains(&f.write_order))
+                || compile_predicate(text, &without).is_err()
+        })
+        .map(|k| k.name.clone())
+        .collect()
 }
 
 /// The row a write is about to store, in the shape [`UniqueKey::covers`]
@@ -830,6 +898,60 @@ mod tests {
         // What the evaluator cannot read is refused, never guessed at.
         assert!(key("lower(status) = 'a'").condition(&fields).is_err());
         assert!(key("status LIKE 'a%'").condition(&fields).is_err());
+    }
+
+    fn soft_delete_fields() -> smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> {
+        use crate::core::db_type::DbType;
+        use crate::core::row::schema::SchemaField;
+        smallvec::smallvec![
+            SchemaField::new("email".into(), DbType::STRING, 0, 0, 0, false),
+            SchemaField::new("deleted_at".into(), DbType::DATETIME, 8, 0, 1, false),
+            SchemaField::new("__null_deleted_at".into(), DbType::U8, 1, 0, 2, false),
+            SchemaField::new("active".into(), DbType::BOOL, 1, 0, 3, false),
+            SchemaField::new("__null_active".into(), DbType::U8, 1, 0, 4, false),
+            SchemaField::new("note".into(), DbType::STRING, 0, 0, 5, false),
+        ]
+    }
+
+    /// `DROP COLUMN` takes the partial keys whose predicate reads the column,
+    /// through the column or its NULL flag, and leaves every other key.
+    #[test]
+    fn a_dropped_column_takes_the_predicates_that_read_it() {
+        let fields = soft_delete_fields();
+        let key = |name: &str, predicate: Option<&str>| UniqueKey {
+            predicate: predicate.map(str::to_string),
+            ..UniqueKey::new(name.into(), vec!["email".into()])
+        };
+        let keys = vec![
+            key("live", Some("deleted_at IS NULL")),
+            key("live_active", Some("active AND deleted_at IS NULL")),
+            key("active_only", Some("active")),
+            key("full", None),
+            // Already unenforced: the drop does not change what it reads.
+            key("broken", Some("gone IS NULL")),
+        ];
+        assert_eq!(dropped_with_column(&keys, &fields, "deleted_at"), vec!["live", "live_active"]);
+        assert_eq!(dropped_with_column(&keys, &fields, "ACTIVE"), vec!["live_active", "active_only"]);
+        assert!(dropped_with_column(&keys, &fields, "note").is_empty());
+        assert!(dropped_with_column(&keys, &fields, "email").is_empty());
+    }
+
+    /// A predicate that no longer compiles is reported once, not on every
+    /// write the key is checked for.
+    #[test]
+    fn an_uncompilable_predicate_is_reported_once() {
+        let fields = soft_delete_fields();
+        let key = UniqueKey {
+            predicate: Some("gone IS NULL".to_string()),
+            ..UniqueKey::new("k".into(), vec!["email".into()])
+        };
+        let write = crate::core::row::row::RowWrite {
+            columns_writing_data: smallvec::SmallVec::new(),
+        };
+        for _ in 0..3 {
+            assert!(partial_check(&key, &fields, &write).unwrap().is_none());
+        }
+        assert!(!key.compiled.first_report(), "the failure was already reported");
     }
 
     fn parsed(clause: &str) -> UniqueKey {

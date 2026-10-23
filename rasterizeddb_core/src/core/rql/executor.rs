@@ -2268,7 +2268,24 @@ async fn rewrite_table_with_columns(
             table.schema.defaults.clone(),
             table.schema.json_columns.clone(),
             unique_columns,
-            table.schema.unique_keys.clone(),
+            // Only the keys the rows were checked under. A predicate that no
+            // longer compiles has not been enforced, and recreated next to a
+            // new column of the name it reads, it would compile against
+            // values no row was checked against: the reinsert below then
+            // failed on the first duplicate, after the table was dropped.
+            table
+                .schema
+                .unique_keys
+                .iter()
+                .filter(|k| match k.condition(schema) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        info!("unique index {} not carried across the rewrite: {}", k.describe(), e);
+                        false
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
             table.schema.type_modifiers.clone(),
             // Carried across for the same reason the type modifiers are: a
             // rewrite drops the table, and a generation expression lost here
@@ -8509,6 +8526,20 @@ async fn execute_alter_table_action(
                     ddl_error(&format!("column '{}' does not exist", name))
                 };
             };
+
+            // A partial unique index whose predicate reads the column goes
+            // with it, as in PostgreSQL. Done first, so a failure here leaves
+            // the column and its index as they were.
+            for key in crate::core::rql::unique_key::dropped_with_column(
+                &schema.unique_keys,
+                &schema.fields,
+                &field.name,
+            ) {
+                if let Err(e) = crate::core::rql::unique_key::remove(io_schema.clone(), &key).await {
+                    return ddl_error(&e.to_string());
+                }
+                info!("index {} dropped with column {}", key, field.name);
+            }
 
             // The column keeps its slot in the row layout and is marked
             // deleted: reclaiming the bytes would move every column after it,
