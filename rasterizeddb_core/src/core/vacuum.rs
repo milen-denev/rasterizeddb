@@ -252,13 +252,27 @@ impl FreeSpace {
         self.layout.load(Ordering::Acquire)
     }
 
-    /// Called before rows move to new positions: drops the list and every
-    /// quarantined batch, and fences off any sweep that read the old layout.
-    /// Loans are left alone, as in [`FreeSpace::clear`].
+    /// Called before rows move to new positions: drops the list, every
+    /// quarantined batch and every loan, and fences off any sweep that read
+    /// the old layout.
+    ///
+    /// Loans go too, unlike in [`FreeSpace::clear`]. The caller holds the
+    /// compaction gate exclusively, and every writer holds it shared from
+    /// [`FreeSpace::alloc`] until its pointer is saved (or its loan given
+    /// back), so no loan here protects a write still in progress: each one's
+    /// pointer is already saved. What a loan still guards against is a sweep
+    /// that read the layout before that pointer existed, and the layout check
+    /// refuses any such sweep from now on. Kept, a loan would retire only
+    /// when a scan saw a live pointer start exactly at its offset, which
+    /// after the rows move is almost never: its bytes would be withheld from
+    /// every later list, every scanned row would take the state lock in
+    /// `retire_loan`, and the service would sweep every tick for good.
     pub fn begin_relayout(&self) {
         {
-            let _state = self.state.lock();
+            let mut state = self.state.lock();
             self.layout.fetch_add(1, Ordering::AcqRel);
+            state.in_flight.clear();
+            self.in_flight_count.store(0, Ordering::Release);
         }
         self.clear();
         // After the bump: a quarantine that checked the layout before it has
@@ -1176,19 +1190,45 @@ fn push_run(runs: &mut Vec<(u64, u64)>, slot: u64) {
 /// Makes durable everything a sweep's reclaimability decisions read from
 /// memory: the deleters' stamps, in the table directory's log, and their
 /// outcomes, in the status log's (the root's, for a table on another storage
-/// location). Directory first, outcomes last, the order
-/// `Database::sync_durable` uses.
+/// location).
 ///
-/// One `fdatasync` per log that owes one, and nothing when neither does.
+/// Syncing the outcome log makes every outcome staged in it durable, not only
+/// the deleters', including an asynchronous commit that also wrote rows on a
+/// location this sweep never looked at. So every log that is not some
+/// database's outcome log is synced first, and then only this database's
+/// outcome log, by `flush_all`, the order `Database::sync_durable` and the
+/// log writer use. No other database's outcome log is synced here: from the
+/// process-wide list this cannot tell which directories belong to that
+/// database, so it could not order that one after them.
+///
+/// That ordering covers outcomes staged before the barrier began. A commit
+/// that appends rows to a directory after the loop has synced it, and stages
+/// its outcome before `flush_all` runs, still reaches the disk outcome first;
+/// the log writer and `Database::sync_durable` share that race, and closing
+/// it is a commit-side change (an outcome naming the log positions it
+/// depends on), not something a barrier can do.
+///
+/// A failure to sync the swept table's own log fails the barrier, and the
+/// caller acts on nothing: that log holds the stamps the decisions rest on.
+/// Another log's failure is logged and the barrier goes on. It cannot order
+/// anything that is not already lost: a failed `fdatasync` poisons that log,
+/// and the log writer syncs every outcome log on its next round whatever
+/// failed before it, as `Database::sync_durable` does after reporting the
+/// error. Stopping here would only stop reclamation on every table of every
+/// database while one directory anywhere is broken. A directory removed
+/// since its log was registered (`NotFound`) is skipped quietly.
+///
+/// One `fdatasync` per log that owes one, and nothing when none does.
 /// Taken once per sweep that found anything reclaimable, before any of it is
-/// acted on (see `run_once`).
+/// acted on (see `run_once`), and by `Table::compact` before it decides what
+/// is dead.
 ///
 /// Run under `block_in_place` on a multi-threaded runtime, so a slow disk
 /// (hundreds of ms per sync on ext4) hands this worker's other tasks to
 /// another thread instead of stalling them. Not `spawn_blocking`: the syncs
 /// stay on the calling thread, which is how the power-loss tests tell the
 /// sweep's syncs from the background log writer's.
-fn outcome_barrier<S: StorageIO>(io_pointers: &S, horizon: &VersionHorizon) -> std::io::Result<()> {
+pub(crate) fn outcome_barrier<S: StorageIO>(io_pointers: &S, horizon: &VersionHorizon) -> std::io::Result<()> {
     let wal = io_pointers
         .get_location()
         .and_then(|location| crate::core::wal::wal_for(&location));
@@ -1196,18 +1236,72 @@ fn outcome_barrier<S: StorageIO>(io_pointers: &S, horizon: &VersionHorizon) -> s
     if wal.is_none() && manager.is_none() {
         return Ok(());
     }
+    let sync_one = |log: &crate::core::wal::Wal| -> std::io::Result<()> {
+        #[cfg(test)]
+        if barrier_test_hooks::fails(log) {
+            return Err(std::io::Error::other("injected failure to sync a log in the vacuum barrier"));
+        }
+        log.sync_pending()
+    };
     let sync = || {
-        if let Some(wal) = wal.as_ref() {
-            wal.sync_pending()?;
+        let Some(manager) = manager else {
+            // No outcomes to order against: the stamps are the whole story.
+            if let Some(wal) = wal.as_ref() {
+                sync_one(&**wal)?;
+            }
+            return Ok(());
+        };
+        // Ours by identity, every database's by the directory it registered
+        // with the log writer under; either way synced last or not at all.
+        let own_outcomes = manager.status().wal();
+        let outcome_dirs = crate::core::log_writer::outcome_dirs();
+        for (dir, log) in crate::core::wal::registered() {
+            if own_outcomes.as_ref().is_some_and(|w| Arc::ptr_eq(w, &log)) || outcome_dirs.contains(&dir) {
+                continue;
+            }
+            if let Err(e) = sync_one(&*log) {
+                if wal.as_ref().is_some_and(|w| Arc::ptr_eq(w, &log)) {
+                    return Err(e);
+                }
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    log::debug!(
+                        "Vacuum barrier: the log at {} is gone ({}); skipped",
+                        log.path().display(),
+                        e
+                    );
+                } else {
+                    log::error!(
+                        "Vacuum barrier: could not sync the log at {} ({}); \
+                         the outcomes are made durable without it",
+                        log.path().display(),
+                        e
+                    );
+                }
+            }
         }
-        if let Some(manager) = manager {
-            manager.flush_all()?;
-        }
-        Ok(())
+        manager.flush_all()
     };
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(sync),
         _ => sync(),
+    }
+}
+
+/// Fails chosen syncs inside [`outcome_barrier`], on the calling thread.
+#[cfg(test)]
+pub(crate) mod barrier_test_hooks {
+    thread_local! {
+        /// The directory whose log the barrier fails to sync.
+        pub(crate) static FAIL_SYNC_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn fails(log: &crate::core::wal::Wal) -> bool {
+        FAIL_SYNC_IN.with(|f| {
+            f.borrow()
+                .as_deref()
+                .is_some_and(|dir| log.path().parent() == Some(dir))
+        })
     }
 }
 
@@ -2732,6 +2826,53 @@ mod tests {
         fs.quarantine(Vec::new(), reg.barrier());
         assert_eq!(fs.quarantined_extents(), 0);
         assert!(fs.take_matured(&reg).is_empty());
+    }
+
+    /// A relayout (`VACUUM FULL`) moves rows into the bytes every extent
+    /// found before it names: what was quarantined goes, and a sweep that read
+    /// the old layout can neither quarantine nor publish afterwards.
+    #[test]
+    fn a_relayout_drops_quarantined_batches_and_fences_off_older_sweeps() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        let old = fs.layout();
+        fs.quarantine_at(vec![e(0, 500)], reg.barrier(), old);
+        assert_eq!(fs.quarantined_extents(), 1);
+
+        fs.begin_relayout();
+        assert_ne!(fs.layout(), old);
+        assert_eq!(fs.quarantined_extents(), 0, "a quarantined batch survived the relayout");
+        assert!(fs.take_matured(&reg).is_empty());
+
+        fs.quarantine_at(vec![e(1000, 500)], reg.barrier(), old);
+        assert_eq!(fs.quarantined_extents(), 0, "a sweep of the old layout quarantined");
+        fs.publish_at(vec![e(2000, 500)], old);
+        assert_eq!(fs.free_bytes(), 0, "a sweep of the old layout published");
+        assert_eq!(fs.alloc(100), None);
+
+        fs.publish_at(vec![e(3000, 500)], fs.layout());
+        assert_eq!(fs.alloc(100), Some(3000), "a sweep of the new layout could not publish");
+    }
+
+    /// Loans from before a relayout describe offsets the rows have moved away
+    /// from, so no scan would ever retire them: they go with the relayout,
+    /// and the bytes they named can be published again.
+    #[test]
+    fn a_relayout_retires_every_loan() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500), e(1000, 500)]);
+        assert_eq!(fs.alloc(500), Some(0));
+        assert_eq!(fs.alloc(500), Some(1000));
+        assert_eq!(fs.loans_outstanding(), 2);
+
+        fs.begin_relayout();
+        assert_eq!(fs.loans_outstanding(), 0, "a loan from before the relayout survived it");
+        assert_eq!(fs.leaked_loans(), 0, "retired loans were counted as failed writes");
+
+        // A sweep of the new layout that finds those bytes free publishes
+        // them whole, rather than withholding them for a loan.
+        fs.publish_at(vec![e(0, 500), e(1000, 500)], fs.layout());
+        assert_eq!(fs.free_bytes(), 1000, "bytes of a pre-relayout loan were withheld");
     }
 
     // -----------------------------------------------------------------------

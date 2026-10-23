@@ -426,6 +426,11 @@ pub struct TableFilters {
     /// reads this first and writes only if it is unchanged, checked under the
     /// column's lock, so nothing learned under one numbering lands under
     /// another.
+    ///
+    /// Odd while a renumbering is running, even otherwise. An unchanged odd
+    /// epoch is no licence at all: work that read it is reading slots while
+    /// they move, and the renumbering has not ended to say so yet. See
+    /// [`renumbering`].
     renumber_epoch: AtomicU64,
 }
 
@@ -795,6 +800,15 @@ impl TableFilters {
         if column.valid_upto() < n_slots {
             return false;
         }
+        // And vouch for them. A demoted prefix (a renumbering began, and
+        // perhaps failed part-way) leaves the frontier where it was, but the
+        // zone bounds below it describe rows by slots they may no longer
+        // occupy: a zone that read as ascending can now hold rows moved in
+        // from a later zone, and `ORDER BY … LIMIT k` bounded by it would
+        // return the wrong rows.
+        if column.unknown_below() > 0 {
+            return false;
+        }
         column
             .zonemap()
             .is_some_and(|zm| zm.is_monotonic_ascending(zonemap::zones_for(n_slots)))
@@ -837,7 +851,10 @@ impl TableFilters {
     /// lock is taken after the bump, so an epoch-checked write that saw the
     /// old epoch has landed before the demotion and before any slot moves.
     pub fn begin_renumbering(&self, n_slots: u64) {
-        self.renumber_epoch.fetch_add(1, Ordering::AcqRel);
+        // To the next odd value: always a change, always "running".
+        let _ = self
+            .renumber_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e | 1) + 2 * (e & 1)));
         for c in &self.columns {
             c.write().demote_below(n_slots);
         }
@@ -869,13 +886,19 @@ impl TableFilters {
     /// renumbering finished or failed: work that read its epoch during it
     /// read a mix of both numberings.
     pub fn end_renumbering(&self) {
-        self.renumber_epoch.fetch_add(1, Ordering::AcqRel);
+        // To the next even value: always a change, never "running".
+        let _ = self
+            .renumber_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e + 2) & !1));
     }
 
     /// [`TableFilters::clear_unindexed_prefix`], unless the slots were
     /// renumbered since `epoch` was read. Returns whether every column was
     /// cleared.
     pub fn clear_unindexed_prefix_at(&self, epoch: u64) -> bool {
+        if renumbering(epoch) {
+            return false;
+        }
         for c in &self.columns {
             let mut g = c.write();
             if self.renumber_epoch() != epoch {
@@ -898,6 +921,9 @@ impl TableFilters {
     /// checked under the numbering it was written in, and the caller re-clears
     /// on the next sweep.
     pub fn on_delete_runs_at(&self, epoch: u64, runs: &[(u64, u64)]) -> bool {
+        if renumbering(epoch) {
+            return false;
+        }
         for cell in &self.columns {
             let mut g = cell.write();
             if self.renumber_epoch() != epoch {
@@ -1231,6 +1257,9 @@ impl TableFilters {
     /// since `epoch` was read: rows read under one numbering must not be
     /// written under another. Returns whether the batch was applied.
     pub fn backfill_batch_at(&self, epoch: u64, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) -> bool {
+        if renumbering(epoch) {
+            return false;
+        }
         if rows.is_empty() {
             return self.renumber_epoch() == epoch;
         }
@@ -1249,6 +1278,17 @@ impl TableFilters {
         }
         true
     }
+}
+
+/// Whether `epoch` (a [`TableFilters::renumber_epoch`]) was read while slots
+/// were being renumbered. Work that read it cannot publish what it learned
+/// even while the epoch is unchanged: the renumbering it overlapped has not
+/// ended yet, and the planes it would write, or the prefix it would clear,
+/// would then outlive a renumbering that fails part-way, vouching for rows
+/// read before they moved.
+#[inline]
+pub fn renumbering(epoch: u64) -> bool {
+    epoch & 1 == 1
 }
 
 /// The longest `IN` list whose values are probed one by one; past it the

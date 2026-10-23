@@ -496,3 +496,359 @@ fn chunked_run_clears_match_clearing_slot_by_slot() {
         "clearing in chunked runs cleared different slots than clearing one at a time"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Follow-ups to the review of 595acf5 and to finding (h).
+// ---------------------------------------------------------------------------
+
+/// Finding (h): a sweep that cannot publish, because an older query is still
+/// running, quarantines what it found. A compaction then packs live rows into
+/// exactly those bytes. A later sweep publishes every quarantined batch whose
+/// barrier has passed, and an insert given one of those extents overwrites a
+/// moved row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_quarantined_before_a_compaction_is_never_published() {
+    use crate::core::vacuum::{ReclaimContext, VacuumConfig};
+    let base = tempfile::tempdir().unwrap();
+    let db = open(base.path()).await;
+    create_and_fill(&db, "cf_q", false).await;
+    let t = db.tables.get("cf_q").unwrap().clone();
+    t.wait_filters_ready().await;
+
+    // Stands in for a query that started before the sweep and is still running.
+    let ticket = t.readers.enter();
+    let config = VacuumConfig {
+        drain_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let horizon = t.version_horizon();
+    let cleared_below = std::sync::atomic::AtomicU64::new(0);
+    let ctx = ReclaimContext {
+        horizon: &horizon,
+        filters: None,
+        indexes: None,
+        cleared_below: &cleared_below,
+        compaction_gate: None,
+    };
+    let report = crate::core::vacuum::run_once(
+        &*t.io_pointers,
+        &*t.io_rows,
+        &t.free_space,
+        &t.readers,
+        &ctx,
+        &config,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(report.deferred, "the sweep published while an older read was live");
+    assert!(
+        t.free_space.quarantined_extents() > 0,
+        "nothing was quarantined, so the case tests nothing: {report:?}"
+    );
+    drop(ticket);
+
+    let compacted = t.compact().await.expect("the compaction failed");
+    assert!(compacted.rows_moved > 0, "the compaction moved no rows: {compacted:?}");
+    // Nothing older is running now, so this publishes whatever is quarantined.
+    t.vacuum_now().await.unwrap();
+    drop(t);
+
+    // Rows the same size as the deleted ones, which a stale extent would take.
+    let added: Vec<i32> = (5000..5000 + DELETED).collect();
+    let values: Vec<String> = added
+        .iter()
+        .map(|&i| format!("({i}, {}, '{}')", i * 10, label(i)))
+        .collect();
+    run(&db, &format!("INSERT INTO cf_q (id, k, label) VALUES {}", values.join(", "))).await;
+
+    let got = labels_in(&run(&db, "SELECT label FROM cf_q").await);
+    let mut want: Vec<String> = (DELETED..ROWS).chain(added.iter().copied()).map(label).collect();
+    want.sort();
+    assert_eq!(got.len(), want.len(), "the table lost or gained rows");
+    assert_eq!(got, want, "an insert overwrote a live row moved by the compaction");
+
+    drop(db);
+    crate::core::wal::remove_for(&path_str(base.path()));
+}
+
+/// Review S3: query-cache entries hold row pointers. A compaction that fails
+/// once rows have moved durably, in phase 1 (row bytes) or phase 2 (slots),
+/// leaves an entry from before it naming bytes another row may now occupy.
+/// The cache serves an entry only while the table's cache generation is the
+/// one it was stored under (see `query_cache::lookup`), so the failed
+/// compaction must have moved it on. The write generation too: the pointer
+/// re-read `DELETE` and `UPDATE` fall back on, and the vacuum service's
+/// "nothing changed" test, both read it.
+///
+/// The generations are asserted rather than a cached `SELECT`: these tests
+/// run with the query cache switched off process-wide (`open` sets
+/// `ENABLE_CACHE` once), and `lookup` is a plain comparison against them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_compaction_retires_cached_row_pointers() {
+    use crate::core::row::table::compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES;
+    let base = tempfile::tempdir().unwrap();
+    let db = open(base.path()).await;
+    create_and_fill(&db, "cf_c", false).await;
+    let t = db.tables.get("cf_c").unwrap().clone();
+    t.wait_filters_ready().await;
+    drop(t);
+
+    for phase in [1, 2] {
+        let t = db.tables.get("cf_c").unwrap().clone();
+        let (cache_before, writes_before) = (t.cache_generation(), t.write_generation());
+        if phase == 1 {
+            FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(Some(MOVED)));
+            let outcome = t.compact().await;
+            FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(None));
+            assert!(outcome.is_err(), "the injected phase-1 failure did not fail the compaction");
+        } else {
+            fail_compaction(&db, "cf_c").await;
+        }
+        assert_ne!(
+            t.cache_generation(),
+            cache_before,
+            "a cached answer from before a compaction that failed in phase {phase} would still be served"
+        );
+        assert_ne!(
+            t.write_generation(),
+            writes_before,
+            "a compaction that failed in phase {phase} left the write generation where it was"
+        );
+        drop(t);
+        assert_all_match(&db, "cf_c", &format!("after a compaction failed in phase {phase}")).await;
+    }
+    drop(db);
+    crate::core::wal::remove_for(&path_str(base.path()));
+}
+
+/// Review follow-up: the renumber epoch is odd exactly while a renumbering
+/// runs, however begins and ends are paired. A compaction dropped before its
+/// renumbering began still ends one (its guard is built first), and one that
+/// began while another had not ended must still read as running.
+#[test]
+fn the_renumber_epoch_is_odd_exactly_while_renumbering() {
+    use crate::core::filter::renumbering;
+    let (f, _) = x_filter(100);
+    let mut seen = vec![f.renumber_epoch()];
+    assert!(!renumbering(seen[0]), "a fresh filter reads as renumbering");
+    for cycle in 0..2 {
+        f.begin_renumbering(100);
+        assert!(renumbering(f.renumber_epoch()), "cycle {cycle}: not renumbering after a begin");
+        seen.push(f.renumber_epoch());
+        f.end_renumbering();
+        assert!(!renumbering(f.renumber_epoch()), "cycle {cycle}: still renumbering after an end");
+        seen.push(f.renumber_epoch());
+    }
+    f.end_renumbering();
+    assert!(!renumbering(f.renumber_epoch()), "an end with no begin left the epoch renumbering");
+    seen.push(f.renumber_epoch());
+    f.begin_renumbering(100);
+    seen.push(f.renumber_epoch());
+    f.begin_renumbering(100);
+    assert!(renumbering(f.renumber_epoch()), "a begin during a renumbering ended it");
+    seen.push(f.renumber_epoch());
+    f.end_renumbering();
+    assert!(!renumbering(f.renumber_epoch()));
+    seen.push(f.renumber_epoch());
+    assert!(
+        seen.windows(2).all(|w| w[1] > w[0]),
+        "a begin or an end left the epoch unchanged, so work across it is not fenced: {seen:?}"
+    );
+}
+
+/// Review follow-up: a compaction future dropped while it waits for the
+/// sidecar's dirty mark, after its renumbering began, must not leave the
+/// epoch reading "renumbering" for good. Every backfill and prefix clear
+/// would be refused, and the filter would stay demoted until a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
+    use crate::core::filter::renumbering;
+    let base = tempfile::tempdir().unwrap();
+    let db = open(base.path()).await;
+    create_and_fill(&db, "cf_x", false).await;
+    let t = db.tables.get("cf_x").unwrap().clone();
+    t.wait_filters_ready().await;
+    // A checkpoint exists, so the renumbering writes the dirty mark.
+    t.checkpoint_filters().await;
+    let filters = t.filters.clone().expect("the table has a filter");
+
+    let marking = filters.dirty_marking.lock().await;
+    let mut compaction = Box::pin(t.compact());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !renumbering(filters.renumber_epoch()) {
+        assert!(Instant::now() < deadline, "the compaction never began its renumbering");
+        tokio::select! {
+            biased;
+            outcome = &mut compaction => panic!(
+                "the compaction ran past the dirty mark it could not take: {:?}",
+                outcome.map(|_| ())
+            ),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    // A cancelled statement drops its future here.
+    drop(compaction);
+    drop(marking);
+    assert!(
+        !renumbering(filters.renumber_epoch()),
+        "a dropped compaction left the epoch renumbering, refusing every backfill"
+    );
+    t.backfill_filters_from(0).await.expect("the backfill was refused");
+    assert!(filters.is_complete(), "the backfill could not restore the filter");
+    drop(filters);
+    drop(t);
+    assert_all_match(&db, "cf_x", "after a compaction was dropped").await;
+
+    drop(db);
+    crate::core::wal::remove_for(&path_str(base.path()));
+}
+
+/// Review S4: work that read the renumber epoch *during* a renumbering, and
+/// writes before it ends, saw an unchanged epoch and was let through. Its
+/// prefix clear then outlives a compaction that fails part-way.
+#[test]
+fn work_that_read_the_epoch_during_a_renumbering_cannot_publish() {
+    let (f, _) = x_filter(100);
+    f.begin_renumbering(100);
+    let during = f.renumber_epoch();
+    assert!(!f.backfill_batch_at(during, &rows(10)), "a batch read mid-renumbering was applied");
+    assert!(!f.on_delete_runs_at(during, &[(3, 2)]), "a clear read mid-renumbering was applied");
+    assert!(!f.clear_unindexed_prefix_at(during), "a backfill mid-renumbering cleared the prefix");
+    assert!(!f.is_complete(), "the demotion was cleared while slots were still moving");
+    f.end_renumbering();
+    let after = f.renumber_epoch();
+    assert_ne!(after, during);
+    assert!(f.backfill_batch_at(after, &rows(100)));
+    assert!(f.clear_unindexed_prefix_at(after));
+    assert!(f.is_complete());
+}
+
+/// Review S4, through the table: the open-time backfill does not take the
+/// compaction gate, so it can start after a compaction began and finish
+/// while that compaction is still moving slots. Its prefix clear must not
+/// land; if it did, a compaction failing afterwards leaves the filter
+/// trusting slots that hold moved rows it never indexed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted() {
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    use crate::core::storage_providers::traits::StorageIO;
+    let base = tempfile::tempdir().unwrap();
+    let db = open(base.path()).await;
+    create_and_fill(&db, "cf_b", false).await;
+    let t = db.tables.get("cf_b").unwrap().clone();
+    t.wait_filters_ready().await;
+    let filters = t.filters.clone().expect("the table has a filter");
+    let n_slots = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+
+    // What `compact` does before its first move; it is still running.
+    filters.begin_renumbering(n_slots);
+    assert!(!filters.is_complete());
+    let _ = t.backfill_filters_from(0).await;
+    assert!(
+        !filters.is_complete(),
+        "a backfill that read slots while they moved cleared the renumbering's demotion"
+    );
+    filters.end_renumbering();
+
+    drop(filters);
+    drop(t);
+    drop(db);
+    crate::core::wal::remove_for(&path_str(base.path()));
+}
+
+/// Review S5, directly: a demoted prefix must stop the zone map licensing
+/// the `ORDER BY … LIMIT` slot ceiling. The frontier is left where it was.
+#[test]
+fn a_demoted_column_is_not_reported_monotonic() {
+    let (f, _) = x_filter(2048);
+    assert!(f.column_is_monotonic(0, 2048), "the fixture is not monotonic, so this proves nothing");
+    f.begin_renumbering(2048);
+    assert!(!f.column_is_monotonic(0, 2048), "a demoted column still licenses the slot ceiling");
+}
+
+/// Review S5, through the table. Values ascend across zones and descend
+/// inside each one, the case the ceiling rounds up to whole zones for. Zone 0
+/// keeps ten rows; the compaction moves 502 records from zone 1 into its
+/// slots and then fails. The zone map still says zone 0 holds the smallest
+/// values, so `ORDER BY v LIMIT 20` bounded to zone 0 finds 512 live rows
+/// there and never looks at the unmoved rows of zone 1, which hold 512..521.
+///
+/// Through `Table::query_row`, the row path that applies the slot ceiling
+/// (the executor's bytes path for a plain `SELECT` does not).
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_limit_after_a_failed_compaction_matches_a_full_sort() {
+    const ZONE: i32 = crate::core::filter::kernels::ZONE_ROWS as i32;
+    const N: i32 = 9 * ZONE;
+    const KEPT: i32 = 10;
+    let value = |slot: i32| {
+        if slot < ZONE {
+            slot
+        } else {
+            (slot / ZONE) * ZONE + (ZONE - 1 - slot % ZONE)
+        }
+    };
+    let base = tempfile::tempdir().unwrap();
+    let db = open(base.path()).await;
+    run(&db, "CREATE TABLE cf_m (id INTEGER, v INTEGER, label TEXT)").await;
+    let mut id = 0;
+    while id < N {
+        let end = (id + 256).min(N);
+        let values: Vec<String> = (id..end)
+            .map(|i| format!("({i}, {}, '{}')", value(i), label(value(i))))
+            .collect();
+        run(&db, &format!("INSERT INTO cf_m (id, v, label) VALUES {}", values.join(", "))).await;
+        id = end;
+    }
+    run(&db, &format!("DELETE FROM cf_m WHERE id >= {KEPT} AND id < {ZONE}")).await;
+    let t = db.tables.get("cf_m").unwrap().clone();
+    t.wait_filters_ready().await;
+
+    let v = t.schema.fields.iter().find(|f| f.name == "v").unwrap().write_order as u32;
+    let all: Vec<u32> = t.schema.fields.iter().map(|f| f.write_order as u32).collect();
+    let fetch = crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::build_fetch_for(
+        &t.schema.fields,
+        &all,
+    );
+    let fields = t.schema.fields.to_vec();
+    let top_20 = async || -> Vec<i32> {
+        let rows = t
+            .query_row("", &fields, fetch.clone(), fetch.clone(), Some(20), Some("v".to_string()))
+            .await
+            .unwrap();
+        let mut got: Vec<i32> = rows
+            .iter()
+            .map(|r| {
+                let c = r.columns.iter().find(|c| c.schema_id as u32 == v).unwrap();
+                i32::from_le_bytes(c.data.into_slice().try_into().unwrap())
+            })
+            .collect();
+        got.sort();
+        got
+    };
+    let want: Vec<i32> = (0..KEPT).chain(ZONE..ZONE + 20 - KEPT).collect();
+    assert_eq!(top_20().await, want, "wrong before the compaction");
+
+    // Otherwise the slot ceiling never applies and the case proves nothing.
+    let filters = t.filters.clone().expect("the table has a filter");
+    assert!(
+        filters.column_is_monotonic(v, N as u64),
+        "the zone map does not license the slot ceiling for `v`, so this tests nothing"
+    );
+
+    FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(Some((ZONE - KEPT) as u64)));
+    let outcome = t.compact().await;
+    FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(None));
+    assert!(outcome.is_err(), "the injected phase-2 failure did not fail the compaction");
+
+    assert_eq!(
+        top_20().await,
+        want,
+        "`ORDER BY v LIMIT 20` disagrees with a full sort after a failed compaction"
+    );
+
+    drop(filters);
+    drop(t);
+    drop(db);
+    crate::core::wal::remove_for(&path_str(base.path()));
+}

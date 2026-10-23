@@ -467,8 +467,14 @@ impl<S: StorageIO> Table<S> {
 
     /// The generation a scan starting now should stamp its cache entry with.
     #[inline]
-    fn cache_generation(&self) -> u64 {
+    pub(crate) fn cache_generation(&self) -> u64 {
         self.cache_generation.load(AtomicOrdering::Acquire)
+    }
+
+    /// See the `write_generation` field.
+    #[cfg(test)]
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.write_generation.load(AtomicOrdering::Acquire)
     }
 
     /// Qualifies this table's query-cache key with the database that owns it.
@@ -1218,11 +1224,39 @@ impl<S: StorageIO> Table<S> {
         #[cfg(test)]
         compact_test_hooks::gate_point(2);
 
+        // Sampled before the barrier below, so every deleter this compaction
+        // will count as reclaimable had left the running set, and so had its
+        // outcome recorded, by the time the barrier ran.
+        let horizon = self.version_horizon();
+        // What is dead is decided from deleters' outcomes held in memory, and
+        // the moves below overwrite those versions' bytes and slots in durable
+        // batches. An asynchronous commit's outcome (or a synchronous one's,
+        // before its sync) is not on disk yet, and a power cut would undo the
+        // delete while the row's bytes already belong to another row. So the
+        // outcomes are made durable first, and nothing moves if they cannot be.
+        if let Err(e) = crate::core::vacuum::outcome_barrier(&*self.io_pointers, &horizon) {
+            error!(
+                "Compaction of {}: the outcomes of the deleted rows could not be made durable \
+                 ({}); nothing was moved",
+                self.schema.name, e
+            );
+            return Err(e.into());
+        }
+
         // Nothing on the free list survives compaction — every extent it names
         // is about to be somewhere else. Quarantined batches go too, and a
         // vacuum sweep that computed extents from the old layout (it releases
         // this gate before publishing) publishes nothing.
         self.free_space.begin_relayout();
+
+        // Cached answers hold row pointers, and rows are about to move. Retired
+        // now rather than only on success: a compaction that fails part-way has
+        // already moved rows durably, and a cached pointer would then read
+        // whatever another row moved over its old bytes. No query can store a
+        // new entry while this gate is held exclusively. The success tail
+        // retires them again for the rebuild it did.
+        self.invalidate_query_caches();
+        self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         // From here rows move (phase 1) and slots are renumbered (phase 2), so
         // everything keyed by slot stops being trusted now, not only once the
@@ -1246,8 +1280,7 @@ impl<S: StorageIO> Table<S> {
         let renumbering = self.begin_renumbering(n_slots_before).await;
 
         let rows_len = self.io_rows.get_len().await;
-        let (live, dead_rows) =
-            collect_live(&*self.io_pointers, rows_len, &self.version_horizon()).await?;
+        let (live, dead_rows) = collect_live(&*self.io_pointers, rows_len, &horizon).await?;
 
         let mut report = CompactReport {
             live_rows: live.len() as u64,
@@ -1315,6 +1348,15 @@ impl<S: StorageIO> Table<S> {
             let _ = token;
 
             report.rows_moved += 1;
+
+            // Test-only: the row moves so far commit as a batch, and the next
+            // batch fails, as an ENOSPC part-way through phase 1 would.
+            #[cfg(test)]
+            if compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.get()) == Some(report.rows_moved) {
+                compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(None));
+                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
+                return Err(std::io::Error::other("injected failure part-way through phase 1"));
+            }
 
             // A failed commit has to stop the compaction, not just be noted.
             // Targets are at or below their sources, so the *next* row's move
@@ -1575,16 +1617,25 @@ impl<S: StorageIO> Table<S> {
     /// one here is defence in depth.
     async fn begin_renumbering(&self, n_slots: u64) -> RenumberingGuard<'_> {
         self.filters_ready.store(false, AtomicOrdering::Release);
+        // Built before the first await, not after: `begin_renumbering_on_disk`
+        // makes the epoch odd and then waits on the sidecar's dirty mark, and
+        // a compaction dropped there (a cancelled statement drops its future)
+        // would otherwise leave it odd with nothing to end it, refusing every
+        // backfill, prefix clear and vacuum clear on this table until the
+        // next compaction or a restart. Ending a renumbering that never began
+        // only moves the epoch to the next even value, which costs whatever
+        // work was in flight a retry.
+        let guard = RenumberingGuard {
+            filters: self.filters.as_deref(),
+            indexes: self.indexes.as_deref(),
+        };
         if let Some(filters) = self.filters.as_ref() {
             filters.begin_renumbering_on_disk(&*self.io_filters, n_slots).await;
         }
         if let Some(indexes) = self.indexes.as_ref() {
             indexes.invalidate();
         }
-        RenumberingGuard {
-            filters: self.filters.as_deref(),
-            indexes: self.indexes.as_deref(),
-        }
+        guard
     }
 
     /// Shortens one file, tolerating a provider that cannot.
@@ -4471,6 +4522,13 @@ async fn backfill_into<S: StorageIO>(
     // under another.
     let epoch = filters.renumber_epoch();
     let renumbered = || std::io::Error::other("slots were renumbered under the filter backfill");
+    // Read while a renumbering runs (this does not wait for one): every batch
+    // and the prefix clear would be refused anyway, and a scan now reads rows
+    // while they move. The renumbering's own rebuild, or the next open's
+    // backfill, indexes the table instead.
+    if crate::core::filter::renumbering(epoch) {
+        return Err(renumbered());
+    }
 
     let fetch = Table::<S>::build_indexed_row_fetch(fields);
     if fetch.columns_fetching_data.is_empty() {
@@ -4634,6 +4692,10 @@ pub(crate) mod compact_test_hooks {
         /// Fails `compact` once this many pointer records have moved in phase
         /// 2, after committing those moves.
         pub static FAIL_PHASE2_AFTER_SLOT_MOVES: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+        /// Fails `compact` once this many rows have moved in phase 1, after
+        /// committing those moves.
+        pub static FAIL_PHASE1_AFTER_ROW_MOVES: std::cell::Cell<Option<u64>> =
             const { std::cell::Cell::new(None) };
         /// Set by `compact` to 1 when it starts waiting for the compaction
         /// gate and to 2 once it holds it, so a test can tell a compaction

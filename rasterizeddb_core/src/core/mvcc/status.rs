@@ -790,6 +790,12 @@ impl StatusLog {
         self.inner.lock().path.clone()
     }
 
+    /// The log this one's writes go through (see [`StatusLog::attach_wal`]):
+    /// the log whose sync makes the outcomes durable.
+    pub fn wal(&self) -> Option<std::sync::Arc<Wal>> {
+        self.inner.lock().wal.as_ref().map(|(w, _)| w.clone())
+    }
+
     /// Routes this log's writes through `wal`, so an outcome and the rows it
     /// validates are recovered together.
     ///
