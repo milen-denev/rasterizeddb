@@ -74,7 +74,6 @@ pub mod route;
 pub mod table;
 #[cfg(test)]
 mod table_tests;
-pub mod xxh64;
 
 pub use key::{KeyFamily, KeyLevel, KeySpec};
 pub use map::{PointRange, RangeMap};

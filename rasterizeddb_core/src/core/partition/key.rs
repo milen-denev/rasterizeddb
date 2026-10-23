@@ -14,7 +14,7 @@ use crate::core::db_type::DbType;
 use crate::core::row::schema::TableSchema;
 
 use super::map::PointRange;
-use super::xxh64::xxh64;
+use crate::core::hash::xxh64;
 
 /// Seed of level 0; level `i` uses `LEVEL_SEED + i` ("RDBPRT").
 pub const LEVEL_SEED: u64 = 0x5244_4250_5254_0000;
