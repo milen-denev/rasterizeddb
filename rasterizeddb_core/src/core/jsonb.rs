@@ -3089,10 +3089,14 @@ impl PathExpr {
                 }
                 // Neither `->'1'` nor `->1`: it can be either, and an index
                 // keyed alike would answer for a path that means something else.
+                // Written as the `#>` array `parse_path_expression` reads back.
+                // It was `#>'1'`, which it cannot read, so an index declared
+                // over such a path was accepted and never built. The text is
+                // always an integer, so it needs no quoting inside the braces.
                 Step::Either(t) => {
-                    key.push_str("#>'");
-                    key.push_str(&t.replace('\'', "''"));
-                    key.push('\'');
+                    key.push_str("#>'{");
+                    key.push_str(t);
+                    key.push_str("}'");
                 }
             }
         }
@@ -3175,6 +3179,35 @@ pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
         steps,
         as_text,
     })
+}
+
+/// A stored index key in the form [`PathExpr::index_key`] wrote before its
+/// `#>` steps were braced (`doc->'a'#>'1'`), rewritten into the current one.
+///
+/// `None` when `key` already reads, or still does not after the rewrite.
+pub fn upgrade_legacy_index_key(key: &str) -> Option<String> {
+    if parse_path_expression(key).is_some() {
+        return None;
+    }
+    let mut upgraded = String::with_capacity(key.len() + 8);
+    let mut rest = key;
+    while let Some(at) = rest.find("#>'") {
+        upgraded.push_str(&rest[..at + 3]);
+        rest = &rest[at + 3..];
+        let end = rest.find('\'')?;
+        let text = &rest[..end];
+        if text.parse::<i32>().is_ok() {
+            upgraded.push('{');
+            upgraded.push_str(text);
+            upgraded.push('}');
+        } else {
+            upgraded.push_str(text);
+        }
+        upgraded.push('\'');
+        rest = &rest[end + 1..];
+    }
+    upgraded.push_str(rest);
+    parse_path_expression(&upgraded).map(|p| p.index_key())
 }
 
 fn strip_outer_parens(text: &str) -> &str {
@@ -3336,6 +3369,31 @@ mod path_tests {
     }
 
     /// `->` and `->>` address the same value, so they must share one index.
+    /// The key is what a declaration is stored under and rebuilt from, so it
+    /// has to read back as the same path. An `Either` step did not, and the
+    /// index over `doc #>> '{a,2}'` was never built.
+    #[test]
+    fn every_index_key_reads_back_as_its_path() {
+        for expression in ["doc#>>'{a,2}'", "doc#>'{2}'", "doc->'a'->2", "doc#>>'{a,-1,b}'", "doc->'x''y'->>'z'"] {
+            let path = parse_path_expression(expression).unwrap();
+            let key = path.index_key();
+            let again = parse_path_expression(&key).unwrap_or_else(|| panic!("{} wrote {}, which does not read", expression, key));
+            assert_eq!(again.steps, path.steps, "{} -> {}", expression, key);
+            assert_eq!(again.index_key(), key);
+        }
+        assert_eq!(parse_path_expression("doc#>>'{a,2}'").unwrap().index_key(), "doc->'a'#>'{2}'");
+    }
+
+    #[test]
+    fn a_legacy_index_key_is_upgraded() {
+        assert_eq!(upgrade_legacy_index_key("doc->'a'#>'2'").as_deref(), Some("doc->'a'#>'{2}'"));
+        assert_eq!(upgrade_legacy_index_key("doc#>'-1'->'b'").as_deref(), Some("doc#>'{-1}'->'b'"));
+        // One that reads is left alone, including a key whose text looks like one.
+        assert_eq!(upgrade_legacy_index_key("doc->'a'#>'{2}'"), None);
+        assert_eq!(upgrade_legacy_index_key("doc->'a#>''1'''"), None);
+        assert_eq!(upgrade_legacy_index_key("not a path"), None);
+    }
+
     #[test]
     fn the_rendering_operator_does_not_change_the_index_key() {
         let a = parse_path_expression("doc->'a'").unwrap();

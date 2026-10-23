@@ -81,9 +81,13 @@ impl PathIndex {
                 .map(|s| s.to_string())
                 .map_err(|e| format!("a path index record is not UTF-8: {}", e))
         };
+        let path = read(FIELD_LEN + 1)?;
+        // A record written before `#>` steps were keyed as `#>'{1}'` could not
+        // be read back, so its index was never built and no query matched it.
+        let path = crate::core::jsonb::upgrade_legacy_index_key(&path).unwrap_or(path);
         Ok(PathIndex {
             name: read(0)?,
-            path: read(FIELD_LEN + 1)?,
+            path,
             is_deleted: raw[(FIELD_LEN + 1) * 2] != 0,
         })
     }

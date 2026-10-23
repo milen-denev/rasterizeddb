@@ -545,3 +545,22 @@ fn broad_gin_answers_come_back_as_bitmaps() {
     let either = gin::JsonExpr::Or(vec![paid.clone(), tagged.clone()]);
     assert_eq!(indexes.plan_json_dense(&either, n, dense_cap(n)), None);
 }
+
+/// An index over a `#>` path that can name either a key or a position is
+/// built. Its declaration used to be stored under a key that did not read back
+/// as a path, so it was accepted and never built; a record still in that form
+/// is upgraded when loaded.
+#[test]
+fn a_path_index_over_an_either_step_is_built() {
+    use crate::core::rql::path_index::PathIndex;
+    let built = |stored: &str| {
+        let mut schema = crate::core::row::schema::TableSchema::new("t".into(), false);
+        schema.fields.push(SchemaField::new("doc".into(), DbType::JSONB, 8, 0, 0, false));
+        let record = PathIndex { name: "ix".into(), path: stored.into(), is_deleted: false };
+        schema.path_indexes.push(PathIndex::from_vec(&record.into_vec()).unwrap());
+        for_schema(&schema).list.len()
+    };
+    let key = crate::core::jsonb::parse_path_expression("doc#>>'{a,2}'").unwrap().index_key();
+    assert_eq!(built(&key), 1, "declared as {}", key);
+    assert_eq!(built("doc->'a'#>'2'"), 1, "a record in the old form");
+}
