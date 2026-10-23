@@ -28,6 +28,12 @@ pub enum AlterAction {
         /// JSON type", which was both wrong and inconsistent with the statement
         /// beside it.
         json: bool,
+        /// `NUMERIC(p, s)`'s precision and scale. Dropped before, so the column
+        /// stored every value at the engine's scale, 9.
+        modifier: Option<(u16, u16)>,
+        /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
+        /// the column was added and never given a value.
+        generated: Option<String>,
     },
     DropColumn {
         name: String,
@@ -213,8 +219,15 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
     let table_name = bare_name(table_token);
 
     // The DEFAULT clause is removed before the action is read, so its
-    // expression cannot be mistaken for a type or a constraint.
+    // expression cannot be mistaken for a type or a constraint. A generation
+    // expression goes first: it is a parenthesised group the DEFAULT and
+    // constraint readers would both take pieces of, as in `CREATE TABLE`.
     let remainder: String = tokens.collect::<Vec<_>>().join(" ");
+    let (remainder, generated) = if remainder.trim_start().to_ascii_uppercase().starts_with("ADD") {
+        crate::core::rql::generated::split_clause(&remainder)
+    } else {
+        (remainder, None)
+    };
     let (remainder, default) = crate::core::rql::column_default::split_clause(&remainder);
     let rest: Vec<&str> = remainder.split_whitespace().collect();
     if rest.is_empty() {
@@ -279,6 +292,33 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let constraints = rest_upper[i + used..].join(" ");
             let nullable =
                 !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            // The declared type as written, across the tokens `NUMERIC(12, 3)`
+            // was split into.
+            let declared = {
+                let mut joined = String::new();
+                for token in &type_tokens {
+                    joined.push_str(token);
+                    let opens = joined.matches('(').count();
+                    if opens == 0 || opens == joined.matches(')').count() {
+                        break;
+                    }
+                    joined.push(' ');
+                }
+                joined
+            };
+            let modifier = match crate::core::rql::type_modifier::parse_numeric_modifier(&declared) {
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(reason)) => return Err(reason),
+                None => None,
+            };
+            if let Some(expression) = generated.as_deref() {
+                if expression.len() > crate::core::rql::generated::MAX_EXPRESSION_LEN {
+                    return Err(format!(
+                        "a generation expression may be at most {} characters",
+                        crate::core::rql::generated::MAX_EXPRESSION_LEN
+                    ));
+                }
+            }
 
             AlterAction::AddColumn {
                 name,
@@ -287,6 +327,8 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 if_not_exists,
                 default,
                 json,
+                modifier,
+                generated,
             }
         }
         "DROP" => {
@@ -944,6 +986,8 @@ mod tests {
                 if_not_exists: false,
                 default: None,
                 json: false,
+                modifier: None,
+                generated: None,
             }
         );
     }

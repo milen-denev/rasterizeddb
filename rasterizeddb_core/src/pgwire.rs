@@ -5656,7 +5656,7 @@ fn sqlstate_for(message: &str) -> &'static str {
         "23503"
     } else if has("violates not-null constraint") || has("not null") && has("null value") {
         "23502"
-    } else if has("violates check constraint") {
+    } else if has("violates check constraint") || (has("check constraint") && has("is violated by some row")) {
         "23514"
     } else if has("permission denied") || has("is not a superuser") {
         "42501"
@@ -5704,6 +5704,9 @@ fn sqlstate_for(message: &str) -> &'static str {
         // PostgreSQL's own codes for a generation expression it refuses:
         // a subquery is a missing feature, the rest a bad definition.
         "0A000"
+    } else if has("both default and generation expression") {
+        // PostgreSQL reports the two clauses together as a syntax error.
+        "42601"
     } else if has("generation expression") {
         "42P17"
     } else if has("can only be updated to default") || has("cannot insert a non-default value") {

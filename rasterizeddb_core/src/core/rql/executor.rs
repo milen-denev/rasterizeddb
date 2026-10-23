@@ -2208,6 +2208,10 @@ async fn rewrite_table_with_columns(
     // JSON columns being added alongside. The table's existing ones are read
     // from its schema; these are the new arrivals.
     new_json: Vec<crate::core::rql::json_map::JsonColumn>,
+    // A new column's NUMERIC(p, s) and generation expression, carried into the
+    // recreated table with the existing ones.
+    new_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
+    new_generated: Vec<crate::core::rql::generated::GeneratedColumn>,
     // The transaction asking. The rows are read as of now on its behalf, so
     // that what it has written here and not yet committed survives the
     // rebuild — a frozen read would not see them, and the drop would take
@@ -2384,8 +2388,8 @@ async fn rewrite_table_with_columns(
             json_columns: json_columns.into_iter().chain(new_json).collect(),
             // Carried across the rewrite. Losing a column's declared scale here
             // would silently reinterpret every decimal it holds.
-            type_modifiers: type_modifiers.into_iter().collect(),
-            generated: generated.into_iter().collect(),
+            type_modifiers: type_modifiers.into_iter().chain(new_modifiers).collect(),
+            generated: generated.into_iter().chain(new_generated).collect(),
             checks: checks.into_iter().collect(),
             unique_columns,
             unique_keys: unique_keys.into_iter().collect(),
@@ -2476,6 +2480,17 @@ async fn rewrite_table_with_columns(
                     })
                     .filter(|literal| literal != "NULL")
                     .and_then(|literal| {
+                        // A NUMERIC(p, s) column stores its values at its own
+                        // scale; the plain encoder writes the engine's.
+                        if field.db_type == crate::core::db_type::DbType::DECIMAL {
+                            if let Some(scale) = field.scale {
+                                return crate::core::value_codec::parse_decimal_rounded(
+                                    literal.trim_matches('\''),
+                                    scale,
+                                )
+                                .map(|v| v.to_le_bytes().to_vec());
+                            }
+                        }
                         crate::core::value_codec::encode_literal(
                             &field.db_type,
                             literal.trim_matches('\''),
@@ -8246,6 +8261,87 @@ fn sequences_named_elsewhere(
         .collect()
 }
 
+/// Fills a generated column just added to a table that already holds rows:
+/// `UPDATE t SET g = DEFAULT`, which recomputes it from each row exactly as an
+/// UPDATE of its inputs would.
+async fn compute_generated_column(database: &Arc<Database>, table_name: &str, column: &str, tx: TxId) -> Vec<u8> {
+    let sql = format!("UPDATE {} SET {} = DEFAULT", table_name, column);
+    let Some(purpose) = recognize_query_purpose(&sql) else {
+        return ddl_error(&format!("could not compute the generated column \"{}\"", column));
+    };
+    let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
+    match response.first() {
+        Some(3) => ddl_error(&format!(
+            "could not compute the generated column \"{}\": {}",
+            column,
+            String::from_utf8_lossy(&response[1..])
+        )),
+        _ => ddl_ok(0),
+    }
+}
+
+/// `ALTER TABLE … ADD [CONSTRAINT name] CHECK (expression)`.
+///
+/// As PostgreSQL does it: the expression must compile against the table, every
+/// existing row must satisfy it (a NULL result passes), and only then is it
+/// stored and enforced on every later write.
+async fn add_check_constraint<S: crate::core::storage_providers::traits::StorageIO>(
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    io_schema: &rclite::Arc<S>,
+    description: &str,
+    expression: String,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    let named = {
+        let words: Vec<&str> = description.split_whitespace().collect();
+        (words.len() > 1 && words[0].eq_ignore_ascii_case("CONSTRAINT")).then(|| words[1].trim_matches('"').to_string())
+    };
+    let ordinal = schema.checks.iter().filter(|c| !c.is_deleted).count() + 1;
+    let name = named.unwrap_or_else(|| crate::core::rql::check::derived_name(table_name, None, ordinal));
+    if schema.checks.iter().any(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name)) {
+        return ddl_error(&format!("constraint \"{}\" for relation \"{}\" already exists", name, table_name));
+    }
+
+    // It must compile, or it would be stored and then skipped on every write.
+    let visible: Vec<crate::core::row::schema::SchemaField> =
+        crate::core::rql::nullable::visible_fields(&schema.fields);
+    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+        visible.iter().cloned().collect();
+    let compiled = crate::core::tokenizer::predicate_rewrite::rewrite_where(&expression, &visible_sv)
+        .and_then(|lowered| crate::core::rql::expr::parse_cond(&lowered, &visible).map(|_| ()));
+    if let Err(reason) = compiled {
+        return ddl_error(&format!("check constraint \"{}\" cannot be compiled: {}", name, reason));
+    }
+
+    // A row for which it is false (NULL is not false) refuses the statement.
+    let probe = format!("SELECT 1 FROM {} WHERE NOT ({}) LIMIT 1", table_name, expression);
+    match run_subquery(&probe, database, tx).await {
+        Ok(rows) if rows.is_empty() => {}
+        Ok(_) => {
+            return ddl_error(&format!(
+                "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                name, table_name
+            ));
+        }
+        Err(e) => return ddl_error(&format!("could not check the existing rows against \"{}\": {}", name, e)),
+    }
+
+    let entry = crate::core::rql::check::CheckConstraint {
+        name,
+        expression,
+        is_deleted: false,
+    };
+    if let Err(e) = crate::core::rql::check::append(io_schema.clone(), &entry).await {
+        return ddl_error(&e.to_string());
+    }
+    match database.reload_table(table_name).await {
+        Ok(()) => ddl_ok(0),
+        Err(e) => ddl_error(&e.to_string()),
+    }
+}
+
 async fn execute_alter_table_action(
     plan: crate::core::rql::lexer_alter::AlterTable,
     database: &Arc<Database>,
@@ -8287,6 +8383,8 @@ async fn execute_alter_table_action(
             if_not_exists,
             default,
             json,
+            modifier,
+            generated,
         } => {
             if nullable::is_hidden(&name) {
                 return ddl_error("column names beginning with __null_ are reserved");
@@ -8325,10 +8423,56 @@ async fn execute_alter_table_action(
                     }
                 }
             }
+            // A generated column is computed from its row, as in PostgreSQL:
+            // it cannot also have a DEFAULT, and its expression must compile
+            // against the table it is being added to.
+            if let Some(expression) = generated.as_deref() {
+                if default.is_some() {
+                    return ddl_error(&format!(
+                        "both default and generation expression specified for column \"{}\"",
+                        name
+                    ));
+                }
+                let mut fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+                    schema.fields.iter().filter(|f| !f.is_deleted).cloned().collect();
+                fields.push(crate::core::row::schema::SchemaField::new(
+                    name.clone(),
+                    db_type.clone(),
+                    db_type.get_size(),
+                    0,
+                    u64::MAX,
+                    false,
+                ));
+                if expression_columns(expression, &fields)
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name))
+                {
+                    return ddl_error(&format!("generation expression of \"{}\" cannot reference itself", name));
+                }
+                if let Err(reason) = crate::core::rql::generated::parse_expression(expression, &fields) {
+                    return ddl_error(&format!(
+                        "the generation expression of \"{}\" cannot be compiled: {}",
+                        name, reason
+                    ));
+                }
+            }
+            let new_modifier = modifier.map(|(precision, scale)| crate::core::rql::type_modifier::TypeModifier {
+                column: name.clone(),
+                precision,
+                scale,
+                is_deleted: false,
+            });
+            let new_generated = generated.clone().map(|expression| crate::core::rql::generated::GeneratedColumn {
+                column: name.clone(),
+                expression,
+                is_deleted: false,
+            });
+
             let fills_existing = default
                 .as_deref()
                 .map(|e| !e.trim().eq_ignore_ascii_case("NULL"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || generated.is_some();
 
             // A declaration still filed under the name — a dead column's, from
             // before drops retired theirs — is retired first. Left, the new
@@ -8423,21 +8567,26 @@ async fn execute_alter_table_action(
                     Vec::new()
                 };
 
-                return match Box::pin(rewrite_table_with_columns(
+                if let Err(e) = Box::pin(rewrite_table_with_columns(
                     &database,
                     &plan.table_name,
                     added,
                     new_defaults,
                     new_json,
+                    new_modifier.into_iter().collect(),
+                    new_generated.into_iter().collect(),
                     tx,
                 ))
                 .await
                 {
-                    Ok(()) => ddl_ok(0),
-                    Err(e) => {
-                        error!("{}", e);
-                        ddl_error(&e)
-                    }
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+                // The rows already there get the column's value the way an
+                // UPDATE gives one: computed from each row.
+                return match generated {
+                    Some(_) => compute_generated_column(&database, &plan.table_name, &name, tx).await,
+                    None => ddl_ok(0),
                 };
             }
 
@@ -8486,6 +8635,16 @@ async fn execute_alter_table_action(
                 }
             }
 
+            if let Some(entry) = &new_modifier {
+                if let Err(e) = crate::core::rql::type_modifier::append(io_schema.clone(), entry).await {
+                    return ddl_error(&e.to_string());
+                }
+            }
+            if let Some(entry) = &new_generated {
+                if let Err(e) = crate::core::rql::generated::append(io_schema.clone(), entry).await {
+                    return ddl_error(&e.to_string());
+                }
+            }
             schema
                 .add_field(io_schema.clone(), name.clone(), db_type, false)
                 .await;
@@ -8754,6 +8913,25 @@ async fn execute_alter_table_action(
                         Ok(found) => removed || found,
                         Err(e) => return ddl_error(&e.to_string()),
                     };
+                    // A CHECK is retired by a tombstone under its name; the
+                    // last record of a name wins when the sidecar is read.
+                    let removed = match schema
+                        .checks
+                        .iter()
+                        .find(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name))
+                    {
+                        Some(check) => {
+                            let tombstone = crate::core::rql::check::CheckConstraint {
+                                is_deleted: true,
+                                ..check.clone()
+                            };
+                            if let Err(e) = crate::core::rql::check::append(io_schema.clone(), &tombstone).await {
+                                return ddl_error(&e.to_string());
+                            }
+                            true
+                        }
+                        None => removed,
+                    };
 
                     if removed {
                         // The sidecars are the source of truth; reloading picks
@@ -8909,8 +9087,18 @@ async fn execute_alter_table_action(
                 Ok(None) => {}
             }
 
-            // Anything left — `CHECK`, `EXCLUDE` — is accepted so a migration
-            // can proceed, and reported as unenforced rather than as done.
+            // `ADD [CONSTRAINT name] CHECK (…)`, enforced from now on as one
+            // declared in `CREATE TABLE` is. It used to fall through to the
+            // warning below: accepted, stored nowhere, and a violating insert
+            // then succeeded.
+            let (_, check_expression) = crate::core::rql::check::split_clause(&description);
+            if let Some(expression) = check_expression {
+                return add_check_constraint(&plan.table_name, &schema, &io_schema, &description, expression, database, tx)
+                    .await;
+            }
+
+            // Anything left — `EXCLUDE` — is accepted so a migration can
+            // proceed, and reported as unenforced rather than as done.
             warn!(
                 "ALTER TABLE {}: constraint accepted but not enforced ({})",
                 plan.table_name, description
@@ -9041,6 +9229,8 @@ async fn execute_alter_table_action(
                         &database,
                         &plan.table_name,
                         vec![companion],
+                        Vec::new(),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         tx,
