@@ -55,6 +55,16 @@ thread_local! {
 /// serving task would report success and then log a failure nobody is watching
 /// for.
 pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server::TcpServer> {
+    bind_on(replication, None)
+}
+
+/// [`bind`], serving `listener` when one is given instead of binding
+/// `listen_addr:listen_port`. The listener comes from
+/// [`Replication::serve_on`], which says why a caller would hand one over.
+pub fn bind_on(
+    replication: &StdArc<Replication>,
+    listener: Option<std::net::TcpListener>,
+) -> std::io::Result<rastcp::server::TcpServer> {
     let config = replication.config();
 
     if let Err(e) = config.validate() {
@@ -74,6 +84,9 @@ pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server
                     .client_auth(config.auth)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             );
+    if let Some(listener) = listener {
+        builder = builder.with_listener(listener);
+    }
 
     // Present this node's own certificate rather than a freshly generated one,
     // so the fingerprint the peers pinned stays the same across restarts.

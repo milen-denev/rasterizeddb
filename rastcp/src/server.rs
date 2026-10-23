@@ -138,6 +138,9 @@ pub struct TcpServerBuilder {
     auth_timeout: Duration,
     allow_tls12: bool,
     early_data: bool,
+    /// A socket the caller already bound, served instead of binding
+    /// `addr:port`. See [`TcpServerBuilder::with_listener`].
+    listener: Option<std::net::TcpListener>,
 }
 
 pub struct TcpServer {
@@ -187,7 +190,33 @@ impl TcpServerBuilder {
             // and a replayed request on a database protocol is a repeated
             // write, not a repeated page view.
             early_data: false,
+            listener: None,
         }
+    }
+
+    /// A builder that serves `listener` rather than binding an address itself.
+    ///
+    /// For callers that must know the port before the server exists — tests
+    /// above all, which bind `127.0.0.1:0` and hand the socket over. Taking a
+    /// port *number* instead means letting go of the socket first, and in the
+    /// window between that and the server's own bind another test can be
+    /// handed the same freed port: one of them then fails to bind, or, worse,
+    /// a client reaches the other test's server. Holding the socket throughout
+    /// closes the window.
+    ///
+    /// The listener's own address is what is served; `addr` and `port` are
+    /// taken from it for logging. Keepalive is applied to it as it is to a
+    /// socket this builder binds.
+    pub fn from_listener(listener: std::net::TcpListener) -> std::io::Result<Self> {
+        let local = listener.local_addr()?;
+        Ok(Self::new(&local.ip().to_string(), local.port()).with_listener(listener))
+    }
+
+    /// Serves `listener` instead of binding `addr:port`. See
+    /// [`TcpServerBuilder::from_listener`].
+    pub fn with_listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// The credential exchange every caller must complete before its first
@@ -367,16 +396,56 @@ impl TcpServerBuilder {
             !self.client_auth.authenticates() && self.authenticator.is_none();
         server_config.send_tls13_tickets = 2;
 
-        // Create server
-        let ip_addr = IpAddr::from_str(&self.addr).map_err(|_| {
-            RastcpError::SocketBindingError(format!("{:?} is not an IP address to bind", self.addr))
+        let listener = match self.listener {
+            Some(listener) => Self::adopt(listener)?,
+            None => Self::bind_socket(&self.addr, self.port)?,
+        };
+        let tokio_listener = TcpListener::from_std(listener)
+            .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        info!("Server built to listen on {}:{}", self.addr, self.port);
+
+        let (shutdown_tx, _) = watch::channel(false);
+
+        Ok(TcpServer {
+            listener: tokio_listener,
+            acceptor,
+            max_connections,
+            current_connections: Arc::new(CacheGuard::new(std::sync::atomic::AtomicUsize::new(0))),
+            connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
+            handshake_timeout: self.handshake_timeout,
+            request_timeout: self.request_timeout,
+            shutdown_grace: self.shutdown_grace,
+            auth_timeout: self.auth_timeout,
+            authenticator: self.authenticator,
+            shutdown_tx: Arc::new(shutdown_tx),
+            certificate_fingerprint,
+        })
+    }
+
+    /// Readies a socket the caller bound for the accept loop: non-blocking, as
+    /// the reactor needs, and with the keepalive a socket bound here gets.
+    fn adopt(listener: std::net::TcpListener) -> Result<std::net::TcpListener, RastcpError> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
+        let socket = socket2::SockRef::from(&listener);
+        _ = socket.set_tcp_nodelay(true);
+        socket
+            .set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(7200)))
+            .map_err(|e| RastcpError::SocketKeepAliveError(e.to_string()))?;
+        Ok(listener)
+    }
+
+    /// Binds and listens on `addr:port`.
+    fn bind_socket(addr: &str, port: u16) -> Result<std::net::TcpListener, RastcpError> {
+        let ip_addr = IpAddr::from_str(addr).map_err(|_| {
+            RastcpError::SocketBindingError(format!("{:?} is not an IP address to bind", addr))
         })?;
 
-        let addr = if cfg!(debug_assertions) {
-            SocketAddr::from((ip_addr, self.port))
-        } else {
-            SocketAddr::from((ip_addr, self.port))
-        };
+        let addr = SocketAddr::from((ip_addr, port));
 
         let socket = Socket::new_raw(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
@@ -404,30 +473,7 @@ impl TcpServerBuilder {
             .set_tcp_keepalive(tcp_keep_alive)
             .map_err(|e| RastcpError::SocketKeepAliveError(e.to_string()))?;
 
-        let listener: std::net::TcpListener = socket.into();
-        let tokio_listener = TcpListener::from_std(listener)
-            .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
-
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
-
-        info!("Server built to listen on {}:{}", self.addr, self.port);
-
-        let (shutdown_tx, _) = watch::channel(false);
-
-        Ok(TcpServer {
-            listener: tokio_listener,
-            acceptor,
-            max_connections,
-            current_connections: Arc::new(CacheGuard::new(std::sync::atomic::AtomicUsize::new(0))),
-            connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
-            handshake_timeout: self.handshake_timeout,
-            request_timeout: self.request_timeout,
-            shutdown_grace: self.shutdown_grace,
-            auth_timeout: self.auth_timeout,
-            authenticator: self.authenticator,
-            shutdown_tx: Arc::new(shutdown_tx),
-            certificate_fingerprint,
-        })
+        Ok(socket.into())
     }
 }
 

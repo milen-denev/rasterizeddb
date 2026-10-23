@@ -20,17 +20,28 @@ use rasterizeddb_core::core::database::Database;
 use rasterizeddb_core::native_auth::{PasswordAuthenticator, RoleAuthenticator};
 use rclite::Arc;
 
-/// A port nothing is listening on.
-fn free_port() -> u16 {
+/// A loopback listener on a port of the kernel's choosing, and that port.
+///
+/// The server is handed the listener itself, never the number to bind again:
+/// a port that is let go can be given to a test running in parallel before the
+/// server binds it, which fails one of them or connects a client to the wrong
+/// server.
+fn loopback() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("a bound address").port();
-    drop(listener);
-    port
+    (listener, port)
 }
 
 /// An in-memory database holding the roles a test needs.
 async fn database_with_roles(roles: &[&str]) -> Arc<Database> {
-    let location = std::env::temp_dir().join(format!("rdb_auth_test_{}", free_port()));
+    // Unique per process and per call. A released port number named it once,
+    // and two tests can be handed the same one.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let location = std::env::temp_dir().join(format!(
+        "rdb_auth_test_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let database = Arc::new(
         Database::new_with_backend(location.to_str().expect("a UTF-8 temp path"), true).await,
     );
@@ -52,14 +63,15 @@ async fn database_with_roles(roles: &[&str]) -> Arc<Database> {
     database
 }
 
-/// Serves on `port`, answering every request with the caller's name and
+/// Serves on `listener`, answering every request with the caller's name and
 /// whether it is a superuser — so a test can check not only that the caller got
 /// in but that it got in as the right person.
-async fn serve(port: u16, database: Arc<Database>, method: AuthMethod) {
+async fn serve(listener: std::net::TcpListener, database: Arc<Database>, method: AuthMethod) {
     let authenticator =
         StdArc::new(RoleAuthenticator::new(database, method)) as StdArc<dyn ServerAuthenticator>;
 
-    let server = TcpServerBuilder::new("127.0.0.1", port)
+    let server = TcpServerBuilder::from_listener(listener)
+        .expect("a bound listener")
         .authenticator(authenticator)
         .build()
         .await
@@ -98,9 +110,9 @@ async fn login(port: u16, credentials: Option<(&str, &str)>) -> Result<String, S
 
 #[tokio::test]
 async fn the_right_password_gets_in_as_the_right_user() {
-    let port = free_port();
+    let (listener, port) = loopback();
     serve(
-        port,
+        listener,
         database_with_roles(&[]).await,
         AuthMethod::ScramSha256,
     )
@@ -116,9 +128,9 @@ async fn the_right_password_gets_in_as_the_right_user() {
 /// The test that matters most: a wrong password has to be refused.
 #[tokio::test]
 async fn a_wrong_password_is_refused() {
-    let port = free_port();
+    let (listener, port) = loopback();
     serve(
-        port,
+        listener,
         database_with_roles(&[]).await,
         AuthMethod::ScramSha256,
     )
@@ -132,9 +144,9 @@ async fn a_wrong_password_is_refused() {
 
 #[tokio::test]
 async fn an_unknown_user_is_refused_and_looks_the_same_as_a_wrong_password() {
-    let port = free_port();
+    let (listener, port) = loopback();
     serve(
-        port,
+        listener,
         database_with_roles(&[]).await,
         AuthMethod::ScramSha256,
     )
@@ -156,9 +168,9 @@ async fn an_unknown_user_is_refused_and_looks_the_same_as_a_wrong_password() {
 
 #[tokio::test]
 async fn a_caller_that_presents_nothing_is_refused() {
-    let port = free_port();
+    let (listener, port) = loopback();
     serve(
-        port,
+        listener,
         database_with_roles(&[]).await,
         AuthMethod::ScramSha256,
     )
@@ -172,9 +184,9 @@ async fn a_caller_that_presents_nothing_is_refused() {
 
 #[tokio::test]
 async fn a_role_that_may_not_log_in_is_refused_even_with_the_right_password() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let database = database_with_roles(&["CREATE ROLE reader NOLOGIN PASSWORD 'letmein'"]).await;
-    serve(port, database, AuthMethod::ScramSha256).await;
+    serve(listener, database, AuthMethod::ScramSha256).await;
 
     assert!(
         login(port, Some(("reader", "letmein"))).await.is_err(),
@@ -184,9 +196,9 @@ async fn a_role_that_may_not_log_in_is_refused_even_with_the_right_password() {
 
 #[tokio::test]
 async fn an_ordinary_user_is_not_a_superuser() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let database = database_with_roles(&["CREATE USER bob PASSWORD 'bobpass'"]).await;
-    serve(port, database, AuthMethod::ScramSha256).await;
+    serve(listener, database, AuthMethod::ScramSha256).await;
 
     assert_eq!(
         login(port, Some(("bob", "bobpass"))).await.unwrap(),
@@ -197,9 +209,9 @@ async fn an_ordinary_user_is_not_a_superuser() {
 /// A role created without a password exists but can authenticate to nothing.
 #[tokio::test]
 async fn a_role_with_no_password_cannot_authenticate() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let database = database_with_roles(&["CREATE USER carol"]).await;
-    serve(port, database, AuthMethod::ScramSha256).await;
+    serve(listener, database, AuthMethod::ScramSha256).await;
 
     assert!(login(port, Some(("carol", ""))).await.is_err());
     assert!(login(port, Some(("carol", "anything"))).await.is_err());
@@ -209,8 +221,8 @@ async fn a_role_with_no_password_cannot_authenticate() {
 /// a client that has said it will accept being waved through.
 #[tokio::test]
 async fn trust_accepts_any_password_but_still_reports_the_user() {
-    let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::Trust).await;
+    let (listener, port) = loopback();
+    serve(listener, database_with_roles(&[]).await, AuthMethod::Trust).await;
 
     let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{}", port))
         .timeout(Duration::from_secs(5))
@@ -232,8 +244,8 @@ async fn trust_accepts_any_password_but_still_reports_the_user() {
 /// that says "you are in" without a challenge has proved nothing about itself.
 #[tokio::test]
 async fn a_client_with_a_password_refuses_a_server_that_never_challenges_it() {
-    let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::Trust).await;
+    let (listener, port) = loopback();
+    serve(listener, database_with_roles(&[]).await, AuthMethod::Trust).await;
 
     let err = login(port, Some(("alice", "hunter2")))
         .await
@@ -244,9 +256,9 @@ async fn a_client_with_a_password_refuses_a_server_that_never_challenges_it() {
 /// A reconnect must authenticate again rather than resuming as nobody.
 #[tokio::test]
 async fn a_reconnected_client_authenticates_again() {
-    let port = free_port();
+    let (listener, port) = loopback();
     serve(
-        port,
+        listener,
         database_with_roles(&[]).await,
         AuthMethod::ScramSha256,
     )

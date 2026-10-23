@@ -785,14 +785,15 @@ mod tests {
 
     #[tokio::test]
     async fn execute_query_retries_on_timed_out_transport() {
+        // Handed to the server bound: a port let go can be given to anyone.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let server = TcpServerBuilder::new("127.0.0.1", port)
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
             .request_timeout(Duration::from_secs(1))
             .build()
             .await
@@ -854,11 +855,12 @@ mod tests {
 
     #[tokio::test]
     async fn get_client_waits_for_released_connection_when_pool_is_saturated() {
+        // Handed to the server bound: a port let go can be given to anyone.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
-        let server = TcpServerBuilder::new("127.0.0.1", port)
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
             .max_connections(4)
             .build()
             .await

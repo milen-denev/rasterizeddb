@@ -20,7 +20,7 @@ use crate::core::rql::lexer_s1::recognize_query_purpose;
 
 use super::config::{Compression, CompressionMode, PeerConfig, ReplicationConfig, SyncMode};
 
-use super::test_support::free_port;
+use super::test_support::listener;
 
 /// Settings that make a test converge in a moment rather than in the seconds a
 /// production default would take.
@@ -34,8 +34,14 @@ fn brisk(config: &mut ReplicationConfig) {
     config.ack_timeout = Duration::from_secs(5);
 }
 
-/// Builds an in-memory node and starts its replication.
-async fn node(node_id: u64, port: u16, peers: Vec<PeerConfig>) -> Arc<Database> {
+/// Builds an in-memory node and starts its replication on `bound`, a
+/// listener from [`listener`] and its port.
+async fn node(
+    node_id: u64,
+    bound: (std::net::TcpListener, u16),
+    peers: Vec<PeerConfig>,
+) -> Arc<Database> {
+    let (socket, port) = bound;
     let database = super::test_support::in_memory_database().await;
 
     let mut config = ReplicationConfig {
@@ -50,6 +56,7 @@ async fn node(node_id: u64, port: u16, peers: Vec<PeerConfig>) -> Arc<Database> 
         .replication
         .set_config(config)
         .expect("the test configuration should be valid");
+    database.replication.serve_on(socket);
     Database::start_replication(database.clone()).expect("replication should start");
 
     database
@@ -121,17 +128,18 @@ where
 
 /// Two nodes, each configured with the other.
 async fn pair() -> (Arc<Database>, Arc<Database>) {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let one = node(
         1,
-        port_one,
+        bound_one,
         vec![PeerConfig::new("two", format!("127.0.0.1:{}", port_two))],
     )
     .await;
     let two = node(
         2,
-        port_two,
+        bound_two,
         vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))],
     )
     .await;
@@ -311,7 +319,8 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transactions_replicate_uncompressed_when_compression_is_off() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let plain = Compression {
         mode: CompressionMode::Off,
@@ -319,7 +328,8 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
         ..Default::default()
     };
 
-    let build = |node_id: u64, port: u16, peer_port: u16| async move {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
         let mut config = ReplicationConfig {
             node_id,
@@ -330,12 +340,13 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
         };
         brisk(&mut config);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         Database::start_replication(database.clone()).unwrap();
         database
     };
 
-    let one = build(1, port_one, port_two).await;
-    let two = build(2, port_two, port_one).await;
+    let one = build(1, bound_one, port_two).await;
+    let two = build(2, bound_two, port_one).await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
@@ -366,7 +377,8 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "replication_compression")]
 async fn a_batch_of_statements_is_compressed_on_the_wire() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let squeeze = Compression {
         mode: CompressionMode::Always,
@@ -377,7 +389,8 @@ async fn a_batch_of_statements_is_compressed_on_the_wire() {
         ..Default::default()
     };
 
-    let build = |node_id: u64, port: u16, peer_port: u16| async move {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
         let mut config = ReplicationConfig {
             node_id,
@@ -391,12 +404,13 @@ async fn a_batch_of_statements_is_compressed_on_the_wire() {
         // compressor has something repetitive to work with.
         config.batch_linger = Duration::from_millis(50);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         Database::start_replication(database.clone()).unwrap();
         database
     };
 
-    let one = build(1, port_one, port_two).await;
-    let two = build(2, port_two, port_one).await;
+    let one = build(1, bound_one, port_two).await;
+    let two = build(2, bound_two, port_one).await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     for id in 1..=200 {
@@ -483,11 +497,13 @@ async fn the_status_view_reports_a_connected_peer() {
 /// A cluster name is a misconfiguration guard, and it has to actually guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_in_different_clusters_do_not_replicate() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
-    let build = |node_id: u64, port: u16, peer_port: u16, cluster: &str| {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16, cluster: &str| {
         let cluster = cluster.to_string();
         async move {
+            let (socket, port) = bound;
             let database = super::test_support::in_memory_database().await;
             let mut config = ReplicationConfig {
                 node_id,
@@ -498,13 +514,14 @@ async fn nodes_in_different_clusters_do_not_replicate() {
             };
             brisk(&mut config);
             database.replication.set_config(config).unwrap();
+            database.replication.serve_on(socket);
             Database::start_replication(database.clone()).unwrap();
             database
         }
     };
 
-    let one = build(1, port_one, port_two, "east").await;
-    let two = build(2, port_two, port_one, "west").await;
+    let one = build(1, bound_one, port_two, "east").await;
+    let two = build(2, bound_two, port_one, "west").await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
@@ -520,9 +537,12 @@ async fn nodes_in_different_clusters_do_not_replicate() {
 /// The whole surface, driven the way an operator would drive it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cluster_can_be_built_entirely_from_sql() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
-    let bare = |node_id: u64, port: u16| async move {
+    // The sockets are handed over now and picked up by `REPLICATION ENABLE`.
+    let bare = |node_id: u64, bound: (std::net::TcpListener, u16)| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
         let mut config = ReplicationConfig {
             node_id,
@@ -531,11 +551,12 @@ async fn a_cluster_can_be_built_entirely_from_sql() {
         };
         brisk(&mut config);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         database
     };
 
-    let one = bare(1, port_one).await;
-    let two = bare(2, port_two).await;
+    let one = bare(1, bound_one).await;
+    let two = bare(2, bound_two).await;
 
     for (database, peer_port) in [(&one, port_two), (&two, port_one)] {
         run_ok(
@@ -594,9 +615,27 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
 
     // The claim on the listener has to have been given back, or the node can
     // never bind for the rest of the process's life.
+    //
+    // Retried on a socket of its own rather than on the port just freed, which
+    // a test running in parallel could be handed in between. That also makes
+    // the retry observable: a start that skipped the bind because the claim
+    // was still held reports success too, but leaves the socket untaken.
     drop(occupied);
+    let (socket, port) = listener();
+    database
+        .replication
+        .update_config(|config| {
+            config.listen_port = port;
+            Ok(())
+        })
+        .unwrap();
+    database.replication.serve_on(socket);
     Database::start_replication(database.clone())
-        .expect("with the port free, a second attempt should succeed");
+        .expect("with a free socket, a second attempt should succeed");
+    assert!(
+        database.replication.take_bound_listener().is_none(),
+        "the second attempt must have bound, not skipped the listener as already claimed"
+    );
 }
 
 /// `REPLICATION RESYNC` has to drain the backlog, not take the first answer.
@@ -604,11 +643,12 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
 /// and stops without saying so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_pulls_every_batch_and_not_just_the_first() {
-    let (port_source, port_puller) = (free_port(), free_port());
+    let (bound_source, (socket_puller, port_puller)) = (listener(), listener());
+    let port_source = bound_source.1;
 
     // The source has no peers, so it never pushes: everything the puller gets,
     // it got by pulling.
-    let source = node(1, port_source, Vec::new()).await;
+    let source = node(1, bound_source, Vec::new()).await;
 
     let puller = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -624,6 +664,7 @@ async fn a_resync_pulls_every_batch_and_not_just_the_first() {
     };
     brisk(&mut config);
     puller.replication.set_config(config).unwrap();
+    puller.replication.serve_on(socket_puller);
     Database::start_replication(puller.clone()).unwrap();
 
     run_ok(
@@ -680,12 +721,13 @@ async fn a_resync_pulls_every_batch_and_not_just_the_first() {
 /// node in the middle. Also the first test with three nodes at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
-    let (port_a, port_b, port_c) = (free_port(), free_port(), free_port());
+    let (bound_a, (socket_b, port_b), bound_c) = (listener(), listener(), listener());
+    let (port_a, port_c) = (bound_a.1, bound_c.1);
 
     // A ── B ── C, and A has never heard of C.
     let a = node(
         1,
-        port_a,
+        bound_a,
         vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
     )
     .await;
@@ -703,11 +745,12 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     };
     brisk(&mut config);
     b.replication.set_config(config).unwrap();
+    b.replication.serve_on(socket_b);
     Database::start_replication(b.clone()).unwrap();
 
     let c = node(
         3,
-        port_c,
+        bound_c,
         vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
     )
     .await;
@@ -755,7 +798,8 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
 /// A synchronous commit returns only once a peer has actually taken the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_commit_waits_for_the_peer() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let ((socket_one, port_one), bound_two) = (listener(), listener());
+    let port_two = bound_two.1;
 
     let one = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -767,11 +811,12 @@ async fn a_synchronous_commit_waits_for_the_peer() {
     };
     brisk(&mut config);
     one.replication.set_config(config).unwrap();
+    one.replication.serve_on(socket_one);
     Database::start_replication(one.clone()).unwrap();
 
     let two = node(
         2,
-        port_two,
+        bound_two,
         vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))],
     )
     .await;
@@ -808,7 +853,7 @@ async fn a_synchronous_commit_waits_for_the_peer() {
 /// local commit has happened, and the wait is bounded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
-    let port = free_port();
+    let (socket, port) = listener();
 
     let one = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -822,6 +867,7 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
     brisk(&mut config);
     config.ack_timeout = Duration::from_millis(300);
     one.replication.set_config(config).unwrap();
+    one.replication.serve_on(socket);
     Database::start_replication(one.clone()).unwrap();
 
     let started = std::time::Instant::now();
@@ -862,7 +908,8 @@ async fn committing_publishes_nothing_until_the_outcome_is_durable() {
     let database = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
         node_id: 1,
-        listen_port: free_port(),
+        // Never bound: this node's replication is not started.
+        listen_port: listener().1,
         ..Default::default()
     };
     brisk(&mut config);
@@ -906,7 +953,8 @@ async fn an_aborted_transaction_is_never_published() {
     let database = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
         node_id: 1,
-        listen_port: free_port(),
+        // Never bound: this node's replication is not started.
+        listen_port: listener().1,
         ..Default::default()
     };
     brisk(&mut config);

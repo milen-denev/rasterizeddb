@@ -17,7 +17,7 @@ use rasterizeddb_core::{
     BATCH_SIZE, MAX_PERMITS_THREADS,
     auth::AuthMethod,
     core::database::{Database, catalog::DatabaseCatalog},
-    pgwire::{AuthConfig, TlsConfig, TlsMode, start_pgwire_with_catalog},
+    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_on_listener},
 };
 use rclite::Arc;
 
@@ -41,11 +41,10 @@ pub struct Server {
 impl Server {
     pub fn start(dir: &str) -> Server {
         init_globals();
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-            probe.local_addr().unwrap().port()
-        };
-        let (db_tx, db_rx) = std::sync::mpsc::channel::<Arc<Database>>();
+        // The server keeps the socket it chose the port with: a probe bound,
+        // dropped and bound again leaves a window in which a parallel test
+        // takes the port and one client reaches the other test's server.
+        let (db_tx, db_rx) = std::sync::mpsc::channel::<(Arc<Database>, u16)>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let owned_dir = dir.to_string();
         let handle = std::thread::Builder::new()
@@ -60,7 +59,10 @@ impl Server {
                     .expect("server runtime");
                 rt.block_on(async move {
                     let db = Arc::new(Database::new_with_backend(&owned_dir, false).await);
-                    db_tx.send(db.clone()).expect("hand the database back");
+                    let listener =
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a free port");
+                    let port = listener.local_addr().expect("the bound port").port();
+                    db_tx.send((db.clone(), port)).expect("hand the database back");
                     let catalog = DatabaseCatalog::single(db);
                     let tls = TlsConfig { mode: TlsMode::Disable, cert_path: None, key_path: None };
                     let auth = AuthConfig {
@@ -69,14 +71,14 @@ impl Server {
                         bootstrap_password: None,
                     };
                     tokio::select! {
-                        _ = start_pgwire_with_catalog(catalog, "127.0.0.1", port, tls, auth) => {}
+                        _ = start_pgwire_on_listener(catalog, listener, tls, auth, ConnectionLimits::default()) => {}
                         _ = shutdown_rx => {}
                     }
                 });
                 rt.shutdown_timeout(Duration::from_secs(5));
             })
             .expect("spawn the server thread");
-        let db = db_rx.recv_timeout(Duration::from_secs(120)).expect("the database opened");
+        let (db, port) = db_rx.recv_timeout(Duration::from_secs(120)).expect("the database opened");
         let server = Server { port, db, dir: dir.to_string(), shutdown: Some(shutdown_tx), handle: Some(handle) };
         // Wait until it accepts.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);

@@ -1806,7 +1806,10 @@ impl Database {
             // Bound here rather than inside the task, so a port that is already
             // held is reported to whoever asked for the listener instead of
             // being logged into the void behind a success.
-            let server = match crate::replication::server::bind(&replication) {
+            // A socket handed over with `Replication::serve_on` if there is
+            // one, the configured port otherwise.
+            let listener = replication.take_bound_listener();
+            let server = match crate::replication::server::bind_on(&replication, listener) {
                 Ok(server) => server,
                 Err(e) => {
                     replication.release_listener();

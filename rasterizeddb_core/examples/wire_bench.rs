@@ -25,7 +25,7 @@ use rasterizeddb_core::{
         database::{DEFAULT_DATABASE_NAME, catalog::DatabaseCatalog},
         processor::concurrent_processor::ENABLE_CACHE,
     },
-    pgwire::{AuthConfig, TlsConfig, TlsMode, start_pgwire_with_catalog},
+    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_on_listener},
 };
 
 const ROWS: usize = 10_000;
@@ -39,10 +39,10 @@ fn main() {
     let _ = BATCH_SIZE.set(10_000);
     let _ = ENABLE_CACHE.set(false);
 
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    // Held, not let go and rebound: a released port can be handed to anyone.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
@@ -66,7 +66,9 @@ fn main() {
                     bootstrap_user: "rasterized".to_string(),
                     bootstrap_password: None,
                 };
-                let _ = start_pgwire_with_catalog(catalog, "127.0.0.1", port, tls, auth).await;
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let limits = ConnectionLimits::default();
+                let _ = start_pgwire_on_listener(catalog, listener, tls, auth, limits).await;
             });
         })
         .unwrap();

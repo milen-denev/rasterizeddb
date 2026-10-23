@@ -352,13 +352,15 @@ fn decode_bench(rows: usize, iters: usize) {
 fn wire_bench(dir: &str, rows: usize, iters: usize, only: Option<&str>) {
     use rasterizeddb_core::auth::AuthMethod;
     use rasterizeddb_core::core::database::{DEFAULT_DATABASE_NAME, catalog::DatabaseCatalog};
-    use rasterizeddb_core::pgwire::{AuthConfig, TlsConfig, TlsMode, start_pgwire_with_catalog};
+    use rasterizeddb_core::pgwire::{
+        AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_on_listener,
+    };
     use std::time::Duration;
 
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    // Held, not let go and rebound: a released port can be handed to anyone.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
     let dir = dir.to_string();
     let on_disk = dir != "mem";
     std::thread::Builder::new()
@@ -383,7 +385,9 @@ fn wire_bench(dir: &str, rows: usize, iters: usize, only: Option<&str>) {
                     bootstrap_user: "rasterized".to_string(),
                     bootstrap_password: None,
                 };
-                let _ = start_pgwire_with_catalog(catalog, "127.0.0.1", port, tls, auth).await;
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let limits = ConnectionLimits::default();
+                let _ = start_pgwire_on_listener(catalog, listener, tls, auth, limits).await;
             });
         })
         .unwrap();

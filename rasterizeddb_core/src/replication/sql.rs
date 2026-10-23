@@ -1244,16 +1244,18 @@ mod tests {
 
     async fn database() -> Arc<Database> {
         let database = crate::replication::test_support::in_memory_database().await;
+        // Its own socket, held from here on: these tests run in parallel and
+        // several of them reach `REPLICATION ENABLE`, which serves it.
+        let (socket, port) = crate::replication::test_support::listener();
         database
             .replication
             .set_config(ReplicationConfig {
                 node_id: 1,
-                // Its own port: these tests run in parallel and several of them
-                // reach `REPLICATION ENABLE`, which now actually binds.
-                listen_port: crate::replication::test_support::free_port(),
+                listen_port: port,
                 ..Default::default()
             })
             .unwrap();
+        database.replication.serve_on(socket);
         database.replication.open_storage(None).unwrap();
         database
     }

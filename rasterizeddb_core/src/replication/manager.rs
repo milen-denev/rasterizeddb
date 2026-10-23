@@ -276,6 +276,9 @@ pub struct Replication {
     /// process, so a `DISABLE` followed by an `ENABLE` restarts the peers
     /// without trying to bind it a second time.
     listener: AtomicBool,
+    /// A socket to serve instead of binding `listen_port`, taken by the next
+    /// start. See [`Replication::serve_on`].
+    bound_listener: parking_lot::Mutex<Option<std::net::TcpListener>>,
 }
 
 impl std::fmt::Debug for Replication {
@@ -313,6 +316,7 @@ impl Replication {
             warned: AtomicU8::new(0),
             capture_order: AtomicU64::new(0),
             listener: AtomicBool::new(false),
+            bound_listener: parking_lot::Mutex::new(None),
         }
     }
 
@@ -331,6 +335,29 @@ impl Replication {
     /// process, with `REPLICATION ENABLE` reporting success each time.
     pub fn release_listener(&self) {
         self.listener.store(false, Ordering::Release);
+    }
+
+    /// Has the next start serve `listener` rather than bind `listen_port`.
+    ///
+    /// For tests, which must know every node's port before any node starts —
+    /// each node is the others' peer — and so bind them all up front. Handing
+    /// over the port *number* instead means letting the socket go until the
+    /// node binds it again, and a test running in parallel can be given the
+    /// same freed port in between: one of them then fails to bind, or a peer
+    /// connects to the wrong test's node. Keeping the socket bound throughout
+    /// closes that window.
+    ///
+    /// The listener's port must be the configured `listen_port`, which is
+    /// what this node advertises to its peers. It reaches the listener however
+    /// the start is asked for — `start_replication` or `REPLICATION ENABLE`.
+    pub fn serve_on(&self, listener: std::net::TcpListener) {
+        *self.bound_listener.lock() = Some(listener);
+    }
+
+    /// The socket [`Replication::serve_on`] left, if any, for the start that
+    /// is about to bind.
+    pub fn take_bound_listener(&self) -> Option<std::net::TcpListener> {
+        self.bound_listener.lock().take()
     }
 
     /// Whether the listener is running.

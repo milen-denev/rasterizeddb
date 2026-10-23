@@ -17,11 +17,16 @@ use rustls::{ClientConfig, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-fn free_port() -> u16 {
+/// A loopback listener on a port of the kernel's choosing, and that port.
+///
+/// The server is handed the listener itself, never the number to bind again:
+/// a port that is let go can be given to a test running in parallel before the
+/// server binds it, which fails one of them or connects a client to the wrong
+/// server.
+fn loopback() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("a bound address").port();
-    drop(listener);
-    port
+    (listener, port)
 }
 
 /// An authenticator that lets everyone in, for tests about the transport
@@ -83,8 +88,9 @@ impl ServerCertVerifier for AcceptAnyCertificate {
 }
 
 /// Starts an echo server with the crate's defaults.
-async fn serve_default(port: u16) {
-    let server = TcpServerBuilder::new("127.0.0.1", port)
+async fn serve_default(listener: std::net::TcpListener) {
+    let server = TcpServerBuilder::from_listener(listener)
+        .expect("a bound listener")
         .build()
         .await
         .expect("the server should build");
@@ -122,8 +128,8 @@ async fn connect_with_tls12_only(port: u16, alpn: &[&[u8]]) -> Result<(), String
 
 #[tokio::test]
 async fn a_tls12_only_client_cannot_connect_to_a_default_server() {
-    let port = free_port();
-    serve_default(port).await;
+    let (listener, port) = loopback();
+    serve_default(listener).await;
 
     let err = connect_with_tls12_only(port, &[rastcp::ALPN_PROTOCOL])
         .await
@@ -139,8 +145,8 @@ async fn a_tls12_only_client_cannot_connect_to_a_default_server() {
 
 #[tokio::test]
 async fn a_default_client_and_server_still_talk_to_each_other() {
-    let port = free_port();
-    serve_default(port).await;
+    let (listener, port) = loopback();
+    serve_default(listener).await;
 
     let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{}", port))
         .timeout(Duration::from_secs(5))
@@ -156,8 +162,8 @@ async fn a_default_client_and_server_still_talk_to_each_other() {
 /// speak it is turned away rather than served bytes it might feed elsewhere.
 #[tokio::test]
 async fn a_client_offering_another_protocol_is_refused() {
-    let port = free_port();
-    serve_default(port).await;
+    let (listener, port) = loopback();
+    serve_default(listener).await;
 
     assert!(
         connect_with_tls12_only(port, &[b"h2"]).await.is_err(),
@@ -170,7 +176,7 @@ async fn a_client_offering_another_protocol_is_refused() {
 /// running unbound.
 #[tokio::test]
 async fn an_authenticated_server_refuses_to_allow_tls12() {
-    let err = match TcpServerBuilder::new("127.0.0.1", free_port())
+    let err = match TcpServerBuilder::new("127.0.0.1", 0)
         .authenticator(Arc::new(AcceptEveryone))
         .allow_tls12(true)
         .build()
@@ -254,8 +260,9 @@ async fn each_connection_has_its_own_channel_binding() {
         }
     }
 
-    let port = free_port();
-    let server = TcpServerBuilder::new("127.0.0.1", port)
+    let (listener, port) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .expect("a bound listener")
         .authenticator(Arc::new(RecordsBinding))
         .build()
         .await

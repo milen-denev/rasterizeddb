@@ -126,42 +126,22 @@ pub(crate) mod test_support {
         Arc::new(Database::new_with_backend("", true).await)
     }
 
-    /// A port nothing is listening on, that no other caller in this process
-    /// will be handed.
+    /// A loopback listener on a port of the kernel's choosing, and that port.
     ///
-    /// Asking the OS for port 0 and letting go looks right and is not enough
-    /// here: the kernel happily hands the same freed ephemeral port to two
-    /// callers moments apart, so a dozen tests each grabbing two or three ports
-    /// in parallel collide often. That used to be invisible — the losing
-    /// listener failed to bind inside a spawned task and the test simply never
-    /// saw a connected peer — and is now a hard failure, because a bind error
-    /// reaches the caller.
-    ///
-    /// So candidates come from a counter that never repeats within the process,
-    /// and each is probed before being handed out to catch anything outside it.
-    pub fn free_port() -> u16 {
-        use std::sync::atomic::{AtomicU16, Ordering};
-
-        // A per-process base, so two test binaries running at once are unlikely
-        // to walk the same range.
-        static NEXT: AtomicU16 = AtomicU16::new(0);
-        const FLOOR: u16 = 20_000;
-        const CEILING: u16 = 60_000;
-
-        let base = FLOOR + (std::process::id() as u16 % (CEILING - FLOOR));
-
-        for _ in 0..2_000 {
-            let offset = NEXT.fetch_add(1, Ordering::Relaxed);
-            let candidate = FLOOR + (base.wrapping_add(offset) % (CEILING - FLOOR));
-
-            // Probing still races against another process, but the counter has
-            // already ruled out the far more likely collision: this one.
-            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-                return candidate;
-            }
-        }
-
-        panic!("no free loopback port found after 2000 attempts");
+    /// Hand the listener itself to the node — `Replication::serve_on` — rather
+    /// than the number to bind again. A port that is let go is free for anyone:
+    /// the kernel happily hands the same ephemeral port to two callers moments
+    /// apart, so tests that each released two or three ports in parallel
+    /// collided, failing with "could not bind the replication listener …
+    /// Address already in use", or worse, with a peer reaching another test's
+    /// node. An earlier fix, a process-wide counter with a probe bind, only
+    /// narrowed the window; another process could still take the port between
+    /// the probe and the real bind. Holding the socket is the only way to have
+    /// no window at all.
+    pub fn listener() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        (listener, port)
     }
 }
 

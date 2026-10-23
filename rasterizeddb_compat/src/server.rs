@@ -9,7 +9,7 @@ use rasterizeddb_core::{
         database::{DEFAULT_DATABASE_NAME, Database, catalog::DatabaseCatalog},
         processor::concurrent_processor::ENABLE_CACHE,
     },
-    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_with_limits},
+    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_on_listener},
 };
 use rclite::Arc;
 
@@ -19,7 +19,7 @@ pub struct TestServer {
     tls: bool,
     /// Fires when the harness is dropped, ending the server's `block_on`.
     ///
-    /// Without it the server runs forever: `start_pgwire_with_limits` never
+    /// Without it the server runs forever: `start_pgwire_on_listener` never
     /// returns, so the thread, its runtime's four workers and the listening
     /// socket all outlive the test that made them.
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -143,13 +143,6 @@ impl TestServer {
     ) -> anyhow::Result<Self> {
         init_globals();
 
-        // Ask the OS for a free port, then hand the number to the server. The
-        // listener is dropped first so the server can bind it; a collision
-        // would only happen if something else grabbed the port in between.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let port = probe.local_addr()?.port();
-        drop(probe);
-
         // In-memory unless a root was given, so the catalogue holds only what
         // a test creates through it.
         let catalog = DatabaseCatalog::open(root, DEFAULT_DATABASE_NAME)
@@ -181,7 +174,21 @@ impl TestServer {
         // deployed. It is not cover for unbounded growth — that would overflow
         // at 32 MiB too, and the day it does is the day to shrink the
         // dispatcher rather than raise this number.
+        //
+        // The server binds port 0 itself, on its own runtime, and reports back
+        // the port it got, keeping the socket bound from then on. It used to
+        // be handed a port *number*: this side bound port 0, read the port,
+        // let go, and the server bound it again. Under a parallel run the
+        // kernel could hand the freed port to another test in that window, so
+        // two servers were started on one port and a client reached the other
+        // test's server. Every test file reuses table names, so the symptom
+        // was a hard, convincing engine error — "Table already exists",
+        // "Failed to add table" on a CREATE TABLE — in one test, and "pool
+        // timed out while waiting for an open connection" in its neighbour.
+        // The listener is bound inside the server's thread because a tokio
+        // listener belongs to the runtime that registered it.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<std::io::Result<u16>>();
         let handle = std::thread::Builder::new()
             .name("rasterizeddb-compat-server".to_string())
             .stack_size(32 * 1024 * 1024)
@@ -193,13 +200,26 @@ impl TestServer {
                     .build()
                     .expect("server runtime");
                 rt.block_on(async move {
+                    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .and_then(|listener| Ok((listener.local_addr()?.port(), listener)))
+                    {
+                        Ok((port, listener)) => {
+                            let _ = bound_tx.send(Ok(port));
+                            listener
+                        }
+                        Err(e) => {
+                            let _ = bound_tx.send(Err(e));
+                            return;
+                        }
+                    };
                     // No certificate path: a self-signed one is generated.
                     let tls = TlsConfig { mode: tls_mode, cert_path: None, key_path: None };
                     // The server never returns on its own, so the harness being
                     // dropped is what ends it. Dropping the accept loop's future
                     // is what closes the listener.
                     tokio::select! {
-                        _ = start_pgwire_with_limits(catalog, "127.0.0.1", port, tls, auth, limits) => {}
+                        _ = start_pgwire_on_listener(catalog, listener, tls, auth, limits) => {}
                         _ = shutdown_rx => {}
                     }
                 });
@@ -211,6 +231,11 @@ impl TestServer {
             })
             .expect("spawn server thread");
 
+        let port = match bound_rx.await {
+            Ok(Ok(port)) => port,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("the test server could not bind: {}", e)),
+            Err(_) => anyhow::bail!("the test server's thread ended before it bound a port"),
+        };
         let server = Self {
             port,
             tls: !matches!(tls_mode, TlsMode::Disable),
@@ -280,13 +305,36 @@ impl TestServer {
         Ok(sea_orm::Database::connect(self.url()).await?)
     }
 
+    /// Waits for the accept loop to answer, so a server that failed to start
+    /// — an unusable certificate, invalid limits — fails here, by name.
+    ///
+    /// A connection alone proves nothing now that the socket is bound before
+    /// the server runs: the kernel completes it into the backlog either way.
+    /// So this asks for TLS, the one request a server answers before any
+    /// authentication, and waits for the one-byte reply. A server that
+    /// stopped closes the socket instead.
     async fn wait_until_accepting(&self) -> anyhow::Result<()> {
-        for _ in 0..200 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // SSLRequest: length 8, then the code 1234 << 16 | 5679.
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await?;
+            stream.write_all(&SSL_REQUEST).await?;
+            let mut reply = [0u8; 1];
+            stream.read_exact(&mut reply).await?;
+            Ok::<u8, std::io::Error>(reply[0])
+        })
+        .await;
+        match answer {
+            Ok(Ok(b'S' | b'N')) => Ok(()),
+            Ok(Ok(other)) => anyhow::bail!(
+                "the server on port {} answered an SSLRequest with {:?}",
+                self.port,
+                other as char
+            ),
+            Ok(Err(e)) => anyhow::bail!("pgwire server on port {} did not start: {}", self.port, e),
+            Err(_) => anyhow::bail!("pgwire server on port {} did not answer within 10s", self.port),
         }
-        anyhow::bail!("pgwire server did not start listening on port {}", self.port)
     }
 }

@@ -347,6 +347,41 @@ pub async fn start_pgwire_with_limits(
     auth: AuthConfig,
     limits: ConnectionLimits,
 ) -> io::Result<()> {
+    let limits = prepare_pgwire(&catalog, &auth, limits).await?;
+    let listener = TcpListener::bind(format!("{}:{}", addr, port)).await?;
+    serve_pgwire(catalog, listener, tls, auth, limits).await
+}
+
+/// [`start_pgwire_with_limits`], serving a listener the caller already bound.
+///
+/// For a caller that must know the port before the server runs — a test
+/// harness above all, which binds `127.0.0.1:0`. Handing over a port *number*
+/// means letting go of the socket until the server binds it again, and in that
+/// window a test running in parallel can be given the same freed port: one
+/// test's client then reaches the other test's server and fails on whatever it
+/// finds there ("table already exists"), a convincing engine error with nothing
+/// wrong in the engine. Holding the socket throughout closes the window.
+///
+/// The listener is served as it is; connections that arrive before the accept
+/// loop starts wait in its backlog.
+pub async fn start_pgwire_on_listener(
+    catalog: Arc<DatabaseCatalog>,
+    listener: TcpListener,
+    tls: TlsConfig,
+    auth: AuthConfig,
+    limits: ConnectionLimits,
+) -> io::Result<()> {
+    let limits = prepare_pgwire(&catalog, &auth, limits).await?;
+    serve_pgwire(catalog, listener, tls, auth, limits).await
+}
+
+/// What has to hold before the first connection is accepted: valid limits,
+/// fitted to the descriptor budget, and every database's roles.
+async fn prepare_pgwire(
+    catalog: &Arc<DatabaseCatalog>,
+    auth: &AuthConfig,
+    limits: ConnectionLimits,
+) -> io::Result<ConnectionLimits> {
     limits.validate()?;
     // From here on `limits` is what is enforced and what `SHOW` reports.
     let limits = limits.fit_to_descriptor_limit();
@@ -355,13 +390,22 @@ pub async fn start_pgwire_with_limits(
     // authenticate: they are per database, so one seeded catalogue does not
     // make the others reachable.
     for database in catalog.all() {
-        if let Err(e) = seed_roles(&database, &auth).await {
+        if let Err(e) = seed_roles(&database, auth).await {
             return Err(io::Error::new(io::ErrorKind::Other, e));
         }
     }
+    Ok(limits)
+}
 
-    let bind_addr = format!("{}:{}", addr, port);
-    let listener = TcpListener::bind(&bind_addr).await?;
+/// The accept loop, shared by every way of starting the server.
+async fn serve_pgwire(
+    catalog: Arc<DatabaseCatalog>,
+    listener: TcpListener,
+    tls: TlsConfig,
+    auth: AuthConfig,
+    limits: ConnectionLimits,
+) -> io::Result<()> {
+    let bind_addr = listener.local_addr()?;
     log::info!(
         "pgwire server listening on {} ({} authentication, TLS {})",
         bind_addr,
