@@ -4102,9 +4102,33 @@ async fn delete_using_join(
         field.name.clone()
     };
 
+    // The source's columns the condition reads are carried out of the join,
+    // so each row's delete can recheck the condition against the target row
+    // as it is when deleted, with the source row it was joined to. The join
+    // ran under its own snapshot; a target row changed since may no longer
+    // match, and PostgreSQL rechecks it rather than deleting it.
+    let target_columns: Vec<String> = {
+        let entry = database.tables.get(table);
+        entry
+            .as_ref()
+            .map(|h| h.schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    let recheck = recheck_terms(condition, target_alias, &target_columns).filter(|t| !t.is_empty());
+    let recheck_text = recheck.as_ref().map(|terms| terms.join(" AND "));
+    let recheck_refs = recheck_text
+        .as_deref()
+        .map(|t| qualified_refs(t, &source_aliases(source_clause)))
+        .unwrap_or_default();
+    let mut projection = vec![format!("{}.{}", target_alias, key)];
+    projection.extend(recheck_refs.iter().cloned());
     let select = format!(
-        "SELECT {}.{} FROM {} {}, {} WHERE {}",
-        target_alias, key, table, target_alias, source_clause, condition
+        "SELECT {} FROM {} {}, {} WHERE {}",
+        projection.join(", "),
+        table,
+        target_alias,
+        source_clause,
+        condition
     );
     let rows = run_subquery(&select, database, tx).await?;
     if rows.is_empty() {
@@ -4136,26 +4160,42 @@ async fn delete_using_join(
         )
         .ok_or_else(|| "a joined key cannot be written back".to_string())?;
 
-        let statement = format!(
-            "DELETE FROM {} WHERE {} = {}{}",
-            table,
-            key,
-            literal,
-            match &returning_unqualified {
-                Some(r) => format!(" {}", r),
-                None => String::new(),
-            }
-        );
-        let purpose = recognize_query_purpose(&statement)
-            .ok_or_else(|| format!("could not parse the rewritten '{}'", statement))?;
-        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+        let returning_text = match &returning_unqualified {
+            Some(r) => format!(" {}", r),
+            None => String::new(),
+        };
+        let key_only = format!("DELETE FROM {} WHERE {} = {}{}", table, key, literal, returning_text);
+        let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
+        for (offset, reference) in recheck_refs.iter().enumerate() {
+            let carried = row
+                .columns
+                .get(1 + offset)
+                .ok_or_else(|| "the join returned fewer values than the delete needs".to_string())?;
+            let literal = crate::core::rql::subquery::value_to_literal(&carried.column_type, carried.data.into_slice())
+                .ok_or_else(|| "a joined value cannot be written back".to_string())?;
+            bindings.push((reference.clone(), literal));
+        }
+        let with_recheck = match &recheck_text {
+            Some(text) => format!(
+                "DELETE FROM {} WHERE {} = {} AND ({}){}",
+                table,
+                key,
+                literal,
+                strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
+                returning_text
+            ),
+            None => key_only.clone(),
+        };
+        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
         if response.first() == Some(&3u8) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
         if returning.is_some() && response.first() == Some(&2u8) {
             returned.extend_from_slice(&response[1..]);
         }
-        deleted += 1;
+        // What the delete removed, not one per key: a row another transaction
+        // deleted first, or one that no longer matches, counts nothing.
+        deleted += affected_by(&response).unwrap_or(0);
     }
 
     if returning.is_some() {
@@ -4300,6 +4340,19 @@ async fn update_from_join(
 
     let carried_at = projection.len();
     projection.extend(carried.iter().cloned());
+    // The source's columns the join condition reads, carried so each row's
+    // write can recheck the condition against the target row as it is when
+    // written, with the source row it was joined to, as PostgreSQL does.
+    let recheck_at = projection.len();
+    let target_columns: Vec<String> = target_schema.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    let recheck_text = recheck_terms(&join_condition, target_alias, &target_columns)
+        .filter(|t| !t.is_empty())
+        .map(|terms| terms.join(" AND "));
+    let recheck_refs = recheck_text
+        .as_deref()
+        .map(|t| qualified_refs(t, &source_aliases(source_clause)))
+        .unwrap_or_default();
+    projection.extend(recheck_refs.iter().cloned());
     let select = format!(
         "SELECT {} FROM {} {}, {} WHERE {}",
         projection.join(", "),
@@ -4443,20 +4496,35 @@ async fn update_from_join(
             sets.push(format!("{} = {}", column, literal));
         }
 
-        let statement = format!(
+        let returning_text = match &returning_unqualified {
+            Some(r) => format!(" {}", r),
+            None => String::new(),
+        };
+        let key_only = format!(
             "UPDATE {} SET {} WHERE {} = {}{}",
             table,
             sets.join(", "),
             key,
             key_literal,
-            match &returning_unqualified {
-                Some(r) => format!(" {}", r),
-                None => String::new(),
-            }
+            returning_text
         );
-        let purpose = recognize_query_purpose(&statement)
-            .ok_or_else(|| format!("could not parse the rewritten '{}'", statement))?;
-        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+        let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
+        for (offset, reference) in recheck_refs.iter().enumerate() {
+            bindings.push((reference.clone(), literal_at(recheck_at + offset)?));
+        }
+        let with_recheck = match &recheck_text {
+            Some(text) => format!(
+                "UPDATE {} SET {} WHERE {} = {} AND ({}){}",
+                table,
+                sets.join(", "),
+                key,
+                key_literal,
+                strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
+                returning_text
+            ),
+            None => key_only.clone(),
+        };
+        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
         if response.first() == Some(&3u8) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -4465,7 +4533,9 @@ async fn update_from_join(
         if returning.is_some() && response.first() == Some(&2u8) {
             returned.extend_from_slice(&response[1..]);
         }
-        written += 1;
+        // What the write changed, not one per key: a row deleted or changed
+        // out of the join's reach since counts nothing.
+        written += affected_by(&response).unwrap_or(0);
     }
 
     if returning.is_some() {
@@ -4477,6 +4547,172 @@ async fn update_from_join(
     let mut result = vec![0u8];
     result.extend_from_slice(&written.to_le_bytes());
     Ok(result)
+}
+
+/// The relation names a `USING` / `FROM` list makes visible: each comma-
+/// separated item's alias, or its table name when it has none.
+fn source_aliases(source_clause: &str) -> Vec<String> {
+    crate::core::rql::lexer_ct::split_definitions(source_clause)
+        .iter()
+        .filter_map(|item| item.split_whitespace().next_back())
+        .map(|name| name.trim_matches('"').to_string())
+        .collect()
+}
+
+/// The `alias.column` references in `text` qualified by one of `aliases`,
+/// each once, in order. Quoted text is skipped.
+fn qualified_refs(text: &str, aliases: &[String]) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii();
+    let mut found: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if is_word(bytes[i]) && (i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.')) {
+            let start = i;
+            while i < bytes.len() && (is_word(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+            let word = &text[start..i];
+            if let Some((qualifier, column)) = word.split_once('.') {
+                if !column.is_empty()
+                    && !column.contains('.')
+                    && aliases.iter().any(|a| a.eq_ignore_ascii_case(qualifier))
+                    && !found.iter().any(|f| f == word)
+                {
+                    found.push(word.to_string());
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The conjuncts of a join condition a per-row write must recheck against
+/// the target row as it is when written, or `None` when the condition cannot
+/// be split safely (a `BETWEEN`, whose `AND` is not a conjunction).
+///
+/// PostgreSQL rechecks the condition on the target row's newest version with
+/// the source row it was joined to. A conjunct that reads only source columns
+/// held when the join ran and still does, so only those reading the target
+/// (through its alias, or a bare name of one of its columns) are kept. Their
+/// source references are substituted with the joined values per row.
+fn recheck_terms(
+    condition: &str,
+    target_alias: &str,
+    target_columns: &[String],
+) -> Option<Vec<String>> {
+    let upper = condition.to_ascii_uppercase();
+    if upper.contains(" BETWEEN ") {
+        return None;
+    }
+    let target = [target_alias.to_string()];
+    Some(
+        crate::core::rql::join::split_conjuncts(condition)
+            .into_iter()
+            .filter(|term| {
+                !qualified_refs(term, &target).is_empty() || bare_words(term).iter().any(|w| {
+                    target_columns.iter().any(|c| c.eq_ignore_ascii_case(w))
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The unqualified identifiers in `text`, outside quotes, that are not a
+/// function name (followed by `(`) or part of a qualified reference.
+fn bare_words(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if is_word(bytes[i]) && !bytes[i].is_ascii_digit() && (i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.')) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            let qualified = bytes.get(i) == Some(&b'.');
+            let call = text[i..].trim_start().starts_with('(');
+            if !qualified && !call {
+                out.push(text[start..i].to_string());
+            }
+            if qualified {
+                // Skip the column after the dot.
+                i += 1;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Rows a per-row write reported, from its response: the count it carries,
+/// or `None` for a `RETURNING` response, which carries rows instead.
+fn affected_by(response: &[u8]) -> Option<u64> {
+    match response.first() {
+        Some(0) if response.len() >= 9 => Some(u64::from_le_bytes(response[1..9].try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Runs one generated per-row write. When it carries a recheck of the join
+/// condition and that cannot run per row (the condition names a column the
+/// rewritten statement cannot resolve), the key-only form is run instead,
+/// which is what this path did before it rechecked.
+async fn run_per_row_write(
+    with_recheck: String,
+    key_only: String,
+    database: &Arc<Database>,
+    depth: usize,
+    tx: TxId,
+) -> Result<Vec<u8>, String> {
+    let mut statement = with_recheck;
+    for attempt in 0..2 {
+        let response = match recognize_query_purpose(&statement) {
+            Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+            None => {
+                let mut refused = vec![3u8];
+                refused.extend_from_slice(format!("could not parse the rewritten '{}'", statement).as_bytes());
+                refused
+            }
+        };
+        if response.first() != Some(&3u8) || attempt == 1 || statement == key_only {
+            return Ok(response);
+        }
+        // A conflict is the statement's to retry whole, never the fallback's.
+        let text = String::from_utf8_lossy(&response[1..]);
+        let marker = crate::core::row::table::Table::<
+            crate::core::storage_providers::file_sync::LocalStorageProvider,
+        >::CONFLICT_RETRYABLE;
+        if text.contains("could not serialize") || text.contains(marker) {
+            return Ok(response);
+        }
+        debug!("per-row recheck could not run ({}); writing by key alone", text);
+        statement = key_only.clone();
+    }
+    unreachable!("the loop returns on its second pass")
 }
 
 /// Where one assigned value comes from once the join has run.
