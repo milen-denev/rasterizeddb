@@ -9910,10 +9910,26 @@ fn field_name_of(
         .map(|f| f.name.clone())
 }
 
+/// Whether `sql` has a `RETURNING` list, which must resolve against `schema`.
+///
+/// Asked before a write, so a list that cannot resolve fails the statement
+/// before it changes anything; the rows themselves are produced afterwards,
+/// from what the write collected.
+fn returning_planned(sql: &str, schema: &[crate::core::row::schema::SchemaField]) -> Result<bool, String> {
+    match crate::core::rql::lexer_ir::returning_items(sql, schema) {
+        None => Ok(false),
+        Some(Err(e)) => Err(e),
+        Some(Ok(_)) => match crate::core::rql::lexer_ir::returning_columns(sql, schema) {
+            Some(Ok(_)) => Ok(true),
+            _ => Err("RETURNING list could not be resolved".to_string()),
+        },
+    }
+}
+
 async fn returning_rows_for_write<S: crate::core::storage_providers::traits::StorageIO>(
     table: &crate::core::row::table::Table<S>,
     sql: &str,
-    where_clause: &str,
+    full_rows: Vec<crate::core::row::row::Row>,
     updates: Option<&smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]>>,
     // Assignments the write path evaluates per row. `RETURNING` reports values
     // *after* the change, so it has to evaluate them too — and against a row
@@ -10024,41 +10040,27 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
             }
         }
     }
-    let requested = crate::core::rql::join::fetch_for(&fetch_fields, schema);
-
-    let mut predicate_fields: Vec<crate::core::row::schema::SchemaField> = Vec::new();
-    for name in crate::core::rql::lexer_query::extract_where_columns(where_clause, schema) {
-        if let Some(f) = schema.iter().find(|f| f.name == name) {
-            predicate_fields.push(f.clone());
-        }
-    }
-    let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
-
-    // Read under the writer's own transaction, not a fresh snapshot.
+    // The rows the write changed, as they were before it, each projected to
+    // the columns this list reads, in `fetch_fields` order (the positions
+    // `null_flags` index).
     //
-    // This used to call `query_row`, which reads as `FROZEN_TX`: a snapshot in
-    // which every concurrent transaction is running and none is the caller's
-    // own. Two things went wrong with that. Inside a block it could not see
-    // rows this transaction had already written, so `UPDATE … RETURNING` after
-    // an earlier `UPDATE` in the same block reported the *pre-block* values for
-    // every column the second statement did not assign. And under concurrency
-    // the fresh snapshot is taken later than the statement's own, which widens
-    // the window in which a row being replaced is visible through neither its
-    // old version nor its new one — the write then applied while `RETURNING`
-    // came back empty, and a client that expects its row back saw the statement
-    // fail with the value already saved.
-    let mut rows = table
-        .query_row_in_txn(
-            where_clause,
-            &schema.to_vec(),
-            query_fetch,
-            requested,
-            None,
-            None,
-            tx,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // They come from the write itself, read under its lock and its snapshot.
+    // A read of its own here (this used to call `query_row_in_txn`) ran under
+    // another snapshot: a row inserted or deleted by a transaction committing
+    // in between was changed but not reported, or reported but not changed,
+    // and the client was told about rows the statement never touched.
+    let mut rows: Vec<crate::core::row::row::Row> = full_rows
+        .into_iter()
+        .map(|full| {
+            let mut row = crate::core::row::row::Row::default();
+            for field in &fetch_fields {
+                if let Some(column) = full.columns.iter().find(|c| u64::from(c.schema_id) == field.write_order) {
+                    row.columns.push(column.clone());
+                }
+            }
+            row
+        })
+        .collect();
 
     // Marked before anything reads the row: an expression has to see a NULL
     // where the row holds one, and a `DELETE … RETURNING` — which has no
@@ -11847,23 +11849,13 @@ pub(crate) async fn execute_with_need(
                 }
             }
 
-            // `RETURNING` on an `UPDATE` reports the rows *after* the change.
-            // They are read before the write and the assignments are overlaid
-            // on the copies, rather than re-reading afterwards — a second read
-            // would use the same `WHERE`, which the update itself may have
-            // stopped matching.
-            let returning = match returning_rows_for_write(
-                &table,
-                &query_sql(&query),
-                &update_plan.where_clause,
-                Some(&update_plan.updates),
-                &update_plan.expressions,
-                &database,
-                tx,
-            )
-            .await
-            {
-                Ok(r) => r,
+            // `RETURNING` on an `UPDATE` reports the rows *after* the change:
+            // the rows the write itself matched, as they were, with the
+            // assignments overlaid. Not read again afterwards, since the update
+            // may stop a row matching its own `WHERE`. The list is resolved
+            // first, so a bad one fails the statement before it writes.
+            let returning_wanted = match returning_planned(&query_sql(&query), &table.schema.fields) {
+                Ok(wanted) => wanted,
                 Err(e) => {
                     error!("Cannot resolve RETURNING: {}", e);
                     let mut result = vec![3u8];
@@ -11871,6 +11863,21 @@ pub(crate) async fn execute_with_need(
                     return result;
                 }
             };
+            // The write consumes the assignments; `RETURNING` overlays them after.
+            let returning_updates: Option<smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]>> =
+                returning_wanted.then(|| {
+                    update_plan
+                        .updates
+                        .iter()
+                        .map(|u| crate::core::row::row::ColumnWritePayload {
+                            data: u.data.clone(),
+                            write_order: u.write_order,
+                            column_type: u.column_type.clone(),
+                            size: u.size,
+                        })
+                        .collect()
+                });
+            let mut before: Vec<crate::core::row::row::Row> = Vec::new();
 
             match table
                 .update_rows_as_of(
@@ -11881,6 +11888,7 @@ pub(crate) async fn execute_with_need(
                     None,
                     tx,
                     statement_visibility,
+                    returning_wanted.then_some(&mut before),
                 )
                 .await
             {
@@ -11895,49 +11903,27 @@ pub(crate) async fn execute_with_need(
                         }
                     }
                     note_write(&database, tx, depth, &query_sql(&query), Some(&table_name));
-                    // A write that applied rows must not report none back.
-                    //
-                    // `RETURNING` is resolved from a read taken before the
-                    // write, so that the values it reports are the ones the
-                    // statement is about to store even where the assignment
-                    // stops the row matching its own `WHERE`. That read runs
-                    // against a table other statements are writing, and it can
-                    // come back empty for a row this statement then updates:
-                    // the version being replaced is already invisible to this
-                    // reader while its replacement is not yet in the scan's
-                    // extent. Reported as-is that is a success carrying no
-                    // rows, which a client that expects its row back reads as
-                    // "no rows returned" — with the value in fact saved.
-                    //
-                    // Re-read once the write has landed. This transaction sees
-                    // its own writes, so the row is now there for it. The
-                    // overlay is deliberately not applied a second time: the
-                    // row already holds the new values, and re-applying an
-                    // expression assignment would report `n + 1` twice.
-                    let returning = match returning {
-                        Some(rows) if n > 0 && rows.is_empty() => {
-                            match returning_rows_for_write(
-                                &table,
-                                &query_sql(&query),
-                                &update_plan.where_clause,
-                                None,
-                                &[],
-                                &database,
-                                tx,
-                            )
-                            .await
-                            {
-                                Ok(Some(again)) if !again.is_empty() => Some(again),
-                                _ => {
-                                    warn!(
-                                        "UPDATE applied {} rows on {} but RETURNING resolved none",
-                                        n, table_name
-                                    );
-                                    Some(rows)
-                                }
+                    let returning = match returning_updates {
+                        Some(updates) => match returning_rows_for_write(
+                            &table,
+                            &query_sql(&query),
+                            before,
+                            Some(&updates),
+                            &update_plan.expressions,
+                            &database,
+                            tx,
+                        )
+                        .await
+                        {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                error!("Cannot resolve RETURNING: {}", e);
+                                let mut result = vec![3u8];
+                                result.extend_from_slice(e.as_bytes());
+                                return result;
                             }
-                        }
-                        other => other,
+                        },
+                        None => None,
                     };
                     if let Some(rows) = returning {
                         let mut result = vec![2u8];
@@ -12183,20 +12169,12 @@ pub(crate) async fn execute_with_need(
                 }
             }
 
-            // `RETURNING` on a `DELETE` reports the rows as they were, so they
-            // are read before the delete removes them.
-            let returning = match returning_rows_for_write(
-                &table,
-                &query_sql(&query),
-                &delete_plan.where_clause,
-                None,
-                &[],
-                &database,
-                tx,
-            )
-            .await
-            {
-                Ok(r) => r,
+            // `RETURNING` on a `DELETE` reports the rows as they were: the
+            // ones the delete itself removed, read under its lock and snapshot.
+            // The list is resolved first, so a bad one fails the statement
+            // before it deletes anything.
+            let returning_wanted = match returning_planned(&query_sql(&query), &table.schema.fields) {
+                Ok(wanted) => wanted,
                 Err(e) => {
                     error!("Cannot resolve RETURNING: {}", e);
                     let mut result = vec![3u8];
@@ -12204,6 +12182,7 @@ pub(crate) async fn execute_with_need(
                     return result;
                 }
             };
+            let mut before: Vec<crate::core::row::row::Row> = Vec::new();
 
             match table
                 .delete_rows_as_of(
@@ -12212,12 +12191,26 @@ pub(crate) async fn execute_with_need(
                     None,
                     tx,
                     statement_visibility,
+                    returning_wanted.then_some(&mut before),
                 )
                 .await
             {
                 Ok(n) => {
                     info!("Deleted {} rows", n);
                     note_write(&database, tx, depth, &query_sql(&query), Some(&table_name));
+                    let returning = if returning_wanted {
+                        match returning_rows_for_write(&table, &query_sql(&query), before, None, &[], &database, tx).await {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                error!("Cannot resolve RETURNING: {}", e);
+                                let mut result = vec![3u8];
+                                result.extend_from_slice(e.as_bytes());
+                                return result;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(rows) = returning {
                         let mut result = vec![2u8];
                         for row in &rows {

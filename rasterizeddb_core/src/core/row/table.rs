@@ -3510,7 +3510,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         deleted_by: TxId,
     ) -> Result<u64> {
-        self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None)
+        self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None, None)
             .await
     }
 
@@ -3523,6 +3523,10 @@ impl<S: StorageIO> Table<S> {
     /// this scan must see the same rows. Taken separately, a parent row
     /// committed between the two was deleted without its children ever being
     /// considered. One snapshot for the statement is also what PostgreSQL does.
+    /// `collect`, when given, receives every deleted row as it was (all its
+    /// columns), read under the same lock and snapshot as the delete itself:
+    /// what `DELETE … RETURNING` reports. Read anywhere else, under another
+    /// snapshot, it could name rows this statement did not delete.
     pub async fn delete_rows_as_of(
         &self,
         where_clause: &str,
@@ -3530,6 +3534,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         deleted_by: TxId,
         visibility: Option<Visibility>,
+        mut collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
         info!("Deleting rows");
 
@@ -3627,12 +3632,34 @@ impl<S: StorageIO> Table<S> {
                 });
             }
 
+            // The row as it was, for `RETURNING`, read before the tombstone.
+            let before = match collect.as_ref() {
+                Some(_) => {
+                    let mut row = Row::default();
+                    let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
+                    if let Err(e) = pointer.fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row).await {
+                        // Given up, not left open, as on a conflict above.
+                        self.io_pointers.abort_txn(txn).await;
+                        return Err(std::io::Error::other(format!(
+                            "could not read a deleted row for RETURNING: {}",
+                            e
+                        ))
+                        .into());
+                    }
+                    Some(row)
+                }
+                None => None,
+            };
+
             if let Err(e) = pointer
                 .delete(self.io_pointers.clone(), record_pos, Some(txn), deleted_by)
                 .await
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
                 continue;
+            }
+            if let (Some(collect), Some(row)) = (collect.as_deref_mut(), before) {
+                collect.push(row);
             }
 
             // Exact removal: clearing the slot's fingerprint bits *improves*
@@ -3746,6 +3773,7 @@ impl<S: StorageIO> Table<S> {
             limit,
             written_by,
             None,
+            None,
         )
         .await
     }
@@ -3753,6 +3781,9 @@ impl<S: StorageIO> Table<S> {
     /// [`Self::update_rows_with_expressions`], matching rows through
     /// `visibility` rather than a snapshot taken here — see
     /// [`Self::delete_rows_as_of`] for why a statement needs that.
+    /// `collect`, when given, receives every updated row as it was before the
+    /// update (all its columns), read under the same lock and snapshot as the
+    /// write: what `UPDATE … RETURNING` overlays its assignments on.
     pub async fn update_rows_as_of(
         &self,
         where_clause: &str,
@@ -3762,6 +3793,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
         visibility: Option<Visibility>,
+        mut collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
         info!("Updating rows");
 
@@ -3780,10 +3812,15 @@ impl<S: StorageIO> Table<S> {
                     written_by,
                     visibility.clone(),
                     Some(stripe),
+                    collect.as_deref_mut(),
                 )
                 .await?
             {
                 return Ok(n);
+            }
+            // The point path wrote nothing; neither may it have reported any.
+            if let Some(collect) = collect.as_deref_mut() {
+                collect.clear();
             }
         }
         self.update_rows_locked(
@@ -3795,6 +3832,7 @@ impl<S: StorageIO> Table<S> {
             written_by,
             visibility,
             None,
+            collect,
         )
         .await
         .map(|n| n.unwrap_or_default())
@@ -3844,6 +3882,7 @@ impl<S: StorageIO> Table<S> {
         written_by: TxId,
         visibility: Option<Visibility>,
         point: Option<usize>,
+        mut collect: Option<&mut Vec<Row>>,
     ) -> Result<Option<u64>> {
         // A caller that brings its own snapshot is a statement with work left
         // to do after this write — foreign-key actions — and that work can
@@ -4220,6 +4259,9 @@ impl<S: StorageIO> Table<S> {
                     ));
                 }
                 updated_count = updated_count.saturating_add(1);
+                if let Some(collect) = collect.as_deref_mut() {
+                    collect.push(row.clone());
+                }
 
                 if crate::core::wal::should_break_transaction(&*self.io_pointers) {
                     self.io_pointers.commit_durable(txn).await?;
@@ -4280,6 +4322,9 @@ impl<S: StorageIO> Table<S> {
 
             if update_result.is_ok() {
                 updated_count = updated_count.saturating_add(1);
+                if let Some(collect) = collect.as_deref_mut() {
+                    collect.push(row.clone());
+                }
             }
 
             // An open transaction blocks checkpointing, so a statement running
