@@ -126,11 +126,9 @@ impl State {
             if newer {
                 self.durable.insert(ino, (p.event.seq, bytes));
             }
-        } else if p.event.tag == "dir"
-            && let Some(parent) = p.event.path.parent()
-        {
+        } else if let Some(dir) = super::dir_synced_by(p.event.tag, &p.event.path) {
             for op in self.ops.iter_mut() {
-                if op.seq < p.event.seq && op.dir == parent {
+                if op.seq < p.event.seq && op.dir == dir {
                     op.durable = true;
                 }
             }
@@ -158,7 +156,7 @@ impl State {
                 // Gone already: the sync will fail or flush nothing here.
                 _ => return,
             }
-        } else if e.tag == "dir" {
+        } else if super::dir_synced_by(e.tag, &e.path).is_some() {
             None
         } else {
             return;

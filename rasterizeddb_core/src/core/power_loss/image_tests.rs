@@ -252,6 +252,26 @@ fn announced_directory_operations_without_a_directory_sync_may_be_undone() {
     assert_eq!(img[&rel("t.db")], b"replacement");
 }
 
+/// `partition::files::sync_dir` notes the directory itself as
+/// `partition_dir`, where `wal::sync_parent_dir` notes a file in it as `dir`:
+/// either makes the directory's earlier operations durable.
+#[test]
+fn a_partition_directory_sync_makes_its_entries_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = Recorder::start(dir.path());
+    let name = "__pt_0000000000000001_00000000.db";
+    let new = dir.path().join(name);
+    sync_audit::dir_op(DirOp::Create(&new));
+    std::fs::write(&new, b"partition").unwrap();
+    sync_file(&new);
+    let cp = rec.cut_quiescent("undurable").unwrap();
+    assert!(!cp.image(P0).contains_key(&rel(name)), "a created entry was durable before its directory sync");
+
+    crate::core::partition::files::sync_dir(dir.path()).unwrap();
+    let cp = rec.cut_quiescent("durable").unwrap();
+    assert_eq!(cp.image(P0)[&rel(name)], b"partition", "the partition directory sync made nothing durable");
+}
+
 #[test]
 fn a_created_file_nothing_synced_or_announced_follows_the_directory() {
     // The documented gap: sites that sync without noting are invisible, so

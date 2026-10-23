@@ -88,6 +88,17 @@ pub(crate) fn temp_synced_for(tag: &str, path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The directory a directory sync flushed: `dir` notes a file in it
+/// (`wal::sync_parent_dir`), `partition_dir` the directory itself
+/// (`partition::files::sync_dir`). `None` for every other tag.
+pub(crate) fn dir_synced_by<'a>(tag: &str, path: &'a Path) -> Option<&'a Path> {
+    match tag {
+        "dir" => path.parent(),
+        "partition_dir" => Some(path),
+        _ => None,
+    }
+}
+
 /// Every tag `sync_audit::note` is called with, and whether it flushes
 /// file bytes (a directory sync or an unlink notice does not). A source test
 /// keeps this complete: a tag missing here would be a sync the model
@@ -116,4 +127,7 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `torn_tail::Floors::store`: a temporary file, a rename and a directory
     // sync.
     ("wal.floors", true),
+    // `partition::files::sync_dir`: a directory sync that notes the
+    // directory itself (see `dir_synced_by`).
+    ("partition_dir", false),
 ];
