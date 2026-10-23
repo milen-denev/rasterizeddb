@@ -3215,6 +3215,11 @@ pub(crate) async fn describe_query(
     if stmt.is_empty() {
         return Ok(None);
     }
+    // Described as it runs: an aggregate over DISTINCT values reads a derived
+    // table, which is described below like any other. The original text has
+    // no column the describer can name, so it described as no columns at all.
+    let distinct_rewritten = crate::core::rql::distinct_aggregate::rewrite(stmt).ok().flatten();
+    let stmt = distinct_rewritten.as_deref().unwrap_or(stmt);
 
     // A `WITH` prefix is stripped and the statement it introduces is described
     // instead — but the outer query usually reads a CTE *as its source
@@ -3805,6 +3810,20 @@ async fn describe_resolved(
                 return Ok(Some((fields, true)));
             }
 
+            // A column is announced under its alias. `SELECT x AS v FROM t` was
+            // described as `x`, so a driver reading `v` by name found nothing,
+            // and a derived table that renamed a column described as having
+            // no columns at all. Matched by the column, each item once, since
+            // the fetch need not be in select-list order and one column may be
+            // selected twice under two names.
+            let mut labels: Vec<Option<&str>> = parsed
+                .select_items
+                .iter()
+                .map(|item| match item {
+                    crate::core::rql::aggregate::SelectItem::Column { label, .. } => Some(label.as_str()),
+                    _ => None,
+                })
+                .collect();
             for c in parsed
                 .requested_row_fetch
                 .columns_fetching_data
@@ -3814,7 +3833,14 @@ async fn describe_resolved(
                 let Some(field) = field_of(&table_fields, c.schema_id) else {
                     continue;
                 };
-                let label: String = field.name.clone();
+                let aliased = (0..parsed.select_items.len())
+                    .find(|&i| {
+                        labels[i].is_some()
+                            && matches!(&parsed.select_items[i], crate::core::rql::aggregate::SelectItem::Column { field: f, .. }
+                                if f.write_order == field.write_order)
+                    })
+                    .and_then(|i| labels[i].take());
+                let label: String = aliased.unwrap_or(&field.name).to_string();
                 // A catalogue view has no `TableSchema` and no JSON columns, so
                 // the field's own type is what it reports.
                 let ty = match &real_table {
@@ -4789,6 +4815,20 @@ where
         .as_ref()
         .map(|m| m.rewritten.as_str())
         .unwrap_or(stmt);
+
+    // `COUNT(DISTINCT x)` and its kin become a plain aggregate over a derived
+    // table that has removed the duplicates, materialised just below.
+    let distinct_rewritten = match crate::core::rql::distinct_aggregate::rewrite(after_cte) {
+        Ok(rewritten) => rewritten,
+        Err(e) => {
+            if let Some(m) = &materialized {
+                crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
+            }
+            fail_statement(state, stream, "0A000", &e).await?;
+            return Ok(());
+        }
+    };
+    let after_cte = distinct_rewritten.as_deref().unwrap_or(after_cte);
 
     // A derived table — `FROM (SELECT …) alias` — becomes a temporary relation
     // the same way a CTE does, and for the same reason: the scan reads one
