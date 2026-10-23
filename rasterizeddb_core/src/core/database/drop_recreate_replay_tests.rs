@@ -2880,6 +2880,113 @@ mod partitioned {
         }
     }
 
+    /// A partitioned drop holds the snapshot gate from before its catalogue
+    /// tombstone through its deletions, as a plain drop does (see
+    /// `a_drop_waits_for_a_snapshot_start_in_progress`): its barrier and its
+    /// deletions land both before the point a snapshot's copy begins or both
+    /// after it. A restore empties a file at its barrier only when the barrier
+    /// committed after the copy began, so a barrier just before it, with the
+    /// file deleted once the copy had read it, would leave the dropped
+    /// partitions' bytes in the snapshot. While it waits, the table is whole
+    /// and still named.
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partitioned_drop_waits_for_a_snapshot_start_in_progress() {
+        let (sc, uid) = scenario(4).await;
+        let db = sc.db.clone();
+        let wal_path = sc.root.join(DEFAULT_WAL_NAME);
+        let barriers = crate::core::wal::barriers_in(&wal_path);
+        let files = files_of_uid(&sc.root, uid);
+        assert!(files.len() > 3, "no partition materialized, so the drop deletes too little: {files:?}");
+        let gate = super::hold_snapshot_start().await;
+        let dropping = tokio::spawn({
+            let db = db.clone();
+            async move { db.drop_table(TABLE).await }
+        });
+        super::parked_on(&wal_path).await;
+        assert_eq!(
+            crate::core::wal::barriers_in(&wal_path),
+            barriers,
+            "a partitioned drop logged its barrier while a snapshot was fixing its start"
+        );
+        assert_eq!(
+            files_of_uid(&sc.root, uid),
+            files,
+            "a partitioned drop deleted files while a snapshot was fixing its start"
+        );
+        assert!(
+            db.partitioned.contains_key(TABLE) && db.tables.contains_key(TABLE),
+            "a partitioned drop waiting for the snapshot had already taken the table out of the maps"
+        );
+        drop(gate);
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(60), dropping)
+            .await
+            .expect("the drop never finished once the snapshot let go")
+            .unwrap();
+        assert!(dropped.unwrap(), "the drop found no table");
+        assert!(crate::core::wal::barriers_in(&wal_path) > barriers, "the drop logged no barrier");
+        assert_eq!(files_of_uid(&sc.root, uid), Vec::<String>::new());
+        drop(db);
+        let Scenario {
+            base, root, db, watch, ..
+        } = sc;
+        drop(watch);
+        close(&root, db);
+        drop(base);
+    }
+
+    /// A partitioned CREATE that fails at its catalogue row discards the files
+    /// it wrote under the same gate: the barrier voiding them and their
+    /// deletion wait together for a snapshot fixing its start. On one thread,
+    /// so the injected failure reaches the CREATE.
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_partitioned_create_discards_its_files_under_the_snapshot_gate() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = open(&root).await;
+        let wal_path = root.join(DEFAULT_WAL_NAME);
+        let partition_files = |dir: &Path| -> Vec<String> {
+            let mut out: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with(PREFIX))
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(partition_files(&root), Vec::<String>::new());
+        let barriers = crate::core::wal::barriers_in(&wal_path);
+
+        let gate = super::hold_snapshot_start().await;
+        crate::core::database::test_hooks::FAIL_CATALOGUE_ROW.with(|f| f.set(true));
+        let creating = tokio::spawn({
+            let db = db.clone();
+            async move { db.create_partitioned_table(create_statement(TABLE), &["id"], PARTITIONS).await }
+        });
+        super::parked_on(&wal_path).await;
+        let reached = !crate::core::database::test_hooks::FAIL_CATALOGUE_ROW.with(|f| f.replace(false));
+        assert!(reached, "the CREATE never wrote its catalogue row");
+        let written = partition_files(&root);
+        assert!(!written.is_empty(), "the CREATE wrote no files, so it discards nothing");
+        assert_eq!(
+            crate::core::wal::barriers_in(&wal_path),
+            barriers,
+            "a failed CREATE logged its barrier while a snapshot was fixing its start"
+        );
+        drop(gate);
+        let created = tokio::time::timeout(std::time::Duration::from_secs(60), creating)
+            .await
+            .expect("the CREATE never finished once the snapshot let go")
+            .unwrap();
+        assert!(created.is_err(), "a CREATE whose catalogue row failed succeeded");
+        assert!(crate::core::wal::barriers_in(&wal_path) > barriers, "the discard logged no barrier");
+        assert_eq!(partition_files(&root), Vec::<String>::new(), "the failed CREATE kept {written:?}");
+        assert!(!db.partitioned.contains_key(TABLE));
+        close(&root, db);
+    }
+
     // -----------------------------------------------------------------------
     // S9: one transaction across partitions is whole in every crash image.
     // -----------------------------------------------------------------------

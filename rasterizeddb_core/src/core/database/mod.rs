@@ -35,6 +35,9 @@ pub(crate) mod test_hooks {
         /// Fails the next catalogue tombstone on this thread before it is
         /// written: the first step of a drop failing.
         pub static FAIL_TOMBSTONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next catalogue row write on this thread before it is
+        /// written: a CREATE failing at its commit point.
+        pub static FAIL_CATALOGUE_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Runs inside `Database::sync_durable` on this thread, after every
         /// non-root location's log is synced and before the root's: the window
         /// another session's commit can fall into.
@@ -3207,6 +3210,10 @@ impl Database {
     /// plain table and the uid of a partitioned one's files. Every row write
     /// goes through here, so the record cannot drift between its writers.
     pub(crate) async fn write_catalogue_row(&self, table_name: &str, clusters: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::FAIL_CATALOGUE_ROW.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected catalogue row failure"));
+        }
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         name_mb
             .into_slice_mut()

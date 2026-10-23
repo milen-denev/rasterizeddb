@@ -235,6 +235,90 @@ async fn a_drop_during_the_upload_is_left_out_of_the_objects() {
     a_drop_during_the_upload(1).await;
 }
 
+/// A partitioned table's files under `dir` (`__pt_<uid>_*`) that hold any
+/// byte.
+fn nonempty_files_of_uid(dir: &Path, uid: u64) -> Vec<String> {
+    let prefix = format!("{}{uid:016x}_", crate::core::partition::files::PREFIX);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            (name.starts_with(&prefix) && e.metadata().ok()?.len() > 0).then_some(name)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// [`a_drop_during_the_upload`] for a partitioned table: its partitions'
+/// and parent files, deleted between the listing and the copy, are left out
+/// as a plain table's are (their barrier is a drop's), and the restore holds
+/// the other table whole and no byte or name of the dropped one.
+async fn a_partitioned_drop_during_the_upload(incremental_min_bytes: u64) {
+    init_globals();
+    let base = tempfile::tempdir().unwrap();
+    let live = base.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let live_str = path_str(&live);
+    let db = Arc::new(Database::new(&live_str).await);
+    table_with_rows(&db, "kept", 12).await;
+    let create = "CREATE TABLE doomed (id INT NOT NULL, note STRING) PARTITION BY HASH (id) PARTITIONS 4";
+    ok(&db, create).await;
+    for i in 0..9 {
+        ok(&db, &format!("INSERT INTO doomed (id, note) VALUES ({i}, 'doomed_{i}')")).await;
+    }
+    let uid = db.partitioned.get("doomed").expect("partitioned").uid();
+    let files = nonempty_files_of_uid(&live, uid);
+    assert!(files.iter().any(|f| f.ends_with("_pointers.db")), "no partition holds a row: {files:?}");
+
+    let config = config("partitioned-drop", incremental_min_bytes);
+    let service = BackupService::connect(config.clone(), &live_str).await.expect("connect");
+    let (snapshot, release) = parked_snapshot(&service, &live_str).await;
+
+    // A drop waits only while a snapshot fixes its start, never for its copy.
+    tokio::time::timeout(Duration::from_secs(20), ok(&db, "DROP TABLE doomed"))
+        .await
+        .expect("a partitioned drop waited for a snapshot's upload");
+    assert_eq!(nonempty_files_of_uid(&live, uid), Vec::<String>::new(), "the drop left its files");
+    let _ = release.send(());
+    let report = finished(snapshot).await;
+
+    let target = base.path().join("restored");
+    let back = restored(&config, &report, &target).await;
+    assert_eq!(count(&back, "SELECT * FROM kept").await, 12, "the restore lost a kept row");
+    assert!(
+        !back.partitioned.contains_key("doomed") && !back.tables.contains_key("doomed"),
+        "the restore brought the dropped table back"
+    );
+    assert_eq!(
+        nonempty_files_of_uid(&target, uid),
+        Vec::<String>::new(),
+        "the restore holds bytes of the dropped table"
+    );
+    // Nothing of it in the way of the name either.
+    ok(&back, create).await;
+    assert!(back.partitioned.get("doomed").is_some_and(|t| t.uid() != uid));
+
+    drop(back);
+    drop(db);
+    crate::core::wal::remove_for(&path_str(&target));
+    crate::core::wal::remove_for(&live_str);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_drop_during_the_upload_is_left_out_of_the_archive() {
+    a_partitioned_drop_during_the_upload(0).await;
+}
+
+/// The same with every non-empty file stored as an object of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_drop_during_the_upload_is_left_out_of_the_objects() {
+    a_partitioned_drop_during_the_upload(1).await;
+}
+
 /// A `RENAME TABLE` in the same window waits for the upload, then succeeds,
 /// and the snapshot holds the table under its old name with every row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

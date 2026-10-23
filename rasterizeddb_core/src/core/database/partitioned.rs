@@ -422,7 +422,7 @@ impl Database {
             Ok(written) => written,
             Err(e) => {
                 error!("CREATE TABLE {} PARTITION BY failed before its catalogue row: {}", ct.table_name, e);
-                if let Err(discard) = self.discard_uid_files(&root, uid) {
+                if let Err(discard) = self.discard_uid_files_gated(&root, uid).await {
                     error!("... and its files under uid {uid:016x} were kept: {discard}");
                 }
                 return Err(e);
@@ -436,7 +436,7 @@ impl Database {
 
         if let Err(e) = self.write_catalogue_row(&ct.table_name, uid).await {
             error!("CREATE TABLE {} PARTITION BY could not write its catalogue row: {}", ct.table_name, e);
-            if let Err(discard) = self.discard_uid_files(&root, uid) {
+            if let Err(discard) = self.discard_uid_files_gated(&root, uid).await {
                 error!("... and its files under uid {uid:016x} were kept: {discard}");
             }
             return Err(e);
@@ -498,6 +498,13 @@ impl Database {
     /// holding a partition). A void that fails keeps the files: deleted with
     /// live records, a replay would write them back as orphans. Either way
     /// nothing names the uid, and the startup reaper finishes the job.
+    ///
+    /// The caller holds the deletion gate ([`Self::uid_deletion_permit`])
+    /// from before the barrier until the deletions are done, as a plain DROP
+    /// holds it from before its catalogue tombstone through its sweep: a
+    /// restore empties a file at its barrier only when the barrier committed
+    /// after the snapshot's copy began, so the barrier and the deletion must
+    /// be on the same side of that point.
     fn discard_uid_files(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
         let names = uid_file_names(root, uid).map_err(DiscardFailure::Delete)?;
         if names.is_empty() {
@@ -506,6 +513,22 @@ impl Database {
         let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
         self.forget_dropped_ids(&self.db_io_pointers, &ids).map_err(DiscardFailure::Void)?;
         files::remove_all(root, uid).map(|_| ()).map_err(DiscardFailure::Delete)
+    }
+
+    /// [`super::deletion_permit`] for a partitioned table's files, which are
+    /// all in the root, so the logs [`Self::discard_uid_files`] voids them in
+    /// are the root's. `None` when no log is there (in memory) or without
+    /// the `s3_backup` feature.
+    async fn uid_deletion_permit(&self) -> Option<impl Sized> {
+        let logs = logs_holding(&self.db_io_pointers, &self.storage, self.location.as_deref());
+        super::deletion_permit(&logs).await
+    }
+
+    /// [`Self::discard_uid_files`] under the deletion gate, for a caller that
+    /// does not already hold it: a CREATE cleaning up after itself.
+    async fn discard_uid_files_gated(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
+        let _snapshot_gate = self.uid_deletion_permit().await;
+        self.discard_uid_files(root, uid)
     }
 
     /// DROP of a partitioned table (§12's DROP order): the catalogue
@@ -525,6 +548,11 @@ impl Database {
     pub(super) async fn drop_partitioned(&self, name: &str) -> io::Result<bool> {
         let _ddl = self.partition_ddl.lock().await;
         let _claim = self.claim_name(name)?;
+        // Through the deletions below, as a plain DROP holds it (see
+        // `deletion_permit`), and taken as that one is, before the table
+        // leaves the maps and the catalogue: waiting with the table half gone
+        // would hide a table whose files are still on disk.
+        let _snapshot_gate = self.uid_deletion_permit().await;
         let Some(table) = self.partitioned.get(name).map(|t| t.value().clone()) else {
             return Ok(false);
         };
