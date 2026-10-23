@@ -44,6 +44,12 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let legacy_rows = legacy_join_rows();
     let mut scanned: Vec<crate::core::rql::join::RowSet> =
         Vec::with_capacity(plan.relations.len());
+    // Every relation is read under one snapshot, the statement's. A snapshot
+    // per scan let a transaction that committed between two of them show in
+    // one relation and not the other: a transfer between two tables joined
+    // to half of itself. All versioned tables share one transaction manager,
+    // so the first one's snapshot is valid for the rest.
+    let mut statement_snapshot: Option<crate::core::mvcc::Visibility> = None;
     for relation in &plan.relations {
         // Cloned out so the map guard does not span the scan below.
         let Some(table) = database
@@ -69,32 +75,37 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
         let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
 
+        let visibility = match table.visibility_for(tx) {
+            crate::core::mvcc::Visibility::All => crate::core::mvcc::Visibility::All,
+            own => statement_snapshot.get_or_insert(own).clone(),
+        };
+
         // No limit is pushed down: it applies to the joined output, and a cap
         // here would drop rows that the join still needs.
         let set = if legacy_rows {
             table
-                .query_row_in_txn(
+                .query_row_with_visibility(
                     &relation.predicate,
                     &schema.to_vec(),
                     query_fetch,
                     requested,
                     None,
                     None,
-                    tx,
+                    visibility,
                 )
                 .await
                 .map(crate::core::rql::join::RowSet::Rows)
                 .map_err(|e| e.to_string())
         } else {
             table
-                .query_row_bytes_in_txn(
+                .query_row_bytes_with_visibility(
                     &relation.predicate,
                     &schema.to_vec(),
                     query_fetch,
                     requested,
                     None,
                     None,
-                    tx,
+                    visibility,
                 )
                 .await
                 .map_err(|e| e.to_string())

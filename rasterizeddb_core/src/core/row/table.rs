@@ -3389,6 +3389,59 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<(Vec<u8>, bool)> {
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            reader,
+            None,
+        )
+        .await
+    }
+
+    /// [`Table::query_row_bytes_in_txn`] under a snapshot the caller took.
+    ///
+    /// For a statement reading several relations, which must read them all
+    /// as of one moment: a join that took a snapshot per relation could show
+    /// one table from before a transaction committed and another from after.
+    pub async fn query_row_bytes_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+    ) -> Result<Vec<u8>> {
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            FROZEN_TX,
+            Some(visibility),
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    async fn query_row_bytes_reporting(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        reader: TxId,
+        visibility: Option<Visibility>,
+    ) -> Result<(Vec<u8>, bool)> {
         info!("Querying row (bytes mode)");
 
         let _gate = self.compaction_gate.read().await;
@@ -3410,7 +3463,7 @@ impl<S: StorageIO> Table<S> {
         // in the set, or the entry has been retired and the scan runs for
         // real. Still read before the scan, so an entry this query stamps is
         // retired by a mutation that lands while it runs.
-        let visibility = self.visibility_for(reader);
+        let visibility = visibility.unwrap_or_else(|| self.visibility_for(reader));
         let generation = self.cache_generation();
 
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
