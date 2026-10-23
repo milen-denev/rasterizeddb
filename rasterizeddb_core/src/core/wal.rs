@@ -2530,7 +2530,11 @@ fn refuse_ambiguous_replay(dir: &str, wal: &Wal) -> io::Result<()> {
     Err(io::Error::other(format!(
         "WAL in {dir} holds records for file ids that more than one file claims: {}; \
          replay could not tell which file they belong to, so nothing was replayed \
-         and the log was left as it was",
+         and the log was left as it was. Normal use cannot produce this: ids are \
+         a 64-bit hash of the file name, unique within one directory. To recover, \
+         move the file no table of this database owns out of {dir} (for a table, \
+         its catalogue entry names it) and open again; the records then replay \
+         into the file that remains. Keep the moved file until the data checks out",
         which.join("; ")
     )))
 }

@@ -1001,7 +1001,9 @@ impl LocalStorageProvider {
                 write_file: Arc::new(RwLock::new(file_write)),
                 read_file,
                 location: location_str.to_string(),
-                table_name: "temp.db".to_string(),
+                // The name the log keys this file by: it must be the file this
+                // provider writes, or its records would carry `temp.db`'s id.
+                table_name: "CONFIG_TABLE.db".to_string(),
                 file_str: file_str.clone(),
                 temp_file_str,
                 temp_file: Arc::new(RwLock::new(temp_file)),
