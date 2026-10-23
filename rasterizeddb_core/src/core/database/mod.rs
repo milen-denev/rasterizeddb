@@ -2706,7 +2706,17 @@ impl Database {
         }
 
         table.enable_versioning(self.transactions.clone());
+        // The table's indexes were built when it opened, from a schema that
+        // did not have its composite keys yet: they are registered above. A
+        // composite PRIMARY KEY or UNIQUE had no index until the next open, so
+        // pg_indexes listed none and its uniqueness checks scanned. Reopened
+        // from the sidecars just written, it has them; the table is empty, so
+        // the reopen builds nothing.
+        let reopen = (!create_table.unique_keys.is_empty()).then(|| create_table.table_name.clone());
         self.tables.insert(create_table.table_name, Arc::new(table));
+        if let Some(name) = reopen {
+            self.reload_table(&name).await?;
+        }
 
         Ok(())
     }

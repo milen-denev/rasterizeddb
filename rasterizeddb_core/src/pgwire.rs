@@ -5116,7 +5116,14 @@ where
                 flattened.as_str()
             }
             Err(e) => {
-                fail_statement(state, stream, "42601", &e).await?;
+                // A subquery that ran and failed reports its own failure's code,
+                // as it would have alone: a refusal inside `IN (…)` is still
+                // 0A000. Only a subquery that could not be read is 42601.
+                let code = match e.strip_prefix("subquery failed: ") {
+                    Some(inner) => sqlstate_for(inner),
+                    None => "42601",
+                };
+                fail_statement(state, stream, code, &e).await?;
                 return Ok(());
             }
         }
@@ -5654,7 +5661,9 @@ fn sqlstate_for(message: &str) -> &'static str {
     } else if has("can only be updated to default") || has("cannot insert a non-default value") {
         // `generated_always`: a value written to a generated column.
         "428C9"
-    } else if has("not supported") || has("unsupported") {
+    } else if has("not supported") || has("unsupported") || has("not a supported") {
+        // The last is the row-lock parser's: "'FOR UPDATE NOWAIT SKIP
+        // LOCKED' is not a supported locking clause", which was XX000.
         "0A000"
     } else if has("syntax error") || has("unexpected") || has("expected ") {
         "42601"
@@ -9302,6 +9311,7 @@ mod sqlstate_tests {
             ("value 300 is out of range for type U8", "22003"),
             ("permission denied: CREATE ROLE requires superuser", "42501"),
             ("NOT LIKE is not supported yet", "0A000"),
+            ("'FOR UPDATE NOWAIT SKIP LOCKED' is not a supported locking clause", "0A000"),
             (
                 "unexpected Ident(\"x\") after the end of the expression",
                 "42601",

@@ -738,7 +738,17 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
         _ => None,
     };
 
-    let name = name.unwrap_or_else(|| UniqueKey::default_name(table, &columns));
+    // An unnamed PRIMARY KEY is `<table>_pkey` in PostgreSQL, whatever its
+    // columns; a composite one was named like a UNIQUE (`t_a_b_key`), so
+    // pg_indexes, a duplicate's error and `ON CONFLICT ON CONSTRAINT t_pkey`
+    // all named a constraint PostgreSQL would not have.
+    let name = name.unwrap_or_else(|| {
+        if rest_upper.starts_with("PRIMARY KEY") {
+            format!("{}_pkey", table)
+        } else {
+            UniqueKey::default_name(table, &columns)
+        }
+    });
     Ok(Some(UniqueKey {
         predicate,
         ..UniqueKey::new(name, columns)
@@ -1091,6 +1101,13 @@ mod tests {
             parsed(r#"UNIQUE ("orgId", "userId")"#).columns,
             vec!["orgId".to_string(), "userId".to_string()]
         );
+    }
+
+    #[test]
+    fn an_unnamed_primary_key_is_named_like_postgresql_names_it() {
+        assert_eq!(parsed("PRIMARY KEY (a, b)").name, "t_pkey");
+        assert_eq!(parsed("UNIQUE (a, b)").name, "t_a_b_key");
+        assert_eq!(parsed("CONSTRAINT mine PRIMARY KEY (a, b)").name, "mine");
     }
 
     /// What `pg_dump` writes around a column is dropped; an expression is
