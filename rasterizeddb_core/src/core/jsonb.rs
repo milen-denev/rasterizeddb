@@ -2084,8 +2084,10 @@ fn item_hasher() -> crate::core::hash::ItemFeed {
     // A fixed seed and a frozen hash (`core::hash`), fed fixed-width
     // little-endian fields: an item must hash the same in every process and
     // every build, since a query built here is matched against items built
-    // when the rows were indexed.
-    crate::core::hash::ItemFeed::new(ITEM_SEED)
+    // when the rows were indexed. The hash is rapidhash V3, which
+    // `gin::GIN_HASHER_ID` names; this is the only caller of its feed (see
+    // `core::hash::source_tests`).
+    crate::core::hash::ItemFeed::rapid(ITEM_SEED)
 }
 
 /// Feeds a scalar into `h` in a form two scalars [`scalar_eq`] calls equal
@@ -4247,12 +4249,17 @@ mod gin_item_tests {
 
     /// The exact byte feed behind each kind of item, rebuilt by hand and
     /// hashed in one piece: fixed-width little-endian fields, nothing
-    /// native-endian or pointer-sized, under `ITEM_SEED`.
+    /// native-endian or pointer-sized, under `ITEM_SEED`. The piece goes
+    /// through `item_hasher`'s own feed, whose digest is the hash of exactly
+    /// the bytes fed (`core::hash`'s tests); the vectors below pin the hash.
     #[test]
-    fn items_are_xxh64_of_their_documented_feed() {
-        use crate::core::hash::xxh64;
+    fn items_are_the_hash_of_their_documented_feed() {
         let le = |n: u64| n.to_le_bytes();
-        let item = |parts: &[&[u8]]| xxh64(&parts.concat(), ITEM_SEED);
+        let item = |parts: &[&[u8]]| {
+            let mut h = item_hasher();
+            h.bytes(&parts.concat());
+            h.finish()
+        };
         let sorted = |mut v: Vec<u64>| {
             v.sort_unstable();
             v
@@ -4294,10 +4301,60 @@ mod gin_item_tests {
     }
 
     /// `(opclass, document, its distinct items, ascending)`, frozen under
-    /// `gin::ITEM_DERIVE_VERSION` 1 with `KEY_ITEM_VECTORS`: never edited (see
-    /// `core::index::vectors` for the rules). A change that moves one item
-    /// fails here; new coverage goes in `ITEM_VECTORS_ADDED`.
+    /// `gin::ITEM_DERIVE_VERSION` 2 (rapidhash V3, `GIN_HASHER_ID` 2) with
+    /// `KEY_ITEM_VECTORS`: never edited (see `core::index::vectors` for the
+    /// rules). A change that moves one item fails here; new coverage goes in
+    /// `ITEM_VECTORS_ADDED`. The last two rows each have an item whose feed
+    /// outgrows the 64-byte stack buffer (a 67-byte key item; a 136-byte path
+    /// item, past rapidhash's 112-byte block), as does the last key.
     const ITEM_VECTORS: &[(GinOpclass, &str, &[u64])] = &[
+        (GinOpclass::Ops, r#"{}"#, &[]),
+        (GinOpclass::Ops, r#"[]"#, &[]),
+        (GinOpclass::Ops, r#"null"#, &[0x2dd3_352c_0a71_5b0e]),
+        (GinOpclass::Ops, r#""status""#, &[0x7137_20ce_605f_fd43, 0x7c69_084b_8789_bcc9]),
+        (GinOpclass::Ops, r#"1"#, &[0xce35_8223_45cd_9b42]),
+        (GinOpclass::Ops, r#"1.0"#, &[0xce35_8223_45cd_9b42]),
+        (GinOpclass::Ops, r#"-2.5e3"#, &[0x08d4_f2fe_caef_df90]),
+        (GinOpclass::Ops, r#"123456789012345678901234567890"#, &[0xc96d_ae0a_f1ef_af0d]),
+        (GinOpclass::Ops, r#"{"status":"shipped","n":1}"#, &[0x7137_20ce_605f_fd43, 0xbe19_fcd0_9a93_7ff6, 0xce35_8223_45cd_9b42, 0xf48c_f225_88d3_3740]),
+        (GinOpclass::Ops, r#"{"a":{"b":[1,"x",null,true,false]}}"#, &[0x00ac_d566_c50d_1513, 0x0500_e759_108b_f234, 0x06d1_9d90_bb17_ceb0, 0x2dd3_352c_0a71_5b0e, 0x7f3f_0a6a_28e4_32e4, 0x8785_cb6a_caf1_51b5, 0xce35_8223_45cd_9b42, 0xd1b4_61e6_c3ff_aa15]),
+        (GinOpclass::Ops, r#"["k",2,{"k":"v"}]"#, &[0x2b4f_a6fe_f8b4_d289, 0x7118_951d_c140_53c4, 0xbb6b_493d_f267_c83f, 0xcdef_9fb7_e58f_7faf]),
+        (GinOpclass::Ops, r#"{"tags":["red","blue"],"e":"é\n"}"#, &[0x0322_b7a1_7133_47d1, 0x1fbb_8a99_d5ca_4197, 0x424b_6091_c12f_1da5, 0x5dff_ca6a_a671_f299, 0x8702_5377_68d8_0d49, 0xab82_e274_55ff_920c, 0xb481_a8b0_0d95_544f]),
+        (GinOpclass::PathOps, r#"{}"#, &[]),
+        (GinOpclass::PathOps, r#"[]"#, &[]),
+        (GinOpclass::PathOps, r#"null"#, &[0xb677_7e2a_f4bf_245d]),
+        (GinOpclass::PathOps, r#""status""#, &[0x326a_9145_76e8_1945]),
+        (GinOpclass::PathOps, r#"1"#, &[0x0be4_65b6_f199_a813]),
+        (GinOpclass::PathOps, r#"1.0"#, &[0x0be4_65b6_f199_a813]),
+        (GinOpclass::PathOps, r#"-2.5e3"#, &[0x558a_70ee_6a83_711a]),
+        (GinOpclass::PathOps, r#"123456789012345678901234567890"#, &[0x208a_8556_0934_8d72]),
+        (GinOpclass::PathOps, r#"{"status":"shipped","n":1}"#, &[0x275b_448e_db5b_f47d, 0x3e3d_42ae_083d_3074]),
+        (GinOpclass::PathOps, r#"{"a":{"b":[1,"x",null,true,false]}}"#, &[0x4138_7e7b_a1b5_82db, 0x67ea_5ca3_f0e1_f8cb, 0x74b6_1016_a065_6985, 0x7f95_4ce4_7bf2_b7fd, 0xf873_4fec_4c8f_1a3d]),
+        (GinOpclass::PathOps, r#"["k",2,{"k":"v"}]"#, &[0x33cd_d055_6d81_fd79, 0x94c3_0dde_7867_8c32, 0xbcdd_b8e7_a59e_7ff4]),
+        (GinOpclass::PathOps, r#"{"tags":["red","blue"],"e":"é\n"}"#, &[0x1166_a271_07d0_39be, 0x8ac3_ff62_d8c0_f3e8, 0xe820_89e5_5927_fd9b]),
+        (GinOpclass::Ops, r#"{"a_key_long_enough_that_its_key_item_spills_the_feed_buffer":{"and_a_second_step":"with a string value"}}"#, &[0x6bc9_7aa9_85ee_66fe, 0xf63f_32f8_636b_db7b, 0xf6fb_fe64_55ee_be49]),
+        (GinOpclass::PathOps, r#"{"a_key_long_enough_that_its_key_item_spills_the_feed_buffer":{"and_a_second_step":"with a string value"}}"#, &[0x0030_e544_daf2_70f7]),
+    ];
+
+    /// `(key, gin_key_item(key))`, frozen with `ITEM_VECTORS`.
+    const KEY_ITEM_VECTORS: &[(&str, u64)] = &[
+        ("", 0x99cd_c8ff_afc7_0f36),
+        ("a", 0x0500_e759_108b_f234),
+        ("status", 0x7137_20ce_605f_fd43),
+        ("日本", 0x5751_38ce_2d7a_370f),
+        ("a key long enough to cross one 112-byte block of the hash and a few of its 16-byte tail steps after it, ending here.", 0x8ed0_3f2c_516b_542a),
+    ];
+
+    /// Item coverage added since the frozen set: checked, not pinned, so no
+    /// version moves. Folded into the next frozen set when the version is
+    /// raised.
+    const ITEM_VECTORS_ADDED: &[(GinOpclass, &str, &[u64])] = &[];
+    const KEY_ITEM_VECTORS_ADDED: &[(&str, u64)] = &[];
+
+    /// The item vectors frozen under `ITEM_DERIVE_VERSION` 1 (XXH64,
+    /// `GIN_HASHER_ID` 1), as written: no longer what this build computes,
+    /// kept unedited so version 1's history row still digests them.
+    const ITEM_VECTORS_V1: &[(GinOpclass, &str, &[u64])] = &[
         (GinOpclass::Ops, r#"{}"#, &[]),
         (GinOpclass::Ops, r#"[]"#, &[]),
         (GinOpclass::Ops, r#"null"#, &[0x744f_d8f0_cf2d_32de]),
@@ -4324,27 +4381,33 @@ mod gin_item_tests {
         (GinOpclass::PathOps, r#"{"tags":["red","blue"],"e":"é\n"}"#, &[0x58f7_8b48_b2a0_d17d, 0x84d0_8ea3_e01a_3901, 0xdc37_ee62_d124_71ff]),
     ];
 
-    /// `(key, gin_key_item(key))`, frozen with `ITEM_VECTORS`.
-    const KEY_ITEM_VECTORS: &[(&str, u64)] = &[
+    /// The key items frozen with `ITEM_VECTORS_V1`.
+    const KEY_ITEM_VECTORS_V1: &[(&str, u64)] = &[
         ("", 0x0f8d_e01b_9755_4cd4),
         ("a", 0xd15b_6338_9761_ccce),
         ("status", 0xe238_3808_e95b_d89c),
         ("日本", 0x5b4c_a201_3ad7_68d5),
     ];
 
-    /// Item coverage added since the frozen set: checked, not pinned, so no
-    /// version moves. Folded into the next frozen set when the version is
-    /// raised.
-    const ITEM_VECTORS_ADDED: &[(GinOpclass, &str, &[u64])] = &[];
-    const KEY_ITEM_VECTORS_ADDED: &[(&str, u64)] = &[];
-
     /// `ITEM_DERIVE_VERSION`'s frozen sets, oldest first.
-    const ITEM_HISTORY: &[crate::core::index::vectors::HistoryRow] = &[(1, item_v1_digest, 0x368b_a24f_6265_f8ec)];
+    const ITEM_HISTORY: &[crate::core::index::vectors::HistoryRow] =
+        &[(1, item_v1_digest, 0x368b_a24f_6265_f8ec), (2, item_v2_digest, 0xceb2_d879_0c26_0df8)];
 
     /// A digest of the item vectors frozen under version 1, as written.
     fn item_v1_digest() -> u64 {
+        item_digest(ITEM_VECTORS_V1, KEY_ITEM_VECTORS_V1)
+    }
+
+    /// A digest of the item vectors frozen under version 2, as written.
+    fn item_v2_digest() -> u64 {
+        item_digest(ITEM_VECTORS, KEY_ITEM_VECTORS)
+    }
+
+    /// The tables' inputs and expected outputs, not what this build computes
+    /// from them, under XXH64 (`ItemFeed::new`), which never moves.
+    fn item_digest(items: &[(GinOpclass, &str, &[u64])], keys: &[(&str, u64)]) -> u64 {
         let mut digest = crate::core::hash::ItemFeed::new(0);
-        for (opclass, doc, want) in ITEM_VECTORS {
+        for (opclass, doc, want) in items {
             digest.u8(match opclass {
                 GinOpclass::Ops => 1,
                 GinOpclass::PathOps => 2,
@@ -4356,7 +4419,7 @@ mod gin_item_tests {
                 digest.u64_le(*i);
             }
         }
-        for (key, want) in KEY_ITEM_VECTORS {
+        for (key, want) in keys {
             digest.u64_le(key.len() as u64);
             digest.bytes(key.as_bytes());
             digest.u64_le(*want);
@@ -4373,7 +4436,7 @@ mod gin_item_tests {
     #[test]
     fn items_are_their_vectors_under_item_derive_version() {
         use crate::core::index::gin::{GIN_HASHER_ID, ITEM_DERIVE_VERSION};
-        assert_eq!(GIN_HASHER_ID, 1, "the vectors below are XXH64's");
+        assert_eq!(GIN_HASHER_ID, 2, "the vectors below are rapidhash V3's");
         for (opclass, doc, want) in ITEM_VECTORS.iter().chain(ITEM_VECTORS_ADDED) {
             assert_eq!(item_vector(*opclass, doc), *want, "{doc} under {opclass:?}: items moved");
         }
@@ -4381,6 +4444,86 @@ mod gin_item_tests {
             assert_eq!(gin_key_item(key.as_bytes()), *want, "the key item for {key:?} moved");
         }
         crate::core::index::vectors::check_history("gin::ITEM_DERIVE_VERSION", ITEM_HISTORY, ITEM_DERIVE_VERSION);
+    }
+
+    /// Every item of `docs` generated documents, under both opclasses, and
+    /// how many distinct item feeds they make. Document `d` is an object of
+    /// `KEYS` keys `field_0` up, each value by `(d * KEYS + k) % 6`: a string,
+    /// an integer and a non-integral number, each unique to `(d, k)`; `true`
+    /// or `false` by `d`'s parity; `null`; or an object `{"field_0": s}`
+    /// whose string is unique too. So under `jsonb_path_ops` each `(d, k)` is
+    /// one item, distinct unless it is a bool or a null on a path already
+    /// seen; under `jsonb_ops` the keys are `KEYS` items in all and every
+    /// value but the bools and null is new. Counted here from that
+    /// construction, not from the hashes.
+    fn generated_items(docs: u64) -> (Vec<u64>, usize) {
+        const KEYS: u64 = 25;
+        let mut items = Vec::with_capacity((docs * KEYS * 2) as usize);
+        let mut shared = std::collections::HashSet::new();
+        let mut unique = 0;
+        let mut text = String::new();
+        for d in 0..docs {
+            text.clear();
+            text.push('{');
+            for k in 0..KEYS {
+                let n = d * KEYS + k;
+                if k > 0 {
+                    text.push(',');
+                }
+                let value = match n % 6 {
+                    0 => format!(r#""v{n}""#),
+                    1 => format!("{n}"),
+                    2 => format!("{n}.25"),
+                    3 => {
+                        shared.insert((Some(k), d % 2));
+                        shared.insert((None, d % 2));
+                        format!("{}", d % 2 == 0)
+                    }
+                    4 => {
+                        shared.insert((Some(k), 2));
+                        shared.insert((None, 2));
+                        "null".to_string()
+                    }
+                    _ => format!(r#"{{"field_0":"n{n}"}}"#),
+                };
+                unique += if n % 6 == 3 || n % 6 == 4 { 0 } else { 2 };
+                text.push_str(&format!(r#""field_{k}":{value}"#));
+            }
+            text.push('}');
+            let doc = encode_text(&text).unwrap();
+            for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+                gin_items(&doc, opclass, &mut items).unwrap();
+            }
+        }
+        // `shared` holds each (path, bool or null) seen under path ops and
+        // each bool or null under ops; the keys are counted once.
+        (items, unique + shared.len() + (docs.min(1) * KEYS) as usize)
+    }
+
+    fn assert_no_item_collides(docs: u64) -> usize {
+        let (mut items, distinct) = generated_items(docs);
+        items.sort_unstable();
+        items.dedup();
+        assert_eq!(items.len(), distinct, "{docs} documents: {} item feeds share a hash", distinct - items.len());
+        distinct
+    }
+
+    /// GIN's hash on realistic items: about 200k distinct item feeds from
+    /// generated documents, through the real item path, and no two share a
+    /// 64-bit hash. A collision only costs a recheck, so this is a check on
+    /// the hash's quality, not on correctness.
+    #[test]
+    fn generated_items_do_not_collide() {
+        assert!(assert_no_item_collides(6_000) > 195_000);
+    }
+
+    /// The same at more than 5M distinct item feeds; run on demand
+    /// (`cargo test --release -p rasterizeddb_core --lib
+    /// generated_items_do_not_collide_at_scale -- --ignored`).
+    #[test]
+    #[ignore = "5M items; run on demand"]
+    fn generated_items_do_not_collide_at_scale() {
+        assert!(assert_no_item_collides(160_000) > 5_000_000);
     }
 
     /// `v` written out again with each number spelled another way it can be

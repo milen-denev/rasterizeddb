@@ -13,7 +13,7 @@ mod downgrade_tests;
 pub mod database;
 pub mod db_type;
 pub mod filter;
-/// Frozen hashes for anything persisted (in-tree XXH64).
+/// Frozen hashes for anything persisted (in-tree XXH64; rapidhash for GIN items).
 pub mod hash;
 pub mod helpers;
 pub mod introspect;

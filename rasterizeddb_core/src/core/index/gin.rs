@@ -62,12 +62,20 @@ const SHARDS: usize = 64;
 /// set, raise this and append that set's row, leaving the old set and row as
 /// they are. Vectors that only add coverage go in the `*_ADDED` tables there,
 /// with no bump.
-pub const ITEM_DERIVE_VERSION: u32 = 1;
+///
+/// 1: items under XXH64 (`GIN_HASHER_ID` 1). 2: the same byte feed under
+/// rapidhash V3 (`GIN_HASHER_ID` 2).
+pub const ITEM_DERIVE_VERSION: u32 = 2;
 
-/// The hash under the items. 1: the in-tree XXH64 (`core::hash`), fed
-/// through `ItemFeed`, in memory and on disk alike, since a lookup probes
-/// every structure with one set of query items.
-pub const GIN_HASHER_ID: u32 = 1;
+/// The hash under the items, in memory and on disk alike, since a lookup
+/// probes every structure with one set of query items. 2: the in-tree
+/// rapidhash, frozen at upstream `rapidhash_v3` (`core::hash::rapidhash`),
+/// fed through `ItemFeed::rapid`. 1 was the in-tree XXH64, which everything
+/// else persisted or routed still uses: an item is about forty bytes hashed
+/// once per document and query, where XXH64's serial multiplies made builds
+/// 22-25% slower than ahash, and a GIN index rechecks every candidate, so a
+/// weaker hash costs only false positives. Raised with `ITEM_DERIVE_VERSION`.
+pub const GIN_HASHER_ID: u32 = 2;
 
 pub struct GinIndex {
     pub decl: IndexDecl,

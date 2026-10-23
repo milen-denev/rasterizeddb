@@ -1532,7 +1532,9 @@ format tests (owner's invariant 5). Hook C5 enforces it in phase 0:
   object and array, out of range, leading space and sign.
 - **Gin items** are versioned by `gin::ITEM_DERIVE_VERSION`: `gin_key_item`,
   `hash_scalar`'s number canonicalisation, the tags, `jsonb_path_ops` folding,
-  and the byte feed.
+  the byte feed, and the hash under it (`GIN_HASHER_ID`). Version 2 is version
+  1's feed under rapidhash instead of xxh64; version 1's vectors stay frozen
+  as written, as `ITEM_VECTORS_V1`.
 
 **The filter's derivations** fall under the same rule, since T4 trusts its
 section at every clean reopen and a silent change would prune matching rows
@@ -1591,18 +1593,51 @@ from `f > x`. Phase 0 adds, in `core/filter`:
   version: they pick only future zones' widths, so a change costs pruning, never
   rows.
 
-**Gin hashes with frozen xxh64 everywhere** (decision 9). Items come today
+**Gin hashes with one frozen hash everywhere** (decision 9). Items came
 from `ahash::RandomState::with_seeds(fixed)` (`jsonb.rs:2003`), not promised
-stable across versions, CPU features or pointer width. xxh64 moves to
-`core/hash/xxh64.rs`, and the in-memory `GinIndex` **and** the snapshot use
-it: a lookup probes with one set of query-item u64s, so two hashers would mean
-silent misses. `GIN_HASHER_ID = 1` is in the identity. Pre-images are not
-stored (`jsonb_path_ops` items hash whole paths). `gin_items` and
+stable across versions, CPU features or pointer width. The in-memory
+`GinIndex` **and** the snapshot use one in-tree hash: a lookup probes with one
+set of query-item u64s, so two hashers would mean silent misses.
+`GIN_HASHER_ID` is in the identity. Pre-images are not stored
+(`jsonb_path_ops` items hash whole paths). `gin_items` and
 `numbers_hash_alike_exactly_when_they_compare_equal` stay unchanged: they test
 relations.
 
+That hash was xxh64 (`GIN_HASHER_ID = 1`, `core/hash/xxh64.rs`) and is now
+**rapidhash V3** (`GIN_HASHER_ID = 2`, `ITEM_DERIVE_VERSION = 2`,
+`core/hash/rapidhash.rs`): upstream `rapidhash.h` frozen at release tag
+`rapidhash_v3`, commit `bc4b4baa48a15ff52ff4725e1ccdcda62815221c`, its
+`rapidhash_withSeed` with the default secrets and both compile-time switches
+at their defaults (`RAPIDHASH_FAST`, `RAPIDHASH_COMPACT`), ported to safe Rust
+with little-endian reads and pinned to vectors from the C reference. A later
+upstream version is a new `GIN_HASHER_ID`. The switch was made before
+anything persisted a gin item, so it rebuilt nothing. Why gin differs from
+everything else:
+
+- **Cost.** An item is about forty bytes, hashed once per document per build
+  and once per query. xxh64's serial chain of multiplies made 1M-document gin
+  builds 22-25% slower than they were on ahash. On a 40-byte item fed as
+  tag, key, length, class, value, length, one-shot xxh64 costs 14.2 ns
+  dependent and 6.0 ns independent; rapidhash 8.4 and 3.9 (rustc `-O`, this
+  repo's box).
+- **Quality only moves false positives.** A gin index is a superset index:
+  every candidate is rechecked against the document, so a collision costs a
+  recheck, never an answer. Tests still pin that 5.3M distinct items from
+  generated documents (200k always on) and the adversarial families (zero
+  runs of every length, single-bit flips, the same bytes under two seeds)
+  never collide.
+- **Routing, shape hashes and the vector-history digests stay on xxh64.**
+  Their outputs are already persisted or on the wire (a routed row
+  sits in the partition its hash chose), so changing them strands data;
+  `ItemFeed::new` is xxh64 and stays so. Only `ItemFeed::rapid`
+  (crate-private) is rapidhash, and `core/hash/source_tests.rs` fails if
+  anything but `jsonb.rs`'s `item_hasher` builds one, or if anything outside
+  `core/hash/` names `rapidhash`.
+
 **The feed is a dedicated type, not a `Hasher`** (N35, N44). `ItemFeed`
-streams into xxh64 state with no per-item allocation. It has only `u8`,
+gathers an item's bytes in a 64-byte stack buffer and hashes them with one
+call at `finish`, with no per-item allocation; past the buffer, xxh64 streams
+and rapidhash (one-shot) gathers the rest too. It has only `u8`,
 `u64_le`, `i64_le` and `bytes` methods, and it does not implement
 `std::hash::Hasher`, whose inherited `write_u16` through `write_i128`,
 `write_usize` and `write_isize` all feed native-endian bytes. `hash_scalar`
@@ -1610,8 +1645,9 @@ streams into xxh64 state with no per-item allocation. It has only `u8`,
 `&mut ItemFeed`. Today's `h.write_i64(parts.point)` and `h.write_usize(len)`
 calls (`jsonb.rs:2020-2058`) then stop compiling and are rewritten as `i64_le`
 and `u64_le`. A wrong call cannot compile, so nothing panics in production. A
-recording test pins the exact byte feed, and golden vectors pin xxh64 and a
-handful of `gin_key_item` and `hash_scalar` outputs.
+recording test pins the exact byte feed, and golden vectors pin the hash
+(xxh64's and rapidhash's against their C references) and a handful of
+`gin_key_item` and `hash_scalar` outputs.
 
 ## 9. RAM at the target, with partitioning phase 3
 
@@ -1876,7 +1912,7 @@ phase 3 alone.
 
 | Phase | Ships | Gate |
 |---|---|---|
-| **0** | Nothing new trusted. `incompat_features`; C5 (versions, vectors incl. navigation, coverage, `CHAR` property test, xxh64 move, gin xxh64 in memory through `ItemFeed`, `KEY_LOOKUPS`); C6; C7; C10 (`Proof` mutator signatures, `IndexView`, the `test_tokens` mint for benches and `rasterizeddb_filter_tests`); filter derivations (`FILTER_DERIVE_VERSION`, vectors, §8). **Today-bug (a) with (d)**: demotion refused inside `TableFilters`, generation-checked readiness, no runtime checkpoint while demoted, compaction success only on an `Ok` backfill (§6). **The checkpoint error bug**: error-returning I/O, `disk_dirty` cleared only after success. N26: fail-stop or the counter. Reload (§7) on the table-lock manager: four modes with the ProcSleep grant rule and a weak-mode fast path, `table_for`/`schema_view` with a private `tables` map, autocommit owners before the first lock with `owner_alias`, one wait in the wait-for graph with the owner-first victim rule, cancellable and bounded by `lock_timeout` (real, default `0`), abort on error in a block, Execute's shape repair on every Execute with `shape_epoch` and the generation bump after the swap, keys-first shadow DDL, sidecar writes inside the reload, `forget_pause` after the lock, ALTER rewrites as one reload keeping each version's visibility, retirement only after AE, and the retired `VacuumService` joined; one `LockOwner` per statement for every sub-execution, O begun in `TransactionManager` and ended on every exit path, no `FROZEN_TX` lock (Q1, Q5); the owner-first victim rule never picking an autocommit reader (Q6); `schema_view` with its lock-free stats accessor (Q3); the per-session shape-change mode (Q2); `shape_epoch` from a database-wide counter (Q7); the DDL's complete lock set in step 1 (Q8); metadata-only shadow ADD COLUMN (Q4); the driver gate (§7) in both modes before W3 merges. **Today-bug (e)** and the slot epoch on every deferred slot- or offset-addressed writer: vacuum batches, free-space publish and quarantine, `BuildToken` batches (§2, Q9, Q10). `wal.rs`: every `commit_through` error poisons, and any failure after the keep-tail rename or after `truncate_locked`'s `set_len(0)` poisons (§3 step 4). The power-loss harness (issue and completion in `sync_audit`) with the suites through clean restart and crash images against today's rebuild. (e) rebuild rate, cold, for a bigint PK, `(tenant_id, id)` and a hash index at 1.5M and 12M rows | baseline green incl. `mid_vacuum_full_phase2` and its backfill variant; V10's reload cases, extended protocol included, each under a 10 s harness bound; the driver gate; point-SELECT and bigint-PK INSERT p99 within noise of today on ext4; `keep_tail_after_rename_fails`, `lazy_open_fails_after_marker`, `vacuum_batch_after_compaction` with its no-batch and quarantine variants, `backfill_batch_after_compaction`; C10's doctest pair and source test; benches run with `--features test_tokens` |
+| **0** | Nothing new trusted. `incompat_features`; C5 (versions, vectors incl. navigation, coverage, `CHAR` property test, xxh64 move, gin items in memory through `ItemFeed`, under rapidhash V3 since `ITEM_DERIVE_VERSION` 2, `KEY_LOOKUPS`); C6; C7; C10 (`Proof` mutator signatures, `IndexView`, the `test_tokens` mint for benches and `rasterizeddb_filter_tests`); filter derivations (`FILTER_DERIVE_VERSION`, vectors, §8). **Today-bug (a) with (d)**: demotion refused inside `TableFilters`, generation-checked readiness, no runtime checkpoint while demoted, compaction success only on an `Ok` backfill (§6). **The checkpoint error bug**: error-returning I/O, `disk_dirty` cleared only after success. N26: fail-stop or the counter. Reload (§7) on the table-lock manager: four modes with the ProcSleep grant rule and a weak-mode fast path, `table_for`/`schema_view` with a private `tables` map, autocommit owners before the first lock with `owner_alias`, one wait in the wait-for graph with the owner-first victim rule, cancellable and bounded by `lock_timeout` (real, default `0`), abort on error in a block, Execute's shape repair on every Execute with `shape_epoch` and the generation bump after the swap, keys-first shadow DDL, sidecar writes inside the reload, `forget_pause` after the lock, ALTER rewrites as one reload keeping each version's visibility, retirement only after AE, and the retired `VacuumService` joined; one `LockOwner` per statement for every sub-execution, O begun in `TransactionManager` and ended on every exit path, no `FROZEN_TX` lock (Q1, Q5); the owner-first victim rule never picking an autocommit reader (Q6); `schema_view` with its lock-free stats accessor (Q3); the per-session shape-change mode (Q2); `shape_epoch` from a database-wide counter (Q7); the DDL's complete lock set in step 1 (Q8); metadata-only shadow ADD COLUMN (Q4); the driver gate (§7) in both modes before W3 merges. **Today-bug (e)** and the slot epoch on every deferred slot- or offset-addressed writer: vacuum batches, free-space publish and quarantine, `BuildToken` batches (§2, Q9, Q10). `wal.rs`: every `commit_through` error poisons, and any failure after the keep-tail rename or after `truncate_locked`'s `set_len(0)` poisons (§3 step 4). The power-loss harness (issue and completion in `sync_audit`) with the suites through clean restart and crash images against today's rebuild. (e) rebuild rate, cold, for a bigint PK, `(tenant_id, id)` and a hash index at 1.5M and 12M rows | baseline green incl. `mid_vacuum_full_phase2` and its backfill variant; V10's reload cases, extended protocol included, each under a 10 s harness bound; the driver gate; point-SELECT and bigint-PK INSERT p99 within noise of today on ext4; `keep_tail_after_rename_fails`, `lazy_open_fails_after_marker`, `vacuum_batch_after_compaction` with its no-batch and quarantine variants, `backfill_batch_after_compaction`; C10's doctest pair and source test; benches run with `--features test_tokens` |
 | **1** | **Gate and filter, every table**: `WriteGate` (packed word), `.ixm`, `Gated<…>`, `BuildToken`, `GatedIo`; FILTER-only snapshots through `serialize_sealed`; seal with writer preemption, `.tmp` landing, barrier, publish; shutdown plan, `rdb_index_checkpoint`, plain-table idle checkpoint; **if partitioning phase 3 is live, its idle close as a FILTER clean point** (otherwise partitions keep a close-time filter checkpoint until this ships); `_flt.db` deleted through the provider family at every open, as evidence beside `.ixm`; `index_store_v1` before the first `.ixm`; `cleared_below` persisted and ticket-free empty vacuum passes; session termination, then vacuum, replication and `flush_loop` stopped, before shutdown seals; `neutralize_aborted`'s one ticket per pass; size reporting and deprecated knobs (§10); excluded tables backfill at open; backfill rows and seconds logged; runtime checkpoint removed | every §11 failpoint for the filter; loom gate model; census test (V3); bug (c)'s scenario on the second location; no backfill after clean reopen, including after vacuum clears and a full vacuum tick, with the pruning-quality check (§11); an open performs zero `.ixm` writes; INSERT p99 on a bigint-PK table during the post-crash rebuild, measured and reported (RV18); one `DIRTY` fsync per writing session (`sync_audit`); writer p99 during an optional snapshot of a large plain table within noise of no snapshot, on tmpfs **and** on ext4 on a consumer disk, both reported (P12) |
 | **2** | **Index sections** (B-tree, hash, path) behind `index_storage = snapshot`: C3, C9, full identity, load at routed open, fallback, audit (Clean-only, in-place rebuild on mismatch), `rdb_index_check`. Tables with gin wait for phase 3 | suites through (a) and (b); clean reopen of 1.53M rows × 3 indexes under 0.3 s and under 10% of (e); RSS after load within noise of after rebuild; a version bump followed by two read-only reopens moves the build counter once; audit with concurrent INSERT/UPDATE (mutation: swap the side build); an injected dropped entry, audit, clean close and reopen moves the build counter |
 | **3** | **GIN sections** once 99's `gin.rs` work settles | `json_indexes.rs` through (a) and (b), dense gin included; `ITEM_DERIVE_VERSION` bump rebuilds once, then loads; forget, clean close, reopen: the superset check passes and `sizes()` equals the live sizes before the close (a rebuild re-adds forgotten versions, RV11); load, forget, compact: `live` never wraps (RV19) |
@@ -1917,7 +1953,7 @@ full workspace is built before shared suites, not `check --lib`.
 | 6 | VACUUM FULL: rebuild under the gate, or remap | rebuild under the gate after `DIRTY`, epoch, demotion; no remap | V9 |
 | 7 | ALTER carries declarations by name | unchanged; rewrite invalidates, new incarnation | V5; ALTER coverage test (B-tree, hash, composite, implicit unique, gin, path) through (a) and (b) |
 | 8 | Twin and randomized tests through restart and crash | §11, power loss not SIGKILL | V1 |
-| 9 | Gin xxh64 everywhere; hash persists `KeyBuf` | §8 | V11 |
+| 9 | Gin one frozen hash everywhere (rapidhash V3, `GIN_HASHER_ID` 2; xxh64 for everything else); hash persists `KeyBuf` | §8 | V11 |
 | 10 | Reload: DDL waits, 55P03, readers never failed | §7 | V10 |
 | 11 | T1-T4 | §2, §3-§4, §5 | V2, V3, V5, V6, V8 |
 
@@ -1991,7 +2027,7 @@ change, in the owner's style, reviewed hunk by hunk:
 
 | # | Change | Phase |
 |---|---|---|
-| C5 | `key::ENCODING_VERSION`, golden vectors, coverage test, bump rule for `key.rs` and `canonical_key`; `TEXT_RENDER_VERSION` (rendering and navigation) and `ITEM_DERIVE_VERSION` with document vectors; gin items through `ItemFeed` (fixed-width LE, no `Hasher` impl) into xxh64 in the in-memory `GinIndex`, `GIN_HASHER_ID` (touches `jsonb.rs`, its own commit); `KEY_LOOKUPS` | 0 |
+| C5 | `key::ENCODING_VERSION`, golden vectors, coverage test, bump rule for `key.rs` and `canonical_key`; `TEXT_RENDER_VERSION` (rendering and navigation) and `ITEM_DERIVE_VERSION` with document vectors; gin items through `ItemFeed` (fixed-width LE, no `Hasher` impl) into a frozen in-tree hash in the in-memory `GinIndex` (xxh64 at first; rapidhash V3 since `ITEM_DERIVE_VERSION` 2, through the crate-private `ItemFeed::rapid` and its source test), `GIN_HASHER_ID` (touches `jsonb.rs`, its own commit); `KEY_LOOKUPS` | 0 |
 | C6 | `TableIndexes::shape_hash()` (§4) | 0 |
 | C10 | Signatures: every `LiveIndex`, `GinIndex` and `TableIndexes` mutator, `load_sorted` included, takes `Proof<'_>` (a one-byte `Copy` struct of a private `ProofKind`, built only by `From<&WriteTicket>`/`From<&BuildToken>`, no `Default` or conversion from a kind; the tokens, minted only in `core::index_store::gate`, have no `Clone`/`Copy`/`Default`/`From`); test callers use `test_mint` (`cfg(test)` or the dev-only `test_tokens` feature); the three-part source test (`ColumnFilter` included); a read-only `IndexView` for `indexes()` and the catalog views (§2). Not a visibility change: `pub(in crate::core::row)` is E0742 | 0 |
 | C3 | `for_each_sorted` on `LiveIndex` and `GinIndex`: entries, `UNKEYED`, `PRESENT`; gin drops exactly `forgotten_slots`; no presence filtering | 2 (gin 3) |
