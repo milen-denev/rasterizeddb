@@ -14,6 +14,8 @@ pub mod xxh64;
 mod rapidhash;
 #[cfg(test)]
 mod source_tests;
+#[cfg(test)]
+mod test_buffers;
 
 pub use xxh64::{Xxh64, xxh64};
 

@@ -141,6 +141,7 @@ pub fn rapidhash(input: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::rapidhash;
+    use crate::core::hash::test_buffers::{PRIME64_1_STEP, generated};
     use std::collections::HashSet;
 
     const PRIME32: u64 = 2_654_435_761;
@@ -163,17 +164,12 @@ mod tests {
             .collect()
     }
 
-    /// xxhsum 0.8's sanity buffer (`XSUM_fillTestBuffer`: multiplying by
-    /// PRIME64), whose bytes do not run out.
+    /// xxhsum 0.8's generator (`XSUM_fillTestBuffer`), whose bytes do not
+    /// run out, but stepping by XXH64's PRIME64_1 where xxhsum steps by its
+    /// own `PRIME64` (6 more): so not xxhsum's buffer, though the vectors
+    /// below were generated over this one and stay on it.
     fn primes_buffer() -> Vec<u8> {
-        let mut byte_gen: u64 = PRIME32;
-        (0..SANITY.len())
-            .map(|_| {
-                let b = (byte_gen >> 56) as u8;
-                byte_gen = byte_gen.wrapping_mul(0x9E37_79B1_85EB_CA87);
-                b
-            })
-            .collect()
+        generated(SANITY.len(), PRIME64_1_STEP)
     }
 
     /// `(text, under seed 0, under GIN_SEED)`, from the C reference (below).
@@ -221,7 +217,7 @@ mod tests {
     ///     const uint64_t seeds[3] = {0, 2654435761u, 0x6a736f6e67696e00ull};
     ///     uint8_t squares[N], primes[N];
     ///     uint32_t g32 = 2654435761u;           /* xxh64.rs's buffer: xxhsum's old generator */
-    ///     uint64_t g64 = 2654435761u;           /* xxhsum 0.8's generator */
+    ///     uint64_t g64 = 2654435761u;           /* xxhsum 0.8's generator, stepping by PRIME64_1 */
     ///     for (int i = 0; i < N; i++) {
     ///         squares[i] = (uint8_t)(g32 >> 24); g32 *= g32;
     ///         primes[i] = (uint8_t)(g64 >> 56);  g64 *= 11400714785074694791ull;
