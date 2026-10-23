@@ -697,16 +697,15 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     let open = rest
         .find('(')
         .ok_or_else(|| "a table-level UNIQUE constraint must list its columns".to_string())?;
-    let close = rest[open..]
-        .find(')')
+    let close = list_close(&rest[open..])
         .map(|i| open + i)
         .ok_or_else(|| "UNIQUE column list is not closed".to_string())?;
 
-    let columns: Vec<String> = rest[open + 1..close]
-        .split(',')
-        .map(|c| c.trim().trim_matches('"').trim().to_string())
-        .filter(|c| !c.is_empty())
-        .collect();
+    let columns: Vec<String> = split_items(&rest[open + 1..close])
+        .into_iter()
+        .map(key_column)
+        .filter(|c| !matches!(c, Ok(c) if c.is_empty()))
+        .collect::<Result<_, _>>()?;
 
     if columns.is_empty() {
         return Err("UNIQUE names no columns".to_string());
@@ -744,6 +743,97 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
         predicate,
         ..UniqueKey::new(name, columns)
     }))
+}
+
+/// The offset of the `)` closing the `(` that `text` starts with, outside
+/// quotes. The first `)` is not it: `pg_dump` writes an expression index as
+/// `(lower(email))`.
+fn list_close(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// `text` split at its top-level commas, outside quotes and parentheses.
+fn split_items(text: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let mut quote: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    items.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    items.push(&text[start..]);
+    items
+}
+
+/// The column one item of a key's column list names.
+///
+/// `pg_dump` writes index items with what PostgreSQL's B-tree needs for
+/// ordering — `email DESC`, `email text_pattern_ops`, `NULLS LAST` — none of
+/// which changes which values are equal, so they are dropped. An expression
+/// (`lower(email)`) is refused: it used to reach the schema as a column named
+/// `lower(email`, and the statement failed as an unknown column, as though
+/// the index were mistyped rather than unsupported.
+fn key_column(item: &str) -> Result<String, String> {
+    let item = item.trim();
+    if item.is_empty() {
+        return Ok(String::new());
+    }
+    let (column, rest) = if let Some(quoted) = item.strip_prefix('"') {
+        let end = quoted
+            .find('"')
+            .ok_or_else(|| format!("unterminated identifier in UNIQUE column list: {}", item))?;
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        let end = item
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(item.len());
+        (&item[..end], &item[end..])
+    };
+    let modifiers_only = rest.is_empty()
+        || (rest.starts_with(char::is_whitespace)
+            && rest.split_whitespace().all(|word| {
+                let upper = word.to_ascii_uppercase();
+                matches!(upper.as_str(), "ASC" | "DESC" | "NULLS" | "FIRST" | "LAST")
+                    || upper.ends_with("_OPS")
+            }));
+    if column.is_empty() || !modifiers_only {
+        return Err(format!(
+            "a unique index on an expression is not supported: {}",
+            item
+        ));
+    }
+    Ok(column.to_string())
 }
 
 #[cfg(test)]
@@ -1001,6 +1091,22 @@ mod tests {
             parsed(r#"UNIQUE ("orgId", "userId")"#).columns,
             vec!["orgId".to_string(), "userId".to_string()]
         );
+    }
+
+    /// What `pg_dump` writes around a column is dropped; an expression is
+    /// refused as unsupported, not misreported as a missing column.
+    #[test]
+    fn index_item_modifiers_are_dropped_and_expressions_refused() {
+        assert_eq!(
+            parsed("UNIQUE (email DESC NULLS LAST, \"orgId\" text_pattern_ops)").columns,
+            vec!["email".to_string(), "orgId".to_string()]
+        );
+        for expression in ["UNIQUE (lower(email))", "UNIQUE ((a + b))", "UNIQUE (a, lower(b))", "UNIQUE (a COLLATE \"C\")"] {
+            let error = parse_clause(expression, "t").unwrap_err();
+            assert!(error.contains("not supported"), "{}: {}", expression, error);
+        }
+        // The predicate after an expression list is not mistaken for part of it.
+        assert!(parse_clause("UNIQUE (lower(email)) WHERE (deleted_at IS NULL)", "t").is_err());
     }
 
     /// Anything that is not a unique constraint falls through, so a caller can

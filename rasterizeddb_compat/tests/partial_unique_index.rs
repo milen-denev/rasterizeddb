@@ -733,3 +733,28 @@ async fn a_rewrite_does_not_revive_an_unenforced_key() {
         owned(&[(2, Some("a"))])
     );
 }
+
+/// What `pg_dump` writes for unique indexes. Ordering and operator-class words
+/// change nothing about which values are equal, so those indexes are enforced.
+/// An expression index is refused as unsupported (0A000); it used to fail as
+/// an unknown column (42703), as though the dump were mistyped.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_dump_index_items() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE acct (id INT, email TEXT, deleted_at TEXT)").await;
+
+    exec(&pool, "CREATE UNIQUE INDEX acct_email ON public.acct USING btree (email DESC NULLS LAST) WHERE (deleted_at IS NULL)").await;
+    exec(&pool, "INSERT INTO acct (id, email) VALUES (1, 'a@x')").await;
+    refused(&pool, "INSERT INTO acct (id, email) VALUES (2, 'a@x')").await;
+
+    for sql in [
+        "CREATE UNIQUE INDEX acct_lower ON public.acct USING btree (lower(email))",
+        "CREATE UNIQUE INDEX acct_lower_live ON public.acct USING btree (lower(email)) WHERE (deleted_at IS NULL)",
+    ] {
+        let error = sqlx::query(AssertSqlSafe(sql)).execute(&pool).await.expect_err(sql);
+        assert_eq!(sqlstate(&error).as_deref(), Some("0A000"), "{sql}: {error}");
+    }
+    // Nothing was half-created: a duplicate by a different case still goes in.
+    exec(&pool, "INSERT INTO acct (id, email) VALUES (3, 'A@x')").await;
+}
