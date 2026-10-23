@@ -68,38 +68,6 @@ async fn open(dir: &Path, name: &str) -> Result<Arc<Database>, String> {
     Database::try_new_named(&path_str(dir), false, name).await.map(Arc::new)
 }
 
-/// Today-bug, outside the indexes: an open resumes transaction ids above
-/// the highest *durable outcome*, not above the ids on disk. A writer whose
-/// outcome never became durable (a rolled-back block, or a statement in
-/// flight at a power cut) has its id handed out again, and the new owner
-/// sees, then commits, the old rows: a rolled-back insert comes back after a
-/// clean restart. Pinned by `a_rolled_back_insert_stays_rolled_back_across_a_clean_restart`.
-///
-/// This does what recovery should: every id a version on disk carries,
-/// at or above the next id, is begun and aborted before anything else runs,
-/// so those versions read as the debris they are. Returns how many ids it
-/// burned; zero once the engine resumes above the ids on disk, and then this
-/// can go.
-async fn burn_reused_ids(db: &Arc<Database>) -> u64 {
-    let Some(t) = db.tables.get(TABLE).map(|t| t.clone()) else {
-        return 0;
-    };
-    let Ok(mut it) = RowPointerIterator::new(t.io_pointers.clone()).await else {
-        return 0;
-    };
-    let mut max = 0;
-    while let Ok(Some((_, p))) = it.next_row_pointer_with_offset().await {
-        max = max.max(p.xmin).max(p.xmax);
-    }
-    let mut burned = 0;
-    while db.transactions.next_id() <= max {
-        let tx = db.transactions.begin();
-        db.abort_transaction(tx);
-        burned += 1;
-    }
-    burned
-}
-
 fn close(dir: &Path, db: Arc<Database>) {
     drop(db);
     crate::core::wal::remove_for(&path_str(dir));
@@ -675,8 +643,6 @@ struct Tally {
     images: usize,
     narrowed: usize,
     checked: usize,
-    /// Ids [`burn_reused_ids`] had to abort.
-    burned: u64,
 }
 
 const SYNC_SITES: &[&str] = &[
@@ -822,7 +788,6 @@ async fn run(kind: Kind, run_seed: u64) -> Tally {
         if restarts.contains(&step) {
             close(&dut_dir, dut);
             dut = open(&dut_dir, &name).await.unwrap_or_else(|e| panic!("clean restart refused: {e}"));
-            tally.burned += burn_reused_ids(&dut).await;
             tally.restarts += 1;
             let preds: Vec<String> = (0..24).map(|_| w.predicate()).collect();
             let now = expect(&twin, &w, &preds).await;
@@ -839,7 +804,6 @@ async fn run(kind: Kind, run_seed: u64) -> Tally {
     close(&dut_dir, dut);
     drop(rec);
     let dut = open(&dut_dir, &name).await.unwrap_or_else(|e| panic!("clean restart refused: {e}"));
-    tally.burned += burn_reused_ids(&dut).await;
     tally.restarts += 1;
     let preds: Vec<String> = (0..24).map(|_| w.predicate()).collect();
     let now = expect(&twin, &w, &preds).await;
@@ -856,7 +820,6 @@ async fn run(kind: Kind, run_seed: u64) -> Tally {
             );
             match open(&img_dir, &name).await {
                 Ok(db) => {
-                    tally.burned += burn_reused_ids(&db).await;
                     let mut states = vec![&point.before];
                     if let Some(after) = &point.after {
                         states.push(after);
@@ -934,10 +897,13 @@ async fn the_randomized_superset_survives_restarts_and_power_cuts() {
 }
 
 
-/// The today-bug [`burn_reused_ids`] stands in for. Ignored so the suite
-/// stays green; run with `--ignored` against a fix.
+/// A rolled-back block's `Aborted` is never flushed, so after a restart only
+/// the id reservation keeps its id from being handed out again. Reissued,
+/// the id's new owner saw the old row as its own and committed it: the
+/// rolled-back insert came back after a clean restart. Ids now resume above
+/// the durable reservation (`mvcc::status`), and the twin suites run with no
+/// workaround for it.
 #[tokio::test]
-#[ignore = "today-bug: ids of writers without a durable outcome are reused after an open"]
 async fn a_rolled_back_insert_stays_rolled_back_across_a_clean_restart() {
     let base = tempfile::tempdir().unwrap();
     let dir = base.path().join("db");
@@ -987,7 +953,6 @@ async fn acknowledged_rows_survive_a_power_cut_after_a_clean_restart() {
     assert_eq!(want.len(), 100);
     close(&dir, db);
     let db = open(&dir, "replayed").await.unwrap();
-    burn_reused_ids(&db).await;
     assert_eq!(rows(&db, &w.row_select()).await.unwrap(), want, "the clean restart itself lost rows");
     let cp = rec.cut_quiescent("after a clean restart").unwrap();
     close(&dir, db);
@@ -996,7 +961,6 @@ async fn acknowledged_rows_survive_a_power_cut_after_a_clean_restart() {
     for seed in 0..5 {
         cp.write_image(seed, &img);
         let db = open(&img, "replayed").await.unwrap();
-        burn_reused_ids(&db).await;
         let got = rows(&db, &w.row_select()).await.unwrap();
         close(&img, db);
         let _ = std::fs::remove_dir_all(&img);
