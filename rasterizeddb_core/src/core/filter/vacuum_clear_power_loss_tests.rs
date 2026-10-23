@@ -305,8 +305,8 @@ impl Fixture {
             id = end;
         }
         let t = db.tables.get(TABLE).unwrap().clone();
-        t.wait_filters_ready().await;
-        t.checkpoint_filters().await;
+        t.wait_filters_ready().await.unwrap();
+        t.checkpoint_filters().await.unwrap();
         drop(t);
         db.sync_durable().unwrap();
 
@@ -555,7 +555,7 @@ async fn scenario(later_label: &str) {
             report.fingerprints_cleared >= 1,
             "vacuum cleared nothing, so the scenario tests nothing: {report:?}"
         );
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
 
         // A later write, left uncommitted, touches the filter so the next
         // checkpoint has something to append.
@@ -565,7 +565,7 @@ async fn scenario(later_label: &str) {
             &format!("INSERT INTO {TABLE} (id, k, label) VALUES (99999, 999990, '{later_label}')"),
         )
         .await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
         drop(t);
         drop(db);
 

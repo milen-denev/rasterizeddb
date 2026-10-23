@@ -151,7 +151,7 @@ async fn a_failed_compaction_leaves_queries_answering_by_the_new_slots() {
     let t = db.tables.get("cf_a").unwrap().clone();
     let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
 
     assert_all_match(&db, "cf_a", "before the compaction").await;
@@ -171,15 +171,15 @@ async fn a_checkpoint_after_a_failed_compaction_does_not_persist_the_old_numberi
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_d", false).await;
     let t = db.tables.get("cf_d").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     // A checkpoint exists, so the table is in the state a long-running one is.
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     drop(t);
 
     fail_compaction(&db, "cf_d").await;
     run(&db, &format!("DELETE FROM cf_d WHERE id = {}", ROWS - 1)).await;
     let t = db.tables.get("cf_d").unwrap().clone();
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_d", "after the failure and a checkpoint").await;
 
@@ -189,7 +189,7 @@ async fn a_checkpoint_after_a_failed_compaction_does_not_persist_the_old_numberi
     assert_all_match(&db, "cf_d", "after reopening").await;
     // And once the open-time backfill has finished with the table.
     let t = db.tables.get("cf_d").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_d", "after reopening and the backfill").await;
 
@@ -329,8 +329,8 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_e", false).await;
     let t = db.tables.get("cf_e").unwrap().clone();
-    t.wait_filters_ready().await;
-    t.checkpoint_filters().await;
+    t.wait_filters_ready().await.unwrap();
+    t.checkpoint_filters().await.unwrap();
     // Marks the sidecar dirty, so the next checkpoint plans a base image.
     run(&db, &format!("DELETE FROM cf_e WHERE id = {}", ROWS - 1)).await;
 
@@ -354,14 +354,14 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
     fail_compaction(&db, "cf_e").await;
     done.store(true, Ordering::Release);
     releaser.await.unwrap();
-    checkpoint.await.unwrap();
+    checkpoint.await.unwrap().unwrap();
 
     drop(db);
     crate::core::wal::remove_for(&path_str(base.path()));
     let db = open(base.path()).await;
     assert_all_match(&db, "cf_e", "after reopening").await;
     let t = db.tables.get("cf_e").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_e", "after reopening and the backfill").await;
 
@@ -412,7 +412,7 @@ async fn a_vacuum_sweep_overlapping_a_compaction_leaves_the_index_whole() {
     let t = db.tables.get("cf_v").unwrap().clone();
     let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_v", "before the compaction").await;
 
@@ -434,7 +434,7 @@ async fn a_vacuum_sweep_overlapping_a_compaction_publishes_no_old_extents() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_p", false).await;
     let t = db.tables.get("cf_p").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
 
     vacuum_overlapping_compaction(&db, "cf_p", crate::core::vacuum::run_once_test_hooks::BEFORE_PUBLISH).await;
@@ -522,7 +522,7 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_q", false).await;
     let t = db.tables.get("cf_q").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     // Stands in for a query that started before the sweep and is still running.
     let d = t.data().unwrap();
@@ -601,7 +601,7 @@ async fn a_failed_compaction_retires_cached_row_pointers() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_c", false).await;
     let t = db.tables.get("cf_c").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     drop(t);
 
     for phase in [1, 2] {
@@ -680,9 +680,9 @@ async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_x", false).await;
     let t = db.tables.get("cf_x").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     // A checkpoint exists, so the renumbering writes the dirty mark.
-    t.checkpoint_filters().await;
+    t.checkpoint_filters().await.unwrap();
     let filters = t.filters().unwrap().clone().expect("the table has a filter");
 
     let marking = filters.dirty_marking.lock().await;
@@ -753,7 +753,7 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_b", false).await;
     let t = db.tables.get("cf_b").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     let filters = t.filters().unwrap().clone().expect("the table has a filter");
     let n_slots = t.io_pointers().unwrap().get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
@@ -820,7 +820,7 @@ async fn order_by_limit_after_a_failed_compaction_matches_a_full_sort() {
     }
     run(&db, &format!("DELETE FROM cf_m WHERE id >= {KEPT} AND id < {ZONE}")).await;
     let t = db.tables.get("cf_m").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     let v = t.schema.fields.iter().find(|f| f.name == "v").unwrap().write_order as u32;
     let all: Vec<u32> = t.schema.fields.iter().map(|f| f.write_order as u32).collect();

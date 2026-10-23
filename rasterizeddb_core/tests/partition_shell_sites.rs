@@ -310,7 +310,7 @@ const SITES: &[Site] = &[
     site("INSERT INTO site_parent (id) SELECT asset_id FROM site_p", Expect::Refused, "S10"),
     site("UPDATE site_p SET n = 1 WHERE tenant_id = 1", Expect::Refused, "S11"),
     site("DELETE FROM site_p WHERE tenant_id = 1", Expect::Refused, "S11"),
-    site("DELETE FROM site_p", Expect::LikeTwin, "no WHERE: 22P02 on any table here"),
+    site("DELETE FROM site_p", Expect::Refused, "S11 (upstream now runs a DELETE with no WHERE)"),
     site("DELETE FROM site_p WHERE n IS NULL OR n IS NOT NULL", Expect::Refused, "S11"),
     in_block("SELECT * FROM site_p WHERE tenant_id = 1", Expect::Refused, "S10"),
     Site {

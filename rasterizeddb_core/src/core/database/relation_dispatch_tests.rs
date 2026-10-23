@@ -173,7 +173,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("drop_partitioned", "the partitioned branch of drop_table_to_depth's dispatch"),
     ("open_partitioned", "startup: builds the partitioned table relation() resolves"),
     ("refuse_held_name", "an in-memory check of the names a held rename keeps; touches no table"),
-    ("refuse_leftover_files", "checks a new name's `<name>*` files; add_table and rename dispatch before it"),
     ("hold_intent", "records a rename's two names in memory; rename dispatches before it"),
     ("relation", "the dispatch itself"),
     ("refuse_partitioned", "the dispatch itself"),

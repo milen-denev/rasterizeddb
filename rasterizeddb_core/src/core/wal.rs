@@ -4123,7 +4123,7 @@ mod tests {
     async fn a_failed_compaction_commit_leaves_no_transaction_open() {
         let dir = temp_dir();
         let (t, wal) = logged_table(dir.path(), 40).await;
-        t.wait_filters_ready().await;
+        t.wait_filters_ready().await.unwrap();
         t.delete_rows(
             "id < 20",
             {

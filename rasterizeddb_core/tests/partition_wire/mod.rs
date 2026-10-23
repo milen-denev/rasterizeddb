@@ -490,6 +490,7 @@ pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
                 &pt.shell().schema.fields,
                 &[],
                 &[],
+                0,
             )
             .unwrap_or_else(|| panic!("cannot build a row from {query}"));
             pt.insert_row_in_txn(row, FROZEN_TX).await.unwrap_or_else(|e| panic!("{query}: {e}"));

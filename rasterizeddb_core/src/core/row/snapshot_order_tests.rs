@@ -204,7 +204,7 @@ async fn open(
     for id in 1..=3u64 {
         t.insert_row(row(id, 1)).await.unwrap();
     }
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     if unique {
         let ix = t.data().unwrap().indexes.as_ref().expect("a UNIQUE column is indexed");
         let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {

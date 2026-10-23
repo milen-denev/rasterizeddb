@@ -70,7 +70,7 @@ async fn vacuum_clears_exactly_the_reclaimed_slots_across_gaps() {
         id = end;
     }
     let t = db.tables.get("vr").unwrap().clone();
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
     let list: Vec<String> = DELETED.iter().map(i32::to_string).collect();
     run(&db, &format!("DELETE FROM vr WHERE id IN ({})", list.join(", "))).await;
 

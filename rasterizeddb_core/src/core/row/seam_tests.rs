@@ -27,6 +27,11 @@ const SCHEMA_ONLY: &[&str] = &[
     "scope_cache_to_database",
     "enable_versioning",
     "visibility_for",
+    // The statement snapshot over `visibility_for`, and the cache counters:
+    // all on `Table`, none on its data.
+    "read_visibility_for",
+    "cache_generation",
+    "write_generation",
     "visibility_now_for",
     "version_horizon",
     "forget_horizon",
