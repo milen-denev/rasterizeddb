@@ -2212,6 +2212,10 @@ impl Wal {
         {
             let mut source = File::open(&self.path)?;
             source.seek(SeekFrom::Start(from))?;
+            // Announced for crash images, which may undo directory operations
+            // no completed directory sync covers (design §11).
+            #[cfg(test)]
+            crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(&temp));
             let mut target = File::create(&temp)?;
             let copied = io::copy(&mut (&mut source).take(tail_len), &mut target)?;
             if copied != tail_len {
@@ -2224,6 +2228,11 @@ impl Wal {
             crate::core::sync_audit::note("wal.keep_tail", &self.path);
             target.sync_data()?;
         }
+        #[cfg(test)]
+        crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Rename {
+            from: &temp,
+            to: &self.path,
+        });
         std::fs::rename(&temp, &self.path)?;
 
         // From here the log's path names the new file while the writer and
@@ -2233,6 +2242,8 @@ impl Wal {
         // acknowledged. Both are replaced under the writer lock the caller
         // holds, so no record or sync falls between them.
         let installed = (|| -> io::Result<()> {
+            #[cfg(test)]
+            crate::core::power_loss::failpoint::hit("keep_tail_after_rename_fails", &self.path)?;
             Self::injected("rename_dir_sync")?;
             sync_parent_dir(&self.path)?;
             Self::injected("rename_open")?;
@@ -2491,7 +2502,7 @@ impl Wal {
 
         // Recovery is only complete once what it wrote is itself durable.
         for target in open_files.values_mut().flatten() {
-            crate::core::sync_audit::note("wal.recover.data_file", path);
+            crate::core::sync_audit::note_file("wal.recover.data_file", target);
             target.sync_data()?;
         }
 

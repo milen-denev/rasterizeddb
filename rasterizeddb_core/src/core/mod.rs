@@ -4,6 +4,10 @@ pub mod bulk_load;
 pub mod cancel;
 pub mod notice;
 pub mod sync_audit;
+/// Crash images, failpoints and the index twin suites through restarts
+/// and power cuts (persistent-indexes design §11).
+#[cfg(test)]
+pub(crate) mod power_loss;
 #[cfg(test)]
 mod downgrade_tests;
 pub mod database;
