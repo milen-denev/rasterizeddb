@@ -344,6 +344,12 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
         users(&two).await.as_deref() == Some(&["ada".to_string()][..])
     })
     .await;
+    // The sender counts a batch once the peer's reply is back, and the peer
+    // applies it before replying: the row can be visible before it is counted.
+    eventually("the batch to be counted", || async {
+        one.replication.stats().bytes_raw.load(std::sync::atomic::Ordering::Relaxed) > 0
+    })
+    .await;
 
     let stats = one.replication.stats();
     let raw = stats.bytes_raw.load(std::sync::atomic::Ordering::Relaxed);
