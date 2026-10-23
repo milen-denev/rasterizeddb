@@ -644,6 +644,79 @@ impl PartitionedTable {
         Ok(route(&live.spec, program.as_ref().map(|p| &p.root), constant_false))
     }
 
+    /// Whether an `UPDATE` matching `where_clause` and assigning `assigned`
+    /// (the constants, by write order; an expression's placeholder included)
+    /// and `computed` (the write orders an expression sets) provably keeps
+    /// every matched row's point (§4.5, §9). True when no key column is
+    /// assigned, or when each one assigned gets a constant that a top-level
+    /// conjunct `key = v` of the clause already pins it to: `SET tenant_id =
+    /// 5 … WHERE tenant_id = 5 AND …`, an ORM's every-column UPDATE. A key
+    /// column given an expression, or a constant nothing pins, is unproven,
+    /// and phase 2a refuses the statement before it writes anything (a key
+    /// change moves a row between partitions: phase 6).
+    ///
+    /// The conjunct is read by `extract_gated`, coerced exactly as the scan
+    /// compares it, so every row the clause matches holds `v` there; the two
+    /// values are compared by level hash, so the point is unchanged. Stricter
+    /// than the range guard, which still checks every merged row.
+    pub fn assignments_keep_point(
+        &self,
+        where_clause: &str,
+        assigned: &[(u32, &[u8])],
+        computed: &[u32],
+    ) -> io::Result<bool> {
+        let live = self.live()?;
+        let levels = live.spec.levels();
+        let touched: SmallVec<[usize; 3]> = (0..levels.len())
+            .filter(|&i| {
+                let wo = levels[i].write_order;
+                computed.contains(&wo) || assigned.iter().any(|(w, _)| *w == wo)
+            })
+            .collect();
+        if touched.is_empty() {
+            return Ok(true);
+        }
+        if touched.iter().any(|&i| computed.contains(&levels[i].write_order)) {
+            return Ok(false);
+        }
+        let schema = &self.shell.schema;
+        let Ok(tokens) = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &schema.fields) else {
+            return Ok(false);
+        };
+        let keyed: SmallVec<[u32; 3]> = levels.iter().map(|l| l.write_order).collect();
+        let Some(program) = sarg::extract_gated(&tokens, &|wo| keyed.contains(&wo), &decimal_scales(schema)) else {
+            return Ok(false);
+        };
+        fn conjuncts<'a>(e: &'a sarg::MaskExpr, out: &mut Vec<&'a sarg::SargPredicate>) {
+            match e {
+                sarg::MaskExpr::Pred(p) => out.push(p),
+                sarg::MaskExpr::And(children) => children.iter().for_each(|c| conjuncts(c, out)),
+                // An `OR` pins nothing on its own, and `All` is no proof.
+                _ => {}
+            }
+        }
+        let mut pinned = Vec::new();
+        conjuncts(&program.root, &mut pinned);
+        for &i in &touched {
+            let wo = levels[i].write_order;
+            let Some((_, value)) = assigned.iter().find(|(w, _)| *w == wo) else {
+                return Ok(false);
+            };
+            let Ok(new) = live.spec.level_hash_of(i, value) else {
+                return Ok(false);
+            };
+            let proven = pinned.iter().any(|p| {
+                p.op == crate::core::filter::zonemap::SargOp::Eq
+                    && p.write_order == wo
+                    && live.spec.level_hash_of(i, &p.value).is_ok_and(|old| old == new)
+            });
+            if !proven {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The materialized partitions `route` reaches under `epoch`, by pid. An
     /// unmaterialized one is skipped: it holds no row (§4.3).
     pub fn materialized(&self, epoch: &MapEpoch, route: &Route) -> io::Result<Vec<(u32, Arc<Table<DbStorageProvider>>)>> {

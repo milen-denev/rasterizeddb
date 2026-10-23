@@ -316,6 +316,18 @@ impl KeySpec {
         Ok(self.prefix_range(columns)?.lo)
     }
 
+    /// Level `level`'s hash of the stored value `column`: the whole hash, of
+    /// which a point keeps that level's top bits. Two values with equal level
+    /// hashes put a row at the same point at that level.
+    pub fn level_hash_of(&self, level: usize, column: &[u8]) -> Result<u64, String> {
+        let l = self
+            .levels
+            .get(level)
+            .ok_or_else(|| format!("a {}-column partition key has no level {level}", self.arity()))?;
+        let (family, norm) = normalise(&l.db_type, column)?;
+        level_hash(level, family, norm.as_slice())
+    }
+
     /// The points rows can occupy once the first `prefix.len()` key columns
     /// are fixed: a whole tenant block for the leading column alone, a single
     /// point for every column, the whole space for none.

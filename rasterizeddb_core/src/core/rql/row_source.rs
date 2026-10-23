@@ -35,6 +35,9 @@
 //! Only a statement reaching at most [`CACHE_MAX_PARTITIONS`] partitions
 //! reads or fills the query cache, each partition under its own scope, so a
 //! wide fan-out cannot flush it.
+//!
+//! [`write_partitions`] is the same fan-out for `UPDATE` and `DELETE` (S11):
+//! one snapshot and one transaction across partitions, visited one at a time.
 
 use std::io;
 use std::sync::Arc as StdArc;
@@ -355,6 +358,103 @@ impl FanOut {
     }
 }
 
+/// One partition's share of a partitioned `UPDATE` or `DELETE`: how many rows
+/// it changed, and their pre-images when the statement collects them.
+pub(crate) type PartWrite = io::Result<(u64, Vec<Row>)>;
+
+/// A partitioned `UPDATE` or `DELETE` (§9): `write` runs on every routed,
+/// materialized partition, and the counts sum. `collect`, when given,
+/// receives every partition's pre-images in pid order (what `RETURNING`
+/// will report, phase 2b).
+///
+/// - **One partition** (a fully keyed `WHERE`, a tenant): `write` gets no
+///   `Visibility`, so the partition snapshots under its own `write_lock`
+///   exactly as a plain table does (§4.4), and keeps the point-update path.
+///   No partition: nothing to write, 0.
+/// - **Several**: §4.4's order (the statement's `Visibility`, then the map
+///   epoch, then the route and the flags), then each partition in ascending
+///   pid order, one at a time, under that one `Visibility` and the
+///   statement's one transaction, each taking only its own `write_lock`. A
+///   snapshot per partition would let a transaction that committed between
+///   two visits be seen by the second and not the first. Passing a
+///   `Visibility` also keeps every partition off the in-place overwrite, so
+///   a later partition's failure leaves only versions the transaction's
+///   abort retires.
+/// - **A conflict** stays retryable only while no partition has applied a
+///   row (§9, I17): a replay in `execute_in_txn` runs in the same
+///   transaction, whose earlier partitions' new versions it would see and
+///   apply again.
+pub(crate) async fn write_partitions<F, Fut>(
+    table: &PartitionedTable,
+    where_clause: &str,
+    tx: TxId,
+    mut collect: Option<&mut Vec<Row>>,
+    mut write: F,
+) -> io::Result<u64>
+where
+    F: FnMut(Arc<PartTable>, Option<Visibility>, bool) -> Fut,
+    Fut: std::future::Future<Output = PartWrite>,
+{
+    table.check()?;
+    let visibility = table.visibility_for(tx);
+    let epoch = table.epoch()?;
+    let route = table.route_where(where_clause)?;
+    let parts = table.materialized(&epoch, &route)?;
+    #[cfg(test)]
+    test_hooks::note_writes(table.uid(), parts.iter().map(|(pid, _)| *pid));
+    let collecting = collect.is_some();
+    if parts.len() <= 1 {
+        drop(visibility);
+        let Some((_, part)) = parts.into_iter().next() else {
+            return Ok(0);
+        };
+        let (n, rows) = write(part, None, collecting).await?;
+        if let Some(c) = collect.as_deref_mut() {
+            c.extend(rows);
+        }
+        return Ok(n);
+    }
+    let mut applied: u64 = 0;
+    for (i, (_pid, part)) in parts.iter().enumerate() {
+        #[cfg(test)]
+        if let Some(e) = test_hooks::injected_failure(table.uid(), i) {
+            return Err(e);
+        }
+        match write(part.clone(), Some(visibility.clone()), collecting).await {
+            Ok((n, rows)) => {
+                applied = applied.saturating_add(n);
+                if let Some(c) = collect.as_deref_mut() {
+                    c.extend(rows);
+                }
+            }
+            Err(e) if applied > 0 => return Err(without_retry_marker(e)),
+            Err(e) => return Err(e),
+        }
+        #[cfg(test)]
+        if i == 0 {
+            if let Some(hook) = test_hooks::after_first(table.uid()) {
+                hook().await;
+            }
+        }
+        #[cfg(not(test))]
+        let _ = i;
+    }
+    // Held to here: the snapshot stays registered, and the epoch counted,
+    // until the last partition has returned.
+    drop(visibility);
+    drop(epoch);
+    Ok(applied)
+}
+
+/// `e` without the marker that lets a retry loop replay its statement.
+fn without_retry_marker(e: io::Error) -> io::Error {
+    let text = e.to_string();
+    match text.strip_suffix(PartTable::CONFLICT_RETRYABLE) {
+        Some(trimmed) => io::Error::new(e.kind(), trimmed.to_string()),
+        None => e,
+    }
+}
+
 /// Test-only observation points in the fan-out, keyed by the partitioned
 /// table's uid so tests running at once never see each other's.
 #[cfg(test)]
@@ -398,8 +498,47 @@ pub(crate) mod test_hooks {
     pub(crate) fn take_reads(uid: u64) -> Vec<u32> {
         reads().lock().unwrap().remove(&uid).unwrap_or_default()
     }
+
+    fn writes() -> &'static Mutex<HashMap<u64, Vec<u32>>> {
+        static W: OnceLock<Mutex<HashMap<u64, Vec<u32>>>> = OnceLock::new();
+        W.get_or_init(Default::default)
+    }
+
+    pub(crate) fn note_writes(uid: u64, pids: impl Iterator<Item = u32>) {
+        writes().lock().unwrap().entry(uid).or_default().extend(pids);
+    }
+
+    /// The partitions an `UPDATE` or `DELETE` on table `uid` was routed to
+    /// since the last call, in order.
+    pub(crate) fn take_writes(uid: u64) -> Vec<u32> {
+        writes().lock().unwrap().remove(&uid).unwrap_or_default()
+    }
+
+    fn failures() -> &'static Mutex<HashMap<u64, usize>> {
+        static F: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+        F.get_or_init(Default::default)
+    }
+
+    /// Fails every multi-partition write on table `uid` just before its
+    /// `k`-th partition (counting from 0), after the earlier ones wrote.
+    pub(crate) fn fail_before(uid: u64, k: Option<usize>) {
+        let mut map = failures().lock().unwrap();
+        match k {
+            Some(k) => map.insert(uid, k),
+            None => map.remove(&uid),
+        };
+    }
+
+    pub(crate) fn injected_failure(uid: u64, i: usize) -> Option<std::io::Error> {
+        (failures().lock().unwrap().get(&uid) == Some(&i))
+            .then(|| std::io::Error::other(format!("injected failure before partition #{i}")))
+    }
 }
 
 #[cfg(test)]
 #[path = "row_source_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "row_source_write_tests.rs"]
+mod write_tests;

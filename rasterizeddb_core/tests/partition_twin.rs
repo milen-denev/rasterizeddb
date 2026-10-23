@@ -190,21 +190,11 @@ const REFUSED: &[Refusal] = &[
     refused(DeleteReturning, "phase 2b"),
     refused(EmptyRouteUpdateReturning, "phase 2b"),
     refused(EmptyRouteDeleteReturning, "phase 2b"),
-    // S11: routed UPDATE and DELETE, VACUUM fan-out.
-    refused(UpdateByKey, "S11"),
-    refused(UpdateByPartitionKey, "S11"),
-    refused(UpdateByPrefix, "S11"),
-    refused(UpdateByNonKey, "S11"),
-    refused(UpdateRelocating, "S11"),
-    refused(UpdateKeySameValue, "S11"),
-    refused(DeleteByKey, "S11"),
-    refused(DeleteByPrefix, "S11"),
-    refused(DeleteByNonKey, "S11"),
-    refused(DeleteIn, "S11"),
-    refused(PreparedUpdate, "S11"),
-    refused(PreparedDelete, "S11"),
-    refused(Vacuum, "S11"),
-    refused(VacuumFull, "S11"),
+    // S11 (routed UPDATE and DELETE, VACUUM fan-out) is built: UpdateByKey,
+    // UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey, UpdateRelocating,
+    // UpdateKeySameValue (a key assigned the value its WHERE pins), DeleteByKey,
+    // DeleteByPrefix, DeleteByNonKey, DeleteIn, PreparedUpdate, PreparedDelete,
+    // Vacuum and VacuumFull are compared with the twin, inside blocks too.
     // A key change moves a row between partitions (I4): phase 6.
     refused(UpdateKeyChange, "phase 6"),
     // Phase 3: UPDATE FROM, DELETE USING, FOR UPDATE, SKIP LOCKED.
@@ -783,8 +773,9 @@ impl Gen {
 /// nested block, no restart.
 const BLOCK_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertSelect, InsertOnConflictUpdate, UpdateByKey, UpdateByPrefix, UpdateRelocating,
-    DeleteByKey, DeleteByNonKey, SelectByPrefix, CountAll, Aggregates, ForUpdate, SkipLocked, PreparedInsert,
-    PreparedSelect, InsertIntoSinkFromT, ReadSinkAndDim,
+    UpdateByNonKey, UpdateKeySameValue, DeleteByKey, DeleteByNonKey, DeleteIn, SelectByPrefix, CountAll,
+    Aggregates, ForUpdate, SkipLocked, PreparedInsert, PreparedSelect, PreparedUpdate, InsertIntoSinkFromT,
+    ReadSinkAndDim,
 ];
 
 /// How often each kind is drawn after the first pass (which draws each once).
@@ -822,6 +813,8 @@ struct Twin {
     tally: BTreeMap<Kind, Tally>,
     /// How many times [`Twin::compare_storage`] ran.
     storage_checks: usize,
+    /// Committed blocks that changed rows in two or more partitions.
+    cross_partition_blocks: usize,
 }
 
 /// Kinds that can change what `{t}` stores: the storage comparison runs
@@ -1076,6 +1069,7 @@ impl Twin {
                 failed
             }
             Step::Block { inner, commit } => {
+                let before = commit.then(|| by_partition(&self.server.as_ref().unwrap().db));
                 self.log.push("BEGIN".into());
                 self.cp().ok("BEGIN");
                 self.cq().ok("BEGIN");
@@ -1093,6 +1087,14 @@ impl Twin {
                 match (p, q) {
                     (Ok(a), Ok(b)) if a.tags == b.tags => {}
                     (p, q) => self.fail(at, op.kind, format!("{end} differs:\n  partitioned: {p:?}\n  twin: {q:?}")),
+                }
+                if let (Some(before), false) = (before, aborted) {
+                    let after = by_partition(&self.server.as_ref().unwrap().db);
+                    let pids: BTreeSet<&u32> = before.keys().chain(after.keys()).collect();
+                    let changed = pids.into_iter().filter(|pid| before.get(*pid) != after.get(*pid)).count();
+                    if changed >= 2 {
+                        self.cross_partition_blocks += 1;
+                    }
                 }
                 self.note(op.kind, &Verdict::Agreed { failed: aborted });
                 false
@@ -1113,6 +1115,17 @@ impl Twin {
             }
         }
     }
+}
+
+/// The partitioned table's rows by partition, each partition's sorted.
+fn by_partition(db: &rclite::Arc<rasterizeddb_core::core::database::Database>) -> BTreeMap<u32, Vec<StoredRow>> {
+    stored_rows_by_partition(db, PART)
+        .into_iter()
+        .map(|(pid, mut rows)| {
+            rows.sort();
+            (pid, rows)
+        })
+        .collect()
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -1216,6 +1229,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         log: Vec::new(),
         tally: BTreeMap::new(),
         storage_checks: 0,
+        cross_partition_blocks: 0,
     };
     // The seeded rows, before anything else runs.
     twin.compare_storage(0, Restart);
@@ -1297,10 +1311,12 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         .map(|(k, t)| format!("{k:?}: refused {} agreed {} both-failed {} known-diverged {}", t.refused, t.agreed, t.both_failed, t.diverged_known))
         .collect();
     eprintln!(
-        "{label} seed {seed:#x}: {ops} ops in {:.1}s, {} bytes, {} storage comparisons\n  {}",
+        "{label} seed {seed:#x}: {ops} ops in {:.1}s, {} bytes, {} storage comparisons, {} committed blocks \
+         across partitions\n  {}",
         started.elapsed().as_secs_f64(),
         bytes,
         twin.storage_checks,
+        twin.cross_partition_blocks,
         summary.join("\n  ")
     );
     twin.cp = None;

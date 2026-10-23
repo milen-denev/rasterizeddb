@@ -13,8 +13,8 @@
 //! answers exactly what it answers on `site_q`, a plain table with the same
 //! columns, constraints and rows, or fails with the same SQLSTATE. The twin
 //! is given the same rows (INSERT routes since S9), so the data-reading
-//! sites compare over rows. The reading sites are `LikeTwin` since S10; the
-//! writing ones S11 moves there.
+//! sites compare over rows. The reading sites are `LikeTwin` since S10, and
+//! the writing and maintenance ones since S11.
 
 mod partition_wire;
 
@@ -213,16 +213,16 @@ const SITES: &[Site] = &[
         "an implicit index: a no-op OK on both (so is any unknown name; PostgreSQL errs)",
     ),
     // Maintenance.
-    site("VACUUM site_p", Expect::Refused, "S11: VACUUM fan-out"),
-    site("VACUUM FULL site_p", Expect::Refused, "S11"),
-    site("VACUUM ANALYZE site_p", Expect::Refused, "S11"),
+    site("VACUUM site_p", Expect::LikeTwin, "S11: every materialized partition"),
+    site("VACUUM FULL site_p", Expect::LikeTwin, "S11"),
+    site("VACUUM ANALYZE site_p", Expect::LikeTwin, "S11"),
     site(
         "VACUUM",
-        Expect::Refused,
-        "finding F2: bare VACUUM fails in any database holding a partitioned table, after vacuuming the \
-         tables before it in map order; S11 makes it succeed with site_p in the report",
+        Expect::LikeTwin,
+        "finding F2, fixed in S11: bare VACUUM failed in any database holding a partitioned table, after \
+         vacuuming the tables before it in map order; it now vacuums site_p's partitions too",
     ),
-    site("VACUUM FULL", Expect::Refused, "finding F2; S11"),
+    site("VACUUM FULL", Expect::LikeTwin, "finding F2, fixed in S11"),
     site("ANALYZE site_p", Expect::LikeTwin, "a no-op on both"),
     site("REINDEX TABLE site_p", Expect::LikeTwin, "not a statement here"),
     site("CLUSTER site_p", Expect::LikeTwin, "not a statement here"),
@@ -330,10 +330,37 @@ const SITES: &[Site] = &[
         Expect::LikeTwin,
         "S10: 23505 on both (site_parent holds ids 1 to 3), nothing written",
     ),
-    site("UPDATE site_p SET n = 1 WHERE tenant_id = 1", Expect::Refused, "S11"),
-    site("DELETE FROM site_p WHERE tenant_id = 1", Expect::Refused, "S11"),
-    site("DELETE FROM site_p", Expect::Refused, "S11 (upstream now runs a DELETE with no WHERE)"),
-    site("DELETE FROM site_p WHERE n IS NULL OR n IS NOT NULL", Expect::Refused, "S11"),
+    site("UPDATE site_p SET n = 1 WHERE tenant_id = 1", Expect::LikeTwin, "S11: a fan-out over tenant 1's groups"),
+    site(
+        "UPDATE site_p SET n = n + 1 WHERE tenant_id = 1 AND asset_group_id = 2",
+        Expect::LikeTwin,
+        "S11: routed to one partition",
+    ),
+    site(
+        "UPDATE site_p SET tenant_id = 1, asset_group_id = 1, label = 'k' WHERE tenant_id = 1 AND asset_group_id = 1",
+        Expect::LikeTwin,
+        "S11: a key column assigned the value the WHERE pins it to",
+    ),
+    site("UPDATE site_p SET tenant_id = 5 WHERE tenant_id = 1", Expect::Refused, "a key change: phase 6"),
+    site("UPDATE site_p SET asset_group_id = asset_group_id + 1", Expect::Refused, "a key change: phase 6"),
+    site("UPDATE site_p SET n = 2 WHERE tenant_id = 1 RETURNING n", Expect::Refused, "RETURNING: phase 2b"),
+    site("DELETE FROM site_p WHERE tenant_id = 7 RETURNING n", Expect::Refused, "RETURNING: phase 2b"),
+    site(
+        "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id",
+        Expect::Refused,
+        "UPDATE … FROM: phase 3",
+    ),
+    site(
+        "DELETE FROM site_p USING site_parent WHERE site_p.asset_id = site_parent.id",
+        Expect::Refused,
+        "DELETE … USING: phase 3",
+    ),
+    in_block("UPDATE site_p SET n = 9 WHERE n IS NULL", Expect::LikeTwin, "S11: a fan-out in a block, rolled back"),
+    site("DELETE FROM site_p WHERE tenant_id = 1", Expect::LikeTwin, "S11"),
+    site("VACUUM FULL site_p", Expect::LikeTwin, "S11: over dead versions"),
+    site("SELECT * FROM site_p", Expect::LikeTwin, "after VACUUM FULL"),
+    site("DELETE FROM site_p WHERE n IS NULL OR n IS NOT NULL", Expect::LikeTwin, "S11"),
+    site("DELETE FROM site_p", Expect::LikeTwin, "S11 (upstream runs a DELETE with no WHERE)"),
     in_block("SELECT * FROM site_p WHERE tenant_id = 1", Expect::LikeTwin, "S10"),
     Site {
         sql: "SELECT * FROM site_p WHERE tenant_id = 1",

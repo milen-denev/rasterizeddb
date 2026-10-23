@@ -3662,6 +3662,12 @@ async fn execute_update_from(
         return ddl_error("UPDATE names no relation");
     };
     let table = table_token.trim_matches('"').to_string();
+    // A partitioned target writes each row back by an identifying key, which
+    // waits on composite identifying keys (§1b, phase 3). Refused before
+    // anything runs; a partitioned source is refused by the join.
+    if database.partitioned.contains_key(&table) {
+        return ddl_error(&format!("UPDATE … FROM on partitioned table \"{table}\" is not supported yet"));
+    }
     let target_alias = match head_words.next() {
         Some(w) if w.eq_ignore_ascii_case("AS") => head_words.next(),
         Some(w) => Some(w),
@@ -4054,6 +4060,10 @@ async fn execute_delete_using(
         return ddl_error("DELETE names no relation");
     };
     let table = table_token.trim_matches('"').to_string();
+    // As for `UPDATE … FROM`: phase 3, refused before anything runs.
+    if database.partitioned.contains_key(&table) {
+        return ddl_error(&format!("DELETE … USING on partitioned table \"{table}\" is not supported yet"));
+    }
     let target_alias = match head_words.next() {
         Some(w) if w.eq_ignore_ascii_case("AS") => head_words.next(),
         Some(w) => Some(w),
@@ -12280,6 +12290,21 @@ pub(crate) async fn execute_with_need(
                 return ddl_error(&e);
             }
 
+            // A partitioned table's rows are in its partitions (§9): `table`
+            // above is its shell, whose schema every check so far read.
+            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&table_name) {
+                return Box::pin(execute_partitioned_update(
+                    query,
+                    update_plan,
+                    pt,
+                    &database,
+                    &table_name,
+                    depth,
+                    tx,
+                ))
+                .await;
+            }
+
             // One snapshot for the statement when its foreign keys need to know
             // which rows it changes: the rows judged and the rows written must
             // be the same rows. `None` — every other UPDATE — leaves the write
@@ -12442,9 +12467,14 @@ pub(crate) async fn execute_with_need(
             // live pointer records sit in one run at the front of their files,
             // and returns the tail to the filesystem — at the cost of stopping
             // everything else on that table for the duration.
+            //
+            // A partitioned table is vacuumed partition by partition (§11):
+            // its shell, which `tables` also holds under its name, has no
+            // rows, and vacuuming it failed the statement, so a bare VACUUM
+            // failed as soon as a partitioned table existed (F2).
             let names: Vec<String> = match &request.table_name {
                 Some(name) => {
-                    if !database.tables.contains_key(name) {
+                    if database.relation(name).is_none() {
                         error!("VACUUM: table {} not found", name);
                         let mut result = vec![3u8];
                         result.extend_from_slice(format!("Table {} not found", name).as_bytes());
@@ -12452,11 +12482,17 @@ pub(crate) async fn execute_with_need(
                     }
                     vec![name.clone()]
                 }
-                None => database
-                    .tables
-                    .iter()
-                    .map(|entry| entry.key().clone())
-                    .collect(),
+                None => {
+                    let mut names: Vec<String> = database
+                        .tables
+                        .iter()
+                        .map(|entry| entry.key().clone())
+                        .chain(database.partitioned.iter().map(|entry| entry.key().clone()))
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    names
+                }
             };
 
             let mut reclaimed: u64 = 0;
@@ -12466,47 +12502,79 @@ pub(crate) async fn execute_with_need(
                 // Resolved and cloned per table rather than held across the
                 // await: a DashMap reference kept over one would block anything
                 // else touching the map for as long as the vacuum runs.
-                let Some(table) = database.tables.get(&name).map(|t| t.value().clone()) else {
-                    continue;
-                };
+                let tables: Vec<_> =
+                    match database.relation(&name) {
+                        None => continue,
+                        Some(crate::core::database::Relation::Plain(table)) => vec![table],
+                        Some(crate::core::database::Relation::Partitioned(pt)) => {
+                            match vacuum_targets(&pt) {
+                                Ok(parts) => parts,
+                                // A bare VACUUM goes on past a table that
+                                // cannot be opened, and says so; naming it
+                                // fails the statement, as any VACUUM error does.
+                                Err(e) if request.table_name.is_none() => {
+                                    crate::core::notice::push(
+                                        "WARNING",
+                                        "01000",
+                                        format!("VACUUM skipped partitioned table \"{name}\": {e}"),
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("VACUUM failed for {}: {}", name, e);
+                                    let mut result = vec![3u8];
+                                    result.extend_from_slice(
+                                        format!("VACUUM failed for {}: {}", name, e).as_bytes(),
+                                    );
+                                    return result;
+                                }
+                            }
+                        }
+                    };
 
-                if request.full {
-                    match table.compact().await {
-                        Ok(report) => {
-                            reclaimed = reclaimed
-                                .saturating_add(report.rows_bytes_freed)
-                                .saturating_add(report.pointer_bytes_freed);
-                            if let Some(why) = report.truncation_skipped {
-                                untruncated.push((name.clone(), why));
+                for table in tables {
+                    if request.full {
+                        match table.compact().await {
+                            Ok(report) => {
+                                reclaimed = reclaimed
+                                    .saturating_add(report.rows_bytes_freed)
+                                    .saturating_add(report.pointer_bytes_freed);
+                                // One line per logical table, however
+                                // many of its partitions kept their tail.
+                                if let Some(why) = report.truncation_skipped
+                                    && !untruncated.iter().any(|(n, _)| *n == name)
+                                {
+                                    untruncated.push((name.clone(), why));
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("VACUUM FULL failed for {}: {}", name, e);
-                            let mut result = vec![3u8];
-                            result.extend_from_slice(
-                                format!("VACUUM FULL failed for {}: {}", name, e).as_bytes(),
-                            );
-                            return result;
-                        }
-                    }
-                } else {
-                    match table.vacuum_now().await {
-                        Ok(report) => {
-                            reclaimed = reclaimed.saturating_add(report.reclaimed_bytes);
-                            if report.deferred {
-                                info!(
-                                    "VACUUM on {} deferred: a query older than the scan is still running",
-                                    name
+                            Err(e) => {
+                                error!("VACUUM FULL failed for {}: {}", name, e);
+                                let mut result = vec![3u8];
+                                result.extend_from_slice(
+                                    format!("VACUUM FULL failed for {}: {}", name, e).as_bytes(),
                                 );
+                                return result;
                             }
                         }
-                        Err(e) => {
-                            error!("VACUUM failed for {}: {}", name, e);
-                            let mut result = vec![3u8];
-                            result.extend_from_slice(
-                                format!("VACUUM failed for {}: {}", name, e).as_bytes(),
-                            );
-                            return result;
+                    } else {
+                        match table.vacuum_now().await {
+                            Ok(report) => {
+                                reclaimed = reclaimed.saturating_add(report.reclaimed_bytes);
+                                if report.deferred {
+                                    info!(
+                                        "VACUUM on {} deferred: a query older than the scan is still running",
+                                        name
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("VACUUM failed for {}: {}", name, e);
+                                let mut result = vec![3u8];
+                                result.extend_from_slice(
+                                    format!("VACUUM failed for {}: {}", name, e).as_bytes(),
+                                );
+                                return result;
+                            }
                         }
                     }
                 }
@@ -12619,6 +12687,21 @@ pub(crate) async fn execute_with_need(
                         return ddl_error(&message);
                     }
                 };
+
+            // A partitioned table's rows are in its partitions (§9); `table`
+            // is its shell, whose schema the parse read.
+            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&table_name) {
+                return Box::pin(execute_partitioned_delete(
+                    &query,
+                    delete_plan,
+                    pt,
+                    &database,
+                    &table_name,
+                    depth,
+                    tx,
+                ))
+                .await;
+            }
 
             // Referencing rows are dealt with before the parent goes, so a
             // blocking action can still refuse and a cascade still has the
@@ -12863,6 +12946,210 @@ async fn execute_partitioned_select(
         }
     };
     execute_query_rows(query_row, source, database, tx).await
+}
+
+/// The tables a `VACUUM` of partitioned table `pt` visits: its materialized
+/// partitions, by pid. An unmaterialized one has no files to vacuum.
+fn vacuum_targets(
+    pt: &crate::core::partition::table::PartitionedTable,
+) -> std::io::Result<
+    Vec<rclite::Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>>>,
+> {
+    pt.check()?;
+    let epoch = pt.epoch()?;
+    Ok(pt
+        .materialized(&epoch, &crate::core::partition::Route::All)?
+        .into_iter()
+        .map(|(_, part)| part)
+        .collect())
+}
+
+/// What the partitioned `UPDATE` and `DELETE` refuse before they write, in
+/// common: a foreign key (S6 refuses them both ways, so none of the plain
+/// arms' foreign-key work can apply; asserted here rather than assumed), and
+/// `RETURNING` (phase 2b). A bad `RETURNING` list fails as it does on a plain
+/// table.
+fn refuse_partitioned_write(
+    database: &Arc<Database>,
+    shell: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>,
+    table_name: &str,
+    verb: &str,
+    sql: &str,
+) -> Result<(), String> {
+    if !shell.schema.foreign_keys.is_empty() || !referencing_keys(database, table_name).is_empty() {
+        return Err(format!(
+            "internal error: partitioned table \"{table_name}\" has a foreign key, which partitioned tables refuse"
+        ));
+    }
+    match returning_planned(sql, &shell.schema.fields) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(format!("{verb} … RETURNING on partitioned table \"{table_name}\" is not supported yet")),
+        Err(e) => Err(e),
+    }
+}
+
+/// An `UPDATE` on a partitioned table (`docs/partitioning.md` §9, S11), from
+/// the plan the arm parsed against the shell's schema, after the arm's
+/// NOT NULL, generated-column and CHECK work.
+///
+/// Before anything is written it refuses `RETURNING` (phase 2b) and any key
+/// assignment not proven to keep every matched row's point
+/// ([`PartitionedTable::assignments_keep_point`]): a key change would move
+/// the row to another partition (phase 6), and refused here it writes
+/// nothing in any partition, where the range guard alone would refuse it
+/// only after earlier partitions had written. The guard still checks every
+/// merged row. Then [`write_partitions`] visits the routed partitions.
+///
+/// Prepared, it stays on the text path (`note_rewritten`), so every
+/// execution routes its own values.
+///
+/// [`PartitionedTable::assignments_keep_point`]: crate::core::partition::table::PartitionedTable::assignments_keep_point
+/// [`write_partitions`]: crate::core::rql::row_source::write_partitions
+async fn execute_partitioned_update(
+    query: &QueryPurpose,
+    update_plan: crate::core::rql::lexer_ur::UpdateRow,
+    pt: Arc<crate::core::partition::table::PartitionedTable>,
+    database: &Arc<Database>,
+    table_name: &str,
+    depth: usize,
+    tx: TxId,
+) -> Vec<u8> {
+    crate::core::rql::prepared::note_rewritten();
+    let sql = query_sql(query);
+    if let Err(e) = refuse_partitioned_write(database, pt.shell(), table_name, "UPDATE", &sql) {
+        error!("{}", e);
+        return ddl_error(&e);
+    }
+    let crate::core::rql::lexer_ur::UpdateRow {
+        where_clause,
+        query_row_fetch,
+        updates,
+        expressions,
+        ..
+    } = update_plan;
+    let keeps_point = {
+        let assigned: Vec<(u32, &[u8])> = updates.iter().map(|u| (u.write_order, u.data.into_slice())).collect();
+        let computed: Vec<u32> = expressions.iter().map(|(wo, _)| *wo).collect();
+        pt.assignments_keep_point(&where_clause, &assigned, &computed)
+    };
+    match keeps_point {
+        Ok(true) => {}
+        Ok(false) => {
+            error!("UPDATE on {}: {}", table_name, crate::core::partition::guard::KEY_CHANGE_REFUSAL);
+            return ddl_error(crate::core::partition::guard::KEY_CHANGE_REFUSAL);
+        }
+        Err(e) => {
+            error!("Cannot update partitioned table {}: {}", table_name, e);
+            return ddl_error(&e.to_string());
+        }
+    }
+    let outcome = crate::core::rql::row_source::write_partitions(
+        &pt,
+        &where_clause,
+        tx,
+        None,
+        |part, visibility, collecting| {
+            // A payload is not `Clone`; each partition consumes its own copy.
+            let updates: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> = updates
+                .iter()
+                .map(|u| crate::core::row::row::ColumnWritePayload {
+                    data: u.data.clone(),
+                    write_order: u.write_order,
+                    column_type: u.column_type.clone(),
+                    size: u.size,
+                })
+                .collect();
+            let (fetch, expressions, where_clause) = (query_row_fetch.clone(), &expressions[..], &where_clause);
+            async move {
+                let mut before = Vec::new();
+                let n = part
+                    .update_rows_as_of(
+                        where_clause,
+                        fetch,
+                        updates,
+                        expressions,
+                        None,
+                        tx,
+                        visibility,
+                        collecting.then_some(&mut before),
+                    )
+                    .await?;
+                Ok((n, before))
+            }
+        },
+    )
+    .await;
+    match outcome {
+        Ok(n) => {
+            info!("Updated {} rows", n);
+            note_write(database, tx, depth, &sql, Some(table_name));
+            let mut result = vec![0u8];
+            result.extend_from_slice(&n.to_le_bytes());
+            result
+        }
+        Err(e) => {
+            // The retry marker is for the retry loops, never a log.
+            error!("Failed to update rows: {}", clean_conflict_text(&e.to_string()));
+            let mut result = vec![3u8];
+            result.extend_from_slice(e.to_string().as_bytes());
+            result
+        }
+    }
+}
+
+/// A `DELETE` on a partitioned table (§9, S11): `RETURNING` refused before
+/// anything is deleted (phase 2b), then [`write_partitions`] over the routed
+/// partitions. Prepared, it stays on the text path, as the `UPDATE` does.
+///
+/// [`write_partitions`]: crate::core::rql::row_source::write_partitions
+async fn execute_partitioned_delete(
+    query: &QueryPurpose,
+    delete_plan: crate::core::rql::lexer_dr::DeleteRow,
+    pt: Arc<crate::core::partition::table::PartitionedTable>,
+    database: &Arc<Database>,
+    table_name: &str,
+    depth: usize,
+    tx: TxId,
+) -> Vec<u8> {
+    crate::core::rql::prepared::note_rewritten();
+    let sql = query_sql(query);
+    if let Err(e) = refuse_partitioned_write(database, pt.shell(), table_name, "DELETE", &sql) {
+        error!("{}", e);
+        return ddl_error(&e);
+    }
+    let crate::core::rql::lexer_dr::DeleteRow { where_clause, query_row_fetch, .. } = delete_plan;
+    let outcome = crate::core::rql::row_source::write_partitions(
+        &pt,
+        &where_clause,
+        tx,
+        None,
+        |part, visibility, collecting| {
+            let (fetch, where_clause) = (query_row_fetch.clone(), &where_clause);
+            async move {
+                let mut before = Vec::new();
+                let n = part
+                    .delete_rows_as_of(where_clause, fetch, None, tx, visibility, collecting.then_some(&mut before))
+                    .await?;
+                Ok((n, before))
+            }
+        },
+    )
+    .await;
+    match outcome {
+        Ok(n) => {
+            info!("Deleted {} rows", n);
+            note_write(database, tx, depth, &sql, Some(table_name));
+            let mut result = vec![0u8];
+            result.extend_from_slice(&n.to_le_bytes());
+            result
+        }
+        Err(e) => {
+            error!("Failed to delete rows: {}", clean_conflict_text(&e.to_string()));
+            let mut result = vec![3u8];
+            result.extend_from_slice(e.to_string().as_bytes());
+            result
+        }
+    }
 }
 
 /// A parsed single-table `SELECT`, run: the half of the `QueryRows` arm that

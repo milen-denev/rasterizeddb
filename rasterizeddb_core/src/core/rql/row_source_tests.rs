@@ -17,49 +17,49 @@ use crate::core::partition::table::PartitionedTable;
 use crate::core::row::row::{Row, vec_into_rows};
 use crate::core::rql::lexer_s1::recognize_query_purpose;
 
-const DDL: &str = "(tenant_id BIGINT NOT NULL, seq BIGINT NOT NULL, amt BIGINT NOT NULL, note TEXT, \
+pub(super) const DDL: &str = "(tenant_id BIGINT NOT NULL, seq BIGINT NOT NULL, amt BIGINT NOT NULL, note TEXT, \
                    PRIMARY KEY (tenant_id, seq))";
-const TENANTS: i64 = 16;
-const OPENING: i64 = 100;
+pub(super) const TENANTS: i64 = 16;
+pub(super) const OPENING: i64 = 100;
 
-fn init() {
+pub(super) fn init() {
     let _ = crate::MAX_PERMITS_THREADS.set(4);
     let _ = crate::BATCH_SIZE.set(512);
     let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
 }
 
-fn path_str(p: &Path) -> String {
+pub(super) fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-async fn open(root: &Path, name: &str) -> Arc<Database> {
+pub(super) async fn open(root: &Path, name: &str) -> Arc<Database> {
     init();
     Arc::new(Database::new_named(&path_str(root), false, name).await)
 }
 
-fn close(db: Arc<Database>, root: &Path) {
+pub(super) fn close(db: Arc<Database>, root: &Path) {
     drop(db);
     crate::core::wal::remove_for(&path_str(root));
 }
 
-async fn exec(db: &Arc<Database>, sql: &str) -> Vec<u8> {
+pub(super) async fn exec(db: &Arc<Database>, sql: &str) -> Vec<u8> {
     let purpose = recognize_query_purpose(sql).unwrap_or_else(|| panic!("unrecognised: {sql}"));
     crate::core::rql::executor::execute(purpose, db.clone()).await
 }
 
-async fn exec_ok(db: &Arc<Database>, sql: &str) {
+pub(super) async fn exec_ok(db: &Arc<Database>, sql: &str) {
     let out = exec(db, sql).await;
     assert!(out.first().is_some_and(|b| *b != 3), "{sql} failed: {}", String::from_utf8_lossy(&out));
 }
 
-async fn rows(db: &Arc<Database>, sql: &str) -> Vec<Row> {
+pub(super) async fn rows(db: &Arc<Database>, sql: &str) -> Vec<Row> {
     let out = exec(db, sql).await;
     assert_eq!(out.first(), Some(&2u8), "{sql}: {}", String::from_utf8_lossy(&out));
     vec_into_rows(&out[1..]).unwrap()
 }
 
 /// The first column of every row, as the BIGINT (or COUNT) it holds.
-async fn ints(db: &Arc<Database>, sql: &str) -> Vec<i64> {
+pub(super) async fn ints(db: &Arc<Database>, sql: &str) -> Vec<i64> {
     rows(db, sql)
         .await
         .iter()
@@ -67,26 +67,26 @@ async fn ints(db: &Arc<Database>, sql: &str) -> Vec<i64> {
         .collect()
 }
 
-fn partitioned(db: &Database, name: &str) -> Arc<PartitionedTable> {
+pub(super) fn partitioned(db: &Database, name: &str) -> Arc<PartitionedTable> {
     match db.relation(name) {
         Some(Relation::Partitioned(t)) => t,
         _ => panic!("{name} is not a partitioned table"),
     }
 }
 
-fn pid_of(pt: &PartitionedTable, tenant: i64) -> u32 {
+pub(super) fn pid_of(pt: &PartitionedTable, tenant: i64) -> u32 {
     let point = pt.spec().unwrap().point_of(&[&tenant.to_le_bytes()[..]]).unwrap();
     pt.epoch().unwrap().map.pid_of(point)
 }
 
-fn materialized(pt: &PartitionedTable) -> Vec<u32> {
+pub(super) fn materialized(pt: &PartitionedTable) -> Vec<u32> {
     let epoch = pt.epoch().unwrap();
     pt.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(pid, _)| pid).collect()
 }
 
 /// `name`, partitioned by tenant into `partitions`, with one opening row of
 /// `OPENING` per tenant `1..=TENANTS`.
-async fn ledger(db: &Arc<Database>, name: &str, partitions: u32) -> Arc<PartitionedTable> {
+pub(super) async fn ledger(db: &Arc<Database>, name: &str, partitions: u32) -> Arc<PartitionedTable> {
     exec_ok(db, &format!("CREATE TABLE {name} {DDL} PARTITION BY HASH (tenant_id) PARTITIONS {partitions}")).await;
     let values: Vec<String> = (1..=TENANTS).map(|t| format!("({t}, 0, {OPENING}, 'opening')")).collect();
     exec_ok(db, &format!("INSERT INTO {name} (tenant_id, seq, amt, note) VALUES {}", values.join(", "))).await;

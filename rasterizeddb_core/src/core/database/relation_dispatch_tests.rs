@@ -467,30 +467,31 @@ async fn storage_statements_skip_or_refuse_a_partitioned_table() {
     assert_eq!(logical_files(second.path(), "acct"), Vec::<String>::new());
 }
 
-/// The VACUUM statement, bare, named and FULL, refuses with 0A000's wording
-/// once a partitioned table exists, rather than reporting the shell
-/// vacuumed (0 bytes) or skipping it; its fan-out is S11's.
+/// The VACUUM statement, bare, named and FULL, vacuums a partitioned
+/// table's materialized partitions (S11), never its shell: before S11 it
+/// refused here, and a bare VACUUM vacuuming the shell failed outright
+/// (finding F2). The shell stays in `tables`, no file appears under the
+/// logical name, and the row survives every pass.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_vacuum_statement_refuses_a_partitioned_table() {
+async fn the_vacuum_statement_vacuums_a_partitioned_tables_partitions() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let db = Arc::new(open(root).await);
     create(&db, "acct", 4).await;
     db.add_table(acct("side")).await.unwrap();
     insert(&partitioned(&db, "acct"), 1, 1).await;
-    for statement in ["VACUUM", "VACUUM acct", "VACUUM FULL", "VACUUM FULL acct"] {
+    for statement in ["VACUUM", "VACUUM acct", "VACUUM FULL", "VACUUM FULL acct", "VACUUM side"] {
         let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(statement).unwrap();
         let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
-        assert_eq!(reply.first(), Some(&3u8), "{statement} answered over a partitioned table");
-        let text = String::from_utf8_lossy(&reply[1..]).to_string();
-        assert!(text.contains("acct"), "{statement}: {text}");
-        refused(statement, &text);
+        assert_eq!(reply.first(), Some(&0u8), "{statement}: {}", String::from_utf8_lossy(&reply[1..]));
+        assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "{statement} replaced the shell");
+        assert_eq!(logical_files(root, "acct"), Vec::<String>::new(), "{statement}");
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose("SELECT COUNT(*) FROM acct").unwrap();
+        let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
+        let rows = crate::core::row::row::vec_into_rows(&reply[1..]).unwrap();
+        let n = i64::from_le_bytes(rows[0].columns[0].data.into_slice().try_into().unwrap());
+        assert_eq!(n, 1, "{statement} lost the row");
     }
-    // A plain table alone is still vacuumed.
-    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose("VACUUM side").unwrap();
-    let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
-    assert_eq!(reply.first(), Some(&0u8), "{}", String::from_utf8_lossy(&reply[1..]));
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()));
 }
 
 /// ALTER and CREATE INDEX on a partitioned table refuse with 0A000's
