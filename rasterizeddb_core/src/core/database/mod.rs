@@ -1423,6 +1423,17 @@ impl Database {
                  restart before dropping it"
             )));
         }
+        // Through the sweep below: see `deletion_permit`. Taken before the
+        // table leaves the map and the catalogue: a drop waiting for it with
+        // the table half gone hid the table, files still on disk, and a
+        // `CREATE TABLE` of the name was refused for those files.
+        let Some(logs) = self.tables.get(table_name).map(|table| {
+            logs_holding(&table.io_rows, &self.storage, self.location.as_deref())
+        }) else {
+            return Ok(false);
+        };
+        let snapshot_gate = deletion_permit(&logs).await;
+        drop(logs);
         let Some((_, table)) = self.tables.remove(table_name) else {
             return Ok(false);
         };
@@ -1518,6 +1529,8 @@ impl Database {
             table_name,
         )
         .await;
+        // Released before the shadow tables below, which take it again.
+        drop(snapshot_gate);
 
         // After the files, never before: a placement dropped first would send
         // the sweep above to the database directory, where it would find
@@ -2206,6 +2219,35 @@ impl Database {
             }
         };
 
+        // The destination's log may still hold live records for this name: a
+        // move away from there whose source could not be released (below)
+        // kept them, and so does a crash between the flip and that release.
+        // The copy writes no records of its own, so the next open replayed
+        // the old incarnation's over it, and wherever the copy was shorter or
+        // had changed since, old rows came back. Voided first, in the
+        // destination primary's logs only: its backup copies are the files a
+        // table elsewhere still mirrors into, and their records are that
+        // table's. Nothing is copied yet, so a failure leaves the table where
+        // it is.
+        {
+            let destination_logs =
+                logs_holding(&to.without_backups(), &self.storage, self.location.as_deref());
+            let _snapshot_gate = deletion_permit(&destination_logs).await;
+            if let Err(failure) = forget_logged_files(&destination_logs, table_name) {
+                if let Some(table) = table {
+                    self.tables.insert(table_name.to_string(), table);
+                }
+                error!(
+                    "Could not move {} to {}: the destination's log would not void its old \
+                     records for that name: {}",
+                    table_name,
+                    destination.as_spec(),
+                    failure.error
+                );
+                return Err(failure.error);
+            }
+        }
+
         let copied = copy_between(&from, &to, table_name).await;
 
         let copied = match copied {
@@ -2336,13 +2378,21 @@ impl Database {
             .insert(table_name.to_string(), Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
-        discard_files(
-                &Arc::new(from.without_backups()),
-                &self.storage,
-                self.location.as_deref(),
-                table_name,
-            )
-            .await;
+        // Kept when their records cannot be voided, and said so: the move is
+        // done, but the source still holds a full copy of the table and its
+        // log holds the old records live. The next move back voids them
+        // first (above), and a restart replays them into the kept files and
+        // truncates the log, so neither reaches a later table; the space and
+        // the files stay until removed. Reported as an error rather than as a
+        // move: a success here hid a copy of the table left on the disk the
+        // move was meant to free.
+        let source_kept = !discard_files(
+            &Arc::new(from.without_backups()),
+            &self.storage,
+            self.location.as_deref(),
+            table_name,
+        )
+        .await;
 
         // Make the destination durable before reporting success.
         //
@@ -2373,6 +2423,18 @@ impl Database {
                 destination.as_spec(),
                 e
             );
+        }
+
+        if source_kept {
+            return Err(io::Error::other(format!(
+                "moved {} to {}, but its files on {} could not be released (the log there \
+                 would not void their records), so a copy of the table is still there; it \
+                 reads from {} now",
+                table_name,
+                destination.as_spec(),
+                current.as_spec(),
+                destination.as_spec()
+            )));
         }
 
         info!(
@@ -3072,9 +3134,10 @@ async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
 /// intent protected is durable, which the barrier's own sync also covers for
 /// everything this log holds before it.
 async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
-    if let Some(wal) = io_pointers
-        .get_location()
-        .and_then(|dir| crate::core::wal::wal_for(&dir))
+    let dir = io_pointers.get_location();
+    let wal = dir.as_deref().and_then(crate::core::wal::wal_for);
+    let _snapshot_gate = deletion_permit(wal.as_slice()).await;
+    if let Some(wal) = &wal
         && let Err(e) =
             wal.forget_files(&[crate::core::wal::file_id_for_name(RENAME_INTENT_FILE)])
     {
@@ -3085,6 +3148,19 @@ async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
     }
     let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
     io.drop_io();
+    // An unlink reaches the disk with the directory's next sync (see
+    // `sweep_files_durably`), and nothing on the rename's path syncs this
+    // directory after this one: a power cut could bring the intent back,
+    // whole and checksummed, and the next open would act on it over a table
+    // created under the old name since. Only where a log reaches, like the
+    // sweep: a directory without one is in memory.
+    if wal.is_some()
+        && let Some(dir) = dir
+        && let Err(e) =
+            crate::core::wal::sync_parent_dir(&std::path::Path::new(&dir).join(RENAME_INTENT_FILE))
+    {
+        error!("Deleted the rename intent in {} but could not sync the directory: {}", dir, e);
+    }
 }
 
 /// The rename intent's bytes: both names and a checksum over them, each line
@@ -3438,6 +3514,64 @@ fn dirs_reached(io: &DbStorageProvider, pool: &StoragePool) -> Vec<String> {
     dirs
 }
 
+/// Held from a barrier through the deletion it announces, when `logs` holds
+/// any log (a statement-scoped relation, in memory, never waits).
+///
+/// A point-in-time restore replays a barrier over the snapshot's copy of the
+/// file, and empties the file only when the barrier committed after the copy
+/// began (see [`crate::core::wal::Wal::recover_restoring`]). That reads the
+/// copy right only if the barrier and the file's deletion are on the same
+/// side of the point the copy began: a barrier committed just before it,
+/// with its file deleted only once the copy had read it, left the deleted
+/// file's bytes in a copy the restore then took for the new file's. A
+/// snapshot holds the gate exclusively while it fixes that point, and no
+/// longer (see [`crate::core::backup::deletion_permit`]): both after it, the
+/// file is emptied, rightly, however long the copy runs.
+#[cfg(feature = "s3_backup")]
+async fn deletion_permit(
+    logs: &[StdArc<crate::core::wal::Wal>],
+) -> Option<tokio::sync::RwLockReadGuard<'static, ()>> {
+    if logs.is_empty() {
+        return None;
+    }
+    #[cfg(test)]
+    let _parked = ParkedDeletion::new(logs[0].path());
+    Some(crate::core::backup::deletion_permit().await)
+}
+
+/// The first log of every [`deletion_permit`] waiting for its permit, so a
+/// test holding the gate knows its deletion reached it rather than guessing
+/// with a sleep.
+#[cfg(all(test, feature = "s3_backup"))]
+pub(crate) static PARKED_DELETIONS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "s3_backup"))]
+struct ParkedDeletion(std::path::PathBuf);
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl ParkedDeletion {
+    fn new(log: &std::path::Path) -> Self {
+        PARKED_DELETIONS.lock().push(log.to_path_buf());
+        ParkedDeletion(log.to_path_buf())
+    }
+}
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl Drop for ParkedDeletion {
+    fn drop(&mut self) {
+        let mut parked = PARKED_DELETIONS.lock();
+        if let Some(at) = parked.iter().position(|p| *p == self.0) {
+            parked.swap_remove(at);
+        }
+    }
+}
+
+#[cfg(not(feature = "s3_backup"))]
+async fn deletion_permit(_logs: &[StdArc<crate::core::wal::Wal>]) -> Option<()> {
+    None
+}
+
 /// Voids the records for every file a table of `name` owns in each of
 /// `logs` (see [`logs_holding`]), durably, in order. See
 /// [`crate::core::wal::Wal::forget_files`].
@@ -3489,7 +3623,9 @@ async fn discard_files(
     own: Option<&str>,
     name: &str,
 ) -> bool {
-    if let Err(failure) = forget_logged_files(&logs_holding(io_pointers, pool, own), name) {
+    let logs = logs_holding(io_pointers, pool, own);
+    let _snapshot_gate = deletion_permit(&logs).await;
+    if let Err(failure) = forget_logged_files(&logs, name) {
         error!(
             "Could not void the log's records for {}'s files, so they were kept: {}",
             name, failure.error

@@ -1173,6 +1173,310 @@ async fn a_dropped_tables_late_writes_do_not_reach_its_successor_after_a_crash()
     .await;
 }
 
+/// A statement holding the dropped table's handle, with an in-place write it
+/// logged before the drop, commits after the name is taken again. The fence
+/// refuses only records framed after the barrier. This one was framed
+/// before, so the log held it, and the commit applied it by path into the
+/// new table's file. Replay voids it, since it precedes the barrier, so the
+/// running database and a restarted one disagreed about the new table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_tables_held_write_does_not_reach_its_successor() {
+    use crate::core::storage_providers::traits::StorageIO;
+    let sc = Scenario::new(6).await;
+    let db = sc.db.clone();
+    let held = db.tables.get(TABLE).unwrap().value().clone();
+    let txn = held.io_rows.begin_txn();
+    assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
+    held.io_rows.write_data_txn(txn, 0, b"GHOST-HELD").await;
+    assert!(db.drop_table(TABLE).await.unwrap());
+    db.add_table(create_statement(TABLE)).await.unwrap();
+    insert(&db, 100, "new_00").await;
+    let committed = held.io_rows.commit_durable(txn).await;
+    assert!(!ghosts_in(&sc.root), "a held write reached the recreated table's file");
+    assert!(
+        committed.is_err(),
+        "a commit whose write went nowhere reported success"
+    );
+    drop(held);
+    let candidates: Vec<String> = names("old", 6).into_iter().chain(names("new", 1)).collect();
+    assert_eq!(labels(&db, &candidates).await, names("new", 1), "live");
+    drop(db);
+    let (_base, root, db) = sc.reopen().await;
+    assert!(!ghosts_in(&root), "a held write replayed into the recreated table's file");
+    assert_eq!(labels(&db, &candidates).await, names("new", 1), "after a reopen");
+    close(&root, db);
+}
+
+/// The same with nothing created under the name before the commit: the held
+/// write created the deleted file again, holding its bytes, and every later
+/// `CREATE TABLE` of the name was refused for the leftover file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_tables_held_write_does_not_bring_its_file_back() {
+    use crate::core::storage_providers::traits::StorageIO;
+    let sc = Scenario::new(3).await;
+    let db = sc.db.clone();
+    let held = db.tables.get(TABLE).unwrap().value().clone();
+    let txn = held.io_rows.begin_txn();
+    assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
+    held.io_rows.write_data_txn(txn, 0, b"GHOST-HELD").await;
+    assert!(db.drop_table(TABLE).await.unwrap());
+    let _ = held.io_rows.commit_durable(txn).await;
+    drop(held);
+    assert!(
+        !sc.root.join(format!("{TABLE}.db")).exists(),
+        "a held write created the dropped table's file again"
+    );
+    db.add_table(create_statement(TABLE))
+        .await
+        .expect("the name was refused after a held write of the dropped table committed");
+    insert(&db, 100, "new_00").await;
+    let candidates: Vec<String> = names("old", 3).into_iter().chain(names("new", 1)).collect();
+    assert_eq!(labels(&db, &candidates).await, names("new", 1));
+    drop(db);
+    let (_base, root, db) = sc.reopen().await;
+    assert_eq!(labels(&db, &candidates).await, names("new", 1), "after a reopen");
+    close(&root, db);
+}
+
+/// The snapshot gate, held as a snapshot holds it while it fixes where its
+/// copy begins. Bounded: a peer test holding it for long must fail this one,
+/// not hang it.
+#[cfg(feature = "s3_backup")]
+async fn hold_snapshot_start() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        crate::core::backup::hold_snapshot_gate(),
+    )
+    .await
+    .expect("the snapshot gate was held elsewhere for a minute")
+}
+
+/// Returns once a deletion whose first log is `log` is waiting for its
+/// permit: a positive signal, where a sleep let a slow drop that had not yet
+/// reached its barrier pass for one that waited.
+#[cfg(feature = "s3_backup")]
+async fn parked_on(log: &Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !super::PARKED_DELETIONS.lock().iter().any(|p| p == log) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deletion never reached the snapshot gate");
+}
+
+/// A drop holds the snapshot gate from its barrier through its deletions, so
+/// both are before the point a snapshot's copy begins or both after it. A
+/// restore empties a file at its barrier only when the barrier committed
+/// after the copy began, and a barrier committed just before it, with the
+/// file deleted once the copy had read it, left the dropped table's bytes in
+/// a copy the restore took for the next table's. Taken before the table
+/// leaves the map: a drop waiting with the table half gone hid it, and a
+/// `CREATE TABLE` of the name was refused for the files still there.
+#[cfg(feature = "s3_backup")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_waits_for_a_snapshot_start_in_progress() {
+    let sc = Scenario::new(2).await;
+    let db = sc.db.clone();
+    let wal_path = sc.root.join(DEFAULT_WAL_NAME);
+    let barriers = crate::core::wal::barriers_in(&wal_path);
+    let gate = hold_snapshot_start().await;
+    let dropping = tokio::spawn({
+        let db = db.clone();
+        async move { db.drop_table(TABLE).await }
+    });
+    parked_on(&wal_path).await;
+    assert_eq!(
+        crate::core::wal::barriers_in(&wal_path),
+        barriers,
+        "a drop logged its barrier while a snapshot was fixing its start"
+    );
+    assert!(
+        sc.root.join(format!("{TABLE}.db")).exists(),
+        "a drop deleted its files while a snapshot was fixing its start"
+    );
+    assert!(
+        db.tables.contains_key(TABLE),
+        "a drop waiting for the snapshot had already taken the table out of the map"
+    );
+    drop(gate);
+    let dropped = tokio::time::timeout(std::time::Duration::from_secs(60), dropping)
+        .await
+        .expect("the drop never finished once the snapshot let go")
+        .unwrap();
+    assert!(dropped.unwrap(), "the drop found no table");
+    assert!(!sc.root.join(format!("{TABLE}.db")).exists());
+    drop(db);
+    let Scenario {
+        base, root, db, watch, ..
+    } = sc;
+    drop(watch);
+    close(&root, db);
+    drop(base);
+}
+
+/// A snapshot's upload, which can take minutes, holds only the compaction
+/// gate. A drop sharing that gate waited for the whole upload, every DDL that
+/// drops (an `ALTER` rewrite, a rename, a move) with it.
+#[cfg(feature = "s3_backup")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_does_not_wait_for_a_snapshot_upload() {
+    let sc = Scenario::new(2).await;
+    let db = sc.db.clone();
+    let uploading = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        crate::core::backup::hold_compaction_gate(),
+    )
+    .await
+    .expect("the compaction gate was held elsewhere for a minute");
+    let dropped = tokio::time::timeout(std::time::Duration::from_secs(20), db.drop_table(TABLE))
+        .await;
+    drop(uploading);
+    let dropped = dropped.expect("a drop waited for a snapshot's upload");
+    assert!(dropped.unwrap(), "the drop found no table");
+    drop(db);
+    let Scenario {
+        base, root, db, watch, ..
+    } = sc;
+    drop(watch);
+    close(&root, db);
+    drop(base);
+}
+
+/// The same for a rename, whose old files go through `discard_files`: its
+/// barrier and its deletions wait for a snapshot fixing its start, then go.
+#[cfg(feature = "s3_backup")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_waits_for_a_snapshot_start_in_progress() {
+    let sc = Scenario::new(2).await;
+    let db = sc.db.clone();
+    let wal_path = sc.root.join(DEFAULT_WAL_NAME);
+    let barriers = crate::core::wal::barriers_in(&wal_path);
+    let gate = hold_snapshot_start().await;
+    let renaming = tokio::spawn({
+        let db = db.clone();
+        async move { db.rename_table(TABLE, "renamed_away").await }
+    });
+    parked_on(&wal_path).await;
+    assert_eq!(
+        crate::core::wal::barriers_in(&wal_path),
+        barriers,
+        "a rename logged its barrier while a snapshot was fixing its start"
+    );
+    assert!(
+        sc.root.join(format!("{TABLE}.db")).exists(),
+        "a rename deleted the old files while a snapshot was fixing its start"
+    );
+    drop(gate);
+    tokio::time::timeout(std::time::Duration::from_secs(60), renaming)
+        .await
+        .expect("the rename never finished once the snapshot let go")
+        .unwrap()
+        .unwrap();
+    assert!(!sc.root.join(format!("{TABLE}.db")).exists());
+    assert_eq!(labels_of(&db, "renamed_away", &names("old", 2)).await, names("old", 2));
+    drop(db);
+    let Scenario {
+        base, root, db, watch, ..
+    } = sc;
+    drop(watch);
+    close(&root, db);
+    drop(base);
+}
+
+/// The rename intent is a logged file too, and clearing it is a barrier and
+/// a deletion: they wait for a snapshot fixing its start, then go. Split
+/// across that point, the copy kept the intent while the restore took its
+/// barrier for one before the copy, and the restored database acted on a
+/// rename it had already finished.
+#[cfg(feature = "s3_backup")]
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_a_rename_intent_waits_for_a_snapshot_start_in_progress() {
+    let sc = Scenario::new(1).await;
+    let db = sc.db.clone();
+    let wal_path = sc.root.join(DEFAULT_WAL_NAME);
+    let intent = sc.root.join(super::RENAME_INTENT_FILE);
+    db.record_rename_intent(TABLE, "renamed_away").await.unwrap();
+    assert!(intent.exists(), "no intent was written, so there is nothing to clear");
+    let barriers = crate::core::wal::barriers_in(&wal_path);
+    let gate = hold_snapshot_start().await;
+    let clearing = tokio::spawn({
+        let db = db.clone();
+        async move { super::clear_intent(&db.db_io_pointers).await }
+    });
+    parked_on(&wal_path).await;
+    assert_eq!(
+        crate::core::wal::barriers_in(&wal_path),
+        barriers,
+        "clearing the intent logged its barrier while a snapshot was fixing its start"
+    );
+    assert!(intent.exists(), "the intent was deleted while a snapshot was fixing its start");
+    drop(gate);
+    tokio::time::timeout(std::time::Duration::from_secs(60), clearing)
+        .await
+        .expect("clearing the intent never finished once the snapshot let go")
+        .unwrap();
+    assert!(!intent.exists());
+    assert!(crate::core::wal::barriers_in(&wal_path) > barriers);
+    drop(db);
+    let Scenario {
+        base, root, db, watch, ..
+    } = sc;
+    drop(watch);
+    close(&root, db);
+    drop(base);
+}
+
+/// A drop whose barrier reached the log but whose commit marker did not (a
+/// full disk, the marker cut back cleanly, the log not poisoned) is refused
+/// and the table put back. The fence the barrier took stayed, so the table's
+/// own handles, born before it, had every record refused until a restart:
+/// the drop said nothing happened, and the table could no longer be written.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drop_whose_barrier_did_not_commit_leaves_the_table_writable() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = open(&root).await;
+    db.add_table(create_statement(TABLE)).await.unwrap();
+    insert(&db, 1, "old_00").await;
+    insert(&db, 2, "old_01").await;
+    let wal_path = root.join(DEFAULT_WAL_NAME);
+    let barriers = crate::core::wal::barriers_in(&wal_path);
+
+    crate::core::wal::test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+    let dropped = db.drop_table(TABLE).await;
+    let reached = !crate::core::wal::test_hooks::FAIL_BARRIER_MARKER.with(|f| f.replace(false));
+    crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+    assert!(reached, "the drop never logged a barrier");
+    assert!(
+        crate::core::wal::barriers_in(&wal_path) > barriers,
+        "no barrier reached the log, so this is not the case under test"
+    );
+    assert!(dropped.is_err(), "a drop whose barrier never committed reported success");
+    assert!(db.tables.contains_key(TABLE), "the refused drop took the table out of the map");
+
+    // In-place writes through the table's own handles, and an append.
+    run(&db, &format!("UPDATE {TABLE} SET label = 'upd_00' WHERE id = 1")).await;
+    run(&db, &format!("DELETE FROM {TABLE} WHERE id = 2")).await;
+    insert(&db, 3, "new_00").await;
+    let candidates: Vec<String> = names("old", 2)
+        .into_iter()
+        .chain(names("upd", 1))
+        .chain(names("new", 1))
+        .collect();
+    let expected: Vec<String> = names("new", 1).into_iter().chain(names("upd", 1)).collect();
+    let mut seen = labels(&db, &candidates).await;
+    seen.sort();
+    assert_eq!(seen, expected, "live");
+    close(&root, db);
+    let db = open(&root).await;
+    let mut seen = labels(&db, &candidates).await;
+    seen.sort();
+    assert_eq!(seen, expected, "after a restart");
+    close(&root, db);
+}
+
 /// Cut off right after a drop or a rename returns, before anything else
 /// syncs the directory: the deleted files must not come back holding the old
 /// table's bytes, and the name can be used again.
@@ -1837,5 +2141,210 @@ mod pools {
         drop(db);
         crate::core::wal::remove_for(&path_str(&root));
         crate::core::wal::remove_for(&path_str(&backup));
+    }
+
+    /// When a rename returns, every deletion it made in the database's own
+    /// directory is followed by a sync of that directory, the rename intent's
+    /// included. A power cut that undid the intent's unlink brought a valid,
+    /// checksummed intent back, and the next open "finished" the rename again,
+    /// over whatever table had taken the old name since. On a second location
+    /// nothing else syncs the database's directory after the intent goes: the
+    /// renamed table's lazily created files are made there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rename_syncs_its_directory_after_clearing_its_intent() {
+        let p = Pooled::new().await;
+        p.db.rename_table(TABLE, "moved_away").await.unwrap();
+        let events = p.watch.take_events();
+        let root = p.root.clone();
+        let intent = root.join(super::super::RENAME_INTENT_FILE);
+        assert!(
+            events.iter().any(|e| e.tag == "unlink" && e.path == intent),
+            "the rename never deleted its intent, so this tests nothing"
+        );
+        let unsynced: Vec<String> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.tag == "unlink" && e.path.parent() == Some(root.as_path()))
+            .filter(|(i, _)| {
+                !events[*i..]
+                    .iter()
+                    .any(|e| e.tag == "dir" && e.path.parent() == Some(root.as_path()))
+            })
+            .map(|(_, e)| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            unsynced,
+            Vec::<String>::new(),
+            "a rename returned with deletions in the database's directory never synced after"
+        );
+        assert!(matches!(gone(&intent, &events), Gone::Durably));
+        let Pooled {
+            base, root, disk, db, watch, ..
+        } = p;
+        drop(watch);
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+        drop(base);
+    }
+
+    /// A move whose source files could not be released (the source's log
+    /// would not take the barrier: a full disk there) kept them, and their
+    /// records stayed live in the source's log. Reported as a plain success,
+    /// nothing stood in the way of a later move back: its copy went into
+    /// those files, and the next open replayed the old incarnation's records
+    /// over it, bringing back a row deleted in between.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_move_back_after_a_move_that_kept_its_source_brings_no_row_back() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let disk = base.path().join("disk");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&disk).unwrap();
+        let db = open(&root).await;
+        db.storage
+            .add_location(&path_str(&disk), LocationRole::Primary, 1, true)
+            .unwrap();
+        db.storage.pin(TABLE, &path_str(&root)).unwrap();
+        db.add_table(create_statement(TABLE)).await.unwrap();
+        assert!(root.join(format!("{TABLE}.db")).exists(), "the table is not on the root");
+        for n in 0..6 {
+            insert(&db, n, &format!("old_{n:02}")).await;
+        }
+        let root_log = root.join(DEFAULT_WAL_NAME);
+        let logged = std::fs::metadata(&root_log).unwrap().len();
+
+        crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| *p.borrow_mut() = Some(root_log.clone()));
+        let moved = db.move_table_to(TABLE, &path_str(&disk)).await;
+        let reached = crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| p.borrow_mut().take()).is_none();
+        assert!(reached, "the move never tried to void the source's records");
+        assert!(disk.join(format!("{TABLE}.db")).exists(), "the table did not reach the disk");
+        assert_eq!(labels(&db, &names("old", 6)).await, names("old", 6), "after the move");
+
+        run(&db, &format!("DELETE FROM {TABLE} WHERE id = 0")).await;
+        db.move_table_to(TABLE, &path_str(&root)).await.unwrap();
+        let mut kept = names("old", 6);
+        kept.remove(0);
+        assert_eq!(labels(&db, &names("old", 6)).await, kept, "after the move back");
+        assert!(
+            std::fs::metadata(&root_log).unwrap().len() >= logged,
+            "the root's log was truncated, so it no longer holds the old records to replay"
+        );
+
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+        let db = open(&root).await;
+        assert_eq!(
+            labels(&db, &names("old", 6)).await,
+            kept,
+            "after a reopen a row deleted before the move back came back"
+        );
+        assert!(
+            moved.is_err(),
+            "a move that kept its source's files and records reported success"
+        );
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+    }
+
+    /// A database with `TABLE` on the root, four durable rows, and a second
+    /// location `disk` it can move to.
+    async fn on_root_with_a_disk() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<Database>) {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let disk = base.path().join("disk");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&disk).unwrap();
+        let db = open(&root).await;
+        db.storage
+            .add_location(&path_str(&disk), LocationRole::Primary, 1, true)
+            .unwrap();
+        db.storage.pin(TABLE, &path_str(&root)).unwrap();
+        db.add_table(create_statement(TABLE)).await.unwrap();
+        assert!(root.join(format!("{TABLE}.db")).exists(), "the table is not on the root");
+        for n in 0..4 {
+            insert(&db, n, &format!("old_{n:02}")).await;
+        }
+        (base, root, disk, db)
+    }
+
+    /// A move whose destination's log will not void its old records for the
+    /// name (a full disk there) copies nothing and leaves the table where it
+    /// was, readable and writable, and says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_move_whose_destination_will_not_void_its_records_stays_where_it_was() {
+        let (base, root, disk, db) = on_root_with_a_disk().await;
+        let disk_log = disk.join(DEFAULT_WAL_NAME);
+        assert!(
+            crate::core::wal::wal_for(&path_str(&disk)).is_some(),
+            "the destination has no log, so it has no barrier to refuse"
+        );
+        let backend = db.storage.backend_of(TABLE);
+
+        crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| *p.borrow_mut() = Some(disk_log.clone()));
+        let moved = db.move_table_to(TABLE, &path_str(&disk)).await;
+        let reached = crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| p.borrow_mut().take()).is_none();
+        assert!(reached, "the move never asked the destination's log for a barrier");
+        assert!(moved.is_err(), "a move whose destination refused its barrier reported success");
+        assert!(db.tables.contains_key(TABLE), "the refused move took the table out of the map");
+        assert_eq!(db.storage.backend_of(TABLE), backend, "the refused move flipped the placement");
+        // Empty files may be there (opening the destination creates some),
+        // and a later table of the name takes those over harmlessly.
+        let copied: Vec<String> = table_file_names(TABLE)
+            .filter(|f| std::fs::metadata(disk.join(f)).is_ok_and(|m| m.len() > 0))
+            .collect();
+        assert_eq!(copied, Vec::<String>::new(), "the refused move copied files to the destination");
+        assert_eq!(labels(&db, &names("old", 4)).await, names("old", 4), "after the refused move");
+        insert(&db, 4, "old_04").await;
+        assert_eq!(labels(&db, &names("old", 5)).await, names("old", 5), "written after it");
+
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+        let db = open(&root).await;
+        assert_eq!(labels(&db, &names("old", 5)).await, names("old", 5), "after a reopen");
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+        drop(base);
+    }
+
+    /// A move voids the destination's old records for the name before its
+    /// copy, under the snapshot gate like every barrier and deletion: it
+    /// waits for a snapshot fixing its start, then goes.
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_waits_for_a_snapshot_start_in_progress() {
+        let (base, root, disk, db) = on_root_with_a_disk().await;
+        let disk_log = disk.join(DEFAULT_WAL_NAME);
+        let barriers = crate::core::wal::barriers_in(&disk_log);
+        let gate = super::hold_snapshot_start().await;
+        let moving = tokio::spawn({
+            let db = db.clone();
+            let disk = path_str(&disk);
+            async move { db.move_table_to(TABLE, &disk).await }
+        });
+        super::parked_on(&disk_log).await;
+        assert_eq!(
+            crate::core::wal::barriers_in(&disk_log),
+            barriers,
+            "a move logged its barrier while a snapshot was fixing its start"
+        );
+        assert!(!disk.join(format!("{TABLE}.db")).exists(), "a move copied while the gate was held");
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(60), moving)
+            .await
+            .expect("the move never finished once the snapshot let go")
+            .unwrap()
+            .unwrap();
+        assert!(disk.join(format!("{TABLE}.db")).exists());
+        assert!(!root.join(format!("{TABLE}.db")).exists());
+        assert_eq!(labels(&db, &names("old", 4)).await, names("old", 4));
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+        drop(base);
     }
 }

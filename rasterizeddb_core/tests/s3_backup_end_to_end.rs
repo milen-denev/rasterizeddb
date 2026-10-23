@@ -265,6 +265,170 @@ e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
     );
 });
 
+e2e_test!(a_restore_across_a_drop_and_recreate_brings_no_old_row_back, config, {
+    // The snapshot holds the old table's files. The archived log after it
+    // holds the drop's barrier, then the recreated table's records, which
+    // were written into files that started empty. Replayed over the old
+    // files, the new rows covered the start and every old row past them came
+    // back under the new table.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE reborn (id INT, note STRING)").await;
+    for i in 0..20 {
+        run(
+            &database,
+            &format!("INSERT INTO reborn (id, note) VALUES ({i}, 'old')"),
+        )
+        .await;
+    }
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    run(&database, "DROP TABLE reborn").await;
+    run(&database, "CREATE TABLE reborn (id INT, note STRING)").await;
+    run(&database, "INSERT INTO reborn (id, note) VALUES (100, 'new')").await;
+    assert_eq!(count_rows(&database, "SELECT * FROM reborn").await, 1);
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+
+    drop(database);
+    std::fs::remove_dir_all(&live).expect("remove the source");
+
+    let restored = Arc::new(Database::new(target.to_str().unwrap()).await);
+    assert_eq!(
+        count_rows(&restored, "SELECT * FROM reborn WHERE note = 'old'").await,
+        0,
+        "the restore brought the dropped table's rows back under the new one"
+    );
+    assert_eq!(
+        count_rows(&restored, "SELECT * FROM reborn").await,
+        1,
+        "the restored table does not hold exactly the recreated table's row"
+    );
+});
+
+e2e_test!(a_restore_keeps_a_table_renamed_onto_a_dropped_name_before_the_snapshot, config, {
+    // The drop's barrier for `x` committed before the snapshot began, in the
+    // segment the snapshot's own first cut archives, so it is replayed. The
+    // copy holds `x` as the rename made it: `y`'s bytes, copied with no log
+    // record. A restore that took the barrier for one committed after the
+    // copy began emptied `x`, and nothing in the log could fill it again.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE x (id INT, note STRING)").await;
+    run(&database, "CREATE TABLE y (id INT, note STRING)").await;
+    for i in 0..5 {
+        run(&database, &format!("INSERT INTO x (id, note) VALUES ({i}, 'dropped')")).await;
+    }
+    for i in 0..12 {
+        run(&database, &format!("INSERT INTO y (id, note) VALUES ({i}, 'renamed')")).await;
+    }
+    run(&database, "DROP TABLE x").await;
+    run(&database, "ALTER TABLE y RENAME TO x").await;
+    assert_eq!(count_rows(&database, "SELECT * FROM x WHERE note = 'renamed'").await, 12);
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+    run(&database, "INSERT INTO x (id, note) VALUES (100, 'after')").await;
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+
+    drop(database);
+    std::fs::remove_dir_all(&live).expect("remove the source");
+
+    let restored = Arc::new(Database::new(target.to_str().unwrap()).await);
+    assert_eq!(
+        count_rows(&restored, "SELECT * FROM x WHERE note = 'renamed'").await,
+        12,
+        "the restore emptied a table renamed onto a dropped name before the snapshot"
+    );
+    assert_eq!(count_rows(&restored, "SELECT * FROM x WHERE note = 'dropped'").await, 0);
+    assert_eq!(count_rows(&restored, "SELECT * FROM x WHERE note = 'after'").await, 1);
+});
+
+e2e_test!(a_drop_does_not_wait_for_a_snapshot_upload_in_progress, config, {
+    // A snapshot keeps deletions out only while it cuts the logs and reads
+    // where its copy begins; a barrier and its deletion both after that point
+    // are emptied by a restore however long the copy runs. Held for the whole
+    // snapshot instead, every DROP, rename, move and ALTER rewrite in the
+    // process waited for the upload, minutes over a slow link.
+    //
+    // The upload is stalled by holding the in-process store's lock, so this
+    // needs the fake store.
+    if std::env::var("RDB_S3_TEST_ENDPOINT").is_ok() {
+        eprintln!("skipping: the upload can only be stalled on the in-process store");
+        return;
+    }
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE kept (id INT, note STRING)").await;
+    run(&database, "CREATE TABLE doomed (id INT, note STRING)").await;
+    for i in 0..5 {
+        run(&database, &format!("INSERT INTO kept (id, note) VALUES ({i}, 'k')")).await;
+        run(&database, &format!("INSERT INTO doomed (id, note) VALUES ({i}, 'd')")).await;
+    }
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+
+    let store = rasterizeddb_core::core::backup::fake_s3::shared().store.clone();
+    let stalled = store.lock();
+    let snapshot = tokio::spawn({
+        let service = service.clone();
+        async move { service.snapshot_now().await }
+    });
+    // A snapshot is running once the compaction gate, which it holds for its
+    // whole run, is taken; from there it cannot finish while the store is
+    // held.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                rasterizeddb_core::core::backup::compaction_permit(),
+            )
+            .await;
+            if probe.is_err() {
+                break;
+            }
+            drop(probe);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the snapshot never started");
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run(&database, "DROP TABLE doomed"),
+    )
+    .await;
+    drop(stalled);
+    assert!(dropped.is_ok(), "a drop waited for a snapshot's upload");
+    snapshot.await.unwrap().expect("snapshot");
+    assert_eq!(count_rows(&database, "SELECT * FROM kept").await, 5);
+});
+
 e2e_test!(recovers_to_a_point_in_time, config, {
     let root = temp_testdir::TempDir::default();
     let live = root.join("live");

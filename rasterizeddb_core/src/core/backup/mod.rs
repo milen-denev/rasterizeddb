@@ -255,6 +255,48 @@ pub async fn compaction_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
     compaction_gate().read().await
 }
 
+/// Keeps a log barrier and the deletion it announces on one side of the
+/// point a snapshot's copy begins.
+///
+/// A point-in-time restore empties a restored file at its barrier only when
+/// the barrier committed after that point (see
+/// [`crate::core::wal::Wal::recover_restoring`]): the copy then may hold the
+/// deleted file. That is right only if the deletion is on the same side as
+/// the barrier. A barrier just before the point with its file deleted after
+/// the copy read it left the deleted file's bytes in a copy the restore took
+/// for the next file's.
+///
+/// Its own gate, not the compaction gate. A snapshot holds that one for its
+/// whole upload, minutes over a slow link, and every `DROP`, rename, move
+/// and `ALTER` rewrite waited that long, process-wide. A barrier and its
+/// deletion both after the point are emptied correctly however long the
+/// copy runs, so the snapshot holds this gate only while it cuts the logs
+/// and reads where its copy begins.
+static DELETION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+
+fn deletion_gate() -> &'static RwLock<()> {
+    DELETION_GATE.get_or_init(|| RwLock::new(()))
+}
+
+/// Held shared from a log barrier through the deletion of the files it
+/// voided; see [`DELETION_GATE`].
+pub async fn deletion_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    deletion_gate().read().await
+}
+
+/// The deletion gate as a snapshot holds it while it fixes where its copy
+/// begins, for tests.
+#[cfg(test)]
+pub(crate) async fn hold_snapshot_gate() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    deletion_gate().write().await
+}
+
+/// The compaction gate as a snapshot's copy holds it, for tests.
+#[cfg(test)]
+pub(crate) async fn hold_compaction_gate() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    compaction_gate().write().await
+}
+
 static SERVICE: OnceLock<Arc<BackupService>> = OnceLock::new();
 
 /// The configured backup service, if one was installed at start-up.
@@ -789,6 +831,9 @@ impl BackupService {
         // Exclusive for the whole copy: compaction is the one writer whose
         // effects replay cannot reconstruct.
         let _no_compaction = compaction_gate().write().await;
+        // Exclusive only until the copy's start is fixed below: see
+        // `DELETION_GATE`.
+        let no_deletion = deletion_gate().write().await;
 
         // Before the first cut, so each location's log is a stream of this
         // snapshot and its window opens with the copy's.
@@ -825,6 +870,9 @@ impl BackupService {
             .map(|(key, wal)| (key.clone(), wal.commit_lsn()))
             .collect();
         let start_lsn = opened_at.get("").copied().unwrap_or(0);
+        // Each window's start is fixed: a barrier from here commits past it,
+        // and its deletion follows it.
+        drop(no_deletion);
 
         let files = self.snapshot_file_list(&locations)?;
         if files.is_empty() {

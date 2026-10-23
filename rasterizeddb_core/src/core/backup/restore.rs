@@ -511,7 +511,11 @@ async fn build(
 
         let window = snapshot.window_for(&database);
         if count > 0 {
-            let applied = replay(&replay_path, &into, ceiling_for(&database))?;
+            // Where this database's copy began: a barrier committed past it
+            // deleted a file the copy still holds. A database with no window
+            // had every file created during the copy, which began at 0.
+            let copied_at = window.as_ref().map_or(0, |w| w.start_lsn);
+            let applied = replay(&replay_path, &into, ceiling_for(&database), copied_at)?;
             stats.applied += applied.applied;
             stats.rolled_back += applied.rolled_back;
             stats.unresolved += applied.unresolved;
@@ -1025,10 +1029,18 @@ async fn download_segments(
 }
 
 /// Applies the concatenated log to the restored files, stopping at `ceiling`.
-fn replay(
+///
+/// `copied_at` is the commit sequence when the snapshot's copy of this
+/// database began: a file whose deletion committed after it is emptied before
+/// replay writes the next file of its name (see
+/// [`crate::core::wal::Wal::recover_restoring`]). Without that, a table
+/// dropped and created again after the snapshot came back holding every old
+/// row past the new table's end.
+pub(super) fn replay(
     replay_path: &Path,
     target_dir: &Path,
     ceiling: Option<u64>,
+    copied_at: u64,
 ) -> io::Result<crate::core::wal::RecoveryStats> {
     // File ids are derived from a name within a database directory, never an
     // absolute path, which is exactly what lets a log recorded under one mount
@@ -1047,7 +1059,12 @@ fn replay(
         resolver.insert(crate::core::wal::file_id_for_name(&name), entry.path());
     }
 
-    crate::core::wal::Wal::recover_upto(replay_path, |id| resolver.get(&id).cloned(), ceiling)
+    crate::core::wal::Wal::recover_restoring(
+        replay_path,
+        |id| resolver.get(&id).cloned(),
+        ceiling,
+        copied_at,
+    )
 }
 
 fn write_marker(target_dir: &Path, report: &RestoreReport) -> io::Result<()> {

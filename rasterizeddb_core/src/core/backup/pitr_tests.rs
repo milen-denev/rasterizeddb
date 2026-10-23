@@ -445,3 +445,288 @@ fn a_torn_tail_does_not_inflate_the_reported_range() {
         "a corrupt record must truncate the range, got {last} against {clean_last}"
     );
 }
+
+/// A table dropped and created again under its name after the snapshot. The
+/// snapshot holds the old table's file; the archived log holds the barrier,
+/// then the new table's records, written into a file that started empty.
+/// Replay skipped the voided records but wrote the new ones over the old
+/// file, so wherever the new file was shorter the old bytes (rows) came back
+/// under the new table.
+#[test]
+fn a_restore_across_a_drop_and_recreate_holds_only_the_new_files_bytes() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal = Wal::open(live.join("rasterized.wal")).unwrap();
+    wal.set_archive_dir(Some(staging.clone())).unwrap();
+    let data_path = live.join("rows.db");
+    let id = file_id_for_name("rows.db");
+
+    // The old table, durable and checkpointed before the snapshot.
+    let old: &[u8] = b"OLD-ROW-1;OLD-ROW-2;OLD-ROW-3;";
+    commit_write(&wal, id, 0, old);
+    std::fs::write(&data_path, old).unwrap();
+    wal.checkpoint().unwrap();
+
+    // The snapshot: the commit sequence when its copy began, the copy, and
+    // the cut that ends its window.
+    let window_start = wal.commit_lsn();
+    let snapshot_copy = root.join("snapshot-rows.db");
+    std::fs::copy(&data_path, &snapshot_copy).unwrap();
+    wal.checkpoint().unwrap();
+
+    // After it: dropped, created again, one shorter row.
+    wal.forget_files(&[id]).unwrap();
+    std::fs::remove_file(&data_path).unwrap();
+    let new: &[u8] = b"NEW-ROW-1;";
+    commit_write(&wal, id, 0, new);
+    std::fs::write(&data_path, new).unwrap();
+    wal.checkpoint().unwrap();
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    super::restore::replay(&replay, &target, None, window_start).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("rows.db")).unwrap(),
+        new,
+        "the restored table holds the dropped table's bytes past its own"
+    );
+}
+
+/// The other side of the same rule: a file deleted and created again *before*
+/// the snapshot began is the new file in the copy, and may hold bytes no
+/// record describes (a rename's or a move's staged copy writes none). The
+/// barrier is in the replayed window all the same, since the window starts at
+/// the last bundle before the copy; emptying the file there would lose them.
+#[test]
+fn a_restore_keeps_a_file_the_snapshot_copied_after_its_barrier() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal = Wal::open(live.join("rasterized.wal")).unwrap();
+    wal.set_archive_dir(Some(staging.clone())).unwrap();
+    let data_path = live.join("rows.db");
+    let id = file_id_for_name("rows.db");
+
+    commit_write(&wal, id, 0, b"OLD-ROW-1;OLD-ROW-2;");
+    std::fs::write(&data_path, b"OLD-ROW-1;OLD-ROW-2;").unwrap();
+    wal.forget_files(&[id]).unwrap();
+    std::fs::remove_file(&data_path).unwrap();
+    // The new file: a logged row, then bytes no record describes.
+    commit_write(&wal, id, 0, b"NEW-ROW-1;");
+    std::fs::write(&data_path, b"NEW-ROW-1;UNLOGGED-COPY;").unwrap();
+    wal.checkpoint().unwrap();
+
+    let window_start = wal.commit_lsn();
+    let snapshot_copy = root.join("snapshot-rows.db");
+    std::fs::copy(&data_path, &snapshot_copy).unwrap();
+    wal.checkpoint().unwrap();
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    super::restore::replay(&replay, &target, None, window_start).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("rows.db")).unwrap(),
+        b"NEW-ROW-1;UNLOGGED-COPY;",
+        "a file the snapshot copied after its barrier lost bytes at the restore"
+    );
+}
+
+/// The emptying rule's boundary: a barrier that was the last commit before
+/// the copy began is before the copy, and the copy holds the file created
+/// after it, unlogged bytes included (a move back writes its staged copy with
+/// no record). Only a barrier committed *after* the copy began empties.
+#[test]
+fn a_restore_keeps_a_file_whose_barrier_was_the_last_commit_before_the_copy() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal = Wal::open(live.join("rasterized.wal")).unwrap();
+    wal.set_archive_dir(Some(staging.clone())).unwrap();
+    let data_path = live.join("rows.db");
+    let id = file_id_for_name("rows.db");
+
+    commit_write(&wal, id, 0, b"OLD-ROW-1;OLD-ROW-2;");
+    std::fs::write(&data_path, b"OLD-ROW-1;OLD-ROW-2;").unwrap();
+    wal.forget_files(&[id]).unwrap();
+    std::fs::remove_file(&data_path).unwrap();
+    // The new file, all of it written with no record, and no commit since.
+    std::fs::write(&data_path, b"STAGED-COPY;").unwrap();
+
+    // The barrier's marker carries this very sequence.
+    let window_start = wal.commit_lsn();
+    let snapshot_copy = root.join("snapshot-rows.db");
+    std::fs::copy(&data_path, &snapshot_copy).unwrap();
+    wal.checkpoint().unwrap();
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    super::restore::replay(&replay, &target, None, window_start).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("rows.db")).unwrap(),
+        b"STAGED-COPY;",
+        "a file whose barrier was the last commit before the copy lost its bytes at the restore"
+    );
+}
+
+/// The transaction-id mark a run leaves for the next. Removed to stand for a
+/// database whose last run left none (written before the mark existed, or
+/// the best-effort write failed), so that the next run reissues ids.
+fn forget_txn_mark(wal_path: &Path) {
+    let mut name = wal_path.file_name().unwrap().to_os_string();
+    name.push(".txn");
+    match std::fs::remove_file(wal_path.with_file_name(name)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Commits one write and returns the transaction id it took.
+fn commit_write_as(wal: &Wal, file_id: u64, offset: u64, bytes: &[u8]) -> u64 {
+    let txn = wal.begin();
+    wal.log(txn, file_id, offset, bytes).unwrap();
+    wal.commit_txn(txn).unwrap();
+    txn
+}
+
+/// Two runs joined end to end, the second reissuing the first's transaction
+/// ids. A drop and a rename onto the name before the snapshot: the barrier
+/// committed before the copy began, so the copy holds the renamed table's
+/// file, whose staged bytes no record describes. The second run's commit of
+/// the barrier's id, after the copy, was taken for the barrier's own, and
+/// the restore emptied the file: the table came back empty.
+#[test]
+fn a_restore_across_runs_resolves_a_barrier_by_its_own_commit() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal_path = live.join("rasterized.wal");
+    let data_path = live.join("x.db");
+    let id = file_id_for_name("x.db");
+    let other = file_id_for_name("y.db");
+
+    // The first run: x written, dropped, and y's bytes copied in as x.
+    let (window_start, barrier_txn, snapshot_copy) = {
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.set_archive_dir(Some(staging.clone())).unwrap();
+        commit_write_as(&wal, id, 0, b"DROPPED-X;");
+        std::fs::write(&data_path, b"DROPPED-X;").unwrap();
+        let barrier_txn = wal.begin() + 1;
+        wal.forget_files(&[id]).unwrap();
+        std::fs::remove_file(&data_path).unwrap();
+        std::fs::write(&data_path, b"RENAMED-Y-ROWS;").unwrap();
+        wal.checkpoint().unwrap();
+
+        let window_start = wal.commit_lsn();
+        let snapshot_copy = root.join("snapshot-x.db");
+        std::fs::copy(&data_path, &snapshot_copy).unwrap();
+        wal.checkpoint().unwrap();
+        (window_start, barrier_txn, snapshot_copy)
+    };
+
+    // The second run reissues ids, and commits the barrier's after the copy.
+    forget_txn_mark(&wal_path);
+    {
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.set_archive_dir(Some(staging.clone())).unwrap();
+        let mut reused = 0;
+        let mut offset = 0;
+        while reused < barrier_txn {
+            reused = commit_write_as(&wal, other, offset, b"y");
+            offset += 1;
+        }
+        assert_eq!(reused, barrier_txn, "the second run did not reissue the barrier's id");
+        assert!(wal.commit_lsn() > window_start);
+        wal.checkpoint().unwrap();
+    }
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(&snapshot_copy, target.join("x.db")).unwrap();
+    std::fs::write(target.join("y.db"), b"").unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    super::restore::replay(&replay, &target, None, window_start).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("x.db")).unwrap(),
+        b"RENAMED-Y-ROWS;",
+        "a later run's commit of the barrier's id emptied the renamed table at the restore"
+    );
+}
+
+/// Two runs joined end to end: a barrier whose marker failed (the drop
+/// refused, the table kept) took an id the first run had committed earlier.
+/// That marker precedes the barrier, so it cannot be the barrier's commit,
+/// yet it counted as one: the restore emptied the live table's file and
+/// voided its records.
+#[test]
+fn a_barrier_that_never_committed_is_not_committed_by_an_earlier_runs_marker() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal_path = live.join("rasterized.wal");
+    let data_path = live.join("x.db");
+    let id = file_id_for_name("x.db");
+
+    let (window_start, snapshot_copy, earlier) = {
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.set_archive_dir(Some(staging.clone())).unwrap();
+        commit_write_as(&wal, id, 0, b"AAAA");
+        std::fs::write(&data_path, b"AAAA").unwrap();
+        wal.checkpoint().unwrap();
+        let window_start = wal.commit_lsn();
+        let snapshot_copy = root.join("snapshot-x.db");
+        std::fs::copy(&data_path, &snapshot_copy).unwrap();
+        let earlier = commit_write_as(&wal, id, 4, b"BBBB");
+        wal.checkpoint().unwrap();
+        (window_start, snapshot_copy, earlier)
+    };
+
+    forget_txn_mark(&wal_path);
+    {
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.set_archive_dir(Some(staging.clone())).unwrap();
+        // Ids up to the one before `earlier` taken, as other work would.
+        while wal.begin() + 1 < earlier {}
+        // The barrier takes `earlier` and fails at its marker.
+        crate::core::wal::test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        let after = commit_write_as(&wal, id, 8, b"CCCC");
+        assert_eq!(after, earlier + 1, "the failed barrier did not take the earlier run's id");
+        wal.checkpoint().unwrap();
+    }
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(&snapshot_copy, target.join("x.db")).unwrap();
+    std::fs::write(target.join("y.db"), b"").unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    super::restore::replay(&replay, &target, None, window_start).unwrap();
+
+    assert_eq!(
+        std::fs::read(target.join("x.db")).unwrap(),
+        b"AAAABBBBCCCC",
+        "a barrier that never committed emptied the table or voided its records at the restore"
+    );
+}

@@ -88,8 +88,18 @@ const HEADER_CRC_LEN: usize = HEADER_LEN - 4;
 
 /// The mark that carries `wal_path`'s commit sequence across a truncation.
 fn lsn_mark_path(wal_path: &Path) -> PathBuf {
+    mark_path(wal_path, LSN_MARK_SUFFIX)
+}
+
+/// The mark that carries `wal_path`'s next transaction id across a
+/// truncation.
+fn txn_mark_path(wal_path: &Path) -> PathBuf {
+    mark_path(wal_path, TXN_MARK_SUFFIX)
+}
+
+fn mark_path(wal_path: &Path, suffix: &str) -> PathBuf {
     let mut name = wal_path.file_name().unwrap_or_default().to_os_string();
-    name.push(LSN_MARK_SUFFIX);
+    name.push(suffix);
     wal_path.with_file_name(name)
 }
 
@@ -100,15 +110,24 @@ fn lsn_mark_path(wal_path: &Path) -> PathBuf {
 /// carries every sequence it has not checkpointed away, and refusing to open a
 /// database over a stray file would be the worse failure.
 fn read_lsn_mark(wal_path: &Path) -> u64 {
-    let path = lsn_mark_path(wal_path);
-    match std::fs::read_to_string(&path) {
+    read_mark(&lsn_mark_path(wal_path), "commit sequence")
+}
+
+/// The first transaction id the last truncation left unissued, or 0 when
+/// there is no usable mark (as [`read_lsn_mark`]).
+fn read_txn_mark(wal_path: &Path) -> u64 {
+    read_mark(&txn_mark_path(wal_path), "transaction id")
+}
+
+fn read_mark(path: &Path, what: &str) -> u64 {
+    match std::fs::read_to_string(path) {
         Ok(text) => match text.trim().parse::<u64>() {
             Ok(lsn) => lsn,
             Err(_) => {
                 log::warn!(
-                    "{} does not hold a commit sequence; the log's own records will have to \
-                     supply it",
-                    path.display()
+                    "{} does not hold a {}; the log's own records will have to supply it",
+                    path.display(),
+                    what
                 );
                 0
             }
@@ -127,16 +146,25 @@ fn read_lsn_mark(wal_path: &Path) -> u64 {
 /// tore across a crash could leave a *lower* number than the one already
 /// issued — which is the one outcome this file exists to prevent.
 fn write_lsn_mark(wal_path: &Path, lsn: u64) -> io::Result<()> {
-    let path = lsn_mark_path(wal_path);
-    let temp = path.with_extension("lsn.partial");
+    write_mark(&lsn_mark_path(wal_path), "lsn.partial", "wal.lsn_mark", lsn)
+}
+
+/// Records `txn` as the floor of the ids a later open hands out, as
+/// [`write_lsn_mark`] does the commit sequence.
+fn write_txn_mark(wal_path: &Path, txn: u64) -> io::Result<()> {
+    write_mark(&txn_mark_path(wal_path), "txn.partial", "wal.txn_mark", txn)
+}
+
+fn write_mark(path: &Path, partial: &str, audit: &'static str, value: u64) -> io::Result<()> {
+    let temp = path.with_extension(partial);
     {
         let mut file = File::create(&temp)?;
-        file.write_all(lsn.to_string().as_bytes())?;
-        crate::core::sync_audit::note("wal.lsn_mark", &path);
+        file.write_all(value.to_string().as_bytes())?;
+        crate::core::sync_audit::note(audit, path);
         file.sync_all()?;
     }
-    std::fs::rename(&temp, &path)?;
-    sync_parent_dir(&path)
+    std::fs::rename(&temp, path)?;
+    sync_parent_dir(path)
 }
 
 /// Refuses absurd record lengths before allocating for them, so a corrupt header
@@ -186,6 +214,18 @@ pub const SEGMENT_SUFFIX: &str = ".wseg";
 /// run compare as newer than a snapshot taken after it. This file is the
 /// floor, and the records still in the log are anything above it.
 pub const LSN_MARK_SUFFIX: &str = ".lsn";
+
+/// Suffix of the file that carries the next transaction id across a
+/// truncation, as [`LSN_MARK_SUFFIX`] carries the commit sequence.
+///
+/// Ids started again at 1 on every restart after a clean checkpoint, and an
+/// archive joins the logs of several runs end to end. Replay matches a commit
+/// marker to its records by id alone, so a marker of one run committed the
+/// records, and the barriers, of another run's transaction of that id. A
+/// separate file rather than a second number in the commit-sequence mark: a
+/// build that predates it reads that mark as one number, and would lose the
+/// sequence over the extra field.
+pub const TXN_MARK_SUFFIX: &str = ".txn";
 
 /// Extension a segment carries while it is still being copied. Renamed to
 /// [`SEGMENT_SUFFIX`] once complete, so the archiver never uploads a half file.
@@ -260,6 +300,9 @@ pub struct RecoveryStats {
     /// Records skipped because a later committed [`Wal::forget_files`]
     /// barrier voided them: their file was deleted after they were logged.
     pub forgotten: u64,
+    /// Restored files emptied at a barrier that committed after their copy
+    /// was taken: see [`Wal::recover_restoring`].
+    pub emptied: u64,
     /// Bytes of trailing garbage ignored — a partial record from a crash.
     pub truncated_tail: u64,
     /// Highest transaction id any record in the log carries. A log that is
@@ -419,11 +462,52 @@ pub struct Wal {
     /// do not take that lock. `u64::MAX` when unset. Written under the writer
     /// lock.
     last_dirty: AtomicU64,
-    /// `file_id` -> the fence [`Wal::forget_files`] took for it: records from
-    /// writers born before it are refused. Written and read under the writer
-    /// lock, so a record is either framed before the barrier (and voided by
-    /// it) or refused. Never shrinks: one entry per name ever deleted.
-    fences: Mutex<HashMap<u64, u64>>,
+    /// `file_id` -> the fences [`Wal::forget_files`] took for it (see
+    /// [`Fence`]). Taken under the writer lock and checked under it by every
+    /// record, so a record is either framed before the barrier (and voided
+    /// by it) or refused. A read-write lock: every record and every held
+    /// apply only read it, and the apply opens its file with it held, so
+    /// readers must not queue behind each other's system calls. Never
+    /// shrinks below one entry per name ever deleted.
+    fences: parking_lot::RwLock<HashMap<u64, Fence>>,
+}
+
+/// One file id's fences: [`Incarnation`]s taken by [`Wal::forget_files`]
+/// barriers for it, in the order writers come to be.
+///
+/// Kept apart by whether the barrier is known to have committed. A barrier
+/// that never commits voids nothing, so its fence must not outlive it, but
+/// the fence of an earlier, committed barrier for the same id still stands:
+/// a writer born before that one writes to a file deleted long ago.
+#[derive(Clone, Copy, Default, Debug)]
+struct Fence {
+    /// The latest barrier whose commit marker is in the log: the file was
+    /// deleted (or is about to be) after it. 0 for none.
+    committed: u64,
+    /// The latest barrier in the log whose commit marker is not, yet: the
+    /// file is still there, and is deleted only once the barrier commits.
+    /// 0 for none.
+    pending: u64,
+}
+
+impl Fence {
+    /// A record from a writer born at `born` may not be framed. A pending
+    /// barrier refuses it too: framed after the barrier, it would not be
+    /// voided if the barrier then commits, and would replay into the next
+    /// file of the name.
+    fn refuses_record(&self, born: Incarnation) -> bool {
+        born.0 <= self.committed.max(self.pending)
+    }
+
+    /// A held write from a writer born at `born` must not be applied: its
+    /// file was deleted at a committed barrier, and its path names whatever
+    /// file took the name since. Under a pending barrier the file is still
+    /// the writer's, and the write belongs in it whichever way the barrier
+    /// goes: voided by replay with the file if it commits, and replayed, as
+    /// the live apply did, if it does not.
+    fn voids_apply(&self, born: Incarnation) -> bool {
+        born.0 <= self.committed
+    }
 }
 
 /// See [`Wal::dirty`].
@@ -494,6 +578,8 @@ impl Wal {
         // from the records still in the log; this is only the floor beneath
         // them, and it is all a cleanly checkpointed log leaves behind.
         let resume_lsn = read_lsn_mark(&path);
+        // The same for transaction ids: see `TXN_MARK_SUFFIX`.
+        let resume_txn = read_txn_mark(&path).max(1);
 
         // Records this process did not write still have to reach their files
         // before a checkpoint may drop them; their headers say which files.
@@ -517,7 +603,7 @@ impl Wal {
             durable: AtomicU64::new(0),
             gate: Mutex::new(()),
             sync_handle: Mutex::new(None),
-            next_txn: AtomicU64::new(1),
+            next_txn: AtomicU64::new(resume_txn),
             commit_lsn: AtomicU64::new(resume_lsn),
             bytes_since_checkpoint: AtomicU64::new(end),
             checkpointing: AtomicBool::new(false),
@@ -540,7 +626,7 @@ impl Wal {
             break_granted_at: AtomicU64::new(0),
             dirty: Mutex::new(dirty),
             last_dirty: AtomicU64::new(u64::MAX),
-            fences: Mutex::new(HashMap::new()),
+            fences: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -777,8 +863,11 @@ impl Wal {
             let mut file = self.writer.lock();
             // Under the writer lock, as the fence is taken: either this record
             // precedes the barrier and is voided by it, or it is refused.
-            if let Some(&fence) = self.fences.lock().get(&file_id)
-                && born.0 <= fence
+            if self
+                .fences
+                .read()
+                .get(&file_id)
+                .is_some_and(|fence| fence.refuses_record(born))
             {
                 return Err(io::Error::other(format!(
                     "refusing a log record for file id {file_id}: its file was deleted after \
@@ -818,6 +907,8 @@ impl Wal {
                 }
                 entry.push(PendingWrite {
                     path,
+                    file_id,
+                    born,
                     offset,
                     log_offset: payload_at,
                     len: bytes.len(),
@@ -997,19 +1088,49 @@ impl Wal {
         // which the data file keeps whatever the failed apply left behind.
         // Poisoning keeps the log, so a restart replays it, and refuses every
         // later commit rather than building on bytes that are not there.
-        if let Err(e) = self.apply_held(held) {
-            self.poison(format!(
-                "applying a committed in-place write of transaction {} failed: {}",
-                txn, e
-            ));
-            return Err(e);
+        let voided = match self.apply_held(held) {
+            Ok(voided) => voided,
+            Err(e) => {
+                self.poison(format!(
+                    "applying a committed in-place write of transaction {} failed: {}",
+                    txn, e
+                ));
+                return Err(e);
+            }
+        };
+        // Writes to a file deleted since they were logged went nowhere: the
+        // table they belonged to is gone, and replay voids their records too.
+        // Not a poisoning failure, since the log and every file still agree,
+        // but the caller wrote to a table that no longer exists and must not
+        // be told it succeeded.
+        if voided > 0 {
+            return Err(io::Error::other(format!(
+                "{voided} in-place write(s) of transaction {txn} were not applied: their file \
+                 was deleted (its table dropped, renamed or moved) after they were logged"
+            )));
         }
 
         Ok(seq)
     }
 
-    /// Copies each held overwrite's payload from the log into its data file.
-    fn apply_held(&self, held: Vec<PendingWrite>) -> io::Result<()> {
+    /// Copies each held overwrite's payload from the log into its data file,
+    /// and returns how many it skipped because their file was deleted since
+    /// they were logged.
+    ///
+    /// The fence [`Wal::forget_files`] takes refuses records framed after the
+    /// barrier. A write framed before it was already held here, and its
+    /// commit could come after the drop that took the fence, after the files
+    /// were deleted and a table of that name created again. Opened by path,
+    /// the apply then wrote the dropped table's bytes into the new table's
+    /// file, or created the file again, holding them, when nothing had taken
+    /// the name. Replay voids such a record (it precedes the barrier), so the
+    /// apply skips it too, once the barrier has committed (see
+    /// [`Fence::voids_apply`]). Checked and opened under the fences read
+    /// lock, and `forget_files` marks a barrier committed under the write
+    /// lock before it returns, so before its caller deletes anything: either
+    /// the committed fence is seen, or the file is opened before the
+    /// deletion, and the write lands in the file it was logged for.
+    fn apply_held(&self, held: Vec<PendingWrite>) -> io::Result<usize> {
         // Released up front for every entry, so an apply that fails partway
         // does not leave the remainder counted forever.
         let held_bytes: u64 = held.iter().map(|w| w.len as u64).sum();
@@ -1017,6 +1138,7 @@ impl Wal {
 
         let mut log_reader: Option<File> = None;
         let mut buf: Vec<u8> = Vec::new();
+        let mut voided = 0usize;
 
         for w in held {
             // The payload is already on stable storage in the log, so read it
@@ -1044,12 +1166,23 @@ impl Wal {
             // so filter checkpoints never reached disk at all while a WAL was
             // enabled. Replaying the log after a crash would have created the
             // file correctly, which is what made the two paths disagree.
-            let existed = w.path.exists();
-            let mut f = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&w.path)?;
+            let (existed, mut f) = {
+                let fences = self.fences.read();
+                if fences
+                    .get(&w.file_id)
+                    .is_some_and(|fence| fence.voids_apply(w.born))
+                {
+                    voided += 1;
+                    continue;
+                }
+                let existed = w.path.exists();
+                let f = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&w.path)?;
+                (existed, f)
+            };
             f.seek(SeekFrom::Start(w.offset))?;
             f.write_all(&buf)?;
             // A new file is only durable once its directory entry is.
@@ -1058,7 +1191,7 @@ impl Wal {
             }
         }
 
-        Ok(())
+        Ok(voided)
     }
 
     /// Returns once every record up to `seq` is on stable storage.
@@ -1100,7 +1233,29 @@ impl Wal {
             match &*slot {
                 Some(h) => h.clone(),
                 None => {
-                    let h = Arc::new(File::options().read(true).write(true).open(&self.path)?);
+                    // Fails as a sync does, by poisoning. Whoever waits here
+                    // already has its commit marker in the file, and the next
+                    // sync anyone takes makes it durable: returning the error
+                    // alone told the committer its transaction failed (a
+                    // drop, that its barrier could never commit, so it put
+                    // the table back) while a crash then replayed it as
+                    // committed. Reached after every keep-tail checkpoint,
+                    // which drops the handle, so `EMFILE` is enough.
+                    #[cfg(test)]
+                    let opened = if test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false)) {
+                        Err(io::Error::other("injected failure to open the log's sync handle"))
+                    } else {
+                        File::options().read(true).write(true).open(&self.path)
+                    };
+                    #[cfg(not(test))]
+                    let opened = File::options().read(true).write(true).open(&self.path);
+                    let h = match opened {
+                        Ok(file) => Arc::new(file),
+                        Err(e) => {
+                            self.poison(format!("opening the log to sync it failed: {}", e));
+                            return Err(e);
+                        }
+                    };
                     *slot = Some(h.clone());
                     h
                 }
@@ -1386,11 +1541,22 @@ impl Wal {
             test_hooks::FAIL_FORGET.with(|f| f.set(false));
             return Err(io::Error::other("injected failure to log a barrier"));
         }
+        #[cfg(test)]
+        if test_hooks::FAIL_FORGET_IN.with(|p| {
+            let mut p = p.borrow_mut();
+            let hit = p.as_deref() == Some(self.path.as_path());
+            if hit {
+                *p = None;
+            }
+            hit
+        }) {
+            return Err(io::Error::other("injected failure to log a barrier in this log"));
+        }
         let txn = self.begin();
         let headers: Vec<[u8; HEADER_LEN]> =
             file_ids.iter().map(|id| forget_header(txn, *id)).collect();
         let framed = (headers.len() * HEADER_LEN) as u64;
-        {
+        let fence = {
             let mut file = self.writer.lock();
             let mut bufs: Vec<io::IoSlice<'_>> =
                 headers.iter().map(|h| io::IoSlice::new(h)).collect();
@@ -1399,26 +1565,80 @@ impl Wal {
             // these files before now cannot log after the barrier, where it
             // would not be voided. Only once the barrier is in the file: a
             // failed append leaves the caller free to keep the table.
+            //
+            // Pending until the marker is written (see `Fence`). Taken in
+            // INCARNATIONS order, so it is the highest pending fence too.
             let fence = INCARNATIONS.fetch_add(1, Ordering::AcqRel);
-            let mut fences = self.fences.lock();
+            let mut fences = self.fences.write();
             for id in file_ids {
-                fences.insert(*id, fence);
+                fences.entry(*id).or_default().pending = fence;
             }
             drop(fences);
             // Not marked dirty: a barrier gives a checkpoint nothing to flush.
             self.write_pos.fetch_add(framed, Ordering::Relaxed);
             self.issued
                 .fetch_add(headers.len() as u64, Ordering::AcqRel);
-        }
+            fence
+        };
         self.bytes_since_checkpoint
             .fetch_add(framed, Ordering::Relaxed);
         #[cfg(test)]
+        if let Some(hook) = test_hooks::AFTER_BARRIER_FENCE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_BARRIER_MARKER.with(|f| f.replace(false)) {
+            test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        }
+        // Decided by whether the marker was written, never by the outcome
+        // of the commit as a whole: a marker in the file commits the barrier
+        // at the next sync anyone takes, whatever this call's own sync says.
+        //
+        // A marker that was not written (cut back cleanly) leaves a barrier
+        // that can never commit and voids nothing, so its fences go: the
+        // caller puts the table back, and the table's own writers, born
+        // before them, would otherwise have every record refused until a
+        // restart. Fences of earlier, committed barriers for the same ids
+        // stay.
+        let seq = match self.log_commit_marker(txn) {
+            Ok(seq) => seq,
+            Err(e) => {
+                self.settle_fences(file_ids, fence, false);
+                return Err(e);
+            }
+        };
+        // Committed from here as far as the fences go, before the sync and
+        // before the caller deletes anything: see `apply_held`. A sync that
+        // fails then poisons the log (see `commit_through_slow`), which is
+        // what tells the caller the barrier may be durable.
+        self.settle_fences(file_ids, fence, true);
+        #[cfg(test)]
         if test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false)) {
-            self.log_commit_marker(txn)?;
             self.poison("injected fdatasync failure".to_string());
             return Err(io::Error::other("injected fdatasync failure"));
         }
-        self.commit_txn(txn)
+        self.commit_through(seq)
+    }
+
+    /// Settles the pending fence `fence` that [`Wal::forget_files`] took for
+    /// `file_ids`: committed, it becomes their committed fence; otherwise it
+    /// is dropped. A later barrier's pending fence for an id is left alone.
+    fn settle_fences(&self, file_ids: &[u64], fence: u64, committed: bool) {
+        let mut fences = self.fences.write();
+        for id in file_ids {
+            let Some(entry) = fences.get_mut(id) else {
+                continue;
+            };
+            if entry.pending == fence {
+                entry.pending = 0;
+            }
+            if committed {
+                entry.committed = entry.committed.max(fence);
+            }
+            if entry.committed == 0 && entry.pending == 0 {
+                fences.remove(id);
+            }
+        }
     }
 
     /// Bytes of in-place overwrites currently held back, across all open
@@ -1494,6 +1714,20 @@ impl Wal {
                 log::error!(
                     "Could not record the commit sequence for {}: {}. Point-in-time recovery \
                      across the next restart may be affected; durability is not.",
+                    self.path.display(),
+                    e
+                );
+            }
+        }
+        // Every id this log has handed out is below it, so every id the
+        // dropped records carry is: the next run starts past them all.
+        let txn = self.next_txn.load(Ordering::Acquire);
+        if txn > 1 {
+            if let Err(e) = write_txn_mark(&self.path, txn) {
+                log::error!(
+                    "Could not record the next transaction id for {}: {}. A point-in-time \
+                     restore across the next restart may match one run's commit to another \
+                     run's transaction; durability is not affected.",
                     self.path.display(),
                     e
                 );
@@ -1903,7 +2137,43 @@ impl Wal {
         resolve: impl Fn(u64) -> Option<PathBuf>,
         upto: Option<u64>,
     ) -> io::Result<RecoveryStats> {
-        let path = path.as_ref();
+        Self::replay_log(path.as_ref(), resolve, upto, None)
+    }
+
+    /// [`Wal::recover_upto`] over files restored from a copy taken when the
+    /// commit sequence stood at `copied_at`, rather than over the files the
+    /// log was written against.
+    ///
+    /// A committed barrier says its file was deleted there. Live, the file
+    /// really was, so replay only has to skip the records before it, and the
+    /// records after it rebuild the next file of the name from empty. A
+    /// restored file is the copy's, and when the barrier committed after the
+    /// copy began, the copy holds the deleted file: the records after the
+    /// barrier were written over it, and wherever the new file was shorter
+    /// the deleted file's bytes stayed, rows included. So each such file is
+    /// emptied first, as the deletion left it.
+    ///
+    /// A barrier that committed before the copy began is left alone: the
+    /// copy then holds the new file, which may hold bytes no record describes
+    /// (a rename's or a move's staged copy writes none). The caller must keep
+    /// a barrier and its deletion from straddling the copy's start, which
+    /// the deleting paths do by holding the snapshot gate across both.
+    pub fn recover_restoring(
+        path: impl AsRef<Path>,
+        resolve: impl Fn(u64) -> Option<PathBuf>,
+        upto: Option<u64>,
+        copied_at: u64,
+    ) -> io::Result<RecoveryStats> {
+        Self::replay_log(path.as_ref(), resolve, upto, Some(copied_at))
+    }
+
+    /// [`Wal::recover_upto`], and with `copied_at`, [`Wal::recover_restoring`].
+    fn replay_log(
+        path: &Path,
+        resolve: impl Fn(u64) -> Option<PathBuf>,
+        upto: Option<u64>,
+        copied_at: Option<u64>,
+    ) -> io::Result<RecoveryStats> {
         let mut stats = RecoveryStats::default();
 
         let total = match std::fs::metadata(path) {
@@ -1918,7 +2188,18 @@ impl Wal {
         // Pass 1: which transactions reached a commit record?
         let mut committed: HashSet<u64> = HashSet::new();
         // `(txn, file_id, position)` of every barrier, committed or not.
-        let mut barriers: Vec<(u64, u64, u64)> = Vec::new();
+        //
+        // With the commit sequence of the marker that committed it, if one
+        // did: the first marker for its transaction *after* it. Never one
+        // before it, nor a later one once that is found: an archive joins the
+        // logs of several runs, and a run whose ids started again (before
+        // the transaction-id mark, or when it could not be written) reissued
+        // the barrier's id. A later run's commit of it then took the barrier
+        // for committed after the copy and the restore emptied the file, and
+        // an earlier run's marker committed a barrier whose own failed.
+        let mut barriers: Vec<(u64, u64, u64, Option<u64>)> = Vec::new();
+        // Barriers whose marker has not been seen yet, by transaction id.
+        let mut awaiting: HashMap<u64, Vec<usize>> = HashMap::new();
         let valid_bytes;
         {
             let mut scan = LogScanner::open(path)?;
@@ -1928,14 +2209,21 @@ impl Wal {
                 ordinal += 1;
                 stats.last_txn = stats.last_txn.max(h.txn);
                 if h.flags & FLAG_COMMIT != 0 {
+                    // Resolved by this marker either way: one past the
+                    // ceiling did not commit them by it.
+                    let resolved = awaiting.remove(&h.txn);
                     // A marker carries its commit sequence in `offset`.
                     if upto.is_some_and(|ceiling| h.offset > ceiling) {
                         continue;
                     }
                     committed.insert(h.txn);
                     stats.last_commit_lsn = stats.last_commit_lsn.max(h.offset);
+                    for index in resolved.into_iter().flatten() {
+                        barriers[index].3 = Some(h.offset);
+                    }
                 } else if h.flags & FLAG_FORGET != 0 {
-                    barriers.push((h.txn, h.file_id, at));
+                    awaiting.entry(h.txn).or_default().push(barriers.len());
+                    barriers.push((h.txn, h.file_id, at, None));
                 }
             }
             valid_bytes = scan.consumed;
@@ -1946,15 +2234,37 @@ impl Wal {
         // that name now, if any, is another one. Known only once pass 1 has
         // seen every marker, since a barrier's commit comes after it.
         let mut void_before: HashMap<u64, u64> = HashMap::new();
-        for (txn, file_id, at) in barriers {
-            if committed.contains(&txn) {
-                let before = void_before.entry(file_id).or_insert(0);
-                *before = (*before).max(at);
+        // Files a restore empties: see `recover_restoring`.
+        let mut emptied: HashSet<u64> = HashSet::new();
+        for (_, file_id, at, commit_lsn) in barriers {
+            let Some(lsn) = commit_lsn else {
+                continue;
+            };
+            let before = void_before.entry(file_id).or_insert(0);
+            *before = (*before).max(at);
+            if copied_at.is_some_and(|copied| lsn > copied) {
+                emptied.insert(file_id);
+            }
+        }
+        // Before any record is applied, which is the barrier's place in log
+        // order for these ids: none of their records before it is applied.
+        let mut open_files: HashMap<u64, Option<File>> = HashMap::new();
+        for file_id in emptied {
+            let Some(target) = resolve(file_id) else {
+                continue;
+            };
+            match File::options().read(true).write(true).open(&target) {
+                Ok(file) => {
+                    file.set_len(0)?;
+                    stats.emptied += 1;
+                    open_files.insert(file_id, Some(file));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
 
         // Pass 2: apply the records those transactions own.
-        let mut open_files: HashMap<u64, Option<File>> = HashMap::new();
         {
             let mut scan = LogScanner::open(path)?;
             let mut ordinal = 0u64;
@@ -2127,6 +2437,12 @@ impl LogScanner {
 /// few dozen bytes regardless of row size.
 struct PendingWrite {
     path: PathBuf,
+    /// The file it was logged for, and when that file's writer came to be:
+    /// a fence [`Wal::forget_files`] took for the id since means the file was
+    /// deleted after this was logged, and the apply must not open the path,
+    /// which names whatever file took it since (see [`Wal::apply_held`]).
+    file_id: u64,
+    born: Incarnation,
     offset: u64,
     /// Offset of this record's payload within the log file.
     log_offset: u64,
@@ -2247,6 +2563,18 @@ pub(crate) mod test_hooks {
         /// of those bytes is then undecided, which is the case to test.
         pub static FAIL_BARRIER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+        /// Makes the next `Wal::forget_files` on this thread write its
+        /// barrier and then fail at its commit marker, cut back cleanly as a
+        /// full disk would leave it: the barrier is in the log, uncommitted,
+        /// and the log is not poisoned.
+        pub static FAIL_BARRIER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next `Wal::forget_files` on this thread *of the log at
+        /// this path* fail before touching the file, as a full disk there
+        /// would. Taken when it fires.
+        pub static FAIL_FORGET_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+
         /// Makes the next WAL write on this thread put only this many bytes
         /// in the file and then fail, as a full disk or EIO would.
         pub static SHORT_WAL_WRITE: std::cell::Cell<Option<usize>> =
@@ -2270,6 +2598,17 @@ pub(crate) mod test_hooks {
         /// records fall into.
         pub static AFTER_CHECKPOINT_SYNC: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
+
+        /// Runs inside `Wal::forget_files` once its barrier is in the log and
+        /// its fences are taken, before its commit marker: the window in
+        /// which the barrier's fate is not yet decided. Taken when it runs.
+        pub static AFTER_BARRIER_FENCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Makes the next opening of a log's sync handle on this thread fail,
+        /// as `EMFILE` would: the reopen every sync after a keep-tail
+        /// checkpoint does, and the first sync of a newly opened log.
+        pub static FAIL_SYNC_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Directories whose log `open_and_recover` refuses, as it refuses one it
@@ -2967,7 +3306,7 @@ mod tests {
         let id = file_id_for_name("t.db");
 
         let wal = Wal::open(&wal_path).unwrap();
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.forget_files(&[id]).unwrap();
         test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(0));
         assert!(wal.checkpoint().unwrap());
@@ -2979,6 +3318,268 @@ mod tests {
         wal.forget_files(&[id]).unwrap();
         drop(wal);
         assert_eq!(files_named_by_log(&wal_path), Some(HashSet::new()));
+    }
+
+    /// An in-place write logged before its file was deleted waits for its
+    /// transaction to commit, and the fence only refuses records framed after
+    /// the barrier. Applied at the commit, it opened the path afresh and wrote
+    /// the deleted file's bytes into whatever file had taken the name since,
+    /// or created the file again when none had. Replay voids that record (it
+    /// precedes the barrier), so the live apply skips it too, applies the
+    /// transaction's other writes, and the commit says what it skipped.
+    #[test]
+    fn a_held_overwrite_does_not_reach_a_file_deleted_since_it_was_logged() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let reborn = dir.path().join("reborn.db");
+        let gone = dir.path().join("gone.db");
+        let other = dir.path().join("other.db");
+        std::fs::write(&reborn, b"old-old-old").unwrap();
+        std::fs::write(&gone, b"old").unwrap();
+        std::fs::write(&other, b"....").unwrap();
+        let (reborn_id, gone_id, other_id) = (
+            file_id_for_name("reborn.db"),
+            file_id_for_name("gone.db"),
+            file_id_for_name("other.db"),
+        );
+        let wal = Wal::open(&wal_path).unwrap();
+        for (id, path) in [(reborn_id, &reborn), (gone_id, &gone), (other_id, &other)] {
+            wal.register_file(id, path).unwrap();
+        }
+
+        let born = Incarnation::new();
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, reborn_id, 0, b"GHOST", born).unwrap();
+        wal.log_in_place_from(txn, gone_id, 0, b"GHOST", born).unwrap();
+        wal.log_in_place_from(txn, other_id, 0, b"kept", born).unwrap();
+        // The drop: barrier, files deleted, one name taken again.
+        wal.forget_files(&[reborn_id, gone_id]).unwrap();
+        std::fs::remove_file(&reborn).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::write(&reborn, b"new").unwrap();
+
+        let committed = wal.commit_txn(txn);
+        assert_eq!(read_file(&reborn), b"new", "a held write reached the successor's file");
+        assert!(!gone.exists(), "a held write created a deleted file again");
+        assert_eq!(read_file(&other), b"kept", "the transaction's other write was dropped");
+        assert!(committed.is_err(), "a commit that skipped writes reported success");
+        assert!(!wal.is_poisoned(), "skipping a voided write poisoned the log");
+        // Kept for the replay below: the checkpoint discards the log.
+        let replay_path = dir.path().join("replay.log");
+        std::fs::copy(&wal_path, &replay_path).unwrap();
+        assert!(wal.checkpoint().unwrap(), "the skipped writes left a claim on the log");
+
+        // Replay agrees with the live apply.
+        drop(wal);
+        let paths = [(reborn_id, reborn.clone()), (gone_id, gone.clone()), (other_id, other.clone())];
+        let stats = Wal::recover(&replay_path, move |id| {
+            paths.iter().find(|(p, _)| *p == id).map(|(_, path)| path.clone())
+        })
+        .unwrap();
+        assert_eq!((stats.forgotten, stats.applied), (2, 1));
+        assert_eq!(read_file(&reborn), b"new");
+        assert!(!gone.exists());
+        assert_eq!(read_file(&other), b"kept");
+    }
+
+    /// A barrier whose commit marker could not be written (cut back cleanly,
+    /// the log not poisoned) voids nothing, so it must fence nothing: the
+    /// caller puts the table back, and its writers, born before the fence,
+    /// were refused every record until a restart.
+    #[test]
+    fn a_barrier_whose_commit_failed_fences_no_writer() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"live", born)
+            .expect("a writer was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+        assert_eq!(read_file(&data), b"live");
+        let txn = wal.begin();
+        wal.log_from(txn, id, 4, b"!", born)
+            .expect("an append was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+
+        // A barrier that commits still fences the same writer.
+        wal.forget_files(&[id]).unwrap();
+        assert!(wal.log_from(wal.begin(), id, 0, b"x", born).is_err());
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.forgotten, 2, "the committed barrier voided the wrong records");
+    }
+
+    /// A second barrier for an id that fails at its marker undoes only its
+    /// own fence. Putting the id back to no fence at all let a straggler of
+    /// the incarnation the first, committed barrier deleted log again, and
+    /// apply a held write by path into whatever file holds the name now.
+    #[test]
+    fn a_failed_barrier_keeps_the_fence_an_earlier_one_took() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        wal.register_file(id, &data).unwrap();
+
+        let old = Incarnation::new();
+        let straggler = wal.begin();
+        wal.log_in_place_from(straggler, id, 0, b"OLD!", old).unwrap();
+        wal.forget_files(&[id]).unwrap();
+        // The file deleted and created again: the next incarnation's writer.
+        std::fs::write(&data, b"new.").unwrap();
+        let mid = Incarnation::new();
+
+        // The second barrier fails at its marker. Inside its window the
+        // straggler commits: its file was deleted at the first barrier.
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        test_hooks::AFTER_BARRIER_FENCE.with(|h| {
+            let (wal, held) = (wal.clone(), held.clone());
+            *h.borrow_mut() = Some(Box::new(move || held.set(Some(wal.commit_txn(straggler).is_ok()))));
+        });
+        test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+        assert_eq!(held.get(), Some(false), "a write to a file deleted at a committed barrier was applied");
+        assert_eq!(read_file(&data), b"new.", "a straggler wrote into the next incarnation's file");
+
+        assert!(
+            wal.log_from(wal.begin(), id, 0, b"x", old).is_err(),
+            "a writer of the file the first barrier deleted logged again"
+        );
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"mid!", mid)
+            .expect("the live incarnation's writer was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+        assert_eq!(read_file(&data), b"mid!");
+    }
+
+    /// An in-place write committed while a barrier for its file is in the log
+    /// but undecided. The file cannot have been deleted yet (that waits for
+    /// the barrier to commit), so the write belongs in it. Skipped, the live
+    /// file lacked a committed write that replay applies whenever the barrier
+    /// then fails: a statement reported failed came back after a crash, and a
+    /// checkpoint first left a committed transaction half applied.
+    #[test]
+    fn a_write_committed_while_its_barrier_is_undecided_matches_its_replay() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let before = dir.path().join("before.db");
+        std::fs::write(&data, b"....").unwrap();
+        std::fs::write(&before, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"held", born).unwrap();
+        let committed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        test_hooks::AFTER_BARRIER_FENCE.with(|h| {
+            let (wal, committed) = (wal.clone(), committed.clone());
+            *h.borrow_mut() = Some(Box::new(move || {
+                *committed.borrow_mut() = Some(wal.commit_txn(txn).map_err(|e| e.to_string()));
+            }));
+        });
+        test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned());
+        assert_eq!(
+            committed.borrow_mut().take(),
+            Some(Ok(())),
+            "a commit inside an undecided barrier's window was refused"
+        );
+        assert_eq!(read_file(&data), b"held", "the live file lacks a committed write");
+
+        let replay = dir.path().join("replay.log");
+        std::fs::copy(&wal_path, &replay).unwrap();
+        Wal::recover(&replay, resolver(before.clone())).unwrap();
+        assert_eq!(read_file(&before), read_file(&data), "the live file and its replay disagree");
+    }
+
+    /// A barrier whose marker is in the log but whose sync failed without
+    /// the sync itself running (opening the sync handle failed, as `EMFILE`
+    /// would) commits at the next sync anyone takes, and replay voids the
+    /// file's earlier records. It must not be taken for one that never
+    /// committed: un-fenced and the table put back, the table wrote on and a
+    /// crash then voided every committed record before the barrier.
+    #[test]
+    fn a_barrier_whose_marker_was_written_is_not_undone_when_its_sync_fails() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+        // Deferred, so the sync handle is not opened before the barrier's.
+        let txn = wal.begin();
+        wal.log_from(txn, id, 4, b"live", born).unwrap();
+        wal.commit_txn_deferred(txn).unwrap();
+
+        test_hooks::FAIL_SYNC_OPEN.with(|f| f.set(true));
+        let forgot = wal.forget_files(&[id]);
+        let fired = !test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false));
+        assert!(fired, "the barrier's sync never opened the handle, so this tests nothing");
+        assert!(forgot.is_err());
+        assert!(
+            wal.is_poisoned(),
+            "a written marker whose sync failed left the log unpoisoned, so the caller \
+             takes the barrier for one that can never commit"
+        );
+        assert!(
+            wal.log_from(wal.begin(), id, 0, b"x", born).is_err(),
+            "a writer of the file was un-fenced though its barrier is in the log, committed"
+        );
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.forgotten, 1, "the barrier did not commit in the log after all");
+    }
+
+    /// Transaction ids started again at 1 on every restart, and an archive
+    /// joins the logs of several runs end to end: a marker of one run then
+    /// committed another run's transaction of the same id, its records and
+    /// its barriers included. The next run's ids start past every id the
+    /// last one handed out.
+    #[test]
+    fn transaction_ids_are_not_reused_across_a_restart() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        let last = {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.register_file(id, &data).unwrap();
+            let mut last = 0;
+            for n in 0..5u8 {
+                last = wal.begin();
+                wal.log(last, id, n as u64, &[n]).unwrap();
+                wal.commit_txn(last).unwrap();
+            }
+            // A clean shutdown's checkpoint leaves no record to recover ids from.
+            assert!(wal.checkpoint().unwrap());
+            last
+        };
+        let wal = Wal::open(&wal_path).unwrap();
+        let next = wal.begin();
+        assert!(next > last, "a restart handed out transaction id {next} again (last was {last})");
     }
 
     /// The write-ahead ordering: an overwrite must not reach the data file until
