@@ -39,6 +39,7 @@ use rclite::Arc;
 use super::failpoint;
 use super::image::{CrashPoint, Recorder, Rng};
 use crate::core::database::Database;
+use crate::core::mvcc::status::read_reservation;
 use crate::core::mvcc::transaction::FROZEN_TX;
 use crate::core::row::row::Row;
 use crate::core::row::row_pointer::{ROW_POINTER_RECORD_LEN, RowPointerIterator};
@@ -967,4 +968,465 @@ async fn acknowledged_rows_survive_a_power_cut_after_a_clean_restart() {
         assert_eq!(got.len(), want.len(), "seed {seed}: an image cut after a clean restart lost acknowledged rows");
         assert_eq!(got, want, "seed {seed}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The transaction id reservation through a power cut
+// ---------------------------------------------------------------------------
+
+/// Ids per raise of the reservation in [`a_lost_reservation_page_never_reissues_an_id`]:
+/// small, so a short workload crosses many marks.
+const RESERVATION_BLOCK: u64 = 4;
+const STATUS_FILE: &str = "db_transactions.status";
+/// Cuts taken inside log syncs, per run.
+const MAX_LOG_SYNC_CUTS: usize = 12;
+/// The row the write after each restart inserts.
+const PROBE_ROW: i64 = 9_999_999;
+
+/// Arms `name` for each of its first `hits` hits under `scope`; the action
+/// decides for itself whether a hit is one to cut at.
+fn arm_every(name: &str, scope: &Path, hits: u64, action: failpoint::Action) -> Vec<failpoint::Guard> {
+    (1..=hits).map(|nth| failpoint::arm(name, scope, nth, action.clone())).collect()
+}
+
+/// The highest id a status file holds any outcome for, read from its bytes:
+/// two bits an id, id 0 in the low bits of byte 0, `00` for none.
+fn highest_with_outcome(status: &Path) -> u64 {
+    let bytes = std::fs::read(status).unwrap_or_default();
+    let mut highest = 0;
+    for (i, byte) in bytes.iter().enumerate() {
+        for slot in 0..4u64 {
+            if (byte >> (slot * 2)) & 0b11 != 0 {
+                highest = i as u64 * 4 + slot;
+            }
+        }
+    }
+    highest
+}
+
+/// Every row version's slot offset with the ids stamped on it, from the
+/// pointer file: what is on disk, whatever any counter says. (Deleted slots
+/// are skipped; nothing here vacuums.)
+async fn stamped(db: &Arc<Database>) -> Result<Vec<(u64, u64, u64)>, String> {
+    let t = db.tables.get(TABLE).map(|t| t.clone()).ok_or("the table is gone")?;
+    let mut it = RowPointerIterator::new(t.io_pointers.clone()).await.map_err(|e| format!("{e:?}"))?;
+    let mut out = Vec::new();
+    while let Some((offset, p)) = it.next_row_pointer_with_offset().await.map_err(|e| format!("{e:?}"))? {
+        out.push((offset, p.xmin, p.xmax));
+    }
+    Ok(out)
+}
+
+struct ReservationPoint {
+    cp: CrashPoint,
+    /// The mark the reservation file held in the page cache at the cut.
+    live_mark: u64,
+    /// The committed ids an image may hold: before and after the statement
+    /// the cut fell in.
+    states: Vec<Vec<i64>>,
+}
+
+#[derive(Default, Debug)]
+struct ReservationTally {
+    /// Cuts in the first log sync after the mark moved: the reservation's
+    /// own record, written and not yet durable.
+    at_reservation_sync: usize,
+    /// Cuts in the log sync after that: usually a writer under the new
+    /// block committing.
+    after_reservation_sync: usize,
+    /// Cuts in a checkpoint's sync of the reservation file itself.
+    at_reservation_file_sync: usize,
+    /// Quiescent cuts with a writer above every durable outcome still open,
+    /// its rows durable.
+    writer_open: usize,
+    disturbed: usize,
+    images: usize,
+    /// Images whose reservation file held a lower mark than the page cache
+    /// did at the cut: the unsynced page was dropped.
+    page_dropped: usize,
+    /// Images whose mark the log's replay raised.
+    replay_raised: usize,
+    /// Images where the write after the restart was acknowledged and is not
+    /// there, because the image's pointer file ended inside a record and the
+    /// append landed after it, out of step with every reader. Not this
+    /// test's property, and not a state a power cut leaves: the harness picks
+    /// a data file's length at any byte between its synced and current ones,
+    /// while each append is one whole-record `write(2)`. Counted, so the
+    /// check stays exact for every other image.
+    probe_lost_to_torn_tail: usize,
+    marks_crossed: u64,
+}
+
+/// Opens one image and checks (a) it opens, (b) exactly the committed rows
+/// are there, (c) ids resume above every id the crash left on disk, and (d)
+/// a write commits, under an id nothing on disk carries, and changes nothing
+/// else.
+async fn check_reservation_image(
+    img: &Path,
+    name: &str,
+    label: &str,
+    point: &ReservationPoint,
+    tally: &mut ReservationTally,
+    problems: &mut Vec<String>,
+) {
+    let status = img.join(STATUS_FILE);
+    let imaged = read_reservation(&status).unwrap_or(0);
+    tally.page_dropped += (imaged < point.live_mark) as usize;
+    // Replayed alone first, so the status file reads as the crash left it
+    // plus its log, before an open records anything of its own.
+    match crate::core::wal::open_and_recover(&path_str(img)) {
+        Ok((wal, _)) => drop(wal),
+        Err(e) => {
+            problems.push(format!("{label}: (a) the log would not replay: {e}"));
+            return;
+        }
+    }
+    let replayed = read_reservation(&status).unwrap_or(0);
+    // A pointer file cut inside a record (see `probe_lost_to_torn_tail`).
+    let torn_pointer_tail = std::fs::metadata(img.join(format!("{TABLE}_pointers.db")))
+        .is_ok_and(|m| m.len() % ROW_POINTER_RECORD_LEN as u64 != 0);
+    tally.replay_raised += (replayed > imaged) as usize;
+    let in_status = highest_with_outcome(&status);
+    let db = match open(img, name).await {
+        Ok(db) => db,
+        Err(e) => {
+            problems.push(format!("{label}: (a) the image would not open: {e}"));
+            crate::core::wal::remove_for(&path_str(img));
+            return;
+        }
+    };
+    let marks = format!("reservation: {imaged} imaged, {replayed} after replay, {} at the cut", point.live_mark);
+    let before = match stamped(&db).await {
+        Ok(v) => v,
+        Err(e) => {
+            problems.push(format!("{label}: reading the row pointers: {e}"));
+            close(img, db);
+            return;
+        }
+    };
+    let in_rows = before.iter().flat_map(|(_, xmin, xmax)| [*xmin, *xmax]).max().unwrap_or(0);
+    let highest = in_rows.max(in_status);
+    // (c) Every id from here on is at least the next one.
+    let resume = db.transactions.next_id();
+    if resume <= highest {
+        problems.push(format!(
+            "{label}: (c) ids resume at {resume}, and id {highest} is already on disk \
+             (rows up to {in_rows}, status up to {in_status}; {marks})"
+        ));
+    }
+    // (b)
+    let got = ids(&db, "id > 0").await;
+    let matched = match &got {
+        Ok(got) => point.states.iter().find(|s| *s == got),
+        Err(_) => None,
+    };
+    if matched.is_none() {
+        problems.push(format!(
+            "{label}: (b) the rows {got:?} are no committed state of the cut ({:?})",
+            point.states.iter().map(|s| s.len()).collect::<Vec<_>>()
+        ));
+    }
+    // (d) A write commits under an id nothing on disk carries. Taken over,
+    // an id makes its new owner's commit commit the old writer's rows too:
+    // its insert appears and its delete removes a committed row.
+    if let Err(e) = exec(&db, &format!("INSERT INTO {TABLE} (id, n) VALUES ({PROBE_ROW}, 0)")).await {
+        problems.push(format!("{label}: (d) the write after the restart failed: {e}"));
+    } else if let Some(state) = matched {
+        match ids(&db, "id > 0").await {
+            Ok(after) => {
+                let appeared: Vec<i64> =
+                    after.iter().filter(|id| **id != PROBE_ROW && !state.contains(id)).copied().collect();
+                let vanished: Vec<i64> = state.iter().filter(|id| !after.contains(id)).copied().collect();
+                if !appeared.is_empty() || !vanished.is_empty() {
+                    problems.push(format!(
+                        "{label}: (d) the write after the restart committed another transaction's \
+                         work: rows {appeared:?} appeared and {vanished:?} vanished ({marks})"
+                    ));
+                }
+                if !after.contains(&PROBE_ROW) {
+                    if torn_pointer_tail {
+                        tally.probe_lost_to_torn_tail += 1;
+                    } else {
+                        problems.push(format!("{label}: (d) the write after the restart is not there ({marks})"));
+                    }
+                }
+            }
+            Err(e) => problems.push(format!("{label}: (d) reading the rows after the write: {e}")),
+        }
+    }
+    // The write's own version, read back: stamped above everything that was
+    // on disk. Unreadable when the append landed after a partial record.
+    match stamped(&db).await {
+        Ok(after) if !torn_pointer_tail => {
+            let old: std::collections::HashSet<u64> = before.iter().map(|(o, _, _)| *o).collect();
+            let new: Vec<&(u64, u64, u64)> = after.iter().filter(|(o, _, _)| !old.contains(o)).collect();
+            if new.is_empty() {
+                problems.push(format!("{label}: (d) the write after the restart left no row version"));
+            }
+            for (offset, xmin, _) in new {
+                if *xmin <= highest {
+                    problems.push(format!(
+                        "{label}: (c) the write after the restart stamped id {xmin} at {offset}, and \
+                         ids up to {highest} were on disk before it ({marks})"
+                    ));
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => problems.push(format!("{label}: reading the row pointers after the write: {e}")),
+    }
+    close(img, db);
+}
+
+async fn reservation_run(run_seed: u64, seeds: u64) -> ReservationTally {
+    use parking_lot::Mutex;
+    use std::sync::Arc as StdArc;
+
+    let name = "lost_reservation";
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let status = dir.join(STATUS_FILE);
+    let reservation_file = crate::core::mvcc::status::reservation_path(&status);
+    let mut plan = Rng::new(0x7265_7365_7276 ^ run_seed);
+    let insert = |id: i64| format!("INSERT INTO {TABLE} (id, n) VALUES ({id}, {})", id % 7);
+
+    let db = open(&dir, name).await.unwrap();
+    exec(&db, &format!("CREATE TABLE {TABLE} (id BIGINT NOT NULL, n INTEGER NOT NULL)")).await.unwrap();
+    let mut committed: Vec<i64> = Vec::new();
+    let mut next_row = 0i64;
+    for _ in 0..4 {
+        next_row += 1;
+        exec(&db, &insert(next_row)).await.unwrap();
+        committed.push(next_row);
+    }
+    // The open reserved a full block. Used up, so every mark from here on is
+    // a small block above the last and the workload crosses many.
+    db.transactions.set_reservation_block(RESERVATION_BLOCK);
+    while db.transactions.next_id() < db.transactions.reserved_ids_below() {
+        let id = db.transactions.begin();
+        db.abort_transaction(id);
+    }
+    next_row += 1;
+    exec(&db, &insert(next_row)).await.unwrap();
+    committed.push(next_row);
+    db.sync_durable().unwrap();
+    let rec = Recorder::start(&dir);
+    let baseline_mark = read_reservation(&status).expect("a mark at the baseline");
+
+    let mut tally = ReservationTally::default();
+    // (mark at the cut, which site, the cut)
+    type Sink = StdArc<Mutex<Vec<(u64, u8, Result<CrashPoint, String>)>>>;
+    let sink: Sink = StdArc::new(Mutex::new(Vec::new()));
+    let context = StdArc::new(Mutex::new(String::new()));
+
+    // Every log sync: the first after the reservation file changed is, with
+    // the reservation logged, the record's own sync in flight; the second is
+    // the first writer under the new block committing.
+    struct Seen {
+        last: u64,
+        since: u32,
+        cuts: usize,
+    }
+    let seen = StdArc::new(Mutex::new(Seen {
+        last: baseline_mark,
+        since: u32::MAX,
+        cuts: 0,
+    }));
+    let at_log_sync: failpoint::Action = {
+        let (rec, sink, context, seen, status) = (rec.clone(), sink.clone(), context.clone(), seen.clone(), status.clone());
+        StdArc::new(move |hit| {
+            let mark = read_reservation(&status).unwrap_or(0);
+            let since = {
+                let mut s = seen.lock();
+                if mark != s.last {
+                    s.last = mark;
+                    s.since = 0;
+                } else {
+                    s.since = s.since.saturating_add(1);
+                }
+                if s.since >= 2 || s.cuts >= MAX_LOG_SYNC_CUTS {
+                    return failpoint::Outcome::Continue;
+                }
+                s.cuts += 1;
+                s.since
+            };
+            let which = if since == 0 { "the log sync after" } else { "the second log sync after" };
+            let label = format!("{}, {which} the mark moved to {mark} (hit {})", context.lock(), hit.nth);
+            let cut = rec.cut_in_sync(label);
+            sink.lock().push((mark, since as u8, cut));
+            failpoint::Outcome::Continue
+        })
+    };
+    // A checkpoint's sync of the reservation file itself.
+    let at_file_sync: failpoint::Action = {
+        let (rec, sink, context, status, file) =
+            (rec.clone(), sink.clone(), context.clone(), status.clone(), reservation_file.clone());
+        StdArc::new(move |hit| {
+            if hit.path != file.as_path() {
+                return failpoint::Outcome::Continue;
+            }
+            let mark = read_reservation(&status).unwrap_or(0);
+            let label = format!("{}, a checkpoint syncing the reservation file at {mark}", context.lock());
+            let cut = rec.cut_in_sync(label);
+            sink.lock().push((mark, 2, cut));
+            failpoint::Outcome::Continue
+        })
+    };
+    let log_guards = arm_every("sync:wal.log", &dir, 1024, at_log_sync);
+
+    let mut points: Vec<ReservationPoint> = Vec::new();
+    let mut held = 0u64;
+    let steps = 36;
+    for step in 0..steps {
+        let before = committed.clone();
+        *context.lock() = format!("run {run_seed} step {step}");
+        match (step % 9, plan.below(4)) {
+            // A writer above every durable outcome, its rows (an insert and a
+            // delete's stamp) made durable, open at the cut and then rolled
+            // back. Its id is the one a lost reservation hands out again.
+            (8, _) | (_, 0) if step >= 6 => {
+                let w = db.transactions.begin();
+                *context.lock() = format!("run {run_seed} step {step}, writer {w} open");
+                exec_in(&db, w, &insert(2_000_000 + step as i64)).await.unwrap();
+                let victim = committed[plan.below(committed.len() as u64) as usize];
+                exec_in(&db, w, &format!("DELETE FROM {TABLE} WHERE id = {victim}")).await.unwrap();
+                db.sync_durable().unwrap();
+                let live_mark = read_reservation(&status).unwrap_or(0);
+                match rec.cut_quiescent(format!("run {run_seed} step {step}: writer {w} open, rows durable")) {
+                    Ok(cp) => {
+                        tally.writer_open += 1;
+                        held += cp.held_bytes();
+                        points.push(ReservationPoint {
+                            cp,
+                            live_mark,
+                            states: vec![committed.clone()],
+                        });
+                    }
+                    Err(why) => {
+                        eprintln!("{why}");
+                        tally.disturbed += 1;
+                    }
+                }
+                db.abort_transaction(w);
+            }
+            // A rolled-back block: an insert and a delete, never visible.
+            (_, 1) => {
+                let r = db.transactions.begin();
+                exec_in(&db, r, &insert(1_000_000 + step as i64)).await.unwrap();
+                let victim = committed[plan.below(committed.len() as u64) as usize];
+                exec_in(&db, r, &format!("DELETE FROM {TABLE} WHERE id = {victim}")).await.unwrap();
+                db.abort_transaction(r);
+            }
+            // A checkpoint, which syncs the reservation file and drops the
+            // records that carried it.
+            (4, _) => {
+                let guards = arm_every("sync:wal.checkpoint.data_file", &dir, 256, at_file_sync.clone());
+                let wal = crate::core::wal::wal_for(&path_str(&dir)).expect("the database has a log");
+                wal.checkpoint().unwrap();
+                drop(guards);
+            }
+            _ => {
+                next_row += 1;
+                exec(&db, &insert(next_row)).await.unwrap();
+                committed.push(next_row);
+            }
+        }
+        let after = committed.clone();
+        for (live_mark, site, cut) in std::mem::take(&mut *sink.lock()) {
+            match cut {
+                Ok(cp) => {
+                    match site {
+                        0 => tally.at_reservation_sync += 1,
+                        1 => tally.after_reservation_sync += 1,
+                        _ => tally.at_reservation_file_sync += 1,
+                    }
+                    held += cp.held_bytes();
+                    let mut states = vec![before.clone()];
+                    if after != before {
+                        states.push(after.clone());
+                    }
+                    points.push(ReservationPoint { cp, live_mark, states });
+                }
+                Err(why) => {
+                    eprintln!("{why}");
+                    tally.disturbed += 1;
+                }
+            }
+        }
+        assert!(
+            held + dir_bytes(base.path()) < MAX_RUN_BYTES,
+            "the run holds {} bytes, past its bound",
+            held + dir_bytes(base.path())
+        );
+    }
+    drop(log_guards);
+    tally.marks_crossed = (db.transactions.reserved_ids_below() - baseline_mark) / RESERVATION_BLOCK;
+    close(&dir, db);
+    drop(rec);
+
+    let img = base.path().join("image");
+    let mut problems = Vec::new();
+    for point in &points {
+        for seed in 0..seeds {
+            point.cp.write_image(seed, &img);
+            let label = format!("{} seed {seed} (in flight: {:?})", point.cp.label, point.cp.in_flight);
+            check_reservation_image(&img, name, &label, point, &mut tally, &mut problems).await;
+            tally.images += 1;
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "run {run_seed}: {} problems ({tally:?}):\n{}",
+        problems.len(),
+        problems.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+    );
+    eprintln!("lost reservation run {run_seed}: {tally:?}");
+    tally
+}
+
+/// The id reservation is the one write whose loss hands ids out again: a
+/// restart resumes at the mark, and an id below it whose writer left rows
+/// on disk with no durable outcome goes to a new owner, who reads those rows
+/// as its own and commits them. Only a power cut can lose it. A killed
+/// process keeps the page cache, so a reservation written and never made
+/// durable passes every clean restart and every `SIGKILL` test, and did.
+///
+/// Many small blocks are crossed while committing, rolling back, and holding
+/// a writer open above every durable outcome with its rows durable. Cuts
+/// fall in the reservation's own log sync, in the sync after it, in a
+/// checkpoint's sync of the reservation file, and with that writer open; the
+/// seeds drop or keep the reservation file's unsynced page and the log's
+/// unsynced tail. Every image must open, hold exactly the committed rows,
+/// resume ids above every id its rows and status file carry, and take a
+/// write under an id of its own.
+#[tokio::test]
+async fn a_lost_reservation_page_never_reissues_an_id() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let runs = env_count("RDB_POWER_LOSS_RUNS", 1, 256);
+    let mut total = ReservationTally::default();
+    for r in 0..runs {
+        let t = reservation_run(r, seeds).await;
+        total.at_reservation_sync += t.at_reservation_sync;
+        total.after_reservation_sync += t.after_reservation_sync;
+        total.at_reservation_file_sync += t.at_reservation_file_sync;
+        total.writer_open += t.writer_open;
+        total.images += t.images;
+        total.page_dropped += t.page_dropped;
+        total.replay_raised += t.replay_raised;
+        total.marks_crossed += t.marks_crossed;
+        total.probe_lost_to_torn_tail += t.probe_lost_to_torn_tail;
+        total.disturbed += t.disturbed;
+    }
+    eprintln!("lost reservation, {runs} runs of {seeds} seeds: {total:?}");
+    // Each kind of cut was imaged, and some images lost the page the test is
+    // about, so the property was asked where it can fail.
+    let runs = runs as usize;
+    assert!(total.marks_crossed >= 4 * runs as u64, "too few marks were crossed ({total:?})");
+    assert!(total.at_reservation_sync >= runs, "no cut fell in a reservation's sync ({total:?})");
+    assert!(total.after_reservation_sync >= runs, "no cut fell in the sync after one ({total:?})");
+    assert!(total.at_reservation_file_sync >= 1, "no checkpoint synced the reservation file ({total:?})");
+    assert!(total.writer_open >= runs, "no cut held an open writer ({total:?})");
+    assert!(total.page_dropped >= runs, "no image dropped the reservation file's page ({total:?})");
+    assert!(total.replay_raised >= runs, "no image needed the log to restore the mark ({total:?})");
 }
