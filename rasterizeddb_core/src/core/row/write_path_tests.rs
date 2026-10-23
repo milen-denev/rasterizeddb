@@ -2214,11 +2214,11 @@ fn create_table_carries_unique_constraints() {
     );
     assert_eq!(
         table_level_of("CREATE TABLE t (id BIGINT, email TEXT, PRIMARY KEY (id))"),
-        Some(vec![("t_id_key".to_string(), vec!["id".to_string()])])
+        Some(vec![("t_pkey".to_string(), vec!["id".to_string()])])
     );
     assert_eq!(
         table_level_of("CREATE TABLE t (id BIGINT, email TEXT, PRIMARY KEY (\"id\"))"),
-        Some(vec![("t_id_key".to_string(), vec!["id".to_string()])])
+        Some(vec![("t_pkey".to_string(), vec!["id".to_string()])])
     );
 
     // A composite key constrains the *pair*, so it is kept whole rather than
@@ -2232,9 +2232,10 @@ fn create_table_carries_unique_constraints() {
         )])
     );
     assert_eq!(
+        // Named as PostgreSQL names a primary key, whatever its columns.
         table_level_of("CREATE TABLE t (a BIGINT, b BIGINT, PRIMARY KEY (a, b))"),
         Some(vec![(
-            "t_a_b_key".to_string(),
+            "t_pkey".to_string(),
             vec!["a".to_string(), "b".to_string()]
         )])
     );

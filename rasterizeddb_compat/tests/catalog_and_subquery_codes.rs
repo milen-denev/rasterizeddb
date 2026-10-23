@@ -15,11 +15,14 @@ async fn a_composite_key_is_indexed_from_creation() {
     let pool = server.connect_sqlx().await.expect("connect");
     pool.execute(sqlx::raw_sql(
         "CREATE TABLE u (a INT NOT NULL, b INT NOT NULL, UNIQUE (a, b));
-         CREATE TABLE p (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));",
+         CREATE TABLE p (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b));
+         CREATE TABLE q (a INT NOT NULL, b INT, PRIMARY KEY (a));",
     ))
     .await
     .expect("schema");
-    for (table, want) in [("u", "u_a_b_key"), ("p", "p_pkey")] {
+    // `q` has a single-column key declared at table level: one index, not
+    // the implicit primary-key index and the constraint's under one name.
+    for (table, want) in [("u", "u_a_b_key"), ("p", "p_pkey"), ("q", "q_pkey")] {
         let names: Vec<String> = sqlx::query("SELECT indexname FROM pg_indexes WHERE tablename = $1")
             .bind(table)
             .fetch_all(&pool)
