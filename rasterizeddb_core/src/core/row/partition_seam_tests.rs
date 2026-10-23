@@ -429,6 +429,61 @@ async fn a_refused_key_change_ends_its_storage_transaction() {
     drop(t);
 }
 
+/// A statement the range guard refuses on a later row leaves no trace of its
+/// earlier rows, even in storage: their pending in-place overwrites are
+/// dropped with the statement's storage transaction, as a refused row check
+/// drops them, rather than committed durably ahead of the error. Checked live
+/// and in the files, through a partition reopened over them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_key_change_leaves_no_earlier_row_in_storage() {
+    struct Uninstall(String);
+    impl Drop for Uninstall {
+        fn drop(&mut self) {
+            crate::core::wal::remove_for(&self.0);
+        }
+    }
+    init();
+    let dir = tempfile::tempdir().unwrap();
+    let location = dir.path().to_str().unwrap().to_string();
+    let wal = std::sync::Arc::new(
+        crate::core::wal::Wal::open(dir.path().join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+    );
+    crate::core::wal::install_for(&location, wal.clone());
+    let _uninstall = Uninstall(location);
+
+    let l = create_logical(dir.path()).await;
+    let t = open(&l, 0, PointRange::FULL).await;
+    for (tenant, n, label) in [(42i64, 1i32, "aaaa"), (7, 2, "bbbb")] {
+        t.insert_row(row(&t, tenant, n, label)).await.unwrap();
+    }
+    t.wait_filters_ready().await.unwrap();
+    let slots = pointers(&t).await.len();
+
+    // Tenant 42's row keeps its point and is overwritten in place (same
+    // length) under the statement's storage transaction; tenant 7's row is
+    // then refused.
+    let e = t
+        .update_rows(
+            "n >= 1",
+            fetch(&t),
+            set(&t, &[("tenant_id", &42i64.to_le_bytes()), ("label", b"cccc")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), KEY_CHANGE_REFUSAL);
+    assert_eq!(wal.pending_transactions(), 0, "the refused statement left its transaction open");
+    assert_untouched(&t).await;
+    assert_eq!(pointers(&t).await.len(), slots);
+    drop(t);
+
+    let t = open(&l, 0, PointRange::FULL).await;
+    assert_untouched(&t).await;
+    assert_eq!(rows(&t, "label = 'cccc'").await.len(), 0, "the refused statement's row is in the files");
+    assert_eq!(rows(&t, "").await.len(), 2);
+    assert_eq!(pointers(&t).await.len(), slots, "the refused statement's row is in the files");
+}
+
 fn expression_set(
     t: &Table<P>,
     column: &str,

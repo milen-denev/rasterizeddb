@@ -4872,17 +4872,14 @@ impl<S: StorageIO> Table<S> {
                     .map_err(std::io::Error::other)
                     .and_then(|before| guard.check_update_from(before, &row_write));
                 if let Err(e) = checked {
-                    // As for a unique violation below: earlier rows of this
-                    // statement are made durable before it fails, and nothing
-                    // is marked retryable, since a retry fails the same way.
-                    d.io_pointers.commit_durable(txn).await?;
-                    d.apply_pending_filters(&mut pending_filters);
-                    self.dead_stamps
-                        .fetch_add(updated_count, AtomicOrdering::Relaxed);
-                    self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
-                    if updated_count > 0 {
-                        self.invalidate_query_caches();
-                    }
+                    // As a row check above is refused: the statement fails as
+                    // a whole, so its storage transaction is abandoned, and
+                    // the earlier rows' pending overwrites with it. Committed
+                    // here, a statement reported as failed left those rows
+                    // rewritten, durably, outside any transaction that could
+                    // take them back. Nothing is marked retryable, since a
+                    // retry fails the same way.
+                    d.io_pointers.abort_txn(txn).await;
                     return Err(e);
                 }
             }
