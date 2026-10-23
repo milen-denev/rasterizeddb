@@ -1082,3 +1082,46 @@ fn every_mutator_of_an_index_or_a_filter_takes_a_proof() {
         problems.into_iter().collect::<Vec<_>>().join("\n  ")
     );
 }
+
+/// `ColumnFilter`'s mutators take no proof; `TableFilters.columns` being
+/// private is what keeps them behind `TableFilters`' proof-taking ones. A `pub`
+/// there, or a method handing a column out mutably, would route around the
+/// gate.
+#[test]
+fn the_column_filters_stay_behind_table_filters() {
+    let path = src_dir().join("core/filter/mod.rs");
+    let file: syn::File = syn::parse_file(&std::fs::read_to_string(&path).expect("read filter/mod.rs"))
+        .expect("parse filter/mod.rs");
+    let mut found = false;
+    let mut problems = Vec::new();
+    for item in &file.items {
+        match item {
+            syn::Item::Struct(s) if s.ident == "TableFilters" => {
+                for field in &s.fields {
+                    if field.ident.as_ref().is_some_and(|i| i == "columns") {
+                        found = true;
+                        if !matches!(field.vis, syn::Visibility::Inherited) {
+                            problems.push("TableFilters.columns is not private".to_string());
+                        }
+                    }
+                }
+            }
+            syn::Item::Impl(imp) if imp.self_ty.to_token_stream().to_string() == "TableFilters" => {
+                for it in &imp.items {
+                    if let syn::ImplItem::Fn(f) = it {
+                        if matches!(f.vis, syn::Visibility::Inherited) {
+                            continue;
+                        }
+                        let ret = f.sig.output.to_token_stream().to_string();
+                        if ret.contains("ColumnFilter") && (ret.contains("mut") || ret.contains("RwLock") || ret.contains("Guard")) {
+                            problems.push(format!("{} hands a ColumnFilter out: {}", f.sig.ident, ret));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(found, "TableFilters.columns not found; update this test");
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

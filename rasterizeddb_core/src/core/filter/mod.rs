@@ -377,6 +377,9 @@ struct ColumnMeta {
 pub struct TableFilters {
     cfg: FilterConfig,
     seed: HashSeed,
+    /// Private, and must stay so: `ColumnFilter`'s mutators take no proof,
+    /// and this field is what keeps them behind `TableFilters`' own, which do
+    /// (hook C10; pinned by the gate's source test).
     columns: Vec<RwLock<ColumnFilter>>,
     /// Parallel to `columns`. Read without locking.
     meta: Vec<ColumnMeta>,
