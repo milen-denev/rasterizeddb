@@ -8351,19 +8351,40 @@ fn plan_column_references(
     use crate::core::rql::{check, generated, unique_key};
     let named = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
 
-    let unique_keys = schema
-        .unique_keys
-        .iter()
-        .filter(|k| !k.is_deleted && k.columns.iter().any(|c| named(c, from)))
-        .map(|k| unique_key::UniqueKey {
+    // A partial index's predicate names columns too. Left naming `from`, it
+    // no longer compiled, and a key that cannot read its predicate is not
+    // enforced: renaming `deleted_at` let every live duplicate in.
+    let mut unique_keys = Vec::new();
+    for k in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+        let predicate = k
+            .predicate
+            .as_deref()
+            .map(|p| rename_column_references(p, table, from, to));
+        if !k.columns.iter().any(|c| named(c, from)) && predicate.as_deref() == k.predicate.as_deref() {
+            continue;
+        }
+        if predicate
+            .as_ref()
+            .is_some_and(|p| p.len() > unique_key::MAX_PREDICATE_LEN)
+        {
+            return Err(format!(
+                "cannot rename column {} to {}: the predicate of unique index {} would exceed {} characters",
+                from,
+                to,
+                k.name,
+                unique_key::MAX_PREDICATE_LEN
+            ));
+        }
+        unique_keys.push(unique_key::UniqueKey {
             columns: k
                 .columns
                 .iter()
                 .map(|c| if named(c, from) { to.to_string() } else { c.clone() })
                 .collect(),
+            predicate,
             ..k.clone()
-        })
-        .collect();
+        });
+    }
 
     // Every table's, since a parent's column is named in its children's
     // sidecars. Collected before anything awaits: no map guard is held then.
