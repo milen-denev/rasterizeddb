@@ -1,9 +1,13 @@
 # Hash partitioning
 
-Status: **designed, not built.** Line anchors were read on 2026-10-16 at
+Status: **phases 0 and 1 built** (`core/partition`, pure and unwired), **phase
+2a in progress, the rest designed, not built.** Line anchors were read on 2026-10-16 at
 `61e9200` and are relative to `rasterizeddb_core/src/`. `core/row/table.rs`,
 `core/vacuum.rs` and `core/filter/sarg.rs` are being edited by another session,
-so anchors there will drift; the function names are the stable part.
+so anchors there will drift; the function names are the stable part. Siblings:
+[Persistent indexes](persistent-indexes.md), whose v1 replaces phase 3's
+rebuild on open after a clean close (§7.2), and [Sharding](sharding.md), which reuses the hash, range map
+and router across nodes and fixes the deployment layout (sharding §11).
 
 ```sql
 CREATE TABLE assets (
@@ -31,10 +35,10 @@ vacuum state (§5), and can sit on its own disk.
 
 | Ask | What this design does |
 |---|---|
-| A distinct subtable per tenant | **Not by default.** Tenants map many-to-one onto 1024 partitions by default; a tenant's rows are always in one partition. `ISOLATE KEY` gives one tenant a partition of its own. Isolating every tenant, or `PARTITIONS` near the tenant count, gives the literal version at 3 files and, when open, 15 fds per tenant, affordable to about 10⁵ partitions per node (§7). |
+| A distinct subtable per tenant | **Not by default.** Tenants map many-to-one onto 1024 partitions by default from phase 3 (64 in phase 2a, §1.2); a tenant's rows are always in one partition. `ISOLATE KEY` gives one tenant a partition of its own. Isolating every tenant, or `PARTITIONS` near the tenant count, gives the literal version at 3 files and, when open, 15 fds per tenant, affordable to about 10⁵ partitions per node (§7); phase 3 caps a node at 65,536 (§15). |
 | 100 tenants at once touch 100 files | **Mostly.** 100 random tenants land on about 95 distinct partitions of 1024, about 91 of them alone. 64 partitions give about 51 distinct, 256 give 83, 4096 give 99. Isolated tenants always get their own. |
 | No contention | **Partly.** Today one tenant's `DELETE` blocks every `UPDATE` and `DELETE` of the table for its whole scan and rewrite (not `INSERT` or `SELECT`); here it blocks only its own partition. `INSERT` and point-`SELECT` throughput should not change: they never took that lock. Until phase 4 all partitions share one disk's log and fsync stream, and every commit shares the transaction manager and root outcome log (§5). |
-| Practically infinite scale | **No, not in one process.** One outcome log and one transaction manager per database bound commit throughput. "Infinite" means sharding across nodes, a separate design that would reuse this one's frozen hash, range map and statement-level routing. |
+| Practically infinite scale | **No, not in one process.** One outcome log and one transaction manager per database bound commit throughput. "Infinite" means sharding across nodes, a separate design ([Sharding](sharding.md)) that reuses this one's frozen hash, range map and statement-level routing. |
 | Balance subtables across disks | **Yes**, per partition, chosen at first write and recorded in the table's own map (§6.1). First for databases without S3 backup; with backup it waits for snapshots covering pool locations (phase 4b). Gated on a crash test of a durability gap that multi-disk transactions make routine (§12). |
 | Several columns in one key | **Yes, hierarchically.** `(tenant_id, asset_group_id)` behaves like `tenant_id` until a large tenant is sub-split by `asset_group_id`; a query fixing only `tenant_id` always routes to that tenant's contiguous sub-range (§1b). |
 
@@ -67,7 +71,8 @@ listed in `pg_indexes`, and refuses `DROP INDEX`.
   snapshots. The hash map gives the same prefix routing and sub-splitting
   without those costs.
 - **Not global uniqueness** (§1b), **not automatic** (splits and moves are
-  statements, like `STORAGE REBALANCE`), **not multi-node sharding**, and not a
+  statements, like `STORAGE REBALANCE`), **not multi-node sharding**
+  ([Sharding](sharding.md) builds that on top), and not a
   way around the shared commit points of §5.
 
 ## 1. Model
@@ -120,10 +125,13 @@ split, a merge or a move sets is a multiple of 2¹⁶, so a tenant not sub-split
 by `SPLIT KEY` is always in exactly one partition. With N partitions the
 initial boundaries are `lo_i = ⌊i · 2⁴⁸ / N⌋ << 16`.
 
-**The proposed default N is 1024**, for the arithmetic above; an unused
-partition costs a map entry, since files and location come at first write
-(§3.2, §6.1). The price, unrouted fan-out, is unmeasured, so phase 2a fixes the
-default (§8).
+**Phase 2a defaults N to 64**, since its cap of 2,048 declared partitions per
+database (§7.1) would admit only two tables at 1024. **From phase 3 the proposed
+default is 1024**, for the arithmetic above; an unused partition costs a map
+entry, since files and location come at first write (§3.2, §6.1). The price,
+unrouted fan-out, is unmeasured, so phase 2a's fan-out and phase 3's open-cost
+measurements fix that default (§8). `RangeMap::initial` lays out at most
+65,536 (`MAX_INITIAL`, `core/partition/map.rs:13`).
 
 ### 1.3 The hash
 
@@ -140,7 +148,11 @@ point, 3 col = top48(H_0) << 16 | top8(H_1) << 8 | top8(H_2)
 
 - **XXH64 is in-tree**, about 80 lines, so no crate update can move data,
   pinned by reference vectors and framed golden vectors per family and level:
-  `0`, `-1`, `i64::MIN`, `u64::MAX`, `''`, non-ASCII text, a fixed UUID.
+  `0`, `-1`, `i64::MIN`, `u64::MAX`, `''`, non-ASCII text, a fixed UUID. It is
+  `core/partition/xxh64.rs` today; persistent indexes move it to a neutral
+  `core/hash/xxh64.rs` (persistent-indexes §8, §15) so their gin item hash and
+  sharding's digests use it without depending on `core/partition`. The move
+  changes no output, and the same reference vectors (I1) pin it.
 - **Not ahash**, which `KeyLocks::stripe_of` (`core/row/key_locks.rs:53-62`)
   uses with `write_usize`: its output can change with crate version, target
   features and pointer width, harmless for lock stripes, catastrophic for
@@ -389,7 +401,10 @@ taking the cluster value, **the commit point**; (3) rewrites the name in
 `__pt_<uid>_schema.db`'s header; (4) tombstones the old row. No file is copied
 or deleted. Recovery reads two live rows with one uid as "rename committed",
 keeps the newer name and finishes steps 3–4; the reaper sees a live uid
-throughout (I25).
+throughout (I25). *Phase 2a refuses `RENAME`, and its startup refuses two live
+rows sharing a uid (`catalogue_duplicates`, `database/partitioned.rs`, marked
+`PARTITION-TODO(rename)`); the rename slice replaces that refusal with this
+recovery.*
 
 **`db_storage.cfg` never names a partition**, even in memory:
 `StorageManager::render` serialises every `placements` entry
@@ -413,6 +428,12 @@ record at append time (`file_sync.rs:1637-1645`, `:1529-1530`). The default
 deferred append stages into `.tmp` and lands later with `sync_all` and no WAL
 record (`file_sync.rs:1647-1700`, `:955-1035`), so nothing would order it before
 an outcome.
+
+The framing, the durable appends and the generation/`SEALED` replay (below) are
+to be factored out of `core/partition/log.rs` into a shared pure module, which
+sharding's cluster map reuses with records of its own
+([sharding §2.2](sharding.md#22-storage-epochs-and-authority), an ask in its
+§16 phase 0). The records below and `MapState`'s rules stay here.
 
 | Record | Payload | Durability |
 |---|---|---|
@@ -775,7 +796,7 @@ holding the old `Arc` can write past the copy into files about to be deleted.
 |---|---|---|---|---|
 | Unmaterialized | 0 | 0 | one map entry, ~16 B | 0 |
 | Closed | 0 | 0 | one slot, ~64 B: state, location, pin, stats, last use | 0 |
-| Open | 15 (3 providers × 5) | 3 | ~8 KB, plus filters and indexes in proportion to rows | 0 from phase 3 |
+| Open | 15 (3 providers × 5); 10 with persistent-index v1, which drops `_flt.db` | 3 | ~8 KB, plus filters and indexes in proportion to rows | 0 from phase 3 |
 | A `Table` today | ~25 | 5 | 15–30 KB, plus filters and indexes | 3–4, ~5.6 wakeups/s idle |
 
 **Startup** from phase 3 opens the shell and replays the map, nothing more; WAL
@@ -790,19 +811,34 @@ never panic; on EMFILE the budget evicts and retries once, then fails the
 statement with `53000` (insufficient resources), and replica apply treats
 `53xxx` as transient and retries, never skips (§12). **A write is never refused for
 the budget**, since success must not depend on this node's `RLIMIT_NOFILE` or
-open count (§12); past it, an open evicts and waits.
+open count (§12); past it, an open evicts and waits. Persistent-index v1
+removes the `_flt.db` provider (its filter becomes a snapshot section) and
+holds no fd for its own files while a partition is open, so from its phase 1
+the divisor drops to 10 (two providers × 5), plus 5 fds per location directory
+for `rdb.ixe` (persistent-indexes §1); its v2 would add one per open
+partition (divisor 11). Sharding sizes `LimitNOFILE` for that (sharding §11.1)
+and asks for a resident-bytes term beside the fd term
+(`partition_resident_budget`, sharding §11.1, §16 phase 0), not yet designed
+here beyond its measure: Σ of persistent-indexes' O(1) `resident_bytes()`
+(hook C11) plus filter bytes plus in-flight load staging, evicted against
+`machine budget ÷ processes_per_machine` (persistent-indexes §9).
 
 **Phase 2 has no idle close** and opens every materialized partition at
-startup, so it caps declared partitions at 2,048 across all tables (about 31k
-fds when all are written), checked by `CREATE`: a constant decides alike on
+startup, so it caps declared partitions at 2,048 per database, across its
+tables (about 31k fds when all are written), checked by `CREATE`: a constant decides alike on
 every node, unlike an `RLIMIT`-derived budget, and no write hits it. Plain
 tables open first; a table whose partitions cannot all open stays a shell,
 erroring loudly (§3.3), and the rest of the database starts.
 
-**Close writes nothing if `write_generation` did not move**, and **a fan-out
-open is scan-only** (filter read-only, index rebuild deferred to the first
-routed access or write, §7.2, point 4), so an unrouted `SELECT` wider than the
-budget rewrites no O(P) checkpoints, feeds no map-log compaction, and starts no
+**Close writes nothing if `write_generation` did not move**, unless
+persistent-index v1 has a snapshot to replace (missing, rejected by this open,
+or invalidated by an audit) and every index is ready (persistent-indexes §3,
+rule 2), so a version bump rebuilds a read-only partition once, not on every
+reopen. **A fan-out open is scan-only** (filter read-only: under
+persistent-index v1, the snapshot's FILTER section alone when the cheap proof
+passes, else an unpruned scan; index rebuild deferred to the first routed
+access or write, §7.2, point 4), so an unrouted `SELECT` wider than the budget
+rewrites no O(P) checkpoints, feeds no map-log compaction, and starts no
 rebuilds it then discards.
 
 ### 7.2 Lazy open and idle close
@@ -852,11 +888,26 @@ set is structural, unlike today's `reload_table`.
 
 **3. Close** lands `.tmp` and, if written since open, writes the filter
 checkpoint and `STATS`; one rejected as dirty is backfilled (correct, unpruned
-meanwhile).
+meanwhile). From persistent-indexes phase 1 the filter checkpoint is that
+design's clean-point snapshot (FILTER section only until its phase 4), trusted
+only under its `DIRTY`/`CLEAN` marker log (persistent-indexes §3, §5); if this
+phase is live first, persistent phase 1 ships this close hook with it, since
+removing `_flt.db` without it would backfill every reopened partition's filter
+from zero (persistent-indexes §12).
 
 **4. Index rebuild on open** is O(partition rows) on the scheduler, affordable
 at 1/N of the table; until ready, queries scan and unique checks use filter
-plus scan, which is correct.
+plus scan, which is correct. Phase 3 ships with this rebuild.
+[Persistent indexes](persistent-indexes.md#4-opening) v1 (its phase 4) skips it
+for a partition closed clean: close (point 3) writes a snapshot of the indexes
+and filter if the partition was written since open or its snapshot must be
+replaced, and the next routed open starts loading it as soon as the proof
+passes (marker log ends in `CLEAN`, identity matches the data), its readers
+waiting up to `index_snapshot.load_wait` rather than scanning. Anything else
+rebuilds exactly as here. A fan-out open stays scan-only and reads only the
+snapshot's FILTER section, for pruning. Persistent-index v2, online
+persistence for a hot set larger than RAM, is requirements only
+(persistent-indexes §16).
 
 **The WAL file map.** `Wal::register_file` silently overwrites a mapped id
 (`wal.rs:488-490`) and checkpoints silently skip unresolvable ids
@@ -1070,7 +1121,10 @@ runs after WAL recovery, before any partition opens.
 `^__pt_[0-9a-f]{16}_([0-9a-f]{8}(_pointers|_flt)?|schema(_[A-Z]+)?|map_[0-9]+|ids|seq)\.db(\.tmp)?$`,
 and deletes one only if its uid has no catalogue row, its pid is retired or
 lacks `MATERIALIZE`, it sits where its map does not place it, or it is a
-non-live map generation (§3.2). It runs **only if every map parsed cleanly**;
+non-live map generation (§3.2). Persistent indexes extend the pattern with
+their per-partition files by a second pattern,
+`^__pt_[0-9a-f]{16}_[0-9a-f]{8}\.(ixs|ixm)(\.tmp)?$` (persistent-indexes §1,
+§10: no table file can end that way). It runs **only if every map parsed cleanly**;
 one unreadable map disables reaping for that start, with a warning, so a
 corrupt log never gets live files deleted.
 
@@ -1161,15 +1215,25 @@ Each phase is safe alone and refuses what it does not support.
 | Phase | Ships | Still refuses | Measures |
 |---|---|---|---|
 | **0** | Nesting-aware `CREATE TABLE` trailer scan, making `PARTITION BY`, `PARTITION OF`, `INHERITS`, `ATTACH`, `DETACH` explicit refusals; refusal of `__pt_` names; hard error on a `Wal::register_file` id collision | all partitioning | the three mis-parse shapes, each asserting no catalogue row is written |
-| **1** | Pure, unwired modules: `partition::hash`, `RangeMap`, the map-log codec, `route(MaskExpr)` | — | route ns/op; I1, I2-pure, I3, I5 |
-| **2a** | **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants with a worker cap, the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH`, ≤ 2,048 declared partitions across tables (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE. **Prepared SELECTs** skip the learned-parse cache (`note_rewritten`), using the text path.<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** |
+| **1** | Pure, unwired modules: the hash (`partition::xxh64`, `partition::key`), `RangeMap`, the map-log codec, `route(MaskExpr)` | — | route ns/op; I1, I2-pure, I3, I5 |
+| **2a** | **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants with a worker cap, the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE. **Prepared SELECTs** skip the learned-parse cache (`note_rewritten`), using the text path.<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** |
 | **2b** | Joins, the prepared-SELECT cache with late routing (I11), ON CONFLICT and RETURNING on partitioned tables | as 2a, less these | prepared point-read cost vs plain |
-| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11), the reader-preferring DDL lock, map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions. **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
+| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11), the reader-preferring DDL lock, map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per node, default N = 1024 once measured (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
 | **4** | Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions; touched-only `sync_durable`. **Gated on** the cross-session crash test and fix (§12). Databases without `s3_backup` only. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
 | **4b** | S3 snapshots and log archive stream every pool location, with a multi-location restore test; phase-4 refusals lift | — | snapshot time vs location count |
 | **5** | Reshape: MOVE, SPLIT, ISOLATE KEY, SPLIT KEY, MERGE, bounded-parallel REBALANCE, conversion; each with crash recovery, range-bounded re-routes, epoch-gated reclamation | — | fence duration vs partition size; throughput during a reshape |
 | **6** | Row moves on key UPDATE, generational physical ALTER, co-location and partition-wise joins, `process_many` and `Folder` merge, `PARTITION OF` write-only alias | — | conversion time per GB |
 | **7** | The §5 shared-point fixes that phase 2a's measurements single out: StatusLog staging, RowLocks fast path, WAL shards | — | commits/s vs cores and disks |
+
+**Asks from the sibling designs**, scheduled by their owners here, listed in
+[sharding §16](sharding.md#16-phased-plan) phase 0: the shared map-log framing
+module (§3.2); the `FOREIGN` per-pid state, `RangeMap::within(owned, n)` and
+`ACQUIRE_SPAN`/`RELEASE_SPAN` map-log edits (sharding §2.1, §5.2); the
+resident-bytes open-budget term (§7.1). Persistent-index v1 hooks phase 3's
+open and close (§7.2, point 4) for index sections in its phase 4; its phase 1
+already moves every table's filter checkpoint to clean-point snapshots and, if
+phase 3 is live by then, makes phase 3's close a FILTER clean point (point 3,
+persistent-indexes §12).
 
 ## 16. Invariants and the tests that pin them
 
@@ -1227,7 +1291,8 @@ section specifying the mechanism.
    Open: does a `max_fanout` refusal beat a slow success? Proposed: a warning
    plus a setting.
 8. **Index memory** is rebuilt on every reopen; if that churns, use a longer
-   idle window or persisted indexes.
+   idle window or [persistent indexes](persistent-indexes.md), whose v1 loads
+   a snapshot instead after a clean close (§7.2, point 4).
 9. **`pg_dump`** emits a plain table, relkind being `'r'` (§14); a re-import
    loses partitioning unless the importer is told.
 10. **Out of scope:** a physical tenant drop (§13), and global uniqueness on a
