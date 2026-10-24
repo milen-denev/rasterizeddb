@@ -96,7 +96,7 @@ async fn settle(db: &Database, pt: &PartitionedTable) {
     for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap() {
         part.wait_filters_ready().await.unwrap();
     }
-    let twin = db.tables.get("twin").unwrap().clone();
+    let twin = db.table_for_tests("twin").unwrap().clone();
     twin.wait_filters_ready().await.unwrap();
 }
 
@@ -179,7 +179,7 @@ async fn view(db: &Arc<Database>, name: &str) -> Vec<Vec<(String, String)>> {
     let temp = super::build(name, db, FROZEN_TX, None).await.unwrap();
     let out = exec(db, &format!("SELECT * FROM {temp}")).await;
     assert_eq!(out.first(), Some(&2u8), "{name}: {}", String::from_utf8_lossy(&out));
-    let fields = db.tables.get(&temp).unwrap().schema.fields.clone();
+    let fields = db.table_for_tests(&temp).unwrap().schema.fields.clone();
     let rows = vec_into_rows(&out[1..])
         .unwrap()
         .iter()
@@ -406,7 +406,7 @@ async fn set_config_vacuum_reaches_every_partition() {
     let epoch = pt.epoch().unwrap();
     let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
     assert!(parts.len() > 1);
-    let twin = db.tables.get("twin").unwrap().clone();
+    let twin = db.table_for_tests("twin").unwrap().clone();
 
     for enabled in [false, true] {
         let reply = show(&db, &format!("SET CONFIG vacuum.enabled = {enabled}")).await.unwrap();
@@ -513,7 +513,7 @@ async fn a_broken_partitioned_table_refuses_rather_than_vanishing() {
         let db = open(root).await;
         let pt = partitioned(&db, "pt");
         assert!(pt.broken().is_some(), "{gone}: opened");
-        assert_eq!(db.tables.contains_key("pt"), shelled, "{gone}: {:?}", pt.broken());
+        assert_eq!(db.has_table("pt"), shelled, "{gone}: {:?}", pt.broken());
         let refused = |what: &str, e: Result<String, String>| {
             let e = e.expect_err(&format!("{gone}: {what} answered for a broken table"));
             assert!(e.contains("cannot be opened"), "{gone}: {what} erred without the reason: {e}");

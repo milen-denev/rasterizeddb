@@ -160,7 +160,7 @@ async fn stress(db: Arc<Database>, secs: u64, label: &'static str) {
             while !stop.load(Ordering::Relaxed) {
                 let _ = exec(&db, "VACUUM t").await;
                 db.transactions.settle_now();
-                if let Some(table) = db.tables.get("t").map(|t| t.value().clone()) {
+                if let Some(table) = db.table_for_tests("t") {
                     let _ = table.neutralize_aborted_now().await;
                 }
                 tally.sweeps.fetch_add(1, Ordering::Relaxed);

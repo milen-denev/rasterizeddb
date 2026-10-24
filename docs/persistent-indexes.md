@@ -1437,6 +1437,49 @@ the shape:
   entry made from the old instance during a DDL is filed under a generation
   that never answers after the swap.
 
+**As built (B3a).** Slots, `schema_view` and the private map; nothing takes
+a new lock yet (B3b).
+- *Slots* (`core/database/slots.rs`). Each name owns a `Slot`: the instance
+  behind an `ArcSwapAny` (through a local `RefCnt` wrapper over the engine's
+  `rclite::Arc<Table>`), plus a live/dropped state. `Slot::swap` is B4's
+  primitive; until then a reload removes the slot and installs a new one,
+  exactly as the map entry was removed and reinserted. A partitioned table's
+  shell has the slot under the logical name, its `PartitionedTable` sits in
+  `partitioned_tables` beside it, and a partitioned table whose schema could
+  not be read has no shell and no slot.
+- *Private maps.* `Database::table_slots` and `partitioned_tables` are private
+  and named only in `slots.rs` (and by the struct and its constructor), pinned
+  by `slots_source_tests` and a `compile_fail` doctest. Every lookup by name
+  goes through `Database::resolve`, the one place identifier case folding
+  drops in (also pinned).
+- *`schema_view(name) -> Option<SchemaView>`* (not `Arc<SchemaView>`: the view
+  holds one `Arc` of the instance, so it costs no allocation). It answers
+  exactly when `tables.get` did, so a shell-less partitioned table is `None`
+  and its error stays `relation()`'s. `schema()`, `is_partitioned()` and
+  `stats().totals()`: file lengths, the id counter and the pointer-record
+  count of the view's own instance (a partitioned table's summed over its
+  partitions), never the shell's data. Describe (`describe_query`, the
+  simple-query RowDescription, `join_output_columns`, `returning_scales`),
+  `learn_prepared`, `param_infer`, the CTE type lookup, `catalog_views`
+  (`columns`, `relation_size`, `tuple_counts`) and `introspect` (`columns`,
+  `schema_map`) read it. `relation()` keeps its type, built from the slot;
+  its callers in `catalog_views` and `introspect` (indexes, vacuum figures)
+  are B3b's to place.
+- *Escape hatches.* `table_unlocked` and `each_table_unlocked` hand executing
+  code an instance with no lock. `slots_source_tests::ESCAPES` lists every
+  caller by file and function (DROP's internals, the FK-sidecar and index
+  walks, the rebalance plan, and 31 executor functions); B3b drains it to the
+  two definitions. Metadata walks use `each_schema`; existence checks
+  `has_table`. Tests, benches and tools outside the engine use
+  `table_for_tests`, which no engine code may call.
+- *Tests.* `slots_tests` (a swap is atomic for readers and returns the
+  instance it replaced; a view keeps one instance's schema and figures across
+  a swap; a held view never blocks an INSERT, a reload or an ALTER; a
+  partitioned table's view and slot cover its logical name) and
+  `pgwire/schema_view_tests` (V10 case 6's stand-in: `pg_class` and
+  `pg_stat_user_tables` answer at once while another block holds ACCESS
+  EXCLUSIVE with a write pending).
+
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
 (auto-prepare) each run describe-before-DDL, execute-after and three

@@ -45,7 +45,7 @@ fn materialized(c: &mut Client, table: &str) -> usize {
 
 /// The pid owning the point of a key whose stored bytes are `key`.
 fn pid_of_key(db: &Arc<Database>, table: &str, key: &[&[u8]]) -> u32 {
-    let pt = db.partitioned.get(table).expect("partitioned").value().clone();
+    let pt = db.partitioned_table(table).expect("partitioned");
     let point = pt.spec().unwrap().point_of(key).unwrap();
     pt.epoch().unwrap().map.pid_of(point)
 }
@@ -369,7 +369,7 @@ fn insert_and_query_agree_on_every_spelling() {
     let db = server.db.clone();
     let mut home: BTreeMap<(&str, i64), u32> = BTreeMap::new();
     for (table, _, _) in tables {
-        let pt = db.partitioned.get(table).unwrap().value().clone();
+        let pt = db.partitioned_table(table).unwrap();
         let epoch = pt.epoch().unwrap();
         let mut seen: BTreeMap<i64, BTreeSet<u32>> = BTreeMap::new();
         let mut copies: BTreeMap<i64, usize> = BTreeMap::new();

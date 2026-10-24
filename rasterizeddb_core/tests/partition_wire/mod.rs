@@ -529,7 +529,7 @@ pub fn block_on_big<T: Send + 'static>(body: impl std::future::Future<Output = T
 pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
     use rasterizeddb_core::core::mvcc::transaction::FROZEN_TX;
     use rasterizeddb_core::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
-    let pt = db.partitioned.get(table).expect("a partitioned table").value().clone();
+    let pt = db.partitioned_table(table).expect("a partitioned table");
     let name = table.to_string();
     block_on_big(async move {
         for query in inserts {
@@ -579,14 +579,14 @@ pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Ve
     let db = db.clone();
     let table = table.to_string();
     block_on_big(async move {
-        let (schema, parts) = match db.partitioned.get(&table).map(|t| t.value().clone()) {
+        let (schema, parts) = match db.partitioned_table(&table) {
             Some(pt) => {
                 let epoch = pt.epoch().expect("the partitioned table opens");
                 let parts = pt.materialized(&epoch, &Route::All).expect("its partitions");
                 (pt.shell().schema.clone(), parts)
             }
             None => {
-                let t = db.tables.get(&table).unwrap_or_else(|| panic!("no table {table}")).value().clone();
+                let t = db.table_for_tests(&table).unwrap_or_else(|| panic!("no table {table}"));
                 (t.schema.clone(), vec![(0, t)])
             }
         };
@@ -630,7 +630,7 @@ pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Ve
 /// The point is the key columns' stored bytes hashed with the table's key.
 pub fn misplaced_rows(db: &Arc<Database>, table: &str) -> Vec<String> {
     use rasterizeddb_core::core::row::schema::SchemaField;
-    let pt = db.partitioned.get(table).expect("a partitioned table").value().clone();
+    let pt = db.partitioned_table(table).expect("a partitioned table");
     let spec = pt.spec().expect("the table opens").clone();
     let key_names: Vec<String> = spec
         .levels()

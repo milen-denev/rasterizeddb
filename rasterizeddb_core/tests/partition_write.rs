@@ -63,7 +63,7 @@ fn a_cross_partition_update_transfer_is_never_seen_half_applied() {
     );
     let opening: Vec<String> = (1..=16).map(|t| format!("({t}, 1000)")).collect();
     setup.ok(&format!("INSERT INTO acct (tenant_id, bal) VALUES {}", opening.join(", ")));
-    let pt = server.db.partitioned.get("acct").unwrap().value().clone();
+    let pt = server.db.partitioned_table("acct").unwrap();
     let epoch = pt.epoch().unwrap();
     let pid = |t: i64| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&t.to_le_bytes()[..]]).unwrap());
     // The two tenants in different groups of the fan-out's eight partitions
@@ -379,7 +379,7 @@ fn a_genuine_key_change_is_refused_before_any_partition_write() {
             (tenants.len() >= 2).then(|| (pid, tenants[0], tenants[1]))
         })
         .expect("a partition holding two tenants");
-    let pt = server.db.partitioned.get("gp").expect("gp").value().clone();
+    let pt = server.db.partitioned_table("gp").expect("gp");
     let before = stored_rows(&server.db, "gp");
     let (refused, overwrites, after_pinned) = block_on_big(async move {
         let epoch = pt.epoch().unwrap();

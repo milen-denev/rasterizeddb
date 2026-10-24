@@ -22,7 +22,6 @@ use crate::core::database::relation::Relation;
 use crate::core::db_type::DbType;
 use crate::core::row::schema::SchemaField;
 use crate::core::rql::cte::Materialized;
-use crate::core::storage_providers::traits::StorageIO;
 use smallvec::SmallVec;
 
 /// The catalogue relations this module can produce.
@@ -735,17 +734,11 @@ async fn build(
     // partitioned table whose schema could not be read has no shell in
     // `tables`; it is listed too, so a view that needs its data or schema
     // refuses rather than answering without it.
-    let mut tables: Vec<String> = database
-        .tables
-        .iter()
-        .map(|entry| entry.key().clone())
+    let tables: Vec<String> = database
+        .relation_names()
+        .into_iter()
         .filter(|name| !is_internal(name))
         .collect();
-    for entry in database.partitioned.iter() {
-        if !database.tables.contains_key(entry.key()) && !is_internal(entry.key()) {
-            tables.push(entry.key().clone());
-        }
-    }
 
     let (create, inserts) = match view {
         "pg_namespace" => (
@@ -791,14 +784,14 @@ async fn build(
         "columns" => {
             let mut rows = Vec::new();
             for name in &tables {
-                let Some(table) = database.tables.get(name) else {
+                let Some(table) = database.schema_view(name) else {
                     if let Some(Relation::Partitioned(t)) = database.relation(name) {
                         return Err(t.broken().unwrap_or("its schema is unavailable").to_string());
                     }
                     continue;
                 };
                 let mut fields: Vec<_> = table
-                    .schema
+                    .schema()
                     .fields
                     .iter()
                     .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -808,7 +801,7 @@ async fn build(
                 for (position, field) in fields.iter().enumerate() {
                     // A column is nullable exactly when it has a companion
                     // recording that, which is the same test the writer uses.
-                    let nullable = table.schema.fields.iter().any(|f| {
+                    let nullable = table.schema().fields.iter().any(|f| {
                         !f.is_deleted
                             && f.name.eq_ignore_ascii_case(
                                 &crate::core::rql::nullable::flag_column_name(&field.name),
@@ -1223,30 +1216,29 @@ async fn build(
 /// partitioned table, or a shell with no partitioned entry) errs rather than
 /// reporting itself empty.
 async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64), String> {
-    let ios = {
-        let table = match database.relation(name) {
-            None => return Ok((0, 0)),
-            Some(Relation::Partitioned(t)) => {
-                let totals = t.totals().await.map_err(|e| e.to_string())?;
-                return Ok((totals.bytes, live_and_dead(totals.ids_handed_out, totals.slots).0));
-            }
-            Some(Relation::Plain(t)) => t,
-        };
-        let data = table.data().map_err(|e| e.to_string())?;
-        [
-            data.io_rows.clone(),
-            data.io_pointers.clone(),
-            table.io_schema.clone(),
-            data.io_filters.clone(),
-            data.ids.io.clone(),
-        ]
-    };
-    let mut total = 0u64;
-    for io in ios {
-        total += io.get_len().await;
+    let totals = totals_of(database, name).await?;
+    Ok((totals.bytes, live_and_dead(totals.ids_handed_out, totals.slots).0))
+}
+
+/// One relation's figures through its [`SchemaView`]'s stats accessor: no
+/// lock, no scan, and the schema and figures of one instance (Q3). `None`
+/// from `schema_view` is a missing table, `(0, 0)`, unless it is a
+/// partitioned table whose schema could not be read, which has no shell and
+/// errs with its reason.
+///
+/// [`SchemaView`]: crate::core::database::SchemaView
+async fn totals_of(database: &Arc<Database>, name: &str) -> Result<crate::core::database::RelationTotals, String> {
+    match database.schema_view(name) {
+        Some(view) => view.stats().totals().await.map_err(|e| e.to_string()),
+        None => match database.relation(name) {
+            Some(Relation::Partitioned(t)) => Err(t
+                .check()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "its schema is unavailable".to_string())),
+            _ => Ok(Default::default()),
+        },
     }
-    let (live, _) = tuple_counts(database, name).await?;
-    Ok((total, live))
 }
 
 /// Live and dead tuple counts for one table.
@@ -1310,24 +1302,8 @@ async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64
 /// handed out, so it reports what a plain table with the same writes would.
 /// Errs on a table that cannot serve data, never `(0, 0)`.
 async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64), String> {
-    let (pointers_io, ids_handed_out) = {
-        let table = match database.relation(name) {
-            None => return Ok((0, 0)),
-            Some(Relation::Partitioned(t)) => {
-                let totals = t.totals().await.map_err(|e| e.to_string())?;
-                return Ok(live_and_dead(totals.ids_handed_out, totals.slots));
-            }
-            Some(Relation::Plain(t)) => t,
-        };
-        let data = table.data().map_err(|e| e.to_string())?;
-        (
-            data.io_pointers.clone(),
-            data.ids.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
-        )
-    };
-
-    let slots = pointers_io.get_len().await / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
-    Ok(live_and_dead(ids_handed_out, slots))
+    let totals = totals_of(database, name).await?;
+    Ok(live_and_dead(totals.ids_handed_out, totals.slots))
 }
 
 /// `live = min(ids handed out, slots)` and `dead = slots - live`; see

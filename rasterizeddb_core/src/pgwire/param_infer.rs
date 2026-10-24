@@ -276,10 +276,10 @@ fn column_oid(database: &Database, rel: &Relations, qualifier: Option<&str>, nam
         None => rel.tables.clone(),
     };
     for table in candidates {
-        let Some(t) = database.tables.get(&table) else {
+        let Some(t) = database.schema_view(&table) else {
             continue;
         };
-        let schema = &t.schema;
+        let schema = t.schema();
         if let Some(field) = schema.fields.iter().find(|f| {
             !f.is_deleted
                 && !crate::core::rql::nullable::is_hidden(&f.name)
@@ -437,8 +437,8 @@ fn insert_columns(database: &Database, toks: &[Tok]) -> Option<(Vec<String>, usi
         let Some(Tok::Ident(_, table)) = toks.get(into + 1) else {
             return None;
         };
-        let entry = database.tables.get(table)?;
-        let schema = &entry.value().schema;
+        let entry = database.schema_view(table)?;
+        let schema = entry.schema();
         let mut fields: Vec<_> = schema
             .fields
             .iter()

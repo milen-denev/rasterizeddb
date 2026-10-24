@@ -28,7 +28,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         result
     }
 
-    let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
+    let schema_of = |name: &str| database.table_unlocked(name).map(|t| t.schema.fields.clone());
 
     let plan = match crate::core::rql::join::plan_statement(sql, &schema_of) {
         Ok(p) => p,
@@ -168,7 +168,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let has_shadow_json = plan.items.iter().any(|item| {
         item.reads_column()
             && plan.relations.get(item.rel).is_some_and(|relation| {
-                database.tables.get(&relation.table).is_some_and(|t| {
+                database.table_unlocked(&relation.table).is_some_and(|t| {
                     crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
                         .is_some()
                 })
@@ -213,7 +213,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         let Some(relation) = plan.relations.get(item.rel) else {
             continue;
         };
-        let Some(shadow_table) = database.tables.get(&relation.table).and_then(|t| {
+        let Some(shadow_table) = database.table_unlocked(&relation.table).and_then(|t| {
             crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
                 .map(|s| s.to_string())
         }) else {
@@ -411,12 +411,12 @@ pub(crate) fn query_output_scales(
         // each output column is (`JoinPlan::output_scales`). Without this arm a
         // join rendered every `NUMERIC(p, s)` at the engine scale.
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
-            let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
+            let schema_of = |name: &str| database.table_unlocked(name).map(|t| t.schema.fields.clone());
             crate::core::rql::join::plan_statement(&qr.query, &schema_of)
                 .ok()
                 .map(|plan| plan.output_scales())
         }
-        QueryPurpose::QueryRows(qr) => database.tables.get(&qr.table_name).and_then(|t| {
+        QueryPurpose::QueryRows(qr) => database.table_unlocked(&qr.table_name).and_then(|t| {
             let schema = &t.schema;
             // Not skipped when the table declares no `NUMERIC(p, s)`: an
             // aggregate's scale is not the column's — `sum(int8)` is a numeric
@@ -920,7 +920,7 @@ async fn check_foreign_keys(
 ) -> Result<(), String> {
     crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
     let foreign_keys = {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         match entry.as_ref() {
             None => return Ok(()),
             Some(t) => t.schema.foreign_keys.clone(),
@@ -941,7 +941,7 @@ async fn check_foreign_keys(
             continue;
         }
 
-        if !database.tables.contains_key(&fk.parent_table) {
+        if !database.has_table(&fk.parent_table) {
             return Err(format!(
                 "foreign key \"{}\" references relation \"{}\", which does not exist",
                 fk.name, fk.parent_table
@@ -1068,7 +1068,7 @@ async fn prevalidate_foreign_keys(
     if statements.len() < 2 {
         return verified;
     }
-    let foreign_keys = match database.tables.get(table_name) {
+    let foreign_keys = match database.table_unlocked(table_name) {
         Some(t) => t.schema.foreign_keys.clone(),
         None => return verified,
     };
@@ -1081,7 +1081,7 @@ async fn prevalidate_foreign_keys(
         .collect();
 
     for fk in foreign_keys.iter() {
-        if !database.tables.contains_key(&fk.parent_table) {
+        if !database.has_table(&fk.parent_table) {
             continue;
         }
         let mut seen = std::collections::HashSet::new();
@@ -1177,7 +1177,7 @@ async fn referenced_values_now(
     tx: TxId,
     limit: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let Some(table) = database.tables.get(table_name).map(|t| t.value().clone()) else {
+    let Some(table) = database.table_unlocked(table_name) else {
         return Err(format!("relation \"{}\" does not exist", table_name));
     };
     let schema = &table.schema.fields;
@@ -1353,13 +1353,13 @@ fn referencing_keys(
     parent_table: &str,
 ) -> Vec<(String, crate::core::rql::foreign_key::ForeignKey)> {
     let mut out = Vec::new();
-    for entry in database.tables.iter() {
-        for fk in entry.value().schema.foreign_keys.iter() {
+    database.each_schema(|table, schema| {
+        for fk in schema.foreign_keys.iter() {
             if fk.parent_table.eq_ignore_ascii_case(parent_table) {
-                out.push((entry.key().clone(), fk.clone()));
+                out.push((table.to_string(), fk.clone()));
             }
         }
-    }
+    });
     out
 }
 
@@ -1372,10 +1372,10 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
     // The guard is dropped before returning: this is called from an async
     // function that goes on to await, and a DashMap guard held across an await
     // deadlocks the next writer.
-    let Some(entry) = database.tables.get(table) else {
+    let Some(entry) = database.table_unlocked(table) else {
         return "NULL".to_string();
     };
-    let schema = &entry.value().schema;
+    let schema = &entry.schema;
     let Some(expression) =
         crate::core::rql::column_default::expression_for(column, &schema.defaults)
     else {
@@ -2280,7 +2280,7 @@ async fn rewrite_table_with_columns(
         old_field_names,
         rows,
     ) = {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return Err(format!("relation '{}' does not exist", table_name));
         };
@@ -2453,7 +2453,7 @@ async fn rewrite_table_with_columns(
     // migration that checks there before creating it would have tried again.
     if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() || carries_unique_keys {
         let (io_schema, fields) = {
-            let entry = database.tables.get(table_name);
+            let entry = database.table_unlocked(table_name);
             let Some(table) = entry.as_ref().clone() else {
                 return Err(format!("relation '{}' vanished during rewrite", table_name));
             };
@@ -2492,7 +2492,7 @@ async fn rewrite_table_with_columns(
             .map_err(|e| format!("could not reopen '{}' with its indexes: {}", table_name, e))?;
     }
 
-    let entry = database.tables.get(table_name);
+    let entry = database.table_unlocked(table_name);
     let Some(table) = entry.as_ref().clone() else {
         return Err(format!("relation '{}' vanished during rewrite", table_name));
     };
@@ -2817,7 +2817,7 @@ async fn store_json_document(
         ));
     }
 
-    if !database.tables.contains_key(shadow_table) {
+    if !database.has_table(shadow_table) {
         run_ddl(
             database,
             &format!(
@@ -3154,7 +3154,7 @@ async fn ensure_shadow_column(
     // `Date` found `date`, skipped the `ADD COLUMN`, and then failed the
     // `INSERT` on a column the parser could not find.
     let (column, existing) = {
-        let entry = database.tables.get(shadow_table);
+        let entry = database.table_unlocked(shadow_table);
         let fields: Vec<crate::core::row::schema::SchemaField> = entry
             .as_ref()
             .map(|t| {
@@ -3251,7 +3251,7 @@ async fn retype_column(
     // frozen read would miss them; `tx`'s own pinned snapshot, if it has one,
     // would miss what others committed since. Both losses would be silent.
     let (fields, rows) = {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return Err(format!("relation '{}' does not exist", table_name));
         };
@@ -3699,7 +3699,7 @@ async fn execute_update_from(
     // anything runs. A partitioned source is supported (S19): it is read by
     // the join `update_from_join` runs through `run_subquery`, under that
     // join's one snapshot, and only this plain target is written back.
-    if database.partitioned.contains_key(&table) {
+    if database.is_partitioned(&table) {
         return ddl_error(&format!("UPDATE … FROM on partitioned table \"{table}\" is not supported yet"));
     }
     let target_alias = match head_words.next() {
@@ -4096,7 +4096,7 @@ async fn execute_delete_using(
     let table = table_token.trim_matches('"').to_string();
     // As for `UPDATE … FROM`: a partitioned target is phase 3, refused
     // before anything runs; a partitioned source is read by the join (S19).
-    if database.partitioned.contains_key(&table) {
+    if database.is_partitioned(&table) {
         return ddl_error(&format!("DELETE … USING on partitioned table \"{table}\" is not supported yet"));
     }
     let target_alias = match head_words.next() {
@@ -4181,7 +4181,7 @@ async fn delete_using_join(
 ) -> Result<Vec<u8>, String> {
     // The target's key. Without one there is no way to name the row again.
     let key = {
-        let table_ref = database.tables.get(table);
+        let table_ref = database.table_unlocked(table);
         let handle = table_ref
             .as_ref()
             .clone()
@@ -4201,7 +4201,7 @@ async fn delete_using_join(
     // ran under its own snapshot; a target row changed since may no longer
     // match, and PostgreSQL rechecks it rather than deleting it.
     let target_columns: Vec<String> = {
-        let entry = database.tables.get(table);
+        let entry = database.table_unlocked(table);
         entry
             .as_ref()
             .map(|h| h.schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect())
@@ -4325,7 +4325,7 @@ async fn update_from_join(
     // The target's key. Without one there is no way to name the row again, so
     // this is refused rather than guessed at.
     let key = {
-        let table_ref = database.tables.get(table);
+        let table_ref = database.table_unlocked(table);
         let handle = table_ref
             .as_ref()
             .clone()
@@ -4395,7 +4395,7 @@ async fn update_from_join(
     // reads are projected instead, and the expression is evaluated per row
     // once they are in hand.
     let target_schema: Vec<crate::core::row::schema::SchemaField> = {
-        let entry = database.tables.get(table);
+        let entry = database.table_unlocked(table);
         let handle = entry
             .as_ref()
             .clone()
@@ -4883,7 +4883,7 @@ async fn apply_conflict_update(
     let keys: Vec<String> = if !spec.arbiter.is_empty() {
         spec.arbiter.clone()
     } else if let Some(name) = &spec.constraint {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", table_name));
         };
@@ -4897,7 +4897,7 @@ async fn apply_conflict_update(
             }
         }
     } else {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", table_name));
         };
@@ -4933,12 +4933,12 @@ async fn apply_conflict_update(
     // outside it — the soft-deleted copies of an email — and the update would
     // have rewritten all of them. An ordinary key over the same columns
     // admits one row per value, so its presence makes the predicate moot.
-    if let Some(entry) = database.tables.get(table_name) {
+    if let Some(entry) = database.table_unlocked(table_name) {
         let same_columns = |columns: &[String]| {
             columns.len() == keys.len()
                 && columns.iter().all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
         };
-        let schema = &entry.value().schema;
+        let schema = &entry.schema;
         let full_key = schema.unique_keys.iter().any(|k| {
             !k.is_deleted && k.predicate.is_none() && same_columns(&k.columns)
         }) || (keys.len() == 1
@@ -5065,7 +5065,7 @@ async fn lock_selected_rows(
     }
 
     let key_field = {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let table = entry
             .as_ref()
             .clone()
@@ -5204,7 +5204,7 @@ async fn execute_lock_table(
     };
 
     for name in &statement.tables {
-        if !database.tables.contains_key(name) {
+        if !database.has_table(name) {
             return ddl_error(&format!("relation '{}' does not exist", name));
         }
 
@@ -5412,7 +5412,7 @@ async fn refuse_write_to_locked_rows(
     }
 
     let key_field = {
-        let entry = database.tables.get(table_name);
+        let entry = database.table_unlocked(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return Ok(());
         };
@@ -5814,7 +5814,7 @@ fn star_output_types(select_sql: &str, database: &Arc<Database>) -> Vec<Option<c
     let Some(name) = select_sql[from + "FROM".len()..].split_whitespace().next() else {
         return Vec::new();
     };
-    let Some(table) = database.tables.get(name.trim_matches('"').trim_end_matches(';')) else {
+    let Some(table) = database.table_unlocked(name.trim_matches('"').trim_end_matches(';')) else {
         return Vec::new();
     };
     let mut fields: Vec<_> = table
@@ -5965,8 +5965,8 @@ async fn supply_insert_column_list(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
     database: &Arc<Database>,
 ) -> Option<Result<QueryPurpose, String>> {
-    let (fields, generated) = database.tables.get(&row_data.table_name).map(|entry| {
-        let schema = &entry.value().schema;
+    let (fields, generated) = database.table_unlocked(&row_data.table_name).map(|entry| {
+        let schema = &entry.schema;
         (schema.fields.clone(), schema.generated.clone())
     })?;
     // A generated column takes no value from the client, so it is not one of
@@ -6024,8 +6024,8 @@ async fn supply_generated_values(
     database: &Arc<Database>,
 ) -> Option<Result<crate::core::rql::lexer_s1::InsertRowData, String>> {
     let (fields, generated, defaults) = {
-        let entry = database.tables.get(&row_data.table_name)?;
-        let schema = &entry.value().schema;
+        let entry = database.table_unlocked(&row_data.table_name)?;
+        let schema = &entry.schema;
         if schema.generated.is_empty() {
             return None;
         }
@@ -6732,8 +6732,8 @@ fn create_table_already_satisfied(
     }
     // A partitioned table that could not be opened has no shell in `tables`,
     // but it exists: a CREATE would only be refused with "already exists".
-    let exists = database.tables.contains_key(&create_table.table_name)
-        || database.partitioned.contains_key(&create_table.table_name);
+    let exists = database.has_table(&create_table.table_name)
+        || database.is_partitioned(&create_table.table_name);
     if exists {
         info!(
             "Table '{}' already exists; IF NOT EXISTS makes that success",
@@ -6795,8 +6795,8 @@ fn partitioned_ddl_message(e: &std::io::Error) -> String {
 /// were. Consults `partitioned` first: a table that could not be opened has
 /// no shell in `tables` but is still partitioned.
 fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result<(), String> {
-    let shell = database.tables.get(table).is_some_and(|t| t.is_shell());
-    if database.partitioned.contains_key(table) || shell {
+    let shell = database.table_unlocked(table).is_some_and(|t| t.is_shell());
+    if database.is_partitioned(table) || shell {
         return Err(format!(
             "{what} on partitioned table \"{table}\" is not supported yet"
         ));
@@ -6837,10 +6837,10 @@ fn check_conflict_target_infers_a_key(
     if target.is_empty() {
         return Ok(());
     }
-    let schema = match database.tables.get(&row_data.table_name) {
+    let schema = match database.table_unlocked(&row_data.table_name) {
         Some(table) => table.schema.clone(),
-        None => match database.partitioned.get(&row_data.table_name) {
-            Some(pt) => pt.value().shell().schema.clone(),
+        None => match database.partitioned_table(&row_data.table_name) {
+            Some(pt) => pt.shell().schema.clone(),
             None => return Ok(()),
         },
     };
@@ -6882,7 +6882,7 @@ fn check_partitioned_conflict_target(
     if target.is_empty() {
         return Ok(());
     }
-    let Some(pt) = database.partitioned.get(table).map(|e| e.value().clone()) else {
+    let Some(pt) = database.partitioned_table(table) else {
         return Ok(());
     };
     let spec = pt.spec().map_err(|e| e.to_string())?;
@@ -6911,9 +6911,9 @@ fn check_partitioned_conflict_target(
 /// own FK check compares it.
 fn is_partitioned_parent(database: &Database, parent: &str) -> bool {
     database
-        .partitioned
+        .partitioned_tables_all()
         .iter()
-        .any(|p| p.key().eq_ignore_ascii_case(parent))
+        .any(|p| p.name().eq_ignore_ascii_case(parent))
 }
 
 /// Rewrites every JSON column's default in a `CREATE TABLE` into the reference
@@ -7347,12 +7347,12 @@ async fn load_json_document(
     use crate::core::db_type::DbType;
     use crate::core::rql::json_map;
 
-    if depth >= json_map::MAX_NESTING_DEPTH || !database.tables.contains_key(shadow_table) {
+    if depth >= json_map::MAX_NESTING_DEPTH || !database.has_table(shadow_table) {
         return None;
     }
 
     let all_fields: Vec<crate::core::row::schema::SchemaField> = {
-        let entry = database.tables.get(shadow_table);
+        let entry = database.table_unlocked(shadow_table);
         let table = entry.as_ref().clone()?;
         crate::core::rql::nullable::visible_fields(&table.schema.fields)
             .into_iter()
@@ -8157,7 +8157,7 @@ async fn existing_rows_break_unique(
     table_name: &str,
     key: &crate::core::rql::unique_key::UniqueKey,
 ) -> Result<Option<String>, String> {
-    let entry = database.tables.get(table_name);
+    let entry = database.table_unlocked(table_name);
     let Some(table) = entry.as_ref().clone() else {
         return Err(format!("relation '{}' does not exist", table_name));
     };
@@ -8350,7 +8350,7 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
             .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"));
     if if_exists {
         if let Some(first) = plans.first() {
-            if database.tables.get(&first.table_name).is_none() {
+            if database.table_unlocked(&first.table_name).is_none() {
                 info!(
                     "ALTER TABLE IF EXISTS {}: relation absent, nothing to do",
                     first.table_name
@@ -8713,14 +8713,13 @@ fn sequences_named_elsewhere(
     database: &Arc<Database>,
     except: &str,
 ) -> std::collections::HashSet<String> {
-    database
-        .tables
-        .iter()
-        .filter(|table| table.key().as_str() != except)
-        .flat_map(|table| {
-            crate::core::rql::sequence::named_by(&table.value().schema.defaults).collect::<Vec<_>>()
-        })
-        .collect()
+    let mut named = std::collections::HashSet::new();
+    database.each_schema(|table, schema| {
+        if table != except {
+            named.extend(crate::core::rql::sequence::named_by(&schema.defaults));
+        }
+    });
+    named
 }
 
 /// Fills a generated column just added to a table that already holds rows:
@@ -8815,7 +8814,7 @@ async fn execute_alter_table_action(
     // The map guard is released immediately: `reload_table` removes the entry,
     // and holding a read guard across that would deadlock the shard.
     let (mut schema, io_schema, row_count) = {
-        let table_ref = database.tables.get(&plan.table_name);
+        let table_ref = database.table_unlocked(&plan.table_name);
         let Some(table) = table_ref.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", plan.table_name));
         };
@@ -9325,7 +9324,7 @@ async fn execute_alter_table_action(
                 return ddl_ok(0);
             }
             let renamed_io = {
-                let entry = database.tables.get(&to);
+                let entry = database.table_unlocked(&to);
                 let Some(table) = entry.as_ref() else {
                     return ddl_error(&format!("relation '{}' vanished during rename", to));
                 };
@@ -9799,7 +9798,7 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         return ddl_error(&e);
     }
     let (io_schema, declared, column_is_a_document) = {
-        let entry = database.tables.get(&statement.table);
+        let entry = database.table_unlocked(&statement.table);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
@@ -9866,16 +9865,20 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
 /// Whether an index of this name exists anywhere in the database. Index
 /// names are database-wide, as in PostgreSQL.
 fn index_name_taken(database: &Arc<Database>, name: &str) -> Option<String> {
-    for entry in database.tables.iter() {
-        let schema = &entry.value().schema;
-        if schema.path_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
-            || schema
-                .secondary_indexes
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(name))
+    let mut taken = None;
+    database.each_schema(|table, schema| {
+        if taken.is_none()
+            && (schema.path_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
+                || schema
+                    .secondary_indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name)))
         {
-            return Some(entry.key().clone());
+            taken = Some(table.to_string());
         }
+    });
+    if taken.is_some() {
+        return taken;
     }
     None
 }
@@ -9898,7 +9901,7 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         return ddl_error(&e);
     }
     let (io_schema, columns, types) = {
-        let entry = database.tables.get(&statement.table);
+        let entry = database.table_unlocked(&statement.table);
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
@@ -9962,14 +9965,13 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
 /// declares one by that name, so the caller tries the other kinds.
 async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
     let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
-    let (table_name, io_schema, decl) = database.tables.iter().find_map(|entry| {
-        entry
-            .value()
+    let (table_name, io_schema, decl) = database.each_table_unlocked().into_iter().find_map(|(key, table)| {
+        table
             .schema
             .secondary_indexes
             .iter()
             .find(|i| i.name.eq_ignore_ascii_case(&name))
-            .map(|d| (entry.key().clone(), entry.value().io_schema.clone(), d.clone()))
+            .map(|d| (key.clone(), table.io_schema.clone(), d.clone()))
     })?;
     // Before the tombstone is written, so a refused drop leaves the
     // declaration as it was.
@@ -10002,14 +10004,13 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
 /// case is left to the constraint.
 async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
     let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
-    let (table_name, io_schema) = database.tables.iter().find_map(|entry| {
-        entry
-            .value()
+    let (table_name, io_schema) = database.each_table_unlocked().into_iter().find_map(|(key, table)| {
+        table
             .schema
             .unique_keys
             .iter()
             .any(|k| !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(&name))
-            .then(|| (entry.key().clone(), entry.value().io_schema.clone()))
+            .then(|| (key.clone(), table.io_schema.clone()))
     })?;
     match crate::core::rql::unique_key::remove(io_schema, &name).await {
         Ok(true) => {}
@@ -10041,18 +10042,11 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
     // Index names are database-wide, so the table holding it is found rather
     // than named.
     let mut found: Option<String> = None;
-    for entry in database.tables.iter() {
-        if entry
-            .value()
-            .schema
-            .path_indexes
-            .iter()
-            .any(|i| i.name.eq_ignore_ascii_case(&name))
-        {
-            found = Some(entry.key().clone());
-            break;
+    database.each_schema(|table, schema| {
+        if found.is_none() && schema.path_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {
+            found = Some(table.to_string());
         }
-    }
+    });
 
     let Some(table_name) = found else {
         // Not an error when the index is one this engine never stored: an
@@ -10066,7 +10060,7 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
         return ddl_error(&e);
     }
     let io_schema = {
-        let entry = database.tables.get(&table_name);
+        let entry = database.table_unlocked(&table_name);
         let Some(table) = entry.as_ref().clone() else {
             return if if_exists {
                 ddl_ok(0)
@@ -11424,11 +11418,11 @@ pub(crate) async fn insert_loaded_row(
     tx: TxId,
 ) -> Option<()> {
     // A partitioned table takes the statement path, which routes the row.
-    if database.partitioned.contains_key(table_name) {
+    if database.is_partitioned(table_name) {
         return None;
     }
     Box::pin(seed_sequences(database, table_name)).await.ok()?;
-    let table = database.tables.get(table_name)?.value().clone();
+    let table = database.table_unlocked(table_name)?;
     let schema = &table.schema;
     if !schema.json_columns.is_empty() {
         return None;
@@ -11733,7 +11727,7 @@ async fn execute_prepared_rows(
             Err(refusal) => refusal,
         };
     }
-    let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
+    let table = database.table_unlocked(&prepared.table_name);
     let Some(table) = table else {
         return ddl_error("Table not found");
     };
@@ -11989,8 +11983,8 @@ pub(crate) async fn execute_with_need(
                     // Copied out so no map guard is held across the scan of
                     // the other tables below.
                     let (fields, defaults) = {
-                        let table = database.tables.get(&name)?;
-                        let schema = &table.value().schema;
+                        let table = database.table_unlocked(&name)?;
+                        let schema = &table.schema;
                         (schema.fields.clone(), schema.defaults.clone())
                     };
                     Some(crate::core::rql::sequence::owned_by(
@@ -12455,7 +12449,7 @@ pub(crate) async fn execute_with_need(
                 // insert. Only the assignments are checked: an UPDATE leaves
                 // every column it does not name alone.
                 {
-                    let entry = database.tables.get(&name);
+                    let entry = database.table_unlocked(&name);
                     if let Some(table) = entry.as_ref().clone() {
                         let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)
                             .unwrap_or_default();
@@ -12539,13 +12533,13 @@ pub(crate) async fn execute_with_need(
             // the table backing a JSON column, which writes this same map; held
             // across it, this is the deadlock the INSERT arm had.
             let table = {
-                let Some(entry) = database.tables.get(&table_name) else {
+                let Some(entry) = database.table_unlocked(&table_name) else {
                     error!("Table not found");
                     let mut result = vec![3u8];
                     result.extend_from_slice("Table not found".as_bytes());
                     return result;
                 };
-                entry.value().clone()
+                entry
             };
 
             // A generated column is computed from the row, so an `UPDATE` to
@@ -12838,10 +12832,9 @@ pub(crate) async fn execute_with_need(
                 }
                 None => {
                     let mut names: Vec<String> = database
-                        .tables
-                        .iter()
-                        .map(|entry| entry.key().clone())
-                        .chain(database.partitioned.iter().map(|entry| entry.key().clone()))
+                        .table_names()
+                        .into_iter()
+                        .chain(database.partitioned_tables_all().iter().map(|t| t.name().to_string()))
                         .collect();
                     names.sort();
                     names.dedup();
@@ -13007,7 +13000,7 @@ pub(crate) async fn execute_with_need(
                 return result;
             }
 
-            let table_ref = database.tables.get(&table_name);
+            let table_ref = database.table_unlocked(&table_name);
             let table_clone = table_ref.as_ref().clone();
             let table = if let Some(table) = table_clone {
                 table
@@ -13211,7 +13204,7 @@ pub(crate) async fn execute_with_need(
                 return Box::pin(execute_partitioned_select(&query, pt, &database, tx, need)).await;
             }
 
-            let table_ref = database.tables.get(table_name);
+            let table_ref = database.table_unlocked(table_name);
             let table_clone = table_ref.as_ref().clone();
             let table = if let Some(table) = table_clone {
                 table
@@ -13248,7 +13241,7 @@ pub(crate) async fn execute_with_need(
             };
 
             crate::core::rql::prepared::note_plain(table_name, &query_row);
-            let source = crate::core::rql::row_source::RowSource::Single(table.value().clone());
+            let source = crate::core::rql::row_source::RowSource::Single(table.clone());
             Box::pin(execute_query_rows(query_row, source, &database, tx)).await
         }
     }

@@ -528,7 +528,7 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
     database
         .refuse_partitioned(&table, "STORAGE PLACE TABLE")
         .map_err(|e| e.to_string())?;
-    if database.tables.contains_key(&table) {
+    if database.has_table(&table) {
         // Reported from the backend rather than the directory: `location_of`
         // is `None` for a table that is not in one, and falling back to the
         // root would tell an operator their key/value table's files are in the
@@ -760,9 +760,9 @@ fn table_counts(
     let root = pool.root().unwrap_or("").to_string();
 
     let mut counts = std::collections::HashMap::new();
-    for entry in database.tables.iter() {
+    for name in database.table_names() {
         let at = placed
-            .get(entry.key())
+            .get(&name)
             .cloned()
             .unwrap_or_else(|| root.clone());
         *counts.entry(at).or_insert(0u64) += 1;
@@ -771,9 +771,9 @@ fn table_counts(
     // its files, whether or not its shell is in `tables` (a broken one's may
     // not be).
     let unshelled = database
-        .partitioned
+        .partitioned_tables_all()
         .iter()
-        .filter(|entry| !database.tables.contains_key(entry.key()))
+        .filter(|table| !database.has_table(table.name()))
         .count() as u64;
     if unshelled > 0 {
         *counts.entry(root).or_insert(0u64) += unshelled;
@@ -1116,14 +1116,9 @@ fn placement_rows(pool: &StorageManager, database: &Arc<Database>) -> Result<Vec
     let root = pool.root().unwrap_or("").to_string();
     let placed: std::collections::HashMap<String, String> = pool.placements().into_iter().collect();
 
-    let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
-    // A partitioned table whose schema could not be read has no shell in
-    // `tables`; it is still a table, at the root.
-    for entry in database.partitioned.iter() {
-        if !names.contains(entry.key()) {
-            names.push(entry.key().clone());
-        }
-    }
+    // A partitioned table whose schema could not be read has no shell; it
+    // is still a table, at the root.
+    let mut names: Vec<String> = database.relation_names();
     // Placements for tables that do not exist are worth showing rather than
     // hiding: a pinned name is how `STORAGE PLACE TABLE` works before the table
     // is created, and a leftover entry is something an operator wants to see.

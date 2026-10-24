@@ -54,7 +54,7 @@ async fn on_disk(db: &Database, name: &str) -> u128 {
 }
 
 fn in_memory(db: &Database, name: &str) -> u128 {
-    db.tables.get(name).expect("open table").schema.incarnation
+    db.table_for_tests(name).expect("open table").schema.incarnation
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -82,8 +82,7 @@ async fn a_table_gets_a_new_incarnation_exactly_when_it_is_a_new_table() {
         exec_sql(&db, "INSERT INTO inc_u (id) VALUES (1)").await;
         exec_sql(&db, "ALTER TABLE inc_u ADD COLUMN extra INT").await;
         assert!(
-            db.tables
-                .get("inc_u")
+            db.table_for_tests("inc_u")
                 .unwrap()
                 .schema
                 .fields

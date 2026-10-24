@@ -146,8 +146,8 @@ fn show_storage(r: &Reply, db: &Database) -> Result<(), String> {
         .and_then(|head| head.rsplit(' ').next())
         .and_then(|n| n.parse().ok())
         .ok_or_else(|| format!("unreadable count in {line}"))?;
-    if count != db.tables.len() {
-        return Err(format!("SHOW STORAGE counts {count} tables, the database has {}: {line}", db.tables.len()));
+    if count != db.table_count() {
+        return Err(format!("SHOW STORAGE counts {count} tables, the database has {}: {line}", db.table_count()));
     }
     Ok(())
 }
@@ -572,7 +572,7 @@ const SITES: &[Site] = &[
 
 /// The shell's schema as its file holds it.
 async fn on_disk_schema(db: &Database, table: &str) -> String {
-    let io = db.tables.get(table).expect("the shell").io_schema.clone();
+    let io = db.table_for_tests(table).expect("the shell").io_schema.clone();
     let s = TableSchema::load(io).await.expect("the schema loads");
     format!(
         "fields={:?} fks={} uks={} idx={} paths={} defaults={} checks={}",
@@ -599,11 +599,11 @@ struct Invariant {
 }
 
 fn check_invariant(rt: &tokio::runtime::Runtime, db: &Database, dir: &Path, inv: &Invariant, after: &str) {
-    let table = db.partitioned.get(T).map(|t| t.value().clone());
+    let table = db.partitioned_table(T);
     let table = table.unwrap_or_else(|| panic!("after `{after}`: {T} is no longer partitioned"));
     assert_eq!(table.uid(), inv.uid, "after `{after}`: a different partitioned table");
     assert!(table.broken().is_none(), "after `{after}`: {:?}", table.broken());
-    let shell = db.tables.get(T).map(|t| t.value().clone());
+    let shell = db.table_for_tests(T);
     let shell = shell.unwrap_or_else(|| panic!("after `{after}`: the shell left Database.tables"));
     assert_eq!(shell.schema.name, T, "after `{after}`");
     assert!(shell.io_rows().is_err(), "after `{after}`: the entry under {T} has row storage");
@@ -723,7 +723,7 @@ fn every_site_is_correct_or_an_error() {
     }
     let db = server.db.clone();
     let inv = Invariant {
-        uid: db.partitioned.get(T).expect("partitioned").uid(),
+        uid: db.partitioned_table(T).expect("partitioned").uid(),
         schema: rt.block_on(on_disk_schema(&db, T)),
     };
     check_invariant(&rt, &db, dir.path(), &inv, "setup");
@@ -801,10 +801,10 @@ fn a_serial_partitioned_table_survives_seed_sequences() {
         c.ok("CREATE TABLE site_serial (id BIGSERIAL PRIMARY KEY, body TEXT) PARTITION BY HASH (id) PARTITIONS 4");
         c.ok("INSERT INTO site_serial (body) VALUES ('a'), ('b')");
     }
-    let uid = server.db.partitioned.get("site_serial").expect("partitioned").uid();
+    let uid = server.db.partitioned_table("site_serial").expect("partitioned").uid();
     server = server.restart();
-    assert_eq!(server.db.partitioned.get("site_serial").map(|t| t.uid()), Some(uid));
-    assert!(server.db.tables.get("site_serial").is_some_and(|t| t.io_rows().is_err()), "the shell");
+    assert_eq!(server.db.partitioned_table("site_serial").map(|t| t.uid()), Some(uid));
+    assert!(server.db.table_for_tests("site_serial").is_some_and(|t| t.io_rows().is_err()), "the shell");
     let mut c = server.connect();
     c.ok("INSERT INTO site_serial (body) VALUES ('c')");
     let mut ids: Vec<i64> = stored_rows(&server.db, "site_serial")
@@ -830,19 +830,19 @@ fn drop_if_exists_removes_the_whole_table() {
     let server = Server::start(dir.path().to_str().unwrap());
     let mut c = server.connect();
     c.ok(&format!("CREATE TABLE site_drop {DDL} PARTITION BY HASH (tenant_id) PARTITIONS 4"));
-    let uid = server.db.partitioned.get("site_drop").expect("partitioned").uid();
+    let uid = server.db.partitioned_table("site_drop").expect("partitioned").uid();
     let prefix = format!("__pt_{uid:016x}_");
     assert!(!files_starting(dir.path(), &prefix).is_empty(), "the table's own files");
     c.ok("DROP TABLE IF EXISTS site_drop");
-    assert!(server.db.partitioned.get("site_drop").is_none());
-    assert!(server.db.tables.get("site_drop").is_none());
+    assert!(server.db.partitioned_table("site_drop").is_none());
+    assert!(server.db.table_for_tests("site_drop").is_none());
     assert_eq!(files_starting(dir.path(), &prefix), Vec::<String>::new());
     assert_eq!(files_of_table(dir.path(), "site_drop"), Vec::<String>::new());
     c.ok("DROP TABLE IF EXISTS site_drop");
     let e = c.simple("DROP TABLE site_drop").expect_err("dropped already");
     assert_eq!(e.code, "42P01", "{e}");
     c.ok("ALTER TABLE IF EXISTS site_drop ADD COLUMN x INT");
-    assert!(server.db.tables.get("site_drop").is_none(), "an ALTER IF EXISTS recreated it");
+    assert!(server.db.table_for_tests("site_drop").is_none(), "an ALTER IF EXISTS recreated it");
     assert_eq!(files_of_table(dir.path(), "site_drop"), Vec::<String>::new());
     drop(c);
     drop(server);

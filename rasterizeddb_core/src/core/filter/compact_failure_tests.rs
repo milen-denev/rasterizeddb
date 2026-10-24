@@ -107,7 +107,7 @@ async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 
 /// Fails a compaction of `table` after `MOVED` slot moves.
 async fn fail_compaction(db: &Arc<Database>, table: &str) {
-    let t = db.tables.get(table).unwrap().clone();
+    let t = db.table_for_tests(table).unwrap().clone();
     FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(Some(MOVED)));
     let outcome = t.compact().await;
     FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(None));
@@ -148,7 +148,7 @@ async fn a_failed_compaction_leaves_queries_answering_by_the_new_slots() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_a", true).await;
-    let t = db.tables.get("cf_a").unwrap().clone();
+    let t = db.table_for_tests("cf_a").unwrap().clone();
     let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
     t.wait_filters_ready().await.unwrap();
@@ -170,7 +170,7 @@ async fn a_checkpoint_after_a_failed_compaction_does_not_persist_the_old_numberi
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_d", false).await;
-    let t = db.tables.get("cf_d").unwrap().clone();
+    let t = db.table_for_tests("cf_d").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     // A checkpoint exists, so the table is in the state a long-running one is.
     t.checkpoint_filters().await.unwrap();
@@ -178,7 +178,7 @@ async fn a_checkpoint_after_a_failed_compaction_does_not_persist_the_old_numberi
 
     fail_compaction(&db, "cf_d").await;
     run(&db, &format!("DELETE FROM cf_d WHERE id = {}", ROWS - 1)).await;
-    let t = db.tables.get("cf_d").unwrap().clone();
+    let t = db.table_for_tests("cf_d").unwrap().clone();
     t.checkpoint_filters().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_d", "after the failure and a checkpoint").await;
@@ -188,7 +188,7 @@ async fn a_checkpoint_after_a_failed_compaction_does_not_persist_the_old_numberi
     let db = open(base.path()).await;
     assert_all_match(&db, "cf_d", "after reopening").await;
     // And once the open-time backfill has finished with the table.
-    let t = db.tables.get("cf_d").unwrap().clone();
+    let t = db.table_for_tests("cf_d").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_d", "after reopening and the backfill").await;
@@ -328,7 +328,7 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_e", false).await;
-    let t = db.tables.get("cf_e").unwrap().clone();
+    let t = db.table_for_tests("cf_e").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     t.checkpoint_filters().await.unwrap();
     // Marks the sidecar dirty, so the next checkpoint plans a base image.
@@ -360,7 +360,7 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
     crate::core::wal::remove_for(&path_str(base.path()));
     let db = open(base.path()).await;
     assert_all_match(&db, "cf_e", "after reopening").await;
-    let t = db.tables.get("cf_e").unwrap().clone();
+    let t = db.table_for_tests("cf_e").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_e", "after reopening and the backfill").await;
@@ -374,7 +374,7 @@ async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_
 async fn vacuum_overlapping_compaction(db: &Arc<Database>, table: &str, point: u8) {
     use crate::core::row::table::compact_test_hooks::GATE_PROBE;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-    let t = db.tables.get(table).unwrap().clone();
+    let t = db.table_for_tests(table).unwrap().clone();
     let park = crate::core::vacuum::run_once_test_hooks::arm(&t.data().unwrap().free_space, point);
     let vt = t.clone();
     let sweep = tokio::spawn(async move { vt.vacuum_now().await.map(|r| r.dead_rows) });
@@ -409,7 +409,7 @@ async fn a_vacuum_sweep_overlapping_a_compaction_leaves_the_index_whole() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_v", true).await;
-    let t = db.tables.get("cf_v").unwrap().clone();
+    let t = db.table_for_tests("cf_v").unwrap().clone();
     let ix = t.data().unwrap().indexes.clone().expect("the CREATE INDEX gave the table an index");
     wait_until("the index build", || ix.is_ready()).await;
     t.wait_filters_ready().await.unwrap();
@@ -433,7 +433,7 @@ async fn a_vacuum_sweep_overlapping_a_compaction_publishes_no_old_extents() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_p", false).await;
-    let t = db.tables.get("cf_p").unwrap().clone();
+    let t = db.table_for_tests("cf_p").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     drop(t);
 
@@ -521,7 +521,7 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_q", false).await;
-    let t = db.tables.get("cf_q").unwrap().clone();
+    let t = db.table_for_tests("cf_q").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
 
     // Stands in for a query that started before the sweep and is still running.
@@ -600,12 +600,12 @@ async fn a_failed_compaction_retires_cached_row_pointers() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_c", false).await;
-    let t = db.tables.get("cf_c").unwrap().clone();
+    let t = db.table_for_tests("cf_c").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     drop(t);
 
     for phase in [1, 2] {
-        let t = db.tables.get("cf_c").unwrap().clone();
+        let t = db.table_for_tests("cf_c").unwrap().clone();
         let (cache_before, writes_before) = (t.cache_generation(), t.write_generation());
         if phase == 1 {
             FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(Some(MOVED)));
@@ -679,7 +679,7 @@ async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_x", false).await;
-    let t = db.tables.get("cf_x").unwrap().clone();
+    let t = db.table_for_tests("cf_x").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     // A checkpoint exists, so the renumbering writes the dirty mark.
     t.checkpoint_filters().await.unwrap();
@@ -752,7 +752,7 @@ async fn a_backfill_that_starts_during_a_renumbering_leaves_the_filter_demoted()
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_b", false).await;
-    let t = db.tables.get("cf_b").unwrap().clone();
+    let t = db.table_for_tests("cf_b").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     let filters = t.filters().unwrap().clone().expect("the table has a filter");
     let n_slots = t.io_pointers().unwrap().get_len().await / ROW_POINTER_RECORD_LEN as u64;
@@ -819,7 +819,7 @@ async fn order_by_limit_after_a_failed_compaction_matches_a_full_sort() {
         id = end;
     }
     run(&db, &format!("DELETE FROM cf_m WHERE id >= {KEPT} AND id < {ZONE}")).await;
-    let t = db.tables.get("cf_m").unwrap().clone();
+    let t = db.table_for_tests("cf_m").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
 
     let v = t.schema.fields.iter().find(|f| f.name == "v").unwrap().write_order as u32;

@@ -1,11 +1,11 @@
 //! What a table name resolves to (`docs/partitioning.md` §3.3): a plain
-//! table, or a partitioned table whose shell sits in `Database.tables` and
-//! whose rows live in its partitions.
+//! table, or a partitioned table whose shell has a slot under the logical
+//! name and whose rows live in its partitions.
 //!
-//! A name-keyed path asks [`Database::relation`] before it touches
-//! `Database.tables`, files or `seed_in`: a shell found there by name has no
-//! data, and a path that rebuilt the entry from `<name>*` files would replace
-//! the partitioned table with an empty plain one.
+//! A name-keyed path asks [`Database::relation`] (in `slots.rs`, built from
+//! the slot) before it touches a slot, files or `seed_in`: a shell found by
+//! name has no data, and a path that rebuilt the entry from `<name>*` files
+//! would replace the partitioned table with an empty plain one.
 
 use std::io;
 
@@ -34,21 +34,6 @@ impl Relation {
 }
 
 impl Database {
-    /// What `name` is. The partitioned map is asked first: a partitioned
-    /// table's shell is in `tables` too, and resolving it there would hand
-    /// out a table whose every data call refuses. A partitioned table whose
-    /// schema could not be read has no shell, and still resolves here, so a
-    /// DROP can remove it. A shell in `tables` with no partitioned entry
-    /// resolves to `Plain(shell)`, whose data calls refuse loudly.
-    pub fn relation(&self, name: &str) -> Option<Relation> {
-        if let Some(table) = self.partitioned.get(name) {
-            return Some(Relation::Partitioned(table.value().clone()));
-        }
-        self.tables
-            .get(name)
-            .map(|table| Relation::Plain(table.value().clone()))
-    }
-
     /// Errs when `name` is a partitioned table, for the name-keyed paths
     /// that work from `<name>*` files or rebuild the map entry with
     /// `Table::new`: on a partitioned name they would find no files and put

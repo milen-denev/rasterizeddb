@@ -571,7 +571,7 @@ async fn containment(t: &Table<DbStorageProvider>) -> Result<Vec<String>, String
 /// whichever of `states` the rows match. Returns the predicates an index
 /// narrowed.
 async fn check(db: &Arc<Database>, w: &Workload, label: &str, states: &[&Expect], problems: &mut Vec<String>) -> usize {
-    let Some(t) = db.tables.get(TABLE).map(|t| t.clone()) else {
+    let Some(t) = db.table_for_tests(TABLE) else {
         problems.push(format!("{label}: the table is gone"));
         return 0;
     };
@@ -1009,7 +1009,7 @@ fn highest_with_outcome(status: &Path) -> u64 {
 /// pointer file: what is on disk, whatever any counter says. (Deleted slots
 /// are skipped; nothing here vacuums.)
 async fn stamped(db: &Arc<Database>) -> Result<Vec<(u64, u64, u64)>, String> {
-    let t = db.tables.get(TABLE).map(|t| t.clone()).ok_or("the table is gone")?;
+    let t = db.table_for_tests(TABLE).ok_or("the table is gone")?;
     let mut it = RowPointerIterator::new(t.io_pointers().map_err(|e| format!("{e:?}"))?.clone()).await.map_err(|e| format!("{e:?}"))?;
     let mut out = Vec::new();
     while let Some((offset, p)) = it.next_row_pointer_with_offset().await.map_err(|e| format!("{e:?}"))? {

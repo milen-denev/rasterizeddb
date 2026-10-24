@@ -98,9 +98,8 @@ async fn servers_started_at_once_each_answer_only_their_own_client() {
     for (i, server) in servers.iter().enumerate() {
         let mut markers: Vec<String> = server
             .database()
-            .tables
-            .iter()
-            .map(|entry| entry.key().clone())
+            .table_names()
+            .into_iter()
             .filter(|name| name.starts_with("whoami_"))
             .collect();
         markers.sort();

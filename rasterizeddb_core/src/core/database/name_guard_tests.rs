@@ -40,7 +40,7 @@ async fn create(db: &Database, name: &str) {
 }
 
 async fn insert_id(db: &Database, table: &str, value: i32) {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let mut mb = MEMORY_POOL.acquire(4);
     mb.into_slice_mut().copy_from_slice(&value.to_le_bytes());
     let row = RowWrite {
@@ -70,7 +70,7 @@ fn fetch_all(fields: &SmallVec<[SchemaField; 20]>) -> crate::core::row::row::Row
 
 /// The table's column names and its ids, or `None` when it did not come back.
 async fn contents(db: &Database, table: &str) -> Option<(Vec<String>, Vec<i32>)> {
-    let table = db.tables.get(table)?.clone();
+    let table = db.table_for_tests(table)?.clone();
     let columns = table.schema.fields.iter().map(|f| f.name.clone()).collect();
     let rows = table
         .query_row(
@@ -141,7 +141,7 @@ async fn a_table_named_after_another_tables_file_is_refused() {
                 err.to_string().contains(&format!("\"{}\"", first)),
                 "the refusal should name the table it collides with: {err}"
             );
-            assert!(!db.tables.contains_key(second));
+            assert!(!db.has_table(second));
             assert!(
                 !db.catalogue_contains(second).await,
                 "a refused create left a catalogue row for {second}"
@@ -180,7 +180,7 @@ async fn a_table_named_after_the_catalogues_files_is_refused() {
         }
 
         let db = open_db(dir.path()).await;
-        let mut names: Vec<String> = db.tables.iter().map(|e| e.key().clone()).collect();
+        let mut names: Vec<String> = db.table_names();
         names.sort();
         assert_eq!(names, vec!["keep".to_string()], "after trying {name}");
         assert_eq!(contents(&db, "keep").await, intact(1..=5));
@@ -210,8 +210,8 @@ async fn a_rename_onto_another_tables_files_is_refused() {
         ] {
             let err = db.rename_table(from, to).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{from} -> {to}");
-            assert!(db.tables.contains_key(from), "{from} -> {to} lost {from}");
-            assert!(!db.tables.contains_key(to));
+            assert!(db.has_table(from), "{from} -> {to} lost {from}");
+            assert!(!db.has_table(to));
         }
     }
 
@@ -239,7 +239,7 @@ async fn a_leftover_file_is_not_inherited() {
 
         let err = db.rename_table("live", name).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "rename to {name}");
-        assert!(db.tables.contains_key("live"));
+        assert!(db.has_table("live"));
     }
 
     // Untouched: refusing is all the guard does.
@@ -312,7 +312,7 @@ async fn a_partition_prefixed_name_is_refused_as_a_destination_only() {
         create(&db, "plain").await;
         let err = db.rename_table("plain", "__pt_plain").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(db.tables.contains_key("plain"));
+        assert!(db.has_table("plain"));
 
         db.add_table_unguarded(create_stmt("__pt_legacy"))
             .await
@@ -326,7 +326,7 @@ async fn a_partition_prefixed_name_is_refused_as_a_destination_only() {
     }
 
     let db = open_db(dir.path()).await;
-    assert!(!db.tables.contains_key("__pt_legacy"));
+    assert!(!db.has_table("__pt_legacy"));
     assert_eq!(contents(&db, "legacy").await, intact(1..=5));
 }
 
@@ -353,8 +353,8 @@ async fn a_name_too_long_for_the_schema_record_is_refused() {
 
     let db = open_db(dir.path()).await;
     assert_eq!(contents(&db, "keep").await, intact(1..=1));
-    assert!(db.tables.contains_key(&"c".repeat(MAX_TABLE_NAME_BYTES)));
-    assert_eq!(db.tables.len(), 2);
+    assert!(db.has_table(&"c".repeat(MAX_TABLE_NAME_BYTES)));
+    assert_eq!(db.table_count(), 2);
 }
 
 #[test]

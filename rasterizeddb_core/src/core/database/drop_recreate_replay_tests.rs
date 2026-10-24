@@ -492,10 +492,10 @@ impl Scenario {
         let mut out = Vec::new();
         for (seed, img) in images {
             let db = open(&img).await;
-            let seen = if db.partitioned.contains_key(table) {
+            let seen = if db.is_partitioned(table) {
                 // Read through the API, partition by partition, below SQL.
                 partitioned::labels_of(&db, table, candidates).await
-            } else if db.tables.contains_key(table) {
+            } else if db.has_table(table) {
                 labels_of(&db, table, candidates).await
             } else {
                 vec![format!("<no table {table}>")]
@@ -845,7 +845,7 @@ async fn a_drop_that_cannot_void_the_log_leaves_the_table_whole() {
     let reached = !crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.replace(false));
     assert!(reached, "the drop never logged a barrier");
     assert!(dropped.is_err(), "a drop that could not void the log reported success");
-    assert!(db.tables.contains_key(TABLE), "the refused drop took the table out of the map");
+    assert!(db.has_table(TABLE), "the refused drop took the table out of the map");
     assert!(root.join(format!("{TABLE}.db")).exists(), "the refused drop deleted files");
     assert_eq!(labels(&db, &candidates).await, candidates);
 
@@ -885,7 +885,7 @@ async fn a_drop_that_fails_at_the_catalogue_writes_no_barrier() {
         0,
         "a barrier went into the log before the catalogue row was tombstoned"
     );
-    assert!(db.tables.contains_key(TABLE), "the failed drop took the table out of the map");
+    assert!(db.has_table(TABLE), "the failed drop took the table out of the map");
     assert_eq!(labels(&db, &names("old", 1)).await, names("old", 1));
     // A drop that succeeds writes one barrier per file the table can own.
     assert!(db.drop_table(TABLE).await.unwrap());
@@ -924,7 +924,7 @@ async fn a_drop_whose_barrier_may_be_durable_does_not_bring_the_table_back() {
     assert!(reached, "the drop never logged a barrier");
     assert!(dropped.is_err(), "a drop whose catalogue log failed its sync reported success");
     assert!(
-        !db.tables.contains_key(TABLE),
+        !db.has_table(TABLE),
         "the table came back although its records may be void"
     );
     assert!(
@@ -959,7 +959,7 @@ async fn a_drop_whose_barrier_may_be_durable_does_not_bring_the_table_back() {
     let candidates: Vec<String> = names("old", 6).into_iter().chain(names("new", 1)).collect();
     for (tag, img) in images {
         let db = open(&img).await;
-        assert!(!db.tables.contains_key(TABLE), "barrier {tag}: the dropped table is back");
+        assert!(!db.has_table(TABLE), "barrier {tag}: the dropped table is back");
         db.add_table(create_statement(TABLE)).await.unwrap();
         insert(&db, 100, "new_00").await;
         assert_eq!(labels(&db, &candidates).await, names("new", 1), "barrier {tag}: live");
@@ -1138,7 +1138,7 @@ async fn late_writes_through_a_dropped_handle() -> (Scenario, Vec<String>) {
     use crate::core::storage_providers::traits::StorageIO;
     let sc = Scenario::new(6).await;
     let db = sc.db.clone();
-    let held = db.tables.get(TABLE).unwrap().value().clone();
+    let held = db.table_for_tests(TABLE).unwrap();
     assert!(db.drop_table(TABLE).await.unwrap());
     held.io_rows().unwrap().append_data(b"GHOST-APPEND-BEFORE", true).await;
     held.io_rows().unwrap().write_data(0, b"GHOST-INPLACE-BEFORE").await;
@@ -1190,7 +1190,7 @@ async fn a_dropped_tables_held_write_does_not_reach_its_successor() {
     use crate::core::storage_providers::traits::StorageIO;
     let sc = Scenario::new(6).await;
     let db = sc.db.clone();
-    let held = db.tables.get(TABLE).unwrap().value().clone();
+    let held = db.table_for_tests(TABLE).unwrap();
     let txn = held.io_rows().unwrap().begin_txn();
     assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
     held.io_rows().unwrap().write_data_txn(txn, 0, b"GHOST-HELD").await;
@@ -1221,7 +1221,7 @@ async fn a_dropped_tables_held_write_does_not_bring_its_file_back() {
     use crate::core::storage_providers::traits::StorageIO;
     let sc = Scenario::new(3).await;
     let db = sc.db.clone();
-    let held = db.tables.get(TABLE).unwrap().value().clone();
+    let held = db.table_for_tests(TABLE).unwrap();
     let txn = held.io_rows().unwrap().begin_txn();
     assert_ne!(txn, 0, "no log took the transaction, so nothing is held");
     held.io_rows().unwrap().write_data_txn(txn, 0, b"GHOST-HELD").await;
@@ -1302,7 +1302,7 @@ async fn a_drop_waits_for_a_snapshot_start_in_progress() {
         "a drop deleted its files while a snapshot was fixing its start"
     );
     assert!(
-        db.tables.contains_key(TABLE),
+        db.has_table(TABLE),
         "a drop waiting for the snapshot had already taken the table out of the map"
     );
     drop(gate);
@@ -1460,7 +1460,7 @@ async fn a_drop_whose_barrier_did_not_commit_leaves_the_table_writable() {
         "no barrier reached the log, so this is not the case under test"
     );
     assert!(dropped.is_err(), "a drop whose barrier never committed reported success");
-    assert!(db.tables.contains_key(TABLE), "the refused drop took the table out of the map");
+    assert!(db.has_table(TABLE), "the refused drop took the table out of the map");
 
     // In-place writes through the table's own handles, and an append.
     run(&db, &format!("UPDATE {TABLE} SET label = 'upd_00' WHERE id = 1")).await;
@@ -1503,7 +1503,7 @@ async fn crash_right_after(rename: bool) {
             Vec::<String>::new(),
             "seed {seed}: the deleted files came back with the old table's bytes"
         );
-        assert!(!db.tables.contains_key(TABLE), "seed {seed}: the old name is a table again");
+        assert!(!db.has_table(TABLE), "seed {seed}: the old name is a table again");
         db.add_table(create_statement(TABLE)).await.unwrap();
         insert(db, 100, "new_00").await;
         assert_eq!(labels(db, &candidates).await, names("new", 1), "seed {seed}");
@@ -1555,7 +1555,7 @@ async fn a_table_is_not_created_over_a_leftover_file() {
     let db = open(&root).await;
     let created = db.add_table(create_statement(TABLE)).await;
     assert!(created.is_err(), "a table was created over the dropped table's files");
-    assert!(!db.tables.contains_key(TABLE));
+    assert!(!db.has_table(TABLE));
     // Nor renamed onto them.
     db.add_table(create_statement("other")).await.unwrap();
     assert!(db.rename_table("other", TABLE).await.is_err(), "a table was renamed onto leftovers");
@@ -1590,7 +1590,7 @@ async fn a_held_renames_table_cannot_be_dropped_before_the_next_open() {
         db.drop_table("moved_away").await.is_err(),
         "the held rename's table was dropped before the open that settles it"
     );
-    assert!(db.tables.contains_key("moved_away"));
+    assert!(db.has_table("moved_away"));
     db.sync_durable().unwrap();
     close(&root, db);
 
@@ -1872,7 +1872,7 @@ mod pools {
         drop(db);
 
         let img = p.crash_after_last_disk_sync().await;
-        if img.db.tables.contains_key(TABLE) {
+        if img.db.has_table(TABLE) {
             assert_eq!(
                 labels(&img.db, &all).await,
                 all,
@@ -1895,7 +1895,7 @@ mod pools {
         let img = p.crash_after_last_disk_sync().await;
         let named: Vec<&str> = [TABLE, "moved_away"]
             .into_iter()
-            .filter(|n| img.db.tables.contains_key(*n))
+            .filter(|n| img.db.has_table(*n))
             .collect();
         assert_eq!(named.len(), 1, "the image holds {named:?}");
         assert_eq!(
@@ -2294,7 +2294,7 @@ mod pools {
         let reached = crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| p.borrow_mut().take()).is_none();
         assert!(reached, "the move never asked the destination's log for a barrier");
         assert!(moved.is_err(), "a move whose destination refused its barrier reported success");
-        assert!(db.tables.contains_key(TABLE), "the refused move took the table out of the map");
+        assert!(db.has_table(TABLE), "the refused move took the table out of the map");
         assert_eq!(db.storage.backend_of(TABLE), backend, "the refused move flipped the placement");
         // Empty files may be there (opening the destination creates some),
         // and a later table of the name takes those over harmlessly.
@@ -2395,8 +2395,8 @@ mod pools {
 
         let db = open(&root).await;
         let (freed, kept) = if stage == RenameStage::Copied { (TABLE, "src_t") } else { ("src_t", TABLE) };
-        assert!(!db.tables.contains_key(freed), "{freed} is still a table");
-        assert!(db.tables.contains_key(kept), "{kept} is gone");
+        assert!(!db.has_table(freed), "{freed} is still a table");
+        assert!(db.has_table(kept), "{kept} is gone");
         assert_eq!(db.storage.spec_of(freed), None, "the settled rename kept {freed}'s placement");
         assert!(db.storage.spec_of(kept).is_some(), "the settled rename forgot {kept}'s placement");
         close(&root, db);
@@ -2441,7 +2441,7 @@ mod partitioned {
         db.create_partitioned_table(create_statement(TABLE), &["id"], PARTITIONS)
             .await
             .unwrap_or_else(|e| panic!("creating partitioned {TABLE}: {e}"));
-        db.partitioned.get(TABLE).expect("partitioned").uid()
+        db.partitioned_table(TABLE).expect("partitioned").uid()
     }
 
     /// [`super::labels_of`] for a partitioned table, read through the API
@@ -2449,7 +2449,7 @@ mod partitioned {
     /// `candidates`, as often as stored, and any other label too, marked, so
     /// replayed garbage fails the comparison.
     pub(super) async fn labels_of(db: &Arc<Database>, table: &str, candidates: &[String]) -> Vec<String> {
-        let pt = db.partitioned.get(table).expect("partitioned").value().clone();
+        let pt = db.partitioned_table(table).expect("partitioned");
         let schema = pt.shell().schema.clone();
         let label = schema.fields.iter().find(|f| f.name == "label").expect("a label column").clone();
         let fetch = crate::core::rql::join::fetch_for(&[label], &schema.fields);
@@ -2553,7 +2553,7 @@ mod partitioned {
             names("new", 1),
             "after a clean reopen the recreated partitioned table shows rows the dropped one held"
         );
-        assert_eq!(db.partitioned.get(TABLE).map(|t| t.uid()), Some(new_uid));
+        assert_eq!(db.partitioned_table(TABLE).map(|t| t.uid()), Some(new_uid));
         assert_eq!(files_of_uid(&root, old_uid), Vec::<String>::new(), "the dropped files came back");
         close(&root, db);
     }
@@ -2607,7 +2607,7 @@ mod partitioned {
         let candidates = all(8, 1);
         for_each_image(sc, async |seed, db, img| {
             assert_eq!(files_of_uid(img, old_uid), Vec::<String>::new(), "seed {seed}: the dropped files survived");
-            assert!(!db.tables.contains_key(TABLE) && !db.partitioned.contains_key(TABLE), "seed {seed}");
+            assert!(!db.has_table(TABLE) && !db.is_partitioned(TABLE), "seed {seed}");
             create_partitioned(db).await;
             insert(db, 100, "new_00").await;
             assert_eq!(labels_of(db, TABLE, &candidates).await, names("new", 1), "seed {seed}");
@@ -2646,7 +2646,7 @@ mod partitioned {
         drop(db);
         let candidates = all(12, 1);
         for_each_image(sc, async |seed, db, img| {
-            assert!(!db.partitioned.contains_key(TABLE), "seed {seed}: the partitioned table came back");
+            assert!(!db.is_partitioned(TABLE), "seed {seed}: the partitioned table came back");
             assert_eq!(files_of_uid(img, old_uid), Vec::<String>::new(), "seed {seed}");
             assert_eq!(super::labels_of(db, TABLE, &candidates).await, names("new", 1), "seed {seed}");
         })
@@ -2662,7 +2662,7 @@ mod partitioned {
         let (sc, _) = scenario(6).await;
         let db = sc.db.clone();
         let held = {
-            let pt = db.partitioned.get(TABLE).unwrap().value().clone();
+            let pt = db.partitioned_table(TABLE).unwrap();
             let epoch = pt.epoch().unwrap();
             let (_, p) = pt.materialized(&epoch, &Route::All).unwrap().into_iter().next().expect("a partition");
             p
@@ -2722,7 +2722,7 @@ mod partitioned {
             .await
             .expect_err("a partitioned table was created under a held name");
         assert!(e.to_string().contains("formerly named"), "refused for another reason: {e}");
-        assert!(!db.partitioned.contains_key(TABLE));
+        assert!(!db.is_partitioned(TABLE));
         db.sync_durable().unwrap();
         close(&root, db);
 
@@ -2756,7 +2756,7 @@ mod partitioned {
 
         let db = open(&root).await;
         let freed = if committed { "src_t" } else { TABLE };
-        assert!(!db.tables.contains_key(freed), "{freed} is still a table");
+        assert!(!db.has_table(freed), "{freed} is still a table");
         let mut ct = create_statement(freed);
         ct.table_name = freed.to_string();
         db.create_partitioned_table(ct, &["id"], PARTITIONS)
@@ -2798,7 +2798,7 @@ mod partitioned {
         let reached = !crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.replace(false));
         assert!(reached, "the drop never logged a barrier");
         assert!(dropped.unwrap(), "the drop past its commit point reported failure");
-        assert!(!db.partitioned.contains_key(TABLE) && !db.tables.contains_key(TABLE));
+        assert!(!db.is_partitioned(TABLE) && !db.has_table(TABLE));
         assert!(!files_of_uid(&root, old_uid).is_empty(), "files with live records were deleted");
 
         let new_uid = create_partitioned(&db).await;
@@ -2840,7 +2840,7 @@ mod partitioned {
         let reached = !crate::core::wal::test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false));
         assert!(reached, "the drop never logged a barrier");
         assert!(dropped.is_err(), "a drop whose catalogue log failed its sync reported success");
-        assert!(!db.partitioned.contains_key(TABLE) && !db.tables.contains_key(TABLE), "the table came back");
+        assert!(!db.is_partitioned(TABLE) && !db.has_table(TABLE), "the table came back");
 
         let events = watch.take_events();
         drop(watch);
@@ -2867,7 +2867,7 @@ mod partitioned {
         let candidates = all(6, 1);
         for (tag, img) in images {
             let db = open(&img).await;
-            assert!(!db.partitioned.contains_key(TABLE), "barrier {tag}: the dropped table is back");
+            assert!(!db.is_partitioned(TABLE), "barrier {tag}: the dropped table is back");
             assert_eq!(files_of_uid(&img, old_uid), Vec::<String>::new(), "barrier {tag}: dropped files kept");
             create_partitioned(&db).await;
             insert(&db, 100, "new_00").await;
@@ -2918,7 +2918,7 @@ mod partitioned {
             "a partitioned drop deleted files while a snapshot was fixing its start"
         );
         assert!(
-            db.partitioned.contains_key(TABLE) && db.tables.contains_key(TABLE),
+            db.is_partitioned(TABLE) && db.has_table(TABLE),
             "a partitioned drop waiting for the snapshot had already taken the table out of the maps"
         );
         drop(gate);
@@ -2986,7 +2986,7 @@ mod partitioned {
         assert!(created.is_err(), "a CREATE whose catalogue row failed succeeded");
         assert!(crate::core::wal::barriers_in(&wal_path) > barriers, "the discard logged no barrier");
         assert_eq!(partition_files(&root), Vec::<String>::new(), "the failed CREATE kept {written:?}");
-        assert!(!db.partitioned.contains_key(TABLE));
+        assert!(!db.is_partitioned(TABLE));
         close(&root, db);
     }
 
@@ -3004,7 +3004,7 @@ mod partitioned {
             let out = crate::core::rql::executor::execute_in_txn(purpose, db.clone(), tx).await;
             assert!(!out.is_empty() && out[0] != 3, "{sql}: {}", String::from_utf8_lossy(&out));
         }
-        let pt = db.partitioned.get(TABLE).unwrap().value().clone();
+        let pt = db.partitioned_table(TABLE).unwrap();
         let epoch = pt.epoch().unwrap();
         let reached: std::collections::BTreeSet<u32> = (0..6i32)
             .map(|n| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&(100 + n * 7).to_le_bytes()[..]]).unwrap()))

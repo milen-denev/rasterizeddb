@@ -106,7 +106,7 @@ async fn ids(db: &Arc<Database>) -> BTreeSet<u64> {
     let res = exec(db, &format!("SELECT id, v FROM {TABLE} WHERE id > 0")).await;
     assert_eq!(res.first(), Some(&2u8), "{}", String::from_utf8_lossy(&res));
     let rows = crate::core::row::row::vec_into_rows(&res[1..]).expect("decode rows");
-    let table = db.tables.get(TABLE).expect("table").clone();
+    let table = db.table_for_tests(TABLE).expect("table").clone();
     let schema = &table.schema.fields;
     rows.iter()
         .map(|row| {

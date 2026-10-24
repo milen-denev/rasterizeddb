@@ -216,13 +216,12 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     let placements: std::collections::HashMap<String, String> =
         pool.placements().into_iter().collect();
     let mut tables: Vec<(String, String, u64)> = Vec::new();
-    for entry in database.tables.iter() {
-        let name = entry.key().clone();
+    for (name, table) in database.each_table_unlocked() {
         // A partitioned table's shell has no files of its own, so it would
         // sort as the smallest table and be picked first, and its partitions
         // are not in the placement map. They rebalance with REBALANCE
         // PARTITIONS, a later version's.
-        if database.partitioned.contains_key(&name) || entry.value().is_shell() {
+        if database.is_partitioned(&name) || table.is_shell() {
             continue;
         }
         let at = match placements.get(&name) {

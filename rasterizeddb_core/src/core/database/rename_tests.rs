@@ -51,7 +51,7 @@ async fn the_rename_file_list_matches_what_a_table_creates() {
     // after a restart. Asserting against the freshly-created set is how three
     // sidecars — CHK, GEN and PIX — sat outside this list unnoticed: they were
     // never on disk while this test was looking.
-    let table = db.tables.get("filelist").expect("table").clone();
+    let table = db.table_for_tests("filelist").expect("table").clone();
     let schema_io = db
         .db_io_pointers
         .create_new("filelist_schema.db".to_string())
@@ -109,9 +109,9 @@ async fn a_rename_moves_the_table_and_its_rows() {
 
     db.rename_table("role", "roles").await.expect("rename");
 
-    assert!(db.tables.contains_key("roles"), "the new name is not live");
+    assert!(db.has_table("roles"), "the new name is not live");
     assert!(
-        !db.tables.contains_key("role"),
+        !db.has_table("role"),
         "the old name is still live"
     );
 
@@ -140,11 +140,11 @@ async fn the_renamed_table_survives_a_reopen_under_its_new_name() {
     // back. An in-memory rename that does not survive here is not a rename.
     let db = open_db(dir.path()).await;
     assert!(
-        db.tables.contains_key("roles"),
+        db.has_table("roles"),
         "the rename did not survive a reopen"
     );
     assert!(
-        !db.tables.contains_key("role"),
+        !db.has_table("role"),
         "the old name came back, so the table exists twice after a restart"
     );
 }
@@ -180,8 +180,8 @@ async fn a_rename_onto_an_existing_name_is_refused() {
 
     // Refusing has to leave both intact — a refusal that half-ran would be
     // worse than the unsupported error this replaced.
-    assert!(db.tables.contains_key("role"));
-    assert!(db.tables.contains_key("roles"));
+    assert!(db.has_table("role"));
+    assert!(db.has_table("roles"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,12 +198,12 @@ async fn a_rename_to_the_same_name_does_nothing() {
     let db = open_db(dir.path()).await;
     create(&db, "role").await;
     db.rename_table("role", "role").await.expect("no-op rename");
-    assert!(db.tables.contains_key("role"));
+    assert!(db.has_table("role"));
     assert!(db.catalogue_contains("role").await);
 }
 
 async fn insert_id(db: &Database, table: &str, value: i32) {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let mut mb = MEMORY_POOL.acquire(4);
     mb.into_slice_mut().copy_from_slice(&value.to_le_bytes());
     let row = RowWrite {
@@ -232,7 +232,7 @@ fn fetch_all(fields: &SmallVec<[SchemaField; 20]>) -> crate::core::row::row::Row
 }
 
 async fn read_ids(db: &Database, table: &str) -> Vec<i32> {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let rows = table
         .query_row(
             "",
@@ -315,11 +315,11 @@ async fn recovery_finishes_a_rename_that_reached_the_catalogue() {
     // finishes rather than unwinds.
     let db = open_db(dir.path()).await;
     assert!(
-        db.tables.contains_key("roles"),
+        db.has_table("roles"),
         "recovery lost the renamed table"
     );
     assert!(
-        !db.tables.contains_key("role"),
+        !db.has_table("role"),
         "recovery left the duplicate in place, so the table exists twice"
     );
     let mut ids = read_ids(&db, "roles").await;
@@ -352,11 +352,11 @@ async fn recovery_abandons_a_rename_that_never_reached_the_catalogue() {
     // belongs to nobody.
     let db = open_db(dir.path()).await;
     assert!(
-        db.tables.contains_key("role"),
+        db.has_table("role"),
         "recovery discarded the original after a rename that never committed"
     );
     assert!(
-        !db.tables.contains_key("roles"),
+        !db.has_table("roles"),
         "an uncommitted rename produced a visible table"
     );
     let mut ids = read_ids(&db, "role").await;
@@ -486,14 +486,14 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
     // here so the drop has something to find.
     create(&db, &shadow).await;
     assert!(
-        db.tables.contains_key(&shadow),
+        db.has_table(&shadow),
         "setup did not create the shadow"
     );
 
     db.drop_table("owner").await.expect("drop");
 
     assert!(
-        !db.tables.contains_key(&shadow),
+        !db.has_table(&shadow),
         "the JSON shadow table outlived the table that owns it"
     );
     assert!(

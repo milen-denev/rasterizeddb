@@ -117,7 +117,7 @@ async fn a_head_build_refuses_this_builds_filter_sidecar() {
         let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).unwrap();
         crate::core::rql::executor::execute(purpose, db.clone()).await;
     }
-    let table = db.tables.get("f").unwrap().value().clone();
+    let table = db.table_for_tests("f").unwrap();
     table.wait_filters_ready().await.unwrap();
     table.checkpoint_filters().await.unwrap();
     let flt = std::fs::read_dir(dir.path())

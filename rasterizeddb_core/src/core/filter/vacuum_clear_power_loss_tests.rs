@@ -304,7 +304,7 @@ impl Fixture {
             .await;
             id = end;
         }
-        let t = db.tables.get(TABLE).unwrap().clone();
+        let t = db.table_for_tests(TABLE).unwrap().clone();
         t.wait_filters_ready().await.unwrap();
         t.checkpoint_filters().await.unwrap();
         drop(t);
@@ -534,7 +534,7 @@ async fn scenario(later_label: &str) {
     for attempt in 1..=MAX_ATTEMPTS {
         let fx = Fixture::new().await;
         let db = fx.db.clone();
-        let t = db.tables.get(TABLE).unwrap().clone();
+        let t = db.table_for_tests(TABLE).unwrap().clone();
 
         let tx = db.transactions.begin();
         // The later writer, begun now (it only writes after the vacuum).
@@ -606,7 +606,7 @@ async fn a_vacuum_full_never_moves_rows_over_an_undone_delete() {
         let root_wal = fx.root.join(DEFAULT_WAL_NAME);
         let disk_wal = fx.disk.join(DEFAULT_WAL_NAME);
         let db = fx.db.clone();
-        let t = db.tables.get(TABLE).unwrap().clone();
+        let t = db.table_for_tests(TABLE).unwrap().clone();
 
         let tx = db.transactions.begin();
         write_in(&db, tx, &format!("DELETE FROM {TABLE} WHERE id = {VICTIM}")).await;
@@ -740,7 +740,7 @@ async fn a_sweep_never_makes_a_transaction_durable_in_part() {
 
         // Both directories in one watch, so its events are in one order.
         let order = sync_audit::watch(fx.base.path());
-        let q = db.tables.get(ROOT_MARK).unwrap().clone();
+        let q = db.table_for_tests(ROOT_MARK).unwrap().clone();
         let report = q.vacuum_now().await.unwrap();
         let ordered = order.take_events();
         drop(order);
@@ -846,7 +846,7 @@ async fn a_sweep_never_syncs_another_databases_outcomes() {
         let _ = fx.root_watch.take_events();
         let _ = fx.disk_watch.take_events();
 
-        let va = a.tables.get("va").unwrap().clone();
+        let va = a.table_for_tests("va").unwrap().clone();
         let report = va.vacuum_now().await.unwrap();
         assert!(report.dead_rows >= 50, "A's sweep found nothing reclaimable, so no barrier ran: {report:?}");
         drop(va);
@@ -893,7 +893,7 @@ async fn a_barrier_that_cannot_sync_the_tables_log_acts_on_nothing() {
     let fx = Fixture::new().await;
     let db = fx.db.clone();
     run(&db, &format!("DELETE FROM {TABLE} WHERE id < 50")).await;
-    let t = db.tables.get(TABLE).unwrap().clone();
+    let t = db.table_for_tests(TABLE).unwrap().clone();
 
     FAIL_SYNC_IN.with(|f| *f.borrow_mut() = Some(fx.disk.clone()));
     let swept = t.vacuum_now().await;
@@ -936,7 +936,7 @@ async fn another_directorys_log_failing_does_not_stop_a_sweep() {
     run(&db, &format!("INSERT INTO {ROOT_MARK} (id, label) VALUES {}", values.join(", "))).await;
     run(&db, &format!("DELETE FROM {ROOT_MARK} WHERE id <= 50")).await;
 
-    let q = db.tables.get(ROOT_MARK).unwrap().clone();
+    let q = db.table_for_tests(ROOT_MARK).unwrap().clone();
     FAIL_SYNC_IN.with(|f| *f.borrow_mut() = Some(fx.disk.clone()));
     let swept = q.vacuum_now().await;
     FAIL_SYNC_IN.with(|f| *f.borrow_mut() = None);

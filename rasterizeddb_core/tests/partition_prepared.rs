@@ -265,7 +265,7 @@ fn prepared_reads_follow_writes_redefinitions_and_restarts() {
             create(&mut setup, table, cols, partitioned && table == PART, &m, true);
         }
         let kind = if partitioned { "partitioned again" } else { "now plain" };
-        assert_eq!(server.db.partitioned.contains_key(PART), partitioned, "{kind}");
+        assert_eq!(server.db.is_partitioned(PART), partitioned, "{kind}");
         step(&format!("{PART} {kind}"), &mut part, &mut plain, &m, &all);
     }
 

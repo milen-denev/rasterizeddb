@@ -121,7 +121,7 @@ async fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes_b
     .await
     .expect("create table");
 
-    let t = db.tables.get("wo").expect("table").value().clone();
+    let t = db.table_for_tests("wo").expect("table");
     t.insert_row(RowWrite {
         columns_writing_data: smallvec![
             payload(&10i32.to_le_bytes(), 0, DbType::I32),

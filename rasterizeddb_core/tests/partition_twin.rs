@@ -1815,7 +1815,7 @@ impl Twin {
                 let server = server.restart();
                 self.cp = Some(server.connect());
                 self.cq = Some(server.connect());
-                let uid = server.db.partitioned.get(PART).map(|t| t.uid());
+                let uid = server.db.partitioned_table(PART).map(|t| t.uid());
                 assert_eq!(uid, Some(self.uid), "{}: the partitioned table did not survive a restart", self.label);
                 self.server = Some(server);
                 self.note(op.kind, &Verdict::Agreed { failed: false });
@@ -1943,7 +1943,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         setup.ok(sql);
     }
     drop(setup);
-    let uid = server.db.partitioned.get(PART).expect("the partitioned table").uid();
+    let uid = server.db.partitioned_table(PART).expect("the partitioned table").uid();
 
     let mut twin = Twin {
         cp: Some(server.connect()),
@@ -2043,8 +2043,8 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     // I8's tail: the shell is still the partitioned table's, and the root
     // holds no file under the logical name.
     let server = twin.server.take().unwrap();
-    assert_eq!(server.db.partitioned.get(PART).map(|t| t.uid()), Some(uid), "{label}");
-    assert!(server.db.tables.get(PART).is_some_and(|t| t.schema.name == PART), "{label}: the shell is gone");
+    assert_eq!(server.db.partitioned_table(PART).map(|t| t.uid()), Some(uid), "{label}");
+    assert!(server.db.table_for_tests(PART).is_some_and(|t| t.schema.name == PART), "{label}: the shell is gone");
     assert_eq!(files_of_table(dir.path(), PART), Vec::<String>::new(), "{label}: files under the logical name");
     let bytes = dir_bytes(dir.path());
     assert!(bytes < 50 * 1024 * 1024, "{label}: the run wrote {bytes} bytes");

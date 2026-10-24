@@ -97,7 +97,7 @@ pub(super) async fn insert(t: &PartitionedTable, tenant: i64, n: i32) {
 
 /// One row into a plain table created from [`acct`].
 pub(super) async fn insert_plain(db: &Database, name: &str, tenant: i64, n: i32) {
-    let table = db.tables.get(name).unwrap().clone();
+    let table = db.table_for_tests(name).unwrap().clone();
     let row = row_for(name, &table.schema.fields, tenant, n);
     table.insert_row(row).await.unwrap();
 }
@@ -122,7 +122,7 @@ pub(super) async fn count(t: &PartitionedTable) -> usize {
 }
 
 pub(super) async fn count_plain(db: &Database, name: &str) -> usize {
-    rows_of(&db.tables.get(name).unwrap().clone()).await
+    rows_of(&db.table_for_tests(name).unwrap().clone()).await
 }
 
 pub(super) fn files_in(root: &Path) -> Vec<String> {
@@ -155,7 +155,21 @@ struct NameKeyed {
 
 const NAME_PARAMS: [&str; 4] = ["table_name: &str", "name: &str", "old_name: &str", "new_name: &str"];
 const DISPATCH: [&str; 2] = ["self.relation(", "self.refuse_partitioned("];
-const TOUCH: [&str; 6] = ["self.tables", "seed_in(", "Table::new", "sweep_files(", "discard_files(", "pool_place("];
+/// The map is touched through the slot primitives (`slots.rs`), or by name
+/// in `slots.rs` itself.
+const TOUCH: [&str; 11] = [
+    "self.table_slots",
+    "self.partitioned_tables",
+    "self.has_table(",
+    "self.table_unlocked(",
+    "self.take_table(",
+    "self.install_table(",
+    "seed_in(",
+    "Table::new",
+    "sweep_files(",
+    "discard_files(",
+    "pool_place(",
+];
 
 /// Name-keyed fns that need no dispatch of their own, with why.
 const ALLOWLIST: &[(&str, &str)] = &[
@@ -178,6 +192,16 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("hold_intent", "records a rename's two names in memory; rename dispatches before it"),
     ("relation", "the dispatch itself"),
     ("refuse_partitioned", "the dispatch itself"),
+    ("resolve", "the name-to-key rule every slot primitive's lookup goes through"),
+    ("schema_view", "a slot primitive: asks the partitioned map itself, as relation() does"),
+    ("slot", "a slot primitive: the raw slot, for B3b's table_for, which dispatches"),
+    ("partitioned_table", "a slot primitive: the partitioned map's lookup"),
+    ("is_partitioned", "a slot primitive: the partitioned map's lookup"),
+    ("has_table", "a slot primitive: what tables.contains_key answered; its callers dispatch"),
+    ("table_unlocked", "a slot primitive: the escape hatch; its callers dispatch"),
+    ("table_for_tests", "a slot primitive: never called by the engine"),
+    ("take_table", "a slot primitive: its callers dispatch"),
+    ("take_partitioned", "a slot primitive: drop_partitioned's removal, after its dispatch"),
 ];
 
 /// Every fn of the `impl Database {` blocks in `src` that takes one of
@@ -256,6 +280,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
     let mut fns = name_keyed(include_str!("mod.rs"));
     fns.extend(name_keyed(include_str!("partitioned.rs")));
     fns.extend(name_keyed(include_str!("relation.rs")));
+    fns.extend(name_keyed(include_str!("slots.rs")));
 
     // A reader that found nothing would pass vacuously; and a multi-line
     // parameter list must still be read.
@@ -293,7 +318,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
 fn the_reader_finds_a_name_keyed_fn_that_skips_the_dispatch() {
     let src = r#"
 impl Database {
-    /// fn hidden(&self, name: &str) { self.tables }
+    /// fn hidden(&self, name: &str) { self.table_slots }
     pub async fn sizes(
         &self,
         table_name: &str,
@@ -305,11 +330,11 @@ impl Database {
     }
     fn checked(&self, old_name: &str, new_name: &str) -> io::Result<()> {
         self.refuse_partitioned(old_name, "x")?;
-        self.tables.remove(old_name);
+        self.take_table(old_name);
         Ok(())
     }
     fn unrelated(&self, depth: usize) {
-        self.tables.clear();
+        self.table_slots.clear();
     }
 }
 "#;
@@ -372,19 +397,19 @@ async fn vacuum_all_fans_out_and_fails_loudly() {
     let (_, report) = &reports[0];
     assert_eq!(report.slots, t.totals().await.unwrap().slots, "{report:?}");
     assert_eq!(report.live_rows, 12, "{report:?}");
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()));
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()));
 
     // A shell with no partitioned table behind it.
     let mut schema = t.shell().schema.clone();
     schema.name = "orphan".into();
-    db.tables.insert(
+    db.install_table(
         "orphan".into(),
         Arc::new(Table::partition_shell(t.shell().io_schema.clone(), schema)),
     );
     let e = db.vacuum_all().await.unwrap_err().to_string();
     assert!(e.contains("orphan"), "{e}");
     refused("vacuum_all over an orphan shell", &e);
-    db.tables.remove("orphan");
+    db.take_table("orphan");
     drop(t);
     close(db, root);
 }
@@ -403,7 +428,7 @@ async fn a_shell_less_partitioned_table_is_refused_not_missing() {
     std::fs::remove_file(root.join(format!("{}.db", crate::core::partition::files::schema_stem(uid)))).unwrap();
 
     let db = open(root).await;
-    assert!(db.tables.get("acct").is_none() && db.partitioned.contains_key("acct"));
+    assert!(db.table_for_tests("acct").is_none() && db.is_partitioned("acct"));
     refused("rename of acct", &db.rename_table("acct", "acct2").await.unwrap_err().to_string());
     refused("reload of acct", &db.reload_table("acct").await.unwrap_err().to_string());
     refused("check_recreatable(acct)", &db.check_recreatable("acct").unwrap_err().to_string());
@@ -414,7 +439,7 @@ async fn a_shell_less_partitioned_table_is_refused_not_missing() {
     // A plain table whose files `acct` would own under an older binary.
     let e = db.add_table(acct("acct_schema")).await.unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
-    assert!(db.relation("acct2").is_none() && db.tables.get("side").is_some());
+    assert!(db.relation("acct2").is_none() && db.table_for_tests("side").is_some());
     close(db, root);
 }
 
@@ -463,7 +488,7 @@ async fn storage_statements_skip_or_refuse_a_partitioned_table() {
 
     crate::core::storage::sql::execute_structured("SHOW STORAGE PLACEMENTS", &db)
         .unwrap_or_else(|e| panic!("SHOW STORAGE PLACEMENTS erred over a partitioned table: {e}"));
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "a refusal removed the shell");
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "a refusal removed the shell");
     assert!(db.storage.spec_of("acct").is_none(), "a refused statement placed the partitioned table");
     assert_eq!(logical_files(root, "acct"), Vec::<String>::new());
     assert_eq!(logical_files(second.path(), "acct"), Vec::<String>::new());
@@ -486,7 +511,7 @@ async fn the_vacuum_statement_vacuums_a_partitioned_tables_partitions() {
         let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(statement).unwrap();
         let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
         assert_eq!(reply.first(), Some(&0u8), "{statement}: {}", String::from_utf8_lossy(&reply[1..]));
-        assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "{statement} replaced the shell");
+        assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "{statement} replaced the shell");
         assert_eq!(logical_files(root, "acct"), Vec::<String>::new(), "{statement}");
         let purpose = crate::core::rql::lexer_s1::recognize_query_purpose("SELECT COUNT(*) FROM acct").unwrap();
         let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
@@ -517,10 +542,10 @@ async fn alter_on_a_partitioned_table_refuses_and_keeps_the_shell() {
         let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
         assert_eq!(reply.first(), Some(&3u8), "{statement} answered on a partitioned table");
         refused(statement, &String::from_utf8_lossy(&reply[1..]));
-        assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "{statement} removed the shell");
+        assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "{statement} removed the shell");
     }
     assert_eq!(std::fs::read(&schema_file).unwrap(), before, "a refused DDL wrote the schema file");
     refused("reload_table", &db.reload_table("acct").await.unwrap_err().to_string());
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()));
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()));
     assert!(db.relation("acct2").is_none());
 }

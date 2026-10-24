@@ -2864,7 +2864,7 @@ async fn a_rolled_back_update_leaves_the_old_value_readable() {
     let resp = crate::core::rql::executor::execute_in_txn(purpose, db.clone(), tx).await;
     assert_ne!(resp.first(), Some(&3), "update should succeed");
 
-    let table = db.tables.get("t").expect("table").clone();
+    let table = db.table_for_tests("t").expect("table").clone();
     let mut it = crate::core::row::row_pointer::RowPointerIterator::new(table.data().unwrap().io_pointers.clone())
         .await
         .unwrap();
@@ -3124,7 +3124,7 @@ async fn a_filter_checkpoint_reaches_disk_with_a_log_installed() {
     }
 
     {
-        let table = db.tables.get("flt").expect("table");
+        let table = db.table_for_tests("flt").expect("table");
         table.wait_filters_ready().await.unwrap();
         assert!(table.data().unwrap().filters.is_some(), "no catalog to checkpoint");
         table.checkpoint_filters().await.unwrap();
@@ -3229,24 +3229,24 @@ async fn a_dropped_table_stays_dropped_across_a_restart() {
         exec("CREATE TABLE drop_me (x INT);").await;
         exec("INSERT INTO drop_me (x) VALUES (1);").await;
 
-        assert!(db.tables.contains_key("drop_me"));
+        assert!(db.has_table("drop_me"));
         assert!(
             db.drop_table("drop_me").await.unwrap(),
             "drop reported nothing removed"
         );
         assert!(
-            !db.tables.contains_key("drop_me"),
+            !db.has_table("drop_me"),
             "still present in the live catalogue"
         );
     }
 
     let reopened = Database::new(&path).await;
     assert!(
-        reopened.tables.contains_key("keep_me"),
+        reopened.has_table("keep_me"),
         "the drop took a table with it that it should not have"
     );
     assert!(
-        !reopened.tables.contains_key("drop_me"),
+        !reopened.has_table("drop_me"),
         "the dropped table came back after a restart"
     );
 }

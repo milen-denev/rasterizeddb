@@ -632,13 +632,11 @@ async fn a_shell_in_a_database_errs_rather_than_answering_empty() {
         let response = sql(statement).await;
         assert_ne!(response.first(), Some(&3u8), "{statement}: {}", String::from_utf8_lossy(&response));
     }
-    let (_, source) = database.tables.remove("pt_src").unwrap();
+    let source = database.take_table("pt_src").unwrap();
     let mut schema = source.schema.clone();
     schema.name = "pt".to_string();
     let io_schema = source.io_schema.clone();
-    database
-        .tables
-        .insert("pt".to_string(), Arc::new(Table::partition_shell(io_schema.clone(), schema)));
+    database.install_table("pt".to_string(), Arc::new(Table::partition_shell(io_schema.clone(), schema)));
     // What the shell's schema file holds, to show a refused DDL wrote nothing.
     let on_disk = || {
         let io_schema = io_schema.clone();
@@ -664,7 +662,7 @@ async fn a_shell_in_a_database_errs_rather_than_answering_empty() {
         Ok(_) => refused("drop_table", &[0u8]),
         Err(e) => refused("drop_table", format!("\u{3}{}", e).as_bytes()),
     }
-    let shell_kept = database.tables.get("pt").is_some_and(|t| t.is_shell());
+    let shell_kept = database.table_for_tests("pt").is_some_and(|t| t.is_shell());
 
     for statement in ["SHOW TABLES", "SHOW DATABASE STATS", "SHOW TABLE STATS pt"] {
         let parsed = parse_introspect(statement).unwrap().unwrap();
@@ -698,7 +696,7 @@ async fn a_shell_in_a_database_errs_rather_than_answering_empty() {
     if disk_after != disk_before {
         extra.push(format!("refused DDL changed the schema file: {:?} -> {:?}", disk_before, disk_after));
     }
-    if database.tables.get("pt").map(|t| t.schema.fields.len()) != Some(source.schema.fields.len()) {
+    if database.table_for_tests("pt").map(|t| t.schema.fields.len()) != Some(source.schema.fields.len()) {
         extra.push("refused DDL changed the shell's schema".to_string());
     }
 
@@ -706,16 +704,16 @@ async fn a_shell_in_a_database_errs_rather_than_answering_empty() {
     // The plain table is entered under many names so that, were the shell
     // checked only on reaching it, some name would almost surely come first
     // (the map's order is random; 63 aliases leave a 1 in 64 miss).
-    let plain = database.tables.get("plain_side").unwrap().clone();
+    let plain = database.table_for_tests("plain_side").unwrap().clone();
     let vacuum_before = plain.vacuum_enabled().unwrap();
     for i in 0..63 {
-        database.tables.insert(format!("plain_alias_{i}"), plain.clone());
+        database.install_table(format!("plain_alias_{i}"), plain.clone());
     }
     let set = format!("SET CONFIG vacuum.enabled = {}", !vacuum_before);
     let parsed = parse_introspect(&set).unwrap().unwrap();
     refused("SET CONFIG vacuum", &introspect(&parsed, &database).await);
     for i in 0..63 {
-        database.tables.remove(&format!("plain_alias_{i}"));
+        database.take_table(&format!("plain_alias_{i}"));
     }
     if plain.vacuum_enabled().unwrap() != vacuum_before {
         extra.push("SET CONFIG vacuum changed a plain table before refusing".to_string());
@@ -752,7 +750,7 @@ async fn a_shell_in_a_database_errs_rather_than_answering_empty() {
     if !shell_kept {
         failures.push("the refused DROP TABLE removed the shell from the map".to_string());
     }
-    if !database.tables.get("pt").is_some_and(|t| t.is_shell()) {
+    if !database.table_for_tests("pt").is_some_and(|t| t.is_shell()) {
         failures.push("a refused statement removed the shell".to_string());
     }
     assert!(failures.is_empty(), "{:#?}", failures);

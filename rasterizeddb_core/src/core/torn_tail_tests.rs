@@ -281,10 +281,10 @@ impl Kind {
         for s in sql {
             exec(db, s).await.unwrap();
         }
-        let schema_io = || db.tables.get("t").unwrap().io_schema.clone();
+        let schema_io = || db.table_for_tests("t").unwrap().io_schema.clone();
         match self {
             Kind::Fields => {
-                let mut schema = db.tables.get("t").unwrap().schema.clone();
+                let mut schema = db.table_for_tests("t").unwrap().schema.clone();
                 schema
                     .add_field(schema_io(), "c2".into(), crate::core::db_type::DbType::I32, false)
                     .await;
@@ -380,7 +380,7 @@ struct Seen {
 async fn restart_and_look(dir: &Path, kind: Kind) -> Seen {
     let db = open(dir).await.unwrap();
     // Less its incarnation, which an `ALTER … ADD COLUMN` mints afresh.
-    let mut schema = db.tables.get("t").unwrap().schema.clone();
+    let mut schema = db.table_for_tests("t").unwrap().schema.clone();
     schema.incarnation = 0;
     let schema = format!("{schema:?}");
     let seen = Seen {
@@ -644,7 +644,7 @@ async fn a_shrink_in_place_lowers_the_floor_first() {
         crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap())
     };
     assert_eq!(floor(&db), 10 * stride);
-    let io = db.tables.get("t").unwrap().io_pointers().unwrap().clone();
+    let io = db.table_for_tests("t").unwrap().io_pointers().unwrap().clone();
     crate::core::storage_providers::traits::StorageIO::truncate(&*io, 4 * stride).await.unwrap();
     assert_eq!(floor(&db), 4 * stride, "the shrink left the floor above the file");
     // And on disk, where the next open reads it.
@@ -839,7 +839,7 @@ async fn a_partitions_shrink_in_place_lowers_its_floor() {
         exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
     }
     checkpoint(&dir);
-    let pt = db.partitioned.get("t").unwrap().value().clone();
+    let pt = db.partitioned_table("t").unwrap();
     let epoch = pt.epoch().unwrap();
     let (pid, part) = pt
         .materialized(&epoch, &crate::core::partition::Route::All)

@@ -1257,10 +1257,10 @@ fn declared_types_among(
     if let Some((_, fields)) = relations.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(name)) {
         return types_in(fields);
     }
-    let Some(table) = database.tables.get(name) else {
+    let Some(table) = database.schema_view(name) else {
         return none;
     };
-    types_in(&table.schema.fields)
+    types_in(&table.schema().fields)
 }
 
 /// Which output columns of `query`, by position, are stored documents, for

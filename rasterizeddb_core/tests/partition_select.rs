@@ -82,7 +82,7 @@ fn a_concurrent_transfer_is_never_seen_half_applied() {
     let opening: Vec<String> = (1..=16).map(|t| format!("({t}, 0, 1000)")).collect();
     setup.ok(&format!("INSERT INTO ledger (tenant_id, seq, amt) VALUES {}", opening.join(", ")));
     // Two tenants in different partitions.
-    let pt = server.db.partitioned.get("ledger").unwrap().value().clone();
+    let pt = server.db.partitioned_table("ledger").unwrap();
     let epoch = pt.epoch().unwrap();
     let pid = |t: i64| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&t.to_le_bytes()[..]]).unwrap());
     let a = 1i64;
@@ -156,7 +156,7 @@ fn predicates_without_proof_fan_out_and_answer_like_the_twin() {
     for t in ["np_p", "np_q"] {
         c.ok(&format!("INSERT INTO {t} (tenant_id, grp, id, n, s, f) VALUES {}", negatives.join(", ")));
     }
-    let pt = server.db.partitioned.get("np_p").unwrap().value().clone();
+    let pt = server.db.partitioned_table("np_p").unwrap();
     let epoch = pt.epoch().unwrap();
     let pid = |t: i64| epoch.map.pid_of(pt.spec().unwrap().point_of(&[&t.to_le_bytes()[..]]).unwrap());
     let split = (1..=12i64).find(|t| pid(*t) != pid(-*t)).expect("a tenant and its negative in two partitions");

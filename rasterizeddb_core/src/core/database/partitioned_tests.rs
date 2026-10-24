@@ -213,7 +213,7 @@ async fn create_writes_only_uid_files_and_a_uid_row() {
     let t = partitioned(&db, "acct");
     let uid = t.uid();
     assert_eq!(t.broken(), None);
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "the shell is not in tables");
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "the shell is not in tables");
 
     let added: Vec<String> = files_in(root).into_iter().filter(|n| !before.contains(n)).collect();
     for name in &added {
@@ -239,7 +239,7 @@ async fn create_writes_only_uid_files_and_a_uid_row() {
     assert_eq!(t.broken(), None);
     assert_eq!(digest(&t.shell().schema), declared);
     assert_eq!(digest(db.relation("acct").unwrap().schema()), declared);
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()));
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()));
     assert_eq!(logical_files(root, "acct"), Vec::<String>::new(), "the reopen created files under the logical name");
     drop(t);
     close(db, root);
@@ -418,7 +418,7 @@ async fn a_mirrored_pool_refuses_partitioning() {
     let db = open(&root).await;
     let early = partitioned(&db, "early");
     assert!(early.broken().is_some_and(|w| w.contains("backup mirrors")), "{:?}", early.broken());
-    assert!(db.tables.get("early").is_none(), "a refused table's stand-in shell reached tables");
+    assert!(db.table_for_tests("early").is_none(), "a refused table's stand-in shell reached tables");
     assert!(matches!(db.relation("side"), Some(Relation::Plain(_))));
     assert_eq!(uid_files(&backup, uid), Vec::<String>::new(), "opening wrote into the backup");
     drop(early);
@@ -447,7 +447,7 @@ async fn drop_removes_every_uid_file_and_the_row() {
 
     assert!(db.drop_table("acct").await.unwrap(), "the drop found no table");
     assert_eq!(uid_files(root, uid), Vec::<String>::new(), "files outlived the drop");
-    assert!(db.relation("acct").is_none() && db.tables.get("acct").is_none());
+    assert!(db.relation("acct").is_none() && db.table_for_tests("acct").is_none());
     assert!(catalogue(&db).await.is_empty(), "the row outlived the drop");
     assert!(!db.drop_table("acct").await.unwrap(), "a second drop found a table");
     // Tenants over every partition, so some land where none was materialized.
@@ -489,10 +489,10 @@ async fn broken_tables_open_loudly_and_drop() {
     assert!(matches!(db.relation("side"), Some(Relation::Plain(t)) if !t.is_shell()));
     let t = partitioned(&db, "no_map");
     assert!(t.broken().is_some(), "a table with no map log opened");
-    assert!(db.tables.get("no_map").is_some_and(|s| s.is_shell()));
+    assert!(db.table_for_tests("no_map").is_some_and(|s| s.is_shell()));
     let t2 = partitioned(&db, "no_schema");
     assert!(t2.broken().is_some_and(|w| w.contains("schema")), "{:?}", t2.broken());
-    assert!(db.tables.get("no_schema").is_none(), "a shell with no schema reached tables");
+    assert!(db.table_for_tests("no_schema").is_none(), "a shell with no schema reached tables");
     assert!(!root.join(&map_file).exists(), "opening recreated the map log");
     assert!(!root.join(&schema_file).exists(), "opening recreated the schema file");
     drop((t, t2));
@@ -622,7 +622,7 @@ async fn partitioned_names_are_guarded() {
     assert!(e.to_string().contains("partitioned"), "{e}");
     let e = db.reload_table("acct").await.unwrap_err();
     assert!(e.to_string().contains("partitioned"), "{e}");
-    assert!(db.tables.get("acct").is_some_and(|s| s.is_shell()), "a refusal removed the shell");
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "a refusal removed the shell");
 
     let partitioned_rows: Vec<_> = catalogue(&db).await.into_iter().filter(|(_, c)| *c != 0).collect();
     assert_eq!(partitioned_rows, rows_before, "a refused CREATE wrote a partitioned row");
@@ -655,9 +655,10 @@ async fn forgetting_advances_with_a_partitioned_table_open() {
     manager.settle_now();
 
     let mut swept = 0;
-    for entry in db.tables.iter() {
-        if !entry.value().is_shell() {
-            entry.value().neutralize_aborted_now().await.unwrap();
+    for name in db.table_names() {
+        let table = db.table_for_tests(&name).unwrap();
+        if !table.is_shell() {
+            table.neutralize_aborted_now().await.unwrap();
         }
     }
     let epoch = t.epoch().unwrap();
@@ -793,7 +794,7 @@ async fn a_rename_cannot_land_inside_a_partitioned_create() {
     let e = renamed.expect_err("a rename committed inside a partitioned CREATE of its name");
     assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
     let uid = partitioned(&db, "race_acct").uid();
-    assert!(db.tables.get("race_acct").is_some_and(|s| s.is_shell()));
+    assert!(db.table_for_tests("race_acct").is_some_and(|s| s.is_shell()));
     assert!(matches!(db.relation("race_src"), Some(Relation::Plain(_))));
     assert_eq!(
         catalogue(&db).await,
@@ -820,7 +821,7 @@ async fn a_recorded_placement_takes_the_name() {
     db.storage
         .pin_backend("placed", &crate::core::storage::TableBackend::Memory)
         .unwrap();
-    assert!(db.tables.get("placed").is_none());
+    assert!(db.table_for_tests("placed").is_none());
     let e = db.create_partitioned_table(acct("placed"), &["tenant_id"], 4).await.unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
     assert!(e.to_string().contains("placement"), "{e}");

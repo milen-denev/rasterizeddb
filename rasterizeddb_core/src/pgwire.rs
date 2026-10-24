@@ -42,6 +42,8 @@ mod statement_intern;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
+mod schema_view_tests;
+#[cfg(test)]
 mod temp_relation_tests;
 mod fixed_rows;
 mod wire_out;
@@ -3733,10 +3735,8 @@ async fn describe_resolved(
                     {
                         return Some(fields.clone());
                     }
-                    database
-                        .tables
-                        .get(name)
-                        .map(|t| t.schema.fields.clone())
+                    database.schema_view(name)
+                        .map(|t| t.schema().fields.clone())
                         .or_else(|| crate::core::rql::catalog_views::synthetic_schema(name))
                 };
                 return Ok(
@@ -3762,7 +3762,7 @@ async fn describe_resolved(
             // Without this a *single-relation* query over one — `SELECT
             // n.nspname FROM pg_namespace n WHERE …` — described as returning
             // nothing, even though the join form had been fixed.
-            let view_schema = if database.tables.contains_key(&qr.table_name) {
+            let view_schema = if database.has_table(&qr.table_name) {
                 None
             } else {
                 derived
@@ -3771,10 +3771,10 @@ async fn describe_resolved(
                     .map(|(_, fields)| fields.clone())
                     .or_else(|| crate::core::rql::catalog_views::synthetic_schema(&qr.table_name))
             };
-            let real_table = database.tables.get(&qr.table_name);
+            let real_table = database.schema_view(&qr.table_name);
             let table_fields = match (&view_schema, &real_table) {
                 (Some(fields), _) => fields.clone(),
-                (None, Some(t)) => t.schema.fields.clone(),
+                (None, Some(t)) => t.schema().fields.clone(),
                 (None, None) => return Ok(None),
             };
             let parsed = match row_fetch_from_select_query(&purpose, &table_fields) {
@@ -3824,7 +3824,7 @@ async fn describe_resolved(
                 match item {
                     crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
                         match &real_table {
-                            Some(t) => reported_type(field, &t.schema),
+                            Some(t) => reported_type(field, t.schema()),
                             None => field.db_type.clone(),
                         }
                     }
@@ -3900,7 +3900,7 @@ async fn describe_resolved(
                 // A catalogue view has no `TableSchema` and no JSON columns, so
                 // the field's own type is what it reports.
                 let ty = match &real_table {
-                    Some(t) => reported_type(field, &t.schema),
+                    Some(t) => reported_type(field, t.schema()),
                     None => field.db_type.clone(),
                 };
                 fields.push((label, ty));
@@ -3908,16 +3908,16 @@ async fn describe_resolved(
             Ok(Some((fields, true)))
         }
         QueryPurpose::InsertRow(ir) => {
-            let Some(table) = database.tables.get(&ir.table_name) else {
+            let Some(table) = database.schema_view(&ir.table_name) else {
                 return Ok(Some((Vec::new(), false)));
             };
-            match crate::core::rql::lexer_ir::returning_columns(&ir.query, &table.schema.fields) {
+            match crate::core::rql::lexer_ir::returning_columns(&ir.query, &table.schema().fields) {
                 Some(Ok(cols)) => {
                     let fields = cols
                         .iter()
                         .map(|f| {
                             let label: String = f.name.clone();
-                            (label, reported_type(f, &table.schema))
+                            (label, reported_type(f, table.schema()))
                         })
                         .collect();
                     Ok(Some((fields, true)))
@@ -3944,16 +3944,16 @@ async fn describe_resolved(
                 .unwrap_or("")
                 .trim_matches('"')
                 .to_string();
-            let Some(table) = database.tables.get(&name) else {
+            let Some(table) = database.schema_view(&name) else {
                 return Ok(Some((Vec::new(), false)));
             };
-            match crate::core::rql::lexer_ir::returning_columns(sql, &table.schema.fields) {
+            match crate::core::rql::lexer_ir::returning_columns(sql, &table.schema().fields) {
                 Some(Ok(cols)) => {
                     let fields = cols
                         .iter()
                         .map(|f| {
                             let label: String = f.name.clone();
-                            (label, reported_type(f, &table.schema))
+                            (label, reported_type(f, table.schema()))
                         })
                         .collect();
                     Ok(Some((fields, true)))
@@ -4521,13 +4521,13 @@ fn learn_prepared(
         info.prepared = PreparedSelect::Ineligible;
         return;
     };
-    let Some(table) = database.tables.get(&table_name).map(|t| t.value().clone()) else {
+    let Some(table) = database.schema_view(&table_name) else {
         return;
     };
     let mut wanted = Vec::with_capacity(columns.len());
     for c in &columns {
         let class = table
-            .schema
+            .schema()
             .fields
             .iter()
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c))
@@ -5429,7 +5429,7 @@ where
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(sql) => Some(crate::core::kv_cache::sql::result_fields(sql)),
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
-            let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
+            let schema_of = |name: &str| database.schema_view(name).map(|t| t.schema().fields.clone());
             match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
                 Ok(plan) => Some(join_output_columns(&plan, database)),
                 Err(e) => {
@@ -5446,10 +5446,7 @@ where
             // client stalls. (It does not block later readers: dashmap 6.1's
             // `try_lock_shared_fast` admits a reader unless a writer *holds* the
             // lock, so parked writers do not queue readers behind them.)
-            let table = database
-                .tables
-                .get(&qr.table_name)
-                .map(|t| t.value().clone());
+            let table = database.schema_view(&qr.table_name);
             let Some(table) = table else {
                 fail_statement(state, stream, "42P01", "relation does not exist").await?;
                 return Ok(());
@@ -5469,7 +5466,7 @@ where
             let advertised = |item: &crate::core::rql::aggregate::SelectItem| -> DbType {
                 match item {
                     crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
-                        reported_type(field, &table.schema)
+                        reported_type(field, table.schema())
                     }
                     other => other.result_type(),
                 }
@@ -5483,7 +5480,7 @@ where
                 }
                 _ => None,
             };
-            match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(&purpose), &table.schema.fields) {
+            match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(&purpose), &table.schema().fields) {
                 Ok(parsed)
                     if parsed.select_items.iter().any(|i| {
                         matches!(
@@ -5525,8 +5522,8 @@ where
                         .iter()
                         .take(parsed.visible_columns)
                         .filter_map(|c| {
-                            field_of(&table.schema.fields, c.schema_id).map(|field| {
-                                (field.name.clone(), reported_type(field, &table.schema))
+                            field_of(&table.schema().fields, c.schema_id).map(|field| {
+                                (field.name.clone(), reported_type(field, table.schema()))
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -5552,10 +5549,8 @@ where
                 .to_string();
             // As above: the fields are copied out so no shard read lock is
             // live across the `fail_statement` await.
-            let fields = database
-                .tables
-                .get(&name)
-                .map(|t| (t.schema.fields.clone(), t.schema.json_columns.clone()));
+            let fields = database.schema_view(&name)
+                .map(|t| (t.schema().fields.clone(), t.schema().json_columns.clone()));
             match fields {
                 None => None,
                 Some((fields, json_columns)) => {
@@ -5574,10 +5569,8 @@ where
                 }
             }
         }
-        QueryPurpose::InsertRow(ir) => match database
-            .tables
-            .get(&ir.table_name)
-            .map(|t| (t.schema.fields.clone(), t.schema.json_columns.clone()))
+        QueryPurpose::InsertRow(ir) => match database.schema_view(&ir.table_name)
+            .map(|t| (t.schema().fields.clone(), t.schema().json_columns.clone()))
         {
             None => None,
             Some((fields, json_columns)) => {
@@ -7329,8 +7322,8 @@ fn join_output_columns(
         let Some(relation) = plan.relations.get(item.rel) else {
             return fallback;
         };
-        match database.tables.get(&relation.table) {
-            Some(table) => reported_type_of(&item.field, &table.schema.json_columns),
+        match database.schema_view(&relation.table) {
+            Some(table) => reported_type_of(&item.field, &table.schema().json_columns),
             None => fallback,
         }
     };
@@ -8024,8 +8017,8 @@ pub(crate) fn purpose_returning_scales(
 /// The declared decimal scale of each `RETURNING` item, when the table has any
 /// `NUMERIC(p, s)` column. A computed item is evaluated at the engine scale.
 fn returning_scales(database: &Arc<Database>, table: &str, sql: &str) -> Option<Vec<u32>> {
-    let fields = database.tables.get(table).and_then(|t| {
-        (!t.schema.type_modifiers.is_empty()).then(|| t.schema.fields.clone())
+    let fields = database.schema_view(table).and_then(|t| {
+        (!t.schema().type_modifiers.is_empty()).then(|| t.schema().fields.clone())
     })?;
     let items = crate::core::rql::lexer_ir::returning_items(sql, &fields)?.ok()?;
     let engine = crate::core::value_codec::DECIMAL_SCALE;

@@ -114,7 +114,7 @@ fn assert_0a000(sql: &str, message: &str) {
 /// at the reload leaves the in-memory schema as it was, so only the file
 /// shows the write.
 async fn on_disk_schema(db: &Database, table: &str) -> String {
-    let io = db.tables.get(table).expect("the shell").io_schema.clone();
+    let io = db.table_for_tests(table).expect("the shell").io_schema.clone();
     let s = TableSchema::load(io).await.expect("the schema loads");
     format!(
         "fields={:?} fks={} uks={} idx={} paths={} defaults={} checks={}",
@@ -188,16 +188,14 @@ fn accepted_shapes_create_partitioned_tables() {
             let before = catalogue_len(&db).await;
             run(&db, sql).await.unwrap_or_else(|e| panic!("{sql} was refused: {e}"));
             assert!(catalogue_len(&db).await > before, "{sql} wrote no catalogue row");
-            let table = db
-                .partitioned
-                .get(name)
+            let table = db.partitioned_table(name)
                 .unwrap_or_else(|| panic!("{sql} did not create a partitioned table"))
                 .clone();
             assert_ne!(table.uid(), 0, "{sql}");
             assert!(table.broken().is_none(), "{sql}: {:?}", table.broken());
             assert_eq!(table.epoch().expect("the map").map.len(), partitions, "{sql}");
             assert_eq!(table.spec().expect("the key").arity(), arity, "{sql}");
-            assert!(db.tables.get(name).is_some_and(|t| t.schema.name == name), "{sql}: no shell");
+            assert!(db.table_for_tests(name).is_some_and(|t| t.schema.name == name), "{sql}: no shell");
             assert_eq!(files_starting(dir.path(), name), Vec::<String>::new(), "{sql}");
             assert!(
                 !files_starting(dir.path(), &format!("__pt_{:016x}_", table.uid())).is_empty(),
@@ -205,9 +203,9 @@ fn accepted_shapes_create_partitioned_tables() {
             );
         }
         // The key's write orders are the named columns', in the order named.
-        let two = db.partitioned.get("pd_two").unwrap().clone();
+        let two = db.partitioned_table("pd_two").unwrap().clone();
         let orders: Vec<u32> = two.spec().unwrap().levels().iter().map(|l| l.write_order).collect();
-        let shell = db.tables.get("pd_two").unwrap().clone();
+        let shell = db.table_for_tests("pd_two").unwrap().clone();
         let order_of =
             |n: &str| shell.schema.fields.iter().find(|f| f.name == n).unwrap().write_order as u32;
         assert_eq!(orders, vec![order_of("tenant_id"), order_of("g")]);
@@ -268,7 +266,7 @@ fn refused_shapes_write_nothing() {
             ("CREATE TABLE __pt_x (k INT NOT NULL) PARTITION BY HASH (k)", "reserved"),
         ] {
             let len_before = catalogue_len(&db).await;
-            let tables_before = db.tables.len();
+            let tables_before = db.table_count();
             let files_before = files_starting(dir.path(), "");
             let reason = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
             assert!(reason.contains(names), "{sql} was refused for the wrong reason: {reason}");
@@ -278,8 +276,8 @@ fn refused_shapes_write_nothing() {
                 assert_0a000(sql, &reason);
             }
             assert_eq!(catalogue_len(&db).await, len_before, "{sql} wrote a catalogue row");
-            assert_eq!(db.tables.len(), tables_before, "{sql} registered a table");
-            assert!(db.partitioned.is_empty(), "{sql} registered a partitioned table");
+            assert_eq!(db.table_count(), tables_before, "{sql} registered a table");
+            assert!((db.partitioned_count() == 0), "{sql} registered a partitioned table");
             assert_eq!(files_starting(dir.path(), ""), files_before, "{sql} left files");
         }
     });
@@ -300,7 +298,7 @@ fn a_unique_key_must_contain_every_key_column() {
         assert!(reason.contains("\"asset_group_id\""), "{reason}");
         assert!(reason.contains("UNIQUE (tenant_id, asset_group_id, asset_id)"), "{reason}");
         assert_0a000(sql, &reason);
-        assert!(db.partitioned.is_empty());
+        assert!((db.partitioned_count() == 0));
 
         // Only the leading key column is not enough either.
         let sql = "CREATE TABLE assets (tenant_id BIGINT NOT NULL, asset_group_id INT NOT NULL, \
@@ -315,7 +313,7 @@ fn a_unique_key_must_contain_every_key_column() {
         )
         .await
         .expect("a primary key holding every key column");
-        assert!(db.partitioned.contains_key("assets"));
+        assert!(db.is_partitioned("assets"));
     });
 }
 
@@ -328,7 +326,7 @@ fn if_not_exists_on_a_partitioned_table_writes_nothing() {
         let db = open(dir.path()).await;
         let sql = "CREATE TABLE IF NOT EXISTS pd_ine (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 4";
         run(&db, sql).await.expect("created");
-        let uid = db.partitioned.get("pd_ine").unwrap().uid();
+        let uid = db.partitioned_table("pd_ine").unwrap().uid();
         let len = catalogue_len(&db).await;
         let files = files_starting(dir.path(), "");
         for again in [
@@ -339,7 +337,7 @@ fn if_not_exists_on_a_partitioned_table_writes_nothing() {
             run(&db, again).await.unwrap_or_else(|e| panic!("{again}: {e}"));
             assert_eq!(catalogue_len(&db).await, len, "{again} wrote a row");
             assert_eq!(files_starting(dir.path(), ""), files, "{again} wrote files");
-            assert_eq!(db.partitioned.get("pd_ine").unwrap().uid(), uid, "{again}");
+            assert_eq!(db.partitioned_table("pd_ine").unwrap().uid(), uid, "{again}");
         }
         for again in [
             "CREATE TABLE pd_ine (k INT NOT NULL) PARTITION BY HASH (k)",
@@ -368,7 +366,7 @@ fn foreign_keys_onto_a_partitioned_table_are_refused() {
         let len = catalogue_len(&db).await;
         let e = run(&db, sql).await.expect_err("a CREATE referencing a partitioned table");
         assert_0a000(sql, &e);
-        assert!(db.tables.get("pd_fk_child").is_none());
+        assert!(db.table_for_tests("pd_fk_child").is_none());
         assert_eq!(catalogue_len(&db).await, len);
 
         run(&db, "CREATE TABLE pd_fk_child (id INT, parent_id INT)").await.expect("plain child");
@@ -383,7 +381,7 @@ fn foreign_keys_onto_a_partitioned_table_are_refused() {
             assert!(e.contains("pd_fk_parent") || e.contains("PD_FK_PARENT"), "{sql}: {e}");
         }
         assert_eq!(on_disk_schema(&db, "pd_fk_child").await, before, "a refused ALTER wrote the FK");
-        assert!(db.tables.get("pd_fk_child").unwrap().schema.foreign_keys.is_empty());
+        assert!(db.table_for_tests("pd_fk_child").unwrap().schema.foreign_keys.is_empty());
     });
 }
 
@@ -423,8 +421,8 @@ fn schema_ddl_on_a_partitioned_table_is_refused_before_it_writes() {
             assert_0a000(sql, &e);
             assert!(e.contains("partitioned"), "{sql}: {e}");
             assert_eq!(on_disk_schema(&db, "pd_alt").await, before, "{sql} wrote the shell's schema");
-            assert!(db.partitioned.contains_key("pd_alt"), "{sql}");
-            assert!(db.tables.get("pd_plain").is_some(), "{sql} moved the plain table");
+            assert!(db.is_partitioned("pd_alt"), "{sql}");
+            assert!(db.table_for_tests("pd_plain").is_some(), "{sql} moved the plain table");
         }
         assert_eq!(catalogue_len(&db).await, len, "a refused statement wrote a catalogue row");
     });
@@ -469,7 +467,7 @@ fn an_in_memory_database_refuses_partition_by() {
         let e = run(&db, sql).await.expect_err("an in-memory partitioned table");
         assert!(e.contains("in-memory"), "{e}");
         assert_0a000(sql, &e);
-        assert!(db.tables.get("pd_mem").is_none() && db.partitioned.is_empty());
+        assert!(db.table_for_tests("pd_mem").is_none() && (db.partitioned_count() == 0));
     });
 }
 
@@ -498,7 +496,7 @@ fn a_mirrored_pool_refuses_partition_by() {
         assert!(e.contains("backup mirrors"), "{e}");
         assert_0a000(sql, &e);
         assert_eq!(catalogue_len(&db).await, len);
-        assert!(db.partitioned.is_empty());
+        assert!((db.partitioned_count() == 0));
         assert_eq!(files_starting(&backup, "__pt_"), Vec::<String>::new());
     });
 }

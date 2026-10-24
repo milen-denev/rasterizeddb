@@ -26,8 +26,14 @@ mod relation_dispatch_tests;
 #[cfg(test)]
 mod reaper_tests;
 pub mod relation;
+pub mod slots;
+#[cfg(test)]
+mod slots_source_tests;
+#[cfg(test)]
+mod slots_tests;
 
 pub use relation::Relation;
+pub use slots::{RelationTotals, SchemaStats, SchemaView};
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
@@ -1067,11 +1073,14 @@ fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
 }
 
 pub struct Database {
-    pub tables: DashMap<String, Arc<Table<DbStorageProvider>>, ahash::RandomState>,
+    /// Each table's slot by name (a partitioned table's shell included).
+    /// Private, and named only in `slots.rs`: metadata readers use
+    /// [`Database::schema_view`], execution the escape hatches listed there.
+    table_slots: DashMap<String, Arc<slots::Slot>, ahash::RandomState>,
     /// Hash-partitioned tables by logical name. Each one's schema-only shell
-    /// is in `tables` too (unless its schema could not be read); resolve a
-    /// name through [`Database::relation`], which asks here first.
-    pub partitioned: DashMap<String, Arc<crate::core::partition::table::PartitionedTable>, ahash::RandomState>,
+    /// has a slot too (unless its schema could not be read); resolve a name
+    /// through [`Database::relation`], which asks here first.
+    partitioned_tables: DashMap<String, Arc<crate::core::partition::table::PartitionedTable>, ahash::RandomState>,
     /// Names a CREATE or a partitioned DROP is working on (see
     /// [`Database::claim_name`]).
     name_claims: DashMap<String, (), ahash::RandomState>,
@@ -1338,7 +1347,7 @@ impl Database {
             partitioned::reap_at_startup(location, &io_pointers, &storage, &tables_names);
         }
 
-        let tables = DashMap::with_hasher(ahash::RandomState::new());
+        let table_slots = DashMap::with_hasher(ahash::RandomState::new());
 
         // Outcomes are durable for a file-backed database and need not be for
         // an in-memory one: nothing there outlives the process, so there is
@@ -1460,7 +1469,7 @@ impl Database {
             }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
-            tables.insert(table_name, Arc::new(table));
+            table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table))));
         }
 
         // Builds before the name guard let two tables share a file (`x` and
@@ -1470,7 +1479,7 @@ impl Database {
         // operator learns why one of them reads wrong. A rewriting ALTER on
         // either is refused (`check_recreatable`) before its drop; a plain DROP
         // or RENAME of either still deletes the shared file, as it always did.
-        let names: Vec<String> = tables.iter().map(|entry| entry.key().clone()).collect();
+        let names: Vec<String> = table_slots.iter().map(|entry| entry.key().clone()).collect();
         for (name, shared) in shared_file_pairs(&names) {
             warn!(
                 "tables \"{}\" and \"{}\" share the file {} (created by a build without the \
@@ -1483,8 +1492,8 @@ impl Database {
         let database = Database {
             id,
             name: name.to_string(),
-            tables,
-            partitioned: DashMap::with_hasher(ahash::RandomState::new()),
+            table_slots,
+            partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
             name_claims: DashMap::with_hasher(ahash::RandomState::new()),
             partition_ddl: tokio::sync::Mutex::new(()),
             db_io_pointers: io_pointers,
@@ -1898,7 +1907,7 @@ impl Database {
         // table leaves the map and the catalogue: a drop waiting for it with
         // the table half gone hid the table, files still on disk, and a
         // `CREATE TABLE` of the name was refused for those files.
-        let Some(logs) = self.tables.get(table_name).map(|table| {
+        let Some(logs) = self.table_unlocked(table_name).map(|table| {
             table
                 .io_rows()
                 .map(|io| logs_holding(io, &self.storage, self.location.as_deref()))
@@ -1908,7 +1917,7 @@ impl Database {
         let logs = logs?;
         let snapshot_gate = deletion_permit(&logs).await;
         drop(logs);
-        let Some((_, table)) = self.tables.remove(table_name) else {
+        let Some(table) = self.take_table(table_name) else {
             return Ok(false);
         };
 
@@ -1916,7 +1925,7 @@ impl Database {
         // than half-dropped, and the catalogue is the half that decides whether
         // it exists at all.
         if let Err(e) = self.forget_in_catalogue(table_name).await {
-            self.tables.insert(table_name.to_string(), table);
+            self.install_table(table_name.to_string(), table);
             error!("Could not remove {} from the catalogue: {}", table_name, e);
             return Err(e);
         }
@@ -1941,7 +1950,7 @@ impl Database {
                         restore
                     );
                 }
-                self.tables.insert(table_name.to_string(), table);
+                self.install_table(table_name.to_string(), table);
                 return Err(failure.error);
             }
             // A barrier may be durable (the log failed past its append and is
@@ -2248,10 +2257,10 @@ impl Database {
         // than reported missing. PARTITION-TODO(rename): §3.1's rename.
         self.refuse_partitioned(old_name, "RENAME")?;
         self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
-        if !self.tables.contains_key(old_name) {
+        if !self.has_table(old_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
-        if self.tables.contains_key(new_name) {
+        if self.has_table(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "a table of that name already exists",
@@ -2286,7 +2295,7 @@ impl Database {
         // The handle goes first so its maintenance task stops before the files
         // are read: a background flush landing mid-copy would put bytes in the
         // source that the copy has already passed.
-        let table = self.tables.remove(old_name).map(|(_, t)| t);
+        let table = self.take_table(old_name);
 
         let copied = self.copy_table_files(old_name, new_name).await;
         if let Err(e) = copied {
@@ -2295,7 +2304,7 @@ impl Database {
             // recovery: no catalogue row names them.
             self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+                self.install_table(old_name.to_string(), table);
             }
             error!("Rename of {} to {}: copy failed: {}", old_name, new_name, e);
             return Err(e);
@@ -2304,7 +2313,7 @@ impl Database {
         if let Err(e) = self.rewrite_schema_name(new_name).await {
             self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+                self.install_table(old_name.to_string(), table);
             }
             error!(
                 "Rename of {} to {}: schema rewrite failed: {}",
@@ -2317,7 +2326,7 @@ impl Database {
         if let Err(e) = self.remember_in_catalogue(new_name).await {
             self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+                self.install_table(old_name.to_string(), table);
             }
             error!(
                 "Rename of {} to {}: catalogue insert failed: {}",
@@ -2698,7 +2707,7 @@ impl Database {
             return Ok(0);
         }
 
-        if !self.tables.contains_key(table_name) {
+        if !self.has_table(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
 
@@ -2716,7 +2725,7 @@ impl Database {
         // are read: a background flush landing mid-copy would put bytes in the
         // source that the copy has already passed. Same reasoning as
         // `rename_table`.
-        let table = self.tables.remove(table_name).map(|(_, t)| t);
+        let table = self.take_table(table_name);
 
         let from = seed_in(
             &self.db_io_pointers,
@@ -2745,7 +2754,7 @@ impl Database {
             Ok(to) => to,
             Err(e) => {
                 if let Some(table) = table {
-                    self.tables.insert(table_name.to_string(), table);
+                    self.install_table(table_name.to_string(), table);
                 }
                 return Err(e);
             }
@@ -2769,7 +2778,7 @@ impl Database {
                 forget_logged_files(&destination_logs, table_name, Barrier::Relocation)
             {
                 if let Some(table) = table {
-                    self.tables.insert(table_name.to_string(), table);
+                    self.install_table(table_name.to_string(), table);
                 }
                 error!(
                     "Could not move {} to {}: the destination's log would not void its old \
@@ -2801,7 +2810,7 @@ impl Database {
             )
             .await;
                 if let Some(table) = table {
-                    self.tables.insert(table_name.to_string(), table);
+                    self.install_table(table_name.to_string(), table);
                 }
                 error!(
                     "Could not move {} to {}: {}",
@@ -2824,7 +2833,7 @@ impl Database {
             )
             .await;
             if let Some(table) = table {
-                self.tables.insert(table_name.to_string(), table);
+                self.install_table(table_name.to_string(), table);
             }
             return Err(io::Error::other(e));
         }
@@ -2886,8 +2895,7 @@ impl Database {
             if rolled_back && !restored.schema_unreadable {
                 restored.scope_cache_to_database(self.id);
                 restored.enable_versioning(self.transactions.clone());
-                self.tables
-                    .insert(table_name.to_string(), Arc::new(restored));
+                self.install_table(table_name.to_string(), Arc::new(restored));
             } else {
                 // Both copies unreadable, or the placement would not go back.
                 // Nothing to publish, and saying so is the only honest answer —
@@ -2908,8 +2916,7 @@ impl Database {
         }
         reopened.scope_cache_to_database(self.id);
         reopened.enable_versioning(self.transactions.clone());
-        self.tables
-            .insert(table_name.to_string(), Arc::new(reopened));
+        self.install_table(table_name.to_string(), Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
         // Kept when their records cannot be voided, and said so: the move is
@@ -3042,14 +3049,9 @@ impl Database {
         // tables, not in the directory.
         let readings = file_readings(name);
         let shared = self
-            .tables
+            .relation_names()
             .iter()
-            .find_map(|entry| file_shared_with(name, &readings, entry.key()))
-            .or_else(|| {
-                self.partitioned
-                    .iter()
-                    .find_map(|entry| file_shared_with(name, &readings, entry.key()))
-            })
+            .find_map(|other| file_shared_with(name, &readings, other))
             .or_else(|| {
                 let held = self.held_names.lock();
                 held.iter().find_map(|other| file_shared_with(name, &readings, other))
@@ -3212,7 +3214,7 @@ impl Database {
         }
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
-        self.tables.insert(new_name.to_string(), Arc::new(table));
+        self.install_table(new_name.to_string(), Arc::new(table));
     }
     /// Writes the catalogue row that makes a table enumerable on the next open.
     ///
@@ -3333,7 +3335,7 @@ impl Database {
         // write a second catalogue row between the check and the insert.
         let _claim = self.claim_name(table_name)?;
 
-        if self.tables.contains_key(table_name) || self.partitioned.contains_key(table_name) {
+        if self.has_table(table_name) || self.is_partitioned(table_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "Table already exists",
@@ -3342,9 +3344,9 @@ impl Database {
         // FKs onto a partitioned parent are phase 3's: the check would read
         // the shell, which holds no rows.
         if let Some(fk) = create_table.foreign_keys.iter().find(|fk| {
-            self.partitioned
+            self.partitioned_tables_all()
                 .iter()
-                .any(|p| p.key().eq_ignore_ascii_case(&fk.parent_table))
+                .any(|p| p.name().eq_ignore_ascii_case(&fk.parent_table))
         }) {
             // InvalidInput, which the CREATE arm reports with its text.
             return Err(io::Error::new(
@@ -3413,7 +3415,7 @@ impl Database {
         // from the sidecars just written, it has them; the table is empty, so
         // the reopen builds nothing.
         let reopen = (!create_table.unique_keys.is_empty()).then(|| create_table.table_name.clone());
-        self.tables.insert(create_table.table_name, Arc::new(table));
+        self.install_table(create_table.table_name, Arc::new(table));
         if let Some(name) = reopen {
             self.reload_table(&name).await?;
         }
@@ -3433,13 +3435,8 @@ impl Database {
     /// the rest read as a complete vacuum to a caller that cannot see the log,
     /// and a partitioned table's shell or a broken one always fails.
     pub async fn vacuum_all(&self) -> io::Result<Vec<(String, crate::core::vacuum::VacuumReport)>> {
-        let mut names: Vec<String> = self.tables.iter().map(|entry| entry.key().clone()).collect();
-        // A broken partitioned table may have no shell in `tables`.
-        for entry in self.partitioned.iter() {
-            if !names.contains(entry.key()) {
-                names.push(entry.key().clone());
-            }
-        }
+        // A broken partitioned table may have no shell, and is listed too.
+        let mut names = self.relation_names();
         names.sort_unstable();
 
         let mut reports = Vec::with_capacity(names.len());
@@ -3603,7 +3600,7 @@ impl Database {
         // reopen below builds a plain table, and a partitioned one with no
         // shell must not read as missing (ALTER and CREATE INDEX reach here).
         self.refuse_partitioned(table_name, "reloading a table's schema")?;
-        if !self.tables.contains_key(table_name) {
+        if !self.has_table(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
         let _changed = SchemaChanged(&self.schema_generation);
@@ -3614,7 +3611,7 @@ impl Database {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // The previous handle is dropped first so its maintenance task stops
         // before a second one starts on the same files.
-        self.tables.remove(table_name);
+        self.take_table(table_name);
         let seed = seed_in(
             &self.db_io_pointers,
             &self.storage,
@@ -3635,7 +3632,7 @@ impl Database {
         }
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
-        self.tables.insert(table_name.to_string(), Arc::new(table));
+        self.install_table(table_name.to_string(), Arc::new(table));
         Ok(())
     }
 }

@@ -704,7 +704,7 @@ pub async fn ensure_role_catalogue(
         Ok(response)
     }
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         run(database, ROLE_TABLE_DDL).await?;
     }
 
@@ -747,7 +747,7 @@ pub async fn lookup_role(
 ) -> Option<Role> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         return None;
     }
 
@@ -812,12 +812,12 @@ pub async fn copy_role_catalogue(
 ) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !from.tables.contains_key(ROLE_TABLE) {
+    if !from.has_table(ROLE_TABLE) {
         // Trust authentication keeps no catalogue, so there is nothing to carry
         // and nothing to refuse.
         return Ok(());
     }
-    if to.tables.contains_key(ROLE_TABLE) {
+    if to.has_table(ROLE_TABLE) {
         return Ok(());
     }
 
@@ -895,7 +895,7 @@ pub async fn copy_role_catalogue(
 pub async fn has_login_role(database: &rclite::Arc<crate::core::database::Database>) -> bool {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         return false;
     }
 
@@ -1066,7 +1066,7 @@ pub async fn execute_role_statement(
         Ok(())
     }
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         run(database, ROLE_TABLE_DDL).await?;
     }
 

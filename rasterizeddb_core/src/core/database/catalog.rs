@@ -213,7 +213,7 @@ impl DatabaseCatalog {
                     .location
                     .clone()
                     .unwrap_or_else(|| "(in memory)".to_string()),
-                tables: entry.database.tables.len() as u64,
+                tables: entry.database.table_count() as u64,
                 sessions: entry.sessions.load(Ordering::Acquire) as u64,
                 is_default: entry.key() == &self.default_name,
             })

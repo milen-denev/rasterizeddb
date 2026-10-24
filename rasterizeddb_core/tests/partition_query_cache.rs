@@ -27,7 +27,7 @@ fn a_narrow_route_uses_the_cache_and_a_wide_one_stores_nothing() {
     for t in ["qc", "qc_plain"] {
         c.ok(&format!("INSERT INTO {t} (tenant_id, id, n) VALUES {}", rows.join(", ")));
     }
-    let pt = server.db.partitioned.get("qc").unwrap().value().clone();
+    let pt = server.db.partitioned_table("qc").unwrap();
     let epoch = pt.epoch().unwrap();
     let materialized = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).unwrap().len();
     assert!(materialized > 4, "the wide query must reach more than 4 partitions, not {materialized}");

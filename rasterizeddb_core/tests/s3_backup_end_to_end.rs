@@ -1962,7 +1962,7 @@ e2e_test!(a_restore_reproduces_every_state_file, config, {
     run(&database, "VACUUM acct").await;
     run(&database, "VACUUM prices").await;
     for name in ["acct", "prices"] {
-        let table = database.tables.get(name).unwrap().value().clone();
+        let table = database.table_for_tests(name).unwrap();
         let swept = table.neutralize_aborted_now().await.expect("forget sweep");
         eprintln!("{name}: forget sweep {swept:?}, horizon {:?}", table.forget_horizon());
     }

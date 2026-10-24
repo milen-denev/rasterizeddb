@@ -2,8 +2,8 @@
 //! §12): CREATE, DROP, the startup open, and the catalogue rules they share.
 //!
 //! A partitioned table is in two maps: its [`PartitionedTable`] in
-//! `Database.partitioned`, and its schema-only shell in `Database.tables`,
-//! where every data call refuses. Its catalogue row carries `clusters = uid`
+//! `Database.partitioned_tables`, and its schema-only shell in a slot under
+//! the logical name (`slots.rs`), where every data call refuses. Its catalogue row carries `clusters = uid`
 //! (nonzero), and every file it has is `__pt_<uid>_*` in the database
 //! directory. No file starts with its logical name: an older binary, which
 //! ignores `clusters`, then finds no `<name>_schema.db` and leaves the table
@@ -309,7 +309,7 @@ impl Database {
         if let Some(reason) = self.table_files_conflict(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
         }
-        if self.tables.contains_key(name) || self.partitioned.contains_key(name) {
+        if self.has_table(name) || self.is_partitioned(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Table already exists"));
         }
         // A reload, MOVE or plain DROP takes the table out of `tables` and
@@ -345,19 +345,22 @@ impl Database {
         if !ct.foreign_keys.is_empty() {
             return Err(unsupported("FOREIGN KEY on a partitioned table is not supported yet"));
         }
-        for table in self.tables.iter() {
-            if table
-                .schema
-                .foreign_keys
-                .iter()
-                .any(|fk| !fk.is_deleted && fk.parent_table.eq_ignore_ascii_case(name))
+        let mut referencing = None;
+        self.each_schema(|table, schema| {
+            if referencing.is_none()
+                && schema
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| !fk.is_deleted && fk.parent_table.eq_ignore_ascii_case(name))
             {
-                return Err(unsupported(format!(
-                    "table \"{}\" has a FOREIGN KEY naming \"{name}\"; a partitioned table as the parent of a \
-                     FOREIGN KEY is not supported yet",
-                    table.key()
-                )));
+                referencing = Some(table.to_string());
             }
+        });
+        if let Some(table) = referencing {
+            return Err(unsupported(format!(
+                "table \"{table}\" has a FOREIGN KEY naming \"{name}\"; a partitioned table as the parent of a \
+                 FOREIGN KEY is not supported yet"
+            )));
         }
         // A shredded JSON column is a shadow table the drop would have to
         // follow; refused rather than half-handled.
@@ -398,7 +401,7 @@ impl Database {
                 )));
             }
         }
-        let open: Vec<Arc<PartitionedTable>> = self.partitioned.iter().map(|t| t.value().clone()).collect();
+        let open: Vec<Arc<PartitionedTable>> = self.partitioned_tables_all();
         check_declared_cap(declared_in(open.iter().map(|t| &**t))?, partitions)
     }
 
@@ -421,7 +424,8 @@ impl Database {
         let root = self.partition_root()?;
         // A uid no live table holds and no file in the root is under, so
         // §12's step 1 (delete orphans of the uid) has nothing to delete.
-        let uid = files::new_uid(&root, |u| self.partitioned.iter().any(|t| t.uid() == u))?;
+        let open = self.partitioned_tables_all();
+        let uid = files::new_uid(&root, |u| open.iter().any(|t| t.uid() == u))?;
 
         let columns = std::mem::take(&mut ct.columns);
         let (io_schema, schema) = match self.write_partitioned_files(&root, &ct, columns, key, partitions, uid).await {
@@ -456,8 +460,7 @@ impl Database {
         let shell = Arc::new(shell);
         let table = Arc::new(PartitionedTable::open(self.open_ctx(), &ct.table_name, uid, shell.clone()).await);
         let broken = table.broken().map(str::to_string);
-        self.partitioned.insert(ct.table_name.clone(), table);
-        self.tables.insert(ct.table_name.clone(), shell);
+        self.install_partitioned(ct.table_name.clone(), table, Some(shell));
         synced?;
         if let Some(why) = broken {
             return Err(io::Error::other(why));
@@ -559,15 +562,14 @@ impl Database {
         // leaves the maps and the catalogue: waiting with the table half gone
         // would hide a table whose files are still on disk.
         let _snapshot_gate = self.uid_deletion_permit().await;
-        let Some(table) = self.partitioned.get(name).map(|t| t.value().clone()) else {
+        let Some(table) = self.partitioned_table(name) else {
             return Ok(false);
         };
         if let Err(e) = self.forget_in_catalogue(name).await {
             error!("Could not remove {} from the catalogue: {}", name, e);
             return Err(e);
         }
-        self.partitioned.remove(name);
-        self.tables.remove_if(name, |_, t| Arc::ptr_eq(t, table.shell()));
+        self.take_partitioned(name, &table);
 
         let uid = table.uid();
         let kept = |what: &str, e: &dyn std::fmt::Display| {
@@ -602,10 +604,7 @@ impl Database {
     pub(super) async fn open_partitioned_rows(&self, rows: Vec<(String, u64)>) {
         for (name, uid) in rows {
             let (shell, table) = self.open_partitioned(&name, uid).await;
-            self.partitioned.insert(name.clone(), Arc::new(table));
-            if let Some(shell) = shell {
-                self.tables.insert(name, shell);
-            }
+            self.install_partitioned(name, Arc::new(table), shell);
         }
     }
 

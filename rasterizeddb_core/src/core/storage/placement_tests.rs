@@ -139,9 +139,7 @@ async fn a_placed_table_still_holds_its_rows_after_a_restart() {
         Some(second_path.as_str()),
         "the placement must come back from the pool file"
     );
-    let table = db
-        .tables
-        .get("moved")
+    let table = db.table_for_tests("moved")
         .expect("the table should be in the catalogue")
         .clone();
     assert_eq!(
@@ -236,8 +234,7 @@ async fn a_backup_added_at_runtime_covers_the_next_table() {
     // And the table opened earlier is not, which the reporting must not claim
     // otherwise.
     assert_eq!(
-        db.tables
-            .get("before_backup")
+        db.table_for_tests("before_backup")
             .unwrap()
             .io_rows()
             .unwrap()
@@ -246,8 +243,7 @@ async fn a_backup_added_at_runtime_covers_the_next_table() {
         "a table already open cannot have acquired a backup copy"
     );
     assert!(
-        db.tables
-            .get("after_backup")
+        db.table_for_tests("after_backup")
             .unwrap()
             .io_rows()
             .unwrap()
@@ -281,9 +277,7 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
     // that is now its own.
     let _ = std::fs::remove_file(backup.path().join(super::POOL_FILE));
     let recovered = open(backup.path()).await;
-    let table = recovered
-        .tables
-        .get("survivor")
+    let table = recovered.table_for_tests("survivor")
         .expect("the backup copy should list the table");
     assert!(
         StorageIO::get_len(&*table.data().unwrap().io_rows).await > 0,
@@ -332,7 +326,7 @@ async fn moving_a_table_takes_its_files_with_it() {
     // Still writable at its new address, which a move that left a stale handle
     // in the table map would not be.
     insert(&db, "travelling", 2, "after").await;
-    let table = db.tables.get("travelling").unwrap().clone();
+    let table = db.table_for_tests("travelling").unwrap().clone();
     assert_eq!(
         StorageIO::get_location(&*table.data().unwrap().io_rows).as_deref(),
         Some(second_path.as_str())

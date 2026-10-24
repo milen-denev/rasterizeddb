@@ -12,13 +12,13 @@ use crate::core::mvcc::owner::probe::{self, Record, Site};
 use crate::core::mvcc::owner::{LockOwner, OwnerKind};
 use tokio::io::AsyncReadExt;
 
-struct Session {
+pub(super) struct Session {
     state: SessionState,
     server: tokio::io::DuplexStream,
     client: tokio::io::DuplexStream,
 }
 
-fn session(db: &Arc<Database>) -> Session {
+pub(super) fn session(db: &Arc<Database>) -> Session {
     let catalog = DatabaseCatalog::single(db.clone());
     let auth = AuthConfig {
         method: crate::auth::AuthMethod::Trust,
@@ -46,7 +46,7 @@ fn session(db: &Arc<Database>) -> Session {
 
 /// Runs one statement and reads its reply up to `CommandComplete` or an
 /// error: `Ok(rows)` or `Err(message)`.
-async fn send(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<usize, String> {
+pub(super) async fn send(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<usize, String> {
     Box::pin(execute_recorded(
         db,
         &mut s.state,
@@ -73,7 +73,7 @@ async fn send(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<usize, S
     }
 }
 
-async fn ok(db: &Arc<Database>, s: &mut Session, sql: &str) -> usize {
+pub(super) async fn ok(db: &Arc<Database>, s: &mut Session, sql: &str) -> usize {
     send(db, s, sql)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"))

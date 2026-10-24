@@ -207,7 +207,7 @@ async fn a_drop_during_the_upload(incremental_min_bytes: u64) {
     let target = base.path().join("restored");
     let back = restored(&config, &report, &target).await;
     assert_eq!(count(&back, "SELECT * FROM kept").await, 12, "the restore lost a kept row");
-    assert!(!back.tables.contains_key("doomed"), "the restore brought the dropped table back");
+    assert!(!back.has_table("doomed"), "the restore brought the dropped table back");
     assert_eq!(
         nonempty_files_of(&target, "doomed"),
         Vec::<String>::new(),
@@ -270,7 +270,7 @@ async fn a_partitioned_drop_during_the_upload(incremental_min_bytes: u64) {
     for i in 0..9 {
         ok(&db, &format!("INSERT INTO doomed (id, note) VALUES ({i}, 'doomed_{i}')")).await;
     }
-    let uid = db.partitioned.get("doomed").expect("partitioned").uid();
+    let uid = db.partitioned_table("doomed").expect("partitioned").uid();
     let files = nonempty_files_of_uid(&live, uid);
     assert!(files.iter().any(|f| f.ends_with("_pointers.db")), "no partition holds a row: {files:?}");
 
@@ -290,7 +290,7 @@ async fn a_partitioned_drop_during_the_upload(incremental_min_bytes: u64) {
     let back = restored(&config, &report, &target).await;
     assert_eq!(count(&back, "SELECT * FROM kept").await, 12, "the restore lost a kept row");
     assert!(
-        !back.partitioned.contains_key("doomed") && !back.tables.contains_key("doomed"),
+        !back.is_partitioned("doomed") && !back.has_table("doomed"),
         "the restore brought the dropped table back"
     );
     assert_eq!(
@@ -300,7 +300,7 @@ async fn a_partitioned_drop_during_the_upload(incremental_min_bytes: u64) {
     );
     // Nothing of it in the way of the name either.
     ok(&back, create).await;
-    assert!(back.partitioned.get("doomed").is_some_and(|t| t.uid() != uid));
+    assert!(back.partitioned_table("doomed").is_some_and(|t| t.uid() != uid));
 
     drop(back);
     drop(db);
@@ -355,7 +355,7 @@ async fn a_rename_during_the_upload_waits_for_it() {
     let target = base.path().join("restored");
     let back = restored(&config, &report, &target).await;
     assert_eq!(count(&back, "SELECT * FROM wren").await, 11, "the snapshot lost the table");
-    assert!(!back.tables.contains_key("wren_renamed"));
+    assert!(!back.has_table("wren_renamed"));
 
     drop(back);
     drop(db);

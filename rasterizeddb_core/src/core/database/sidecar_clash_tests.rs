@@ -42,7 +42,7 @@ async fn create(db: &Database, name: &str) {
 }
 
 async fn insert_id(db: &Database, table: &str, value: i32) {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let mut mb = MEMORY_POOL.acquire(4);
     mb.into_slice_mut().copy_from_slice(&value.to_le_bytes());
     let row = RowWrite {
@@ -72,7 +72,7 @@ fn fetch_all(fields: &SmallVec<[SchemaField; 20]>) -> crate::core::row::row::Row
 
 /// The table's ids, sorted, or `None` when it did not come back.
 async fn ids(db: &Database, table: &str) -> Option<Vec<i32>> {
-    let table = db.tables.get(table)?.clone();
+    let table = db.table_for_tests(table)?.clone();
     let rows = table
         .query_row(
             "",
@@ -218,14 +218,14 @@ async fn every_sidecar_name_is_refused_in_both_orders_on_create_and_rename() {
                 let err = db.add_table(create_stmt(newcomer)).await.unwrap_err();
                 assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "create {context}");
                 assert_names_the_file(&err.to_string(), newcomer, existing, &context);
-                assert!(!db.tables.contains_key(newcomer.as_str()), "{context}");
+                assert!(!db.has_table(newcomer.as_str()), "{context}");
                 assert!(!db.catalogue_contains(newcomer).await, "{context}: catalogue row");
 
                 let err = db.rename_table("bystander", newcomer).await.unwrap_err();
                 assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "rename {context}");
                 assert_names_the_file(&err.to_string(), newcomer, existing, &context);
-                assert!(db.tables.contains_key("bystander"), "{context}: lost the bystander");
-                assert!(!db.tables.contains_key(newcomer.as_str()), "{context}");
+                assert!(db.has_table("bystander"), "{context}: lost the bystander");
+                assert!(!db.has_table(newcomer.as_str()), "{context}");
 
                 // And what a client sees: the statement, not just the call.
                 let (status, text) = sql(&db, &format!("CREATE TABLE {newcomer} (id INT)")).await;
@@ -239,7 +239,7 @@ async fn every_sidecar_name_is_refused_in_both_orders_on_create_and_rename() {
 
             let db = open_db(dir.path()).await;
             assert_eq!(ids(&db, existing).await, Some(vec![7]), "{context}: damaged");
-            assert!(!db.tables.contains_key(newcomer.as_str()), "{context}: after reopen");
+            assert!(!db.has_table(newcomer.as_str()), "{context}: after reopen");
         }
     }
 }
@@ -368,7 +368,7 @@ async fn file_names_are_compared_ignoring_case() {
         text.contains("table \"X\"") && text.contains("case-insensitive filesystem"),
         "names X and why: {text}"
     );
-    assert!(!db.tables.contains_key("x") && db.tables.contains_key("X"));
+    assert!(!db.has_table("x") && db.has_table("X"));
 
     // The other order: `x_POINTERS` first, then `X`.
     let dir = tempfile::tempdir().unwrap();
@@ -383,7 +383,7 @@ async fn file_names_are_compared_ignoring_case() {
     // copied onto itself on those filesystems.
     let err = db.rename_table("other", "OTHER").await.unwrap_err();
     assert_names_the_file(&err.to_string(), "OTHER", "other", "other -> OTHER");
-    assert!(db.tables.contains_key("other"));
+    assert!(db.has_table("other"));
     // Unrelated names are unaffected.
     create(&db, "Y").await;
 }
@@ -433,7 +433,7 @@ async fn a_database_that_already_holds_a_sharing_pair_still_opens() {
 
     let db = rclite::Arc::new(open_db(dir.path()).await);
     for name in ["x", "x_pointers", "keep"] {
-        assert!(db.tables.contains_key(name), "{name} did not open");
+        assert!(db.has_table(name), "{name} did not open");
     }
     // `x` never had `x_pointers` write a row into its pointer file, so it reads
     // as it did: the guard took nothing away.
@@ -442,7 +442,7 @@ async fn a_database_that_already_holds_a_sharing_pair_still_opens() {
     insert_id(&db, "keep", 10).await;
     assert_eq!(ids(&db, "keep").await, Some(vec![9, 10]));
 
-    let names: Vec<String> = db.tables.iter().map(|e| e.key().clone()).collect();
+    let names: Vec<String> = db.table_names();
     let pairs = shared_file_pairs(&names);
     assert_eq!(pairs.len(), 1, "{pairs:?}");
     assert_eq!((pairs[0].0.as_str(), pairs[0].1.owner.as_str()), ("x", "x_pointers"));
@@ -688,8 +688,8 @@ async fn a_partitioned_table_without_its_shell_still_holds_its_files() {
     let (status, text) =
         sql(&db, "CREATE TABLE acct (tenant_id BIGINT NOT NULL, n INT) PARTITION BY HASH (tenant_id)").await;
     assert_eq!(status, 0, "{text}");
-    assert!(db.partitioned.contains_key("acct"));
-    db.tables.remove("acct");
+    assert!(db.is_partitioned("acct"));
+    db.take_table("acct");
     for newcomer in ["acct_schema", "acct_pointers", "ACCT_schema_FIELDS"] {
         let err = db.add_table(create_stmt(newcomer)).await.unwrap_err();
         assert_names_the_file(&err.to_string(), newcomer, "acct", newcomer);

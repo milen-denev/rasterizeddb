@@ -281,9 +281,7 @@ impl Harness {
 /// What an image shows: which name the column has, and whether everything the
 /// column carries behaves as declared under that name.
 async fn judge(db: &Arc<Database>) -> Result<String, String> {
-    let schema = db
-        .tables
-        .get(TABLE)
+    let schema = db.table_for_tests(TABLE)
         .ok_or_else(|| "the table is gone".to_string())?
         .schema
         .clone();
@@ -447,9 +445,7 @@ const DROPPED: &str = "crash_drop_d";
 /// live with its CHECK, `"dropped"` when it is gone with every declaration —
 /// a column added again under the name is plain — or what is wrong.
 async fn judge_drop(db: &Arc<Database>) -> Result<&'static str, String> {
-    let live = db
-        .tables
-        .get(DROPPED)
+    let live = db.table_for_tests(DROPPED)
         .ok_or_else(|| "the table is gone".to_string())?
         .schema
         .fields
@@ -461,7 +457,7 @@ async fn judge_drop(db: &Arc<Database>) -> Result<&'static str, String> {
         }
         return Ok("kept");
     }
-    let schema = db.tables.get(DROPPED).expect("table").schema.clone();
+    let schema = db.table_for_tests(DROPPED).expect("table").schema.clone();
     let mut wrong = Vec::new();
     if !(schema.defaults.is_empty() && schema.checks.is_empty() && schema.unique_keys.is_empty()) {
         wrong.push(format!(

@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         run(&pool, &format!("INSERT INTO m (id, amount, note) VALUES ({}, {}, 'x')", id, id)).await;
     }
 
-    let table = server.database().tables.get("m").expect("table").clone();
+    let table = server.database().table_for_tests("m").expect("table").clone();
 
     let before = table.in_place_column_updates();
     for round in 0..200i64 {

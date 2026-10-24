@@ -105,7 +105,7 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
             .await
             .unwrap_or_else(|e| panic!("{} was refused: {}", sql, e));
         assert!(
-            db.partitioned.contains_key(table),
+            db.is_partitioned(table),
             "{} did not create a partitioned table",
             sql
         );
@@ -180,7 +180,7 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
             "CREATE TABLE pt_unclosed (id INT NOT NULL PARTITION BY HASH (id)",
         ),
     ] {
-        let tables_before = db.tables.len();
+        let tables_before = db.table_count();
         let len_before = catalogue_len(&db).await;
         let reason = run(&db, sql)
             .await
@@ -200,12 +200,12 @@ async fn partitioning_syntax_is_refused_and_writes_no_catalogue_row_body() {
             sql, reason
         );
         assert!(
-            !db.tables.contains_key(table),
+            !db.has_table(table),
             "{} registered table {}",
             sql,
             table
         );
-        assert_eq!(db.tables.len(), tables_before, "{} registered a table", sql);
+        assert_eq!(db.table_count(), tables_before, "{} registered a table", sql);
         assert_eq!(
             catalogue_len(&db).await,
             len_before,
@@ -261,8 +261,8 @@ async fn attach_and_detach_partition_are_refused_body() {
         );
     }
     // Both tables are still there and still plain tables.
-    assert!(db.tables.contains_key("pa_parent"));
-    assert!(db.tables.contains_key("pa_child"));
+    assert!(db.has_table("pa_parent"));
+    assert!(db.has_table("pa_child"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -294,7 +294,7 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
     )
     .await
     .expect("partitioned");
-    let uid = db.partitioned.get("pu_part").expect("partitioned").uid();
+    let uid = db.partitioned_table("pu_part").expect("partitioned").uid();
     let len = catalogue_len(&db).await;
 
     let mut statements = vec![
@@ -338,7 +338,7 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
         {
             wrong.push(format!("{sql}: accepted as a no-op by pgwire"));
         }
-        let tables_before = db.tables.len();
+        let tables_before = db.table_count();
         let outcome = match recognize_query_purpose(sql) {
             None => Err("not recognised".to_string()),
             Some(purpose) => {
@@ -362,10 +362,10 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
             }
             Err(_) => {}
         }
-        assert_eq!(db.tables.len(), tables_before, "{sql} registered a table");
+        assert_eq!(db.table_count(), tables_before, "{sql} registered a table");
         assert_eq!(catalogue_len(&db).await, len, "{sql} wrote a catalogue row");
-        assert_eq!(db.partitioned.get("pu_part").map(|t| t.uid()), Some(uid), "{sql}");
-        assert_eq!(db.partitioned.len(), 1, "{sql} made pu_plain partitioned");
+        assert_eq!(db.partitioned_table("pu_part").map(|t| t.uid()), Some(uid), "{sql}");
+        assert_eq!(db.partitioned_count(), 1, "{sql} made pu_plain partitioned");
     }
     assert!(wrong.is_empty(), "statements not refused as unsupported:\n{}", wrong.join("\n"));
 }

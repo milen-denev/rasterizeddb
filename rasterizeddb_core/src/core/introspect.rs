@@ -495,13 +495,7 @@ async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Re
 /// schema could not be read, which has no shell there. Leaving it out would
 /// list a subset; listed, its figures refuse with the reason.
 fn table_names(database: &Database) -> Vec<String> {
-    let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
-    for entry in database.partitioned.iter() {
-        if !database.tables.contains_key(entry.key()) {
-            names.push(entry.key().clone());
-        }
-    }
-    names
+    database.relation_names()
 }
 
 type DbTable = crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>;
@@ -1542,16 +1536,14 @@ async fn partitions(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, St
 
 fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let table = database
-        .tables
-        .get(name)
-        .map(|t| t.value().clone())
+        .schema_view(name)
         .ok_or_else(|| match database.relation(name) {
             // Its schema could not be read; an empty column list would be a
             // wrong answer.
             Some(Relation::Partitioned(t)) => t.broken().unwrap_or("its schema is unavailable").to_string(),
             _ => format!("relation `{}` does not exist", name),
         })?;
-    let schema = &table.schema;
+    let schema = table.schema();
     let settings = crate::filter_settings();
 
     let mut out = Vec::new();
@@ -1634,13 +1626,13 @@ fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
 
     let mut out = Vec::new();
     for name in names {
-        let Some(table) = database.tables.get(&name).map(|t| t.value().clone()) else {
+        let Some(table) = database.schema_view(&name) else {
             if let Some(Relation::Partitioned(t)) = database.relation(&name) {
                 return Err(t.broken().unwrap_or("its schema is unavailable").to_string());
             }
             continue;
         };
-        let schema = &table.schema;
+        let schema = table.schema();
 
         for fk in schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
             out.push(row(&[
@@ -2839,7 +2831,7 @@ mod tests {
 
         assert_eq!(value_of("tables"), "1", "the shadow table was counted");
         assert!(
-            database.tables.len() >= 2,
+            database.table_count() >= 2,
             "the fixture did not actually create the shadow table"
         );
     }

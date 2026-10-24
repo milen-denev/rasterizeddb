@@ -4586,7 +4586,7 @@ mod tests {
         assert_eq!(notices.len(), 1, "no warning that the space was not returned");
         assert_eq!((notices[0].severity, notices[0].sqlstate), ("WARNING", "01000"));
         assert!(notices[0].message.contains("could not return the space"), "{:?}", notices[0]);
-        let table = db.tables.get("t").unwrap().value().clone();
+        let table = db.table_for_tests("t").unwrap();
         assert_eq!(table.vacuum_stats().unwrap().full_untruncated.load(Ordering::Relaxed), 1);
         // The data is intact.
         let rows = exec_sql(&db, "SELECT id FROM t WHERE id > 0").await;
@@ -5219,7 +5219,7 @@ mod tests {
             assert_eq!(res.first(), Some(&2u8), "seed {}: expected rows", seed);
             let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-            let table = db.tables.get("torn").expect("table").clone();
+            let table = db.table_for_tests("torn").expect("table").clone();
             let schema = &table.schema.fields;
 
             let mut seen: Vec<u64> = Vec::new();
@@ -5954,7 +5954,7 @@ mod tests {
         }
         let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-        let table = db.tables.get("crashy").expect("table").clone();
+        let table = db.table_for_tests("crashy").expect("table").clone();
         let schema = &table.schema.fields;
 
         rows.into_iter()
@@ -6114,7 +6114,7 @@ mod tests {
         assert_eq!(res.first(), Some(&2u8), "query should have returned rows");
         let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-        let table = db.tables.get("durable").expect("table").clone();
+        let table = db.table_for_tests("durable").expect("table").clone();
         let schema = &table.schema.fields;
 
         let mut seen: Vec<u64> = Vec::new();
@@ -6212,7 +6212,7 @@ mod tests {
             return Vec::new();
         };
 
-        let Some(table) = db.tables.get("churn").map(|t| t.clone()) else {
+        let Some(table) = db.table_for_tests("churn") else {
             return Vec::new();
         };
         let schema = &table.schema.fields;

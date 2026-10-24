@@ -463,11 +463,11 @@ async fn other_foreign_keys(
     table: &str,
 ) -> Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKey>)> {
     let ios: Vec<(String, Arc<DbStorageProvider>)> = database
-        .tables
-        .iter()
-        .filter(|e| !named(e.key(), table))
-        .filter(|e| !e.value().schema.foreign_keys.is_empty())
-        .map(|e| (e.key().clone(), e.value().io_schema.clone()))
+        .each_table_unlocked()
+        .into_iter()
+        .filter(|(name, _)| !named(name, table))
+        .filter(|(_, t)| !t.schema.foreign_keys.is_empty())
+        .map(|(name, t)| (name, t.io_schema.clone()))
         .collect();
     let mut out = Vec::new();
     for (name, io) in ios {
@@ -971,16 +971,10 @@ pub(crate) async fn retarget_parent(
     new: &str,
 ) -> Result<Vec<String>, String> {
     let ios: Vec<(String, Arc<DbStorageProvider>)> = database
-        .tables
-        .iter()
-        .filter(|e| {
-            e.value()
-                .schema
-                .foreign_keys
-                .iter()
-                .any(|fk| named(&fk.parent_table, old))
-        })
-        .map(|e| (e.key().clone(), e.value().io_schema.clone()))
+        .each_table_unlocked()
+        .into_iter()
+        .filter(|(_, t)| t.schema.foreign_keys.iter().any(|fk| named(&fk.parent_table, old)))
+        .map(|(name, t)| (name, t.io_schema.clone()))
         .collect();
     let mut changed = Vec::new();
     // Grouped by directory, one transaction each.

@@ -393,7 +393,7 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
             run(&db, "CREATE INDEX ix_status ON t ((doc->>'status'))").await;
 
             let declared = {
-                let entry = db.tables.get("t").expect("table");
+                let entry = db.table_for_tests("t").expect("table");
                 entry.schema.path_indexes.clone()
             };
             assert_eq!(declared.len(), 1, "the declaration was not recorded");
@@ -405,7 +405,7 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
         {
             let db = Arc::new(Database::new_with_backend(&dir, false).await);
             let declared = {
-                let entry = db.tables.get("t").expect("table after reopen");
+                let entry = db.table_for_tests("t").expect("table after reopen");
                 entry.schema.path_indexes.clone()
             };
             assert_eq!(
@@ -420,7 +420,7 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
 
             // Dropping it takes it away, and that survives too.
             run(&db, "DROP INDEX ix_status").await;
-            let entry = db.tables.get("t").expect("table");
+            let entry = db.table_for_tests("t").expect("table");
             assert!(
                 entry.schema.path_indexes.is_empty(),
                 "the drop was not recorded"
@@ -428,7 +428,7 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
         }
         {
             let db = Arc::new(Database::new_with_backend(&dir, false).await);
-            let entry = db.tables.get("t").expect("table");
+            let entry = db.table_for_tests("t").expect("table");
             assert!(
                 entry.schema.path_indexes.is_empty(),
                 "the drop did not survive the reopen"

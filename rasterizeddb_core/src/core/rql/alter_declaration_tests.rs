@@ -84,8 +84,7 @@ async fn ints(database: &Arc<Database>, sql: &str) -> Vec<Option<i64>> {
 }
 
 fn schema_of(db: &Arc<Database>, table: &str) -> crate::core::row::schema::TableSchema {
-    db.tables
-        .get(table)
+    db.table_for_tests(table)
         .unwrap_or_else(|| panic!("no table {table}"))
         .schema
         .clone()
@@ -95,7 +94,7 @@ fn io_of(
     db: &Arc<Database>,
     table: &str,
 ) -> Arc<crate::core::storage_providers::backend::DbStorageProvider> {
-    db.tables.get(table).expect("table").io_schema.clone()
+    db.table_for_tests(table).expect("table").io_schema.clone()
 }
 
 // ---------------------------------------------------------------------------

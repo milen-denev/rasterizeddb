@@ -155,9 +155,7 @@ async fn ext_cov_employees_end_to_end_queries() {
     assert_ok(&res, "CREATE TABLE employees");
 
     // Sanity: table exists in the DB map.
-    let table = database
-        .tables
-        .get("employees")
+    let table = database.table_for_tests("employees")
         .expect("employees table should exist after CREATE TABLE")
         .clone();
 
@@ -668,9 +666,7 @@ async fn run_rowcount_case(rows_to_insert: usize) {
         assert_ok(&res, "INSERT tiny_counts");
     }
 
-    let _table = database
-        .tables
-        .get("tiny_counts")
+    let _table = database.table_for_tests("tiny_counts")
         .expect("tiny_counts table should exist after CREATE TABLE")
         .clone();
 
@@ -872,9 +868,7 @@ async fn ext_cov_concurrent_inserts_keep_row_offsets() {
         "every concurrently inserted row must be readable"
     );
 
-    let schema = &database
-        .tables
-        .get("conc_rows")
+    let schema = &database.table_for_tests("conc_rows")
         .expect("conc_rows table should exist")
         .schema
         .fields;
@@ -953,9 +947,7 @@ async fn ext_cov_pagination_spellings_agree() {
         assert_ok(&res, "INSERT paged_rows");
     }
 
-    let table = database
-        .tables
-        .get("paged_rows")
+    let table = database.table_for_tests("paged_rows")
         .expect("paged_rows table should exist")
         .clone();
     let schema = &table.schema.fields;
@@ -1103,9 +1095,7 @@ async fn ext_cov_order_by_honours_every_key() {
         assert_ok(&res, "INSERT sorted_rows");
     }
 
-    let table = database
-        .tables
-        .get("sorted_rows")
+    let table = database.table_for_tests("sorted_rows")
         .expect("sorted_rows table should exist")
         .clone();
     let schema = &table.schema.fields;

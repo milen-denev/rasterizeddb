@@ -80,7 +80,7 @@ fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
 }
 
 async fn row_count(db: &Arc<Database>, table: &str) -> usize {
-    let handle = db.tables.get(table).expect("table is not in the live map");
+    let handle = db.table_for_tests(table).expect("table is not in the live map");
     let fields = handle.schema.fields.to_vec();
     handle
         .query_row(
@@ -340,7 +340,7 @@ async fn a_table_whose_store_vanished_is_absent_rather_than_empty() {
     std::fs::remove_file(root.path().join(super::kv_registry::KV_FILE)).unwrap();
     let db = open(root.path()).await;
     assert!(
-        db.tables.get("archived").is_none(),
+        db.table_for_tests("archived").is_none(),
         "a table whose store is gone must not open as an empty one"
     );
 }
@@ -514,7 +514,7 @@ async fn a_table_converts_between_every_backend_and_keeps_its_rows() {
     ] {
         let lines = storage(&db, &format!("STORAGE MOVE TABLE wander TO '{target}'")).await;
         assert!(
-            db.tables.contains_key("wander"),
+            db.has_table("wander"),
             "after moving to {target} the table is not in the live map; move said {lines:?}"
         );
         assert!(
@@ -1133,7 +1133,7 @@ async fn a_table_converted_into_memory_does_not_wedge_the_next_start_up() {
         Some(TableBackend::Memory),
         "the placement should still say where the operator put it"
     );
-    if db.tables.get("volatile").is_some() {
+    if db.table_for_tests("volatile").is_some() {
         assert_eq!(
             row_count(&db, "volatile").await,
             0,

@@ -225,12 +225,8 @@ async fn create_employees_table(database: &Arc<Database>) {
 }
 
 async fn populate_employees(database: &Arc<Database>) {
-    let table = database
-        .tables
-        .get("employees")
-        .expect("employees table should exist after setup")
-        .value()
-        .clone();
+    let table = database.table_for_tests("employees")
+        .expect("employees table should exist after setup");
 
     for id in 1..=ROW_COUNT {
         table

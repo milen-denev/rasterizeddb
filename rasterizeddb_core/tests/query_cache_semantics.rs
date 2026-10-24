@@ -111,7 +111,7 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
         .await
         .expect("create table");
 
-    let t = database.tables.get(table).expect("table").value().clone();
+    let t = database.table_for_tests(table).expect("table");
     for id in 1..=ROW_COUNT {
         // Age descends as id ascends, so ORDER BY age has to actually reorder.
         t.insert_row(row(id, (ROW_COUNT - id) as i32))
@@ -279,7 +279,7 @@ async fn writes_invalidate_cached_answers() {
     init_globals();
     let dir = tempfile::tempdir().unwrap();
     let db = setup(dir.path().to_str().unwrap(), "t_write").await;
-    let table = db.tables.get("t_write").unwrap().value().clone();
+    let table = db.table_for_tests("t_write").unwrap();
 
     const ALL: &str = "SELECT id, age FROM t_write WHERE id > 0";
 
@@ -351,7 +351,7 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
     })
     .await
     .expect("create t_b");
-    let b = db.tables.get("t_b").unwrap().value().clone();
+    let b = db.table_for_tests("t_b").unwrap();
     for id in 1..=3u64 {
         b.insert_row(row(id, id as i32)).await.expect("insert");
     }

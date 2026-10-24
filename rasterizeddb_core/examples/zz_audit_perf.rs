@@ -297,7 +297,7 @@ async fn read_mode(db: &Arc<Database>, args: &Args) {
 
     // Touch the table once so the file-open cost is not in the first sample.
     let _ = exec(db, &format!("SELECT id FROM {} WHERE id = 1", args.table)).await;
-    if let Some(t) = db.tables.get(&args.table).map(|t| t.value().clone()) {
+    if let Some(t) = db.table_for_tests(&args.table) {
         let slots = t.io_pointers().unwrap().get_len().await
             / rasterizeddb_core::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
         let rows_len = t.io_rows().unwrap().get_len().await;

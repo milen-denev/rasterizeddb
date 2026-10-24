@@ -348,7 +348,7 @@ async fn a_rename_onto_a_name_with_a_leftover_default_does_not_inherit_it() {
 
     ok(&db, "CREATE TABLE t (x INT, b INT)").await;
     // The leftover, written as an older engine's `DROP COLUMN c` left it.
-    let io = db.tables.get("t").expect("table t").io_schema.clone();
+    let io = db.table_for_tests("t").expect("table t").io_schema.clone();
     crate::core::rql::column_default::append(
         io,
         &crate::core::rql::column_default::ColumnDefault {
@@ -588,7 +588,7 @@ async fn a_generated_column_follows_its_renamed_input() {
 /// Seeds a declaration under `column` the way an older engine's `DROP COLUMN`
 /// left it, or a power loss between a drop's separately durable writes.
 async fn seed_leftover_default(db: &Arc<Database>, table: &str, column: &str, expression: &str) {
-    let io = db.tables.get(table).expect("table").io_schema.clone();
+    let io = db.table_for_tests(table).expect("table").io_schema.clone();
     crate::core::rql::column_default::append(
         io,
         &crate::core::rql::column_default::ColumnDefault {
