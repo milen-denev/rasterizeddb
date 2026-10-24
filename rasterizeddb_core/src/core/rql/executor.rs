@@ -7825,10 +7825,11 @@ fn check_constraints_hold(
 /// 10)` reads, while `UPDATE t SET lo = 5` supplies half of
 /// `CHECK (lo < hi)` and the other half is in a row this has not read.
 ///
-/// **The rest are not enforced on update.** An `UPDATE` can therefore leave a
-/// row that violates a multi-column check. That is stated rather than hidden,
-/// and it is the narrower half of the choice: evaluating a check against a
-/// value it does not have would reject rows that are perfectly valid.
+/// The rest, every check that also reads a column the statement leaves alone
+/// or assigns an expression, are judged row by row by the write, against the
+/// row as it will be stored ([`UpdateRowChecks`]). They used to go unjudged:
+/// `UPDATE t SET lo = 5` under `CHECK (lo < hi)` stored a row with `hi` 3 and
+/// reported success.
 #[inline(never)]
 fn check_constraints_hold_for_update(
     table_name: &str,
@@ -7911,8 +7912,8 @@ pub(crate) struct UpdateRowChecks {
 }
 
 impl UpdateRowChecks {
-    /// Empty, at the cost of two `is_empty`s, unless the table has checks and
-    /// the statement assigns an expression.
+    /// Empty unless the table has a check this statement's assignments can
+    /// change and [`check_constraints_hold_for_update`] cannot judge alone.
     pub(crate) fn compile(
         schema: &crate::core::row::schema::TableSchema,
         updates: &[crate::core::row::row::ColumnWritePayload],
@@ -7922,7 +7923,7 @@ impl UpdateRowChecks {
             visible: Vec::new(),
             checks: Vec::new(),
         };
-        if schema.checks.is_empty() || expressions.is_empty() {
+        if schema.checks.is_empty() {
             return out;
         }
         out.visible = crate::core::rql::nullable::visible_fields(&schema.fields);
@@ -7945,10 +7946,13 @@ impl UpdateRowChecks {
             collect_condition_columns(&condition, &mut columns);
             let assigned = |wo: u64| updates.iter().any(|u| u.write_order as u64 == wo);
             let computed = |wo: u64| expressions.iter().any(|(e, _)| *e as u64 == wo);
-            if columns.is_empty()
-                || !columns.iter().all(|f| assigned(f.write_order))
-                || !columns.iter().any(|f| computed(f.write_order))
-            {
+            // A check reading no assigned column held before and still does.
+            // One whose every column is assigned a constant was judged before
+            // the scan. Every other one needs the stored row: a column it
+            // reads is left alone, or assigned an expression of the row.
+            let judged_up_front = columns.iter().all(|f| assigned(f.write_order))
+                && !columns.iter().any(|f| computed(f.write_order));
+            if columns.is_empty() || !columns.iter().any(|f| assigned(f.write_order)) || judged_up_front {
                 continue;
             }
             let upper = constraint.expression.to_ascii_uppercase();

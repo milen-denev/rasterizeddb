@@ -4692,6 +4692,14 @@ impl<S: StorageIO> Table<S> {
         let mut txn = d.io_pointers.begin_txn();
 
         let mut updated_count: u64 = 0;
+        // Set by the first row overwritten in place, and from then on the
+        // statement takes no batch break. A batch's commit is past any abort,
+        // and an overwrite keeps no previous version: a row overwritten in a
+        // committed batch stayed changed when a later row failed. A new
+        // version written in one is undone by the abort, so breaks before the
+        // first overwrite are harmless. The cost is a log that cannot be cut
+        // while one huge in-place UPDATE runs.
+        let mut overwrote_in_place = false;
         let mut row = Row::default();
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
@@ -4983,14 +4991,9 @@ impl<S: StorageIO> Table<S> {
                     ));
                 }
                 updated_count = updated_count.saturating_add(1);
+                overwrote_in_place = true;
                 if let Some(collect) = collect.as_deref_mut() {
                     collect.push(row.clone());
-                }
-
-                if crate::core::wal::should_break_transaction(&*d.io_pointers) {
-                    d.io_pointers.commit_durable(txn).await?;
-                    d.apply_pending_filters(&mut pending_filters);
-                    txn = d.io_pointers.begin_txn();
                 }
                 continue;
             }
@@ -5053,10 +5056,11 @@ impl<S: StorageIO> Table<S> {
 
             // An open transaction blocks checkpointing, so a statement running
             // over millions of rows would grow the log without bound. Break it
-            // into batches once the log is due for a checkpoint: the statement
-            // is then atomic per batch rather than as a whole, which is the
-            // price of a reclaimable log.
-            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+            // into batches once the log is due for a checkpoint. The statement
+            // stays atomic, since every row written so far is a new version its
+            // abort makes invisible, but not after an overwrite in place (see
+            // `overwrote_in_place`).
+            if !overwrote_in_place && crate::core::wal::should_break_transaction(&*d.io_pointers) {
                 d.io_pointers.commit_durable(txn).await?;
                 d.apply_pending_filters(&mut pending_filters);
                 txn = d.io_pointers.begin_txn();

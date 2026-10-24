@@ -224,15 +224,15 @@ async fn an_update_that_violates_a_single_column_check_is_refused() {
     assert_eq!(status, 7, "the refused update must not have landed");
 }
 
-/// A check reading a column the statement does not assign is **not** enforced
-/// on update.
+/// A check reading a column the statement does not assign is enforced on
+/// update, as PostgreSQL enforces it: judged per row against the row as it
+/// will be stored, the other half read from the row itself.
 ///
-/// Judging it would need the row's current value for the other half, which the
-/// update plan has not read. Pinned as a test rather than left undiscovered:
-/// the alternative — evaluating against a value it does not have — would reject
-/// rows that are perfectly valid.
+/// This test used to pin the opposite, a gap: `UPDATE m SET lo = 50` under
+/// `CHECK (lo < hi)` with `hi` 10 landed, because the check was judged only
+/// from the SET list and so not at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_multi_column_check_is_not_enforced_on_a_partial_update() {
+async fn a_multi_column_check_is_enforced_on_a_partial_update() {
     let (_s, pool) = server().await;
     run(
         &pool,
@@ -242,14 +242,20 @@ async fn a_multi_column_check_is_not_enforced_on_a_partial_update() {
     .expect("create");
     run(&pool, "INSERT INTO m (id, lo, hi) VALUES (1, 1, 10)").await.expect("insert");
 
-    // PostgreSQL would refuse this. Here it lands, because `hi` is not in the
-    // SET list and the check cannot be judged from the assignments alone.
-    run(&pool, "UPDATE m SET lo = 50 WHERE id = 1").await.expect("the gap this pins");
-
-    // Assigning both halves *is* judged.
+    run(&pool, "UPDATE m SET lo = 50 WHERE id = 1")
+        .await
+        .expect_err("hi is 10, so lo = 50 violates the check");
     run(&pool, "UPDATE m SET lo = 50, hi = 20 WHERE id = 1")
         .await
         .expect_err("both columns assigned, so the check applies");
+    // What the check allows lands, from either half.
+    run(&pool, "UPDATE m SET lo = 5 WHERE id = 1").await.expect("5 < 10");
+    run(&pool, "UPDATE m SET hi = 6 WHERE id = 1").await.expect("5 < 6");
+    let (lo, hi): (i32, i32) = sqlx::query_as("SELECT lo, hi FROM m WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .expect("select");
+    assert_eq!((lo, hi), (5, 6));
 }
 
 /// A check on a column assigned an expression of the row, `SET q = q + 1`.
