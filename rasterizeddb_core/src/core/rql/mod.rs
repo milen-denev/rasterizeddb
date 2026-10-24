@@ -55,6 +55,7 @@ pub mod row_lock;
 /// partitions under one snapshot.
 pub(crate) mod row_source;
 pub mod sequence;
+pub(crate) mod shadow_lock;
 /// Combining the branches of a `UNION`.
 pub mod set_ops;
 pub mod statement_snapshot;

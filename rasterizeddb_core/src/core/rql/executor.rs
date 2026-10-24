@@ -2789,6 +2789,8 @@ type DbTypeRef = crate::core::db_type::DbType;
 /// was stored as, or `None` when the statement has no JSON column to map.
 async fn rewrite_json_values(
     database: &Arc<Database>,
+    // The table whose JSON columns these are (the shadows' parent).
+    parent: &str,
     sql: &str,
     assignments: &[(String, String)],
     json_columns: &[crate::core::rql::json_map::JsonColumn],
@@ -2799,8 +2801,9 @@ async fn rewrite_json_values(
     if json_columns.is_empty() {
         return Ok(None);
     }
-
-    let mut replacements: Vec<(String, String)> = Vec::new();
+    // The documents first, parsed; then every shadow change all of them need
+    // (keys first: no shadow row is written yet); then the rows.
+    let mut documents: Vec<(String, &str, serde_json::Value)> = Vec::new();
     for (column, literal) in assignments {
         let Some(shadow_table) = json_map::shadow_for(column, json_columns) else {
             continue;
@@ -2856,20 +2859,27 @@ async fn rewrite_json_values(
             _ => {}
         }
 
-        let reference = Box::pin(store_json_document(
-            database,
-            shadow_table,
-            &document,
-            0,
-            tx,
-        ))
-        .await?;
-        replacements.push((literal.clone(), reference));
+        documents.push((literal.clone(), shadow_table, document));
     }
-
-    if replacements.is_empty() {
+    if documents.is_empty() {
         return Ok(None);
     }
+    crate::core::rql::shadow_lock::scoped(parent, true, async {
+        for (_, shadow_table, document) in &documents {
+            Box::pin(store_json_document(database, shadow_table, document, 0, tx)).await?;
+        }
+        Ok::<(), String>(())
+    })
+    .await?;
+    let mut replacements: Vec<(String, String)> = Vec::new();
+    crate::core::rql::shadow_lock::scoped(parent, false, async {
+        for (literal, shadow_table, document) in &documents {
+            let reference = Box::pin(store_json_document(database, shadow_table, document, 0, tx)).await?;
+            replacements.push((literal.clone(), reference));
+        }
+        Ok::<(), String>(())
+    })
+    .await?;
 
     let mut rewritten = sql.to_string();
     for (from, to) in replacements {
@@ -2950,15 +2960,21 @@ async fn store_json_document(
     }
 
     if !database.has_table(shadow_table) {
-        run_ddl(
-            database,
-            &format!(
-                "CREATE TABLE {} ({} UUID NOT NULL)",
-                shadow_table, JSON_KEY_COLUMN
-            ),
-            tx,
-        )
-        .await?;
+        // Under the shadow's DDL latch, and asked again there: two writers
+        // carrying the first document of a column both found it missing, and
+        // the second CREATE failed its statement.
+        let _ddl = crate::core::rql::shadow_lock::ddl(database, shadow_table).await?;
+        if !database.has_table(shadow_table) {
+            run_ddl(
+                database,
+                &format!(
+                    "CREATE TABLE {} ({} UUID NOT NULL)",
+                    shadow_table, JSON_KEY_COLUMN
+                ),
+                tx,
+            )
+            .await?;
+        }
     }
 
     let reference = new_json_reference();
@@ -3254,6 +3270,13 @@ async fn write_shadow_row(
         values.push(literal);
     }
 
+    // The keys-first walk writes no row: its columns are in place now.
+    if crate::core::rql::shadow_lock::dry() {
+        return Ok(());
+    }
+    // Shared with other row writers, never beside a rewrite of the shadow,
+    // which would not carry a row appended under it (`shadow_lock`).
+    let _writing = crate::core::rql::shadow_lock::writing(database, shadow_table).await;
     run_ddl(
         database,
         &format!(
@@ -3279,13 +3302,73 @@ async fn ensure_shadow_column(
 ) -> Result<(String, String), String> {
     use crate::core::rql::json_map;
 
-    // The column is matched by exact name. A match that differs only in case
-    // is a different key — JSON keys are case-sensitive — that the engine's
-    // case-insensitive column names cannot hold under its own spelling, so
-    // that key takes the hashed form instead. Matching loosely here was how
-    // `Date` found `date`, skipped the `ADD COLUMN`, and then failed the
-    // `INSERT` on a column the parser could not find.
-    let (column, existing) = {
+    let (resolved, existing) = resolve_shadow_column(database, shadow_table, column).await?;
+    if let Some(existing) = &existing {
+        if json_map::widen(existing, &db_type).is_none() {
+            // The column already holds this.
+            return Ok((resolved, json_map::reliteral(&literal, existing)));
+        }
+    }
+
+    // A change: under the shadow's DDL latch (`shadow_lock`), and resolved
+    // again there, since another writer may have made it meanwhile.
+    let _ddl = crate::core::rql::shadow_lock::ddl(database, shadow_table).await?;
+    let (column, existing) = resolve_shadow_column(database, shadow_table, column).await?;
+    let column = column.as_str();
+
+    let Some(existing) = existing else {
+        // A key with no column yet gets one, which is what makes a document
+        // with new fields extend the table rather than be rejected.
+        run_ddl(
+            database,
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                shadow_table,
+                column,
+                json_map::sql_type_name(&db_type)
+            ),
+            tx,
+        )
+        .await?;
+        return Ok((column.to_string(), literal));
+    };
+
+    match json_map::widen(&existing, &db_type) {
+        // Another writer widened it first.
+        None => Ok((column.to_string(), json_map::reliteral(&literal, &existing))),
+        Some(widened) => {
+            // Refusing here would make the column's type depend on whichever
+            // document happened to arrive first. Dropping and re-adding would
+            // widen the type but discard every value already stored, so the
+            // column is retyped and its values converted.
+            log::info!(
+                "widening {}.{} from {} to {} for an incoming JSON value",
+                shadow_table,
+                column,
+                existing,
+                widened
+            );
+            Box::pin(retype_column(database, shadow_table, column, &widened, tx)).await?;
+            Ok((column.to_string(), json_map::reliteral(&literal, &widened)))
+        }
+    }
+}
+
+/// The shadow column a key's value goes in, and its type if it exists.
+///
+/// The column is matched by exact name. A match that differs only in case is
+/// a different key — JSON keys are case-sensitive — that the engine's
+/// case-insensitive column names cannot hold under its own spelling, so that
+/// key takes the hashed form instead. Matching loosely here was how `Date`
+/// found `date`, skipped the `ADD COLUMN`, and then failed the `INSERT` on a
+/// column the parser could not find.
+async fn resolve_shadow_column(
+    database: &Arc<Database>,
+    shadow_table: &str,
+    column: &str,
+) -> Result<(String, Option<crate::core::db_type::DbType>), String> {
+    use crate::core::rql::json_map;
+    Ok({
         let entry = database.table_for(shadow_table, owner(), TableMode::AccessExclusive).await?;
         let fields: Vec<crate::core::row::schema::SchemaField> = entry
             .as_ref()
@@ -3313,45 +3396,7 @@ async fn ensure_shadow_column(
             }
             None => (column.to_string(), None),
         }
-    };
-    let column = column.as_str();
-
-    let Some(existing) = existing else {
-        // A key with no column yet gets one, which is what makes a document
-        // with new fields extend the table rather than be rejected.
-        run_ddl(
-            database,
-            &format!(
-                "ALTER TABLE {} ADD COLUMN {} {}",
-                shadow_table,
-                column,
-                json_map::sql_type_name(&db_type)
-            ),
-            tx,
-        )
-        .await?;
-        return Ok((column.to_string(), literal));
-    };
-
-    match json_map::widen(&existing, &db_type) {
-        // The column already holds this.
-        None => Ok((column.to_string(), json_map::reliteral(&literal, &existing))),
-        Some(widened) => {
-            // Refusing here would make the column's type depend on whichever
-            // document happened to arrive first. Dropping and re-adding would
-            // widen the type but discard every value already stored, so the
-            // column is retyped and its values converted.
-            log::info!(
-                "widening {}.{} from {} to {} for an incoming JSON value",
-                shadow_table,
-                column,
-                existing,
-                widened
-            );
-            Box::pin(retype_column(database, shadow_table, column, &widened, tx)).await?;
-            Ok((column.to_string(), json_map::reliteral(&literal, &widened)))
-        }
-    }
+    })
 }
 
 /// Changes a column's type, converting every stored value.
@@ -7033,7 +7078,15 @@ async fn json_default_reference(
         return Ok(Some(expression));
     }
     let shadow = crate::core::rql::json_map::shadow_table_name(table, column);
-    let reference = store_json_document(database, &shadow, &document, 0, tx).await?;
+    // Keys first, then the rows (`shadow_lock`).
+    crate::core::rql::shadow_lock::scoped(table, true, Box::pin(store_json_document(database, &shadow, &document, 0, tx)))
+        .await?;
+    let reference = crate::core::rql::shadow_lock::scoped(
+        table,
+        false,
+        Box::pin(store_json_document(database, &shadow, &document, 0, tx)),
+    )
+    .await?;
     Ok(Some(reference))
 }
 
@@ -12799,6 +12852,7 @@ pub(crate) async fn execute_with_need(
             }
             let statement = match rewrite_json_values(
                 &database,
+                &row_data.table_name,
                 &row_data.query,
                 &insert_assignments,
                 &schema.json_columns,
@@ -13181,6 +13235,7 @@ pub(crate) async fn execute_with_need(
                     crate::core::rql::lexer_ur::assignments_of_update(&sql).unwrap_or_default();
                 match rewrite_json_values(
                     &database,
+                    &table.schema.name,
                     &sql,
                     &assignments,
                     &table.schema.json_columns,
@@ -15468,3 +15523,7 @@ mod future_size_tests {
         execute(recognize_query_purpose(sql).expect("parse"), database.clone()).await
     }
 }
+
+#[cfg(test)]
+#[path = "shadow_latch_tests.rs"]
+mod shadow_latch_tests;

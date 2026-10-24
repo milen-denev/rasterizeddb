@@ -86,7 +86,9 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "check_foreign_keys", "table_for"),
     (EXEC, "default_literal_for", "schema_view"),
     (EXEC, "delete_using_join", "table_for"),
-    (EXEC, "ensure_shadow_column", "table_for"),
+    // B5: the lookup moved to its own fn, called twice (before and under
+    // the shadow's DDL latch).
+    (EXEC, "resolve_shadow_column", "table_for"),
     (EXEC, "execute_alter_table_action", "table_for"),
     (EXEC, "execute_create_index", "table_for"),
     (EXEC, "execute_create_path_index", "table_for"),
