@@ -70,6 +70,8 @@ enum Kind {
     UpdateKeySameValue,
     UpdateKeyChange,
     UpdateReturning,
+    // RETURNING expressions and aliases over a fan-out (S17).
+    UpdateReturningExpr,
     UpdateFrom,
     DeleteByKey,
     DeleteByPrefix,
@@ -77,6 +79,8 @@ enum Kind {
     DeleteByFunction,
     DeleteIn,
     DeleteReturning,
+    // An unrouted DELETE … RETURNING * inside a block, rolled back (S17).
+    DeleteReturningFanOut,
     DeleteUsing,
     // Writes elsewhere that read the partitioned table.
     InsertIntoSinkFromT,
@@ -141,6 +145,9 @@ enum Kind {
     PreparedInsert,
     PreparedUpdate,
     PreparedDelete,
+    // A prepared UPDATE … RETURNING with an alias and an expression (S17):
+    // the Describe and every execution compared.
+    PreparedUpdateReturning,
     // Catalogs and introspection.
     CatalogColumns,
     CatalogTables,
@@ -161,9 +168,9 @@ use Kind::*;
 const ALL_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertNulls, InsertQuotedKey, InsertSelect, InsertOnConflictNothing,
     InsertOnConflictUpdate, InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
-    UpdateByFunction, UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateFrom,
-    DeleteByKey, DeleteByPrefix, DeleteByNonKey, DeleteByFunction, DeleteIn, DeleteReturning, DeleteUsing,
-    InsertIntoSinkFromT,
+    UpdateByFunction, UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateReturningExpr,
+    UpdateFrom, DeleteByKey, DeleteByPrefix, DeleteByNonKey, DeleteByFunction, DeleteIn, DeleteReturning,
+    DeleteReturningFanOut, DeleteUsing, InsertIntoSinkFromT,
     UpdateDimViaSubquery, Vacuum, VacuumFull, Analyze, SelectAll, SelectByKey, SelectByPartitionKey,
     SelectByPrefix, SelectIn, SelectInComposite, SelectOr, SelectOrUnconstrained, SelectRange,
     SelectNonKeyRange, SelectRowValue, SelectSpellings, SelectNonKey, SelectFunctionWhere, SelectLimitZero,
@@ -172,7 +179,7 @@ const ALL_KINDS: &[Kind] = &[
     SelfJoin, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedDescribeAlias, PreparedSelectAcrossDdl,
-    PreparedInsert, PreparedUpdate, PreparedDelete, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
+    PreparedInsert, PreparedUpdate, PreparedDelete, PreparedUpdateReturning, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
     TxCommit, TxRollback, Restart,
 ];
 
@@ -198,14 +205,14 @@ const REFUSED: &[Refusal] = &[
     // S9 (routed INSERT) is built: InsertOne, InsertMulti, InsertNulls,
     // InsertQuotedKey, InsertSelect and PreparedInsert are compared with the
     // twin, and so is what they store (`Twin::compare_storage`).
-    // 2b: ON CONFLICT and RETURNING on partitioned tables (§15).
+    // S17 (RETURNING on INSERT, UPDATE and DELETE) is built: InsertReturning,
+    // UpdateReturning, UpdateReturningExpr, DeleteReturning,
+    // DeleteReturningFanOut, PreparedUpdateReturning and the empty-route
+    // UPDATE and DELETE … RETURNING are compared with the twin, rows as
+    // multisets, names and type OIDs included, inside blocks too.
+    // 2b: ON CONFLICT on partitioned tables (§15), RETURNING or not: S18.
     refused(InsertOnConflictNothing, "phase 2b"),
     refused(InsertOnConflictUpdate, "phase 2b"),
-    refused(InsertReturning, "phase 2b"),
-    refused(UpdateReturning, "phase 2b"),
-    refused(DeleteReturning, "phase 2b"),
-    refused(EmptyRouteUpdateReturning, "phase 2b"),
-    refused(EmptyRouteDeleteReturning, "phase 2b"),
     // S11 (routed UPDATE and DELETE, VACUUM fan-out) is built: UpdateByKey,
     // UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey, UpdateRelocating,
     // UpdateKeySameValue (a key assigned the value its WHERE pins), DeleteByKey,
@@ -480,8 +487,30 @@ impl Gen {
                 )
             }
             InsertReturning => {
-                let r = self.row();
-                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} RETURNING tenant_id, grp, id, n, s"))
+                // One row, several (each placed in its own partition), and
+                // INSERT … SELECT; a column list, `*`, or columns out of order.
+                let list = match self.rng.u8(..3) {
+                    0 => "tenant_id, grp, id, n, s",
+                    1 => "*",
+                    _ => "s, id, f, tenant_id",
+                };
+                let sql = match self.rng.u8(..3) {
+                    0 => format!("INSERT INTO {{t}} {cols} VALUES {} RETURNING {list}", self.row()),
+                    1 => {
+                        let k = self.rng.usize(2..=4);
+                        let rows: Vec<String> = (0..k).map(|_| self.row()).collect();
+                        format!("INSERT INTO {{t}} {cols} VALUES {} RETURNING {list}", rows.join(", "))
+                    }
+                    _ => {
+                        let (t, g) = (self.tenant(), self.grp());
+                        let m = self.rng.i64(0..IDS);
+                        format!(
+                            "INSERT INTO {{t}} {cols} SELECT tenant_id, grp, id, n, s, f FROM stage \
+                             WHERE tenant_id = {t} AND grp = {g} AND id > {m} RETURNING {list}"
+                        )
+                    }
+                };
+                self.simple(kind, sql)
             }
             UpdateByKey => {
                 let w = self.pk_eq();
@@ -535,6 +564,17 @@ impl Gen {
                     format!("UPDATE {{t}} SET n = n * 2 WHERE tenant_id = {t} RETURNING tenant_id, grp, id, n"),
                 )
             }
+            UpdateReturningExpr => {
+                // A fan-out: no key column in the WHERE.
+                let v = self.rng.i32(-50..100);
+                self.simple(
+                    kind,
+                    format!(
+                        "UPDATE {{t}} SET n = n + 1 WHERE n > {v} \
+                         RETURNING tenant_id, grp, id, n * 2 + 1, COALESCE(s, 'x') AS s2, f AS ff"
+                    ),
+                )
+            }
             UpdateFrom => {
                 let t = self.tenant();
                 self.simple(
@@ -578,6 +618,15 @@ impl Gen {
                     kind,
                     format!("DELETE FROM {{t}} WHERE tenant_id = {t} AND grp = {g} RETURNING tenant_id, grp, id, n"),
                 )
+            }
+            DeleteReturningFanOut => {
+                let v = self.rng.i32(-50..60);
+                let inner = Op {
+                    kind,
+                    step: Step::Simple(format!("DELETE FROM {{t}} WHERE n < {v} OR s IS NULL RETURNING *")),
+                    ordered: false,
+                };
+                Op { kind, step: Step::Block { inner: vec![inner], commit: false }, ordered: false }
             }
             DeleteUsing => {
                 let t = self.tenant();
@@ -873,6 +922,18 @@ impl Gen {
                 let runs = self.prepared_runs(|g| vec![Some(g.tenant().to_string()), Some(g.id().to_string())]);
                 self.prepared(kind, "DELETE FROM {t} WHERE tenant_id = $1 AND id = $2", runs)
             }
+            PreparedUpdateReturning => {
+                let runs = self.prepared_runs(|g| vec![Some(g.rng.i32(-3..4).to_string()), Some(g.tenant().to_string())]);
+                let mut op = self.prepared(
+                    kind,
+                    "UPDATE {t} SET n = n + $1 WHERE tenant_id = $2 RETURNING grp, id AS v, n * 2, s",
+                    runs,
+                );
+                if let Step::Prepared { columns, .. } = &mut op.step {
+                    *columns = Some(&["grp", "v", "?column?", "s"]);
+                }
+                op
+            }
             CatalogColumns => self.ordered(
                 kind,
                 "SELECT column_name, data_type, is_nullable, ordinal_position FROM information_schema.columns \
@@ -923,8 +984,9 @@ impl Gen {
 /// Kinds a transaction block draws from: no VACUUM (not in a block), no
 /// nested block, no restart.
 const BLOCK_KINDS: &[Kind] = &[
-    InsertOne, InsertMulti, InsertSelect, InsertOnConflictUpdate, UpdateByKey, UpdateByPrefix, UpdateRelocating,
-    UpdateByNonKey, UpdateByFunction, UpdateKeySameValue, DeleteByKey, DeleteByNonKey, DeleteIn, SelectByPrefix,
+    InsertOne, InsertMulti, InsertSelect, InsertOnConflictUpdate, InsertReturning, UpdateByKey, UpdateByPrefix,
+    UpdateRelocating, UpdateByNonKey, UpdateByFunction, UpdateKeySameValue, UpdateReturning, UpdateReturningExpr,
+    DeleteByKey, DeleteByNonKey, DeleteIn, DeleteReturning, PreparedUpdateReturning, SelectByPrefix,
     SelectFunctionWhere, CountAll,
     Aggregates, ForUpdate, SkipLocked, PreparedInsert, PreparedSelect, PreparedUpdate, InsertIntoSinkFromT,
     ReadSinkAndDim,
@@ -993,6 +1055,7 @@ fn writes_t(kind: Kind) -> bool {
             | UpdateKeySameValue
             | UpdateKeyChange
             | UpdateReturning
+            | UpdateReturningExpr
             | UpdateFrom
             | DeleteByKey
             | DeleteByPrefix
@@ -1000,12 +1063,14 @@ fn writes_t(kind: Kind) -> bool {
             | DeleteByFunction
             | DeleteIn
             | DeleteReturning
+            | DeleteReturningFanOut
             | DeleteUsing
             | EmptyRouteUpdateReturning
             | EmptyRouteDeleteReturning
             | PreparedInsert
             | PreparedUpdate
             | PreparedDelete
+            | PreparedUpdateReturning
             | Vacuum
             | VacuumFull
             | TxCommit

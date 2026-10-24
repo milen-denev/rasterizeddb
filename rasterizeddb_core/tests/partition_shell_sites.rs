@@ -427,8 +427,38 @@ const SITES: &[Site] = &[
     ),
     site("UPDATE site_p SET tenant_id = 5 WHERE tenant_id = 1", Expect::Refused, "a key change: phase 6"),
     site("UPDATE site_p SET asset_group_id = asset_group_id + 1", Expect::Refused, "a key change: phase 6"),
-    site("UPDATE site_p SET n = 2 WHERE tenant_id = 1 RETURNING n", Expect::Refused, "RETURNING: phase 2b"),
-    site("DELETE FROM site_p WHERE tenant_id = 7 RETURNING n", Expect::Refused, "RETURNING: phase 2b"),
+    site(
+        "UPDATE site_p SET n = 2 WHERE tenant_id = 1 RETURNING n",
+        Expect::LikeTwinAnswered,
+        "S17: RETURNING over a fan-out of tenant 1's groups",
+    ),
+    in_block(
+        "UPDATE site_p SET n = n + 1 WHERE tenant_id = 1 AND asset_group_id = 2 RETURNING asset_id AS v, n * 2, label",
+        Expect::LikeTwinAnswered,
+        "S17: routed, an alias and an expression, rolled back by the block",
+    ),
+    site("DELETE FROM site_p WHERE tenant_id = 7 RETURNING n", Expect::LikeTwinAnswered, "S17: routed"),
+    in_block(
+        "DELETE FROM site_p WHERE n IS NOT NULL RETURNING *",
+        Expect::LikeTwinAnswered,
+        "S17: a fan-out, rolled back by the block",
+    ),
+    in_block(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n, label) VALUES (3, 1, 5, 50, 'e') RETURNING *",
+        Expect::LikeTwinAnswered,
+        "S17: rolled back by the block",
+    ),
+    in_block(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (3, 1, 6, 1), (4, 2, 7, NULL) \
+         RETURNING asset_id, n, label",
+        Expect::LikeTwinAnswered,
+        "S17: a multi-row insert over two partitions, rolled back by the block",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (5, 1, 8) ON CONFLICT DO NOTHING RETURNING asset_id",
+        Expect::Refused,
+        "ON CONFLICT, RETURNING or not: S18",
+    ),
     site(
         "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id",
         Expect::Refused,
