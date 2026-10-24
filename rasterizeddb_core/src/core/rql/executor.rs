@@ -3440,6 +3440,10 @@ async fn constant_select_insert(
     // row to evaluate against.
     if let Some(condition) = condition {
         if !constant_condition_holds(condition)? {
+            // No row, but RETURNING still owes the client its description.
+            if returning_tail.is_some() {
+                return Ok(vec![2u8]);
+            }
             let mut result = vec![0u8];
             result.extend_from_slice(&0u64.to_le_bytes());
             return Ok(result);
@@ -5778,8 +5782,13 @@ async fn insert_from_select(
     };
 
     // An empty result is the statement succeeding with nothing to do, which is
-    // what PostgreSQL reports.
+    // what PostgreSQL reports. With RETURNING it is an empty row set, not a
+    // count: the client is owed a RowDescription for the rows it asked for,
+    // even when there are none, and a bare count sent only the command tag.
     if rows.is_empty() {
+        if returning_tail.is_some() {
+            return Some(vec![2u8]);
+        }
         let mut result = vec![0u8];
         result.extend_from_slice(&0u64.to_le_bytes());
         return Some(result);
