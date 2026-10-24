@@ -142,6 +142,10 @@ impl Database {
         if lock_exempt(name) {
             return Ok(());
         }
+        #[cfg(any(test, feature = "test_tokens"))]
+        if test_hooks::parks(name, mode) {
+            Box::pin(test_hooks::park(name, mode)).await;
+        }
         let key = self.lock_key(name);
         let role = role_for(owner, mode);
         match self.row_locks.table_locks().request(owner.owner, &key, mode, role) {
@@ -384,5 +388,64 @@ pub mod test_hooks {
     /// Every queued table-lock request since the last call, in order.
     pub fn take_waits() -> Vec<(String, TableMode)> {
         std::mem::take(&mut *WAITS.lock())
+    }
+
+    /// One parked request: the next table-lock request on its table in a
+    /// mode other than ACCESS EXCLUSIVE stops before it is made, says so,
+    /// and goes on when released (B7: a statement parked between what it
+    /// read before its lock and the lock itself, while a DDL swaps the
+    /// table; finding L7).
+    pub struct Park {
+        table: String,
+        arrived: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    static PARKS: parking_lot::Mutex<Vec<(String, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>)>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Parks the next non-exclusive table-lock request on `table`, once.
+    pub fn park_next(table: &str) -> Park {
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        PARKS.lock().push((table.to_string(), arrived.clone(), release.clone()));
+        Park { table: table.to_string(), arrived, release }
+    }
+
+    impl Park {
+        /// Waits until the parked request has stopped.
+        pub async fn arrived(&self) {
+            self.arrived.notified().await;
+        }
+
+        /// Lets the parked request go on (to its lock).
+        pub fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            PARKS.lock().retain(|(t, _, _)| *t != self.table);
+            self.release.notify_one();
+        }
+    }
+
+    pub(super) fn parks(table: &str, mode: TableMode) -> bool {
+        mode != TableMode::AccessExclusive && PARKS.lock().iter().any(|(t, _, _)| t == table)
+    }
+
+    pub(super) async fn park(table: &str, mode: TableMode) {
+        if mode == TableMode::AccessExclusive {
+            return;
+        }
+        let taken = {
+            let mut parks = PARKS.lock();
+            parks.iter().position(|(t, _, _)| t == table).map(|i| parks.remove(i))
+        };
+        if let Some((_, arrived, release)) = taken {
+            arrived.notify_one();
+            release.notified().await;
+        }
     }
 }

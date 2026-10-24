@@ -12416,6 +12416,15 @@ async fn execute_prepared_rows(
         Ok(relation) => relation,
         Err(e) => return ddl_error(&e),
     };
+    // Re-checked now that the lock is held (`docs/persistent-indexes.md` §7
+    // `shape_epoch`, Q7; finding L7): pgwire chose this parse before the
+    // statement waited for its lock, and a DDL that swapped the table while
+    // it waited (a reshape, or a DROP and CREATE under the name) leaves a
+    // parse, a description and scales from another instance. Nothing is
+    // read; pgwire runs the statement's text instead.
+    if relation.is_some() && database.slot_shape_epoch(&prepared.table_name) != Some(prepared.shape_epoch) {
+        return ddl_error(crate::core::rql::prepared::STALE_PLAN);
+    }
     if let Some(crate::core::database::Relation::Partitioned(pt)) = relation.clone() {
         let mut query_row = prepared.query_row;
         apply_subquery_need(&mut query_row, need);
@@ -13980,7 +13989,11 @@ pub(crate) async fn execute_with_need(
                 }
             };
 
-            crate::core::rql::prepared::note_plain(table_name, &query_row);
+            crate::core::rql::prepared::note_plain(
+                table_name,
+                &query_row,
+                database.slot_shape_epoch(table_name).unwrap_or(0),
+            );
             let source = crate::core::rql::row_source::RowSource::Single(table.clone());
             Box::pin(execute_query_rows(query_row, source, &database, tx)).await
         }
@@ -14024,7 +14037,7 @@ async fn execute_partitioned_select(
     if let Some(refusal) = refuse_partitioned_row_lock(&query_row, &name) {
         return refusal;
     }
-    crate::core::rql::prepared::note_plain(&name, &query_row);
+    crate::core::rql::prepared::note_plain(&name, &query_row, database.slot_shape_epoch(&name).unwrap_or(0));
     match partitioned_source(&query_row, pt, None, tx) {
         Ok(source) => execute_query_rows(query_row, source, database, tx).await,
         Err(refusal) => refusal,

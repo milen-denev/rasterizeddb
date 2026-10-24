@@ -53,6 +53,8 @@ mod ddl_rewrite_tests;
 mod temp_relation_tests;
 #[cfg(test)]
 mod block_error_tests;
+#[cfg(test)]
+mod shape_repair_tests;
 mod fixed_rows;
 mod wire_out;
 
@@ -1371,7 +1373,11 @@ where
     // The session is established; from here a quiet client is an idle
     // session, bounded (if at all) by the idle timeouts instead.
     context.handshake_finished.store(true, Ordering::Release);
-    let startup_timeout = (startup_statement_timeout(parameters), startup_lock_timeout(parameters));
+    let startup_timeout = (
+        startup_statement_timeout(parameters),
+        startup_lock_timeout(parameters),
+        startup_shape_change(parameters),
+    );
     SESSION_CANCEL
         .scope(
             registration.session.clone(),
@@ -1441,9 +1447,26 @@ fn startup_lock_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
 /// A time setting (`name`, milliseconds) from the StartupMessage: the
 /// parameter on its own, or `-c name=value` inside `options`.
 fn startup_time_setting(parameters: &HashMap<String, String>, setting_name: &str) -> Option<u64> {
+    startup_setting(parameters, setting_name, parse_statement_timeout)
+}
+
+/// `rdb.shape_change` as the StartupMessage asked for it (Q2):
+/// `options=-c rdb.shape_change=error`, or the parameter on its own.
+fn startup_shape_change(parameters: &HashMap<String, String>) -> Option<ShapeChangeMode> {
+    startup_setting(parameters, ShapeChangeMode::SETTING, ShapeChangeMode::parse)
+}
+
+/// A setting from the StartupMessage, read by `parse`: the parameter on its
+/// own, or `-c name=value` inside `options`. The first spelling that parses
+/// wins.
+fn startup_setting<T>(
+    parameters: &HashMap<String, String>,
+    setting_name: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
     if let Some(direct) = parameters.get(setting_name) {
-        if let Some(ms) = parse_statement_timeout(direct) {
-            return Some(ms);
+        if let Some(value) = parse(direct) {
+            return Some(value);
         }
     }
 
@@ -1486,8 +1509,8 @@ fn startup_time_setting(parameters: &HashMap<String, String>, setting_name: &str
         };
         if let Some((name, value)) = setting.and_then(|s| s.split_once('=')) {
             if name.trim().eq_ignore_ascii_case(setting_name) {
-                if let Some(ms) = parse_statement_timeout(value) {
-                    return Some(ms);
+                if let Some(parsed) = parse(value) {
+                    return Some(parsed);
                 }
             }
         }
@@ -1588,7 +1611,8 @@ async fn run_message_loop<S>(
     limits: ConnectionLimits,
     stream: &mut S,
     // `statement_timeout` and `lock_timeout` from the StartupMessage.
-    startup_timeouts: (Option<u64>, Option<u64>),
+    // And `rdb.shape_change` (Q2), when the StartupMessage named one.
+    startup_timeouts: (Option<u64>, Option<u64>, Option<ShapeChangeMode>),
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1599,6 +1623,9 @@ where
     // whenever it happens to issue a `SET`.
     state.statement_timeout_ms = startup_timeouts.0;
     state.lock_timeout_ms = startup_timeouts.1;
+    if let Some(mode) = startup_timeouts.2 {
+        state.shape_change = mode;
+    }
     // A connection that drops mid-transaction must not leave it running: it
     // would hold back reclamation forever and its versions would never resolve.
     // The loop returns from several places, so the cleanup is a guard rather
@@ -1970,6 +1997,59 @@ struct SessionState {
     idle_in_transaction_timeout: Duration,
     /// `idle_session_timeout` for this session. Zero disables it.
     idle_session_timeout: Duration,
+    /// `rdb.shape_change` for this session (`docs/persistent-indexes.md` §7,
+    /// Q2): what an `Execute` whose result no longer has the shape its
+    /// statement was described with answers. See [`ShapeChangeMode`].
+    shape_change: ShapeChangeMode,
+    /// Set by an `Execute` whose learned parse the executor found stale
+    /// after its lock (`prepared::STALE_PLAN`): the statement ran from its
+    /// text instead, and the parse is learned again.
+    stale_plan: bool,
+}
+
+/// `rdb.shape_change`: what an `Execute` sends when the statement's result
+/// is not the shape its `Describe` told the client (`docs/persistent-indexes.md`
+/// §7, Q2; findings L7, L10, L13).
+///
+/// The default stays `rowdescription` until the driver gate (B8, open
+/// question Q1) decides otherwise: sqlx is the one driver shown to need it,
+/// and it never re-prepares on 0A000 (memory `sqlx-ignores-0a000`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ShapeChangeMode {
+    /// A fresh `RowDescription` ahead of the rows, on every `Execute` until
+    /// the client describes again. Never 0A000.
+    #[default]
+    RowDescription,
+    /// PostgreSQL's `0A000 cached plan must not change result type`, which
+    /// pgjdbc, npgsql and psycopg answer by preparing again. Raised before
+    /// the statement runs when the shape moved before it; when the shape
+    /// moves while it waits for its lock (finding L7) a read, or anything in
+    /// a block (whose error aborts it), still gets 0A000, but an autocommit
+    /// write that has already committed gets the `RowDescription` instead:
+    /// an error then would invite the client to apply the write again.
+    Error,
+}
+
+impl ShapeChangeMode {
+    const SETTING: &'static str = "rdb.shape_change";
+
+    fn parse(value: &str) -> Option<Self> {
+        let v = value.trim().trim_matches('\'').trim_matches('"').trim();
+        if v.eq_ignore_ascii_case("rowdescription") || v.eq_ignore_ascii_case("default") {
+            Some(ShapeChangeMode::RowDescription)
+        } else if v.eq_ignore_ascii_case("error") {
+            Some(ShapeChangeMode::Error)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ShapeChangeMode::RowDescription => "rowdescription",
+            ShapeChangeMode::Error => "error",
+        }
+    }
 }
 
 impl Default for IsolationLevel {
@@ -2185,6 +2265,8 @@ impl SessionState {
             statement_failed: false,
             error_in_batch: false,
             statement_error: None,
+            shape_change: ShapeChangeMode::default(),
+            stale_plan: false,
         }
     }
 
@@ -2297,6 +2379,10 @@ struct PreparedLearned {
     /// verifying executions (S16b). Reset with everything else on a schema
     /// change.
     route: Option<crate::core::rql::prepared::RoutePlan>,
+    /// The shape epoch of the instance both verifying executions read
+    /// (§7 `shape_epoch`, Q7). The executor re-checks it after the lock: a
+    /// change while a run waited takes the text path in the same `Execute`.
+    shape_epoch: u64,
 }
 
 /// A cached parse to run instead of the statement text, and the description
@@ -2347,9 +2433,12 @@ struct StatementInfo {
 /// The column list a `Describe` gave the client, and how it was computed.
 #[derive(Clone, Debug)]
 struct ToldShape {
-    /// The schema generation the answer was computed at. While it is still
-    /// current, the answer is too, and `Execute` checks nothing.
-    generation: u64,
+    /// The database-wide shape epoch (`Database::shape_epoch`) read before
+    /// the answer was computed. While it is still the epoch when a result
+    /// has been built (its locks held), the answer is still the shape, and
+    /// `Execute` compares nothing (§7: the skip path, read after the lock;
+    /// finding L7). One number for every table the statement reads (Q7).
+    epoch: u64,
     /// `S` or `P`. `Execute` describes the statement again the same way to
     /// compare: a statement whose shape depends on its values would otherwise
     /// look changed when only the way of asking had.
@@ -2759,6 +2848,10 @@ where
     let generation = database
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
+    // Read before describing for the same reason: a shape change landing
+    // while the describe runs leaves `told` under an epoch that has already
+    // moved, so the next `Execute` compares instead of skipping.
+    let epoch = database.shape_epoch();
     let description = description_now(database, state, &stmt_name, kind, &sql, &bound, generation).await?;
 
     // A *statement* describe answers with ParameterDescription first. A
@@ -2783,7 +2876,7 @@ where
             // Remembered so a later `Execute` can tell whether the shape the
             // client cached is still the shape the table has.
             info.described = Some(ToldShape {
-                generation,
+                epoch,
                 kind,
                 fields: fields.clone(),
             });
@@ -2977,12 +3070,12 @@ where
         info.params.clone(),
     );
 
-    let query: StdArc<str> = state
+    let sql: StdArc<str> = state
         .statements
         .get(&stmt_name)
         .map(|s| s.sql.clone())
         .unwrap_or_else(|| StdArc::from(""));
-    let query: &str = &query;
+    let query: &str = &sql;
 
     if query.trim().is_empty() {
         state.error_in_batch = true;
@@ -2990,60 +3083,55 @@ where
         return Ok(());
     }
 
-    let mut schema_changed = false;
-    // A schema change since this statement was described makes the client's
-    // cached column list wrong, and nothing on the wire would tell it.
-    if let Some(told) = state
-        .statements
-        .get(&stmt_name)
-        .and_then(|info| info.described.clone())
-    {
-        let now = database
-            .schema_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        if now != told.generation {
-            // Described the way the client was told, and remembered, so the
-            // executes after this one find the answer rather than describe.
-            let bound: &[BoundParam] = if told.kind == b'P' { &params } else { &[] };
-            let current = description_now(database, state, &stmt_name, told.kind, query, bound, now)
-                .await?
-                .filter(|(_, is_select)| *is_select)
-                .map(|(fields, _)| fields);
-            if current.as_deref() != Some(&*told.fields) {
-                // The rows go out with a fresh `RowDescription` in front of
-                // them, which `Execute` does not normally send.
-                //
-                // The two alternatives are both worse. Saying nothing leaves
-                // the client decoding against the shape it cached, so a dropped
-                // column keeps appearing and every column after it is read from
-                // the wrong place. Refusing with `0A000 cached plan must not
-                // change result type` — what PostgreSQL raises — assumes the
-                // client will drop the statement and prepare it again, and sqlx
-                // does not: the *next* execute failed the same way, so an
-                // `ALTER TABLE` broke every later use of that statement rather
-                // than one.
-                //
-                // On every execute until the client describes again, not only
-                // the first. sqlx applies a description that comes with the
-                // rows to that execution alone and keeps the cached one, so
-                // the second execute was decoded against the old shape: a
-                // renamed column read under its old name, a dropped one's
-                // neighbour under the dropped one's. `told` is therefore left
-                // as it is. A client that never runs DDL still never sees a
-                // second description, and one whose statement kept its shape
-                // sees none.
-                schema_changed = true;
-            } else if let Some(info) = state.statements.get_mut(&stmt_name) {
-                // What the client was told is still the shape, so it is good
-                // at this generation too, and the executes after this one need
-                // not ask. Only the generation moves: the columns stay exactly
-                // the ones a `Describe` sent.
-                if let Some(t) = info.described.as_mut() {
-                    t.generation = now;
+    // What the client was told this statement returns, by its last
+    // `Describe`. Whether the result still has that shape is decided after
+    // the result is built, where it is sent (`reconcile_shape`; findings L7,
+    // L13): a schema generation read here, before the statement waits for
+    // its locks, would let a DDL that swaps the table while it waits put
+    // rows of the new shape under the old description.
+    let mut told = state.statements.get(&stmt_name).and_then(|info| info.described.clone());
+
+    // `rdb.shape_change = error` refuses as PostgreSQL does, before the
+    // statement runs, when the shape already moved: a write is then never
+    // applied only to be reported as failed. The check after the build
+    // stays, for a change landing while the statement waits for its locks.
+    if state.shape_change == ShapeChangeMode::Error {
+        if let Some(t) = told.as_mut() {
+            let now = database.shape_epoch();
+            if now != t.epoch {
+                let generation = database
+                    .schema_generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let bound: &[BoundParam] = if t.kind == b'P' { &params } else { &[] };
+                let current = description_now(database, state, &stmt_name, t.kind, query, bound, generation)
+                    .await?
+                    .filter(|(_, is_select)| *is_select)
+                    .map(|(fields, _)| fields);
+                if current.as_deref() != Some(&*t.fields) {
+                    return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
+                }
+                // Still the shape the client was told: good at `now` too.
+                t.epoch = now;
+                if let Some(info) = state.statements.get_mut(&stmt_name) {
+                    if let Some(d) = info.described.as_mut() {
+                        d.epoch = now;
+                    }
                 }
             }
         }
     }
+    let check = told.map(|told| {
+        StdArc::new(ShapeCheck {
+            database: database.clone(),
+            stmt_name: stmt_name.clone(),
+            sql: sql.clone(),
+            bound: if told.kind == b'P' { params.clone() } else { StdArc::from(Vec::new()) },
+            mode: state.shape_change,
+            in_block: state.transaction.is_some(),
+            told,
+            still_good_at: std::sync::Mutex::new(None),
+        })
+    });
 
     // The engine only parses whole statements, so the bound values are folded
     // back into the SQL text as properly quoted literals.
@@ -3067,29 +3155,16 @@ where
         // A prepared `SELECT` may run from its cached parse, a fresh
         // description included: a client that never describes again gets one
         // on every execute, and would otherwise never run from it again.
-        if !is_copy {
-            return execute_watched(
-                database,
-                state,
-                stream,
-                &stmt_name,
-                &query,
-                &params,
-                &result_formats,
-                !schema_changed,
-            )
-            .await;
-        }
-        return execute_recorded(
-            database,
-            state,
-            stream,
-            &query,
-            &result_formats,
-            !schema_changed,
-            None,
-        )
-        .await;
+        let run = async {
+            if !is_copy {
+                execute_watched(database, state, stream, &stmt_name, &query, &params, &result_formats, true).await
+            } else {
+                execute_recorded(database, state, stream, &query, &result_formats, true, None).await
+            }
+        };
+        let result = with_shape_check(check.clone(), run).await;
+        finish_shape_check(state, &stmt_name, check.as_deref());
+        return result;
     }
 
     // A row limit: the statement runs exactly as above, into a buffer, and
@@ -3100,16 +3175,13 @@ where
         inner: &mut *stream,
         out: Vec::new(),
     };
-    execute_recorded(
-        database,
-        state,
-        &mut capture,
-        &query,
-        &result_formats,
-        !schema_changed,
-        None,
+    let ran = with_shape_check(
+        check.clone(),
+        execute_recorded(database, state, &mut capture, &query, &result_formats, true, None),
     )
-    .await?;
+    .await;
+    finish_shape_check(state, &stmt_name, check.as_deref());
+    ran?;
     let mut result = SuspendedResult {
         bytes: capture.out,
         at: 0,
@@ -3123,6 +3195,170 @@ where
         info.suspended = Some(Box::new(next));
     }
     Ok(())
+}
+
+/// PostgreSQL's message for a prepared statement whose result changed shape
+/// (sqlstate 0A000), sent in `rdb.shape_change = error` mode.
+const CACHED_PLAN_CHANGED: &str = "cached plan must not change result type";
+
+/// One `Execute`'s reconciliation of the shape its statement was described
+/// with against the result it builds (`docs/persistent-indexes.md` §7, "The
+/// client's shape changes only at Describe"; findings L7, L13; Q2, Q7).
+///
+/// Set for the statement's run by `handle_execute` when the client was told
+/// a shape, and read where the rows are sent ([`reconcile_shape`]), after the
+/// result is built and while the statement still holds its table locks. It
+/// is never consulted for a statement run by the simple protocol, which
+/// always sends its description.
+struct ShapeCheck {
+    database: Arc<Database>,
+    stmt_name: String,
+    /// The statement's text, placeholders and all, and the portal's values
+    /// for a portal describe: how the client was told its shape, so the
+    /// shape it could be told now is computed the same way.
+    sql: StdArc<str>,
+    bound: StdArc<[BoundParam]>,
+    mode: ShapeChangeMode,
+    /// The statement runs in a block, so an error it raises aborts the block
+    /// and undoes what it wrote (R3).
+    in_block: bool,
+    told: ToldShape,
+    /// Set when the result was found still to have the told shape at a later
+    /// epoch: the client's description is good there too, and the executes
+    /// after this one skip the comparison. Only the epoch moves; the columns
+    /// stay exactly what a `Describe` sent.
+    still_good_at: std::sync::Mutex<Option<u64>>,
+}
+
+/// What [`reconcile_shape`] decided for one result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeReply {
+    /// The told shape is the result's: rows alone, as `Execute` sends them.
+    Omit,
+    /// A fresh `RowDescription`, the result's own columns, ahead of the rows.
+    Describe,
+    /// 0A000 `cached plan must not change result type`, no rows.
+    Refuse,
+}
+
+tokio::task_local! {
+    static SHAPE_CHECK: StdArc<ShapeCheck>;
+}
+
+/// Runs `fut` (one `Execute`'s statement) with `check` in scope.
+async fn with_shape_check<F: std::future::Future>(check: Option<StdArc<ShapeCheck>>, fut: F) -> F::Output {
+    match check {
+        Some(check) => SHAPE_CHECK.scope(check, Box::pin(fut)).await,
+        None => Box::pin(fut).await,
+    }
+}
+
+/// After the run: a result found still to have the told shape at a later
+/// epoch moves the told epoch there, so the next `Execute` skips. The told
+/// columns never change here (Execute never updates the client's shape).
+fn finish_shape_check(state: &mut SessionState, stmt_name: &str, check: Option<&ShapeCheck>) {
+    let Some(check) = check else {
+        return;
+    };
+    let Some(epoch) = check.still_good_at.lock().ok().and_then(|g| *g) else {
+        return;
+    };
+    if let Some(told) = state.statements.get_mut(stmt_name).and_then(|i| i.described.as_mut()) {
+        if told.kind == check.told.kind && StdArc::ptr_eq(&told.fields, &check.told.fields) && epoch > told.epoch {
+            told.epoch = epoch;
+        }
+    }
+}
+
+/// Decides, after a result is built and before any of it is sent, whether an
+/// `Execute`'s rows go out alone, behind a fresh `RowDescription`, or not at
+/// all (finding L7: the decision moved here from before the run).
+///
+/// `omit` is the caller's default (an `Execute` sends no description). With
+/// no [`ShapeCheck`] in scope, or none needed, that default stands. Otherwise:
+/// - the database shape epoch is read **now**, after the build, with the
+///   statement's table locks held, so a DDL that swapped a table while the
+///   statement waited for its lock has already moved it (it moves after the
+///   swap, before the DDL's lock is released). Unchanged since the
+///   `Describe` means nothing changed what any table returns: no comparison;
+/// - otherwise the told columns are compared, exactly (names and types),
+///   with `built`, the columns the rows were built and will be encoded under
+///   (the payload's own description: memory `describe-and-payload-share-one-
+///   source`). Equal: rows alone;
+/// - unequal, the shape the statement would be described with now is
+///   computed the way the client was told it (`description_now`, under the
+///   same locks). If that is still the told shape, the table did not change
+///   what the client can see, and the difference is between the describe and
+///   the payload paths themselves, as it was before any DDL: rows alone, as
+///   they would have gone;
+/// - a real change answers by the session's `rdb.shape_change`: the fresh
+///   `RowDescription` (every time, until the client describes again), or
+///   0A000 (see [`ShapeChangeMode::Error`] for the autocommit write).
+async fn reconcile_shape(
+    state: &mut SessionState,
+    omit: bool,
+    built: &[(String, DbType)],
+    purpose_kind: PurposeKind,
+) -> io::Result<ShapeReply> {
+    if !omit {
+        return Ok(ShapeReply::Describe);
+    }
+    let Ok(check) = SHAPE_CHECK.try_with(|c| c.clone()) else {
+        return Ok(ShapeReply::Omit);
+    };
+    reconcile_with(state, &check, built, purpose_kind).await
+}
+
+async fn reconcile_with(
+    state: &mut SessionState,
+    check: &ShapeCheck,
+    built: &[(String, DbType)],
+    purpose_kind: PurposeKind,
+) -> io::Result<ShapeReply> {
+    let now = check.database.shape_epoch();
+    if now == check.told.epoch {
+        return Ok(ShapeReply::Omit);
+    }
+    let same = |fields: &[(String, DbType)]| {
+        fields.len() == check.told.fields.len()
+            && fields.iter().zip(check.told.fields.iter()).all(|((n, t), (tn, tt))| n == tn && t == tt)
+    };
+    let still_good = |check: &ShapeCheck| {
+        if let Ok(mut g) = check.still_good_at.lock() {
+            *g = Some(now);
+        }
+    };
+    if same(built) {
+        still_good(check);
+        return Ok(ShapeReply::Omit);
+    }
+    let generation = check
+        .database
+        .schema_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    let current = description_now(
+        &check.database,
+        state,
+        &check.stmt_name,
+        check.told.kind,
+        &check.sql,
+        &check.bound,
+        generation,
+    )
+    .await?
+    .filter(|(_, is_select)| *is_select)
+    .map(|(fields, _)| fields);
+    if current.as_deref().is_some_and(|c| same(c)) {
+        still_good(check);
+        return Ok(ShapeReply::Omit);
+    }
+    Ok(match check.mode {
+        ShapeChangeMode::RowDescription => ShapeReply::Describe,
+        ShapeChangeMode::Error if check.in_block || matches!(purpose_kind, PurposeKind::QueryRows) => {
+            ShapeReply::Refuse
+        }
+        ShapeChangeMode::Error => ShapeReply::Describe,
+    })
 }
 
 async fn handle_close<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
@@ -4614,6 +4850,7 @@ where
                                 // This execution's own values, through the
                                 // cached derivation (I11).
                                 key: l.route.as_ref().and_then(|plan| plan.bind(lits)),
+                                shape_epoch: l.shape_epoch,
                             }),
                             fields: l.fields.clone(),
                             scales: l.scales.clone(),
@@ -4643,8 +4880,20 @@ where
 
     match step {
         Step::Run(run) => {
-            PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            execute_recorded(database, state, stream, query, result_formats, omit_description, Some(run)).await
+            state.stale_plan = false;
+            let result =
+                execute_recorded(database, state, stream, query, result_formats, omit_description, Some(run)).await;
+            if std::mem::take(&mut state.stale_plan) {
+                // The executor found the table reshaped after this parse was
+                // learned, once it held the lock, and the text path answered
+                // instead (§7 `shape_epoch`): the parse is learned again.
+                if let Some(info) = state.statements.get_mut(stmt_name) {
+                    info.prepared = PreparedSelect::Unknown;
+                }
+            } else {
+                PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result
         }
         Step::Text => execute_recorded(database, state, stream, query, result_formats, omit_description, None).await,
         Step::Watch => {
@@ -4693,7 +4942,14 @@ fn learn_prepared(
     if database.schema_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
         return;
     }
-    let Some((table_name, query_row, fields, scales)) = capture.plain_only() else {
+    let Some(pr::Learned {
+        table: table_name,
+        query_row,
+        fields,
+        scales,
+        shape_epoch,
+    }) = capture.plain_only()
+    else {
         info.prepared = PreparedSelect::Ineligible;
         return;
     };
@@ -4742,6 +4998,7 @@ fn learn_prepared(
                 scales,
                 misses: 0,
                 route: None,
+                shape_epoch,
             })),
             // A value that also occurs elsewhere in the clause; another
             // execution may place it unambiguously.
@@ -4758,6 +5015,7 @@ fn learn_prepared(
                     PreparedSelect::Candidate(l)
                 }
             } else if l.table_name == table_name
+                && l.shape_epoch == shape_epoch
                 && l.shape == shape
                 && l.fields == fields
                 && l.scales == scales
@@ -4916,6 +5174,15 @@ where
                 .await
         }
     };
+    // The table changed shape while this execution waited for its lock
+    // (§7 `shape_epoch`, Q7; finding L7): the learned parse, description and
+    // scales belong to another instance. Nothing was read; the statement's
+    // text runs instead, under the same owner and in the same `Execute`.
+    if resp.first() == Some(&3) && resp[1..] == *crate::core::rql::prepared::STALE_PLAN.as_bytes() {
+        state.stale_plan = true;
+        return Box::pin(execute_single_statement(database, state, stream, stmt, result_formats, omit_description))
+            .await;
+    }
     let result = send_engine_response(
         state,
         stream,
@@ -5588,20 +5855,102 @@ where
         }
     }
 
+    // Read before the description is computed, and again once the result
+    // is built (finding L7): the description below reads the tables with no
+    // lock, before the statement waits for its own, and a DDL that swaps a
+    // table while it waits leaves it describing the old instance while the
+    // rows come from the new one. A moved epoch recomputes it, under the
+    // locks the statement then holds, from the instance the rows came from.
+    let shape_epoch_before = database.shape_epoch();
+    let (select_fields, select_scales) = match result_description(database, &purpose) {
+        Ok(described) => described,
+        Err((code, e)) => {
+            fail_statement(state, stream, code, &e).await?;
+            return Ok(());
+        }
+    };
+
+
+    // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
+    // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
+    //
+    // A statement that does not re-recognise fails on its own rather than
+    // closing the connection: an `Err` here would end the session, and the
+    // client would see only its socket close.
+    let Some(purpose_exec) = recognize_query_purpose(stmt) else {
+        fail_statement(state, stream, "XX000", "internal error: the statement could not be re-read for execution").await?;
+        return Ok(());
+    };
+
+    // Inside a block the statement joins the session's transaction, so it sees
+    // the block's own earlier writes and its effects stay invisible to everyone
+    // else until COMMIT. Outside one, `execute` opens and closes a transaction
+    // of its own.
+    let resp = match state.current_tx() {
+        Some(tx) => {
+            crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx).await
+        }
+        None => {
+            crate::core::rql::executor::execute_with_sync(
+                purpose_exec,
+                database.clone(),
+                state.synchronous_commit(),
+            )
+            .await
+        }
+    };
+    // The result is built and the statement holds its locks: a table that
+    // changed shape since the description was computed is described again,
+    // from the instance the rows came from, so the rows and the description
+    // they go out under (and that the shape check compares) agree.
+    let (select_fields, select_scales) = if database.shape_epoch() != shape_epoch_before {
+        match result_description(database, &purpose) {
+            Ok(described) => described,
+            Err((code, e)) => {
+                fail_statement(state, stream, code, &e).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        (select_fields, select_scales)
+    };
+    crate::core::rql::prepared::note_description(&select_fields, &select_scales);
+    send_engine_response(
+        state,
+        stream,
+        resp,
+        purpose_kind,
+        select_fields,
+        select_scales,
+        result_formats,
+        omit_description,
+    )
+    .await
+}
+
+/// The columns, and their declared scales, a statement's rows go out under:
+/// the payload's description, which also types every cell (memory
+/// `describe-and-payload-share-one-source`). Read from the tables' schemas
+/// with no lock. `Err((sqlstate, message))` when the statement cannot be
+/// described as it would run.
+fn result_description(
+    database: &Arc<Database>,
+    purpose: &QueryPurpose,
+) -> Result<(Option<Vec<(String, DbType)>>, Option<Vec<u32>>), (&'static str, String)> {
     // Precompute SELECT column metadata (needed even if result set is empty).
     // The declared decimal scale of each output column, where the statement
     // selects from a table that recorded one.
-    let select_scales: Option<Vec<u32>> = match &purpose {
+    let select_scales: Option<Vec<u32>> = match purpose {
         // Shared with the subquery boundary (`executor::query_output_scales`),
         // which must read the same bytes at the same scales.
-        QueryPurpose::QueryRows(_) => crate::core::rql::executor::query_output_scales(&purpose, database),
+        QueryPurpose::QueryRows(_) => crate::core::rql::executor::query_output_scales(purpose, database),
         // `RETURNING` sends rows too, and a returned column is read straight
         // from storage at its own scale. Without these arms every `RETURNING v`
         // over a `NUMERIC(p, s)` column was rendered at the engine default.
         other => purpose_returning_scales(database, other),
     };
 
-    let select_fields = match &purpose {
+    let select_fields = match purpose {
         // `SHOW REPLICATION` produces rows without a relation behind them, so
         // its one column is named here rather than derived from a schema.
         QueryPurpose::Replication(sql) => Some(
@@ -5626,10 +5975,7 @@ where
             let schema_of = |name: &str| database.schema_view(name).map(|t| t.schema().fields.clone());
             match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
                 Ok(plan) => Some(join_output_columns(&plan, database)),
-                Err(e) => {
-                    fail_statement(state, stream, "42601", &e).await?;
-                    return Ok(());
-                }
+                Err(e) => return Err(("42601", e)),
             }
         }
         QueryPurpose::QueryRows(qr) => {
@@ -5642,8 +5988,7 @@ where
             // lock, so parked writers do not queue readers behind them.)
             let table = database.schema_view(&qr.table_name);
             let Some(table) = table else {
-                fail_statement(state, stream, "42P01", "relation does not exist").await?;
-                return Ok(());
+                return Err(("42P01", "relation does not exist".to_string()));
             };
             // The type a select item is *advertised* as. Same rule as the
             // describe path: a shredded JSON column is stored as a `UUID` and
@@ -5674,7 +6019,7 @@ where
                 }
                 _ => None,
             };
-            match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(&purpose), &table.schema().fields) {
+            match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(purpose), &table.schema().fields) {
                 Ok(parsed)
                     if parsed.select_items.iter().any(|i| {
                         matches!(
@@ -5722,10 +6067,7 @@ where
                         })
                         .collect::<Vec<_>>(),
                 ),
-                Err(e) => {
-                    fail_statement(state, stream, "42601", &e).await?;
-                    return Ok(());
-                }
+                Err(e) => return Err(("42601", e)),
             }
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
@@ -5754,10 +6096,7 @@ where
                                 .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                                 .collect::<Vec<_>>(),
                         ),
-                        Some(Err(e)) => {
-                            fail_statement(state, stream, "42703", &e).await?;
-                            return Ok(());
-                        }
+                        Some(Err(e)) => return Err(("42703", e)),
                         None => None,
                     }
                 }
@@ -5774,10 +6113,7 @@ where
                             .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                             .collect::<Vec<_>>(),
                     ),
-                    Some(Err(e)) => {
-                        fail_statement(state, stream, "42703", &e).await?;
-                        return Ok(());
-                    }
+                    Some(Err(e)) => return Err(("42703", e)),
                     None => None,
                 }
             }
@@ -5790,7 +6126,7 @@ where
     };
     // A `UNION`'s fields come from its first branch; its integer columns are
     // widened here as `describe_query` widens them, so they match the rows.
-    let select_fields = match &purpose {
+    let select_fields = match purpose {
         QueryPurpose::QueryRows(qr) => {
             select_fields.map(|fields| match crate::core::rql::join::union_branches(&qr.query) {
                 // The statement runs as it is here, its CTEs and derived
@@ -5805,47 +6141,7 @@ where
         _ => select_fields,
     };
 
-    crate::core::rql::prepared::note_description(&select_fields, &select_scales);
-
-    // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
-    // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
-    //
-    // A statement that does not re-recognise fails on its own rather than
-    // closing the connection: an `Err` here would end the session, and the
-    // client would see only its socket close.
-    let Some(purpose_exec) = recognize_query_purpose(stmt) else {
-        fail_statement(state, stream, "XX000", "internal error: the statement could not be re-read for execution").await?;
-        return Ok(());
-    };
-
-    // Inside a block the statement joins the session's transaction, so it sees
-    // the block's own earlier writes and its effects stay invisible to everyone
-    // else until COMMIT. Outside one, `execute` opens and closes a transaction
-    // of its own.
-    let resp = match state.current_tx() {
-        Some(tx) => {
-            crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx).await
-        }
-        None => {
-            crate::core::rql::executor::execute_with_sync(
-                purpose_exec,
-                database.clone(),
-                state.synchronous_commit(),
-            )
-            .await
-        }
-    };
-    send_engine_response(
-        state,
-        stream,
-        resp,
-        purpose_kind,
-        select_fields,
-        select_scales,
-        result_formats,
-        omit_description,
-    )
-    .await
+    Ok((select_fields, select_scales))
 }
 
 /// Turns the engine's answer to a statement into the wire messages that
@@ -5928,14 +6224,32 @@ where
                 PurposeKind::DeleteRow => format!("DELETE {}", row_count),
                 _ => format!("SELECT {}", row_count),
             };
+            // Decided now that the result is built (finding L7): see
+            // `reconcile_shape`. The description it compares, and sends, is
+            // the one the rows are encoded under.
+            let built = match result_columns(select_fields, rows_bytes) {
+                Ok(columns) => columns,
+                Err(e) => {
+                    fail_statement(state, stream, "XX000", &format!("internal error: damaged result ({})", e)).await?;
+                    return Ok(());
+                }
+            };
+            let omit = match reconcile_shape(state, omit_description, &built, purpose_kind).await? {
+                ShapeReply::Omit => true,
+                ShapeReply::Describe => false,
+                ShapeReply::Refuse => {
+                    fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await?;
+                    return Ok(());
+                }
+            };
             send_serialized_query_result(
                 stream,
-                select_fields.as_deref(),
+                Some(&built),
                 select_scales.as_deref(),
                 rows_bytes,
                 result_formats,
                 &tag,
-                omit_description,
+                omit,
             )
             .await?;
         }
@@ -7254,6 +7568,39 @@ where
         return Ok(true);
     }
 
+    // `rdb.shape_change` (Q2): what an `Execute` whose result changed shape
+    // since its `Describe` answers. A real setting, so a value it does not
+    // know is refused rather than acknowledged and dropped. `SET LOCAL` is
+    // taken as a session setting, as `lock_timeout`'s is.
+    if let Some(rest) = strip_setting(&s_lower, ShapeChangeMode::SETTING) {
+        match rest {
+            None => {
+                state.shape_change = ShapeChangeMode::default();
+                send_command_complete(stream, "SET").await?;
+            }
+            Some(value) => match ShapeChangeMode::parse(&value) {
+                Some(mode) => {
+                    state.shape_change = mode;
+                    send_command_complete(stream, "SET").await?;
+                }
+                None => {
+                    fail_statement(
+                        state,
+                        stream,
+                        "22023",
+                        &format!(
+                            "invalid value for parameter \"{}\": \"{}\" (use rowdescription or error)",
+                            ShapeChangeMode::SETTING,
+                            value
+                        ),
+                    )
+                    .await?;
+                }
+            },
+        }
+        return Ok(true);
+    }
+
     // The idle timeouts are enforced, so they are real settings too: a `SET`
     // acknowledged and dropped would let a pool believe its sessions are
     // bounded when nothing bounds them.
@@ -7493,6 +7840,9 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
             format_time_setting(state.idle_in_transaction_timeout)
         }
         "idle_session_timeout" => format_time_setting(state.idle_session_timeout),
+        // Q2: this session's reply to an `Execute` whose result changed
+        // shape since its `Describe`.
+        ShapeChangeMode::SETTING => state.shape_change.name().to_string(),
         "max_connections" => state.limits.max_connections.to_string(),
         "authentication_timeout" => format_time_setting(state.limits.handshake_timeout),
         _ => return None,
@@ -7739,6 +8089,27 @@ fn validate_serialized_rows(rows_bytes: &[u8]) -> io::Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+/// The columns a serialized result goes out under: `fields` when the
+/// statement has them, otherwise one per cell of the first row, named
+/// `columnN` and typed as stored (no rows, no columns). Shared by the sender
+/// and by the shape check, so the description compared is the one sent.
+fn result_columns(fields: Option<Vec<(String, DbType)>>, rows_bytes: &[u8]) -> io::Result<Vec<(String, DbType)>> {
+    if let Some(f) = fields {
+        return Ok(f);
+    }
+    let invalid = |e: io::Error| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
+    let mut meta = Vec::new();
+    if let Some(first) = crate::core::row::row::serialized_rows(rows_bytes).next() {
+        for (i, cell) in crate::core::row::row::serialized_cells(first.map_err(invalid)?)
+            .map_err(invalid)?
+            .enumerate()
+        {
+            meta.push((format!("column{}", i + 1), cell.map_err(invalid)?.column_type));
+        }
+    }
+    Ok(meta)
 }
 
 /// [`send_query_result`] over the engine's serialized rows, encoding each

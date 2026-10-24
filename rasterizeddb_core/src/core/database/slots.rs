@@ -47,7 +47,7 @@
 //! ```
 
 use std::io;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use arc_swap::{ArcSwapAny, RefCnt};
 use rclite::Arc;
@@ -171,14 +171,27 @@ const DROPPED: u8 = 1;
 pub(crate) struct Slot {
     table: ArcSwapAny<TableRef>,
     state: AtomicU8,
+    /// The shape epoch this name's instance was installed or last reshaped
+    /// under, drawn from the database-wide counter (§7 `shape_epoch`, Q7).
+    /// Written only under ACCESS EXCLUSIVE on the name (an install, a swap),
+    /// so a reader holding any lock on the name reads the epoch of the
+    /// instance it loaded; lockless readers use the database counter.
+    shape_epoch: AtomicU64,
 }
 
 impl Slot {
-    pub(super) fn new(table: Arc<DbTable>) -> Self {
+    pub(super) fn new(table: Arc<DbTable>, shape_epoch: u64) -> Self {
         Slot {
             table: ArcSwapAny::new(ArcRef(table)),
             state: AtomicU8::new(LIVE),
+            shape_epoch: AtomicU64::new(shape_epoch),
         }
+    }
+
+    /// The shape epoch of the instance this slot holds (see the field).
+    #[inline]
+    pub(crate) fn shape_epoch(&self) -> u64 {
+        self.shape_epoch.load(Ordering::Acquire)
     }
 
     /// The current instance.
@@ -477,9 +490,21 @@ impl Database {
     /// a MOVE's swap), returning the instance it replaced. The slot stays,
     /// and stays live, so a statement queued on the name's lock finds the
     /// new instance in it. Registers a new slot when the name has none.
+    ///
+    /// An instance with another column shape than the one it replaces draws
+    /// a new shape epoch for the slot and moves the database counter, after
+    /// the store, so a reader that sees the moved counter sees the new
+    /// instance (§7 "Generation order"). Index-only changes keep the epoch.
     pub(crate) fn swap_instance(&self, name: &str, table: Arc<DbTable>) -> Option<Arc<DbTable>> {
         match self.resolve(name, |key| self.table_slots.get(key).map(|slot| slot.value().clone())) {
-            Some(slot) => Some(slot.swap(table)),
+            Some(slot) => {
+                let old = slot.swap(table.clone());
+                if !same_result_shape(&old.schema, &table.schema) && !super::table_for::lock_exempt(name) {
+                    slot.shape_epoch.store(self.draw_shape_epoch(), Ordering::Release);
+                    self.shape_epoch.fetch_add(1, Ordering::AcqRel);
+                }
+                Some(old)
+            }
             None => {
                 self.install_table(name.to_string(), table);
                 None
@@ -488,12 +513,44 @@ impl Database {
     }
 
     /// Registers `table` under `name` in a new slot, replacing (and marking
-    /// dropped) any slot the name had.
+    /// dropped) any slot the name had. The slot draws a fresh shape epoch
+    /// from the database counter, and the counter moves again once the slot
+    /// is in place: whatever the name meant before, a statement told its
+    /// shape then is compared again. An engine-private relation (a
+    /// statement's temporary, a shadow table) is never named by a client and
+    /// moves nothing.
     pub(crate) fn install_table(&self, name: String, table: Arc<DbTable>) {
         let name = Self::canonical_key(name);
-        if let Some(old) = self.table_slots.insert(name, Arc::new(Slot::new(table))) {
+        let private = super::table_for::lock_exempt(&name);
+        let epoch = if private { 0 } else { self.draw_shape_epoch() };
+        if let Some(old) = self.table_slots.insert(name, Arc::new(Slot::new(table, epoch))) {
             old.mark_dropped();
         }
+        if !private {
+            self.shape_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A new value of the database-wide shape counter, never handed out
+    /// before.
+    fn draw_shape_epoch(&self) -> u64 {
+        self.shape_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The database-wide shape epoch now (§7 `shape_epoch`, Q7). Read before
+    /// a Describe computes a shape, and after a statement's result is built
+    /// (its locks then held): unchanged means no table changed what it
+    /// returns in between, so nothing needs comparing.
+    #[inline]
+    pub fn shape_epoch(&self) -> u64 {
+        self.shape_epoch.load(Ordering::Acquire)
+    }
+
+    /// The shape epoch of the instance `name` resolves to now. Exact for a
+    /// caller holding a lock on `name` (only ACCESS EXCLUSIVE moves it); a
+    /// partitioned table's is its shell's slot, under the logical name.
+    pub fn slot_shape_epoch(&self, name: &str) -> Option<u64> {
+        self.slot(name).map(|slot| slot.shape_epoch())
     }
 
     /// Removes `name`'s slot and returns its instance.
@@ -530,4 +587,27 @@ impl Database {
             slot.mark_dropped();
         }
     }
+}
+
+/// Whether two schemas give a statement the same result columns: the same
+/// fields in the same places with the same names, types and declared scales,
+/// and the same JSON and type-modifier declarations (both decide the type a
+/// column is reported as, and its rendering). Constraints, defaults, checks
+/// and indexes do not change a result's shape, so a CREATE INDEX keeps the
+/// epoch and discards nothing a client was told. Anything else unequal is a
+/// new shape: a spurious difference costs one comparison at the next
+/// Execute, a missed one a client decoding against the wrong columns.
+pub(crate) fn same_result_shape(a: &TableSchema, b: &TableSchema) -> bool {
+    a.fields.len() == b.fields.len()
+        && a.fields.iter().zip(b.fields.iter()).all(|(x, y)| {
+            x.name == y.name
+                && x.db_type == y.db_type
+                && x.size == y.size
+                && x.offset == y.offset
+                && x.write_order == y.write_order
+                && x.is_deleted == y.is_deleted
+                && x.scale == y.scale
+        })
+        && format!("{:?}", a.json_columns) == format!("{:?}", b.json_columns)
+        && format!("{:?}", a.type_modifiers) == format!("{:?}", b.type_modifiers)
 }

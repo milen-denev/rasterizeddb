@@ -200,6 +200,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("is_partitioned", "a slot primitive: the partitioned map's lookup"),
     ("has_table", "a slot primitive: what tables.contains_key answered; its callers dispatch"),
     ("swap_instance", "a slot primitive: a reload's or a MOVE's swap; its callers dispatch"),
+    ("slot_shape_epoch", "a slot primitive: the shape epoch of the slot a name resolves to, a partitioned table's shell's included (B7, Q7)"),
     ("put_back_after_failed_drop", "drop_table_to_depth's failure path, after its dispatch"),
     ("reload_table", "delegates to reload_with, which dispatches"),
     ("reload_with", "delegates to reload_with_instance, which dispatches"),

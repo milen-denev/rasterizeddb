@@ -1126,6 +1126,16 @@ pub struct Database {
     /// "cached plan must not change result type", which every driver handles by
     /// re-preparing. This counter is how the wire layer knows to look.
     pub schema_generation: StdArc<CacheGuard<std::sync::atomic::AtomicU64>>,
+    /// The database-wide shape epoch (`docs/persistent-indexes.md` §7
+    /// `shape_epoch`, Q7): one monotonic counter, moved only when what a name
+    /// returns changes (a table installed under a name, or an instance
+    /// swapped in with another column shape), never by index-only DDL. Each
+    /// slot keeps the value it drew (`Slot::shape_epoch`), so a DROP and
+    /// CREATE of a name can never repeat an epoch an old instance used, and
+    /// a statement over several tables, or a join, compares this one number
+    /// with the value it read when the client was told its shape. See
+    /// [`Database::shape_epoch`].
+    shape_epoch: CacheGuard<std::sync::atomic::AtomicU64>,
     /// Ships committed transactions to the other instances, and applies theirs.
     ///
     /// Always present and inert until configured, so the write path can hook
@@ -1487,7 +1497,7 @@ impl Database {
             }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
-            table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table))));
+            table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table), 0)));
         }
 
         // Builds before the name guard let two tables share a file (`x` and
@@ -1524,6 +1534,7 @@ impl Database {
                 StdArc::clone(&transactions),
             )),
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
+            shape_epoch: std::sync::atomic::AtomicU64::new(0).into(),
             replication: StdArc::new(crate::replication::Replication::new()),
             location: (!in_memory).then(|| location.to_string()),
             storage,

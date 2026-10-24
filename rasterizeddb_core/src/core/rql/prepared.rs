@@ -59,7 +59,18 @@ pub struct PreparedRows {
     /// values through the statement's [`RoutePlan`] (S16b). `None` routes the
     /// rendered `WHERE` instead, as S15 does.
     pub key: Option<BoundKey>,
+    /// The shape epoch of the table instance the parse was learned on
+    /// (`docs/persistent-indexes.md` §7 `shape_epoch`, Q7): re-checked by the
+    /// executor after the table lock is granted. A table reshaped, or dropped
+    /// and created again, since then answers [`STALE_PLAN`] before anything
+    /// is read, and pgwire runs the statement's text in the same Execute.
+    pub shape_epoch: u64,
 }
+
+/// The executor's answer to a learned parse whose table changed shape after
+/// it was learned (see [`PreparedRows::shape_epoch`]). Never reaches a
+/// client: pgwire runs the statement's text instead.
+pub const STALE_PLAN: &str = "internal: the prepared plan's table changed shape";
 
 /// How a learned statement on a partitioned table names its partition from
 /// its own values (`docs/partitioning.md` §4.1, S16b): which parameter feeds
@@ -185,8 +196,9 @@ pub struct Capture {
     pub arm_entries: u32,
     /// Something rewrote the statement around the parse.
     pub invalid: bool,
-    /// The plain single-table branch's parse, and its table.
-    pub plain: Option<(String, QueryRows)>,
+    /// The plain single-table branch's parse, its table, and that table's
+    /// shape epoch as the branch read it, under the statement's lock.
+    pub plain: Option<(String, QueryRows, u64)>,
     /// The column description and scales the rows were sent with.
     pub description: Option<(Option<Vec<(String, DbType)>>, Option<Vec<u32>>)>,
 }
@@ -220,13 +232,14 @@ pub fn note_rewritten() {
     with(|c| c.invalid = true);
 }
 
-/// The plain single-table branch is about to run this parse.
-pub fn note_plain(table_name: &str, query_row: &QueryRows) {
+/// The plain single-table branch is about to run this parse, on a table
+/// whose shape epoch is `shape_epoch` (read under the statement's lock).
+pub fn note_plain(table_name: &str, query_row: &QueryRows, shape_epoch: u64) {
     with(|c| {
         if c.plain.is_some() {
             c.invalid = true;
         } else {
-            c.plain = Some((table_name.to_string(), query_row.clone()));
+            c.plain = Some((table_name.to_string(), query_row.clone(), shape_epoch));
         }
     });
 }
@@ -238,14 +251,25 @@ pub fn note_description(fields: &Option<Vec<(String, DbType)>>, scales: &Option<
 
 impl Capture {
     /// The plain parse, when it is the whole story of the statement.
-    pub fn plain_only(self) -> Option<(String, QueryRows, Option<Vec<(String, DbType)>>, Option<Vec<u32>>)> {
+    pub fn plain_only(self) -> Option<Learned> {
         if self.invalid || self.arm_entries != 1 {
             return None;
         }
-        let (table, query_row) = self.plain?;
+        let (table, query_row, shape_epoch) = self.plain?;
         let (fields, scales) = self.description?;
-        Some((table, query_row, fields, scales))
+        Some(Learned { table, query_row, fields, scales, shape_epoch })
     }
+}
+
+/// What one watched execution of the plain branch shows: its parse, its
+/// table and that table's shape epoch, and the description its rows went out
+/// under.
+pub struct Learned {
+    pub table: String,
+    pub query_row: QueryRows,
+    pub fields: Option<Vec<(String, DbType)>>,
+    pub scales: Option<Vec<u32>>,
+    pub shape_epoch: u64,
 }
 
 /// The shape of a literal a template may be reused with: `Some(0)` for an
