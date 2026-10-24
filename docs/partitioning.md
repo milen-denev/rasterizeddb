@@ -1,11 +1,17 @@
 # Hash partitioning
 
-Status: **phases 0 and 1 built** (`core/partition`, pure and unwired), **phase
-2a built through S11** (the seam, the table, `CREATE`, catalogs, routed
-`INSERT`, single-snapshot fan-out `SELECT`/`COUNT`, routed `UPDATE`/`DELETE`,
-`VACUUM` over the partitions; what it still refuses is listed in §2), with S12
-(a cheap cross-partition `ORDER BY` merge and the statement worker budget, §8)
-and S13 (the §15 measurements) left; **the rest designed, not built.** Line anchors were read on 2026-10-16 at
+Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **not
+advertised**, and **phases 3 to 7 designed, not built.** Phases 0 and 1 are
+the trailer scan and the pure `core/partition` modules; 2a the seam, the
+table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
+`SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
+2b prepared `SELECT` from the learned parse with late routing, a cached route
+derivation for full-key point reads, `RETURNING`, `ON CONFLICT` and joins.
+What is still refused, and which phase lifts it, is §2's table; the summary
+is [Phase 2b as built](#phase-2b-as-built). Left from 2a: S12 (a cheap
+cross-partition `ORDER BY` merge and the statement worker budget, §8), which
+waits on the scan-concurrency owner, and §15's ext4 measurements. "Advertised"
+waits on one idle-box wall-clock A/B (§15). Line anchors were read on 2026-10-16 at
 `61e9200` and are relative to `rasterizeddb_core/src/`. `core/row/table.rs`,
 `core/vacuum.rs` and `core/filter/sarg.rs` are being edited by another session,
 so anchors there will drift; the function names are the stable part. Siblings:
@@ -78,6 +84,87 @@ listed in `pg_indexes`, and refuses `DROP INDEX`.
   statements, like `STORAGE REBALANCE`), **not multi-node sharding**
   ([Sharding](sharding.md) builds that on top), and not a
   way around the shared commit points of §5.
+
+## Phase 2b as built
+
+Built on `feat/partition-2b` (S15–S20, 2026-10-24), over phase 2a. Not
+advertised: §15's exit criterion is met on instructions per op, and the
+idle-box wall-clock A/B is still to run.
+
+**What works on a partitioned table**, answering like a plain twin (I6):
+
+- `CREATE TABLE … PARTITION BY HASH` (one to three key columns, default 64
+  partitions, at most 2,048 declared per database), `DROP`, the catalogs and
+  `SHOW PARTITIONS` (2a).
+- `INSERT` in every form, routed per row; `SELECT` and `COUNT` routed or
+  fanned out under one snapshot, with aggregates, `GROUP BY`, `DISTINCT`,
+  windows, `UNION`, CTEs, `IN (SELECT …)`, `ORDER BY … LIMIT` and empty
+  routes; `UPDATE` and `DELETE` routed or fanned out, all or nothing across
+  partitions; `VACUUM` and `VACUUM FULL` (2a).
+- Prepared `SELECT` and `COUNT` from the learned parse, routed per execution
+  (S15, I11), under one snapshot on the fast path (I7); a full-key point read
+  names its partition from its bound key (S16b, I2). Prepared writes take the
+  text path every execution.
+- `RETURNING` on `INSERT`, `UPDATE` and `DELETE`, from the pre-images the
+  write itself read, never re-read (S17).
+- `ON CONFLICT DO NOTHING` and `DO UPDATE` in every form: targetless, by
+  columns, `ON CONSTRAINT`, with `WHERE`, `EXCLUDED` and `RETURNING`,
+  multi-row and `INSERT … SELECT`, simple and prepared; each key unique under
+  concurrency (S18, I10).
+- Joins: inner, `LEFT`, self-joins, partitioned × plain and × partitioned,
+  with CTEs, derived tables and aggregates, every relation and partition
+  under the join's one snapshot, each routed on its own predicate; `UPDATE …
+  FROM` and `DELETE … USING` reading a partitioned source into a plain target
+  (S19, I3, I7).
+- A key column assigned the value its `WHERE` pins (an ORM's every-column
+  `UPDATE`, `SET tenant_id = EXCLUDED.tenant_id`) is an ordinary update and
+  is eligible for the in-place overwrite, like a plain table (97e187f, §4.5).
+
+**Still refused** (0A000, before anything is written; the full table is §2):
+
+| Refused | Phase |
+|---|---|
+| `UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` | 3 (composite identifying keys, §1b) |
+| `ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`; FKs onto or from a partitioned table | 3 (§10, §11); physical-rewrite `ALTER` 6 |
+| A key change: an `UPDATE` or `DO UPDATE` assigning a key column anything its `WHERE` does not pin to the same value | 6 (row moves, §9) |
+| Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`) and reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`) | 5 |
+| `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
+
+**Known limits** (correct answers, not refusals, unless stated):
+
+- **Joins do not infer a key route transitively.** `t JOIN d ON t.k = d.k
+  WHERE d.k = 5` routes `d` but fans out over `t`: each relation routes on its
+  own pushed-down predicate only (§4.1).
+- **`k = 1 AND k = 2` is not proved empty.** Two equalities on one key level
+  are unioned, never intersected (§4.2, step 3), so the statement reads both
+  partitions and the scan returns no rows. Only a clause
+  `clause_is_constant_false` proves false (a comparison of constants, such
+  as `1 = 0`) routes to none.
+- **A partitioned target of `UPDATE … FROM` / `DELETE … USING` is refused**
+  (phase 3), as is any statement that addresses rows by one identifying
+  column: a partitioned table has only composite unique keys (§1b).
+- **The WHERE-arithmetic gap** reported with S18 is a plain-table evaluator
+  limit and the owner's (rasterizeddb-47) to fix:
+  `… ON CONFLICT … DO UPDATE SET … WHERE t.n IS NOT NULL AND EXCLUDED.n > t.n - 100`
+  fails with 42601 "expected closing parenthesis" on both table kinds, while
+  the same predicate without the subtraction runs. Routing never narrows on
+  arithmetic (it widens, §4.2), so a partitioned table answers exactly as its
+  plain twin does.
+- **No statement worker budget and no cheap cross-partition `ORDER BY`
+  merge** (S12, §8): each partition's scan starts its own workers, at most
+  `FANOUT_IN_FLIGHT` = 8 partitions at once, and `ORDER BY` decodes each
+  partition's top `k`.
+- **A signed numeric literal is never learned** (`k = -1`): such a prepared
+  read runs from its text and fans out (§4.1).
+- **Phase 2a's resource limits stand**: every materialized partition opens at
+  startup (lazy open is phase 3), every partition sits in the root location
+  (placement is phase 4), and the default stays 64 partitions (§1.2, §7).
+
+**Final twin pass (S20, at 97e187f):** `tests/partition_twin.rs` green in all
+four configurations at the default seeds (0x5eed0001, 0x5eed7a11, 300
+statements), at 0x5eed2b20 and at 0x5eedf1a1 with 1,500 statements each;
+`KNOWN_DIVERGENCES` is empty, and `REFUSED` holds only the phase 3 and 6
+kinds above. Every `partition_*` suite, core and compat, passes.
 
 ## 1. Model
 
@@ -351,30 +438,49 @@ SET partition_trace = on;   -- a NOTICE per statement: partitions routed, and wh
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
 | Temporary partitioned tables; KV-backed partitions | KV until measured |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
-| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; phase 2a refuses any key assignment its `WHERE` does not pin to the same value, §4.5); FKs referencing a partitioned table (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (composite identifying keys, §1b); reshapes (phase 5). Built in 2b: `RETURNING` (S17) and `ON CONFLICT` (S18, §9), joins and partitioned sources of `UPDATE … FROM`/`DELETE … USING` (S19, §8) | §15 |
+| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5); FKs either way (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (phase 3: composite identifying keys, §1b); conversion and reshapes (phase 5) | §15 |
 
-**What phase 2a refuses, as built (S11; S17 lifted `RETURNING`, S18 `ON
-CONFLICT`, S19 joins).** Each with 0A000 and "not supported", before anything is read or
-written: `UPDATE … FROM` and `DELETE … USING` with a
-partitioned target (refused at their entry; a partitioned source is built, S19),
-`FOR UPDATE`/`SHARE`, `SKIP LOCKED` (phase 3); `ALTER` in every
-form, `RENAME`, `CREATE`/`DROP INDEX`, FKs either way (phase 3); key changes
-(phase 6), a `DO UPDATE` that would change one included (refused when the
-conflict happens, before the update writes); reshapes and `STORAGE MOVE`/`REBALANCE PARTITION[S]` (phase 5); the
-rows above. `SELECT` with `ORDER BY` across partitions is **not** refused: it
-is correct and not yet cheap (§8, S12). Everything else in the twin test's
-statement set (I6) answers like a plain table: `INSERT` in every form, single-
-and multi-partition `SELECT`/`COUNT` (aggregates, `GROUP BY`, `DISTINCT`,
-windows, `UNION`, CTEs, `IN (SELECT …)`, empty routes), `UPDATE` and `DELETE`
-routed or fanned out, in autocommit and in blocks, `RETURNING` on `INSERT`,
-`UPDATE` and `DELETE` (S17), `ON CONFLICT DO NOTHING` and `DO UPDATE` in
-every form (S18), joins (inner, `LEFT`, self-joins, partitioned ×
-plain and × partitioned, with CTEs, derived tables, `IN (SELECT …)`,
-aggregates and `ORDER BY … LIMIT` over them) and `UPDATE … FROM`/`DELETE …
-USING` reading a partitioned source into a plain target (S19), prepared `SELECT`, `INSERT`, `UPDATE` and
-`DELETE`, `VACUUM` and `VACUUM FULL`, named and bare.
-`LOCK TABLE` takes the logical name's lock, which a partitioned `UPDATE` and
-`DELETE` check before routing, as a plain table's do.
+**What phase 2b refuses, as built (S20).** Each with 0A000 and "not
+supported" and a reason, before anything is read or written; the twin's
+`REFUSED` list (`tests/partition_twin.rs`) and the site catalogue
+(`tests/partition_shell_sites.rs`) pin each row. Everything not listed
+answers like a plain table (below).
+
+| Refused on a partitioned table | Where it is refused | Lifted by |
+|---|---|---|
+| `UPDATE … FROM` and `DELETE … USING` with a partitioned **target** | their executor entry, before the join runs | phase 3 (composite identifying keys, §1b) |
+| `SELECT … FOR UPDATE`/`FOR SHARE`, `SKIP LOCKED`, `NOWAIT` | `refuse_partitioned_row_lock`, before routing | phase 3 |
+| `ALTER TABLE` in every form (columns, defaults, `NOT NULL`, constraints, `RENAME`, `RENAME TO` onto the name, the verbs a plain table takes as no-ops), `CREATE INDEX` in every form | the DDL arms, before any sidecar is written | phase 3 (metadata DDL, §11); physical-rewrite forms phase 6 |
+| `FOREIGN KEY` from a partitioned table (`CREATE … PARTITION BY`, `ADD CONSTRAINT`), and onto one (`REFERENCES`, `ADD CONSTRAINT`) | `CREATE` and the DDL arms | phase 3 (§10) |
+| An `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value (`SET tenant_id = 5 WHERE tenant_id = 1`, `SET g = g + 1`), and a `DO UPDATE` that does so when its conflict happens | `assignments_keep_point` before routing (`DO UPDATE`: before the update writes); the range guard on every merged row behind it | phase 6 (row moves, §9) |
+| `ALTER … PARTITION BY`, `CREATE INDEX … USING partition` (on plain tables too), `SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`; `STORAGE MOVE TABLE` on the logical name, which points at `MOVE PARTITION` | the ALTER, CREATE INDEX and STORAGE arms | phase 5 |
+| Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; KV-backed partitions; shredded JSON columns | `CREATE … PARTITION BY` | not scheduled; KV until measured |
+
+`ON CONFLICT` with a target that is not exactly one unique key (one that leaves
+out a key column, a subset or a superset) is not a refusal but PostgreSQL's
+42P10, on plain tables too, and a multi-row `DO UPDATE` proposing one key
+twice is 21000 (§9). Two phase-5 spellings are not yet parsed as such:
+`STORAGE MOVE PARTITION t FOR (…)` is read as a move of a table named
+`PARTITION` and refused for that, and `STORAGE REBALANCE PARTITIONS` as a
+whole-database `STORAGE REBALANCE`, which never proposes the shell.
+`SELECT` with `ORDER BY` across partitions is **not** refused: it is correct
+and not yet cheap (§8, S12).
+
+Everything else in the twin test's statement set (I6) answers like a plain
+table: `INSERT` in every form, single- and multi-partition `SELECT`/`COUNT`
+(aggregates, `GROUP BY`, `DISTINCT`, windows, `UNION`, CTEs, `IN (SELECT …)`,
+empty routes), `UPDATE` and `DELETE` routed or fanned out, a key column
+assigned the value its `WHERE` pins (in place, as on a plain table, §4.5), in
+autocommit and in blocks; `RETURNING` on `INSERT`, `UPDATE` and `DELETE`;
+`ON CONFLICT DO NOTHING` and `DO UPDATE` in every form, targetless,
+by columns and `ON CONSTRAINT`, multi-row and `INSERT … SELECT`; joins
+(inner, `LEFT`, self-joins, partitioned × plain and × partitioned, with
+CTEs, derived tables, `IN (SELECT …)`, aggregates and `ORDER BY … LIMIT`
+over them) and `UPDATE … FROM`/`DELETE … USING` reading a
+partitioned source into a plain target; prepared `SELECT` (from the learned
+parse), joins, `INSERT`, upserts, `UPDATE` and `DELETE`; `VACUUM` and `VACUUM
+FULL`, named and bare. `LOCK TABLE` takes the logical name's lock, which a
+partitioned `UPDATE` and `DELETE` check before routing, as a plain table's do.
 
 **Today's mis-parse, fixed first.** `parse_create_table` takes the body between
 the first `(` and the **last** `)` (`core/rql/lexer_ct.rs:169-171`), so `… k INT
@@ -599,8 +705,10 @@ resolve the table name and dispatch on `relation()`:
 |---|---|
 | SELECT | the `QueryRows` arm (`executor.rs:10911`) and `execute_query_rows` (`:10954`), taking a `RowSource::{Single, Partitioned}` |
 | Prepared SELECT | **As built (S15): learned parse, routed per execution.** `execute_partitioned_select` notes its parse (`note_plain`, after the row-lock refusal) under the **logical** name, so pgwire learns it as a plain table's. A learned execution reaches `execute_prepared_rows`, which looks the name up again and reads through `read_partitioned`, the text path's own read half: pgwire rendered this execution's literals into the template (`execute_watched`), and that `WHERE` routes fresh, with the materialized flags read after this execution's snapshot. **S16b caches the route's derivation, never a route:** for the full-key point shape (every key column compared by `=` with exactly one parameter, as a top-level conjunct), `learn_route` (pgwire) keeps a `prepared::RoutePlan`, which parameter feeds each key column and the column's write order and declared type, and only after checking that the key each of the two verifying executions binds routes exactly where `route_where` routes its rendered `WHERE`. Each execution binds its own values (`RoutePlan::bind` → `prepared::key_value_bytes`, the scan's own reading of an unsigned integer or plain string; anything else binds nothing and routes the rendered `WHERE`), and `FanOut::plan` names the partition from that key (`PartitionedTable::keyed_range`, which refuses a key bound for another table uid or another key, then `materialized_in`), with the snapshot taken first and the materialized flag read after it, as before. An `IN` list, part of the key, a range, an `OR` or a `NOT` keeps the per-execution `route_where`. So a learned parse still cannot pin the first tenant's partition (I11), and a cached key hashes as `route_where` and the insert path do (I2): a property test over SMALLINT, INT, BIGINT, TEXT and a composite key checks all three agree. A one-partition fan-out awaits its read in place rather than through `join_all`. `run_statement` runs a learned parse with no `row_lock` inside `statement_snapshot::scope`, as the text path runs a read-only statement (I7 on the fast path); a plain table's learned `FOR UPDATE` stays outside it, as `is_read_only` keeps its text outside. A signed numeric literal is never learned (`prepared::literal_class` admits unsigned numbers only): the text path rewrites `k = -1` to `k = - 1`, so the literal would not pass through the rewrites unchanged, which every admitted one must. Such an execution runs from its text, where `k = - 1` is not routed yet and reads every materialized partition (a superset, so correct). Routing `k = - 1` on the text path is a pure performance gain and a separate, later item. |
-| INSERT | after defaults, generated values and CHECKs (`executor.rs:9917`), from the final `RowWrite` |
-| UPDATE / DELETE | `executor.rs:10318` / `:10737` |
+| Prepared INSERT, UPDATE, DELETE | **As built:** the text path every execution. `execute_partitioned_update` and `execute_partitioned_delete` call `note_rewritten`, so pgwire never learns them, and each execution's rendered `WHERE` routes on its own values (I11); a prepared `INSERT` routes each row as the text `INSERT` does. |
+| INSERT | after defaults, generated values and CHECKs (`executor.rs:9917`), from the final `RowWrite`; `RETURNING` is built from the payload the partition stores (§9) |
+| INSERT … ON CONFLICT | **As built (S18):** `check_conflict_target_infers_a_key` and `check_partitioned_conflict_target` at the statement's first dispatch (42P10 before anything runs); the insert routes as above; `DO UPDATE` re-dispatches its generated `UPDATE … WHERE <target> = <literal>` through the UPDATE hook, which routes it to the inserted row's partition (§9) |
+| UPDATE / DELETE | `executor.rs:10318` / `:10737`; **as built:** `execute_partitioned_update` / `execute_partitioned_delete`, which resolve the `RETURNING` list (`check_partitioned_write`) and, for an `UPDATE`, prove its key assignments keep the point (`assignments_keep_point`, §4.5) before routing, then `write_partitions` (§9) |
 | Joins | `execute_join`'s relation loop (`executor.rs:24`): each relation's pushed-down predicate routes it. **As built (S19):** the loop resolves each relation through `Database::relation`; a partitioned one is read by `RowSource::partitioned_with`, which plans its fan-out (`FanOut::plan_with`) under the `Visibility` the join already holds, so every relation and partition, a self-join's two sides included, reads under one snapshot, scoped or not. Each routes on its own pushed-down predicate, the exact text its scans evaluate, through `route_where` (`extract_gated`, never the path-aware variant). No transitive inference: `t JOIN d ON t.k = d.k WHERE d.k = 5` fans out on `t`, correct and slower (future work). |
 | UNION, CTEs, `IN (SELECT …)` | re-dispatched as SQL text (`substitute_in_subqueries`, `executor.rs:645`) |
 | `$n` | already inlined as literal text (`pg_params.rs:97`) |
@@ -710,6 +818,29 @@ tenant_id = 42 AND id = 7`, an ORM's every-column `UPDATE`, passes; an
 expression on a key column, or a constant nothing pins, does not, even where
 no matched row would change. Stricter than the guard, which stays.
 
+**In-place eligibility, as built (97e187f).** An in-place overwrite cannot be
+undone by the statement's abort, so a partition's `update_rows_locked` keeps a
+statement off it whenever the guard might refuse a later row after an earlier
+one was overwritten. It decides that from the same proof, a free function over
+the guard's `KeySpec` and the schema
+(`partition::table::assignments_keep_point`, which the executor's
+`PartitionedTable::assignments_keep_point` calls too): **a same-value key
+assignment pinned by the `WHERE` (`SET tenant_id = 1, n = 42 WHERE tenant_id
+= 1 AND …`, `ON CONFLICT`'s `SET tenant_id = EXCLUDED.tenant_id`) is eligible
+for the in-place update, like a plain table**, and writes no more versions
+than its twin. A key assignment the `WHERE` does not pin, or one an expression
+computes, writes new versions only; the guard still checks every merged row;
+a multi-partition fan-out passes a `Visibility` and so never overwrites in
+place (§9). Before the fix every key-assigning statement wrote a version the
+plain table overwrote, one dead slot per row per statement, which the twin
+saw in `reltuples` and `n_dead_tup`. Tests: `tests/partition_write.rs`'s
+`a_same_value_key_assignment_writes_no_more_versions_than_the_twin` (the same
+`reltuples`, `n_live_tup` and `n_dead_tup` as the twin after routed and
+`ON CONFLICT` same-value assignments, the twin's dead count 0) and
+`a_genuine_key_change_is_refused_before_any_partition_write` (a statement
+keeping one row's point and moving another's is refused with no in-place
+overwrite and nothing changed; the pinned form overwrites in place once).
+
 The rule is "the point is unchanged", which depends only on the frozen hash so
 every node agrees, not "the row stays in this partition", which depends on this
 node's count and sub-splits and could pass on the primary but fail on a
@@ -739,7 +870,7 @@ and point `SELECT` never took `write_lock`: expect parity, not a gain.
 | `RowLocks::release_all` | two global mutexes per commit | no | atomic fast path at `row_count == 0`; cheap, independent of this work |
 | The query-stats ring | one mutex | no | shard it |
 | `Arc<PartitionedTable>` refcount, epoch `load_full` | one `fetch_add` each on one cache line per logical table | no | borrow from the map guard |
-| Per-logical-table DDL lock (§11), new | one shared acquire, an atomic RMW | across the statement, never blocking one | none; reader-preferring, so DDL waits, never statements |
+| Per-logical-table DDL lock (§11), new | one shared acquire, an atomic RMW | across the statement, never blocking one | none; reader-preferring, so DDL waits, never statements. **Superseded** by persistent-indexes §7's one table-lock manager: partitioned DDL takes ACCESS EXCLUSIVE on the logical name (§11) |
 | WAL checkpoint sync pass and keep-tail (`core/wal.rs:1328-1347`, `:1418-1455`) | sequential `sync_data` per dirty file, about 2.3 ms each on .7's disk; then the tail is copied, fsynced and renamed **under the writer lock** | yes | parallelise the pass (bounded threads) or `syncfs` past a threshold; rotate segments instead of copying the tail |
 
 Only the checkpoint row worsens with partitioning: about 3 dirty files per
@@ -1023,6 +1154,8 @@ budget below is S12. `ORDER BY` across partitions asks each partition for its
 sorted top `k` and sorts the union with the scan's own comparator
 (`ConcurrentProcessor::sort_rows_for_merge`), decoding every row: correct, not
 cheap, until S12's merge. Writes (S11) visit partitions one at a time (§9).
+Phase 2b added no worker budget either: S12 waits on the scan-concurrency
+owner, and the fan-out width is still `FANOUT_IN_FLIGHT`.
 
 **Phase 2 fan-out** keeps at most 8 partitions in flight, with workers from
 **one statement budget** of `max_permits_threads()`, so the variants take a
@@ -1040,7 +1173,8 @@ read must cost no more than an unpartitioned one plus one route. Phase 6's `proc
 | LIMIT without ORDER BY | stop launching partitions once enough rows exist, then truncate |
 | ORDER BY … LIMIT k OFFSET o | each partition returns its sorted top `k + o` (`QueryRows.limit` already includes OFFSET); concatenate and re-cut with `sort_rows_if_needed` (`concurrent_processor.rs:1800`, made `pub(crate)`) |
 | ORDER BY without LIMIT, DISTINCT, windows, expression sorts | gather, then the existing post-scan pipeline; valid because every partition's schema is a clone of one, so `write_order`s agree |
-| Joins | concatenated bytes in one `RowSet::Serialized` (`core/rql/join.rs:331`); the 4 GiB cap (`join.rs:343`) applies to the sum, and still errors. As built (S19): every relation under the join's one `Visibility`, each routed on its own pushed-down predicate (§4.1); `UPDATE … FROM`/`DELETE … USING` read a partitioned source through the same join, and only a plain target is written back |
+| Prepared SELECT and COUNT | **As built (S15, S16b):** the learned parse, read through `read_partitioned` like the text path, routed per execution (§4.1, I11). `run_statement` runs it inside `statement_snapshot::scope`, so a fan-out takes one snapshot on the fast path too (I7); a full-key point read names its partition from the bound key (`RoutePlan`, `keyed_range`), snapshot first; a one-partition read is awaited in place |
+| Joins | concatenated bytes in one `RowSet::Serialized` (`core/rql/join.rs:331`); the 4 GiB cap (`join.rs:343`) applies to the sum, and still errors. **As built (S19):** every relation and partition, a self-join's two sides included, under the join's one `Visibility` (`FanOut::plan_with`), each relation routed on its own pushed-down predicate (§4.1), with no transitive inference across `ON` (a key pinned only on the other side fans out: correct, slower). A prepared join takes the scoped text path. `UPDATE … FROM`/`DELETE … USING` read a partitioned source through the same join, and only a plain target is written back; a partitioned target is refused (phase 3) |
 | FOR UPDATE, SKIP LOCKED | refused until composite identifying keys (§1b); then gathered |
 
 **An empty route still runs the pipeline.** A constant-false clause, or only
@@ -1135,7 +1269,9 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   `UpdateReturningExpr`, `DeleteReturning`, `DeleteReturningFanOut`,
   `PreparedUpdateReturning` and the empty-route kinds.
 - **Assigning a key column** with the point unchanged is ordinary, as it must
-  be: ORMs assign every column, usually its current value. Any other key change
+  be: ORMs assign every column, usually its current value. Pinned by the
+  `WHERE`, it is eligible for the in-place overwrite exactly as on a plain
+  table (§4.5, as built in 97e187f). Any other key change
   fails the whole statement at the guard (§4.5, which also says why the rule is
   not "stays in its partition") with 0A000 ("changing a partition key value is
   not supported yet"). Phase 6 adds the move, allowing every key change:
@@ -1159,9 +1295,16 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
     exclusion constraint matching the ON CONFLICT specification";
     `check_partitioned_conflict_target`, which replaced
     `refuse_partitioned_insert_clauses`). The parser now keeps `DO NOTHING`'s
-    target (`InsertRowData::on_conflict_target`) for it. PostgreSQL also
-    refuses a target that holds the key but matches no key exactly; this
-    engine, like its plain tables, does not check that.
+    target (`InsertRowData::on_conflict_target`) for it. Since 1c421c4 a
+    target must name exactly one unique key's columns, in any order, as
+    PostgreSQL infers its arbiter, on plain tables too
+    (`check_conflict_target_infers_a_key`): a subset or a superset of a key is
+    42P10. Before it, `ON CONFLICT (tenant_id) DO UPDATE` over a key on
+    `(tenant_id, grp, id)` updated every row of the tenant, on both kinds of
+    table, so the twin could not see it.
+  - A multi-row `DO UPDATE` proposing one key twice is refused with 21000
+    before any row is written (1c421c4, plain tables too). Keys are compared
+    as written, so `1` and `'1'` are a known miss, never a false refusal.
   - `ON CONFLICT ON CONSTRAINT name DO UPDATE` resolves the name to the
     constraint's columns (`constraint_columns`: a table-level key such as
     `<t>_pkey`, a single-column key, or an inline `UNIQUE` by its default
@@ -1173,8 +1316,10 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
     conflict happens, before the update writes. PostgreSQL refuses the
     cross-partition case with 0A000 too ("invalid ON UPDATE specification").
     `SET tenant_id = EXCLUDED.tenant_id` substitutes the literal the `WHERE`
-    pins, so it keeps the point; an expression is not proven to, and is
-    refused, as in a plain `UPDATE`. A multi-row statement whose earlier
+    pins, so it keeps the point and, like any same-value key assignment
+    the `WHERE` pins, overwrites in place as a plain table does (§4.5); an
+    expression is not proven to, and is refused, as in a plain `UPDATE`.
+    A multi-row statement whose earlier
     tuples landed fails whole, as any failed statement does.
   - Multi-row upserts across partitions re-dispatch per tuple
     (`insert_values_batch`), with the clause restored on each and the tag
@@ -1191,7 +1336,8 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
     clients over the primary key and a composite UNIQUE in every transaction
     shape, and 300 keys over every partition from four connections, mutation
     the in-flight rule off in `find_row_with_tuple`: 848 rows for 300 keys),
-    and the twin's ON CONFLICT kinds.
+    and the twin's ON CONFLICT kinds, `InsertOnConflictSubsetTarget` (42P10)
+    and `InsertOnConflictUpdateTwice` (21000) among them.
 - **Replication capture** (`note_write`, `executor.rs:9383`) records the
   logical name.
 
@@ -1243,6 +1389,18 @@ long fan-out cannot stall every tenant, and no wait cycle forms through a
 statement holding it while waiting on a row lock (the row-lock deadlock detector
 sees only transaction edges, `core/mvcc/row_locks.rs:607-635`). The cost: DDL
 can starve under load and must be retried.
+
+**Superseded (phase 2b plan, 2026-10-24).** Phase 3 does not build this
+lock: there is one table-lock manager, persistent-indexes §7's (PostgreSQL's
+modes and grant rule, one wait-for graph), and metadata DDL on a partitioned
+table takes ACCESS EXCLUSIVE on the **logical** name, never on a partition's
+physical name; reopening the partitions is the reload's work under that lock.
+Two managers would need a lock order and two graphs, with cycles across them
+invisible. The cost is PostgreSQL's queueing: a pending ACCESS EXCLUSIVE
+queues new statements on the table, so a long fan-out can stall its tenants
+behind an `ALTER`. Whether phase 3 accepts that or try-acquires with `55P03`
+is open; nothing in 2b depends on it. I26 is re-specified on that manager when
+phase 3 is planned.
 
 **Physical-rewrite DDL** (populated `ADD COLUMN`, `ALTER … TYPE`, rewriting
 `DROP COLUMN`; `rewrite_table_with_columns`, `executor.rs:2125`;
@@ -1375,9 +1533,9 @@ Each phase is safe alone and refuses what it does not support.
 |---|---|---|---|
 | **0** | Nesting-aware `CREATE TABLE` trailer scan, making `PARTITION BY`, `PARTITION OF`, `INHERITS`, `ATTACH`, `DETACH` explicit refusals; refusal of `__pt_` names; hard error on a `Wal::register_file` id collision | all partitioning | the three mis-parse shapes, each asserting no catalogue row is written |
 | **1** | Pure, unwired modules: the hash (`partition::xxh64`, `partition::key`), `RangeMap`, the map-log codec, `route(MaskExpr)` | — | route ns/op; I1, I2-pure, I3, I5 |
-| **2a** | **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants (their worker cap is S12; 2a bounds partitions in flight with `FANOUT_IN_FLIGHT = 8`, §8), the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE, VACUUM over the partitions. **Prepared SELECT, UPDATE and DELETE** skip the learned-parse cache (`note_rewritten`), using the text path.<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals (the as-built list is in §2) | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** |
-| **2b** | Joins, the prepared-SELECT cache with late routing (I11), ON CONFLICT and RETURNING on partitioned tables | as 2a, less these | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs` (S16b measured point 1.02, tcount 1.005). **"Advertised" additionally needs** an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. |
-| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11), the reader-preferring DDL lock, map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per node, default N = 1024 once measured (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
+| **2a** | **Built** (S1–S11; S12, the worker budget and cheap merge, not built, §8). **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants (their worker cap is S12; 2a bounds partitions in flight with `FANOUT_IN_FLIGHT = 8`, §8), the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE, VACUUM over the partitions. **Prepared SELECT, UPDATE and DELETE** skip the learned-parse cache (`note_rewritten`), using the text path (2b gives `SELECT` the cache).<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals (the as-built list is in §2) | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** **As measured:** on tmpfs only, partbench and jsonbench (the 2b row's figures); the ext4 items wait for a venue (.7); 2b went ahead without them. |
+| **2b** | **Built** (S15–S20, 2026-10-24; [as built](#phase-2b-as-built)). Joins (per-relation routing, one `Visibility`, no transitive inference; partitioned sources of `UPDATE … FROM`/`DELETE … USING`), the prepared-SELECT cache with late routing (I11) and a cached route derivation for full-key point reads (S16b), `ON CONFLICT` and `RETURNING` on partitioned tables; a same-value key assignment overwrites in place (§4.5). **Not advertised** until the wall-clock A/B below. | as 2a, less these: partitioned targets of `UPDATE … FROM`/`DELETE … USING`, `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `ALTER`/`RENAME`/`CREATE INDEX`, FKs (phase 3); key changes, including by `DO UPDATE` (phase 6); conversion and reshapes (phase 5) | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). S15's learned parse brought them to 0.81–0.88× (point) and 0.86–0.93× (`COUNT`), wall-clock on a loaded box; S16b's profile put the rest in re-deriving the route, `join_all` and one async layer. **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs`. **As measured (S16b, user-mode instructions per op, part/plain): point 1.02 at c=1 and c=16 (1.19 and 1.18 before), `COUNT` 1.005 (1.04 before): the merge gate is met.** Wall-clock on that box (load 7–30) ranged 0.49–1.96 for one binary, so it is not evidence either way. **"Advertised" additionally needs**, and is still pending, an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. |
+| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11) under ACCESS EXCLUSIVE on the logical name (the table-lock manager, §11), map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per node, default N = 1024 once measured (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
 | **4** | Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions; touched-only `sync_durable`. **Gated on** the cross-session crash test and fix (§12). Databases without `s3_backup` only. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
 | **4b** | S3 snapshots and log archive stream every pool location, with a multi-location restore test; phase-4 refusals lift | — | snapshot time vs location count |
 | **5** | Reshape: MOVE, SPLIT, ISOLATE KEY, SPLIT KEY, MERGE, bounded-parallel REBALANCE, conversion; each with crash recovery, range-bounded re-routes, epoch-gated reclamation | — | fence duration vs partition size; throughput during a reshape |
@@ -1404,22 +1562,22 @@ section specifying the mechanism.
 | # | Invariant | Enforced by | Test (and the mutation it must catch) |
 |---|---|---|---|
 | I1 | The hash never changes within a `route_v` | §1.3 | reference and framed golden vectors per family and level |
-| I2 | Insert and query agree on a value's point | §1.3 | property test through the real tokenizer, `insert_row_with_defaults` and `extract_gated`, for every spelling the evaluator calls equal: `42`, `'42'`, `42::bigint`, `$1` text and binary, the prepared render; INT = BIGINT. *(Mutation: hash the literal text.)* |
+| I2 | Insert and query agree on a value's point | §1.3 | property test through the real tokenizer, `insert_row_with_defaults` and `extract_gated`, for every spelling the evaluator calls equal: `42`, `'42'`, `42::bigint`, `$1` text and binary, the prepared render; INT = BIGINT. *(Mutation: hash the literal text.)* **As built:** `partition::table_tests::insert_and_query_agree_on_points_for_every_spelling`, `tests/partition_insert.rs`'s `insert_and_query_agree_on_every_spelling`; **the cached route (S16b):** `pgwire::prepared_partition_tests::the_cached_route_hashes_like_route_where_and_insert`, over SMALLINT, INT, BIGINT, TEXT and a composite (BIGINT, TEXT) key, 900+ values: the bound key's partition equals `route_where`'s and the insert point's, and exactly the certain values bind. *(Mutations: hash a string's quoted text; hash an integer's text.)* |
 | I3 | Routing is a superset, in bounded memory | §4.2, §4.3 | random `WHERE` trees (AND, OR, IN, ranges, casts, functions, contradictions) over random rows: every brute-force-matching partition is routed; two and three 10k-value `IN` lists route in bounded allocation and time, and still as a superset. *(Mutations: intersect inside `And`; prune an `Or` with an unconstrained branch; accept casts; keep only the first box; truncate at the cap instead of degrading; cap after the product; clear the bitmap bit when vacuum finds no live rows.)* **Joins (S19):** `row_source::join_tests::a_join_reads_only_the_partitions_its_own_predicate_proves`: a key pinned in the `WHERE` or an `ON` term reads its partition, a constant-false clause none, a key pinned only on the other side every materialized one. *(Mutation: route on an empty clause instead of the relation's predicate.)* |
-| I4 | No row outside its range; no update changes a point | §4.5 | an injected wrong route errors; a key-changing `UPDATE` with no other transaction running (in-place fast path eligible) returns 0A000, the in-place counter stays, I6 finds no stray row. *(Mutations: remove the guard; move it back onto the relocating branch only, which I6 must catch.)* |
+| I4 | No row outside its range; no update changes a point | §4.5 | an injected wrong route errors; a key-changing `UPDATE` with no other transaction running (in-place fast path eligible) returns 0A000, the in-place counter stays, I6 finds no stray row. *(Mutations: remove the guard; move it back onto the relocating branch only, which I6 must catch.)* **As built:** `tests/partition_write.rs`'s `refused_writes_change_nothing` and `a_genuine_key_change_is_refused_before_any_partition_write` (a statement keeping one row's point and moving another's, in one partition: refused, no in-place overwrite, nothing changed); `tests/partition_upsert.rs`'s `a_do_update_that_moves_the_point_is_refused_before_any_write`; the twin's `UpdateKeyChange` and `InsertOnConflictKeyChange` (refused) and `UpdateKeySameValue` and `InsertOnConflictKeyAssign` (compared). **In-place eligibility (97e187f, §4.5):** `a_same_value_key_assignment_writes_no_more_versions_than_the_twin`, the twin's `reltuples`, `n_live_tup` and `n_dead_tup` after each same-value assignment. |
 | I5 | The map is total and disjoint | §1.1 | fuzz the map log, truncating or corrupting at every offset: the last valid epoch is recovered, or the table refused loudly |
-| I6 | A partitioned table answers like a plain twin | everything | **twin-table model test**, extending the index model test: N = 7 and 1024, open budget 1, random reshapes between; random inserts, updates (in place, relocating, same-value key assignment), deletes, rollbacks, conflicts, ON CONFLICT, RETURNING, VACUUM, VACUUM FULL, IN, OR, `$n`, prepared runs; every read compared (counts, aggregates, ORDER BY LIMIT OFFSET, DISTINCT, windows, joins). Empty routes: `COUNT(*)`, `MAX`, other aggregates without `GROUP BY`, `RETURNING`, `UPDATE … RETURNING`, on a never-written tenant and on `WHERE tenant_id = 1 AND tenant_id = 2`. |
+| I6 | A partitioned table answers like a plain twin | everything | **twin-table model test**, extending the index model test: N = 7 and 1024, open budget 1, random reshapes between; random inserts, updates (in place, relocating, same-value key assignment), deletes, rollbacks, conflicts, ON CONFLICT, RETURNING, VACUUM, VACUUM FULL, IN, OR, `$n`, prepared runs; every read compared (counts, aggregates, ORDER BY LIMIT OFFSET, DISTINCT, windows, joins). Empty routes: `COUNT(*)`, `MAX`, other aggregates without `GROUP BY`, `RETURNING`, `UPDATE … RETURNING`, on a never-written tenant and on `WHERE tenant_id = 1 AND tenant_id = 2`. **As built (2b):** `tests/partition_twin.rs`, four configurations (`twin_hash_tenant_7`, `twin_hash_tenant_64`, `twin_hash_tenant_grp_64`, `twin_hash_full_key_7`), seeds 0x5eed0001 and 0x5eed7a11 at 300 statements by default (`PART_TWIN_SEED`, `PART_TWIN_OPS`), a restart midway, what both tables store compared after writes, every kind required to run and every answering kind to agree on rows; each pgwire session's answers (rows as multisets where PostgreSQL gives no order, column names, type OIDs, tags, SQLSTATEs) compared, inside blocks too. The 2b kinds: the RETURNING kinds (S17), the ON CONFLICT kinds with 42P10 and 21000 (S18), `Join`, `LeftJoin`, `SelfJoin`, `JoinRouted`, `JoinFanOut`, `JoinPartitionedBoth`, `JoinAggregates`, `PreparedJoin`, `UpdateDimFromT`, `DeleteDimUsingT` (S19), and prepared reads that must run from the learned parse (S15). `REFUSED` holds only `UpdateKeyChange`, `InsertOnConflictKeyChange` (phase 6), `UpdateFrom`, `DeleteUsing`, `ForUpdate`, `SkipLocked` (phase 3); `KNOWN_DIVERGENCES` is empty. N = 1024, the open budget and reshapes wait for phases 3 and 5. `tests/partition_shell_sites.rs` runs each statement front door against a twin too (I8). |
 | I7 | One snapshot per multi-partition statement, taken before the map | §4.4, §8 | cross-tenant transfers beside a fan-out `SUM(balance)` that stays constant, across reshapes and in `REPEATABLE READ`; a fan-out `SELECT` at budget 1 with a slow lane, a reshape flipped and the reclaimer run mid-statement, returns the twin's rows. *(Mutations: a snapshot per partition; map read before snapshot; reclaim on the `Table`'s strong count.)* **Prepared fast path (S15):** `pgwire::prepared_partition_tests::the_fast_path_reads_one_snapshot_across_partitions`, 20 runs of a prepared unrouted `SUM`, a transfer committed between the first and second partition reads of each, under 5 s. *(Mutations: no scope in `run_statement`, failed at the first cached run by the scope check; a snapshot per partition, failed by the sum.)* **Joins (S19):** `row_source::join_tests::a_join_never_sees_a_cross_partition_transfer_half_applied` (partitioned × plain, a self-join, two partitioned tables, through `execute()` with no scope, a transfer across partitions and tables committed between the first and second partition reads of each fan-out) and `pgwire::prepared_partition_tests::a_prepared_join_reads_one_snapshot_across_both_sides` (the same over prepared executions, which take the scoped text path). *(Mutations: `plan_with` taking its own snapshot, failed by the self-join; a snapshot per partition, failed by the sums; no scope on the text arm, failed by the scope check.)* |
 | I8 | The shell never serves data | §3.3 | a site catalogue, each statement correct or an error, never empty or a subset, the shell still in `Database.tables` after: DROP and ALTER `IF EXISTS`, `CREATE IF NOT EXISTS`, CREATE INDEX (reaching `reload_table`), VACUUM t, bare VACUUM (table in the report), LOCK, FOR UPDATE and SKIP LOCKED (refused until phase 3, then succeeding on a `PRIMARY KEY (tenant_id, asset_group_id, asset_id)` table), COPY, every ALTER verb, `STORAGE MOVE TABLE`, `STORAGE REBALANCE` and `DRY RUN`, `SHOW STORAGE`, every `pg_*` view (declared indexes in `pg_indexes`), FK checks, `seed_sequences`; no `<logical>*` file in root. *(Mutation: delete one routing call; that statement must error.)* |
 | I9 | A partition opens only from its map location; missing files of a materialized partition, or the parent's ids or map file, are an error | §3.1, §3.5 | delete the files: a loud error; make the pool answer root: it still opens from its map entry. *(Mutation: open through `create_new` without the check.)* |
-| I10 | Uniqueness holds | §1b | concurrent duplicate inserts and upserts across tenants and through reshapes; DDL refusals |
+| I10 | Uniqueness holds | §1b | concurrent duplicate inserts and upserts across tenants and through reshapes; DDL refusals. **As built (S18):** `rasterizeddb_compat/tests/partition_upsert_matrix.rs`: `concurrent_upserts_on_a_partitioned_table_keep_every_key_unique_and_count_every_update` (sixteen clients over the primary key and a composite UNIQUE, `DO NOTHING` single- and multi-row and `INSERT … SELECT`, `DO UPDATE SET n = n + 1`, plain `INSERT`, in autocommit and committing and rolled-back blocks: no duplicate, every reported update applied once) and `three_hundred_keys_across_partitions_are_stored_once_under_concurrent_upserts` *(mutation: the in-flight rule off in `find_row_with_tuple`, 848 rows for 300 keys)*; `tests/partition_insert.rs`'s `duplicates_are_refused_and_racing_duplicates_store_one_row`; `tests/partition_ddl.rs`'s `a_unique_key_must_contain_every_key_column`. Reshapes wait for phase 5. |
 | I11 | A prepared statement never pins a partition | §4.1 | prepared SELECT, UPDATE, DELETE, 10 runs alternating tenants, past the learned third. *(Mutation: route before `note_plain`.)* **As built (S15):** `pgwire::prepared_partition_tests::each_execution_routes_its_own_values` (point SELECT and COUNT, two tenants in two partitions, 10 runs each: own rows, own partition's reads only, 2 parses per statement; mutations: the first execution's route kept, failed at run 3; `note_rewritten` restored, 20 parses), `a_tenant_first_written_after_learning_is_counted` (mutation: each `WHERE`'s first materialized list kept), `text_and_binary_keys_route_alike_from_the_cached_parse`, `a_learned_parse_is_not_parsed_again`; `tests/partition_prepared.rs` (writes, DROP and re-CREATE under the name, columns reordered, a type change, the name changing kind, a restart; mutation: no schema-generation reset, failed on the reordered columns); the twin's `PreparedSelect`, `PreparedCount`, `PreparedDescribeAlias` and `PreparedSelectAcrossDdl`, which fail a run past the second that the cache did not answer. |
 | I12 | Row ids are unique across the logical table | §3.5 | merge two partitions: no repeated id; ids file missing: table refused |
 | I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* |
 | I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers |
 | I15 | The reaper never deletes live data | §12 | corrupt one map, restart: every other table's files intact |
 | I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin |
-| I17 | No retry after a partial apply | §9 | a conflict in the second partition of a fan-out UPDATE, in autocommit and in BEGIN |
+| I17 | No retry after a partial apply | §9 | a conflict in the second partition of a fan-out UPDATE, in autocommit and in BEGIN. **As built:** `row_source::write_tests::a_conflict_after_a_partition_applied_rows_is_not_replayed` and, with `RETURNING` (S17), `row_source::returning_tests::a_returning_conflict_after_a_partition_applied_rows_is_not_replayed`; a multi-row upsert keeps it by `insert_values_batch`, where a tuple's empty `RETURNING` reply no longer strips the marker (S18, §9). |
 | I18 | Downgrade fails loudly, leaving no shadowing duplicate | §3.1 | the previous release opens a phase-2 database: table absent, not empty; `CREATE TABLE t` there, insert, re-upgrade: the new binary refuses to start, naming both rows |
 | I19 | Every crash window leaks rather than loses | §12, §3.2 | failpoints at each step of create, materialize, rename, reshape, conversion and drop, under SIGKILL and the page-cache-drop harness, including a page-cache drop after the outcome is durable: rows equal before or after, never neither. *(Mutation: append `MATERIALIZE` with `append_data(_, false)`.)* |
 | I20 | Cache scopes are distinct | §3.4 | one `WHERE` on two partitions with different rows. *(Mutation: scope from `schema.name`.)* |

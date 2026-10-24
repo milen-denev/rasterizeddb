@@ -23,9 +23,9 @@
 //! Inside a transaction block any failure ends the block: both sides roll
 //! back, so a refused write never reaches the twin.
 //!
-//! [`REFUSED`] is the one place that says what phase 2a does not do yet.
-//! Slices S9 to S12 each remove their kinds from it; the twin is their
-//! done-check. [`KNOWN_DIVERGENCES`] lists allowed kinds whose answers differ
+//! [`REFUSED`] is the one place that says what the partitioned table does
+//! not do yet: since phase 2b, only what phases 3 and 6 build. Slices S9 to
+//! S19 each removed their kinds from it; the twin was their done-check. [`KNOWN_DIVERGENCES`] lists allowed kinds whose answers differ
 //! today because of a bug found by this test, each with its finding; an entry
 //! that stops diverging fails the test, so it is removed with the fix.
 //!
@@ -237,7 +237,8 @@ const fn refused(kind: Kind, lifted_by: &'static str) -> Refusal {
     Refusal { kind, code: "0A000", lifted_by, or_like_twin: None }
 }
 
-/// What phase 2a's partitioned table does not do yet. One entry per kind.
+/// What the partitioned table does not do yet, as of phase 2b: the phase 3
+/// and phase 6 kinds. One entry per kind.
 /// A slice that builds a kind removes its entry; the twin then compares that
 /// kind's answers instead of demanding a refusal.
 const REFUSED: &[Refusal] = &[
