@@ -324,3 +324,76 @@ async fn a_cached_parse_reads_through_the_transaction() {
     assert_eq!(code.as_deref(), Some("25P02"));
     conn.execute("ROLLBACK").await.unwrap();
 }
+
+/// A partitioned table learns its parse like a plain one (S15) and every
+/// cached execution routes its own value (I11): point reads and counts for
+/// tenants in different partitions, alternating, and an unrouted fan-out,
+/// each matching the text path and the plain twin, with the cache used.
+/// File-backed, as a partitioned table needs a directory; on tmpfs, small.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_learns_its_parse_and_routes_each_execution() {
+    let _counted = COUNTED.lock().await;
+    struct Root(std::path::PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            rasterizeddb_core::core::wal::remove_for(&self.0.to_string_lossy());
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Root(std::env::temp_dir().join(format!("prepared_select_cache_part_{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    let server = TestServer::start_file_backed(&root.0.to_string_lossy()).await.expect("server should start");
+    let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+    let columns = "(tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, s TEXT NOT NULL, n INT, PRIMARY KEY (tenant_id, id))";
+    conn.execute(AssertSqlSafe(format!("CREATE TABLE tp {columns} PARTITION BY HASH (tenant_id) PARTITIONS 16")))
+        .await
+        .unwrap();
+    conn.execute(AssertSqlSafe(format!("CREATE TABLE tq {columns}"))).await.unwrap();
+    let mut values = Vec::new();
+    for t in 1..=40i64 {
+        for id in 1..=3i64 {
+            let n = if (t + id) % 5 == 0 { "NULL".to_string() } else { ((t * 3 + id) % 17).to_string() };
+            values.push(format!("({t}, {id}, 'tenant{t}/{id}', {n})"));
+        }
+    }
+    for table in ["tp", "tq"] {
+        conn.execute(AssertSqlSafe(format!("INSERT INTO {table} (tenant_id, id, s, n) VALUES {}", values.join(", "))))
+            .await
+            .unwrap();
+    }
+
+    // The first two of each statement's values teach it, so they differ in
+    // every value and no literal occurs inside another (`WhereTemplate`).
+    let tenants: Vec<i64> = [34i64, 5, 21, 17, 40, 3, 26, 9, 33, 12, 999].to_vec();
+    let mut cached = 0;
+    for table in ["tp", "tq"] {
+        let point = format!("SELECT tenant_id, id, s, n FROM {table} WHERE tenant_id = $1");
+        let pair = format!("SELECT s FROM {table} WHERE tenant_id = $1 AND id = $2");
+        let count = format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1");
+        let fan_out = format!("SELECT COUNT(*), SUM(n) FROM {table} WHERE n > $1");
+        let before = runs();
+        for t in &tenants {
+            same(&mut conn, &point, &[Value::I(*t)]).await;
+            same(&mut conn, &pair, &[Value::I(*t), Value::I(t % 3 + 1)]).await;
+            same(&mut conn, &count, &[Value::I(*t)]).await;
+        }
+        for v in [4i64, 11, 0, 16, 7, 30] {
+            same(&mut conn, &fan_out, &[Value::I(v)]).await;
+        }
+        let moved = runs() - before;
+        if table == "tp" {
+            cached = moved;
+        }
+        // Each statement learns from its first two executions.
+        assert!(moved >= 30, "{table}: only {moved} executions ran from a cached parse");
+    }
+    // The partitioned answers are the twin's, row for row.
+    for t in &tenants {
+        let p = prepared_rows(&mut conn, "SELECT id, s, n FROM tp WHERE tenant_id = $1", &[Value::I(*t)]).await;
+        let q = prepared_rows(&mut conn, "SELECT id, s, n FROM tq WHERE tenant_id = $1", &[Value::I(*t)]).await;
+        assert_eq!(p, q, "tenant {t}: partitioned against plain");
+    }
+    assert!(cached >= 30, "the partitioned table never ran from a cached parse");
+    drop(conn);
+    drop(server);
+}

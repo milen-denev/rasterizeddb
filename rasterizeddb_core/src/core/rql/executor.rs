@@ -11347,18 +11347,21 @@ async fn execute_prepared_rows(
     need: SubqueryNeed,
 ) -> Vec<u8> {
     let prepared = *prepared;
-    // A partitioned table's SELECT marks itself rewritten, so pgwire never
-    // learns a parse for it (I11) and this cannot happen. Should it, the
-    // shell under that name would answer as an empty table; the error says
-    // the cache, not the table, is wrong.
-    if database.partitioned.contains_key(&prepared.table_name) {
-        let e = format!(
-            "internal error: a stale prepared plan reached partitioned table \"{}\"; prepared statements on it \
-             run from their text",
-            prepared.table_name
-        );
-        error!("{}", e);
-        return ddl_error(&e);
+    #[cfg(test)]
+    crate::core::rql::prepared::test_counters::note_learned_run(
+        &prepared.table_name,
+        crate::core::rql::statement_snapshot::in_scope(),
+    );
+    // A partitioned table, looked up by its logical name on every execution,
+    // as the text path does: the parse is the only thing cached. Its `WHERE`
+    // is this execution's values rendered into the template that two
+    // text-path executions verified, and it is routed here afresh, with the
+    // materialized flags read after this execution's snapshot (I11, §4.1).
+    // Nothing about a route outlives the execution that computed it.
+    if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&prepared.table_name) {
+        let mut query_row = prepared.query_row;
+        apply_subquery_need(&mut query_row, need);
+        return read_partitioned(query_row, pt, &database, tx).await;
     }
     let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
     let Some(table) = table else {
@@ -12878,6 +12881,8 @@ pub(crate) async fn execute_with_need(
             // an unsupported predicate form, an unknown column. Reporting it
             // verbatim is the difference between the client seeing which
             // feature is missing and seeing a generic mismatch.
+            #[cfg(test)]
+            crate::core::rql::prepared::test_counters::note_parse(table_name);
             let query_row = match row_fetch_from_select_query(&query, &schema.fields) {
                 Ok(mut q) => {
                     apply_subquery_need(&mut q, need);
@@ -12904,10 +12909,12 @@ pub(crate) async fn execute_with_need(
 /// parse's own `WHERE` clause and reads every reached partition under one
 /// snapshot. Everything after the scan is the plain table's path.
 ///
-/// A prepared statement on it never learns a parse (I11): the statement is
-/// marked rewritten, so pgwire keeps it on the text path, which routes each
-/// execution's rendered values afresh. Row locks are refused before any
-/// read, as phase 3 builds them.
+/// A prepared statement on it learns its parse like a plain table's (S15):
+/// the parse is noted here, under the logical name, and a learned execution
+/// comes back through [`execute_prepared_rows`], which routes that
+/// execution's own rendered `WHERE` (I11). Row locks are refused before any
+/// read, as phase 3 builds them, and before the parse is noted, so a
+/// locking statement fails and never teaches.
 async fn execute_partitioned_select(
     query: &QueryPurpose,
     pt: Arc<crate::core::partition::table::PartitionedTable>,
@@ -12915,8 +12922,9 @@ async fn execute_partitioned_select(
     tx: TxId,
     need: SubqueryNeed,
 ) -> Vec<u8> {
-    crate::core::rql::prepared::note_rewritten();
     let name = pt.name().to_string();
+    #[cfg(test)]
+    crate::core::rql::prepared::test_counters::note_parse(&name);
     let query_row = match row_fetch_from_select_query(query, &pt.shell().schema.fields) {
         Ok(mut q) => {
             apply_subquery_need(&mut q, need);
@@ -12929,10 +12937,35 @@ async fn execute_partitioned_select(
             return result;
         }
     };
-    if query_row.row_lock.is_some() {
-        let e = format!("SELECT … FOR UPDATE/SHARE on partitioned table \"{name}\" is not supported yet");
-        error!("{}", e);
-        return ddl_error(&e);
+    if let Some(refusal) = refuse_partitioned_row_lock(&query_row, &name) {
+        return refusal;
+    }
+    crate::core::rql::prepared::note_plain(&name, &query_row);
+    read_partitioned(query_row, pt, database, tx).await
+}
+
+/// `SELECT … FOR UPDATE/SHARE` on partitioned table `name`: refused, as
+/// phase 3 builds row locks on partitions.
+fn refuse_partitioned_row_lock(query_row: &crate::core::rql::lexer_query::QueryRows, name: &str) -> Option<Vec<u8>> {
+    query_row.row_lock.as_ref()?;
+    let e = format!("SELECT … FOR UPDATE/SHARE on partitioned table \"{name}\" is not supported yet");
+    error!("{}", e);
+    Some(ddl_error(&e))
+}
+
+/// The read half of a partitioned `SELECT`, shared by the text path and a
+/// learned parse: the row-lock refusal, then a source routed on this
+/// `query_row`'s own `WHERE` (one snapshot, then the map, then the flags,
+/// §4.4), then the plain table's pipeline.
+async fn read_partitioned(
+    query_row: crate::core::rql::lexer_query::QueryRows,
+    pt: Arc<crate::core::partition::table::PartitionedTable>,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    let name = pt.name().to_string();
+    if let Some(refusal) = refuse_partitioned_row_lock(&query_row, &name) {
+        return refusal;
     }
     let source = match crate::core::rql::row_source::RowSource::for_select(
         crate::core::database::Relation::Partitioned(pt),

@@ -55,6 +55,13 @@ pub fn get_or_take(take: impl FnOnce() -> Visibility) -> Visibility {
     }
 }
 
+/// Whether the caller runs inside [`scope`]. For the tests that pin which
+/// paths read a statement under one snapshot.
+#[cfg(test)]
+pub(crate) fn in_scope() -> bool {
+    READ.try_with(|_| ()).is_ok()
+}
+
 /// Whether `sql` only reads, so its pieces may share one snapshot.
 ///
 /// Conservative: a statement opening with `SELECT`, `VALUES`, `TABLE` or

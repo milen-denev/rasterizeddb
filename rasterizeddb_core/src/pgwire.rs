@@ -36,6 +36,8 @@ use crate::core::{
 use crate::pg_params::{BoundParam, inline_params};
 
 mod param_infer;
+#[cfg(test)]
+mod prepared_partition_tests;
 mod statement_intern;
 #[cfg(test)]
 mod temp_relation_tests;
@@ -4554,6 +4556,31 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match prepared {
+        // A learned parse reads under the statement's one snapshot, as the
+        // text path below reads a read-only statement: a partitioned table's
+        // fan-out takes its `Visibility` from the scope, so no later read of
+        // the same statement can take another (I7 on the fast path).
+        //
+        // Not every learned parse is read-only. A plain table's `SELECT …
+        // FOR UPDATE` is learned too (nothing in `compared_columns` refuses
+        // it), and `is_read_only` keeps its text out of the scope, because a
+        // conflict retry under the first attempt's snapshot would meet the
+        // same superseded versions and conflict again. A learned parse is a
+        // plain single-table `SELECT` (a CTE, subquery or union is a rewrite,
+        // never learned), so a locking clause, which the parse records in
+        // `row_lock`, is its only way to be more than a read.
+        Some(run) if run.rows.query_row.row_lock.is_none() => {
+            crate::core::rql::statement_snapshot::scope(execute_prepared(
+                database,
+                state,
+                stream,
+                stmt,
+                run,
+                result_formats,
+                omit_description,
+            ))
+            .await
+        }
         Some(run) => execute_prepared(database, state, stream, stmt, run, result_formats, omit_description).await,
         // A read-only statement's subqueries, CTEs and relations are read under
         // one snapshot, as PostgreSQL reads a statement; see `statement_snapshot`.

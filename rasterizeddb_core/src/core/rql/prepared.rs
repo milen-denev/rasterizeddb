@@ -27,6 +27,15 @@
 //! verified with (`literal_class`): an unquoted number, or a single-quoted
 //! string with no quote or backslash inside. A `NULL` has no class, and always
 //! takes the text path.
+//!
+//! A partitioned table learns the same way (`docs/partitioning.md` §4.1, S15).
+//! [`PreparedRows::table_name`] is its logical name, and only the parse is
+//! cached: each execution renders its own values into the template and the
+//! executor routes that rendered `WHERE` afresh, then reads which partitions
+//! are materialized after the execution's snapshot. So a learned parse
+//! never pins the partition its first execution read (I11). pgwire runs a
+//! learned, non-locking parse inside `statement_snapshot::scope`, as the text
+//! path runs a read-only statement.
 
 use std::cell::RefCell;
 
@@ -401,6 +410,44 @@ pub fn shape_of(query_row: &QueryRows) -> String {
     let mut q = query_row.clone();
     q.where_clause = String::new();
     format!("{:?}", q)
+}
+
+/// How many times the executor parsed a single-table `SELECT` on each table,
+/// for the tests that show a learned execution skips the parse. Keyed by
+/// table name so tests running at once never see each other's.
+#[cfg(test)]
+pub(crate) mod test_counters {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn parses() -> &'static Mutex<HashMap<String, u64>> {
+        static P: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        P.get_or_init(Default::default)
+    }
+
+    pub(crate) fn note_parse(table: &str) {
+        *parses().lock().unwrap().entry(table.to_string()).or_default() += 1;
+    }
+
+    /// The `SELECT` parses on `table` so far.
+    pub(crate) fn parses_of(table: &str) -> u64 {
+        parses().lock().unwrap().get(table).copied().unwrap_or(0)
+    }
+
+    fn learned_runs() -> &'static Mutex<HashMap<String, Vec<bool>>> {
+        static R: OnceLock<Mutex<HashMap<String, Vec<bool>>>> = OnceLock::new();
+        R.get_or_init(Default::default)
+    }
+
+    /// A learned parse on `table` ran, inside `statement_snapshot::scope` or not.
+    pub(crate) fn note_learned_run(table: &str, in_scope: bool) {
+        learned_runs().lock().unwrap().entry(table.to_string()).or_default().push(in_scope);
+    }
+
+    /// Whether each learned run on `table` since the last call was scoped.
+    pub(crate) fn take_learned_runs(table: &str) -> Vec<bool> {
+        learned_runs().lock().unwrap().remove(table).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
