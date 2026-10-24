@@ -43,6 +43,7 @@ mod statement_intern;
 mod owner_tests;
 #[cfg(test)]
 mod temp_relation_tests;
+mod fixed_rows;
 mod wire_out;
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
@@ -7545,6 +7546,12 @@ where
         send_row_description(stream, col_meta, result_formats).await?;
     }
 
+    // Planned from the first row; every row is still checked against it.
+    let fixed_shape = crate::core::row::row::serialized_rows(rows_bytes)
+        .next()
+        .and_then(|first| first.ok())
+        .and_then(|first| fixed_rows::FixedRowShape::plan(first, col_meta, result_formats));
+
     let mut frame: Vec<u8> = Vec::with_capacity(256);
     for (sent, span) in crate::core::row::row::serialized_rows(rows_bytes).enumerate() {
         #[cfg(feature = "query_stats")]
@@ -7558,13 +7565,22 @@ where
         }
 
         frame.clear();
+        let span = span.map_err(invalid)?;
+        // All fixed-width numbers in binary, no NULL: one permute or one
+        // MOVBE a value instead of a dispatch a cell. See `fixed_rows`.
+        if let Some(shape) = fixed_shape.as_ref() {
+            if shape.encode(span, &mut frame) {
+                stream.write_all(&frame).await?;
+                continue;
+            }
+        }
         let start = wire_out::begin_message(&mut frame, b'D');
         // The column count is not in the row's header, so it is patched in
         // once the cells are written.
         let count_at = frame.len();
         frame.extend_from_slice(&[0u8; 2]);
         let mut columns = 0usize;
-        for (i, cell) in crate::core::row::row::serialized_cells(span.map_err(invalid)?)
+        for (i, cell) in crate::core::row::row::serialized_cells(span)
             .map_err(invalid)?
             .enumerate()
         {
