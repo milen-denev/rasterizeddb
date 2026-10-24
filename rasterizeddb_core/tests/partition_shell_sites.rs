@@ -14,8 +14,9 @@
 //! columns, constraints and rows, or fails with the same SQLSTATE. The twin
 //! is given the same rows (INSERT routes since S9), so the data-reading
 //! sites compare over rows. The reading sites are `LikeTwin` since S10, and
-//! the writing and maintenance ones since S11, RETURNING since S17, and the
-//! ON CONFLICT ones since S18.
+//! the writing and maintenance ones since S11, RETURNING since S17, the
+//! ON CONFLICT ones since S18, and joins (with a partitioned source of
+//! UPDATE … FROM / DELETE … USING) since S19.
 
 mod partition_wire;
 
@@ -400,8 +401,24 @@ const SITES: &[Site] = &[
     ),
     site(
         "SELECT p.n, s.id FROM site_p p JOIN site_parent s ON p.asset_id = s.id",
-        Expect::Refused,
-        "joins: phase 2b",
+        Expect::LikeTwinAnswered,
+        "S19: a join, the partitioned side fanned out",
+    ),
+    site(
+        "SELECT s.id, p.n, p.label FROM site_parent s LEFT JOIN site_p p ON p.asset_id = s.id AND p.tenant_id = 1",
+        Expect::LikeTwinAnswered,
+        "S19: a LEFT JOIN, the partitioned side null-supplying, NULLs carried",
+    ),
+    site(
+        "SELECT a.asset_id, b.asset_id FROM site_p a JOIN site_p b ON a.tenant_id = b.tenant_id \
+         WHERE a.tenant_id = 1 AND a.asset_group_id = 2",
+        Expect::LikeTwinAnswered,
+        "S19: a self-join, one side routed",
+    ),
+    site(
+        "SELECT COUNT(*), SUM(p.n) FROM site_p p JOIN site_parent s ON p.asset_id = s.id",
+        Expect::LikeTwinAnswered,
+        "S19: an aggregate over a join",
     ),
     // A duplicate of a setup row: 23505 on both since S9.
     site("INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1)", Expect::LikeTwin, "S9"),
@@ -516,12 +533,25 @@ const SITES: &[Site] = &[
     site(
         "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id",
         Expect::Refused,
-        "UPDATE … FROM: phase 3",
+        "UPDATE … FROM with a partitioned target: phase 3",
     ),
     site(
         "DELETE FROM site_p USING site_parent WHERE site_p.asset_id = site_parent.id",
         Expect::Refused,
-        "DELETE … USING: phase 3",
+        "DELETE … USING with a partitioned target: phase 3",
+    ),
+    // A partitioned source writing the plain, shared site_parent: in a
+    // rolled-back block, so the twin's run starts from the same rows.
+    in_block(
+        "UPDATE site_parent SET id = site_parent.id FROM site_p WHERE site_parent.id = site_p.asset_id \
+         AND site_p.n IS NOT NULL RETURNING site_parent.id",
+        Expect::LikeTwinAnswered,
+        "S19: UPDATE … FROM a partitioned source",
+    ),
+    in_block(
+        "DELETE FROM site_parent USING site_p WHERE site_parent.id = site_p.asset_id RETURNING site_parent.id",
+        Expect::LikeTwinAnswered,
+        "S19: DELETE … USING a partitioned source",
     ),
     in_block("UPDATE site_p SET n = 9 WHERE n IS NULL", Expect::LikeTwin, "S11: a fan-out in a block, rolled back"),
     site("DELETE FROM site_p WHERE tenant_id = 1", Expect::LikeTwin, "S11"),

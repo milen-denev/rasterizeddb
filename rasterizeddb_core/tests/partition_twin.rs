@@ -135,6 +135,19 @@ enum Kind {
     Join,
     LeftJoin,
     SelfJoin,
+    // Joins over partitioned tables (S19): a join whose WHERE pins the
+    // partitioned side's key (routed), one that fans out (ORDER BY/LIMIT, a
+    // CTE, a derived table, an IN subquery, the key pinned only on the
+    // other side), two partitioned tables joined (`{u}`), aggregates over a
+    // join, a prepared join, and a partitioned source of UPDATE … FROM and
+    // DELETE … USING writing a plain target (`{d}`).
+    JoinRouted,
+    JoinFanOut,
+    JoinPartitionedBoth,
+    JoinAggregates,
+    PreparedJoin,
+    UpdateDimFromT,
+    DeleteDimUsingT,
     InSubquery,
     Union,
     Cte,
@@ -195,7 +208,8 @@ const ALL_KINDS: &[Kind] = &[
     SelectNonKeyRange, SelectRowValue, SelectSpellings, SelectNonKey, SelectFunctionWhere, SelectLimitZero,
     CountAll, CountByPrefix, Aggregates, GroupBy, GroupByOrdered, OrderByLimit, OrderByExpr, Distinct,
     CountDistinct, Window, Join, LeftJoin,
-    SelfJoin, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
+    SelfJoin, JoinRouted, JoinFanOut, JoinPartitionedBoth, JoinAggregates, PreparedJoin, UpdateDimFromT,
+    DeleteDimUsingT, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedDescribeAlias, PreparedSelectAcrossDdl,
     PreparedInsert, PreparedUpdate, PreparedDelete, PreparedUpdateReturning, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
@@ -244,7 +258,9 @@ const REFUSED: &[Refusal] = &[
     // Vacuum and VacuumFull are compared with the twin, inside blocks too.
     // A key change moves a row between partitions (I4): phase 6.
     refused(UpdateKeyChange, "phase 6"),
-    // Phase 3: UPDATE FROM, DELETE USING, FOR UPDATE, SKIP LOCKED.
+    // Phase 3: UPDATE FROM and DELETE USING with a partitioned target (a
+    // partitioned source is built since S19: UpdateDimFromT,
+    // DeleteDimUsingT), FOR UPDATE, SKIP LOCKED.
     refused(UpdateFrom, "phase 3"),
     refused(DeleteUsing, "phase 3"),
     refused(ForUpdate, "phase 3"),
@@ -255,10 +271,10 @@ const REFUSED: &[Refusal] = &[
     // cheap), and so are the reads inside INSERT … SELECT, IN (SELECT …),
     // UNION and CTEs, the empty routes, and prepared SELECT and COUNT. Since
     // S15 those two run from the learned parse, routed per execution (I11).
-    // 2b: joins.
-    refused(Join, "phase 2b"),
-    refused(LeftJoin, "phase 2b"),
-    refused(SelfJoin, "phase 2b"),
+    // S19 (joins) is built: Join, LeftJoin, SelfJoin, JoinRouted,
+    // JoinFanOut, JoinPartitionedBoth, JoinAggregates and PreparedJoin are
+    // compared with the twin, names and type OIDs included, inside blocks
+    // too, every relation and partition read under the join's one snapshot.
 ];
 
 /// Allowed kinds whose answers differ today, each with the finding that
@@ -295,29 +311,34 @@ struct Config {
     partitions: u32,
 }
 
-/// Each side's names: `{t}` the table under test, `{d}` a dimension table,
-/// `{s}` a sink. The stage table is shared and read-only.
+/// Each side's names: `{t}` the table under test, `{d}` a dimension table
+/// (keyed by tenant, so `UPDATE {d} … FROM {t}` can write each row back),
+/// `{s}` a sink, `{u}` a second table partitioned on the partitioned side
+/// (read-only, for joins of two partitioned tables, S19). The stage table is
+/// shared and read-only.
 struct Side {
     t: &'static str,
     d: &'static str,
     s: &'static str,
+    u: &'static str,
 }
 
-const SIDE_PART: Side = Side { t: PART, d: "dim_part", s: "sink_part" };
-const SIDE_PLAIN: Side = Side { t: PLAIN, d: "dim_plain", s: "sink_plain" };
+const SIDE_PART: Side = Side { t: PART, d: "dim_part", s: "sink_part", u: "pair_part" };
+const SIDE_PLAIN: Side = Side { t: PLAIN, d: "dim_plain", s: "sink_plain", u: "pair_plain" };
 
 fn render(template: &str, side: &Side) -> String {
-    template.replace("{t}", side.t).replace("{d}", side.d).replace("{s}", side.s)
+    template.replace("{t}", side.t).replace("{d}", side.d).replace("{s}", side.s).replace("{u}", side.u)
 }
 
 /// Undoes [`render`] in an answer, so the two sides compare.
 fn unrender(text: &str) -> String {
     let mut out = text.to_string();
     for side in [&SIDE_PART, &SIDE_PLAIN] {
-        out = out.replace(side.d, "{d}").replace(side.s, "{s}").replace(side.t, "{t}");
+        out = out.replace(side.d, "{d}").replace(side.s, "{s}").replace(side.u, "{u}").replace(side.t, "{t}");
         out = out
             .replace(&side.d.to_ascii_uppercase(), "{D}")
             .replace(&side.s.to_ascii_uppercase(), "{S}")
+            .replace(&side.u.to_ascii_uppercase(), "{U}")
             .replace(&side.t.to_ascii_uppercase(), "{T}");
     }
     out
@@ -1004,6 +1025,178 @@ impl Gen {
                 kind,
                 "SELECT COUNT(*) FROM {t} a JOIN {t} b ON a.tenant_id = b.tenant_id AND a.grp = b.grp".into(),
             ),
+            JoinRouted => {
+                let (k, g) = (self.tenant(), self.grp());
+                let sql = match self.rng.u8(..3) {
+                    0 => format!(
+                        "SELECT {{t}}.tenant_id, {{t}}.grp, {{t}}.id, {{t}}.n, {{d}}.label FROM {{t}} JOIN {{d}} \
+                         ON {{t}}.tenant_id = {{d}}.tenant_id WHERE {{t}}.tenant_id = {k} AND {{t}}.grp = {g}"
+                    ),
+                    // The plain side's label is NULL-extended for an even tenant.
+                    1 => format!(
+                        "SELECT {{t}}.id, {{t}}.s, {{t}}.f, {{d}}.label FROM {{t}} LEFT JOIN {{d}} \
+                         ON {{d}}.tenant_id = {{t}}.tenant_id WHERE {{t}}.tenant_id = {k}"
+                    ),
+                    _ => format!(
+                        "SELECT x.tenant_id, x.id, y.label FROM {{t}} x JOIN {{d}} y ON x.tenant_id = y.tenant_id \
+                         WHERE x.tenant_id IN ({})",
+                        self.tenant_list()
+                    ),
+                };
+                self.simple(kind, sql)
+            }
+            JoinFanOut => {
+                let v = self.rng.i32(-50..100);
+                let (g, k) = (self.grp(), self.tenant());
+                match self.rng.u8(..6) {
+                    0 => {
+                        let l = self.rng.usize(1..=8);
+                        self.ordered(
+                            kind,
+                            format!(
+                                "SELECT {{t}}.tenant_id, {{t}}.grp, {{t}}.id, {{t}}.n, {{d}}.label FROM {{t}} JOIN {{d}} \
+                                 ON {{t}}.tenant_id = {{d}}.tenant_id WHERE {{t}}.n > {v} \
+                                 ORDER BY {{t}}.n DESC, {{t}}.tenant_id, {{t}}.grp, {{t}}.id LIMIT {l}"
+                            ),
+                        )
+                    }
+                    1 => self.simple(
+                        kind,
+                        format!(
+                            "WITH x AS (SELECT tenant_id, n FROM {{t}} WHERE grp = {g}) \
+                             SELECT x.tenant_id, x.n, {{d}}.label FROM x JOIN {{d}} ON x.tenant_id = {{d}}.tenant_id"
+                        ),
+                    ),
+                    2 => self.simple(
+                        kind,
+                        "SELECT {d}.tenant_id, m.mx FROM {d} JOIN (SELECT tenant_id, MAX(n) AS mx FROM {t} GROUP BY tenant_id) m \
+                         ON m.tenant_id = {d}.tenant_id"
+                            .into(),
+                    ),
+                    // The key pinned on the other side only: no transitive
+                    // inference in 2b, so the partitioned side fans out.
+                    3 => self.simple(
+                        kind,
+                        format!(
+                            "SELECT {{d}}.tenant_id, {{t}}.id, {{t}}.n FROM {{d}} JOIN {{t}} ON {{t}}.tenant_id = {{d}}.tenant_id \
+                             WHERE {{d}}.tenant_id = {k}"
+                        ),
+                    ),
+                    4 => self.simple(
+                        kind,
+                        format!(
+                            "SELECT {{t}}.tenant_id, {{t}}.id, {{d}}.label FROM {{t}} JOIN {{d}} ON {{t}}.tenant_id = {{d}}.tenant_id \
+                             WHERE {{t}}.tenant_id IN (SELECT tenant_id FROM {{u}} WHERE w > {v})"
+                        ),
+                    ),
+                    _ => self.simple(
+                        kind,
+                        "SELECT {d}.label, {t}.id, {t}.s FROM {d} JOIN {t} ON {t}.tenant_id = {d}.tenant_id \
+                         WHERE {t}.s IS NULL OR {t}.n < 0"
+                            .into(),
+                    ),
+                }
+            }
+            JoinPartitionedBoth => {
+                let (k, v) = (self.tenant(), self.rng.i32(0..130));
+                let sql = match self.rng.u8(..4) {
+                    0 => "SELECT {t}.tenant_id, {t}.grp, {t}.id, {u}.w, {u}.tag FROM {t} JOIN {u} \
+                          ON {t}.tenant_id = {u}.tenant_id AND {t}.grp = {u}.grp"
+                        .to_string(),
+                    1 => format!(
+                        "SELECT {{t}}.tenant_id, {{t}}.id, {{u}}.w, COALESCE({{u}}.tag, 'none') FROM {{t}} LEFT JOIN {{u}} \
+                         ON {{u}}.tenant_id = {{t}}.tenant_id AND {{u}}.grp = {{t}}.grp WHERE {{t}}.tenant_id = {k}"
+                    ),
+                    // The table under test null-supplying, the other routed.
+                    2 => format!(
+                        "SELECT {{u}}.tenant_id, {{u}}.grp, {{t}}.id, {{t}}.n FROM {{u}} LEFT JOIN {{t}} \
+                         ON {{t}}.tenant_id = {{u}}.tenant_id AND {{t}}.grp = {{u}}.grp WHERE {{u}}.tenant_id = {k}"
+                    ),
+                    _ => format!(
+                        "SELECT COUNT(*), SUM({{u}}.w), MAX({{t}}.n), MIN({{t}}.s) FROM {{t}} JOIN {{u}} \
+                         ON {{t}}.tenant_id = {{u}}.tenant_id AND {{t}}.grp = {{u}}.grp WHERE {{u}}.w > {v}"
+                    ),
+                };
+                self.simple(kind, sql)
+            }
+            JoinAggregates => match self.rng.u8(..3) {
+                0 => self.simple(
+                    kind,
+                    "SELECT {d}.label, COUNT(*), SUM({t}.n), MIN({t}.s), MAX({t}.f) FROM {t} JOIN {d} \
+                     ON {t}.tenant_id = {d}.tenant_id GROUP BY {d}.label"
+                        .into(),
+                ),
+                1 => self.simple(
+                    kind,
+                    "SELECT COUNT(*), COUNT({t}.n), SUM({t}.f), AVG({t}.f) FROM {d} LEFT JOIN {t} \
+                     ON {t}.tenant_id = {d}.tenant_id"
+                        .into(),
+                ),
+                _ => self.ordered(
+                    kind,
+                    "SELECT {t}.tenant_id, COUNT(*), MAX({t}.id) FROM {t} JOIN {d} ON {t}.tenant_id = {d}.tenant_id \
+                     GROUP BY {t}.tenant_id ORDER BY {t}.tenant_id"
+                        .into(),
+                ),
+            },
+            PreparedJoin => {
+                if self.rng.bool() {
+                    let runs = self.prepared_runs(|g| vec![Some(g.tenant().to_string())]);
+                    self.prepared(
+                        kind,
+                        "SELECT {t}.id, {t}.n, {d}.label FROM {t} JOIN {d} ON {t}.tenant_id = {d}.tenant_id \
+                         WHERE {t}.tenant_id = $1",
+                        runs,
+                    )
+                } else {
+                    let runs = self.prepared_runs(|g| vec![Some(g.tenant().to_string()), Some(g.id().to_string())]);
+                    self.prepared(
+                        kind,
+                        "SELECT a.id, b.id, b.n FROM {t} a JOIN {t} b ON a.tenant_id = b.tenant_id AND a.grp = b.grp \
+                         WHERE a.tenant_id = $1 AND a.id < $2",
+                        runs,
+                    )
+                }
+            }
+            UpdateDimFromT => {
+                // A constant label, so which source row a dimension row
+                // pairs with first cannot matter.
+                let w = WORDS[self.rng.usize(..4)];
+                let v = self.rng.i32(-50..100);
+                let sql = match self.rng.u8(..3) {
+                    0 => format!(
+                        "UPDATE {{d}} SET label = '{w}' FROM {{t}} WHERE {{d}}.tenant_id = {{t}}.tenant_id AND {{t}}.n > {v}"
+                    ),
+                    1 => format!(
+                        "UPDATE {{d}} SET label = '{w}' FROM {{t}} WHERE {{d}}.tenant_id = {{t}}.tenant_id \
+                         AND {{t}}.tenant_id = {} RETURNING {{d}}.tenant_id, {{d}}.label",
+                        self.tenant()
+                    ),
+                    _ => format!(
+                        "UPDATE {{d}} SET label = '{w}' FROM {{t}} x WHERE {{d}}.tenant_id = x.tenant_id AND x.s IS NULL"
+                    ),
+                };
+                self.simple(kind, sql)
+            }
+            DeleteDimUsingT => {
+                // Rolled back, so the dimension keeps its rows for the other
+                // kinds; the read inside the block sees what it removed.
+                let g = self.grp();
+                let delete = if self.rng.bool() {
+                    format!("DELETE FROM {{d}} USING {{t}} WHERE {{d}}.tenant_id = {{t}}.tenant_id AND {{t}}.grp = {g}")
+                } else {
+                    format!(
+                        "DELETE FROM {{d}} USING {{t}} WHERE {{d}}.tenant_id = {{t}}.tenant_id AND {{t}}.tenant_id = {} \
+                         RETURNING {{d}}.tenant_id, {{d}}.label",
+                        self.tenant()
+                    )
+                };
+                let inner = vec![
+                    Op { kind, step: Step::Simple(delete), ordered: false },
+                    Op { kind, step: Step::Simple("SELECT tenant_id, label FROM {d}".into()), ordered: false },
+                ];
+                Op { kind, step: Step::Block { inner, commit: false }, ordered: false }
+            }
             InSubquery => {
                 let v = self.rng.i32(-50..100);
                 self.simple(
@@ -1174,7 +1367,7 @@ const BLOCK_KINDS: &[Kind] = &[
     DeleteByKey, DeleteByNonKey, DeleteIn, DeleteReturning, PreparedUpdateReturning, SelectByPrefix,
     SelectFunctionWhere, CountAll,
     Aggregates, ForUpdate, SkipLocked, PreparedInsert, PreparedSelect, PreparedUpdate, InsertIntoSinkFromT,
-    ReadSinkAndDim,
+    ReadSinkAndDim, Join, LeftJoin, JoinRouted, JoinPartitionedBoth, UpdateDimFromT,
 ];
 
 /// How often each kind is drawn after the first pass (which draws each once).
@@ -1199,7 +1392,15 @@ struct Tally {
     agreed: usize,
     both_failed: usize,
     diverged_known: usize,
+    /// Rows the agreeing answers held, so a kind that only ever agreed on
+    /// nothing is caught (`ANSWERING_KINDS`).
+    rows: usize,
 }
+
+/// Read kinds that must agree on at least one row per run: an empty answer
+/// on both sides compares nothing.
+const ANSWERING_KINDS: &[Kind] =
+    &[Join, LeftJoin, SelfJoin, JoinRouted, JoinFanOut, JoinPartitionedBoth, JoinAggregates, PreparedJoin];
 
 struct Twin {
     server: Option<Server>,
@@ -1393,6 +1594,7 @@ impl Twin {
                     format!("the partitioned table succeeded where the twin failed: `{sql_p}`\n  twin: {eq}\n  partitioned: {reply_p:?}"),
                 ),
                 Ok(reply_q) => {
+                    self.tally.entry(kind).or_default().rows += reply_p.rows.len();
                     if let Err(why) = self.compare(at, op, sql_p, &reply_p, &reply_q) {
                         if KNOWN_DIVERGENCES.iter().any(|(k, _)| *k == kind) {
                             self.tally.entry(kind).or_default().diverged_known += 1;
@@ -1626,10 +1828,28 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     ));
     setup.ok(&format!("CREATE TABLE {PLAIN} {COLUMNS}"));
     for side in [&SIDE_PART, &SIDE_PLAIN] {
-        setup.ok(&format!("CREATE TABLE {} (tenant_id BIGINT NOT NULL, label TEXT)", side.d));
+        setup.ok(&format!("CREATE TABLE {} (tenant_id BIGINT NOT NULL PRIMARY KEY, label TEXT)", side.d));
         let dims: Vec<String> = (1..=TENANTS).step_by(2).map(|t| format!("({t}, 'tenant {t}')")).collect();
         setup.ok(&format!("INSERT INTO {} (tenant_id, label) VALUES {}", side.d, dims.join(", ")));
         setup.ok(&format!("CREATE TABLE {} (tenant_id BIGINT, id BIGINT, n INT)", side.s));
+        // The second partitioned table (S19), read-only: most (tenant, grp)
+        // pairs, NULLs in both value columns.
+        let partitioning = if side.u == SIDE_PART.u { " PARTITION BY HASH (tenant_id) PARTITIONS 5" } else { "" };
+        setup.ok(&format!(
+            "CREATE TABLE {} (tenant_id BIGINT NOT NULL, grp BIGINT NOT NULL, w INT, tag TEXT, \
+             PRIMARY KEY (tenant_id, grp)){partitioning}",
+            side.u
+        ));
+        let pairs: Vec<String> = (1..=TENANTS)
+            .flat_map(|t| (1..=GROUPS).map(move |g| (t, g)))
+            .filter(|(t, g)| (t + g) % 4 != 0)
+            .map(|(t, g)| {
+                let w = if (t * g) % 5 == 0 { "NULL".to_string() } else { (t * 10 + g).to_string() };
+                let tag = if t % 3 == 0 { "NULL".to_string() } else { format!("'tag {t}.{g}'") };
+                format!("({t}, {g}, {w}, {tag})")
+            })
+            .collect();
+        setup.ok(&format!("INSERT INTO {} (tenant_id, grp, w, tag) VALUES {}", side.u, pairs.join(", ")));
     }
     // The shared, read-only source of INSERT … SELECT.
     setup.ok(&format!("CREATE TABLE stage {COLUMNS}"));
@@ -1739,6 +1959,10 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
              ({finding})"
         );
     }
+    for kind in ANSWERING_KINDS {
+        let rows = twin.tally.get(kind).map_or(0, |t| t.rows);
+        assert!(rows > 0, "{label} seed {seed:#x}: {kind:?} agreed only on empty answers, so it compared nothing");
+    }
     // A refused kind ran and was refused; a kind not in REFUSED was never refused.
     for (kind, t) in &twin.tally {
         if refusal(*kind).is_none() {
@@ -1771,7 +1995,12 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     let summary: Vec<String> = twin
         .tally
         .iter()
-        .map(|(k, t)| format!("{k:?}: refused {} agreed {} both-failed {} known-diverged {}", t.refused, t.agreed, t.both_failed, t.diverged_known))
+        .map(|(k, t)| {
+            format!(
+                "{k:?}: refused {} agreed {} both-failed {} known-diverged {} rows {}",
+                t.refused, t.agreed, t.both_failed, t.diverged_known, t.rows
+            )
+        })
         .collect();
     assert!(twin.cached_runs > 0, "{label} seed {seed:#x}: no prepared execution answered from a learned parse");
     eprintln!(
