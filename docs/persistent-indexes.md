@@ -1215,8 +1215,13 @@ through `table_for`).
   B3b). `execute_with_sync` opens a scope only when none is in place, which
   is how the native protocol, login lookups, the importer's DDL and any other
   `execute()` caller get one (finding L3), and `execute_in_txn` falls back to
-  its transaction's root. A nested entry point always joins the scope it
-  finds. `SET`, `SHOW`, `BEGIN` and other statements answered above the
+  its transaction's root. A nested entry point joins the scope it finds
+  only when that scope belongs to the same database (the same
+  `TransactionManager`): a sub-execution against another database (CREATE
+  DATABASE's role catalogue, an import into a target) gets an owner of its
+  own there, released when it ends. Joined across, its locks were taken in
+  the other database's manager under an id of the first's transactions and
+  released only in the first, so they were never released. `SET`, `SHOW`, `BEGIN` and other statements answered above the
   engine begin no O.
 - *O is an owner-only id.* `TransactionManager::begin_owner` begins O in
   `running` (so it reads `InProgress`, holds `oldest_active`, and the status

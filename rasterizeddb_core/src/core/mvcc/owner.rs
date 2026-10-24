@@ -154,6 +154,13 @@ pub fn in_scope() -> bool {
     SCOPE.try_with(|_| ()).is_ok()
 }
 
+/// Whether the caller runs inside an owner scope of the database whose
+/// transactions `transactions` are: an owner is one database's transaction,
+/// so a sub-execution against another database never joins it.
+fn in_scope_of(transactions: &Arc<TransactionManager>) -> bool {
+    SCOPE.try_with(|scope| Arc::ptr_eq(&scope.transactions, transactions)).unwrap_or(false)
+}
+
 /// The scope's owner if it has one already; `None` outside a scope or before
 /// a lazy one is minted. Never mints.
 pub fn current() -> Option<StatementOwner> {
@@ -220,7 +227,7 @@ pub fn statement<F: Future>(
     kind: OwnerKind,
     fut: F,
 ) -> impl Future<Output = F::Output> {
-    if in_scope() {
+    if in_scope_of(transactions) {
         return futures::future::Either::Left(fut);
     }
     futures::future::Either::Right(SCOPE.scope(
@@ -249,7 +256,7 @@ pub fn under<F: Future>(
     fut: F,
 ) -> impl Future<Output = F::Output> {
     match LockOwner::block(transactions.top_level(root)) {
-        Some(owner) if !in_scope() => futures::future::Either::Right(SCOPE.scope(
+        Some(owner) if !in_scope_of(transactions) => futures::future::Either::Right(SCOPE.scope(
             OwnerScope {
                 kind,
                 fixed: Some(owner),

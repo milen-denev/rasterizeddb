@@ -962,6 +962,91 @@ mod load_tests {
         assert!(!database.row_locks.owner_holds_tables(tx), "the batch's commit did not release its owner");
     }
 
+    /// Whether another owner of `database` takes ACCESS EXCLUSIVE on `table`
+    /// at once: nothing is left holding it.
+    fn lockable_now(database: &Arc<Database>, table: &str) -> bool {
+        use crate::core::mvcc::table_locks::{LockOwner, TableMode};
+        let probe = LockOwner::autocommit(database.transactions.begin_owner()).unwrap();
+        let took = database
+            .row_locks
+            .table_locks()
+            .try_acquire(probe, table, TableMode::AccessExclusive);
+        database.row_locks.release_owner(probe);
+        database.transactions.end_owner(probe.id());
+        took
+    }
+
+    /// A statement's owner never crosses into another database: a
+    /// sub-execution against database B inside a statement of database A
+    /// (CREATE DATABASE's role catalogue) runs under an owner of B's own,
+    /// released when it ends. Joined to A's scope, its ACCESS EXCLUSIVE in
+    /// B's lock manager was held by an id of A's transactions, released only
+    /// in A, and every later statement on the table in B queued forever.
+    ///
+    /// Mutation: `owner::statement` joins any scope (`in_scope()`); the table
+    /// in B stays locked after both statements ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_statement_owner_never_crosses_into_another_database() {
+        use crate::core::mvcc::owner::{self, OwnerKind};
+        let a = crate::replication::test_support::in_memory_database().await;
+        let b = crate::replication::test_support::in_memory_database().await;
+        let (ta, la) = (a.transactions.clone(), a.row_locks.clone());
+        let b2 = b.clone();
+        owner::statement(&ta, &la, OwnerKind::Statement, async move {
+            // A's owner exists before the sub-execution, as a session's does.
+            owner::ensure().expect("A's statement has an owner");
+            for sql in ["CREATE TABLE crossed (id INT PRIMARY KEY)", "INSERT INTO crossed (id) VALUES (1)"] {
+                let response = executor::execute_as(
+                    OwnerKind::Auth,
+                    recognize_query_purpose(sql).expect("parse"),
+                    b2.clone(),
+                )
+                .await;
+                assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response[1..]));
+            }
+        })
+        .await;
+        assert!(lockable_now(&b, "crossed"), "a lock taken in B under A's statement owner was never released");
+    }
+
+    /// An import batch into database B, driven from a statement of database
+    /// A, runs under its batch's own owner in B, released at the batch's
+    /// commit: B's table is free afterwards, by the direct write and by the
+    /// statement path alike.
+    ///
+    /// Mutation: `owner::under` joins any scope; the batch's RX stays held in
+    /// B under A's owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_import_from_another_databases_statement_leaves_no_lock() {
+        use crate::core::mvcc::owner::{self, OwnerKind};
+        for direct in [true, false] {
+            let a = crate::replication::test_support::in_memory_database().await;
+            let b = crate::replication::test_support::in_memory_database().await;
+            let table = plan_for("imported");
+            run_ddl(&b, &table.create).await.expect("create");
+            let (ta, la) = (a.transactions.clone(), a.row_locks.clone());
+            let b2 = b.clone();
+            owner::statement(&ta, &la, OwnerKind::Statement, async move {
+                owner::ensure().expect("A's statement has an owner");
+                let options = ImportOptions {
+                    batch_rows: 2,
+                    ..ImportOptions::default()
+                };
+                let mut loader = TableLoader::new(&b2, &table, &options);
+                loader.direct = direct;
+                for i in 1..=3 {
+                    loader.row(&copy_line(i)).await.expect("row");
+                }
+                assert_eq!(loader.finish().await.expect("finish"), 3);
+            })
+            .await;
+            assert!(
+                lockable_now(&b, "imported"),
+                "direct={direct}: the import left a lock in the target under the session's owner"
+            );
+        }
+    }
+
     /// Every value the import converts, stored by the direct write and by the
     /// statement it replaced, must read back identically — NULLs, NUMERIC
     /// scales, floats' edge values, escapes, JSON, arrays, BYTEA and the
