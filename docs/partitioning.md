@@ -351,12 +351,12 @@ SET partition_trace = on;   -- a NOTICE per statement: partitions routed, and wh
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
 | Temporary partitioned tables; KV-backed partitions | KV until measured |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
-| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; phase 2a refuses any key assignment its `WHERE` does not pin to the same value, §4.5); FKs referencing a partitioned table (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (composite identifying keys, §1b); joins, `ON CONFLICT` and `RETURNING` on partitioned tables (phase 2b); reshapes (phase 5) | §15 |
+| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; phase 2a refuses any key assignment its `WHERE` does not pin to the same value, §4.5); FKs referencing a partitioned table (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (composite identifying keys, §1b); joins and `ON CONFLICT` on partitioned tables (phase 2b; `RETURNING` is built, S17, §9); reshapes (phase 5) | §15 |
 
-**What phase 2a refuses, as built (S11).** Each with 0A000 and "not
-supported", before anything is read or written: `RETURNING` on `INSERT`,
-`UPDATE` and `DELETE`, `ON CONFLICT` in either form, and joins reading a
-partitioned table (2b); `UPDATE … FROM` and `DELETE … USING` with a
+**What phase 2a refuses, as built (S11; S17 lifted `RETURNING`).** Each with
+0A000 and "not supported", before anything is read or written: `ON CONFLICT`
+in either form, with or without `RETURNING`, and joins reading a partitioned
+table (2b); `UPDATE … FROM` and `DELETE … USING` with a
 partitioned target (refused at their entry) or source (refused by the join),
 `FOR UPDATE`/`SHARE`, `SKIP LOCKED` (phase 3); `ALTER` in every
 form, `RENAME`, `CREATE`/`DROP INDEX`, FKs either way (phase 3); key changes
@@ -366,8 +366,9 @@ is correct and not yet cheap (§8, S12). Everything else in the twin test's
 statement set (I6) answers like a plain table: `INSERT` in every form, single-
 and multi-partition `SELECT`/`COUNT` (aggregates, `GROUP BY`, `DISTINCT`,
 windows, `UNION`, CTEs, `IN (SELECT …)`, empty routes), `UPDATE` and `DELETE`
-routed or fanned out, in autocommit and in blocks, prepared `SELECT`,
-`INSERT`, `UPDATE` and `DELETE`, `VACUUM` and `VACUUM FULL`, named and bare.
+routed or fanned out, in autocommit and in blocks, `RETURNING` on `INSERT`,
+`UPDATE` and `DELETE` (S17), prepared `SELECT`, `INSERT`, `UPDATE` and
+`DELETE`, `VACUUM` and `VACUUM FULL`, named and bare.
 `LOCK TABLE` takes the logical name's lock, which a partitioned `UPDATE` and
 `DELETE` check before routing, as a plain table's do.
 
@@ -1093,10 +1094,42 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   commits or aborts across its partitions as one transaction, and a crash
   before its outcome is durable leaves none of it. The retry marker is
   stripped from a partition's error once an earlier partition applied rows
-  (I17). `RETURNING` is refused until 2b, though the pre-images are threaded
-  (`collect`, concatenated in pid order). A prepared `UPDATE` or `DELETE` is
+  (I17). A prepared `UPDATE` or `DELETE` is
   marked rewritten (`note_rewritten`), as a prepared `SELECT` is, so each
   execution takes the text path and routes its own values (I11).
+- **`RETURNING`, as built in 2b (S17).** `execute_partitioned_update` and
+  `execute_partitioned_delete` resolve the list against the shell's schema
+  before anything is written (`check_partitioned_write`; a bad list fails as
+  on a plain table), pass `collect` to `write_partitions`, and build the rows
+  only after every partition succeeded (`partitioned_write_reply`):
+  `returning_rows_for_write` over the shell, the collected pre-images, and,
+  for an `UPDATE`, the assignments cloned before the write consumed them and
+  the per-row expressions, exactly as the plain arms do. The pre-images were
+  read by the write itself, under the statement's one `Visibility` (several
+  partitions) or the partition's `write_lock` (one), and are never read
+  again, so no row is reported that the statement did not change (memory
+  `one-snapshot-per-statement`). Rows concatenate in pid order; PostgreSQL
+  gives none without `ORDER BY`, and the twin compares them as multisets. An
+  empty route returns zero rows with the row description. A failed statement
+  returns its error and no rows: the partial `collect` is dropped with it.
+  `INSERT … RETURNING` needed only its refusal lifted
+  (`refuse_partitioned_insert_clauses` now refuses `ON CONFLICT` alone): the
+  returned row is built from the payload the partition stores, and the
+  multi-row and `INSERT … SELECT` paths concatenate their per-row answers.
+  pgwire's Describe and scale lookups already read the shell's schema.
+  Tests: `row_source::returning_tests` (one snapshot under a writer
+  committing between partition visits, mutation a snapshot per partition;
+  unset columns reported as stored, the overlay trap, mutation pre-images
+  without their text columns; a third-partition failure returns nothing and
+  changes nothing, mutation the partial rows returned on error; I17 with
+  `RETURNING`), `tests/partition_returning.rs` (every statement shape against
+  the twin with NULLs, JSONB, `NUMERIC(10,2)`, a default, a generated column
+  and a `BIGSERIAL`, blocks, prepared; failures change nothing; Describe of
+  `RETURNING id AS v, n * 2`, mutation the overlay skipped; a prepared
+  `UPDATE … RETURNING` across writes and a restart, mutation the assignment
+  expressions dropped), and the twin's `InsertReturning`, `UpdateReturning`,
+  `UpdateReturningExpr`, `DeleteReturning`, `DeleteReturningFanOut`,
+  `PreparedUpdateReturning` and the empty-route kinds.
 - **Assigning a key column** with the point unchanged is ordinary, as it must
   be: ORMs assign every column, usually its current value. Any other key change
   fails the whole statement at the guard (§4.5, which also says why the rule is
