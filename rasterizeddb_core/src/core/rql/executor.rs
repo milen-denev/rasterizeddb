@@ -5691,6 +5691,32 @@ fn strip_qualifier(text: &str, table: &str) -> String {
     }
 }
 
+/// The output types of `SELECT * FROM <table> …`: the table's visible
+/// columns, in order. Empty for anything else.
+fn star_output_types(select_sql: &str, database: &Arc<Database>) -> Vec<Option<crate::core::db_type::DbType>> {
+    let Some(from) = crate::core::rql::join::find_keyword(select_sql, "FROM", 0) else {
+        return Vec::new();
+    };
+    let head: Vec<&str> = select_sql[..from].split_whitespace().collect();
+    if !(head.len() == 2 && head[0].eq_ignore_ascii_case("SELECT") && head[1] == "*") {
+        return Vec::new();
+    }
+    let Some(name) = select_sql[from + "FROM".len()..].split_whitespace().next() else {
+        return Vec::new();
+    };
+    let Some(table) = database.tables.get(name.trim_matches('"').trim_end_matches(';')) else {
+        return Vec::new();
+    };
+    let mut fields: Vec<_> = table
+        .schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .collect();
+    fields.sort_by_key(|f| f.write_order);
+    fields.into_iter().map(|f| Some(f.db_type.clone())).collect()
+}
+
 /// Runs an `INSERT … SELECT`, or returns `None` when the statement is not one.
 ///
 /// The query supplies the rows, so it runs first and its results become a
@@ -5759,14 +5785,32 @@ async fn insert_from_select(
         return Some(result);
     }
 
+    // A scanned row reports a document, a byte string and an array by their
+    // physical type, which is text, so their stored bytes were written back as
+    // a text literal: copying a JSONB column failed with 22P02. The query's
+    // declared output types say what each value really is.
+    let declared = {
+        let declared = crate::core::rql::cte::declared_item_types(select_sql, database);
+        if declared.is_empty() { star_output_types(select_sql, database) } else { declared }
+    };
+    let erased = |t: &crate::core::db_type::DbType| {
+        matches!(
+            t,
+            crate::core::db_type::DbType::JSONB | crate::core::db_type::DbType::BYTEA | crate::core::db_type::DbType::ARRAY
+        )
+    };
     let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut parts: Vec<String> = Vec::with_capacity(row.columns.len());
-        for column in &row.columns {
+        for (at, column) in row.columns.iter().enumerate() {
+            let column_type = match declared.get(at).cloned().flatten() {
+                Some(t) if erased(&t) && column.column_type != crate::core::db_type::DbType::NULL => t,
+                _ => column.column_type.clone(),
+            };
             // `value_to_literal` quotes and escapes, so a value holding a quote
             // or a parenthesis rebuilds as data rather than as syntax.
             let Some(literal) = crate::core::rql::subquery::value_to_literal(
-                &column.column_type,
+                &column_type,
                 column.data.into_slice(),
             ) else {
                 return Some(ddl_error(&format!(
@@ -10629,13 +10673,31 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                         crate::core::rql::expr::eval(expr, row, schema)?,
                         db_type,
                     );
+                    // A NUMERIC is shown at the scale PostgreSQL gives the
+                    // expression (the larger of its operands' for `+`, their
+                    // sum for `*`), carried in the cell as SELECT's computed
+                    // items carry it. Without it the wire trimmed the engine's
+                    // nine places to the value's own: `amt * 2` on a
+                    // NUMERIC(10,2) holding 1.50 arrived as 3, not 3.00.
+                    let shown = match (db_type, crate::core::rql::expr::display_scale(expr)) {
+                        (crate::core::db_type::DbType::DECIMAL, Some(scale)) => Some(scale),
+                        _ => None,
+                    };
+                    let value = crate::core::rql::expr::at_display_scale(value, shown)?;
                     let (bytes, ty) = match value {
                         crate::core::rql::expr::Value::Null => {
                             (Vec::new(), crate::core::db_type::DbType::NULL)
                         }
-                        crate::core::rql::expr::Value::Data { bytes, .. } => {
-                            (bytes, db_type.clone())
-                        }
+                        crate::core::rql::expr::Value::Data { bytes, .. } => match shown {
+                            Some(scale) if bytes.len() == 16 => (
+                                crate::core::value_codec::decimal_cell_with_scale(
+                                    i128::from_le_bytes(bytes.as_slice().try_into().expect("sixteen bytes")),
+                                    scale,
+                                ),
+                                db_type.clone(),
+                            ),
+                            _ => (bytes, db_type.clone()),
+                        },
                     };
                     let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
                     mb.into_slice_mut().copy_from_slice(&bytes);
@@ -11789,9 +11851,6 @@ pub(crate) async fn execute_with_need(
             };
 
             let schema = &table.schema;
-            // Copied out: the table handle is borrowed across the write below,
-            // and the hydration needs the list afterwards.
-            let json_columns_for_returning = schema.json_columns.clone();
 
             // A RETURNING clause turns the write into a statement that also
             // produces rows. Resolving it before the insert means a bad column
@@ -11897,61 +11956,26 @@ pub(crate) async fn execute_with_need(
                 // The returned row is built from the payload about to be
                 // written, so it reflects exactly what was stored without
                 // reading the row back off disk.
-                let returned_row = returning.as_ref().map(|fields| {
-                    let mut columns: crate::core::row::row::RowColumns =
-                        smallvec::SmallVec::new();
-                    for field in fields {
-                        let payload = insert_row
-                            .columns_writing_data
-                            .iter()
-                            .find(|c| c.write_order as u64 == field.write_order);
-                        // Whether the row stores a NULL here is the
-                        // companion's business, not the value's: a NULL
-                        // occupies its slot as zeroes (or as nothing at all),
-                        // which is indistinguishable from a real zero or an
-                        // empty string. Typed as the column's own type it
-                        // reached the client as `0` or `""` — a silent wrong
-                        // answer on every nullable column — and for an array
-                        // it was worse: a zero-length payload where the
-                        // decoder reads five `i32` headers panicked the
-                        // client outright. `DbType::NULL` is what makes the
-                        // wire layer send an actual NULL.
-                        let is_null = payload.is_none() || {
-                            let flag_name =
-                                crate::core::rql::nullable::flag_column_name(&field.name);
-                            schema
-                                .fields
-                                .iter()
-                                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag_name))
-                                .and_then(|flag| {
-                                    insert_row
-                                        .columns_writing_data
-                                        .iter()
-                                        .find(|c| c.write_order as u64 == flag.write_order)
-                                })
-                                .is_some_and(|c| {
-                                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                                })
-                        };
-                        columns.push(crate::core::row::row::Column {
-                            schema_id: crate::core::row::row::schema_id_of(field.write_order),
-                            data: if is_null {
-                                crate::memory_pool::MemoryBlock::default()
-                            } else {
-                                payload.map(|p| p.data.clone()).unwrap_or_default()
-                            },
-                            column_type: if is_null {
-                                crate::core::db_type::DbType::NULL
-                            } else {
-                                field.db_type.physical()
-                            },
-                        });
-                    }
-                    crate::core::row::row::Row {
-                        position: 0,
-                        columns,
-                        length: 0,
-                    }
+                // The returned row is the payload about to be written, every
+                // column of it, so RETURNING reports exactly what was stored
+                // without reading the row back. It goes through the same
+                // builder UPDATE and DELETE use, which evaluates a computed
+                // item against the row. Echoing payloads by the item's write
+                // order instead returned NULL for `RETURNING id AS k`, whose
+                // item is a computed echo with a synthetic write order, and
+                // for any expression.
+                let returned_row = returning.as_ref().map(|_| crate::core::row::row::Row {
+                    position: 0,
+                    columns: insert_row
+                        .columns_writing_data
+                        .iter()
+                        .map(|c| crate::core::row::row::Column {
+                            schema_id: crate::core::row::row::schema_id_of(c.write_order as u64),
+                            data: c.data.clone(),
+                            column_type: c.column_type.clone(),
+                        })
+                        .collect(),
+                    length: 0,
                 });
 
                 // A partitioned table routes the final row, defaults and
@@ -11970,23 +11994,29 @@ pub(crate) async fn execute_with_need(
                     // replica writes the same values rather than new ones.
                     note_write(&database, tx, depth, &row_data.query, Some(table_name));
                     if let Some(row) = returned_row {
-                        // The row was assembled from what was written, so its
                         // JSON columns still hold the reference the rewrite put
-                        // there rather than the document the client sent.
-                        let mut rows = vec![row];
-                        if let Some(fields) = returning.as_ref() {
-                            hydrate_json_in_returning(
-                                &database,
-                                &mut rows,
-                                fields,
-                                &json_columns_for_returning,
-                                tx,
-                            )
-                            .await;
-                        }
-                        let mut result = vec![2u8];
-                        rows[0].extend_serialized(&mut result);
-                        return result;
+                        // there; the builder hydrates them into documents.
+                        let built = Box::pin(returning_rows_for_write(
+                            &table,
+                            &row_data.query,
+                            vec![row],
+                            None,
+                            &[],
+                            &database,
+                            tx,
+                        ))
+                        .await;
+                        return match built {
+                            Ok(Some(rows)) => {
+                                let mut result = vec![2u8];
+                                for row in &rows {
+                                    row.extend_serialized(&mut result);
+                                }
+                                result
+                            }
+                            Ok(None) => ddl_ok(1),
+                            Err(e) => ddl_error(&e),
+                        };
                     }
                     // Keep status=0 for backward compatibility, but also include rows-affected.
                     // pgwire can use this to emit INSERT 0 <n>.
