@@ -1111,6 +1111,23 @@ impl TableLocks {
         fast.union(main.tables.get(table).map_or(ModeSet::EMPTY, |t| t.held_by(owner)))
     }
 
+    /// The tables `owner` holds ACCESS EXCLUSIVE on, in no order. A strong
+    /// mode is only ever on the main path, so the shards need no look.
+    pub fn exclusive_tables(&self, owner: LockOwner) -> Vec<String> {
+        let main = self.main();
+        let Some(keys) = main.owned.get(&owner) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|key| {
+                main.tables
+                    .get(&**key)
+                    .is_some_and(|t| t.held_by(owner).contains(TableMode::AccessExclusive))
+            })
+            .map(|key| key.to_string())
+            .collect()
+    }
+
     /// Who `owner`'s queued request waits for: the other owners holding a
     /// conflicting mode and the conflicting requests ahead of its place
     /// (rules (a) and (b)). Empty when it is not waiting.

@@ -48,6 +48,8 @@ mod table_lock_tests;
 #[cfg(test)]
 mod ddl_lock_tests;
 #[cfg(test)]
+mod ddl_rewrite_tests;
+#[cfg(test)]
 mod temp_relation_tests;
 mod fixed_rows;
 mod wire_out;
@@ -4433,7 +4435,10 @@ where
         .scope(cancel, async {
             match block_root {
                 Some(root) => {
-                    crate::core::mvcc::owner::under(
+                    // A block's DDL gives its ACCESS EXCLUSIVE back at its
+                    // end (finding L5): see `executor::BlockDdl`.
+                    let ddl = crate::core::rql::executor::BlockDdl::begin(database, root, stmt);
+                    let result = crate::core::mvcc::owner::under(
                         &transactions,
                         root,
                         crate::core::mvcc::owner::OwnerKind::Block,
@@ -4447,7 +4452,11 @@ where
                             prepared,
                         )),
                     )
-                    .await
+                    .await;
+                    if let Some(ddl) = ddl {
+                        ddl.end(database);
+                    }
+                    result
                 }
                 None => {
                     #[cfg(not(any(test, feature = "test_tokens")))]

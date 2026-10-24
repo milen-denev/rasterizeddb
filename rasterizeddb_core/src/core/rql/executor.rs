@@ -11560,6 +11560,76 @@ fn fk_parent_of_clause(description: &str) -> Option<String> {
         .map(|fk| fk.parent_table)
 }
 
+/// A DDL statement of an explicit block, from before it runs to its end
+/// (finding L5, docs/persistent-indexes.md §7 "As built (B5)").
+///
+/// DDL is not transactional here: what a DDL statement changed is changed
+/// whether the block commits or not. So the ACCESS EXCLUSIVE it took on a
+/// table is not held to the block's end, as PostgreSQL holds it, which
+/// would stop every reader of the table for as long as the block stays
+/// open. At the statement's end each table it newly holds ACCESS EXCLUSIVE
+/// on goes back to what the block needs there:
+/// - **downgraded to ROW EXCLUSIVE** when the block has written the table's
+///   file set (it holds ROW EXCLUSIVE beside the AE: it wrote the table
+///   before, or the rewrite carried its versions, `rewrite_rows`). Its
+///   uncommitted versions are in the files, and its own later writes need
+///   the lock; a DDL of another owner must keep waiting for the block, as
+///   it waits for any writer (its index build and, from B11, its seal must
+///   not run beside the block's versions), while readers go on;
+/// - **released** otherwise, back to whatever the block held before (an
+///   ACCESS SHARE a REPEATABLE READ block took by reading it stays).
+///
+/// An ACCESS EXCLUSIVE the block held before the statement (a `LOCK TABLE`,
+/// an earlier statement's) is not touched, and `LOCK TABLE` itself is no
+/// DDL here: it holds what it names to the block's end.
+pub(crate) struct BlockDdl {
+    owner: crate::core::mvcc::table_locks::LockOwner,
+    held_before: Vec<String>,
+}
+
+/// Whether `sql` is a DDL statement for [`BlockDdl`]: one that takes ACCESS
+/// EXCLUSIVE because it changes a table (ALTER, CREATE, DROP), not one that
+/// asks for the lock itself.
+fn is_block_ddl(sql: &str) -> bool {
+    let head = sql
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '(')
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("");
+    ["ALTER", "CREATE", "DROP"].iter().any(|k| head.eq_ignore_ascii_case(k))
+}
+
+impl BlockDdl {
+    /// Before a block statement runs: `None` unless it is DDL.
+    pub(crate) fn begin(database: &Database, root: TxId, sql: &str) -> Option<BlockDdl> {
+        if !is_block_ddl(sql) {
+            return None;
+        }
+        let owner = crate::core::mvcc::table_locks::LockOwner::block(database.transactions.top_level(root))?;
+        Some(BlockDdl {
+            owner,
+            held_before: database.row_locks.table_locks().exclusive_tables(owner),
+        })
+    }
+
+    /// After it, on every way out (an error too: a DDL that failed may have
+    /// taken its lock and written nothing, and holds nothing then).
+    pub(crate) fn end(self, database: &Database) {
+        use crate::core::mvcc::table_locks::TableMode;
+        let locks = database.row_locks.table_locks();
+        for table in locks.exclusive_tables(self.owner) {
+            if self.held_before.contains(&table) {
+                continue;
+            }
+            if locks.holds(self.owner, &table).contains(TableMode::RowExclusive) {
+                locks.downgrade(self.owner, &table, TableMode::AccessExclusive, TableMode::RowExclusive);
+            } else {
+                locks.release_mode(self.owner, &table, TableMode::AccessExclusive);
+            }
+        }
+    }
+}
+
 pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
     execute_with_sync(query, database, crate::synchronous_commit()).await
 }
