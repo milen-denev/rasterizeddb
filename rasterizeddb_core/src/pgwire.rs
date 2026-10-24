@@ -2164,6 +2164,11 @@ struct PreparedLearned {
     /// Watched executions that could not teach anything (repeated values, a
     /// literal seen twice). Past a few, the statement stops being watched.
     misses: u8,
+    /// On a partitioned table, the full-key point shape's route derivation,
+    /// learned with the parse and checked against `route_where` on both
+    /// verifying executions (S16b). Reset with everything else on a schema
+    /// change.
+    route: Option<crate::core::rql::prepared::RoutePlan>,
 }
 
 /// A cached parse to run instead of the statement text, and the description
@@ -4423,6 +4428,9 @@ where
                             rows: Box::new(pr::PreparedRows {
                                 table_name: l.table_name.clone(),
                                 query_row,
+                                // This execution's own values, through the
+                                // cached derivation (I11).
+                                key: l.route.as_ref().and_then(|plan| plan.bind(lits)),
                             }),
                             fields: l.fields.clone(),
                             scales: l.scales.clone(),
@@ -4550,6 +4558,7 @@ fn learn_prepared(
                 fields,
                 scales,
                 misses: 0,
+                route: None,
             })),
             // A value that also occurs elsewhere in the clause; another
             // execution may place it unambiguously.
@@ -4572,6 +4581,7 @@ fn learn_prepared(
                 && l.classes == classes
                 && l.template.render(&literals) == query_row.where_clause
             {
+                l.route = learn_route(database, &l, &columns, &literals);
                 let mut query_row = query_row;
                 query_row.where_clause = String::new();
                 l.query_row = query_row;
@@ -4584,6 +4594,46 @@ fn learn_prepared(
         }
         other => other,
     };
+}
+
+/// The route derivation a statement just verified on a partitioned table
+/// keeps (S16b): `Some` only for the full-key point shape, every key column
+/// compared with exactly one parameter, and only when the key each of the
+/// two verifying executions binds (`l.literals`, then `literals`) routes
+/// exactly where `route_where` routes its rendered `WHERE`: one point, the
+/// same one. That check is what admits only top-level equalities: an `OR`,
+/// a range, a `NOT` or a second constant on the key routes elsewhere, and
+/// the statement keeps routing its rendered `WHERE` per execution (S15).
+fn learn_route(
+    database: &Arc<Database>,
+    l: &PreparedLearned,
+    columns: &[String],
+    literals: &[String],
+) -> Option<crate::core::rql::prepared::RoutePlan> {
+    use crate::core::partition::Route;
+    let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&l.table_name) else {
+        return None;
+    };
+    let fields = &pt.shell().schema.fields;
+    let key: Vec<(u32, DbType, &str)> = pt
+        .spec()
+        .ok()?
+        .levels()
+        .iter()
+        .map(|level| {
+            let field = fields.iter().find(|f| !f.is_deleted && f.write_order as u32 == level.write_order)?;
+            Some((level.write_order, level.db_type.clone(), field.name.as_str()))
+        })
+        .collect::<Option<_>>()?;
+    let plan = crate::core::rql::prepared::RoutePlan::derive(pt.uid(), &key, columns)?;
+    for lits in [&l.literals[..], literals] {
+        let bound = plan.bind(lits)?;
+        let range = pt.keyed_range(bound.uid, &bound.levels)?;
+        if pt.route_where(&l.template.render(lits)).ok()? != Route::Points(vec![range]) {
+            return None;
+        }
+    }
+    Some(plan)
 }
 
 /// One statement: its cached parse when it has one, its text otherwise.

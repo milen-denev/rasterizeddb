@@ -730,6 +730,51 @@ impl PartitionedTable {
         Ok(out)
     }
 
+    /// The point a full key routes to, for a learned prepared statement's
+    /// bound key (S16b): `levels` holds, per key level and leading first, the
+    /// write order and declared type the key was bound for and the stored
+    /// bytes its value compares as. `None`, so the caller routes the rendered
+    /// `WHERE` instead, unless `uid` is this table's and `levels` names this
+    /// table's key exactly: a table re-created under the name, or a key that
+    /// changed columns or types, never routes on a key bound for another.
+    /// Hashed through `KeySpec::prefix_range`, as `route_where` and the
+    /// insert path hash.
+    pub fn keyed_range<V: AsRef<[u8]>>(
+        &self,
+        uid: u64,
+        levels: &[(u32, crate::core::db_type::DbType, V)],
+    ) -> Option<PointRange> {
+        if uid != self.uid {
+            return None;
+        }
+        let spec = &self.live().ok()?.spec;
+        let key = spec.levels();
+        if key.len() != levels.len()
+            || key.iter().zip(levels).any(|(k, (wo, ty, _))| k.write_order != *wo || k.db_type != *ty)
+        {
+            return None;
+        }
+        let values: SmallVec<[&[u8]; 3]> = levels.iter().map(|(_, _, v)| v.as_ref()).collect();
+        spec.prefix_range(&values).ok()
+    }
+
+    /// [`Self::materialized`] for the route `Points([range])`, as a bound key's
+    /// [`Self::keyed_range`] names it: without building the route when one
+    /// partition owns the whole range, which a full key's range (one point,
+    /// or a 2¹⁶ tenant block for a one-column key) is unless a reshape split
+    /// it; through the general path when it did.
+    pub fn materialized_in(
+        &self,
+        epoch: &MapEpoch,
+        range: PointRange,
+    ) -> io::Result<SmallVec<[(u32, Arc<Table<DbStorageProvider>>); 1]>> {
+        let Some(pid) = epoch.map.sole_pid(range.lo, range.hi) else {
+            return Ok(SmallVec::from_vec(self.materialized(epoch, &Route::Points(vec![range]))?));
+        };
+        let live = self.live()?;
+        Ok(Self::slot(live, pid)?.open.get().map(|table| (pid, table.clone())).into_iter().collect())
+    }
+
     fn slot(live: &Live, pid: u32) -> io::Result<&Slot> {
         match live.slots.get(pid as usize) {
             Some(slot) if slot.pid == pid => Ok(slot),

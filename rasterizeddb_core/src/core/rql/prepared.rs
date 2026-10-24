@@ -38,6 +38,11 @@
 //! never pins the partition its first execution read (I11). pgwire runs a
 //! learned, non-locking parse inside `statement_snapshot::scope`, as the text
 //! path runs a read-only statement.
+//!
+//! For the full-key point shape S16b also caches how the route is derived,
+//! never a route: a [`RoutePlan`] says which parameter feeds each key column,
+//! and each execution binds its own values through it ([`BoundKey`]) instead
+//! of routing its rendered `WHERE` again.
 
 use std::cell::RefCell;
 
@@ -49,6 +54,126 @@ use crate::core::rql::lexer_query::QueryRows;
 pub struct PreparedRows {
     pub table_name: String,
     pub query_row: QueryRows,
+    /// On a partitioned table whose learned `WHERE` pins every key column
+    /// by equality to a parameter: this execution's key, from its own
+    /// values through the statement's [`RoutePlan`] (S16b). `None` routes the
+    /// rendered `WHERE` instead, as S15 does.
+    pub key: Option<BoundKey>,
+}
+
+/// How a learned statement on a partitioned table names its partition from
+/// its own values (`docs/partitioning.md` §4.1, S16b): which parameter feeds
+/// each key column, and that column's write order and declared type.
+///
+/// Learned only for the full-key point shape, every key column compared by
+/// `=` with exactly one parameter as a top-level conjunct, and only after
+/// pgwire checked that the key it binds routes exactly where `route_where`
+/// routes the rendered `WHERE`, on both executions that verified the
+/// template. Anything else (an `IN` list, part of the key, a range, an `OR`)
+/// keeps S15's per-execution `route_where`. Only the derivation is cached:
+/// every execution binds its own values ([`RoutePlan::bind`]), and the
+/// executor reads which partition that is, and whether it is materialized,
+/// after the execution's snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePlan {
+    /// The partitioned table it was learned on (`PartitionedTable::uid`). A
+    /// table re-created under the name has another, and the executor routes
+    /// the rendered `WHERE` instead.
+    pub uid: u64,
+    /// One per key level, leading column first.
+    pub slots: smallvec::SmallVec<[RouteSlot; 3]>,
+}
+
+/// One key level of a [`RoutePlan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteSlot {
+    /// The parameter compared with the key column, by index (`$n` is `n - 1`).
+    pub param: usize,
+    pub write_order: u32,
+    /// The key column's declared type.
+    pub db_type: DbType,
+}
+
+/// One execution's key: per level, leading first, the key column's write
+/// order and declared type (checked against the live key before use), and
+/// the stored bytes this execution's value compares as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundKey {
+    pub uid: u64,
+    pub levels: smallvec::SmallVec<[(u32, DbType, smallvec::SmallVec<[u8; 16]>); 3]>,
+}
+
+impl RoutePlan {
+    /// The plan for a statement whose parameters are compared with
+    /// `columns` (by index, [`compared_columns`]' answer), on table `uid`
+    /// keyed by `key` (each level's write order, declared type and column
+    /// name, leading first): `Some` when every key column is compared with
+    /// exactly one parameter. Whether those comparisons are top-level
+    /// equalities is not read here; the caller checks the plan against
+    /// `route_where` on observed executions before keeping it.
+    pub fn derive(uid: u64, key: &[(u32, DbType, &str)], columns: &[String]) -> Option<Self> {
+        let mut slots = smallvec::SmallVec::new();
+        for (write_order, db_type, name) in key {
+            let mut params = columns.iter().enumerate().filter(|(_, c)| c.eq_ignore_ascii_case(name));
+            let (param, _) = params.next()?;
+            if params.next().is_some() {
+                return None;
+            }
+            slots.push(RouteSlot { param, write_order: *write_order, db_type: db_type.clone() });
+        }
+        (!slots.is_empty()).then_some(Self { uid, slots })
+    }
+
+    /// This execution's key from its `literals` (as `pg_params::param_literal`
+    /// wrote them). `None` when a value is not one [`key_value_bytes`] reads
+    /// for certain; the execution then routes its rendered `WHERE`.
+    pub fn bind(&self, literals: &[String]) -> Option<BoundKey> {
+        let mut levels = smallvec::SmallVec::new();
+        for slot in &self.slots {
+            let value = key_value_bytes(literals.get(slot.param)?, &slot.db_type)?;
+            levels.push((slot.write_order, slot.db_type.clone(), value));
+        }
+        Some(BoundKey { uid: self.uid, levels })
+    }
+}
+
+/// The stored bytes a key column of declared type `ty` holds when it equals
+/// `literal`, as the scan reads `column = literal`: the tokenizer types the
+/// number at the column's type (`parse_by_db_type`) and `coerce_literal`
+/// keeps it there, and a plain string is its own bytes. Only the shapes
+/// learning admits (`literal_class`) whose reading is certain: an unsigned
+/// integer the column's type holds, or a single-quoted string with no quote
+/// or backslash for a text column. Anything else (a fraction, an
+/// out-of-range number, a sign, another type) is `None`, and the caller
+/// routes the rendered `WHERE`, which reads it however the scan does.
+pub fn key_value_bytes(literal: &str, ty: &DbType) -> Option<smallvec::SmallVec<[u8; 16]>> {
+    use DbType::*;
+    let b = literal.as_bytes();
+    if *ty == STRING {
+        let inner = b.strip_prefix(b"'")?.strip_suffix(b"'")?;
+        if inner.iter().any(|c| *c == b'\'' || *c == b'\\') {
+            return None;
+        }
+        return Some(smallvec::SmallVec::from_slice(inner));
+    }
+    if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let v: u128 = literal.parse().ok()?;
+    let out = match ty {
+        I8 => i8::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        I16 => i16::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        I32 => i32::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        I64 => i64::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        I128 => i128::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        U8 => u8::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        U16 => u16::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        U32 => u32::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        U64 => u64::try_from(v).ok()?.to_le_bytes().as_slice().into(),
+        U128 => v.to_le_bytes().as_slice().into(),
+        _ => return None,
+    };
+    Some(out)
 }
 
 /// What the text path did for one statement, recorded while it ran.

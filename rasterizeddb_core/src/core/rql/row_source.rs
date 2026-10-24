@@ -17,6 +17,8 @@
 //!   `WHERE` text the partitions' scans evaluate: `extract_gated`, never the
 //!   path-aware variant, and zero partitions only for a constant-false
 //!   clause. An unmaterialized partition holds no row (§4.3) and is skipped.
+//!   A learned prepared statement's bound key (S16b) stands in for
+//!   `route_where` only where pgwire proved the two agree.
 //! - **Merging like one scan.** Unordered results concatenate; a `LIMIT`
 //!   without `ORDER BY` stops launching partitions once enough rows are in
 //!   and cuts the concatenation. `ORDER BY [… LIMIT k]` asks every partition
@@ -64,6 +66,9 @@ pub(crate) const FANOUT_IN_FLIGHT: usize = 8;
 /// the query cache (§8).
 pub(crate) const CACHE_MAX_PARTITIONS: usize = 4;
 
+/// A fan-out's partitions, by ascending pid.
+pub(crate) type Parts = smallvec::SmallVec<[(u32, Arc<PartTable>); 1]>;
+
 /// What a `SELECT` reads.
 pub(crate) enum RowSource {
     /// A plain table, read exactly as before partitioning existed.
@@ -82,18 +87,28 @@ pub(crate) struct FanOut {
     /// The map epoch the route was computed under, counted (`load_full`) and
     /// held for the statement, so a reshape's reclamation waits for it.
     _epoch: StdArc<MapEpoch>,
-    /// The routed partitions that are materialized, by ascending pid.
-    parts: Vec<(u32, Arc<PartTable>)>,
+    /// The routed partitions that are materialized, by ascending pid. Inline
+    /// for the one a routed point read reaches.
+    parts: Parts,
     cache: bool,
 }
 
 impl RowSource {
     /// The source for a `SELECT` on `relation` whose scan evaluates
-    /// `where_clause`, read as `tx`.
-    pub(crate) fn for_select(relation: Relation, where_clause: &str, tx: TxId) -> io::Result<Self> {
+    /// `where_clause`, read as `tx`. `key`, a learned prepared statement's
+    /// bound key (S16b), names a partitioned table's one partition without
+    /// routing `where_clause`; see [`FanOut::plan`].
+    pub(crate) fn for_select(
+        relation: Relation,
+        where_clause: &str,
+        key: Option<&crate::core::rql::prepared::BoundKey>,
+        tx: TxId,
+    ) -> io::Result<Self> {
         match relation {
             Relation::Plain(table) => Ok(RowSource::Single(table)),
-            Relation::Partitioned(table) => Ok(RowSource::Partitioned(Box::new(FanOut::plan(table, where_clause, tx)?))),
+            Relation::Partitioned(table) => {
+                Ok(RowSource::Partitioned(Box::new(FanOut::plan(table, where_clause, key, tx)?)))
+            }
         }
     }
 
@@ -307,17 +322,54 @@ impl FanOut {
     /// was committed after its partition was materialized, and the flags are
     /// read after the snapshot, so an unmaterialized partition skipped here
     /// holds nothing this statement may see (§4.3).
-    fn plan(table: Arc<PartitionedTable>, where_clause: &str, tx: TxId) -> io::Result<FanOut> {
+    ///
+    /// The route is `route_where(where_clause)`, except for a learned
+    /// prepared statement's bound `key` (S16b): this execution's own values,
+    /// bound through the statement's cached derivation, already name one
+    /// point, which pgwire checked routes as `route_where` routes the
+    /// rendered clause. `keyed_range` refuses a key bound for another table
+    /// or another key, and then the clause is routed as before. The flags
+    /// are still read here, after this execution's snapshot.
+    fn plan(
+        table: Arc<PartitionedTable>,
+        where_clause: &str,
+        key: Option<&crate::core::rql::prepared::BoundKey>,
+        tx: TxId,
+    ) -> io::Result<FanOut> {
+        match Self::plan_inner(&table, where_clause, key, tx) {
+            Ok((visibility, epoch, parts)) => {
+                let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+                Ok(FanOut { table, visibility, _epoch: epoch, parts, cache })
+            }
+            Err(e) => {
+                log::error!("Cannot read partitioned table {}: {}", table.name(), e);
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn plan_inner(
+        table: &PartitionedTable,
+        where_clause: &str,
+        key: Option<&crate::core::rql::prepared::BoundKey>,
+        tx: TxId,
+    ) -> io::Result<(Visibility, StdArc<MapEpoch>, Parts)> {
         table.check()?;
         // The statement's one snapshot when it has one (a read-only
         // statement's subqueries, CTEs and relations share it), else one
         // taken now; either way every partition is read under this value.
         let visibility = crate::core::rql::statement_snapshot::get_or_take(|| table.visibility_for(tx));
         let epoch = table.epoch()?;
-        let route = table.route_where(where_clause)?;
-        let parts = table.materialized(&epoch, &route)?;
-        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
-        Ok(FanOut { table, visibility, _epoch: epoch, parts, cache })
+        let parts = match key.and_then(|k| table.keyed_range(k.uid, &k.levels)) {
+            Some(range) => {
+                #[cfg(test)]
+                test_hooks::note_keyed(table.uid());
+                table.materialized_in(&epoch, range)?
+            }
+            None => Parts::from_vec(table.materialized(&epoch, &table.route_where(where_clause)?)?),
+        };
+        Ok((visibility, epoch, parts))
     }
 
     /// Runs `read` on every planned partition, at most [`FANOUT_IN_FLIGHT`]
@@ -341,9 +393,16 @@ impl FanOut {
             }
             #[cfg(test)]
             test_hooks::note_reads(self.table.uid(), chunk.iter().map(|(pid, _)| *pid));
-            let reads = chunk.iter().map(|(_, part)| read(part.clone(), self.visibility.clone(), self.cache));
-            for answer in futures::future::join_all(reads).await {
-                out.push(answer?);
+            if let [(_, part)] = chunk {
+                // One partition, as a routed point read is: awaited in place.
+                // `join_all` would move the scan's future into a `Vec` of its
+                // own, and the profile showed those copies (S16b).
+                out.push(read(part.clone(), self.visibility.clone(), self.cache).await?);
+            } else {
+                let reads = chunk.iter().map(|(_, part)| read(part.clone(), self.visibility.clone(), self.cache));
+                for answer in futures::future::join_all(reads).await {
+                    out.push(answer?);
+                }
             }
             #[cfg(test)]
             if group == 0 {
@@ -498,6 +557,21 @@ pub(crate) mod test_hooks {
     /// The partitions read for table `uid` since the last call, in order.
     pub(crate) fn take_reads(uid: u64) -> Vec<u32> {
         reads().lock().unwrap().remove(&uid).unwrap_or_default()
+    }
+
+    fn keyed() -> &'static Mutex<HashMap<u64, u64>> {
+        static K: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+        K.get_or_init(Default::default)
+    }
+
+    pub(crate) fn note_keyed(uid: u64) {
+        *keyed().lock().unwrap().entry(uid).or_default() += 1;
+    }
+
+    /// Fan-outs over table `uid` planned from a learned statement's bound key
+    /// (S16b), not from `route_where`, since the last call.
+    pub(crate) fn take_keyed(uid: u64) -> u64 {
+        keyed().lock().unwrap().remove(&uid).unwrap_or(0)
     }
 
     fn writes() -> &'static Mutex<HashMap<u64, Vec<u32>>> {

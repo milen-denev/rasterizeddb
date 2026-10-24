@@ -130,6 +130,17 @@ impl RangeMap {
         self.entries.iter().position(|&(_, p)| p == pid).map(|j| self.range_at(j))
     }
 
+    /// The one partition whose range holds all of `[lo, hi)`, or `None` when
+    /// the interval meets several (or is empty): [`Self::pids_overlapping`]
+    /// for the common one-partition case, without a `Vec`.
+    pub fn sole_pid(&self, lo: u64, hi: u128) -> Option<u32> {
+        if lo as u128 >= hi {
+            return None;
+        }
+        let j = self.index_of(lo);
+        (self.range_at(j).hi >= hi).then(|| self.entries[j].1)
+    }
+
     /// Every partition whose range meets `[lo, hi)`, sorted by pid. Empty only
     /// for an empty interval.
     pub fn pids_overlapping(&self, lo: u64, hi: u128) -> Vec<u32> {

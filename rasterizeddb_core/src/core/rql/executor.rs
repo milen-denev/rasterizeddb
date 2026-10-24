@@ -11494,10 +11494,19 @@ async fn execute_prepared_rows(
     // text-path executions verified, and it is routed here afresh, with the
     // materialized flags read after this execution's snapshot (I11, §4.1).
     // Nothing about a route outlives the execution that computed it.
+    //
+    // S16b: a full-key point shape also carries this execution's key, bound
+    // from its own values through the statement's cached derivation; the
+    // fan-out reads that one partition without routing the rendered `WHERE`,
+    // and still reads whether it is materialized after this execution's
+    // snapshot. A key bound for another table or key is ignored there.
     if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&prepared.table_name) {
         let mut query_row = prepared.query_row;
         apply_subquery_need(&mut query_row, need);
-        return read_partitioned(query_row, pt, &database, tx).await;
+        return match partitioned_source(&query_row, pt, prepared.key.as_ref(), tx) {
+            Ok(source) => execute_query_rows(query_row, source, &database, tx).await,
+            Err(refusal) => refusal,
+        };
     }
     let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
     let Some(table) = table else {
@@ -13046,7 +13055,10 @@ async fn execute_partitioned_select(
         return refusal;
     }
     crate::core::rql::prepared::note_plain(&name, &query_row);
-    read_partitioned(query_row, pt, database, tx).await
+    match partitioned_source(&query_row, pt, None, tx) {
+        Ok(source) => execute_query_rows(query_row, source, database, tx).await,
+        Err(refusal) => refusal,
+    }
 }
 
 /// `SELECT … FOR UPDATE/SHARE` on partitioned table `name`: refused, as
@@ -13059,31 +13071,30 @@ fn refuse_partitioned_row_lock(query_row: &crate::core::rql::lexer_query::QueryR
 }
 
 /// The read half of a partitioned `SELECT`, shared by the text path and a
-/// learned parse: the row-lock refusal, then a source routed on this
-/// `query_row`'s own `WHERE` (one snapshot, then the map, then the flags,
-/// §4.4), then the plain table's pipeline.
-async fn read_partitioned(
-    query_row: crate::core::rql::lexer_query::QueryRows,
+/// learned parse, up to the plain table's pipeline (`execute_query_rows`,
+/// which the caller runs over the source): the row-lock refusal, then a
+/// source routed on this `query_row`'s own `WHERE`, or on a learned parse's
+/// bound `key` (S16b) (one snapshot, then the map, then the flags, §4.4).
+/// `Err` is the reply. Not `async`, so the parse is not moved through one
+/// more future on its way to the scan (the S16b profile).
+fn partitioned_source(
+    query_row: &crate::core::rql::lexer_query::QueryRows,
     pt: Arc<crate::core::partition::table::PartitionedTable>,
-    database: &Arc<Database>,
+    key: Option<&crate::core::rql::prepared::BoundKey>,
     tx: TxId,
-) -> Vec<u8> {
-    let name = pt.name().to_string();
-    if let Some(refusal) = refuse_partitioned_row_lock(&query_row, &name) {
-        return refusal;
+) -> Result<crate::core::rql::row_source::RowSource, Vec<u8>> {
+    if let Some(refusal) = refuse_partitioned_row_lock(query_row, pt.name()) {
+        return Err(refusal);
     }
-    let source = match crate::core::rql::row_source::RowSource::for_select(
+    // `FanOut::plan` logs a failure with the table's name, so the success
+    // path neither clones the table's `Arc` nor its name.
+    crate::core::rql::row_source::RowSource::for_select(
         crate::core::database::Relation::Partitioned(pt),
         &query_row.where_clause,
+        key,
         tx,
-    ) {
-        Ok(source) => source,
-        Err(e) => {
-            error!("Cannot read partitioned table {}: {}", name, e);
-            return ddl_error(&e.to_string());
-        }
-    };
-    execute_query_rows(query_row, source, database, tx).await
+    )
+    .map_err(|e| ddl_error(&e.to_string()))
 }
 
 /// The tables a `VACUUM` of partitioned table `pt` visits: its materialized
