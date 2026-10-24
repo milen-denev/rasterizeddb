@@ -12,7 +12,10 @@
 //!   read under that one `Visibility` through the `_with_visibility` entry
 //!   points. A snapshot per partition would let a transaction that committed
 //!   between two partition reads show in one and not the other: a transfer
-//!   across tenants seen half applied (I7).
+//!   across tenants seen half applied (I7). A join (S19) takes its one
+//!   `Visibility` itself and hands it to every relation's fan-out
+//!   ([`FanOut::plan_with`]), so two partitioned relations, or a self-join's
+//!   two sides, cannot take two.
 //! - **Pruning only on proof** (I3). The route is `route_where` on the exact
 //!   `WHERE` text the partitions' scans evaluate: `extract_gated`, never the
 //!   path-aware variant, and zero partitions only for a constant-false
@@ -110,6 +113,19 @@ impl RowSource {
                 Ok(RowSource::Partitioned(Box::new(FanOut::plan(table, where_clause, key, tx)?)))
             }
         }
+    }
+
+    /// A partitioned table's source read under `visibility`, a snapshot the
+    /// caller already holds, rather than one [`FanOut::plan`] takes: a join
+    /// reads every relation, partitioned or not, under the statement's one
+    /// `Visibility` (S19, I7). Routed on `where_clause`, the text the
+    /// partitions' scans evaluate (I3).
+    pub(crate) fn partitioned_with(
+        table: Arc<PartitionedTable>,
+        where_clause: &str,
+        visibility: Visibility,
+    ) -> io::Result<Self> {
+        Ok(RowSource::Partitioned(Box::new(FanOut::plan_with(table, where_clause, visibility)?)))
     }
 
     /// The declared schema: the plain table's, or the partitioned table's
@@ -336,7 +352,32 @@ impl FanOut {
         key: Option<&crate::core::rql::prepared::BoundKey>,
         tx: TxId,
     ) -> io::Result<FanOut> {
-        match Self::plan_inner(&table, where_clause, key, tx) {
+        // The statement's one snapshot when it has one (a read-only
+        // statement's subqueries, CTEs and relations share it), else one
+        // taken now; either way every partition is read under this value.
+        Self::planned(table, where_clause, key, |table| table.read_visibility_for(tx))
+    }
+
+    /// [`Self::plan`] under `visibility`, which the caller took before this
+    /// call, so §4.4's order holds: the snapshot, then the epoch, then the
+    /// route and the flags. For a statement reading several relations under
+    /// one snapshot it took itself (a join, S19), with or without a
+    /// `statement_snapshot` scope around it.
+    pub(crate) fn plan_with(
+        table: Arc<PartitionedTable>,
+        where_clause: &str,
+        visibility: Visibility,
+    ) -> io::Result<FanOut> {
+        Self::planned(table, where_clause, None, move |_| visibility)
+    }
+
+    fn planned(
+        table: Arc<PartitionedTable>,
+        where_clause: &str,
+        key: Option<&crate::core::rql::prepared::BoundKey>,
+        visibility: impl FnOnce(&PartitionedTable) -> Visibility,
+    ) -> io::Result<FanOut> {
+        match Self::plan_inner(&table, where_clause, key, visibility) {
             Ok((visibility, epoch, parts)) => {
                 let cache = parts.len() <= CACHE_MAX_PARTITIONS;
                 Ok(FanOut { table, visibility, _epoch: epoch, parts, cache })
@@ -353,13 +394,10 @@ impl FanOut {
         table: &PartitionedTable,
         where_clause: &str,
         key: Option<&crate::core::rql::prepared::BoundKey>,
-        tx: TxId,
+        visibility: impl FnOnce(&PartitionedTable) -> Visibility,
     ) -> io::Result<(Visibility, StdArc<MapEpoch>, Parts)> {
         table.check()?;
-        // The statement's one snapshot when it has one (a read-only
-        // statement's subqueries, CTEs and relations share it), else one
-        // taken now; either way every partition is read under this value.
-        let visibility = crate::core::rql::statement_snapshot::get_or_take(|| table.visibility_for(tx));
+        let visibility = visibility(table);
         let epoch = table.epoch()?;
         let parts = match key.and_then(|k| table.keyed_range(k.uid, &k.levels)) {
             Some(range) => {
@@ -621,3 +659,7 @@ mod write_tests;
 #[cfg(test)]
 #[path = "row_source_returning_tests.rs"]
 mod returning_tests;
+
+#[cfg(test)]
+#[path = "row_source_join_tests.rs"]
+mod join_tests;

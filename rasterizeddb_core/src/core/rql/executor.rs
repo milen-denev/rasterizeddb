@@ -38,15 +38,6 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
     };
 
-    // A join reading a partitioned table is phase 2b (§8): refused before
-    // any relation is scanned, rather than left to its shell's refusal
-    // after the relations ahead of it were read.
-    if let Some(relation) = plan.relations.iter().find(|r| database.partitioned.contains_key(&r.table)) {
-        let e = format!("JOIN on partitioned table \"{}\" is not supported yet", relation.table);
-        error!("{}", e);
-        return error(&e);
-    }
-
     // Each relation is kept as the scan's serialized rows: a decoded `Row` is
     // ~1.5 KB whatever it holds. `RDB_JOIN_ROWS=1` scans into `Vec<Row>`
     // instead, the path this replaced, for A/B measurement.
@@ -60,16 +51,16 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     // so the first one's snapshot is valid for the rest.
     let mut statement_snapshot: Option<crate::core::mvcc::Visibility> = None;
     for relation in &plan.relations {
-        // Cloned out so the map guard does not span the scan below.
-        let Some(table) = database
-            .tables
-            .get(&relation.table)
-            .map(|t| t.value().clone())
-        else {
+        // A partitioned table's rows are in its partitions; `tables` holds
+        // only its shell under this name (§3.3). Cloned out, so no map guard
+        // spans the scan below.
+        let Some(source) = database.relation(&relation.table) else {
             return error(&format!("relation '{}' does not exist", relation.table));
         };
 
-        let schema = &table.schema.fields;
+        // The declared schema: a partitioned table's shell's, which every
+        // partition's is a clone of, and which planned the join.
+        let schema = &source.schema().fields;
         let requested = crate::core::rql::join::fetch_for(&relation.fetch_columns, schema);
 
         // The scan needs whatever the predicate reads, which may be columns the
@@ -83,43 +74,75 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             }
         }
         let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
-
-        let visibility = match table.read_visibility_for(tx) {
-            crate::core::mvcc::Visibility::All => crate::core::mvcc::Visibility::All,
-            own => statement_snapshot.get_or_insert(own).clone(),
-        };
+        let schema = schema.to_vec();
 
         // No limit is pushed down: it applies to the joined output, and a cap
         // here would drop rows that the join still needs.
-        let set = if legacy_rows {
-            table
-                .query_row_with_visibility(
+        let set = match &source {
+            crate::core::database::Relation::Plain(table) => {
+                let visibility = match table.read_visibility_for(tx) {
+                    crate::core::mvcc::Visibility::All => crate::core::mvcc::Visibility::All,
+                    own => statement_snapshot.get_or_insert(own).clone(),
+                };
+                if legacy_rows {
+                    table
+                        .query_row_with_visibility(
+                            &relation.predicate,
+                            &schema,
+                            query_fetch,
+                            requested,
+                            None,
+                            None,
+                            visibility,
+                        )
+                        .await
+                        .map(crate::core::rql::join::RowSet::Rows)
+                        .map_err(|e| e.to_string())
+                } else {
+                    table
+                        .query_row_bytes_with_visibility(
+                            &relation.predicate,
+                            &schema,
+                            query_fetch,
+                            requested,
+                            None,
+                            None,
+                            visibility,
+                            true,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(crate::core::rql::join::RowSet::from_serialized)
+                }
+            }
+            // Its partitions, under the statement's one snapshot (S19, I7):
+            // the join's, handed to the fan-out, never one the fan-out takes
+            // for itself, so a second partitioned relation, or a self-join's
+            // other side, reads under the same one. Routed on this relation's
+            // own pushed-down predicate, the exact text its partitions' scans
+            // evaluate (I3); a join term naming another relation routes
+            // nothing.
+            crate::core::database::Relation::Partitioned(pt) => {
+                let visibility =
+                    statement_snapshot.get_or_insert_with(|| pt.read_visibility_for(tx)).clone();
+                match crate::core::rql::row_source::RowSource::partitioned_with(
+                    pt.clone(),
                     &relation.predicate,
-                    &schema.to_vec(),
-                    query_fetch,
-                    requested,
-                    None,
-                    None,
                     visibility,
-                )
-                .await
-                .map(crate::core::rql::join::RowSet::Rows)
-                .map_err(|e| e.to_string())
-        } else {
-            table
-                .query_row_bytes_with_visibility(
-                    &relation.predicate,
-                    &schema.to_vec(),
-                    query_fetch,
-                    requested,
-                    None,
-                    None,
-                    visibility,
-                    true,
-                )
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(crate::core::rql::join::RowSet::from_serialized)
+                ) {
+                    Err(e) => Err(e.to_string()),
+                    Ok(source) if legacy_rows => source
+                        .query_rows(&relation.predicate, &schema, query_fetch, requested, None, None, tx)
+                        .await
+                        .map(crate::core::rql::join::RowSet::Rows)
+                        .map_err(|e| e.to_string()),
+                    Ok(source) => source
+                        .query_bytes(&relation.predicate, &schema, query_fetch, requested, None, None, tx)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(crate::core::rql::join::RowSet::from_serialized),
+                }
+            }
         };
         match set {
             Ok(set) => scanned.push(set),
@@ -3673,7 +3696,9 @@ async fn execute_update_from(
     let table = table_token.trim_matches('"').to_string();
     // A partitioned target writes each row back by an identifying key, which
     // waits on composite identifying keys (§1b, phase 3). Refused before
-    // anything runs; a partitioned source is refused by the join.
+    // anything runs. A partitioned source is supported (S19): it is read by
+    // the join `update_from_join` runs through `run_subquery`, under that
+    // join's one snapshot, and only this plain target is written back.
     if database.partitioned.contains_key(&table) {
         return ddl_error(&format!("UPDATE … FROM on partitioned table \"{table}\" is not supported yet"));
     }
@@ -4069,7 +4094,8 @@ async fn execute_delete_using(
         return ddl_error("DELETE names no relation");
     };
     let table = table_token.trim_matches('"').to_string();
-    // As for `UPDATE … FROM`: phase 3, refused before anything runs.
+    // As for `UPDATE … FROM`: a partitioned target is phase 3, refused
+    // before anything runs; a partitioned source is read by the join (S19).
     if database.partitioned.contains_key(&table) {
         return ddl_error(&format!("DELETE … USING on partitioned table \"{table}\" is not supported yet"));
     }

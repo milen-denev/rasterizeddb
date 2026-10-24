@@ -505,6 +505,124 @@ async fn the_fast_path_reads_one_snapshot_across_partitions() {
     close(db, dir.path());
 }
 
+/// I7 for a prepared join (S19, owner constraint 2). A join is never a
+/// learned parse (only a plain single-table `SELECT` is), so its executions
+/// take the text path, which `run_statement` runs inside
+/// `statement_snapshot::scope` for a read-only statement. Two partitioned
+/// tables, `jacct` (7 partitions) and `jbank` (5), one row per tenant. Between
+/// the first and second partition reads of every fan-out over `jacct`, one
+/// transaction commits: 2 out of a `jacct` tenant in the partition read
+/// first, 1 into one read after it, and 1 into `jbank`. A prepared
+/// `jacct ⋈ jbank` keeps the combined total and a prepared self-join's sides
+/// agree on every run, and every hook saw the reader inside the scope.
+/// Bounded: 2 × 8 runs, under 10 s.
+///
+/// Mutation: drop the scope from `run_statement`'s text arm: the scope check
+/// fails. Mutation: a snapshot per partition (`FanOut::each`): the sums are
+/// off by a transfer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_join_reads_one_snapshot_across_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "prep_join").await;
+    for (table, partitions) in [("jacct", 7), ("jbank", 5)] {
+        exec_ok(
+            &db,
+            &format!(
+                "CREATE TABLE {table} (tenant_id BIGINT NOT NULL, bal BIGINT NOT NULL, PRIMARY KEY (tenant_id)) \
+                 PARTITION BY HASH (tenant_id) PARTITIONS {partitions}"
+            ),
+        )
+        .await;
+        let opening: Vec<String> = (1..=ACCOUNTS).map(|t| format!("({t}, {OPENING})")).collect();
+        exec_ok(&db, &format!("INSERT INTO {table} (tenant_id, bal) VALUES {}", opening.join(", "))).await;
+    }
+    let pt = partitioned(&db, "jacct");
+    let parts = materialized(&pt);
+    assert!(parts.len() >= 2, "the tenants reach one partition only: {parts:?}");
+    let debit = (1..=ACCOUNTS).find(|t| pid_of(&pt, &t.to_le_bytes()) == parts[0]).unwrap();
+    let credit = (1..=ACCOUNTS).find(|t| pid_of(&pt, &t.to_le_bytes()) != parts[0]).unwrap();
+
+    let transfers = StdArc::new(AtomicI64::new(0));
+    let unscoped = StdArc::new(AtomicBool::new(false));
+    let hook: test_hooks::Hook = {
+        let (db, transfers, unscoped) = (db.clone(), transfers.clone(), unscoped.clone());
+        StdArc::new(move || {
+            let (db, transfers, unscoped) = (db.clone(), transfers.clone(), unscoped.clone());
+            Box::pin(async move {
+                if !crate::core::rql::statement_snapshot::in_scope() {
+                    unscoped.store(true, Ordering::SeqCst);
+                }
+                // Routed, one-partition writes in one transaction: no
+                // fan-out of their own, so the hook never fires inside itself.
+                let tx = db.transactions.begin();
+                for sql in [
+                    format!("UPDATE jacct SET bal = bal - 2 WHERE tenant_id = {debit}"),
+                    format!("UPDATE jacct SET bal = bal + 1 WHERE tenant_id = {credit}"),
+                    format!("UPDATE jbank SET bal = bal + 1 WHERE tenant_id = {credit}"),
+                ] {
+                    let purpose = recognize_query_purpose(&sql).unwrap();
+                    let out = crate::core::rql::executor::execute_in_txn(purpose, db.clone(), tx).await;
+                    assert!(out.first().is_some_and(|b| *b != 3), "{sql}: {}", String::from_utf8_lossy(&out));
+                }
+                db.commit_written_transaction(tx).expect("commit");
+                db.transactions.flush().expect("flush the outcome");
+                transfers.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+    };
+    test_hooks::set_after_first(pt.uid(), Some(hook));
+
+    let total = ACCOUNTS * OPENING;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        with_session(&db, async |w: &mut Wire| {
+            w.prepare(
+                "both",
+                "SELECT SUM(a.bal), SUM(b.bal) FROM jacct a JOIN jbank b ON a.tenant_id = b.tenant_id \
+                 WHERE a.tenant_id > $1",
+                &[],
+            )
+            .await;
+            w.prepare(
+                "selfj",
+                "SELECT COUNT(*), SUM(a.bal) FROM jacct a JOIN jacct b ON a.tenant_id = b.tenant_id \
+                 WHERE a.bal = b.bal AND a.tenant_id > $1",
+                &[],
+            )
+            .await;
+            for run in 0..8i64 {
+                let before = transfers.load(Ordering::SeqCst);
+                let got = w.run("both", &[t(-run)]).await;
+                assert_eq!(
+                    got.rows,
+                    vec![row(&[&(total - before).to_string(), &(total + before).to_string()])],
+                    "run {run}: a prepared join read its two tables at two moments"
+                );
+                assert_eq!(transfers.load(Ordering::SeqCst), before + 1, "run {run}: the hook did not run");
+
+                let before = transfers.load(Ordering::SeqCst);
+                let got = w.run("selfj", &[t(-run)]).await;
+                assert_eq!(
+                    got.rows,
+                    vec![row(&[&ACCOUNTS.to_string(), &(total - before).to_string()])],
+                    "run {run}: a prepared self-join's sides read two snapshots"
+                );
+                assert_eq!(transfers.load(Ordering::SeqCst), before + 2, "run {run}: the hook did not run on both sides");
+                assert!(
+                    !unscoped.load(Ordering::SeqCst),
+                    "run {run}: a prepared join read partitions outside the statement's snapshot scope"
+                );
+            }
+        }),
+    )
+    .await;
+    test_hooks::set_after_first(pt.uid(), None);
+    outcome.expect("sixteen prepared joins took over 10 s");
+    assert_eq!(transfers.load(Ordering::SeqCst), 24, "a transfer failed to commit");
+    drop(pt);
+    close(db, dir.path());
+}
+
 /// The learned arm of `run_statement` scopes a parse whose `row_lock` is
 /// empty; the text path scopes a statement `is_read_only` admits. They are the
 /// same rule only if every locking clause `is_read_only` refuses is one the

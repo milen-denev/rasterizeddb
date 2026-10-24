@@ -617,6 +617,14 @@ impl PartitionedTable {
         Visibility::for_snapshot(self.transactions.snapshot(tx), self.transactions.clone())
     }
 
+    /// [`Self::visibility_for`] for a query, as `Table::read_visibility_for`
+    /// is for a plain table: inside a read-only statement, the snapshot every
+    /// read of that statement shares (`statement_snapshot`), else a new one.
+    /// A partitioned table is always versioned, so this is never `All`.
+    pub fn read_visibility_for(&self, tx: TxId) -> Visibility {
+        crate::core::rql::statement_snapshot::get_or_take(|| self.visibility_for(tx))
+    }
+
     /// The current map epoch, counted (`load_full`, never `load`): step 2 of
     /// §4.4, after the statement's visibility.
     pub fn epoch(&self) -> io::Result<StdArc<MapEpoch>> {
