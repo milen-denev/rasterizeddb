@@ -196,11 +196,12 @@ fn duplicates_are_refused_and_racing_duplicates_store_one_row() {
     drop(server);
 }
 
-/// `ON CONFLICT` and `RETURNING` stay refused (phase 2b) with 0A000, in every
-/// statement shape, before anything is written or materialized and before an
-/// `INSERT … SELECT` runs its source.
+/// `ON CONFLICT` stays refused (phase 2b, S18) with 0A000, with or without
+/// `RETURNING`, in every statement shape, before anything is written or
+/// materialized and before an `INSERT … SELECT` runs its source. (`RETURNING`
+/// alone is built since S17: `partition_returning.rs`.)
 #[test]
-fn on_conflict_and_returning_are_refused_before_writing() {
+fn on_conflict_is_refused_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path().to_str().unwrap());
     let mut c = server.connect();
@@ -212,11 +213,12 @@ fn on_conflict_and_returning_are_refused_before_writing() {
         format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT DO NOTHING"),
         format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO NOTHING"),
         format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO UPDATE SET label = 'u'"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') RETURNING id"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT DO NOTHING RETURNING id"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO UPDATE SET label = 'u' RETURNING *"),
         format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT DO NOTHING"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') RETURNING tenant_id, id"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT DO NOTHING RETURNING tenant_id, id"),
         format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT DO NOTHING"),
-        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src RETURNING id"),
+        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT DO NOTHING RETURNING id"),
     ] {
         let e = expect_code(c.simple(&sql), "0A000");
         assert!(e.is_unsupported(), "{sql}: {e}");
@@ -224,7 +226,10 @@ fn on_conflict_and_returning_are_refused_before_writing() {
         assert_eq!(materialized(&mut c, "refu"), 0, "{sql} materialized a partition");
     }
     // Prepared, and inside a block: the block then fails like any statement.
-    let out = match c.prepare("p1", "INSERT INTO refu (tenant_id, id, label) VALUES ($1, $2, $3) RETURNING id") {
+    let out = match c.prepare(
+        "p1",
+        "INSERT INTO refu (tenant_id, id, label) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id",
+    ) {
         Ok(_) => c.execute_prepared("p1", &[Some("5".into()), Some("5".into()), Some("p".into())]),
         Err(e) => Err(e),
     };

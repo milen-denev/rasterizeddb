@@ -174,8 +174,9 @@ fn blocks_commit_or_roll_back_every_partition_together() {
 }
 
 /// The refusals, each before anything is written, with its SQLSTATE: a key
-/// change (phase 6), RETURNING (phase 2b), UPDATE … FROM and DELETE … USING
-/// (phase 3). Assigning a key the value its WHERE pins is not a change.
+/// change (phase 6), UPDATE … FROM and DELETE … USING (phase 3). Assigning a
+/// key the value its WHERE pins is not a change. (RETURNING is built since
+/// S17: `partition_returning.rs`.)
 #[test]
 fn refused_writes_change_nothing() {
     let dir = tempfile::tempdir().expect("dir");
@@ -189,8 +190,6 @@ fn refused_writes_change_nothing() {
         "UPDATE rp SET tenant_id = 99 WHERE tenant_id = 1",
         "UPDATE rp SET tenant_id = 2 WHERE n > 10",
         "UPDATE rp SET tenant_id = tenant_id + 1 WHERE tenant_id = 1",
-        "UPDATE rp SET n = 1 WHERE tenant_id = 1 RETURNING id",
-        "DELETE FROM rp WHERE tenant_id = 1 RETURNING id",
         "UPDATE rp SET n = 1 FROM rdim WHERE rp.tenant_id = rdim.tenant_id",
         "DELETE FROM rp USING rdim WHERE rp.tenant_id = rdim.tenant_id",
     ] {

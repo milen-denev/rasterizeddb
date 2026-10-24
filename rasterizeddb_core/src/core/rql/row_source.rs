@@ -365,7 +365,8 @@ pub(crate) type PartWrite = io::Result<(u64, Vec<Row>)>;
 /// A partitioned `UPDATE` or `DELETE` (§9): `write` runs on every routed,
 /// materialized partition, and the counts sum. `collect`, when given,
 /// receives every partition's pre-images in pid order (what `RETURNING`
-/// will report, phase 2b).
+/// reports, S17). On an error it may hold the earlier partitions' rows; the
+/// caller drops them with the statement.
 ///
 /// - **One partition** (a fully keyed `WHERE`, a tenant): `write` gets no
 ///   `Visibility`, so the partition snapshots under its own `write_lock`
@@ -542,3 +543,7 @@ mod tests;
 #[cfg(test)]
 #[path = "row_source_write_tests.rs"]
 mod write_tests;
+
+#[cfg(test)]
+#[path = "row_source_returning_tests.rs"]
+mod returning_tests;

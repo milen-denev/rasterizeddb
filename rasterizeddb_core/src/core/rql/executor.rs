@@ -6603,11 +6603,16 @@ fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result
     Ok(())
 }
 
-/// Refuses the `INSERT` clauses phase 2a does not route on a partitioned
-/// table (`docs/partitioning.md` §15, phase 2b): `ON CONFLICT` in either form
-/// and `RETURNING`. Checked before the statement does anything at all, so a
-/// refused multi-row or `INSERT … SELECT` statement writes no row and runs no
-/// source query. A plain table passes.
+/// Refuses the `INSERT` clause phase 2b does not route on a partitioned table
+/// yet (`docs/partitioning.md` §15): `ON CONFLICT` in either form, with or
+/// without `RETURNING` (S18). Checked before the statement does anything at
+/// all, so a refused multi-row or `INSERT … SELECT` statement writes no row
+/// and runs no source query. A plain table passes.
+///
+/// `RETURNING` alone is not refused (S17): the returned row is built from the
+/// payload the partition is about to store, exactly as on a plain table, and
+/// the multi-row and `INSERT … SELECT` paths concatenate their per-row
+/// answers whatever the target.
 fn refuse_partitioned_insert_clauses(
     database: &Database,
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
@@ -6616,14 +6621,10 @@ fn refuse_partitioned_insert_clauses(
     if !database.partitioned.contains_key(table) {
         return Ok(());
     }
-    let clause = if row_data.on_conflict_do_nothing || row_data.on_conflict_update.is_some() {
-        "INSERT … ON CONFLICT"
-    } else if crate::core::rql::lexer_ir::returning_split(&row_data.query).is_some() {
-        "INSERT … RETURNING"
-    } else {
-        return Ok(());
-    };
-    Err(format!("{clause} on partitioned table \"{table}\" is not supported yet"))
+    if row_data.on_conflict_do_nothing || row_data.on_conflict_update.is_some() {
+        return Err(format!("INSERT … ON CONFLICT on partitioned table \"{table}\" is not supported yet"));
+    }
+    Ok(())
 }
 
 /// Whether `parent` names a partitioned table, compared as the database's
@@ -12997,41 +12998,80 @@ fn vacuum_targets(
         .collect())
 }
 
-/// What the partitioned `UPDATE` and `DELETE` refuse before they write, in
-/// common: a foreign key (S6 refuses them both ways, so none of the plain
+/// What the partitioned `UPDATE` and `DELETE` check before they write, in
+/// common: no foreign key (S6 refuses them both ways, so none of the plain
 /// arms' foreign-key work can apply; asserted here rather than assumed), and
-/// `RETURNING` (phase 2b). A bad `RETURNING` list fails as it does on a plain
-/// table.
-fn refuse_partitioned_write(
+/// a `RETURNING` list that resolves against the shell's schema, which every
+/// partition shares. A bad list fails as it does on a plain table, before
+/// anything is written. `Ok(true)`: the statement returns rows (S17).
+fn check_partitioned_write(
     database: &Arc<Database>,
     shell: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>,
     table_name: &str,
-    verb: &str,
     sql: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !shell.schema.foreign_keys.is_empty() || !referencing_keys(database, table_name).is_empty() {
         return Err(format!(
             "internal error: partitioned table \"{table_name}\" has a foreign key, which partitioned tables refuse"
         ));
     }
-    match returning_planned(sql, &shell.schema.fields) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(format!("{verb} … RETURNING on partitioned table \"{table_name}\" is not supported yet")),
-        Err(e) => Err(e),
+    returning_planned(sql, &shell.schema.fields)
+}
+
+/// A partitioned write's reply: the `RETURNING` rows (status 2, zero rows for
+/// an empty route) when the statement has a list, else the count. Built only
+/// after every partition succeeded, from the pre-images the partitions
+/// collected under the statement's one snapshot (several partitions) or the
+/// partition's own `write_lock` (one), with the assignments overlaid as the
+/// plain arms do: never read again, so no row is reported that the statement
+/// did not change. The shell supplies the schema; no data accessor follows.
+async fn partitioned_write_reply(
+    pt: &crate::core::partition::table::PartitionedTable,
+    sql: &str,
+    n: u64,
+    returning: Option<(
+        Vec<crate::core::row::row::Row>,
+        Option<&smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]>>,
+        &[(u32, crate::core::rql::expr::Expr)],
+    )>,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    if let Some((before, updates, expressions)) = returning {
+        match returning_rows_for_write(pt.shell(), sql, before, updates, expressions, database, tx).await {
+            Ok(Some(rows)) => {
+                let mut result = vec![2u8];
+                for row in &rows {
+                    row.extend_serialized(&mut result);
+                }
+                return result;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("Cannot resolve RETURNING: {}", e);
+                return ddl_error(&e);
+            }
+        }
     }
+    let mut result = vec![0u8];
+    result.extend_from_slice(&n.to_le_bytes());
+    result
 }
 
 /// An `UPDATE` on a partitioned table (`docs/partitioning.md` §9, S11), from
 /// the plan the arm parsed against the shell's schema, after the arm's
 /// NOT NULL, generated-column and CHECK work.
 ///
-/// Before anything is written it refuses `RETURNING` (phase 2b) and any key
-/// assignment not proven to keep every matched row's point
+/// Before anything is written it resolves the `RETURNING` list and refuses
+/// any key assignment not proven to keep every matched row's point
 /// ([`PartitionedTable::assignments_keep_point`]): a key change would move
 /// the row to another partition (phase 6), and refused here it writes
 /// nothing in any partition, where the range guard alone would refuse it
 /// only after earlier partitions had written. The guard still checks every
-/// merged row. Then [`write_partitions`] visits the routed partitions.
+/// merged row. Then [`write_partitions`] visits the routed partitions, each
+/// collecting its pre-images when the statement returns rows (S17); the
+/// rows are built only once every partition has succeeded, so a failed
+/// statement returns none.
 ///
 /// Prepared, it stays on the text path (`note_rewritten`), so every
 /// execution routes its own values.
@@ -13049,10 +13089,13 @@ async fn execute_partitioned_update(
 ) -> Vec<u8> {
     crate::core::rql::prepared::note_rewritten();
     let sql = query_sql(query);
-    if let Err(e) = refuse_partitioned_write(database, pt.shell(), table_name, "UPDATE", &sql) {
-        error!("{}", e);
-        return ddl_error(&e);
-    }
+    let returning_wanted = match check_partitioned_write(database, pt.shell(), table_name, &sql) {
+        Ok(wanted) => wanted,
+        Err(e) => {
+            error!("{}", e);
+            return ddl_error(&e);
+        }
+    };
     let crate::core::rql::lexer_ur::UpdateRow {
         where_clause,
         query_row_fetch,
@@ -13076,11 +13119,26 @@ async fn execute_partitioned_update(
             return ddl_error(&e.to_string());
         }
     }
+    // The write consumes its copies of the assignments; `RETURNING` overlays
+    // these after it, as the plain arm does.
+    let returning_updates: Option<smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]>> =
+        returning_wanted.then(|| {
+            updates
+                .iter()
+                .map(|u| crate::core::row::row::ColumnWritePayload {
+                    data: u.data.clone(),
+                    write_order: u.write_order,
+                    column_type: u.column_type.clone(),
+                    size: u.size,
+                })
+                .collect()
+        });
+    let mut before: Vec<crate::core::row::row::Row> = Vec::new();
     let outcome = crate::core::rql::row_source::write_partitions(
         &pt,
         &where_clause,
         tx,
-        None,
+        returning_wanted.then_some(&mut before),
         |part, visibility, collecting| {
             // A payload is not `Clone`; each partition consumes its own copy.
             let updates: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> = updates
@@ -13116,9 +13174,8 @@ async fn execute_partitioned_update(
         Ok(n) => {
             info!("Updated {} rows", n);
             note_write(database, tx, depth, &sql, Some(table_name));
-            let mut result = vec![0u8];
-            result.extend_from_slice(&n.to_le_bytes());
-            result
+            let returning = returning_updates.as_ref().map(|u| (before, Some(u), &expressions[..]));
+            partitioned_write_reply(&pt, &sql, n, returning, database, tx).await
         }
         Err(e) => {
             // The retry marker is for the retry loops, never a log.
@@ -13130,9 +13187,11 @@ async fn execute_partitioned_update(
     }
 }
 
-/// A `DELETE` on a partitioned table (§9, S11): `RETURNING` refused before
-/// anything is deleted (phase 2b), then [`write_partitions`] over the routed
-/// partitions. Prepared, it stays on the text path, as the `UPDATE` does.
+/// A `DELETE` on a partitioned table (§9, S11): the `RETURNING` list resolved
+/// before anything is deleted, then [`write_partitions`] over the routed
+/// partitions, each collecting the rows it deleted when the statement returns
+/// them (S17), reported once every partition has succeeded. Prepared, it
+/// stays on the text path, as the `UPDATE` does.
 ///
 /// [`write_partitions`]: crate::core::rql::row_source::write_partitions
 async fn execute_partitioned_delete(
@@ -13146,16 +13205,20 @@ async fn execute_partitioned_delete(
 ) -> Vec<u8> {
     crate::core::rql::prepared::note_rewritten();
     let sql = query_sql(query);
-    if let Err(e) = refuse_partitioned_write(database, pt.shell(), table_name, "DELETE", &sql) {
-        error!("{}", e);
-        return ddl_error(&e);
-    }
+    let returning_wanted = match check_partitioned_write(database, pt.shell(), table_name, &sql) {
+        Ok(wanted) => wanted,
+        Err(e) => {
+            error!("{}", e);
+            return ddl_error(&e);
+        }
+    };
     let crate::core::rql::lexer_dr::DeleteRow { where_clause, query_row_fetch, .. } = delete_plan;
+    let mut before: Vec<crate::core::row::row::Row> = Vec::new();
     let outcome = crate::core::rql::row_source::write_partitions(
         &pt,
         &where_clause,
         tx,
-        None,
+        returning_wanted.then_some(&mut before),
         |part, visibility, collecting| {
             let (fetch, where_clause) = (query_row_fetch.clone(), &where_clause);
             async move {
@@ -13172,9 +13235,8 @@ async fn execute_partitioned_delete(
         Ok(n) => {
             info!("Deleted {} rows", n);
             note_write(database, tx, depth, &sql, Some(table_name));
-            let mut result = vec![0u8];
-            result.extend_from_slice(&n.to_le_bytes());
-            result
+            let returning = returning_wanted.then_some((before, None, &[][..]));
+            partitioned_write_reply(&pt, &sql, n, returning, database, tx).await
         }
         Err(e) => {
             error!("Failed to delete rows: {}", clean_conflict_text(&e.to_string()));
