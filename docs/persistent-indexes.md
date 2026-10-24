@@ -1423,9 +1423,11 @@ the shape:
   session's default; otherwise the default stays `rowdescription`, because
   sqlx sets no `application_name` by default (from memory, not checked) and is
   the one driver shown to need it. Bind's
-  per-column result formats apply positionally when their count matches the
-  new columns, a single format applies to all, otherwise text; the
-  RowDescription states the formats used.
+  result formats apply as the protocol says for the new columns: none means
+  text, a single format applies to all, otherwise positionally, and a column
+  past the formats given goes as text (as built; B8's pgjdbc replay sends
+  three formats for four columns); the RowDescription states the formats
+  used.
 - **`shape_epoch`**, separate from `schema_generation`, is drawn from **one
   database-wide monotonic counter** (Q7) and stored per table, so a DROP and
   CREATE, or a RENAME and then CREATE, of the same name can never repeat an
@@ -2057,6 +2059,89 @@ a pending or held AE (bounded by `lock_timeout` and cancellation, with a
 graph edge when the family holds locks elsewhere) and returns the new shape;
 rule (b) keeps holders lock-free.
 
+**As built (B8).** The gate ran in both modes; no driver works in neither,
+so the Describe fallback above is not built.
+- *sqlx and tokio-postgres* (`rasterizeddb_compat/tests/driver_matrix.rs`,
+  `shape_change_mid_prepare_through_each_driver_in_both_modes`): a
+  statement prepared and described, another session's ADD COLUMN, DROP
+  COLUMN or INT to BIGINT, four executes, then the driver's own recovery.
+  Each execute is classed against a twin; `WRONG` (rows decoded under the
+  old columns) appears in no cell:
+
+  | Driver | `rowdescription` | `error` |
+  |---|---|---|
+  | sqlx 0.9 (cached statement) | ok ×4, ok after | 0A000 ×4, and 0A000 again: sqlx never re-prepares |
+  | tokio-postgres 0.7 (kept `Statement`) | "unexpected message" ×4; a fresh `prepare` reads the new shape | 0A000 ×4; a fresh `prepare` reads the new shape |
+  | pgjdbc 42.x (replay `pgjdbc-flip`) | a RowDescription after a Bind it sent no Describe for: from its source, `pendingDescribePortalQueue` is empty and `processResults` fails | 0A000 at Bind with `R=RevalidateCachedQuery`, then its own retry (Close `S_1`, Parse `S_2`) heals, as against PostgreSQL 17 |
+  | npgsql 8 (replay `npgsql-auto-prepare`) | a RowDescription where it decodes by its cached one: from its source, an unexpected message | 0A000 at Bind, as PostgreSQL 17; re-preparing heals |
+
+  The same file runs both drivers through lock waits (55P03 under
+  `lock_timeout`, a wait and then the rows under `0`), a cancelled lock
+  wait (57014 by CancelRequest and by `statement_timeout`), a deadlock
+  across the two drivers (one 40P01, the victim's block over at once), R3
+  through each transaction API (25P02, a waiting CREATE INDEX runs before
+  the ROLLBACK) and DDL against DML (a cached INSERT and a kept read work
+  after the ALTER).
+- *pgjdbc and npgsql* are replayed frame by frame (Java and Npgsql are not
+  installed; the owner's Q2 condition), each sequence first run against
+  `postgres:17` (docker, tmpfs) and recorded, then required of this engine
+  (§13, "The driver gate's sequences").
+- *Found and fixed* (`pgwire.rs`): in `error` mode this engine answered
+  BindComplete and then 0A000 at Execute, where PostgreSQL refuses at Bind;
+  and its 0A000 carried no routine field, which is what pgjdbc's
+  `willHealViaReparse` tests (`RevalidateCachedQuery`), so pgjdbc would
+  have handed every stale execute's error to the application and never
+  re-prepared. Bind now refuses (`stale_in_error_mode`, shared with
+  Execute's check), and the cached-plan error carries `R`.
+- *Finding L10, the input for Q1* (not decided here; the default stays
+  `rowdescription`): sqlx needs `rowdescription` and fails forever in
+  `error`. pgjdbc and npgsql need `error` (they heal from 0A000, and
+  `rowdescription` sends them a message they do not expect).
+  tokio-postgres heals in neither by itself; `error` gives the same
+  PostgreSQL-compatible error an application already handles.
+  Behaviour-based switching as L10 suggests (0A000 first, then the
+  RowDescription if the same statement is executed again without a new
+  Parse) would serve all four: sqlx re-executes the stale statement,
+  pgjdbc and npgsql re-Parse.
+- *The perf gate, W3 cumulative* (`.claude/reviews/b8-perf/`: the B3b
+  bench `examples/table_lock_bench.rs`, instructions per statement by
+  differencing 2,000 and 6,000 statements under `perf stat -e
+  instructions:u`, release, tmpfs, three interleaved runs, medians, load
+  average 1.6-3.3). Before is `dedd503`, the parent of B1. The commits
+  between it and B8's tip are not all W3 (partitioning 2b, the SIMD
+  kernels, the scan prefilter, fixed-shape binary rows, the CHECK fix, the
+  join-star fix), so the bench was also built at the two points that
+  bracket the non-W3 run, `801af73` (B2) and `cc09005` (before B3a), and
+  at `18a0141` (B3b's base):
+
+  | Workload | before | B1-B2 | non-W3 | B3a | B3b-B8 | tip | W3 total | all |
+  |---|---|---|---|---|---|---|---|---|
+  | prepared point SELECT | 69,322 | +3,561 | +3,466 | +493 | +1,825 | 78,667 | **+5,879 (+8.5%)** | +13.5% |
+  | prepared point UPDATE | 199,220 | +2,833 | +1,654 | +724 | +2,540 | 206,971 | **+6,097 (+3.1%)** | +3.9% |
+  | prepared bigint-PK INSERT | 132,012 | +3,379 | -58 | +842 | +6,155 | 142,330 | **+10,376 (+7.9%)** | +7.8% |
+
+  CTE, derived table and `pg_class` moved +2.3%, +2.5% and +1.0% from
+  `dedd503` to the tip, non-W3 included. Point SELECT and INSERT are over
+  the ~5% the gate allows. A differenced profile (`perf record -e
+  instructions:u -c 400000` at 10,000 and 50,000 statements, by symbol;
+  `profile_diff.txt`; a smaller period is throttled and undercounts)
+  finds no hotspot: the W3 cost is spread over the per-statement owner
+  (O is a second `TxId` per autocommit statement: its begin and end in
+  `TransactionManager`'s running set, `BTreeMap` insert and remove,
+  `StatusLog::record` of a second id, `retire_family`,
+  `execute_autocommit`'s alias and release, `owner_alias`, together about
+  2.5-3k instructions), B7's boxed shape-check future and task-local per
+  Execute (about 1k, `handle_execute`'s box, malloc and free), and the
+  lookups at each `table_for` site (`DashMap` slot lookup,
+  `TableLocks::shard`; about 1.5k on INSERT, which reaches more sites).
+  B3b measured the manager itself at 77 ns a statement. The largest single
+  lever is Q4's alternative (the first attempt's id as O, no second id);
+  the owner decides whether the gate passes as is.
+- *TODO before advertising persistent indexes*: a run of the real pgjdbc
+  and Npgsql (downloading Java and the NuGet package) over these
+  scenarios; the replays were written from the drivers' source as read
+  from memory, not captured.
+
 **Removed**: the reload mutex (AE conflicts with itself), the slot queue and
 its `Ref` rule (the lock queue is keyed by name and survives the swap), the
 run-ahead exemption (rule (b)), the own-family drain exclusion, the slot's
@@ -2638,6 +2723,72 @@ full workspace is built before shared suites, not `check --lib`.
 | V13 | Files in the right lists | `owns()`, explicit `rdb.ixe`, names no table file can take, stem from the physical name (§1) | rename and drop guards that reopen; reaper regex; tables `t`, `t_ixs`, `t_ixm`, `t.ixs`, `rdb_ixe`, `a.b` and `ab` side by side through publish, marker compaction, open, drop and reopen, every row of each kept; a crash leaving `.ixm.tmp` is reaped and swept by drop; `relation_size` counts `owns()` files. *(Copy `.ixs` on rename; miss `.ixs.tmp` or `.ixm.tmp` in drop; name the snapshot `<t>_ixs.db`; name the epoch log `rdb_ixe.db`; stem from `schema.name`)* |
 | V14 | Downgrade fails loudly | feature-gated `incompat_features` | build without the feature refuses a v1 directory |
 
+### V10's reload cases, as built (B8)
+
+Every case runs with `lock_timeout = 0` (each session checks `SHOW
+lock_timeout`) under a 10 s harness bound. New tests are in
+`rasterizeddb_compat/tests/v10_reload.rs` unless named otherwise; each new
+one was mutation-verified.
+
+| Case | Test | Mutation it fails |
+|---|---|---|
+| 1 | `case_1_own_family_never_waits_on_itself` | an owner's own modes conflict (hangs) |
+| 2 | `case_2_r1_over_the_extended_protocol` (CREATE INDEX, ADD COLUMN, DROP INDEX × one-by-one, pgjdbc, sqlx framings) | rule (b) off (the DDL gets 40P01); writes take no ROW EXCLUSIVE |
+| 3 | `case_3_describe_during_a_pending_access_exclusive` | the skip path always taken (no RowDescription after ADD COLUMN) |
+| 4 | core `shape_repair_tests` (B7); compat `prepared_shape_change`; `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes` | (B7's); the skip path always taken (sqlx decodes `WRONG`) |
+| 5 | core `ddl_rewrite_tests::a_block_insert_committed_while_the_alter_waits_survives` (B5); `case_5_describe_and_select_during_a_rewrite` | reads take no ACCESS SHARE |
+| 6 | core `schema_view_tests` (B3a); `case_6_catalog_reads_during_a_pending_access_exclusive` | the catalog's figures read through `table_for` (hangs) |
+| 7 | `case_7_insert_select_against_a_blocks_create_index` | the youngest member is the victim; R3 off |
+| 8 | `case_8_two_blocks_create_index_one_victim` (one table, crossed tables) | R3 off (the survivor waits for the victim's client) |
+| 9 | core `block_error_tests::a_cycle_through_a_conflict_retry_and_a_ddl_fails_only_the_ddl` (B6) | (B6's) |
+| 10 | `case_10_autocommit_join_with_crossed_ddls` | the youngest member is the victim (the join gets 40P01) |
+| 11 | core `tests/shredded_shadow_ddl.rs` (B5) | (B5's) |
+| 12 | core `ddl_rewrite_tests::a_rewrite_keeps_every_versions_visibility` (B5) | (B5's) |
+| 13 | `case_13_bounds_and_cancellation`, `case_13_cancelled_ddl_declares_nothing_after_reopen`, `case_13_shutdown_during_a_wait`; `driver_matrix::a_lock_wait_is_cancelled_through_each_driver` | the wait ignores `lock_timeout`; the wait ignores `cancel::tripped()`; (shutdown: a harness bound, no engine mutation) |
+| 14 | `driver_matrix` (six tests), `wire_replay` (five) | see below |
+| 15 | core `owner_tests::every_piece_of_a_wire_statement_runs_under_one_owner` (B2), `owner_tests::a_granted_statement_finishes_before_a_ddl_queued_behind_it` | a derived body under a fresh owner (hangs) |
+| 16 | `case_16_reader_in_a_cycle_is_never_the_victim` | the youngest member is the victim |
+| 17 | core `shape_repair_tests::a_learned_parse_is_rechecked_after_the_lock` (B7) | (B7's) |
+| 18 | `case_18_drop_of_a_shredded_parent_waits_and_writes_nothing` | DROP's three lock sites under ACCESS SHARE (the drop goes ahead; the debug assertion in `drop_table` stops it) |
+
+Deviations, as built:
+- `pg_cancel_backend` is not implemented; case 13 and 18 cancel with the
+  protocol's CancelRequest, which reaches the same `cancel::tripped()`.
+- There is no `shutdown_deadline`; the server stops its runtime with a
+  2 s bound, and case 13 checks a lock waiter neither hangs nor answers.
+- Case 7's waiter meets the block through a uniqueness conflict (the
+  block's uncommitted key), the one edge from an INSERT … SELECT to a
+  block that holds `t` in ROW EXCLUSIVE only.
+- Case 16: reader restarts (`max_lock_restarts`) are not built, so every
+  reader waits holding its set with edges; the reader holds `t1` while it
+  waits for `t2` (sets are taken in name order, each held before the
+  next).
+- Case 5 over the extended protocol: a Parse that names the column an
+  ADD COLUMN is adding answers 42703 at once, where PostgreSQL's Parse
+  would wait for the ALTER and succeed (Describe takes no lock, §7). The
+  simple protocol's SELECT waits and reads the new shape.
+- The doc's "within 100 ms" is asserted as "while the DDL still waits,
+  and within 2 s": the property is not queueing, and the box's load makes
+  100 ms a flake.
+
+### The driver gate's sequences (B8)
+
+Named sequences in `rasterizeddb_compat/tests/wire_replay/`, recorded from
+PostgreSQL 17.x (`postgres:17`, trust, tmpfs) by
+`validate_against_postgresql_17` and required of this engine token for
+token (message types, sqlstates, 0A000's message and routine, column names,
+type OIDs and formats, cell bytes, command tags, transaction status).
+Left out: ParameterStatus, BackendKeyData, notices, a RowDescription's
+table OID, column number, size and modifier, other errors' messages.
+
+| Sequence | Frames | PostgreSQL 17 | This engine |
+|---|---|---|---|
+| `pgjdbc-flip` (Q2 (a)) | P"" B D(P) E S ×4; P`S_1` B D(P) E S; B`S_1` formats `[1,0,1]` E S; ADD COLUMN; B`S_1` E S; C(S)`S_1` P`S_2` B D(P) E S; B`S_2` `[1,0,1,1]` E S | as recorded, incl. `E(0A000 R=RevalidateCachedQuery) Z(I)` at the stale Bind and `3 1 2 T D C Z` for the retry | identical in `error` mode; in `rowdescription` the stale Bind answers `2 T D C Z` on every execute |
+| `npgsql-batch` (Q2 (b)) | P B(binary) D(P) E for INSERT and SELECT, one S | `1 2 n C 1 2 T D C Z` | identical |
+| `npgsql-batch-error` (Q2 (b)) | INSERT, INSERT of a duplicate key, SELECT, one S | `1 2 n C 1 2 n E(23505) Z`: the SELECT skipped | identical; **but** the first INSERT stays (each Execute commits alone), where PostgreSQL's batch is one implicit transaction and rolls it back. A known divergence (the simple protocol's multi-statement string has it too), found by B8, not fixed |
+| `npgsql-batch-lock` | SELECT u, SELECT t (held ACCESS EXCLUSIVE elsewhere, `lock_timeout` 300 ms), SELECT u, one S | the second Parse fails: `1 2 T D C E(55P03) Z` | `1 2 T D C 1 2 T E(55P03) Z`: Parse and Describe take no lock (§7), the Execute times out; the rest skipped alike |
+| `npgsql-auto-prepare` | P B D(P) E S; P`_auto0` D(S) B E S; B E S; ADD COLUMN; B E S; P`_auto1` D(S) B E S; B E S | `E(0A000 R=RevalidateCachedQuery) Z` at the stale Bind | identical in `error` mode; `2 T D C Z` in `rowdescription` |
+
 ### Owner's invariants
 
 | # | Invariant | v1 mechanism | Rows |
@@ -2943,3 +3094,29 @@ stated fallback if the NULL decode cannot land in phase 0 (risk 12).
 | Q17: aliases, renames and tuple-struct construction defeat name matching | §2 Pinned by, V3 | no `type` alias, `use … as` or renamed re-export of the tokens; both are braced named-field structs |
 | Q18: enumerated duplication and leak lists miss forms | §2 Pinned by, V3 | no `unsafe` in `index_store`, token-naming fns or fns touching ticket fields; leak list by path or method |
 | Q19: `truncate_locked` leaves `write_pos` stale after `set_len(0)` | §3 step 4, §11 | reset at once after `set_len(0)`; later failure poisons; variant of `keep_tail_after_rename_fails` |
+
+**The lock-manager design check** (L1-L13, `.claude/reviews/lock-manager-design-check.md`).
+Each closed by a named test (B8's merge condition).
+
+| Finding | Slice | Test |
+|---|---|---|
+| L1 conflict retries outside the graph | B6 | `rql::conflict_wait_tests` (per-site waits and edges); `pgwire::block_error_tests::a_cycle_through_a_conflict_retry_and_a_ddl_fails_only_the_ddl`; compat `v10_reload::case_7_insert_select_against_a_blocks_create_index` |
+| L2 replication apply leaks locks, skips lock losses | B2, B6 | `replication::server::tests::an_apply_that_loses_a_lock_is_retried_and_lands`, `an_apply_that_keeps_losing_its_lock_is_not_advanced_past` |
+| L3 O minted only in pgwire | B2 | `mvcc::owner_tests::the_native_protocol_and_login_run_under_named_owners` |
+| L4 release points | B2 | `mvcc::owner_tests::an_attempts_end_keeps_its_owners_table_locks`, `a_blocks_table_lock_survives_another_statements_retries` |
+| L5 a block's DDL and the ticket | B5 | `pgwire::ddl_rewrite_tests::a_block_ddl_gives_its_access_exclusive_back` |
+| L6 VACUUM's locks | B3b, B4 | `pgwire::ddl_lock_tests::plain_vacuum_runs_beside_a_writer_and_vacuum_full_waits`, `a_bare_vacuum_gives_each_table_back` |
+| L7 Execute's shape check before the lock | B7 | `pgwire::shape_repair_tests::alter_while_execute_waits_for_its_lock_is_caught_after_the_build` |
+| L8 the reader definition | B6 | `rql::conflict_wait_tests::an_autocommit_owner_that_wrote_is_no_reader` |
+| L9 shadow DDL and a pending parent AE | B5 | `rql::shadow_lock::tests::shadow_ddl_does_not_queue_behind_a_pending_parent_access_exclusive`; `tests/shredded_shadow_ddl.rs::a_writers_shadow_ddl_does_not_queue_behind_a_pending_parent_alter` |
+| L10 the shape-change mode by driver | B8 (input; Q1 open) | compat `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes`, `wire_replay` (§7 "As built (B8)") |
+| L11 FK DDL locks the parent | B4 | `pgwire::ddl_lock_tests::fk_ddl_locks_the_other_side` |
+| L12 temporaries and the cost | B3b, B4 | `database::reload_tests::a_statement_private_temp_is_dropped_without_a_lock_or_retirement`; B3b's and B8's perf gates (§7 "As built (B3b)", below) |
+| L13 RETURNING in the shape check | B7 | `pgwire::shape_repair_tests::returning_across_an_alter_is_repaired`; compat `prepared_shape_change::sqlx_cached_returning_decodes_the_new_shape_every_time` |
+
+**Decision (B8, the owner's Q2 condition).** The W3 merge gate rests on
+raw-wire replays of pgjdbc and npgsql validated against PostgreSQL 17,
+which reproduce pgjdbc's `prepareThreshold` flip with its retry after
+0A000 and npgsql's one-Sync batching with an error mid-batch (§13 "The
+driver gate's sequences"). A real-driver run is a precondition for
+advertising persistent indexes, not for merging.
