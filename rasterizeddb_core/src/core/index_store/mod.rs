@@ -7,10 +7,15 @@
 //! nothing yet: [`marker`] (`.ixm`), [`snapshot`] (`.ixs`), [`identity`] (what
 //! both record about the snapshot) and [`epoch_log`] (`rdb.ixe`), over the
 //! shared [`codec`].
+//!
+//! Slice B10 adds [`gate_word`]: the packed gate word, every transition on
+//! it as a one-atomic-operation-per-step machine, [`gate_word::WriteGate`]
+//! over them, and an exhaustive interleaving model; also used by nothing yet.
 
 pub mod codec;
 pub mod epoch_log;
 pub mod gate;
+pub mod gate_word;
 pub mod identity;
 pub mod marker;
 pub mod snapshot;
