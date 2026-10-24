@@ -29,6 +29,9 @@ pub mod relation;
 pub mod slots;
 pub mod table_for;
 pub mod reload;
+pub(crate) mod rewrite;
+#[cfg(test)]
+mod rewrite_tests;
 #[cfg(test)]
 mod reload_tests;
 #[cfg(test)]
@@ -368,6 +371,13 @@ fn table_name_refusal(name: &str) -> Option<String> {
             PARTITION_FILE_PREFIX
         ));
     }
+    if name.starts_with(rewrite::BACKUP_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the copy a table's files are held in \
+             while an ALTER changes them",
+            rewrite::BACKUP_PREFIX
+        ));
+    }
     table_stem_refusal(name)
 }
 
@@ -431,7 +441,7 @@ fn same_file_name(a: &str, b: &str) -> bool {
 /// stem is reserved whole, sidecars included) or one of [`RESERVED_FILES`].
 ///
 /// Every other file the engine keeps beside the tables (`db_transactions.*`,
-/// `rasterized.wal*`, `db_storage.cfg`, `__rename.intent`,
+/// `rasterized.wal*`, `db_storage.cfg`, `__rename.intent`, `__rewrite_*.intent`,
 /// `incompat_features`) ends in no table suffix, so no table name reaches it;
 /// `sidecar_clash_tests` lists a fresh directory to hold that true.
 fn reserved_file_owner(file: &str) -> Option<&'static str> {
@@ -1324,6 +1334,10 @@ impl Database {
             &seeds,
         )
         .await;
+
+        // Before any table opens: a change a crash interrupted is undone from
+        // its backup (`rewrite.rs`), so the table opens as it was.
+        rewrite::recover_interrupted_rewrites(&io_pointers, &storage, &kv_stores, &seeds).await;
 
         let tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
@@ -2521,49 +2535,7 @@ impl Database {
         )
         .await;
 
-        for suffix in RENAMED_SUFFIXES {
-            let source = from.create_new(format!("{}{}", old_name, suffix)).await;
-            let len = source.get_len().await;
-            if len == 0 {
-                continue;
-            }
-
-            let destination = to.create_new(format!("{}{}", new_name, suffix)).await;
-
-            // Chunked rather than one allocation: a table is not bounded by
-            // memory and a rename of a large one should not be.
-            const CHUNK: usize = 1 << 20;
-            let mut position = 0u64;
-            let mut buffer = vec![0u8; CHUNK.min(len as usize)];
-            while position < len {
-                let remaining = (len - position) as usize;
-                let take = remaining.min(buffer.len());
-                let mut cursor = position;
-                source
-                    .read_data_into_buffer(&mut cursor, &mut buffer[..take])
-                    .await?;
-                destination.append_data(&buffer[..take], false).await;
-                position += take as u64;
-            }
-
-            // Durable before the catalogue names it: a file the catalogue
-            // points at but the page cache has not written is the one state
-            // this whole ordering exists to avoid.
-            let token = destination.begin_txn();
-            destination
-                .commit_durable(token)
-                .await
-                .map_err(|e| io::Error::other(format!("{e:?}")))?;
-
-            let written = destination.get_len().await;
-            if written != len {
-                return Err(io::Error::other(format!(
-                    "copying {}{} produced {} bytes from {}",
-                    new_name, suffix, written, len
-                )));
-            }
-        }
-        Ok(())
+        copy_files_between(&from, &to, old_name, new_name, RENAMED_SUFFIXES).await
     }
 
     /// Total bytes a table occupies, across every file it owns.
@@ -4486,6 +4458,107 @@ async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
         let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
         io.drop_io();
     }
+}
+
+/// Copies each file derived from `old_name` with one of `suffixes`, from the
+/// provider family `from` to one derived from `new_name` in `to`, each made
+/// durable before the next: a rename's copy, and an ALTER's file-set backup
+/// and its restore (`rewrite.rs`). A file that does not exist, or is empty,
+/// copies as nothing: sidecars are created lazily.
+pub(super) async fn copy_files_between(
+    from: &DbStorageProvider,
+    to: &DbStorageProvider,
+    old_name: &str,
+    new_name: &str,
+    suffixes: &[&str],
+) -> io::Result<()> {
+    for suffix in suffixes {
+        let source = from.create_new(format!("{}{}", old_name, suffix)).await;
+        let len = source.get_len().await;
+        if len == 0 {
+            continue;
+        }
+
+        let destination = to.create_new(format!("{}{}", new_name, suffix)).await;
+
+        // Chunked rather than one allocation: a table is not bounded by
+        // memory and a rename of a large one should not be.
+        const CHUNK: usize = 1 << 20;
+        let mut position = 0u64;
+        let mut buffer = vec![0u8; CHUNK.min(len as usize)];
+        while position < len {
+            let remaining = (len - position) as usize;
+            let take = remaining.min(buffer.len());
+            let mut cursor = position;
+            source
+                .read_data_into_buffer(&mut cursor, &mut buffer[..take])
+                .await?;
+            destination.append_data(&buffer[..take], false).await;
+            position += take as u64;
+        }
+
+        // Durable before the catalogue names it: a file the catalogue
+        // points at but the page cache has not written is the one state
+        // this whole ordering exists to avoid.
+        let token = destination.begin_txn();
+        destination
+            .commit_durable(token)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+
+        let written = destination.get_len().await;
+        if written != len {
+            return Err(io::Error::other(format!(
+                "copying {}{} produced {} bytes from {}",
+                new_name, suffix, written, len
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`discard_files`] for only the files of `name` ending in one of
+/// `suffixes`: their log records voided first (a relocation barrier: what
+/// replaces them may be a copy no record describes), then the files deleted
+/// and the directories synced. False, deleting nothing, when the records
+/// could not be voided.
+pub(super) async fn discard_files_in(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+    suffixes: &[&str],
+) -> bool {
+    let logs = logs_holding(io_pointers, pool, own);
+    let _snapshot_gate = deletion_permit(&logs).await;
+    let ids: Vec<u64> = suffixes
+        .iter()
+        .map(|suffix| crate::core::wal::file_id_for_name(&format!("{name}{suffix}")))
+        .collect();
+    if let Err(failure) = forget_logged_ids(&logs, &ids, Barrier::Relocation) {
+        error!(
+            "Could not void the log's records for {}'s files, so they were kept: {}",
+            name, failure.error
+        );
+        return false;
+    }
+    for suffix in suffixes {
+        let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
+        io.drop_io();
+    }
+    if logs.is_empty() {
+        return true;
+    }
+    for dir in dirs_reached(io_pointers, pool) {
+        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+    true
 }
 
 async fn load_db_tables<S: StorageIO>(

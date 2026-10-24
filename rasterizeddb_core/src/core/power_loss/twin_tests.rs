@@ -1425,3 +1425,6 @@ async fn a_lost_reservation_page_never_reissues_an_id() {
     assert!(total.replay_raised >= runs, "no image needed the log to restore the mark ({total:?})");
     assert!(total.torn_pointer_tails >= runs, "no image tore the pointer file inside a record ({total:?})");
 }
+
+#[path = "rewrite_crash_tests.rs"]
+mod rewrite_crash_tests;

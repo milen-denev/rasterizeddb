@@ -202,6 +202,11 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("swap_instance", "a slot primitive: a reload's or a MOVE's swap; its callers dispatch"),
     ("put_back_after_failed_drop", "drop_table_to_depth's failure path, after its dispatch"),
     ("reload_table", "delegates to reload_with, which dispatches"),
+    ("reload_with", "delegates to reload_with_instance, which dispatches"),
+    ("rewrite_table", "a reload: delegates to reload_with_instance, which dispatches"),
+    ("reload_atomic", "delegates to reload_atomic_with"),
+    ("reload_atomic_with", "a reload: delegates to reload_with_instance, which dispatches"),
+    ("seed_of", "the seed of a name its callers (a backup, a rewrite) took inside reload_with_instance's dispatch"),
     ("open_instance", "opens the files of a name its callers (reload_with, reopen_fresh) resolved"),
     ("retire_current", "retires the instance its caller (RENAME, MOVE) resolved and holds AE on"),
     ("reopen_fresh", "the fresh-instance rule after a failure, for a name its caller resolved"),
@@ -288,6 +293,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
     fns.extend(name_keyed(include_str!("relation.rs")));
     fns.extend(name_keyed(include_str!("slots.rs")));
     fns.extend(name_keyed(include_str!("reload.rs")));
+    fns.extend(name_keyed(include_str!("rewrite.rs")));
 
     // A reader that found nothing would pass vacuously; and a multi-line
     // parameter list must still be read.

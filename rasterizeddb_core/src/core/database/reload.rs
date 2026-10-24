@@ -103,6 +103,25 @@ impl Database {
         F: FnOnce(Arc<DbTable>) -> Fut,
         Fut: Future<Output = Result<T, String>>,
     {
+        self.reload_with_instance(table_name, |old| async move { work(old).await.map(|v| (v, None)) })
+            .await
+    }
+
+    /// [`Database::reload_with`] whose `work` may hand back the new instance
+    /// itself, already open over the files it wrote (an ALTER rewrite fills
+    /// the instance it opened, before anyone can see it): step 3 then swaps
+    /// that one in instead of opening the files again. `None` opens them as
+    /// `reload_with` does. A failing `work` still gets a fresh instance from
+    /// disk; whatever it opened is its own to retire.
+    pub(crate) async fn reload_with_instance<T, F, Fut>(
+        &self,
+        table_name: &str,
+        work: F,
+    ) -> Result<T, ReloadFailure>
+    where
+        F: FnOnce(Arc<DbTable>) -> Fut,
+        Fut: Future<Output = Result<(T, Option<Arc<DbTable>>), String>>,
+    {
         // The map key DDL mutates (`resolve_key`): where identifier case
         // folding drops in, so every mutator removes the slot a lookup finds.
         let resolved = self.resolve_key(table_name);
@@ -141,9 +160,16 @@ impl Database {
                 #[cfg(any(test, feature = "test_tokens"))]
                 hooks::reached(self, table_name, hooks::Step::Retired, &old);
 
-                // Step 3: the DDL's work, then the reopen.
-                let worked = work(old.clone()).await;
-                let reopened = self.open_instance(table_name).await;
+                // Step 3: the DDL's work, then the reopen (unless the work
+                // opened the new instance itself).
+                let (worked, opened) = match work(old.clone()).await {
+                    Ok((value, opened)) => (Ok(value), opened),
+                    Err(e) => (Err(e), None),
+                };
+                let reopened = match opened {
+                    Some(table) => Ok(table),
+                    None => self.open_instance(table_name).await,
+                };
                 let table = match reopened {
                     Ok(table) => table,
                     Err(e) => {

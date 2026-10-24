@@ -248,6 +248,17 @@ impl Harness {
                     continue;
                 }
                 let now = std::fs::read(&path).unwrap();
+                // A B5 change intent is only ever put in place whole, by a
+                // rename over it of a temporary file synced first, and the
+                // directory synced after: present at the cut, it is durable
+                // as it is. (This model follows syncs by path, so it would
+                // otherwise read the rename's target as never synced.)
+                if name.to_string_lossy().starts_with("__rewrite_")
+                    && path.extension().is_some_and(|x| x == "intent")
+                {
+                    std::fs::write(img.join(name), now).unwrap();
+                    continue;
+                }
                 let synced = synced_prefix(&path, &self.events);
                 let ino = std::fs::metadata(&path).unwrap().ino();
                 let base = self
@@ -419,9 +430,13 @@ async fn a_power_cut_inside_rename_column_leaves_it_undone_or_done() {
     let mut seen = Vec::new();
     for (point, seed, img) in images {
         let db = open(&img).await;
-        // Before the commit marker is durable nothing of the rename may show;
-        // once it is (the commit syncs), all of it must.
-        let expected = if point.starts_with("logged.") { "a" } else { "z" };
+        // Before the commit marker is durable nothing of the rename may show.
+        // Since B5 the rename is a reload's work, whose backup (the table's
+        // and its FK child's schema files) and intent stay until it is
+        // durable and done: a cut right after its log commit is undone by the
+        // next open too, whole. Once the statement has finished, all of it
+        // must show.
+        let expected = if point.starts_with("logged.") || point == "rename.after_commit" { "a" } else { "z" };
         match judge(&db).await {
             Ok(name) if name == expected => seen.push(format!("{point}/{seed}: {name}")),
             Ok(name) => failures.push(format!("{point}/seed {seed}: shows {name}, not {expected}")),

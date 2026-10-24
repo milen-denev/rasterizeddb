@@ -3676,6 +3676,67 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// Writes one row version as another instance of this table's file set
+    /// held it: created by `xmin` and, unless `xmax` is `NO_TX`, retired by
+    /// `xmax`. For an ALTER rewrite (docs/persistent-indexes.md §7, R5), which
+    /// copies every version a snapshot can still see with the stamps it had,
+    /// so the rewrite changes no one's view of the rows: a committed row stays
+    /// committed, a version the ALTER's own transaction wrote stays its own
+    /// (gone if it rolls back), and a row it deleted comes back if it does.
+    ///
+    /// No uniqueness check: the versions were checked when they were written,
+    /// a rewrite changes no key, and two versions of one key (the old one
+    /// retired) must both go in. The caller holds ACCESS EXCLUSIVE, so
+    /// nothing else writes the table meanwhile. Indexed and filtered like any
+    /// insert.
+    pub(crate) async fn insert_version(&self, row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
+        let d = self.data()?;
+        let _gate = self.compaction_gate.read().await;
+        if let Some(manager) = self.versions.load().as_ref() {
+            // The transaction that will end these versions must know it wrote
+            // here (its commit syncs this table); a committed one is done.
+            for id in [xmin, xmax] {
+                if id != NO_TX && id != FROZEN_TX && manager.outcome(id) == crate::core::mvcc::TxOutcome::InProgress {
+                    manager.mark_wrote(id);
+                }
+            }
+        }
+        let _id = d.ids.reserve_insert_id().await;
+        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos(
+            d.io_pointers.clone(),
+            d.io_rows.clone(),
+            &d.ids.last_row_id,
+            &d.len,
+            #[cfg(feature = "enable_long_row")]
+            0u32,
+            &row_write,
+            None,
+            // Appended, in the order read: a fresh file set has no free space.
+            None,
+            None,
+            xmin,
+        )
+        .await
+        .map_err(std::io::Error::from)?;
+        if xmax != NO_TX {
+            pointer
+                .delete(d.io_pointers.clone(), record_pos, None, xmax)
+                .await
+                .map_err(std::io::Error::from)?;
+        }
+
+        let ticket = gate::ticket();
+        let slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
+        if let Some(filters) = d.filters.as_ref() {
+            filters.on_insert(Proof::from(&ticket), slot, &row_write);
+        }
+        if let Some(indexes) = d.indexes.as_ref() {
+            indexes.on_insert(Proof::from(&ticket), slot, &row_write);
+        }
+        self.invalidate_query_caches();
+        Ok(())
+    }
+
     /// Queries outside any transaction. On a versioned table this still takes a
     /// snapshot — other transactions may be in flight, and their uncommitted
     /// rows must stay hidden.

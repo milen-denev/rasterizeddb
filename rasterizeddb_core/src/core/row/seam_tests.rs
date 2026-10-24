@@ -77,6 +77,7 @@ const CALLED_ON_SHELL: &[&str] = &[
     "build_candidates",
     "insert_row",
     "insert_row_in_txn",
+    "insert_version",
     "query_row",
     "count_rows_in_txn",
     "count_rows_with_visibility",
@@ -442,6 +443,7 @@ async fn a_shell_refuses_every_data_method() {
     expect("build_candidates", unit(shell.build_candidates("id = 1", None).await));
     expect("insert_row", unit(shell.insert_row(row(1)).await));
     expect("insert_row_in_txn", unit(shell.insert_row_in_txn(row(1), FROZEN_TX).await));
+    expect("insert_version", unit(shell.insert_version(row(1), FROZEN_TX, crate::core::mvcc::transaction::NO_TX).await));
     expect(
         "query_row",
         unit(shell.query_row("", &fields, fetch(&shell), fetch(&shell), None, None).await),

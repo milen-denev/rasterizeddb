@@ -2033,11 +2033,14 @@ mod pools {
         drop(base);
     }
 
-    /// An `ALTER … ADD COLUMN` rewrite of a mirrored table whose drop got its
-    /// barrier into the database's log but not into the backup's (a full
-    /// backup disk, the log not poisoned). The drop happened, table and files,
-    /// and used to report an error anyway, so the rewrite stopped before its
-    /// create and lost every row it was carrying.
+    /// An `ALTER … ADD COLUMN` rewrite of a mirrored table whose release of
+    /// its old files got its barrier into the database's log but not into the
+    /// backup's (a full backup disk, the log not poisoned). The drop-and-create
+    /// rewrite this was written for went on and kept its rows; since B5 the
+    /// rewrite holds the old files aside first (`rewrite.rs`), so a barrier
+    /// that fails fails the statement and puts the old files back. Either way
+    /// no row is lost: the rewrite succeeds with them, or fails leaving the
+    /// table exactly as it was.
     #[tokio::test(flavor = "current_thread")]
     async fn a_rewrite_keeps_its_rows_when_only_a_backups_barrier_fails() {
         let base = tempfile::tempdir().unwrap();
@@ -2053,8 +2056,6 @@ mod pools {
         for n in 0..5 {
             insert(&db, n, &format!("old_{n:02}")).await;
         }
-        let wal_path = backup.join(DEFAULT_WAL_NAME);
-        let before = crate::core::wal::barriers_in(&wal_path);
 
         crate::core::wal::test_hooks::FORGETS_BEFORE_FAILING.with(|n| n.set(1));
         crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.set(true));
@@ -2066,20 +2067,24 @@ mod pools {
         let reached = !crate::core::wal::test_hooks::FAIL_FORGET.with(|f| f.replace(false));
         crate::core::wal::test_hooks::FORGETS_BEFORE_FAILING.with(|n| n.set(0));
         assert!(reached, "the backup's barrier was never attempted");
-        assert_eq!(
-            crate::core::wal::barriers_in(&wal_path),
-            before,
-            "the backup's log took a barrier, so this is not the case under test"
-        );
-        assert!(
-            !out.is_empty() && out[0] != 3,
-            "the rewrite failed: {}",
-            String::from_utf8_lossy(&out)
-        );
+        // Not compared with `before` any more: since B5 a failed barrier
+        // fails the rewrite, whose restore then takes barriers of its own
+        // there. `reached` is what says the failure under test happened.
+        assert!(!out.is_empty(), "the rewrite answered nothing");
+        let failed = out[0] == 3;
         assert_eq!(
             labels(&db, &names("old", 5)).await,
             names("old", 5),
-            "the rewrite lost rows when only the backup's barrier failed"
+            "the rewrite lost rows when only the backup's barrier failed (it {})",
+            if failed { "failed" } else { "succeeded" }
+        );
+        let has_extra = db
+            .schema_view(TABLE)
+            .is_some_and(|v| v.schema().fields.iter().any(|f| f.name == "extra" && !f.is_deleted));
+        assert_eq!(
+            has_extra, !failed,
+            "the table's shape does not match the statement's outcome: {}",
+            String::from_utf8_lossy(&out)
         );
         drop(db);
         crate::core::wal::remove_for(&path_str(&root));

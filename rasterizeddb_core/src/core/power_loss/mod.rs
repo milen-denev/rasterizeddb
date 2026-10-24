@@ -84,6 +84,8 @@ pub(crate) fn temp_synced_for(tag: &str, path: &Path) -> Option<PathBuf> {
         "wal.keep_tail" => Some(path.with_extension("ckpt")),
         // `torn_tail::Floors::store`.
         "wal.floors" => Some(path.with_extension(crate::core::torn_tail::FLOORS_PARTIAL_EXTENSION)),
+        // `database::rewrite::write_intent`.
+        "rewrite.intent" => Some(path.with_extension("partial")),
         _ => None,
     }
 }
@@ -130,4 +132,7 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `partition::files::sync_dir`: a directory sync that notes the
     // directory itself (see `dir_synced_by`).
     ("partition_dir", false),
+    // `database::rewrite::write_intent`: a temporary file, a rename over the
+    // intent and a directory sync.
+    ("rewrite.intent", true),
 ];

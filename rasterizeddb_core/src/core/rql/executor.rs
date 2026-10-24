@@ -2322,395 +2322,454 @@ async fn rewrite_table_with_columns(
     // recreated table with the existing ones.
     new_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
     new_generated: Vec<crate::core::rql::generated::GeneratedColumn>,
-    // The transaction asking. The rows are read as of now on its behalf, so
-    // that what it has written here and not yet committed survives the
-    // rebuild — a frozen read would not see them, and the drop would take
-    // them — without narrowing to a snapshot it may have pinned, which would
-    // take what others have committed since.
+    // The transaction asking. The rewrite keeps every version's own stamps
+    // (R5), so this decides nothing about which rows survive; it says
+    // whether the rewrite wrote versions of this family, which then hold the
+    // table as any write does (`rewrite_rows`).
     reader: TxId,
 ) -> Result<(), String> {
+    let new_columns = std::sync::Mutex::new(Some((new_columns, new_defaults, new_json, new_modifiers, new_generated)));
+    rewrite_rows(database, table_name, reader, |definition, versions| {
+        let (columns, defaults, json, modifiers, generated) =
+            new_columns.lock().unwrap().take().expect("the definition is built once");
+        definition.columns.extend(columns);
+        definition.defaults.extend(defaults);
+        definition.json_columns.extend(json);
+        definition.type_modifiers.extend(modifiers);
+        definition.generated.extend(generated);
+        Ok(versions)
+    })
+    .await
+}
+
+/// One row version as a rewrite read it from the old files: its stamps, and
+/// its values by **column name**.
+///
+/// By name, not by `write_order`: the recreated table renumbers its columns
+/// from zero, so a write_order is only stable while the old numbering had no
+/// gaps. `DROP COLUMN` leaves one: after dropping `b` from `(a, b, c)` the
+/// surviving fields still read `a=0, c=2`, while the rewritten table numbers
+/// them `a=0, c=1, d=2`, so `c`'s bytes were written into `d`, and every
+/// later column shifted with it. That reported success and stored a corrupt
+/// row. Names survive the rewrite unchanged.
+struct RewrittenVersion {
+    xmin: TxId,
+    xmax: TxId,
+    values: Vec<(String, crate::memory_pool::MemoryBlock, DbTypeRef)>,
+}
+
+/// Rewrites every row of `table_name` under a new definition, as one reload
+/// under the ACCESS EXCLUSIVE the caller holds (`Database::rewrite_table`,
+/// docs/persistent-indexes.md §7 "ALTER rewrites are one reload", R5).
+///
+/// A row is a fixed-width record whose column offsets come from the schema,
+/// so a column appended to the schema alone would be read at an offset the
+/// stored rows never wrote; every row is rewritten under the new layout.
+///
+/// The definition starts as the table's own, every declaration carried
+/// (constraints, defaults, JSON registrations, NUMERIC modifiers, generation
+/// expressions, checks, the PRIMARY KEY, index and path-index declarations
+/// by column name), and `reshape` changes it and the versions read (a new
+/// column, a retyped value). Read **after** the lock, from the retired
+/// instance: every version some snapshot can still see, each written back
+/// with its own `xmin` and `xmax`, so nobody's view of the rows changes. A
+/// committed row stays committed whoever wrote it; a version the caller's
+/// family wrote and has not committed stays its own, gone if it rolls back;
+/// a committed row it deleted keeps that `xmax`, so a rollback revives it.
+/// An aborted version, or one no snapshot can see, is left behind, and an
+/// aborted deleter's stamp is cleared. A failure or a crash anywhere leaves
+/// the old table.
+///
+/// When the caller's family has versions in the table (it wrote here before,
+/// so it holds ROW EXCLUSIVE already), that lock is confirmed afterwards:
+/// a block's ACCESS EXCLUSIVE then downgrades to it at the statement's end
+/// rather than being released (finding L5).
+async fn rewrite_rows<F>(database: &Arc<Database>, table_name: &str, reader: TxId, reshape: F) -> Result<(), String>
+where
+    F: FnOnce(
+        &mut crate::core::rql::lexer_ct::CreateTable,
+        Vec<RewrittenVersion>,
+    ) -> Result<Vec<RewrittenVersion>, String>,
+{
     use crate::core::rql::lexer_ct::{CreateColumnData, CreateTable};
 
-    // The rewrite drops the table and creates it again under the same name. A
-    // name older builds accepted can be refused by the create; asked after the
-    // drop, that refusal would lose every row.
+    // The rewrite recreates the table's files under its name. A name older
+    // builds accepted can be refused by the create; asked after the old files
+    // were released, that refusal would lose every row.
     database
         .check_recreatable(table_name)
         .map_err(|e| format!("cannot rewrite '{}': {}", table_name, e))?;
+    // The statement holds ACCESS EXCLUSIVE already (the ALTER arm, or a JSON
+    // shadow's internal lock); confirmed, never newly waited for, here.
+    database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
 
-    let (
-        existing_columns,
-        foreign_keys,
-        mut defaults,
-        json_columns,
-        unique_columns,
-        unique_keys,
-        type_modifiers,
-        generated,
-        checks,
-        carried_indexes,
-        carried_path_indexes,
-        old_field_names,
-        rows,
-    ) = {
-        let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
-        let Some(table) = entry.as_ref().clone() else {
-            return Err(format!("relation '{}' does not exist", table_name));
-        };
+    struct Plan {
+        versions: Vec<RewrittenVersion>,
+        carried_indexes: Vec<(crate::core::index::IndexDecl, Vec<Option<String>>)>,
+        carried_path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
+        defaults: Vec<crate::core::rql::column_default::ColumnDefault>,
+    }
 
-        let schema = &table.schema.fields;
-        let mut ordered: Vec<crate::core::row::schema::SchemaField> =
-            schema.iter().filter(|f| !f.is_deleted).cloned().collect();
-        ordered.sort_by_key(|f| f.write_order);
+    let family = database.transactions.top_level(reader);
+    let database_id = database.id;
+    let read_db = database.clone();
+    let written_by_family = database
+        .rewrite_table(
+            table_name,
+            move |old| async move {
+                let schema = &old.schema.fields;
+                let mut ordered: Vec<crate::core::row::schema::SchemaField> =
+                    schema.iter().filter(|f| !f.is_deleted).cloned().collect();
+                ordered.sort_by_key(|f| f.write_order);
+                let fetch = crate::core::rql::join::fetch_for(&ordered, schema);
+                // The old numbering, so each fetched value can be named.
+                let name_of: std::collections::HashMap<u64, String> =
+                    schema.iter().map(|f| (f.write_order, f.name.clone())).collect();
 
-        let fetch = crate::core::rql::join::fetch_for(&ordered, schema);
-        let empty = crate::core::rql::join::fetch_for(&[], schema);
-        let visibility = table.visibility_now_for(reader);
-        let rows = table
-            .query_row_with_visibility("", &schema.to_vec(), empty, fetch, None, None, visibility)
-            .await
-            .map_err(|e| format!("could not read '{}' for rewrite: {}", table_name, e))?;
-
-        let columns: Vec<CreateColumnData> = ordered
-            .iter()
-            .map(|f| CreateColumnData {
-                name: f.name.clone(),
-                data_type: f.db_type.clone(),
-            })
-            .collect();
-
-        // A rewrite drops and recreates the table, so every constraint has to be
-        // carried across or `ALTER TABLE … ADD COLUMN` would quietly drop the
-        // table's uniqueness along with it.
-        let unique_columns: Vec<String> = ordered
-            .iter()
-            .filter(|f| f.is_unique)
-            .map(|f| f.name.clone())
-            .collect();
-
-        // The old numbering, so each fetched value can be named before the
-        // table is dropped and renumbered.
-        let old_field_names: std::collections::HashMap<u64, String> = schema
-            .iter()
-            .map(|f| (f.write_order, f.name.clone()))
-            .collect();
-
-        (
-            columns,
-            table.schema.foreign_keys.clone(),
-            table.schema.defaults.clone(),
-            table.schema.json_columns.clone(),
-            unique_columns,
-            // Only the keys the rows were checked under. A predicate that no
-            // longer compiles has not been enforced, and recreated next to a
-            // new column of the name it reads, it would compile against
-            // values no row was checked against: the reinsert below then
-            // failed on the first duplicate, after the table was dropped.
-            table
-                .schema
-                .unique_keys
-                .iter()
-                .filter(|k| match k.condition(schema) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        info!("unique index {} not carried across the rewrite: {}", k.describe(), e);
-                        false
+                let horizon = old.version_horizon();
+                let io_pointers = old.io_pointers().map_err(|e| e.to_string())?.clone();
+                let io_rows = old.io_rows().map_err(|e| e.to_string())?.clone();
+                let mut pointers = crate::core::row::row_pointer::RowPointerIterator::new(io_pointers)
+                    .await
+                    .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?;
+                let mut versions = Vec::new();
+                while let Some((_, pointer)) = pointers
+                    .next_row_pointer_with_offset()
+                    .await
+                    .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?
+                {
+                    // Aborted, or dead for every snapshot that exists or can.
+                    if pointer.deleted || horizon.is_reclaimable(false, pointer.xmin, pointer.xmax) {
+                        continue;
                     }
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-            table.schema.type_modifiers.clone(),
-            // Carried across for the same reason the type modifiers are: a
-            // rewrite drops the table, and a generation expression lost here
-            // would leave the column present and permanently NULL.
-            table.schema.generated.clone(),
-            // Carried for the same reason: a rewrite drops the table, and a
-            // constraint lost here stops being enforced with nothing said.
-            table.schema.checks.clone(),
-            // Index declarations, each with its columns by name: the rewrite
-            // renumbers columns, and a name is what survives it.
-            table
-                .schema
-                .secondary_indexes
-                .iter()
-                .map(|decl| {
-                    let names: Vec<Option<String>> = decl
+                    // An aborted deleter's stamp never retired anything.
+                    let xmax = if pointer.xmax != crate::core::mvcc::transaction::NO_TX
+                        && read_db.transactions.outcome(pointer.xmax) == crate::core::mvcc::TxOutcome::Aborted
+                    {
+                        crate::core::mvcc::transaction::NO_TX
+                    } else {
+                        pointer.xmax
+                    };
+                    let row = pointer
+                        .fetch_row(io_rows.clone(), &fetch)
+                        .await
+                        .map_err(|e| format!("could not read a row of '{}' for rewrite: {}", old.schema.name, e))?;
+                    let values = row
                         .columns
                         .iter()
-                        .map(|wo| {
-                            table
-                                .schema
-                                .fields
-                                .iter()
-                                .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
-                                .map(|f| f.name.clone())
+                        .filter_map(|c| {
+                            name_of
+                                .get(&u64::from(c.schema_id))
+                                .map(|name| (name.clone(), c.data.clone(), c.column_type.clone()))
                         })
                         .collect();
-                    (decl.clone(), names)
-                })
-                .collect::<Vec<_>>(),
-            // Path-index declarations, which a rewrite used to lose: the
-            // filter then stopped carrying the path, silently.
-            table.schema.path_indexes.clone(),
-            old_field_names,
-            rows,
-        )
-    };
+                    versions.push(RewrittenVersion {
+                        xmin: pointer.xmin,
+                        xmax,
+                        values,
+                    });
+                }
 
-    // Values are captured by **column name**, not by `write_order`.
-    //
-    // The recreated table renumbers its columns from zero, so a write_order is
-    // only stable while the old numbering had no gaps. `DROP COLUMN` leaves
-    // one: after dropping `b` from `(a, b, c)` the surviving fields still read
-    // `a=0, c=2`, while the rewritten table numbers them `a=0, c=1, d=2` — so
-    // `c`'s bytes were written into `d`, and every later column shifted with
-    // it. That reported success and stored a corrupt row. Names survive the
-    // rewrite unchanged, so they are what the values are matched on.
-    let name_of: std::collections::HashMap<u64, String> = old_field_names;
-    let mut captured: Vec<Vec<(String, crate::memory_pool::MemoryBlock, DbTypeRef)>> =
-        Vec::with_capacity(rows.len());
-    for row in &rows {
-        captured.push(
-            row.columns
-                .iter()
-                .filter_map(|c| {
-                    name_of
-                        .get(&u64::from(c.schema_id))
-                        .map(|name| (name.clone(), c.data.clone(), c.column_type.clone()))
-                })
-                .collect(),
-        );
-    }
-
-    let mut columns = existing_columns;
-    columns.extend(new_columns);
-    let carries_unique_keys = unique_keys.iter().any(|k| !k.is_deleted);
-
-    database
-        .drop_table(table_name)
-        .await
-        .map_err(|e| format!("could not clear '{}': {}", table_name, e))?;
-    database
-        .add_table(CreateTable {
-            table_name: table_name.to_string(),
-            columns,
-            is_immutable: false,
-            // A rewrite always creates the table it just dropped.
-            if_not_exists: false,
-            foreign_keys: foreign_keys.into_iter().collect(),
-            defaults: {
-                defaults.extend(new_defaults.iter().cloned());
-                defaults.into_iter().collect()
-            },
-            json_columns: json_columns.into_iter().chain(new_json).collect(),
-            // Carried across the rewrite. Losing a column's declared scale here
-            // would silently reinterpret every decimal it holds.
-            type_modifiers: type_modifiers.into_iter().chain(new_modifiers).collect(),
-            generated: generated.into_iter().chain(new_generated).collect(),
-            checks: checks.into_iter().collect(),
-            unique_columns,
-            unique_keys: unique_keys.into_iter().collect(),
-            // A shadow table for a JSON document has no declared key.
-            primary_key: None,
-        })
-        .await
-        .map_err(|e| format!("could not recreate '{}': {}", table_name, e))?;
-
-    // Index declarations go back before the rows do, so reopening builds the
-    // (still empty) indexes and every reinserted row is indexed by its insert.
-    //
-    // Table-level unique keys reopen it too. `add_table` registers them on a
-    // table whose indexes were already built, so without a reopen their
-    // implicit indexes were missing until the next restart: `pg_indexes`
-    // stopped listing a partial unique index after `ADD COLUMN`, and a
-    // migration that checks there before creating it would have tried again.
-    if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() || carries_unique_keys {
-        let (io_schema, fields) = {
-            let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
-            let Some(table) = entry.as_ref().clone() else {
-                return Err(format!("relation '{}' vanished during rewrite", table_name));
-            };
-            (table.io_schema.clone(), table.schema.fields.clone())
-        };
-        for (decl, names) in carried_indexes {
-            // An index over a column this rewrite dropped goes with it, as in
-            // PostgreSQL.
-            let columns: Option<Vec<u32>> = names
-                .iter()
-                .map(|name| {
-                    let name = name.as_ref()?;
-                    fields
+                let unique_columns: Vec<String> =
+                    ordered.iter().filter(|f| f.is_unique).map(|f| f.name.clone()).collect();
+                let mut definition = CreateTable {
+                    table_name: old.schema.name.clone(),
+                    columns: ordered
                         .iter()
-                        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
-                        .map(|f| f.write_order as u32)
-                })
-                .collect();
-            let Some(columns) = columns else {
-                info!("index {} dropped with its column", decl.name);
-                continue;
-            };
-            let decl = crate::core::index::IndexDecl { columns, ..decl };
-            crate::core::index::decl::append(io_schema.clone(), &decl)
-                .await
-                .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
-        }
-        for path_index in &carried_path_indexes {
-            crate::core::rql::path_index::append(io_schema.clone(), path_index)
-                .await
-                .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
-        }
-        database
-            .reload_table(table_name)
-            .await
-            .map_err(|e| format!("could not reopen '{}' with its indexes: {}", table_name, e))?;
-    }
-
-    let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
-    let Some(table) = entry.as_ref().clone() else {
-        return Err(format!("relation '{}' vanished during rewrite", table_name));
-    };
-    let schema = table.schema.fields.clone();
-
-    for values in captured {
-        let mut payloads: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> =
-            smallvec::SmallVec::new();
-
-        for field in schema.iter().filter(|f| !f.is_deleted) {
-            let stored = values
-                .iter()
-                .find(|(name, _, _)| name.eq_ignore_ascii_case(&field.name));
-            let data = match stored {
-                Some((_, block, _)) => block.clone(),
-                // A column the row predates. Fixed-width slots have to be
-                // filled, and the new column's companion marks it NULL.
-                None => {
-                    // A default gives the existing rows a value; without one
-                    // they take NULL, which is what makes `NOT NULL` without a
-                    // `DEFAULT` impossible here.
-                    let from_default = crate::core::rql::column_default::expression_for(
-                        &field.name,
-                        &table.schema.defaults,
-                    )
-                    .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &field.db_type, database.id)
-                            .ok()
+                        .map(|f| CreateColumnData {
+                            name: f.name.clone(),
+                            data_type: f.db_type.clone(),
+                        })
+                        .collect(),
+                    is_immutable: false,
+                    if_not_exists: false,
+                    foreign_keys: old.schema.foreign_keys.iter().cloned().collect(),
+                    defaults: old.schema.defaults.iter().cloned().collect(),
+                    json_columns: old.schema.json_columns.iter().cloned().collect(),
+                    // Losing a column's declared scale here would silently
+                    // reinterpret every decimal it holds.
+                    type_modifiers: old.schema.type_modifiers.iter().cloned().collect(),
+                    // A generation expression lost here would leave the column
+                    // present and permanently NULL.
+                    generated: old.schema.generated.iter().cloned().collect(),
+                    // A constraint lost here stops being enforced with nothing said.
+                    checks: old.schema.checks.iter().cloned().collect(),
+                    unique_columns,
+                    // Only the keys the rows were checked under. A predicate that
+                    // no longer compiles has not been enforced, and recreated next
+                    // to a new column of the name it reads, it would compile
+                    // against values no row was checked against.
+                    unique_keys: old
+                        .schema
+                        .unique_keys
+                        .iter()
+                        .filter(|k| match k.condition(schema) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                info!("unique index {} not carried across the rewrite: {}", k.describe(), e);
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect(),
+                    // The declared key goes back into the header: a rewrite used
+                    // to drop it, and clients asking which column is the key got
+                    // none after an ADD COLUMN.
+                    primary_key: old.schema.primary_key.clone(),
+                };
+                // Index declarations, each with its columns by name: the rewrite
+                // renumbers columns, and a name is what survives it.
+                let carried_indexes = old
+                    .schema
+                    .secondary_indexes
+                    .iter()
+                    .map(|decl| {
+                        let names: Vec<Option<String>> = decl
+                            .columns
+                            .iter()
+                            .map(|wo| {
+                                schema
+                                    .iter()
+                                    .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
+                                    .map(|f| f.name.clone())
+                            })
+                            .collect();
+                        (decl.clone(), names)
                     })
-                    .filter(|literal| literal != "NULL")
-                    .and_then(|literal| {
-                        // A NUMERIC(p, s) column stores its values at its own
-                        // scale; the plain encoder writes the engine's.
-                        if field.db_type == crate::core::db_type::DbType::DECIMAL {
-                            if let Some(scale) = field.scale {
-                                return crate::core::value_codec::parse_decimal_rounded(
-                                    literal.trim_matches('\''),
-                                    scale,
-                                )
-                                .map(|v| v.to_le_bytes().to_vec());
+                    .collect();
+                // Path-index declarations, which a rewrite used to lose.
+                let carried_path_indexes = old.schema.path_indexes.clone();
+                let versions = reshape(&mut definition, versions)?;
+                let defaults = definition.defaults.clone();
+                Ok((
+                    definition,
+                    Plan {
+                        versions,
+                        carried_indexes,
+                        carried_path_indexes,
+                        defaults,
+                    },
+                ))
+            },
+            |plan, created| {
+                let io_schema = created.io_schema.clone();
+                let fields = created.schema.fields.clone();
+                let carried_indexes = plan.carried_indexes.clone();
+                let carried_path_indexes = plan.carried_path_indexes.clone();
+                async move {
+                    // Declarations go in before any row, so the open that
+                    // follows builds the (empty) indexes and every row is
+                    // indexed by its insert.
+                    for (decl, names) in carried_indexes {
+                        // An index over a column this rewrite dropped goes
+                        // with it, as in PostgreSQL.
+                        let columns: Option<Vec<u32>> = names
+                            .iter()
+                            .map(|name| {
+                                let name = name.as_ref()?;
+                                fields
+                                    .iter()
+                                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+                                    .map(|f| f.write_order as u32)
+                            })
+                            .collect();
+                        let Some(columns) = columns else {
+                            info!("index {} dropped with its column", decl.name);
+                            continue;
+                        };
+                        let decl = crate::core::index::IndexDecl { columns, ..decl };
+                        crate::core::index::decl::append(io_schema.clone(), &decl)
+                            .await
+                            .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
+                    }
+                    for path_index in &carried_path_indexes {
+                        crate::core::rql::path_index::append(io_schema.clone(), path_index)
+                            .await
+                            .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
+                    }
+                    Ok(())
+                }
+            },
+            |plan, table| {
+                let database = database.clone();
+                async move {
+                    let table_name = table.schema.name.clone();
+                    let schema = table.schema.fields.clone();
+                    let mut family_versions = 0u64;
+                    for (n, version) in plan.versions.into_iter().enumerate() {
+                        let row = rewrite_payload(&table_name, &schema, &plan.defaults, &version.values, database_id)?;
+                        for id in [version.xmin, version.xmax] {
+                            if id != crate::core::mvcc::transaction::NO_TX
+                                && id != crate::core::mvcc::transaction::FROZEN_TX
+                                && database.transactions.top_level(id) == family
+                            {
+                                family_versions += 1;
                             }
                         }
-                        crate::core::value_codec::encode_literal(
-                            &field.db_type,
-                            literal.trim_matches('\''),
-                        )
-                        .or_else(|| {
-                            crate::core::value_codec::coerce_literal(
-                                literal.trim_matches('\'').as_bytes(),
-                                &crate::core::db_type::DbType::STRING,
-                                &field.db_type,
-                            )
-                        })
-                    });
-
-                    if let Some(bytes) = from_default {
-                        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                        mb.into_slice_mut().copy_from_slice(&bytes);
-                        mb
-                    } else if field.db_type.is_variable_width() {
-                        crate::memory_pool::MemoryBlock::default()
-                    } else if crate::core::rql::nullable::is_hidden(&field.name) {
-                        let tracked =
-                            &field.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..];
-
-                        // Does this row already hold a value for the column the
-                        // companion tracks?
-                        //
-                        // A companion is new in two quite different situations,
-                        // and only one of them means NULL:
-                        //
-                        // - `ADD COLUMN v TEXT` — `v` is new too, no row has a
-                        //   value, so the companion says NULL unless a DEFAULT
-                        //   fills it.
-                        // - `ALTER COLUMN v DROP NOT NULL` — `v` is **not** new
-                        //   and every row already has a value. Saying NULL here
-                        //   does not lose the bytes; it makes the column report
-                        //   NULL in projection and in `WHERE` while the data
-                        //   sits intact underneath, which is worse than losing
-                        //   it because nothing looks wrong.
-                        //
-                        // So the row itself decides, not the schema.
-                        let tracked_present = schema
-                            .iter()
-                            .find(|f| f.name.eq_ignore_ascii_case(tracked))
-                            .is_some_and(|f| {
-                                values
-                                    .iter()
-                                    .any(|(name, _, _)| name.eq_ignore_ascii_case(&f.name))
-                            });
-
-                        let is_null = !tracked_present
-                            && crate::core::rql::column_default::expression_for(
-                                tracked,
-                                &table.schema.defaults,
-                            )
-                            .map(|e| e.trim().eq_ignore_ascii_case("NULL"))
-                            .unwrap_or(true);
-                        let bytes = crate::core::rql::nullable::flag_bytes(is_null);
-                        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                        mb.into_slice_mut().copy_from_slice(&bytes);
-                        mb
-                    } else {
-                        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(field.size as usize);
-                        mb.into_slice_mut().fill(0);
-                        mb
+                        table
+                            .insert_version(row, version.xmin, version.xmax)
+                            .await
+                            .map_err(|e| format!("could not rewrite a row of '{}': {}", table_name, e))?;
+                        if n == 0 {
+                            // After the first row: the fill is under way.
+                            crate::core::database::rewrite::point(&database, "mid_fill")?;
+                        }
                     }
+                    Ok(family_versions > 0)
                 }
-            };
+            },
+        )
+        .await
+        .map_err(|failure| format!("{failure}"))?;
+    if written_by_family {
+        // Held already (the family wrote here first); confirmed, so the
+        // statement's end keeps it (finding L5).
+        database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
+    }
+    Ok(())
+}
 
-            // A fixed-width column occupies exactly its declared size in the
-            // record. Writing fewer bytes than declared does not fail — it
-            // shifts every column after it, so the next column's bytes are read
-            // at the wrong offset and come back as a plausible number for a
-            // value nobody wrote. Refusing here turns silent corruption of an
-            // existing table into a failed `ALTER` that names the column.
-            if !field.db_type.is_variable_width() && data.len() != field.size as usize {
-                return Err(format!(
-                    "cannot rewrite '{}': column '{}' holds {} bytes but its type needs {}. \
-                     Writing it would shift every later column and corrupt the row.",
-                    table_name,
-                    field.name,
-                    data.len(),
-                    field.size
-                ));
+/// One version's row under the rewritten schema: its values by name, and for
+/// a column the row predates, the column's DEFAULT, else NULL (its companion
+/// says so), else zeros.
+fn rewrite_payload(
+    table_name: &str,
+    schema: &[crate::core::row::schema::SchemaField],
+    defaults: &[crate::core::rql::column_default::ColumnDefault],
+    values: &[(String, crate::memory_pool::MemoryBlock, DbTypeRef)],
+    database_id: u64,
+) -> Result<crate::core::row::row::RowWrite, String> {
+    let mut payloads: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> = smallvec::SmallVec::new();
+    for field in schema.iter().filter(|f| !f.is_deleted) {
+        let stored = values
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&field.name));
+        let data = match stored {
+            Some((_, block, _)) => block.clone(),
+            // A column the row predates. Fixed-width slots have to be
+            // filled, and the new column's companion marks it NULL.
+            None => {
+                // A default gives the existing rows a value; without one
+                // they take NULL, which is what makes `NOT NULL` without a
+                // `DEFAULT` impossible here.
+                let from_default = crate::core::rql::column_default::expression_for(
+                    &field.name,
+                    defaults,
+                )
+                .and_then(|e| {
+                    crate::core::rql::column_default::evaluate(e, &field.db_type, database_id)
+                        .ok()
+                })
+                .filter(|literal| literal != "NULL")
+                .and_then(|literal| {
+                    // A NUMERIC(p, s) column stores its values at its own
+                    // scale; the plain encoder writes the engine's.
+                    if field.db_type == crate::core::db_type::DbType::DECIMAL {
+                        if let Some(scale) = field.scale {
+                            return crate::core::value_codec::parse_decimal_rounded(
+                                literal.trim_matches('\''),
+                                scale,
+                            )
+                            .map(|v| v.to_le_bytes().to_vec());
+                        }
+                    }
+                    crate::core::value_codec::encode_literal(
+                        &field.db_type,
+                        literal.trim_matches('\''),
+                    )
+                    .or_else(|| {
+                        crate::core::value_codec::coerce_literal(
+                            literal.trim_matches('\'').as_bytes(),
+                            &crate::core::db_type::DbType::STRING,
+                            &field.db_type,
+                        )
+                    })
+                });
+
+                if let Some(bytes) = from_default {
+                    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                    mb
+                } else if field.db_type.is_variable_width() {
+                    crate::memory_pool::MemoryBlock::default()
+                } else if crate::core::rql::nullable::is_hidden(&field.name) {
+                    let tracked =
+                        &field.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..];
+
+                    // Does this row already hold a value for the column the
+                    // companion tracks?
+                    //
+                    // A companion is new in two quite different situations,
+                    // and only one of them means NULL:
+                    //
+                    // - `ADD COLUMN v TEXT` — `v` is new too, no row has a
+                    //   value, so the companion says NULL unless a DEFAULT
+                    //   fills it.
+                    // - `ALTER COLUMN v DROP NOT NULL` — `v` is **not** new
+                    //   and every row already has a value. Saying NULL here
+                    //   does not lose the bytes; it makes the column report
+                    //   NULL in projection and in `WHERE` while the data
+                    //   sits intact underneath, which is worse than losing
+                    //   it because nothing looks wrong.
+                    //
+                    // So the row itself decides, not the schema.
+                    let tracked_present = schema
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(tracked))
+                        .is_some_and(|f| {
+                            values
+                                .iter()
+                                .any(|(name, _, _)| name.eq_ignore_ascii_case(&f.name))
+                        });
+
+                    let is_null = !tracked_present
+                        && crate::core::rql::column_default::expression_for(
+                            tracked,
+                            defaults,
+                        )
+                        .map(|e| e.trim().eq_ignore_ascii_case("NULL"))
+                        .unwrap_or(true);
+                    let bytes = crate::core::rql::nullable::flag_bytes(is_null);
+                    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                    mb
+                } else {
+                    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(field.size as usize);
+                    mb.into_slice_mut().fill(0);
+                    mb
+                }
             }
+        };
 
-            payloads.push(crate::core::row::row::ColumnWritePayload {
-                data,
-                write_order: field.write_order as u32,
-                column_type: field.db_type.physical(),
-                size: field.size,
-            });
+        // A fixed-width column occupies exactly its declared size in the
+        // record. Writing fewer bytes than declared does not fail — it
+        // shifts every column after it, so the next column's bytes are read
+        // at the wrong offset and come back as a plausible number for a
+        // value nobody wrote. Refusing here turns silent corruption of an
+        // existing table into a failed `ALTER` that names the column.
+        if !field.db_type.is_variable_width() && data.len() != field.size as usize {
+            return Err(format!(
+                "cannot rewrite '{}': column '{}' holds {} bytes but its type needs {}. \
+                 Writing it would shift every later column and corrupt the row.",
+                table_name,
+                field.name,
+                data.len(),
+                field.size
+            ));
         }
 
-        payloads.sort_by_key(|c| c.write_order);
-        table
-            .insert_row(crate::core::row::row::RowWrite {
-                columns_writing_data: payloads,
-            })
-            .await
-            .map_err(|e| format!("could not rewrite a row of '{}': {}", table_name, e))?;
+        payloads.push(crate::core::row::row::ColumnWritePayload {
+            data,
+            write_order: field.write_order as u32,
+            column_type: field.db_type.physical(),
+            size: field.size,
+        });
     }
 
-    Ok(())
+    payloads.sort_by_key(|c| c.write_order);
+    Ok(crate::core::row::row::RowWrite {
+        columns_writing_data: payloads,
+    })
 }
 
 /// What fills an output slot no fetched column occupies.
@@ -3308,142 +3367,69 @@ async fn retype_column(
     new_type: &crate::core::db_type::DbType,
     tx: TxId,
 ) -> Result<(), String> {
-    use crate::core::rql::json_map;
+    use crate::core::rql::nullable;
 
-    // Dropped and created again below; refuse up front, as the rewrite does.
-    database
-        .check_recreatable(table_name)
-        .map_err(|e| format!("cannot retype '{}': {}", table_name, e))?;
-
-    // Read every row as the documents they represent, so the conversion goes
-    // through one representation rather than a matrix of type pairs.
+    // The values are read as the documents they represent, so the conversion
+    // goes through one representation rather than a matrix of type pairs.
+    // Only the retyped column is converted; every other value keeps its own
+    // bytes, so nothing goes through a text round trip it could not survive.
     //
-    // As of now, on `tx`'s behalf: `tx` may have written rows here it has not
-    // committed — a batch of documents whose later member is the one widening
-    // the column — and the rebuild below keeps only what this read returns. A
-    // frozen read would miss them; `tx`'s own pinned snapshot, if it has one,
-    // would miss what others committed since. Both losses would be silent.
-    let (fields, rows) = {
-        let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
-        let Some(table) = entry.as_ref().clone() else {
-            return Err(format!("relation '{}' does not exist", table_name));
+    // Every version keeps its own stamps (`rewrite_rows`, R5): the documents
+    // `tx` has written here and not committed, a batch whose later member is
+    // the one widening the column, stay `tx`'s; other writers' rows stay
+    // theirs. The rewrite used to recreate the table and insert every row
+    // under `tx`, so a rollback of the widening statement emptied the
+    // shadow table of every other document.
+    let new_type = new_type.clone();
+    rewrite_rows(database, table_name, tx, move |definition, mut versions| {
+        let Some(declared) = definition.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(column)) else {
+            return Err(format!("column \"{}\" of \"{}\" does not exist", column, table_name));
         };
-        let visible = crate::core::rql::nullable::visible_fields(&table.schema.fields);
-        let fetch = crate::core::rql::join::fetch_for(&visible, &table.schema.fields);
-        let empty = crate::core::rql::join::fetch_for(&[], &table.schema.fields);
-        let visibility = table.visibility_now_for(tx);
-        let rows = table
-            .query_row_with_visibility(
-                "",
-                &table.schema.fields.to_vec(),
-                empty,
-                fetch,
-                None,
-                None,
-                visibility,
-            )
-            .await
-            .map_err(|e| format!("could not read '{}' to retype: {}", table_name, e))?;
-        (visible, rows)
-    };
-
-    // Capture each row as literals before the table is rebuilt.
-    let mut captured: Vec<Vec<(String, String)>> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let mut values: Vec<(String, String)> = Vec::new();
-        for (index, field) in fields.iter().enumerate() {
-            let Some(cell) = row.columns.get(index) else {
+        let old_type = std::mem::replace(&mut declared.data_type, new_type.clone());
+        let companion = nullable::flag_column_name(column);
+        for version in &mut versions {
+            let Some(at) = version.values.iter().position(|(name, _, _)| name.eq_ignore_ascii_case(column)) else {
                 continue;
             };
-            if cell.column_type == crate::core::db_type::DbType::NULL {
-                continue;
+            let converted = json_value_of(&old_type, version.values[at].1.into_slice())
+                .and_then(|value| literal_of_json(&value, &new_type))
+                .and_then(|literal| {
+                    let text = literal
+                        .strip_prefix('\'')
+                        .and_then(|t| t.strip_suffix('\''))
+                        .map(|t| t.replace("''", "'"))
+                        .unwrap_or(literal);
+                    crate::core::value_codec::encode_literal(&new_type, &text).or_else(|| {
+                        crate::core::value_codec::coerce_literal(
+                            text.as_bytes(),
+                            &crate::core::db_type::DbType::STRING,
+                            &new_type,
+                        )
+                    })
+                });
+            match converted {
+                Some(bytes) => {
+                    let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                    block.into_slice_mut().copy_from_slice(&bytes);
+                    version.values[at] = (version.values[at].0.clone(), block, new_type.clone());
+                }
+                // No value at the new type (a NULL, or one that does not
+                // convert): the column reads NULL, as the statement-built
+                // rewrite left it.
+                None => {
+                    version.values.remove(at);
+                    if let Some(flag) = version.values.iter_mut().find(|(name, _, _)| name.eq_ignore_ascii_case(&companion)) {
+                        let bytes = nullable::flag_bytes(true);
+                        let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                        block.into_slice_mut().copy_from_slice(&bytes);
+                        flag.1 = block;
+                    }
+                }
             }
-            let bytes = cell.data.into_slice();
-
-            // Only the column being retyped is converted. Every other value
-            // is re-rendered from its own bytes by its own type, so nothing is
-            // put through a text round trip that could not survive one — a
-            // UUID read as text would come back as replacement characters.
-            let literal = if field.name.eq_ignore_ascii_case(column) {
-                let Some(value) = json_value_of(&field.db_type, bytes) else {
-                    continue;
-                };
-                match literal_of_json(&value, new_type) {
-                    Some(literal) => literal,
-                    None => continue,
-                }
-            } else {
-                match crate::core::rql::subquery::value_to_literal(&field.db_type, bytes) {
-                    Some(literal) => literal,
-                    None => continue,
-                }
-            };
-            values.push((field.name.clone(), literal));
         }
-        captured.push(values);
-    }
-
-    // Rebuild with the column at its new type.
-    let columns: Vec<crate::core::rql::lexer_ct::CreateColumnData> = fields
-        .iter()
-        .map(|f| crate::core::rql::lexer_ct::CreateColumnData {
-            name: f.name.clone(),
-            data_type: if f.name.eq_ignore_ascii_case(column) {
-                new_type.clone()
-            } else {
-                f.db_type.clone()
-            },
-        })
-        .collect();
-
-    let declarations: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            let nullability = if c.name == JSON_KEY_COLUMN {
-                " NOT NULL"
-            } else {
-                ""
-            };
-            format!(
-                "{} {}{}",
-                c.name,
-                json_map::sql_type_name(&c.data_type),
-                nullability
-            )
-        })
-        .collect();
-
-    database
-        .drop_table(table_name)
-        .await
-        .map_err(|e| format!("could not clear '{}': {}", table_name, e))?;
-    run_ddl(
-        database,
-        &format!("CREATE TABLE {} ({})", table_name, declarations.join(", ")),
-        tx,
-    )
-    .await?;
-
-    for values in captured {
-        if values.is_empty() {
-            continue;
-        }
-        let names: Vec<&str> = values.iter().map(|(n, _)| n.as_str()).collect();
-        let literals: Vec<&str> = values.iter().map(|(_, l)| l.as_str()).collect();
-        run_ddl(
-            database,
-            &format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                table_name,
-                names.join(", "),
-                literals.join(", ")
-            ),
-            tx,
-        )
-        .await?;
-    }
-
-    Ok(())
+        Ok(versions)
+    })
+    .await
 }
 
 /// Renders a JSON value as the literal a column of `db_type` takes.
@@ -8617,13 +8603,12 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
 /// width change is. On an empty one the new modifier is recorded. A changed
 /// precision at the same scale is only recorded. Returns whether anything was
 /// written.
-async fn retype_numeric_modifier<S: crate::core::storage_providers::traits::StorageIO>(
+fn numeric_modifier_change(
     schema: &crate::core::row::schema::TableSchema,
     column: &str,
     declared: &str,
     row_count: u64,
-    io_schema: Arc<S>,
-) -> Result<bool, String> {
+) -> Result<Option<crate::core::rql::type_modifier::TypeModifier>, String> {
     use crate::core::rql::type_modifier::{self, TypeModifier};
     let current = schema
         .type_modifiers
@@ -8637,8 +8622,8 @@ async fn retype_numeric_modifier<S: crate::core::storage_providers::traits::Stor
     let scale_now = current.map_or(type_modifier::DEFAULT_DECIMAL_SCALE, |m| m.scale);
     let scale_wanted = wanted.map_or(type_modifier::DEFAULT_DECIMAL_SCALE, |(_, s)| s);
     let entry = match (current, wanted) {
-        (None, None) => return Ok(false),
-        (Some(m), Some((p, s))) if m.precision == p && m.scale == s => return Ok(false),
+        (None, None) => return Ok(None),
+        (Some(m), Some((p, s))) if m.precision == p && m.scale == s => return Ok(None),
         (_, Some((precision, scale))) => TypeModifier {
             column: column.to_string(),
             precision,
@@ -8661,12 +8646,9 @@ async fn retype_numeric_modifier<S: crate::core::storage_providers::traits::Stor
     }
     if entry.is_deleted && scale_now == scale_wanted {
         // Unconstrained at the scale it already stores: nothing to change.
-        return Ok(false);
+        return Ok(None);
     }
-    type_modifier::append(io_schema, &entry)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(true)
+    Ok(Some(entry))
 }
 
 /// `expression` with every reference to column `from` spelled `to` instead.
@@ -9015,7 +8997,7 @@ async fn execute_alter_table_action(
     use crate::core::rql::lexer_alter::AlterAction;
     use crate::core::rql::nullable;
 
-    let (mut schema, io_schema, row_count) = {
+    let (schema, io_schema, row_count) = {
         // ACCESS EXCLUSIVE before the schema is read (§7): every reader and
         // writer of the table has finished, and none starts until this
         // statement ends.
@@ -9056,6 +9038,10 @@ async fn execute_alter_table_action(
         return ddl_error(&e);
     }
 
+    // Every arm ends the statement itself. Since B5 each one's writes are its
+    // reload's work (`reload_with`, `reload_atomic[_with]`, `rewrite_rows`),
+    // so none writes and then reloads, and nothing falls through to a reload
+    // here.
     match plan.action {
         // Logged rather than silent, so a migration that depended on one is
         // traceable afterwards.
@@ -9294,17 +9280,9 @@ async fn execute_alter_table_action(
                 return ddl_error(&e);
             }
 
-            // A dropped column still holding this name — or its companion's —
-            // is retired first, exactly as `RENAME COLUMN` does. `add_field`
-            // skips a name the schema already holds, tombstones included, so
-            // `DROP COLUMN a` then `ADD COLUMN a` on an empty table reported
-            // success and added nothing: every later reference to `a` failed.
-            for taken in [name.clone(), nullable::flag_column_name(&name)] {
-                if let Err(e) = retire_tombstoned_name(&mut schema, &taken, io_schema.clone()).await {
-                    return ddl_error(&e);
-                }
-            }
-
+            // The document a JSON DEFAULT names is stored first, in its own
+            // table (a statement of its own there); everything this table
+            // records goes in as the reload's work below.
             let default =
                 match json_default_reference(&database, &plan.table_name, &name, default, json, tx)
                     .await
@@ -9312,63 +9290,78 @@ async fn execute_alter_table_action(
                     Ok(d) => d,
                     Err(e) => return ddl_error(&e),
                 };
-            if let Some(expression) = default {
-                let entry = crate::core::rql::column_default::ColumnDefault {
-                    column: name.clone(),
-                    expression,
-                    is_deleted: false,
-                };
-                if let Err(e) =
-                    crate::core::rql::column_default::append(io_schema.clone(), &entry).await
-                {
-                    return ddl_error(&e.to_string());
-                }
-            }
-
-            if let Some(entry) = &new_modifier {
-                if let Err(e) = crate::core::rql::type_modifier::append(io_schema.clone(), entry).await {
-                    return ddl_error(&e.to_string());
-                }
-            }
-            if let Some(entry) = &new_generated {
-                if let Err(e) = crate::core::rql::generated::append(io_schema.clone(), entry).await {
-                    return ddl_error(&e.to_string());
-                }
-            }
-            schema
-                .add_field(io_schema.clone(), name.clone(), db_type, false)
-                .await;
-            if is_nullable {
-                schema
-                    .add_field(
-                        io_schema.clone(),
-                        nullable::flag_column_name(&name),
-                        nullable::FLAG_TYPE,
-                        false,
-                    )
-                    .await;
-            }
-
-            // A JSON column is a `UUID` plus a table of its own, and the sidecar
-            // entry is what connects the two. Registered here exactly as
-            // `Database::add_table` does for `CREATE TABLE`, so the two
-            // statements produce the same thing rather than one working and the
-            // other refusing.
-            if json {
-                let entry = crate::core::rql::json_map::JsonColumn {
-                    column: name.clone(),
-                    shadow_table: crate::core::rql::json_map::shadow_table_name(
-                        &plan.table_name,
-                        &name,
-                    ),
-                    is_deleted: false,
-                };
-                if let Err(e) = crate::core::rql::json_map::append(io_schema.clone(), &entry).await
-                {
-                    return ddl_error(&e.to_string());
-                }
-                schema.json_columns.push(entry);
-            }
+            let table_name = plan.table_name.clone();
+            // Every write of this arm as one reload's work, all or nothing
+            // (B5): the dead names retired, the DEFAULT, NUMERIC scale and
+            // generation expression, the field and its companion, the JSON
+            // registration. They were separately durable writes, and a
+            // failure between two left a declaration filed under a column
+            // that did not exist, which the next column of the name took.
+            return match database
+                .reload_atomic(&plan.table_name, |old| async move {
+                    let io_schema = old.io_schema.clone();
+                    let mut schema = schema;
+                    // A dropped column still holding this name — or its
+                    // companion's — is retired first, exactly as `RENAME
+                    // COLUMN` does. `add_field` skips a name the schema already
+                    // holds, tombstones included, so `DROP COLUMN a` then `ADD
+                    // COLUMN a` on an empty table reported success and added
+                    // nothing: every later reference to `a` failed.
+                    for taken in [name.clone(), nullable::flag_column_name(&name)] {
+                        retire_tombstoned_name(&mut schema, &taken, io_schema.clone()).await?;
+                    }
+                    if let Some(expression) = default {
+                        let entry = crate::core::rql::column_default::ColumnDefault {
+                            column: name.clone(),
+                            expression,
+                            is_deleted: false,
+                        };
+                        crate::core::rql::column_default::append(io_schema.clone(), &entry)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(entry) = &new_modifier {
+                        crate::core::rql::type_modifier::append(io_schema.clone(), entry)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(entry) = &new_generated {
+                        crate::core::rql::generated::append(io_schema.clone(), entry)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    schema.add_field(io_schema.clone(), name.clone(), db_type, false).await;
+                    if is_nullable {
+                        schema
+                            .add_field(
+                                io_schema.clone(),
+                                nullable::flag_column_name(&name),
+                                nullable::FLAG_TYPE,
+                                false,
+                            )
+                            .await;
+                    }
+                    // A JSON column is a `UUID` plus a table of its own, and
+                    // the sidecar entry is what connects the two. Registered
+                    // here exactly as `Database::add_table` does for `CREATE
+                    // TABLE`, so the two statements produce the same thing.
+                    if json {
+                        let entry = crate::core::rql::json_map::JsonColumn {
+                            column: name.clone(),
+                            shadow_table: crate::core::rql::json_map::shadow_table_name(&table_name, &name),
+                            is_deleted: false,
+                        };
+                        crate::core::rql::json_map::append(io_schema.clone(), &entry)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                Ok(()) => ddl_ok(0),
+                Err(failure) => reload_failed(failure, ""),
+            };
         }
         AlterAction::DropColumn { name, if_exists } => {
             // The live column of the name: a dropped one holding it is not a
@@ -9388,46 +9381,59 @@ async fn execute_alter_table_action(
                 }
             };
 
-            // A partial unique index whose predicate reads the column goes
-            // with it, as in PostgreSQL. Done first, so a failure here leaves
-            // the column and its index as they were.
-            for key in crate::core::rql::unique_key::dropped_with_column(
+            // The partial unique indexes, the column, its companion and its
+            // declarations go as the reload's work, all or nothing (B5): a
+            // failure part-way leaves the column and its indexes as they were.
+            let dropped_keys = crate::core::rql::unique_key::dropped_with_column(
                 &schema.unique_keys,
                 &schema.fields,
                 &field.name,
-            ) {
-                if let Err(e) = crate::core::rql::unique_key::remove(io_schema.clone(), &key).await {
+            );
+            let table_name = plan.table_name.clone();
+            // The FK children whose keys reference the column: their sidecars
+            // change with it, so they are held aside with it (one intent).
+            let children = database.fk_children_on(&plan.table_name, Some(&[name.as_str()]));
+            let others = match database
+                .reload_atomic_with(&plan.table_name, children, |old| async move {
+                    // A partial unique index whose predicate reads the column
+                    // goes with it, as in PostgreSQL.
+                    for key in dropped_keys {
+                        crate::core::rql::unique_key::remove(old.io_schema.clone(), &key)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        info!("index {} dropped with column {}", key, field.name);
+                    }
+                    // The column keeps its slot in the row layout and is marked
+                    // deleted: reclaiming the bytes would move every column
+                    // after it, which is the same rewrite `ADD COLUMN` needs.
+                    // Its companion and every declaration filed under its name
+                    // go with it, in one log transaction. Left behind, they
+                    // were picked up by the next column to take the name — the
+                    // retype dance's renamed temporary, or a plain re-`ADD` —
+                    // which then defaulted to the dropped column's value, or
+                    // was bound by its foreign key, UNIQUE key or CHECK.
+                    crate::core::rql::column_declarations::drop_column(
+                        database,
+                        &table_name,
+                        &schema,
+                        &old.io_schema,
+                        &name,
+                    )
+                    .await
+                })
+                .await
+            {
+                Ok(others) => others,
+                Err(failure) => return reload_failed(failure, ""),
+            };
+            // FK children whose sidecars named the column, reopened after it.
+            for other in others {
+                if let Err(e) = database.reload_table(&other).await {
                     return ddl_error(&e.to_string());
                 }
-                info!("index {} dropped with column {}", key, field.name);
             }
+            return ddl_ok(0);
 
-            // The column keeps its slot in the row layout and is marked
-            // deleted: reclaiming the bytes would move every column after it,
-            // which is the same rewrite `ADD COLUMN` needs. Its companion and
-            // every declaration filed under its name go with it, in one
-            // transaction. Left behind, they were picked up by the next column
-            // to take the name — the retype dance's renamed temporary, or a
-            // plain re-`ADD` — which then defaulted to the dropped column's
-            // value, or was bound by its foreign key, UNIQUE key or CHECK.
-            match crate::core::rql::column_declarations::drop_column(
-                database,
-                &plan.table_name,
-                &schema,
-                &io_schema,
-                &name,
-            )
-            .await
-            {
-                Ok(others) => {
-                    for other in others {
-                        if let Err(e) = database.reload_table(&other).await {
-                            return ddl_error(&e.to_string());
-                        }
-                    }
-                }
-                Err(e) => return ddl_error(&e),
-            }
         }
         AlterAction::RenameColumn { from, to } => {
             if nullable::is_hidden(&to) {
@@ -9467,31 +9473,38 @@ async fn execute_alter_table_action(
             // between two left the field renamed without its companion (every
             // NULL read as 0) or constraints naming a column that no longer
             // existed, skipped as "not enforced" for good.
-            match crate::core::rql::column_declarations::rename_column(
-                database,
-                &plan.table_name,
-                &schema,
-                &io_schema,
-                &from,
-                &to,
-            )
-            .await
+            //
+            // Run as the reload's work, all or nothing with the reload (B5).
+            let table_name = plan.table_name.clone();
+            // The FK children whose keys name either column: their sidecars
+            // change with it, so they are held aside with it (one intent).
+            let children = database.fk_children_on(&plan.table_name, Some(&[from.as_str(), to.as_str()]));
+            let others = match database
+                .reload_atomic_with(&plan.table_name, children, |old| async move {
+                    let others = crate::core::rql::column_declarations::rename_column(
+                        database,
+                        &table_name,
+                        &schema,
+                        &old.io_schema,
+                        &from,
+                        &to,
+                    )
+                    .await?;
+                    crate::core::rql::column_declarations::crash_points::reached(&table_name, "rename.after_commit");
+                    Ok(others)
+                })
+                .await
             {
-                Ok(others) => {
-                    crate::core::rql::column_declarations::crash_points::reached(
-                        &plan.table_name,
-                        "rename.after_commit",
-                    );
-                    // This table is reopened below; a table whose foreign key
-                    // named the renamed parent column is reopened here.
-                    for other in others {
-                        if let Err(e) = database.reload_table(&other).await {
-                            return ddl_error(&e.to_string());
-                        }
-                    }
+                Ok(others) => others,
+                Err(failure) => return reload_failed(failure, ""),
+            };
+            // A table whose foreign key named the renamed parent column.
+            for other in others {
+                if let Err(e) = database.reload_table(&other).await {
+                    return ddl_error(&e.to_string());
                 }
-                Err(e) => return ddl_error(&e),
             }
+            return ddl_ok(0);
         }
         AlterAction::RenameTable { to } => {
             // Used to parse as a *column* rename and come back as "RENAME
@@ -9546,32 +9559,30 @@ async fn execute_alter_table_action(
             if followed.is_empty() {
                 return ddl_ok(0);
             }
-            let renamed_io = {
-                // The renamed table under its new name, ACCESS EXCLUSIVE too.
-                let entry = match database.table_for(&to, owner(), TableMode::AccessExclusive).await {
-                    Ok(entry) => entry,
-                    Err(e) => return ddl_error(&e),
-                };
-                let Some(table) = entry.as_ref() else {
-                    return ddl_error(&format!("relation '{}' vanished during rename", to));
-                };
-                table.io_schema.clone()
-            };
-            for (entry, from, to) in &followed {
-                if let Err(e) =
-                    crate::core::rql::column_default::append(renamed_io.clone(), entry).await
-                {
-                    return ddl_error(&format!(
-                        "renamed, but sequence {} could not follow as {}: {}",
-                        from, to, e
-                    ));
-                }
+            // The renamed table under its new name, ACCESS EXCLUSIVE too.
+            if let Err(e) = database.table_for(&to, owner(), TableMode::AccessExclusive).await {
+                return ddl_error(&e);
+            }
+            // Every default that follows, as one reload's work (B5): all of
+            // them or none. The counters move only once they are durable.
+            let defaults: Vec<_> = followed.iter().map(|(entry, _, _)| entry.clone()).collect();
+            if let Err(failure) = database
+                .reload_atomic(&to, |renamed| async move {
+                    for entry in &defaults {
+                        crate::core::rql::column_default::append(renamed.io_schema.clone(), entry)
+                            .await
+                            .map_err(|e| format!("sequence default for {} could not follow: {}", entry.column, e))?;
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                return reload_failed(failure, "renamed, but its sequences could not follow");
+            }
+            for (_, from, to) in &followed {
                 crate::core::rql::sequence::rename(database.id, from, to);
             }
-            return match database.reload_table(&to).await {
-                Ok(()) => ddl_ok(0),
-                Err(e) => ddl_error(&e.to_string()),
-            };
+            return ddl_ok(0);
         }
         AlterAction::ConstraintClause { drop, description } => {
             use crate::core::rql::foreign_key;
@@ -9876,19 +9887,19 @@ async fn execute_alter_table_action(
                 let type_tokens: Vec<&str> = words[1..].to_vec();
                 return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
                     Ok((db_type, _)) if db_type == field.db_type => {
-                        match retype_numeric_modifier(
-                            &schema,
-                            &name,
-                            &type_tokens.join(" "),
-                            row_count,
-                            io_schema.clone(),
-                        )
-                        .await
-                        {
-                            Ok(false) => ddl_ok(0),
-                            Ok(true) => match database.reload_table(&plan.table_name).await {
+                        match numeric_modifier_change(&schema, &name, &type_tokens.join(" "), row_count) {
+                            Ok(None) => ddl_ok(0),
+                            // The reload's work, all or nothing (B5).
+                            Ok(Some(entry)) => match database
+                                .reload_atomic(&plan.table_name, |old| async move {
+                                    crate::core::rql::type_modifier::append(old.io_schema.clone(), &entry)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                })
+                                .await
+                            {
                                 Ok(()) => ddl_ok(0),
-                                Err(e) => ddl_error(&e.to_string()),
+                                Err(failure) => reload_failed(failure, ""),
                             },
                             Err(e) => ddl_error(&e),
                         }
@@ -9986,13 +9997,21 @@ async fn execute_alter_table_action(
                 // removing it is what makes the column NOT NULL. Tombstoned
                 // rather than reclaimed, exactly as `DROP COLUMN` does, because
                 // moving the columns after it is the rewrite being avoided.
-                if let Some(flag) = nullable::flag_field(&name, &schema.fields) {
-                    let flag_name = flag.name.clone();
-                    schema
-                        .mark_field_as_deleted(&flag_name, io_schema.clone())
-                        .await;
-                }
-                // Falls through to the reload below.
+                let flag_name = nullable::flag_field(&name, &schema.fields).map(|flag| flag.name.clone());
+                // The reload's work, all or nothing (B5).
+                return match database
+                    .reload_atomic(&plan.table_name, |old| async move {
+                        if let Some(flag_name) = flag_name {
+                            let mut schema = schema;
+                            schema.mark_field_as_deleted(&flag_name, old.io_schema.clone()).await;
+                        }
+                        Ok(())
+                    })
+                    .await
+                {
+                    Ok(()) => ddl_ok(0),
+                    Err(failure) => reload_failed(failure, ""),
+                };
             } else {
                 warn!(
                     "ALTER TABLE {}: ALTER COLUMN {} {} ignored",
@@ -10000,14 +10019,6 @@ async fn execute_alter_table_action(
                 );
                 return ddl_ok(0);
             }
-        }
-    }
-
-    match database.reload_table(&plan.table_name).await {
-        Ok(()) => ddl_ok(0),
-        Err(e) => {
-            error!("Failed to reload {} after ALTER: {}", plan.table_name, e);
-            ddl_error(&e.to_string())
         }
     }
 }
