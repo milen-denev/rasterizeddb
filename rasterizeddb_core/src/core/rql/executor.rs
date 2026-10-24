@@ -6509,6 +6509,40 @@ async fn insert_values_tuples(
     depth: usize,
     tx: TxId,
 ) -> Option<Vec<u8>> {
+    // Two rows of one `INSERT … ON CONFLICT DO UPDATE` with the same arbiter
+    // key would update one row twice, the second time the row the first had
+    // just written. PostgreSQL refuses the statement (21000) rather than let
+    // the order of the VALUES list decide the outcome; checked before any row
+    // is written. Compared as written, so `1` and `'1'` are not caught: a
+    // missed duplicate is today's behaviour, and nothing valid is refused.
+    if let Some(spec) = row_data.on_conflict_update.as_ref().filter(|s| !s.arbiter.is_empty()) {
+        if statements.len() > 1 {
+            let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+            for stmt in &statements {
+                let values = crate::core::rql::lexer_ir::assignments_of_insert(stmt).unwrap_or_default();
+                let key: Option<Vec<String>> = spec
+                    .arbiter
+                    .iter()
+                    .map(|column| {
+                        values
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                            .map(|(_, literal)| literal.trim().to_string())
+                    })
+                    .collect();
+                if let Some(key) = key {
+                    if !seen.insert(key) {
+                        return Some(ddl_error(
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time: \
+                             ensure that no rows proposed for insertion within the same command \
+                             have duplicate constrained values",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let mut inserted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
     let mut any_returning = false;
@@ -6745,6 +6779,58 @@ fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result
 /// key columns place the probe, the insert and the follow-up `UPDATE` in the
 /// row's one partition, whose own uniqueness check (in-flight writers
 /// included) decides the conflict.
+/// An `ON CONFLICT (cols)` target names exactly the columns of one unique key,
+/// in any order, or the statement is refused with 42P10, as PostgreSQL infers
+/// its arbiter index.
+///
+/// A target that is only part of a key was taken as the key: `ON CONFLICT
+/// (tenant_id) DO UPDATE` over a key on `(tenant_id, grp, id)` rewrote to an
+/// UPDATE matching every row of the tenant, and updated them all. A target
+/// that is a superset of a key is not a key either, so it is refused too.
+fn check_conflict_target_infers_a_key(
+    database: &Database,
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+) -> Result<(), String> {
+    let target: &[String] = match &row_data.on_conflict_update {
+        Some(spec) => &spec.arbiter,
+        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target,
+        None => return Ok(()),
+    };
+    if target.is_empty() {
+        return Ok(());
+    }
+    let schema = match database.tables.get(&row_data.table_name) {
+        Some(table) => table.schema.clone(),
+        None => match database.partitioned.get(&row_data.table_name) {
+            Some(pt) => pt.value().shell().schema.clone(),
+            None => return Ok(()),
+        },
+    };
+    let mut wanted: Vec<String> = target.iter().map(|c| c.trim_matches('"').to_ascii_lowercase()).collect();
+    wanted.sort();
+    wanted.dedup();
+    let same = |columns: &[String]| {
+        let mut have: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+        have.sort();
+        have.dedup();
+        have == wanted
+    };
+    let single = |name: &str| wanted.len() == 1 && wanted[0].eq_ignore_ascii_case(name);
+    let inferred = schema.unique_keys.iter().any(|k| !k.is_deleted && same(&k.columns))
+        || schema.primary_key.as_deref().is_some_and(single)
+        || schema.fields.iter().any(|f| f.is_unique && !f.is_deleted && single(&f.name));
+    if inferred {
+        Ok(())
+    } else {
+        Err(format!(
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification: \
+             no unique key of \"{}\" is exactly ({})",
+            row_data.table_name,
+            target.join(", ")
+        ))
+    }
+}
+
 fn check_partitioned_conflict_target(
     database: &Database,
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
@@ -11900,6 +11986,10 @@ pub(crate) async fn execute_with_need(
             // an `INSERT … SELECT`, a default's sequence, or the first row of
             // a multi-row insert.
             if let Err(e) = check_partitioned_conflict_target(&database, row_data) {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
+            if let Err(e) = check_conflict_target_infers_a_key(&database, row_data) {
                 error!("{}", e);
                 return ddl_error(&e);
             }

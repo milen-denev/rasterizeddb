@@ -5848,6 +5848,9 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "23503"
     } else if has("violates not-null constraint") || has("not null") && has("null value") {
         "23502"
+    } else if has("cannot affect row a second time") {
+        // cardinality_violation.
+        "21000"
     } else if has("violates check constraint") || (has("check constraint") && has("is violated by some row")) {
         "23514"
     } else if has("permission denied") || has("is not a superuser") {
