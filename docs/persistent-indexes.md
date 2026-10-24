@@ -146,8 +146,13 @@ while the partition is open, and v1 drops the `_flt.db` provider (§5;
 falls from 15 to **10** (two providers × 5); `rdb.ixe` costs five fds per
 directory.
 
-**Snapshot.** A header (magic `RZIXSNP1`, `format_ver`, the identity of §4, a
-section table of kind, ordinal, offset, len, crc32c), then sections:
+**Snapshot.** A header (magic `RZIXSNP1`, `format_ver`, `header_len`, the
+identity of §4, a section table of kind, ordinal, offset, len, crc32c, and a
+**header crc32c** over every header byte before it), then sections. The
+header checksum lets a fan-out open (§4) trust the section table without
+reading the whole file for the footer: a rotted offset would otherwise send
+its FILTER `pread` elsewhere, and only that section's own crc32c would
+notice. The sections:
 - **FILTER**: today's `persist` base-image format, written by
   `serialize_sealed` with the true frontier (§5);
 - **INDEX** per B-tree, hash or path index: sorted `(key ‖ slot)` blocks,
@@ -173,8 +178,14 @@ snapshot length, footer checksum). Rules (finding 11, N33):
   it, and then rotted. Cutting back to the `CLEAN` and crashing before the next
   `DIRTY` is durable would leave `CLEAN` last over changed data. So an append
   after bad bytes overwrites in place: `pwrite` the new record at the last good
-  record's end, fdatasync, then `ftruncate` just past it. Some bytes follow the
-  `CLEAN` at every instant, so a crash anywhere leaves it untrusted.
+  record's end, fdatasync, `ftruncate` just past it, fdatasync, with nothing
+  else issued in between and no write admitted until the last fdatasync has
+  returned. Some bytes follow the `CLEAN` at every instant, so a crash
+  anywhere leaves it untrusted. The second fdatasync matters as much as the
+  first: `rec_seq` binds a record to its position, so a stale record that
+  happens to be valid and sits right after the new one reads as its successor
+  until the truncate is durable (an old `CLEAN` there would prove a snapshot
+  the new `DIRTY` revoked). B11 pins the order in a crash-image test.
 - Compaction happens only inside a publish while `DIRTY` is last, **before**
   the `PUBLISHING` compare-and-swap (§3 step 6), so a writer's `PUBLISHING`
   wait never includes it (P31): rewrite as `HEADER` + `DIRTY` via `.ixm.tmp`,
@@ -1199,17 +1210,31 @@ REPEATABLE READ: a rewrite reinserts only rows visible now
 is not transactional here, so an AE taken in a block is released when the DDL
 statement ends, and the family keeps what it held before.
 
-**Granting.** A request is granted when it conflicts with no mode another owner
-holds and either (a) no conflicting S or AE request waits ahead of it, or (b)
-the requester already holds some lock on the table (PostgreSQL's ProcSleep
-rule, keyed by owner). A waiting AS or RX delays nobody, so a waiter that holds
-nothing is on no cycle. That holds only with one owner per statement (above):
-a task that waits under a second owner for a lock its first owner's
-statement needs is on a cycle that no graph sees. In R1's case, `BEGIN; INSERT INTO t` (RX), a waiting
-autocommit `CREATE INDEX ON t(x)` (AE), and the first session's next Execute
-and COMMIT go through by (b); the AE is granted after COMMIT. An owner's own
-locks never conflict: upgrading RX to AE waits only for other owners, which
-replaces the drain's own-family exclusion (RV1, P2).
+**Granting.** PostgreSQL's rule (`ProcSleep` and `ProcLockWakeup`), keyed by
+owner. A request is granted when it conflicts with no mode another owner
+holds and no request of another owner that conflicts with it waits ahead of
+its place in the queue:
+- (a) every conflicting waiter counts, weak ones included (PostgreSQL's
+  `waitMask`);
+- (b) the requester's place is just ahead of the first waiter that a mode it
+  already holds conflicts with (that waiter waits for it, so queueing behind
+  it would deadlock), and otherwise the end of the queue. Waiters past that
+  place never hold it back; waiters before it do when they conflict.
+
+Both clauses are about starvation. Under a rule (a) that counted only S and
+AE waiters, S requests (which do not conflict with S) kept passing a waiting
+RX, so a stream of CREATE INDEX-style S holders starved writers. Under a rule
+(b) that let a holder of *any* mode go ahead, a holder passed waiters it does
+not block: AS holders asking for RX passed a waiting S, and the S waited for
+as long as that traffic lasted. One owner per statement (above) is what keeps
+(b) sound: a task that waits under a second owner for a lock its first
+owner's statement needs is on a cycle that no graph sees. In R1's case,
+`BEGIN; INSERT INTO t` (RX), a waiting autocommit `CREATE INDEX ON t(x)` (AE),
+and the first session's next Execute and COMMIT go through by (b), since RX
+conflicts with AE; the AE is granted after COMMIT. An owner's own locks never
+conflict: upgrading RX to AE waits only for other owners, which replaces the
+drain's own-family exclusion (RV1, P2). A queued request's wait-for edges are
+the conflicting holders plus the conflicting waiters ahead of its place.
 
 **Acquisition.** A statement requests its whole known table set at once and
 holds none of it while waiting. A table found late (a CTE body, an FK parent, a

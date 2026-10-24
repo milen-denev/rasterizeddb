@@ -182,19 +182,19 @@ fn no_interleaving_grants_ae_beside_a_fast_path_rx() {
             for second in first..=strong_steps {
                 let locks = TableLocks::new();
                 let mut weak: Option<bool> = None;
-                let mut fell_through: Option<bool> = None;
+                let mut fell_through: Option<ModeSet> = None;
                 let mut strong: Option<Request> = None;
                 for step in 0..=strong_steps {
                     if step == first {
                         match locks.fast_try(a, "t", RXm) {
                             Fast::Granted => weak = Some(true),
-                            Fast::Main { holds_fast } => fell_through = Some(holds_fast),
+                            Fast::Main { fast } => fell_through = Some(fast),
                         }
                     }
                     if step == second
-                        && let Some(holds_fast) = fell_through.take()
+                        && let Some(fast) = fell_through.take()
                     {
-                        weak = Some(match locks.decide(a, "t", RXm, WaitRole::Other, holds_fast) {
+                        weak = Some(match locks.decide(a, "t", RXm, WaitRole::Other, fast) {
                             Decided::Already | Decided::Granted => true,
                             Decided::Queued(_) => false,
                         });
@@ -323,15 +323,116 @@ fn rule_a_queues_a_newcomer_behind_a_conflicting_strong_waiter_in_order() {
 }
 
 #[test]
-fn a_waiting_weak_request_delays_nobody() {
+fn rule_a_a_waiting_rx_holds_back_a_later_s() {
+    // PostgreSQL's waitMask: a conflicting waiter of any mode queues a
+    // newcomer, though S does not conflict with the S that is held.
     let locks = TableLocks::new();
     let (a, b, c) = (owner(10), owner(11), owner(12));
     assert!(granted(locks.request(a, "t", Sm, WaitRole::Other)));
-    let _wb = queued(locks.request(b, "t", RXm, WaitRole::Other));
-    assert!(
-        granted(locks.request(c, "t", Sm, WaitRole::Other)),
-        "only S and AE waiters hold back a newcomer (§7), unlike PostgreSQL's waitMask"
-    );
+    let wb = queued(locks.request(b, "t", RXm, WaitRole::Other));
+    let wc = queued(locks.request(c, "t", Sm, WaitRole::Other));
+    assert_eq!(&locks.blockers(c)[..], &[b], "C's edge is the RX ahead of it, not A's S");
+    locks.release_owner(a);
+    assert_eq!(wb.outcome(), WaitOutcome::Granted);
+    assert_eq!(wc.outcome(), WaitOutcome::Waiting);
+    assert_eq!(&locks.blockers(c)[..], &[b]);
+    locks.release_owner(b);
+    assert_eq!(wc.outcome(), WaitOutcome::Granted);
+}
+
+#[test]
+fn a_stream_of_s_requests_does_not_starve_a_waiting_rx() {
+    // CREATE INDEX-style S holders overlapping one another: under a rule
+    // that counted only S and AE waiters, each new S passed the waiting RX
+    // and the writer waited for as long as the stream lasted.
+    let locks = TableLocks::new();
+    let writer = owner(5);
+    assert!(granted(locks.request(owner(10), "t", Sm, WaitRole::Other)));
+    let w = queued(locks.request(writer, "t", RXm, WaitRole::Other));
+    let mut later = Vec::new();
+    for id in 11..20 {
+        let r = locks.request(owner(id), "t", Sm, WaitRole::Other);
+        assert!(!r.is_granted(), "S request {id} passed the waiting RX");
+        later.push(queued(r));
+    }
+    // The S held when the RX queued ends: the RX goes next, before every S
+    // that came after it.
+    locks.release_owner(owner(10));
+    assert_eq!(w.outcome(), WaitOutcome::Granted, "the RX is granted once the S it waited for ends");
+    assert!(later.iter().all(|l| l.outcome() == WaitOutcome::Waiting));
+    locks.release_owner(writer);
+    assert!(later.iter().all(|l| l.outcome() == WaitOutcome::Granted), "the S requests share the table after it");
+}
+
+#[test]
+fn a_stream_of_as_holders_re_requesting_does_not_starve_a_waiting_ae() {
+    // Holders already block the AE, so their own next requests go ahead of
+    // it (rule (b)), but a newcomer holding nothing queues behind it, and
+    // once the holders end the AE is granted before any of them.
+    let locks = TableLocks::new();
+    let ddl = owner(5);
+    let holders: Vec<LockOwner> = (10..14).map(owner).collect();
+    for h in &holders {
+        assert!(granted(locks.request(*h, "t", ASm, WaitRole::Other)));
+    }
+    let w = queued(locks.request(ddl, "t", AEm, WaitRole::Ddl));
+    let mut newcomers = Vec::new();
+    for (i, h) in holders.iter().enumerate() {
+        assert!(granted(locks.request(*h, "t", ASm, WaitRole::Other)), "a held AS re-requested");
+        assert!(granted(locks.request(*h, "t", RXm, WaitRole::Other)), "an AS holder blocks the AE, so it may pass it");
+        newcomers.push(queued(locks.request(owner(100 + i as TxId), "t", ASm, WaitRole::AutocommitReader)));
+        locks.release_owner(*h);
+    }
+    assert_eq!(w.outcome(), WaitOutcome::Granted, "the AE is granted once the holders end");
+    assert!(newcomers.iter().all(|n| n.outcome() == WaitOutcome::Waiting));
+    locks.release_owner(ddl);
+    assert!(newcomers.iter().all(|n| n.outcome() == WaitOutcome::Granted));
+}
+
+#[test]
+fn rule_b_a_holder_passes_only_the_waiters_it_blocks() {
+    // X holds RX, so B's S waits. Readers holding AS then ask for RX: AS
+    // does not conflict with S, so B does not wait for them and they may not
+    // pass it. Under "holds any mode goes ahead" each would take RX beside
+    // X's, and B would wait for as long as such readers kept coming.
+    let locks = TableLocks::new();
+    let (x, b) = (owner(5), owner(6));
+    assert!(granted(locks.request(x, "t", RXm, WaitRole::Other)));
+    let wb = queued(locks.request(b, "t", Sm, WaitRole::Other));
+    let mut readers = Vec::new();
+    for id in 10..14 {
+        let r = owner(id);
+        assert!(granted(locks.request(r, "t", ASm, WaitRole::Other)), "AS conflicts with neither X nor B");
+        let got = locks.request(r, "t", RXm, WaitRole::Other);
+        assert!(!got.is_granted(), "reader {id}'s RX passed the S it does not block");
+        assert_eq!(&locks.blockers(r)[..], &[b]);
+        readers.push((r, queued(got)));
+    }
+    locks.release_owner(x);
+    assert_eq!(wb.outcome(), WaitOutcome::Granted, "the S is granted once X ends");
+    assert!(readers.iter().all(|(_, w)| w.outcome() == WaitOutcome::Waiting));
+    locks.release_owner(b);
+    assert!(readers.iter().all(|(_, w)| w.outcome() == WaitOutcome::Granted));
+}
+
+#[test]
+fn rule_b_a_holder_goes_ahead_of_everything_behind_the_first_waiter_it_blocks() {
+    // A holds AS; the queue is [B: AE, C: S]. A's RX conflicts with both,
+    // but A's place is just ahead of B (its AS blocks B), so C, behind B,
+    // does not hold it back. Judged waiter by waiter, C would: A waits for
+    // C, C for B (rule a), B for A's AS, a cycle PostgreSQL never forms.
+    let locks = TableLocks::new();
+    let (a, b, c, d) = (owner(10), owner(11), owner(12), owner(13));
+    assert!(granted(locks.request(a, "t", ASm, WaitRole::Other)));
+    let _wb = queued(locks.request(b, "t", AEm, WaitRole::Ddl));
+    let _wc = queued(locks.request(c, "t", Sm, WaitRole::Other));
+    assert!(granted(locks.request(a, "t", RXm, WaitRole::Other)));
+    assert_eq!(locks.deadlock_check(c), None);
+    // D holds nothing: its place is the end, behind both.
+    let _wd = queued(locks.request(d, "t", RXm, WaitRole::Other));
+    let mut bd = locks.blockers(d).to_vec();
+    bd.sort();
+    assert_eq!(bd, vec![b, c]);
 }
 
 #[test]

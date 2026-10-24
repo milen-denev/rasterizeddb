@@ -38,23 +38,26 @@
 //! # Granting (PostgreSQL's ProcSleep rule, keyed by owner)
 //!
 //! A request is granted when it conflicts with no mode *another* owner holds,
-//! and either
-//! - (a) no conflicting S or AE request from another owner waits ahead of it,
-//!   or
-//! - (b) the requester already holds some mode on the table.
+//! and no request of another owner that conflicts with it waits ahead of its
+//! place in the queue:
+//! - (a) every conflicting waiter counts, weak ones included;
+//! - (b) the requester's place is just ahead of the first waiter that a mode
+//!   it already holds conflicts with (that waiter waits for it, so queueing
+//!   behind it would deadlock), and otherwise the end of the queue.
 //!
-//! Rule (a) is what stops a stream of readers starving a waiting ALTER; rule
-//! (b) is what keeps a block that already holds the table from queueing
-//! behind an ALTER that is itself waiting for that block (R1: `BEGIN; INSERT`,
-//! a waiting `CREATE INDEX`, and the block's next statement and COMMIT go
-//! through). An owner's own modes never conflict, so an upgrade (RX to AE)
-//! waits only for other owners. A waiting AS or RX delays nobody: a waiter
-//! that holds nothing is on no cycle.
-//!
-//! This is narrower than PostgreSQL in two directions, both deliberate (§7):
-//! PostgreSQL also queues a request behind a conflicting weak waiter, and
-//! lets a holder jump only the waiters its held modes conflict with, where (b)
-//! lets any holder go ahead.
+//! This is PostgreSQL's own rule (`ProcSleep` and `ProcLockWakeup`, keyed by
+//! owner). Rule (a) is what stops a stream of requests starving a waiter they
+//! conflict with: a waiting ALTER behind readers, and also a waiting RX
+//! behind a stream of S holders (S does not conflict with S, so a rule that
+//! counted only S and AE waiters let every new S pass the RX). Rule (b) is
+//! what keeps a block that already holds the table from queueing behind an
+//! ALTER that is itself waiting for that block (R1: `BEGIN; INSERT`, a
+//! waiting `CREATE INDEX`, and the block's next statement and COMMIT go
+//! through), and lets it pass only the waiters it blocks: a rule that let any
+//! holder go ahead let a stream of AS holders requesting RX pass a waiting S
+//! they do not block, delaying it for as long as the traffic lasted. An
+//! owner's own modes never conflict, so an upgrade (RX to AE) waits only for
+//! other owners.
 //!
 //! # The weak-mode fast path
 //!
@@ -83,8 +86,8 @@
 //! A queued request is granted by whoever frees what it waited for (release,
 //! downgrade, an abandoned or failed wait ahead of it), in queue order, and
 //! woken through its [`Wait`]. Its blockers ([`TableLocks::blockers`]) are the
-//! other owners holding a conflicting mode plus, unless rule (b) lets it pass,
-//! the conflicting S/AE waiters ahead of it. After
+//! other owners holding a conflicting mode plus the conflicting waiters ahead
+//! of its place (rule (b) above). After
 //! [`TableLockConfig::deadlock_timeout`] a waiter looks for a cycle through
 //! itself ([`TableLocks::deadlock_check`]); the victim is chosen by
 //! [`choose_victim`], whatever member did the looking, and its wait fails
@@ -95,7 +98,9 @@
 //! 3. otherwise the youngest member that is not an autocommit reader.
 //!
 //! An autocommit reader is never chosen: AS and RX conflict only with S and
-//! AE, so every cycle through a reader contains an S or AE requester.
+//! AE, so the member whose edge points at a reader (it conflicts with what
+//! the reader holds or requests) requests S or AE, and every cycle through a
+//! reader contains an S or AE requester.
 //!
 //! # lock_timeout
 //!
@@ -490,10 +495,10 @@ struct Waiter {
     owner: LockOwner,
     mode: TableMode,
     role: WaitRole,
-    /// The owner held a fast-path mode on the table when it queued. Its
-    /// fast-path entries cannot leave while it waits (only it releases them,
-    /// and a migration moves them into `holders`), so this stays true.
-    holds_fast: bool,
+    /// The fast-path modes the owner held on the table when it queued. They
+    /// cannot leave while it waits (only it releases them, and a migration
+    /// moves them into `holders`), so this stays a subset of what it holds.
+    fast: ModeSet,
     slot: Arc<WaitSlot>,
 }
 
@@ -520,18 +525,30 @@ impl TableState {
             .any(|(o, set)| *o != owner && set.conflicts_with(mode))
     }
 
-    /// Whether a conflicting S or AE request of another owner waits among the
-    /// first `ahead` waiters: rule (a).
-    fn strong_waits_ahead(&self, owner: LockOwner, mode: TableMode, ahead: usize) -> bool {
+    /// The waiters, among the first `ahead`, that a request for `mode` by
+    /// `owner`, holding `held` on the table, queues behind: rules (a) and
+    /// (b). Its place is just ahead of the first waiter of another owner that
+    /// `held` conflicts with, or `ahead`; every waiter of another owner
+    /// before that place whose request conflicts with `mode` holds it back.
+    fn waiters_ahead(
+        &self,
+        owner: LockOwner,
+        mode: TableMode,
+        held: ModeSet,
+        ahead: usize,
+    ) -> impl Iterator<Item = &Waiter> {
         self.waiters
             .iter()
             .take(ahead)
-            .any(|w| w.owner != owner && w.mode.is_strong() && w.mode.conflicts_with(mode))
+            .filter(move |w| w.owner != owner)
+            .take_while(move |w| !held.conflicts_with(w.mode))
+            .filter(move |w| w.mode.conflicts_with(mode))
     }
 
-    /// The grant rule: no conflicting holder, and (a) or (b).
-    fn grantable(&self, owner: LockOwner, mode: TableMode, holds_any: bool, ahead: usize) -> bool {
-        !self.holder_conflict(owner, mode) && (holds_any || !self.strong_waits_ahead(owner, mode, ahead))
+    /// The grant rule: no conflicting holder, and no conflicting waiter ahead
+    /// of the request's place.
+    fn grantable(&self, owner: LockOwner, mode: TableMode, held: ModeSet, ahead: usize) -> bool {
+        !self.holder_conflict(owner, mode) && self.waiters_ahead(owner, mode, held, ahead).next().is_none()
     }
 
     /// Adds `mode` to `owner`'s set. True if the owner held nothing here
@@ -647,9 +664,9 @@ impl Default for TableLockConfig {
 /// What the fast path decided.
 enum Fast {
     Granted,
-    /// Take the main path; `holds_fast` if the owner holds another weak mode
-    /// on the table in its shard.
-    Main { holds_fast: bool },
+    /// Take the main path; `fast` is what the owner holds on the table in
+    /// its shard.
+    Main { fast: ModeSet },
 }
 
 /// What the main path decided.
@@ -721,7 +738,7 @@ impl TableLocks {
         if !mode.is_strong() {
             return match self.fast_try(owner, table, mode) {
                 Fast::Granted => Request::Granted,
-                Fast::Main { holds_fast } => match self.decide(owner, table, mode, role, holds_fast) {
+                Fast::Main { fast } => match self.decide(owner, table, mode, role, fast) {
                     Decided::Already | Decided::Granted => Request::Granted,
                     Decided::Queued(wait) => Request::Queued(wait),
                 },
@@ -750,9 +767,7 @@ impl TableLocks {
             shard.record(owner, table, mode);
             return Fast::Granted;
         }
-        Fast::Main {
-            holds_fast: !held.is_empty(),
-        }
+        Fast::Main { fast: held }
     }
 
     /// A strong request's first step: weak requests on the table take the
@@ -784,7 +799,7 @@ impl TableLocks {
 
     /// A strong request's main-path step, after every shard migrated.
     fn strong_finish(&self, owner: LockOwner, table: &str, mode: TableMode, role: WaitRole) -> Request {
-        match self.decide(owner, table, mode, role, false) {
+        match self.decide(owner, table, mode, role, ModeSet::EMPTY) {
             Decided::Already => {
                 // The held mode already counts once.
                 self.strong(table).fetch_sub(1, Ordering::SeqCst);
@@ -796,7 +811,7 @@ impl TableLocks {
     }
 
     /// The main path: the grant rule against the table's holders and queue.
-    fn decide(&self, owner: LockOwner, table: &str, mode: TableMode, role: WaitRole, holds_fast: bool) -> Decided {
+    fn decide(&self, owner: LockOwner, table: &str, mode: TableMode, role: WaitRole, fast: ModeSet) -> Decided {
         let mut main = self.main();
         let Main { tables, owned, waiting } = &mut *main;
         debug_assert!(!waiting.contains_key(&owner), "{owner:?} requested a lock while it waits for another");
@@ -806,8 +821,7 @@ impl TableLocks {
         if mine.contains(mode) {
             return Decided::Already;
         }
-        let holds_any = holds_fast || !mine.is_empty();
-        if state.grantable(owner, mode, holds_any, state.waiters.len()) {
+        if state.grantable(owner, mode, mine.union(fast), state.waiters.len()) {
             if state.add(owner, mode) {
                 owned.entry(owner).or_default().push(key);
             }
@@ -818,7 +832,7 @@ impl TableLocks {
             owner,
             mode,
             role,
-            holds_fast,
+            fast,
             slot: slot.clone(),
         });
         waiting.insert(owner, key.clone());
@@ -976,8 +990,8 @@ impl TableLocks {
     }
 
     /// Who `owner`'s queued request waits for: the other owners holding a
-    /// conflicting mode and, unless rule (b) lets it pass, the conflicting
-    /// S/AE requests ahead of it. Empty when it is not waiting.
+    /// conflicting mode and the conflicting requests ahead of its place
+    /// (rules (a) and (b)). Empty when it is not waiting.
     pub fn blockers(&self, owner: LockOwner) -> SmallVec<[LockOwner; 4]> {
         edges(&self.main(), owner)
     }
@@ -1091,8 +1105,9 @@ fn forget_owned(owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>, owner: 
 /// Grants, in queue order, every waiter on `key` the grant rule now admits,
 /// and drops the table's state once nothing holds or awaits it.
 ///
-/// One pass suffices: a grant only adds a holder, which cannot make an
-/// earlier, ungranted waiter grantable, and later waiters are judged after it.
+/// One pass suffices: a grant adds a holder, which cannot make an earlier,
+/// ungranted waiter grantable, and removes a waiter, which only later
+/// waiters (judged after it) can have been queued behind.
 fn wake(
     tables: &mut HashMap<Arc<str>, TableState>,
     owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>,
@@ -1105,8 +1120,8 @@ fn wake(
     let mut i = 0;
     while i < state.waiters.len() {
         let w = &state.waiters[i];
-        let holds_any = w.holds_fast || !state.held_by(w.owner).is_empty();
-        if state.grantable(w.owner, w.mode, holds_any, i) {
+        let held = w.fast.union(state.held_by(w.owner));
+        if state.grantable(w.owner, w.mode, held, i) {
             let w = state.waiters.remove(i).expect("index is in range");
             if state.add(w.owner, w.mode) {
                 owned.entry(w.owner).or_default().push(key.clone());
@@ -1123,8 +1138,9 @@ fn wake(
 }
 
 /// `owner`'s wait-for edges, from the main table alone: a queued weak request
-/// waits only on S/AE holders and waiters, which are always there, and a
-/// queued strong one migrated its table's fast-path entries before queueing.
+/// waits only on S/AE holders and waiters, which are always there; a queued
+/// strong one migrated its table's fast-path entries before queueing; and
+/// every waiter, weak or strong, is in the main table's queue.
 fn edges(main: &Main, owner: LockOwner) -> SmallVec<[LockOwner; 4]> {
     let mut out: SmallVec<[LockOwner; 4]> = SmallVec::new();
     let Some(key) = main.waiting.get(&owner) else {
@@ -1137,21 +1153,15 @@ fn edges(main: &Main, owner: LockOwner) -> SmallVec<[LockOwner; 4]> {
         return out;
     };
     let w = &state.waiters[pos];
-    let holds_any = w.holds_fast || !state.held_by(owner).is_empty();
+    let held = w.fast.union(state.held_by(owner));
     for (o, set) in &state.holders {
         if *o != owner && set.conflicts_with(w.mode) && !out.contains(o) {
             out.push(*o);
         }
     }
-    if !holds_any {
-        for ahead in state.waiters.iter().take(pos) {
-            if ahead.owner != owner
-                && ahead.mode.is_strong()
-                && ahead.mode.conflicts_with(w.mode)
-                && !out.contains(&ahead.owner)
-            {
-                out.push(ahead.owner);
-            }
+    for ahead in state.waiters_ahead(owner, w.mode, held, pos) {
+        if !out.contains(&ahead.owner) {
+            out.push(ahead.owner);
         }
     }
     out
