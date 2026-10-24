@@ -43,50 +43,63 @@ const MAP_FIELDS: &[(&str, &str, &str, usize)] = &[
 ];
 
 /// Every caller of the escape hatches, `(file, fn, count)`, with the two
-/// definitions. B3b drains this to the definitions alone.
+/// definitions. B3b drained the executor, the wire and the rebalance plan to
+/// `table_for` / `relation_for` / `schema_view` (see [`FORMER_ESCAPES`]);
+/// what is left takes a `Table` with no lock of its own for a reason:
 const ESCAPES: &[(&str, &str, usize)] = &[
     // The definitions.
     (SLOTS, "table_unlocked", 1),
     (SLOTS, "each_table_unlocked", 1),
-    // DROP's internals (B4 runs them under AE).
+    // DROP's internals: run under the ACCESS EXCLUSIVE `execute_drop_table`
+    // takes on the name before it calls `drop_table`; B4 asserts it there
+    // and marks the slot dropped under it.
     (MOD, "drop_table_to_depth", 1),
-    // Walks over every table's files: FK sidecars, index declarations, the
-    // rebalance plan.
+    // A rename's and a column change's walk over every *other* table's
+    // foreign-key sidecar (the children), under the DDL's ACCESS EXCLUSIVE
+    // on its own table only: the children's lock set is B4's (finding L11:
+    // FK DDL adds the other side in name order).
     ("core/rql/column_declarations.rs", "other_foreign_keys", 1),
     ("core/rql/column_declarations.rs", "retarget_parent", 1),
-    ("core/storage/relocate.rs", "plan", 1),
-    // The executor (B3b: `table_for`, with the statement's owner and mode).
-    (EXEC, "apply_conflict_update", 3),
-    (EXEC, "check_conflict_target_infers_a_key", 1),
-    (EXEC, "check_foreign_keys", 1),
-    (EXEC, "default_literal_for", 1),
-    (EXEC, "delete_using_join", 2),
-    (EXEC, "ensure_shadow_column", 1),
-    (EXEC, "execute_alter_table", 1),
-    (EXEC, "execute_alter_table_action", 2),
-    (EXEC, "execute_create_index", 1),
-    (EXEC, "execute_create_path_index", 1),
-    (EXEC, "execute_drop_index", 1),
-    (EXEC, "execute_drop_partial_unique", 1),
-    (EXEC, "execute_drop_path_index", 1),
-    (EXEC, "execute_join", 3),
-    (EXEC, "execute_prepared_rows", 1),
-    (EXEC, "execute_with_need", 5),
-    (EXEC, "existing_rows_break_unique", 1),
-    (EXEC, "insert_loaded_row", 1),
-    (EXEC, "load_json_document", 1),
-    (EXEC, "lock_selected_rows", 1),
-    (EXEC, "prevalidate_foreign_keys", 1),
-    (EXEC, "query_output_scales", 2),
-    (EXEC, "referenced_values_now", 1),
-    (EXEC, "refuse_if_partitioned", 1),
-    (EXEC, "refuse_write_to_locked_rows", 1),
-    (EXEC, "retype_column", 1),
-    (EXEC, "rewrite_table_with_columns", 3),
-    (EXEC, "star_output_types", 1),
-    (EXEC, "supply_generated_values", 1),
-    (EXEC, "supply_insert_column_list", 1),
-    (EXEC, "update_from_join", 2),
+];
+
+/// The callers B3b moved off the escape hatches, `(file, fn)`, each with the
+/// lock-taking (or lock-free metadata) accessor it uses now. Pinned so a
+/// former caller cannot drift back to an unlocked path quietly: each must
+/// name at least one of `table_for`, `relation_for` or `tables_for` (it
+/// locks), or be one of the schema-only readers that read under the
+/// statement's lock set through `schema_view`.
+const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
+    (EXEC, "apply_conflict_update", "table_for"),
+    (EXEC, "check_conflict_target_infers_a_key", "schema_view"),
+    (EXEC, "check_foreign_keys", "table_for"),
+    (EXEC, "default_literal_for", "schema_view"),
+    (EXEC, "delete_using_join", "table_for"),
+    (EXEC, "ensure_shadow_column", "table_for"),
+    (EXEC, "execute_alter_table_action", "table_for"),
+    (EXEC, "execute_create_index", "table_for"),
+    (EXEC, "execute_create_path_index", "table_for"),
+    (EXEC, "execute_drop_index", "table_for"),
+    (EXEC, "execute_drop_partial_unique", "table_for"),
+    (EXEC, "execute_drop_path_index", "table_for"),
+    (EXEC, "execute_join", "relation_for"),
+    (EXEC, "execute_prepared_rows", "relation_for"),
+    (EXEC, "execute_with_need", "table_for"),
+    (EXEC, "existing_rows_break_unique", "table_for"),
+    (EXEC, "insert_loaded_row", "table_for"),
+    (EXEC, "load_json_document", "table_for"),
+    (EXEC, "lock_selected_rows", "table_for"),
+    (EXEC, "prevalidate_foreign_keys", "table_for"),
+    (EXEC, "query_output_scales", "schema_view"),
+    (EXEC, "referenced_values_now", "table_for"),
+    (EXEC, "refuse_if_partitioned", "schema_view"),
+    (EXEC, "refuse_write_to_locked_rows", "table_for"),
+    (EXEC, "retype_column", "table_for"),
+    (EXEC, "rewrite_table_with_columns", "table_for"),
+    (EXEC, "star_output_types", "schema_view"),
+    (EXEC, "supply_generated_values", "table_for"),
+    (EXEC, "supply_insert_column_list", "table_for"),
+    (EXEC, "update_from_join", "table_for"),
+    ("core/storage/relocate.rs", "plan", "schema_view"),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -511,4 +524,77 @@ fn every_ddl_mutator_resolves_its_key_first() {
             "{installer} must register canonical_key's spelling: {canon:?}"
         );
     }
+}
+
+/// How many times `.name(` occurs as a method call in `tokens`, any depth.
+fn method_calls(tokens: TokenStream, name: &str) -> usize {
+    let flat: Vec<TokenTree> = tokens.into_iter().collect();
+    let here = flat
+        .windows(3)
+        .filter(|w| {
+            matches!((&w[0], &w[1], &w[2]),
+                (TokenTree::Punct(dot), TokenTree::Ident(m), TokenTree::Group(g))
+                    if dot.as_char() == '.' && m == name
+                        && g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+        })
+        .count();
+    here + flat
+        .iter()
+        .map(|t| match t {
+            TokenTree::Group(g) => method_calls(g.stream(), name),
+            _ => 0,
+        })
+        .sum::<usize>()
+}
+
+/// B3b: every former escape caller now locks (or reads only metadata, under
+/// the statement's set, through `schema_view`), and the executor never asks
+/// `relation` (which takes no lock) for a table it executes against:
+/// `relation_for` instead.
+#[test]
+fn every_former_escape_caller_now_locks() {
+    let mut missing = Vec::new();
+    let all = sources();
+    let mut parsed: BTreeMap<&str, syn::File> = BTreeMap::new();
+    for (rel, _, _) in FORMER_ESCAPES {
+        if !parsed.contains_key(rel) {
+            let text = &all.iter().find(|(r, _)| r == rel).unwrap_or_else(|| panic!("{rel} is gone")).1;
+            parsed.insert(rel, parse(rel, text));
+        }
+    }
+    for (rel, func, accessor) in FORMER_ESCAPES {
+        let file = &parsed[rel];
+        let uses = occurrences(file, accessor);
+        if !uses.contains_key(*func) {
+            missing.push(format!("{rel}::{func} (expected {accessor})"));
+        }
+        // A locking caller must not keep an unlocked path beside the lock.
+        for hatch in ["table_unlocked", "each_table_unlocked"] {
+            if occurrences(file, hatch).contains_key(*func) {
+                missing.push(format!("{rel}::{func} still calls {hatch}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "former escape callers that no longer lock: {missing:?}");
+
+    let n = method_calls(engine_tokens(&parsed[EXEC]), "relation");
+    assert_eq!(n, 0, "the executor asks `relation` (no lock) {n} times: use `relation_for`");
+}
+
+/// `Slot` hands out a `Table`, so only the slot primitives and `table_for`
+/// (which loads it after the lock) may ask for one.
+#[test]
+fn only_table_for_loads_a_slot() {
+    let mut callers = Vec::new();
+    for (rel, text) in sources() {
+        if is_test_file(&rel) || rel == SLOTS || !text.contains(".slot(") {
+            continue;
+        }
+        let file = parse(&rel, &text);
+        let n = method_calls(engine_tokens(&file), "slot");
+        if n > 0 && rel != "core/database/table_for.rs" {
+            callers.push((rel, n));
+        }
+    }
+    assert!(callers.is_empty(), "a Slot is loaded outside table_for: {callers:?}");
 }

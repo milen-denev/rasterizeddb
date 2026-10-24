@@ -74,6 +74,27 @@ pub struct StatementCancel {
     /// from inside the scan, is the same place and the same reason the deadline
     /// is checked.
     gone: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// The session's `lock_timeout` in milliseconds, for any table-lock wait
+    /// the statement makes; `0`, the default, is no bound (PostgreSQL's
+    /// meaning, never "fail at once").
+    lock_timeout_ms: u64,
+    /// The end of the statement's wire reply, held until its lock owner has
+    /// released (pgwire's `ReplyHold`); `None` when nothing is held back.
+    held_reply: Option<parking_lot::Mutex<HeldReply>>,
+}
+
+/// Wire bytes a statement's reply ends with, kept back until the statement's
+/// table locks are released (see `pgwire::ReplyHold`). Carried by the
+/// statement's signal because the signal is already scoped to exactly the
+/// statement, outside its lock owner's scope: a scope of its own would wrap
+/// (and copy) the statement's future once more.
+#[derive(Debug, Default)]
+pub struct HeldReply {
+    pub bytes: Vec<u8>,
+    /// Holding has begun: every later message is held too.
+    pub holding: bool,
+    /// An `ErrorResponse` is among the held bytes.
+    pub error: bool,
 }
 
 impl std::fmt::Debug for StatementCancel {
@@ -82,6 +103,7 @@ impl std::fmt::Debug for StatementCancel {
             .field("deadline", &self.deadline)
             .field("flagged", &self.flagged)
             .field("watching", &self.gone.is_some())
+            .field("lock_timeout_ms", &self.lock_timeout_ms)
             .finish()
     }
 }
@@ -92,7 +114,32 @@ impl StatementCancel {
             deadline,
             flagged: AtomicU8::new(0),
             gone: None,
+            lock_timeout_ms: 0,
+            held_reply: None,
         }
+    }
+
+    /// Holds back the end of this statement's reply (see [`HeldReply`]).
+    pub fn holding_reply(mut self) -> Self {
+        self.held_reply = Some(parking_lot::Mutex::new(HeldReply::default()));
+        self
+    }
+
+    /// The held reply, when this statement holds one back.
+    pub fn held_reply(&self) -> Option<&parking_lot::Mutex<HeldReply>> {
+        self.held_reply.as_ref()
+    }
+
+    /// Bounds this statement's table-lock waits by `lock_timeout`
+    /// (milliseconds; `0` is no bound).
+    pub fn with_lock_timeout(mut self, ms: u64) -> Self {
+        self.lock_timeout_ms = ms;
+        self
+    }
+
+    /// This statement's `lock_timeout`, as a wait reads it.
+    pub fn lock_timeout(&self) -> crate::core::mvcc::table_locks::LockTimeout {
+        crate::core::mvcc::table_locks::LockTimeout::from_setting_ms(self.lock_timeout_ms)
     }
 
     /// Also stop when `gone()` reports the client has left.
@@ -166,6 +213,22 @@ pub fn current() -> Option<Arc<StatementCancel>> {
 /// Why the current statement should stop, if there is a signal and it tripped.
 pub fn tripped() -> Option<CancelReason> {
     STATEMENT_CANCEL.try_with(|c| c.tripped()).ok().flatten()
+}
+
+/// Runs `fut` as a statement whose table-lock waits are bounded by
+/// `lock_timeout = ms`, for tests driving the engine below the wire.
+#[cfg(any(test, feature = "test_tokens"))]
+pub async fn with_lock_timeout<F: std::future::Future>(ms: u64, fut: F) -> F::Output {
+    STATEMENT_CANCEL
+        .scope(Arc::new(StatementCancel::new(None).with_lock_timeout(ms)), fut)
+        .await
+}
+
+/// The current statement's `lock_timeout`; no bound outside a statement.
+pub fn lock_timeout() -> crate::core::mvcc::table_locks::LockTimeout {
+    STATEMENT_CANCEL
+        .try_with(|c| c.lock_timeout())
+        .unwrap_or(crate::core::mvcc::table_locks::LockTimeout::Unbounded)
 }
 
 // ------------------------------------------------------------ CancelRequest

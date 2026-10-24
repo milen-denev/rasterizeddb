@@ -39,6 +39,7 @@ pub mod cte;
 pub mod expr;
 pub mod foreign_key;
 pub mod join;
+pub mod lock_set;
 pub mod json_map;
 pub mod path_index;
 pub mod prepared;

@@ -700,7 +700,9 @@ async fn concurrent_updates_of_one_row_behave_as_on_a_plain_table() {
 
 /// `LOCK TABLE` on the logical name holds off a partitioned UPDATE and
 /// DELETE from another transaction, exactly as it does a plain table's: the
-/// check is by name, before any partition is routed to.
+/// writer's ROW EXCLUSIVE is asked by the logical name, before any partition
+/// is routed to, and waits (here bounded by `lock_timeout`, so it ends in
+/// 55P03 instead of waiting for the holder).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_table_lock_on_the_logical_name_refuses_other_writers() {
     let dir = tempfile::tempdir().unwrap();
@@ -716,8 +718,8 @@ async fn a_table_lock_on_the_logical_name_refuses_other_writers() {
             format!("UPDATE {table} SET amt = amt + 1"),
             format!("DELETE FROM {table} WHERE tenant_id = 1"),
         ] {
-            let e = exec_err(&db, &sql).await;
-            assert!(e.contains("locked by transaction"), "{sql}: {e}");
+            let e = crate::core::cancel::with_lock_timeout(150, exec_err(&db, &sql)).await;
+            assert!(e.contains("lock timeout"), "{sql}: {e}");
         }
         rollback(&db, holder);
         let sql = format!("UPDATE {table} SET amt = amt + 1 WHERE tenant_id = 1");

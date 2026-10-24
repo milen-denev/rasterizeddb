@@ -13,9 +13,9 @@ use crate::core::mvcc::owner::{LockOwner, OwnerKind};
 use tokio::io::AsyncReadExt;
 
 pub(super) struct Session {
-    state: SessionState,
-    server: tokio::io::DuplexStream,
-    client: tokio::io::DuplexStream,
+    pub(super) state: SessionState,
+    pub(super) server: tokio::io::DuplexStream,
+    pub(super) client: tokio::io::DuplexStream,
 }
 
 pub(super) fn session(db: &Arc<Database>) -> Session {

@@ -52,9 +52,10 @@
 //!
 //! # Representation
 //!
-//! O is a `TxId` per autocommit statement, as §7 decides. Open question Q4
-//! (that, or a cheaper tagged registry) is B3b's perf gate; everything outside
-//! this module and [`TransactionManager::begin_owner`] sees only
+//! O is a `TxId` per autocommit statement, as §7 decides, and B3b's perf
+//! gate kept it (Q4: O's own cost is B2's ~210 ns, and the table locks on
+//! top of it measured 1-4% of a point statement, none of it in O); everything
+//! outside this module and [`TransactionManager::begin_owner`] sees only
 //! [`StatementOwner`] and [`LockOwner`], so swapping it touches this file.
 
 use std::future::Future;

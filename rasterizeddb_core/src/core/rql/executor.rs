@@ -2,7 +2,17 @@ use rclite::Arc;
 
 use log::{debug, error, info, warn};
 
+use crate::core::mvcc::table_locks::TableMode;
 use crate::core::mvcc::transaction::TxId;
+
+/// The running statement's lock owner (§7 Owner): a block's root, or an
+/// autocommit statement's O, begun now if nothing asked for it yet. Every
+/// table this file reaches is taken through `Database::table_for` /
+/// `relation_for` under it.
+#[inline]
+fn owner() -> Option<crate::core::mvcc::owner::StatementOwner> {
+    crate::core::mvcc::owner::ensure()
+}
 
 use crate::core::{
     database::Database,
@@ -28,7 +38,16 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         result
     }
 
-    let schema_of = |name: &str| database.table_unlocked(name).map(|t| t.schema.fields.clone());
+    // Every relation the join reads, at once and in name order (§7
+    // Acquisition), before its schemas plan anything: the plan below reads
+    // them through `schema_view`, under these locks.
+    if let Err(e) = database
+        .tables_for(&crate::core::rql::lock_set::statement_lock_set(sql), owner())
+        .await
+    {
+        return error(&e);
+    }
+    let schema_of = |name: &str| database.schema_view(name).map(|v| v.schema().fields.clone());
 
     let plan = match crate::core::rql::join::plan_statement(sql, &schema_of) {
         Ok(p) => p,
@@ -37,6 +56,17 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             return error(&e);
         }
     };
+    // The relations the plan resolved, which the text scan may have spelled
+    // differently: confirmed (a held lock is granted again from the fast
+    // path) or taken, at once, before any is scanned.
+    let planned: Vec<(String, TableMode)> = plan
+        .relations
+        .iter()
+        .map(|r| (r.table.clone(), TableMode::AccessShare))
+        .collect();
+    if let Err(e) = database.tables_for(&planned, owner()).await {
+        return error(&e);
+    }
 
     // Each relation is kept as the scan's serialized rows: a decoded `Row` is
     // ~1.5 KB whatever it holds. `RDB_JOIN_ROWS=1` scans into `Vec<Row>`
@@ -54,8 +84,13 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         // A partitioned table's rows are in its partitions; `tables` holds
         // only its shell under this name (§3.3). Cloned out, so no map guard
         // spans the scan below.
-        let Some(source) = database.relation(&relation.table) else {
-            return error(&format!("relation '{}' does not exist", relation.table));
+        let source = match database
+            .relation_for(&relation.table, owner(), TableMode::AccessShare)
+            .await
+        {
+            Ok(Some(source)) => source,
+            Ok(None) => return error(&format!("relation '{}' does not exist", relation.table)),
+            Err(e) => return error(&e),
         };
 
         // The declared schema: a partitioned table's shell's, which every
@@ -168,8 +203,8 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let has_shadow_json = plan.items.iter().any(|item| {
         item.reads_column()
             && plan.relations.get(item.rel).is_some_and(|relation| {
-                database.table_unlocked(&relation.table).is_some_and(|t| {
-                    crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
+                database.schema_view(&relation.table).is_some_and(|v| {
+                    crate::core::rql::json_map::shadow_for(&item.field.name, &v.schema().json_columns)
                         .is_some()
                 })
             })
@@ -213,8 +248,8 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         let Some(relation) = plan.relations.get(item.rel) else {
             continue;
         };
-        let Some(shadow_table) = database.table_unlocked(&relation.table).and_then(|t| {
-            crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
+        let Some(shadow_table) = database.schema_view(&relation.table).and_then(|v| {
+            crate::core::rql::json_map::shadow_for(&item.field.name, &v.schema().json_columns)
                 .map(|s| s.to_string())
         }) else {
             continue;
@@ -411,13 +446,13 @@ pub(crate) fn query_output_scales(
         // each output column is (`JoinPlan::output_scales`). Without this arm a
         // join rendered every `NUMERIC(p, s)` at the engine scale.
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
-            let schema_of = |name: &str| database.table_unlocked(name).map(|t| t.schema.fields.clone());
+            let schema_of = |name: &str| database.schema_view(name).map(|v| v.schema().fields.clone());
             crate::core::rql::join::plan_statement(&qr.query, &schema_of)
                 .ok()
                 .map(|plan| plan.output_scales())
         }
-        QueryPurpose::QueryRows(qr) => database.table_unlocked(&qr.table_name).and_then(|t| {
-            let schema = &t.schema;
+        QueryPurpose::QueryRows(qr) => database.schema_view(&qr.table_name).and_then(|v| {
+            let schema = v.schema();
             // Not skipped when the table declares no `NUMERIC(p, s)`: an
             // aggregate's scale is not the column's — `sum(int8)` is a numeric
             // at scale 0, `avg(int)` at sixteen places.
@@ -919,12 +954,10 @@ async fn check_foreign_keys(
     tx: TxId,
 ) -> Result<(), String> {
     crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
-    let foreign_keys = {
-        let entry = database.table_unlocked(table_name);
-        match entry.as_ref() {
-            None => return Ok(()),
-            Some(t) => t.schema.foreign_keys.clone(),
-        }
+    // The child is the statement's write target: its RX is held (or taken).
+    let foreign_keys = match database.table_for(table_name, owner(), TableMode::RowExclusive).await? {
+        None => return Ok(()),
+        Some(t) => t.schema.foreign_keys.clone(),
     };
     if foreign_keys.is_empty() {
         return Ok(());
@@ -1068,9 +1101,11 @@ async fn prevalidate_foreign_keys(
     if statements.len() < 2 {
         return verified;
     }
-    let foreign_keys = match database.table_unlocked(table_name) {
-        Some(t) => t.schema.foreign_keys.clone(),
-        None => return verified,
+    // On a lock failure nothing is proved: each row's own check meets the
+    // same lock and reports it.
+    let foreign_keys = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
+        Ok(Some(t)) => t.schema.foreign_keys.clone(),
+        Ok(None) | Err(_) => return verified,
     };
     if foreign_keys.is_empty() {
         return verified;
@@ -1177,7 +1212,9 @@ async fn referenced_values_now(
     tx: TxId,
     limit: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let Some(table) = database.table_unlocked(table_name) else {
+    // A foreign key's other side, read: ACCESS SHARE (§7's "the FK parent
+    // check"), taken here if the statement's set did not already hold it.
+    let Some(table) = database.table_for(table_name, owner(), TableMode::AccessShare).await? else {
         return Err(format!("relation \"{}\" does not exist", table_name));
     };
     let schema = &table.schema.fields;
@@ -1372,10 +1409,12 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
     // The guard is dropped before returning: this is called from an async
     // function that goes on to await, and a DashMap guard held across an await
     // deadlocks the next writer.
-    let Some(entry) = database.table_unlocked(table) else {
+    // Schema only, under the ROW EXCLUSIVE `apply_on_delete` took on the
+    // child before it acts.
+    let Some(view) = database.schema_view(table) else {
         return "NULL".to_string();
     };
-    let schema = &entry.schema;
+    let schema = view.schema();
     let Some(expression) =
         crate::core::rql::column_default::expression_for(column, &schema.defaults)
     else {
@@ -1449,7 +1488,25 @@ async fn apply_on_delete(
         }
     }
 
-    for (child_table, fk) in referencing_keys(database, parent_table) {
+    let referencing = referencing_keys(database, parent_table);
+    // The children this delete reaches, locked at once in name order before
+    // any is read or written: a check reads its child (ACCESS SHARE), an
+    // action writes it (ROW EXCLUSIVE), as PostgreSQL's referential triggers
+    // lock them when they run.
+    let children: Vec<(String, TableMode)> = referencing
+        .iter()
+        .filter(|(_, fk)| {
+            keys.iter()
+                .any(|k| k.column.eq_ignore_ascii_case(&fk.parent_column) && !k.literals.is_empty())
+        })
+        .map(|(child, fk)| {
+            let mode = if fk.on_delete.blocks() { TableMode::AccessShare } else { TableMode::RowExclusive };
+            (child.clone(), mode)
+        })
+        .collect();
+    database.tables_for(&children, owner()).await?;
+
+    for (child_table, fk) in referencing {
         let Some(referenced) = keys
             .iter()
             .find(|k| k.column.eq_ignore_ascii_case(&fk.parent_column))
@@ -2094,7 +2151,23 @@ async fn apply_on_update(
         ));
     }
 
-    for (child_table, fk) in referencing_keys(database, parent_table) {
+    let referencing = referencing_keys(database, parent_table);
+    // The children this update reaches, at once in name order (see
+    // `apply_on_delete`): read for a check, written by an action.
+    let children: Vec<(String, TableMode)> = referencing
+        .iter()
+        .filter(|(_, fk)| changes.columns.iter().any(|c| c.column.eq_ignore_ascii_case(&fk.parent_column)))
+        .map(|(child, fk)| {
+            let mode = match fk.on_update {
+                ReferentialAction::NoAction | ReferentialAction::Restrict => TableMode::AccessShare,
+                _ => TableMode::RowExclusive,
+            };
+            (child.clone(), mode)
+        })
+        .collect();
+    database.tables_for(&children, owner()).await?;
+
+    for (child_table, fk) in referencing {
         let Some(change) = changes
             .columns
             .iter()
@@ -2280,7 +2353,7 @@ async fn rewrite_table_with_columns(
         old_field_names,
         rows,
     ) = {
-        let entry = database.table_unlocked(table_name);
+        let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
         let Some(table) = entry.as_ref().clone() else {
             return Err(format!("relation '{}' does not exist", table_name));
         };
@@ -2453,7 +2526,7 @@ async fn rewrite_table_with_columns(
     // migration that checks there before creating it would have tried again.
     if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() || carries_unique_keys {
         let (io_schema, fields) = {
-            let entry = database.table_unlocked(table_name);
+            let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
             let Some(table) = entry.as_ref().clone() else {
                 return Err(format!("relation '{}' vanished during rewrite", table_name));
             };
@@ -2492,7 +2565,7 @@ async fn rewrite_table_with_columns(
             .map_err(|e| format!("could not reopen '{}' with its indexes: {}", table_name, e))?;
     }
 
-    let entry = database.table_unlocked(table_name);
+    let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
     let Some(table) = entry.as_ref().clone() else {
         return Err(format!("relation '{}' vanished during rewrite", table_name));
     };
@@ -3154,7 +3227,7 @@ async fn ensure_shadow_column(
     // `Date` found `date`, skipped the `ADD COLUMN`, and then failed the
     // `INSERT` on a column the parser could not find.
     let (column, existing) = {
-        let entry = database.table_unlocked(shadow_table);
+        let entry = database.table_for(shadow_table, owner(), TableMode::AccessExclusive).await?;
         let fields: Vec<crate::core::row::schema::SchemaField> = entry
             .as_ref()
             .map(|t| {
@@ -3251,7 +3324,7 @@ async fn retype_column(
     // frozen read would miss them; `tx`'s own pinned snapshot, if it has one,
     // would miss what others committed since. Both losses would be silent.
     let (fields, rows) = {
-        let entry = database.table_unlocked(table_name);
+        let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
         let Some(table) = entry.as_ref().clone() else {
             return Err(format!("relation '{}' does not exist", table_name));
         };
@@ -4181,7 +4254,7 @@ async fn delete_using_join(
 ) -> Result<Vec<u8>, String> {
     // The target's key. Without one there is no way to name the row again.
     let key = {
-        let table_ref = database.table_unlocked(table);
+        let table_ref = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = table_ref
             .as_ref()
             .clone()
@@ -4201,7 +4274,7 @@ async fn delete_using_join(
     // ran under its own snapshot; a target row changed since may no longer
     // match, and PostgreSQL rechecks it rather than deleting it.
     let target_columns: Vec<String> = {
-        let entry = database.table_unlocked(table);
+        let entry = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         entry
             .as_ref()
             .map(|h| h.schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect())
@@ -4325,7 +4398,7 @@ async fn update_from_join(
     // The target's key. Without one there is no way to name the row again, so
     // this is refused rather than guessed at.
     let key = {
-        let table_ref = database.table_unlocked(table);
+        let table_ref = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = table_ref
             .as_ref()
             .clone()
@@ -4395,7 +4468,7 @@ async fn update_from_join(
     // reads are projected instead, and the expression is evaluated per row
     // once they are in hand.
     let target_schema: Vec<crate::core::row::schema::SchemaField> = {
-        let entry = database.table_unlocked(table);
+        let entry = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = entry
             .as_ref()
             .clone()
@@ -4870,6 +4943,12 @@ async fn apply_conflict_update(
         return ddl_error("ON CONFLICT DO UPDATE needs the inserted values to resolve EXCLUDED");
     }
 
+    // The write target, ROW EXCLUSIVE (held from the INSERT that conflicted).
+    let target = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
+        Ok(target) => target,
+        Err(e) => return ddl_error(&e),
+    };
+
     let value_of = |column: &str| -> Option<String> {
         inserted
             .iter()
@@ -4883,7 +4962,7 @@ async fn apply_conflict_update(
     let keys: Vec<String> = if !spec.arbiter.is_empty() {
         spec.arbiter.clone()
     } else if let Some(name) = &spec.constraint {
-        let entry = database.table_unlocked(table_name);
+        let entry = target.clone();
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", table_name));
         };
@@ -4897,7 +4976,7 @@ async fn apply_conflict_update(
             }
         }
     } else {
-        let entry = database.table_unlocked(table_name);
+        let entry = target.clone();
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", table_name));
         };
@@ -4933,7 +5012,7 @@ async fn apply_conflict_update(
     // outside it — the soft-deleted copies of an email — and the update would
     // have rewritten all of them. An ordinary key over the same columns
     // admits one row per value, so its presence makes the predicate moot.
-    if let Some(entry) = database.table_unlocked(table_name) {
+    if let Some(entry) = target.clone() {
         let same_columns = |columns: &[String]| {
             columns.len() == keys.len()
                 && columns.iter().all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
@@ -5065,7 +5144,7 @@ async fn lock_selected_rows(
     }
 
     let key_field = {
-        let entry = database.table_unlocked(table_name);
+        let entry = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
         let table = entry
             .as_ref()
             .clone()
@@ -5176,18 +5255,24 @@ async fn lock_selected_rows(
     Ok(kept)
 }
 
-/// Takes the table locks a `LOCK TABLE` asks for.
+/// Takes the table locks a `LOCK TABLE` asks for, in the mode the statement
+/// names mapped to one of the four (never weaker; `PgLockMode::table_mode`),
+/// for the block's owner, held until the block ends.
 ///
-/// Locks are held for the transaction, so outside an explicit block the
-/// statement's own autocommit transaction ends immediately and the lock with
-/// it — which is what PostgreSQL does, and it warns for the same reason.
+/// Each relation is waited for through the table locks' one wait
+/// (`Database::lock_table`'s): no bound of its own under `lock_timeout = 0`,
+/// 55P03 past a positive one, 57014 on cancellation, 40P01 to a cycle's
+/// victim (an S or AE requester, which `LOCK TABLE` in those modes is, comes
+/// before any reader). `NOWAIT` asks once and fails with 55P03 (`could not
+/// obtain lock`) rather than queue. A partitioned table is locked by its
+/// logical name, which is what every statement on it locks.
 #[inline(never)]
 async fn execute_lock_table(
     database: &Arc<Database>,
     statement: crate::core::rql::row_lock::LockTable,
     tx: TxId,
 ) -> Vec<u8> {
-    use crate::core::mvcc::row_locks::Acquired;
+    use crate::core::mvcc::table_locks::{Request, WaitRole};
 
     // PostgreSQL refuses this outside a transaction block, because the lock
     // would be released the instant the statement ended and the caller would be
@@ -5195,66 +5280,34 @@ async fn execute_lock_table(
     if tx == crate::core::mvcc::transaction::FROZEN_TX {
         return ddl_error("LOCK TABLE can only be used in transaction blocks");
     }
-
-    let live = |candidate: TxId| {
-        matches!(
-            database.transactions.status().outcome(candidate),
-            crate::core::mvcc::transaction::TxOutcome::InProgress
-        )
+    let Some(owner) = crate::core::mvcc::owner::ensure() else {
+        return ddl_error("LOCK TABLE can only be used in transaction blocks");
     };
+    let mode = statement.mode.table_mode();
 
     for name in &statement.tables {
-        if !database.has_table(name) {
+        if !database.has_table(name) && !database.is_partitioned(name) {
             return ddl_error(&format!("relation '{}' does not exist", name));
         }
-
-        let mut outcome = database
-            .row_locks
-            .acquire_table(name, tx, statement.mode, &live);
-        if !statement.nowait {
-            let started = std::time::Instant::now();
-            let deadline = started + LOCK_WAIT_TIMEOUT;
-            let _waiting = database.row_locks.waiting_guard(tx);
-            while let Acquired::Held(_) = outcome {
-                // `statement_timeout` and a departed client end the wait, as
-                // the cancellation error rather than the lock-timeout one.
-                if let Some(reason) = crate::core::cancel::tripped() {
-                    return ddl_error(reason.eval_error().as_str());
-                }
-                if let Some(deadlock) = deadlock_check(
-                    &database,
-                    tx,
-                    started,
-                    || {
-                        database
-                            .row_locks
-                            .table_blockers(name, tx, statement.mode, &live)
-                    },
-                    &live,
-                ) {
-                    return ddl_error(&deadlock);
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                outcome = database
-                    .row_locks
-                    .acquire_table(name, tx, statement.mode, &live);
+        let key = database.lock_key(name);
+        let locks = database.row_locks.table_locks();
+        if statement.nowait {
+            if !locks.try_acquire(owner.owner, &key, mode) {
+                return ddl_error(&format!("could not obtain lock on relation \"{}\"", name));
             }
+            continue;
         }
-
-        if let Acquired::Held(owner) = outcome {
-            return ddl_error(&if statement.nowait {
-                format!("could not obtain lock on relation '{}'", name)
-            } else {
-                format!(
-                    "timed out waiting {}s for a lock on relation '{}' held by transaction {}",
-                    LOCK_WAIT_TIMEOUT.as_secs(),
-                    name,
-                    owner
-                )
-            });
+        let wait = match locks.request(owner.owner, &key, mode, WaitRole::Other) {
+            Request::Granted => continue,
+            Request::Queued(wait) => wait,
+        };
+        let timeout = crate::core::cancel::lock_timeout();
+        let cancelled = || crate::core::cancel::tripped().is_some();
+        if let Err(e) = locks
+            .wait_for(&wait, timeout, &cancelled, &|o| database.row_locks.table_deadlock_check(o))
+            .await
+        {
+            return ddl_error(&crate::core::database::table_for::lock_error_message(e, &key, mode));
         }
     }
 
@@ -5394,25 +5447,16 @@ async fn refuse_write_to_locked_rows(
         )
     };
 
-    // A whole-table lock answers for every row in it, so it is checked first
-    // and without needing to know which rows the statement touches.
-    if let Some(owner) = database
-        .row_locks
-        .table_conflict(table_name, tx, true, &live)
-    {
-        return Err(format!(
-            "relation '{}' is locked by transaction {}; the statement that locked it must \
-             finish first",
-            table_name, owner
-        ));
-    }
-
+    // A whole-table lock (`LOCK TABLE`) is the table-lock manager's: the
+    // statement holds ROW EXCLUSIVE on its target (taken before this, and
+    // waited for behind any SHARE or ACCESS EXCLUSIVE holder), so only row
+    // locks are left to check.
     if database.row_locks.is_empty() {
         return Ok(());
     }
 
     let key_field = {
-        let entry = database.table_unlocked(table_name);
+        let entry = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
         let Some(table) = entry.as_ref().clone() else {
             return Ok(());
         };
@@ -5814,11 +5858,13 @@ fn star_output_types(select_sql: &str, database: &Arc<Database>) -> Vec<Option<c
     let Some(name) = select_sql[from + "FROM".len()..].split_whitespace().next() else {
         return Vec::new();
     };
-    let Some(table) = database.table_unlocked(name.trim_matches('"').trim_end_matches(';')) else {
+    // Schema only, under the statement's set (the source of an `INSERT …
+    // SELECT`, ACCESS SHARE).
+    let Some(view) = database.schema_view(name.trim_matches('"').trim_end_matches(';')) else {
         return Vec::new();
     };
-    let mut fields: Vec<_> = table
-        .schema
+    let mut fields: Vec<_> = view
+        .schema()
         .fields
         .iter()
         .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -5965,10 +6011,14 @@ async fn supply_insert_column_list(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
     database: &Arc<Database>,
 ) -> Option<Result<QueryPurpose, String>> {
-    let (fields, generated) = database.table_unlocked(&row_data.table_name).map(|entry| {
+    let entry = match database.table_for(&row_data.table_name, owner(), TableMode::RowExclusive).await {
+        Ok(entry) => entry?,
+        Err(e) => return Some(Err(e)),
+    };
+    let (fields, generated) = {
         let schema = &entry.schema;
         (schema.fields.clone(), schema.generated.clone())
-    })?;
+    };
     // A generated column takes no value from the client, so it is not one of
     // the positions `INSERT INTO t VALUES (…)` fills — PostgreSQL maps the
     // tuple across the columns that *can* be written. Leaving it in the list
@@ -6024,7 +6074,10 @@ async fn supply_generated_values(
     database: &Arc<Database>,
 ) -> Option<Result<crate::core::rql::lexer_s1::InsertRowData, String>> {
     let (fields, generated, defaults) = {
-        let entry = database.table_unlocked(&row_data.table_name)?;
+        let entry = match database.table_for(&row_data.table_name, owner(), TableMode::RowExclusive).await {
+            Ok(entry) => entry?,
+            Err(e) => return Some(Err(e)),
+        };
         let schema = &entry.schema;
         if schema.generated.is_empty() {
             return None;
@@ -6795,7 +6848,7 @@ fn partitioned_ddl_message(e: &std::io::Error) -> String {
 /// were. Consults `partitioned` first: a table that could not be opened has
 /// no shell in `tables` but is still partitioned.
 fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result<(), String> {
-    let shell = database.table_unlocked(table).is_some_and(|t| t.is_shell());
+    let shell = database.schema_view(table).is_some_and(|v| v.is_shell());
     if database.is_partitioned(table) || shell {
         return Err(format!(
             "{what} on partitioned table \"{table}\" is not supported yet"
@@ -6837,8 +6890,9 @@ fn check_conflict_target_infers_a_key(
     if target.is_empty() {
         return Ok(());
     }
-    let schema = match database.table_unlocked(&row_data.table_name) {
-        Some(table) => table.schema.clone(),
+    // Schema only, under the INSERT's ROW EXCLUSIVE from the statement's set.
+    let schema = match database.schema_view(&row_data.table_name) {
+        Some(view) => view.schema().clone(),
         None => match database.partitioned_table(&row_data.table_name) {
             Some(pt) => pt.shell().schema.clone(),
             None => return Ok(()),
@@ -7352,8 +7406,12 @@ async fn load_json_document(
     }
 
     let all_fields: Vec<crate::core::row::schema::SchemaField> = {
-        let entry = database.table_unlocked(shadow_table);
-        let table = entry.as_ref().clone()?;
+        // A shadow table: covered by its parent's lock (`lock_exempt`).
+        let table = database
+            .table_for(shadow_table, owner(), TableMode::AccessShare)
+            .await
+            .ok()
+            .flatten()?;
         crate::core::rql::nullable::visible_fields(&table.schema.fields)
             .into_iter()
             .filter(|f| f.name != JSON_KEY_COLUMN)
@@ -7682,6 +7740,71 @@ fn ddl_ok(rows: u64) -> Vec<u8> {
     result
 }
 
+/// Gives back one mode on drop: a bare `VACUUM`'s per-table ROW EXCLUSIVE.
+struct ModeRelease {
+    database: Arc<Database>,
+    owner: Option<crate::core::mvcc::table_locks::LockOwner>,
+    table: String,
+    mode: TableMode,
+}
+
+impl Drop for ModeRelease {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner {
+            self.database.row_locks.table_locks().release_mode(owner, &self.table, self.mode);
+        }
+    }
+}
+
+/// `VACUUM`'s lock on one table: ROW EXCLUSIVE through `relation_for`, and
+/// for a bare `VACUUM` (`per_table`) a guard that gives it back when the
+/// table is done, unless the owner held it before.
+async fn vacuum_lock(
+    database: &Arc<Database>,
+    name: &str,
+    per_table: bool,
+) -> Result<(Option<crate::core::database::Relation>, Option<ModeRelease>), String> {
+    let statement_owner = owner();
+    let held_before = statement_owner.is_some_and(|o| {
+        database
+            .row_locks
+            .table_locks()
+            .holds(o.owner, &database.lock_key(name))
+            .contains(TableMode::RowExclusive)
+    });
+    let relation = database
+        .relation_for(name, statement_owner, TableMode::RowExclusive)
+        .await?;
+    let release = (per_table && !held_before).then(|| ModeRelease {
+        database: database.clone(),
+        owner: statement_owner.map(|o| o.owner),
+        table: database.lock_key(name).into_owned(),
+        mode: TableMode::RowExclusive,
+    });
+    Ok((relation, release))
+}
+
+/// The sequences a `DROP TABLE` takes with it, read from the table's schema
+/// once the drop holds ACCESS EXCLUSIVE on it (so no ALTER can change what
+/// it owns in between). Empty when the statement does not parse or names no
+/// table: the drop reports that.
+async fn sequences_owned_by_dropped(sql: &str, database: &Arc<Database>) -> Result<Vec<String>, String> {
+    let Ok((name, _)) = crate::core::rql::lexer_alter::parse_drop_table(sql) else {
+        return Ok(Vec::new());
+    };
+    let Some(table) = database.table_for(&name, owner(), TableMode::AccessExclusive).await? else {
+        return Ok(Vec::new());
+    };
+    let (fields, defaults) = (table.schema.fields.clone(), table.schema.defaults.clone());
+    drop(table);
+    Ok(crate::core::rql::sequence::owned_by(
+        &name,
+        &fields,
+        &defaults,
+        &sequences_named_elsewhere(database, &name),
+    ))
+}
+
 async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     use crate::core::rql::lexer_alter;
 
@@ -7693,6 +7816,15 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         }
     };
 
+    // ACCESS EXCLUSIVE on the name, a partitioned table's logical one
+    // included, before anything is dropped (B4 marks the slot dropped under
+    // it, so queued waiters get 42P01).
+    if let Err(e) = database
+        .relation_for(&table_name, owner(), TableMode::AccessExclusive)
+        .await
+    {
+        return ddl_error(&e);
+    }
     match database.drop_table(&table_name).await {
         Ok(true) => ddl_ok(0),
         Ok(false) if if_exists => ddl_ok(0),
@@ -8069,7 +8201,11 @@ fn condition_reads_a_null(
 /// So a partitioned table that cannot be read is an error here, which the
 /// insert reports; a plain table's failure is only logged, as it always was.
 async fn seed_sequences(database: &Arc<Database>, table_name: &str) -> Result<(), String> {
-    let (table, partitioned) = match database.relation(table_name) {
+    // The INSERT's target, ROW EXCLUSIVE; a partitioned one by its name.
+    let (table, partitioned) = match database
+        .relation_for(table_name, owner(), TableMode::RowExclusive)
+        .await?
+    {
         Some(crate::core::database::Relation::Plain(table)) => (table, None),
         Some(crate::core::database::Relation::Partitioned(pt)) => (pt.shell().clone(), Some(pt)),
         None => return Ok(()),
@@ -8157,7 +8293,7 @@ async fn existing_rows_break_unique(
     table_name: &str,
     key: &crate::core::rql::unique_key::UniqueKey,
 ) -> Result<Option<String>, String> {
-    let entry = database.table_unlocked(table_name);
+    let entry = database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
     let Some(table) = entry.as_ref().clone() else {
         return Err(format!("relation '{}' does not exist", table_name));
     };
@@ -8350,7 +8486,7 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
             .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"));
     if if_exists {
         if let Some(first) = plans.first() {
-            if database.table_unlocked(&first.table_name).is_none() {
+            if !database.has_table(&first.table_name) {
                 info!(
                     "ALTER TABLE IF EXISTS {}: relation absent, nothing to do",
                     first.table_name
@@ -8814,7 +8950,16 @@ async fn execute_alter_table_action(
     // The map guard is released immediately: `reload_table` removes the entry,
     // and holding a read guard across that would deadlock the shard.
     let (mut schema, io_schema, row_count) = {
-        let table_ref = database.table_unlocked(&plan.table_name);
+        // ACCESS EXCLUSIVE before the schema is read (§7; B4 adds the reload
+        // under it): every reader and writer of the table has finished, and
+        // none starts until this statement ends.
+        let table_ref = match database
+            .table_for(&plan.table_name, owner(), TableMode::AccessExclusive)
+            .await
+        {
+            Ok(table_ref) => table_ref,
+            Err(e) => return ddl_error(&e),
+        };
         let Some(table) = table_ref.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", plan.table_name));
         };
@@ -9324,7 +9469,11 @@ async fn execute_alter_table_action(
                 return ddl_ok(0);
             }
             let renamed_io = {
-                let entry = database.table_unlocked(&to);
+                // The renamed table under its new name, ACCESS EXCLUSIVE too.
+                let entry = match database.table_for(&to, owner(), TableMode::AccessExclusive).await {
+                    Ok(entry) => entry,
+                    Err(e) => return ddl_error(&e),
+                };
                 let Some(table) = entry.as_ref() else {
                     return ddl_error(&format!("relation '{}' vanished during rename", to));
                 };
@@ -9798,7 +9947,15 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         return ddl_error(&e);
     }
     let (io_schema, declared, column_is_a_document) = {
-        let entry = database.table_unlocked(&statement.table);
+        // ACCESS EXCLUSIVE before the schema is read (§7; B4 moves the
+        // declaration into the reload under it).
+        let entry = match database
+            .table_for(&statement.table, owner(), TableMode::AccessExclusive)
+            .await
+        {
+            Ok(entry) => entry,
+            Err(e) => return ddl_error(&e),
+        };
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
@@ -9901,7 +10058,15 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         return ddl_error(&e);
     }
     let (io_schema, columns, types) = {
-        let entry = database.table_unlocked(&statement.table);
+        // ACCESS EXCLUSIVE before the schema is read (§7; B4 moves the
+        // declaration into the reload under it).
+        let entry = match database
+            .table_for(&statement.table, owner(), TableMode::AccessExclusive)
+            .await
+        {
+            Ok(entry) => entry,
+            Err(e) => return ddl_error(&e),
+        };
         let Some(table) = entry.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", statement.table));
         };
@@ -9965,14 +10130,28 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
 /// declares one by that name, so the caller tries the other kinds.
 async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
     let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
-    let (table_name, io_schema, decl) = database.each_table_unlocked().into_iter().find_map(|(key, table)| {
-        table
-            .schema
-            .secondary_indexes
-            .iter()
-            .find(|i| i.name.eq_ignore_ascii_case(&name))
-            .map(|d| (key.clone(), table.io_schema.clone(), d.clone()))
-    })?;
+    // Index names are database-wide: the table is found by a metadata walk
+    // (no lock), then locked ACCESS EXCLUSIVE (a late find, §7) and read
+    // again under the lock, which a concurrent DROP INDEX may have beaten.
+    let mut found: Option<String> = None;
+    database.each_schema(|table, schema| {
+        if found.is_none() && schema.secondary_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {
+            found = Some(table.to_string());
+        }
+    });
+    let table_name = found?;
+    let table = match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
+        Ok(table) => table?,
+        Err(e) => return Some(ddl_error(&e)),
+    };
+    let decl = table
+        .schema
+        .secondary_indexes
+        .iter()
+        .find(|i| i.name.eq_ignore_ascii_case(&name))
+        .cloned()?;
+    let io_schema = table.io_schema.clone();
+    drop(table);
     // Before the tombstone is written, so a refused drop leaves the
     // declaration as it was.
     if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
@@ -10004,14 +10183,27 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
 /// case is left to the constraint.
 async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
     let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
-    let (table_name, io_schema) = database.each_table_unlocked().into_iter().find_map(|(key, table)| {
-        table
-            .schema
-            .unique_keys
-            .iter()
-            .any(|k| !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(&name))
-            .then(|| (key.clone(), table.io_schema.clone()))
-    })?;
+    // Found by a metadata walk, then locked and read again (see
+    // `execute_drop_index`).
+    let is_it = |k: &crate::core::rql::unique_key::UniqueKey| {
+        !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(&name)
+    };
+    let mut found: Option<String> = None;
+    database.each_schema(|table, schema| {
+        if found.is_none() && schema.unique_keys.iter().any(is_it) {
+            found = Some(table.to_string());
+        }
+    });
+    let table_name = found?;
+    let table = match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
+        Ok(table) => table?,
+        Err(e) => return Some(ddl_error(&e)),
+    };
+    if !table.schema.unique_keys.iter().any(is_it) {
+        return None;
+    }
+    let io_schema = table.io_schema.clone();
+    drop(table);
     match crate::core::rql::unique_key::remove(io_schema, &name).await {
         Ok(true) => {}
         Ok(false) => {
@@ -10060,7 +10252,10 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
         return ddl_error(&e);
     }
     let io_schema = {
-        let entry = database.table_unlocked(&table_name);
+        let entry = match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
+            Ok(entry) => entry,
+            Err(e) => return ddl_error(&e),
+        };
         let Some(table) = entry.as_ref().clone() else {
             return if if_exists {
                 ddl_ok(0)
@@ -11057,6 +11252,62 @@ fn fold_outcomes_if_large(database: &Arc<Database>) {
     }
 }
 
+/// The text a statement's known table set is read from (§7 Acquisition),
+/// for the statements that read or write tables by name. `None` for the
+/// rest: a prepared parse locks its one table where it reads it, `LOCK
+/// TABLE` and `VACUUM` lock in their own arms, and the surfaces that touch
+/// no table (filters, replication, introspection, …) take none.
+fn statement_lock_text(query: &QueryPurpose) -> Option<&str> {
+    match query {
+        QueryPurpose::QueryRows(d) => Some(&d.query),
+        QueryPurpose::InsertRow(d) => Some(&d.query),
+        QueryPurpose::UpdateRow(sql)
+        | QueryPurpose::DeleteRow(sql)
+        | QueryPurpose::CreateIndex(sql)
+        | QueryPurpose::DropTable(sql)
+        | QueryPurpose::AddColumn(sql)
+        | QueryPurpose::DropColumn(sql)
+        | QueryPurpose::RenameColumn(sql) => Some(sql),
+        _ => None,
+    }
+}
+
+/// Takes the statement's whole known table set at once, before any part of
+/// it runs (§7 Acquisition; `lock_set`): every relation it names at any
+/// depth, with the foreign-key parents of every table it writes (ACCESS
+/// SHARE, the parent check's mode), deduplicated and in name order. What the
+/// text cannot show is taken late, where it is reached.
+pub(crate) async fn lock_statement_set(database: &Arc<Database>, sql: &str) -> Result<(), String> {
+    let statement_owner = owner();
+    if statement_owner.is_none() {
+        return Ok(());
+    }
+    // A single-table write's set is its target, which its arm takes; its
+    // FK parents are taken where their check reads them (a late find, as §7
+    // Acquisition lists it).
+    if crate::core::rql::lock_set::is_single_target_write(sql) {
+        return Ok(());
+    }
+    let mut set = crate::core::rql::lock_set::statement_lock_set(sql);
+    if set.is_empty() {
+        return Ok(());
+    }
+    let parents: Vec<(String, TableMode)> = set
+        .iter()
+        .filter(|(_, mode)| *mode == TableMode::RowExclusive)
+        .filter_map(|(name, _)| database.schema_view(name))
+        .flat_map(|view| {
+            view.schema()
+                .foreign_keys
+                .iter()
+                .map(|fk| (fk.parent_table.clone(), TableMode::AccessShare))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    set.extend(parents);
+    database.tables_for(&set, statement_owner).await
+}
+
 pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
     execute_with_sync(query, database, crate::synchronous_commit()).await
 }
@@ -11152,6 +11403,15 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         }
         _ => None,
     };
+    // The statement's whole known table set, at once, before its first
+    // attempt: held by O, so every retry runs under the same locks.
+    if let Some(sql) = statement_lock_text(&query)
+        && !crate::core::rql::lock_set::is_single_target_write(sql)
+    {
+        if let Err(e) = Box::pin(lock_statement_set(&database, sql)).await {
+            return ddl_error(&e);
+        }
+    }
     let mut pending: Option<QueryPurpose> = Some(query);
     // The first conflict seen, kept so a later attempt that matches nothing can
     // report it rather than a misleading empty success.
@@ -11422,7 +11682,13 @@ pub(crate) async fn insert_loaded_row(
         return None;
     }
     Box::pin(seed_sequences(database, table_name)).await.ok()?;
-    let table = database.table_unlocked(table_name)?;
+    // The import batch's owner takes ROW EXCLUSIVE, as the statement path's
+    // INSERT would; on a lock failure the ordinary path reports it.
+    let table = database
+        .table_for(table_name, owner(), TableMode::RowExclusive)
+        .await
+        .ok()
+        .flatten()?;
     let schema = &table.schema;
     if !schema.json_columns.is_empty() {
         return None;
@@ -11565,6 +11831,15 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         _ => None,
     };
 
+    // The statement's whole known table set, at once, before it runs (see
+    // `execute_autocommit`); the block's owner holds it to the block's end.
+    if let Some(sql) = statement_lock_text(&query)
+        && !crate::core::rql::lock_set::is_single_target_write(sql)
+    {
+        if let Err(e) = Box::pin(lock_statement_set(&database, sql)).await {
+            return ddl_error(&e);
+        }
+    }
     let mut query = query;
     let mut attempt = 0usize;
     loop {
@@ -11719,7 +11994,14 @@ async fn execute_prepared_rows(
     // fan-out reads that one partition without routing the rendered `WHERE`,
     // and still reads whether it is materialized after this execution's
     // snapshot. A key bound for another table or key is ignored there.
-    if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&prepared.table_name) {
+    let relation = match database
+        .relation_for(&prepared.table_name, owner(), TableMode::AccessShare)
+        .await
+    {
+        Ok(relation) => relation,
+        Err(e) => return ddl_error(&e),
+    };
+    if let Some(crate::core::database::Relation::Partitioned(pt)) = relation.clone() {
         let mut query_row = prepared.query_row;
         apply_subquery_need(&mut query_row, need);
         return match partitioned_source(&query_row, pt, prepared.key.as_ref(), tx) {
@@ -11727,8 +12009,7 @@ async fn execute_prepared_rows(
             Err(refusal) => refusal,
         };
     }
-    let table = database.table_unlocked(&prepared.table_name);
-    let Some(table) = table else {
+    let Some(crate::core::database::Relation::Plain(table)) = relation else {
         return ddl_error("Table not found");
     };
     let mut query_row = prepared.query_row;
@@ -11977,24 +12258,10 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::DropTable(sql) => {
             // Which sequences the table owns, read before the drop takes the
             // schema that says so.
-            let owned = crate::core::rql::lexer_alter::parse_drop_table(sql)
-                .ok()
-                .and_then(|(name, _)| {
-                    // Copied out so no map guard is held across the scan of
-                    // the other tables below.
-                    let (fields, defaults) = {
-                        let table = database.table_unlocked(&name)?;
-                        let schema = &table.schema;
-                        (schema.fields.clone(), schema.defaults.clone())
-                    };
-                    Some(crate::core::rql::sequence::owned_by(
-                        &name,
-                        &fields,
-                        &defaults,
-                        &sequences_named_elsewhere(&database, &name),
-                    ))
-                })
-                .unwrap_or_default();
+            let owned = match Box::pin(sequences_owned_by_dropped(sql, &database)).await {
+                Ok(owned) => owned,
+                Err(e) => return ddl_error(&e),
+            };
             let response = Box::pin(execute_drop_table(sql, &database)).await;
             if response.first() != Some(&3) {
                 // The sequences go with the table. Without this a table dropped
@@ -12140,7 +12407,13 @@ pub(crate) async fn execute_with_need(
             // is then its shell: the schema every check below reads, never the
             // writer. Resolved through `relation`, as a shell found in `tables`
             // by name refuses every write.
-            let (table, partitioned) = match database.relation(table_name) {
+            // ROW EXCLUSIVE on the target (a partitioned one by its logical
+            // name): held from the statement's set, or taken here.
+            let relation = match Box::pin(database.relation_for(table_name, owner(), TableMode::RowExclusive)).await {
+                Ok(relation) => relation,
+                Err(e) => return ddl_error(&e),
+            };
+            let (table, partitioned) = match relation {
                 Some(crate::core::database::Relation::Plain(table)) => (table, None),
                 Some(crate::core::database::Relation::Partitioned(pt)) => {
                     if let Err(e) = pt.check() {
@@ -12449,7 +12722,11 @@ pub(crate) async fn execute_with_need(
                 // insert. Only the assignments are checked: an UPDATE leaves
                 // every column it does not name alone.
                 {
-                    let entry = database.table_unlocked(&name);
+                    // ROW EXCLUSIVE on the target before its schema is read.
+                    let entry = match Box::pin(database.table_for(&name, owner(), TableMode::RowExclusive)).await {
+                        Ok(entry) => entry,
+                        Err(e) => return ddl_error(&e),
+                    };
                     if let Some(table) = entry.as_ref().clone() {
                         let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)
                             .unwrap_or_default();
@@ -12533,7 +12810,11 @@ pub(crate) async fn execute_with_need(
             // the table backing a JSON column, which writes this same map; held
             // across it, this is the deadlock the INSERT arm had.
             let table = {
-                let Some(entry) = database.table_unlocked(&table_name) else {
+                let entry = match Box::pin(database.table_for(&table_name, owner(), TableMode::RowExclusive)).await {
+                    Ok(entry) => entry,
+                    Err(e) => return ddl_error(&e),
+                };
+                let Some(entry) = entry else {
                     error!("Table not found");
                     let mut result = vec![3u8];
                     result.extend_from_slice("Table not found".as_bytes());
@@ -12640,7 +12921,7 @@ pub(crate) async fn execute_with_need(
 
             // A partitioned table's rows are in its partitions (§9): `table`
             // above is its shell, whose schema every check so far read.
-            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&table_name) {
+            if let Some(pt) = database.partitioned_table(&table_name) {
                 return Box::pin(execute_partitioned_update(
                     query,
                     update_plan,
@@ -12822,7 +13103,7 @@ pub(crate) async fn execute_with_need(
             // failed as soon as a partitioned table existed (F2).
             let names: Vec<String> = match &request.table_name {
                 Some(name) => {
-                    if database.relation(name).is_none() {
+                    if !database.has_table(name) && !database.is_partitioned(name) {
                         error!("VACUUM: table {} not found", name);
                         let mut result = vec![3u8];
                         result.extend_from_slice(format!("Table {} not found", name).as_bytes());
@@ -12846,11 +13127,26 @@ pub(crate) async fn execute_with_need(
             // Tables compacted whose space could not be given back.
             let mut untruncated: Vec<(String, &'static str)> = Vec::new();
             for name in names {
+                // ROW EXCLUSIVE on each table while it is vacuumed (finding
+                // L6): it conflicts with a DDL's ACCESS EXCLUSIVE, so no
+                // reload swaps the instance under the vacuum. A bare VACUUM
+                // gives each table's back when it moves on (unless the owner
+                // held it already), so it never holds every table at once;
+                // B4 gives each table an owner of its own.
+                let relation = match Box::pin(vacuum_lock(&database, &name, request.table_name.is_none())).await {
+                    Ok(relation) => relation,
+                    Err(e) => {
+                        let mut result = vec![3u8];
+                        result.extend_from_slice(e.as_bytes());
+                        return result;
+                    }
+                };
+                let _released = relation.1;
                 // Resolved and cloned per table rather than held across the
                 // await: a DashMap reference kept over one would block anything
                 // else touching the map for as long as the vacuum runs.
                 let tables: Vec<_> =
-                    match database.relation(&name) {
+                    match relation.0 {
                         None => continue,
                         Some(crate::core::database::Relation::Plain(table)) => vec![table],
                         Some(crate::core::database::Relation::Partitioned(pt)) => {
@@ -13000,7 +13296,11 @@ pub(crate) async fn execute_with_need(
                 return result;
             }
 
-            let table_ref = database.table_unlocked(&table_name);
+            // ROW EXCLUSIVE on the target, a partitioned one by its name.
+            let table_ref = match Box::pin(database.table_for(&table_name, owner(), TableMode::RowExclusive)).await {
+                Ok(table_ref) => table_ref,
+                Err(e) => return ddl_error(&e),
+            };
             let table_clone = table_ref.as_ref().clone();
             let table = if let Some(table) = table_clone {
                 table
@@ -13037,7 +13337,7 @@ pub(crate) async fn execute_with_need(
 
             // A partitioned table's rows are in its partitions (§9); `table`
             // is its shell, whose schema the parse read.
-            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(&table_name) {
+            if let Some(pt) = database.partitioned_table(&table_name) {
                 return Box::pin(execute_partitioned_delete(
                     &query,
                     delete_plan,
@@ -13200,12 +13500,21 @@ pub(crate) async fn execute_with_need(
             // A partitioned table's rows are in its partitions: read under one
             // snapshot, routed only on proof (§4, §8). Its shell, which `tables`
             // holds under this name, has the schema and no rows.
-            if let Some(crate::core::database::Relation::Partitioned(pt)) = database.relation(table_name) {
+            //
+            // ACCESS SHARE on it first, a partitioned table by its logical
+            // name (a locking clause adds ROW EXCLUSIVE where it locks rows).
+            let relation = match Box::pin(database.relation_for(table_name, owner(), TableMode::AccessShare)).await {
+                Ok(relation) => relation,
+                Err(e) => return ddl_error(&e),
+            };
+            if let Some(crate::core::database::Relation::Partitioned(pt)) = relation.clone() {
                 return Box::pin(execute_partitioned_select(&query, pt, &database, tx, need)).await;
             }
 
-            let table_ref = database.table_unlocked(table_name);
-            let table_clone = table_ref.as_ref().clone();
+            let table_clone = match relation {
+                Some(crate::core::database::Relation::Plain(table)) => Some(table),
+                _ => None,
+            };
             let table = if let Some(table) = table_clone {
                 table
             } else {

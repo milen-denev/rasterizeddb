@@ -690,3 +690,94 @@ async fn the_wait_loop_breaks_a_deadlock_with_40p01_to_the_victim_only() {
     assert_eq!(LockError::Deadlock.sqlstate(), "40P01");
     assert_eq!(locks.holds(a, "t"), ModeSet::of(RXm).union(ModeSet::of(AEm)));
 }
+
+/// The safety net for an owner that never released (B3b): a holder whose
+/// transaction aborted is released by the first request it blocks, and what
+/// waited behind it is granted; a live holder, and a committed one (whose
+/// locks must outlive its commit until its release, finding L4), is not.
+///
+/// Mutation: `prune_dead` prunes nothing (the request queues behind the
+/// dead holder for ever).
+#[test]
+fn an_aborted_holder_is_released_by_the_request_it_blocks() {
+    let locks = TableLocks::new();
+    let dead: Arc<std::sync::Mutex<std::collections::HashSet<TxId>>> = Arc::default();
+    let marks = dead.clone();
+    locks.set_liveness(move |id| !marks.lock().unwrap().contains(&id));
+    let (a, b, c) = (owner(10), owner(11), owner(12));
+    assert!(granted(locks.request(a, "t", AEm, WaitRole::Ddl)));
+    let w = queued(locks.request(b, "t", ASm, WaitRole::Other));
+    // Alive: c queues too.
+    let wc = queued(locks.request(c, "t", RXm, WaitRole::Other));
+    assert_eq!(locks.abandon(&wc), WaitOutcome::Waiting);
+    // Dead: the next request releases it, and the queue behind it moves.
+    dead.lock().unwrap().insert(10);
+    assert!(granted(locks.request(c, "t", RXm, WaitRole::Other)), "a dead holder still blocked");
+    assert_eq!(w.outcome(), WaitOutcome::Granted, "the waiter behind the dead holder was not granted");
+    assert!(locks.holds(a, "t").is_empty());
+    assert_eq!(locks.strong_pending_for("t"), 0, "the dead AE's strong count was left behind");
+}
+
+/// A wait whose future is dropped (its task cancelled) leaves the queue: it
+/// is not granted later behind the holder's release, so a request after
+/// that release is not held back by it.
+///
+/// Mutation: `wait_for` without its drop guard (the dropped waiter is
+/// granted AS on the holder's release and refuses the AE).
+#[tokio::test]
+async fn a_dropped_wait_leaves_the_queue() {
+    let locks = Arc::new(TableLocks::with_config(quick()));
+    let (a, b, c) = (owner(10), owner(11), owner(12));
+    assert!(granted(locks.request(a, "t", AEm, WaitRole::Ddl)));
+    let l = locks.clone();
+    let waiter = tokio::spawn(async move {
+        l.acquire(b, "t", ASm, WaitRole::Other, LockTimeout::Unbounded, NEVER).await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(locks.queued_on("t"), 1);
+    waiter.abort();
+    let _ = waiter.await;
+    assert_eq!(locks.queued_on("t"), 0, "the dropped wait is still queued");
+    locks.release_owner(a);
+    assert!(locks.holds(b, "t").is_empty(), "the dropped wait was granted");
+    assert!(locks.try_acquire(c, "t", AEm));
+}
+
+/// `release_owner` skips the main mutex when nothing is on the main path,
+/// and still releases a main-path holding when something is: the fast-path
+/// statement end and the strong one share one function.
+///
+/// Mutation: the skip ignores `main_busy` (an AE is never released).
+#[test]
+fn release_owner_skips_the_main_path_only_when_it_is_empty() {
+    let locks = TableLocks::new();
+    let (a, b) = (owner(10), owner(11));
+    assert!(granted(locks.request(a, "t", ASm, WaitRole::Other)));
+    locks.release_owner(a);
+    assert!(locks.main_is_empty() && locks.fast_path_len() == 0);
+    assert!(granted(locks.request(a, "t", AEm, WaitRole::Ddl)));
+    locks.release_owner(a);
+    assert!(locks.holds(a, "t").is_empty(), "the AE outlived its owner's release");
+    assert!(locks.try_acquire(b, "t", AEm));
+    locks.release_owner(b);
+    assert!(locks.main_is_empty());
+}
+
+/// What a statement's weak lock costs on the fast path, request and the
+/// owner's release, for B3b's perf gate: run with `--release --ignored
+/// fast_path_cost --nocapture`.
+#[test]
+#[ignore]
+fn fast_path_cost() {
+    let locks = TableLocks::new();
+    let n = 1_000_000u64;
+    let started = Instant::now();
+    for i in 0..n {
+        let o = owner(1_000 + i);
+        assert!(granted(locks.request(o, "acc", ASm, WaitRole::AutocommitReader)));
+        assert!(granted(locks.request(o, "acc", ASm, WaitRole::AutocommitReader)));
+        locks.release_owner(o);
+    }
+    let per = started.elapsed().as_nanos() as f64 / n as f64;
+    println!("{per:7.1} ns per statement: one AS, one confirmation, one release");
+}

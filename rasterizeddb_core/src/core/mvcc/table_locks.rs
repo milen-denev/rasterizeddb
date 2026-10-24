@@ -1,14 +1,15 @@
 //! Table locks: the one owner-keyed lock manager that statements and DDL go
 //! through (docs/persistent-indexes.md §7, W3 option C).
 //!
-//! # Not wired yet
+//! # Wired (B3b)
 //!
-//! This is slice B1: the lock state, the grant rule, the fast path, the
-//! wait-for graph and the wait loop, unit-tested and used by nothing. B2 gives
-//! every statement one [`LockOwner`], B3b routes every table lookup through
-//! `table_for(name, owner, mode)`, which lands here, and `RowLocks` delegates
-//! its table space (`table_blockers`, `set_waiting`) to it so table, row and
-//! referenced-key waits share one graph.
+//! `RowLocks` owns the manager and delegates its table space to it, so
+//! table, row and referenced-key waits share one graph
+//! (`RowLocks::table_deadlock_check`, `RowLocks::deadlock_victim`). Every
+//! table a statement executes against is taken through
+//! `Database::table_for` / `relation_for` / `tables_for`
+//! (`core/database/table_for.rs`) for the statement's [`LockOwner`], and
+//! `LOCK TABLE` maps its mode through [`PgLockMode::table_mode`].
 //!
 //! # Modes
 //!
@@ -111,7 +112,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -119,6 +120,33 @@ use smallvec::SmallVec;
 
 use crate::core::mvcc::TxId;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
+
+/// Hashes a [`LockOwner`] (a transaction id) with one multiply: ids are
+/// sequential, so the golden-ratio multiply spreads them over the table's
+/// top bits, where hashbrown looks. The owner-keyed maps are on every
+/// statement's path (a weak request and its release), and SipHash cost more
+/// than the rest of the fast path.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct OwnerHasher(u64);
+
+impl std::hash::Hasher for OwnerHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type OwnerMap<V> = HashMap<LockOwner, V, std::hash::BuildHasherDefault<OwnerHasher>>;
+type TableMap<V> = HashMap<Arc<str>, V, ahash::RandomState>;
 
 /// The four table-lock modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -573,19 +601,19 @@ impl TableState {
 
 #[derive(Default)]
 struct Main {
-    tables: HashMap<Arc<str>, TableState>,
+    tables: TableMap<TableState>,
     /// The tables each owner holds a main-path mode on, so releasing an owner
     /// costs its own locks, not a walk of every table.
-    owned: HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>,
+    owned: OwnerMap<SmallVec<[Arc<str>; 4]>>,
     /// The table each queued owner waits on. An owner waits for one lock at a
     /// time: its statement is one task.
-    waiting: HashMap<LockOwner, Arc<str>>,
+    waiting: OwnerMap<Arc<str>>,
 }
 
 /// One fast-path shard: weak holdings of the owners hashed to it.
 #[derive(Default)]
 struct Shard {
-    held: HashMap<LockOwner, SmallVec<[(Arc<str>, ModeSet); 4]>>,
+    held: OwnerMap<SmallVec<[(Arc<str>, ModeSet); 4]>>,
 }
 
 impl Shard {
@@ -682,6 +710,18 @@ pub struct TableLocks {
     main: Mutex<Main>,
     shards: Box<[Mutex<Shard>]>,
     strong_pending: Box<[AtomicU32]>,
+    /// How many owners hold or await anything on the main path (`owned` plus
+    /// `waiting`), published under the main mutex after every change. Zero is
+    /// the common case (only weak modes, all on the fast path), and lets
+    /// [`TableLocks::release_owner`] skip the main mutex, the one lock every
+    /// statement would otherwise take at its end. An owner's own main entries
+    /// are made by its own requests, or by a migration that holds the owner's
+    /// shard lock while it publishes; the release takes that shard lock
+    /// first, so it always sees a count that includes them.
+    main_busy: AtomicUsize,
+    /// Whether an owner's transaction can still be holding (see
+    /// [`TableLocks::set_liveness`]); unset, every owner is live.
+    liveness: std::sync::OnceLock<Box<dyn Fn(TxId) -> bool + Send + Sync>>,
     config: TableLockConfig,
 }
 
@@ -710,6 +750,8 @@ impl TableLocks {
             main: Mutex::new(Main::default()),
             shards: (0..FAST_PATH_SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
             strong_pending: (0..STRONG_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            main_busy: AtomicUsize::new(0),
+            liveness: std::sync::OnceLock::new(),
             config,
         }
     }
@@ -718,8 +760,54 @@ impl TableLocks {
         self.config
     }
 
+    /// Installs the test of whether an owner can still be holding: `false`
+    /// for an owner whose transaction has aborted. Every engine path releases
+    /// its owner explicitly (a statement's scope, a block's `OwnerRelease`,
+    /// replication's and the importer's owners), so this is the safety net
+    /// for one that never did: a holder found dead by a request it blocks is
+    /// released then, as the row locks prune theirs, instead of wedging the
+    /// table for the life of the process. Committed owners are never pruned:
+    /// a block's locks must outlive its commit until its outcome is durable
+    /// (finding L4), and only its release says when that is.
+    pub fn set_liveness(&self, live: impl Fn(TxId) -> bool + Send + Sync + 'static) {
+        let _ = self.liveness.set(Box::new(live));
+    }
+
+    fn is_dead(&self, owner: LockOwner) -> bool {
+        self.liveness.get().is_some_and(|live| !live(owner.id()))
+    }
+
+    /// Releases, on the main path, every holder of `key` that is dead (see
+    /// [`TableLocks::set_liveness`]) and that `owner`'s request for `mode`
+    /// conflicts with. True if any was.
+    fn prune_dead(&self, main: &mut Main, key: &Arc<str>, owner: LockOwner, mode: TableMode) -> bool {
+        if self.liveness.get().is_none() {
+            return false;
+        }
+        let dead: SmallVec<[LockOwner; 2]> = match main.tables.get(key) {
+            Some(state) => state
+                .holders
+                .iter()
+                .filter(|(o, set)| *o != owner && set.conflicts_with(mode) && self.is_dead(*o))
+                .map(|(o, _)| *o)
+                .collect(),
+            None => return false,
+        };
+        for o in &dead {
+            self.release_main(main, *o);
+        }
+        !dead.is_empty()
+    }
+
     fn main(&self) -> MutexGuard<'_, Main> {
         self.main.lock().expect("table lock map poisoned")
+    }
+
+    /// Publishes [`TableLocks::main_busy`]; called under the main mutex by
+    /// everything that changes `owned` or `waiting`.
+    fn publish(&self, main: &Main) {
+        self.main_busy
+            .store(main.owned.len() + main.waiting.len(), Ordering::SeqCst);
     }
 
     fn shard(&self, index: usize) -> MutexGuard<'_, Shard> {
@@ -795,6 +883,7 @@ impl TableLocks {
                 }
             }
         }
+        self.publish(&main);
     }
 
     /// A strong request's main-path step, after every shard migrated.
@@ -813,7 +902,7 @@ impl TableLocks {
     /// The main path: the grant rule against the table's holders and queue.
     fn decide(&self, owner: LockOwner, table: &str, mode: TableMode, role: WaitRole, fast: ModeSet) -> Decided {
         let mut main = self.main();
-        let Main { tables, owned, waiting } = &mut *main;
+        let Main { tables, waiting, .. } = &mut *main;
         debug_assert!(!waiting.contains_key(&owner), "{owner:?} requested a lock while it waits for another");
         let key = key_for(tables, table);
         let state = tables.entry(key.clone()).or_default();
@@ -821,10 +910,18 @@ impl TableLocks {
         if mine.contains(mode) {
             return Decided::Already;
         }
+        if state.holder_conflict(owner, mode) && self.prune_dead(&mut main, &key, owner, mode) {
+            // A dead holder was in the way and is gone; decide again.
+            drop(main);
+            return self.decide(owner, table, mode, role, fast);
+        }
+        let Main { tables, owned, waiting } = &mut *main;
+        let state = tables.entry(key.clone()).or_default();
         if state.grantable(owner, mode, mine.union(fast), state.waiters.len()) {
             if state.add(owner, mode) {
                 owned.entry(owner).or_default().push(key);
             }
+            self.publish(&main);
             return Decided::Granted;
         }
         let slot = Arc::new(WaitSlot::new());
@@ -836,6 +933,7 @@ impl TableLocks {
             slot: slot.clone(),
         });
         waiting.insert(owner, key.clone());
+        self.publish(&main);
         Decided::Queued(Wait {
             owner,
             table: key,
@@ -867,6 +965,7 @@ impl TableLocks {
         }
         let Main { tables, owned, waiting } = &mut *main;
         self.unqueue(tables, owned, waiting, wait.owner, ABANDONED);
+        self.publish(&main);
         WaitOutcome::Waiting
     }
 
@@ -874,9 +973,9 @@ impl TableLocks {
     /// strong counter it raised and grants what it was holding up.
     fn unqueue(
         &self,
-        tables: &mut HashMap<Arc<str>, TableState>,
-        owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>,
-        waiting: &mut HashMap<LockOwner, Arc<str>>,
+        tables: &mut TableMap<TableState>,
+        owned: &mut OwnerMap<SmallVec<[Arc<str>; 4]>>,
+        waiting: &mut OwnerMap<Arc<str>>,
         owner: LockOwner,
         state: u8,
     ) {
@@ -925,6 +1024,7 @@ impl TableLocks {
             self.strong(&key).fetch_sub(1, Ordering::SeqCst);
         }
         wake(tables, owned, waiting, &key);
+        self.publish(&main);
         true
     }
 
@@ -956,6 +1056,7 @@ impl TableLocks {
             self.strong(&key).fetch_sub(1, Ordering::SeqCst);
         }
         wake(tables, owned, waiting, &key);
+        self.publish(&main);
         true
     }
 
@@ -964,9 +1065,29 @@ impl TableLocks {
         // The shard first, then the main table, never both at once: a
         // migration holds a shard lock while it takes the main one. An entry
         // migrated before the shard lock is taken is in `holders` below.
-        self.shard(shard_of(owner)).held.remove(&owner);
+        {
+            let mut shard = self.shard(shard_of(owner));
+            if !shard.held.is_empty() {
+                shard.held.remove(&owner);
+            }
+        }
+        // Nobody holds or awaits anything on the main path, so neither does
+        // this owner (see `main_busy`): the common statement end.
+        if self.main_busy.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         let mut main = self.main();
-        let Main { tables, owned, waiting } = &mut *main;
+        if !main.owned.contains_key(&owner) && !main.waiting.contains_key(&owner) {
+            return;
+        }
+        self.release_main(&mut main, owner);
+    }
+
+    /// The main path's half of [`TableLocks::release_owner`]: `owner`'s
+    /// queued request and every main-path holding, with what they held up
+    /// granted.
+    fn release_main(&self, main: &mut Main, owner: LockOwner) {
+        let Main { tables, owned, waiting } = main;
         self.unqueue(tables, owned, waiting, owner, ABANDONED);
         for key in owned.remove(&owner).unwrap_or_default() {
             if let Some(state) = tables.get_mut(&key)
@@ -980,6 +1101,7 @@ impl TableLocks {
             }
             wake(tables, owned, waiting, &key);
         }
+        self.publish(main);
     }
 
     /// The modes `owner` holds on `table`, fast path and main.
@@ -1002,30 +1124,80 @@ impl TableLocks {
     /// returns the victim. `None` when `owner` is not waiting or is on no
     /// cycle.
     pub fn deadlock_check(&self, owner: LockOwner) -> Option<LockOwner> {
+        self.deadlock_check_with(owner, &HashMap::new())
+    }
+
+    /// [`TableLocks::deadlock_check`] over one graph with the row and
+    /// referenced-key waits (`RowLocks`'s edges, keyed by owner id): an owner
+    /// waiting here has this table's edges, any other owner `outside`'s. A
+    /// waiter outside this manager is weighed as an `Other` member waiting
+    /// for no table mode. The victim is [`choose_victim`]'s pick over the
+    /// whole cycle; if it waits here its wait fails and it is returned, and
+    /// if it waits outside, `None` is returned and the row side, which reads
+    /// the same graph and applies the same rule, fails it.
+    pub fn deadlock_check_with(
+        &self,
+        owner: LockOwner,
+        outside: &HashMap<TxId, SmallVec<[TxId; 4]>>,
+    ) -> Option<LockOwner> {
         let mut main = self.main();
-        let cycle = find_cycle(&main, owner)?;
+        let cycle = find_cycle(&main, owner, outside)?;
         let members: SmallVec<[CycleMember; 8]> = cycle
             .iter()
-            .map(|o| {
-                let key = &main.waiting[o];
-                let w = main.tables[key]
-                    .waiters
-                    .iter()
-                    .find(|w| w.owner == *o)
-                    .expect("a waiting owner is queued on its table");
-                CycleMember {
+            .map(|o| match waiter_of(&main, *o) {
+                Some(w) => CycleMember {
                     owner: *o,
                     mode: Some(w.mode),
                     role: w.role,
-                }
+                },
+                None => CycleMember {
+                    owner: *o,
+                    mode: None,
+                    role: WaitRole::Other,
+                },
             })
             .collect();
         let victim = choose_victim(&members);
         debug_assert!(victim.is_some(), "a cycle of autocommit readers only: {members:?}");
         let victim = victim?;
+        if !main.waiting.contains_key(&victim) {
+            return None;
+        }
         let Main { tables, owned, waiting } = &mut *main;
         self.unqueue(tables, owned, waiting, victim, DEADLOCK);
+        self.publish(&main);
         Some(victim)
+    }
+
+    /// The mode and role of `owner`'s queued request here, if it has one.
+    pub fn waiting_for(&self, owner: LockOwner) -> Option<(TableMode, WaitRole)> {
+        let main = self.main();
+        waiter_of(&main, owner).map(|w| (w.mode, w.role))
+    }
+
+    /// Whether `owner` holds or awaits anything here, on either path.
+    pub fn holds_any(&self, owner: LockOwner) -> bool {
+        if self.shard(shard_of(owner)).held.contains_key(&owner) {
+            return true;
+        }
+        let main = self.main();
+        main.owned.contains_key(&owner) || main.waiting.contains_key(&owner)
+    }
+
+    /// Another owner holding a mode on `table` that conflicts with `mode`,
+    /// read from the main path alone: exact for a weak `mode` (AS and RX
+    /// conflict only with S and AE, which never sit on the fast path), and
+    /// for a strong one right after a request for it on this table (which
+    /// migrated the fast path). Diagnostic and for tests.
+    pub fn conflicting_holder(&self, owner: LockOwner, table: &str, mode: TableMode) -> Option<LockOwner> {
+        let main = self.main();
+        main.tables.get(table).and_then(|state| {
+            state
+                .holders
+                .iter()
+                .find(|(o, set)| *o != owner && set.conflicts_with(mode))
+                .map(|(o, _)| *o)
+        })
     }
 
     /// Requests `mode` on `table` and waits for it: through the grant, a
@@ -1041,12 +1213,59 @@ impl TableLocks {
         timeout: LockTimeout,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), LockError> {
+        self.acquire_with(owner, table, mode, role, timeout, cancelled, &|o| self.deadlock_check(o))
+            .await
+    }
+
+    /// [`TableLocks::acquire`] with the deadlock check supplied by the caller
+    /// (`RowLocks`'s, which sees the row and referenced-key waits too).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_with(
+        &self,
+        owner: LockOwner,
+        table: &str,
+        mode: TableMode,
+        role: WaitRole,
+        timeout: LockTimeout,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        deadlock_check: &(dyn Fn(LockOwner) -> Option<LockOwner> + Sync),
+    ) -> Result<(), LockError> {
         let wait = match self.request(owner, table, mode, role) {
             Request::Granted => return Ok(()),
             Request::Queued(wait) => wait,
         };
+        self.wait_for(&wait, timeout, cancelled, deadlock_check).await
+    }
+
+    /// Waits for an already queued request (see [`TableLocks::acquire_with`]).
+    pub async fn wait_for(
+        &self,
+        wait: &Wait,
+        timeout: LockTimeout,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        deadlock_check: &(dyn Fn(LockOwner) -> Option<LockOwner> + Sync),
+    ) -> Result<(), LockError> {
+        // A wait whose future is dropped (its task cancelled) gives up its
+        // place in the queue rather than leave a request nobody will settle
+        // in front of every later one (rule (a)).
+        struct Settle<'a> {
+            locks: &'a TableLocks,
+            wait: &'a Wait,
+        }
+        impl Drop for Settle<'_> {
+            fn drop(&mut self) {
+                if self.wait.outcome() == WaitOutcome::Waiting {
+                    self.locks.abandon(self.wait);
+                }
+            }
+        }
+        let _settle = Settle { locks: self, wait };
+        let owner = wait.owner;
         let start = Instant::now();
         loop {
+            // A holder whose transaction aborted without releasing is
+            // released now (see `set_liveness`), which may grant this wait.
+            self.prune_for(wait);
             match wait.outcome() {
                 WaitOutcome::Granted => return Ok(()),
                 WaitOutcome::Deadlock => return Err(LockError::Deadlock),
@@ -1054,15 +1273,15 @@ impl TableLocks {
                 WaitOutcome::Waiting => {}
             }
             if cancelled() {
-                return self.give_up(&wait, LockError::Cancelled);
+                return self.give_up(wait, LockError::Cancelled);
             }
             let waited = start.elapsed();
             if let Some(limit) = timeout.limit()
                 && waited >= limit
             {
-                return self.give_up(&wait, LockError::Timeout);
+                return self.give_up(wait, LockError::Timeout);
             }
-            if waited >= self.config.deadlock_timeout && self.deadlock_check(owner).is_some() {
+            if waited >= self.config.deadlock_timeout && deadlock_check(owner).is_some() {
                 // Some member's wait failed; if it was this one, the outcome
                 // says so at the top.
                 continue;
@@ -1078,6 +1297,19 @@ impl TableLocks {
         }
     }
 
+    /// [`TableLocks::prune_dead`] for a queued request's table.
+    fn prune_for(&self, wait: &Wait) {
+        if self.liveness.get().is_none() || wait.outcome() != WaitOutcome::Waiting {
+            return;
+        }
+        let mut main = self.main();
+        if self.prune_dead(&mut main, &wait.table, wait.owner, wait.mode) {
+            let Main { tables, owned, waiting } = &mut *main;
+            wake(tables, owned, waiting, &wait.table);
+            self.publish(&main);
+        }
+    }
+
     /// Ends a wait with `error` unless it was settled first.
     fn give_up(&self, wait: &Wait, error: LockError) -> Result<(), LockError> {
         match self.abandon(wait) {
@@ -1089,11 +1321,11 @@ impl TableLocks {
 }
 
 /// The map's own `Arc` for `table`, or a new one.
-fn key_for(tables: &HashMap<Arc<str>, TableState>, table: &str) -> Arc<str> {
+fn key_for(tables: &TableMap<TableState>, table: &str) -> Arc<str> {
     tables.get_key_value(table).map_or_else(|| Arc::from(table), |(k, _)| k.clone())
 }
 
-fn forget_owned(owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>, owner: LockOwner, key: &Arc<str>) {
+fn forget_owned(owned: &mut OwnerMap<SmallVec<[Arc<str>; 4]>>, owner: LockOwner, key: &Arc<str>) {
     if let Some(list) = owned.get_mut(&owner) {
         list.retain(|k| k != key);
         if list.is_empty() {
@@ -1109,9 +1341,9 @@ fn forget_owned(owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>, owner: 
 /// ungranted waiter grantable, and removes a waiter, which only later
 /// waiters (judged after it) can have been queued behind.
 fn wake(
-    tables: &mut HashMap<Arc<str>, TableState>,
-    owned: &mut HashMap<LockOwner, SmallVec<[Arc<str>; 4]>>,
-    waiting: &mut HashMap<LockOwner, Arc<str>>,
+    tables: &mut TableMap<TableState>,
+    owned: &mut OwnerMap<SmallVec<[Arc<str>; 4]>>,
+    waiting: &mut OwnerMap<Arc<str>>,
     key: &Arc<str>,
 ) {
     let Some(state) = tables.get_mut(key) else {
@@ -1167,11 +1399,32 @@ fn edges(main: &Main, owner: LockOwner) -> SmallVec<[LockOwner; 4]> {
     out
 }
 
+/// `owner`'s queued request, if it waits on the main path.
+fn waiter_of(main: &Main, owner: LockOwner) -> Option<&Waiter> {
+    let key = main.waiting.get(&owner)?;
+    main.tables.get(key)?.waiters.iter().find(|w| w.owner == owner)
+}
+
 /// A cycle of the wait-for graph through `start`, as its members, or `None`.
-fn find_cycle(main: &Main, start: LockOwner) -> Option<SmallVec<[LockOwner; 8]>> {
+/// An owner waiting here has its table edges; any other has `outside`'s
+/// (the row and referenced-key waits), which is how a cycle through both
+/// kinds of wait is one cycle.
+fn find_cycle(
+    main: &Main,
+    start: LockOwner,
+    outside: &HashMap<TxId, SmallVec<[TxId; 4]>>,
+) -> Option<SmallVec<[LockOwner; 8]>> {
     if !main.waiting.contains_key(&start) {
         return None;
     }
+    let edges_of = |o: LockOwner| -> Option<SmallVec<[LockOwner; 4]>> {
+        if main.waiting.contains_key(&o) {
+            return Some(edges(main, o));
+        }
+        outside
+            .get(&o.id())
+            .map(|e| e.iter().filter_map(|id| LockOwner::new(*id)).collect())
+    };
     // Depth-first from `start`, looking for a path back to it.
     let mut path: Vec<(LockOwner, SmallVec<[LockOwner; 4]>, usize)> = vec![(start, edges(main, start), 0)];
     let mut visited = std::collections::HashSet::new();
@@ -1186,11 +1439,13 @@ fn find_cycle(main: &Main, start: LockOwner) -> Option<SmallVec<[LockOwner; 8]>>
         if to == start {
             return Some(path.iter().map(|(n, ..)| *n).collect());
         }
-        // An owner that is not waiting has no edges.
-        if !main.waiting.contains_key(&to) || !visited.insert(to) {
+        if !visited.insert(to) {
             continue;
         }
-        let e = edges(main, to);
+        // An owner that is waiting nowhere has no edges.
+        let Some(e) = edges_of(to) else {
+            continue;
+        };
         path.push((to, e, 0));
     }
     None

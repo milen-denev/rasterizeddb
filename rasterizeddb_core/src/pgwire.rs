@@ -44,6 +44,8 @@ mod owner_tests;
 #[cfg(test)]
 mod schema_view_tests;
 #[cfg(test)]
+mod table_lock_tests;
+#[cfg(test)]
 mod temp_relation_tests;
 mod fixed_rows;
 mod wire_out;
@@ -921,6 +923,69 @@ tokio::task_local! {
     static SESSION_CANCEL: StdArc<crate::core::cancel::SessionCancel>;
 }
 
+/// The end of an autocommit statement's reply, held until its table locks are
+/// released (docs/persistent-indexes.md §7, "As built (B3b)").
+///
+/// An autocommit statement's owner O holds its ACCESS SHARE and ROW EXCLUSIVE
+/// locks to its end: after the commit, the outcome flush and the sync, after
+/// its CTE temporaries are dropped, when its scope in [`execute_recorded`]
+/// ends. The reply used to be written inside that scope, and an
+/// `ErrorResponse` is flushed at once (as is a result that passes
+/// `wire_out::FLUSH_AT`), so a client could read its statement's answer and
+/// start the next thing it does, on this connection or another, while the
+/// statement's locks were still held: a `LOCK TABLE … NOWAIT` refused, a DDL
+/// queued, by a statement the client had already seen finish.
+///
+/// So from the first message that ends the statement's reply
+/// (`CommandComplete`, `ErrorResponse`, `EmptyQueryResponse`,
+/// `PortalSuspended`), everything [`send_message`] would write is kept here
+/// instead, and written after the scope has released O: release after
+/// durability, before the reply. Rows ahead of it still stream as they
+/// always did (the result is not buffered whole); only its last few
+/// messages wait. A block's statements are not held: the block's owner keeps
+/// its locks to COMMIT or ROLLBACK, which release before they reply.
+///
+/// The bytes live on the statement's cancel signal (`HeldReply`), which is
+/// scoped to exactly the statement and outside its owner's scope.
+type ReplyHold = crate::core::cancel::HeldReply;
+
+/// Whether `tag` ends a statement's reply (see [`ReplyHold`]).
+fn ends_reply(tag: u8) -> bool {
+    matches!(tag, b'C' | b'E' | b'I' | b's')
+}
+
+/// Keeps a message for the statement's [`ReplyHold`] when one is open and
+/// holding (or `tag` begins holding); `false` when it should be written now.
+fn hold_reply(tag: u8, header: &[u8], payload: &[u8]) -> bool {
+    crate::core::cancel::STATEMENT_CANCEL
+        .try_with(|cancel| {
+            let Some(hold) = cancel.held_reply() else {
+                return false;
+            };
+            let mut hold: parking_lot::MutexGuard<'_, ReplyHold> = hold.lock();
+            if !hold.holding && !ends_reply(tag) {
+                return false;
+            }
+            hold.holding = true;
+            hold.error |= tag == b'E';
+            hold.bytes.extend_from_slice(header);
+            hold.bytes.extend_from_slice(payload);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Test hook: a statement carrying the comment `/* rdb_release_delay_ms=N */`
+/// waits N ms between its end and its owner's release, so a test can tell a
+/// reply sent before the release from one sent after it. Per statement, so
+/// no other test's statements are slowed. Off in every server build.
+#[cfg(any(test, feature = "test_tokens"))]
+fn test_release_delay(stmt: &str) -> Option<std::time::Duration> {
+    let at = stmt.find("/* rdb_release_delay_ms=")? + "/* rdb_release_delay_ms=".len();
+    let digits: String = stmt[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok().map(std::time::Duration::from_millis)
+}
+
 /// The duplicate descriptor `PEER_WATCH` holds, and what the session's read
 /// buffer knows that the descriptor cannot see.
 ///
@@ -1300,7 +1365,7 @@ where
     // The session is established; from here a quiet client is an idle
     // session, bounded (if at all) by the idle timeouts instead.
     context.handshake_finished.store(true, Ordering::Release);
-    let startup_timeout = startup_statement_timeout(parameters);
+    let startup_timeout = (startup_statement_timeout(parameters), startup_lock_timeout(parameters));
     SESSION_CANCEL
         .scope(
             registration.session.clone(),
@@ -1358,7 +1423,19 @@ mod peer_watch_tests {
 /// Both spellings are accepted: the parameter on its own, which PostgreSQL
 /// allows for any GUC, and inside `options`.
 fn startup_statement_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
-    if let Some(direct) = parameters.get("statement_timeout") {
+    startup_time_setting(parameters, "statement_timeout")
+}
+
+/// `lock_timeout` as the StartupMessage asked for it, spelled either way
+/// [`startup_statement_timeout`] accepts.
+fn startup_lock_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
+    startup_time_setting(parameters, "lock_timeout")
+}
+
+/// A time setting (`name`, milliseconds) from the StartupMessage: the
+/// parameter on its own, or `-c name=value` inside `options`.
+fn startup_time_setting(parameters: &HashMap<String, String>, setting_name: &str) -> Option<u64> {
+    if let Some(direct) = parameters.get(setting_name) {
         if let Some(ms) = parse_statement_timeout(direct) {
             return Some(ms);
         }
@@ -1402,7 +1479,7 @@ fn startup_statement_timeout(parameters: &HashMap<String, String>) -> Option<u64
             field.strip_prefix("-c")
         };
         if let Some((name, value)) = setting.and_then(|s| s.split_once('=')) {
-            if name.trim().eq_ignore_ascii_case("statement_timeout") {
+            if name.trim().eq_ignore_ascii_case(setting_name) {
                 if let Some(ms) = parse_statement_timeout(value) {
                     return Some(ms);
                 }
@@ -1504,7 +1581,8 @@ async fn run_message_loop<S>(
     principal: Principal,
     limits: ConnectionLimits,
     stream: &mut S,
-    startup_statement_timeout: Option<u64>,
+    // `statement_timeout` and `lock_timeout` from the StartupMessage.
+    startup_timeouts: (Option<u64>, Option<u64>),
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1513,7 +1591,8 @@ where
     // Applied before the first statement, so a driver that set it at connection
     // time is protected by it from the very first query rather than from
     // whenever it happens to issue a `SET`.
-    state.statement_timeout_ms = startup_statement_timeout;
+    state.statement_timeout_ms = startup_timeouts.0;
+    state.lock_timeout_ms = startup_timeouts.1;
     // A connection that drops mid-transaction must not leave it running: it
     // would hold back reclamation forever and its versions would never resolve.
     // The loop returns from several places, so the cleanup is a guard rather
@@ -1836,6 +1915,11 @@ struct SessionState {
     /// as milliseconds because that is the unit `SHOW` reports when the value
     /// carries no unit of its own.
     statement_timeout_ms: Option<u64>,
+    /// `SET lock_timeout` for this session, in milliseconds: how long one
+    /// table-lock wait may last before it fails with 55P03. `None` never set
+    /// and zero both mean no bound, PostgreSQL's default (§7: a bounded
+    /// default would fail long migrations under load).
+    lock_timeout_ms: Option<u64>,
     /// `SET synchronous_commit = off` for this session, if it set one.
     ///
     /// `None` means follow the server, which is what a session that never asks
@@ -2055,6 +2139,7 @@ impl SessionState {
             default_isolation: IsolationLevel::default(),
             default_read_only: false,
             statement_timeout_ms: None,
+            lock_timeout_ms: None,
             synchronous_commit: None,
             statement_tx: None,
             statement_failed: false,
@@ -4295,8 +4380,16 @@ where
         .filter(|ms| *ms > 0)
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     // The scan asks this per batch, in the same place it checks the deadline.
+    // An autocommit statement's reply ends after its owner has released its
+    // locks (see `ReplyHold`): held on the signal, drained below once the
+    // signal's scope, and with it the owner's, has ended.
+    let holds_reply = state.transaction.is_none();
     let cancel = {
-        let base = crate::core::cancel::StatementCancel::new(deadline);
+        let mut base = crate::core::cancel::StatementCancel::new(deadline)
+            .with_lock_timeout(state.lock_timeout_ms.unwrap_or(0));
+        if holds_reply {
+            base = base.holding_reply();
+        }
         match PEER_WATCH.try_with(|w| w.clone()).ok().flatten() {
             Some(watch) => {
                 std::sync::Arc::new(base.watching(Box::new(move || watch.gone())))
@@ -4333,7 +4426,8 @@ where
     // future so the statement's is stored once.
     let block_root = state.transaction.as_ref().map(|t| t.id);
     let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
-    crate::core::cancel::STATEMENT_CANCEL
+    let signal = cancel.clone();
+    let result = crate::core::cancel::STATEMENT_CANCEL
         .scope(cancel, async {
             match block_root {
                 Some(root) => {
@@ -4354,11 +4448,21 @@ where
                     .await
                 }
                 None => {
-                    crate::core::mvcc::owner::statement(
-                        &transactions,
-                        &row_locks,
-                        crate::core::mvcc::owner::OwnerKind::Statement,
-                        crate::core::notice::collect(execute_recorded_inner(
+                    #[cfg(not(any(test, feature = "test_tokens")))]
+                    let inner = execute_recorded_inner(
+                        database,
+                        state,
+                        stream,
+                        stmt,
+                        result_formats,
+                        omit_description,
+                        prepared,
+                    );
+                    // Inside O's scope, a test hook can widen the window
+                    // between the statement's end and its locks' release.
+                    #[cfg(any(test, feature = "test_tokens"))]
+                    let inner = async {
+                        let result = execute_recorded_inner(
                             database,
                             state,
                             stream,
@@ -4366,13 +4470,35 @@ where
                             result_formats,
                             omit_description,
                             prepared,
-                        )),
+                        )
+                        .await;
+                        if let Some(delay) = test_release_delay(stmt) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        result
+                    };
+                    crate::core::mvcc::owner::statement(
+                        &transactions,
+                        &row_locks,
+                        crate::core::mvcc::owner::OwnerKind::Statement,
+                        crate::core::notice::collect(inner),
                     )
                     .await
                 }
             }
         })
-        .await
+        .await;
+    // O's scope has ended, so its locks are released: now the reply's end.
+    if let Some(hold) = signal.held_reply() {
+        let held = std::mem::take(&mut *hold.lock());
+        if !held.bytes.is_empty() {
+            stream.write_all(&held.bytes).await?;
+            if held.error {
+                stream.flush().await?;
+            }
+        }
+    }
+    result
 }
 
 /// Runs a prepared statement's execution from its cached parse when it has
@@ -4982,6 +5108,18 @@ where
         crate::core::rql::prepared::note_rewritten();
     }
     let stmt = folded_where.as_str();
+
+    // A statement with CTE bodies or derived tables runs parts of itself
+    // before the engine sees its outer statement, so its whole known table
+    // set is taken here, at once and in name order, before any part runs
+    // (§7 Acquisition); the engine's entry then finds every lock held. A
+    // plain statement's set is taken at the engine's entry.
+    if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::lock_set::names_a_subquery(stmt) {
+        if let Err(e) = crate::core::rql::executor::lock_statement_set(database, stmt).await {
+            fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+            return Ok(());
+        }
+    }
 
     let materialized = match crate::core::rql::cte::materialize(stmt, database, effective_tx).await
     {
@@ -5809,6 +5947,13 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
     if has("constraint \"") && has("\" for table \"") && has("does not exist") {
         return "42704";
+    }
+    // `55P03` is `lock_not_available`: a table-lock wait that outlasted
+    // `lock_timeout`, or a `NOWAIT` that found the lock held. Decided before
+    // 57014, whose words ("canceling statement") the timeout's message shares,
+    // as PostgreSQL's does.
+    if has("canceling statement due to lock timeout") || has("could not obtain lock on") {
+        return "55P03";
     }
     // `57014` is `query_canceled`, which is what a driver watches for to tell
     // "the server gave up on this" apart from "this statement is wrong".
@@ -7012,6 +7157,33 @@ where
         return Ok(true);
     }
 
+    // `lock_timeout` bounds every table-lock wait (55P03 past it; `0` is no
+    // bound), so it is a real setting, answered before the generic branch
+    // that would acknowledge it and drop it.
+    if let Some(rest) = strip_setting(&s_lower, "lock_timeout") {
+        match rest {
+            None => {
+                state.lock_timeout_ms = None;
+                send_command_complete(stream, "SET").await?;
+            }
+            Some(value) => match parse_statement_timeout(&value) {
+                Some(ms) => {
+                    state.lock_timeout_ms = Some(ms);
+                    send_command_complete(stream, "SET").await?;
+                }
+                None => {
+                    send_error_response(
+                        stream,
+                        "22023",
+                        &format!("invalid value for parameter \"lock_timeout\": \"{}\"", value),
+                    )
+                    .await?;
+                }
+            },
+        }
+        return Ok(true);
+    }
+
     // The idle timeouts are enforced, so they are real settings too: a `SET`
     // acknowledged and dropped would let a pool believe its sessions are
     // bounded when nothing bounds them.
@@ -7239,10 +7411,12 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
             Some(ms) => format!("{}ms", ms),
             None => "0".to_string(),
         },
-        // Still unenforced, and still answered as disabled, which is what it
-        // is. Not grouped with `statement_timeout` any more precisely because
-        // that one now means something.
-        "lock_timeout" => "0".to_string(),
+        // Enforced on every table-lock wait, and reported as this session set
+        // it: `0` (no bound) unless it set one.
+        "lock_timeout" => match state.lock_timeout_ms {
+            Some(ms) if ms > 0 => format!("{}ms", ms),
+            _ => "0".to_string(),
+        },
         // Enforced per session (see `idle_limit`), and reported as this
         // session has them.
         "idle_in_transaction_session_timeout" => {
@@ -9035,6 +9209,11 @@ where
     let mut header = [0u8; 5];
     header[0] = tag;
     header[1..].copy_from_slice(&len.to_be_bytes());
+    // The end of an autocommit statement's reply waits for its locks'
+    // release (see `ReplyHold`).
+    if hold_reply(tag, &header, payload) {
+        return Ok(());
+    }
     stream.write_all(&header).await?;
     stream.write_all(payload).await?;
     // Not flushed here. The session stream (`wire_out::WireStream`) buffers,

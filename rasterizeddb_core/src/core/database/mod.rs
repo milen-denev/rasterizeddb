@@ -27,6 +27,7 @@ mod relation_dispatch_tests;
 mod reaper_tests;
 pub mod relation;
 pub mod slots;
+pub mod table_for;
 #[cfg(test)]
 mod slots_source_tests;
 #[cfg(test)]

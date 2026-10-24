@@ -18,11 +18,11 @@
 //!   catalog views, introspection) use [`Database::schema_view`]: the schema
 //!   plus a read-only stats accessor, never a scan, a mutator or a `Table`,
 //!   and no lock (§7's deliberate deviation; Q3).
-//! - Everything that executes still reaches a `Table` through the escape
-//!   hatches [`Database::table_unlocked`] and
-//!   [`Database::each_table_unlocked`]. Their callers are listed by name in
-//!   `slots_source_tests`; B3b replaces each with `table_for`, which takes the
-//!   table lock first, and the lists must then be empty.
+//! - Everything that executes reaches a `Table` through `table_for` /
+//!   `relation_for` (`table_for.rs`), which take the table lock first and
+//!   only then load the slot. The escape hatches [`Database::table_unlocked`]
+//!   and [`Database::each_table_unlocked`] remain for three callers, each
+//!   listed with its reason in `slots_source_tests::ESCAPES`.
 //!
 //! Outside `core::database` the maps do not compile; a crate reaches a table
 //! through these functions:
@@ -193,9 +193,8 @@ impl Slot {
     }
 
     /// False once the name no longer owns this slot (DROP, RENAME, a reload's
-    /// removal): B3b's `table_for` re-resolves the name when it finds that
-    /// after waiting.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// removal): `table_for` re-resolves the name when it finds that after
+    /// waiting.
     pub(crate) fn is_live(&self) -> bool {
         self.state.load(Ordering::Acquire) == LIVE
     }
@@ -237,6 +236,16 @@ impl SchemaView {
 
     pub fn is_partitioned(&self) -> bool {
         matches!(self.of, ViewOf::Partitioned(_))
+    }
+
+    /// Whether the instance is a schema-only shell: a partitioned table's,
+    /// or a shell with no partitioned table behind it (whose data calls
+    /// refuse).
+    pub fn is_shell(&self) -> bool {
+        match &self.of {
+            ViewOf::Partitioned(_) => true,
+            ViewOf::Plain(table) => table.is_shell(),
+        }
     }
 
     /// The read-only stats accessor (Q3).
@@ -322,6 +331,15 @@ impl Database {
         })
     }
 
+    /// The key a table lock on `name` is taken under: the key `name`
+    /// resolves to, so two spellings that resolve to one table lock one
+    /// entry once case folding lands in [`Database::resolve`]. Today the
+    /// name itself, borrowed (no allocation on the statement path).
+    #[inline]
+    pub(crate) fn lock_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str> {
+        std::borrow::Cow::Borrowed(name)
+    }
+
     /// The key a new name is registered under: CREATE (and every reinstall)
     /// stores the canonical spelling, the one [`Database::resolve_key`] maps
     /// lookups to. Today the identity; case folding decides it here.
@@ -330,8 +348,8 @@ impl Database {
         name
     }
 
-    /// The slot `name` resolves to (B3b's `table_for` loads through it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The slot `name` resolves to; `table_for` loads it after the lock
+    /// (and only it may: `slots_source_tests::only_table_for_loads_a_slot`).
     pub(crate) fn slot(&self, name: &str) -> Option<Arc<Slot>> {
         self.resolve(name, |key| {
             self.table_slots.get(key).map(|slot| slot.value().clone())
@@ -443,10 +461,10 @@ impl Database {
         }
     }
 
-    /// **Transitional escape hatch.** The instance registered under `name`
-    /// (a partitioned table's shell, as `tables.get` gave), taken with no
-    /// table lock. Its callers are listed in `slots_source_tests` so B3b can
-    /// move each to `table_for`; the list must then be empty.
+    /// **Escape hatch.** The instance registered under `name` (a partitioned
+    /// table's shell, as `tables.get` gave), taken with no table lock. Its
+    /// callers are listed, each with its reason, in
+    /// `slots_source_tests::ESCAPES`; executing code takes `table_for`.
     #[inline]
     pub(crate) fn table_unlocked(&self, name: &str) -> Option<Arc<DbTable>> {
         self.resolve(name, |key| {
@@ -454,10 +472,9 @@ impl Database {
         })
     }
 
-    /// **Transitional escape hatch.** Every registered instance with its
-    /// name, taken with no table lock, for the paths that walk every table
-    /// (VACUUM, SHOW STORAGE, the index-name lookups). Listed like
-    /// [`Database::table_unlocked`].
+    /// **Escape hatch.** Every registered instance with its name, taken with
+    /// no table lock, for the FK-sidecar walks over other tables (B4 gives
+    /// them their lock set). Listed like [`Database::table_unlocked`].
     pub(crate) fn each_table_unlocked(&self) -> Vec<(String, Arc<DbTable>)> {
         self.table_slots
             .iter()

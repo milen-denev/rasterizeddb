@@ -229,7 +229,11 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockTable {
     pub tables: Vec<String>,
-    pub mode: crate::core::mvcc::row_locks::TableLockMode,
+    /// The mode as PostgreSQL names it; [`PgLockMode::table_mode`] is the one
+    /// of the four this engine takes (never weaker).
+    ///
+    /// [`PgLockMode::table_mode`]: crate::core::mvcc::table_locks::PgLockMode::table_mode
+    pub mode: crate::core::mvcc::table_locks::PgLockMode,
     /// `NOWAIT` — fail instead of waiting for the holder.
     pub nowait: bool,
 }
@@ -238,7 +242,7 @@ pub struct LockTable {
 ///
 /// Returns `None` when the statement is not a `LOCK`.
 pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
-    use crate::core::mvcc::row_locks::TableLockMode;
+    use crate::core::mvcc::table_locks::PgLockMode;
 
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
     let upper = trimmed.to_ascii_uppercase();
@@ -280,7 +284,7 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
     }
 
     let mut tail = rest[list_end..].trim_start();
-    let mut mode = TableLockMode::Exclusive; // PostgreSQL's default.
+    let mut mode = PgLockMode::AccessExclusive; // PostgreSQL's default.
 
     if tail.to_ascii_uppercase().starts_with("IN ") {
         let after = tail[3..].trim_start();
@@ -295,15 +299,14 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
             .collect::<Vec<_>>()
             .join(" ");
         mode = match named.as_str() {
-            // Readers. `SHARE` blocks writers but not other readers.
-            "ACCESS SHARE" | "ROW SHARE" | "SHARE" => TableLockMode::Shared,
-            // Everything from `ROW EXCLUSIVE` up. Mapped to one exclusive mode,
-            // which refuses more than PostgreSQL would and permits no less.
-            "ROW EXCLUSIVE"
-            | "SHARE UPDATE EXCLUSIVE"
-            | "SHARE ROW EXCLUSIVE"
-            | "EXCLUSIVE"
-            | "ACCESS EXCLUSIVE" => TableLockMode::Exclusive,
+            "ACCESS SHARE" => PgLockMode::AccessShare,
+            "ROW SHARE" => PgLockMode::RowShare,
+            "ROW EXCLUSIVE" => PgLockMode::RowExclusive,
+            "SHARE UPDATE EXCLUSIVE" => PgLockMode::ShareUpdateExclusive,
+            "SHARE" => PgLockMode::Share,
+            "SHARE ROW EXCLUSIVE" => PgLockMode::ShareRowExclusive,
+            "EXCLUSIVE" => PgLockMode::Exclusive,
+            "ACCESS EXCLUSIVE" => PgLockMode::AccessExclusive,
             other => {
                 return Some(Err(format!("'{}' is not a lock mode", other)));
             }
@@ -332,7 +335,7 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
 #[cfg(test)]
 mod lock_table_tests {
     use super::*;
-    use crate::core::mvcc::row_locks::TableLockMode;
+    use crate::core::mvcc::table_locks::PgLockMode;
 
     fn parsed(sql: &str) -> LockTable {
         parse_lock_table(sql).expect("is a LOCK").expect("parses")
@@ -344,7 +347,7 @@ mod lock_table_tests {
         // never grants less than the caller expects.
         let l = parsed("LOCK TABLE t");
         assert_eq!(l.tables, vec!["t".to_string()]);
-        assert_eq!(l.mode, TableLockMode::Exclusive);
+        assert_eq!(l.mode, PgLockMode::AccessExclusive);
         assert!(!l.nowait);
     }
 
@@ -357,15 +360,15 @@ mod lock_table_tests {
         );
         assert_eq!(
             parsed("LOCK TABLE t IN SHARE MODE").mode,
-            TableLockMode::Shared
+            PgLockMode::Share
         );
         assert_eq!(
             parsed("LOCK TABLE t IN ACCESS SHARE MODE").mode,
-            TableLockMode::Shared
+            PgLockMode::AccessShare
         );
         assert_eq!(
             parsed("LOCK TABLE t IN ACCESS EXCLUSIVE MODE").mode,
-            TableLockMode::Exclusive
+            PgLockMode::AccessExclusive
         );
         assert!(parsed("LOCK TABLE t IN EXCLUSIVE MODE NOWAIT").nowait);
         // Quoted and schema-qualified names are what an ORM emits.

@@ -18,7 +18,8 @@ use super::probe::{self, Record, Site};
 use super::*;
 use crate::core::database::Database;
 use crate::core::mvcc::TxOutcome;
-use crate::core::mvcc::row_locks::{Acquired, TableLockMode};
+use crate::core::mvcc::row_locks::Acquired;
+use crate::core::mvcc::table_locks::TableMode;
 use crate::core::mvcc::status::StatusLog;
 use crate::core::mvcc::transaction::FROZEN_TX;
 use crate::core::rql::executor;
@@ -215,7 +216,7 @@ fn an_attempts_end_keeps_its_owners_table_locks() {
     assert_eq!(locks.owner_of(a1), o.id());
     assert_eq!(locks.txn_of(a1), a1);
     assert_eq!(
-        locks.acquire_table("t", a1, TableLockMode::Exclusive, LIVE),
+        locks.acquire_table("t", a1, TableMode::AccessExclusive),
         Acquired::Yes
     );
     assert_eq!(
@@ -245,7 +246,7 @@ fn an_attempts_end_keeps_its_owners_table_locks() {
         "attempt 1's row lock carried past its end"
     );
     assert_eq!(
-        locks.table_conflict("t", other, true, LIVE),
+        locks.table_conflict("t", other, true),
         Some(o.id()),
         "attempt 1's abort released O's table lock"
     );
@@ -255,11 +256,11 @@ fn an_attempts_end_keeps_its_owners_table_locks() {
     let alias = locks.owner_alias(a2, o);
     assert_eq!(locks.owner_of(a2), o.id(), "attempt 2 is not aliased to O");
     assert_eq!(
-        locks.acquire_table("t", a2, TableLockMode::Exclusive, LIVE),
+        locks.acquire_table("t", a2, TableMode::AccessExclusive),
         Acquired::Yes
     );
     assert_eq!(
-        locks.table_conflict("t", a2, true, LIVE),
+        locks.table_conflict("t", a2, true),
         None,
         "O's own lock conflicted with its attempt"
     );
@@ -269,7 +270,7 @@ fn an_attempts_end_keeps_its_owners_table_locks() {
 
     locks.release_owner(o);
     assert!(!locks.owner_holds_tables(o.id()));
-    assert_eq!(locks.table_conflict("t", other, true, LIVE), None);
+    assert_eq!(locks.table_conflict("t", other, true), None);
     assert_eq!(locks.alias_len(), 0);
 }
 
@@ -282,7 +283,7 @@ fn a_blocks_rows_end_with_it_and_its_table_locks_with_its_owner() {
     let block = m.begin();
     let other = m.begin();
     assert_eq!(
-        locks.acquire_table("t", block, TableLockMode::Shared, LIVE),
+        locks.acquire_table("t", block, TableMode::Share),
         Acquired::Yes
     );
     assert_eq!(
@@ -301,9 +302,9 @@ fn a_blocks_rows_end_with_it_and_its_table_locks_with_its_owner() {
         locks.owner_holds_tables(block),
         "the commit released the block's table lock before durability"
     );
-    assert_eq!(locks.table_conflict("t", other, true, LIVE), Some(block));
+    assert_eq!(locks.table_conflict("t", other, true), Some(block));
     locks.release_owner(LockOwner::block(block).unwrap());
-    assert_eq!(locks.table_conflict("t", other, true, LIVE), None);
+    assert_eq!(locks.table_conflict("t", other, true), None);
 }
 
 // ------------------------------------------------------------ the scope
@@ -323,7 +324,7 @@ async fn a_statement_scope_mints_once_joins_nested_and_ends_o() {
         assert_eq!(db.transactions.outcome(o.owner.id()), TxOutcome::InProgress);
         let nested = statement(&t, &l, OwnerKind::Native, async { ensure().unwrap() }).await;
         db.row_locks
-            .acquire_table("t", o.owner.id(), TableLockMode::Exclusive, LIVE);
+            .acquire_table("t", o.owner.id(), TableMode::AccessExclusive);
         (o, nested)
     })
     .await;
@@ -365,7 +366,7 @@ async fn a_block_scope_is_its_root_and_outlives_the_statement() {
     let o = under(&db.transactions, root, OwnerKind::Block, async {
         let o = ensure().unwrap();
         db.row_locks
-            .acquire_table("t", root, TableLockMode::Exclusive, LIVE);
+            .acquire_table("t", root, TableMode::AccessExclusive);
         o
     })
     .await;
@@ -408,7 +409,7 @@ async fn an_adopted_o_is_the_statements_transaction() {
                 "an adopted O reads and writes"
             );
             db.row_locks
-                .acquire_table("t", tx, TableLockMode::Exclusive, LIVE);
+                .acquire_table("t", tx, TableMode::AccessExclusive);
             (o, tx)
         },
     )
@@ -535,7 +536,7 @@ async fn every_autocommit_attempt_acts_for_the_same_o() {
                 async {
                     let o = ensure().unwrap().owner;
                     db.row_locks
-                        .acquire_table("t", o.id(), TableLockMode::Exclusive, LIVE);
+                        .acquire_table("t", o.id(), TableMode::AccessExclusive);
                     *minted.lock() = Some(o);
                     executor::execute_with_sync(
                         purpose("UPDATE u SET v = 'won' WHERE id = 1"),
@@ -652,16 +653,26 @@ async fn a_blocks_table_lock_survives_another_statements_retries() {
         db.row_locks.owner_holds_tables(block),
         "another statement's retries released the block's lock"
     );
-    let refused = executor::execute_with_sync(
-        purpose("UPDATE locked SET v = 'b' WHERE id = 1"),
-        db.clone(),
-        false,
+    // The write waits behind the block's lock (B3b); bounded here so it
+    // ends in 55P03 rather than waiting for the block.
+    let refused = crate::core::cancel::with_lock_timeout(
+        200,
+        executor::execute_with_sync(
+            purpose("UPDATE locked SET v = 'b' WHERE id = 1"),
+            db.clone(),
+            false,
+        ),
     )
     .await;
     assert_eq!(
         refused.first(),
         Some(&3),
         "a write got past the block's EXCLUSIVE lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains("lock timeout"),
+        "{}",
+        String::from_utf8_lossy(&refused)
     );
 
     db.commit_transaction(block);
@@ -697,7 +708,7 @@ async fn o_is_released_and_ended_on_every_exit_path() {
                 let o = ensure().unwrap().owner;
                 assert_eq!(
                     db.row_locks
-                        .acquire_table("t", o.id(), TableLockMode::Exclusive, LIVE),
+                        .acquire_table("t", o.id(), TableMode::AccessExclusive),
                     Acquired::Yes
                 );
                 (body().await, o)
@@ -768,7 +779,7 @@ async fn o_is_released_and_ended_on_every_exit_path() {
                 let o = ensure().unwrap().owner;
                 *seen.lock() = Some(o);
                 db.row_locks
-                    .acquire_table("t", o.id(), TableLockMode::Exclusive, LIVE);
+                    .acquire_table("t", o.id(), TableMode::AccessExclusive);
                 executor::execute_with_sync(purpose(waiting), db.clone(), false).await
             },
         ),

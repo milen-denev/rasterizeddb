@@ -953,10 +953,9 @@ mod load_tests {
             assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "the row ran outside its batch's owner");
         }
         // Something for the batch's owner to hold, so only its release frees it.
-        let live: &dyn Fn(crate::core::mvcc::TxId) -> bool = &|_| true;
         database
             .row_locks
-            .acquire_table("owned", tx, crate::core::mvcc::row_locks::TableLockMode::Shared, live);
+            .acquire_table("owned", tx, crate::core::mvcc::table_locks::TableMode::Share);
         assert!(database.row_locks.owner_holds_tables(tx));
         let n = loader.finish().await.expect("finish");
         assert_eq!(n, 1);
