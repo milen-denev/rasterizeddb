@@ -133,22 +133,19 @@ fn probe_avx512_shim(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WORDS])
 
 static PROBE: OnceLock<ProbeFn> = OnceLock::new();
 
-/// Resolve the best probe kernel for this CPU, once.
+/// Resolve the probe kernel for the process's SIMD level, once.
+///
+/// The level is [`crate::simds::cpu::level`], which `--simd` fixes at startup,
+/// so forcing `avx2` on an AVX-512 machine forces it here too. That level
+/// already accounts for what the CPU and the OS support.
 #[inline]
 pub fn probe_fn() -> ProbeFn {
-    *PROBE.get_or_init(|| {
+    *PROBE.get_or_init(|| match crate::simds::cpu::level() {
         #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx512f") {
-                return probe_avx512_shim as ProbeFn;
-            }
-            // AVX2 is guaranteed by the crate's `target-cpu=x86-64-v3` baseline,
-            // but detect anyway so the binary stays correct if that changes.
-            if is_x86_feature_detected!("avx2") {
-                return probe_avx2_shim as ProbeFn;
-            }
-        }
-        probe_zone_scalar as ProbeFn
+        crate::simds::cpu::SimdLevel::Avx512 => probe_avx512_shim as ProbeFn,
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx2 => probe_avx2_shim as ProbeFn,
+        _ => probe_zone_scalar as ProbeFn,
     })
 }
 
@@ -171,16 +168,13 @@ pub(super) fn runnable_kernels() -> Vec<(&'static str, ProbeFn)> {
 
 /// Name of the active kernel. For benchmarks and diagnostics.
 pub fn active_kernel() -> &'static str {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return "avx512f";
-        }
-        if is_x86_feature_detected!("avx2") {
-            return "avx2";
-        }
+    match crate::simds::cpu::level() {
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx512 => "avx512f",
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx2 => "avx2",
+        _ => "scalar",
     }
-    "scalar"
 }
 
 /// Write the `f`-bit fingerprint `g` into slot `local` of a zone's planes.
