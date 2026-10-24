@@ -77,6 +77,11 @@ enum Kind {
     // the conflict, and with it the refusal, always happens.
     InsertOnConflictKeyChange,
     PreparedUpsert,
+    // ON CONFLICT errors, the same SQLSTATE on both table kinds with
+    // nothing written (1c421c4): a target that is a strict subset of the
+    // key (42P10), and a multi-row DO UPDATE proposing one key twice (21000).
+    InsertOnConflictSubsetTarget,
+    InsertOnConflictUpdateTwice,
     InsertReturning,
     UpdateByKey,
     UpdateByPartitionKey,
@@ -199,7 +204,8 @@ const ALL_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertNulls, InsertQuotedKey, InsertSelect, InsertOnConflictNothing,
     InsertOnConflictUpdate, InsertOnConflictNothingReturning, InsertOnConflictUpdateWhere,
     InsertOnConflictUpdateReturning, InsertMultiOnConflict, InsertSelectOnConflict, InsertOnConflictKeyAssign,
-    InsertOnConflictKeyChange, PreparedUpsert, InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
+    InsertOnConflictKeyChange, PreparedUpsert, InsertOnConflictSubsetTarget, InsertOnConflictUpdateTwice,
+    InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
     UpdateByFunction, UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateReturningExpr,
     UpdateFrom, DeleteByKey, DeleteByPrefix, DeleteByNonKey, DeleteByFunction, DeleteIn, DeleteReturning,
     DeleteReturningFanOut, DeleteUsing, InsertIntoSinkFromT,
@@ -692,6 +698,24 @@ impl Gen {
                     "INSERT INTO {t} (tenant_id, grp, id, n) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, grp, id) \
                      DO UPDATE SET n = EXCLUDED.n + COALESCE({t}.n, 0)",
                     runs,
+                )
+            }
+            InsertOnConflictSubsetTarget => {
+                let r = self.row();
+                let target = if self.rng.bool() { "(tenant_id)" } else { "(grp, tenant_id)" };
+                let action = if self.rng.bool() { "DO NOTHING" } else { "DO UPDATE SET n = EXCLUDED.n" };
+                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT {target} {action}"))
+            }
+            InsertOnConflictUpdateTwice => {
+                let (t, g, i) = (self.tenant(), self.grp(), self.id());
+                let other = (self.tenant(), self.grp(), self.id());
+                self.simple(
+                    kind,
+                    format!(
+                        "INSERT INTO {{t}} (tenant_id, grp, id, n) VALUES ({t}, {g}, {i}, 1), ({}, {}, {}, 2), \
+                         ({t}, {g}, {i}, 3) ON CONFLICT (tenant_id, grp, id) DO UPDATE SET n = EXCLUDED.n",
+                        other.0, other.1, other.2
+                    ),
                 )
             }
             InsertReturning => {
@@ -1439,6 +1463,8 @@ fn writes_t(kind: Kind) -> bool {
             | InsertOnConflictKeyAssign
             | InsertOnConflictKeyChange
             | PreparedUpsert
+            | InsertOnConflictSubsetTarget
+            | InsertOnConflictUpdateTwice
             | InsertReturning
             | UpdateByKey
             | UpdateByPartitionKey
@@ -1478,6 +1504,16 @@ fn writes_t(kind: Kind) -> bool {
 /// which end when one does.
 fn may_fail_on_both(kind: Kind) -> bool {
     writes_t(kind) || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery)
+}
+
+/// Kinds that must fail, on both table kinds, with this SQLSTATE and
+/// nothing written.
+fn expected_error(kind: Kind) -> Option<&'static str> {
+    match kind {
+        InsertOnConflictSubsetTarget => Some("42P10"),
+        InsertOnConflictUpdateTwice => Some("21000"),
+        _ => None,
+    }
 }
 
 /// What an operation came to.
@@ -1655,8 +1691,28 @@ impl Twin {
                 let sql_p = render(template, &SIDE_PART);
                 let sql_q = render(template, &SIDE_PLAIN);
                 self.log.push(sql_p.clone());
+                let expected = expected_error(op.kind);
+                let before = expected.map(|_| {
+                    let db = &self.server.as_ref().unwrap().db;
+                    (stored_rows(db, PART), stored_rows(db, PLAIN))
+                });
                 let p = self.cp().simple(&sql_p);
+                if let Some(code) = expected {
+                    match &p {
+                        Err(e) if e.code == code => {}
+                        other => self.fail(at, op.kind, format!("`{sql_p}` must fail with {code}: {other:?}")),
+                    }
+                }
                 let verdict = self.judge(at, op, &sql_p, p, true, &mut |tw: &mut Twin| tw.cq().simple(&sql_q));
+                if let Some(before) = before {
+                    let db = &self.server.as_ref().unwrap().db;
+                    if (stored_rows(db, PART), stored_rows(db, PLAIN)) != before {
+                        self.fail(at, op.kind, format!("`{sql_p}` failed and still wrote rows"));
+                    }
+                    if !matches!(verdict, Verdict::Agreed { failed: true }) {
+                        self.fail(at, op.kind, format!("`{sql_p}` did not fail alike on both tables"));
+                    }
+                }
                 self.note(op.kind, &verdict);
                 !matches!(verdict, Verdict::Agreed { failed: false })
             }
