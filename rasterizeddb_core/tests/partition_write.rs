@@ -293,3 +293,129 @@ fn vacuum_leaves_the_table_like_its_twin() {
     drop(c);
     drop(server);
 }
+
+/// `pg_class.reltuples` and `pg_stat_user_tables`' live and dead counts for
+/// `t`: the slot-derived figures the twin compares (finding: a same-value key
+/// assignment cost the partitioned table a version the twin overwrote).
+fn tuple_stats(c: &mut Client, t: &str) -> Vec<Vec<Option<String>>> {
+    let mut out = c.ok(&format!("SELECT reltuples FROM pg_class WHERE relname = '{t}'")).rows;
+    out.extend(c.ok(&format!("SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = '{t}'")).rows);
+    out
+}
+
+/// A routed UPDATE assigning key columns the values its WHERE pins, and an
+/// `ON CONFLICT … DO UPDATE` assigning the key `EXCLUDED`'s equal value, take
+/// the plain table's in-place overwrite: no more versions than the twin, so
+/// the same `reltuples`, `n_live_tup` and `n_dead_tup` after each. Before the
+/// fix the partitioned side wrote a new version every time (twin seeds
+/// 0x5eed1234 and 0x5eed4242 at 700 ops: reltuples 1010 vs 1009).
+#[test]
+fn a_same_value_key_assignment_writes_no_more_versions_than_the_twin() {
+    let dir = tempfile::tempdir().expect("dir");
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    twins(&mut c, "kp", "kq", 7);
+    assert_eq!(tuple_stats(&mut c, "kp"), tuple_stats(&mut c, "kq"), "before any update");
+    for (i, sql) in [
+        "UPDATE {t} SET tenant_id = 3, n = 42 WHERE tenant_id = 3 AND grp = 1 AND id = 4",
+        "UPDATE {t} SET tenant_id = 5, grp = 2, n = 43 WHERE tenant_id = 5 AND grp = 2",
+        "INSERT INTO {t} (tenant_id, grp, id, n, s) VALUES (7, 3, 7, 44, 'x') \
+         ON CONFLICT (tenant_id, grp, id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, n = EXCLUDED.n",
+        "INSERT INTO {t} (tenant_id, grp, id, n, s) VALUES (9, 1, 1, 45, 'x') \
+         ON CONFLICT (tenant_id, grp, id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, grp = EXCLUDED.grp, \
+         id = EXCLUDED.id, n = {t}.n + EXCLUDED.n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rp = c.ok(&sql.replace("{t}", "kp"));
+        let rq = c.ok(&sql.replace("{t}", "kq"));
+        assert_eq!(rp.tags, rq.tags, "{sql}");
+        same_rows(&mut c, "kp", "kq", sql);
+        let (sp, sq) = (tuple_stats(&mut c, "kp"), tuple_stats(&mut c, "kq"));
+        assert_eq!(sp, sq, "statement {i} `{sql}`: partitioned vs twin (reltuples; n_live_tup, n_dead_tup)");
+        // The comparison is only worth having if the twin overwrote in place.
+        // The last statement's `n` is an expression, which writes a version
+        // on both sides.
+        if i < 3 {
+            assert_eq!(sq[1][1].as_deref(), Some("0"), "statement {i}: the twin's dead tuples");
+        }
+    }
+    assert!(misplaced_rows(&server.db, "kp").is_empty());
+    drop(c);
+    drop(server);
+}
+
+/// A partition's own UPDATE assigning a key column a value the WHERE does not
+/// pin keeps off the in-place overwrite, so a guard refusal of a later row
+/// finds nothing written: refused, rows unchanged, nothing overwritten. The
+/// statement pairs a row whose point it keeps with one it would move, in the
+/// one partition holding both tenants. The same assignment pinned by the
+/// WHERE does overwrite in place, as the plain table's would.
+#[test]
+fn a_genuine_key_change_is_refused_before_any_partition_write() {
+    use rasterizeddb_core::core::mvcc::transaction::FROZEN_TX;
+    use rasterizeddb_core::core::partition::Route;
+    use rasterizeddb_core::core::rql::lexer_s1::QueryPurpose;
+    use rasterizeddb_core::core::rql::lexer_ur::update_row_from_query_purpose;
+    let dir = tempfile::tempdir().expect("dir");
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    twins(&mut c, "gp", "gq", 7);
+    drop(c);
+    // Twelve tenants in seven partitions: some partition holds two.
+    let (pid, a, b) = stored_rows_by_partition(&server.db, "gp")
+        .into_iter()
+        .find_map(|(pid, rows)| {
+            let mut tenants: Vec<i64> = rows
+                .iter()
+                .map(|r| {
+                    let bytes = &r.iter().find(|(n, _)| n == "tenant_id").expect("tenant_id").1;
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap())
+                })
+                .collect();
+            tenants.sort();
+            tenants.dedup();
+            (tenants.len() >= 2).then(|| (pid, tenants[0], tenants[1]))
+        })
+        .expect("a partition holding two tenants");
+    let pt = server.db.partitioned.get("gp").expect("gp").value().clone();
+    let before = stored_rows(&server.db, "gp");
+    let (refused, overwrites, after_pinned) = block_on_big(async move {
+        let epoch = pt.epoch().unwrap();
+        let part = pt
+            .materialized(&epoch, &Route::All)
+            .unwrap()
+            .into_iter()
+            .find(|(p, _)| *p == pid)
+            .expect("the partition")
+            .1;
+        let fields = pt.shell().schema.fields.clone();
+        let update = |sql: String| update_row_from_query_purpose(&QueryPurpose::UpdateRow(sql.clone()), &fields)
+            .unwrap_or_else(|| panic!("cannot parse {sql}"));
+        let in_place = part.in_place_column_updates();
+        // Row `a` keeps its point and is scanned first; row `b` would move.
+        let u = update(format!("UPDATE gp SET tenant_id = {a}, n = 77 WHERE tenant_id IN ({a}, {b}) AND grp = 1 AND id = 1"));
+        let refused = part
+            .update_rows_as_of(&u.where_clause, u.query_row_fetch, u.updates, &u.expressions, None, FROZEN_TX, None, None)
+            .await;
+        let overwrites = part.in_place_column_updates() - in_place;
+        let u = update(format!("UPDATE gp SET tenant_id = {a}, n = 78 WHERE tenant_id = {a} AND grp = 1 AND id = 1"));
+        let pinned = part
+            .update_rows_as_of(&u.where_clause, u.query_row_fetch, u.updates, &u.expressions, None, FROZEN_TX, None, None)
+            .await
+            .expect("a pinned same-value key assignment");
+        assert_eq!(pinned, 1, "the pinned update matched its row");
+        (refused, overwrites, part.in_place_column_updates() - in_place)
+    });
+    let e = refused.expect_err("a key change refused by the range guard");
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+    assert!(e.to_string().contains("not supported"), "{e}");
+    assert_eq!(overwrites, 0, "the refused statement overwrote a row in place before its refusal");
+    assert_eq!(after_pinned, 1, "the pinned same-value key assignment did not overwrite in place");
+    let after = stored_rows(&server.db, "gp");
+    assert_eq!(after.len(), before.len(), "row count");
+    let changed: Vec<_> = before.iter().filter(|r| !after.contains(r)).collect();
+    assert_eq!(changed.len(), 1, "only the pinned update's row changed: {changed:?}");
+    drop(server);
+}

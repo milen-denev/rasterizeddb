@@ -4560,14 +4560,30 @@ impl<S: StorageIO> Table<S> {
         // reported as failed. Such a statement always writes a new version.
         let may_fail_after_write = visibility.is_some();
         // The range guard can refuse a later row after earlier ones are
-        // written, and an aborted statement cannot undo an in-place overwrite.
-        // So a statement assigning a partition key writes new versions only.
-        // An expression leaves a placeholder in `updates`, so this sees it too.
+        // written, and an aborted statement cannot undo an in-place overwrite
+        // (a batch committed by `should_break_transaction` is past any abort).
+        // So a statement whose key assignments might move a row writes new
+        // versions only. An expression leaves a placeholder in `updates`, and
+        // a key it computes is unproven, so this sees it too.
+        //
+        // A statement that provably keeps every row's point — each assigned
+        // key column gets the constant a top-level `key = v` of its WHERE
+        // already pins (an ORM's every-column UPDATE, ON CONFLICT's `SET
+        // tenant_id = EXCLUDED.tenant_id`) — cannot be refused by the guard,
+        // so it keeps the in-place overwrite exactly as the plain table does.
+        // Without this every such statement wrote a version the plain twin
+        // overwrote: one dead slot per row per statement.
         let assigns_key = d.guard.as_ref().is_some_and(|g| {
-            g.spec()
-                .levels()
-                .iter()
-                .any(|l| updates.iter().any(|u| u.write_order == l.write_order))
+            let assigned: SmallVec<[(u32, &[u8]); 8]> =
+                updates.iter().map(|u| (u.write_order, u.data.into_slice())).collect();
+            let computed: SmallVec<[u32; 4]> = expressions.iter().map(|(wo, _)| *wo).collect();
+            !crate::core::partition::table::assignments_keep_point(
+                g.spec(),
+                &self.schema,
+                where_clause,
+                &assigned,
+                &computed,
+            )
         });
 
         self.note_write(written_by);

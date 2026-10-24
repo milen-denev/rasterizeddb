@@ -301,6 +301,67 @@ pub(crate) fn declared_in<'a>(tables: impl IntoIterator<Item = &'a PartitionedTa
     Ok(total)
 }
 
+/// [`PartitionedTable::assignments_keep_point`] for key `spec` and a clause
+/// read against `schema`: shared with the partition's own `UPDATE`, which
+/// asks the same question of its range guard's key to decide whether the
+/// in-place overwrite is open to it (`Table::update_rows_locked`). True only
+/// when no key column is assigned, or each one assigned gets a constant that
+/// a top-level conjunct `key = v` pins to the same level hash; an expression
+/// on a key column, a clause the tokenizer cannot read, or anything else
+/// unproven is false.
+pub(crate) fn assignments_keep_point(
+    spec: &KeySpec,
+    schema: &crate::core::row::schema::TableSchema,
+    where_clause: &str,
+    assigned: &[(u32, &[u8])],
+    computed: &[u32],
+) -> bool {
+    let levels = spec.levels();
+    let touched: SmallVec<[usize; 3]> = (0..levels.len())
+        .filter(|&i| {
+            let wo = levels[i].write_order;
+            computed.contains(&wo) || assigned.iter().any(|(w, _)| *w == wo)
+        })
+        .collect();
+    if touched.is_empty() {
+        return true;
+    }
+    if touched.iter().any(|&i| computed.contains(&levels[i].write_order)) {
+        return false;
+    }
+    let Ok(tokens) = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &schema.fields) else {
+        return false;
+    };
+    let keyed: SmallVec<[u32; 3]> = levels.iter().map(|l| l.write_order).collect();
+    let Some(program) = sarg::extract_gated(&tokens, &|wo| keyed.contains(&wo), &decimal_scales(schema)) else {
+        return false;
+    };
+    fn conjuncts<'a>(e: &'a sarg::MaskExpr, out: &mut Vec<&'a sarg::SargPredicate>) {
+        match e {
+            sarg::MaskExpr::Pred(p) => out.push(p),
+            sarg::MaskExpr::And(children) => children.iter().for_each(|c| conjuncts(c, out)),
+            // An `OR` pins nothing on its own, and `All` is no proof.
+            _ => {}
+        }
+    }
+    let mut pinned = Vec::new();
+    conjuncts(&program.root, &mut pinned);
+    touched.iter().all(|&i| {
+        let wo = levels[i].write_order;
+        let Some((_, value)) = assigned.iter().find(|(w, _)| *w == wo) else {
+            return false;
+        };
+        let Ok(new) = spec.level_hash_of(i, value) else {
+            return false;
+        };
+        pinned.iter().any(|p| {
+            p.op == crate::core::filter::zonemap::SargOp::Eq
+                && p.write_order == wo
+                && spec.level_hash_of(i, &p.value).is_ok_and(|old| old == new)
+        })
+    })
+}
+
 /// Each `NUMERIC(p, s)` column's non-default scale, as `Table` passes the
 /// extractor, so a clause is read exactly as the table's own scan reads it.
 fn decimal_scales(schema: &crate::core::row::schema::TableSchema) -> SmallVec<[(u32, u32); 4]> {
@@ -674,55 +735,7 @@ impl PartitionedTable {
         computed: &[u32],
     ) -> io::Result<bool> {
         let live = self.live()?;
-        let levels = live.spec.levels();
-        let touched: SmallVec<[usize; 3]> = (0..levels.len())
-            .filter(|&i| {
-                let wo = levels[i].write_order;
-                computed.contains(&wo) || assigned.iter().any(|(w, _)| *w == wo)
-            })
-            .collect();
-        if touched.is_empty() {
-            return Ok(true);
-        }
-        if touched.iter().any(|&i| computed.contains(&levels[i].write_order)) {
-            return Ok(false);
-        }
-        let schema = &self.shell.schema;
-        let Ok(tokens) = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &schema.fields) else {
-            return Ok(false);
-        };
-        let keyed: SmallVec<[u32; 3]> = levels.iter().map(|l| l.write_order).collect();
-        let Some(program) = sarg::extract_gated(&tokens, &|wo| keyed.contains(&wo), &decimal_scales(schema)) else {
-            return Ok(false);
-        };
-        fn conjuncts<'a>(e: &'a sarg::MaskExpr, out: &mut Vec<&'a sarg::SargPredicate>) {
-            match e {
-                sarg::MaskExpr::Pred(p) => out.push(p),
-                sarg::MaskExpr::And(children) => children.iter().for_each(|c| conjuncts(c, out)),
-                // An `OR` pins nothing on its own, and `All` is no proof.
-                _ => {}
-            }
-        }
-        let mut pinned = Vec::new();
-        conjuncts(&program.root, &mut pinned);
-        for &i in &touched {
-            let wo = levels[i].write_order;
-            let Some((_, value)) = assigned.iter().find(|(w, _)| *w == wo) else {
-                return Ok(false);
-            };
-            let Ok(new) = live.spec.level_hash_of(i, value) else {
-                return Ok(false);
-            };
-            let proven = pinned.iter().any(|p| {
-                p.op == crate::core::filter::zonemap::SargOp::Eq
-                    && p.write_order == wo
-                    && live.spec.level_hash_of(i, &p.value).is_ok_and(|old| old == new)
-            });
-            if !proven {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(assignments_keep_point(&live.spec, &self.shell.schema, where_clause, assigned, computed))
     }
 
     /// The materialized partitions `route` reaches under `epoch`, by pid. An
