@@ -312,3 +312,40 @@ async fn a_bare_vacuum_gives_each_table_back() {
     let (_, out, _) = finish("VACUUM", vacuum).await;
     out.expect("VACUUM after the block");
 }
+
+/// A partitioned table's ALTER and CREATE INDEX, which are refused (0A000),
+/// are refused at once, taking no lock: they never wait behind the table's
+/// readers first. DROP of it does wait, and drops.
+///
+/// Mutation: `refused_on_a_partitioned_table` answers false (the ALTER
+/// waits for the reader before its refusal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partitioned_ddl_is_refused_before_any_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = crate::MAX_PERMITS_THREADS.set(4);
+    let _ = crate::BATCH_SIZE.set(512);
+    let db = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "ddl_part").await);
+    let _s = setup(
+        &db,
+        &["CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
+           PARTITION BY HASH (tenant_id) PARTITIONS 4"],
+    )
+    .await;
+    let mut r = reader(&db, "pt").await;
+    for sql in ["ALTER TABLE pt ADD COLUMN w BIGINT", "CREATE INDEX pt_v ON pt (v)"] {
+        let refused = spawn(&db, session(&db), sql);
+        let (_, out, took) = finish(sql, refused).await;
+        let e = out.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), "0A000", "{sql}: {e}");
+        assert!(took < SETTLE * 5, "{sql}: waited {took:?} before its refusal");
+    }
+    let drop_pt = spawn(&db, session(&db), "DROP TABLE pt");
+    tokio::time::sleep(SETTLE).await;
+    assert!(!drop_pt.is_finished(), "DROP of a partitioned table ran beside a reader");
+    ok(&db, &mut r, "COMMIT").await;
+    let (_, out, _) = finish("DROP", drop_pt).await;
+    out.expect("DROP of the partitioned table");
+    drop((r, _s));
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+}

@@ -11386,6 +11386,9 @@ pub(crate) async fn lock_statement_set(database: &Arc<Database>, sql: &str) -> R
     if set.is_empty() {
         return Ok(());
     }
+    if refused_on_a_partitioned_table(sql, &set, database) {
+        return Ok(());
+    }
     let parents: Vec<(String, TableMode)> = set
         .iter()
         .filter(|(_, mode)| *mode == TableMode::RowExclusive)
@@ -11431,6 +11434,19 @@ async fn lock_create_target(
             .map(|fk| (fk.parent_table.clone(), TableMode::Share)),
     );
     database.lock_names(&set, owner()).await
+}
+
+/// Whether `sql` is an ALTER TABLE or CREATE INDEX on a partitioned table,
+/// which its arm refuses (0A000) before reading anything: such a statement
+/// takes no lock at all, so it is refused at once instead of first waiting
+/// for every reader of the table (§7 B4: "partitioned DDL stays refused
+/// before any lock"). DROP of a partitioned table is built, and locks.
+fn refused_on_a_partitioned_table(sql: &str, set: &[(String, TableMode)], database: &Database) -> bool {
+    let first = sql.split_whitespace().next().unwrap_or("");
+    (first.eq_ignore_ascii_case("ALTER") || first.eq_ignore_ascii_case("CREATE"))
+        && set
+            .iter()
+            .any(|(name, mode)| *mode == TableMode::AccessExclusive && database.is_partitioned(name))
 }
 
 /// What an `ALTER TABLE` or `DROP TABLE` locks beyond the names its text
