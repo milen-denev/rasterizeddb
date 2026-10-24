@@ -555,6 +555,10 @@ impl Database {
     /// then `DROPPED` is durable in its map log. A successor under the name
     /// takes a new uid, so no record of these files can replay into it.
     pub(super) async fn drop_partitioned(&self, name: &str) -> io::Result<bool> {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(name);
+        let name = resolved.as_deref().unwrap_or(name);
         let _ddl = self.partition_ddl.lock().await;
         let _claim = self.claim_name(name)?;
         // Through the deletions below, as a plain DROP holds it (see

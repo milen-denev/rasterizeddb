@@ -440,3 +440,75 @@ fn the_readers_attribute_uses_to_the_right_fn() {
         "only g's call is engine code"
     );
 }
+
+/// The DDL key rule (B3a review, owner's ask 2): every function that takes a
+/// slot out of the maps (`take_table`, `take_partitioned`: DROP, RENAME,
+/// MOVE, ALTER's reload) asks `resolve_key` first, and the registration
+/// primitives store `canonical_key`'s spelling, so when identifier case
+/// folding lands in `resolve` a mutator removes exactly the slot a lookup by
+/// the same name finds, and CREATE registers the name lookups fold to. Today
+/// both are the identity; this pins the routing, by name, so a new mutator
+/// that skips it fails here.
+#[test]
+fn every_ddl_mutator_resolves_its_key_first() {
+    /// The functions that take a slot out, with where they live.
+    const MUTATORS: &[(&str, &str)] = &[
+        (MOD, "drop_table_to_depth"),
+        (MOD, "move_table_to_backend"),
+        (MOD, "reload_table"),
+        (MOD, "rename_table"),
+        ("core/database/partitioned.rs", "drop_partitioned"),
+    ];
+    let mut takers: Vec<(String, String)> = Vec::new();
+    let mut unresolved = Vec::new();
+    for (rel, text) in sources() {
+        if rel == SLOTS || !rel.starts_with("core/database/") || is_test_file(&rel) {
+            continue;
+        }
+        if !text.contains("take_table") && !text.contains("take_partitioned") {
+            continue;
+        }
+        let file = parse(&rel, &text);
+        let mut takes: BTreeMap<String, usize> = occurrences(&file, "take_table");
+        for (at, n) in occurrences(&file, "take_partitioned") {
+            *takes.entry(at).or_default() += n;
+        }
+        let resolves = occurrences(&file, "resolve_key");
+        for (at, _) in takes {
+            if !resolves.contains_key(&at) {
+                unresolved.push(format!("{rel}::{at}"));
+            }
+            takers.push((rel.clone(), at));
+        }
+    }
+    takers.sort();
+    let mut expected: Vec<(String, String)> = MUTATORS
+        .iter()
+        .map(|(r, f)| (r.to_string(), f.to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        takers, expected,
+        "the set of DDL mutators changed: a new one must call resolve_key before it takes a slot \
+         out, and be listed here"
+    );
+    assert!(
+        unresolved.is_empty(),
+        "these take a slot out without resolve_key, so under case folding they would remove a \
+         different key than a lookup finds: {unresolved:?}"
+    );
+
+    // Registration stores the canonical spelling.
+    let text = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(SLOTS),
+    )
+    .unwrap();
+    let file = parse(SLOTS, &text);
+    let canon = occurrences(&file, "canonical_key");
+    for installer in ["install_table", "install_partitioned"] {
+        assert!(
+            canon.get(installer).is_some_and(|n| *n > 0),
+            "{installer} must register canonical_key's spelling: {canon:?}"
+        );
+    }
+}

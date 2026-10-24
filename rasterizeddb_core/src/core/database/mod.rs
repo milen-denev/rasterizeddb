@@ -1877,6 +1877,10 @@ impl Database {
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
     async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
         // A partitioned table drops through its own order. Resolved before
         // `tables` is touched: its shell is there too, and the plain path
         // below would sweep `<name>*` files it never had.
@@ -2211,6 +2215,10 @@ impl Database {
     /// no more correct and briefly much less so. The names read as stale; the
     /// data resolves.
     pub async fn rename_table(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(old_name);
+        let old_name = resolved.as_deref().unwrap_or(old_name);
         // For the whole rename, before anything is checked or paused: a
         // snapshot uploading now listed the old files and holds none of the
         // new ones (see `relocation_permit`).
@@ -2633,6 +2641,10 @@ impl Database {
         destination: &crate::core::storage::TableBackend,
     ) -> io::Result<u64> {
         use crate::core::storage::{LocationRole, TableBackend};
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
         // For the whole move, as a rename: see `relocation_permit`.
         let _relocating = relocation_permit(self.location.is_some(), table_name).await;
         // The table's handle is dropped before the reopened one registers;
@@ -3592,6 +3604,10 @@ impl Database {
     }
 
     pub async fn reload_table(&self, table_name: &str) -> io::Result<()> {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
         // The table's handle is dropped before the reopened one registers;
         // the database's forgotten horizon must not move in that gap, or the
         // reopened files could carry ids it forgot. See `ForgetRegistry`.

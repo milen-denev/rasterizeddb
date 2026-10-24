@@ -63,32 +63,95 @@ type DbTable = Table<DbStorageProvider>;
 
 /// The `rclite::Arc` the engine passes tables around in, as an `ArcSwap`
 /// pointer. `arc_swap` implements its trait for `std::sync::Arc` only, and
-/// the orphan rule needs a local type.
-#[derive(Clone)]
-struct TableRef(Arc<DbTable>);
+/// the orphan rule needs a local type. Generic only so its tests can run it
+/// over small values without a database; the slots use [`TableRef`].
+struct ArcRef<T>(Arc<T>);
 
-// SAFETY: `into_ptr` and `as_ptr` return the same pointer, the one
-// `rclite::Arc::from_raw` takes back; `into_ptr` forgets its value without
-// touching the count and `from_ptr` rebuilds one without touching it, so
-// arc_swap's borrowing and debt accounting see exactly a strong reference per
-// pointer it holds, which is what it does with `std::sync::Arc`. `rclite::Arc`
-// is `Send + Sync` for a `Send + Sync` table, and its pointer is to a
-// non-zero-sized allocation, so distinct live values have distinct pointers.
-unsafe impl RefCnt for TableRef {
-    type Base = DbTable;
+impl<T> Clone for ArcRef<T> {
+    fn clone(&self) -> Self {
+        ArcRef(self.0.clone())
+    }
+}
 
-    fn into_ptr(me: Self) -> *mut DbTable {
-        Arc::into_raw(me.0) as *mut DbTable
+type TableRef = ArcRef<DbTable>;
+
+// SAFETY: `RefCnt` asks that `into_ptr`, `as_ptr` and `from_ptr` agree on one
+// pointer per value, that `into_ptr` hand over exactly one strong reference
+// and `from_ptr` take exactly that one back, and that distinct live values
+// have distinct pointers. For `rclite` 0.4.1 each holds by its layout:
+//
+// - `ArcInner<T>` is `#[repr(C)] { data: UnsafeCell<T>, counter }`, so `data`
+//   sits at offset 0 and the allocation's pointer *is* the data pointer.
+//   `Arc::as_ptr` returns that pointer cast to `*const T`, and `Arc::into_raw`
+//   is `as_ptr` followed by `mem::forget`: the same pointer, the count
+//   untouched, one strong reference now owned by the raw pointer.
+//   `Arc::from_raw` rebuilds the `Arc` from exactly that pointer (it casts it
+//   back to `*mut ArcInner<T>`, no offset arithmetic, which is only right
+//   because `data` is first) and touches no count either. So `into_ptr` then
+//   `from_ptr` is a move of one strong reference, which is how arc_swap's
+//   borrowing and debt accounting treat `std::sync::Arc`.
+// - The counter cannot wrap: past a barrier below its maximum, `clone` drops
+//   the extra reference and panics ("reference counter overflow"), so a
+//   pointer arc_swap holds is never freed under it by a wrapped count.
+// - Every `ArcInner` holds a counter, so even a zero-sized `T` has a real,
+//   non-zero-sized allocation and two live values never share a pointer
+//   (the slots hold `Table`, which is not zero-sized either); `rclite::Arc`
+//   is `Send + Sync` for a `Send + Sync` value, as arc_swap needs.
+//
+// `refcnt_tests` pins the first point: an rclite release that reorders
+// `ArcInner` makes `Arc::as_ptr` differ from the value's address and fails
+// there, loudly, rather than this impl turning into a use-after-free.
+unsafe impl<T> RefCnt for ArcRef<T> {
+    type Base = T;
+
+    fn into_ptr(me: Self) -> *mut T {
+        Arc::into_raw(me.0) as *mut T
     }
 
-    fn as_ptr(me: &Self) -> *mut DbTable {
-        Arc::as_ptr(&me.0) as *mut DbTable
+    fn as_ptr(me: &Self) -> *mut T {
+        Arc::as_ptr(&me.0) as *mut T
     }
 
-    unsafe fn from_ptr(ptr: *const DbTable) -> Self {
+    unsafe fn from_ptr(ptr: *const T) -> Self {
         // SAFETY: `ptr` came from `into_ptr` (the trait's contract), so from
         // `rclite::Arc::into_raw`.
-        TableRef(unsafe { Arc::from_raw(ptr) })
+        ArcRef(unsafe { Arc::from_raw(ptr) })
+    }
+}
+
+/// The layout [`ArcRef`]'s `unsafe impl RefCnt` stands on (see its SAFETY
+/// comment), on values of several sizes and alignments, never a database:
+/// a pointer bug here must fail an assertion, not crash the test binary.
+#[cfg(test)]
+mod refcnt_tests {
+    use super::*;
+
+    fn check<T>(value: T) {
+        let a = Arc::new(value);
+        let data = &*a as *const T as usize;
+        // The library property: an rclite `Arc`'s pointer is its value's.
+        assert_eq!(Arc::as_ptr(&a) as usize, data, "rclite::Arc::as_ptr is the value's address");
+        let r = ArcRef(a.clone());
+        assert_eq!(Arc::strong_count(&a), 2);
+        assert_eq!(<ArcRef<T> as RefCnt>::as_ptr(&r) as usize, data, "ArcRef::as_ptr is the value's address");
+        let raw = <ArcRef<T> as RefCnt>::into_ptr(r);
+        assert_eq!(raw as usize, data, "into_ptr gives the value's address");
+        assert_eq!(Arc::strong_count(&a), 2, "into_ptr keeps the reference it hands over");
+        // SAFETY: `raw` came from `into_ptr` just above.
+        let back = unsafe { <ArcRef<T> as RefCnt>::from_ptr(raw) };
+        assert_eq!(<ArcRef<T> as RefCnt>::as_ptr(&back) as usize, data, "from_ptr rebuilds the same pointer");
+        assert_eq!(Arc::strong_count(&a), 2, "from_ptr takes that one reference back, no more");
+        drop(back);
+        assert_eq!(Arc::strong_count(&a), 1);
+    }
+
+    #[test]
+    fn rclite_arc_points_at_its_data() {
+        check([7u64; 16]);
+        check(String::from("x"));
+        check(3u8);
+        check(0u128);
+        check(());
     }
 }
 
@@ -110,7 +173,7 @@ pub(crate) struct Slot {
 impl Slot {
     pub(super) fn new(table: Arc<DbTable>) -> Self {
         Slot {
-            table: ArcSwapAny::new(TableRef(table)),
+            table: ArcSwapAny::new(ArcRef(table)),
             state: AtomicU8::new(LIVE),
         }
     }
@@ -126,7 +189,7 @@ impl Slot {
     /// that already loaded the old keeps it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn swap(&self, table: Arc<DbTable>) -> Arc<DbTable> {
-        self.table.swap(TableRef(table)).0
+        self.table.swap(ArcRef(table)).0
     }
 
     /// False once the name no longer owns this slot (DROP, RENAME, a reload's
@@ -244,6 +307,27 @@ impl Database {
     #[inline]
     fn resolve<T>(&self, name: &str, find: impl Fn(&str) -> Option<T>) -> Option<T> {
         find(name)
+    }
+
+    /// The map key a DDL mutator acts on for `name`: the key [`Database::resolve`]
+    /// finds `name` registered under (a table, a shell or a partitioned table),
+    /// `None` when nothing is. DROP, RENAME, MOVE and ALTER (`reload_table`)
+    /// ask it before they take a slot out, so a mutator always removes the
+    /// slot a lookup by the same name would have found, whatever key
+    /// identifier case folding later maps that name to. Today the identity.
+    pub(crate) fn resolve_key(&self, name: &str) -> Option<String> {
+        self.resolve(name, |key| {
+            (self.table_slots.contains_key(key) || self.partitioned_tables.contains_key(key))
+                .then(|| key.to_string())
+        })
+    }
+
+    /// The key a new name is registered under: CREATE (and every reinstall)
+    /// stores the canonical spelling, the one [`Database::resolve_key`] maps
+    /// lookups to. Today the identity; case folding decides it here.
+    #[inline]
+    fn canonical_key(name: String) -> String {
+        name
     }
 
     /// The slot `name` resolves to (B3b's `table_for` loads through it).
@@ -394,6 +478,7 @@ impl Database {
     /// Registers `table` under `name` in a new slot, replacing (and marking
     /// dropped) any slot the name had.
     pub(crate) fn install_table(&self, name: String, table: Arc<DbTable>) {
+        let name = Self::canonical_key(name);
         if let Some(old) = self.table_slots.insert(name, Arc::new(Slot::new(table))) {
             old.mark_dropped();
         }
@@ -415,6 +500,7 @@ impl Database {
         table: Arc<PartitionedTable>,
         shell: Option<Arc<DbTable>>,
     ) {
+        let name = Self::canonical_key(name);
         self.partitioned_tables.insert(name.clone(), table);
         if let Some(shell) = shell {
             self.install_table(name, shell);

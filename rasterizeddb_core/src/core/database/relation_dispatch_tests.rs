@@ -193,6 +193,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("relation", "the dispatch itself"),
     ("refuse_partitioned", "the dispatch itself"),
     ("resolve", "the name-to-key rule every slot primitive's lookup goes through"),
+    ("resolve_key", "a slot primitive: the key a DDL mutator acts on, asked before its own dispatch"),
     ("schema_view", "a slot primitive: asks the partitioned map itself, as relation() does"),
     ("slot", "a slot primitive: the raw slot, for B3b's table_for, which dispatches"),
     ("partitioned_table", "a slot primitive: the partitioned map's lookup"),
