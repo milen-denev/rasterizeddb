@@ -19,7 +19,9 @@ async fn an_empty_returning_still_sends_its_row_description() {
         .batch_execute(
             "CREATE TABLE src (tenant_id BIGINT NOT NULL, n INT);
              CREATE TABLE rq (tenant_id BIGINT NOT NULL, id BIGSERIAL, n INT, PRIMARY KEY (tenant_id, id));
-             INSERT INTO src VALUES (2, 1), (8, 2), (11, 3);",
+             CREATE TABLE jt (id INT PRIMARY KEY, tenant_id BIGINT NOT NULL, n INT);
+             INSERT INTO src VALUES (2, 1), (8, 2), (11, 3);
+             INSERT INTO jt VALUES (1, 2, 0), (2, 8, 0);",
         )
         .await
         .expect("schema");
@@ -29,6 +31,9 @@ async fn an_empty_returning_still_sends_its_row_description() {
         "INSERT INTO rq (tenant_id, n) SELECT 5, 1 WHERE 1 = 0 RETURNING id",
         "UPDATE rq SET n = 0 WHERE tenant_id > 100 RETURNING id",
         "DELETE FROM rq WHERE tenant_id > 100 RETURNING id",
+        // Through a join, which writes back row by row (found by eb's S19 twin).
+        "UPDATE jt SET n = 1 FROM src WHERE jt.tenant_id = src.tenant_id AND src.tenant_id > 100 RETURNING jt.id",
+        "DELETE FROM jt USING src WHERE jt.tenant_id = src.tenant_id AND src.tenant_id > 100 RETURNING jt.id",
     ] {
         let messages = client.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         let described: Vec<String> = messages

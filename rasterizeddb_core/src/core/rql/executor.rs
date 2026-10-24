@@ -4199,6 +4199,12 @@ async fn delete_using_join(
     );
     let rows = run_subquery(&select, database, tx).await?;
     if rows.is_empty() {
+        // With RETURNING, an empty row set: the client is owed a
+        // RowDescription even when nothing matched, as dedd503 gives an
+        // `INSERT … SELECT`. A bare count sent only the command tag.
+        if returning.is_some() {
+            return Ok(vec![2u8]);
+        }
         let mut result = vec![0u8];
         result.extend_from_slice(&0u64.to_le_bytes());
         return Ok(result);
@@ -4431,6 +4437,12 @@ async fn update_from_join(
 
     let rows = run_subquery(&select, database, tx).await?;
     if rows.is_empty() {
+        // With RETURNING, an empty row set: the client is owed a
+        // RowDescription even when nothing matched, as dedd503 gives an
+        // `INSERT … SELECT`. A bare count sent only the command tag.
+        if returning.is_some() {
+            return Ok(vec![2u8]);
+        }
         let mut result = vec![0u8];
         result.extend_from_slice(&0u64.to_le_bytes());
         return Ok(result);
