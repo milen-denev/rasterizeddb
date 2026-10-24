@@ -28,7 +28,11 @@
 //! are skipped or read whole, so a keyword inside a literal is no keyword.
 //! `FROM` inside a function call's parentheses (`EXTRACT(year FROM ts)`,
 //! `SUBSTRING(s FROM 2)`, `TRIM(BOTH FROM s)`) and in `IS DISTINCT FROM` is
-//! not a relation list. A name that is not a table (a CTE's, an alias that
+//! not a relation list, but a paren that opens with `SELECT`, `WITH` or
+//! `VALUES` is a subquery whatever word precedes it (`ARRAY(SELECT …)`). A
+//! `FROM`/`USING` list is followed per paren depth, so a comma after a
+//! subquery, a function, a parenthesised join or a join's `ON` still names
+//! the next relation. A name that is not a table (a CTE's, an alias that
 //! looks like one) costs nothing: the set is filtered by what is
 //! registered. A table it misses is still locked, late.
 
@@ -336,6 +340,33 @@ pub fn is_single_target_write(sql: &str) -> bool {
     froms == usize::from(delete)
 }
 
+/// Words that end a `FROM`/`USING` list at its own depth: after one, a comma
+/// at that depth is no longer a list separator (`ORDER BY a, b`, `SET a = 1,
+/// b = 2`, `RETURNING a, b`).
+const ENDS_LIST: &[&str] = &[
+    "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "RETURNING",
+    "SET", "FOR", "FETCH", "VALUES", "SELECT", "DO",
+];
+
+/// Words after which `(` is a subquery's, whatever precedes it:
+/// `ARRAY(SELECT …)` and `LIMIT (SELECT …)` read relations as much as
+/// `IN (SELECT …)` does.
+fn opens_a_query(t: Option<&Tok<'_>>) -> bool {
+    t.is_some_and(|t| is_kw(t, "SELECT") || is_kw(t, "WITH") || is_kw(t, "VALUES"))
+}
+
+/// One level of parentheses in [`statement_lock_set`]'s scan (the
+/// statement's top level is the first).
+struct Depth {
+    /// A function call's arguments: `FROM` here is `EXTRACT(year FROM ts)`'s.
+    call: bool,
+    /// The `FROM`/`USING` list open at this depth and its mode: a comma here
+    /// names the next relation in it, until a word of [`ENDS_LIST`] or the
+    /// depth's `)`. Kept across a parenthesised item, a join and its `ON`,
+    /// so `FROM (SELECT …) s, t` and `FROM a JOIN b ON …, c` find `t` and `c`.
+    list: Option<TableMode>,
+}
+
 /// The relations `sql` names and the mode each needs, as written (a name
 /// may appear more than once; `tables_for` merges). See the module comment.
 pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
@@ -344,48 +375,107 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
     if let Some(ddl) = ddl_targets(&toks) {
         return ddl;
     }
-    // One entry per open paren: whether it is a function call's.
-    let mut calls: Vec<bool> = Vec::new();
+    // The top level, and a level per open paren above it (allocated only
+    // once a statement has one, as most single-table statements do not).
+    let mut top = Depth { call: false, list: None };
+    let mut depths: Vec<Depth> = Vec::new();
+    macro_rules! depth {
+        () => {
+            depths.last_mut().unwrap_or(&mut top)
+        };
+    }
+    // The `(` a relation list stopped at: an item of that list (a subquery,
+    // a function, a parenthesised join), not an expression's paren.
+    let mut item_paren: Option<usize> = None;
     let mut locking = false;
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i];
+        let prev = i.checked_sub(1).map(|p| &toks[p]);
         match t {
             Tok::Punct('(') => {
-                let call = matches!(
-                    i.checked_sub(1).map(|p| &toks[p]),
-                    Some(prev @ Tok::Word { quoted: false, .. }) if !NOT_A_CALL.iter().any(|kw| is_kw(prev, kw))
-                );
-                calls.push(call);
+                let call = !opens_a_query(toks.get(i + 1))
+                    && matches!(
+                        prev,
+                        Some(prev @ Tok::Word { quoted: false, .. }) if !NOT_A_CALL.iter().any(|kw| is_kw(prev, kw))
+                    );
+                let outer = depth!().list;
+                depths.push(Depth { call, list: None });
                 i += 1;
+                if item_paren.take() == Some(i - 1) && !call {
+                    if let Some(mode) = outer {
+                        // `FROM (a JOIN b ON …)`: a parenthesised join is a
+                        // relation list of its own; `((…))` nests one.
+                        if toks.get(i) == Some(&Tok::Punct('(')) {
+                            depth!().list = Some(mode);
+                            item_paren = Some(i);
+                        } else if !opens_a_query(toks.get(i)) {
+                            depth!().list = Some(mode);
+                            i = list_from(&toks, i, mode, &mut out, &mut item_paren);
+                        }
+                    }
+                }
                 continue;
             }
             Tok::Punct(')') => {
-                calls.pop();
+                depths.pop();
+                i += 1;
+                continue;
+            }
+            Tok::Punct(',') => {
+                let depth = depth!();
+                if let (false, Some(mode)) = (depth.call, depth.list) {
+                    i = list_from(&toks, i + 1, mode, &mut out, &mut item_paren);
+                    continue;
+                }
                 i += 1;
                 continue;
             }
             _ => {}
         }
-        let in_call = calls.last().copied().unwrap_or(false);
-        let prev = i.checked_sub(1).map(|p| &toks[p]);
+        let in_call = depth!().call;
+        if depth!().list.is_some() && ENDS_LIST.iter().any(|kw| is_kw(t, kw)) {
+            depth!().list = None;
+        }
         if is_kw(t, "FROM") && !in_call && !prev.is_some_and(|p| is_kw(p, "DISTINCT")) {
             let mode = if prev.is_some_and(|p| is_kw(p, "DELETE")) {
                 TableMode::RowExclusive
             } else {
                 TableMode::AccessShare
             };
-            i = relation_list(&toks, i + 1, mode, &mut out);
+            depth!().list = Some(mode);
+            i = list_from(&toks, i + 1, mode, &mut out, &mut item_paren);
             continue;
         }
-        if is_kw(t, "USING") && !in_call && toks.get(i + 1) != Some(&Tok::Punct('(')) {
-            i = relation_list(&toks, i + 1, TableMode::AccessShare, &mut out);
+        // `DELETE FROM t USING …`: the one USING that follows the write
+        // target's own list (still open, ROW EXCLUSIVE), so its first item
+        // may be a subquery; a join's `USING (id)` names columns.
+        let deletes_using = depth!().list == Some(TableMode::RowExclusive);
+        if is_kw(t, "USING") && !in_call && (deletes_using || toks.get(i + 1) != Some(&Tok::Punct('('))) {
+            depth!().list = Some(TableMode::AccessShare);
+            i = list_from(&toks, i + 1, TableMode::AccessShare, &mut out, &mut item_paren);
             continue;
         }
         if is_kw(t, "JOIN") && !in_call {
             if let Some((name, next)) = relation_at(&toks, i + 1) {
+                if toks.get(next) == Some(&Tok::Punct('(')) {
+                    // `JOIN f(x)`: a function, not a relation.
+                    item_paren = Some(next);
+                    i = next;
+                    continue;
+                }
                 out.push((name, TableMode::AccessShare));
                 i = next;
+                continue;
+            }
+            // `JOIN (…)`, `JOIN LATERAL (…)`: an item, as in a list.
+            let mut at = i + 1;
+            while toks.get(at).is_some_and(|t| is_kw(t, "LATERAL")) {
+                at += 1;
+            }
+            if toks.get(at) == Some(&Tok::Punct('(')) {
+                item_paren = Some(at);
+                i = at;
                 continue;
             }
         }
@@ -424,14 +514,33 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
     out
 }
 
+/// [`relation_list`] from `i`, noting the `(` it stopped at as an item of
+/// the list (see `item_paren` in [`statement_lock_set`]).
+fn list_from(
+    toks: &[Tok<'_>],
+    i: usize,
+    mode: TableMode,
+    out: &mut Vec<(String, TableMode)>,
+    item_paren: &mut Option<usize>,
+) -> usize {
+    let end = relation_list(toks, i, mode, out);
+    if toks.get(end) == Some(&Tok::Punct('(')) {
+        *item_paren = Some(end);
+    }
+    end
+}
+
 /// A `FROM`/`USING` list starting at `i`: relations separated by commas,
-/// each with an optional alias; a parenthesised item is a subquery, left
-/// for the main scan. Returns where the list ends.
+/// each with an optional alias. A parenthesised item (a subquery, a
+/// function's arguments, a parenthesised join) is left for the main scan,
+/// which sees the paren next and resumes the list at the comma after it.
+/// Returns where the list stops.
 fn relation_list(toks: &[Tok<'_>], mut i: usize, mode: TableMode, out: &mut Vec<(String, TableMode)>) -> usize {
     loop {
-        if toks.get(i) == Some(&Tok::Punct('(')) || toks.get(i).is_some_and(|t| is_kw(t, "LATERAL")) {
-            // A subquery or a function in FROM: its contents are scanned by
-            // the caller, which sees the paren next.
+        while toks.get(i).is_some_and(|t| is_kw(t, "LATERAL")) {
+            i += 1;
+        }
+        if toks.get(i) == Some(&Tok::Punct('(')) {
             return i;
         }
         let Some((name, next)) = relation_at(toks, i) else {
@@ -587,6 +696,84 @@ mod tests {
         ] {
             assert!(!is_single_target_write(no), "{no}");
         }
+    }
+
+    /// Each statement's whole set, as a table: the shapes the first scanner
+    /// lost a relation in (a list resumed after a parenthesised item or a
+    /// join, a subquery in any call's parens, a parenthesised join), the
+    /// shapes it already read, and commas that are not a list's.
+    #[test]
+    fn every_relation_is_found_past_parens_joins_and_calls() {
+        let cases: &[(&str, &[(&str, TableMode)])] = &[
+            // A list resumed after a parenthesised item.
+            ("SELECT * FROM (SELECT 1) a, t3", &[("t3", AS)]),
+            ("SELECT * FROM generate_series(1,3) g, t3", &[("t3", AS)]),
+            ("SELECT * FROM t1, LATERAL (SELECT 1) x, t3", &[("t1", AS), ("t3", AS)]),
+            ("SELECT jsonb_agg(x) FROM (VALUES (1)) v(x), t", &[("t", AS)]),
+            ("SELECT * FROM t, unnest(t.arr) AS x(v), u", &[("t", AS), ("u", AS)]),
+            ("SELECT row_to_json(r) FROM (SELECT * FROM u) r", &[("u", AS)]),
+            ("UPDATE t SET v = 1 FROM (SELECT 1) s, u", &[("t", RX), ("u", AS)]),
+            ("DELETE FROM t USING (SELECT 1) s, u WHERE true", &[("t", RX), ("u", AS)]),
+            // A list resumed after a join.
+            ("SELECT * FROM t1 x JOIN t2 y USING (id), t3", &[("t1", AS), ("t2", AS), ("t3", AS)]),
+            ("SELECT * FROM t1 CROSS JOIN t2, t3", &[("t1", AS), ("t2", AS), ("t3", AS)]),
+            ("SELECT * FROM t1 JOIN t2 ON (t1.a = t2.a), t3", &[("t1", AS), ("t2", AS), ("t3", AS)]),
+            ("SELECT * FROM t1 LEFT JOIN LATERAL f(t1.x) g ON true, t3", &[("t1", AS), ("t3", AS)]),
+            ("SELECT * FROM t1 JOIN (SELECT * FROM u) s ON true, t3", &[("t1", AS), ("t3", AS), ("u", AS)]),
+            ("DELETE FROM t USING u JOIN w USING (id), v", &[("t", RX), ("u", AS), ("v", AS), ("w", AS)]),
+            // A subquery in a call's parens, whatever the call.
+            ("SELECT ARRAY(SELECT x FROM u) FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t WHERE v = ANY(ARRAY(SELECT v FROM u))", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t LIMIT (SELECT n FROM u)", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t OFFSET (SELECT 1 FROM u)", &[("t", AS), ("u", AS)]),
+            // A parenthesised join.
+            ("SELECT * FROM (a JOIN b ON a.id = b.id)", &[("a", AS), ("b", AS)]),
+            (
+                "SELECT * FROM ((a JOIN b ON true) JOIN c ON true), d",
+                &[("a", AS), ("b", AS), ("c", AS), ("d", AS)],
+            ),
+            // Read right before, and still.
+            ("SELECT * FROM t WHERE x = 1 UNION ALL SELECT * FROM u", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t WHERE (a, b) IN (SELECT a, b FROM u)", &[("t", AS), ("u", AS)]),
+            ("SELECT coalesce((SELECT max(v) FROM u), 0) FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT GREATEST((SELECT 1 FROM u), 2) FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t WHERE x > ALL (SELECT v FROM u)", &[("t", AS), ("u", AS)]),
+            ("SELECT (SELECT v FROM u WHERE u.id = t.id) AS s FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t WHERE v IN (1, 2) AND NOT EXISTS(SELECT 1 FROM u)", &[("t", AS), ("u", AS)]),
+            ("SELECT count(*) FILTER (WHERE v IN (SELECT v FROM u)) FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT CAST((SELECT v FROM u) AS int) FROM t", &[("t", AS), ("u", AS)]),
+            ("SELECT * FROM t ORDER BY (SELECT 1 FROM u)", &[("t", AS), ("u", AS)]),
+            (
+                "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = SOME (SELECT y FROM w))",
+                &[("t", AS), ("u", AS), ("w", AS)],
+            ),
+            ("INSERT INTO t SELECT * FROM u ON CONFLICT DO NOTHING", &[("t", RX), ("u", AS)]),
+            ("SELECT * FROM t FOR UPDATE OF t", &[("t", RX)]),
+            ("SELECT * FROM t1 AS x(a,b), t2", &[("t1", AS), ("t2", AS)]),
+            ("SELECT * FROM t WHERE s = 'it''s FROM q'", &[("t", AS)]),
+            ("SELECT * FROM \"a\"\"b\"", &[("a\"b", AS)]),
+            ("SELECT * FROM t WINDOW w AS (PARTITION BY a)", &[("t", AS)]),
+            ("SELECT EXTRACT(year FROM ts), SUBSTRING(s FROM 2 FOR 3) FROM t", &[("t", AS)]),
+            // Commas that are not a list's: no entry for what follows them.
+            ("SELECT * FROM t1 JOIN t2 USING (id, t3)", &[("t1", AS), ("t2", AS)]),
+            ("SELECT a, b FROM t ORDER BY a, b", &[("t", AS)]),
+            ("SELECT a FROM t GROUP BY a, b HAVING count(*) > 1", &[("t", AS)]),
+            (
+                "INSERT INTO t (a, b) SELECT x, y FROM u ON CONFLICT (a) DO UPDATE SET b = 1, c = 2",
+                &[("t", RX), ("u", AS)],
+            ),
+            ("UPDATE t SET a = 1, b = 2 FROM s, u WHERE t.id = s.id", &[("s", AS), ("t", RX), ("u", AS)]),
+            ("DELETE FROM t WHERE id = 1 RETURNING a, b", &[("t", RX)]),
+            ("SELECT * FROM t1, t2 x WHERE a IN (1, 2) UNION SELECT a, b FROM u", &[("t1", AS), ("t2", AS), ("u", AS)]),
+        ];
+        let mut wrong = Vec::new();
+        for (sql, want) in cases {
+            let (got, want) = (set(sql), s(want));
+            if got != want {
+                wrong.push(format!("{sql}\n    got  {got:?}\n    want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{} of {} sets wrong:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
     }
 
     #[test]
