@@ -598,11 +598,36 @@ fn ddl_targets(toks: &[Tok<'_>]) -> Option<Vec<(String, TableMode)>> {
             let on = toks.iter().position(|t| is_kw(t, "ON"))?;
             return Some(relation_at(toks, on + 1).map(|(n, _)| vec![(n, ae)]).unwrap_or_default());
         }
-        // CREATE TABLE and the rest name no existing table to lock here
-        // (B4 adds ADD/REFERENCES parents, finding L11).
+        // `CREATE TABLE n AS SELECT … FROM t` reads t: the main scan finds
+        // it (ACCESS SHARE). B4's CREATE arm locks n itself.
+        if is_create_table_as(toks) {
+            return None;
+        }
+        // CREATE TABLE and the rest name no existing table to lock here (the
+        // CREATE arm locks its name and its FK parents, finding L11).
         return Some(Vec::new());
     }
     None
+}
+
+/// `CREATE … TABLE … AS <query>`: an `AS` outside every parenthesis (a
+/// generated column's `AS (…)` is inside the column list) followed by a
+/// query.
+fn is_create_table_as(toks: &[Tok<'_>]) -> bool {
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth = depth.saturating_sub(1),
+            _ if depth == 0 && is_kw(t, "AS") => {
+                return toks.get(i + 1).is_some_and(|n| {
+                    ["SELECT", "WITH", "VALUES", "TABLE"].iter().any(|kw| is_kw(n, kw)) || *n == Tok::Punct('(')
+                });
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -785,6 +810,18 @@ mod tests {
         assert_eq!(set("CREATE INDEX ix ON t (a)"), s(&[("t", AE)]));
         assert_eq!(set("CREATE UNIQUE INDEX IF NOT EXISTS ix ON ONLY t ((doc->>'k'))"), s(&[("t", AE)]));
         assert_eq!(set("CREATE TABLE n (id INT REFERENCES p (id))"), s(&[]));
+        assert_eq!(set("CREATE TABLE n (id INT, g INT GENERATED ALWAYS AS (id * 2) STORED)"), s(&[]));
+    }
+
+    /// `CREATE TABLE … AS SELECT` reads its source: ACCESS SHARE on it
+    /// (B4; it used to be an empty set, so the source was never locked).
+    ///
+    /// Mutation: `is_create_table_as` answers false (the source drops out).
+    #[test]
+    fn create_table_as_locks_its_source() {
+        assert_eq!(set("CREATE TABLE n AS SELECT * FROM t"), s(&[("t", AS)]));
+        assert_eq!(set("CREATE TABLE n (a, b) AS SELECT a, b FROM t JOIN u ON t.id = u.id"), s(&[("t", AS), ("u", AS)]));
+        assert_eq!(set("CREATE TEMP TABLE n AS (SELECT * FROM t WHERE x > 1)"), s(&[("t", AS)]));
     }
 }
 
