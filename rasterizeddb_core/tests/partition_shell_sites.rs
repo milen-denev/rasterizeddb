@@ -14,7 +14,8 @@
 //! columns, constraints and rows, or fails with the same SQLSTATE. The twin
 //! is given the same rows (INSERT routes since S9), so the data-reading
 //! sites compare over rows. The reading sites are `LikeTwin` since S10, and
-//! the writing and maintenance ones since S11.
+//! the writing and maintenance ones since S11, RETURNING since S17, and the
+//! ON CONFLICT ones since S18.
 
 mod partition_wire;
 
@@ -456,9 +457,62 @@ const SITES: &[Site] = &[
     ),
     site(
         "INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (5, 1, 8) ON CONFLICT DO NOTHING RETURNING asset_id",
-        Expect::Refused,
-        "ON CONFLICT, RETURNING or not: S18",
+        Expect::LikeTwinAnswered,
+        "S18: DO NOTHING … RETURNING, the row inserted",
     ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (5, 1, 8, 99) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO NOTHING",
+        Expect::LikeTwinAnswered,
+        "S18: DO NOTHING over a stored key, INSERT 0 0",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (5, 1, 8, 99) \
+         ON CONFLICT (asset_group_id, asset_id) DO NOTHING",
+        Expect::Error("42P10"),
+        "S18: a target leaving out a key column matches no unique key, as in PostgreSQL",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (1, 1, 1, 5) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET n = site_p.n + EXCLUDED.n, label = 'up' \
+         RETURNING *",
+        Expect::LikeTwinAnswered,
+        "S18: DO UPDATE … RETURNING, the post-image",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (1, 1, 1, 6) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET n = EXCLUDED.n WHERE site_p.n > 1000 \
+         RETURNING asset_id, n",
+        Expect::LikeTwin,
+        "S18: DO UPDATE … WHERE that declines: a description and no rows",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (1, 1, 1, 7) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, n = 7",
+        Expect::LikeTwinAnswered,
+        "S18: a key column assigned EXCLUDED's own value keeps the point",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id) VALUES (1, 1, 1) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id + 1",
+        Expect::Refused,
+        "S18: a DO UPDATE that changes a key value: phase 6",
+    ),
+    in_block(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES (1, 1, 1, 1), (3, 3, 3, 3), (5, 1, 8, 5) \
+         ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET n = EXCLUDED.n * 10 RETURNING asset_id, n",
+        Expect::LikeTwinAnswered,
+        "S18: a multi-row upsert over three partitions, rolled back by the block",
+    ),
+    Site {
+        sql: "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n) VALUES ($1, $2, $3, $4) \
+              ON CONFLICT (tenant_id, asset_group_id, asset_id) DO UPDATE SET n = EXCLUDED.n RETURNING asset_id, n",
+        expect: Expect::LikeTwinAnswered,
+        around: None,
+        note: "S18: a prepared upsert, inserting then updating",
+        runs: &[&["6", "1", "9", "1"], &["6", "1", "9", "2"], &["1", "1", "1", "3"]],
+        columns: Some(&["asset_id", "n"]),
+    },
     site(
         "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id",
         Expect::Refused,

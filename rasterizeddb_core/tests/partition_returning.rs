@@ -131,6 +131,12 @@ fn returning_answers_like_the_twin_in_every_statement_shape() {
             3,
         ),
         ("INSERT INTO {t} (tenant_id, n, amt) SELECT tenant_id, n, amt FROM src RETURNING *", 3),
+        // Aliases and expressions on INSERT (upstream since 3fa2fc3).
+        (
+            "INSERT INTO {t} (tenant_id, n, amt) VALUES (6, 8, 1.25), (11, NULL, 2.5) \
+             RETURNING id AS k, tenant_id AS t, n * 2 AS dbl, amt + 1, COALESCE(s, 'x') AS s2, g",
+            2,
+        ),
         // UPDATE routed: one tenant, one partition.
         ("UPDATE {t} SET n = n + 1, amt = amt * 2 WHERE tenant_id = 3 RETURNING id, n, amt, g, doc, s", 4),
         ("UPDATE {t} SET n = 2 WHERE tenant_id = 4 AND id = 10 RETURNING *", 1),
@@ -158,11 +164,10 @@ fn returning_answers_like_the_twin_in_every_statement_shape() {
         }
         same_rows(&mut c, sql);
     }
-    // An INSERT … SELECT whose source is empty: compared only. The plain
-    // table answers it with no row description at all (PostgreSQL sends one
-    // with zero rows), and the partitioned table must answer the same.
-    let r = both(&mut pair, "INSERT INTO {t} (tenant_id, n) SELECT tenant_id, n FROM src WHERE tenant_id > 100 RETURNING id");
-    assert!(r.is_ok_and(|r| r.rows.is_empty()));
+    // An INSERT … SELECT whose source is empty: a row description and no
+    // rows, as PostgreSQL answers (upstream since dedd503).
+    let r = both_rows(&mut pair, "INSERT INTO {t} (tenant_id, n) SELECT tenant_id, n FROM src WHERE tenant_id > 100 RETURNING id");
+    assert!(r.rows.is_empty());
     // The stored scale and JSONB, as returned, are what a SELECT reads.
     let r = both_rows(&mut pair, "UPDATE {t} SET amt = 1.5 WHERE tenant_id = 12 RETURNING amt, doc, s, g");
     assert_eq!(r.rows, vec![vec![Some("1.50".into()), None, Some("dflt".into()), None]]);

@@ -60,6 +60,23 @@ enum Kind {
     InsertSelect,
     InsertOnConflictNothing,
     InsertOnConflictUpdate,
+    // ON CONFLICT on partitioned tables (S18): DO NOTHING … RETURNING (only
+    // the inserted rows come back), DO UPDATE … WHERE with EXCLUDED,
+    // DO UPDATE … RETURNING (the post-image), a multi-row upsert over three
+    // tenants with a duplicate (the row count compared), INSERT … SELECT
+    // … ON CONFLICT, a key column assigned EXCLUDED's own value, and a
+    // prepared upsert alternating tenants.
+    InsertOnConflictNothingReturning,
+    InsertOnConflictUpdateWhere,
+    InsertOnConflictUpdateReturning,
+    InsertMultiOnConflict,
+    InsertSelectOnConflict,
+    InsertOnConflictKeyAssign,
+    // A DO UPDATE that would move the row to another point: refused (phase
+    // 6). Run in a rolled-back block after an insert of the same key, so
+    // the conflict, and with it the refusal, always happens.
+    InsertOnConflictKeyChange,
+    PreparedUpsert,
     InsertReturning,
     UpdateByKey,
     UpdateByPartitionKey,
@@ -167,7 +184,9 @@ use Kind::*;
 
 const ALL_KINDS: &[Kind] = &[
     InsertOne, InsertMulti, InsertNulls, InsertQuotedKey, InsertSelect, InsertOnConflictNothing,
-    InsertOnConflictUpdate, InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
+    InsertOnConflictUpdate, InsertOnConflictNothingReturning, InsertOnConflictUpdateWhere,
+    InsertOnConflictUpdateReturning, InsertMultiOnConflict, InsertSelectOnConflict, InsertOnConflictKeyAssign,
+    InsertOnConflictKeyChange, PreparedUpsert, InsertReturning, UpdateByKey, UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey,
     UpdateByFunction, UpdateRelocating, UpdateKeySameValue, UpdateKeyChange, UpdateReturning, UpdateReturningExpr,
     UpdateFrom, DeleteByKey, DeleteByPrefix, DeleteByNonKey, DeleteByFunction, DeleteIn, DeleteReturning,
     DeleteReturningFanOut, DeleteUsing, InsertIntoSinkFromT,
@@ -210,9 +229,14 @@ const REFUSED: &[Refusal] = &[
     // DeleteReturningFanOut, PreparedUpdateReturning and the empty-route
     // UPDATE and DELETE … RETURNING are compared with the twin, rows as
     // multisets, names and type OIDs included, inside blocks too.
-    // 2b: ON CONFLICT on partitioned tables (§15), RETURNING or not: S18.
-    refused(InsertOnConflictNothing, "phase 2b"),
-    refused(InsertOnConflictUpdate, "phase 2b"),
+    // S18 (ON CONFLICT) is built: InsertOnConflictNothing,
+    // InsertOnConflictUpdate, InsertOnConflictNothingReturning,
+    // InsertOnConflictUpdateWhere, InsertOnConflictUpdateReturning,
+    // InsertMultiOnConflict, InsertSelectOnConflict, InsertOnConflictKeyAssign
+    // and PreparedUpsert are compared with the twin, and so is what they
+    // store, inside blocks too. A DO UPDATE that changes a key value moves
+    // the row (I4): phase 6.
+    refused(InsertOnConflictKeyChange, "phase 6"),
     // S11 (routed UPDATE and DELETE, VACUUM fan-out) is built: UpdateByKey,
     // UpdateByPartitionKey, UpdateByPrefix, UpdateByNonKey, UpdateRelocating,
     // UpdateKeySameValue (a key assigned the value its WHERE pins), DeleteByKey,
@@ -392,6 +416,29 @@ impl Gen {
         (0..k).map(|_| self.tenant().to_string()).collect::<Vec<_>>().join(", ")
     }
 
+    /// A RETURNING list: columns, `*`, columns out of order, or aliases and
+    /// expressions (INSERT … RETURNING col AS alias, upstream since 3fa2fc3).
+    fn returning_list(&mut self) -> &'static str {
+        match self.rng.u8(..4) {
+            0 => "tenant_id, grp, id, n, s",
+            1 => "*",
+            2 => "s, id, f, tenant_id",
+            _ => "tenant_id AS t, id AS k, n * 2 + 1, COALESCE(s, 'x') AS s2",
+        }
+    }
+
+    /// An ON CONFLICT target that a partitioned table's unique key matches
+    /// (every key column named), with its trailing space: none, the primary
+    /// key's columns in some order, or the key by constraint name.
+    fn conflict_target(&mut self) -> &'static str {
+        match self.rng.u8(..4) {
+            0 => "",
+            1 => "(tenant_id, grp, id) ",
+            2 => "(id, tenant_id, grp) ",
+            _ => "ON CONSTRAINT {t}_pkey ",
+        }
+    }
+
     fn simple(&mut self, kind: Kind, sql: String) -> Op {
         Op { kind, step: Step::Simple(sql), ordered: false }
     }
@@ -473,27 +520,163 @@ impl Gen {
             }
             InsertOnConflictNothing => {
                 let r = self.row();
-                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT DO NOTHING"))
+                let target = self.conflict_target();
+                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT {target}DO NOTHING"))
             }
             InsertOnConflictUpdate => {
                 let r = self.row();
                 let n = self.n();
+                let set = match self.rng.u8(..3) {
+                    0 => format!("n = {n}, s = 'upserted'"),
+                    1 => "n = EXCLUDED.n, s = EXCLUDED.s, f = EXCLUDED.f".to_string(),
+                    _ => "n = COALESCE({t}.n, 0) + COALESCE(EXCLUDED.n, 1), s = 'again'".to_string(),
+                };
+                let target = if self.rng.u8(..4) == 0 { "ON CONSTRAINT {t}_pkey" } else { "(tenant_id, grp, id)" };
+                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT {target} DO UPDATE SET {set}"))
+            }
+            InsertOnConflictNothingReturning => {
+                // One row or several; only the rows inserted come back.
+                let k = self.rng.usize(1..=4);
+                let rows: Vec<String> = (0..k).map(|_| self.row()).collect();
+                let target = self.conflict_target();
+                let list = self.returning_list();
+                self.simple(
+                    kind,
+                    format!("INSERT INTO {{t}} {cols} VALUES {} ON CONFLICT {target}DO NOTHING RETURNING {list}", rows.join(", ")),
+                )
+            }
+            InsertOnConflictUpdateWhere => {
+                let r = self.row();
+                let v = self.rng.i32(-50..100);
+                let condition = match self.rng.u8(..4) {
+                    0 => format!("{{t}}.n < {v}"),
+                    1 => "EXCLUDED.n IS NOT NULL AND {t}.n IS DISTINCT FROM EXCLUDED.n".to_string(),
+                    2 => format!("EXCLUDED.n > {v} OR {{t}}.s IS NULL"),
+                    _ => "{t}.s <> 'kept'".to_string(),
+                };
                 self.simple(
                     kind,
                     format!(
                         "INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT (tenant_id, grp, id) \
-                         DO UPDATE SET n = {n}, s = 'upserted'"
+                         DO UPDATE SET n = EXCLUDED.n, s = 'kept' WHERE {condition}"
                     ),
+                )
+            }
+            InsertOnConflictUpdateReturning => {
+                // The post-image comes back: an updated row's new values, an
+                // inserted row's own. One row or several (each placed in its
+                // own partition), WHERE or not.
+                let k = self.rng.usize(1..=3);
+                let rows: Vec<String> = (0..k).map(|_| self.row()).collect();
+                let condition = if self.rng.bool() { " WHERE {t}.n IS NOT NULL" } else { "" };
+                let list = self.returning_list();
+                self.simple(
+                    kind,
+                    format!(
+                        "INSERT INTO {{t}} {cols} VALUES {} ON CONFLICT (tenant_id, grp, id) \
+                         DO UPDATE SET n = COALESCE({{t}}.n, 0) + 1, f = EXCLUDED.f{condition} RETURNING {list}",
+                        rows.join(", ")
+                    ),
+                )
+            }
+            InsertMultiOnConflict => {
+                // Three tenants, one tuple repeated: DO NOTHING skips the
+                // repeat (and any stored key), and the count says how many
+                // landed. DO UPDATE gets distinct keys (PostgreSQL refuses a
+                // row affected twice).
+                let (a, b) = (self.row(), self.row());
+                let c = self.row();
+                if self.rng.bool() {
+                    let target = self.conflict_target();
+                    self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {a}, {b}, {a}, {c} ON CONFLICT {target}DO NOTHING"))
+                } else {
+                    let tenants = [self.tenant(), self.tenant(), self.tenant()];
+                    let i = self.id();
+                    let rows: Vec<String> = tenants
+                        .iter()
+                        .enumerate()
+                        .map(|(j, t)| format!("({t}, {}, {i}, {}, 'multi', 0.5)", j as i64 + 1, self.n()))
+                        .collect();
+                    self.simple(
+                        kind,
+                        format!(
+                            "INSERT INTO {{t}} {cols} VALUES {} ON CONFLICT (tenant_id, grp, id) \
+                             DO UPDATE SET n = {{t}}.n + 1, s = EXCLUDED.s",
+                            rows.join(", ")
+                        ),
+                    )
+                }
+            }
+            InsertSelectOnConflict => {
+                let t = self.tenant();
+                let m = self.rng.i64(0..IDS);
+                let tail = match self.rng.u8(..3) {
+                    0 => "DO NOTHING".to_string(),
+                    1 => "DO UPDATE SET n = COALESCE({t}.n, 0) + EXCLUDED.n".to_string(),
+                    _ => "DO UPDATE SET s = EXCLUDED.s RETURNING tenant_id, grp, id, s".to_string(),
+                };
+                self.simple(
+                    kind,
+                    format!(
+                        "INSERT INTO {{t}} {cols} SELECT tenant_id, grp, id, n, s, f FROM stage \
+                         WHERE tenant_id = {t} AND id > {m} ON CONFLICT (tenant_id, grp, id) {tail}"
+                    ),
+                )
+            }
+            InsertOnConflictKeyAssign => {
+                // A key column assigned EXCLUDED's own value keeps the point.
+                let r = self.row();
+                let n = self.n();
+                let set = if self.rng.bool() {
+                    format!("tenant_id = EXCLUDED.tenant_id, n = {n}")
+                } else {
+                    "tenant_id = EXCLUDED.tenant_id, grp = EXCLUDED.grp, id = EXCLUDED.id, s = 'assigned'".to_string()
+                };
+                self.simple(kind, format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT (tenant_id, grp, id) DO UPDATE SET {set}"))
+            }
+            InsertOnConflictKeyChange => {
+                let r = self.row();
+                // tenant_id leads the key in every configuration, so each of
+                // these moves the point there.
+                let set = match self.rng.u8(..3) {
+                    0 => "tenant_id = EXCLUDED.tenant_id + 100",
+                    1 => "tenant_id = {t}.tenant_id - 1000, n = 0",
+                    _ => "n = 1, tenant_id = 77",
+                };
+                let seed = Op {
+                    kind: InsertOnConflictNothing,
+                    step: Step::Simple(format!("INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT DO NOTHING")),
+                    ordered: false,
+                };
+                let change = Op {
+                    kind,
+                    step: Step::Simple(format!(
+                        "INSERT INTO {{t}} {cols} VALUES {r} ON CONFLICT (tenant_id, grp, id) DO UPDATE SET {set}"
+                    )),
+                    ordered: false,
+                };
+                Op { kind, step: Step::Block { inner: vec![seed, change], commit: false }, ordered: false }
+            }
+            PreparedUpsert => {
+                let runs = self.prepared_runs(|g| {
+                    vec![
+                        Some(g.tenant().to_string()),
+                        Some(g.grp().to_string()),
+                        Some(g.id().to_string()),
+                        Some(g.rng.i32(-50..100).to_string()),
+                    ]
+                });
+                self.prepared(
+                    kind,
+                    "INSERT INTO {t} (tenant_id, grp, id, n) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, grp, id) \
+                     DO UPDATE SET n = EXCLUDED.n + COALESCE({t}.n, 0)",
+                    runs,
                 )
             }
             InsertReturning => {
                 // One row, several (each placed in its own partition), and
                 // INSERT … SELECT; a column list, `*`, or columns out of order.
-                let list = match self.rng.u8(..3) {
-                    0 => "tenant_id, grp, id, n, s",
-                    1 => "*",
-                    _ => "s, id, f, tenant_id",
-                };
+                let list = self.returning_list();
                 let sql = match self.rng.u8(..3) {
                     0 => format!("INSERT INTO {{t}} {cols} VALUES {} RETURNING {list}", self.row()),
                     1 => {
@@ -984,7 +1167,9 @@ impl Gen {
 /// Kinds a transaction block draws from: no VACUUM (not in a block), no
 /// nested block, no restart.
 const BLOCK_KINDS: &[Kind] = &[
-    InsertOne, InsertMulti, InsertSelect, InsertOnConflictUpdate, InsertReturning, UpdateByKey, UpdateByPrefix,
+    InsertOne, InsertMulti, InsertSelect, InsertOnConflictNothing, InsertOnConflictUpdate,
+    InsertOnConflictNothingReturning, InsertOnConflictUpdateWhere, InsertOnConflictUpdateReturning,
+    InsertMultiOnConflict, InsertSelectOnConflict, InsertOnConflictKeyAssign, PreparedUpsert, InsertReturning, UpdateByKey, UpdateByPrefix,
     UpdateRelocating, UpdateByNonKey, UpdateByFunction, UpdateKeySameValue, UpdateReturning, UpdateReturningExpr,
     DeleteByKey, DeleteByNonKey, DeleteIn, DeleteReturning, PreparedUpdateReturning, SelectByPrefix,
     SelectFunctionWhere, CountAll,
@@ -1045,6 +1230,14 @@ fn writes_t(kind: Kind) -> bool {
             | InsertSelect
             | InsertOnConflictNothing
             | InsertOnConflictUpdate
+            | InsertOnConflictNothingReturning
+            | InsertOnConflictUpdateWhere
+            | InsertOnConflictUpdateReturning
+            | InsertMultiOnConflict
+            | InsertSelectOnConflict
+            | InsertOnConflictKeyAssign
+            | InsertOnConflictKeyChange
+            | PreparedUpsert
             | InsertReturning
             | UpdateByKey
             | UpdateByPartitionKey
