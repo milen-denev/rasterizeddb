@@ -1540,10 +1540,11 @@ impl<S: StorageIO> Table<S> {
     /// ([`crate::core::rql::statement_snapshot`]). An unversioned table reads
     /// everything, whatever the statement holds.
     pub fn read_visibility_for(&self, tx: TxId) -> Visibility {
-        if self.versions.load().is_none() {
+        let versions = self.versions.load();
+        let Some(manager) = versions.as_ref() else {
             return Visibility::All;
-        }
-        crate::core::rql::statement_snapshot::get_or_take(|| self.visibility_for(tx))
+        };
+        crate::core::rql::statement_snapshot::get_or_take(manager, || self.visibility_for(tx))
     }
 
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned.

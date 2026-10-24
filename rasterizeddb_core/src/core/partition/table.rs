@@ -683,7 +683,7 @@ impl PartitionedTable {
     /// read of that statement shares (`statement_snapshot`), else a new one.
     /// A partitioned table is always versioned, so this is never `All`.
     pub fn read_visibility_for(&self, tx: TxId) -> Visibility {
-        crate::core::rql::statement_snapshot::get_or_take(|| self.visibility_for(tx))
+        crate::core::rql::statement_snapshot::get_or_take(&self.transactions, || self.visibility_for(tx))
     }
 
     /// The current map epoch, counted (`load_full`, never `load`): step 2 of

@@ -23,7 +23,10 @@
 //! afresh each time: a retry under the first attempt's snapshot would find
 //! the same superseded versions and conflict again.
 
+use std::sync::Arc;
+
 use crate::core::mvcc::Visibility;
+use crate::core::mvcc::transaction::TransactionManager;
 
 tokio::task_local! {
     static READ: parking_lot::Mutex<Option<Visibility>>;
@@ -34,16 +37,23 @@ pub async fn scope<F: std::future::Future>(f: F) -> F::Output {
     READ.scope(parking_lot::Mutex::new(None), f).await
 }
 
-/// The statement's snapshot, taken with `take` on the first read. Outside
-/// [`scope`], `take`'s, every time.
+/// The statement's snapshot for a table whose transactions `manager` keeps,
+/// taken with `take` on the first read. Outside [`scope`], `take`'s, every
+/// time.
 ///
 /// Only a snapshot is kept: `Visibility::All` is a table with no versions,
 /// and whether the next table has them is its own question. Every versioned
-/// table shares one transaction manager, so any table's snapshot serves all.
-pub fn get_or_take(take: impl FnOnce() -> Visibility) -> Visibility {
+/// table of one database shares its transaction manager, so that database's
+/// snapshot serves all of them; a read of another database's table (a role
+/// lookup, a catalogue copy) is that database's ids, which the kept snapshot
+/// says nothing about, so it takes its own and the kept one stays.
+pub fn get_or_take(manager: &Arc<TransactionManager>, take: impl FnOnce() -> Visibility) -> Visibility {
     let kept = READ.try_with(|read| read.lock().clone());
     match kept {
-        Ok(Some(visibility)) => visibility,
+        Ok(Some(Visibility::AsOf { snapshot, manager: kept })) if Arc::ptr_eq(&kept, manager) => {
+            Visibility::AsOf { snapshot, manager: kept }
+        }
+        Ok(Some(_)) => take(),
         Ok(None) => {
             let visibility = take();
             if matches!(visibility, Visibility::AsOf { .. }) {
@@ -118,7 +128,38 @@ fn words_outside_quotes(sql: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_read_only;
+    use super::*;
+
+    fn kept_by(visibility: &Visibility) -> *const TransactionManager {
+        match visibility {
+            Visibility::AsOf { manager, .. } => Arc::as_ptr(manager),
+            Visibility::All => std::ptr::null(),
+        }
+    }
+
+    /// A statement's snapshot is one database's: a read of another
+    /// database's table inside the same statement takes that database's own
+    /// snapshot, and the statement's stays for its own tables.
+    ///
+    /// Mutation: the `Arc::ptr_eq` guard always true (the other database
+    /// reads under this one's snapshot).
+    #[tokio::test]
+    async fn a_snapshot_serves_only_its_own_database() {
+        let (here, there) = (Arc::new(TransactionManager::in_memory()), Arc::new(TransactionManager::in_memory()));
+        let take = |m: &Arc<TransactionManager>| {
+            let m = m.clone();
+            move || Visibility::for_snapshot(m.snapshot(crate::core::mvcc::transaction::FROZEN_TX), m)
+        };
+        scope(async {
+            let first = get_or_take(&here, take(&here));
+            assert_eq!(kept_by(&first), Arc::as_ptr(&here));
+            let other = get_or_take(&there, take(&there));
+            assert_eq!(kept_by(&other), Arc::as_ptr(&there), "read another database under this one's snapshot");
+            let again = get_or_take(&here, || panic!("the statement's snapshot was replaced"));
+            assert_eq!(kept_by(&again), Arc::as_ptr(&here));
+        })
+        .await;
+    }
 
     #[test]
     fn reads_are_read_only() {
