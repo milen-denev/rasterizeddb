@@ -147,6 +147,17 @@ impl FixedRowShape {
         if !ENABLED.load(Ordering::Relaxed) {
             return None;
         }
+        Self::shape_of(first_row, col_meta, result_formats)
+    }
+
+    /// [`Self::plan`] whatever the switch says. Tests hold the tiers to the
+    /// generic bytes through this, so a sibling test turning the switch off
+    /// cannot make the plan they need disappear mid-test.
+    fn shape_of(
+        first_row: &[u8],
+        col_meta: &[(String, DbType)],
+        result_formats: &[i16],
+    ) -> Option<FixedRowShape> {
         let mut cells: SmallVec<[Cell; 16]> = SmallVec::new();
         // 'D', the message length, the column count.
         let mut dst = 1 + 4 + 2;
@@ -401,7 +412,13 @@ mod fixed_rows_tests {
         &[DbType::BOOL, DbType::I32],
     ];
 
-    /// The whole sender, plan on and off, at every SIMD level this CPU runs.
+    /// The whole sender, plan on and off, at the process's own SIMD level.
+    ///
+    /// Not at every level: `cpu::init` is process-wide, and the filter
+    /// index's `probe_fn` caches whichever level it first sees, so forcing
+    /// `scalar` here for a moment could leave every other test in the binary
+    /// on the scalar probe. Each tier is held to the generic bytes directly by
+    /// `every_tier_writes_the_generic_bytes` instead.
     #[tokio::test]
     async fn fixed_rows_go_out_byte_identical() {
         let _g = SWITCH.lock().await;
@@ -415,20 +432,17 @@ mod fixed_rows_tests {
                 for formats in [&[1i16][..], &[], &[0], &mixed] {
                     set_enabled(false);
                     let generic = send(&bytes, &fields, formats).await;
-                    for level in cpu::runnable_levels() {
-                        cpu::init(SimdRequest::Fixed(level)).unwrap();
-                        set_enabled(true);
-                        let fast = send(&bytes, &fields, formats).await;
-                        assert!(
-                            fast == generic,
-                            "{types:?} nulls every {null_every} formats {formats:?} at {level}"
-                        );
-                        compared += 1;
-                    }
+                    set_enabled(true);
+                    let fast = send(&bytes, &fields, formats).await;
+                    assert!(
+                        fast == generic,
+                        "{types:?} nulls every {null_every} formats {formats:?} at {}",
+                        cpu::level()
+                    );
+                    compared += 1;
                 }
             }
         }
-        cpu::init(SimdRequest::Auto).unwrap();
         set_enabled(true);
         assert!(compared > 0);
     }
@@ -444,7 +458,7 @@ mod fixed_rows_tests {
             let rs = rows(types, 64, 5);
             let bytes = rows_into_vec(rs);
             let spans: Vec<&[u8]> = crate::core::row::row::serialized_rows(&bytes).map(|s| s.unwrap()).collect();
-            let shape = FixedRowShape::plan(spans[0], &fields, &[1]).expect("all fixed, all binary: planned");
+            let shape = FixedRowShape::shape_of(spans[0], &fields, &[1]).expect("all fixed, all binary: planned");
             planned += 1;
             for span in &spans {
                 // The generic encoder's DataRow for this row.
@@ -489,13 +503,13 @@ mod fixed_rows_tests {
         let f = |t: &[DbType]| -> Vec<(String, DbType)> { t.iter().map(|t| ("c".to_string(), t.clone())).collect() };
         let bytes = rows_into_vec(rows(&[DbType::I64, DbType::STRING], 1, 0));
         let span = crate::core::row::row::serialized_rows(&bytes).next().unwrap().unwrap();
-        assert!(FixedRowShape::plan(span, &f(&[DbType::I64, DbType::STRING]), &[1]).is_none());
+        assert!(FixedRowShape::shape_of(span, &f(&[DbType::I64, DbType::STRING]), &[1]).is_none());
         let bytes = rows_into_vec(rows(&[DbType::I64], 1, 0));
         let span = crate::core::row::row::serialized_rows(&bytes).next().unwrap().unwrap();
-        assert!(FixedRowShape::plan(span, &f(&[DbType::I64]), &[0]).is_none());
+        assert!(FixedRowShape::shape_of(span, &f(&[DbType::I64]), &[0]).is_none());
         // Declared differently from how it is stored: the generic encoder
         // formats by the declared type, so this must not plan.
-        assert!(FixedRowShape::plan(span, &f(&[DbType::DATETIME]), &[1]).is_none());
+        assert!(FixedRowShape::shape_of(span, &f(&[DbType::DATETIME]), &[1]).is_none());
     }
 
     /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
