@@ -358,6 +358,33 @@ pub struct TransactionManager {
     unreserved_from: AtomicU64,
     /// Why the last raise failed, for the error a refused commit reports.
     reservation_failure: parking_lot::Mutex<Option<ReservationFailure>>,
+    /// Woken when a transaction ends, for a conflict retry waiting on the
+    /// transaction it met (slice B6, finding L1; `rql::conflict_wait`).
+    /// Signalled only while `end_watchers` is non-zero, so a commit with
+    /// nobody waiting pays one atomic load.
+    ended: tokio::sync::Notify,
+    /// How many waits are watching [`TransactionManager::ended`].
+    end_watchers: AtomicUsize,
+}
+
+/// Counts one wait among [`TransactionManager`]'s end watchers until dropped.
+pub struct EndWatch<'a> {
+    manager: &'a TransactionManager,
+}
+
+impl EndWatch<'_> {
+    /// Resolves at the next transaction end after it is enabled (see
+    /// [`tokio::sync::Notified::enable`]); the caller re-checks what it is
+    /// waiting for, since any end wakes every watcher.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.manager.ended.notified()
+    }
+}
+
+impl Drop for EndWatch<'_> {
+    fn drop(&mut self) {
+        self.manager.end_watchers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A failed raise of the id reservation (see [`IdReservation::cover`]).
@@ -634,6 +661,23 @@ impl TransactionManager {
             reservation: parking_lot::Mutex::new(reservation),
             unreserved_from: AtomicU64::new(unreserved_from),
             reservation_failure: parking_lot::Mutex::new(failure),
+            ended: tokio::sync::Notify::new(),
+            end_watchers: AtomicUsize::new(0),
+        }
+    }
+
+    /// Watches transaction ends (see [`EndWatch`]) until the guard drops.
+    pub fn watch_ends(&self) -> EndWatch<'_> {
+        self.end_watchers.fetch_add(1, Ordering::SeqCst);
+        EndWatch { manager: self }
+    }
+
+    /// Wakes the end watchers, if there are any. After the outcome is
+    /// recorded and the family retired, so a woken waiter reads it ended.
+    #[inline]
+    fn signal_ended(&self) {
+        if self.end_watchers.load(Ordering::SeqCst) > 0 {
+            self.ended.notify_waiters();
         }
     }
 
@@ -965,6 +1009,9 @@ impl TransactionManager {
         inner.running.remove(&tx);
         inner.pinned.remove(&tx);
         self.publish_savepoints(&inner);
+        drop(inner);
+        // A conflict wait on one of its versions can go on now.
+        self.signal_ended();
     }
 
     /// Merges `tx` into its parent: its writes now stand or fall with it.
@@ -1147,6 +1194,7 @@ impl TransactionManager {
     pub fn commit(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Committed);
         self.retire_family(tx);
+        self.signal_ended();
         self.maybe_settle();
     }
 
@@ -1155,6 +1203,7 @@ impl TransactionManager {
     pub fn abort(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Aborted);
         self.retire_family(tx);
+        self.signal_ended();
         self.maybe_settle();
     }
 

@@ -1192,6 +1192,35 @@ impl TableLocks {
         waiter_of(&main, owner).map(|w| (w.mode, w.role))
     }
 
+    /// `owner`'s queued request, if it has one: its wait-for edges with its
+    /// mode and role, read under one lock, so a cycle weighed from them
+    /// cannot see the edges of a wait and then find it gone (its own check
+    /// failing it in between) and misjudge it as a row waiter.
+    pub fn wait_edges(&self, owner: LockOwner) -> Option<(SmallVec<[LockOwner; 4]>, TableMode, WaitRole)> {
+        let main = self.main();
+        let waiter = waiter_of(&main, owner)?;
+        let (mode, role) = (waiter.mode, waiter.role);
+        Some((edges(&main, owner), mode, role))
+    }
+
+    /// Sets the role of `owner`'s queued request, if it has one: the caller
+    /// learnt after queueing who the victim rule should take it for (an
+    /// autocommit statement's reader-ness, finding L8, is asked only of a
+    /// request that queued, since answering costs a walk).
+    pub fn set_role(&self, owner: LockOwner, role: WaitRole) {
+        let mut main = self.main();
+        let Some(key) = main.waiting.get(&owner).cloned() else {
+            return;
+        };
+        if let Some(waiter) = main
+            .tables
+            .get_mut(&key)
+            .and_then(|state| state.waiters.iter_mut().find(|w| w.owner == owner))
+        {
+            waiter.role = role;
+        }
+    }
+
     /// Whether `owner` holds or awaits anything here, on either path.
     pub fn holds_any(&self, owner: LockOwner) -> bool {
         if self.shard(shard_of(owner)).held.contains_key(&owner) {

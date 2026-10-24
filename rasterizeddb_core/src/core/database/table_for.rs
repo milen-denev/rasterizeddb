@@ -56,13 +56,29 @@ pub(crate) fn lock_exempt(name: &str) -> bool {
 
 /// Who the victim rule takes a waiter for (§7 Victims): ACCESS EXCLUSIVE
 /// outside `LOCK TABLE` is a DDL, which has written nothing while it waits;
-/// an autocommit statement's ACCESS SHARE is a reader; everything else,
+/// an autocommit statement's ACCESS SHARE is a reader **while its owner has
+/// written nothing** (finding L8: a `WITH` whose data-modifying body already
+/// wrote under O is no reader, whatever its head says); everything else,
 /// blocks and writers alike, is `Other`. `LOCK TABLE` passes its own role.
+///
+/// This is the provisional role a request is made with: whether the owner
+/// wrote is asked only once the request queues ([`refine_role`]), since it
+/// walks the owner's attempts and a granted request never needs a role.
 pub(crate) fn role_for(owner: StatementOwner, mode: TableMode) -> WaitRole {
     match mode {
         TableMode::AccessExclusive => WaitRole::Ddl,
         TableMode::AccessShare if owner.kind != OwnerKind::Block => WaitRole::AutocommitReader,
         _ => WaitRole::Other,
+    }
+}
+
+/// The role of a request that queued, given the provisional one
+/// [`role_for`] gave it: an autocommit reader whose owner has written is
+/// `Other` (finding L8). `wrote` is asked only for a provisional reader.
+pub(crate) fn refine_role(provisional: WaitRole, wrote: impl FnOnce() -> bool) -> WaitRole {
+    match provisional {
+        WaitRole::AutocommitReader if wrote() => WaitRole::Other,
+        role => role,
     }
 }
 
@@ -131,6 +147,11 @@ impl Database {
         match self.row_locks.table_locks().request(owner.owner, &key, mode, role) {
             Request::Granted => Ok(()),
             Request::Queued(wait) => {
+                // Finding L8: a reader is an owner that has written nothing.
+                let refined = refine_role(role, || self.row_locks.owner_wrote(owner.owner.id()));
+                if refined != role {
+                    self.row_locks.table_locks().set_role(owner.owner, refined);
+                }
                 // §7 step 1: "no `table_for` wait happens after step 2(a)".
                 // A reload's complete lock set is taken before it retires
                 // anything; a wait in its steps would be unbounded under

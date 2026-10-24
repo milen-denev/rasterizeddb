@@ -232,6 +232,25 @@ pub struct RowLocks {
     /// `aliases.len()`, readable without touching the map: with no alias in
     /// place `owner_of` is the transaction, as it always was.
     alias_count: AtomicUsize,
+    /// Conflict retries that waited on the transaction they met (slice B6,
+    /// finding L1; `rql::conflict_wait`). Diagnostic and for tests.
+    pub conflict_waits: ConflictWaitStats,
+}
+
+/// Counts of conflict-retry waits, per retry site (`rql::conflict_wait::Site`
+/// indexes them): how many waits began on a live blocker, and how many
+/// ended because it did.
+#[derive(Default, Debug)]
+pub struct ConflictWaitStats {
+    pub waits: [AtomicUsize; 3],
+    pub woken: [AtomicUsize; 3],
+}
+
+impl ConflictWaitStats {
+    /// (waits begun, waits ended by their blocker's end) at `site`.
+    pub fn at(&self, site: usize) -> (usize, usize) {
+        (self.waits[site].load(Ordering::Acquire), self.woken[site].load(Ordering::Acquire))
+    }
 }
 
 /// See [`RowLocks::owner_alias`]. Dropping it ends the alias.
@@ -753,23 +772,62 @@ impl RowLocks {
     /// side fails that wait and every row waiter here is told no.
     pub fn deadlock_victim(&self, waiter: TxId, is_live: &dyn Fn(TxId) -> bool) -> bool {
         let waiter = self.owner_of(waiter);
+        self.cycle_through(waiter, is_live)
+            .is_some_and(|members| Self::victim_of(&members).is_some_and(|v| v.id() == waiter))
+    }
+
+    /// [`RowLocks::deadlock_victim`] for a conflict retry's wait (slice B6,
+    /// finding L1), which also settles a cycle whose victim waits for a
+    /// table lock: that wait is failed now, through the table side's check
+    /// from the victim, rather than when the victim's own poll next asks.
+    /// A conflict wait is bounded (its retry budget), so it cannot rely on
+    /// the victim's `deadlock_timeout` coming round before the budget ends.
+    pub fn conflict_deadlock_victim(&self, waiter: TxId, is_live: &dyn Fn(TxId) -> bool) -> bool {
+        let waiter = self.owner_of(waiter);
+        let Some(members) = self.cycle_through(waiter, is_live) else {
+            return false;
+        };
+        let Some(victim) = Self::victim_of(&members) else {
+            return false;
+        };
+        if victim.id() == waiter {
+            return true;
+        }
+        if members.iter().any(|m| m.owner == victim && m.mode.is_some()) {
+            let outside = self.waits.lock().expect("wait graph poisoned").clone();
+            let _ = self.table_locks.deadlock_check_with(victim, &outside);
+        }
+        false
+    }
+
+    /// The members of a cycle of the one graph through `waiter` (an owner
+    /// id), each weighed as it was found: a table waiter with the mode and
+    /// role its edges were read with (`TableLocks::wait_edges`, one lock),
+    /// any other as a row waiter. `None` when there is no cycle.
+    fn cycle_through(&self, waiter: TxId, is_live: &dyn Fn(TxId) -> bool) -> Option<SmallVec<[CycleMember; 8]>> {
         // Copied, so the graph mutex is not held while the table locks' is
         // taken below (the table side takes them in the other order).
         let waits = self.waits.lock().expect("wait graph poisoned").clone();
         if !waits.contains_key(&waiter) {
-            return false;
+            return None;
         }
-        let edges_of = |node: TxId| -> Option<SmallVec<[TxId; 4]>> {
+        let row_member = |node: TxId| LockOwner::block(node).map(|owner| CycleMember { owner, mode: None, role: WaitRole::Other });
+        let edges_of = |node: TxId| -> Option<(SmallVec<[TxId; 4]>, Option<CycleMember>)> {
             if let Some(e) = waits.get(&node) {
-                return Some(e.clone());
+                return Some((e.clone(), row_member(node)));
             }
             let owner = LockOwner::block(node)?;
-            let blockers = self.table_locks.blockers(owner);
-            (!blockers.is_empty()).then(|| blockers.iter().map(|o| o.id()).collect())
+            let (blockers, mode, role) = self.table_locks.wait_edges(owner)?;
+            (!blockers.is_empty()).then(|| {
+                (
+                    blockers.iter().map(|o| o.id()).collect(),
+                    Some(CycleMember { owner, mode: Some(mode), role }),
+                )
+            })
         };
         // Depth-first from the waiter, looking for a path back to it.
-        let mut path: Vec<(TxId, SmallVec<[TxId; 4]>, usize)> =
-            vec![(waiter, waits.get(&waiter).cloned().unwrap_or_default(), 0)];
+        let mut path: Vec<(Option<CycleMember>, SmallVec<[TxId; 4]>, usize)> =
+            vec![(row_member(waiter), waits.get(&waiter).cloned().unwrap_or_default(), 0)];
         let mut visited: std::collections::HashSet<TxId> = std::collections::HashSet::new();
         visited.insert(waiter);
         while let Some((_, edges, next)) = path.last_mut() {
@@ -780,38 +838,59 @@ impl RowLocks {
             let to = edges[*next];
             *next += 1;
             if to == waiter {
-                let members: SmallVec<[TxId; 8]> = path.iter().map(|(n, ..)| *n).collect();
-                return self.is_victim(waiter, &members);
+                return Some(path.iter().filter_map(|(m, ..)| *m).collect());
             }
             // A finished holder is not waiting for anything; nor is one
             // waiting nowhere.
             if !is_live(to) || !visited.insert(to) {
                 continue;
             }
-            let Some(e) = edges_of(to) else {
+            let Some((e, member)) = edges_of(to) else {
                 continue;
             };
-            path.push((to, e, 0));
+            path.push((member, e, 0));
         }
-        false
+        None
     }
 
-    /// Whether `waiter` is the member of the cycle `members` that fails.
-    fn is_victim(&self, waiter: TxId, members: &[TxId]) -> bool {
-        let weighed: SmallVec<[CycleMember; 8]> = members
-            .iter()
-            .filter_map(|id| {
-                let owner = LockOwner::block(*id)?;
-                Some(match self.table_locks.waiting_for(owner) {
-                    Some((mode, role)) => CycleMember { owner, mode: Some(mode), role },
-                    None => CycleMember { owner, mode: None, role: WaitRole::Other },
-                })
-            })
-            .collect();
-        if weighed.iter().all(|m| m.mode.is_none()) {
-            return members.iter().copied().max() == Some(waiter);
+    /// The member of the cycle `members` that fails: the youngest when no
+    /// member waits for a table lock, otherwise [`choose_victim`]'s pick.
+    fn victim_of(members: &[CycleMember]) -> Option<LockOwner> {
+        if members.iter().all(|m| m.mode.is_none()) {
+            return members.iter().map(|m| m.owner).max();
         }
-        choose_victim(&weighed).is_some_and(|v| v.id() == waiter)
+        choose_victim(members)
+    }
+
+    /// Whether `owner` (an owner id) has written anything: its own family
+    /// (a block's root, a `WITH` statement's adopted transaction) or any
+    /// attempt aliased to it (an autocommit statement's). The victim rule's
+    /// reader is an owner for which this is false (slice B6, finding L8).
+    /// Walks the aliases, so only for a wait that has queued.
+    pub fn owner_wrote(&self, owner: TxId) -> bool {
+        let Some(transactions) = &self.transactions else {
+            return false;
+        };
+        if transactions.wrote_family(owner) {
+            return true;
+        }
+        self.alias_count.load(Ordering::Acquire) > 0
+            && self
+                .aliases
+                .iter()
+                .any(|entry| *entry.value() == owner && transactions.wrote_family(*entry.key()))
+    }
+
+    /// The owners `waiter`'s recorded row, referenced-key or conflict wait
+    /// is waiting for. Diagnostic and for tests.
+    pub fn waiting_on(&self, waiter: TxId) -> SmallVec<[TxId; 4]> {
+        let waiter = self.owner_of(waiter);
+        self.waits
+            .lock()
+            .expect("wait graph poisoned")
+            .get(&waiter)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Clears `waiter`'s wait-for edge when dropped, however the wait ends —

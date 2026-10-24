@@ -1493,10 +1493,11 @@ impl<S: StorageIO> Table<S> {
     /// two versions of one row are visible and the row is duplicated — and the
     /// update that was overwritten is silently lost.
     ///
-    /// First updater wins. The second is told to retry rather than being made to
-    /// wait, which is what PostgreSQL does under `REPEATABLE READ`; blocking
-    /// until the first transaction ends would need a lock manager this engine
-    /// does not have.
+    /// First updater wins. The second is told to retry, naming the transaction
+    /// it met (`conflict_wait::note_blocker`); the executor's retry waits for
+    /// that transaction to end, with a wait-for edge (slice B6, finding L1),
+    /// and replays, which under `READ COMMITTED` is PostgreSQL's block and
+    /// re-evaluate, and under `REPEATABLE READ` conflicts again and reports.
     fn check_write_conflict(&self, pointer: &RowPointer, writer: TxId) -> Result<()> {
         if pointer.xmax == NO_TX || pointer.xmax == writer {
             return Ok(());
@@ -1509,6 +1510,9 @@ impl<S: StorageIO> Table<S> {
         if manager.outcome(pointer.xmax) == crate::core::mvcc::TxOutcome::Aborted {
             return Ok(());
         }
+        // The transaction to wait for, for the retry that replays this
+        // (slice B6, finding L1): carried beside the error, not in its text.
+        crate::core::rql::conflict_wait::note_blocker(pointer.xmax);
         Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             format!(
@@ -2694,6 +2698,11 @@ impl<S: StorageIO> Table<S> {
                     continue;
                 }
             }
+            // The writer of a key in flight is the transaction the
+            // replay waits for (slice B6, finding L1).
+            if in_flight {
+                crate::core::rql::conflict_wait::note_blocker(pointer.xmin);
+            }
             return Ok(Some((pointer.row_id(), in_flight)));
         }
 
@@ -3106,6 +3115,11 @@ impl<S: StorageIO> Table<S> {
                         same_unique_value(&field.db_type, column.data.into_slice(), value)
                     })
             {
+                // The writer of a key in flight is the transaction the
+                // replay waits for (slice B6, finding L1).
+                if in_flight {
+                    crate::core::rql::conflict_wait::note_blocker(pointer.xmin);
+                }
                 return Ok(Some((pointer.row_id(), in_flight)));
             }
         }

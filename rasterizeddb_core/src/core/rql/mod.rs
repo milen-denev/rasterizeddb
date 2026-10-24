@@ -35,6 +35,8 @@ pub mod aggregate;
 /// `HAVING` parsing and evaluation, shared by the single-table and join planners.
 pub mod having;
 pub mod column_default;
+/// Conflict retries waiting on the transaction they met (slice B6).
+pub(crate) mod conflict_wait;
 pub mod cte;
 pub mod expr;
 pub mod foreign_key;

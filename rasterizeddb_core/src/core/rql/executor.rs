@@ -6686,7 +6686,9 @@ async fn insert_values_tuples(
         // inside an explicit `BEGIN`, and an explicit block does not go
         // through `execute_with_sync` at all. It aborted a demote that had
         // already copied 165,000 rows.
-        let mut attempt = 0usize;
+        // A conflict waits on the transaction it met, with a wait-for edge
+        // from the statement's owner (slice B6, finding L1).
+        let mut pacing = crate::core::rql::conflict_wait::Pacing::new(crate::core::rql::conflict_wait::Site::Batch);
         let response = loop {
             let Some(mut purpose) = recognize_query_purpose(&stmt) else {
                 return Some(ddl_error("could not re-parse a row of the VALUES clause"));
@@ -6713,15 +6715,21 @@ async fn insert_values_tuples(
                 data.on_conflict_update = row_data.on_conflict_update.clone();
             }
             crate::owner_probe!(crate::core::mvcc::owner::probe::Site::BatchTuple, tx, database);
-            let response =
-                Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
-            if !is_retryable_conflict(&response) || attempt >= MAX_CONFLICT_RETRIES {
+            let (response, blocker) = crate::core::rql::conflict_wait::capture(Box::pin(
+                execute_with_context(purpose, database.clone(), depth, tx),
+            ))
+            .await;
+            if !is_retryable_conflict(&response) {
                 break response;
             }
-            attempt += 1;
-            // The transaction that won has to get to run for this to clear, so
-            // backing off beats spinning on it.
-            tokio::time::sleep(conflict_backoff(attempt)).await;
+            // The transaction that won has to end for this to clear: waited
+            // for, in the graph, rather than slept on.
+            let waiter = database.row_locks.owner_of(tx);
+            match pacing.pause(database, waiter, blocker, MAX_CONFLICT_RETRIES).await {
+                crate::core::rql::conflict_wait::Pause::Retry => {}
+                crate::core::rql::conflict_wait::Pause::GiveUp => break response,
+                crate::core::rql::conflict_wait::Pause::Fail(message) => break ddl_error(&message),
+            }
         };
         match response.first() {
             // Having applied nothing, the statement as a whole is still safe
@@ -11355,13 +11363,14 @@ fn identifying_field(
 /// bound on *waiting*, not on correctness: the replay only ever re-runs a
 /// statement that has applied nothing, so a caller either gets its write or an
 /// error, never a partial one.
+///
+/// Since slice B6 (finding L1) a conflict that names the transaction it met
+/// waits on that transaction instead (`conflict_wait`), and such waits are
+/// bounded by `conflict_wait::CONFLICT_WAIT_BUDGET` rather than counted
+/// here. This bounds the replays that waited for nothing: a blocker that had
+/// already ended, or a conflict that named none.
 const MAX_CONFLICT_RETRIES: usize = 12;
 
-/// How long to wait before replaying attempt `n` of a conflicted write.
-///
-/// Doubling, capped per sleep so a late attempt does not stall a request for
-/// seconds on its own. The winner is another task that has to be scheduled,
-/// so backing off beats spinning.
 /// Whether a replayed write's answer reports that it changed nothing.
 ///
 /// Either a rows-affected count of zero, or a `RETURNING` answer carrying no
@@ -11378,9 +11387,6 @@ fn retry_matched_nothing(response: &[u8]) -> bool {
     }
 }
 
-fn conflict_backoff(attempt: usize) -> std::time::Duration {
-    std::time::Duration::from_millis((1u64 << attempt.min(8)).min(250))
-}
 
 /// How much unwritten outcome bitmap is allowed to pile up before a read-only
 /// statement pays to fold it away. Four transactions to the byte, so this is
@@ -11799,6 +11805,9 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // while each attempt's row locks are its own and end with it (L4).
     let owner = crate::core::mvcc::owner::ensure().map(|o| o.owner);
     let mut _alias: Option<crate::core::mvcc::row_locks::AliasGuard<'_>> = None;
+    // Each conflict waits on the transaction it met, with a wait-for edge
+    // from O (slice B6, finding L1): see `conflict_wait`.
+    let mut pacing = crate::core::rql::conflict_wait::Pacing::new(crate::core::rql::conflict_wait::Site::Autocommit);
     let (tx, response) = loop {
         let tx = database.transactions.begin_autocommit();
         _alias = owner.map(|o| database.row_locks.owner_alias(tx, o));
@@ -11837,41 +11846,46 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         // `execute_with_context` allocated and copied a future sized for every
         // statement arm, on the per-execution path of a statement whose whole
         // dispatch is a table lookup and the scan.
-        let response = {
+        let (response, blocker) = {
             use futures::FutureExt;
-            let caught = match purpose {
+            let (caught, blocker) = match purpose {
                 QueryPurpose::PreparedRows(prepared) => {
-                    std::panic::AssertUnwindSafe(Box::pin(execute_prepared_rows(
-                        prepared,
-                        database.clone(),
-                        tx,
-                        SubqueryNeed::All,
-                    )))
-                    .catch_unwind()
+                    crate::core::rql::conflict_wait::capture(
+                        std::panic::AssertUnwindSafe(Box::pin(execute_prepared_rows(
+                            prepared,
+                            database.clone(),
+                            tx,
+                            SubqueryNeed::All,
+                        )))
+                        .catch_unwind(),
+                    )
                     .await
                 }
                 purpose => {
-                    std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
-                        purpose,
-                        database.clone(),
-                        0,
-                        tx,
-                    )))
-                    .catch_unwind()
+                    crate::core::rql::conflict_wait::capture(
+                        std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
+                            purpose,
+                            database.clone(),
+                            0,
+                            tx,
+                        )))
+                        .catch_unwind(),
+                    )
                     .await
                 }
             };
-            match caught {
+            let response = match caught {
                 Ok(response) => response,
                 Err(_) => {
                     error!("statement panicked; its transaction {} is aborted", tx);
                     ddl_error("internal error: the statement panicked and was rolled back")
                 }
-            }
+            };
+            (response, blocker)
         };
         let conflicted = is_retryable_conflict(&response);
 
-        if !conflicted || !retryable || attempt >= MAX_CONFLICT_RETRIES {
+        if !conflicted || !retryable {
             // A replay that matched nothing reports the original conflict. The
             // row plainly existed a moment ago, so "no rows" means the retry
             // lost it, not that it is gone, and an error the caller can retry
@@ -11901,8 +11915,15 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
             let _ = database.transactions.flush();
         }
 
-        attempt += 1;
-        tokio::time::sleep(conflict_backoff(attempt)).await;
+        // Waits for the transaction the conflict met (after the attempt's
+        // abort, so the attempt holds nothing anyone waits for), or backs
+        // off when there is none to wait for.
+        let waiter = owner.map_or(tx, |o| o.id());
+        match pacing.pause(&database, waiter, blocker, MAX_CONFLICT_RETRIES).await {
+            crate::core::rql::conflict_wait::Pause::Retry => attempt += 1,
+            crate::core::rql::conflict_wait::Pause::GiveUp => break (tx, response),
+            crate::core::rql::conflict_wait::Pause::Fail(message) => break (tx, ddl_error(&message)),
+        }
     };
     let _ = attempt;
 
@@ -12165,9 +12186,10 @@ fn is_retryable_conflict(response: &[u8]) -> bool {
 /// PostgreSQL does not abort the second writer of a row at the default
 /// isolation level: it blocks until the first transaction ends and then
 /// re-evaluates **that statement**, leaving the rest of the block untouched.
-/// This engine cannot block — there is no lock manager — so it re-runs the
-/// statement instead, which is equivalent precisely because the statement is
-/// only replayed when it had applied nothing (see `CONFLICT_RETRYABLE`).
+/// This engine waits for the transaction the conflict met (with a wait-for
+/// edge, slice B6: `conflict_wait`) and then re-runs the statement, which is
+/// equivalent precisely because the statement is only replayed when it had
+/// applied nothing (see `CONFLICT_RETRYABLE`).
 ///
 /// A `REPEATABLE READ` block pins its snapshot, so a replay there sees the
 /// same world and conflicts again; the bounded attempts then surface the
@@ -12216,27 +12238,45 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         }
     }
     let mut query = query;
-    let mut attempt = 0usize;
+    // A conflict waits on the transaction it met, with a wait-for edge from
+    // the owner (slice B6, finding L1): see `conflict_wait`.
+    let mut pacing = crate::core::rql::conflict_wait::Pacing::new(crate::core::rql::conflict_wait::Site::Block);
     loop {
         // Every attempt runs under the same transaction, so under the same
         // owner: a block's root, or the statement's O its transaction acts for.
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::InTxnAttempt, tx, database);
         // See `execute_with_sync`: a prepared `SELECT` skips the box sized for
         // every statement arm.
-        let response = match query {
+        let (response, blocker) = match query {
             QueryPurpose::PreparedRows(prepared) => {
-                Box::pin(execute_prepared_rows(prepared, database.clone(), tx, SubqueryNeed::All))
-                    .await
+                crate::core::rql::conflict_wait::capture(Box::pin(execute_prepared_rows(
+                    prepared,
+                    database.clone(),
+                    tx,
+                    SubqueryNeed::All,
+                )))
+                .await
             }
-            query => Box::pin(execute_with_context(query, database.clone(), 0, tx)).await,
+            query => {
+                crate::core::rql::conflict_wait::capture(Box::pin(execute_with_context(
+                    query,
+                    database.clone(),
+                    0,
+                    tx,
+                )))
+                .await
+            }
         };
-        if !retryable || attempt >= MAX_CONFLICT_RETRIES || !is_retryable_conflict(&response) {
+        if !retryable || !is_retryable_conflict(&response) {
             return strip_conflict_marker(response);
         }
-        attempt += 1;
-        // Long enough for the transaction that won to end; it is another task
-        // that has to run, so backing off beats spinning.
-        tokio::time::sleep(conflict_backoff(attempt)).await;
+        // Until the transaction that won ends: a real wait, in the graph.
+        let waiter = database.row_locks.owner_of(tx);
+        match pacing.pause(&database, waiter, blocker, MAX_CONFLICT_RETRIES).await {
+            crate::core::rql::conflict_wait::Pause::Retry => {}
+            crate::core::rql::conflict_wait::Pause::GiveUp => return strip_conflict_marker(response),
+            crate::core::rql::conflict_wait::Pause::Fail(message) => return ddl_error(&message),
+        }
         query = match recognize_query_purpose(&retry_sql) {
             Some(mut reparsed) => {
                 if let Some((do_nothing, update)) = insert_conflict.clone() {
