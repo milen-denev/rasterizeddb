@@ -501,10 +501,19 @@ impl<'a> TableLoader<'a> {
         // never builds. Anything that path cannot do exactly — a JSON column, a
         // generated one, a refusal — comes back `None` and runs as the
         // statement below, which then has the last word.
+        // Each batch transaction is a named owner, the importer's, never
+        // `FROZEN_TX` (docs/persistent-indexes.md §7 Owner); `commit` and
+        // `abort` release it.
+        let importer = crate::core::mvcc::owner::OwnerKind::Importer;
         if self.direct
-            && executor::insert_loaded_row(database, &table.name, &self.statement, tx)
-                .await
-                .is_some()
+            && crate::core::mvcc::owner::under(
+                &database.transactions,
+                tx,
+                importer,
+                executor::insert_loaded_row(database, &table.name, &self.statement, tx),
+            )
+            .await
+            .is_some()
         {
             self.direct_rows += 1;
             self.note_row();
@@ -520,7 +529,13 @@ impl<'a> TableLoader<'a> {
             ));
         };
 
-        let response = executor::execute_in_txn(purpose, database.clone(), tx).await;
+        let response = crate::core::mvcc::owner::under(
+            &database.transactions,
+            tx,
+            importer,
+            executor::execute_in_txn(purpose, database.clone(), tx),
+        )
+        .await;
         if response.first() == Some(&3) {
             let message = String::from_utf8_lossy(&response[1..]).to_string();
             self.abort();
@@ -643,7 +658,12 @@ async fn run_ddl(database: &Arc<Database>, sql: &str) -> Result<(), String> {
             sql
         ));
     };
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = executor::execute_as(
+        crate::core::mvcc::owner::OwnerKind::Importer,
+        purpose,
+        database.clone(),
+    )
+    .await;
     if response.first() == Some(&3) {
         return Err(format!(
             "{}\n  while running: {}",
@@ -665,6 +685,11 @@ async fn commit(database: &Arc<Database>, tx: crate::core::mvcc::TxId) -> Result
     // Publishing to peers is the one thing a batch still does, so a replica
     // keeps pace with the load rather than receiving it all at the end.
     let family = database.commit_transaction(tx);
+    // The batch's outcome is as durable as an import's gets until `finish`
+    // (above), so its owner goes with the commit.
+    if let Some(owner) = crate::core::mvcc::owner::LockOwner::block(tx) {
+        database.release_owner(owner);
+    }
     database.publish_transaction(family).await;
     Ok(())
 }
@@ -700,6 +725,9 @@ fn abort(database: &Arc<Database>, tx: crate::core::mvcc::TxId) {
     // The flush is skipped for the same reason `commit` skips it: an aborted
     // batch fails the import, and the database is dropped behind it.
     database.abort_transaction(tx);
+    if let Some(owner) = crate::core::mvcc::owner::LockOwner::block(tx) {
+        database.release_owner(owner);
+    }
 }
 
 /// The one column an `IMPORT` reports through.
@@ -885,6 +913,54 @@ mod load_tests {
     async fn select(database: &Arc<Database>, sql: &str) -> Vec<u8> {
         let purpose = recognize_query_purpose(sql).expect("parse");
         executor::execute(purpose, database.clone()).await
+    }
+
+    /// The importer runs as a named owner, never unowned (§7 Owner): its DDL
+    /// one owner per statement, each batch transaction under its own root,
+    /// released when the batch commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_importer_runs_under_named_owners() {
+        use crate::core::mvcc::owner::{probe, LockOwner, OwnerKind};
+        let database = crate::replication::test_support::in_memory_database().await;
+        let table = plan_for("owned");
+        let (created, records) = probe::capture(run_ddl(&database, &table.create)).await;
+        created.expect("create");
+        assert!(!records.is_empty(), "the DDL recorded nothing");
+        let ddl_owner = records[0].owner.expect("the DDL ran under no owner");
+        for r in &records {
+            assert_eq!(r.owner, Some(ddl_owner), "the DDL's {:?} ran under another owner", r.site);
+            assert_eq!(ddl_owner.kind, OwnerKind::Importer);
+        }
+        assert_ne!(
+            database.transactions.outcome(ddl_owner.owner.id()),
+            crate::core::mvcc::TxOutcome::InProgress,
+            "the DDL's owner was never ended"
+        );
+
+        let options = ImportOptions {
+            batch_rows: 2,
+            ..ImportOptions::default()
+        };
+        let mut loader = TableLoader::new(&database, &table, &options);
+        loader.direct = false;
+        let (row, records) = probe::capture(loader.row(&copy_line(1))).await;
+        row.expect("row");
+        let tx = loader.transaction.expect("the batch is open");
+        assert!(!records.is_empty());
+        for r in &records {
+            let o = r.owner.unwrap_or_else(|| panic!("the import row's {:?} ran under no owner", r.site));
+            assert_eq!(o.kind, OwnerKind::Importer);
+            assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "the row ran outside its batch's owner");
+        }
+        // Something for the batch's owner to hold, so only its release frees it.
+        let live: &dyn Fn(crate::core::mvcc::TxId) -> bool = &|_| true;
+        database
+            .row_locks
+            .acquire_table("owned", tx, crate::core::mvcc::row_locks::TableLockMode::Shared, live);
+        assert!(database.row_locks.owner_holds_tables(tx));
+        let n = loader.finish().await.expect("finish");
+        assert_eq!(n, 1);
+        assert!(!database.row_locks.owner_holds_tables(tx), "the batch's commit did not release its owner");
     }
 
     /// Every value the import converts, stored by the direct write and by the

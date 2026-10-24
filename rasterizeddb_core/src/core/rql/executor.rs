@@ -617,11 +617,14 @@ pub(crate) async fn run_returning_rows(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ReturningBody, tx, database);
     let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
     // Runs inside the caller's transaction rather than opening its own. A
     // data-modifying CTE is part of one statement, so committing it separately
     // would leave its writes behind when the outer statement fails — or when
-    // the block it belongs to is rolled back.
+    // the block it belongs to is rolled back. Under `FROZEN_TX` it opens an
+    // autocommit attempt, which joins this statement's owner O rather than
+    // beginning a second one (§7: one owner per statement).
     let response = if tx == crate::core::mvcc::transaction::FROZEN_TX {
         Box::pin(execute(purpose, database.clone())).await
     } else {
@@ -728,6 +731,7 @@ pub async fn substitute_in_subqueries(
 ) -> Result<String, String> {
     use crate::core::rql::subquery;
 
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Subquery, tx, database);
     const MAX_SUBQUERIES: usize = 8;
 
     let mut current = sql.to_string();
@@ -891,6 +895,7 @@ async fn check_foreign_keys(
     assignments: &[(String, String)],
     tx: TxId,
 ) -> Result<(), String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
     let foreign_keys = {
         let entry = database.tables.get(table_name);
         match entry.as_ref() {
@@ -4808,6 +4813,7 @@ async fn apply_conflict_update(
     depth: usize,
     tx: TxId,
 ) -> Vec<u8> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ConflictUpdate, tx, database);
     let inserted =
         crate::core::rql::lexer_ir::assignments_of_insert(insert_sql).unwrap_or_default();
     if inserted.is_empty() {
@@ -6482,6 +6488,7 @@ async fn insert_values_tuples(
                 data.on_conflict_do_nothing = row_data.on_conflict_do_nothing;
                 data.on_conflict_update = row_data.on_conflict_update.clone();
             }
+            crate::owner_probe!(crate::core::mvcc::owner::probe::Site::BatchTuple, tx, database);
             let response =
                 Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
             if !is_retryable_conflict(&response) || attempt >= MAX_CONFLICT_RETRIES {
@@ -6745,6 +6752,7 @@ async fn json_default_reference(
     is_json: bool,
     tx: TxId,
 ) -> Result<Option<String>, String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::JsonDefault, tx, database);
     let Some(expression) = expression else {
         return Ok(None);
     };
@@ -6813,6 +6821,7 @@ fn json_default_is_an_object(expression: &str) -> Result<(), String> {
 /// and not yet committed. Run beside the transaction it would not see them,
 /// and the drop-and-recreate would discard them with nothing reporting it.
 async fn run_ddl(database: &Arc<Database>, sql: &str, tx: TxId) -> Result<(), String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ShadowDdl, tx, database);
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
     let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
@@ -10392,6 +10401,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<Option<Vec<crate::core::row::row::Row>>, String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Returning, tx, database);
     let schema = &table.schema.fields;
 
     let items = match crate::core::rql::lexer_ir::returning_items(sql, schema) {
@@ -10833,6 +10843,18 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
     execute_with_sync(query, database, crate::synchronous_commit()).await
 }
 
+/// [`execute`] as one statement of a named internal owner (§7 Owner): login
+/// role lookups and the role catalogue's bootstrap, the importer's DDL, the
+/// native protocol. Inside an owner scope already, it joins that one.
+pub async fn execute_as(
+    kind: crate::core::mvcc::owner::OwnerKind,
+    query: QueryPurpose,
+    database: Arc<Database>,
+) -> Vec<u8> {
+    let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
+    crate::core::mvcc::owner::statement(&transactions, &row_locks, kind, execute(query, database)).await
+}
+
 /// `execute`, with the caller choosing whether the commit waits for its sync.
 ///
 /// `wait` is the effective `synchronous_commit` — the server default unless the
@@ -10849,6 +10871,22 @@ pub async fn execute_with_sync(
     database: Arc<Database>,
     wait: bool,
 ) -> Vec<u8> {
+    // One owner O for the statement, whatever protocol or internal caller it
+    // came from (finding L3): the wire's scope if it opened one, otherwise a
+    // new one, ended (its locks released, after the durability steps below)
+    // when this returns or is dropped.
+    let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
+    crate::core::mvcc::owner::statement(
+        &transactions,
+        &row_locks,
+        crate::core::mvcc::owner::OwnerKind::Statement,
+        execute_autocommit(query, database, wait),
+    )
+    .await
+}
+
+/// [`execute_with_sync`] inside its owner scope.
+async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: bool) -> Vec<u8> {
     // Autocommit: a statement arriving outside an explicit transaction still
     // gets one. It has to. A DELETE has to stamp `xmax` with an id that other
     // snapshots can order themselves against, and reclamation reads a bare
@@ -10901,8 +10939,17 @@ pub async fn execute_with_sync(
     // report it rather than a misleading empty success.
     let mut first_conflict: Option<Vec<u8>> = None;
     let mut attempt = 0usize;
+    // O, begun before the first attempt so it reads `InProgress` across every
+    // one of them and is older than each (§7 Owner). Each attempt acts for it
+    // through an alias held across the attempt's commit or abort: the
+    // statement's table locks and graph node are O's and survive a retry,
+    // while each attempt's row locks are its own and end with it (L4).
+    let owner = crate::core::mvcc::owner::ensure().map(|o| o.owner);
+    let mut _alias: Option<crate::core::mvcc::row_locks::AliasGuard<'_>> = None;
     let (tx, response) = loop {
         let tx = database.transactions.begin_autocommit();
+        _alias = owner.map(|o| database.row_locks.owner_alias(tx, o));
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Attempt, tx, database);
 
         // The purpose is consumed by each attempt, so later ones re-read it
         // from the statement text. `retryable` already established that the
@@ -11266,6 +11313,20 @@ fn is_retryable_conflict(response: &[u8]) -> bool {
 /// same world and conflicts again; the bounded attempts then surface the
 /// error, which is what that level is supposed to do.
 pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
+    // Under the scope already in place (a statement's sub-execution joins its
+    // owner); otherwise under the transaction's root, which is a block's owner
+    // and is released by whoever ends the block.
+    let transactions = database.transactions.clone();
+    crate::core::mvcc::owner::under(
+        &transactions,
+        tx,
+        crate::core::mvcc::owner::OwnerKind::Block,
+        execute_in_txn_inner(query, database, tx),
+    )
+    .await
+}
+
+async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let retry_sql = query_sql(&query);
     // `InsertRow` for the same reason the autocommit path replays it: the
     // uniqueness check runs before the row is written, so a statement it
@@ -11288,6 +11349,9 @@ pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: Tx
     let mut query = query;
     let mut attempt = 0usize;
     loop {
+        // Every attempt runs under the same transaction, so under the same
+        // owner: a block's root, or the statement's O its transaction acts for.
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::InTxnAttempt, tx, database);
         // See `execute_with_sync`: a prepared `SELECT` skips the box sized for
         // every statement arm.
         let response = match query {
@@ -11453,6 +11517,7 @@ pub(crate) async fn execute_with_need(
     tx: TxId,
     need: SubqueryNeed,
 ) -> Vec<u8> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Dispatch { depth }, tx, database);
     // A cached parse goes straight to the scan: it is the parse the plain
     // branch below made for this statement, and was only cached because that
     // branch is all the statement ever took.

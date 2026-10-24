@@ -40,6 +40,8 @@ mod param_infer;
 mod prepared_partition_tests;
 mod statement_intern;
 #[cfg(test)]
+mod owner_tests;
+#[cfg(test)]
 mod temp_relation_tests;
 mod wire_out;
 
@@ -1552,6 +1554,7 @@ where
         if wrote {
             flush_outcomes(database);
         }
+        t.owner.release();
     }
     result
 }
@@ -1778,6 +1781,7 @@ where
         if wrote {
             flush_outcomes(database);
         }
+        t.owner.release();
     } else {
         log::info!("{}", message);
     }
@@ -2020,6 +2024,10 @@ struct SessionTransaction {
     /// clients depend on it: the alternative is a transaction that commits
     /// having silently skipped the statement that did not work.
     failed: bool,
+    /// The block's lock owner (its root), released when the block ends: by
+    /// each ending path after its last durability step and before it replies
+    /// (finding L4), and by the drop on any path that forgets to.
+    owner: crate::core::mvcc::owner::OwnerRelease,
 }
 
 impl SessionState {
@@ -4309,19 +4317,55 @@ where
     //
     // Notices the engine raises for this statement are collected here and
     // sent ahead of its `CommandComplete` (see `send_command_complete`).
+    //
+    // One lock owner for the whole statement and everything it runs (CTE and
+    // derived bodies, catalog relations and their drops, subqueries, the
+    // engine's attempts): the open block's root, or for an autocommit
+    // statement its owner O, begun the first time something asks for it and
+    // ended (its locks released) as this statement's future ends, on every way
+    // out (docs/persistent-indexes.md §7 Owner, Q1). Each arm builds its own
+    // future so the statement's is stored once.
+    let block_root = state.transaction.as_ref().map(|t| t.id);
+    let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
     crate::core::cancel::STATEMENT_CANCEL
-        .scope(
-            cancel,
-            crate::core::notice::collect(execute_recorded_inner(
-                database,
-                state,
-                stream,
-                stmt,
-                result_formats,
-                omit_description,
-                prepared,
-            )),
-        )
+        .scope(cancel, async {
+            match block_root {
+                Some(root) => {
+                    crate::core::mvcc::owner::under(
+                        &transactions,
+                        root,
+                        crate::core::mvcc::owner::OwnerKind::Block,
+                        crate::core::notice::collect(execute_recorded_inner(
+                            database,
+                            state,
+                            stream,
+                            stmt,
+                            result_formats,
+                            omit_description,
+                            prepared,
+                        )),
+                    )
+                    .await
+                }
+                None => {
+                    crate::core::mvcc::owner::statement(
+                        &transactions,
+                        &row_locks,
+                        crate::core::mvcc::owner::OwnerKind::Statement,
+                        crate::core::notice::collect(execute_recorded_inner(
+                            database,
+                            state,
+                            stream,
+                            stmt,
+                            result_formats,
+                            omit_description,
+                            prepared,
+                        )),
+                    )
+                    .await
+                }
+            }
+        })
         .await
 }
 
@@ -4794,10 +4838,25 @@ where
     // they need one transaction. Outside an explicit block there is none yet —
     // `execute` would open its own *after* the CTE bodies had already run and
     // committed — so one is opened here to span both, and closed on the outcome.
+    //
+    // That transaction **is** the statement's owner O (§7 Owner, Q1), never a
+    // second owner beside it: its CTE bodies and the outer statement hold
+    // their locks as O. Should O already have been begun as a plain owner, a
+    // transaction of its own acts for it through an alias instead.
+    let mut _cte_alias: Option<crate::core::mvcc::row_locks::AliasGuard<'_>> = None;
     let cte_tx = match state.current_tx() {
         Some(tx) => Some((tx, false)),
         None if crate::core::rql::cte::has_with_clause(stmt) => {
-            Some((database.transactions.begin_autocommit(), true))
+            let tx = match crate::core::mvcc::owner::adopt_transaction() {
+                Some(o) => o,
+                None => {
+                    let tx = database.transactions.begin_autocommit();
+                    _cte_alias = crate::core::mvcc::owner::ensure()
+                        .map(|o| database.row_locks.owner_alias(tx, o.owner));
+                    tx
+                }
+            };
+            Some((tx, true))
         }
         None => None,
     };
@@ -6047,6 +6106,7 @@ fn open_block(
         read_only,
         savepoints: Vec::new(),
         failed: false,
+        owner: crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, id),
     });
 }
 
@@ -6166,6 +6226,7 @@ where
                 if wrote {
                     flush_outcomes(database);
                 }
+                t.owner.release();
                 send_command_complete(stream, "ROLLBACK").await?;
             }
             Some(t) => {
@@ -6184,6 +6245,7 @@ where
 
                 if !wrote {
                     let family = database.commit_transaction(t.id);
+                    t.owner.release();
                     database.publish_transaction(family).await;
                     if let Some((level, read_only)) = chain_into {
                         open_block(database, state, level, read_only);
@@ -6202,6 +6264,7 @@ where
                         log::error!("Could not make the block's rows durable: {}", e);
                         database.abort_transaction(t.id);
                         flush_outcomes(database);
+                        t.owner.release();
                         let message = format!(
                             "could not commit: the rows written could not be made durable ({})",
                             e
@@ -6233,6 +6296,7 @@ where
                 if let Err(e) = database.transactions.flush_deferred() {
                     log::error!("Could not record the transaction outcome: {}", e);
                     database.abort_transaction(t.id);
+                    t.owner.release();
                     send_error_response(
                         stream,
                         "58030",
@@ -6258,6 +6322,7 @@ where
                         log::error!("Could not make the block's rows durable: {}", e);
                         database.abort_transaction(t.id);
                         flush_outcomes(database);
+                        t.owner.release();
                         send_error_response(
                             stream,
                             "58030",
@@ -6273,6 +6338,9 @@ where
                     }
                 }
 
+                // The last durability step is done: the block's table locks go
+                // now, before the reply (finding L4).
+                t.owner.release();
                 // Durable, so the block's writes may now go to the other
                 // instances. Before the flush they could have been
                 // published and then rolled back here.
@@ -6512,6 +6580,7 @@ where
                 if wrote {
                     flush_outcomes(database);
                 }
+                t.owner.release();
             }
         }
         if let Some((level, read_only)) = chain_into {

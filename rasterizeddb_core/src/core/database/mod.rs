@@ -93,7 +93,7 @@ use crate::{
             schema::{SchemaCalculator, SchemaField, TableSchema},
             table::Table,
         },
-        rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose},
+        rql::{executor::execute_as, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose},
         storage_providers::{backend::DbStorageProvider, traits::StorageIO},
     },
     memory_pool::MEMORY_POOL,
@@ -1704,10 +1704,21 @@ impl Database {
         // past the commit, which it happens to do and is not obliged to.
         let family = self.family_of(tx);
         self.transactions.commit(tx);
-        // A lock outlives nothing: whatever this transaction held is another
-        // transaction's the moment it ends.
-        self.row_locks.release_all(tx);
+        // A row lock outlives nothing: whatever this transaction held is
+        // another transaction's the moment it ends. Its owner's table locks
+        // are not released here (finding L4): the outcome is not durable yet,
+        // and an AE granted in between could rewrite rows a failed flush then
+        // aborts. The owner goes after the last durability step, with
+        // `release_owner` (an autocommit statement's scope end, a block's end).
+        self.row_locks.release_rows(tx);
         family
+    }
+
+    /// Releases everything `owner` holds: its table locks, its wait-for edge,
+    /// the aliases pointing at it. After the last durability step of the
+    /// statement or block it owns (docs/persistent-indexes.md §7 Lifetime).
+    pub fn release_owner(&self, owner: crate::core::mvcc::owner::LockOwner) {
+        self.row_locks.release_owner(owner);
     }
 
     /// Hands a committed, durable transaction to the peers.
@@ -1765,7 +1776,10 @@ impl Database {
         // relying on that would make this quietly wrong the day something does.
         let family = self.family_of(tx);
         self.transactions.abort(tx);
-        self.row_locks.release_all(tx);
+        // Rows only, as in `commit_transaction`. An autocommit attempt that
+        // conflicted ends here, and its statement's owner keeps its table
+        // locks and graph node for the next attempt (finding L4).
+        self.row_locks.release_rows(tx);
         // Every id, including savepoints: their buffers would otherwise sit in
         // the capture map for the life of the process.
         self.replication.on_abort_family(&family.ids());
@@ -4655,10 +4669,19 @@ pub(crate) async fn process_incoming_queries(
 }
 
 /// Runs one recognised statement from the native protocol.
+/// [`run_native_query`], for the owner tests.
+#[cfg(test)]
+pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Database>) -> Vec<u8> {
+    run_native_query(query, database).await
+}
+
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
     if let Some(query_purpose) = recognize_query_purpose(query) {
         info!("Recognized query purpose: {:?}", query_purpose);
-        execute(query_purpose, database).await
+        // A named owner for the native protocol's statements (§7 Owner;
+        // finding L3): never `FROZEN_TX`, and one per statement.
+        execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database)
+            .await
     } else {
         error!("Could not recognize query purpose");
         error_response("Unrecognized query")

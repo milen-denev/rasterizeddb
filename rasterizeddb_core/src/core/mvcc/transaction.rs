@@ -547,6 +547,11 @@ struct Inner {
     /// Ids are removed as their family retires, so this holds one entry per
     /// writing transaction currently in flight rather than a history.
     wrote: BTreeSet<TxId>,
+    /// Statement lock owners O ([`TransactionManager::begin_owner`]): running,
+    /// so they read `InProgress` and hold `oldest_active` and the status log's
+    /// settling below them, but they never take a snapshot, read or write.
+    /// The in-place gate looks past them; see `try_begin_in_place_for`.
+    owner_only: BTreeSet<TxId>,
 }
 
 impl TransactionManager {
@@ -613,6 +618,7 @@ impl TransactionManager {
                 children: std::collections::BTreeMap::new(),
                 rolled_back: BTreeSet::new(),
                 wrote: BTreeSet::new(),
+                owner_only: BTreeSet::new(),
             }),
             next_id: AtomicU64::new(next_id).into(),
             status,
@@ -774,7 +780,14 @@ impl TransactionManager {
         // Read `running` while holding the latch, so no `begin` can land
         // between observing it empty and raising the count.
         let inner = self.inner.read();
-        if inner.running.iter().any(|id| *id != own) {
+        // A statement's lock owner O is running but holds no snapshot, so it
+        // cannot tell before from after: counting it would make every
+        // autocommit statement decline (its own O is always running).
+        if inner
+            .running
+            .iter()
+            .any(|id| *id != own && !inner.owner_only.contains(id))
+        {
             return None;
         }
         // Two separate conditions, and the second is easy to miss. "Nobody else
@@ -808,7 +821,38 @@ impl TransactionManager {
     /// never be rolled back after its statement returns, which is what makes the
     /// in-place fast path safe for it and unsafe for a `BEGIN` block.
     pub fn begin_autocommit(&self) -> TxId {
-        self.begin_inner(true)
+        self.begin_inner(true, false)
+    }
+
+    /// Begins an autocommit statement's lock owner O (docs/persistent-indexes.md
+    /// §7 Owner, slice B2): a real top-level id, so it reads `InProgress`
+    /// from here until [`TransactionManager::end_owner`], however many
+    /// attempts the statement makes under ids of their own, and the status
+    /// log can neither settle nor forget it meanwhile (it holds
+    /// `oldest_active` down, which bounds both).
+    ///
+    /// It never takes a snapshot, reads or writes: each attempt does that
+    /// under its own id, aliased to O for locks (`RowLocks::owner_alias`).
+    /// So the in-place gate does not count it as a reader.
+    pub fn begin_owner(&self) -> TxId {
+        self.begin_inner(true, true)
+    }
+
+    /// Ends an owner begun by [`TransactionManager::begin_owner`]. It wrote
+    /// nothing, so it commits with no durable record: a restart that finds
+    /// none reads it as aborted, which changes nothing.
+    pub fn end_owner(&self, o: TxId) {
+        debug_assert!(
+            !self.inner.read().wrote.contains(&o),
+            "the owner {o} stamped a version; only its attempts write"
+        );
+        self.commit(o);
+    }
+
+    /// Whether `tx` is an owner begun by [`TransactionManager::begin_owner`]
+    /// and still running.
+    pub fn is_owner_only(&self, tx: TxId) -> bool {
+        self.inner.read().owner_only.contains(&tx)
     }
 
     /// Republishes the count [`TransactionManager::outcome`]'s lock-free path
@@ -863,6 +907,7 @@ impl TransactionManager {
             inner.statement_scoped.remove(&id);
             inner.rolled_back.remove(&id);
             inner.wrote.remove(&id);
+            inner.owner_only.remove(&id);
             if let Some(parent) = inner.parent.remove(&id) {
                 if let Some(kids) = inner.children.get_mut(&parent) {
                     kids.retain(|k| *k != id);
@@ -983,14 +1028,14 @@ impl TransactionManager {
     /// middle of one would read the new bytes for a row it is entitled to see
     /// unchanged. See [`TransactionManager::try_begin_in_place`].
     pub fn begin(&self) -> TxId {
-        self.begin_inner(false)
+        self.begin_inner(false, false)
     }
 
     /// `begin`, optionally marking the transaction statement-scoped in the
     /// same critical section — so no observer of `inner` can see an
     /// autocommit transaction running but not yet statement-scoped, and the
     /// begin takes the write lock once rather than twice.
-    fn begin_inner(&self, statement_scoped: bool) -> TxId {
+    fn begin_inner(&self, statement_scoped: bool, owner_only: bool) -> TxId {
         let mut in_place = lock(&self.in_place);
         while *in_place > 0 {
             in_place = self
@@ -1023,6 +1068,9 @@ impl TransactionManager {
         inner.running.insert(id);
         if statement_scoped {
             inner.statement_scoped.insert(id);
+        }
+        if owner_only {
+            inner.owner_only.insert(id);
         }
         self.next_id.store(inner.next_id, Ordering::Release);
         self.status.record(id, TxOutcome::InProgress);
@@ -1159,13 +1207,32 @@ impl TransactionManager {
             return self.status.forgotten_below();
         }
         let min = state.tables.values().copied().min().unwrap_or(TxId::MAX);
-        self.status.forget_below(min)
+        let forgotten = self.status.forget_below(min);
+        self.assert_no_running_id_settled();
+        forgotten
     }
 
     /// Settles the status log up to [`Self::settle_bound`] now. Returns the
     /// horizon reached.
     pub fn settle_now(&self) -> TxId {
-        self.status.settle_below(self.settle_bound())
+        let reached = self.status.settle_below(self.settle_bound());
+        self.assert_no_running_id_settled();
+        reached
+    }
+
+    /// The status log never settles, and so never forgets, an id still in
+    /// progress: a statement's owner O must read `InProgress` for its whole
+    /// life (§7 Owner), and a block's root for its own. Settling is bounded by
+    /// `oldest_active`, which only rises, so the settled horizon stays at or
+    /// below the oldest running id.
+    #[inline]
+    fn assert_no_running_id_settled(&self) {
+        debug_assert!(
+            self.status.settled_below() <= self.oldest_active(),
+            "the status log settled past running id {} (settled below {})",
+            self.oldest_active(),
+            self.status.settled_below()
+        );
     }
 
     /// How often, in transaction ids, a commit tries to settle. Tests shrink it.

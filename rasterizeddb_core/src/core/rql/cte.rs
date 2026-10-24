@@ -932,6 +932,7 @@ async fn materialize_inner(
     if rest.trim().is_empty() {
         return Err("a WITH clause with no statement after it".to_string());
     }
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Cte, tx, database);
 
     let mut rewritten = rest;
 
@@ -1467,6 +1468,7 @@ pub async fn drop_temps(
     tx: crate::core::mvcc::transaction::TxId,
 ) {
     for temp in temps {
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::DropTemps, tx, database);
         let sql = format!("DROP TABLE {}", temp);
         if let Err(e) = crate::core::rql::executor::run_statement(&sql, database, tx).await {
             log::warn!("could not drop the temporary table {}: {}", temp, e);
@@ -1711,6 +1713,7 @@ async fn materialize_derived_inner(
             break;
         };
         found_any = true;
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Derived, tx, database);
 
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());

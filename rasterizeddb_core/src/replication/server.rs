@@ -416,6 +416,10 @@ async fn apply_record(
 
     let tx = database.transactions.begin();
     replication.enter_apply(tx, record.origin);
+    // The apply's lock owner: a named internal owner, its transaction's root,
+    // never `FROZEN_TX` (docs/persistent-indexes.md §7 Owner; finding L2).
+    // Released after the last durability step below, or on any way out.
+    let owner = crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, tx);
 
     let mut failure: Option<String> = None;
     for statement in &record.statements {
@@ -424,7 +428,13 @@ async fn apply_record(
             break;
         };
 
-        let response = execute_in_txn(purpose, database.clone(), tx).await;
+        let response = crate::core::mvcc::owner::under(
+            &database.transactions,
+            tx,
+            crate::core::mvcc::owner::OwnerKind::Replication,
+            execute_in_txn(purpose, database.clone(), tx),
+        )
+        .await;
         if response.first() == Some(&3) {
             let message = String::from_utf8_lossy(&response[1..]).to_string();
             match policy {
@@ -448,10 +458,14 @@ async fn apply_record(
     replication.leave_apply(tx);
 
     if let Some(message) = failure {
-        database.transactions.abort(tx);
+        // `Database::abort_transaction`, not the manager's `abort`: the latter
+        // ended the transaction but left its row locks in the lock table and
+        // its capture buffers behind (finding L2).
+        database.abort_transaction(tx);
         if let Err(e) = database.transactions.flush() {
             warn!("Could not make the aborted outcome durable: {}", e);
         }
+        owner.release();
         // Deliberately *not* advancing the applied position. Under `abort` the
         // stream stops here rather than silently skipping a transaction, which
         // is the difference between a visible stall and quiet divergence.
@@ -474,6 +488,7 @@ async fn apply_record(
         if let Err(e) = database.transactions.flush() {
             warn!("Could not make the aborted outcome durable: {}", e);
         }
+        owner.release();
         // Not recorded as applied, so the record comes again and is applied
         // then, instead of being skipped for good.
         return refuse(
@@ -490,12 +505,15 @@ async fn apply_record(
         if let Err(e) = database.transactions.flush() {
             warn!("Could not make the aborted outcome durable: {}", e);
         }
+        owner.release();
         return refuse(
             &record,
             ApplyStatus::Failed,
             format!("the transaction outcome could not be made durable: {}", e),
         );
     }
+    // Durable: the apply's table locks go now (finding L4).
+    owner.release();
 
     // Recorded after the commit is durable: a crash in the window between them
     // replays this transaction rather than losing it. See `super::log`.
@@ -645,6 +663,89 @@ mod tests {
         assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
         assert_eq!(row_count(&database).await, 1);
         assert_eq!(replication.applied().high_water(2), 1);
+    }
+
+    /// Replication apply runs under a named owner, its transaction's root,
+    /// never unowned (§7 Owner; finding L2). A failed apply ends through
+    /// `Database::abort_transaction`, so its row and referenced-key locks
+    /// go, and its owner is released.
+    #[tokio::test]
+    async fn an_apply_runs_under_its_named_owner_and_releases_it_on_every_end() {
+        use crate::core::mvcc::owner::{probe, LockOwner, OwnerKind};
+        let database = database().await;
+        create_table(&database).await;
+        for sql in [
+            "CREATE TABLE repl_parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE repl_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES repl_parent(id))",
+            "INSERT INTO repl_parent (id) VALUES (1)",
+        ] {
+            let response = crate::core::rql::executor::execute(recognize_query_purpose(sql).unwrap(), database.clone()).await;
+            assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response));
+        }
+        let replication = database.replication.clone();
+
+        let check = |what: &str, records: &[probe::Record]| -> crate::core::mvcc::TxId {
+            assert!(!records.is_empty(), "{what}: the apply recorded nothing");
+            let tx = records[0].tx;
+            for r in records {
+                let o = r.owner.unwrap_or_else(|| panic!("{what}: {:?} ran under no owner", r.site));
+                assert_eq!(o.kind, OwnerKind::Replication, "{what}: {:?}", r.site);
+                assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "{what}: not the apply's own transaction");
+                assert!(r.owner_in_progress);
+            }
+            tx
+        };
+
+        let (outcome, records) = probe::capture(apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO repl_child (id, pid) VALUES (10, 1)"]),
+            NO_SENDER,
+        ))
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        let tx = check("applied", &records);
+        assert!(!database.row_locks.txn_holds_rows(tx), "an applied transaction kept its key locks");
+        assert!(!database.row_locks.owner_holds_tables(tx));
+
+        // Control: the first statement below takes a row lock its transaction
+        // holds to its end, or the check after the failed apply proves nothing.
+        let control = database.transactions.begin();
+        let response = crate::core::rql::executor::execute_in_txn(
+            recognize_query_purpose("SELECT id FROM repl_parent WHERE id = 1 FOR UPDATE").unwrap(),
+            database.clone(),
+            control,
+        )
+        .await;
+        assert_ne!(response.first(), Some(&3), "{}", String::from_utf8_lossy(&response));
+        assert!(database.row_locks.txn_holds_rows(control), "the control statement took no lock");
+        database.abort_transaction(control);
+
+        // Under `abort` (the default), a statement that fails ends the apply.
+        // The statement before it took a row lock.
+        assert_eq!(replication.conflict_policy(), ConflictPolicy::Abort);
+        let (outcome, records) = probe::capture(apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                2,
+                vec![
+                    "SELECT id FROM repl_parent WHERE id = 1 FOR UPDATE",
+                    "INSERT INTO no_such_table (id) VALUES (1)",
+                ],
+            ),
+            NO_SENDER,
+        ))
+        .await;
+        assert_ne!(outcome.status, ApplyStatus::Applied);
+        let tx = check("failed", &records);
+        assert_eq!(database.transactions.outcome(tx), crate::core::mvcc::TxOutcome::Aborted);
+        assert!(
+            !database.row_locks.txn_holds_rows(tx),
+            "a failed apply left its row locks in the lock table"
+        );
+        assert!(!database.row_locks.owner_holds_tables(tx));
     }
 
     #[tokio::test]

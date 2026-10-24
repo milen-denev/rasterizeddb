@@ -15,6 +15,26 @@
 //! Only if writers consult it. `UPDATE` and `DELETE` take the same lock before
 //! rewriting a row, so a row another transaction holds `FOR UPDATE` cannot be
 //! written underneath it — which is the whole point of taking one.
+//!
+//! # Transactions and owners (docs/persistent-indexes.md §7, slice B2)
+//!
+//! Two identities, resolved differently:
+//! - the **transaction** ([`RowLocks::txn_of`], the top-level id) holds row and
+//!   referenced-key locks, and ending it ([`RowLocks::release_rows`], from
+//!   `Database::commit_transaction` and `abort_transaction`) frees them. A
+//!   statement's conflict retry runs each attempt under a fresh id, and
+//!   attempt 1's `FOR UPDATE` and referenced-key locks must not carry into
+//!   attempt 2.
+//! - the **owner** ([`RowLocks::owner_of`]) holds table locks and is the node
+//!   of the wait-for graph. A block's owner is its root; an autocommit
+//!   statement's is its owner O, to which each attempt is aliased
+//!   ([`RowLocks::owner_alias`]), so the statement's table locks and its graph
+//!   node survive its retries and the graph ages it by O. They are freed by
+//!   [`RowLocks::release_owner`] once the statement's or block's last
+//!   durability step is done (finding L4), never by an attempt's end.
+//!
+//! For a block, transaction and owner are the same id, so nothing about its
+//! locks changes; the split only matters once an id is aliased.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,6 +45,8 @@ use smallvec::SmallVec;
 use crate::core::mvcc::TxId;
 use crate::core::mvcc::transaction::TransactionManager;
 use crate::core::rql::row_lock::LockStrength;
+
+pub use crate::core::mvcc::table_locks::LockOwner;
 
 /// Who holds one row's lock.
 #[derive(Debug, Clone)]
@@ -137,9 +159,30 @@ impl Inner {
     /// Everything `tx` holds, gone. Returns how many row and table entries
     /// were removed, for the lock-free emptiness counters.
     fn release(&mut self, tx: TxId) -> (usize, usize) {
-        let Some(list) = self.owned.remove(&tx) else {
+        self.release_where(tx, |_| true)
+    }
+
+    /// What `tx` holds in the spaces `space` accepts, gone; the rest stays
+    /// recorded under it.
+    fn release_where(&mut self, tx: TxId, space_filter: impl Fn(Space) -> bool) -> (usize, usize) {
+        let Some(mut list) = self.owned.remove(&tx) else {
             return (0, 0);
         };
+        let kept: Vec<(Space, NameId, Key)> = {
+            let mut kept = Vec::new();
+            list.retain(|entry| {
+                if space_filter(entry.0) {
+                    true
+                } else {
+                    kept.push(entry.clone());
+                    false
+                }
+            });
+            kept
+        };
+        if !kept.is_empty() {
+            self.owned.insert(tx, kept);
+        }
         let (mut rows_removed, mut tables_removed) = (0, 0);
         for (space, name, key) in list {
             match space {
@@ -210,6 +253,26 @@ pub struct RowLocks {
     /// does, so the graph stays empty unless something is actually stuck. A
     /// mutex of its own: lock operations never take it.
     waits: Mutex<HashMap<TxId, SmallVec<[TxId; 4]>>>,
+    /// Attempt id → its statement's owner O ([`RowLocks::owner_alias`]).
+    aliases: dashmap::DashMap<TxId, TxId>,
+    /// `aliases.len()`, readable without touching the map: with no alias in
+    /// place `owner_of` is the transaction, as it always was.
+    alias_count: AtomicUsize,
+}
+
+/// See [`RowLocks::owner_alias`]. Dropping it ends the alias.
+pub struct AliasGuard<'a> {
+    locks: &'a RowLocks,
+    tx: TxId,
+    owner: TxId,
+}
+
+impl Drop for AliasGuard<'_> {
+    fn drop(&mut self) {
+        if self.locks.aliases.remove_if(&self.tx, |_, o| *o == self.owner).is_some() {
+            self.locks.alias_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// See [`RowLocks::waiting_guard`].
@@ -237,12 +300,50 @@ impl RowLocks {
         }
     }
 
+    /// The transaction `tx` belongs to: itself, or for a savepoint the
+    /// top-level transaction. Row and referenced-key locks are held by it.
     #[inline]
-    fn owner_of(&self, tx: TxId) -> TxId {
+    pub fn txn_of(&self, tx: TxId) -> TxId {
         match &self.transactions {
             Some(manager) => manager.top_level(tx),
             None => tx,
         }
+    }
+
+    /// The lock owner `tx` acts for: its transaction, or the statement owner
+    /// O that transaction is aliased to. Table locks and wait-for edges are
+    /// keyed by it.
+    #[inline]
+    pub fn owner_of(&self, tx: TxId) -> TxId {
+        let txn = self.txn_of(tx);
+        if self.alias_count.load(Ordering::Acquire) == 0 {
+            return txn;
+        }
+        self.aliases.get(&txn).map_or(txn, |o| *o)
+    }
+
+    /// Makes `tx` (an autocommit statement's attempt) act for `owner` (the
+    /// statement's O) until the guard drops: its table locks and wait-for
+    /// edges are O's. Its row and referenced-key locks stay its own, freed
+    /// when it ends (§7 Owner; finding L4).
+    ///
+    /// The caller keeps the guard across the attempt's commit or abort.
+    pub fn owner_alias(&self, tx: TxId, owner: LockOwner) -> AliasGuard<'_> {
+        let txn = self.txn_of(tx);
+        debug_assert_ne!(txn, crate::core::mvcc::transaction::FROZEN_TX, "FROZEN_TX acts for no owner");
+        if txn != owner.id() && self.aliases.insert(txn, owner.id()).is_none() {
+            self.alias_count.fetch_add(1, Ordering::AcqRel);
+        }
+        AliasGuard {
+            locks: self,
+            tx: txn,
+            owner: owner.id(),
+        }
+    }
+
+    /// How many ids are aliased to an owner. Diagnostic and for tests.
+    pub fn alias_len(&self) -> usize {
+        self.alias_count.load(Ordering::Acquire)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -264,7 +365,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Acquired {
-        let tx = self.owner_of(tx);
+        let tx = self.txn_of(tx);
         // `FROZEN_TX` is not a transaction: nothing ever commits or aborts it,
         // so a lock recorded under it is never released and wedges the row for
         // the life of the process. A statement running outside a transaction
@@ -338,7 +439,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Option<TxId> {
-        let tx = self.owner_of(tx);
+        let tx = self.txn_of(tx);
         let mut inner = self.lock();
         let name_id = *inner.names.get(name)?;
         let map = inner.map(space);
@@ -499,21 +600,81 @@ impl RowLocks {
         }
     }
 
-    /// Releases everything `tx` holds. Called when a transaction ends, however
-    /// it ends.
+    /// Releases everything `tx` holds and everything its owner holds: both
+    /// halves below at once. Not what a transaction's end does any more (see
+    /// [`RowLocks::release_rows`]); kept for callers that own both.
+    pub fn release_all(&self, tx: TxId) {
+        self.release_rows(tx);
+        if let Some(owner) = LockOwner::block(self.owner_of(tx)) {
+            self.release_owner(owner);
+        }
+    }
+
+    /// Releases the row and referenced-key locks of `tx`'s transaction.
+    /// Called when a transaction ends, however it ends, including an
+    /// autocommit attempt that conflicted: its owner's table locks survive it
+    /// (finding L4) and go with [`RowLocks::release_owner`].
     ///
     /// Proportional to what `tx` holds, not to every lock in the database: it
     /// runs on every commit, under the one mutex every lock operation takes.
-    pub fn release_all(&self, tx: TxId) {
-        let tx = self.owner_of(tx);
-        self.clear_waiting(tx);
+    pub fn release_rows(&self, tx: TxId) {
+        let txn = self.txn_of(tx);
+        // The edge belongs to the owner. An attempt's wait has ended (its
+        // guard cleared the edge) before the attempt can end, so clearing here
+        // only matters for a transaction that is its own owner, as before.
+        if self.owner_of(tx) == txn {
+            self.clear_waiting(txn);
+        }
         let mut inner = self.lock();
-        if !inner.owned.contains_key(&tx) {
+        if !inner.owned.contains_key(&txn) {
             return;
         }
-        inner.release(tx);
+        inner.release_where(txn, |space| space != Space::Table);
         inner.shrink();
         self.publish_counts(&inner);
+    }
+
+    /// Releases everything `owner` holds: its table locks, anything its own
+    /// transaction id still holds in the row spaces, its wait-for edge and
+    /// any alias still pointing at it. Called once the statement's or block's
+    /// last durability step is done (§7 Lifetime; finding L4), on every exit
+    /// path.
+    pub fn release_owner(&self, owner: LockOwner) {
+        let id = owner.id();
+        if self.alias_count.load(Ordering::Acquire) > 0 {
+            let before = self.aliases.len();
+            self.aliases.retain(|_, o| *o != id);
+            let removed = before.saturating_sub(self.aliases.len());
+            if removed > 0 {
+                self.alias_count.fetch_sub(removed, Ordering::AcqRel);
+            }
+        }
+        self.clear_waiting_owner(id);
+        let mut inner = self.lock();
+        if !inner.owned.contains_key(&id) {
+            return;
+        }
+        inner.release(id);
+        inner.shrink();
+        self.publish_counts(&inner);
+    }
+
+    /// Whether `owner` still holds a table lock. Diagnostic and for tests.
+    pub fn owner_holds_tables(&self, owner: TxId) -> bool {
+        self.lock()
+            .owned
+            .get(&owner)
+            .is_some_and(|list| list.iter().any(|(space, ..)| *space == Space::Table))
+    }
+
+    /// Whether `tx`'s transaction still holds a row or referenced-key lock.
+    /// Diagnostic and for tests.
+    pub fn txn_holds_rows(&self, tx: TxId) -> bool {
+        let txn = self.txn_of(tx);
+        self.lock()
+            .owned
+            .get(&txn)
+            .is_some_and(|list| list.iter().any(|(space, ..)| *space != Space::Table))
     }
 
     fn blockers_of(holder: Option<&Holder>, tx: TxId, exclusive: bool, is_live: &dyn Fn(TxId) -> bool) -> SmallVec<[TxId; 4]> {
@@ -539,7 +700,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> SmallVec<[TxId; 4]> {
-        let tx = self.owner_of(tx);
+        let tx = self.txn_of(tx);
         let mut inner = self.lock();
         let Some(name_id) = inner.names.get(name).copied() else {
             return SmallVec::new();
@@ -607,6 +768,13 @@ impl RowLocks {
     pub fn set_waiting(&self, waiter: TxId, blockers: &[TxId]) {
         let waiter = self.owner_of(waiter);
         if waiter == crate::core::mvcc::transaction::FROZEN_TX {
+            // Its edge is dropped, which is only harmless while it holds
+            // nothing anyone could wait for: `FROZEN_TX` never holds a table
+            // lock (§7 Owner; `LockOwner` cannot be built from it).
+            debug_assert!(
+                !self.owner_holds_tables(waiter),
+                "FROZEN_TX holds a table lock, so its dropped edge can hide a cycle"
+            );
             return;
         }
         let mut waits = self.waits.lock().expect("wait graph poisoned");
@@ -619,7 +787,10 @@ impl RowLocks {
 
     /// `waiter` is no longer waiting — it got the lock, gave up, or ended.
     pub fn clear_waiting(&self, waiter: TxId) {
-        let waiter = self.owner_of(waiter);
+        self.clear_waiting_owner(self.owner_of(waiter));
+    }
+
+    fn clear_waiting_owner(&self, waiter: TxId) {
         let mut waits = self.waits.lock().expect("wait graph poisoned");
         waits.remove(&waiter);
         if waits.is_empty() && waits.capacity() > 64 {

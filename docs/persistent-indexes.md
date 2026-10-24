@@ -1202,6 +1202,71 @@ queues behind the AE. O waiting on its own body is an await inside one task,
 not a lock edge, so no cycle is ever found. So the statement's `WITH`
 transaction **is** O: one `begin_autocommit`, not two.
 
+**As built (B2).** Owners are threaded; nothing new takes a table lock yet
+(only `LOCK TABLE`, in its old two-mode space, until B3b routes lookups
+through `table_for`).
+- *Where O is minted.* The owner rides in a task-local scope
+  (`core/mvcc/owner.rs`), not in parameters, so every sub-execution finds it
+  however its call reached it. The wire opens the scope in
+  `pgwire.rs:execute_recorded`, around `execute_recorded_inner`: the open
+  block's root (`owner::under`), or for an autocommit statement a lazy O
+  (`owner::statement`), begun the first time something asks
+  (`owner::ensure`: the engine's attempt loop now, every `table_for` from
+  B3b). `execute_with_sync` opens a scope only when none is in place, which
+  is how the native protocol, login lookups, the importer's DDL and any other
+  `execute()` caller get one (finding L3), and `execute_in_txn` falls back to
+  its transaction's root. A nested entry point always joins the scope it
+  finds. `SET`, `SHOW`, `BEGIN` and other statements answered above the
+  engine begin no O.
+- *O is an owner-only id.* `TransactionManager::begin_owner` begins O in
+  `running` (so it reads `InProgress`, holds `oldest_active`, and the status
+  log can neither settle nor forget it: `settle_now` and `try_forget` assert
+  the settled horizon stays at or below the oldest running id) and marks it
+  owner-only: it never snapshots, reads or writes, so the in-place gate looks
+  past it (counting it would close the gate for every autocommit statement).
+  `end_owner` commits it with no durable record. A `WITH` statement's
+  transaction is adopted as O (`owner::adopt_transaction`), a regular
+  transaction the statement ends itself.
+- *Release by space (finding L4).* `RowLocks` resolves two identities: row
+  and referenced-key locks belong to the **transaction** (`txn_of`, the
+  top-level id) and go when it ends (`release_rows`, from
+  `Database::commit_transaction` and `abort_transaction`, which no longer
+  release table locks); table locks and the wait-for node belong to the
+  **owner** (`owner_of`, which consults `owner_alias`) and go with
+  `release_owner`. Each autocommit attempt is aliased to O for its life, so
+  attempt 1's `FOR UPDATE` and referenced-key locks never carry into attempt
+  2, while O's table locks and graph node survive every attempt's abort. For
+  a block the two identities are one id.
+- *Release points.* An autocommit scope releases O, then ends it, when its
+  future is dropped: after `execute_with_sync`'s commit, flush and sync, and
+  on error, cancellation, a departed client, a panic or a dropped future
+  alike. A block's owner is an `OwnerRelease` in the session's block,
+  released by COMMIT, ROLLBACK, a failed block's COMMIT, the idle timeout and
+  disconnect after their last durability step and before the reply, and by
+  its drop on any other path. Replication apply runs under its
+  transaction's root (`OwnerKind::Replication`), now ends a failed apply
+  through `abort_transaction` (finding L2, part 1) and releases after the
+  outcome is durable; import batches run under theirs
+  (`OwnerKind::Importer`), released at the batch's commit or abort.
+- *Deviation to settle in B3b.* On the wire an autocommit statement's reply
+  is sent inside `execute_single_statement_inner`, before `drop_temps`, so
+  O is released after the reply. Harmless in B2, where an autocommit
+  statement holds no table lock (`LOCK TABLE` is refused outside a block);
+  from B3b its AS/RX locks would outlive the reply by the temp drops, so a
+  waiting AE is granted a little later than the client's next statement
+  could start. B3b either releases before the reply or accepts that.
+- *Representation and cost (Q4).* O is a `TxId` per autocommit statement,
+  as decided, behind `owner::StatementOwner` and `LockOwner`; swapping it
+  for a tagged registry touches `owner.rs` and `begin_owner`. Measured by
+  `owner_tests.rs:owner_cost` (release, in-memory database, load average
+  ~18, 20,000 point SELECTs through `execute_with_sync`): ids per autocommit
+  statement went from 1 to **2.00**, so the status bitmap grows twice as fast
+  between settles (two bits per id; settled blocks compress as before). O's
+  own work (begin, alias one attempt, release, end) costs **~210 ns**, about
+  **0.3%** of a ~68 µs point SELECT there; one plain autocommit id costs
+  ~130 ns. B3b's perf gate on ext4 decides Q4.
+
+
 **Lifetime.** A family's locks are released with its tickets, once its outcome
 is final and its post-commit work is done (§2 Ticket lifetime); an autocommit
 statement's at its end. AS is held to the end of a block, which matters at

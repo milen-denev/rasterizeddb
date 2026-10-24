@@ -264,6 +264,7 @@ pub async fn materialize(
     if wanted.is_empty() {
         return Ok(None);
     }
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Catalog, tx, database);
 
     let mut temps: Vec<String> = Vec::new();
     let mut rewritten = sql.to_string();

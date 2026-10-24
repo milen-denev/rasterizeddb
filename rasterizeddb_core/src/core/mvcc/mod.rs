@@ -53,6 +53,7 @@
 //! is exactly what a non-versioned scan computes. See
 //! [`transaction::Snapshot::sees_everything`].
 
+pub mod owner;
 pub mod row_locks;
 pub mod status;
 pub mod table_locks;

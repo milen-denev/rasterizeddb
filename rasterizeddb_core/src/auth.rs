@@ -697,7 +697,7 @@ pub async fn ensure_role_catalogue(
     ) -> Result<Vec<u8>, String> {
         let purpose =
             recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database.clone()).await;
+        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -757,7 +757,7 @@ pub async fn lookup_role(
         quote(name)
     );
     let purpose = recognize_query_purpose(&sql)?;
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
     if response.first() != Some(&2) {
         return None;
     }
@@ -824,7 +824,7 @@ pub async fn copy_role_catalogue(
     let run = |database: rclite::Arc<crate::core::database::Database>, sql: String| async move {
         let purpose =
             recognize_query_purpose(&sql).ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database).await;
+        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database).await;
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -906,7 +906,7 @@ pub async fn has_login_role(database: &rclite::Arc<crate::core::database::Databa
     let Some(purpose) = recognize_query_purpose(&sql) else {
         return false;
     };
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
     if response.first() != Some(&2) {
         return false;
     }
@@ -1059,7 +1059,7 @@ pub async fn execute_role_statement(
     ) -> Result<(), String> {
         let purpose =
             recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database.clone()).await;
+        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
