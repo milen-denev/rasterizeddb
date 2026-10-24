@@ -2888,12 +2888,16 @@ pub(crate) fn to_integer_column(value: Value, target: &DbType) -> Result<Value, 
             ..
         } => {
             let f = as_f64(&value).unwrap_or(f64::NAN);
-            // `f64::round` is half away from zero, which is PostgreSQL's rule
-            // for a float assigned to an integer too.
-            if !f.is_finite() || f.round().abs() >= 1.7e38 {
+            // Ties to even: PostgreSQL converts a float with `rint`, so
+            // `2.5::float8::int` is 2 and `-2.5` is -2. Only `numeric` rounds
+            // half away from zero (`2.5::numeric::int` is 3), which is the arm
+            // above. This used `f64::round` for both, so every exact .5 from a
+            // float landed one away from PostgreSQL's answer, with no error.
+            let r = f.round_ties_even();
+            if !f.is_finite() || r.abs() >= 1.7e38 {
                 return Err(integer_out_of_range(target));
             }
-            f.round() as i128
+            r as i128
         }
         Value::Data { db_type, .. }
             if matches!(
@@ -4095,6 +4099,18 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         });
     }
 
+    // A float to an integer rounds ties to even, as PostgreSQL's `rint`
+    // does. It must not reach the text path at the end, which re-reads the
+    // rendered value with `numeric`'s half-away-from-zero rounding.
+    if matches!(db_type, DbType::F32 | DbType::F64)
+        && matches!(
+            target,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    {
+        return to_integer_column(Value::Data { bytes, db_type }, target);
+    }
+
     // Between numeric widths.
     let value = Value::Data {
         bytes,
@@ -5041,6 +5057,59 @@ mod tests {
             assert_eq!(bytes.as_slice(), &[want][..], "{}", text);
         }
         assert!(eval(&parse("'maybe'::bool", &s).unwrap(), &r, &s).is_err());
+    }
+
+    /// A float rounds into an integer with `rint`, ties to even; only a
+    /// `numeric` (and text, which is read as one) rounds half away. Against
+    /// PostgreSQL 17, `select 0.5::float8::int4, 1.5::float8::int4,
+    /// 2.5::float8::int4, (-2.5)::float8::int8, 2.5::float4::int2,
+    /// 2.5::numeric::int4` is `0|2|2|-2|2|3`. Both ways a float reaches an
+    /// integer are covered: a cast, and assignment to an integer column.
+    #[test]
+    fn a_float_rounds_into_an_integer_ties_to_even() {
+        let s = schema();
+        let r = row_with(Some(1), "");
+        let int_of = |v: Value| -> i64 {
+            let Value::Data { bytes, db_type } = v else {
+                panic!("null")
+            };
+            match db_type {
+                DbType::I16 => i16::from_le_bytes(bytes[..].try_into().unwrap()) as i64,
+                DbType::I32 => i32::from_le_bytes(bytes[..].try_into().unwrap()) as i64,
+                DbType::I64 => i64::from_le_bytes(bytes[..].try_into().unwrap()),
+                other => panic!("not an integer: {other:?}"),
+            }
+        };
+        for (sql, want) in [
+            ("('0.5'::float8)::int", 0),
+            ("('1.5'::float8)::int", 2),
+            ("('2.5'::float8)::int", 2),
+            ("('3.5'::float8)::int", 4),
+            ("('-2.5'::float8)::bigint", -2),
+            ("('2.5'::real)::smallint", 2),
+            ("('2.7'::float8)::int", 3),
+            ("('-2.7'::float8)::int", -3),
+            // Not a float: half away, unchanged.
+            ("'2.5'::int", 3),
+        ] {
+            assert_eq!(int_of(eval(&parse(sql, &s).unwrap(), &r, &s).unwrap()), want, "{sql}");
+        }
+        // The range check is on the rounded value: 32766.5 rounds to the even
+        // 32766, 32767.5 to 32768, which no smallint holds.
+        assert_eq!(int_of(eval(&parse("('32766.5'::float8)::smallint", &s).unwrap(), &r, &s).unwrap()), 32766);
+        assert!(eval(&parse("('32767.5'::float8)::smallint", &s).unwrap(), &r, &s).is_err());
+
+        let f64v = |f: f64| Value::Data { bytes: f.to_le_bytes().to_vec(), db_type: DbType::F64 };
+        let f32v = |f: f32| Value::Data { bytes: f.to_le_bytes().to_vec(), db_type: DbType::F32 };
+        assert_eq!(int_of(to_integer_column(f64v(2.5), &DbType::I32).unwrap()), 2);
+        assert_eq!(int_of(to_integer_column(f64v(-0.5), &DbType::I64).unwrap()), 0);
+        assert_eq!(int_of(to_integer_column(f32v(-2.5), &DbType::I16).unwrap()), -2);
+        assert_eq!(int_of(to_integer_column(f64v(1.5), &DbType::I32).unwrap()), 2);
+        let decimal = Value::Data {
+            bytes: (25 * 10i128.pow(crate::core::value_codec::DECIMAL_SCALE - 1)).to_le_bytes().to_vec(),
+            db_type: DbType::DECIMAL,
+        };
+        assert_eq!(int_of(to_integer_column(decimal, &DbType::I32).unwrap()), 3, "numeric 2.5");
     }
 
     #[test]
