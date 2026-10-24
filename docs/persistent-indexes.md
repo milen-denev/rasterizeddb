@@ -1836,6 +1836,94 @@ under an internal lock (finding L9, R4, Q4).
   blocks adding keys: no deadlock, SELECT does not wait; a writer behind a
   pending parent ALTER; keys first; concurrent writers lose no document).
 
+**As built (B6).** Errors end blocks (R3); conflict retries are waits in
+the graph (finding L1); a reader is an owner that has written nothing
+(finding L8); replication retries a record that lost a lock (finding L2,
+part 2).
+- *An error ends the block* (R3, `pgwire.rs:fail_statement`,
+  `SessionTransaction::abort_now`). With no savepoint open, every error
+  reported in a block aborts its transaction before the error is sent: the
+  outcome made durable if it wrote, its row and key locks released with the
+  abort, its owner's table locks and wait edges released
+  (`OwnerRelease::release_held`, which stays armed so the block's end
+  releases anything taken after). The block stays failed: 25P02 for every
+  later statement, SAVEPOINT, RELEASE and SET TRANSACTION included (one
+  hanging off an aborted transaction would let `ROLLBACK TO` revive writes
+  nobody sees, and `SET TRANSACTION` would pin a snapshot for a retired id);
+  COMMIT reports ROLLBACK; ROLLBACK, the idle timeout and disconnect find
+  nothing left to abort (`abort_unless_aborted`). Under an open savepoint
+  the error only fails the block, as before, and `ROLLBACK TO` revives it.
+- *Conflict retries wait on the blocker* (finding L1, option 1;
+  `core/rql/conflict_wait.rs`). `check_write_conflict` (the version's
+  `xmax`) and the two in-flight UNIQUE paths (`find_row_with_value`,
+  `find_row_with_tuple`: the key's creator) name the transaction they met
+  through a task-local side channel (`note_blocker`), never in the message.
+  Each retry site runs its attempt under `capture`, which reads it back and
+  passes it on to an enclosing capture: the autocommit loop
+  (`execute_autocommit`), the block loop (`execute_in_txn_inner`) and the
+  multi-row insert's tuple loop (`insert_values_tuples`). `Pacing::pause`
+  then waits for that transaction to end (`TransactionManager::watch_ends`,
+  a `Notify` signalled on commit, abort and savepoint rollback only while a
+  wait is watching), polling cancellation (57014), the session's
+  `lock_timeout` (55P03) and, from `deadlock_timeout` on, the graph: the
+  waiter's owner (O, or the block's root) gets an edge to the blocker's
+  owner, and `RowLocks::conflict_deadlock_victim` checks for a cycle. When
+  the cycle's victim waits for a table lock (V10 case 9's CREATE INDEX), the
+  conflict side fails that wait itself through the table side's check from
+  the victim, since the conflict wait is bounded and the victim's own poll
+  may come too late. An autocommit attempt is aborted before it waits, so it
+  holds nothing anyone waits for but O's table locks. A blocker of the
+  waiter's own family (a savepoint's key in flight) is never waited on.
+  **Deviation: the budget stays.** PostgreSQL waits as long as the blocker
+  lives; here a statement's waits are bounded together by
+  `CONFLICT_WAIT_BUDGET` (1.5 s, the blind back-off's old total) from its
+  first conflict, then 40001 as before, so `READ COMMITTED` still replays
+  transparently within it and `REPEATABLE READ` still reports 40001 (its
+  replay conflicts again with the committed version and runs at once,
+  counted against `MAX_CONFLICT_RETRIES`). Unbounded, a block that
+  conflicts with a block its own client waits on would hang
+  (`write_conflicts::a_conflict_inside_an_explicit_block_is_reported`). A
+  crossed pair of block writers now gets one 40P01 at `deadlock_timeout`
+  where both spun to 40001.
+- *Found on the way: two victims from one cycle.* The row side read a table
+  waiter's edges and, under a second lock, its mode; when the waiter's own
+  check failed it in between, the row side weighed it as a row waiter and
+  failed itself too (seen once in `deadlock_detection::a_cycle_through_a_
+  key_share_lock_and_a_table_lock_is_detected`: two 40P01). The cycle walk
+  now weighs each table waiter with the mode and role its edges were read
+  with (`TableLocks::wait_edges`, one lock).
+- *The reader* (finding L8, `table_for::refine_role`). An autocommit
+  statement's ACCESS SHARE request is an `AutocommitReader`, never a victim,
+  only while its owner has written nothing: its own family (a `WITH`
+  statement's adopted transaction) and every attempt aliased to it
+  (`RowLocks::owner_wrote`). Asked only of a request that queued, which
+  then has its role set (`TableLocks::set_role`), so the granted path pays
+  nothing. A ROW EXCLUSIVE request stays `Other`, as before. Reader restarts
+  (`max_lock_restarts`) are still not built (B3b), so L8's restart half has
+  nothing to guard.
+- *Replication retries the record* (finding L2, part 2;
+  `replication/server.rs:apply_record`, `lost_a_lock`). A statement that
+  fails with 40P01, 55P03, 57014 or 57P01 (classified by the wire's own
+  `sqlstate_for`) aborts the apply's transaction, releases its owner, backs
+  off (10 ms doubling, capped at 500 ms) and runs the whole record again in
+  a fresh transaction, up to `APPLY_LOCK_RETRIES` (8), under every conflict
+  policy: never skipped under Skip or LastWriterWins. Past the retries the
+  record is refused as `Failed`, not advanced past, so the sender delivers
+  it again (`apply_retries` counts the retries in the stats).
+- *Tests* (each mutation-verified): `rql::conflict_wait::tests` (the
+  autocommit, block and batch sites each wait on a live blocker and wake at
+  its end, by per-site counters, and the block's wait shows its edge in the
+  graph; a passed-in `None` blocker at each site fails its test; the
+  own-family filter; L8's role both ways, `refine_role` ignoring the writes
+  fails it), `pgwire::block_error_tests` (R3: the block reads aborted and
+  its lock is free before ROLLBACK, 25P02 after, COMMIT says ROLLBACK, under
+  a savepoint only failed; V10 case 9 with the DDL sent 600 ms into the
+  writer's wait: one 40P01 to the DDL, the writer's UPDATE lands; no edge,
+  no active table-victim fail and R3 off each fail it), and
+  `replication::server::tests` (an apply behind a local `LOCK TABLE` under
+  `lock_timeout` retries and lands under Skip; one that keeps losing is
+  `Failed` and not advanced; `lost_a_lock` answering false fails both).
+
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
 (auto-prepare) each run describe-before-DDL, execute-after and three
