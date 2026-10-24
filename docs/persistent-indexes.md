@@ -1674,7 +1674,11 @@ and VACUUM under it.
   reopens fresh from the source. Retiring fixed a quiet miss: the old code
   took the slot out to stop the instance's maintenance but kept the `Arc`
   in a local, so the maintenance ran on through the copy (RENAME had the
-  same). REBALANCE holds AE on each moved table to the statement's end.
+  same). REBALANCE gives each moved table's AE back once its move is done
+  (`relocate::MoveRelease`, a B4 follow-up; a block that held AE on the
+  table before keeps it): each move is complete and durable on its own,
+  the plan is fixed up front, and no step touches another step's table, so
+  no later step needs an earlier table held.
 - *VACUUM* (finding L6, `executor::vacuum_mode`): plain VACUUM takes RX,
   which runs beside DML and conflicts with DDL; VACUUM FULL takes AE, as in
   PostgreSQL (the modes table said RX). A bare VACUUM in autocommit takes

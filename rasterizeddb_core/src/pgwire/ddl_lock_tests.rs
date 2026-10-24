@@ -349,3 +349,71 @@ async fn partitioned_ddl_is_refused_before_any_lock() {
     drop(db);
     crate::core::wal::remove_for(&dir.path().to_string_lossy());
 }
+
+/// `STORAGE REBALANCE` gives each moved table's ACCESS EXCLUSIVE back once
+/// that table's move is done: while it waits on its second table (held by a
+/// block), the table it already moved is free, so another session takes
+/// ACCESS EXCLUSIVE on it at once (B4 follow-up).
+///
+/// Mutation: `MoveRelease`'s drop releases nothing (the moved table stays
+/// locked to the statement's end; NOWAIT fails with 55P03).
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebalance_gives_each_moved_table_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let _ = crate::MAX_PERMITS_THREADS.set(4);
+    let _ = crate::BATCH_SIZE.set(512);
+    let db = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "ddl_rebalance").await);
+    let mut statements = Vec::new();
+    for name in ["rb_a", "rb_b", "rb_c", "rb_d"] {
+        statements.push(format!("CREATE TABLE {name} (id INT PRIMARY KEY)"));
+        statements.push(format!("INSERT INTO {name} (id) VALUES (1)"));
+    }
+    let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+    let _s = setup(&db, &refs).await;
+    let second_path = second.path().to_string_lossy().to_string();
+    crate::core::storage::sql::execute(&format!("STORAGE ADD LOCATION '{second_path}'"), &db)
+        .await
+        .unwrap();
+    crate::core::storage::sql::execute("STORAGE SET POLICY = 'round-robin'", &db)
+        .await
+        .unwrap();
+    // The plan's order: its lines name each table first.
+    let plan = crate::core::storage::sql::execute("STORAGE REBALANCE DRY RUN", &db)
+        .await
+        .unwrap();
+    let moves: Vec<String> = plan
+        .iter()
+        .filter_map(|line| line.split(' ').next())
+        .filter(|t| t.starts_with("rb_"))
+        .map(str::to_string)
+        .collect();
+    assert!(moves.len() >= 2, "the plan moves fewer than two tables: {plan:?}");
+    let (first, then) = (&moves[0], &moves[1]);
+
+    // A block holds the second table, so the REBALANCE waits there.
+    let mut h = session(&db);
+    ok(&db, &mut h, "BEGIN").await;
+    ok(&db, &mut h, &format!("LOCK TABLE {then} IN ACCESS SHARE MODE")).await;
+    let rebalance = spawn(&db, session(&db), "STORAGE REBALANCE");
+    tokio::time::sleep(SETTLE).await;
+    assert!(!rebalance.is_finished(), "REBALANCE did not wait on the held table");
+    assert_eq!(
+        db.storage.spec_of(first).as_deref(),
+        Some(second_path.as_str()),
+        "REBALANCE has not moved {first} before waiting on {then}"
+    );
+    let mut other = session(&db);
+    ok(&db, &mut other, "BEGIN").await;
+    let took = send(&db, &mut other, &format!("LOCK TABLE {first} IN ACCESS EXCLUSIVE MODE NOWAIT")).await;
+    took.expect("a table REBALANCE had already moved was still locked");
+    ok(&db, &mut other, "COMMIT").await;
+    ok(&db, &mut h, "COMMIT").await;
+    let (_, out, _) = finish("REBALANCE", rebalance).await;
+    out.expect("REBALANCE after the block");
+    drop((h, other, _s));
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    crate::core::wal::remove_for(&second_path);
+}

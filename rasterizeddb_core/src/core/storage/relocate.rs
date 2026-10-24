@@ -186,8 +186,18 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         // move is individually atomic — see `Database::move_table_to` — so
         // stopping leaves a consistent database with part of the plan applied,
         // and the next `STORAGE REBALANCE` re-plans from where it got to.
-        // ACCESS EXCLUSIVE per table, as `move_table` takes it; held to the
-        // statement's end like every lock of its owner.
+        // ACCESS EXCLUSIVE per table, as `move_table` takes it, and given
+        // back as soon as that table's move is done (`MoveRelease`), so a
+        // table already moved is not held while the rest of the plan copies.
+        //
+        // No later step needs an earlier table still exclusive: each move is
+        // complete and durable on its own (the copy is synced, and the flip,
+        // `pin_backend`, persists the placement file before it returns), the
+        // plan was fixed above from sizes read once, and no step reads or
+        // writes another step's table. A writer growing a moved table only
+        // makes the fixed plan's free-space figures stale, as any concurrent
+        // write between two REBALANCE statements would.
+        let release = MoveRelease::before(database, &step.table);
         let outcome = match database
             .lock_table(
                 &step.table,
@@ -201,6 +211,7 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
                 .await,
             Err(e) => Err(std::io::Error::other(e)),
         };
+        drop(release);
         match outcome {
             Ok(bytes) => {
                 moved += 1;
@@ -226,6 +237,50 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         human_bytes(moved_bytes)
     ));
     Ok(lines)
+}
+
+/// Gives one moved table's ACCESS EXCLUSIVE back when dropped, unless the
+/// statement's owner held it before the move (a block that locked the table
+/// itself keeps it, and keeps any other mode it held: the manager holds a
+/// mode set per owner). Taken before the request, so a failed or cancelled
+/// wait gives back nothing it did not get.
+struct MoveRelease<'a> {
+    database: &'a Database,
+    owner: Option<crate::core::mvcc::table_locks::LockOwner>,
+    table: String,
+}
+
+impl<'a> MoveRelease<'a> {
+    fn before(database: &'a Database, table: &str) -> Self {
+        use crate::core::mvcc::table_locks::TableMode;
+        let key = database.lock_key(table).into_owned();
+        let owner = crate::core::mvcc::owner::ensure()
+            .map(|o| o.owner)
+            .filter(|&o| {
+                !database
+                    .row_locks
+                    .table_locks()
+                    .holds(o, &key)
+                    .contains(TableMode::AccessExclusive)
+            });
+        MoveRelease {
+            database,
+            owner,
+            table: key,
+        }
+    }
+}
+
+impl Drop for MoveRelease<'_> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner {
+            self.database.row_locks.table_locks().release_mode(
+                owner,
+                &self.table,
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            );
+        }
+    }
 }
 
 /// Works out what should move, without moving anything.
