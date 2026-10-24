@@ -1924,6 +1924,124 @@ part 2).
   `lock_timeout` retries and lands under Skip; one that keeps losing is
   `Failed` and not advanced; `lost_a_lock` answering false fails both).
 
+**As built (B7).** Execute's shape repair completed: the comparison after
+the build (finding L7), RETURNING included (finding L13), `shape_epoch` from
+one database-wide counter (Q7), and the per-session `rdb.shape_change`
+(Q2).
+- *The flow* (`pgwire.rs`). `handle_describe` reads the database shape epoch
+  (`Database::shape_epoch`), then describes, and records `ToldShape { epoch,
+  kind, fields }`: read before describing, so a change landing during the
+  describe leaves the told epoch behind and the next Execute compares.
+  `handle_execute` no longer decides anything before the run: it puts a
+  `ShapeCheck` (the told shape, the statement text and portal values, the
+  mode, whether a block is open) in a task-local around the statement and
+  runs it with `omit_description` always set. `send_engine_response`, once
+  the result is built and before a byte of it is sent, and while the
+  statement still holds every table lock it took, calls `reconcile_shape`:
+  it reads the epoch **now**; unchanged since Describe means no table
+  changed what it returns, so rows go alone (the skip path, read after the
+  lock: a DDL moves the epoch after its swap and before releasing ACCESS
+  EXCLUSIVE). Otherwise the told columns are compared exactly (names and
+  types) with `built`, the columns the rows were built and are encoded
+  under (`result_columns`: the payload's own description, which the
+  comparison and the RowDescription share). Equal: rows alone, and the told
+  epoch moves forward so later Executes skip. Unequal: the shape the
+  statement would be described with now is computed the way the client was
+  told (`description_now`, under the same locks); if it still equals the
+  told shape the difference lies between the describe and payload paths
+  themselves (as it would without any DDL), and the rows go alone as they
+  always did. A real change answers by the mode: a fresh RowDescription of
+  `built` ahead of the rows, on every Execute until the client describes
+  again (the told columns never change at Execute), or 0A000.
+- *The text path's own description* (finding L7). The payload's field list
+  and scales (`result_description`, extracted from
+  `execute_single_statement_inner`) are read from schemas with no lock,
+  before the statement waits for its own. The epoch is read before them and
+  again after the build; a move recomputes them from the instance the rows
+  came from, so the rows, the description they go out under and what
+  `reconcile_shape` compares agree. The simple protocol gets this too: a
+  `Q` parked behind an ALTER used to describe the old shape over the new
+  rows.
+- *RETURNING* (finding L13) needs nothing of its own: INSERT, UPDATE and
+  DELETE … RETURNING send their rows through the same `send_engine_response`
+  arm, with the payload description computed from the target's schema.
+- *`shape_epoch`* (Q7; `core/database/slots.rs`). One `AtomicU64` per
+  database. Each `Slot` keeps the value it drew. `install_table` (CREATE,
+  RENAME's new name, a partitioned table's shell) draws a fresh value and
+  moves the counter again once the slot is in place; `swap_instance` (a
+  reload, MOVE, a failed change's reopen) draws one only when the new
+  instance's result shape differs (`same_result_shape`: field names, types,
+  sizes, offsets, write orders, dropped flags and scales, JSON columns and
+  type modifiers; constraints, defaults, checks and indexes excluded) and
+  moves the counter after the store. Engine-private relations (statement
+  temporaries, shadow tables) move nothing. So CREATE INDEX moves nothing
+  (pinned), a DROP and CREATE of a name can never repeat an epoch an old
+  instance used, and a statement over several tables, a join included,
+  compares one number. A partitioned table's epoch is its shell's slot,
+  under the logical name; ALTER on one stays refused.
+- *The learned parse* (`PreparedLearned::shape_epoch`, `PreparedRows::
+  shape_epoch`). Learned from the epoch the plain branch read under its lock
+  (`prepared::note_plain`), and equal on both verifying executions.
+  `execute_prepared_rows` re-checks the slot's epoch right after
+  `relation_for` grants: a mismatch reads nothing and answers
+  `prepared::STALE_PLAN`, on which `execute_prepared` runs the statement's
+  text in the same Execute, under the same owner, and `execute_watched`
+  resets the statement to `Unknown` (and does not count the run in
+  `PREPARED_RUNS`). The existing reset on a moved `schema_generation`
+  before the run stays.
+- *`rdb.shape_change`* (Q2). `rowdescription` (the default, unchanged) or
+  `error`; `SET`, `SET … TO`, `RESET`, `= DEFAULT`, `SHOW`, and the startup
+  packet (`options=-c rdb.shape_change=error`, or the parameter on its
+  own); an unknown value is 22023. `SET LOCAL` is taken as a session
+  setting, as `lock_timeout`'s is. In `error` mode the stale Execute gets
+  PostgreSQL's `0A000 cached plan must not change result type` **before the
+  statement runs** when the shape moved before it (describe now against
+  told, as PostgreSQL's plan check), so a write is never applied and then
+  reported failed. A change landing while the statement waits for its lock
+  is caught by the check after the build: a read, or anything in a block
+  (whose error aborts it, R3), gets 0A000; **deviation:** an autocommit
+  write that has already committed gets the RowDescription instead, since
+  0A000 would invite the client to apply it again. Behaviour-based
+  switching (finding L10) and whether the default changes wait for B8's
+  driver matrix (open question Q1); nothing reads `application_name`.
+- *Test hook.* `table_for::test_hooks::park_next(table)` parks the next
+  non-exclusive table-lock request on a table before it is made, so a test
+  can land a DDL in the window between what a statement read before its
+  lock and the lock itself.
+- *Tests* (`pgwire::shape_repair_tests`, each mutation-verified, observing
+  the RowDescription sent, its names and type OIDs, and the row cells):
+  Describe, ADD COLUMN from another session, three Executes each repaired
+  with the new column's type and values, re-Describe stops it, CREATE INDEX
+  moves no epoch (no comparison after the epoch moves, Execute taking the
+  shape it sent as told, and 0A000 in `rowdescription` mode each fail it);
+  an ALTER while the Execute is parked before its lock, on the extended and
+  the simple protocol (the skip decided from the epoch read when Execute
+  began, and the description not recomputed after the build, each fail
+  it); a learned parse parked across an ALTER, and case 17 (DROP and
+  CREATE with another NUMERIC scale) parked and between executions, with no
+  learned run on the first execution after (no re-check after the lock,
+  and a per-instance epoch, each fail it); UPDATE, INSERT and DELETE …
+  RETURNING across ADD COLUMN (a SELECT-only comparison fails it); a join
+  whose two tables are retyped in turn (a per-table epoch fails it); the
+  mode: SHOW, 22023, 0A000 with PostgreSQL's message before the run (the
+  UPDATE not applied), re-prepare heals, 0A000 for a SELECT parked across an
+  ALTER, the RowDescription for an autocommit write parked across one,
+  RESET (no check before the run fails it); the startup spellings; and a
+  plain table joined with a partitioned one, the plain side retyped and the
+  partitioned name dropped and created with another type, plus ALTER on the
+  partitioned table refused. Through real drivers
+  (`rasterizeddb_compat/tests/prepared_shape_change.rs`): sqlx's cached
+  `UPDATE … RETURNING *` decodes the new shape on three executes after an
+  ADD COLUMN, and tokio-postgres connected with `options=-c
+  rdb.shape_change=error` gets 0A000 with PostgreSQL's message on every
+  stale execute for each of the four changes, then re-prepares into the
+  twin's rows. `slot_shape_epoch` is allowlisted in
+  `relation_dispatch_tests` (a slot primitive).
+- *Found, not this slice's:* `SELECT *` over a join returns the engine's
+  `__null_<col>` companion columns, in the Describe answer and the rows
+  alike (seen on a plain join and on a plain-with-partitioned join), so the
+  tests name their join columns.
+
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
 (auto-prepare) each run describe-before-DDL, execute-after and three
