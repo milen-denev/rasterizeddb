@@ -2600,11 +2600,26 @@ pub fn plan(
     // rather than to the join.
     let mut expression_items: Vec<(usize, String, Option<String>)> = Vec::new();
     let mut items: Vec<JoinSelectItem> = Vec::new();
+    // The relations a `*` item expands: every one for a bare `*`, the one it
+    // names for `t.*`; `None` for any other item. A star expands to the
+    // declared columns only (`visible_fields`): never a `__null_` companion,
+    // never a dropped column. Each used to come out as a column of its own,
+    // ten for six, and a client reading by position read the wrong values.
+    let star_relations = |item: &str| -> Option<Result<Vec<usize>, String>> {
+        let item = item.trim();
+        if item == "*" {
+            return Some(Ok((0..relations.len()).collect()));
+        }
+        let qualifier = item.strip_suffix(".*")?.trim().trim_matches('"');
+        Some(
+            index_of_label(qualifier)
+                .map(|rel| vec![rel])
+                .ok_or_else(|| format!("missing FROM-clause entry for table \"{}\"", qualifier)),
+        )
+    };
     if select_list.trim() == "*" {
         for (i, s) in schemas.iter().enumerate() {
-            let mut fields: Vec<&SchemaField> = s.iter().collect();
-            fields.sort_by_key(|f| f.write_order);
-            for f in fields {
+            for f in crate::core::rql::nullable::visible_fields(s) {
                 items.push(JoinSelectItem {
                     rel: i,
                     field: f.clone(),
@@ -2625,6 +2640,22 @@ pub fn plan(
         for raw in split_top_level_commas(select_list) {
             let item = raw.trim();
             if item.is_empty() {
+                continue;
+            }
+            if let Some(rels) = star_relations(item) {
+                for rel in rels? {
+                    for f in crate::core::rql::nullable::visible_fields(&schemas[rel]) {
+                        items.push(JoinSelectItem {
+                            rel,
+                            label: f.name.clone(),
+                            field: f,
+                            scalar: None,
+                            literal: None,
+                            expr: None,
+                            pending_expression: false,
+                        });
+                    }
+                }
                 continue;
             }
             if item.contains('(') {
@@ -3089,17 +3120,28 @@ pub fn plan(
     // expanded columns are the positions.
     let mut order_by = order_by;
     {
-        let labels: Vec<String> = if select_list.trim() == "*" {
-            items.iter().map(|i| i.label.clone()).collect()
-        } else {
-            split_top_level_commas(select_list)
-                .into_iter()
-                .map(|raw| {
-                    let (expr, alias) = select_entry(raw.trim());
-                    alias.unwrap_or(expr)
+        // A star's columns are counted one by one, each named with its
+        // relation: `ORDER BY 1` over `a JOIN b` must not find `id` ambiguous.
+        let star_labels = |rels: Vec<usize>| -> Vec<String> {
+            rels.into_iter()
+                .flat_map(|rel| {
+                    let label = relations[rel].label.as_str();
+                    crate::core::rql::nullable::visible_fields(&schemas[rel])
+                        .into_iter()
+                        .map(move |f| format!("{}.{}", label, f.name))
                 })
                 .collect()
         };
+        let mut labels: Vec<String> = Vec::new();
+        for raw in split_top_level_commas(select_list) {
+            match star_relations(raw.trim()) {
+                Some(rels) => labels.extend(star_labels(rels?)),
+                None => {
+                    let (expr, alias) = select_entry(raw.trim());
+                    labels.push(alias.unwrap_or(expr));
+                }
+            }
+        }
         crate::core::rql::order_by::resolve_ordinals(&mut order_by, &labels)?;
     }
 
