@@ -195,12 +195,12 @@ impl Wire {
         self.until_ready().await.unwrap_or_else(|e| panic!("prepare {sql}: {e}"))
     }
 
-    /// A simple query.
-    async fn simple(&mut self, sql: &str) {
+    /// A simple query: the text path, always.
+    async fn simple(&mut self, sql: &str) -> Answer {
         let mut body = Vec::new();
         cstr(&mut body, sql);
         self.send(b'Q', &body).await;
-        self.until_ready().await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        self.until_ready().await.unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 
     /// Bind `params` to statement `name`, execute the unnamed portal, sync.
@@ -619,16 +619,95 @@ async fn text_and_binary_keys_route_alike_from_the_cached_parse() {
                         let got = w.run(name, &[p]).await;
                         executions += 1;
                         assert_eq!(got.rows, vec![row(&[&v.to_string(), &format!("v{v}")])], "{table} {name} {v}");
-                        assert_eq!(
-                            test_hooks::take_reads(pt.uid()),
-                            vec![pid_of(&pt, &key(v))],
-                            "{table} {name} {v}: not routed to its point's partition"
-                        );
+                        let reads = test_hooks::take_reads(pt.uid());
+                        if v >= 0 {
+                            assert_eq!(reads, vec![pid_of(&pt, &key(v))], "{table} {name} {v}: not routed to its point's partition");
+                        } else {
+                            // A signed value runs from its text, where `k = - 1`
+                            // is not yet routed (docs/partitioning.md §4.1): a
+                            // superset, never a miss.
+                            assert!(reads.contains(&pid_of(&pt, &key(v))), "{table} {name} {v}: its partition was not read");
+                        }
                     }
                 }
             }
+            // Two learning executions per statement; a signed value is never
+            // learned (`literal_class`), so each of the two negative values
+            // parses on every run, by both statements, both rounds.
+            let negatives = values.iter().filter(|v| **v < 0).count() as u64;
             let parses = parses_of(table) - before;
-            assert!(parses <= 4, "{table}: {parses} parses in {executions} executions; the cache never answered");
+            assert_eq!(
+                parses,
+                4 + negatives * 2 * 2,
+                "{table}: {parses} parses in {executions} executions; the cache never answered, or answered a \
+                 signed value"
+            );
+        }
+    })
+    .await;
+    close(db, dir.path());
+}
+
+// ---------------------------------------------------------------------------
+// Signed literals.
+// ---------------------------------------------------------------------------
+
+/// A signed value is never learned (`prepared::literal_class`): the text path
+/// rewrites `k = -1` to `k = - 1`, so a signed literal does not pass through
+/// the rewrites unchanged, which every admitted literal must. On a plain and
+/// a partitioned table:
+/// - a statement bound only to negative keys, five times with five values,
+///   never runs from a cached parse, and answers as the same statement sent
+///   as simple-query text does;
+/// - once a statement learned on positive keys, a negative key still runs
+///   from its text, and answers as the text does.
+///
+/// Mutation: admit a leading `-` in `literal_class` again: the learned
+/// statement runs the negative keys from its cached parse.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_key_is_never_learned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "prep_signed").await;
+    exec_ok(&db, "CREATE TABLE pr_sg (k BIGINT NOT NULL, label TEXT)").await;
+    exec_ok(&db, "CREATE TABLE pr_sgp (k BIGINT NOT NULL, label TEXT) PARTITION BY HASH (k) PARTITIONS 64").await;
+    let rows: Vec<String> = (-9..=9i64).map(|v| format!("({v}, 'v{v}')")).collect();
+    for table in ["pr_sg", "pr_sgp"] {
+        exec_ok(&db, &format!("INSERT INTO {table} (k, label) VALUES {}", rows.join(", "))).await;
+    }
+    with_session(&db, async |w: &mut Wire| {
+        for table in ["pr_sg", "pr_sgp"] {
+            let sql = format!("SELECT k, label FROM {table} WHERE k = $1");
+            let text = async |w: &mut Wire, v: i64| w.simple(&format!("SELECT k, label FROM {table} WHERE k = {v}")).await;
+
+            w.prepare("neg", &sql, &[]).await;
+            take_learned_runs(table);
+            let before = parses_of(table);
+            for v in [-1i64, -2, -3, -4, -5] {
+                let got = w.run("neg", &[t(v)]).await;
+                assert_eq!(got.rows, vec![row(&[&v.to_string(), &format!("v{v}")])], "{table} {v}");
+                assert_eq!(got.rows, text(w, v).await.rows, "{table} {v}: the prepared answer is not the text's");
+            }
+            assert_eq!(take_learned_runs(table), Vec::<bool>::new(), "{table}: a signed key ran from a cached parse");
+            // Five prepared executions and five simple queries, all parsed.
+            assert_eq!(parses_of(table) - before, 10, "{table}: a signed key skipped the parse");
+
+            w.prepare("pos", &sql, &[]).await;
+            for v in [3i64, 4, 5] {
+                assert_eq!(w.run("pos", &[t(v)]).await.rows, vec![row(&[&v.to_string(), &format!("v{v}")])]);
+            }
+            assert_eq!(take_learned_runs(table).len(), 1, "{table}: the positive keys did not learn the parse");
+            for v in [-1i64, -7, -1] {
+                let got = w.run("pos", &[t(v)]).await;
+                assert_eq!(got.rows, vec![row(&[&v.to_string(), &format!("v{v}")])], "{table} learned, {v}");
+                assert_eq!(got.rows, text(w, v).await.rows, "{table} learned, {v}: not the text's answer");
+            }
+            assert_eq!(
+                take_learned_runs(table),
+                Vec::<bool>::new(),
+                "{table}: a learned statement ran a signed key from its cached parse"
+            );
+            assert_eq!(w.run("pos", &[t(6)]).await.rows, vec![row(&["6", "v6"])]);
+            assert_eq!(take_learned_runs(table).len(), 1, "{table}: the learned parse was lost to a signed key");
         }
     })
     .await;

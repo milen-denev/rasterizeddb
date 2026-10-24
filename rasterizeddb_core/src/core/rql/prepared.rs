@@ -24,9 +24,11 @@
 //! good.
 //!
 //! Every reuse also requires each value to have the literal class it was
-//! verified with (`literal_class`): an unquoted number, or a single-quoted
-//! string with no quote or backslash inside. A `NULL` has no class, and always
-//! takes the text path.
+//! verified with (`literal_class`): an unsigned unquoted number, or a
+//! single-quoted string with no quote or backslash inside. A `NULL` has no
+//! class, and always takes the text path; so does a signed number, which the
+//! text path rewrites (`k = -1` becomes `k = - 1`), so it would not pass
+//! through unchanged as an admitted literal must.
 //!
 //! A partitioned table learns the same way (`docs/partitioning.md` §4.1, S15).
 //! [`PreparedRows::table_name`] is its logical name, and only the parse is
@@ -122,19 +124,25 @@ impl Capture {
 }
 
 /// The shape of a literal a template may be reused with: `Some(0)` for an
-/// unquoted number, `Some(1)` for a plain single-quoted string. Anything else
-/// (`NULL`, an escape string, a string holding a quote or backslash, a
-/// keyword) is `None` and keeps its statement on the text path.
+/// unsigned unquoted number, `Some(1)` for a plain single-quoted string.
+/// Anything else (`NULL`, a signed number, an escape string, a string holding
+/// a quote or backslash, a keyword) is `None` and keeps its statement on the
+/// text path.
+///
+/// Every admitted literal must pass through the text path's rewrites
+/// unchanged, or the template that two executions verified no longer
+/// describes what the text path would run. A sign does not: the text path
+/// rewrites `k = -1` to `k = - 1`. So a signed number is never learned, and
+/// a statement bound to one runs from its text.
 pub fn literal_class(literal: &str) -> Option<u8> {
     let b = literal.as_bytes();
     if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
         let inner = &b[1..b.len() - 1];
         return (!inner.iter().any(|c| *c == b'\'' || *c == b'\\')).then_some(1);
     }
-    let digits = b.strip_prefix(b"-").unwrap_or(b);
     let mut seen_digit = false;
     let mut seen_dot = false;
-    for c in digits {
+    for c in b {
         match c {
             b'0'..=b'9' => seen_digit = true,
             b'.' if !seen_dot => seen_dot = true,
@@ -519,7 +527,11 @@ mod tests {
     #[test]
     fn literal_classes() {
         assert_eq!(literal_class("42"), Some(0));
-        assert_eq!(literal_class("-4.5"), Some(0));
+        assert_eq!(literal_class("4.5"), Some(0));
+        // Signed: the text path spaces the sign out (`- 1`), so never learned.
+        assert_eq!(literal_class("-4.5"), None);
+        assert_eq!(literal_class("-1"), None);
+        assert_eq!(literal_class("+1"), None);
         assert_eq!(literal_class("'abc'"), Some(1));
         assert_eq!(literal_class("''"), Some(1));
         assert_eq!(literal_class("NULL"), None);
