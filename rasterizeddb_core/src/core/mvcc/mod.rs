@@ -55,6 +55,7 @@
 
 pub mod row_locks;
 pub mod status;
+pub mod table_locks;
 pub mod transaction;
 pub mod visibility;
 
