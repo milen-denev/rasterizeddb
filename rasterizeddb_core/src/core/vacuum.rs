@@ -716,9 +716,23 @@ pub struct ReclaimContext<'a> {
     /// one would forget index entries by slot numbers and row positions that
     /// now belong to live rows. `None` only for a table that never compacts.
     pub compaction_gate: Option<&'a tokio::sync::RwLock<()>>,
+    /// The instance's maintenance flag, which `Table::retire` clears before
+    /// it joins this sweep. Checked between pointer chunks and through the
+    /// drain wait, so a DDL holding ACCESS EXCLUSIVE waits for one chunk, not
+    /// the rest of the sweep (as PostgreSQL's autovacuum cancels itself when
+    /// it blocks a lock request); a sweep that sees it cleared returns
+    /// `deferred` and publishes nothing. `None` where nothing retires the
+    /// storage (tests driving `run_once` directly).
+    pub alive: Option<&'a AtomicBool>,
 }
 
 impl ReclaimContext<'_> {
+    /// Whether the instance this sweep runs on has been retired.
+    #[inline]
+    fn retired(&self) -> bool {
+        self.alive.is_some_and(|alive| !alive.load(Ordering::Acquire))
+    }
+
     /// Whether this sweep is the one that should clear `xmax`'s fingerprints.
     #[inline]
     fn should_clear(&self, xmax: TxId, previous_bound: TxId) -> bool {
@@ -984,6 +998,9 @@ struct ScanResult {
     /// Reclaimable versions a secondary index still holds: their keys are
     /// read back and forgotten before this run publishes anything.
     index_dead: Vec<(u64, crate::core::row::row_pointer::RowPointer)>,
+    /// The instance was retired mid-scan, which stopped there: nothing it
+    /// found may be acted on.
+    retired: bool,
 }
 
 /// Walks every pointer record of `io`, tombstones included, calling `visit` on
@@ -996,11 +1013,28 @@ struct ScanResult {
 /// into a just-allocated extent could be missed.
 async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
     io: &S,
-    mut visit: F,
+    visit: F,
 ) -> std::io::Result<()> {
-    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    sweep_pointers_until(io, SCAN_RECORDS_PER_CHUNK, &|| false, None, visit)
+        .await
+        .map(|_| ())
+}
 
-    let mut buffer = vec![0u8; RECORD * SCAN_RECORDS_PER_CHUNK];
+/// [`sweep_pointers`], `records_per_chunk` at a time, asking `stop` after
+/// each chunk: `Ok(true)` when it stopped there, with the rest unread.
+/// `park_key` names the sweep to the test park points; unused otherwise.
+async fn sweep_pointers_until<S: StorageIO, F: FnMut(&RowPointer)>(
+    io: &S,
+    records_per_chunk: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+    park_key: Option<&FreeSpace>,
+    mut visit: F,
+) -> std::io::Result<bool> {
+    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    #[cfg(not(test))]
+    let _ = park_key;
+
+    let mut buffer = vec![0u8; RECORD * records_per_chunk.max(1)];
     let mut scanned_to: u64 = 0;
     let mut caught_up = false;
 
@@ -1020,7 +1054,7 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
                 Ok(()) => {}
                 // A concurrent append can leave the length ahead of the bytes
                 // for an instant. Whatever is missing is past our frontier.
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
                 Err(e) => return Err(e),
             }
 
@@ -1029,6 +1063,14 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
             }
 
             scanned_to += want as u64;
+
+            #[cfg(test)]
+            if let Some(free_space) = park_key {
+                run_once_test_hooks::reached(free_space, run_once_test_hooks::IN_SCAN).await;
+            }
+            if stop() {
+                return Ok(true);
+            }
         }
     }
 
@@ -1040,7 +1082,7 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
         );
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Takes reclaimed versions out of the secondary indexes, keyed by what their
@@ -1092,9 +1134,15 @@ async fn scan_pointers<S: StorageIO>(
         clear_runs: Vec::new(),
         frontier: 0,
         index_dead: Vec::new(),
+        retired: false,
     };
 
-    sweep_pointers(io_pointers, |pointer| {
+    #[cfg(test)]
+    let records_per_chunk = run_once_test_hooks::chunk_records(free_space);
+    #[cfg(not(test))]
+    let records_per_chunk = SCAN_RECORDS_PER_CHUNK;
+    let retired = || ctx.retired();
+    result.retired = sweep_pointers_until(io_pointers, records_per_chunk, &retired, Some(free_space), |pointer| {
         let slot = result.slots;
         result.slots += 1;
 
@@ -1586,6 +1634,12 @@ pub async fn run_once<S: StorageIO>(
     .await?;
     #[cfg(test)]
     run_once_test_hooks::reached(free_space, run_once_test_hooks::AFTER_SCAN).await;
+    // Retired mid-scan (or since): the scan is partial, or its instance is
+    // going, so nothing is cleared, forgotten or published, and the report
+    // says deferred (the sweep has not seen everything).
+    if scan.retired || ctx.retired() {
+        return Ok(retired_report(&scan));
+    }
 
     // Everything below acts on the sweep's decisions as final: fingerprints
     // cleared (and then checkpointed), extents handed to writers. Those
@@ -1694,6 +1748,12 @@ pub async fn run_once<S: StorageIO>(
     let deadline = std::time::Instant::now() + config.drain_timeout;
     let mut drained = true;
     while !readers.drained_past(barrier) {
+        // Checked as often as the deadline: a DDL retiring this instance
+        // waits for this sweep, so it stops publishing nothing.
+        if ctx.retired() {
+            report.deferred = true;
+            return Ok(report);
+        }
         if std::time::Instant::now() >= deadline {
             drained = false;
             break;
@@ -1746,6 +1806,24 @@ pub async fn run_once<S: StorageIO>(
     Ok(report)
 }
 
+/// The report of a sweep stopped by its instance's retirement: what it
+/// counted, deferred, nothing reclaimed.
+fn retired_report(scan: &ScanResult) -> VacuumReport {
+    VacuumReport {
+        slots: scan.slots,
+        live_rows: scan.live_rows,
+        dead_rows: scan.dead_rows,
+        live_bytes: scan.live_bytes,
+        dead_bytes: 0,
+        reclaimed_bytes: 0,
+        extents: 0,
+        deferred: true,
+        fingerprints_cleared: 0,
+        held_rows: scan.held_rows,
+        held_min_xmax: scan.held_min_xmax,
+    }
+}
+
 /// Parks one `run_once` of a chosen table (named by its `FreeSpace`) at a
 /// chosen point, for tests that need something to happen there.
 #[cfg(test)]
@@ -1756,6 +1834,24 @@ pub(crate) mod run_once_test_hooks {
     pub(crate) const AFTER_SCAN: u8 = 1;
     /// Before the drain wait and the publish.
     pub(crate) const BEFORE_PUBLISH: u8 = 2;
+    /// After each chunk of the pointer sweep (parks once, after the first).
+    pub(crate) const IN_SCAN: u8 = 3;
+
+    static CHUNK: parking_lot::Mutex<Option<(usize, usize)>> = parking_lot::Mutex::new(None);
+
+    /// Sweeps of `free_space`'s table read `records` pointer records a chunk,
+    /// so a test can stop one between chunks without writing thousands of
+    /// rows.
+    pub(crate) fn set_chunk_records(free_space: &super::FreeSpace, records: usize) {
+        *CHUNK.lock() = Some((free_space as *const _ as usize, records));
+    }
+
+    pub(super) fn chunk_records(free_space: &super::FreeSpace) -> usize {
+        match *CHUNK.lock() {
+            Some((at, records)) if at == free_space as *const _ as usize => records,
+            _ => super::SCAN_RECORDS_PER_CHUNK,
+        }
+    }
 
     #[derive(Default)]
     pub(crate) struct Park {
@@ -2012,6 +2108,7 @@ impl<S: StorageIO> VacuumService<S> {
             cleared_below: &self.cleared_below,
             indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
             compaction_gate: Some(&self.compaction_gate),
+            alive: Some(&self.alive),
         };
 
         match run_once(

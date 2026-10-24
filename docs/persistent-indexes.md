@@ -1605,7 +1605,13 @@ and VACUUM under it.
   `vacuum_now` for a manual VACUUM; so it returns with no vacuum writing
   through the old providers (RV14). `neutralize_aborted` checks the flag
   between batches and while readers drain (`NeutralizeParts::alive`), so
-  the join waits for one batch, not one sweep. Reads through a retired
+  the join waits for one batch, not one sweep. The reclamation sweep
+  (`run_once`) does the same (`ReclaimContext::alive`, a B4 follow-up): it
+  checks the flag after each pointer chunk and through its drain wait, and
+  a retired one returns `deferred` having cleared, forgotten and published
+  nothing, so a DDL landing mid-sweep on a big table holds ACCESS
+  EXCLUSIVE for one chunk, not the rest of the sweep, as PostgreSQL's
+  autovacuum cancels itself when it blocks a lock request. Reads through a retired
   instance go on. **Step 3:** `work` (the DDL's sidecar write) runs here,
   then the new instance is opened from disk (`open_instance`). A failing
   `work` still opens a fresh instance and swaps it in, never the retired

@@ -1590,6 +1590,7 @@ impl<S: StorageIO> Table<S> {
             cleared_below: &self.cleared_below,
             indexes: d.indexes.as_deref().zip(index_fetch.as_ref()),
             compaction_gate: Some(&self.compaction_gate),
+            alive: Some(&self.maintenance_alive),
         };
         let report = crate::core::vacuum::run_once(
             &*d.io_pointers,

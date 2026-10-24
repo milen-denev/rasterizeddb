@@ -643,6 +643,7 @@ async fn a_running_query_defers_publication() {
         indexes: None,
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
         compaction_gate: None,
+        alive: None,
     };
     let report = crate::core::vacuum::run_once(
         &*t.data().unwrap().io_pointers,
@@ -665,6 +666,64 @@ async fn a_running_query_defers_publication() {
     let report = t.vacuum_now().await.unwrap();
     assert!(!report.deferred);
     assert!(report.reclaimed_bytes > 0);
+}
+
+/// A DDL retiring an instance mid-sweep waits for one pointer chunk, not the
+/// rest of the sweep (B4 follow-up to RV14): `retire` clears the maintenance
+/// flag and joins the sweep, which stops at its next chunk boundary, reports
+/// itself deferred and publishes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn retirement_stops_a_sweep_within_one_chunk() {
+    use crate::core::vacuum::run_once_test_hooks;
+    const CHUNK: usize = 8;
+    const ROWS: u64 = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let t = Arc::new(open_table(dir.path(), "wp_retire_sweep").await);
+    for i in 0..ROWS {
+        insert(&t, i, i as i32, "label-long-enough-to-matter").await;
+    }
+    t.wait_filters_ready().await.unwrap();
+    t.delete_rows("cat < 32", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
+
+    let free_space = &t.data().unwrap().free_space;
+    run_once_test_hooks::set_chunk_records(free_space, CHUNK);
+    let free_before = free_space.free_bytes();
+    let park = run_once_test_hooks::arm(free_space, run_once_test_hooks::IN_SCAN);
+    let sweeping = t.clone();
+    let sweep = tokio::spawn(async move { sweeping.vacuum_now().await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), park.parked.notified())
+        .await
+        .expect("the sweep never reached its first chunk");
+
+    // The DDL's step 2: clears the flag, then waits for the sweep.
+    let retiring = t.clone();
+    let retire = tokio::spawn(async move { retiring.retire().await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !t.is_retired() {
+        assert!(std::time::Instant::now() < deadline, "retire never cleared the flag");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    park.release.notify_one();
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), sweep)
+        .await
+        .expect("the sweep did not stop")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), retire)
+        .await
+        .expect("retire did not return once the sweep stopped")
+        .unwrap();
+    assert!(report.deferred, "a sweep stopped by retirement reported itself complete: {report:?}");
+    assert!(
+        report.slots <= 2 * CHUNK as u64,
+        "the sweep read {} of {} slots after its instance was retired; it should stop within one chunk",
+        report.slots,
+        ROWS
+    );
+    assert_eq!(free_space.free_bytes(), free_before, "a retired sweep published space");
 }
 
 use crate::core::vacuum::VacuumConfig;
@@ -1107,6 +1166,7 @@ async fn the_capped_path_never_rehands_a_reused_extent() {
             indexes: None,
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
             compaction_gate: None,
+            alive: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,
@@ -1772,6 +1832,7 @@ async fn a_permanently_busy_table_still_reclaims() {
             indexes: None,
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
             compaction_gate: None,
+            alive: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,
