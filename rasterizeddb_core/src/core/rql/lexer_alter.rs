@@ -388,8 +388,11 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let detail_upper = detail.to_ascii_uppercase();
 
             // `SET DEFAULT` arrives with the clause already split off, leaving
-            // a bare `SET`; `DROP DEFAULT` keeps its keyword.
-            if default.is_some() || detail_upper.starts_with("SET") {
+            // a bare `SET`; `DROP DEFAULT` keeps its keyword. Only that `SET`:
+            // `SET NOT NULL` starts with it too, and matched here it became
+            // `DROP DEFAULT`, so the statement dropped the column's default
+            // and enforced nothing, reporting success.
+            if default.is_some() || detail_upper.trim() == "SET" || detail_upper.starts_with("SET DEFAULT") {
                 return Ok(AlterTable {
                     table_name,
                     action: AlterAction::SetDefault {
@@ -408,6 +411,13 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 });
             }
 
+            // PostgreSQL's long form of `TYPE`. It used to match the bare
+            // `SET` above and drop the column's default instead.
+            let detail = if detail_upper.starts_with("SET DATA TYPE") {
+                format!("TYPE{}", &detail["SET DATA TYPE".len()..])
+            } else {
+                detail
+            };
             AlterAction::AlterColumn { name, detail }
         }
         // Storage tuning and constraint validation: accepted, not acted on.
@@ -848,6 +858,35 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// `SET NOT NULL` is the nullability arm, never `SET DEFAULT`: matched as
+    /// the bare `SET` that `SET DEFAULT` leaves, it dropped the column's
+    /// default and enforced nothing.
+    #[test]
+    fn set_not_null_is_not_a_default() {
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET NOT NULL").unwrap();
+        match a.action {
+            AlterAction::AlterColumn { name, detail } => {
+                assert_eq!(name, "d");
+                assert!(detail.eq_ignore_ascii_case("SET NOT NULL"), "{detail}");
+            }
+            other => panic!("SET NOT NULL parsed as {other:?}"),
+        }
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET DEFAULT 5").unwrap();
+        assert!(
+            matches!(&a.action, AlterAction::SetDefault { expression: Some(e), .. } if e == "5"),
+            "{:?}",
+            a.action
+        );
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d DROP DEFAULT").unwrap();
+        assert!(matches!(a.action, AlterAction::SetDefault { expression: None, .. }), "{:?}", a.action);
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET DATA TYPE bigint").unwrap();
+        assert!(
+            matches!(&a.action, AlterAction::AlterColumn { detail, .. } if detail.eq_ignore_ascii_case("TYPE bigint")),
+            "{:?}",
+            a.action
+        );
+    }
+
     use super::*;
 
     /// Anything answered here is answered *instead of* the engine, so an entry
