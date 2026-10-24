@@ -1248,7 +1248,8 @@ through `table_for`).
   through `abort_transaction` (finding L2, part 1) and releases after the
   outcome is durable; import batches run under theirs
   (`OwnerKind::Importer`), released at the batch's commit or abort.
-- *Deviation to settle in B3b.* On the wire an autocommit statement's reply
+- *Deviation to settle in B3b* (settled: see "As built (B3b)", release
+  before the reply). On the wire an autocommit statement's reply
   is sent inside `execute_single_statement_inner`, before `drop_temps`, so
   O is released after the reply. Harmless in B2, where an autocommit
   statement holds no table lock (`LOCK TABLE` is refused outside a block);
@@ -1479,6 +1480,109 @@ a new lock yet (B3b).
   `pgwire/schema_view_tests` (V10 case 6's stand-in: `pg_class` and
   `pg_stat_user_tables` answer at once while another block holds ACCESS
   EXCLUSIVE with a write pending).
+
+**As built (B3b).** `table_for` takes table locks for real.
+- *The API* (`core/database/table_for.rs`). `Database::table_for(name,
+  owner, mode)` acquires (or confirms: a held mode is granted again from the
+  fast path) the lock for the statement's owner, then loads the slot;
+  `relation_for` is the same for a partitioned name, locked by its logical
+  name, never a partition's; `tables_for(set, owner)` takes a set at once,
+  deduplicated with the strongest mode per name and in name order. The
+  owner is `owner::ensure()`; no scope at all (start-up, recovery, tests
+  below the statement layer) takes no lock. Statement-private temporaries
+  (`__cte_…`, `__cat_…`) and JSON shadow tables (`__json_…`, covered by
+  their parent; B5 adds their internal lock) are exempt (finding L12).
+- *Modes.* SELECT and every read of another table (an FK parent's check, a
+  join's relations, a subquery's table): AS. INSERT, UPDATE, DELETE, `SELECT
+  … FOR UPDATE/SHARE`, the importer's rows, ON CONFLICT's update, FK
+  actions that write a child: RX. ALTER (every arm), CREATE/DROP INDEX
+  (path and partial unique included), DROP TABLE: AE, before the schema is
+  read (B4 adds the reload under it). `LOCK TABLE` takes
+  `PgLockMode::table_mode` of the mode it names (never weaker), with
+  `NOWAIT` asking once (55P03 `could not obtain lock`). VACUUM takes RX per
+  table, and a bare VACUUM gives each table's back as it moves on, so it
+  never holds every table at once (finding L6's concern; B4 gives each
+  table an owner of its own).
+- *The whole known set at once* (`core/rql/lock_set.rs`). Before any part of
+  a statement runs, the relations its text names at every depth (FROM, JOIN
+  and USING lists; INSERT INTO, UPDATE, DELETE FROM targets, a
+  data-modifying CTE's included; ALTER/DROP/CREATE INDEX targets) plus the
+  FK parents of every table it writes are taken through `tables_for`: at
+  `execute_with_sync`'s and `execute_in_txn`'s entry, and in
+  `execute_single_statement` before CTE and derived bodies run. A
+  single-target write (`INSERT … VALUES`, `UPDATE t … WHERE`, `DELETE FROM
+  t …` naming nothing else; `lock_set::is_single_target_write`) skips the
+  scan: its set is its target, which its arm takes, and its FK parents are
+  taken where their check reads them (the late find §7 lists). The scan is
+  over tokens (literals, quoted names and comments skipped; `FROM` inside a
+  function call and `IS DISTINCT FROM` ignored). A name that is no table is
+  skipped. A table the text cannot show (an FK child a cascade reaches, an
+  index's table, a rewrite's) is taken where it is reached; `apply_on_delete`
+  and `apply_on_update` take their children as one set too.
+- *Late finds wait with edges* (deviation). The plan's try-or-restart for
+  readers (`max_lock_restarts`) is not built: a table found late is waited
+  for while holding the set, with graph edges, readers and writers alike.
+  The victim rule still never picks an autocommit reader (every cycle
+  through one contains an S or AE requester, which it picks first), so the
+  cost is a DDL that is failed where a restart would have let it through.
+- *The wait.* One loop (`TableLocks::wait_for`): woken by the grant,
+  polling `cancel::tripped()` (57014), bounded by the session's
+  `lock_timeout` (`StatementCancel::with_lock_timeout`; 55P03, mapped by
+  pgwire before 57014), and from `deadlock_timeout` on checking one graph
+  with the row and referenced-key waits: `RowLocks` owns the `TableLocks`,
+  a table waiter's edges are its queue's and any other owner's are
+  `RowLocks::waits`, and both sides pick the victim by `choose_victim` over
+  the same cycle (a cycle of row waits alone still fails its youngest), so
+  exactly one wait fails. A dropped wait leaves the queue. `LOCK_WAIT_TIMEOUT`
+  no longer bounds table locks (row waits keep it). The DML lock check's
+  table half (`table_conflict`, which failed at once) is gone: the writer's
+  RX waits behind S and AE in the manager.
+- *Safety net.* Every engine path releases its owner explicitly; a holder
+  whose transaction **aborted** without releasing is released by the first
+  request it blocks (`TableLocks::set_liveness`). A committed one never is:
+  its locks outlive its commit until its release, after durability (L4).
+- *`lock_timeout`* is a real GUC: `SET`, `RESET`, `SHOW` (`300ms`, or `0`),
+  and `-c lock_timeout=…` in the startup packet. `0`, the default, waits as
+  long as it takes. `ddl_lock_timeout_default` is not built.
+- *Release before the reply* (B2's deviation, settled). An autocommit
+  statement's reply ends (`CommandComplete`, `ErrorResponse`,
+  `EmptyQueryResponse`, `PortalSuspended`, and anything after them) are held
+  in a per-statement `ReplyHold` from the first such message and written
+  once O's scope has ended: after the commit, the outcome flush and sync and
+  the temporaries' drops, and after the release. An `ErrorResponse` is
+  flushed at once as before, and a result's rows still stream; only its end
+  waits. A client that reads its reply and acts at once (another
+  connection's `LOCK TABLE … NOWAIT`) never meets the statement's lock.
+- *Escapes drained.* The executor, the rebalance plan and the DROP INDEX
+  name lookups moved to `table_for`/`relation_for` or, for schema-only
+  readers under the statement's set, `schema_view`
+  (`slots_source_tests::FORMER_ESCAPES`; the executor never calls
+  `relation`). Three callers stay, each with its reason: DROP's internals
+  (`drop_table_to_depth`, under the AE `execute_drop_table` takes) and the
+  two FK-sidecar walks over other tables (`other_foreign_keys`,
+  `retarget_parent`), whose lock set is B4's (L11).
+- *Cost, and Q4* (`examples/table_lock_bench.rs`; instructions per
+  statement by differencing two run lengths under `perf stat -e
+  instructions:u`, release build, tmpfs, three interleaved runs, load
+  average 0.8-1.6, medians against `18a0141`): prepared point SELECT
+  76,758 → 77,537 (+1.0%), prepared point UPDATE 203,676 → 208,058
+  (+2.2%), prepared bigint-PK INSERT 135,963 → 141,008 (+3.7%), CTE
+  1,058,979 → 1,072,532 (+1.3%), derived table 1,062,563 → 1,076,616
+  (+1.3%), `pg_class` 2,269,447 → 2,278,305 (+0.4%). The manager itself is
+  small: a statement's AS, one confirmation and the owner's release cost
+  77 ns on the fast path (`table_locks_tests::fast_path_cost`), the set scan
+  100-170 ns (`lock_set::cost`); the rest is the extra lookups at each
+  `table_for` site. Two costs were found and removed on the way: a reply
+  hold wrapped around the statement copied its whole future once more per
+  statement (it now rides on the statement's cancel signal), and SipHash on
+  the owner-keyed maps (now one multiply). Q4 is decided for the `TxId`:
+  O's own cost is unchanged from B2's ~210 ns, and nothing in the gate
+  points at it. tmpfs hides fsync and read cost; instructions do not depend
+  on the filesystem, and the ext4 run is left to B8's gate.
+- *Seams left to B4.* RENAME locks the old name and then the new one, not
+  both in name order; DDL's FK parents and children, and `reload_table`'s
+  AE assertion; DROP's waiters see 42P01 only because the slot is gone
+  (B4 marks it dropped under AE); VACUUM's per-table owners.
 
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
