@@ -351,23 +351,24 @@ SET partition_trace = on;   -- a NOTICE per statement: partitions routed, and wh
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
 | Temporary partitioned tables; KV-backed partitions | KV until measured |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
-| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; phase 2a refuses any key assignment its `WHERE` does not pin to the same value, §4.5); FKs referencing a partitioned table (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (composite identifying keys, §1b); joins and `ON CONFLICT` on partitioned tables (phase 2b; `RETURNING` is built, S17, §9); reshapes (phase 5) | §15 |
+| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; phase 2a refuses any key assignment its `WHERE` does not pin to the same value, §4.5); FKs referencing a partitioned table (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (composite identifying keys, §1b); joins on partitioned tables (phase 2b; `RETURNING` is built, S17, and `ON CONFLICT`, S18, §9); reshapes (phase 5) | §15 |
 
-**What phase 2a refuses, as built (S11; S17 lifted `RETURNING`).** Each with
-0A000 and "not supported", before anything is read or written: `ON CONFLICT`
-in either form, with or without `RETURNING`, and joins reading a partitioned
-table (2b); `UPDATE … FROM` and `DELETE … USING` with a
+**What phase 2a refuses, as built (S11; S17 lifted `RETURNING`, S18 `ON
+CONFLICT`).** Each with 0A000 and "not supported", before anything is read or
+written: joins reading a partitioned table (2b); `UPDATE … FROM` and `DELETE … USING` with a
 partitioned target (refused at their entry) or source (refused by the join),
 `FOR UPDATE`/`SHARE`, `SKIP LOCKED` (phase 3); `ALTER` in every
 form, `RENAME`, `CREATE`/`DROP INDEX`, FKs either way (phase 3); key changes
-(phase 6); reshapes and `STORAGE MOVE`/`REBALANCE PARTITION[S]` (phase 5); the
+(phase 6), a `DO UPDATE` that would change one included (refused when the
+conflict happens, before the update writes); reshapes and `STORAGE MOVE`/`REBALANCE PARTITION[S]` (phase 5); the
 rows above. `SELECT` with `ORDER BY` across partitions is **not** refused: it
 is correct and not yet cheap (§8, S12). Everything else in the twin test's
 statement set (I6) answers like a plain table: `INSERT` in every form, single-
 and multi-partition `SELECT`/`COUNT` (aggregates, `GROUP BY`, `DISTINCT`,
 windows, `UNION`, CTEs, `IN (SELECT …)`, empty routes), `UPDATE` and `DELETE`
 routed or fanned out, in autocommit and in blocks, `RETURNING` on `INSERT`,
-`UPDATE` and `DELETE` (S17), prepared `SELECT`, `INSERT`, `UPDATE` and
+`UPDATE` and `DELETE` (S17), `ON CONFLICT DO NOTHING` and `DO UPDATE` in
+every form (S18), prepared `SELECT`, `INSERT`, `UPDATE` and
 `DELETE`, `VACUUM` and `VACUUM FULL`, named and bare.
 `LOCK TABLE` takes the logical name's lock, which a partitioned `UPDATE` and
 `DELETE` check before routing, as a plain table's do.
@@ -1113,7 +1114,7 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   empty route returns zero rows with the row description. A failed statement
   returns its error and no rows: the partial `collect` is dropped with it.
   `INSERT … RETURNING` needed only its refusal lifted
-  (`refuse_partitioned_insert_clauses` now refuses `ON CONFLICT` alone): the
+  (`refuse_partitioned_insert_clauses`, removed by S18): the
   returned row is built from the payload the partition stores, and the
   multi-row and `INSERT … SELECT` paths concatenate their per-row answers.
   pgwire's Describe and scale lookups already read the shell's schema.
@@ -1141,10 +1142,53 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   point and the mover's `xmin`, so a later visit of the same statement would
   match it again; phase 6 must design a per-statement record of versions
   written.
-- **ON CONFLICT.** The target is a unique key, so contains the partition key:
-  probe, insert and follow-up update all hit the inserted row's partition, where
-  `apply_conflict_update` (`executor.rs:4319`) runs unchanged. Targetless `DO
-  NOTHING` is covered too, as every unique key contains the partition key.
+- **ON CONFLICT, as built in 2b (S18).** The target is a unique key, so
+  contains the partition key: probe, insert and follow-up update all hit the
+  inserted row's partition, whose own uniqueness check, the in-flight-writer
+  rule of `find_row_with_value` / `find_row_with_tuple` included, decides the
+  conflict exactly. `apply_conflict_update` runs unchanged: its generated
+  `UPDATE … WHERE <every target column> = <literal>` routes through
+  `execute_partitioned_update` to that one partition. Targetless `DO NOTHING`
+  is covered too, as every unique key contains the partition key.
+  - A target (`DO NOTHING`'s or `DO UPDATE`'s) that leaves out a key column
+    matches no unique key, so it is refused at the statement's first dispatch,
+    before anything runs, with PostgreSQL's 42P10 ("there is no unique or
+    exclusion constraint matching the ON CONFLICT specification";
+    `check_partitioned_conflict_target`, which replaced
+    `refuse_partitioned_insert_clauses`). The parser now keeps `DO NOTHING`'s
+    target (`InsertRowData::on_conflict_target`) for it. PostgreSQL also
+    refuses a target that holds the key but matches no key exactly; this
+    engine, like its plain tables, does not check that.
+  - `ON CONFLICT ON CONSTRAINT name DO UPDATE` resolves the name to the
+    constraint's columns (`constraint_columns`: a table-level key such as
+    `<t>_pkey`, a single-column key, or an inline `UNIQUE` by its default
+    name), on plain tables too; an unknown name is 42704. Before S18 the name
+    was ignored, so a composite key could not be found at all.
+  - A `DO UPDATE` assigning a key column a value that moves the point
+    (`SET tenant_id = EXCLUDED.tenant_id + 1`, `SET tenant_id = 77`) is a key
+    change: `assignments_keep_point` refuses it with 0A000 (phase 6) when the
+    conflict happens, before the update writes. PostgreSQL refuses the
+    cross-partition case with 0A000 too ("invalid ON UPDATE specification").
+    `SET tenant_id = EXCLUDED.tenant_id` substitutes the literal the `WHERE`
+    pins, so it keeps the point; an expression is not proven to, and is
+    refused, as in a plain `UPDATE`. A multi-row statement whose earlier
+    tuples landed fails whole, as any failed statement does.
+  - Multi-row upserts across partitions re-dispatch per tuple
+    (`insert_values_batch`), with the clause restored on each and the tag
+    counting rows. `DO NOTHING … RETURNING` that skips a row answers an empty
+    row set rather than a bare count, so the RowDescription is sent (on plain
+    tables too), and a tuple's empty `RETURNING` reply no longer strips the
+    retry marker, which only a tuple that wrote a row may do (I17).
+  - Tests: `tests/partition_upsert.rs` (every shape against the twin; the
+    multi-row clause and count, mutation the clause not restored per tuple;
+    the key-changing `DO UPDATE` refused with nothing stored, in a block and
+    prepared; a rolled-back block leaves nothing; 42P10, 42704 and prepared
+    upserts), `tests/partition_insert.rs` (42P10 before any write in every
+    shape), `rasterizeddb_compat/tests/partition_upsert_matrix.rs` (sixteen
+    clients over the primary key and a composite UNIQUE in every transaction
+    shape, and 300 keys over every partition from four connections, mutation
+    the in-flight rule off in `find_row_with_tuple`: 848 rows for 300 keys),
+    and the twin's ON CONFLICT kinds.
 - **Replication capture** (`note_write`, `executor.rs:9383`) records the
   logical name.
 

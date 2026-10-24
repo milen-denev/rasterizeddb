@@ -82,6 +82,7 @@ fn row_for(table: &str, fields: &[SchemaField], tenant: i64, n: i32) -> crate::c
         table_name: table.to_string(),
         query: format!("INSERT INTO {table} (tenant_id, n, label) VALUES ({tenant}, {n}, 'x')"),
         on_conflict_do_nothing: false,
+        on_conflict_target: Vec::new(),
         on_conflict_update: None,
     });
     crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, fields, &[], &[], 0)

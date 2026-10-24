@@ -4799,8 +4799,20 @@ enum AssignedValue {
 ///
 /// `EXCLUDED.<column>` names the value the insert would have written, so the
 /// insert's own assignments are what resolve it. The conflicting row is found
-/// by the arbiter columns, or — when none was written — by whichever unique
-/// column the statement supplies a value for.
+/// by the arbiter columns, or the columns of the constraint `ON CONSTRAINT`
+/// names, or — when neither was written — by whichever unique column the
+/// statement supplies a value for.
+///
+/// On a partitioned table the generated `UPDATE` routes like any other,
+/// through `execute_partitioned_update` (S18). Its `WHERE` pins every
+/// partition-key column, because every unique key holds every key column
+/// (`docs/partitioning.md` §1.5) and the target was checked to name them all
+/// (`check_partitioned_conflict_target`), so it reaches exactly the
+/// partition the insert collided in. A `SET` that would move the row's point,
+/// `SET tenant_id = EXCLUDED.tenant_id + 1`, is refused there by
+/// `assignments_keep_point` with 0A000 (a key change, phase 6) before any
+/// partition is written; `SET tenant_id = EXCLUDED.tenant_id` substitutes
+/// the literal the `WHERE` pins, so it keeps the point and runs.
 ///
 /// Kept out of `execute_with_context`'s frame: that function is one large
 /// match, so its future is the sum of every arm's locals.
@@ -4832,6 +4844,20 @@ async fn apply_conflict_update(
     // thing it can have collided on.
     let keys: Vec<String> = if !spec.arbiter.is_empty() {
         spec.arbiter.clone()
+    } else if let Some(name) = &spec.constraint {
+        let entry = database.tables.get(table_name);
+        let Some(table) = entry.as_ref().clone() else {
+            return ddl_error(&format!("relation '{}' does not exist", table_name));
+        };
+        match constraint_columns(&table.schema, table_name, name) {
+            Some(columns) => columns,
+            None => {
+                return ddl_error(&format!(
+                    "constraint \"{}\" for table \"{}\" does not exist",
+                    name, table_name
+                ))
+            }
+        }
     } else {
         let entry = database.tables.get(table_name);
         let Some(table) = entry.as_ref().clone() else {
@@ -4933,6 +4959,42 @@ async fn apply_conflict_update(
         return ddl_error(&format!("could not parse the rewritten '{}'", statement));
     };
     Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await
+}
+
+/// The columns of the unique constraint `name` on `schema`'s table, for `ON
+/// CONFLICT ON CONSTRAINT name`: a table-level key (a composite `PRIMARY KEY`
+/// among them, named `<table>_pkey`), a single-column `PRIMARY KEY`
+/// (`<table>_pkey`), or an inline `UNIQUE` column (`<table>_<column>_key`).
+/// `None` when no live constraint has that name.
+fn constraint_columns(
+    schema: &crate::core::row::schema::TableSchema,
+    table_name: &str,
+    name: &str,
+) -> Option<Vec<String>> {
+    if let Some(key) = schema
+        .unique_keys
+        .iter()
+        .find(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(name))
+    {
+        return Some(key.columns.clone());
+    }
+    if name.eq_ignore_ascii_case(&format!("{}_pkey", table_name)) {
+        if let Some(pk) = schema.primary_key.as_deref() {
+            return Some(vec![pk.to_string()]);
+        }
+    }
+    schema
+        .fields
+        .iter()
+        .filter(|f| f.is_unique && !f.is_deleted)
+        .find(|f| {
+            let default = crate::core::rql::unique_key::UniqueKey::default_name(
+                table_name,
+                std::slice::from_ref(&f.name),
+            );
+            default.eq_ignore_ascii_case(name)
+        })
+        .map(|f| vec![f.name.clone()])
 }
 
 /// Takes the locks a `SELECT … FOR UPDATE` asks for, and reports which rows
@@ -6069,6 +6131,7 @@ async fn supply_generated_values(
         query: rewritten,
         on_conflict_do_nothing: row_data.on_conflict_do_nothing,
         on_conflict_update: row_data.on_conflict_update.clone(),
+        on_conflict_target: row_data.on_conflict_target.clone(),
     }))
 }
 
@@ -6449,6 +6512,11 @@ async fn insert_values_tuples(
     let mut inserted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
     let mut any_returning = false;
+    // A tuple returned a row, so it wrote one: an inserted row or a `DO
+    // UPDATE`d one. A `RETURNING` reply with no row (a `DO NOTHING` that
+    // skipped, a `DO UPDATE … WHERE` that declined) wrote nothing, so it
+    // leaves the statement as replayable as a skipped count of zero does.
+    let mut returned_a_row = false;
     for stmt in statements {
         // A tuple that loses a uniqueness race is replayed *here*, rather than
         // by re-running the whole statement upstream, because only here is
@@ -6505,7 +6573,7 @@ async fn insert_values_tuples(
             // has landed it is not safe, and the conflict surfaces as itself
             // rather than inviting a replay that would re-insert those rows.
             Some(3) => {
-                return Some(if inserted > 0 || any_returning {
+                return Some(if inserted > 0 || returned_a_row {
                     strip_conflict_marker(response)
                 } else {
                     response
@@ -6516,6 +6584,7 @@ async fn insert_values_tuples(
                 // count comes from the rows themselves downstream, so nothing
                 // is added here.
                 any_returning = true;
+                returned_a_row |= response.len() > 1;
                 returned.extend_from_slice(&response[1..]);
             }
             // A row-count reply carries the count as a `u64`, and it is not
@@ -6663,26 +6732,53 @@ fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result
     Ok(())
 }
 
-/// Refuses the `INSERT` clause phase 2b does not route on a partitioned table
-/// yet (`docs/partitioning.md` §15): `ON CONFLICT` in either form, with or
-/// without `RETURNING` (S18). Checked before the statement does anything at
-/// all, so a refused multi-row or `INSERT … SELECT` statement writes no row
-/// and runs no source query. A plain table passes.
+/// Refuses an `ON CONFLICT` target on a partitioned table that leaves out a
+/// partition-key column, with PostgreSQL's 42P10 ("there is no unique or
+/// exclusion constraint matching the ON CONFLICT specification"): every
+/// unique key of a partitioned table holds every key column
+/// (`docs/partitioning.md` §1.5), so such a target matches none, in
+/// PostgreSQL as here. Checked at the statement's first dispatch, before
+/// anything is read or written. A plain table, a targetless clause and `ON
+/// CONSTRAINT` pass: a constraint is a unique key, which holds the key.
 ///
-/// `RETURNING` alone is not refused (S17): the returned row is built from the
-/// payload the partition is about to store, exactly as on a plain table, and
-/// the multi-row and `INSERT … SELECT` paths concatenate their per-row
-/// answers whatever the target.
-fn refuse_partitioned_insert_clauses(
+/// That is what makes ON CONFLICT exact per partition (S18): the target's
+/// key columns place the probe, the insert and the follow-up `UPDATE` in the
+/// row's one partition, whose own uniqueness check (in-flight writers
+/// included) decides the conflict.
+fn check_partitioned_conflict_target(
     database: &Database,
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
 ) -> Result<(), String> {
     let table = &row_data.table_name;
-    if !database.partitioned.contains_key(table) {
+    let target: &[String] = match &row_data.on_conflict_update {
+        Some(spec) => &spec.arbiter,
+        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target,
+        None => return Ok(()),
+    };
+    if target.is_empty() {
         return Ok(());
     }
-    if row_data.on_conflict_do_nothing || row_data.on_conflict_update.is_some() {
-        return Err(format!("INSERT … ON CONFLICT on partitioned table \"{table}\" is not supported yet"));
+    let Some(pt) = database.partitioned.get(table).map(|e| e.value().clone()) else {
+        return Ok(());
+    };
+    let spec = pt.spec().map_err(|e| e.to_string())?;
+    let fields = &pt.shell().schema.fields;
+    for level in spec.levels() {
+        let Some(field) = fields
+            .iter()
+            .find(|f| !f.is_deleted && f.write_order == u64::from(level.write_order))
+        else {
+            continue;
+        };
+        if !target.iter().any(|c| c.eq_ignore_ascii_case(&field.name)) {
+            return Err(format!(
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification: \
+                 every unique key of partitioned table \"{table}\" holds its partition key column \
+                 \"{}\", which the target ({}) leaves out",
+                field.name,
+                target.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -11213,6 +11309,7 @@ pub(crate) async fn insert_loaded_row(
         table_name: table_name.to_string(),
         query: sql.to_string(),
         on_conflict_do_nothing: false,
+        on_conflict_target: Vec::new(),
         on_conflict_update: None,
     };
     // Asked of the schema rather than by computing the values: computing them
@@ -11798,10 +11895,11 @@ pub(crate) async fn execute_with_need(
             response
         }
         QueryPurpose::InsertRow(row_data) => {
-            // A partitioned table refuses what phase 2a does not route yet
-            // before anything runs: the source of an `INSERT … SELECT`, a
-            // default's sequence, or the first row of a multi-row insert.
-            if let Err(e) = refuse_partitioned_insert_clauses(&database, row_data) {
+            // A partitioned table refuses an ON CONFLICT target its unique
+            // keys cannot match (42P10) before anything runs: the source of
+            // an `INSERT … SELECT`, a default's sequence, or the first row of
+            // a multi-row insert.
+            if let Err(e) = check_partitioned_conflict_target(&database, row_data) {
                 error!("{}", e);
                 return ddl_error(&e);
             }
@@ -12138,7 +12236,14 @@ pub(crate) async fn execute_with_need(
                     // `ON CONFLICT DO NOTHING`: the duplicate is the statement
                     // working, not failing. Reported as zero rows affected, which
                     // is what PostgreSQL returns and what a seed migration
-                    // re-run against an existing database depends on.
+                    // re-run against an existing database depends on. With
+                    // RETURNING it is an empty row set rather than a count:
+                    // PostgreSQL still sends the RowDescription, and a bare
+                    // count sent only the command tag (as `INSERT … SELECT`
+                    // did before dedd503).
+                    if returning.is_some() {
+                        return vec![2u8];
+                    }
                     let mut result = vec![0u8];
                     result.extend_from_slice(&0u64.to_le_bytes());
                     return result;

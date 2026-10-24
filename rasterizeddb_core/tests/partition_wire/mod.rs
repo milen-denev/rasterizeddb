@@ -537,6 +537,7 @@ pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
                 table_name: name.clone(),
                 query: query.clone(),
                 on_conflict_do_nothing: false,
+                on_conflict_target: Vec::new(),
                 on_conflict_update: None,
             });
             let row = rasterizeddb_core::core::rql::lexer_ir::insert_row_with_defaults(

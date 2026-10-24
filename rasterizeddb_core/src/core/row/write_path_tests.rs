@@ -1479,6 +1479,7 @@ fn a_bad_literal_is_rejected_rather_than_zeroed() {
                 table_name: "t".into(),
                 query: sql.to_string(),
                 on_conflict_do_nothing: false,
+                on_conflict_target: Vec::new(),
                 on_conflict_update: None,
             }),
             &schema,

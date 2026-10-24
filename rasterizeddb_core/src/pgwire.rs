@@ -5806,6 +5806,16 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("operator does not exist") {
         return "42883";
     }
+    // `invalid_column_reference`: an ON CONFLICT target no unique key
+    // matches (a partitioned table's that leaves out a key column, S18).
+    // Decided early: the message quotes the column names.
+    if has("no unique or exclusion constraint matching the on conflict specification") {
+        return "42P10";
+    }
+    // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
+    if has("constraint \"") && has("\" for table \"") && has("does not exist") {
+        return "42704";
+    }
     // `57014` is `query_canceled`, which is what a driver watches for to tell
     // "the server gave up on this" apart from "this statement is wrong".
     if has("canceling statement") {

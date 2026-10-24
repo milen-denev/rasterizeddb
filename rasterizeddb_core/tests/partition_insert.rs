@@ -196,12 +196,13 @@ fn duplicates_are_refused_and_racing_duplicates_store_one_row() {
     drop(server);
 }
 
-/// `ON CONFLICT` stays refused (phase 2b, S18) with 0A000, with or without
-/// `RETURNING`, in every statement shape, before anything is written or
-/// materialized and before an `INSERT … SELECT` runs its source. (`RETURNING`
-/// alone is built since S17: `partition_returning.rs`.)
+/// An `ON CONFLICT` target that leaves out a partition-key column matches no
+/// unique key of a partitioned table (every one holds the key, §1.5), so it
+/// is refused with PostgreSQL's 42P10, in every statement shape, before
+/// anything is written or materialized and before an `INSERT … SELECT` runs
+/// its source. (ON CONFLICT itself is built since S18: `partition_upsert.rs`.)
 #[test]
-fn on_conflict_is_refused_before_writing() {
+fn a_conflict_target_without_the_key_is_refused_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path().to_str().unwrap());
     let mut c = server.connect();
@@ -210,37 +211,39 @@ fn on_conflict_is_refused_before_writing() {
     c.ok("INSERT INTO src (tenant_id, id, label) VALUES (1, 1, 's'), (2, 2, 's')");
     let cols = "(tenant_id, id, label)";
     for sql in [
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT DO NOTHING"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO NOTHING"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO UPDATE SET label = 'u'"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT DO NOTHING RETURNING id"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (tenant_id, id) DO UPDATE SET label = 'u' RETURNING *"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT DO NOTHING"),
-        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT DO NOTHING RETURNING tenant_id, id"),
-        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT DO NOTHING"),
-        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT DO NOTHING RETURNING id"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (id) DO NOTHING"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (id) DO UPDATE SET label = 'u'"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (id) DO NOTHING RETURNING id"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a') ON CONFLICT (\"id\") DO UPDATE SET label = 'u' RETURNING *"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT (id, label) DO NOTHING"),
+        format!("INSERT INTO refu {cols} VALUES (1, 1, 'a'), (2, 2, 'b') ON CONFLICT (id) DO NOTHING RETURNING tenant_id, id"),
+        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT (id) DO NOTHING"),
+        format!("INSERT INTO refu {cols} SELECT tenant_id, id, label FROM src ON CONFLICT (id) DO UPDATE SET label = 'u' RETURNING id"),
     ] {
-        let e = expect_code(c.simple(&sql), "0A000");
-        assert!(e.is_unsupported(), "{sql}: {e}");
+        let e = expect_code(c.simple(&sql), "42P10");
+        assert!(e.message.contains("no unique or exclusion constraint matching"), "{sql}: {e}");
         assert!(stored_rows(&server.db, "refu").is_empty(), "{sql} wrote a row");
         assert_eq!(materialized(&mut c, "refu"), 0, "{sql} materialized a partition");
     }
     // Prepared, and inside a block: the block then fails like any statement.
     let out = match c.prepare(
         "p1",
-        "INSERT INTO refu (tenant_id, id, label) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id",
+        "INSERT INTO refu (tenant_id, id, label) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING RETURNING id",
     ) {
         Ok(_) => c.execute_prepared("p1", &[Some("5".into()), Some("5".into()), Some("p".into())]),
         Err(e) => Err(e),
     };
-    let e = expect_code(out, "0A000");
-    assert!(e.is_unsupported(), "{e}");
+    expect_code(out, "42P10");
     assert!(stored_rows(&server.db, "refu").is_empty());
     c.ok("BEGIN");
     c.ok("INSERT INTO refu (tenant_id, id, label) VALUES (9, 9, 'in block')");
-    expect_code(c.simple("INSERT INTO refu (tenant_id, id, label) VALUES (9, 10, 'b') ON CONFLICT DO NOTHING"), "0A000");
+    expect_code(c.simple("INSERT INTO refu (tenant_id, id, label) VALUES (9, 10, 'b') ON CONFLICT (id) DO NOTHING"), "42P10");
+    assert_eq!(c.status, b'E', "the failure ends the block");
     c.ok("ROLLBACK");
     assert!(stored_rows(&server.db, "refu").is_empty());
+    // A target naming the whole key, in any order or case, is accepted.
+    c.ok("INSERT INTO refu (tenant_id, id, label) VALUES (3, 3, 'k') ON CONFLICT (ID, Tenant_Id) DO NOTHING");
+    assert_eq!(stored_rows(&server.db, "refu").len(), 1);
     drop(c);
     drop(server);
 }

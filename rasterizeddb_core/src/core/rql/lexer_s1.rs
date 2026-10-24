@@ -93,15 +93,28 @@ pub struct InsertRowData {
     /// would have been inserted has been built, so resolving them is the
     /// executor's job.
     pub on_conflict_update: Option<ConflictUpdate>,
+    /// The columns a `DO NOTHING` names as its target, `ON CONFLICT (a, b) DO
+    /// NOTHING`; empty when it names none or names a constraint. (`DO UPDATE`
+    /// keeps its own in [`ConflictUpdate::arbiter`].)
+    ///
+    /// Read once, by the partitioned-table check that refuses a target missing
+    /// a partition-key column (42P10, as PostgreSQL), at the statement's first
+    /// dispatch. A statement re-parsed from its tuples or rewritten from its
+    /// `SELECT` may carry it empty: by then the check has passed.
+    pub on_conflict_target: Vec<String>,
 }
 
 /// The `DO UPDATE SET … [WHERE …]` of an `INSERT … ON CONFLICT`.
 #[derive(Debug, Clone)]
 pub struct ConflictUpdate {
     /// Columns named by the arbiter, `ON CONFLICT (a, b)`. Empty when none was
-    /// written, in which case the conflicting row is found by whichever unique
-    /// column the insert actually collided on.
+    /// written, in which case the conflicting row is found by the constraint
+    /// it names, or else by whichever unique column the insert actually
+    /// collided on.
     pub arbiter: Vec<String>,
+    /// The constraint `ON CONFLICT ON CONSTRAINT name` names, as written
+    /// (unquoted). The executor resolves it to the constraint's columns.
+    pub constraint: Option<String>,
     /// The `SET` list, as written.
     pub assignments: String,
     /// The optional `WHERE` that decides whether the update happens at all.
@@ -110,17 +123,18 @@ pub struct ConflictUpdate {
 
 /// Splits a trailing `ON CONFLICT …` clause off an `INSERT`.
 ///
-/// Returns the statement without the clause, whether it was `DO NOTHING`, and
-/// the `DO UPDATE` half when there was one.
+/// Returns the statement without the clause, whether it was `DO NOTHING`, the
+/// `DO UPDATE` half when there was one, and the columns a `DO NOTHING` names
+/// as its target.
 ///
 /// A `RETURNING` after the conflict clause belongs to the statement, not to the
 /// clause, so it is moved back onto the `INSERT`. Cutting at `ON CONFLICT` and
 /// discarding the rest would have dropped it, and the caller would have got no
 /// rows back from a statement that asked for them.
-fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
+fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<String>) {
     let upper = query.to_ascii_uppercase();
     let Some(at) = find_top_level(&upper, "ON CONFLICT") else {
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, Vec::new());
     };
 
     let clause = &query[at..];
@@ -138,52 +152,23 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
         None => head.to_string(),
     };
 
-    if clause_upper.contains("DO NOTHING") {
-        return (rebuilt, true, None);
+    if let Some(do_at) = clause_upper.find("DO NOTHING") {
+        let (target, _) = conflict_target(clause[..do_at].trim());
+        return (rebuilt, true, None, target);
     }
 
     let Some(do_at) = clause_upper.find("DO UPDATE") else {
         // Neither form: leave the statement alone so it is reported rather than
         // silently treated as one of them.
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, Vec::new());
     };
 
-    // `ON CONFLICT (a, b) DO UPDATE …`, or `ON CONFLICT (a) WHERE pred DO
-    // UPDATE …` naming a partial unique index. The column list ends at the
-    // parenthesis matching its own: the last one in the clause may be the
-    // predicate's, and reading up to it took `a) WHERE (pred` for a column.
-    // The predicate itself is not needed here; the executor finds the index
-    // from the columns (see `apply_conflict_update`).
-    let arbiter_text = clause[..do_at].trim();
-    let arbiter_close = arbiter_text.find('(').and_then(|open| {
-        let mut depth = 0usize;
-        arbiter_text[open..].char_indices().find_map(|(i, c)| {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(open + i);
-                    }
-                }
-                _ => {}
-            }
-            None
-        })
-    });
-    let arbiter = match (arbiter_text.find('('), arbiter_close) {
-        (Some(open), Some(close)) if close > open => arbiter_text[open + 1..close]
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_string())
-            .filter(|c| !c.is_empty())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let (arbiter, constraint) = conflict_target(clause[..do_at].trim());
 
     let after_do = &clause[do_at + "DO UPDATE".len()..];
     let after_do_upper = &clause_upper[do_at + "DO UPDATE".len()..];
     let Some(set_at) = after_do_upper.find("SET") else {
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, Vec::new());
     };
     let body = &after_do[set_at + "SET".len()..];
     let body_upper = &after_do_upper[set_at + "SET".len()..];
@@ -201,10 +186,58 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
         false,
         Some(ConflictUpdate {
             arbiter,
+            constraint,
             assignments,
             where_clause,
         }),
+        Vec::new(),
     )
+}
+
+/// The target of an `ON CONFLICT` clause, `arbiter_text` being the clause up
+/// to its `DO`: the columns of `ON CONFLICT (a, b)`, or the name of `ON
+/// CONFLICT ON CONSTRAINT name`, or neither.
+///
+/// `ON CONFLICT (a) WHERE pred` names a partial unique index. The column list
+/// ends at the parenthesis matching its own: the last one in the clause may be
+/// the predicate's, and reading up to it took `a) WHERE (pred` for a column.
+/// The predicate itself is not needed here; the executor finds the index from
+/// the columns (see `apply_conflict_update`).
+fn conflict_target(arbiter_text: &str) -> (Vec<String>, Option<String>) {
+    let upper = arbiter_text.to_ascii_uppercase();
+    if let Some(on) = find_top_level(&upper, "ON CONSTRAINT") {
+        let name = arbiter_text[on + "ON CONSTRAINT".len()..]
+            .split_whitespace()
+            .next()
+            .map(|n| n.trim_matches('"').to_string())
+            .filter(|n| !n.is_empty());
+        return (Vec::new(), name);
+    }
+    let arbiter_close = arbiter_text.find('(').and_then(|open| {
+        let mut depth = 0usize;
+        arbiter_text[open..].char_indices().find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })
+    });
+    let columns = match (arbiter_text.find('('), arbiter_close) {
+        (Some(open), Some(close)) if close > open => arbiter_text[open + 1..close]
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    (columns, None)
 }
 
 /// Finds `needle` in `haystack` outside quotes and parentheses.
@@ -504,13 +537,14 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         }
     } else if simd_compare_strings(query_bytes, b"INSERT INTO", &StartsWith) {
         if let Some(table_name_extract) = query_trimmed.split_whitespace().nth(2) {
-            let (query, on_conflict_do_nothing, on_conflict_update) =
+            let (query, on_conflict_do_nothing, on_conflict_update, on_conflict_target) =
                 split_on_conflict(query_trimmed);
             Some(InsertRow(InsertRowData {
                 table_name: normalize_table_name(table_name_extract),
                 query,
                 on_conflict_do_nothing,
                 on_conflict_update,
+                on_conflict_target,
             }))
         } else {
             None
@@ -627,5 +661,46 @@ mod strip_comment_tests {
             strip_sql_comments("SELECT '-- not a comment'"),
             "SELECT '-- not a comment'"
         );
+    }
+}
+
+#[cfg(test)]
+mod conflict_target_tests {
+    use super::split_on_conflict;
+
+    /// `DO NOTHING` keeps its target's columns now (the partitioned-table
+    /// check reads them), `DO UPDATE` its arbiter, and `ON CONSTRAINT` its
+    /// name; `RETURNING` still moves back onto the statement.
+    #[test]
+    fn each_form_keeps_its_target() {
+        let (sql, nothing, update, target) =
+            split_on_conflict("INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (\"a\", B) DO NOTHING RETURNING a");
+        assert_eq!(sql, "INSERT INTO t (a, b) VALUES (1, 2) RETURNING a");
+        assert!(nothing && update.is_none());
+        assert_eq!(target, vec!["a".to_string(), "B".to_string()]);
+
+        let (_, nothing, update, target) =
+            split_on_conflict("INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING");
+        assert!(nothing && update.is_none() && target.is_empty(), "a name is not a column list");
+
+        let (_, _, update, _) = split_on_conflict(
+            "INSERT INTO t (a, n) VALUES (1, 2) ON CONFLICT ON CONSTRAINT \"t_pkey\" DO UPDATE SET n = EXCLUDED.n WHERE t.n < 5",
+        );
+        let update = update.expect("DO UPDATE");
+        assert!(update.arbiter.is_empty());
+        assert_eq!(update.constraint.as_deref(), Some("t_pkey"));
+        assert_eq!(update.assignments, "n = EXCLUDED.n");
+        assert_eq!(update.where_clause.as_deref(), Some("t.n < 5"));
+
+        // A partial index's predicate is not part of the column list.
+        let (_, _, update, _) = split_on_conflict(
+            "INSERT INTO t (a, n) VALUES (1, 2) ON CONFLICT (a) WHERE (n > 0) DO UPDATE SET n = 1",
+        );
+        let update = update.expect("DO UPDATE");
+        assert_eq!(update.arbiter, vec!["a".to_string()]);
+        assert!(update.constraint.is_none());
+
+        let (_, nothing, update, target) = split_on_conflict("INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING");
+        assert!(nothing && update.is_none() && target.is_empty());
     }
 }

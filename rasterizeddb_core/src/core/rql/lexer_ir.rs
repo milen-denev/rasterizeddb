@@ -1424,6 +1424,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1455,6 +1456,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         assert!(insert_row_from_query_purpose(&qp, &schema).is_none());
@@ -1550,6 +1552,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1644,6 +1647,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1715,6 +1719,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1756,6 +1761,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "results".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1809,6 +1815,7 @@ mod tests {
                 query: sql.to_string(),
                 table_name: "users".to_string(),
                 on_conflict_do_nothing: false,
+                on_conflict_target: Vec::new(),
                 on_conflict_update: None,
             });
             let row_write =
@@ -1851,6 +1858,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "t".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1866,6 +1874,7 @@ mod tests {
             query: sql2.to_string(),
             table_name: "t".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write2 =
@@ -2065,6 +2074,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "employees".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row_write =
@@ -2566,6 +2576,7 @@ mod insert_parse_bench {
                     query: t.clone(),
                     table_name: "items".to_string(),
                     on_conflict_do_nothing: false,
+                    on_conflict_target: Vec::new(),
                     on_conflict_update: None,
                 })
             })

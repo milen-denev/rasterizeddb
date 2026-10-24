@@ -114,6 +114,7 @@ fn insert_row(t: &PartitionedTable, tenant: &str, n: i32, label: &str) -> Option
         table_name: "acct".to_string(),
         query: format!("INSERT INTO acct (tenant_id, n, label) VALUES ({tenant}, {n}, '{label}')"),
         on_conflict_do_nothing: false,
+        on_conflict_target: Vec::new(),
         on_conflict_update: None,
     });
     crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[], 0)

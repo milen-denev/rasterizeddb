@@ -76,6 +76,7 @@ async fn twins(db: &Arc<Database>) -> Arc<PartitionedTable> {
             table_name: "pt".to_string(),
             query: query.clone(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Vec::new(),
             on_conflict_update: None,
         });
         let row = crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &pt.shell().schema.fields, &[], &[], 0).unwrap();
