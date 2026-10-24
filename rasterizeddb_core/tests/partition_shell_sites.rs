@@ -57,14 +57,31 @@ struct Site {
     around: Option<(&'static str, &'static str)>,
     /// Who changes this expectation, or why it is what it is.
     note: &'static str,
+    /// Not empty: `sql` is prepared (its Describe compared too) and executed
+    /// once per entry with these text parameters, each execution compared.
+    runs: &'static [&'static [&'static str]],
+    /// The column names the prepared statement's Describe must give.
+    columns: Option<&'static [&'static str]>,
 }
 
 const fn site(sql: &'static str, expect: Expect, note: &'static str) -> Site {
-    Site { sql, expect, around: None, note }
+    Site { sql, expect, around: None, note, runs: &[], columns: None }
 }
 
 const fn in_block(sql: &'static str, expect: Expect, note: &'static str) -> Site {
-    Site { sql, expect, around: Some(("BEGIN", "ROLLBACK")), note }
+    Site { sql, expect, around: Some(("BEGIN", "ROLLBACK")), note, runs: &[], columns: None }
+}
+
+/// A prepared `SELECT`, run past its learned parse (the third run on answers
+/// from the cache, S15): every Describe and execution like the twin's, rows
+/// included.
+const fn prepared(
+    sql: &'static str,
+    runs: &'static [&'static [&'static str]],
+    columns: Option<&'static [&'static str]>,
+    note: &'static str,
+) -> Site {
+    Site { sql, expect: Expect::LikeTwinAnswered, around: None, note, runs, columns }
 }
 
 fn rows_text(r: &Reply) -> String {
@@ -271,6 +288,32 @@ const SITES: &[Site] = &[
     site("SHOW TABLE STATS site_p", Expect::Check(table_stats), "S8"),
     site("SHOW PARTITIONS site_p", Expect::Check(show_partitions), "S8"),
     site("DESCRIBE site_p", Expect::LikeTwin, "from the shell's schema"),
+    // Prepared reads past the learned parse (S15): routed per execution, and
+    // described by select-item alias (owner constraint 1).
+    prepared(
+        "SELECT * FROM site_p WHERE tenant_id = $1 AND asset_group_id = $2",
+        &[&["7", "3"], &["1", "2"], &["2", "1"], &["1", "1"], &["7", "3"]],
+        None,
+        "S15: the learned parse, routed per execution",
+    ),
+    prepared(
+        "SELECT COUNT(*) FROM site_p WHERE tenant_id = $1",
+        &[&["7"], &["1"], &["2"], &["999"], &["1"]],
+        None,
+        "S15",
+    ),
+    prepared(
+        "SELECT n AS v, tenant_id AS t FROM site_p WHERE tenant_id = $1",
+        &[&["7"], &["1"], &["2"], &["1"]],
+        Some(&["v", "t"]),
+        "S15; aliases by select item (1099cb0)",
+    ),
+    prepared(
+        "SELECT tenant_id AS a, tenant_id AS b FROM site_p WHERE tenant_id = $1",
+        &[&["7"], &["1"], &["2"], &["1"]],
+        Some(&["a", "b"]),
+        "S15; each item labels one column",
+    ),
     site("SHOW COLUMNS FROM site_p", Expect::LikeTwin, "from the shell's schema"),
     site("EXPLAIN SELECT * FROM site_p", Expect::LikeTwin, "not a statement here"),
     // Every pg_* view and information_schema relation.
@@ -408,6 +451,8 @@ const SITES: &[Site] = &[
         expect: Expect::LikeTwin,
         around: Some(("BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK")),
         note: "S10",
+        runs: &[],
+        columns: None,
     },
 ];
 
@@ -494,8 +539,47 @@ fn to_twin(sql: &str) -> String {
     out
 }
 
-/// Runs `sql` (and its `around`) on a session.
+/// Runs `sql` (and its `around`) on a session. A prepared site's outcome is
+/// its Describe and every execution, in one reply: the first failure, or the
+/// columns of the Describe followed by each execution's columns, rows and
+/// tags, so every one of them is compared.
 fn run_site(c: &mut Client, site: &Site, sql: &str) -> Outcome {
+    if !site.runs.is_empty() {
+        let described = c.prepare("site", sql);
+        let mut whole = match described {
+            Ok(r) => r,
+            Err(e) => {
+                c.close_prepared("site");
+                return Err(e);
+            }
+        };
+        if let Some(want) = site.columns {
+            assert_eq!(whole.columns, want, "`{sql}`: the statement Describe");
+        }
+        for (i, params) in site.runs.iter().enumerate() {
+            let params: Vec<Option<String>> = params.iter().map(|p| Some(p.to_string())).collect();
+            match c.execute_prepared("site", &params) {
+                Ok(r) => {
+                    if let Some(want) = site.columns {
+                        assert_eq!(r.columns, want, "`{sql}` run {i}: the portal Describe");
+                    }
+                    whole.columns.extend(r.columns.iter().map(|col| format!("{i}:{col}")));
+                    whole.types.extend(r.types);
+                    whole.rows.extend(r.rows.into_iter().map(|mut row| {
+                        row.insert(0, Some(format!("run {i}")));
+                        row
+                    }));
+                    whole.tags.extend(r.tags);
+                }
+                Err(e) => {
+                    c.close_prepared("site");
+                    return Err(e);
+                }
+            }
+        }
+        c.close_prepared("site");
+        return Ok(whole);
+    }
     if let Some((before, _)) = site.around {
         c.ok(before);
     }

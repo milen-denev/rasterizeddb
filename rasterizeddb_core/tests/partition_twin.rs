@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use partition_wire::*;
+use rasterizeddb_core::pgwire::PREPARED_RUNS;
 
 // ---------------------------------------------------------------------------
 // The statement kinds, and what the partitioned side does not support yet.
@@ -127,8 +128,16 @@ enum Kind {
     EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning,
     // Prepared statements, several runs each, alternating tenants.
+    // PreparedSelect and PreparedCount run past the learned parse (S15): the
+    // partitioned side must answer its later runs from the cache.
     PreparedSelect,
     PreparedCount,
+    // A prepared SELECT whose Describe labels columns by select-item alias,
+    // each item used once (owner constraint 1, 1099cb0).
+    PreparedDescribeAlias,
+    // A prepared SELECT learned, then an unrelated table created and dropped
+    // between its runs: the parse is learned again, and no route was kept.
+    PreparedSelectAcrossDdl,
     PreparedInsert,
     PreparedUpdate,
     PreparedDelete,
@@ -162,8 +171,8 @@ const ALL_KINDS: &[Kind] = &[
     CountDistinct, Window, Join, LeftJoin,
     SelfJoin, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
-    EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedInsert, PreparedUpdate, PreparedDelete,
-    CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
+    EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedDescribeAlias, PreparedSelectAcrossDdl,
+    PreparedInsert, PreparedUpdate, PreparedDelete, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
     TxCommit, TxRollback, Restart,
 ];
 
@@ -213,7 +222,8 @@ const REFUSED: &[Refusal] = &[
     // kind is compared with the twin, ORDER BY across partitions included
     // (correct by sorting the partitions' top-N together; S12 makes it
     // cheap), and so are the reads inside INSERT … SELECT, IN (SELECT …),
-    // UNION and CTEs, the empty routes, and prepared SELECT and COUNT.
+    // UNION and CTEs, the empty routes, and prepared SELECT and COUNT. Since
+    // S15 those two run from the learned parse, routed per execution (I11).
     // 2b: joins.
     refused(Join, "phase 2b"),
     refused(LeftJoin, "phase 2b"),
@@ -288,7 +298,18 @@ fn unrender(text: &str) -> String {
 
 enum Step {
     Simple(String),
-    Prepared { sql: String, runs: Vec<Vec<Option<String>>> },
+    Prepared {
+        sql: String,
+        runs: Vec<Vec<Option<String>>>,
+        /// From this run (0-based) on, the partitioned side must answer from
+        /// the learned parse (`PREPARED_RUNS` moves): the first two runs
+        /// teach it, with values that place unambiguously.
+        cached_from: Option<usize>,
+        /// Run once (on the shared database) after the run of that index.
+        ddl_after: Vec<(usize, String)>,
+        /// The column names the statement's Describe must give, on both sides.
+        columns: Option<&'static [&'static str]>,
+    },
     /// BEGIN, the inner operations, then COMMIT (true) or ROLLBACK.
     Block { inner: Vec<Op>, commit: bool },
     Restart,
@@ -373,7 +394,38 @@ impl Gen {
     }
 
     fn prepared(&mut self, kind: Kind, sql: &str, runs: Vec<Vec<Option<String>>>) -> Op {
-        Op { kind, step: Step::Prepared { sql: sql.to_string(), runs }, ordered: false }
+        let step = Step::Prepared { sql: sql.to_string(), runs, cached_from: None, ddl_after: Vec::new(), columns: None };
+        Op { kind, step, ordered: false }
+    }
+
+    /// A prepared statement run past its learned parse: four to six runs, the
+    /// first two with tenants in `4..=9` (single digits, never a group number,
+    /// so `WhereTemplate::derive` places each value) differing in every value,
+    /// and the partitioned side answering from the cache from the third.
+    fn learned(&mut self, kind: Kind, sql: &str, with_grp: bool, columns: Option<&'static [&'static str]>) -> Op {
+        let t1 = self.rng.i64(4..=9);
+        let t2 = loop {
+            let t = self.rng.i64(4..=9);
+            if t != t1 {
+                break t;
+            }
+        };
+        let g1 = self.grp();
+        let g2 = if g1 == GROUPS { 1 } else { g1 + 1 };
+        let one = |t: i64, g: i64| {
+            let mut run = vec![Some(t.to_string())];
+            if with_grp {
+                run.push(Some(g.to_string()));
+            }
+            run
+        };
+        let mut runs = vec![one(t1, g1), one(t2, g2)];
+        for _ in 0..self.rng.usize(2..=4) {
+            let (t, g) = (self.tenant(), self.grp());
+            runs.push(one(t, g));
+        }
+        let step = Step::Prepared { sql: sql.to_string(), runs, cached_from: Some(2), ddl_after: Vec::new(), columns };
+        Op { kind, step, ordered: false }
     }
 
     fn op(&mut self, kind: Kind) -> Op {
@@ -766,13 +818,34 @@ impl Gen {
             EmptyRouteDeleteReturning => {
                 self.simple(kind, "DELETE FROM {t} WHERE tenant_id = 1 AND tenant_id = 2 RETURNING id".into())
             }
-            PreparedSelect => {
-                let runs = self.prepared_runs(|g| vec![Some(g.tenant().to_string()), Some(g.grp().to_string())]);
-                self.prepared(kind, "SELECT * FROM {t} WHERE tenant_id = $1 AND grp = $2", runs)
+            PreparedSelect => self.learned(kind, "SELECT * FROM {t} WHERE tenant_id = $1 AND grp = $2", true, None),
+            PreparedCount => self.learned(kind, "SELECT COUNT(*) FROM {t} WHERE tenant_id = $1", false, None),
+            PreparedDescribeAlias => {
+                if self.rng.bool() {
+                    self.learned(kind, "SELECT n AS v, tenant_id AS t FROM {t} WHERE tenant_id = $1", false, Some(&["v", "t"]))
+                } else {
+                    // The same column twice: each item labels one column.
+                    let sql = "SELECT tenant_id AS a, tenant_id AS b FROM {t} WHERE tenant_id = $1";
+                    self.learned(kind, sql, false, Some(&["a", "b"]))
+                }
             }
-            PreparedCount => {
-                let runs = self.prepared_runs(|g| vec![Some(g.tenant().to_string())]);
-                self.prepared(kind, "SELECT COUNT(*) FROM {t} WHERE tenant_id = $1", runs)
+            PreparedSelectAcrossDdl => {
+                let mut op = self.learned(kind, "SELECT * FROM {t} WHERE tenant_id = $1 AND grp = $2", true, None);
+                if let Step::Prepared { runs, ddl_after, cached_from, .. } = &mut op.step {
+                    // Learned by run 2 and used at run 2; the CREATE after it
+                    // resets the parse, which runs 3 and 4 learn again, and the
+                    // DROP after run 4 resets it once more. No cached-run check:
+                    // which runs relearn depends on the values drawn.
+                    while runs.len() < 6 {
+                        let (t, g) = (self.rng.i64(1..=TENANTS), self.rng.i64(1..=GROUPS));
+                        runs.push(vec![Some(t.to_string()), Some(g.to_string())]);
+                    }
+                    let name = format!("twin_ddl_{}", self.rng.u32(..));
+                    ddl_after.push((2, format!("CREATE TABLE {name} (x INT)")));
+                    ddl_after.push((4, format!("DROP TABLE {name}")));
+                    *cached_from = None;
+                }
+                op
             }
             PreparedInsert => {
                 let runs = self.prepared_runs(|g| {
@@ -894,6 +967,8 @@ struct Twin {
     storage_checks: usize,
     /// Committed blocks that changed rows in two or more partitions.
     cross_partition_blocks: usize,
+    /// Partitioned-side executions that answered from a learned parse.
+    cached_runs: usize,
 }
 
 /// Kinds that can change what `{t}` stores: the storage comparison runs
@@ -1125,21 +1200,45 @@ impl Twin {
                 self.note(op.kind, &verdict);
                 !matches!(verdict, Verdict::Agreed { failed: false })
             }
-            Step::Prepared { sql, runs } => {
+            Step::Prepared { sql, runs, cached_from, ddl_after, columns } => {
                 let sql_p = render(sql, &SIDE_PART);
                 let sql_q = render(sql, &SIDE_PLAIN);
                 let name = format!("tw{at}");
                 self.log.push(format!("PREPARE {name} AS {sql_p}"));
                 let p = self.cp().prepare(&name, &sql_p);
+                if let (Some(want), Ok(reply)) = (columns, &p) {
+                    if reply.columns != *want {
+                        self.fail(at, op.kind, format!("`{sql_p}` described as {:?}, not {want:?}", reply.columns));
+                    }
+                }
                 let name_q = name.clone();
                 let verdict = self.judge(at, op, &sql_p, p, false, &mut |tw: &mut Twin| tw.cq().prepare(&name_q, &sql_q));
                 let mut failed = !matches!(verdict, Verdict::Agreed { failed: false });
                 if failed {
                     self.note(op.kind, &verdict);
                 } else {
-                    for params in runs {
+                    for (i, params) in runs.iter().enumerate() {
                         self.log.push(format!("EXECUTE {name} {params:?}"));
+                        let before = PREPARED_RUNS.load(std::sync::atomic::Ordering::Relaxed);
                         let p = self.cp().execute_prepared(&name, params);
+                        // Other twins in this process only add to the count, so
+                        // a run that moved nothing did not use the cache.
+                        let moved = PREPARED_RUNS.load(std::sync::atomic::Ordering::Relaxed) - before;
+                        if cached_from.is_some_and(|from| i >= from) && p.is_ok() {
+                            if moved == 0 {
+                                self.fail(
+                                    at,
+                                    op.kind,
+                                    format!("run {i} of `{sql_p}` ({params:?}) did not answer from the learned parse"),
+                                );
+                            }
+                            self.cached_runs += 1;
+                        }
+                        if let (Some(want), Ok(reply)) = (columns, &p) {
+                            if reply.columns != *want {
+                                self.fail(at, op.kind, format!("run {i} of `{sql_p}`: columns {:?}, not {want:?}", reply.columns));
+                            }
+                        }
                         let name_q = name.clone();
                         let params_q = params.clone();
                         let verdict = self.judge(at, op, &format!("{sql_p} with {params:?}"), p, true, &mut |tw: &mut Twin| {
@@ -1149,6 +1248,10 @@ impl Twin {
                         if !matches!(verdict, Verdict::Agreed { failed: false }) {
                             failed = true;
                             break;
+                        }
+                        for (_, ddl) in ddl_after.iter().filter(|(after, _)| *after == i) {
+                            self.log.push(ddl.clone());
+                            self.cp().ok(ddl);
                         }
                     }
                 }
@@ -1318,6 +1421,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         tally: BTreeMap::new(),
         storage_checks: 0,
         cross_partition_blocks: 0,
+        cached_runs: 0,
     };
     // The seeded rows, before anything else runs.
     twin.compare_storage(0, Restart);
@@ -1411,13 +1515,15 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         .iter()
         .map(|(k, t)| format!("{k:?}: refused {} agreed {} both-failed {} known-diverged {}", t.refused, t.agreed, t.both_failed, t.diverged_known))
         .collect();
+    assert!(twin.cached_runs > 0, "{label} seed {seed:#x}: no prepared execution answered from a learned parse");
     eprintln!(
         "{label} seed {seed:#x}: {ops} ops in {:.1}s, {} bytes, {} storage comparisons, {} committed blocks \
-         across partitions\n  {}",
+         across partitions, {} cached prepared runs\n  {}",
         started.elapsed().as_secs_f64(),
         bytes,
         twin.storage_checks,
         twin.cross_partition_blocks,
+        twin.cached_runs,
         summary.join("\n  ")
     );
     twin.cp = None;
