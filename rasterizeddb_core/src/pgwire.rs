@@ -51,6 +51,8 @@ mod ddl_lock_tests;
 mod ddl_rewrite_tests;
 #[cfg(test)]
 mod temp_relation_tests;
+#[cfg(test)]
+mod block_error_tests;
 mod fixed_rows;
 mod wire_out;
 
@@ -1635,11 +1637,7 @@ where
         // `Database::abort_transaction`, not the manager's `abort`: the latter
         // ends the transaction but leaves its row and key locks in the lock
         // table and its replication buffers in the capture map.
-        let wrote = database.transactions.wrote_family(t.id);
-        database.abort_transaction(t.id);
-        if wrote {
-            flush_outcomes(database);
-        }
+        t.abort_unless_aborted(database);
         t.owner.release();
     }
     result
@@ -1862,11 +1860,7 @@ where
         state.end_block_settings(&t);
         // What `ROLLBACK` does, row locks and replication buffers included:
         // releasing what the idle block holds is the point of the timeout.
-        let wrote = database.transactions.wrote_family(t.id);
-        database.abort_transaction(t.id);
-        if wrote {
-            flush_outcomes(database);
-        }
+        t.abort_unless_aborted(database);
         t.owner.release();
     } else {
         log::info!("{}", message);
@@ -2115,10 +2109,52 @@ struct SessionTransaction {
     /// clients depend on it: the alternative is a transaction that commits
     /// having silently skipped the statement that did not work.
     failed: bool,
+    /// The block's transaction was aborted at its error (R3, slice B6): with
+    /// no savepoint open, an error ends the block at once, as PostgreSQL's
+    /// TBLOCK_ABORT does, releasing its locks, its keys in flight and its
+    /// wait-for edges then rather than at the client's ROLLBACK. The block
+    /// stays open and failed (25P02) until COMMIT (which reports ROLLBACK)
+    /// or ROLLBACK, which find nothing left to abort.
+    aborted: bool,
+    /// The database the block runs in, for the abort at the error.
+    database: Arc<Database>,
     /// The block's lock owner (its root), released when the block ends: by
     /// each ending path after its last durability step and before it replies
     /// (finding L4), and by the drop on any path that forgets to.
     owner: crate::core::mvcc::owner::OwnerRelease,
+}
+
+impl SessionTransaction {
+    /// Ends the block's transaction at its error (R3): aborted, its outcome
+    /// made durable when it wrote (nothing on disk may carry a running id
+    /// nobody will end), and its owner's locks released (row and key locks
+    /// go with the abort). The block stays failed; closing it later finds
+    /// nothing to undo.
+    fn abort_now(&mut self) {
+        if self.aborted {
+            return;
+        }
+        self.aborted = true;
+        let wrote = self.database.transactions.wrote_family(self.id);
+        self.database.abort_transaction(self.id);
+        if wrote {
+            flush_outcomes(&self.database);
+        }
+        self.owner.release_held();
+    }
+
+    /// Aborts the block's transaction unless its error already did (R3);
+    /// for every path that closes a failed or abandoned block.
+    fn abort_unless_aborted(&self, database: &Arc<Database>) {
+        if self.aborted {
+            return;
+        }
+        let wrote = database.transactions.wrote_family(self.id);
+        database.abort_transaction(self.id);
+        if wrote {
+            flush_outcomes(database);
+        }
+    }
 }
 
 impl SessionState {
@@ -4114,6 +4150,15 @@ where
     state.statement_error = Some(message.to_string());
     if let Some(t) = state.transaction.as_mut() {
         t.failed = true;
+        // R3 (slice B6): with no savepoint open, the error ends the block
+        // now, before it is reported: a deadlock's victim gives its locks and
+        // keys back here, so the survivor goes on without waiting for the
+        // victim's client to send ROLLBACK. Under a savepoint the block is
+        // only failed, as before: ROLLBACK TO revives it, and the family
+        // keeps its locks until then (per-savepoint release is v2).
+        if t.savepoints.is_empty() {
+            t.abort_now();
+        }
     }
     // The planning paths report every failure as a syntax error; a pattern the
     // `SIMILAR TO` matcher refuses is PostgreSQL's `2201B` instead.
@@ -6319,6 +6364,8 @@ fn open_block(
         read_only,
         savepoints: Vec::new(),
         failed: false,
+        aborted: false,
+        database: database.clone(),
         owner: crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, id),
     });
 }
@@ -6433,12 +6480,9 @@ where
                 //
                 // The aborted outcome only has to reach disk if the block wrote
                 // something for it to disown; a block that only read leaves
-                // nothing behind for a restart to misread.
-                let wrote = database.transactions.wrote_family(t.id);
-                database.abort_transaction(t.id);
-                if wrote {
-                    flush_outcomes(database);
-                }
+                // nothing behind for a restart to misread. A block its error
+                // already aborted (R3) has nothing left to abort.
+                t.abort_unless_aborted(database);
                 t.owner.release();
                 send_command_complete(stream, "ROLLBACK").await?;
             }
@@ -6578,6 +6622,24 @@ where
         .strip_prefix("set transaction")
         .filter(|rest| rest.is_empty() || rest.starts_with(' '))
         .map(|rest| (false, rest.trim()));
+    // A block its error aborted (R3) accepts nothing but its end: a
+    // savepoint taken there would hang off an aborted transaction, and
+    // `ROLLBACK TO` it would revive the block over writes nobody can see; a
+    // `SET TRANSACTION` would pin a snapshot for an id already retired.
+    let block_aborted = state.transaction.as_ref().is_some_and(|t| t.aborted);
+    let opens_or_changes = transaction_modes.is_some()
+        || strip_keyword(&lower, "savepoint").is_some()
+        || strip_keyword(&lower, "release savepoint").is_some()
+        || strip_keyword(&lower, "release").is_some();
+    if block_aborted && opens_or_changes {
+        send_error_response(
+            stream,
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+        .await?;
+        return Ok(true);
+    }
     if let Some((for_session, rest)) = session_modes.or(transaction_modes) {
         let modes = match TransactionModes::parse(rest) {
             Ok(m) => m,
@@ -6787,12 +6849,9 @@ where
                 // them once no snapshot can reach them.
                 //
                 // A block that wrote nothing has no versions to make invisible,
-                // so its aborted record does not have to reach disk either.
-                let wrote = database.transactions.wrote_family(t.id);
-                database.abort_transaction(t.id);
-                if wrote {
-                    flush_outcomes(database);
-                }
+                // so its aborted record does not have to reach disk either. A
+                // block its error already aborted (R3): a no-op.
+                t.abort_unless_aborted(database);
                 t.owner.release();
             }
         }

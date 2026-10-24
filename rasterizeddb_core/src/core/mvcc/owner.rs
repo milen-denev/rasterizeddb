@@ -304,6 +304,16 @@ impl OwnerRelease {
         self.release_now();
     }
 
+    /// Releases what the owner holds now and stays armed, so the drop (or a
+    /// later [`OwnerRelease::release`]) releases again whatever was taken
+    /// since: a failed block's owner gives everything back at the error (R3,
+    /// slice B6) and again when the block is closed.
+    pub fn release_held(&self) {
+        if let Some(owner) = self.owner {
+            self.row_locks.release_owner(owner);
+        }
+    }
+
     fn release_now(&mut self) {
         if let Some(owner) = self.owner.take() {
             self.row_locks.release_owner(owner);
