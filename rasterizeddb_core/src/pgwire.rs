@@ -1801,7 +1801,7 @@ where
                 handle_parse(state, stream, &payload).await?;
             }
             b'B' => {
-                handle_bind(state, stream, &payload).await?;
+                handle_bind(database, state, stream, &payload).await?;
             }
             b'D' => {
                 handle_describe(database, state, stream, &payload).await?;
@@ -2684,7 +2684,12 @@ where
     send_message(stream, b'1', &[]).await
 }
 
-async fn handle_bind<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
+async fn handle_bind<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    payload: &[u8],
+) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -2763,6 +2768,15 @@ where
         let (fmt, next) = read_i16_be_from(payload, i)?;
         result_formats.push(fmt);
         i = next;
+    }
+
+    // `rdb.shape_change = error` refuses where PostgreSQL does: at Bind
+    // (`exec_bind_message` revalidates the cached plan), with no
+    // BindComplete and no portal, so a driver reading the reply sees exactly
+    // PostgreSQL's sequence (slice B8, the pgjdbc and npgsql replays).
+    // Execute checks again, for a change landing between Bind and Execute.
+    if state.shape_change == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt, &params).await? {
+        return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
     }
 
     state.portals.insert(
@@ -3089,37 +3103,16 @@ where
     // L13): a schema generation read here, before the statement waits for
     // its locks, would let a DDL that swaps the table while it waits put
     // rows of the new shape under the old description.
-    let mut told = state.statements.get(&stmt_name).and_then(|info| info.described.clone());
-
     // `rdb.shape_change = error` refuses as PostgreSQL does, before the
     // statement runs, when the shape already moved: a write is then never
-    // applied only to be reported as failed. The check after the build
-    // stays, for a change landing while the statement waits for its locks.
-    if state.shape_change == ShapeChangeMode::Error {
-        if let Some(t) = told.as_mut() {
-            let now = database.shape_epoch();
-            if now != t.epoch {
-                let generation = database
-                    .schema_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                let bound: &[BoundParam] = if t.kind == b'P' { &params } else { &[] };
-                let current = description_now(database, state, &stmt_name, t.kind, query, bound, generation)
-                    .await?
-                    .filter(|(_, is_select)| *is_select)
-                    .map(|(fields, _)| fields);
-                if current.as_deref() != Some(&*t.fields) {
-                    return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
-                }
-                // Still the shape the client was told: good at `now` too.
-                t.epoch = now;
-                if let Some(info) = state.statements.get_mut(&stmt_name) {
-                    if let Some(d) = info.described.as_mut() {
-                        d.epoch = now;
-                    }
-                }
-            }
-        }
+    // applied only to be reported as failed. Bind refused already when the
+    // move came before it; this catches one between Bind and Execute. The
+    // check after the build stays, for a change landing while the statement
+    // waits for its locks.
+    if state.shape_change == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt_name, &params).await? {
+        return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
     }
+    let told = state.statements.get(&stmt_name).and_then(|info| info.described.clone());
     let check = told.map(|told| {
         StdArc::new(ShapeCheck {
             database: database.clone(),
@@ -3200,6 +3193,54 @@ where
 /// PostgreSQL's message for a prepared statement whose result changed shape
 /// (sqlstate 0A000), sent in `rdb.shape_change = error` mode.
 const CACHED_PLAN_CHANGED: &str = "cached plan must not change result type";
+
+/// The routine PostgreSQL names in that error's `R` field. pgjdbc decides
+/// whether to re-prepare and retry by it, not by the sqlstate or the
+/// message (`QueryExecutorBase.willHealViaReparse` compares the routine with
+/// `RevalidateCachedQuery`), so without it pgjdbc reports the 0A000 to the
+/// application and keeps the stale statement, failing every later use.
+const CACHED_PLAN_ROUTINE: &str = "RevalidateCachedQuery";
+
+/// In `rdb.shape_change = error` mode: whether `stmt_name`, bound with
+/// `params`, would now be described with columns other than the ones its
+/// last `Describe` told the client, so its Bind or Execute must answer
+/// 0A000 before anything runs. A statement never described, or described at
+/// the current shape epoch, is not stale; one found unchanged at a later
+/// epoch moves its told epoch forward, so the next check skips.
+async fn stale_in_error_mode(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stmt_name: &str,
+    params: &[BoundParam],
+) -> io::Result<bool> {
+    let Some((told, sql)) = state
+        .statements
+        .get(stmt_name)
+        .and_then(|info| info.described.clone().map(|t| (t, info.sql.clone())))
+    else {
+        return Ok(false);
+    };
+    let now = database.shape_epoch();
+    if now == told.epoch {
+        return Ok(false);
+    }
+    let generation = database
+        .schema_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    let bound: &[BoundParam] = if told.kind == b'P' { params } else { &[] };
+    let current = description_now(database, state, stmt_name, told.kind, &sql, bound, generation)
+        .await?
+        .filter(|(_, is_select)| *is_select)
+        .map(|(fields, _)| fields);
+    if current.as_deref() != Some(&*told.fields) {
+        return Ok(true);
+    }
+    // Still the shape the client was told: good at `now` too.
+    if let Some(d) = state.statements.get_mut(stmt_name).and_then(|i| i.described.as_mut()) {
+        d.epoch = now;
+    }
+    Ok(false)
+}
 
 /// One `Execute`'s reconciliation of the shape its statement was described
 /// with against the result it builds (`docs/persistent-indexes.md` §7, "The
@@ -9476,6 +9517,14 @@ where
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+
+    // PostgreSQL's routine for the one error a driver dispatches on by it
+    // (see `CACHED_PLAN_ROUTINE`).
+    if sqlstate == "0A000" && message == CACHED_PLAN_CHANGED {
+        payload.push(b'R');
+        payload.extend_from_slice(CACHED_PLAN_ROUTINE.as_bytes());
+        payload.push(0);
+    }
 
     payload.push(0);
 
