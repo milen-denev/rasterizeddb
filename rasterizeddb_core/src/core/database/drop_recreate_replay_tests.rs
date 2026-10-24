@@ -446,10 +446,13 @@ impl Scenario {
             }
         }
         // `db_storage.cfg` names absolute paths, which would send the image
-        // back to the source directory.
-        let pool = img.join(crate::core::storage::POOL_FILE);
-        if let Ok(text) = std::fs::read_to_string(&pool) {
-            std::fs::write(&pool, text.replace(&path_str(&self.root), &path_str(&img))).unwrap();
+        // back to the source directory. Only a pooled build writes one.
+        #[cfg(feature = "storage_pools")]
+        {
+            let pool = img.join(crate::core::storage::POOL_FILE);
+            if let Ok(text) = std::fs::read_to_string(&pool) {
+                std::fs::write(&pool, text.replace(&path_str(&self.root), &path_str(&img))).unwrap();
+            }
         }
         img
     }

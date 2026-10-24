@@ -264,9 +264,14 @@ impl Harness {
                 };
                 std::fs::write(img.join(name), bytes).unwrap();
             }
-            let pool = img.join(crate::core::storage::POOL_FILE);
-            if let Ok(text) = std::fs::read_to_string(&pool) {
-                std::fs::write(&pool, text.replace(&path_str(&self.root), &path_str(&img))).unwrap();
+            // Only a pooled build writes `db_storage.cfg`, whose absolute
+            // paths would send the image back to the source directory.
+            #[cfg(feature = "storage_pools")]
+            {
+                let pool = img.join(crate::core::storage::POOL_FILE);
+                if let Ok(text) = std::fs::read_to_string(&pool) {
+                    std::fs::write(&pool, text.replace(&path_str(&self.root), &path_str(&img))).unwrap();
+                }
             }
             self.images.push((point.to_string(), seed, img));
         }

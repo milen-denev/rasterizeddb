@@ -72,6 +72,7 @@ fn a_head_build_reads_a_settled_and_forgetting_status_file() {
 /// `HEAD`'s `DeltaBatch::decode` accepts exactly version 1 and ignores
 /// anything after the records. A batch carrying an `aborted` list must not be
 /// version 1, or `HEAD` would honour an in-doubt commit the list overrides.
+#[cfg(feature = "kv_storage")]
 #[test]
 fn a_head_build_refuses_a_kv_batch_it_would_misread() {
     use crate::core::storage_providers::kv::layout::{DeltaBatch, Record, RecordKind};

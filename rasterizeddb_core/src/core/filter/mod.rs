@@ -38,7 +38,8 @@ mod integration_tests;
 mod nan_bounds_tests;
 #[cfg(test)]
 mod compact_failure_tests;
-#[cfg(test)]
+// Every scenario in it runs a table on a second storage location.
+#[cfg(all(test, feature = "storage_pools"))]
 mod vacuum_clear_power_loss_tests;
 #[cfg(test)]
 mod vacuum_clear_runs_tests;

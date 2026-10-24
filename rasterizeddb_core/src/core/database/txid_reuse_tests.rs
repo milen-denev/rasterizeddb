@@ -282,10 +282,13 @@ async fn an_unfinished_insert_stays_invisible_in_a_crash_image() {
     db.sync_durable().unwrap();
     copy_tree(&dir, &image);
     // `db_storage.cfg` names absolute paths, which would send the image back
-    // to the source directory.
-    let pool = image.join(crate::core::storage::POOL_FILE);
-    if let Ok(text) = std::fs::read_to_string(&pool) {
-        std::fs::write(&pool, text.replace(&path_str(&dir), &path_str(&image))).unwrap();
+    // to the source directory. Only a pooled build writes one.
+    #[cfg(feature = "storage_pools")]
+    {
+        let pool = image.join(crate::core::storage::POOL_FILE);
+        if let Ok(text) = std::fs::read_to_string(&pool) {
+            std::fs::write(&pool, text.replace(&path_str(&dir), &path_str(&image))).unwrap();
+        }
     }
     db.abort_transaction(tx);
     close(&dir, db);
