@@ -723,3 +723,75 @@ async fn tp_twin(client: &tokio_postgres::Client) -> Vec<Vec<(String, Option<Str
     }
     out
 }
+
+/// Finding L13 through a real driver: sqlx's cached `UPDATE … RETURNING *`,
+/// described before an ADD COLUMN, decodes the new shape on every execute
+/// after it, names and values both, as the twin (the row read back by a
+/// simple query) does.
+#[tokio::test]
+async fn sqlx_cached_returning_decodes_the_new_shape_every_time() {
+    let _counted = COUNTED.lock().await;
+    let server = TestServer::start().await.expect("server");
+    let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+    conn.execute("CREATE TABLE t (id INT, a INT)").await.expect("create");
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 10)").await.expect("insert");
+    let sql = "UPDATE t SET a = a + 1 WHERE id = $1 RETURNING *";
+    assert_eq!(cached(&mut conn, sql).await.expect("first execute"), ["id=Some(1) a=Some(11)"]);
+    conn.execute("ALTER TABLE t ADD COLUMN c INT DEFAULT 7").await.expect("alter");
+    let mut failures = Vec::new();
+    for n in 1..=3 {
+        let got = cached(&mut conn, sql).await;
+        let expected = vec![format!("id=Some(1) a=Some({}) c=Some(7)", 11 + n)];
+        if got.as_ref() != Ok(&expected) {
+            failures.push(format!("execute {n}: got {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let twin_rows = twin(&mut conn, "SELECT * FROM t").await;
+    assert_eq!(twin_rows, ["id=Some(1) a=Some(14) c=Some(7)"]);
+}
+
+/// `rdb.shape_change = error` set in the startup packet (Q2), as a JVM or
+/// .NET driver would be configured: tokio-postgres's kept statement gets
+/// PostgreSQL's 0A000 after the change, every time, never rows under the old
+/// columns; preparing again reads the new shape.
+#[tokio::test]
+async fn error_mode_from_the_startup_packet_answers_0a000() {
+    let _counted = COUNTED.lock().await;
+    for change in CHANGES {
+        let server = TestServer::start().await.expect("server");
+        let url = format!("{}&options=-c%20rdb.shape_change%3Derror", server.url());
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("tokio-postgres connects");
+        tokio::spawn(conn);
+        let mode = client.simple_query("SHOW rdb.shape_change").await.expect("show");
+        let shown: Vec<String> = mode
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, ["error"], "{}", change.name);
+        for sql in change.setup {
+            client.batch_execute(sql).await.expect("setup");
+        }
+        let stmt = client.prepare(STAR).await.expect("prepare");
+        client.query(&stmt, &[]).await.expect("first execute");
+        for sql in change.alter {
+            client.batch_execute(sql).await.expect("alter");
+        }
+        for n in 1..=2 {
+            let e = client.query(&stmt, &[]).await.expect_err("a stale statement ran");
+            let db = e.as_db_error().unwrap_or_else(|| panic!("{}: execute {n}: {e}", change.name));
+            assert_eq!(db.code().code(), "0A000", "{}: execute {n}", change.name);
+            assert_eq!(db.message(), "cached plan must not change result type", "{}", change.name);
+        }
+        let expected = tp_twin(&client).await;
+        let fresh = client.prepare(STAR).await.expect("prepare again");
+        let rows = client.query(&fresh, &[]).await.expect("fresh statement");
+        let got: Vec<_> = rows.iter().map(tp_render).collect();
+        assert_eq!(got, expected, "{}", change.name);
+    }
+}
