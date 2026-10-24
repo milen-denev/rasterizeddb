@@ -326,3 +326,81 @@ async fn a_blocks_owner_is_released_at_every_block_end() {
         "a dropped session's block kept its owner's locks"
     );
 }
+
+/// V10 case 15 (Q1), the pending-DDL form (slice B8): a statement that holds
+/// ACCESS SHARE on the inner table when a CREATE INDEX on it queues for
+/// ACCESS EXCLUSIVE runs its derived-table or CTE body under its own owner,
+/// so the body's request on the inner table is a held lock, never a wait
+/// behind that DDL. The statement is parked after taking the inner table and
+/// before the outer one (`test_hooks::park_next`: its set is taken in name
+/// order, `t2` before `z1`), the DDL queues, then the statement goes on: it
+/// finishes, and the DDL after it.
+///
+/// Mutation: derived and CTE bodies run under a fresh autocommit owner (a
+/// second owner, not `O`): the body's ACCESS SHARE queues behind the DDL,
+/// which waits for the statement, which waits for its body, and the bound
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_granted_statement_finishes_before_a_ddl_queued_behind_it() {
+    use crate::core::database::table_for::test_hooks;
+    let db = db().await;
+    let mut a = session(&db);
+    for sql in [
+        "CREATE TABLE z1 (id INT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, v TEXT)",
+        "INSERT INTO z1 (id, name) VALUES (1, 'one')",
+        "INSERT INTO t2 (id, t1_id, v) VALUES (10, 1, 'x')",
+    ] {
+        ok(&db, &mut a, sql).await;
+    }
+    let bound = std::time::Duration::from_secs(10);
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "derived",
+            "SELECT z1.name, d.v FROM z1 JOIN (SELECT t1_id, v FROM t2) d ON d.t1_id = z1.id",
+            "CREATE INDEX t2_v1 ON t2 (v)",
+        ),
+        (
+            "with",
+            "WITH c AS (SELECT t1_id, v FROM t2) SELECT z1.name, c.v FROM z1 JOIN c ON c.t1_id = z1.id",
+            "CREATE INDEX t2_v2 ON t2 (v)",
+        ),
+    ];
+    for (what, sql, ddl) in cases {
+        let park = test_hooks::park_next("z1");
+        let statement = {
+            let db = db.clone();
+            let sql = sql.to_string();
+            let mut a = std::mem::replace(&mut a, session(&db));
+            tokio::spawn(async move {
+                let r = send(&db, &mut a, &sql).await;
+                (r, a)
+            })
+        };
+        tokio::time::timeout(bound, park.arrived())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the statement never reached z1"));
+        let index = {
+            let db = db.clone();
+            let ddl = ddl.to_string();
+            tokio::spawn(async move {
+                let mut s = session(&db);
+                send(&db, &mut s, &ddl).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!index.is_finished(), "{what}: the CREATE INDEX ran beside the statement's ACCESS SHARE");
+        park.release();
+        let (rows, back) = tokio::time::timeout(bound, statement)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the statement waited behind the DDL queued on its own table"))
+            .unwrap();
+        assert_eq!(rows, Ok(1), "{what}");
+        a = back;
+        let done = tokio::time::timeout(bound, index)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the CREATE INDEX never ran"))
+            .unwrap();
+        assert_eq!(done, Ok(0), "{what}");
+    }
+}
