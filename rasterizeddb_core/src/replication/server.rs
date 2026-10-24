@@ -414,50 +414,69 @@ async fn apply_record(
         );
     }
 
-    let tx = database.transactions.begin();
-    replication.enter_apply(tx, record.origin);
-    // The apply's lock owner: a named internal owner, its transaction's root,
-    // never `FROZEN_TX` (docs/persistent-indexes.md §7 Owner; finding L2).
-    // Released after the last durability step below, or on any way out.
-    let owner = crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, tx);
+    // A statement that failed on a lock (40P01, 55P03, 57014, 57P01: a
+    // deadlock's victim, a lock or statement timeout, a cancel) applied
+    // nothing wrong; it lost a race with local work. The record is retried
+    // whole, in a fresh transaction, after the failed one is aborted and its
+    // owner released, so a deadlock it was part of is broken (finding L2,
+    // part 2). Never skipped under Skip or LastWriterWins, which would lose
+    // the statement on this node; never advanced past when the retries run
+    // out, so the sender delivers it again.
+    let mut tries = 0usize;
+    let (tx, owner) = loop {
+        let tx = database.transactions.begin();
+        replication.enter_apply(tx, record.origin);
+        // The apply's lock owner: a named internal owner, its transaction's
+        // root, never `FROZEN_TX` (docs/persistent-indexes.md §7 Owner;
+        // finding L2). Released after the last durability step below, or on
+        // any way out.
+        let owner = crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, tx);
 
-    let mut failure: Option<String> = None;
-    for statement in &record.statements {
-        let Some(purpose) = recognize_query_purpose(statement) else {
-            failure = Some(format!("could not parse `{}`", truncate(statement)));
-            break;
-        };
+        let mut failure: Option<String> = None;
+        let mut transient = false;
+        for statement in &record.statements {
+            let Some(purpose) = recognize_query_purpose(statement) else {
+                failure = Some(format!("could not parse `{}`", truncate(statement)));
+                break;
+            };
 
-        let response = crate::core::mvcc::owner::under(
-            &database.transactions,
-            tx,
-            crate::core::mvcc::owner::OwnerKind::Replication,
-            execute_in_txn(purpose, database.clone(), tx),
-        )
-        .await;
-        if response.first() == Some(&3) {
-            let message = String::from_utf8_lossy(&response[1..]).to_string();
-            match policy {
-                ConflictPolicy::Skip | ConflictPolicy::LastWriterWins => {
-                    warn!(
-                        "Skipping a statement of transaction {}:{}: {} (`{}`)",
-                        record.origin,
-                        record.seq,
-                        message,
-                        truncate(statement)
-                    );
-                }
-                ConflictPolicy::Abort => {
+            let response = crate::core::mvcc::owner::under(
+                &database.transactions,
+                tx,
+                crate::core::mvcc::owner::OwnerKind::Replication,
+                execute_in_txn(purpose, database.clone(), tx),
+            )
+            .await;
+            if response.first() == Some(&3) {
+                let message = String::from_utf8_lossy(&response[1..]).to_string();
+                if lost_a_lock(&message) {
                     failure = Some(format!("{} (`{}`)", message, truncate(statement)));
+                    transient = true;
                     break;
+                }
+                match policy {
+                    ConflictPolicy::Skip | ConflictPolicy::LastWriterWins => {
+                        warn!(
+                            "Skipping a statement of transaction {}:{}: {} (`{}`)",
+                            record.origin,
+                            record.seq,
+                            message,
+                            truncate(statement)
+                        );
+                    }
+                    ConflictPolicy::Abort => {
+                        failure = Some(format!("{} (`{}`)", message, truncate(statement)));
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    replication.leave_apply(tx);
+        replication.leave_apply(tx);
 
-    if let Some(message) = failure {
+        let Some(message) = failure else {
+            break (tx, owner);
+        };
         // `Database::abort_transaction`, not the manager's `abort`: the latter
         // ended the transaction but left its row locks in the lock table and
         // its capture buffers behind (finding L2).
@@ -466,6 +485,25 @@ async fn apply_record(
             warn!("Could not make the aborted outcome durable: {}", e);
         }
         owner.release();
+        if transient {
+            if tries < APPLY_LOCK_RETRIES {
+                tries += 1;
+                replication.stats().apply_retries.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Transaction {}:{} lost a lock ({}); retrying it (try {})",
+                    record.origin, record.seq, message, tries
+                );
+                tokio::time::sleep(apply_lock_backoff(tries)).await;
+                continue;
+            }
+            // Not applied and not advanced past: the sender delivers it again.
+            warn!(
+                "Transaction {}:{} kept losing locks to local work ({}); it will be \
+                 delivered again",
+                record.origin, record.seq, message
+            );
+            return refuse(&record, ApplyStatus::Failed, message);
+        }
         // Deliberately *not* advancing the applied position. Under `abort` the
         // stream stops here rather than silently skipping a transaction, which
         // is the difference between a visible stall and quiet divergence.
@@ -476,7 +514,7 @@ async fn apply_record(
             record.origin, record.seq, message
         );
         return refuse(&record, ApplyStatus::Conflict, message);
-    }
+    };
 
     // Through the same path as a client's commit: rows applied to a table on
     // another storage location are in that location's log, and they have to
@@ -557,6 +595,27 @@ async fn apply_record(
         status: ApplyStatus::Applied,
         message: String::new(),
     }
+}
+
+/// How many times a record that lost a lock is retried before it is handed
+/// back undelivered (finding L2).
+const APPLY_LOCK_RETRIES: usize = 8;
+
+/// The pause before retry `n` of a record that lost a lock: doubling from
+/// 10 ms, capped at 500 ms (about 1.6 s over every retry).
+fn apply_lock_backoff(n: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((10u64 << n.min(6)).min(500))
+}
+
+/// Whether a statement's failure means it lost a lock to local work rather
+/// than that it cannot apply: 40P01 (a deadlock's victim), 55P03 (lock
+/// timeout, NOWAIT), 57014 (a statement timeout or cancel), 57P01 (shutdown).
+/// Classified by the wire's own mapping, so the two never disagree.
+fn lost_a_lock(message: &str) -> bool {
+    matches!(
+        crate::pgwire::sqlstate_for(message),
+        "40P01" | "55P03" | "57014" | "57P01"
+    )
 }
 
 /// Keeps a statement short enough for a log line.
@@ -970,6 +1029,133 @@ mod tests {
             0,
             "the stream must stall rather than skip the transaction"
         );
+    }
+
+    /// A local block holding `LOCK TABLE repl_t IN ACCESS EXCLUSIVE MODE`,
+    /// and the id that ends it.
+    async fn lock_holder(database: &Arc<Database>) -> crate::core::mvcc::TxId {
+        let holder = database.transactions.begin();
+        let response = execute_in_txn(
+            recognize_query_purpose("LOCK TABLE repl_t IN ACCESS EXCLUSIVE MODE").unwrap(),
+            database.clone(),
+            holder,
+        )
+        .await;
+        assert_ne!(response.first(), Some(&3), "{}", String::from_utf8_lossy(&response));
+        holder
+    }
+
+    fn end_holder(database: &Arc<Database>, holder: crate::core::mvcc::TxId) {
+        database.commit_transaction(holder);
+        database.release_owner(crate::core::mvcc::owner::LockOwner::block(holder).unwrap());
+    }
+
+    fn skip_policy(replication: &StdArc<Replication>) {
+        replication
+            .update_config(|config| {
+                config.conflict = ConflictPolicy::Skip;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Finding L2, part 2: an apply whose statement loses a lock to local
+    /// work (here 55P03: `lock_timeout` behind a local `LOCK TABLE`) is
+    /// aborted, released and retried whole, never skipped, even under
+    /// `Skip`; once the local block ends, the retry applies it. The row is
+    /// there, the position advanced, and the retries were counted.
+    ///
+    /// Mutation: `lost_a_lock` answers false: under `Skip` the statement is
+    /// skipped, the record reported applied, and the row is missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_apply_that_loses_a_lock_is_retried_and_lands() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        skip_policy(&replication);
+        let holder = lock_holder(&database).await;
+        let retries_before = replication.stats().apply_retries.load(Ordering::Relaxed);
+        // Ends the holder once the apply has retried, never by the clock.
+        let ender = {
+            let (database, replication) = (database.clone(), replication.clone());
+            tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    while replication.stats().apply_retries.load(Ordering::Relaxed) <= retries_before {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("the apply never retried");
+                end_holder(&database, holder);
+            })
+        };
+        let outcome = crate::core::cancel::with_lock_timeout(
+            100,
+            apply_record(
+                &database,
+                &replication,
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                NO_SENDER,
+            ),
+        )
+        .await;
+        ender.await.unwrap();
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        assert_eq!(row_count(&database).await, 1, "the statement was skipped, not retried");
+        assert_eq!(replication.applied().high_water(2), 1);
+        assert!(replication.stats().apply_retries.load(Ordering::Relaxed) > retries_before);
+    }
+
+    /// When the local work outlasts every retry, the record is handed back
+    /// undelivered (`Failed`, so the sender sends it again): not applied,
+    /// not skipped, the position not advanced, nothing held.
+    ///
+    /// Mutation: `lost_a_lock` answers false: the record is reported applied
+    /// under `Skip` and the position moves past a statement this node lacks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_apply_that_keeps_losing_its_lock_is_not_advanced_past() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        skip_policy(&replication);
+        let holder = lock_holder(&database).await;
+        let outcome = crate::core::cancel::with_lock_timeout(
+            20,
+            apply_record(
+                &database,
+                &replication,
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                NO_SENDER,
+            ),
+        )
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Failed, "{}", outcome.message);
+        assert!(!outcome.status.is_settled());
+        assert_eq!(replication.applied().high_water(2), 0, "advanced past a statement it lacks");
+        end_holder(&database, holder);
+        assert_eq!(row_count(&database).await, 0);
+    }
+
+    /// The four lock failures are retried; a conflict or a constraint is the
+    /// policy's to decide.
+    #[test]
+    fn lock_failures_are_told_apart_from_conflicts() {
+        for message in [
+            "deadlock detected while waiting for AccessExclusiveLock on relation \"t\"",
+            "canceling statement due to lock timeout (waiting for transaction 7)",
+            "could not obtain lock on relation \"t\"",
+            "canceling statement due to statement timeout",
+            "canceling statement due to user request",
+        ] {
+            assert!(lost_a_lock(message), "{message}");
+        }
+        for message in [
+            "could not serialize access due to concurrent update of row 1",
+            "duplicate value for UNIQUE column \"id\" (row 1 already holds it)",
+            "relation does not exist",
+        ] {
+            assert!(!lost_a_lock(message), "{message}");
+        }
     }
 
     #[tokio::test]

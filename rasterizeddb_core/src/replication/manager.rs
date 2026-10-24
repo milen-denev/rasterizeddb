@@ -96,6 +96,9 @@ pub struct Stats {
     pub compressed_batches: AtomicU64,
     /// Commits that waited for a peer and gave up on the timeout.
     pub ack_timeouts: AtomicU64,
+    /// Applies retried after a lock failure (40P01, 55P03, 57014, 57P01):
+    /// aborted, released and run again rather than skipped (finding L2).
+    pub apply_retries: AtomicU64,
 }
 
 impl Stats {
