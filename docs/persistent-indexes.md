@@ -1279,7 +1279,8 @@ statement's at its end. AS is held to the end of a block, which matters at
 REPEATABLE READ: a rewrite reinserts only rows visible now
 (`visibility_now_for`), dropping versions an older snapshot still reads. DDL
 is not transactional here, so an AE taken in a block is released when the DDL
-statement ends, and the family keeps what it held before.
+statement ends, and the family keeps what it held before (as built in B5,
+downgraded to ROW EXCLUSIVE where the family wrote the table: finding L5).
 
 **Granting.** PostgreSQL's rule (`ProcSleep` and `ProcLockWakeup`), keyed by
 owner. A request is granted when it conflicts with no mode another owner
@@ -1629,7 +1630,8 @@ and VACUUM under it.
   RENAME COLUMN, SET NOT NULL, a NUMERIC scale change, RENAME TO's sequence
   defaults) still write before calling `reload_table`, but under the
   statement's complete lock set, so a lock failure (55P03, 40P01, 57014)
-  still writes nothing; moving them into `work` comes with B5's rewrites.
+  still writes nothing; moving them into `work` comes with B5's rewrites
+  (done: see "As built (B5)").
 - *The complete lock set* (finding L11). `lock_statement_set` adds
   `ddl_lock_extras` to an ALTER's or DROP's text set and takes it through
   `Database::lock_names`: every name, registered or not, in one name order.
@@ -1707,6 +1709,133 @@ and VACUUM under it.
   FULL behind it; a bare VACUUM gives each table back), and
   `lock_set::create_table_as_locks_its_source`.
 
+**As built (B5).** ALTER rewrites as one reload keeping each version's
+visibility (R5); the multi-write arms inside the reload; a block's DDL
+giving its ACCESS EXCLUSIVE back (finding L5); JSON shadow DDL keys first
+under an internal lock (finding L9, R4, Q4).
+- *The rewrite is one reload* (`core/database/rewrite.rs`:
+  `Database::rewrite_table(name, read, prepare, fill)`, over
+  `reload_with_instance`, which is `reload_with` whose work may hand back
+  the new instance; `executor::rewrite_rows`). Under the AE the statement
+  holds, after retirement: `read` gets the retired instance and reads the
+  rows; the table's files are copied aside to `__rwb_<name>` (a reserved
+  prefix) and an **intent** naming the table and its backup is written
+  beside the catalogue (a temporary file, synced, renamed, the directory
+  synced); the old files are released (relocation barriers first); the new
+  files are created with every carried declaration (constraints, defaults,
+  JSON registrations, NUMERIC modifiers, generation expressions, checks,
+  index and path-index declarations by column name, and the PRIMARY KEY
+  header, which the old rewrite dropped); `prepare` writes the index
+  declarations against the new numbering; the new instance is opened,
+  `fill` writes every version into it (`Table::insert_version`), the whole
+  is made durable (`sync_durable`), then the intent goes, then the backup,
+  then the swap. Waiters stay queued on the name throughout and a lockless
+  reader sees the old instance until the swap, so nobody gets 42P01. The
+  rewriters are ADD COLUMN on a table with rows, DROP NOT NULL (a new
+  companion) and a JSON shadow's widening (`retype_column`); a real type
+  change, a DROP COLUMN rewrite and `ALTER … USING` are refused or never
+  rewrite in this engine (USING's silent-drop guard still holds, tested).
+- *Each version keeps its visibility* (R5), more strictly than the plan's
+  "committed rows frozen": every version some snapshot can still see is
+  written back with **its own** `xmin` and `xmax`. A version whose creator
+  aborted, or that is dead for every snapshot that exists or can
+  (`VersionHorizon::is_reclaimable`), is left behind, and an aborted
+  deleter's stamp is cleared. So a committed row stays committed whoever
+  wrote it; the caller's family's uncommitted versions stay its own (a
+  savepoint's sub-id included), gone if it rolls back; a committed row it
+  deleted or updated keeps that `xmax` and comes back on a rollback; and a
+  snapshot older than the ALTER, held by a block that never touched the
+  table (so the ALTER did not wait for it), reads exactly the rows it read
+  before, in the new shape. (PostgreSQL's rewrite shows such a snapshot an
+  empty table.) Under AE no other family has uncommitted versions; if one
+  did, they would keep their stamps too. The new files carry no aborted
+  id, so no forgotten-id hazard is introduced (`forget_pause` is held from
+  the lock to the swap, as in B4).
+- *Crash and failure atomicity.* A failure after the backup puts it back
+  and swaps a fresh instance of it in; a crash leaves the intent, and the
+  next open puts the backup back before any table opens
+  (`recover_interrupted_rewrites`, also removing an intent's temporary
+  left by a cut before its rename). So a rewrite leaves the old table or
+  the new one, never a mix; the statement reports success only after the
+  intent is gone. Cost: one copy of the table's files beside the rewrite's
+  own pass. A failed barrier on a mirror's log now fails the rewrite and
+  keeps the old table (it used to go on).
+- *The multi-write arms inside the reload* (`reload_atomic`,
+  `reload_atomic_with`): the same backup and intent, for the `_schema*`
+  files only, around each arm's writes as the reload's work:
+  - **ADD COLUMN on an empty table**: the dead names retired, the DEFAULT,
+    NUMERIC modifier and generation expression, the field and its
+    companion, the JSON registration (a JSON DEFAULT's document is stored
+    first, in its shadow; `retire_for_new_column`, one log transaction of
+    its own, still runs before);
+  - **DROP COLUMN**: the partial unique indexes reading the column, then
+    `column_declarations::drop_column`;
+  - **RENAME COLUMN**: `column_declarations::rename_column`;
+  - **SET NOT NULL**: the companion tombstoned;
+  - **the NUMERIC modifier change** (`numeric_modifier_change` decides,
+    the work appends; a restatement that changes nothing reloads nothing);
+  - **RENAME TO's sequence defaults**: every default that follows, all or
+    none, the counters renamed only after (the rename itself is its own
+    crash-safe step before, and `retarget_parent` of the children after).
+  DROP and RENAME COLUMN hold the FK children whose keys reference the
+  column aside under the same intent (`fk_children_on`), since their
+  sidecars change in the same log transaction: a crash or failure puts all
+  of them back together. Every arm now ends the statement itself; nothing
+  writes and then reloads. **Found on the way**: `ALTER COLUMN … SET NOT
+  NULL` was parsed as DROP DEFAULT (it dropped the default and enforced
+  nothing, reporting success), and `SET DATA TYPE` the same; both fixed
+  in `lexer_alter` (e0a8cb4).
+- *Block DDL* (finding L5, `executor::BlockDdl`, wrapped by pgwire around
+  each block statement whose head is ALTER, CREATE or DROP): at the
+  statement's end, on every way out, each table it newly holds AE on is
+  **downgraded to ROW EXCLUSIVE** when the block holds ROW EXCLUSIVE there
+  (it wrote the table, or the rewrite carried its versions and confirmed
+  the lock: its uncommitted versions are in the file set, so another
+  owner's DDL keeps waiting for the block while readers go on; this is the
+  "family holds or took a ticket" rule of L5, tickets being B11's), and
+  **released** otherwise, back to what the block held before (an ACCESS
+  SHARE stays). An AE held before the statement (LOCK TABLE) is untouched.
+  A rollback after a block's DDL restores the rows (the stamps above);
+  the shape stays, DDL not being transactional (V10 case 12).
+- *JSON shadow DDL* (`core/rql/shadow_lock.rs`). A shadow's DDL (ADD
+  COLUMN, widening, its CREATE) takes the shadow's latch exclusively for
+  the one statement, re-resolving the column under it; a shadow row write
+  takes it shared for the one INSERT. Neither waits for anything else
+  while holding it nor holds it past its statement, so it adds no edge a
+  cycle could use. Before the latch, DDL waits while another owner holds a
+  **granted** AE on the parent, never a pending one (L9). **Keys first**:
+  a statement's documents are walked once doing only DDL, then again
+  writing rows. **Deviation**: the shadow ADD COLUMN is not metadata-only:
+  that needs each row to record the columns it was written with, read by
+  every reader (fetch, the predicate path, the filter's fingerprints),
+  which v1 does not have. It is a rewrite under the latch, carrying other
+  writers' uncommitted rows by their stamps; a new key still costs a pass
+  over the shadow. Widenings take no AE on the shadow, so there is no
+  40P01 to make `CONFLICT_RETRYABLE`. V10 case 11's "zero 40P01" and "the
+  SELECT does not wait" hold; "metadata-only" does not.
+- *Not built here.* Steps 2-4 still run on the caller's task (B4).
+  `compute_generated_column` after an ADD COLUMN … GENERATED rewrite
+  still fills the column by an UPDATE after the reload. The rename in
+  RENAME TO, `retarget_parent` and `retire_for_new_column` are their own
+  crash-safe steps outside the backup. An older snapshot reads old rows in
+  the new shape (shapes are not versioned).
+- *Tests* (each mutation-verified): `pgwire::ddl_rewrite_tests` (R5 under
+  a block's ALTER with an old REPEATABLE READ snapshot, a reader between
+  swap and rollback, and the rollback: versions written frozen, under the
+  caller's id, without `xmax`, or only those visible now each fail; a
+  block INSERT committed while the ALTER waits survives; L5's four cases:
+  `end` doing nothing or releasing instead of downgrading each fail),
+  `database::rewrite_tests` (each moved arm failed after its writes
+  leaves the schema, through a reopen; a rewrite failed mid-fill keeps the
+  old table; SET NOT NULL; USING; the PRIMARY KEY), `power_loss`
+  `rewrite_crash_tests` (cuts at seven rewrite points and inside its
+  syncs under every seed kind: old or new, never a mix; recovery skipping
+  intents fails it), `shadow_lock::tests` and `executor::shadow_latch_tests`
+  (granted AE waited for, pending not; a row written during a parked
+  shadow rewrite waits and is kept), `tests/shredded_shadow_ddl.rs` (two
+  blocks adding keys: no deadlock, SELECT does not wait; a writer behind a
+  pending parent ALTER; keys first; concurrent writers lose no document).
+
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
 (auto-prepare) each run describe-before-DDL, execute-after and three
@@ -1744,7 +1873,9 @@ SELECT wait on other DML:
   INSERT's pending AE then queues every later SELECT of the column behind it
   by rule (a), with no bound under `lock_timeout = 0`.
 
-So **a shadow ADD COLUMN stays off the user-visible AE path in v1**. Adding a
+So **a shadow ADD COLUMN stays off the user-visible AE path in v1** (as
+built in B5 a rewrite under an internal latch rather than metadata-only:
+see "As built (B5)"). Adding a
 nullable column to an internal shadow table is metadata-only, with no rewrite
 and no instance swap; rows written before it read the column as NULL. That
 part of v2 comes forward for shadow tables only. The change is serialised per
