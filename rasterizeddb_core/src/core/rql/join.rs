@@ -4519,7 +4519,7 @@ pub(crate) fn comparison_value(
 /// `CASE` after its `ELSE` when that has a name and `case` otherwise, and a
 /// cast after what it casts or, when that has no name, the type. Anything else
 /// — an operator, a constant, a comparison, a JSON path — is `?column?`.
-fn pg_column_name(text: &str) -> String {
+pub(crate) fn pg_column_name(text: &str) -> String {
     figure_column_name(text)
         .map(|(name, _)| name)
         .unwrap_or_else(|| "?column?".to_string())

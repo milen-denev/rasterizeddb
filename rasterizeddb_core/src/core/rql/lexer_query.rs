@@ -165,9 +165,11 @@ fn parse_computed_item(
         expr: parsed,
         inputs,
         db_type,
+        // PostgreSQL's name for it (`FigureColname`): `COALESCE(MAX(x), 0)`
+        // is `coalesce`, an operator over aggregates `?column?`.
         label: alias
             .map(|a| a.to_string())
-            .unwrap_or_else(|| "?column?".to_string()),
+            .unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
     }))
 }
 
@@ -477,7 +479,7 @@ fn parse_select_items(
                     out.push(SelectItem::RowExpr {
                         expr: parsed,
                         db_type,
-                        label: alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                        label: alias.clone().unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
                     });
                     continue;
                 }
@@ -495,7 +497,7 @@ fn parse_select_items(
             out.push(SelectItem::RowExpr {
                 db_type: crate::core::rql::expr::static_type(&parsed),
                 expr: parsed,
-                label: alias.unwrap_or_else(|| "?column?".to_string()),
+                label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
             });
             continue;
         }
@@ -506,7 +508,7 @@ fn parse_select_items(
             out.push(SelectItem::Literal {
                 bytes,
                 db_type,
-                label: alias.unwrap_or_else(|| "?column?".to_string()),
+                label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
             });
             continue;
         }
@@ -535,7 +537,7 @@ fn parse_select_items(
                 out.push(SelectItem::RowExpr {
                     expr: parsed,
                     db_type,
-                    label: alias.unwrap_or_else(|| "?column?".to_string()),
+                    label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
                 });
                 continue;
             }

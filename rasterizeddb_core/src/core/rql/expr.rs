@@ -3306,6 +3306,24 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
         // reach. Both stay: the companion is what a scan of a real table
         // carries, and the marker is what a rebuilt row carries.
         Some(column) if column.column_type == DbType::NULL => Value::Null,
+        // A shredded JSON column's cell after hydration: the schema still
+        // says the `UUID` it is stored as, the cell holds the rebuilt
+        // document's text. Read under the schema's type, `doc::text` of
+        // `{"a":1}` came back `7b226122-3a31-7d`, a UUID's dashes over the
+        // document's hex. Handed on as native JSONB, the document casts,
+        // compares and takes `->>` as a stored one does.
+        Some(column) if column.column_type == DbType::JSON && field.db_type != DbType::JSON => {
+            match std::str::from_utf8(column.data.into_slice())
+                .ok()
+                .and_then(|text| crate::core::jsonb::encode_text(text).ok())
+            {
+                Some(bytes) => Value::Data { bytes, db_type: DbType::JSONB },
+                None => Value::Data {
+                    bytes: column.data.into_slice().to_vec(),
+                    db_type: field.db_type.clone(),
+                },
+            }
+        }
         Some(column) => Value::Data {
             bytes: column.data.into_slice().to_vec(),
             db_type: field.db_type.clone(),
