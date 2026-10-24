@@ -17,6 +17,7 @@ use smallvec::SmallVec;
 
 use tokio::{sync::Semaphore, task};
 
+use super::prefilter::{self, BatchPrefilter};
 use super::transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor};
 
 use crate::{
@@ -747,6 +748,21 @@ impl ConcurrentProcessor {
         columns
     }
 
+    /// The batch prefilter for a filtered scan, built from the same tokens as
+    /// its plan; `None` with no `WHERE`, with `--scan-prefilter false`, or when
+    /// nothing in the clause is a comparison it can decide.
+    fn build_prefilter(
+        no_filter: bool,
+        tokens_arc: &Arc<SmallVec<[Token; 36]>>,
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        query_row_fetch: &RowFetch,
+    ) -> Option<Arc<BatchPrefilter>> {
+        if no_filter {
+            return None;
+        }
+        BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch).map(Arc::new)
+    }
+
     /// Compiles the `WHERE` clause into a transformer plan.
     ///
     /// Returns the compile error rather than panicking on it. It used to
@@ -798,6 +814,9 @@ impl ConcurrentProcessor {
         shared_tuple: Arc<(RowFetch, RowFetch)>,
         schema_arc: Arc<SmallVec<[SchemaField; 20]>>,
         compiled_plan: Option<Arc<TransformerPlan>>,
+        // Drops rows the WHERE cannot match before they are fetched, a batch
+        // at a time. `None` when the clause has nothing it can decide.
+        prefilter: Option<Arc<BatchPrefilter>>,
         io_rows_outer: Arc<S>,
         // Exactly ONE of `tx_rows` / `tx_bytes` should be Some, depending on
         // whether the caller wants `Vec<Row>` (e.g. for ORDER BY or row-level
@@ -930,6 +949,7 @@ impl ConcurrentProcessor {
             let tx_rp_clone = tx_rp.as_ref().map(|s| s.clone());
             let schema_ref = Arc::clone(&schema_arc);
             let compiled_plan_ref = compiled_plan.as_ref().map(Arc::clone);
+            let prefilter_ref = prefilter.as_ref().map(Arc::clone);
             let io_rows_batch = Arc::clone(&io_rows_outer);
             let limit_counter_ref = Arc::clone(&limit_counter);
             let stop_ref = Arc::clone(&stop_processing);
@@ -980,6 +1000,8 @@ impl ConcurrentProcessor {
 
                 // Row layout for fetched WHERE columns is stable within a query.
                 let mut row_layout_built = false;
+
+                let mut prefilter_scratch = prefilter::Scratch::default();
 
                 // Per-worker result accumulators. Sent ONCE at the end of
                 // this worker's lifetime to avoid per-batch channel sends
@@ -1127,7 +1149,27 @@ impl ConcurrentProcessor {
                         // WHERE-filtered path
                         let (query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
-                        for pointer in pointers.iter() {
+                        // Rows the predicate's simple comparisons rule out,
+                        // decided for the whole batch before any is fetched.
+                        // A superset: see `prefilter`. It reads nothing the
+                        // loop below would skip unread.
+                        let keep = match prefilter_ref.as_deref() {
+                            Some(pf)
+                                if pf.select(
+                                    pointers.iter(),
+                                    |p| {
+                                        p.deleted
+                                            || horizon_ref.is_reclaimable(p.deleted, p.xmin, p.xmax)
+                                    },
+                                    &mut prefilter_scratch,
+                                ) =>
+                            {
+                                pf.run(pointers.len(), io_rows_ref, &mut prefilter_scratch).await
+                            }
+                            _ => None,
+                        };
+
+                        for (batch_index, pointer) in pointers.iter().enumerate() {
                             if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
@@ -1163,6 +1205,14 @@ impl ConcurrentProcessor {
                                 pointer.xmax,
                             )) {
                                 continue;
+                            }
+
+                            // Cannot match, so it is not in the cached set
+                            // either: exactly what evaluating it would decide.
+                            if let Some(keep) = keep {
+                                if !prefilter::kept(keep, batch_index) {
+                                    continue;
+                                }
                             }
 
                             // The reason is logged, not discarded: this fires in
@@ -1962,6 +2012,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan,
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
             Arc::clone(&io_rows),
             // No row channel and no bytes channel: nothing is emitted.
             None,
@@ -2113,6 +2164,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
             io_rows_outer.clone(),
             Some(tx.clone()),
             None,
@@ -2361,6 +2413,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
             io_rows_outer.clone(),
             None,
             Some(tx_b.clone()),
@@ -2509,6 +2562,16 @@ impl ConcurrentProcessor {
         let schema_arc = Arc::new(table_schema);
         let tokens_arc = Arc::new(tokens);
 
+        // As in the SELECT scan, built once for the statement and shared by
+        // every batch. Not for an index's candidate list: those few rows are
+        // already the ones that may match, so there is nothing left to skip
+        // and building it would be the whole cost.
+        let prefilter: Option<Arc<BatchPrefilter>> = if no_filter || iterator.has_sparse_candidates() {
+            None
+        } else {
+            BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), &shared_tuple).map(Arc::new)
+        };
+
         log::info!(
             "Preperation for pointer query completed in {:.2?}",
             prep_stopwatch.elapsed()
@@ -2583,6 +2646,7 @@ impl ConcurrentProcessor {
             let tx_clone = tx.clone();
             let schema_ref = Arc::clone(&schema_arc);
             let tokens_ref = Arc::clone(&tokens_arc);
+            let prefilter_ref = prefilter.as_ref().map(Arc::clone);
             let io_rows_batch = Arc::clone(&io_rows_outer);
 
             let limit_opt = limit;
@@ -2679,7 +2743,24 @@ impl ConcurrentProcessor {
                 );
                 let mut plan_built = false;
 
-                for pwo in pointers.into_iter() {
+                // Rows the WHERE cannot match, decided for the batch before any
+                // is fetched; see `prefilter`. It reads only rows this snapshot
+                // can see, which are the only rows the loop below reads.
+                let mut prefilter_scratch = prefilter::Scratch::default();
+                let keep = match prefilter_ref.as_deref() {
+                    Some(pf)
+                        if pf.select(
+                            pointers.iter().map(|p| &p.pointer),
+                            |p| !visibility_ref.visible(p.deleted, p.xmin, p.xmax),
+                            &mut prefilter_scratch,
+                        ) =>
+                    {
+                        pf.run(pointers.len(), io_rows_ref, &mut prefilter_scratch).await
+                    }
+                    _ => None,
+                };
+
+                for (batch_index, pwo) in pointers.into_iter().enumerate() {
                     if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
@@ -2697,6 +2778,18 @@ impl ConcurrentProcessor {
                         pwo.pointer.xmax,
                     ) {
                         continue;
+                    }
+
+                    // Only once the plan is built: it is compiled from the first
+                    // row this batch fetches, and a clause it refuses has to
+                    // fail the statement on that same row, not vanish because
+                    // the prefilter dropped every row before it was reached.
+                    if plan_built {
+                        if let Some(keep) = keep {
+                            if !prefilter::kept(keep, batch_index) {
+                                continue;
+                            }
+                        }
                     }
 
                     let query_row_fetch = &*tuple_clone;

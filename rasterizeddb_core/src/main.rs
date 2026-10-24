@@ -9,6 +9,7 @@ use rasterizeddb_core::{
 use tokio::runtime::Builder;
 
 use clap::ValueEnum;
+use rasterizeddb_core::simds::cpu::SimdRequest;
 use rasterizeddb_core::configuration::Configuration;
 
 /// S3 backup and restore flags. Off by default and absent from the binary
@@ -120,6 +121,20 @@ struct Args {
     /// win, and what would remove the need for it.
     #[arg(long = "tune-allocator", alias = "tune_allocator", value_name = "BOOL")]
     tune_allocator: Option<bool>,
+
+    /// Instruction set for the SIMD kernels: auto, avx512, avx2 or scalar
+    /// (default: auto, the best this CPU supports).
+    ///
+    /// An explicit level the CPU cannot run refuses to start rather than
+    /// quietly falling back. `avx2` on an AVX-512 machine is how to measure
+    /// what an AVX2-only server (such as the i5-10400 in production) will do.
+    #[arg(long = "simd", value_name = "LEVEL")]
+    simd: Option<SimdRequest>,
+
+    /// Drop rows a WHERE clause cannot match before fetching them, a batch at
+    /// a time, using SIMD compares on fixed-width columns (default: true).
+    #[arg(long = "scan-prefilter", alias = "scan_prefilter", value_name = "BOOL")]
+    scan_prefilter: Option<bool>,
 
     /// Run an in-memory database (no files are created).
     /// Master switch for the bit-level filter index.
@@ -728,6 +743,10 @@ fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
 }
 
 fn main() -> std::io::Result<()> {
+    // First, before anything compiled for x86-64-v3 has a chance to run: on a
+    // CPU without AVX2 the alternative is a SIGILL with no explanation.
+    rasterizeddb_core::simds::cpu::ensure_baseline_or_exit();
+
     // 32 MiB
     const STACK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -745,6 +764,18 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let args = Args::parse();
+
+    // Before any kernel resolves its path: the filter index's probe caches the
+    // first one it sees.
+    let simd_level =
+        match rasterizeddb_core::simds::cpu::init(args.simd.unwrap_or(SimdRequest::Auto)) {
+            Ok(level) => level,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+    rasterizeddb_core::core::processor::prefilter::set_enabled(args.scan_prefilter.unwrap_or(true));
 
     // Before the database opens, so every buffer a statement allocates is
     // governed by it. Off by default: see `tune_allocator` for the measurements
@@ -923,6 +954,21 @@ fn main() -> std::io::Result<()> {
         env_logger::Builder::new()
             .filter_level(level)
             .init();
+
+        {
+            let cpu = rasterizeddb_core::simds::cpu::features();
+            // Printed, not logged: the default level is `error`, and which
+            // path the kernels run is the first thing to know when a number
+            // measured on one machine does not reproduce on another.
+            println!(
+                "SIMD: {} on {} [{}]{}; scan prefilter {}",
+                simd_level,
+                rasterizeddb_core::simds::cpu::describe_cpu(cpu),
+                cpu.flag_list(),
+                if cpu.fast_pext() { ", fast PEXT" } else { "" },
+                if rasterizeddb_core::core::processor::prefilter::enabled() { "on" } else { "off" },
+            );
+        }
 
         #[cfg(debug_assertions)]
         let db_location = if args.in_memory {
