@@ -1150,9 +1150,9 @@ stricter one, never a weaker one.
 | Mode | Taken by | Conflicts with |
 |---|---|---|
 | AS (ACCESS SHARE) | SELECT; the FK parent check | AE |
-| RX (ROW EXCLUSIVE) | INSERT, UPDATE, DELETE, COPY FROM, `SELECT … FOR UPDATE`, replication apply, VACUUM FULL (which keeps `compaction_gate` inside) | S, AE |
-| S (SHARE) | `LOCK TABLE … SHARE` | RX, AE |
-| AE (ACCESS EXCLUSIVE) | every reloading DDL: CREATE/DROP INDEX, path-index DDL, every ALTER arm, DROP, RENAME, MOVE, a JSON shadow type widening (below; a shadow ADD COLUMN takes none); `LOCK TABLE` in EXCLUSIVE, SHARE ROW EXCLUSIVE or ACCESS EXCLUSIVE | all |
+| RX (ROW EXCLUSIVE) | INSERT, UPDATE, DELETE, COPY FROM, `SELECT … FOR UPDATE`, replication apply, plain VACUUM (B4; finding L6) | S, AE |
+| S (SHARE) | `LOCK TABLE … SHARE`; an FK parent for ADD/DROP FOREIGN KEY and `CREATE TABLE … REFERENCES` (B4; finding L11) | RX, AE |
+| AE (ACCESS EXCLUSIVE) | every reloading DDL: CREATE/DROP INDEX, path-index DDL, every ALTER arm (and the FK children whose sidecars it rewrites), DROP, RENAME (both names), MOVE, CREATE TABLE (its name), VACUUM FULL (B4: was RX here), a JSON shadow type widening (below; a shadow ADD COLUMN takes none); `LOCK TABLE` in EXCLUSIVE, SHARE ROW EXCLUSIVE or ACCESS EXCLUSIVE | all |
 
 CREATE INDEX under S, as PostgreSQL runs it, is v2.
 
@@ -1583,6 +1583,114 @@ a new lock yet (B3b).
   both in name order; DDL's FK parents and children, and `reload_table`'s
   AE assertion; DROP's waiters see 42P01 only because the slot is gone
   (B4 marks it dropped under AE); VACUUM's per-table owners.
+
+**As built (B4).** The reload under ACCESS EXCLUSIVE; DROP, RENAME, MOVE
+and VACUUM under it.
+- *The reload* (`core/database/reload.rs`: `Database::reload_with(name,
+  work)`; `reload_table` is it with no work). **Step 1:** the caller holds
+  AE on the table and on the rest of its complete lock set, all taken
+  before anything is written; `reload_with` asserts it
+  (`Database::exclusive_held`, a debug assertion: true outside every owner
+  scope and for exempt relations), and `lock_table` asserts that no request
+  queues inside steps 2-4 (a task-local is set around them).
+  `forget_pause` is taken after the lock, then the entry bump of
+  `schema_generation`. **Step 2:** `Table::retire` clears
+  `maintenance_alive`, then takes the instance's `maintenance_tick` mutex,
+  which the `VacuumService` holds for each sweep (after its permit) and
+  `vacuum_now` for a manual VACUUM; so it returns with no vacuum writing
+  through the old providers (RV14). `neutralize_aborted` checks the flag
+  between batches and while readers drain (`NeutralizeParts::alive`), so
+  the join waits for one batch, not one sweep. Reads through a retired
+  instance go on. **Step 3:** `work` (the DDL's sidecar write) runs here,
+  then the new instance is opened from disk (`open_instance`). A failing
+  `work` still opens a fresh instance and swaps it in, never the retired
+  one; a reopen that fails removes the slot (absent, not stale), as before.
+  **Step 4:** `Slot::swap` (the slot stays, and stays live), then the end
+  bump of `schema_generation`, so a reader that sees the final generation
+  sees the new instance. AE is released by the owner when the statement
+  ends, after durability.
+- *Work inside the reload.* The sidecar write is `work` for CREATE INDEX,
+  path-index CREATE and DROP, DROP INDEX, a partial unique index's DROP,
+  ALTER … DROP CONSTRAINT (FK, UNIQUE, CHECK and the inline UNIQUE flag; a
+  name that matches nothing in the open schema reloads nothing), ADD
+  FOREIGN KEY, ADD UNIQUE/PRIMARY KEY, ADD CHECK and ALTER COLUMN SET/DROP
+  DEFAULT. The other ALTER arms (ADD COLUMN on an empty table, DROP and
+  RENAME COLUMN, SET NOT NULL, a NUMERIC scale change, RENAME TO's sequence
+  defaults) still write before calling `reload_table`, but under the
+  statement's complete lock set, so a lock failure (55P03, 40P01, 57014)
+  still writes nothing; moving them into `work` comes with B5's rewrites.
+- *The complete lock set* (finding L11). `lock_statement_set` adds
+  `ddl_lock_extras` to an ALTER's or DROP's text set and takes it through
+  `Database::lock_names`: every name, registered or not, in one name order.
+  `executor::alter_lock_set` gives, beyond the table's own AE: for RENAME
+  TO, the new name and every FK child (AE; each is reloaded); for ADD, DROP
+  and RENAME COLUMN, the FK children whose keys reference that column (AE),
+  never the rest; for ADD FOREIGN KEY and the DROP CONSTRAINT of one, the
+  parent (S). The arm reads the set again under its AE (no child can appear
+  then: adding one takes S on the parent) and takes anything new, with
+  graph edges, before its first write. CREATE TABLE takes AE on its own name
+  and S on each FK parent (`lock_create_target`). **Deviation:** S, not the
+  never-weaker mapping of PostgreSQL's SHARE ROW EXCLUSIVE (AE). S conflicts
+  with what L11 is about, a parent DELETE's RX and a parent DDL's AE, and
+  unlike AE it does not make the FK DDL wait for the parent's readers, as
+  PostgreSQL's does not; it lets two FK DDLs on one parent run together,
+  which is harmless since neither writes the parent.
+- *Escapes drained.* `table_unlocked` and `each_table_unlocked` are gone.
+  DROP's internals and the FK-sidecar walks (`other_foreign_keys`,
+  `retarget_parent`) reach their tables through `Database::table_held`,
+  which asserts the statement's AE and never waits;
+  `slots_source_tests::HELD` pins its callers with their reasons, and
+  `ESCAPES` is empty.
+- *DROP* asserts AE, retires the instance once it is out of the map (not a
+  statement's own temporary, finding L12) and, on a failure after that,
+  opens a fresh instance instead of putting the retired one back. A
+  statement queued behind a DROP finds its slot dropped and resolves the
+  name again: 42P01 by design, because a CREATE of the name takes AE on it
+  too and so queues behind that statement. **Deviation:** the map entry
+  goes during the DROP, not after AE is released; a statement arriving
+  after that gets the same 42P01 without queueing.
+- *RENAME* takes both names in name order at the statement's entry, so
+  crossed RENAMEs serialise and a CREATE of the target waits for the RENAME
+  (or the RENAME for it); `rename_table` asserts both. The old instance is
+  retired and stays in the old name's slot until the commit point (a
+  statement queued on the name waits there); before it a failure reopens
+  fresh; after it the old slot is removed and the new one installed.
+- *MOVE.* `STORAGE MOVE TABLE` and each `STORAGE REBALANCE` step take AE
+  (`storage/relocate.rs`, after the partitioned refusal);
+  `move_table_to_backend` asserts it, retires the instance, keeps it in the
+  slot through the copy and swaps the moved instance in, so a statement
+  queued on the name never finds it missing. A failure before the flip
+  reopens fresh from the source. Retiring fixed a quiet miss: the old code
+  took the slot out to stop the instance's maintenance but kept the `Arc`
+  in a local, so the maintenance ran on through the copy (RENAME had the
+  same). REBALANCE holds AE on each moved table to the statement's end.
+- *VACUUM* (finding L6, `executor::vacuum_mode`): plain VACUUM takes RX,
+  which runs beside DML and conflicts with DDL; VACUUM FULL takes AE, as in
+  PostgreSQL (the modes table said RX). A bare VACUUM in autocommit takes
+  each table under an owner of its own (`VacuumOwner`: `begin_owner`, then
+  `release_owner` and `end_owner` when the table is done); in a block,
+  under the block's owner, given back per table unless the block held it.
+- *Temporaries* (finding L12) stay exempt from locks, and their DROP skips
+  retirement.
+- *Not built here.* Steps 2-4 run on the caller's task, not a spawned one:
+  statement cancellation is cooperative (`core/cancel.rs`; a statement
+  future is not dropped to stop it) and is polled only by lock waits and
+  scans, which steps 2-4 do not make; a spawned task would also lose the
+  statement's owner scope. The gate, ticket and seal parts of step 2 are
+  B11's. Partitioned ALTER and CREATE INDEX are refused before their set
+  is taken. `CREATE TABLE … AS SELECT` is still not executed; `lock_set`
+  now reads its source (AS) all the same.
+- *Tests* (each mutation-verified): `reload_tests` (a held old instance
+  reads on, a new reader sees the new schema; no reader sees the final
+  generation with the old instance, by step probes and a racing reader;
+  the AE assertion; no wait inside the steps; a failing work leaves a
+  fresh instance; a temporary's DROP takes no lock and no retirement),
+  `pgwire::ddl_lock_tests` (CREATE INDEX waits for a block's AS; DROP
+  waits for readers and its waiters get 42P01 with a CREATE queued after
+  them; crossed RENAMEs serialise with no 40P01; RENAME and CREATE of its
+  target serialise; L11 both ways; plain VACUUM beside a writer, VACUUM
+  FULL behind it; a bare VACUUM gives each table back), and
+  `lock_set::create_table_as_locks_its_source`.
 
 **Driver gate** (phase 0, before W3 merges): sqlx, tokio-postgres, pgjdbc
 (past `prepareThreshold`: named statements, binary formats) and npgsql
