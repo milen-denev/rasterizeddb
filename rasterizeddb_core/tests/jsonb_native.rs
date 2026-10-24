@@ -70,8 +70,10 @@ fn fresh(tag: &str) -> String {
 /// client sees is a different layer and is covered by the compat suite, which
 /// goes over the wire.
 fn stores_document(response: &[u8], expected: &str) -> bool {
-    let value: serde_json::Value = serde_json::from_str(expected).expect("expected parses");
-    let encoded = rasterizeddb_core::core::jsonb::encode(&value);
+    // Encoded from the text, as the engine encodes it: exactly. Through a
+    // `serde_json::Value` a 30-digit integer or a 23-digit fraction is an f64
+    // and loses digits, so the oracle, not the row, was wrong.
+    let encoded = rasterizeddb_core::core::jsonb::encode_text(expected).expect("expected parses");
     response
         .windows(encoded.len())
         .any(|window| window == encoded.as_slice())
@@ -465,13 +467,15 @@ fn an_index_that_cannot_be_built_is_refused_with_a_reason() {
             "a path into a non-document should be refused"
         );
 
-        // An index over an ordinary column is not claimed here at all: the
-        // engine maintains one over every eligible column already, and over the
-        // Postgres wire the statement is answered as an accepted no-op. What
-        // matters is that it is not mistaken for a path index — that is the
-        // compat suite's `an_ordinary_index_is_still_accepted`.
+        // An index over an ordinary column is a statement of its own since
+        // secondary indexes landed (it builds a B-tree), so it is recognised.
+        // What matters here is that it is not mistaken for a path index.
         assert!(
-            recognize_query_purpose("CREATE INDEX ix_name ON t (name)").is_none(),
+            recognize_query_purpose("CREATE INDEX ix_name ON t (name)").is_some(),
+            "an ordinary index is a statement"
+        );
+        assert!(
+            rasterizeddb_core::core::rql::path_index::parse_create("CREATE INDEX ix_name ON t (name)").is_none(),
             "an ordinary index should not be claimed as a path index"
         );
 
