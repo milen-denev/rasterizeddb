@@ -40,6 +40,10 @@ const SCHEMA_ONLY: &[&str] = &[
     "in_place_column_updates",
     "is_shell",
     "data",
+    // A reload's retirement (§7 step 2): the maintenance flag and the
+    // vacuum join, on `Table` itself (a shell has both, and runs nothing).
+    "retire",
+    "is_retired",
     // Test-only: the cache scope string and generation counter.
     "cache_key",
 ];

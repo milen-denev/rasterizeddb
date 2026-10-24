@@ -83,6 +83,17 @@ pub async fn move_table(
         )]);
     }
 
+    // ACCESS EXCLUSIVE on the name for the move (§7): every statement on the
+    // table has finished and none starts until this one ends, so the copy
+    // reads files nothing is writing, and the swap is seen only after it.
+    // After the partitioned refusal above, so that one never waits.
+    database
+        .lock_table(
+            table,
+            crate::core::mvcc::owner::ensure(),
+            crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+        )
+        .await?;
     let bytes = database
         .move_table_to_backend(table, destination)
         .await
@@ -175,10 +186,22 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         // move is individually atomic — see `Database::move_table_to` — so
         // stopping leaves a consistent database with part of the plan applied,
         // and the next `STORAGE REBALANCE` re-plans from where it got to.
-        match database
-            .move_table_to_backend(&step.table, &TableBackend::Directory(step.to.clone()))
+        // ACCESS EXCLUSIVE per table, as `move_table` takes it; held to the
+        // statement's end like every lock of its owner.
+        let outcome = match database
+            .lock_table(
+                &step.table,
+                crate::core::mvcc::owner::ensure(),
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            )
             .await
         {
+            Ok(()) => database
+                .move_table_to_backend(&step.table, &TableBackend::Directory(step.to.clone()))
+                .await,
+            Err(e) => Err(std::io::Error::other(e)),
+        };
+        match outcome {
             Ok(bytes) => {
                 moved += 1;
                 moved_bytes = moved_bytes.saturating_add(bytes);

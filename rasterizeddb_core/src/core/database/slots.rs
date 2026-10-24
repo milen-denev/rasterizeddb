@@ -20,9 +20,10 @@
 //!   and no lock (§7's deliberate deviation; Q3).
 //! - Everything that executes reaches a `Table` through `table_for` /
 //!   `relation_for` (`table_for.rs`), which take the table lock first and
-//!   only then load the slot. The escape hatches [`Database::table_unlocked`]
-//!   and [`Database::each_table_unlocked`] remain for three callers, each
-//!   listed with its reason in `slots_source_tests::ESCAPES`.
+//!   only then load the slot; a DDL's own internals (DROP, RENAME, MOVE, a
+//!   reload, the FK children a parent's DDL rewrites) through `table_held`,
+//!   which asserts the ACCESS EXCLUSIVE their statement took. B4 removed the
+//!   escape hatches that took a `Table` with no lock at all.
 //!
 //! Outside `core::database` the maps do not compile; a crate reaches a table
 //! through these functions:
@@ -162,9 +163,11 @@ const DROPPED: u8 = 1;
 /// atomically, and whether the name still owns it.
 ///
 /// A reader that loaded the instance keeps it for as long as it holds the
-/// `Arc`, whatever is stored into the slot after. B4's reload builds the new
-/// instance, then [`Slot::swap`]s it in; until then a reload removes the slot
-/// and installs a new one (unchanged behaviour). B11 adds the gate here.
+/// `Arc`, whatever is stored into the slot after. A reload and a MOVE build
+/// the new instance, then [`Slot::swap`] it in (slice B4), so the slot, and
+/// the name's place in the map, never go away during the change: a lockless
+/// reader sees the old instance or the new one, never 42P01. B11 adds the
+/// gate here.
 pub(crate) struct Slot {
     table: ArcSwapAny<TableRef>,
     state: AtomicU8,
@@ -187,14 +190,13 @@ impl Slot {
     /// Stores `table` as the current instance and returns the previous one.
     /// A reader sees the old instance or the new one, never neither, and one
     /// that already loaded the old keeps it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn swap(&self, table: Arc<DbTable>) -> Arc<DbTable> {
         self.table.swap(ArcRef(table)).0
     }
 
-    /// False once the name no longer owns this slot (DROP, RENAME, a reload's
-    /// removal): `table_for` re-resolves the name when it finds that after
-    /// waiting.
+    /// False once the name no longer owns this slot (DROP, the old name of a
+    /// RENAME, a reload whose reopen failed): `table_for` re-resolves the
+    /// name when it finds that after waiting. A swap keeps it live.
     pub(crate) fn is_live(&self) -> bool {
         self.state.load(Ordering::Acquire) == LIVE
     }
@@ -461,27 +463,6 @@ impl Database {
         }
     }
 
-    /// **Escape hatch.** The instance registered under `name` (a partitioned
-    /// table's shell, as `tables.get` gave), taken with no table lock. Its
-    /// callers are listed, each with its reason, in
-    /// `slots_source_tests::ESCAPES`; executing code takes `table_for`.
-    #[inline]
-    pub(crate) fn table_unlocked(&self, name: &str) -> Option<Arc<DbTable>> {
-        self.resolve(name, |key| {
-            self.table_slots.get(key).map(|slot| slot.load())
-        })
-    }
-
-    /// **Escape hatch.** Every registered instance with its name, taken with
-    /// no table lock, for the FK-sidecar walks over other tables (B4 gives
-    /// them their lock set). Listed like [`Database::table_unlocked`].
-    pub(crate) fn each_table_unlocked(&self) -> Vec<(String, Arc<DbTable>)> {
-        self.table_slots
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().load()))
-            .collect()
-    }
-
     /// The instance registered under `name`, for tests, benches and tools
     /// outside the crate, which have no lock owner. Never called by the
     /// engine (pinned by `slots_source_tests`).
@@ -490,6 +471,20 @@ impl Database {
         self.resolve(name, |key| {
             self.table_slots.get(key).map(|slot| slot.load())
         })
+    }
+
+    /// Stores `table` as `name`'s current instance (§7 step 4: a reload's or
+    /// a MOVE's swap), returning the instance it replaced. The slot stays,
+    /// and stays live, so a statement queued on the name's lock finds the
+    /// new instance in it. Registers a new slot when the name has none.
+    pub(crate) fn swap_instance(&self, name: &str, table: Arc<DbTable>) -> Option<Arc<DbTable>> {
+        match self.resolve(name, |key| self.table_slots.get(key).map(|slot| slot.value().clone())) {
+            Some(slot) => Some(slot.swap(table)),
+            None => {
+                self.install_table(name.to_string(), table);
+                None
+            }
+        }
     }
 
     /// Registers `table` under `name` in a new slot, replacing (and marking

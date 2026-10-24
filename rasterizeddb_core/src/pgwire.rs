@@ -46,6 +46,8 @@ mod schema_view_tests;
 #[cfg(test)]
 mod table_lock_tests;
 #[cfg(test)]
+mod ddl_lock_tests;
+#[cfg(test)]
 mod temp_relation_tests;
 mod fixed_rows;
 mod wire_out;

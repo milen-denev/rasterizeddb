@@ -28,6 +28,9 @@ mod reaper_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;
+pub mod reload;
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod slots_source_tests;
 #[cfg(test)]
@@ -1882,6 +1885,14 @@ impl Database {
         // folding drops in, so every mutator removes the slot a lookup finds.
         let resolved = self.resolve_key(table_name);
         let table_name = resolved.as_deref().unwrap_or(table_name);
+        // §7: DROP runs under the ACCESS EXCLUSIVE its statement took on the
+        // name (a shadow table, exempt, under its parent's). Statements that
+        // queued behind it find the slot dropped once it is released, and get
+        // 42P01 (see `table_for`).
+        debug_assert!(
+            self.exclusive_held(table_name),
+            "DROP of \"{table_name}\" without ACCESS EXCLUSIVE on it (§7)"
+        );
         // A partitioned table drops through its own order. Resolved before
         // `tables` is touched: its shell is there too, and the plain path
         // below would sweep `<name>*` files it never had.
@@ -1912,7 +1923,7 @@ impl Database {
         // table leaves the map and the catalogue: a drop waiting for it with
         // the table half gone hid the table, files still on disk, and a
         // `CREATE TABLE` of the name was refused for those files.
-        let Some(logs) = self.table_unlocked(table_name).map(|table| {
+        let Some(logs) = self.table_held(table_name).map(|table| {
             table
                 .io_rows()
                 .map(|io| logs_holding(io, &self.storage, self.location.as_deref()))
@@ -1925,12 +1936,18 @@ impl Database {
         let Some(table) = self.take_table(table_name) else {
             return Ok(false);
         };
+        // Its maintenance stops, and a vacuum in flight on it finishes, before
+        // its files are released (§7 step 2). Not for a statement's own
+        // temporary, which no maintenance outlives (finding L12).
+        if !table_for::lock_exempt(table_name) {
+            table.retire().await;
+        }
 
         // Before the files go: a failure here must leave the table intact rather
         // than half-dropped, and the catalogue is the half that decides whether
         // it exists at all.
         if let Err(e) = self.forget_in_catalogue(table_name).await {
-            self.install_table(table_name.to_string(), table);
+            self.put_back_after_failed_drop(table_name, table).await;
             error!("Could not remove {} from the catalogue: {}", table_name, e);
             return Err(e);
         }
@@ -1955,7 +1972,7 @@ impl Database {
                         restore
                     );
                 }
-                self.install_table(table_name.to_string(), table);
+                self.put_back_after_failed_drop(table_name, table).await;
                 return Err(failure.error);
             }
             // A barrier may be durable (the log failed past its append and is
@@ -2061,6 +2078,19 @@ impl Database {
         }
         info!("Dropped table {}", table_name);
         Ok(true)
+    }
+
+    /// A DROP that failed after taking the table out puts it back: a
+    /// retired instance never goes back (N14, N23), so a fresh one is opened
+    /// from the files the failure left; a statement's own temporary, which
+    /// was not retired, goes back as it was.
+    async fn put_back_after_failed_drop(&self, table_name: &str, table: Arc<Table<DbStorageProvider>>) {
+        if table.is_retired() && !table_for::lock_exempt(table_name) {
+            drop(table);
+            self.reopen_fresh(table_name).await;
+        } else {
+            self.install_table(table_name.to_string(), table);
+        }
     }
 
     /// Whether the database's own log, which holds the catalogue, is poisoned.
@@ -2233,6 +2263,12 @@ impl Database {
         if old_name == new_name {
             return Ok(());
         }
+        // §7: under ACCESS EXCLUSIVE on both names, taken in name order by
+        // the statement before anything here ran.
+        debug_assert!(
+            self.exclusive_held(old_name) && self.exclusive_held(new_name),
+            "RENAME of \"{old_name}\" to \"{new_name}\" without ACCESS EXCLUSIVE on both names (§7)"
+        );
         if new_name.is_empty() || new_name.len() > 128 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2301,10 +2337,13 @@ impl Database {
         // name to the directory its files are actually in.
         pool_rename(&self.storage, old_name, new_name);
 
-        // The handle goes first so its maintenance task stops before the files
-        // are read: a background flush landing mid-copy would put bytes in the
-        // source that the copy has already passed.
-        let table = self.take_table(old_name);
+        // The instance is retired first so its maintenance stops before the
+        // files are read: a background flush landing mid-copy would put bytes
+        // in the source that the copy has already passed. It stays in the
+        // old name's slot until the commit point (§7 step 2): a statement
+        // queued on the name waits there rather than finding it missing, and
+        // a failure below swaps a fresh instance in, never this one.
+        let mut table = self.retire_current(old_name).await;
 
         let copied = self.copy_table_files(old_name, new_name).await;
         if let Err(e) = copied {
@@ -2312,8 +2351,8 @@ impl Database {
             // started in. The partial copies are dropped rather than left for
             // recovery: no catalogue row names them.
             self.abandon_copy(old_name, new_name).await;
-            if let Some(table) = table {
-                self.install_table(old_name.to_string(), table);
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
             error!("Rename of {} to {}: copy failed: {}", old_name, new_name, e);
             return Err(e);
@@ -2321,8 +2360,8 @@ impl Database {
 
         if let Err(e) = self.rewrite_schema_name(new_name).await {
             self.abandon_copy(old_name, new_name).await;
-            if let Some(table) = table {
-                self.install_table(old_name.to_string(), table);
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
             error!(
                 "Rename of {} to {}: schema rewrite failed: {}",
@@ -2334,8 +2373,8 @@ impl Database {
         // The commit point. After this the new name is the real one.
         if let Err(e) = self.remember_in_catalogue(new_name).await {
             self.abandon_copy(old_name, new_name).await;
-            if let Some(table) = table {
-                self.install_table(old_name.to_string(), table);
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
             error!(
                 "Rename of {} to {}: catalogue insert failed: {}",
@@ -2353,6 +2392,8 @@ impl Database {
                  Both names will be visible until the next open completes the rename.",
                 old_name, new_name, e
             );
+            drop(table.take());
+            self.take_table(old_name);
             self.open_renamed_table(new_name).await;
             return Ok(());
         }
@@ -2390,6 +2431,8 @@ impl Database {
                     old_name, new_name, e
                 );
                 self.hold_intent(old_name, new_name);
+                drop(table.take());
+                self.take_table(old_name);
                 self.open_renamed_table(new_name).await;
                 return Err(e);
             }
@@ -2415,6 +2458,8 @@ impl Database {
             // open the kept files as its own.
             self.hold_intent(old_name, new_name);
         }
+        drop(table);
+        self.take_table(old_name);
         self.open_renamed_table(new_name).await;
 
         info!("Renamed table {} to {}", old_name, new_name);
@@ -2723,6 +2768,11 @@ impl Database {
         if !self.has_table(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
+        // §7: under the ACCESS EXCLUSIVE its statement took on the name.
+        debug_assert!(
+            self.exclusive_held(table_name),
+            "STORAGE MOVE of \"{table_name}\" without ACCESS EXCLUSIVE on it (§7)"
+        );
 
         // Every write this table has made has to be on the source before the
         // source is read. The handle's own maintenance stops when it is removed
@@ -2734,11 +2784,14 @@ impl Database {
             warn!("could not flush before moving {}: {}", table_name, e);
         }
 
-        // The handle goes first so its maintenance task stops before the bytes
-        // are read: a background flush landing mid-copy would put bytes in the
-        // source that the copy has already passed. Same reasoning as
-        // `rename_table`.
-        let table = self.take_table(table_name);
+        // The instance is retired first so its maintenance stops before the
+        // bytes are read: a background flush landing mid-copy would put bytes
+        // in the source that the copy has already passed. Same reasoning as
+        // `rename_table`. It stays in the slot until the swap below (§7 step
+        // 4), so a statement queued on the name finds the moved table, never
+        // a missing one; a failure before the flip swaps a fresh instance
+        // from the source in, never this one.
+        let table = self.retire_current(table_name).await;
 
         let from = seed_in(
             &self.db_io_pointers,
@@ -2766,8 +2819,8 @@ impl Database {
         {
             Ok(to) => to,
             Err(e) => {
-                if let Some(table) = table {
-                    self.install_table(table_name.to_string(), table);
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
                 }
                 return Err(e);
             }
@@ -2790,8 +2843,8 @@ impl Database {
             if let Err(failure) =
                 forget_logged_files(&destination_logs, table_name, Barrier::Relocation)
             {
-                if let Some(table) = table {
-                    self.install_table(table_name.to_string(), table);
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
                 }
                 error!(
                     "Could not move {} to {}: the destination's log would not void its old \
@@ -2822,8 +2875,8 @@ impl Database {
                 table_name,
             )
             .await;
-                if let Some(table) = table {
-                    self.install_table(table_name.to_string(), table);
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
                 }
                 error!(
                     "Could not move {} to {}: {}",
@@ -2845,8 +2898,8 @@ impl Database {
                 table_name,
             )
             .await;
-            if let Some(table) = table {
-                self.install_table(table_name.to_string(), table);
+            if table.is_some() {
+                self.reopen_fresh(table_name).await;
             }
             return Err(io::Error::other(e));
         }
@@ -2908,8 +2961,10 @@ impl Database {
             if rolled_back && !restored.schema_unreadable {
                 restored.scope_cache_to_database(self.id);
                 restored.enable_versioning(self.transactions.clone());
-                self.install_table(table_name.to_string(), Arc::new(restored));
+                self.swap_instance(table_name, Arc::new(restored));
             } else {
+                // Absent, not the retired instance.
+                self.take_table(table_name);
                 // Both copies unreadable, or the placement would not go back.
                 // Nothing to publish, and saying so is the only honest answer —
                 // but the bytes are still under the placement that is recorded.
@@ -2929,7 +2984,7 @@ impl Database {
         }
         reopened.scope_cache_to_database(self.id);
         reopened.enable_versioning(self.transactions.clone());
-        self.install_table(table_name.to_string(), Arc::new(reopened));
+        self.swap_instance(table_name, Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
         // Kept when their records cannot be voided, and said so: the move is
@@ -3601,55 +3656,6 @@ impl Database {
 
         info!("Database stopped");
 
-        Ok(())
-    }
-
-    pub async fn reload_table(&self, table_name: &str) -> io::Result<()> {
-        // The map key DDL mutates (`resolve_key`): where identifier case
-        // folding drops in, so every mutator removes the slot a lookup finds.
-        let resolved = self.resolve_key(table_name);
-        let table_name = resolved.as_deref().unwrap_or(table_name);
-        // The table's handle is dropped before the reopened one registers;
-        // the database's forgotten horizon must not move in that gap, or the
-        // reopened files could carry ids it forgot. See `ForgetRegistry`.
-        let _forget_pause = self.transactions.forget_pause();
-        // Before the entry is removed, and before `tables` is asked: the
-        // reopen below builds a plain table, and a partitioned one with no
-        // shell must not read as missing (ALTER and CREATE INDEX reach here).
-        self.refuse_partitioned(table_name, "reloading a table's schema")?;
-        if !self.has_table(table_name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
-        }
-        let _changed = SchemaChanged(&self.schema_generation);
-        // Every schema change comes through here, so this is where a client's
-        // cached column list becomes stale. See `schema_generation`.
-        // Bumped again once the reload is done: see `SchemaChanged`.
-        self.schema_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // The previous handle is dropped first so its maintenance task stops
-        // before a second one starts on the same files.
-        self.take_table(table_name);
-        let seed = seed_in(
-            &self.db_io_pointers,
-            &self.storage,
-            &self.kv,
-            &self.seeds,
-            table_name,
-        )
-        .await;
-        let mut table = Table::new(table_name, seed, Vec::new()).await;
-        if table.schema_unreadable {
-            // The old handle has already been removed, so the table is now
-            // absent rather than stale. That is the safe end of this: a query
-            // says it does not exist, instead of reading it with no columns.
-            return Err(io::Error::other(format!(
-                "table '{}' could not be reopened: its schema could not be read",
-                table_name
-            )));
-        }
-        table.scope_cache_to_database(self.id);
-        table.enable_versioning(self.transactions.clone());
-        self.install_table(table_name.to_string(), Arc::new(table));
         Ok(())
     }
 }

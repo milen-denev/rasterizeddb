@@ -456,18 +456,22 @@ impl Batch {
     }
 }
 
-/// Every table's foreign-key sidecar but `table`'s own, read before anything
-/// awaits on the map.
+/// The foreign-key sidecar of every *other* table whose keys reference one
+/// of `columns` of `table`: the children a column's DDL on `table` reads and
+/// may rewrite. Each is held under ACCESS EXCLUSIVE, taken by the statement
+/// with `table`'s own (`executor::alter_lock_set`, finding L11), and
+/// asserted by `table_held`; a table with no key on those columns has
+/// nothing here to change.
 async fn other_foreign_keys(
     database: &Arc<Database>,
     table: &str,
+    columns: &[&str],
 ) -> Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKey>)> {
     let ios: Vec<(String, Arc<DbStorageProvider>)> = database
-        .each_table_unlocked()
+        .fk_children_on(table, Some(columns))
         .into_iter()
-        .filter(|(name, _)| !named(name, table))
-        .filter(|(_, t)| !t.schema.foreign_keys.is_empty())
-        .map(|(name, t)| (name, t.io_schema.clone()))
+        .filter(|name| !named(name, table))
+        .filter_map(|name| database.table_held(&name).map(|t| (name, t.io_schema.clone())))
         .collect();
     let mut out = Vec::new();
     for (name, io) in ios {
@@ -612,7 +616,7 @@ pub(crate) async fn retire_for_new_column(
     let fields = visible(schema);
     let mut decl = Declarations::read(io_schema).await;
     decl.retire_leftovers(table, name, &fields);
-    let mut others = other_foreign_keys(database, table).await;
+    let mut others = other_foreign_keys(database, table, &[name]).await;
     retire_parent_side(&mut others, table, name);
     let header = schema
         .primary_key
@@ -652,7 +656,7 @@ pub(crate) async fn drop_column(
     name: &str,
 ) -> Result<Vec<String>, String> {
     let mut decl = Declarations::read(io_schema).await;
-    let mut others = other_foreign_keys(database, table).await;
+    let mut others = other_foreign_keys(database, table, &[name]).await;
 
     let depends = |fk: &foreign_key::ForeignKey| {
         !fk.is_deleted && named(&fk.parent_table, table) && named(&fk.parent_column, name)
@@ -768,7 +772,7 @@ pub(crate) async fn rename_column(
         .collect();
 
     let mut decl = Declarations::read(io_schema).await;
-    let mut others = other_foreign_keys(database, table).await;
+    let mut others = other_foreign_keys(database, table, &[from, to]).await;
 
     // Leftovers under `to` first: they name a column no live field has.
     decl.retire_leftovers(table, to, &before);
@@ -970,11 +974,13 @@ pub(crate) async fn retarget_parent(
     old: &str,
     new: &str,
 ) -> Result<Vec<String>, String> {
+    // The children of `old`, the renamed table's own self-references (under
+    // `new` now) included, each under the ACCESS EXCLUSIVE the RENAME took
+    // with both names (`executor::alter_lock_set`, finding L11).
     let ios: Vec<(String, Arc<DbStorageProvider>)> = database
-        .each_table_unlocked()
+        .fk_children(old)
         .into_iter()
-        .filter(|(_, t)| t.schema.foreign_keys.iter().any(|fk| named(&fk.parent_table, old)))
-        .map(|(name, t)| (name, t.io_schema.clone()))
+        .filter_map(|name| database.table_held(&name).map(|t| (name, t.io_schema.clone())))
         .collect();
     let mut changed = Vec::new();
     // Grouped by directory, one transaction each.

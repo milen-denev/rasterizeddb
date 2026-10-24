@@ -161,7 +161,7 @@ const TOUCH: [&str; 11] = [
     "self.table_slots",
     "self.partitioned_tables",
     "self.has_table(",
-    "self.table_unlocked(",
+    "self.table_held(",
     "self.take_table(",
     "self.install_table(",
     "seed_in(",
@@ -199,7 +199,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("partitioned_table", "a slot primitive: the partitioned map's lookup"),
     ("is_partitioned", "a slot primitive: the partitioned map's lookup"),
     ("has_table", "a slot primitive: what tables.contains_key answered; its callers dispatch"),
-    ("table_unlocked", "a slot primitive: the escape hatch; its callers dispatch"),
+    ("swap_instance", "a slot primitive: a reload's or a MOVE's swap; its callers dispatch"),
+    ("put_back_after_failed_drop", "drop_table_to_depth's failure path, after its dispatch"),
+    ("reload_table", "delegates to reload_with, which dispatches"),
+    ("open_instance", "opens the files of a name its callers (reload_with, reopen_fresh) resolved"),
+    ("retire_current", "retires the instance its caller (RENAME, MOVE) resolved and holds AE on"),
+    ("reopen_fresh", "the fresh-instance rule after a failure, for a name its caller resolved"),
     ("table_for_tests", "a slot primitive: never called by the engine"),
     ("take_table", "a slot primitive: its callers dispatch"),
     ("take_partitioned", "a slot primitive: drop_partitioned's removal, after its dispatch"),
@@ -282,6 +287,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
     fns.extend(name_keyed(include_str!("partitioned.rs")));
     fns.extend(name_keyed(include_str!("relation.rs")));
     fns.extend(name_keyed(include_str!("slots.rs")));
+    fns.extend(name_keyed(include_str!("reload.rs")));
 
     // A reader that found nothing would pass vacuously; and a multi-line
     // parameter list must still be read.
@@ -290,6 +296,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
         "move_table_to_backend",
         "rename_table",
         "reload_table",
+        "reload_with",
         "drop_table_to_depth",
         "check_recreatable",
         "copy_table_files",

@@ -130,7 +130,19 @@ impl Database {
         let role = role_for(owner, mode);
         match self.row_locks.table_locks().request(owner.owner, &key, mode, role) {
             Request::Granted => Ok(()),
-            Request::Queued(wait) => Box::pin(self.wait_queued(wait, mode)).await,
+            Request::Queued(wait) => {
+                // §7 step 1: "no `table_for` wait happens after step 2(a)".
+                // A reload's complete lock set is taken before it retires
+                // anything; a wait in its steps would be unbounded under
+                // `lock_timeout = 0` and land a 40P01 halfway through.
+                debug_assert!(
+                    !super::reload::in_reload_steps(),
+                    "a table-lock wait for {} on \"{}\" inside a reload's steps 2-4 (§7 step 1)",
+                    mode_name(mode),
+                    name
+                );
+                Box::pin(self.wait_queued(wait, mode)).await
+            }
         }
     }
 
@@ -167,7 +179,15 @@ impl Database {
         if slot.is_live() {
             return Ok(Some(slot.load()));
         }
-        // Replaced (a reload) or dropped while the request waited.
+        // Dropped (DROP, the old name of a RENAME) while the request waited:
+        // a reload or a MOVE swaps the instance and keeps the slot live. The
+        // name is resolved again, and that is 42P01 by design, not by luck:
+        // the lock is the name's, and a CREATE of the name takes ACCESS
+        // EXCLUSIVE on it too, so one that asked after this request queues
+        // behind it (rule (a)) and cannot have installed a table in between.
+        // One that asked first ran first, and its table is the one the name
+        // means now, under the lock this request holds: PostgreSQL's
+        // re-resolution after a lock wait.
         Ok(self.slot(name).map(|slot| slot.load()))
     }
 
@@ -195,6 +215,97 @@ impl Database {
             return Ok(Some(Relation::Plain(slot.load())));
         }
         Ok(self.relation(name))
+    }
+
+    /// [`Database::tables_for`] for a DDL's complete lock set (§7 step 1):
+    /// every name is locked whether or not a table is registered under it.
+    /// A name a DDL creates (`CREATE TABLE`'s, a `RENAME`'s target) or drops
+    /// `IF EXISTS` is locked too, so a concurrent `CREATE`, `RENAME` or
+    /// `DROP` of that name is serialised against it instead of racing it.
+    /// Exempt relations are skipped. In name order, deduplicated with the
+    /// strongest mode per name.
+    pub(crate) async fn lock_names(
+        &self,
+        set: &[(String, TableMode)],
+        owner: Option<StatementOwner>,
+    ) -> Result<(), String> {
+        if owner.is_none() || set.is_empty() {
+            return Ok(());
+        }
+        let mut wanted: smallvec::SmallVec<[(&str, TableMode); 4]> = smallvec::SmallVec::new();
+        for (name, mode) in set {
+            if lock_exempt(name) || name.is_empty() {
+                continue;
+            }
+            match wanted.iter_mut().find(|(n, _)| *n == name.as_str()) {
+                Some((_, m)) => *m = stronger(*m, *mode),
+                None => wanted.push((name.as_str(), *mode)),
+            }
+        }
+        wanted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (name, mode) in wanted {
+            self.lock_table(name, owner, mode).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the running statement may change `name` as a DDL does: its
+    /// owner holds ACCESS EXCLUSIVE on it. True outside every owner scope
+    /// (start-up, recovery, tests below the statement layer, which take no
+    /// locks) and for an exempt relation, which takes none (finding L12).
+    /// What `reload_with`, DROP, RENAME and MOVE assert (§7 step 1).
+    pub(crate) fn exclusive_held(&self, name: &str) -> bool {
+        if lock_exempt(name) || !crate::core::mvcc::owner::in_scope() {
+            return true;
+        }
+        crate::core::mvcc::owner::current().is_some_and(|o| {
+            self.row_locks
+                .table_locks()
+                .holds(o.owner, &self.lock_key(name))
+                .contains(TableMode::AccessExclusive)
+        })
+    }
+
+    /// The instance registered under `name`, for a DDL's internals that run
+    /// under the ACCESS EXCLUSIVE their statement took on it: DROP's,
+    /// RENAME's and MOVE's own table, a reload's old instance, and the FK
+    /// children a parent's DDL rewrites (finding L11). Never waits; asserts
+    /// the lock (a debug assertion: [`Database::exclusive_held`]).
+    pub(crate) fn table_held(&self, name: &str) -> Option<Arc<DbTable>> {
+        debug_assert!(
+            self.exclusive_held(name),
+            "\"{name}\" is reached by a DDL that does not hold ACCESS EXCLUSIVE on it (§7 step 1)"
+        );
+        self.slot(name).map(|slot| slot.load())
+    }
+
+    /// The tables whose live foreign keys name `parent` as their parent,
+    /// `parent` itself included when it references itself: the children a
+    /// DDL on `parent` may rewrite (finding L11). A metadata walk, no lock;
+    /// stable once the caller holds ACCESS EXCLUSIVE on `parent`, since
+    /// adding a child (`ADD FOREIGN KEY`, `CREATE TABLE … REFERENCES`) takes
+    /// SHARE on the parent, which conflicts with it.
+    pub(crate) fn fk_children(&self, parent: &str) -> Vec<String> {
+        self.fk_children_on(parent, None)
+    }
+
+    /// [`Database::fk_children`], narrowed to the children whose keys
+    /// reference one of `columns` of `parent` (`None`: any column): the only
+    /// children a column's DDL on the parent rewrites or reads, so an ADD,
+    /// DROP or RENAME COLUMN waits for no other child's readers.
+    pub(crate) fn fk_children_on(&self, parent: &str, columns: Option<&[&str]>) -> Vec<String> {
+        let mut children = Vec::new();
+        self.each_schema(|name, schema| {
+            if schema.foreign_keys.iter().any(|fk| {
+                !fk.is_deleted
+                    && fk.parent_table.eq_ignore_ascii_case(parent)
+                    && columns.is_none_or(|cs| cs.iter().any(|c| fk.parent_column.eq_ignore_ascii_case(c)))
+            }) {
+                children.push(name.to_string());
+            }
+        });
+        children.sort();
+        children
     }
 
     /// Takes a statement's whole known table set at once (§7 Acquisition):

@@ -42,22 +42,34 @@ const MAP_FIELDS: &[(&str, &str, &str, usize)] = &[
     ("partitioned_tables", MOD, "try_new_named", 1),
 ];
 
-/// Every caller of the escape hatches, `(file, fn, count)`, with the two
-/// definitions. B3b drained the executor, the wire and the rebalance plan to
-/// `table_for` / `relation_for` / `schema_view` (see [`FORMER_ESCAPES`]);
-/// what is left takes a `Table` with no lock of its own for a reason:
-const ESCAPES: &[(&str, &str, usize)] = &[
-    // The definitions.
-    (SLOTS, "table_unlocked", 1),
-    (SLOTS, "each_table_unlocked", 1),
-    // DROP's internals: run under the ACCESS EXCLUSIVE `execute_drop_table`
-    // takes on the name before it calls `drop_table`; B4 asserts it there
-    // and marks the slot dropped under it.
+/// Every caller of the escape hatches `table_unlocked` and
+/// `each_table_unlocked`, `(file, fn, count)`. B3b drained the executor, the
+/// wire and the rebalance plan to `table_for` / `relation_for` /
+/// `schema_view` (see [`FORMER_ESCAPES`]); B4 drained the last three (DROP's
+/// internals, and the FK-sidecar walks `other_foreign_keys` and
+/// `retarget_parent`) to [`HELD`]'s `table_held`, which asserts the ACCESS
+/// EXCLUSIVE their statement took, and removed the hatches. Empty: a hatch
+/// defined again, or called, fails here.
+const ESCAPES: &[(&str, &str, usize)] = &[];
+
+/// Every caller of `table_held`, `(file, fn, count)`: a DDL's internals
+/// reaching a table under the ACCESS EXCLUSIVE their statement took (the
+/// accessor debug-asserts it and never waits), each with its reason.
+const HELD: &[(&str, &str, usize)] = &[
+    // The definition.
+    ("core/database/table_for.rs", "table_held", 1),
+    // DROP's own table, under the AE `execute_drop_table` (or a parent's
+    // drop, for a shadow table) took on the name.
     (MOD, "drop_table_to_depth", 1),
-    // A rename's and a column change's walk over every *other* table's
-    // foreign-key sidecar (the children), under the DDL's ACCESS EXCLUSIVE
-    // on its own table only: the children's lock set is B4's (finding L11:
-    // FK DDL adds the other side in name order).
+    // A reload's old instance (§7 steps 1-2), under the AE its DDL took.
+    ("core/database/reload.rs", "reload_with", 1),
+    // RENAME's and MOVE's own table, retired under their AE.
+    ("core/database/reload.rs", "retire_current", 1),
+    // A test probe at the reload's steps (compiled into test builds only).
+    ("core/database/reload.rs", "reached", 1),
+    // The FK children a parent's ADD/DROP/RENAME COLUMN or RENAME TO
+    // rewrites, under the AE `executor::alter_lock_set` took on each
+    // (finding L11).
     ("core/rql/column_declarations.rs", "other_foreign_keys", 1),
     ("core/rql/column_declarations.rs", "retarget_parent", 1),
 ];
@@ -303,6 +315,29 @@ fn the_table_maps_are_named_only_by_the_slot_primitives() {
     );
 }
 
+/// B4: `table_held`'s callers are exactly [`HELD`].
+#[test]
+fn the_held_accessor_has_exactly_the_listed_callers() {
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
+    for (rel, text) in sources() {
+        if is_test_file(&rel) || !text.contains("table_held") {
+            continue;
+        }
+        for (at, n) in occurrences(&parse(&rel, &text), "table_held") {
+            seen.push((rel.clone(), at, n));
+        }
+    }
+    seen.sort();
+    let mut expected: Vec<(String, String, usize)> =
+        HELD.iter().map(|(r, f, n)| (r.to_string(), f.to_string(), *n)).collect();
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "table_held's callers changed: it hands a DDL's internals a table under the ACCESS EXCLUSIVE \
+         their statement took; executing code takes table_for"
+    );
+}
+
 /// 2: the escape hatches' callers are exactly [`ESCAPES`].
 #[test]
 fn the_escape_hatches_have_exactly_the_listed_callers() {
@@ -406,7 +441,6 @@ fn every_lookup_by_name_goes_through_resolve() {
         "schema_view",
         "relation",
         "has_table",
-        "table_unlocked",
         "partitioned_table",
     ] {
         assert!(
@@ -468,7 +502,8 @@ fn every_ddl_mutator_resolves_its_key_first() {
     const MUTATORS: &[(&str, &str)] = &[
         (MOD, "drop_table_to_depth"),
         (MOD, "move_table_to_backend"),
-        (MOD, "reload_table"),
+        ("core/database/reload.rs", "reload_with"),
+        ("core/database/reload.rs", "reopen_fresh"),
         (MOD, "rename_table"),
         ("core/database/partitioned.rs", "drop_partitioned"),
     ];

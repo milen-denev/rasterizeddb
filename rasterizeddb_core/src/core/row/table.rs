@@ -208,6 +208,11 @@ pub struct Table<S: StorageIO> {
     filters_ready: StdArc<CacheGuard<AtomicBool>>,
     /// Drop signal for the maintenance task.
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    /// Held by the reclamation service for each piece of work it does on
+    /// this instance, and by [`Table::vacuum_now`]: what [`Table::retire`]
+    /// waits on, so a retired instance has no vacuum still writing through
+    /// its providers (§7 step 2(b), RV14).
+    maintenance_tick: StdArc<tokio::sync::Mutex<()>>,
 }
 
 /// A table's row storage and what indexes it: the part a partition shell does
@@ -848,6 +853,7 @@ impl<S: StorageIO> Table<S> {
             filters_ready: StdArc::new(CacheGuard::new(AtomicBool::new(true))),
             // Nothing watches it: the shell spawns no task.
             maintenance_alive: StdArc::new(CacheGuard::new(AtomicBool::new(false))),
+            maintenance_tick: StdArc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1298,6 +1304,7 @@ impl<S: StorageIO> Table<S> {
         let write_lock = StdArc::new(tokio::sync::RwLock::new(()));
         let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
         let forget = StdArc::new(std::sync::OnceLock::new());
+        let maintenance_tick = StdArc::new(tokio::sync::Mutex::new(()));
 
         if crate::vacuum_enabled() {
             VacuumService {
@@ -1308,6 +1315,7 @@ impl<S: StorageIO> Table<S> {
                 readers: readers.clone(),
                 stats: vacuum_stats.clone(),
                 alive: maintenance_alive.clone(),
+                tick: maintenance_tick.clone(),
                 mutations: write_generation.clone(),
                 dead_stamps: dead_stamps.clone(),
                 versions: versions.clone(),
@@ -1361,7 +1369,30 @@ impl<S: StorageIO> Table<S> {
             cache_generation,
             filters_ready,
             maintenance_alive,
+            maintenance_tick,
         }
+    }
+
+    /// Retires this instance (§7 step 2): its maintenance stops, and any
+    /// vacuum work in flight on it (the reclamation service's current
+    /// sweep, a manual `VACUUM`) has finished when this returns. Reads
+    /// through an instance a statement still holds keep working: retiring
+    /// stops only the background writers, so the reload that replaces this
+    /// instance never has two maintenance tasks on one set of files.
+    ///
+    /// Called with ACCESS EXCLUSIVE held on the table's name (or with no
+    /// lock owner at all), so no statement is using the instance. The flag
+    /// goes first: a sweep in flight checks it between batches and while it
+    /// waits for a permit, which bounds the wait below.
+    pub async fn retire(&self) {
+        self.maintenance_alive.store(false, AtomicOrdering::Release);
+        let _joined = self.maintenance_tick.lock().await;
+    }
+
+    /// Whether [`Table::retire`] has run (or the table was dropped, or is a
+    /// shell, which runs no maintenance).
+    pub fn is_retired(&self) -> bool {
+        !self.maintenance_alive.load(AtomicOrdering::Acquire)
     }
 
     /// The highest id the sequence reservation covers, for tests.
@@ -1423,6 +1454,7 @@ impl<S: StorageIO> Table<S> {
             cache_generation: &self.cache_generation,
             dead_stamps: &self.dead_stamps,
             drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
+            alive: None,
         };
         crate::core::vacuum::neutralize_aborted(&parts, &manager, handle).await
     }
@@ -1544,6 +1576,8 @@ impl<S: StorageIO> Table<S> {
     /// with `deferred` set and nothing is published.
     pub async fn vacuum_now(&self) -> Result<VacuumReport> {
         let d = self.data()?;
+        // Joined by `retire`, like the service's own sweeps.
+        let _tick = self.maintenance_tick.lock().await;
         let config = VacuumConfig::default();
         let horizon = self.version_horizon();
         let index_fetch = d

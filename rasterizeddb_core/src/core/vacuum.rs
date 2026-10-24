@@ -1803,6 +1803,11 @@ pub struct VacuumService<S: StorageIO> {
     pub stats: Arc<VacuumStats>,
     /// Cleared when the table is dropped; the loop stops on the next slice.
     pub alive: Arc<CacheGuard<AtomicBool>>,
+    /// Held for each piece of work a tick does (a forget sweep, a
+    /// reclamation sweep), after its permit: `Table::retire` clears `alive`
+    /// and then takes it, so it returns only once no sweep is writing
+    /// through this instance's providers (§7 step 2(b), RV14).
+    pub tick: Arc<tokio::sync::Mutex<()>>,
     /// Bumped by every committed `DELETE` and `UPDATE`. Nothing else can create
     /// dead space, so an unchanged value means there is nothing new to find.
     pub mutations: Arc<CacheGuard<AtomicU64>>,
@@ -1915,6 +1920,10 @@ impl<S: StorageIO> VacuumService<S> {
                 && manager.settle_bound().saturating_sub(handle.horizon()) >= FORGET_STEP
             {
                 if let Some(_permit) = sweep_scheduler().acquire(1.0, &self.alive).await {
+                    let _tick = self.tick.lock().await;
+                    if !self.alive.load(Ordering::Acquire) {
+                        return ControlFlow::Break(());
+                    }
                     let parts = NeutralizeParts {
                         io_pointers: &*self.io_pointers,
                         write_lock: &self.write_lock,
@@ -1924,6 +1933,7 @@ impl<S: StorageIO> VacuumService<S> {
                         cache_generation: &self.cache_generation,
                         dead_stamps: &self.dead_stamps,
                         drain_timeout: self.config.drain_timeout,
+                        alive: Some(&self.alive),
                     };
                     match neutralize_aborted(&parts, &manager, handle).await {
                         Ok(report) if report.tombstoned + report.cleared > 0 => info!(
@@ -1986,6 +1996,11 @@ impl<S: StorageIO> VacuumService<S> {
         let Some(_permit) = sweep_scheduler().acquire(priority, &self.alive).await else {
             return ControlFlow::Break(());
         };
+        // Joined by `Table::retire` (see `tick`).
+        let _tick = self.tick.lock().await;
+        if !self.alive.load(Ordering::Acquire) {
+            return ControlFlow::Break(());
+        }
 
         let horizon = match self.versions.load_full() {
             Some(manager) => VersionHorizon::sample(&manager),
@@ -2128,6 +2143,11 @@ pub struct NeutralizeParts<'a, S: StorageIO> {
     /// follows. Aborted inserts were never counted anywhere else.
     pub dead_stamps: &'a AtomicU64,
     pub drain_timeout: std::time::Duration,
+    /// The service's liveness flag, checked between batches and while
+    /// readers drain: a retired table's sweep stops at the next batch
+    /// boundary without advancing (RV14), so retirement waits for one batch,
+    /// not one sweep. `None` for an explicit sweep, which runs to its end.
+    pub alive: Option<&'a AtomicBool>,
 }
 
 /// Whether `pointer` carries the id of a transaction below `bound` that did
@@ -2193,7 +2213,13 @@ pub async fn neutralize_aborted<S: StorageIO>(
 
     // 3. Rewrite them.
     let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
+    let retired = || parts.alive.is_some_and(|alive| !alive.load(Ordering::Acquire));
     for batch in candidates.chunks(1024) {
+        // Stopping between batches leaves every batch whole and the horizon
+        // where it was, which is safe: it only pins.
+        if retired() {
+            return Ok(report);
+        }
         let _write = parts.write_lock.write().await;
         let txn = parts.io_pointers.begin_txn();
         let mut token = txn;
@@ -2239,7 +2265,7 @@ pub async fn neutralize_aborted<S: StorageIO>(
     let barrier = parts.readers.barrier();
     let deadline = std::time::Instant::now() + parts.drain_timeout;
     while !parts.readers.drained_past(barrier) {
-        if std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline || retired() {
             return Ok(report);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2461,6 +2487,7 @@ mod tests {
             readers: Arc::new(ReaderRegistry::new()),
             stats: stats.clone(),
             alive: alive.clone(),
+            tick: Arc::new(tokio::sync::Mutex::new(())),
             mutations: Arc::new(CacheGuard::new(AtomicU64::new(0))),
             dead_stamps: Arc::new(AtomicU64::new(0)),
             versions: Arc::new(arc_swap::ArcSwapOption::empty()),

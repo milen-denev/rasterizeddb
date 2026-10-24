@@ -7756,30 +7756,93 @@ impl Drop for ModeRelease {
     }
 }
 
-/// `VACUUM`'s lock on one table: ROW EXCLUSIVE through `relation_for`, and
-/// for a bare `VACUUM` (`per_table`) a guard that gives it back when the
-/// table is done, unless the owner held it before.
+/// One table's own lock owner for a bare autocommit `VACUUM` (finding L6):
+/// begun for the table and ended, its lock released, when the table is done,
+/// as PostgreSQL vacuums each table in a transaction of its own.
+struct VacuumOwner {
+    database: Arc<Database>,
+    owner: crate::core::mvcc::owner::StatementOwner,
+}
+
+impl Drop for VacuumOwner {
+    fn drop(&mut self) {
+        self.database.row_locks.release_owner(self.owner.owner);
+        self.database.transactions.end_owner(self.owner.owner.id());
+    }
+}
+
+/// What gives a bare `VACUUM`'s lock on one table back when it moves on.
+#[allow(dead_code)] // held for its `Drop`
+enum VacuumRelease {
+    /// A table's own owner (autocommit).
+    Owner(VacuumOwner),
+    /// The block's one mode on the table (a block has one owner).
+    Mode(ModeRelease),
+}
+
+/// The mode `VACUUM` takes on each table it vacuums (finding L6). Plain
+/// `VACUUM` rebuilds the free list beside running DML, so it takes ROW
+/// EXCLUSIVE: it conflicts with a DDL's ACCESS EXCLUSIVE (no reload swaps or
+/// retires the instance under it) and with SHARE, not with INSERT, UPDATE,
+/// DELETE or SELECT. PostgreSQL's SHARE UPDATE EXCLUSIVE has no exact match
+/// in the four modes, and the never-weaker mapping (ACCESS EXCLUSIVE) would
+/// stop all DML for a plain VACUUM, which PostgreSQL never does; ROW
+/// EXCLUSIVE keeps what matters, the conflict with DDL. `VACUUM FULL`
+/// rewrites the table and takes ACCESS EXCLUSIVE, as in PostgreSQL.
+pub(crate) fn vacuum_mode(full: bool) -> TableMode {
+    if full {
+        TableMode::AccessExclusive
+    } else {
+        TableMode::RowExclusive
+    }
+}
+
+/// `VACUUM`'s lock on one table, in [`vacuum_mode`], through
+/// `relation_for`. A named `VACUUM t` holds it under the statement's owner
+/// to the statement's end. A bare `VACUUM` (`per_table`) gives each table's
+/// back when it moves on, so it never holds every table at once: in
+/// autocommit each table is taken under an owner of its own
+/// ([`VacuumOwner`]); in a block, under the block's owner, released unless
+/// the block held that mode before.
 async fn vacuum_lock(
     database: &Arc<Database>,
     name: &str,
+    full: bool,
     per_table: bool,
-) -> Result<(Option<crate::core::database::Relation>, Option<ModeRelease>), String> {
+) -> Result<(Option<crate::core::database::Relation>, Option<VacuumRelease>), String> {
+    use crate::core::mvcc::owner::{OwnerKind, StatementOwner};
+    let mode = vacuum_mode(full);
     let statement_owner = owner();
+    if per_table && statement_owner.is_some_and(|o| o.kind != OwnerKind::Block) {
+        let Some(own) = crate::core::mvcc::table_locks::LockOwner::autocommit(database.transactions.begin_owner())
+        else {
+            return Err("internal error: no lock owner for VACUUM".to_string());
+        };
+        let guard = VacuumOwner {
+            database: database.clone(),
+            owner: StatementOwner {
+                owner: own,
+                kind: OwnerKind::Statement,
+            },
+        };
+        let relation = database.relation_for(name, Some(guard.owner), mode).await?;
+        return Ok((relation, Some(VacuumRelease::Owner(guard))));
+    }
     let held_before = statement_owner.is_some_and(|o| {
         database
             .row_locks
             .table_locks()
             .holds(o.owner, &database.lock_key(name))
-            .contains(TableMode::RowExclusive)
+            .contains(mode)
     });
-    let relation = database
-        .relation_for(name, statement_owner, TableMode::RowExclusive)
-        .await?;
-    let release = (per_table && !held_before).then(|| ModeRelease {
-        database: database.clone(),
-        owner: statement_owner.map(|o| o.owner),
-        table: database.lock_key(name).into_owned(),
-        mode: TableMode::RowExclusive,
+    let relation = database.relation_for(name, statement_owner, mode).await?;
+    let release = (per_table && !held_before).then(|| {
+        VacuumRelease::Mode(ModeRelease {
+            database: database.clone(),
+            owner: statement_owner.map(|o| o.owner),
+            table: database.lock_key(name).into_owned(),
+            mode,
+        })
     });
     Ok((relation, release))
 }
@@ -8882,10 +8945,9 @@ async fn compute_generated_column(database: &Arc<Database>, table_name: &str, co
 /// As PostgreSQL does it: the expression must compile against the table, every
 /// existing row must satisfy it (a NULL result passes), and only then is it
 /// stored and enforced on every later write.
-async fn add_check_constraint<S: crate::core::storage_providers::traits::StorageIO>(
+async fn add_check_constraint(
     table_name: &str,
     schema: &crate::core::row::schema::TableSchema,
-    io_schema: &rclite::Arc<S>,
     description: &str,
     expression: String,
     database: &Arc<Database>,
@@ -8930,12 +8992,18 @@ async fn add_check_constraint<S: crate::core::storage_providers::traits::Storage
         expression,
         is_deleted: false,
     };
-    if let Err(e) = crate::core::rql::check::append(io_schema.clone(), &entry).await {
-        return ddl_error(&e.to_string());
-    }
-    match database.reload_table(table_name).await {
+    // §7 step 3: the reload's work, after the rows were checked under the
+    // same ACCESS EXCLUSIVE.
+    match database
+        .reload_with(table_name, |old| async move {
+            crate::core::rql::check::append(old.io_schema.clone(), &entry)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+    {
         Ok(()) => ddl_ok(0),
-        Err(e) => ddl_error(&e.to_string()),
+        Err(failure) => reload_failed(failure, ""),
     }
 }
 
@@ -8947,12 +9015,10 @@ async fn execute_alter_table_action(
     use crate::core::rql::lexer_alter::AlterAction;
     use crate::core::rql::nullable;
 
-    // The map guard is released immediately: `reload_table` removes the entry,
-    // and holding a read guard across that would deadlock the shard.
     let (mut schema, io_schema, row_count) = {
-        // ACCESS EXCLUSIVE before the schema is read (§7; B4 adds the reload
-        // under it): every reader and writer of the table has finished, and
-        // none starts until this statement ends.
+        // ACCESS EXCLUSIVE before the schema is read (§7): every reader and
+        // writer of the table has finished, and none starts until this
+        // statement ends.
         let table_ref = match database
             .table_for(&plan.table_name, owner(), TableMode::AccessExclusive)
             .await
@@ -8977,6 +9043,18 @@ async fn execute_alter_table_action(
             data.len.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
+
+    // The rest of the action's complete lock set (§7 step 1, finding L11):
+    // the RENAME target, the FK children whose sidecars it rewrites, the
+    // parent of a foreign key it adds or drops. The statement took it with
+    // its own name, in name order; read again here under this table's
+    // ACCESS EXCLUSIVE, which stops a child appearing (adding one takes
+    // SHARE on this table), and anything new is taken now, with graph
+    // edges, before a single sidecar is written. So a 55P03 or 40P01 here
+    // has written nothing.
+    if let Err(e) = database.lock_names(&alter_lock_set(&plan, database), owner()).await {
+        return ddl_error(&e);
+    }
 
     match plan.action {
         // Logged rather than silent, so a migration that depended on one is
@@ -9505,59 +9583,15 @@ async fn execute_alter_table_action(
             // not an error: the constraint is gone either way, which is what
             // the statement asked for.
             if drop {
-                let name = description
-                    .split_whitespace()
-                    .find(|w| {
-                        !matches!(
-                            w.to_ascii_uppercase().as_str(),
-                            "CONSTRAINT" | "IF" | "EXISTS"
-                        )
-                    })
-                    .map(|n| n.trim_matches('"').to_string());
-
-                if let Some(name) = name {
-                    let removed = match foreign_key::remove(io_schema.clone(), &name).await {
-                        Ok(found) => found,
-                        Err(e) => return ddl_error(&e.to_string()),
-                    };
-                    let removed = match crate::core::rql::unique_key::remove(
-                        io_schema.clone(),
-                        &name,
-                    )
-                    .await
-                    {
-                        Ok(found) => removed || found,
-                        Err(e) => return ddl_error(&e.to_string()),
-                    };
-                    // A CHECK is retired by a tombstone under its name; the
-                    // last record of a name wins when the sidecar is read.
-                    let removed = match schema
-                        .checks
-                        .iter()
-                        .find(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name))
-                    {
-                        Some(check) => {
-                            let tombstone = crate::core::rql::check::CheckConstraint {
-                                is_deleted: true,
-                                ..check.clone()
-                            };
-                            if let Err(e) = crate::core::rql::check::append(io_schema.clone(), &tombstone).await {
-                                return ddl_error(&e.to_string());
-                            }
-                            true
-                        }
-                        None => removed,
-                    };
-
-                    if removed {
-                        // The sidecars are the source of truth; reloading picks
-                        // the removal up.
-                        return match database.reload_table(&plan.table_name).await {
-                            Ok(()) => ddl_ok(0),
-                            Err(e) => ddl_error(&e.to_string()),
-                        };
-                    }
-
+                if let Some(name) = dropped_constraint_name(&description) {
+                    // What the name matches, read from the open schema (the
+                    // sidecars' loaded copy, which nothing changes while this
+                    // statement holds ACCESS EXCLUSIVE): a name matching
+                    // nothing reloads nothing.
+                    let named = |n: &str| n.eq_ignore_ascii_case(&name);
+                    let stored = schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
+                        || schema.unique_keys.iter().any(|k| !k.is_deleted && named(&k.name))
+                        || schema.checks.iter().any(|c| !c.is_deleted && named(&c.name));
                     // A column declared `UNIQUE` inline is a flag on the field,
                     // not a named sidecar, so no name could ever match it —
                     // and `DROP CONSTRAINT <table>_<column>_key`, which is what
@@ -9565,13 +9599,53 @@ async fn execute_alter_table_action(
                     // against PostgreSQL asks for, silently did nothing. The
                     // constraint then outlived the migration meant to replace
                     // it and rejected rows the new one allows.
-                    if let Some(column) = implicit_unique_column(&name, &schema.fields) {
-                        schema
-                            .set_field_unique(&column, false, io_schema.clone())
+                    let implicit = implicit_unique_column(&name, &schema.fields);
+                    if stored || implicit.is_some() {
+                        // §7 step 3: the removals are the reload's work. Both
+                        // sidecars are tried, since the name alone does not say
+                        // which kind it was; the sidecars are the source of
+                        // truth, and the reload picks the removal up.
+                        let mut schema = schema.clone();
+                        let reloaded = database
+                            .reload_with(&plan.table_name, |old| async move {
+                                let io_schema = old.io_schema.clone();
+                                let removed = foreign_key::remove(io_schema.clone(), &name)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                let removed = crate::core::rql::unique_key::remove(io_schema.clone(), &name)
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                    || removed;
+                                // A CHECK is retired by a tombstone under its
+                                // name; the last record of a name wins when the
+                                // sidecar is read.
+                                let check = schema
+                                    .checks
+                                    .iter()
+                                    .find(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name))
+                                    .cloned();
+                                let removed = match check {
+                                    Some(check) => {
+                                        let tombstone = crate::core::rql::check::CheckConstraint {
+                                            is_deleted: true,
+                                            ..check
+                                        };
+                                        crate::core::rql::check::append(io_schema.clone(), &tombstone)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                        true
+                                    }
+                                    None => removed,
+                                };
+                                if !removed && let Some(column) = implicit {
+                                    schema.set_field_unique(&column, false, io_schema).await;
+                                }
+                                Ok(())
+                            })
                             .await;
-                        return match database.reload_table(&plan.table_name).await {
+                        return match reloaded {
                             Ok(()) => ddl_ok(0),
-                            Err(e) => ddl_error(&e.to_string()),
+                            Err(failure) => reload_failed(failure, ""),
                         };
                     }
                 }
@@ -9618,13 +9692,19 @@ async fn execute_alter_table_action(
                 {
                     return ddl_error(&format!("column '{}' does not exist", fk.column));
                 }
-                if let Err(e) = foreign_key::append(io_schema.clone(), &fk).await {
-                    return ddl_error(&e.to_string());
-                }
-                // The sidecar is the source of truth; reloading picks it up.
-                return match database.reload_table(&plan.table_name).await {
+                // §7 step 3: the declaration is the reload's work, under
+                // this table's ACCESS EXCLUSIVE and SHARE on the parent
+                // (finding L11: a parent DELETE in flight finishes before the
+                // key exists, and none starts until it is enforced). The
+                // sidecar is the source of truth; reloading picks it up.
+                return match database
+                    .reload_with(&plan.table_name, |old| async move {
+                        foreign_key::append(old.io_schema.clone(), &fk).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                {
                     Ok(()) => ddl_ok(0),
-                    Err(e) => ddl_error(&e.to_string()),
+                    Err(failure) => reload_failed(failure, ""),
                 };
             }
 
@@ -9697,16 +9777,19 @@ async fn execute_alter_table_action(
                         Ok(None) => {}
                     }
 
-                    if let Err(e) =
-                        crate::core::rql::unique_key::append(io_schema.clone(), &key).await
-                    {
-                        return ddl_error(&e.to_string());
-                    }
-                    // The sidecar is the source of truth; reloading picks it up,
+                    // §7 step 3: the declaration is the reload's work. The
+                    // sidecar is the source of truth; reloading picks it up,
                     // which is also what arms the write lock for it.
-                    return match database.reload_table(&plan.table_name).await {
+                    return match database
+                        .reload_with(&plan.table_name, |old| async move {
+                            crate::core::rql::unique_key::append(old.io_schema.clone(), &key)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
                         Ok(()) => ddl_ok(0),
-                        Err(e) => ddl_error(&e.to_string()),
+                        Err(failure) => reload_failed(failure, ""),
                     };
                 }
                 Ok(None) => {}
@@ -9718,7 +9801,7 @@ async fn execute_alter_table_action(
             // then succeeded.
             let (_, check_expression) = crate::core::rql::check::split_clause(&description);
             if let Some(expression) = check_expression {
-                return add_check_constraint(&plan.table_name, &schema, &io_schema, &description, expression, database, tx)
+                return add_check_constraint(&plan.table_name, &schema, &description, expression, database, tx)
                     .await;
             }
 
@@ -9745,14 +9828,17 @@ async fn execute_alter_table_action(
                 expression: expression.clone().unwrap_or_default(),
                 is_deleted: expression.is_none(),
             };
-            if let Err(e) =
-                crate::core::rql::column_default::append(io_schema.clone(), &entry).await
+            // §7 step 3: the reload's work.
+            return match database
+                .reload_with(&plan.table_name, |old| async move {
+                    crate::core::rql::column_default::append(old.io_schema.clone(), &entry)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
             {
-                return ddl_error(&e.to_string());
-            }
-            return match database.reload_table(&plan.table_name).await {
                 Ok(()) => ddl_ok(0),
-                Err(e) => ddl_error(&e.to_string()),
+                Err(failure) => reload_failed(failure, ""),
             };
         }
         AlterAction::AlterColumn { name, detail } => {
@@ -9926,6 +10012,18 @@ async fn execute_alter_table_action(
     }
 }
 
+/// A reload's failure (§7 steps 2-4) as a DDL reports it: its own work's
+/// message, or why the table could not be reopened after it, prefixed with
+/// what had already happened.
+fn reload_failed(failure: crate::core::database::reload::ReloadFailure, reopen_context: &str) -> Vec<u8> {
+    use crate::core::database::reload::ReloadFailure;
+    match failure {
+        ReloadFailure::Work(e) => ddl_error(&e),
+        ReloadFailure::Reopen(e) if reopen_context.is_empty() => ddl_error(&e.to_string()),
+        ReloadFailure::Reopen(e) => ddl_error(&format!("{reopen_context}: {e}")),
+    }
+}
+
 /// Records an index over a path into a document.
 ///
 /// The declaration is persisted and the table reopened so it takes effect; it
@@ -9946,9 +10044,9 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
     if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
         return ddl_error(&e);
     }
-    let (io_schema, declared, column_is_a_document) = {
-        // ACCESS EXCLUSIVE before the schema is read (§7; B4 moves the
-        // declaration into the reload under it).
+    let (declared, column_is_a_document) = {
+        // ACCESS EXCLUSIVE before the schema is read (§7); the declaration
+        // is written inside the reload, under it.
         let entry = match database
             .table_for(&statement.table, owner(), TableMode::AccessExclusive)
             .await
@@ -9964,11 +10062,7 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
                 && !f.is_deleted
                 && f.db_type == crate::core::db_type::DbType::JSONB
         });
-        (
-            table.io_schema.clone(),
-            table.schema.path_indexes.clone(),
-            is_document,
-        )
+        (table.schema.path_indexes.clone(), is_document)
     };
 
     if !column_is_a_document {
@@ -10007,14 +10101,14 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         path: key,
         is_deleted: false,
     };
-    if let Err(e) = path_index::append(io_schema, &entry).await {
-        return ddl_error(&e.to_string());
-    }
-    if let Err(e) = database.reload_table(&statement.table).await {
-        return ddl_error(&format!(
-            "the index was recorded but the table could not be reopened: {}",
-            e
-        ));
+    // §7 step 3: the declaration is the reload's work.
+    let reloaded = database
+        .reload_with(&statement.table, |old| async move {
+            path_index::append(old.io_schema.clone(), &entry).await.map_err(|e| e.to_string())
+        })
+        .await;
+    if let Err(failure) = reloaded {
+        return reload_failed(failure, "the index was recorded but the table could not be reopened");
     }
     ddl_ok(0)
 }
@@ -10057,9 +10151,9 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
         return ddl_error(&e);
     }
-    let (io_schema, columns, types) = {
-        // ACCESS EXCLUSIVE before the schema is read (§7; B4 moves the
-        // declaration into the reload under it).
+    let (columns, types) = {
+        // ACCESS EXCLUSIVE before the schema is read (§7); the declaration
+        // is written inside the reload, under it.
         let entry = match database
             .table_for(&statement.table, owner(), TableMode::AccessExclusive)
             .await
@@ -10091,7 +10185,7 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
                 }
             }
         }
-        (table.io_schema.clone(), columns, types)
+        (columns, types)
     };
 
     if index_name_taken(database, &name).is_some() {
@@ -10113,14 +10207,15 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         columns,
         is_deleted: false,
     };
-    if let Err(e) = index::decl::append(io_schema, &decl).await {
-        return ddl_error(&e.to_string());
-    }
-    if let Err(e) = database.reload_table(&statement.table).await {
-        return ddl_error(&format!(
-            "the index was recorded but the table could not be reopened: {}",
-            e
-        ));
+    // §7 step 3: the declaration is the reload's work, so a lock wait that
+    // fails (55P03, 40P01) has written nothing.
+    let reloaded = database
+        .reload_with(&statement.table, |old| async move {
+            index::decl::append(old.io_schema.clone(), &decl).await.map_err(|e| e.to_string())
+        })
+        .await;
+    if let Err(failure) = reloaded {
+        return reload_failed(failure, "the index was recorded but the table could not be reopened");
     }
     info!("Created {} index {} on {}", method.name(), name, statement.table);
     ddl_ok(0)
@@ -10150,7 +10245,6 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
         .iter()
         .find(|i| i.name.eq_ignore_ascii_case(&name))
         .cloned()?;
-    let io_schema = table.io_schema.clone();
     drop(table);
     // Before the tombstone is written, so a refused drop leaves the
     // declaration as it was.
@@ -10161,14 +10255,16 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
         is_deleted: true,
         ..decl
     };
-    if let Err(e) = crate::core::index::decl::append(io_schema, &tombstone).await {
-        return Some(ddl_error(&e.to_string()));
-    }
-    if let Err(e) = database.reload_table(&table_name).await {
-        return Some(ddl_error(&format!(
-            "the index was dropped but the table could not be reopened: {}",
-            e
-        )));
+    // §7 step 3: the tombstone is the reload's work.
+    let reloaded = database
+        .reload_with(&table_name, |old| async move {
+            crate::core::index::decl::append(old.io_schema.clone(), &tombstone)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+    if let Err(failure) = reloaded {
+        return Some(reload_failed(failure, "the index was dropped but the table could not be reopened"));
     }
     Some(ddl_ok(0))
 }
@@ -10202,23 +10298,25 @@ async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Opt
     if !table.schema.unique_keys.iter().any(is_it) {
         return None;
     }
-    let io_schema = table.io_schema.clone();
     drop(table);
-    match crate::core::rql::unique_key::remove(io_schema, &name).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Some(ddl_error(&format!(
-                "index \"{}\" could not be found in the sidecar of '{}'",
-                name, table_name
-            )));
-        }
-        Err(e) => return Some(ddl_error(&e.to_string())),
-    }
-    if let Err(e) = database.reload_table(&table_name).await {
-        return Some(ddl_error(&format!(
-            "the index was dropped but the table could not be reopened: {}",
-            e
-        )));
+    // §7 step 3: the key's removal is the reload's work.
+    let reloaded = database
+        .reload_with(&table_name, |old| {
+            let (name, table_name) = (name.clone(), table_name.clone());
+            async move {
+                match crate::core::rql::unique_key::remove(old.io_schema.clone(), &name).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(format!(
+                        "index \"{}\" could not be found in the sidecar of '{}'",
+                        name, table_name
+                    )),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        })
+        .await;
+    if let Err(failure) = reloaded {
+        return Some(reload_failed(failure, "the index was dropped but the table could not be reopened"));
     }
     Some(ddl_ok(0))
 }
@@ -10251,34 +10349,26 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
     if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
         return ddl_error(&e);
     }
-    let io_schema = {
-        let entry = match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
-            Ok(entry) => entry,
-            Err(e) => return ddl_error(&e),
-        };
-        let Some(table) = entry.as_ref().clone() else {
-            return if if_exists {
-                ddl_ok(0)
-            } else {
-                ddl_error("relation vanished")
-            };
-        };
-        table.io_schema.clone()
-    };
+    match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
+        Ok(Some(_)) => {}
+        Ok(None) if if_exists => return ddl_ok(0),
+        Ok(None) => return ddl_error("relation vanished"),
+        Err(e) => return ddl_error(&e),
+    }
 
     let entry = crate::core::rql::path_index::PathIndex {
         name,
         path: String::new(),
         is_deleted: true,
     };
-    if let Err(e) = path_index::append(io_schema, &entry).await {
-        return ddl_error(&e.to_string());
-    }
-    if let Err(e) = database.reload_table(&table_name).await {
-        return ddl_error(&format!(
-            "the index was dropped but the table could not be reopened: {}",
-            e
-        ));
+    // §7 step 3: the tombstone is the reload's work.
+    let reloaded = database
+        .reload_with(&table_name, |old| async move {
+            path_index::append(old.io_schema.clone(), &entry).await.map_err(|e| e.to_string())
+        })
+        .await;
+    if let Err(failure) = reloaded {
+        return reload_failed(failure, "the index was dropped but the table could not be reopened");
     }
     ddl_ok(0)
 }
@@ -11268,6 +11358,10 @@ fn statement_lock_text(query: &QueryPurpose) -> Option<&str> {
         | QueryPurpose::AddColumn(sql)
         | QueryPurpose::DropColumn(sql)
         | QueryPurpose::RenameColumn(sql) => Some(sql),
+        // `CREATE TABLE n AS SELECT … FROM t` reads t (`lock_set`); a plain
+        // CREATE TABLE's set is empty there, and its arm locks its own name
+        // and its FK parents.
+        QueryPurpose::CreateTable(sql) => Some(sql),
         _ => None,
     }
 }
@@ -11305,7 +11399,138 @@ pub(crate) async fn lock_statement_set(database: &Arc<Database>, sql: &str) -> R
         })
         .collect();
     set.extend(parents);
+    // A DDL's complete lock set (§7 step 1): the names its text shows plus
+    // what only the schemas can say (`ddl_lock_extras`), every name locked
+    // whether or not a table is registered under it yet, all in one name
+    // order. So a RENAME takes its old and new names together, and two
+    // crossed RENAMEs, or a RENAME and a CREATE of its target, serialise
+    // instead of deadlocking on the order they asked in.
+    if let Some(extras) = ddl_lock_extras(sql, database) {
+        set.extend(extras);
+        return database.lock_names(&set, statement_owner).await;
+    }
     database.tables_for(&set, statement_owner).await
+}
+
+/// `CREATE TABLE`'s lock set: ACCESS EXCLUSIVE on the name it creates,
+/// which serialises it against a concurrent CREATE, DROP or RENAME of that
+/// name and keeps statements queued behind a DROP of it from meeting the new
+/// table (they reach the name first; see `table_for`), and SHARE on every
+/// parent its foreign keys reference (finding L11: a child appearing beside
+/// a parent's DELETE or DDL in flight; SHARE for `alter_lock_set`'s reason).
+/// In name order.
+async fn lock_create_target(
+    database: &Arc<Database>,
+    create_table: &crate::core::rql::lexer_ct::CreateTable,
+) -> Result<(), String> {
+    let mut set = vec![(create_table.table_name.clone(), TableMode::AccessExclusive)];
+    set.extend(
+        create_table
+            .foreign_keys
+            .iter()
+            .map(|fk| (fk.parent_table.clone(), TableMode::Share)),
+    );
+    database.lock_names(&set, owner()).await
+}
+
+/// What an `ALTER TABLE` or `DROP TABLE` locks beyond the names its text
+/// shows (§7 step 1), or `None` for any other statement: for ALTER, each
+/// action's [`alter_lock_set`]. Read from the schemas with no lock, so the
+/// arm reads it again under its ACCESS EXCLUSIVE and takes anything new
+/// before it writes.
+fn ddl_lock_extras(sql: &str, database: &Database) -> Option<Vec<(String, TableMode)>> {
+    let first = sql.split_whitespace().next()?;
+    if first.eq_ignore_ascii_case("DROP") {
+        return Some(Vec::new());
+    }
+    if !first.eq_ignore_ascii_case("ALTER") {
+        return None;
+    }
+    let plans = crate::core::rql::lexer_alter::parse_alter_table_actions(sql).ok()?;
+    Some(plans.iter().flat_map(|plan| alter_lock_set(plan, database)).collect())
+}
+
+/// The rest of one ALTER action's complete lock set (§7 step 1, finding
+/// L11), beyond ACCESS EXCLUSIVE on its own table:
+/// - `RENAME TO new`: the new name, ACCESS EXCLUSIVE;
+/// - an action that may rewrite other tables' foreign-key sidecars, through
+///   `column_declarations`: for `RENAME TO` every FK child of the table, for
+///   `ADD`, `DROP` and `RENAME COLUMN` the children whose keys reference that
+///   column; ACCESS EXCLUSIVE, since each is reloaded;
+/// - `ADD` or `DROP` of a foreign key: its parent, SHARE. PostgreSQL takes
+///   SHARE ROW EXCLUSIVE there; SHARE is the mode of the four that conflicts
+///   with what matters (a parent DELETE's ROW EXCLUSIVE, a parent DDL's
+///   ACCESS EXCLUSIVE) without making the DDL wait for the parent's readers.
+///   ACCESS EXCLUSIVE, the never-weaker mapping, would.
+pub(crate) fn alter_lock_set(
+    plan: &crate::core::rql::lexer_alter::AlterTable,
+    database: &Database,
+) -> Vec<(String, TableMode)> {
+    use crate::core::rql::lexer_alter::AlterAction;
+    let table = plan.table_name.as_str();
+    let children = |columns: Option<&[&str]>| {
+        database
+            .fk_children_on(table, columns)
+            .into_iter()
+            .map(|child| (child, TableMode::AccessExclusive))
+            .collect::<Vec<_>>()
+    };
+    match &plan.action {
+        AlterAction::RenameTable { to } => {
+            let mut set = children(None);
+            set.push((to.clone(), TableMode::AccessExclusive));
+            set
+        }
+        // The children `column_declarations` reads and rewrites for the
+        // column: those whose keys reference it (or, for a RENAME, its new
+        // name's leftovers), never the rest.
+        AlterAction::AddColumn { name, .. } | AlterAction::DropColumn { name, .. } => {
+            children(Some(&[name.as_str()]))
+        }
+        AlterAction::RenameColumn { from, to } => children(Some(&[from.as_str(), to.as_str()])),
+        AlterAction::ConstraintClause { drop: false, description } => fk_parent_of_clause(description)
+            .map(|parent| vec![(parent, TableMode::Share)])
+            .unwrap_or_default(),
+        AlterAction::ConstraintClause { drop: true, description } => {
+            let Some(name) = dropped_constraint_name(description) else {
+                return Vec::new();
+            };
+            database
+                .schema_view(table)
+                .map(|view| {
+                    view.schema()
+                        .foreign_keys
+                        .iter()
+                        .filter(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name))
+                        .map(|fk| (fk.parent_table.clone(), TableMode::Share))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The name `ALTER TABLE … DROP CONSTRAINT [IF EXISTS] <name>` drops, read
+/// as the constraint arm reads it.
+fn dropped_constraint_name(description: &str) -> Option<String> {
+    description
+        .split_whitespace()
+        .find(|w| !matches!(w.to_ascii_uppercase().as_str(), "CONSTRAINT" | "IF" | "EXISTS"))
+        .map(|n| n.trim_matches('"').to_string())
+}
+
+/// The parent an `ADD [CONSTRAINT n] FOREIGN KEY … REFERENCES p` names,
+/// parsed as the constraint arm parses it; `None` for any other clause.
+fn fk_parent_of_clause(description: &str) -> Option<String> {
+    let upper = description.to_ascii_uppercase();
+    if !upper.contains("FOREIGN KEY") && !upper.contains("REFERENCES") {
+        return None;
+    }
+    let clause_at = upper.find("FOREIGN KEY").or_else(|| upper.find("REFERENCES")).unwrap_or(0);
+    crate::core::rql::foreign_key::parse_clause(&description[clause_at..], None, None)
+        .ok()
+        .map(|fk| fk.parent_table)
 }
 
 pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
@@ -12174,6 +12399,12 @@ pub(crate) async fn execute_with_need(
                 return ddl_error(&reason);
             }
             if let Some(create_table) = parsed {
+                // ACCESS EXCLUSIVE on the new name and SHARE on each parent it
+                // references, before anything is checked or written (§7; see
+                // `lock_create_target`).
+                if let Err(e) = Box::pin(lock_create_target(&database, &create_table)).await {
+                    return ddl_error(&e);
+                }
                 // `IF NOT EXISTS` means an existing table is success. Checked
                 // before the create rather than by interpreting its failure,
                 // since `add_table` reports one error for every reason.
@@ -13127,13 +13358,21 @@ pub(crate) async fn execute_with_need(
             // Tables compacted whose space could not be given back.
             let mut untruncated: Vec<(String, &'static str)> = Vec::new();
             for name in names {
-                // ROW EXCLUSIVE on each table while it is vacuumed (finding
-                // L6): it conflicts with a DDL's ACCESS EXCLUSIVE, so no
-                // reload swaps the instance under the vacuum. A bare VACUUM
-                // gives each table's back when it moves on (unless the owner
-                // held it already), so it never holds every table at once;
-                // B4 gives each table an owner of its own.
-                let relation = match Box::pin(vacuum_lock(&database, &name, request.table_name.is_none())).await {
+                // ROW EXCLUSIVE (plain) or ACCESS EXCLUSIVE (FULL) on each
+                // table while it is vacuumed (finding L6, `vacuum_mode`):
+                // either conflicts with a DDL's ACCESS EXCLUSIVE, so no reload
+                // swaps or retires the instance under the vacuum. A bare
+                // VACUUM takes each table under an owner of its own and gives
+                // it back when it moves on, so it never holds every table at
+                // once.
+                let relation = match Box::pin(vacuum_lock(
+                    &database,
+                    &name,
+                    request.full,
+                    request.table_name.is_none(),
+                ))
+                .await
+                {
                     Ok(relation) => relation,
                     Err(e) => {
                         let mut result = vec![3u8];

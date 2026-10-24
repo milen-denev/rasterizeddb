@@ -278,7 +278,7 @@ async fn slot_lookup_cost() {
         let map = t.elapsed();
         let t = Instant::now();
         for i in 0..N {
-            // The same body as `table_unlocked`, which this file may not call.
+            // The same body as `table_held`'s lookup.
             std::hint::black_box(db.table_for_tests(if i % 2 == 0 { "lk_7" } else { "lk_19" }));
         }
         let slots = t.elapsed();
