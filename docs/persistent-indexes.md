@@ -1317,6 +1317,154 @@ huge insert-only tables make this painful, "trusted tail resume" becomes a v2
 requirement (R14) with its own durability argument. KV-backed and
 `wal_enabled=false` tables backfill at every open (§14).
 
+**As built (B14).** The filter is under T4: an open that proves its
+snapshot loads the FILTER section and does not rebuild; any other open
+rebuilds exactly as before; `_flt.db` is retired.
+- **The proof** (`index_store::open_proof::prove`, run in `Table::assemble`
+  for plain tables and partitions alike, writing nothing). In order, each
+  failure a `Reject` logged at info (debug for a table that never had a
+  snapshot) and counted by name (`open_proof::rejected_total`): the file set
+  has a directory; no `_flt.db` evidence and no legacy pair; the word is
+  `Clean`; the slot epoch is the recovered `rdb.ixe` record's; `.ixm` reads
+  as this incarnation's log; its last good record is `CLEAN` with no byte
+  after it (B9's `proven_clean`); the `CLEAN`'s identity equals the one the
+  open builds from the files and the binary, field by field (incarnation,
+  slot epoch, slot count, pointer and row file lengths from the providers
+  as the seal sampled them, the whole version tuple with
+  `FILTER_DERIVE_VERSION` and `persist::FORMAT_VER`, the shape hash, and the
+  configuration hash of the filter a rebuild would start from); `.ixs`
+  reads and its length is the `CLEAN`'s; its header crc32c, every section's
+  crc32c and the footer xxh64 verify (`snapshot::decode`); its footer is the
+  `CLEAN`'s and its header identity the `CLEAN`'s; it has a FILTER section
+  exactly when the table has a filter. `rdb_index_snapshot_loaded_total` is
+  `open_proof::loaded_total`.
+- **The load.** `TableFilters::load_sealed` reads the section against the
+  rebuild's template (`for_table` on the live schema and `SET FILTER`
+  settings): the same columns in order by write order and type, each
+  restored with the template's per-column configuration
+  (`persist::deserialize_columns`), so a loaded filter differs from a
+  rebuilt one only in what it has indexed; a section that replays delta
+  records is refused. A load restores `cleared_below` (below) into the
+  table's atomic before the `VacuumService` is spawned, so vacuum's first
+  tick sees it (P23's "vacuum waits for the load" holds by construction: the
+  load is synchronous in the open). The word is vouched only when the
+  loaded filter covers every slot and the word is still `Clean`; a rejected
+  open clears vouched (a reload's live word may have carried it), so its
+  next clean point rewrites the snapshot (§3 rule 2). The word's **state**
+  stays the log's either way (N21): a rejected `CLEAN` is still `Clean`, and
+  the first write makes `DIRTY` durable.
+- **`cleared_below` persisted**: `persist::FORMAT_VER` 6 records it in the
+  superblock (offset 48). v4 and v5 read as 0, which is what every open
+  assumed before, so `OLDEST_READABLE_VER` stays 4 and `FILTER_DERIVE_VERSION`
+  stays 1 (`DERIVE_VERSIONS` gains the row `(1, 6, 4, …)`).
+- **`_flt.db` retired.** No provider opens it: a table holds four files
+  (rows, pointers, schema, sequence; a partition two), the runtime
+  checkpoint loop, the delete/update dirty byte and the checkpoint requests
+  are gone from `table.rs`, compaction no longer checkpoints the filter, and
+  `begin_renumbering_on_disk` is replaced by the in-memory
+  `begin_renumbering`. `Table::checkpoint_filters` is now a mandatory seal
+  (kept for callers that predate B14). At every open,
+  `FileGate::retire_flt` deletes `<stem>_flt.db` and its `.tmp`: beside an
+  existing `.ixm` it is evidence, so `.ixs` is unlinked and the directory
+  fsynced first (failpoint `flt_evidence_before_ixs_unlink` after that
+  sync); the directory log's records for the file are voided before the
+  delete (every open replays the log, which would write it back); a failure
+  of either step keeps the file and starts the word `Unknown`
+  (`WriteGate::start_unknown`, only on an unused word). The `Unknown` slow
+  path deletes a lingering `_flt.db` after the log rewrite or `.ixs` unlink
+  returned, and the word leaves `Unknown` only once that delete returned
+  `Ok` (R9, Q12; failpoint `unknown_flt_delete_order`). The B11 census
+  exemption (`Scope::exempt`) and B12's `Ungated::FilterCheckpoint` are
+  removed: the census is strict for every file of the set. B12's deviation
+  (a) is gone: an open that loads, or rebuilds, writes nothing.
+- **Size reporting** (`relation_size`, introspect's `filters`, the
+  partition totals) counts `.ixs` + `.ixm` (`Table::index_store_bytes`).
+- **S3 snapshots leave the index-store files out** (§10;
+  `backup::excluded_file`): now that an open trusts a proven pair, a fuzzy
+  walk must not pair a copied `CLEAN` with rows changed after it. `rdb.ixe`
+  is kept. A restore rebuilds.
+- **The reaper and DROP**: `partition::files::parse_name` reads
+  `__pt_<uid>_<pid>.(ixs|ixm)(.tmp)?` as the partition's data files, so the
+  startup reaper sweeps an unmaterialized partition's and a dead uid's pair
+  and `remove_all` (a partitioned DROP) removes them; `DATA_SUFFIXES` drops
+  `_flt.db` (a materialized partition must have only rows and pointers), and
+  a materialization deletes leftover `_flt.db`, `.ixs`, `.ixm` and their
+  `.tmp`s with the data files. A plain DROP already swept the pair (B11).
+- **`mark_checkpointed`** is called by the seal under its transient ticket
+  (`SealTarget::before_seal`, `TableFilters::mark_checkpointed` with the
+  ticket's proof), not after publish: after `CLEAN` no ticket may be held,
+  and the bookkeeping it resets (`dirty_min`, `touched_min`) was read only
+  by the retired runtime checkpoint. Their removal is the owner's call.
+- **B11's deviation 3 is gone for filter-only tables**: after a clean
+  reopen the first vacuum pass finds every reclaimed slot's codes already
+  empty and takes no ticket. A table with secondary indexes still rebuilds
+  them at open (B17), dead versions included, so its first pass forgets
+  them under a ticket.
+
+Deviations, as built:
+- **Legacy pairs are judged from the directory, not the catalogue** (P19):
+  `<t>_flt.db` is kept, and `<t>` takes no snapshot, when `<t>_flt_schema.db`
+  or `<t>_flt_pointers.db` exists beside it or its bytes are not a filter
+  image (`RDBFLT01`). That covers unopenable catalogue entries as long as
+  their files exist, without threading the catalogue into the open.
+- **Excluded tables** (memory, key/value, mirrored) delete `_flt.db` through
+  their provider family only when it holds a filter image; an empty file is
+  left (no binary trusts one). The provider's delete reports no error, so
+  P33's pending-delete flag is not built.
+- **Not built**: vacuum's R11 clear-candidate rule (`xmax == NO_TX`) and
+  P23's "no bound advance while the filter is unready" (both pruning
+  quality only, never rows); `main.rs`'s refusal of `test_tokens`; the
+  downgrade-upgrade-downgrade cycle on KV and mirrored tables (V8); the
+  failpoints `ixm_read_eio_at_open` (already B11's) and
+  `backfill_batch_after_compaction` / `mid_vacuum_full_phase2` (phase 0's).
+- **The whole `.ixs` is read into memory** at the load (one FILTER section,
+  ~34 MB at 1.5M rows); B17's streaming load replaces it.
+
+Tests (`index_store::open_proof::tests`, each mutation-verified): the
+false-negative guard `a_loaded_filter_answers_every_query_a_rebuilt_one_does`
+(writes, deletes, single-row updates to fresh values, vacuum, two `VACUUM
+FULL`s, seal, reopen; 162 predicates against a model and against a rebuild
+of the same files, row for row; the loaded filter prunes exactly as the one
+sealed; then a stale pair put back under compacted, regrown files must
+rebuild: with the identity comparison skipped, rows go missing);
+`every_identity_field_that_differs_forces_a_rebuild`;
+`every_mismatch_in_the_files_forces_a_rebuild` (trailing bytes, a `DIRTY`
+after the `CLEAN`, a foreign log, no or a longer snapshot, a header,
+section or footer byte, another valid snapshot of the same length, `_flt.db`
+evidence); `an_unreadable_epoch_log_refuses_the_snapshot`;
+`an_open_that_loads_writes_nothing_and_its_first_vacuum_takes_no_ticket`
+(with `cleared_below` restored); `no_crash_image_loads_a_snapshot_that_does_not_match_its_files`
+(cuts around every seal step and around a post-load UPDATE, compaction and
+regrowth; every image answers as its rebuilt twin; mutation: the doc's
+"load when the log ends `DIRTY`" with the identity row skipped);
+the `_flt.db` cases (no log, evidence and its unlink-then-delete order, a
+failed unlink, a failed delete and the `Unknown` retry and its order, the
+legacy-pair rule); `drop_and_the_reaper_remove_the_pair`. Elsewhere:
+`backup::tests::index_store_files_are_left_out_of_snapshots`,
+`compact_failure_tests::a_checkpoint_after_a_failed_compaction_persists_nothing`,
+`integration_tests::{a_leftover_sidecar_is_never_read, no_mutation_or_timer_writes_a_sidecar}`,
+`gated_io::tests::the_filter_has_no_file_of_its_own`, the reaper test with
+planted pairs. The `_flt.db`-format tests of the `rasterizeddb_filter_tests`
+crate write the library checkpoint to a `<t>.sidecar` file of their own.
+
+**Measured** (B15's indicative RV7; filter only, a table with four
+filtered columns and no index, 1M rows: rows 56 MB, pointers 37 MB,
+snapshot 3.2 MB; release build, three alternating rounds, open to
+filter-ready): on tmpfs, snapshot 0.004 s median (0.086 s the first, cold
+round) against rebuild 0.618 s; on `/mnt/Volume4` (fuseblk on NVMe),
+snapshot 0.060 s median against rebuild 0.673 s (the first snapshot round,
+1.82 s, is the database open's own recovery after a 94 s load, not the
+filter). tmpfs hides disk cost; neither venue is the consumer ext4 disk the
+gate names.
+
+**Observed, not changed**: after `VACUUM FULL` a long-lived filter prunes
+far worse than a fresh rebuild of the same rows (993 against 4 candidate
+slots for one equality on a distinct column, 6,110 slots). The snapshot
+records the live filter faithfully, so a clean reopen keeps that state (as
+a loaded `_flt.db` did before); only a rebuild resets it. Correctness is
+unaffected (it is a superset). Worth the owner's look: compaction's in-place rebuild
+(`backfill_filters_from(0)` over the demoted filter) is the suspect.
+
 ## 6. Renumbering and other invalidations
 
 `compact()` (`table.rs:1581`) renumbers in place, committing phase 2 in
