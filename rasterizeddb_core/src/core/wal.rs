@@ -2347,7 +2347,7 @@ impl Wal {
         // acknowledged. Both are replaced under the writer lock the caller
         // holds, so no record or sync falls between them.
         let installed = (|| -> io::Result<()> {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "index_store_failpoints"))]
             crate::core::power_loss::failpoint::hit("keep_tail_after_rename_fails", &self.path)?;
             Self::injected("rename_dir_sync")?;
             sync_parent_dir(&self.path)?;

@@ -166,6 +166,14 @@ memory_pool_reuse = []
 # start with it (docs/persistent-indexes.md §2).
 test_tokens = []
 
+# The power-loss harness (`core::power_loss`: named failpoints, crash images)
+# for callers that link the library without `cfg(test)`: the compat suites,
+# which arm failpoints and image directories under a server running in their
+# own process (docs/persistent-indexes.md §11). `rasterizeddb_compat` enables
+# it as a dev-dependency feature only. Never in a server build: the binary
+# refuses to start with it, like `test_tokens`.
+index_store_failpoints = []
+
 # Compressed transaction exchange between replicating instances.
 #
 # On by default. Turning it off drops the codec, and a node built without it

@@ -751,13 +751,16 @@ fn main() -> std::io::Result<()> {
     const STACK_SIZE: usize = 32 * 1024 * 1024;
 
     // `test_tokens` lets any caller mint a write ticket, which only tests and
-    // benches may (docs/persistent-indexes.md §2). Feature unification can
-    // still build this binary with it (`cargo bench --features test_tokens`,
-    // `cargo test --workspace`), so it refuses here rather than at compile
+    // benches may (docs/persistent-indexes.md §2), and `index_store_failpoints`
+    // puts named failpoints and the crash-image recorder on the I/O paths
+    // (§11), which only the compat suites may arm. Feature unification can
+    // still build this binary with either (`cargo bench --features
+    // test_tokens`, `cargo test --workspace`, whose compat dev-dependency
+    // enables the failpoints), so it refuses here rather than at compile
     // time, which would break those builds.
-    if cfg!(feature = "test_tokens") {
+    if let Some(feature) = rasterizeddb_core::TEST_ONLY_FEATURES.first() {
         eprintln!(
-            "this server was built with the test-only `test_tokens` feature and will not start; rebuild without it"
+            "this server was built with the test-only `{feature}` feature and will not start; rebuild without it"
         );
         std::process::exit(2);
     }

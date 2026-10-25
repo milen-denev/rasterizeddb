@@ -45,8 +45,8 @@
 //! another thread records a sync is discarded as disturbed rather than
 //! imaged: it might pair a later write with an earlier durable state.
 
-pub(crate) mod failpoint;
-pub(crate) mod image;
+pub mod failpoint;
+pub mod image;
 
 #[cfg(test)]
 mod image_tests;

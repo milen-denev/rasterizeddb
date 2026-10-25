@@ -4,6 +4,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 pub(crate) const SERVER_PORT: u16 = 61170;
 
+/// The test-only Cargo features this library was built with. A server binary
+/// refuses to start when this is not empty (`main.rs`): `test_tokens` mints
+/// write tickets for any caller, and `index_store_failpoints` puts named
+/// failpoints and the crash-image recorder on the I/O paths
+/// (docs/persistent-indexes.md §2, §11).
+pub const TEST_ONLY_FEATURES: &[&str] = &[
+    #[cfg(feature = "test_tokens")]
+    "test_tokens",
+    #[cfg(feature = "index_store_failpoints")]
+    "index_store_failpoints",
+];
+
 pub static MAX_PERMITS_THREADS: OnceLock<usize> = OnceLock::new(); // 16 by default
 
 /// Worker threads for a query, defaulting when nothing has set it.

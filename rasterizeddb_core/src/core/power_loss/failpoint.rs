@@ -22,26 +22,26 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use parking_lot::Mutex;
 
 /// What a site does after its action ran.
-pub(crate) enum Outcome {
+pub enum Outcome {
     Continue,
     Fail(io::Error),
 }
 
 /// One hit of an armed failpoint.
-pub(crate) struct Hit<'a> {
+pub struct Hit<'a> {
     pub name: &'a str,
     pub path: &'a Path,
     pub nth: u64,
 }
 
-pub(crate) type Action = StdArc<dyn Fn(&Hit<'_>) -> Outcome + Send + Sync>;
+pub type Action = StdArc<dyn Fn(&Hit<'_>) -> Outcome + Send + Sync>;
 
 /// The v1 failpoints of design §11, by name. Only
 /// `keep_tail_after_rename_fails` has a site today (`Wal::keep_tail_locked`,
 /// right after the rename); the others have none until the paths they sit
 /// in exist, and arming one now is allowed so harness scenarios can be
 /// written against the table.
-pub(crate) const V1_NAMES: &[&str] = &[
+pub const V1_NAMES: &[&str] = &[
     "snapshot_before_fsync",
     "snapshot_after_fsync",
     "snapshot_after_rename",
@@ -76,7 +76,7 @@ pub(crate) const V1_NAMES: &[&str] = &[
 ];
 
 /// Whether `name` may be armed.
-pub(crate) fn is_known(name: &str) -> bool {
+pub fn is_known(name: &str) -> bool {
     if let Some(tag) = name.strip_prefix("sync:") {
         return super::SYNC_TAGS.iter().any(|(t, _)| *t == tag);
     }
@@ -98,14 +98,14 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
 
 /// Disarms on drop.
-pub(crate) struct Guard {
+pub struct Guard {
     id: u64,
     fired: StdArc<AtomicU64>,
 }
 
 impl Guard {
     /// How many times the action ran (0 or 1).
-    pub(crate) fn fired(&self) -> u64 {
+    pub fn fired(&self) -> u64 {
         self.fired.load(Ordering::Acquire)
     }
 }
@@ -122,7 +122,7 @@ impl Drop for Guard {
 
 /// Arms `name` for paths under `scope`, to run `action` on its `nth` hit
 /// (counting from 1). Panics on a name [`is_known`] refuses.
-pub(crate) fn arm(name: &str, scope: &Path, nth: u64, action: Action) -> Guard {
+pub fn arm(name: &str, scope: &Path, nth: u64, action: Action) -> Guard {
     assert!(is_known(name), "no failpoint is named {name:?}");
     assert!(nth >= 1, "hits count from 1");
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -143,7 +143,7 @@ pub(crate) fn arm(name: &str, scope: &Path, nth: u64, action: Action) -> Guard {
 /// A site: runs the action of every failpoint armed under `name` for a
 /// directory holding `path` whose `nth` hit this is. One relaxed load when
 /// nothing is armed.
-pub(crate) fn hit(name: &str, path: &Path) -> io::Result<()> {
+pub fn hit(name: &str, path: &Path) -> io::Result<()> {
     if ARMED.load(Ordering::Relaxed) == 0 {
         return Ok(());
     }
@@ -173,7 +173,7 @@ pub(crate) fn hit(name: &str, path: &Path) -> io::Result<()> {
 }
 
 /// The `sync:<tag>` site of a noted sync. Its action cannot fail the sync.
-pub(crate) fn on_sync(event: &crate::core::sync_audit::SyncEvent) {
+pub fn on_sync(event: &crate::core::sync_audit::SyncEvent) {
     if ARMED.load(Ordering::Relaxed) == 0 {
         return;
     }

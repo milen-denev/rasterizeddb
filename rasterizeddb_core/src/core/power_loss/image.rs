@@ -10,24 +10,24 @@ use parking_lot::Mutex;
 
 use crate::core::sync_audit::{self, Completion, DirOp, SyncEvent};
 
-pub(crate) const PAGE: usize = 4096;
+pub const PAGE: usize = 4096;
 
 /// How long a cut waits for another thread's sync to show where it stands
 /// before counting it in flight.
 const PROBE_ROUNDS: usize = 200;
 
-pub(crate) fn current_tid() -> i32 {
+pub fn current_tid() -> i32 {
     (unsafe { libc::syscall(libc::SYS_gettid) }) as i32
 }
 
 /// xorshift64*, so a failing seed reproduces without a dependency.
-pub(crate) struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
-    pub(crate) fn new(seed: u64) -> Rng {
+    pub fn new(seed: u64) -> Rng {
         Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
-    pub(crate) fn next(&mut self) -> u64 {
+    pub fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -35,11 +35,11 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    pub(crate) fn below(&mut self, n: u64) -> u64 {
+    pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next() % n }
     }
     /// Uniform in `[0, 1)`.
-    pub(crate) fn unit(&mut self) -> f64 {
+    pub fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 }
@@ -94,7 +94,7 @@ fn tag_flushes_bytes(tag: &str) -> bool {
 }
 
 /// Every regular file under `dir`, recursively, by path relative to it.
-pub(crate) fn walk(dir: &Path) -> Vec<PathBuf> {
+pub fn walk(dir: &Path) -> Vec<PathBuf> {
     fn go(base: &Path, at: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(at) else { return };
         for e in entries.flatten() {
@@ -197,13 +197,13 @@ impl State {
     }
 }
 
-pub(crate) fn on_sync(event: &SyncEvent) {
+pub fn on_sync(event: &SyncEvent) {
     for r in recorders_for(&event.path) {
         r.lock().record(event);
     }
 }
 
-pub(crate) fn on_dir_op(op: DirOp<'_>, seq: u64) {
+pub fn on_dir_op(op: DirOp<'_>, seq: u64) {
     let probe = match op {
         DirOp::Create(p) | DirOp::Unlink(p) => p,
         DirOp::Rename { to, .. } => to,
@@ -213,8 +213,21 @@ pub(crate) fn on_dir_op(op: DirOp<'_>, seq: u64) {
     }
 }
 
+/// Where [`Recorder::cut_action`] puts its cuts.
+pub type CutSink = StdArc<Mutex<Vec<Result<CrashPoint, String>>>>;
+
+/// An empty [`CutSink`], for callers outside the crate (the compat suites).
+pub fn cut_sink() -> CutSink {
+    StdArc::new(Mutex::new(Vec::new()))
+}
+
+/// Everything `sink` collected so far, emptied.
+pub fn drain(sink: &CutSink) -> Vec<Result<CrashPoint, String>> {
+    std::mem::take(&mut *sink.lock())
+}
+
 /// Watches one directory and freezes crash points from it.
-pub(crate) struct Recorder {
+pub struct Recorder {
     state: StdArc<Mutex<State>>,
     _watch: sync_audit::Watch,
 }
@@ -231,7 +244,7 @@ enum Base {
 }
 
 /// One frozen instant, imaged any number of times.
-pub(crate) struct CrashPoint {
+pub struct CrashPoint {
     pub label: String,
     dir: PathBuf,
     /// Every file at the cut: inode and bytes.
@@ -247,7 +260,7 @@ pub(crate) struct CrashPoint {
 impl Recorder {
     /// Syncs every file under `dir` and the directory itself, takes that as
     /// durable, and records from here on.
-    pub(crate) fn start(dir: &Path) -> StdArc<Recorder> {
+    pub fn start(dir: &Path) -> StdArc<Recorder> {
         let mut baseline = HashMap::new();
         for rel in walk(dir) {
             let path = dir.join(&rel);
@@ -274,13 +287,13 @@ impl Recorder {
     }
 
     /// Cuts with no sync of the calling thread in flight: between statements.
-    pub(crate) fn cut_quiescent(&self, label: impl Into<String>) -> Result<CrashPoint, String> {
+    pub fn cut_quiescent(&self, label: impl Into<String>) -> Result<CrashPoint, String> {
         self.cut(label.into(), false)
     }
 
     /// Cuts from inside a `sync:<tag>` failpoint: the calling thread's
     /// latest sync is the one about to be issued, so it is in flight.
-    pub(crate) fn cut_in_sync(&self, label: impl Into<String>) -> Result<CrashPoint, String> {
+    pub fn cut_in_sync(&self, label: impl Into<String>) -> Result<CrashPoint, String> {
         self.cut(label.into(), true)
     }
 
@@ -294,7 +307,7 @@ impl Recorder {
     /// one (a directory fsync after a rename, with no later sync noted on
     /// that thread) in flight, and images undid a rename the code had made
     /// durable while keeping later unsynced writes.
-    pub(crate) fn cut_action(
+    pub fn cut_action(
         self: &StdArc<Self>,
         label: String,
         sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>>,
@@ -439,14 +452,14 @@ impl Drop for Recorder {
 
 /// How one seed treats what is not durable.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SeedKind {
+pub struct SeedKind {
     /// Keep probability for an unsynced page and an undurable operation.
     pub p: f64,
     /// Logs cut at their synced length whatever `p` keeps elsewhere.
     pub logs_at_synced: bool,
 }
 
-pub(crate) fn seed_kind(seed: u64, rng: &mut Rng) -> SeedKind {
+pub fn seed_kind(seed: u64, rng: &mut Rng) -> SeedKind {
     match seed % 5 {
         0 => SeedKind { p: 0.0, logs_at_synced: false },
         1 => SeedKind { p: 1.0, logs_at_synced: false },
@@ -469,7 +482,7 @@ fn keep(p: f64, rng: &mut Rng) -> bool {
 /// `base` with each 4 KiB page that differs from `current` kept (current
 /// bytes) or dropped (base bytes, zeros past its end), at a length between
 /// the two.
-pub(crate) fn mix_pages(base: &[u8], current: &[u8], p: f64, at_base_len: bool, rng: &mut Rng) -> Vec<u8> {
+pub fn mix_pages(base: &[u8], current: &[u8], p: f64, at_base_len: bool, rng: &mut Rng) -> Vec<u8> {
     let len = if at_base_len || p <= 0.0 {
         base.len()
     } else if p >= 1.0 {
@@ -502,7 +515,7 @@ fn is_log(rel: &Path) -> bool {
 
 impl CrashPoint {
     /// Bytes held, for the scenario bound.
-    pub(crate) fn held_bytes(&self) -> u64 {
+    pub fn held_bytes(&self) -> u64 {
         let f: usize = self.files.values().map(|(_, b)| b.len()).sum();
         let v: usize = self.victims.values().map(Vec::len).sum();
         let b: usize = self
@@ -518,7 +531,7 @@ impl CrashPoint {
 
     /// Each file at the cut with its inode, current length and where its
     /// image starts from, and the undurable operations: for failure reports.
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         let mut out = String::new();
         for (name, (ino, bytes)) in &self.files {
             let base = match self.bases.get(ino) {
@@ -535,7 +548,7 @@ impl CrashPoint {
     }
 
     /// Names (relative) and bytes of the image for `seed`.
-    pub(crate) fn image(&self, seed: u64) -> BTreeMap<PathBuf, Vec<u8>> {
+    pub fn image(&self, seed: u64) -> BTreeMap<PathBuf, Vec<u8>> {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for b in self.label.bytes() {
             h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
@@ -580,24 +593,27 @@ impl CrashPoint {
         out
     }
 
-    /// Writes the image for `seed` into `out`, a fresh directory, with the
-    /// storage pool file's absolute paths pointed at it.
-    pub(crate) fn write_image(&self, seed: u64, out: &Path) {
+    /// Writes the image for `seed` into `out`, a fresh directory, with every
+    /// storage pool file's absolute paths pointed at it: the recorded
+    /// directory may hold a database's root and its second location side by
+    /// side (a location may not nest inside the root), so the pool file can
+    /// sit one level down.
+    pub fn write_image(&self, seed: u64, out: &Path) {
         std::fs::create_dir_all(out).unwrap();
         for (name, bytes) in self.image(seed) {
             let path = out.join(&name);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
+            #[cfg(feature = "storage_pools")]
+            let bytes = if name.file_name().is_some_and(|n| n == crate::core::storage::POOL_FILE) {
+                let from = self.dir.to_string_lossy().into_owned();
+                let to = out.to_string_lossy().into_owned();
+                String::from_utf8_lossy(&bytes).replace(&from, &to).into_bytes()
+            } else {
+                bytes
+            };
             std::fs::write(&path, bytes).unwrap();
-        }
-        #[cfg(feature = "storage_pools")]
-        let pool = out.join(crate::core::storage::POOL_FILE);
-        #[cfg(feature = "storage_pools")]
-        if let Ok(text) = std::fs::read_to_string(&pool) {
-            let from = self.dir.to_string_lossy().into_owned();
-            let to = out.to_string_lossy().into_owned();
-            std::fs::write(&pool, text.replace(&from, &to)).unwrap();
         }
     }
 }

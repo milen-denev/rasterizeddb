@@ -25,7 +25,7 @@ static WATCHED: Mutex<Vec<(PathBuf, Vec<(&'static str, PathBuf)>)>> = Mutex::new
 /// One noted sync with what a crash image needs to know about it: the file's
 /// length when the sync was issued, which every byte of is durable once it
 /// returns, and the thread that issued it.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 #[derive(Debug, Clone)]
 pub struct SyncEvent {
     pub tag: &'static str,
@@ -44,7 +44,7 @@ pub struct SyncEvent {
 
 /// Per watched directory, in order. Test-only: the `metadata` call is a
 /// system call per sync, which production does not pay.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 static EVENTS: Mutex<Vec<(PathBuf, Vec<SyncEvent>)>> = Mutex::new(Vec::new());
 
 /// Records a sync of `path` from the site named `tag`.
@@ -55,7 +55,7 @@ pub fn note(tag: &'static str, path: &Path) {
     }
     // Entered before any lock below, so a thread parked on one of them is
     // seen as still inside this call: its sync has not been issued.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     let inside = calls::enter();
     let mut watched = WATCHED.lock();
     for (dir, seen) in watched.iter_mut() {
@@ -64,9 +64,9 @@ pub fn note(tag: &'static str, path: &Path) {
         }
     }
     drop(watched);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     let mut recorded = None;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     {
         let mut events = EVENTS.lock();
         if events.iter().any(|(dir, _)| path.starts_with(dir)) {
@@ -94,11 +94,11 @@ pub fn note(tag: &'static str, path: &Path) {
     }
     // Outside every lock here: a recorder reads the file, and a failpoint
     // armed on this sync may cut power, which reads the whole directory.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     if let Some(event) = recorded {
         crate::core::power_loss::on_sync(&event);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     drop(inside);
 }
 
@@ -107,7 +107,7 @@ pub fn note(tag: &'static str, path: &Path) {
 /// power cut may undo it, and crash images keep or revert it per seed.
 /// Operations nobody announces are kept, as an image read from the
 /// directory shows them.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 #[derive(Debug, Clone, Copy)]
 pub enum DirOp<'a> {
     Create(&'a Path),
@@ -117,7 +117,7 @@ pub enum DirOp<'a> {
 
 /// Announces `op` to whatever records the directory it touches. A no-op
 /// unless something is watching.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 pub fn dir_op(op: DirOp<'_>) {
     if WATCHERS.load(Ordering::Relaxed) == 0 {
         return;
@@ -127,7 +127,7 @@ pub fn dir_op(op: DirOp<'_>) {
 
 /// Whether the sync an event recorded has returned, as far as can be told
 /// without the call site saying so.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
     /// Its thread has moved on: a later [`note`], or a blocking system call
@@ -142,14 +142,14 @@ pub enum Completion {
 }
 
 /// Where `event`'s sync stands now. See [`Completion`].
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 pub fn completion(event: &SyncEvent) -> Completion {
     calls::completion(event)
 }
 
 /// Per thread: how many calls to [`note`] it has entered, and whether it is
 /// inside one, readable from another thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "index_store_failpoints"))]
 mod calls {
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -306,7 +306,7 @@ pub fn note_file(tag: &'static str, file: &std::fs::File) {
 /// back what was seen.
 pub fn watch(dir: &Path) -> Watch {
     WATCHED.lock().push((dir.to_path_buf(), Vec::new()));
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     EVENTS.lock().push((dir.to_path_buf(), Vec::new()));
     WATCHERS.fetch_add(1, Ordering::AcqRel);
     Watch {
@@ -331,7 +331,7 @@ impl Watch {
 
     /// Every sync recorded so far with its length and thread, in order, and
     /// starts afresh. Independent of [`Watch::take`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     pub fn take_events(&self) -> Vec<SyncEvent> {
         let mut events = EVENTS.lock();
         events
@@ -358,7 +358,7 @@ impl Drop for Watch {
             watched.remove(i);
         }
         drop(watched);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "index_store_failpoints"))]
         {
             let mut events = EVENTS.lock();
             if let Some(i) = events.iter().position(|(d, _)| *d == self.dir) {

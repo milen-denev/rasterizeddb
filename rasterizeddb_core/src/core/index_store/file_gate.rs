@@ -293,14 +293,15 @@ pub(super) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// A named failpoint (`core::power_loss::failpoint`); nothing outside tests.
+/// A named failpoint (`core::power_loss::failpoint`); nothing outside tests
+/// and the `index_store_failpoints` feature.
 #[inline]
 pub(super) fn failpoint(name: &str, path: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     {
         crate::core::power_loss::failpoint::hit(name, path)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "index_store_failpoints")))]
     {
         let _ = (name, path);
         Ok(())
@@ -310,18 +311,18 @@ pub(super) fn failpoint(name: &str, path: &Path) -> io::Result<()> {
 /// Announces a directory operation to the crash-image recorder.
 #[inline]
 pub(super) fn dir_op(op: DirOp<'_>) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "index_store_failpoints"))]
     crate::core::sync_audit::dir_op(match op {
         DirOp::Create(p) => crate::core::sync_audit::DirOp::Create(p),
         DirOp::Rename { from, to } => crate::core::sync_audit::DirOp::Rename { from, to },
         DirOp::Unlink(p) => crate::core::sync_audit::DirOp::Unlink(p),
     });
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "index_store_failpoints")))]
     let _ = op;
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(any(test, feature = "index_store_failpoints")), allow(dead_code))]
 pub(super) enum DirOp<'a> {
     Create(&'a Path),
     Rename { from: &'a Path, to: &'a Path },
