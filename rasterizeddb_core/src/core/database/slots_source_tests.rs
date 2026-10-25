@@ -98,6 +98,9 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "execute_join", "relation_for"),
     (EXEC, "execute_prepared_rows", "relation_for"),
     (EXEC, "execute_with_need", "table_for"),
+    // B8b: the INSERT arm resolves its target once, under ROW EXCLUSIVE, and
+    // hands the schema to the steps that read it (`SCHEMA_FROM_CALLER`).
+    (EXEC, "execute_with_need", "relation_for"),
     (EXEC, "existing_rows_break_unique", "table_for"),
     (EXEC, "insert_loaded_row", "table_for"),
     (EXEC, "load_json_document", "table_for"),
@@ -111,10 +114,18 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     // statement's ACCESS EXCLUSIVE and reads inside the reload.
     (EXEC, "rewrite_rows", "table_for"),
     (EXEC, "star_output_types", "schema_view"),
-    (EXEC, "supply_generated_values", "table_for"),
-    (EXEC, "supply_insert_column_list", "table_for"),
     (EXEC, "update_from_join", "table_for"),
     ("core/storage/relocate.rs", "plan", "schema_view"),
+];
+
+/// Former escape callers that take no table at all since B8b: they read
+/// only the schema their caller (the INSERT arm, under the ROW EXCLUSIVE its
+/// `relation_for` took) hands them. Pinned the other way round: each names no
+/// lookup, locking or not, and no escape hatch, so none can drift back to
+/// reading a table of its own.
+const SCHEMA_FROM_CALLER: &[(&str, &str)] = &[
+    (EXEC, "supply_generated_values"),
+    (EXEC, "supply_insert_column_list"),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -610,6 +621,26 @@ fn every_former_escape_caller_now_locks() {
         for hatch in ["table_unlocked", "each_table_unlocked"] {
             if occurrences(file, hatch).contains_key(*func) {
                 missing.push(format!("{rel}::{func} still calls {hatch}"));
+            }
+        }
+    }
+    for (rel, func) in SCHEMA_FROM_CALLER {
+        let file = parsed.entry(rel).or_insert_with(|| {
+            let text = &all.iter().find(|(r, _)| r == rel).unwrap_or_else(|| panic!("{rel} is gone")).1;
+            parse(rel, text)
+        });
+        for name in [
+            "table_unlocked",
+            "each_table_unlocked",
+            "table_for",
+            "relation_for",
+            "tables_for",
+            "relation",
+            "slot",
+            "schema_view",
+        ] {
+            if occurrences(file, name).contains_key(*func) {
+                missing.push(format!("{rel}::{func} reads a table of its own ({name})"));
             }
         }
     }
