@@ -1224,6 +1224,185 @@ widths, planes or HLL state are soft divergence. Any other difference is counted
 
 `rdb_index_check(regclass)` does the same on demand.
 
+**As built (B17): INDEX sections, loaded at open.** A table or partition
+opens without rebuilding its B-tree, hash and path indexes when its snapshot
+proves clean and `index_snapshot.index_storage` is `snapshot`. The default
+stays `rebuild` (owner's decision on Q3: opt-in until phase 2's gate, a
+power-loss soak and a real-driver run).
+- **The setting.** `index_snapshot.index_storage` = `rebuild` | `snapshot`,
+  a hot `SET CONFIG` key and the server flag `--index-storage` (the flag is
+  what the opens at startup see). Beside it: `index_snapshot.
+  max_concurrent_loads` (0, the default, is half the cores, at least two)
+  and `index_snapshot.load_wait_ms` (600). Under `rebuild` nothing changes:
+  seals write FILTER only and every open builds its indexes.
+- **Capture** (`index_store::load::capture_sections`, called from the seal
+  target's `capture`). Under `snapshot`, a table whose indexes are B-tree,
+  hash or path, with no gin index, gets one INDEX section per index, ordinal
+  = its position in `for_schema` order, each streamed through C3 and encoded
+  as it comes; `CANCEL` is checked every `SORTED_BLOCK` parts and a
+  cancelled capture is a skip. A table with a gin index writes FILTER only
+  and rebuilds all its indexes (persistent phase 3).
+- **The section's bytes** (`index_store::index_section`, `INDEX_SECTION_VER`
+  1): `ver u16 ‖ flags u16 (0) ‖ n_entries u64`, then the `(key ‖ slot)`
+  pairs in that order, each `shared varint ‖ unshared varint ‖ unshared
+  bytes ‖ slot varint`, a restart (whole key, whole slot) every 16 pairs, a
+  slot under the same key as the pair before it written as the gap minus
+  one; then the unkeyed slots (count, the first whole, then gaps minus
+  one); then `PRESENT` as alternating runs, zeros first (the first may be
+  empty, the last is ones). Varints are LEB128, never overlong. A golden
+  vector covers an empty key, a key whose slots cross a restart, shared
+  prefixes, a 31-byte key, unkeyed slots and every run shape, pinned by a
+  `check_history` row (`0x9a31_76c2_d6b6_ad91`). Measured: 6-8 bytes an
+  entry (1M rows: primary key 7.9 MB, `(tenant_id, id)` 5.8 MB, hash 6.4 MB,
+  FILTER 3.4 MB; 23.5 MB in all).
+- **C3 no longer leans on the gate for presence** (owner's hardening, in
+  `core/index`). Both `for_each_sorted` read the presence bits **before**
+  the entry sweep and still emit them last. `insert` lists a slot's entries
+  before it sets its bit, so every bit the stream carries names a slot the
+  sweep finds: a loaded index holds no slot it cannot find, whether or not a
+  write overlapped the capture. Gin reads them after `forgotten_slots`, so a
+  forget between the two leaves a stale superset (N37's leak), never a held
+  slot whose items were dropped. An in-place move during the sweep can
+  still leave a slot under neither key; the seal's gate still keeps every
+  write out of a published capture.
+- **The proof streams `.ixs`** (`snapshot::verify_stream`): the file is read
+  once, front to back, in 1 MiB pieces, checking the header crc32c, each
+  section's crc32c and the footer xxh64 as `decode` does, keeping only the
+  FILTER section; it hands the INDEX entries on. B14's deviation (the whole
+  file in memory) is closed.
+- **The load** (`index_store::load`). `plan` decides at the open: load when
+  the proof passed, the setting is `snapshot`, the table captures (above),
+  and the snapshot has exactly one INDEX section per index; otherwise build,
+  as before. A load raises the file set's `LoadBarrier` (on `FileGate`,
+  shared by the gates RENAME and MOVE carry the word to) before the open
+  returns, and runs on the open's task:
+  - **writes wait** in `gate::ticket`, before the slow path: a load runs
+    only on a word the open found `Clean`, so every first ticket comes
+    there, and nothing is issued until the load has finished or failed;
+  - **readers wait** in `Table::build_candidates` up to `load_wait`, then
+    scan;
+  - **loads queue** on one process-wide queue of `max_concurrent_loads`
+    slots, the costliest (slots × indexes) first, so the opens at startup,
+    which queue as they open, are served largest first; a load dropped while
+    it waits gives back a slot it was granted;
+  - each section is read again alone and checked against its crc32c
+    (`snapshot::read_section`), decoded into a checked `SortedLoad`, one
+    thread per section; only once all decoded is any index touched, with
+    `load_sorted` per index (one thread each), then `set_ready_at(epoch)`;
+  - **any error** (read, crc32c, version, bytes, a refused stream, a
+    renumbering) clears the indexes, releases the barrier and builds from
+    rows with `build_indexes` under the open's `BuildToken` (minted in
+    `assemble`, as before);
+  - a load vouches for the word when the open's FILTER load did and the
+    word is still `Clean`; a failed one leaves it unvouched (§3 rule 2).
+- **The seal** waits for a load in flight before it looks
+  (`SealTarget::settle`), and a vouched word whose snapshot lacks the INDEX
+  sections the setting now asks for is sealed again
+  (`SealTarget::snapshot_current`), so turning `snapshot` on rewrites the
+  snapshot at the next clean point without a reopen.
+- **Counters**: `load::loaded_total` (`rdb_index_snapshot_index_loads_total`),
+  `load::built_total` (`rdb_index_builds_total`, every open-time build),
+  `load::failed_total` (`rdb_index_snapshot_load_failed_total`); per
+  instance, `Table::index_origin` (`Pending`, `Loaded`, `Built`,
+  `FellBack`) and `Table::index_load_settled`.
+
+**Measured** (release build, `load_tests::b17_measure_open_time`, one mode
+per process, the pair put back before each run, five alternating rounds,
+medians with min-max; 1M rows, a bigint primary key, `(tenant_id, id)` and
+a hash index; rows 36 MB, pointers 37 MB, snapshot 23.5 MB; warm page cache;
+load average 1.2):
+
+| Venue | Open to indexes ready: load | rebuild | RSS after: load | rebuild | Peak: load |
+|---|---|---|---|---|---|
+| tmpfs | 0.116 s (0.113-0.125) | 0.669 s (0.667-0.680) | 168 MiB (anon 153, file 15) | 338 MiB (anon 253, file 15, shmem ~70) | 284 MiB |
+| `/mnt/Volume4` (fuseblk, NVMe) | 0.184 s (0.176-0.213) | 0.741 s (0.733-0.805) | 167 MiB (anon 152, file 15) | 338 MiB (anon 253, file 85) | 281 MiB |
+
+The index load itself is 0.10-0.11 s (decode 0.038 s, install 0.062-0.072
+s); the rest is the database open (0.013 s on tmpfs, ~0.08 s on fuseblk).
+Before the per-index threads it was 0.20 s (decode 0.088, install 0.114).
+RSS after a load is **not** "within noise" of a rebuild's: it is half. The
+rebuild's scan maps the rows and pointers files (the shmem column on tmpfs,
+the file column on fuseblk: ~70 MB), and leaves ~100 MB more anonymous
+memory: the allocator's share of the scan's row buffers, and B-tree nodes
+grown by ascending inserts, half full where a load's bulk build fills them.
+The load's peak (281-287 MiB) is every section's decoded stream at once,
+still below the rebuild's. tmpfs hides disk cost; both runs are warm; the
+cold, 1.5M-row gate is B18's on a quiet box.
+
+Deviations, as built:
+- **The section's version is in the section, not the identity.** The
+  identity's layout is frozen (its own history row); a section of another
+  version is a load error, so the open rebuilds once and its clean point
+  rewrites the section, exactly as a bumped identity field would.
+- **Capture is in memory**: the seal encodes the whole snapshot, then
+  writes it (B13's `write_tmp`), so a seal holds the snapshot's bytes once
+  (23.5 MB at 1M rows × 3 indexes). The design's streaming capture and its
+  token bucket are not built.
+- **"Unique and implicit B-trees first"** has nothing to order: the
+  fallback is one pass over the rows for every index, and readiness is the
+  table's, all at once (per-index readiness would be `core/index`'s).
+- **Writes wait at the ticket's slow path**, not at each write path. A
+  ticketless provider write (a bug the census catches; GatedIo's inline
+  slow path in release) does not wait.
+- **The load decodes every section before installing any**, so its peak
+  holds all of them; the install is all-or-nothing per table.
+- **"Queued at once" at startup** is the queue: tables open one by one, so
+  the first `max_concurrent_loads` take slots as they open and the rest are
+  granted costliest first as slots free.
+- **The phase-1 suites read `vouched` after the load settles**, and a live
+  instance is not asked whether its `vouched` came from a load (a publish
+  vouches too).
+
+Not built: the audit and `rdb_index_check` (B18); GIN sections (phase 3);
+staging bytes against `partition_resident_budget` and the token bucket
+(phase 4); the fan-out FILTER-only open (phase 4).
+
+Tests (each mutation-verified, `// MUTATED`, failed by assertion, restored
+byte-exact; `grep -rn MUTATED` clean):
+- `index::tests::a_capture_overlapping_inserts_never_holds_a_slot_it_cannot_find`
+  and `index::gin::tests::…` (the hardening: inserts land mid-stream with no
+  gate; every slot the stream marks present is findable after the load;
+  killed by reading presence last, in either index);
+- `index_section::tests` (frozen bytes and history row, 400 random streams
+  round trip, every truncation and malformed field refused, 30,000
+  corruptions never panic, the writer refuses parts out of order);
+  `snapshot::tests::the_streaming_check_agrees_with_decode`;
+- `load::tests::a_loaded_index_finds_every_row_a_rebuilt_one_finds` (the
+  false-negative guard: inserts, deletes, updates of every indexed column in
+  place and as new versions, vacuum, `VACUUM FULL`; the reopen loads, the
+  load counter moves, the instance built nothing, the loaded streams equal
+  the sealed ones, every visible row is found in every index, a rebuild of
+  the same files lists nothing for a visible slot the load lacks, answers
+  equal the twin through the indexes (`KEY_LOOKUPS` moves); a write and an
+  abandoned close rebuild; mutation: drop a section);
+- `a_version_bump_rebuilds_once_then_loads` (`FellBack`, `Loaded`,
+  `Loaded`; mutations: vouch whatever the load did, a failed load marked
+  ready unbuilt); `turning_snapshot_on_rewrites_a_vouched_snapshot_at_the_next_clean_point`
+  (mutation: `snapshot_current` always true);
+- `a_bad_index_section_checksum_falls_back_and_answers_as_the_twin`;
+  `a_section_its_index_refuses_falls_back_and_answers_as_the_twin` (valid
+  checksums, a slot past the table; then a section missing);
+  `a_stale_pair_never_loads_indexes_over_changed_files` (mutation: skip an
+  identity row);
+- `writes_wait_for_the_load_and_readers_wait_up_to_load_wait` (mutations:
+  the ticket does not wait, the reader does not wait);
+  `loads_queue_costliest_first_and_never_past_the_limit` (mutations: arrival
+  order, no limit);
+- `every_partition_loads_after_a_clean_shutdown` (six partitions'
+  primary keys through `seal_for_shutdown`, `KEY_LOOKUPS` counted, the
+  twin equal); `a_table_with_a_gin_index_writes_filter_only_and_rebuilds`;
+- the B15 suites extended: `power_loss::phase1_tests::the_indexes_survive_power_cuts_at_every_phase_1_failpoint_{in_the_root,on_a_second_location}`
+  (the table with a B-tree, a hash and a composite index; every image that
+  proves its snapshot loads its INDEX sections, 50 of 270 per placement, and
+  every index finds every visible row; mutation: load when the log ends
+  `DIRTY`, which loads a stale index and answers `WHERE a = 767139` with
+  nothing where the twin has a row); compat
+  `index_store_power_loss::{a_clean_reopen_loads_the_indexes_*,
+  the_indexes_survive_power_cuts_over_pgwire_*}` over pgwire, every image's
+  sampled rows asked through each index;
+- `gin::tests::the_sorted_stream_drops_exactly_the_forgotten_slots` still
+  kills "C3 keeps forgotten GIN slots".
+
 ## 5. The filter under the same rule (T4)
 
 Today the sidecar is trusted when its dirty byte is clear. Deletes and updates
@@ -1418,7 +1597,8 @@ Deviations, as built:
   failpoints `ixm_read_eio_at_open` (already B11's) and
   `backfill_batch_after_compaction` / `mid_vacuum_full_phase2` (phase 0's).
 - **The whole `.ixs` is read into memory** at the load (one FILTER section,
-  ~34 MB at 1.5M rows); B17's streaming load replaces it.
+  ~34 MB at 1.5M rows); B17's streaming load replaces it (closed in B17:
+  the proof streams the file and keeps only the FILTER section).
 
 Tests (`index_store::open_proof::tests`, each mutation-verified): the
 false-negative guard `a_loaded_filter_answers_every_query_a_rebuilt_one_does`
