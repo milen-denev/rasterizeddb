@@ -441,3 +441,7 @@ pub(crate) mod hooks {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "audit_tests.rs"]
+mod tests;

@@ -839,6 +839,134 @@ async fn loads_queue_costliest_first_and_never_past_the_limit() {
     tokio::time::timeout(Duration::from_secs(5), DROPPED.admit(1)).await.expect("a dropped waiter kept the slot");
 }
 
+/// The priority bump (B18), on a queue alone: one slot, held; three loads
+/// queue, costliest first; the cheapest one's barrier is waited on by a
+/// write (`settled_for_write`), then the middle one's by a reader
+/// (`settled_within`), so they are granted in that order, ahead of the
+/// costliest. Never past the limit. A load nobody waits for is never
+/// moved, and a granted one is no longer marked.
+///
+/// Mutations (bump removed; the queue ignores the mark): the cheapest load
+/// is granted last. (A marked load granted past the limit): the peak is 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_someone_waits_for_is_granted_next_and_never_past_the_limit() {
+    static ONE: LoadQueue = LoadQueue::new(|| 1);
+    let first = ONE.admit(1).await;
+    let order = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let barriers: Vec<std::sync::Arc<LoadBarrier>> = (0..3).map(|_| std::sync::Arc::default()).collect();
+    let mut tasks = Vec::new();
+    for (cost, barrier) in [50u64, 40, 5].into_iter().zip(barriers.iter().cloned()) {
+        let order = order.clone();
+        let guard = barrier.raise();
+        tasks.push(tokio::spawn(async move {
+            let slot = ONE.admit_load(cost, barrier).await;
+            order.lock().push(cost);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            drop(slot);
+            drop(guard);
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A write on the cheapest table: it waits for the load, which moves.
+    let bumps = bumped_total();
+    let cheapest = barriers[2].clone();
+    let writer = tokio::spawn(async move { cheapest.settled_for_write().await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !barriers[2].bumped() {
+        assert!(Instant::now() < deadline, "the waiting write did not mark its load urgent");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(bumped_total() > bumps);
+    assert!(!barriers[0].bumped() && !barriers[1].bumped(), "a load nobody waits for was marked");
+    // A reader about to wait on the middle one, marked second.
+    assert!(!barriers[1].settled_within(Duration::from_millis(1)).await);
+    assert!(barriers[1].bumped(), "a waiting reader did not mark its load urgent");
+    assert!(order.lock().is_empty(), "a load ran past the limit");
+    drop(first);
+    for t in tasks {
+        t.await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), writer).await.expect("the write never stopped waiting").unwrap();
+    assert_eq!(*order.lock(), vec![5, 40, 50], "the loads waited for were not granted first, earliest marked first");
+    assert_eq!(ONE.peak_and_reset(), 1, "a marked load was granted past the limit");
+    assert!(barriers.iter().all(|b| !b.bumped()), "a granted load stayed marked");
+}
+
+/// The priority bump on a real database: four tables of different sizes
+/// sealed under `snapshot`, reopened with one load slot (a queue of this
+/// directory's own) and the first load granted held. A write to the
+/// cheapest table still queued waits for its load (nothing writes an index
+/// before its load installs), and that load is granted right after the
+/// held one, ahead of every costlier table; without the write it would be
+/// last. The write lands and every table answers as its twin.
+///
+/// Mutation (bump removed): the written table's load is granted last.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_moves_its_queued_load_to_the_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let _snap = storage_override::set(d, IndexStorage::Snapshot);
+    let sizes = [("q_big", 1500i64), ("q_mid", 1000), ("q_low", 600), ("q_min", 250)];
+    let mut models = BTreeMap::new();
+    {
+        let db = open(d).await;
+        for (name, rows) in sizes {
+            let mut model = Model::default();
+            create(&db, name).await;
+            insert(&db, name, &mut model, 0..rows).await;
+            settled(&table(&db, name)).await;
+            assert!(matches!(checkpoint(&db, name).await, SealOutcome::Published));
+            models.insert(name, model);
+        }
+        close(d, db);
+    }
+    static QUEUE_OF_ONE: LoadQueue = LoadQueue::new(|| 1);
+    let queue: &'static LoadQueue = &QUEUE_OF_ONE;
+    let _queue = hooks::queue(d, queue);
+    let held = hooks::hold(d);
+    let db = open(d).await;
+    let deadline = Instant::now() + SETTLE;
+    while hooks::grants(d).is_empty() {
+        assert!(Instant::now() < deadline, "no load was granted");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let first = hooks::grants(d)[0].clone();
+    // The cheapest table still queued: costliest-first grants it last.
+    let target = sizes.iter().rev().map(|(n, _)| *n).find(|n| *n != first).unwrap();
+    let t = table(&db, target);
+    assert!(t.gate().loads().loading(), "{target}'s load is not in flight");
+    let writer = {
+        let db = db.clone();
+        let sql = format!("UPDATE {target} SET a = 4242 WHERE id = 7");
+        tokio::spawn(async move { exec(&db, &sql).await })
+    };
+    while !t.gate().loads().bumped() {
+        assert!(Instant::now() < deadline, "the write did not mark {target}'s load urgent");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!writer.is_finished(), "a write went ahead of its table's load");
+    drop(held);
+    tokio::time::timeout(SETTLE, writer).await.expect("the write never finished").unwrap();
+    models.get_mut(target).unwrap().rows.get_mut(&7).unwrap().a = 4242;
+    let mut problems = Vec::new();
+    let mut rng = fastrand::Rng::with_seed(0xb18);
+    for (name, model) in &models {
+        let t = table(&db, name);
+        settled(&t).await;
+        assert_eq!(t.index_origin(), Origin::Loaded, "{name}");
+        let touched: Vec<(i64, R)> = model.rows.get(&7).map(|r| (7, r.clone())).into_iter().collect();
+        problems.extend(answers(&db, name, model, &model.battery(&mut rng, &touched), name).await);
+    }
+    let grants = hooks::grants(d);
+    assert_eq!(grants.len(), 4, "{grants:?}");
+    assert_eq!(grants[1], target, "the written table's load was not granted next: {grants:?}");
+    assert_eq!(queue.peak_and_reset(), 1);
+    drop(t);
+    close(d, db);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Partitions and gin
 // ---------------------------------------------------------------------------
