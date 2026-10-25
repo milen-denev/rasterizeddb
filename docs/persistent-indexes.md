@@ -747,7 +747,12 @@ Deviations, as built:
   one from `.ixm`.
 - **Verdicts** (the table in the module documentation): the registration is
   the B10 `IoOp` (`WriteGate::register_write`, a guard that borrows the word:
-  one `fetch_add` in, one `fetch_sub` out, no `Arc` clone). Tests panic, naming
+  one `fetch_add` in, one `fetch_sub` out, no `Arc` clone), taken by a
+  synchronous fast path (`GatedIo::admit_now`); only release's slow path is a
+  boxed future, so a write's future carries one pointer for it. An `async`
+  admission nested in every write future measured +0.4% to +0.55%
+  instructions per point UPDATE and INSERT (9 of 9 reps); the synchronous one
+  is within noise (`.claude/reviews/b12-perf/`). Tests panic, naming
   the entry point and the file, on `Clean`, `Unknown`, `PUBLISHING`, and a
   ticketless write during an unpublished seal (count zero). Release takes the
   slow path inline for the first three (`acquire`: wait out the window, make

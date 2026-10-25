@@ -19,7 +19,7 @@
 //! only kind whose word can ever be `Clean`; every other backend's word is
 //! detached and `Dirty` for good, P33) carries a [`GatedIo`] in the commit
 //! state its clones share, and every write entry point calls
-//! [`GatedIo::admit`] first. A table attaches its word to the providers it
+//! [`GatedIo::admit_now`] first. A table attaches its word to the providers it
 //! owns when it is assembled ([`GatedIo::attach`]: rows, pointers, `_flt.db`,
 //! and for a plain table `_schema.db` and `_seq.db`); a provider created from
 //! an attached one for a file named after it (`<t>_schema.db` creates
@@ -274,61 +274,48 @@ impl GatedIo {
     }
 
     /// Registers a write of `file` in `location` through `site` (module
-    /// documentation, Verdicts). `Err` only in release, when the slow path
-    /// failed: nothing may be issued.
+    /// documentation, Verdicts): the fast path, synchronous, so a provider's
+    /// write future carries no state machine for it. `Ok` is the
+    /// registration to hold until the write returns (or none, for a provider
+    /// with no word); `Err` is release's slow path, to await before issuing
+    /// (tests panic before ever returning one, unless they asked for release
+    /// verdicts). The caller then calls [`GatedIo::note_write`]; file
+    /// providers do all three through `file_sync`'s `gated!`.
     #[inline]
-    pub async fn admit(&self, site: Site, location: &str, file: &str) -> io::Result<Registration<'_>> {
+    pub fn admit_now(&self, site: Site, location: &str, file: &str) -> Result<Registration<'_>, SlowPath> {
         let Some(a) = self.slot.get() else {
-            self.note_write(location, file);
             return Ok(Registration::Ungated);
         };
-        let registration = match a.word.register_write() {
+        match a.word.register_write() {
             Ok(reg) => {
                 if reg.ticketless() && a.panics() {
                     ticketless(site, location, file, "an unpublished seal, and no ticket held anywhere");
                 }
-                Registration::Io(reg)
+                Ok(Registration::Io(reg))
             }
             Err(reason) => {
                 if a.panics() {
                     ticketless(site, location, file, reason_text(reason));
                 }
-                Registration::Held(slow(&a.file_set).await?)
+                Err(slow(&a.file_set))
             }
-        };
-        // Tests only: a write parked here, registered and not yet issued, is
-        // what a seal's count must cover (RV15).
-        #[cfg(test)]
-        park::at(file).await;
-        self.note_write(location, file);
-        Ok(registration)
+        }
     }
 
-    /// [`GatedIo::admit`], recording a failure where `on_fail` says and
-    /// returning `None` (skip the write) instead of the error.
-    pub async fn admit_or_record(
-        &self,
-        site: Site,
-        location: &str,
-        file: &str,
-        on_fail: Failure,
-    ) -> Option<Registration<'_>> {
-        match self.admit(site, location, file).await {
-            Ok(registration) => Some(registration),
-            Err(e) => {
-                log::error!(
-                    "{}/{}: the write gate's slow path failed ({}); the write was skipped",
-                    location,
-                    file,
-                    e
-                );
-                use crate::core::storage_providers::file_sync::failed_appends;
-                match on_fail {
-                    Failure::Txn(txn) => failed_appends::record(location, file, txn, e),
-                    Failure::Untokened => failed_appends::record_gate(location, e),
-                }
-                None
-            }
+    /// Records a failed slow path for a write that cannot return it, where
+    /// `on_fail` says (module documentation): the write is then skipped.
+    #[cold]
+    pub fn record_failure(location: &str, file: &str, on_fail: Failure, e: io::Error) {
+        log::error!(
+            "{}/{}: the write gate's slow path failed ({}); the write was skipped",
+            location,
+            file,
+            e
+        );
+        use crate::core::storage_providers::file_sync::failed_appends;
+        match on_fail {
+            Failure::Txn(txn) => failed_appends::record(location, file, txn, e),
+            Failure::Untokened => failed_appends::record_gate(location, e),
         }
     }
 
@@ -406,6 +393,10 @@ fn ticketless(site: Site, location: &str, file: &str, why: &str) -> ! {
     )
 }
 
+/// Release's slow path for one write, boxed: awaiting it gives the
+/// registration to hold, or the error that means nothing may be issued.
+pub type SlowPath = Pin<Box<dyn Future<Output = io::Result<Registration<'static>>> + Send + Sync + 'static>>;
+
 /// Release's verdict on a write that found no ticket possible: the slow
 /// path inline (wait out a `PUBLISHING` window or a mandatory seal; in
 /// `Clean` or `Unknown`, `DIRTY` durable first), its count held for the
@@ -413,7 +404,8 @@ fn ticketless(site: Site, location: &str, file: &str, why: &str) -> ! {
 /// clean point, and every provider write's future would otherwise carry it.
 /// A file set no longer open (its table dropped, a provider clone still
 /// writing) cannot make `DIRTY` durable: the write fails instead.
-fn slow(file_set: &Weak<FileGate>) -> Pin<Box<dyn Future<Output = io::Result<Hold>> + Send + Sync + 'static>> {
+#[cold]
+fn slow(file_set: &Weak<FileGate>) -> SlowPath {
     let file_set = file_set.upgrade();
     Box::pin(async move {
         let Some(gate) = file_set else {
@@ -421,7 +413,7 @@ fn slow(file_set: &Weak<FileGate>) -> Pin<Box<dyn Future<Output = io::Result<Hol
                 "the write gate's file set is no longer open, so DIRTY cannot be made durable before the write",
             ));
         };
-        gate.word().acquire(|state| gate.slow_path(state)).await
+        gate.word().acquire(|state| gate.slow_path(state)).await.map(Registration::Held)
     })
 }
 
@@ -454,7 +446,8 @@ mod scope {
 }
 
 /// Test-only: parks the next registered write of a named file between its
-/// registration and its issue, until the test releases it.
+/// registration and its issue, until the test releases it (`gated!` awaits
+/// [`park::at`] there in test builds).
 #[cfg(test)]
 pub(crate) mod park {
     use std::sync::Arc;
@@ -481,7 +474,7 @@ pub(crate) mod park {
         parked
     }
 
-    pub(super) async fn at(file: &str) {
+    pub async fn at(file: &str) {
         if !ARMED.load(Ordering::Acquire) {
             return;
         }

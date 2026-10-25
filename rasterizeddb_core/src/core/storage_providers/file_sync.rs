@@ -27,7 +27,31 @@ use smallvec::SmallVec;
 // Removed chunk cache; no longer need helpers::Chunk
 
 use super::{CRC, traits::StorageIO};
-use crate::core::index_store::gated_io::{Failure, Site};
+use crate::core::index_store::gated_io::{Failure, GatedIo, Site};
+
+/// Registers a write of this provider's file on its file set's word
+/// (`index_store::gated_io`, B12) and evaluates to the registration, to hold
+/// until the write returns. The fast path is synchronous
+/// (`GatedIo::admit_now`); only release's slow path is awaited, boxed, so a
+/// write's future carries one pointer for it. `$fail` runs, with the error
+/// bound to `$e`, when that slow path failed and nothing may be issued.
+macro_rules! gated {
+    ($self:ident, $site:expr, |$e:ident| $fail:expr) => {{
+        let registration = match $self.commit.gated.admit_now($site, &$self.location, &$self.table_name) {
+            Ok(registration) => registration,
+            Err(slow) => match slow.await {
+                Ok(registration) => registration,
+                Err($e) => $fail,
+            },
+        };
+        // Tests only: a write parked here, registered and not yet issued, is
+        // what a seal's count must cover (RV15).
+        #[cfg(test)]
+        crate::core::index_store::gated_io::park::at(&$self.table_name).await;
+        $self.commit.gated.note_write(&$self.location, &$self.table_name);
+        registration
+    }};
+}
 
 pub enum FastPathResult {
     Done,              // fully satisfied
@@ -398,11 +422,7 @@ impl LocalStorageProvider {
             }
             if self.temp_has_data.load(Ordering::Acquire) {
                 // A landing writes the main file: registered like any write.
-                let _registered = self
-                    .commit
-                    .gated
-                    .admit(Site::Land, &self.location, &self.table_name)
-                    .await?;
+                let _registered = gated!(self, Site::Land, |e| return Err(e));
                 self.land_staged_durably().await?;
             }
         }
@@ -1718,14 +1738,10 @@ impl StorageIO for LocalStorageProvider {
         // Registered on the file set's word until the write returns (B12).
         // A gate failure (release only) skips the write and fails `txn`'s
         // commit.
-        let Some(_registered) = self
-            .commit
-            .gated
-            .admit_or_record(Site::WriteInPlace, &self.location, &self.table_name, Failure::Txn(txn))
-            .await
-        else {
+        let _registered = gated!(self, Site::WriteInPlace, |e| {
+            GatedIo::record_failure(&self.location, &self.table_name, Failure::Txn(txn), e);
             return txn;
-        };
+        });
         // Recorded now, applied to `file_len` at commit — see `inplace_end`.
         // Raising the length here instead would publish a length whose bytes
         // are not in the file yet, since the apply is deferred to commit.
@@ -1795,14 +1811,10 @@ impl StorageIO for LocalStorageProvider {
     async fn append_data_txn(&self, txn: u64, buffer: &[u8]) -> (u64, u64) {
         // As `write_data_txn`: a skipped append reports the allocator's end,
         // which nothing may use, since `txn`'s commit fails.
-        let Some(_registered) = self
-            .commit
-            .gated
-            .admit_or_record(Site::Append, &self.location, &self.table_name, Failure::Txn(txn))
-            .await
-        else {
+        let _registered = gated!(self, Site::Append, |e| {
+            GatedIo::record_failure(&self.location, &self.table_name, Failure::Txn(txn), e);
             return (self.file_len.load(Ordering::Acquire), txn);
-        };
+        });
         let mut file = self.append_file.write();
         // `file_len` is the append allocator, and this is where these bytes go.
         let at = self.file_len.load(Ordering::Acquire);
@@ -1897,11 +1909,7 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn truncate(&self, len: u64) -> io::Result<()> {
-        let _registered = self
-            .commit
-            .gated
-            .admit(Site::Truncate, &self.location, &self.table_name)
-            .await?;
+        let _registered = gated!(self, Site::Truncate, |e| return Err(e));
         // Staged appends live past the current end, so they are exactly the
         // bytes a truncation would drop. Land them first and let the caller see
         // a length that accounts for them, rather than silently discarding
@@ -1990,14 +1998,10 @@ impl StorageIO for LocalStorageProvider {
 
         // A staged write is a write of the file set too (its `.tmp`). A gate
         // failure is reported by the next commit in the directory.
-        let Some(_registered) = self
-            .commit
-            .gated
-            .admit_or_record(Site::Stage, &self.location, &self.table_name, Failure::Untokened)
-            .await
-        else {
+        let _registered = gated!(self, Site::Stage, |e| {
+            GatedIo::record_failure(&self.location, &self.table_name, Failure::Untokened, e);
             return self.file_len.load(Ordering::Acquire) + self.temp_file_len.load(Ordering::Acquire);
-        };
+        });
 
         // If a flush is ongoing, wait briefly until it completes to keep ordering simple.
         while self.append_blocked.load(Ordering::Acquire) {
@@ -2232,14 +2236,10 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
-        let Some(_registered) = self
-            .commit
-            .gated
-            .admit_or_record(Site::WriteSeek, &self.location, &self.table_name, Failure::Untokened)
-            .await
-        else {
+        let _registered = gated!(self, Site::WriteSeek, |e| {
+            GatedIo::record_failure(&self.location, &self.table_name, Failure::Untokened, e);
             return;
-        };
+        });
         let mut file = self.write_file.write();
         let written = file
             .seek(seek)
@@ -2383,14 +2383,10 @@ impl StorageIO for LocalStorageProvider {
 
     async fn swap_temp(&self, _temp_io_sync: &mut Self) {
         // Replaces this file's bytes wholesale: a write of the file set.
-        let Some(_registered) = self
-            .commit
-            .gated
-            .admit_or_record(Site::SwapTemp, &self.location, &self.table_name, Failure::Untokened)
-            .await
-        else {
+        let _registered = gated!(self, Site::SwapTemp, |e| {
+            GatedIo::record_failure(&self.location, &self.table_name, Failure::Untokened, e);
             return;
-        };
+        });
         yield_now().await;
 
         let delimiter = if cfg!(unix) {
