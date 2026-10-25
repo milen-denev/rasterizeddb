@@ -11881,19 +11881,34 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         // dispatch is a table lookup and the scan.
         let (response, blocker) = {
             use futures::FutureExt;
+            // The blocker is read only to pace a replay, so a statement this
+            // loop never replays (a read, DDL) runs without the capture's
+            // task-local scope, which is entered and left on every poll
+            // (slice B8b). A blocker noted inside it still reaches an
+            // enclosing capture, as the capture would have passed it on.
             let (caught, blocker) = match purpose {
-                QueryPurpose::PreparedRows(prepared) => {
-                    crate::core::rql::conflict_wait::capture(
-                        std::panic::AssertUnwindSafe(Box::pin(execute_prepared_rows(
-                            prepared,
-                            database.clone(),
-                            tx,
-                            SubqueryNeed::All,
-                        )))
-                        .catch_unwind(),
-                    )
-                    .await
-                }
+                QueryPurpose::PreparedRows(prepared) => (
+                    std::panic::AssertUnwindSafe(Box::pin(execute_prepared_rows(
+                        prepared,
+                        database.clone(),
+                        tx,
+                        SubqueryNeed::All,
+                    )))
+                    .catch_unwind()
+                    .await,
+                    None,
+                ),
+                purpose if !retryable => (
+                    std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
+                        purpose,
+                        database.clone(),
+                        0,
+                        tx,
+                    )))
+                    .catch_unwind()
+                    .await,
+                    None,
+                ),
                 purpose => {
                     crate::core::rql::conflict_wait::capture(
                         std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
