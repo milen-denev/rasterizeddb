@@ -6,10 +6,9 @@
 //! Every statement and every block has exactly one lock owner, from its first
 //! lock to its last durability step:
 //! - a block's owner is its root transaction ([`LockOwner::block`]);
-//! - an autocommit statement's is **O**, a top-level id begun in the
-//!   transaction manager ([`TransactionManager::begin_owner`]) before its first
-//!   lock and ended after its last durability step. Each conflict-retry
-//!   attempt runs under an id of its own, aliased to O
+//! - an autocommit statement's is **O**, its first attempt's transaction
+//!   (slice B8b; [`claim_attempt`]), begun before its first lock. A later
+//!   conflict-retry attempt runs under an id of its own, aliased to O
 //!   (`RowLocks::owner_alias`), so the statement's table locks and its node in
 //!   the wait-for graph survive its retries. A `WITH` statement's own
 //!   transaction *is* O ([`adopt_transaction`]; Q1);
@@ -41,6 +40,27 @@
 //! id. O is begun before the first attempt, so it is older than every attempt
 //! id the statement uses, and the graph ages the statement by it.
 //!
+//! # O is the first attempt (slice B8b)
+//!
+//! O is begun as an ordinary autocommit transaction, and the first attempt
+//! of the statement's attempt loop runs as it ([`claim_attempt`]): one id
+//! per statement, not two. So O's *transaction* can end before its *scope*
+//! does: a conflict aborts attempt 1 and the statement retries under a fresh
+//! id aliased to O, still holding O's table locks; a failed statement aborts
+//! it and then reports. Whatever asks whether an owner can still hold or
+//! wait must therefore not read O's outcome alone: before O's transaction is
+//! aborted while its scope goes on, the scope registers it ([`outlive`],
+//! `TransactionManager::owner_outlives`), and the lock manager's prune and
+//! the wait-for graph ask `TransactionManager::outlives` first. A scope that
+//! acts for O again after O's transaction committed registers it then
+//! ([`ensure`]). The scope's end releases O's locks and only then
+//! unregisters it.
+//!
+//! An O that no attempt claimed (a statement that took locks but ran no
+//! attempt loop) wrote nothing and is committed by the scope's end, as
+//! before. A claimed O the statement never ended (its future dropped
+//! mid-attempt) is aborted by the scope's end.
+//!
 //! # Released by space
 //!
 //! A transaction's end releases its row and referenced-key locks only
@@ -52,11 +72,11 @@
 //!
 //! # Representation
 //!
-//! O is a `TxId` per autocommit statement, as §7 decides, and B3b's perf
-//! gate kept it (Q4: O's own cost is B2's ~210 ns, and the table locks on
-//! top of it measured 1-4% of a point statement, none of it in O); everything
-//! outside this module and [`TransactionManager::begin_owner`] sees only
-//! [`StatementOwner`] and [`LockOwner`], so swapping it touches this file.
+//! O is a `TxId` per autocommit statement, as §7 decides; since B8b it is
+//! the first attempt's (Q4's alternative, taken after B8's perf gate found
+//! the second id the largest single cost). Standalone owners that never
+//! write (a bare `VACUUM`'s per-table owner, tests) still come from
+//! [`TransactionManager::begin_owner`].
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,10 +125,17 @@ pub struct OwnerScope {
     fixed: Option<LockOwner>,
     /// O, once something asked for it.
     minted: OnceLock<LockOwner>,
-    /// O was begun as the statement's own transaction (a `WITH` statement's),
-    /// so its outcome is the statement's to decide and the scope's end only
-    /// releases its locks.
+    /// O's transaction was taken by the statement: adopted as a `WITH`
+    /// statement's ([`adopt_transaction`]) or claimed by the attempt loop
+    /// ([`claim_attempt`]). Its outcome is the statement's to decide.
+    taken: AtomicBool,
+    /// Taken by [`adopt_transaction`]: the scope's end only releases it.
     adopted: AtomicBool,
+    /// The attempt that claimed O has ended (committed or aborted), so a
+    /// later ask for the owner acts for an ended transaction ([`ensure`]).
+    ended: AtomicBool,
+    /// O is registered with `TransactionManager::owner_outlives`.
+    outlived: AtomicBool,
     transactions: Arc<TransactionManager>,
     /// Set for an autocommit scope, which releases O when it ends.
     row_locks: Option<Arc<RowLocks>>,
@@ -122,9 +149,25 @@ impl Drop for OwnerScope {
         let Some(owner) = self.minted.get().copied() else {
             return;
         };
-        row_locks.release_owner(owner);
-        if !self.adopted.load(Ordering::Acquire) {
-            self.transactions.end_owner(owner.id());
+        let id = owner.id();
+        if !self.taken.load(Ordering::Acquire) {
+            // No attempt ran as O: it only held locks, and wrote nothing.
+            row_locks.release_owner(owner);
+            self.transactions.end_owner(id);
+        } else {
+            if !self.adopted.load(Ordering::Acquire)
+                && self.transactions.outcome(id) == super::TxOutcome::InProgress
+            {
+                // The attempt running as O never ended: the statement's
+                // future was dropped mid-attempt. Its writes must not stand.
+                self.transactions.abort(id);
+            }
+            row_locks.release_owner(owner);
+        }
+        // After the release: until then O's locks are held, and must read as
+        // a live owner's.
+        if self.outlived.load(Ordering::Acquire) {
+            self.transactions.owner_released(id);
         }
     }
 }
@@ -134,14 +177,44 @@ impl OwnerScope {
         self.fixed.or_else(|| self.minted.get().copied())
     }
 
+    fn mint(&self) -> LockOwner {
+        *self.minted.get_or_init(|| {
+            LockOwner::autocommit(self.transactions.begin_autocommit())
+                .expect("a begun id is a real transaction")
+        })
+    }
+
     fn ensure(&self) -> LockOwner {
         if let Some(owner) = self.fixed {
             return owner;
         }
-        *self.minted.get_or_init(|| {
-            LockOwner::autocommit(self.transactions.begin_owner())
-                .expect("a begun id is a real transaction")
-        })
+        let owner = self.mint();
+        // Acting for O after its attempt ended (a later statement of the same
+        // scope, a lookup after the commit): O must read live from here on.
+        if self.ended.load(Ordering::Acquire) {
+            self.register_outliving(owner);
+        }
+        owner
+    }
+
+    fn register_outliving(&self, owner: LockOwner) {
+        if !self.outlived.swap(true, Ordering::AcqRel) {
+            self.transactions.owner_outlives(owner.id());
+        }
+    }
+
+    /// Takes O's transaction for the statement, once per scope.
+    fn take(&self, adopt: bool) -> Option<TxId> {
+        if self.fixed.is_some() || self.row_locks.is_none() {
+            return None;
+        }
+        if self.taken.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        if adopt {
+            self.adopted.store(true, Ordering::Release);
+        }
+        Some(self.mint().id())
     }
 }
 
@@ -186,30 +259,58 @@ pub fn ensure() -> Option<StatementOwner> {
         .ok()
 }
 
-/// Begins O as the statement's own transaction, for a `WITH` statement whose
+/// Takes O as the statement's own transaction, for a `WITH` statement whose
 /// CTE bodies and outer statement share one (Q1: the `WITH` transaction is
-/// O, never a second owner). `None` when the scope is not an autocommit one or
-/// O was already begun as a plain owner; the caller then begins its own
-/// transaction and aliases it to [`ensure`]'s owner.
+/// O, never a second owner), beginning it if nothing asked for it yet. The
+/// statement ends it; the scope's end only releases its locks. `None` when
+/// the scope is not an autocommit one or O's transaction was already taken;
+/// the caller then begins its own transaction and aliases it to [`ensure`]'s
+/// owner.
 pub fn adopt_transaction() -> Option<TxId> {
-    SCOPE
-        .try_with(|scope| {
-            if scope.fixed.is_some() || scope.minted.get().is_some() {
-                return None;
-            }
-            let mut begun = None;
-            let owner = *scope.minted.get_or_init(|| {
-                let tx = scope.transactions.begin_autocommit();
-                begun = Some(tx);
-                LockOwner::autocommit(tx).expect("a begun id is a real transaction")
-            });
-            let tx = begun?;
-            debug_assert_eq!(owner.id(), tx);
-            scope.adopted.store(true, Ordering::Release);
-            Some(tx)
-        })
-        .ok()
-        .flatten()
+    SCOPE.try_with(|scope| scope.take(true)).ok().flatten()
+}
+
+/// The transaction the attempt loop's first attempt runs as: O itself
+/// (slice B8b), begun now if nothing asked for it yet, so an autocommit
+/// statement costs one id. `None` outside an autocommit scope, or when O's
+/// transaction was already taken (a nested statement's loop, a second
+/// statement of the scope, an adopted `WITH` transaction): that loop begins
+/// its attempts under ids of their own and aliases them to O.
+///
+/// The loop ends the claimed transaction itself, and calls [`outlive`]
+/// before it aborts it and [`attempt_ended`] once it is done with it.
+pub fn claim_attempt() -> Option<TxId> {
+    SCOPE.try_with(|scope| scope.take(false)).ok().flatten()
+}
+
+/// Called before the attempt loop aborts `tx`: when `tx` is the scope's O
+/// (the claimed first attempt), registers O as live past its transaction
+/// (`TransactionManager::owner_outlives`), so neither a blocked lock
+/// request (the prune of an aborted holder) nor the wait-for graph takes the
+/// still-running statement's locks or node for a dead one. A no-op for any
+/// other id.
+pub fn outlive(tx: TxId) {
+    let _ = SCOPE.try_with(|scope| {
+        if scope.fixed.is_none()
+            && !scope.adopted.load(Ordering::Acquire)
+            && let Some(owner) = scope.minted.get().copied()
+            && owner.id() == tx
+        {
+            scope.ended.store(true, Ordering::Release);
+            scope.register_outliving(owner);
+        }
+    });
+}
+
+/// Called once the attempt loop has decided `tx`'s end: when `tx` is the
+/// scope's O, a later ask for the owner registers O then ([`ensure`]). One
+/// atomic store, so the committing path registers nothing.
+pub fn attempt_ended(tx: TxId) {
+    let _ = SCOPE.try_with(|scope| {
+        if scope.fixed.is_none() && scope.minted.get().is_some_and(|o| o.id() == tx) {
+            scope.ended.store(true, Ordering::Release);
+        }
+    });
 }
 
 /// Runs `fut` as one autocommit statement of `kind`: under the scope already
@@ -235,7 +336,10 @@ pub fn statement<F: Future>(
             kind,
             fixed: None,
             minted: OnceLock::new(),
+            taken: AtomicBool::new(false),
             adopted: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            outlived: AtomicBool::new(false),
             transactions: transactions.clone(),
             row_locks: Some(row_locks.clone()),
         },
@@ -261,7 +365,10 @@ pub fn under<F: Future>(
                 kind,
                 fixed: Some(owner),
                 minted: OnceLock::new(),
+                taken: AtomicBool::new(false),
                 adopted: AtomicBool::new(false),
+                ended: AtomicBool::new(false),
+                outlived: AtomicBool::new(false),
                 transactions: transactions.clone(),
                 row_locks: None,
             },
@@ -389,8 +496,10 @@ pub mod probe {
         /// `RowLocks::owner_of(tx)`: whom that transaction's table locks and
         /// edges belong to.
         pub owner_of_tx: TxId,
-        /// Whether the owner read `InProgress` at the site.
-        pub owner_in_progress: bool,
+        /// Whether the owner was live at the site
+        /// (`TransactionManager::owner_live`: in progress, or its scope open
+        /// past its transaction's end, slice B8b).
+        pub owner_live: bool,
     }
 
     tokio::task_local! {
@@ -419,9 +528,7 @@ pub mod probe {
             owner,
             tx,
             owner_of_tx: row_locks.owner_of(tx),
-            owner_in_progress: owner.is_some_and(|o| {
-                transactions.outcome(o.owner.id()) == crate::core::mvcc::TxOutcome::InProgress
-            }),
+            owner_live: owner.is_some_and(|o| transactions.owner_live(o.owner.id())),
         };
         let _ = RECORDS.try_with(|r| r.lock().push(record));
     }

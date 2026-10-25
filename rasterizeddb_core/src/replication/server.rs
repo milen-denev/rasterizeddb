@@ -750,7 +750,7 @@ mod tests {
                 let o = r.owner.unwrap_or_else(|| panic!("{what}: {:?} ran under no owner", r.site));
                 assert_eq!(o.kind, OwnerKind::Replication, "{what}: {:?}", r.site);
                 assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "{what}: not the apply's own transaction");
-                assert!(r.owner_in_progress);
+                assert!(r.owner_live);
             }
             tx
         };

@@ -11798,18 +11798,26 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // report it rather than a misleading empty success.
     let mut first_conflict: Option<Vec<u8>> = None;
     let mut attempt = 0usize;
-    // O, begun before the first attempt so it reads `InProgress` across every
-    // one of them and is older than each (§7 Owner). Each attempt acts for it
-    // through an alias held across the attempt's commit or abort: the
-    // statement's table locks and graph node are O's and survive a retry,
-    // while each attempt's row locks are its own and end with it (L4).
+    // O, begun before the first attempt and older than each (§7 Owner). The
+    // first attempt runs as O itself (slice B8b): one id per statement. A
+    // later attempt (and every attempt of a loop whose O was already taken:
+    // a nested statement, a scope's second statement) acts for O through an
+    // alias held across its commit or abort: the statement's table locks and
+    // graph node are O's and survive a retry, while each attempt's row locks
+    // are its own and end with it (L4). Before O's own transaction is aborted
+    // with the statement going on, `owner::outlive` registers O as live past
+    // it, so nothing prunes the locks the statement still holds.
+    let mut first = crate::core::mvcc::owner::claim_attempt();
     let owner = crate::core::mvcc::owner::ensure().map(|o| o.owner);
     let mut _alias: Option<crate::core::mvcc::row_locks::AliasGuard<'_>> = None;
     // Each conflict waits on the transaction it met, with a wait-for edge
     // from O (slice B6, finding L1): see `conflict_wait`.
     let mut pacing = crate::core::rql::conflict_wait::Pacing::new(crate::core::rql::conflict_wait::Site::Autocommit);
     let (tx, response) = loop {
-        let tx = database.transactions.begin_autocommit();
+        let tx = match first.take() {
+            Some(o) => o,
+            None => database.transactions.begin_autocommit(),
+        };
         _alias = owner.map(|o| database.row_locks.owner_alias(tx, o));
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Attempt, tx, database);
 
@@ -11893,6 +11901,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
             if let Some(conflict) = first_conflict.take() {
                 if !conflicted && retry_matched_nothing(&response) {
                     let wrote = database.transactions.wrote_family(tx);
+                    crate::core::mvcc::owner::outlive(tx);
                     database.abort_transaction(tx);
                     if wrote {
                         let _ = database.transactions.flush();
@@ -11910,6 +11919,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         // Asked before the abort, which retires the transaction and forgets
         // the answer — the ordering the commit path below is careful about.
         let attempt_wrote = database.transactions.wrote_family(tx);
+        crate::core::mvcc::owner::outlive(tx);
         database.abort_transaction(tx);
         if attempt_wrote {
             let _ = database.transactions.flush();
@@ -11926,6 +11936,9 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         }
     };
     let _ = attempt;
+    // The loop is done with `tx`: if it is O, whatever acts for O after its
+    // end below registers it (`owner::ensure`); the commit registers nothing.
+    crate::core::mvcc::owner::attempt_ended(tx);
 
     // Did this statement put anything on disk? Asked before the commit, which
     // retires the transaction and forgets the answer.
@@ -11940,6 +11953,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // statement that failed must leave nothing behind, and aborting is what
     // makes its versions invisible.
     if response.first() == Some(&3) {
+        crate::core::mvcc::owner::outlive(tx);
         database.abort_transaction(tx);
         if wrote {
             let _ = database.transactions.flush();
@@ -11965,6 +11979,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         Ok(family) => family,
         Err(e) => {
             error!("Could not make the written rows durable: {}", e);
+            crate::core::mvcc::owner::outlive(tx);
             database.abort_transaction(tx);
             let _ = database.transactions.flush();
             let mut failed = vec![3u8];
@@ -11987,6 +12002,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // `INSERT` used to cost.
     if let Err(e) = database.transactions.flush_deferred() {
         error!("Could not record the transaction outcome: {}", e);
+        crate::core::mvcc::owner::outlive(tx);
         database.abort_transaction(tx);
         let mut failed = vec![3u8];
         failed.extend_from_slice(
@@ -12016,6 +12032,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
             // Back to aborted, which is what a restart would conclude anyway, so
             // the client and the disk agree instead of the client holding a
             // third story.
+            crate::core::mvcc::owner::outlive(tx);
             database.abort_transaction(tx);
             let _ = database.transactions.flush();
             let mut failed = vec![3u8];

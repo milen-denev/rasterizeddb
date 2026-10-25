@@ -105,7 +105,7 @@ fn one_owner(what: &str, records: &[Record], kind: OwnerKind) -> LockOwner {
             r.site, o, first
         );
         assert!(
-            r.owner_in_progress,
+            r.owner_live,
             "{what}: the owner was not in progress at {:?}",
             r.site
         );

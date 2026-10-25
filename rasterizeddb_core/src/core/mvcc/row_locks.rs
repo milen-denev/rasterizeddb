@@ -262,6 +262,11 @@ pub struct AliasGuard<'a> {
 
 impl Drop for AliasGuard<'_> {
     fn drop(&mut self) {
+        // An attempt that is its owner's own transaction (slice B8b) was
+        // never aliased.
+        if self.tx == self.owner {
+            return;
+        }
         if self.locks.aliases.remove_if(&self.tx, |_, o| *o == self.owner).is_some() {
             self.locks.alias_count.fetch_sub(1, Ordering::AcqRel);
         }
@@ -293,8 +298,15 @@ impl RowLocks {
         };
         // A table lock whose owner aborted without releasing it is nobody's
         // (`TableLocks::set_liveness`); a committed one waits for its release.
+        // An autocommit statement's O is its first attempt's transaction
+        // (slice B8b), which a conflict retry aborts while the statement
+        // goes on holding O's locks: the scope registers O first
+        // (`TransactionManager::owner_outlives`), and that is asked before
+        // the outcome, so a request blocked by a retrying statement never
+        // prunes its locks.
         locks.table_locks.set_liveness(move |owner| {
-            transactions.outcome(owner) != crate::core::mvcc::TxOutcome::Aborted
+            transactions.outlives(owner)
+                || transactions.outcome(owner) != crate::core::mvcc::TxOutcome::Aborted
         });
         locks
     }
@@ -338,6 +350,13 @@ impl RowLocks {
             tx: txn,
             owner: owner.id(),
         }
+    }
+
+    /// Whether `owner`'s scope outlives its transaction
+    /// (`TransactionManager::owner_outlives`).
+    #[inline]
+    fn owner_outlives(&self, owner: TxId) -> bool {
+        self.transactions.as_ref().is_some_and(|m| m.outlives(owner))
     }
 
     /// How many ids are aliased to an owner. Diagnostic and for tests.
@@ -841,8 +860,10 @@ impl RowLocks {
                 return Some(path.iter().filter_map(|(m, ..)| *m).collect());
             }
             // A finished holder is not waiting for anything; nor is one
-            // waiting nowhere.
-            if !is_live(to) || !visited.insert(to) {
+            // waiting nowhere. `to` is an owner: one whose transaction ended
+            // while its scope goes on (an autocommit statement retrying after
+            // its first attempt, which is O, aborted; slice B8b) is live.
+            if !(is_live(to) || self.owner_outlives(to)) || !visited.insert(to) {
                 continue;
             }
             let Some((e, member)) = edges_of(to) else {

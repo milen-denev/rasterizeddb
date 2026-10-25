@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cacheguard::CacheGuard;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 
 use super::status::{IdReservation, StatusLog};
 
@@ -365,6 +366,18 @@ pub struct TransactionManager {
     ended: tokio::sync::Notify,
     /// How many waits are watching [`TransactionManager::ended`].
     end_watchers: AtomicUsize,
+    /// Statement owners O whose transaction has ended while their scope
+    /// still acts for them (slice B8b; see
+    /// [`TransactionManager::owner_outlives`]). Few, and only on a rare
+    /// path: a conflict retry, a failed statement, or a scope that goes on
+    /// after its first attempt committed.
+    outliving: parking_lot::Mutex<SmallVec<[TxId; 4]>>,
+    /// `outliving.len()`, so the common answer ("no owner outlives its
+    /// transaction") is one atomic load.
+    outliving_count: AtomicUsize,
+    /// Registrations ever made: diagnostic, and what the test that a
+    /// committing statement registers nothing reads.
+    outliving_total: AtomicU64,
 }
 
 /// Counts one wait among [`TransactionManager`]'s end watchers until dropped.
@@ -663,6 +676,9 @@ impl TransactionManager {
             reservation_failure: parking_lot::Mutex::new(failure),
             ended: tokio::sync::Notify::new(),
             end_watchers: AtomicUsize::new(0),
+            outliving: parking_lot::Mutex::new(SmallVec::new()),
+            outliving_count: AtomicUsize::new(0),
+            outliving_total: AtomicU64::new(0),
         }
     }
 
@@ -897,6 +913,64 @@ impl TransactionManager {
     /// and still running.
     pub fn is_owner_only(&self, tx: TxId) -> bool {
         self.inner.read().owner_only.contains(&tx)
+    }
+
+    /// Registers `o`, an autocommit statement's owner O that is also its
+    /// first attempt's transaction (slice B8b, `owner::claim_attempt`), as
+    /// live for as long as its scope lasts, whatever that transaction's
+    /// outcome: called before the transaction ends while the scope goes on
+    /// (an attempt aborted for a conflict retry or a failure, or a scope that
+    /// acts for O again after its attempt committed), and undone by
+    /// [`TransactionManager::owner_released`] after the scope has released
+    /// O's locks. Idempotent.
+    ///
+    /// The lock manager asks [`TransactionManager::owner_live`] rather than
+    /// O's outcome: an aborted O still holds its statement's table locks and
+    /// is still a node of the wait-for graph while the statement retries.
+    pub fn owner_outlives(&self, o: TxId) {
+        let mut set = self.outliving.lock();
+        if !set.contains(&o) {
+            set.push(o);
+            self.outliving_count.store(set.len(), Ordering::Release);
+            self.outliving_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Ends [`TransactionManager::owner_outlives`] for `o`: its scope has
+    /// released everything it held.
+    pub fn owner_released(&self, o: TxId) {
+        let mut set = self.outliving.lock();
+        if let Some(at) = set.iter().position(|id| *id == o) {
+            set.swap_remove(at);
+            self.outliving_count.store(set.len(), Ordering::Release);
+        }
+    }
+
+    /// Whether `o` is registered by [`TransactionManager::owner_outlives`].
+    #[inline]
+    pub fn outlives(&self, o: TxId) -> bool {
+        self.outliving_count.load(Ordering::Acquire) > 0 && self.outliving.lock().contains(&o)
+    }
+
+    /// How many owners outlive their transaction. Diagnostic and for tests.
+    pub fn outliving_len(&self) -> usize {
+        self.outliving_count.load(Ordering::Acquire)
+    }
+
+    /// How many registrations [`TransactionManager::owner_outlives`] has
+    /// made. Diagnostic and for tests.
+    pub fn outliving_total(&self) -> u64 {
+        self.outliving_total.load(Ordering::Relaxed)
+    }
+
+    /// Whether an owner can still act (slice B8b): its transaction is in
+    /// progress, or its scope is open past that transaction's end
+    /// ([`TransactionManager::owner_outlives`]). What the wait-for graph
+    /// asks of a node; never what a row lock's holder (a transaction) is
+    /// asked.
+    #[inline]
+    pub fn owner_live(&self, o: TxId) -> bool {
+        self.outcome(o) == TxOutcome::InProgress || self.outlives(o)
     }
 
     /// Republishes the count [`TransactionManager::outcome`]'s lock-free path

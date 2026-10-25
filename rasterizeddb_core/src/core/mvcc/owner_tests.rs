@@ -64,8 +64,8 @@ async fn captured(db: &Arc<Database>, sql: &str) -> (Vec<u8>, Vec<Record>) {
 
 const LIVE: &dyn Fn(TxId) -> bool = &|_| true;
 
-/// Every record ran under one owner of `kind`, which read `InProgress` at
-/// each site, and every transaction a piece ran under acts for it. Returns it.
+/// Every record ran under one owner of `kind`, which was live at each site
+/// (in progress, or its scope open past its first attempt's end; slice B8b), and every transaction a piece ran under acts for it. Returns it.
 fn one_owner(what: &str, records: &[Record], kind: OwnerKind) -> LockOwner {
     assert!(
         !records.is_empty(),
@@ -88,8 +88,8 @@ fn one_owner(what: &str, records: &[Record], kind: OwnerKind) -> LockOwner {
             r.site, o, first
         );
         assert!(
-            r.owner_in_progress,
-            "{what}: the owner was not in progress at {:?}",
+            r.owner_live,
+            "{what}: the owner was not live at {:?}",
             r.site
         );
         if r.tx != FROZEN_TX {
@@ -501,20 +501,22 @@ async fn every_sub_execution_of_an_engine_statement_runs_under_its_owner() {
             );
         }
         assert!(seen.contains(&Site::Attempt), "{sql}: no attempt recorded");
+        // The statement's first attempt is O itself (slice B8b), and O is
+        // older than every later one.
+        let attempts: Vec<TxId> = records.iter().filter(|r| r.site == Site::Attempt).map(|r| r.tx).collect();
+        assert_eq!(attempts[0], o.id(), "{sql}: the first attempt is not O");
         assert!(
-            records
-                .iter()
-                .filter(|r| r.site == Site::Attempt)
-                .all(|r| r.tx > o.id()),
+            attempts[1..].iter().all(|tx| *tx > o.id()),
             "{sql}: O is not older than its attempts"
         );
         assert_ended(&db, sql, o);
     }
 }
 
-/// The autocommit retry loop: every attempt is a fresh transaction aliased
-/// to the same O, which reads in progress across all of them (and through
-/// each attempt's abort) and ends once, after the last.
+/// The autocommit retry loop: the first attempt is O (slice B8b), every
+/// later one a fresh transaction aliased to it; O is live across all of them
+/// (through its own abort, registered as outliving it) and its scope ends
+/// once, after the last.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_autocommit_attempt_acts_for_the_same_o() {
     let db = db().await;
@@ -564,6 +566,11 @@ async fn every_autocommit_attempt_acts_for_the_same_o() {
     assert_ok("the retried UPDATE", &out);
     let o = one_owner("the retried UPDATE", &records, OwnerKind::Statement);
     assert_eq!(o, held);
+    assert_eq!(
+        db.transactions.outliving_len(),
+        0,
+        "the scope's end left O registered as outliving its transaction"
+    );
     let attempts: Vec<TxId> = records
         .iter()
         .filter(|r| r.site == Site::Attempt)
@@ -831,13 +838,205 @@ async fn the_native_protocol_and_login_run_under_named_owners() {
             r.site,
             o.kind
         );
-        assert!(r.owner_in_progress);
+        assert!(r.owner_live);
     }
 
     let (role, records) = probe::capture(crate::auth::lookup_role(&db, "boot")).await;
     assert!(role.is_some(), "the bootstrap role was not found");
     let o = one_owner("login lookup", &records, OwnerKind::Auth);
     assert_ended(&db, "login lookup", o);
+}
+
+// ------------------------------- O is the first attempt (slice B8b)
+
+/// An autocommit statement takes one id: its first attempt is O. And a
+/// statement that commits registers nothing as outliving its transaction:
+/// the registry is the rare path's (a retry, a failure), not every
+/// statement's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_autocommit_statement_takes_one_id_and_registers_nothing() {
+    let db = db().await;
+    fixture(&db).await;
+    let registered = db.transactions.outliving_total();
+    for sql in [
+        "SELECT id, v FROM u WHERE id = 1",
+        "UPDATE u SET v = 'one' WHERE id = 1",
+        "INSERT INTO u (id, v) VALUES (40, 'n')",
+    ] {
+        for _ in 0..3 {
+            run(&db, "SELECT id FROM u WHERE id = 1").await;
+        }
+        let before = db.transactions.next_id();
+        let (out, records) = captured(&db, sql).await;
+        assert_ok(sql, &out);
+        assert_eq!(
+            db.transactions.next_id() - before,
+            1,
+            "{sql}: an autocommit statement took more than one id"
+        );
+        let o = one_owner(sql, &records, OwnerKind::Statement);
+        assert_ended(&db, sql, o);
+    }
+    assert_eq!(
+        db.transactions.outliving_total(),
+        registered,
+        "a committing statement registered its owner as outliving its transaction"
+    );
+}
+
+/// The trap Q4's alternative sets (slice B8b): O is attempt 1's id, a write
+/// conflict aborts attempt 1, and the statement retries still holding O's
+/// ROW EXCLUSIVE. A DDL whose ACCESS EXCLUSIVE request arrives during the
+/// back-off (and is re-checked when the block it also waits for releases)
+/// must not prune that lock as an aborted holder's: it waits until the
+/// UPDATE's statement ends. The statement's scope is held open past its
+/// retry so a DDL that got in early would finish inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retrying_statements_lock_survives_its_first_attempts_abort() {
+    let db = db().await;
+    fixture(&db).await;
+    let block = db.transactions.begin();
+    let release = OwnerRelease::for_root(&db.row_locks, block);
+    run_in(&db, block, "UPDATE u SET v = 'held' WHERE id = 1").await;
+
+    const HOLD: Duration = Duration::from_millis(700);
+    let minted = StdArc::new(parking_lot::Mutex::new(None));
+    let update = {
+        let db = db.clone();
+        let minted = minted.clone();
+        tokio::spawn(async move {
+            probe::capture(statement(
+                &db.transactions,
+                &db.row_locks,
+                OwnerKind::Statement,
+                async {
+                    *minted.lock() = Some(ensure().unwrap().owner);
+                    let out = executor::execute_with_sync(
+                        purpose("UPDATE u SET v = 'won' WHERE id = 1"),
+                        db.clone(),
+                        false,
+                    )
+                    .await;
+                    tokio::time::sleep(HOLD).await;
+                    out
+                },
+            ))
+            .await
+        })
+    };
+
+    // Attempt 1 (O itself) met the block's version and was aborted; the
+    // statement waits for the block, holding O's ROW EXCLUSIVE on u.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let o = minted.lock().expect("the statement began its owner");
+    assert_eq!(
+        db.transactions.outcome(o.id()),
+        TxOutcome::Aborted,
+        "attempt 1 (O) was not aborted, so the trap was not set"
+    );
+    assert!(db.row_locks.owner_holds_tables(o.id()), "O holds nothing to lose");
+
+    // The DDL's request arrives during the back-off.
+    let ddl = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            executor::execute_with_sync(purpose("ALTER TABLE u ADD COLUMN w TEXT"), db.clone(), false).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!ddl.is_finished(), "the DDL ran beside the block's and the UPDATE's ROW EXCLUSIVE");
+    assert!(
+        db.row_locks.owner_holds_tables(o.id()),
+        "the DDL's request pruned the retrying UPDATE's ROW EXCLUSIVE as an aborted holder's"
+    );
+
+    // The block ends: its lock goes, the UPDATE's attempt 2 runs and the
+    // statement holds on. The DDL is re-checked against O alone.
+    db.commit_transaction(block);
+    drop(release);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !update.is_finished(),
+        "the UPDATE's statement ended early, so the hold proves nothing"
+    );
+    assert!(
+        !ddl.is_finished(),
+        "the DDL got in while the UPDATE's statement still held its ROW EXCLUSIVE"
+    );
+    assert!(db.row_locks.owner_holds_tables(o.id()));
+
+    let (out, records) = tokio::time::timeout(Duration::from_secs(20), update)
+        .await
+        .expect("the UPDATE finished")
+        .unwrap();
+    assert_ok("the retried UPDATE", &out);
+    let owner = one_owner("the retried UPDATE", &records, OwnerKind::Statement);
+    assert_eq!(owner, o);
+    let attempts = records.iter().filter(|r| r.site == Site::Attempt).count();
+    assert!(attempts >= 2, "the UPDATE never retried ({attempts})");
+    let altered = tokio::time::timeout(Duration::from_secs(20), ddl)
+        .await
+        .expect("the DDL went ahead once the UPDATE ended")
+        .unwrap();
+    assert_ok("the ALTER", &altered);
+    assert_eq!(db.transactions.outliving_len(), 0, "O stayed registered past its scope");
+    assert_ended(&db, "the retried UPDATE", o);
+}
+
+/// The lock manager's prune asks whether the owner outlives its transaction
+/// before its outcome: a registered owner's lock survives its abort; once
+/// unregistered, an aborted holder that never released is pruned, as
+/// before.
+#[test]
+fn an_outliving_owners_table_lock_is_not_pruned() {
+    use crate::core::mvcc::table_locks::{Request, WaitRole};
+    let m = StdArc::new(TransactionManager::in_memory());
+    let locks = row_locks(&m);
+    let o = LockOwner::autocommit(m.begin_autocommit()).unwrap();
+    assert!(locks.table_locks().try_acquire(o, "t", TableMode::RowExclusive));
+    m.owner_outlives(o.id());
+    m.abort(o.id());
+    let ddl = LockOwner::autocommit(m.begin_owner()).unwrap();
+    let Request::Queued(wait) = locks.table_locks().request(ddl, "t", TableMode::AccessExclusive, WaitRole::Ddl) else {
+        panic!("the DDL pruned an outliving owner's ROW EXCLUSIVE");
+    };
+    assert!(locks.owner_holds_tables(o.id()));
+    locks.table_locks().abandon(&wait);
+
+    // Unregistered (the scope ended without releasing, which no engine path
+    // does): the safety net prunes it.
+    m.owner_released(o.id());
+    assert!(
+        locks.table_locks().request(ddl, "t", TableMode::AccessExclusive, WaitRole::Ddl).is_granted(),
+        "an aborted holder that never released was not pruned"
+    );
+    locks.release_owner(ddl);
+    m.end_owner(ddl.id());
+}
+
+/// The wait-for graph takes an outliving owner for a live node: a younger
+/// block waiting on a retrying statement's O, which waits on the block, is
+/// a cycle the block's own check finds and picks itself for.
+#[test]
+fn an_outliving_owner_is_a_live_node_of_the_graph() {
+    let m = StdArc::new(TransactionManager::in_memory());
+    let locks = row_locks(&m);
+    let o = m.begin_autocommit();
+    let block = m.begin();
+    m.owner_outlives(o);
+    m.abort(o);
+    locks.set_waiting(block, &[o]);
+    locks.set_waiting(o, &[block]);
+    let in_progress = |tx: TxId| m.outcome(tx) == TxOutcome::InProgress;
+    assert!(
+        locks.deadlock_victim(block, &in_progress),
+        "the block's walk skipped the retrying statement's O, so the cycle went unseen"
+    );
+    assert!(!locks.deadlock_victim(o, &in_progress), "two victims");
+    locks.clear_waiting(block);
+    locks.clear_waiting(o);
+    m.owner_released(o);
+    m.commit(block);
 }
 
 // ------------------------------------------------------------- the cost
@@ -900,9 +1099,5 @@ async fn owner_cost() {
         100.0 * per(owner) / per(statement),
         per(plain)
     );
-    assert_eq!(
-        ids,
-        2 * n,
-        "an autocommit statement takes its attempt's id and O's"
-    );
+    assert_eq!(ids, n, "an autocommit statement takes one id: its first attempt is O (B8b)");
 }
