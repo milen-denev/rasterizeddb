@@ -520,6 +520,14 @@ async fn seeded(db: &Arc<Database>, name: &str, rows: i64) -> Arc<DbTable> {
     }
     let t = table(db, name);
     t.wait_filters_ready().await.unwrap();
+    // The primary key's build too: a seal refuses a table whose index is
+    // not ready, and under a loaded run the build's task can trail the
+    // INSERT.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while t.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+        assert!(std::time::Instant::now() < deadline, "the index build never finished");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     t
 }
 

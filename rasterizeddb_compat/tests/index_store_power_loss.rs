@@ -411,10 +411,10 @@ async fn clean_reopen(place: Place, table: &'static str, indexed: bool) {
     assert_eq!(answered, "1 of 1 clean", "rdb_index_checkpoint answered {answered}");
     s.stop().await;
     let loads = rasterizeddb_core::core::index_store::open_proof::loaded_total();
+    let index_loads = rasterizeddb_core::core::index_store::load::loaded_total();
     let s = Subject::start(&dirs, table).await;
     let mut problems = Vec::new();
     let preds = battery(&[&model], &[]);
-    let index_loads = rasterizeddb_core::core::index_store::load::loaded_total();
     let loaded = check(&s, &format!("{place:?} clean reopen"), &[model.clone()], &preds, Expect::Load, &mut problems).await;
     assert!(loaded && rasterizeddb_core::core::index_store::open_proof::loaded_total() > loads, "the reopen did not load");
     if indexed {
