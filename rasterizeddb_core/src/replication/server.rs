@@ -884,7 +884,6 @@ mod tests {
                 began_clean: true,
                 structures: &table.census_structures(),
                 files: &table.census_files(),
-                exempt: &["_flt.db"],
             },
         )
         .unwrap_or_else(|e| panic!("census: {e}"));

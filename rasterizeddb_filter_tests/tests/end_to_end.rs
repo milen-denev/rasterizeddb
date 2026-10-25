@@ -383,61 +383,58 @@ async fn reopen_after_delete_is_still_correct() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mutation_marks_the_sidecar_dirty_on_disk() {
-    // Regression: the dirty byte must actually reach the file. Guarding this
-    // write on `io.get_len()` silently disabled it, because the provider tracks
-    // length in an atomic that `write_data` does not update.
+async fn a_mutation_writes_no_sidecar() {
+    // Persistent indexes B14 retired `_flt.db` and its dirty byte: a delete
+    // after a checkpoint writes nothing beside the table.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e2e_dirty_flt.db");
     let t = open_table(dir.path(), "e2e_dirty", &std_columns()).await;
     fill_std(&t).await;
     t.checkpoint_filters().await.unwrap();
-    assert_eq!(std::fs::read(&path).unwrap()[13], 0, "fresh checkpoint should be clean");
-
     t.delete_rows("id = 42", full_fetch(&t.schema.fields), None).await.unwrap();
-    assert_eq!(
-        std::fs::read(&path).unwrap()[13],
-        1,
-        "a delete must mark the on-disk checkpoint stale"
-    );
+    assert!(!path.exists(), "a sidecar was written");
+    assert!(run(&t, "id = 42").await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_corrupt_sidecar_falls_back_to_a_rebuild() {
+/// An older build's `_flt.db`, whole, corrupt or truncated, is never read:
+/// a filter image is deleted at open, other bytes are left alone, and the
+/// rebuilt filter answers exactly.
+async fn a_leftover_sidecar_is_never_read(name: &str, mangle: fn(Vec<u8>) -> Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let t = open_table(dir.path(), "e2e_corrupt", &std_columns()).await;
+    let image = {
+        let t = open_table(dir.path(), name, &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await.unwrap();
-    }
-    let path = dir.path().join("e2e_corrupt_flt.db");
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes[0..4].copy_from_slice(b"JUNK");
-    std::fs::write(&path, &bytes).unwrap();
+        checkpoint_sidecar(&t, dir.path()).await;
+        std::fs::read(sidecar_path(dir.path(), name)).unwrap()
+    };
+    let path = dir.path().join(format!("{name}_flt.db"));
+    std::fs::write(&path, mangle(image)).unwrap();
 
-    let t = open_table(dir.path(), "e2e_corrupt", &std_columns()).await;
+    let t = open_table(dir.path(), name, &std_columns()).await;
     t.wait_filters_ready().await.unwrap();
     for target in [0u64, 1234, N - 1] {
         assert_eq!(u64s(&run(&t, &format!("id = {}", target)).await, 0), vec![target]);
     }
+    assert_eq!(run(&t, "").await.len() as u64, N);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_sidecar_falls_back_to_a_rebuild() {
+    a_leftover_sidecar_is_never_read("e2e_corrupt", |mut b| {
+        b[0..4].copy_from_slice(b"JUNK");
+        b
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_truncated_sidecar_falls_back_to_a_rebuild() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let t = open_table(dir.path(), "e2e_trunc", &std_columns()).await;
-        fill_std(&t).await;
-        t.checkpoint_filters().await.unwrap();
-    }
-    let path = dir.path().join("e2e_trunc_flt.db");
-    let bytes = std::fs::read(&path).unwrap();
-    std::fs::write(&path, &bytes[..bytes.len() / 3]).unwrap();
+    a_leftover_sidecar_is_never_read("e2e_trunc", |b| b[..b.len() / 3].to_vec()).await;
+}
 
-    let t = open_table(dir.path(), "e2e_trunc", &std_columns()).await;
-    t.wait_filters_ready().await.unwrap();
-    assert_eq!(u64s(&run(&t, "id = 1234").await, 0), vec![1234]);
-    assert_eq!(run(&t, "").await.len() as u64, N);
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_sidecar_is_deleted_and_never_read() {
+    a_leftover_sidecar_is_never_read("e2e_whole", |b| b).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

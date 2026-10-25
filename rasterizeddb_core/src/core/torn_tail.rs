@@ -95,8 +95,9 @@
 //!   record), never appended to.
 //! - `<t>_seq.db`, `db_transactions.next`, `db_transactions.status`: written
 //!   at fixed offsets, not appended; a short status file reads as no outcome.
-//! - `<t>_flt.db`: its append point is an in-memory length restored from the
-//!   last delta that parses whole, not the file's length.
+//! - `<t>_flt.db`: retired (persistent indexes §5, B14), deleted at open and
+//!   never written; `.ixs` and `.ixm` are written whole and proven by
+//!   checksums and the marker log, never appended to by offset.
 //! - `db_replication.state`: cut back to whole 16-byte records at its own
 //!   open (`replication::log`).
 //! - files written by temporary name and rename (`.cfg`, marks, snapshots).

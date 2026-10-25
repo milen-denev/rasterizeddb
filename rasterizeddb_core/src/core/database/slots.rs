@@ -332,7 +332,7 @@ impl SchemaStats<'_> {
                 let bytes = data.io_rows.get_len().await
                     + pointers
                     + table.io_schema.get_len().await
-                    + data.io_filters.get_len().await
+                    + table.index_store_bytes()?
                     + data.ids.io.get_len().await;
                 Ok(RelationTotals {
                     bytes,

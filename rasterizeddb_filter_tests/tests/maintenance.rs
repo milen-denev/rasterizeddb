@@ -2,8 +2,9 @@
 //!
 //! Filter maintenance on the write path is unavoidable — data has to be indexed
 //! as it arrives. Everything else runs on a per-table task: the initial
-//! backfill, and checkpointing. No caller should ever pay for either, and the
-//! task must not outlive its table.
+//! backfill. No caller should ever pay for it, and the task must not outlive
+//! its table. (The runtime checkpoint the task also ran was retired with
+//! `_flt.db` in persistent indexes B14.)
 
 use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::row::row::RowWrite;
@@ -14,7 +15,7 @@ use std::time::Duration;
 const N: u64 = STD_N;
 
 fn sidecar(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    dir.join(format!("{}_flt.db", name))
+    sidecar_path(dir, name)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -58,35 +59,19 @@ async fn queries_are_correct_before_the_backfill_finishes() {
     assert_eq!(run(&t, "").await.len() as u64, N);
 }
 
+/// No background checkpoint (persistent indexes B14): with the old
+/// interval long past, a delete leaves no sidecar of any kind, and the
+/// reopen is still exact.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_service_checkpoints_without_being_asked() {
+async fn the_service_writes_no_sidecar() {
     rasterizeddb_core::filter_settings().set_checkpoint_interval_secs(1);
     let dir = tempfile::tempdir().unwrap();
-    let path = sidecar(dir.path(), "mnt_service");
     {
         let t = open_table(dir.path(), "mnt_service", &std_columns()).await;
         fill_std(&t).await;
-        // A delete requests a checkpoint; nobody calls checkpoint_filters().
         t.delete_rows("id = 42", full_fetch(&t.schema.fields), None).await.unwrap();
-
-        // Wait for the condition rather than for a fixed time, with a deadline
-        // generous enough that machine load cannot reach it: several builds
-        // running alongside can starve a 1-second timer for a long while, and a
-        // tight bound here would fail without the code being wrong.
-        let mut wrote = false;
-        for _ in 0..600 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(b) = std::fs::read(&path) {
-                if b.len() > 64 && b[13] == 0 {
-                    wrote = true;
-                    break;
-                }
-            }
-        }
-        assert!(
-            wrote,
-            "the maintenance task never wrote a clean sidecar within 60s"
-        );
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(!dir.path().join("mnt_service_flt.db").exists(), "the service wrote a sidecar");
     }
 
     let t = open_table(dir.path(), "mnt_service", &std_columns()).await;
@@ -245,7 +230,7 @@ async fn an_explicit_checkpoint_is_idempotent_and_stays_loadable() {
 
     let mut sizes = Vec::new();
     for _ in 0..5 {
-        t.checkpoint_filters().await.unwrap();
+        checkpoint_sidecar(&t, dir.path()).await;
         sizes.push(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
     }
     assert!(sizes.windows(2).all(|w| w[0] == w[1]), "checkpoint size drifted: {:?}", sizes);

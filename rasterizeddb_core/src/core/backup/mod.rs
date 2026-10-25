@@ -147,6 +147,18 @@ const EXCLUDED: &[&str] = &[
     STAGING_DIR,
 ];
 
+/// Whether a file is left out of every snapshot: [`EXCLUDED`], and the
+/// index-store files (`.ixs`, `.ixm` and their `.tmp`s; persistent indexes
+/// §10). An open trusts a snapshot its marker log proves (B14), and a fuzzy
+/// walk could pair a copied `CLEAN` with rows changed after it; a restore
+/// rebuilds instead. `rdb.ixe` is kept: it is WAL'd.
+fn excluded_file(name: &str) -> bool {
+    EXCLUDED.contains(&name)
+        || crate::core::index_store::file_gate::INDEX_STORE_SUFFIXES
+            .iter()
+            .any(|s| name.ends_with(s))
+}
+
 /// S3 minimum for any part but the last.
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
@@ -1376,7 +1388,7 @@ impl BackupService {
                 if !file_type.is_file() {
                     continue;
                 }
-                if EXCLUDED.contains(&name.as_str())
+                if excluded_file(&name)
                     || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
                 {
                     continue;
@@ -1403,7 +1415,7 @@ impl BackupService {
                     continue;
                 };
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                    || EXCLUDED.contains(&name.as_str())
+                    || excluded_file(&name)
                     || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
                 {
                     continue;
@@ -3032,6 +3044,20 @@ mod bundle_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Persistent indexes §10 (B14): no snapshot carries an index-store
+    /// file, so a restore never pairs a copied `CLEAN` with rows changed
+    /// after it; the WAL'd `rdb.ixe` and every table file are kept.
+    /// Mutation: `excluded_file` checks `EXCLUDED` only.
+    #[test]
+    fn index_store_files_are_left_out_of_snapshots() {
+        for name in ["t.ixs", "t.ixm", "t.ixs.tmp", "t.ixm.tmp", "__pt_00000000000000aa_00000001.ixs"] {
+            assert!(excluded_file(name), "{name} would be backed up");
+        }
+        for name in ["rdb.ixe", "t.db", "t_pointers.db", "t_schema.db", "t.db.tmp", "t_ixs.db"] {
+            assert!(!excluded_file(name), "{name} would be left out");
+        }
+    }
 
     #[test]
     fn a_schedule_resumes_from_the_last_run_rather_than_restarting() {

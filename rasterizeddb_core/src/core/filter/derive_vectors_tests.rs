@@ -613,8 +613,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// never edited; the last row is the current one.
 ///
 /// v4 sidecars are read under derive version 1: v4 is the NaN-order change,
-/// and v5 changed only the layout.
-const DERIVE_VERSIONS: &[(u32, u16, u16, u64)] = &[(1, 5, 4, 0x76d32637f5a8cc9a)];
+/// and v5 changed only the layout. v6 (persistent indexes B14) records
+/// `cleared_below` in the superblock: a layout change, so derive version 1
+/// and v4 still readable.
+const DERIVE_VERSIONS: &[(u32, u16, u16, u64)] = &[(1, 5, 4, 0x76d32637f5a8cc9a), (1, 6, 4, 0x76d32637f5a8cc9a)];
 
 /// The current derive version's frozen block. See the module docs.
 const FROZEN: (u32, &str) = (1, GOLDEN_V1);

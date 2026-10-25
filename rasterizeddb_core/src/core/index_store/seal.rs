@@ -9,9 +9,9 @@
 //!    `CLEAN`, or loaded it) has nothing to add. A `Clean` word that is not
 //!    vouched, or an `Unknown` one, first takes and drops a ticket, so
 //!    `DIRTY` is durable before `.ixs` is replaced (§3 rule 2). The target's
-//!    `before_seal` runs then, under a transient ticket: `_flt.db`'s
-//!    runtime checkpoint is brought up to date, so its loop has nothing to
-//!    write after the `CLEAN` (until B14 retires it).
+//!    `before_seal` runs then, under that transient ticket: the filter's
+//!    checkpoint bookkeeping is reset (B14; §3 step 7's `mark_checkpointed`,
+//!    moved here since no ticket may be held after `CLEAN`).
 //! 1. **Seal** (`fetch_or(SEALED)`, with `MANDATORY` for shutdown and
 //!    `rdb_index_checkpoint`). An optional seal that finds tickets skips at
 //!    once; a mandatory one waits up to `seal_timeout` for them, new ones
@@ -214,9 +214,9 @@ pub trait SealTarget: Send + Sync {
     /// Whether the instance was retired (§7 step 2).
     fn retired(&self) -> bool;
     /// Run before the seal, under a transient ticket the seal holds: what
-    /// must be written while the word is still `Dirty` and would otherwise
-    /// be written after the `CLEAN` (B13: `_flt.db`'s checkpoint).
-    fn before_seal(&self) -> impl Future<Output = ()> + Send;
+    /// must change while the word is still `Dirty` and would otherwise
+    /// change after the `CLEAN` (B14: the filter's checkpoint bookkeeping).
+    fn before_seal(&self, ticket: &super::gate::WriteTicket) -> impl Future<Output = ()> + Send;
     /// §3 step 2: every provider's staged appends landed durably.
     fn land_staged(&self) -> impl Future<Output = io::Result<()>> + Send;
     /// §3 step 3: `Some(why)` when the snapshot must not be taken.
@@ -260,7 +260,7 @@ pub async fn seal<T: SealTarget>(t: &T, kind: SealKind) -> SealOutcome {
     // under.
     match super::gate::ticket(&gate, None).await {
         Ok(ticket) => {
-            t.before_seal().await;
+            t.before_seal(&ticket).await;
             drop(ticket);
         }
         Err(e) => {

@@ -13,7 +13,7 @@ use std::time::Duration;
 use rclite::Arc;
 
 use super::park;
-use super::{Policy, UNGATED, Ungated};
+use super::{Policy, UNGATED};
 use crate::core::database::Database;
 use crate::core::index_store::census::{Census, Event};
 use crate::core::index_store::file_gate::{self, FileGate};
@@ -205,7 +205,6 @@ async fn the_census_does_not_count_a_registration_as_a_ticket() {
             began_clean: false,
             structures: &[],
             files: &files,
-            exempt: &[],
         },
     );
     assert!(
@@ -626,14 +625,15 @@ async fn the_sidecar_family_registers() {
     family_registers(Family::Sidecar).await;
 }
 
-/// `_flt.db` registers too, under its exemption: its checkpoint loop writes
-/// under no ticket, so a write on a `Clean` word takes the release slow path
-/// (`DIRTY` durable first) instead of panicking.
+/// The filter has no file of its own any more (B14 retired `_flt.db` and
+/// its exemption): a filter checkpoint of a `Clean` table is a seal, which
+/// makes `DIRTY` durable before anything else and publishes a snapshot,
+/// with no write reaching a `_flt.db` and no file of that name left.
 ///
-/// Mutation: the filter provider is not attached in `assemble` (its write
-/// then reaches the live, `Clean` file set around the word, and panics).
+/// Mutation: the filter's old provider comes back in `assemble` (a
+/// `_flt.db` is created beside the table).
 #[tokio::test(flavor = "multi_thread")]
-async fn the_filter_family_registers() {
+async fn the_filter_has_no_file_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "families").await;
     let t = seeded(&db, "flt", 5).await;
@@ -646,18 +646,15 @@ async fn the_filter_family_registers() {
     .await;
     let events = census.finish();
     assert_eq!(panicked, None, "the filter checkpoint panicked");
-    let file = dir.path().join("flt_flt.db");
-    let id = t.gate().census_id();
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            Event::Write { file: f, gate: Some(g), ungated: Some(Ungated::FilterCheckpoint), .. }
-                if *f == file && *g == id
-        )),
-        "the checkpoint's write did not register on the table's word"
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Write { file: f, .. } if f.to_string_lossy().ends_with("_flt.db"))),
+        "a write reached a _flt.db"
     );
-    assert_eq!(t.gate().state(), GateState::Dirty);
-    assert_eq!(log_state(t.gate()), LogState::Dirty);
+    assert!(!dir.path().join("flt_flt.db").exists(), "a _flt.db was created");
+    assert_eq!(t.gate().state(), GateState::Clean, "the checkpoint is a seal now");
+    assert_eq!(log_state(t.gate()), LogState::Clean);
     drop(t);
     close(dir.path(), db);
 }

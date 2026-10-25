@@ -2032,13 +2032,12 @@ impl Database {
         data.io_rows.drop_io();
         data.io_pointers.drop_io();
         table.io_schema.drop_io();
-        data.io_filters.drop_io();
         // Including the id sequence: a table recreated under the same name would
         // otherwise inherit the old one's floor and start numbering from it.
         data.ids.io.drop_io();
 
-        // The five handles above are the five files a `Table` holds open. A
-        // table owns ten: the `_schema_*` sidecars are opened lazily, so they
+        // The four handles above are the four files a `Table` holds open. A
+        // table owns more: the `_schema_*` sidecars are opened lazily, so they
         // were never in a handle to release and survived every drop. Sweeping
         // the full list closes that, and uses the same list the rename moves —
         // one place to update when a sidecar is added, and one guard test

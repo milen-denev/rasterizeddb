@@ -892,7 +892,7 @@ impl PartitionedTable {
         Ok((
             table.io_rows()?.get_len().await,
             table.io_pointers()?.get_len().await,
-            table.io_filters()?.get_len().await,
+            table.index_store_bytes()?,
         ))
     }
 

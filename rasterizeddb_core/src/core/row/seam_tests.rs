@@ -32,6 +32,8 @@ const SCHEMA_ONLY: &[&str] = &[
     // and no data or structures.
     "census_files",
     "census_structures",
+    // Vacuum's clear horizon, a field every table has (B14's tests).
+    "cleared_below_for_tests",
     "scope_cache_to_database",
     "enable_versioning",
     "visibility_for",
@@ -62,7 +64,7 @@ const SCHEMA_ONLY: &[&str] = &[
 const CALLED_ON_SHELL: &[&str] = &[
     "io_rows",
     "io_pointers",
-    "io_filters",
+    "index_store_bytes",
     "io_sequence",
     "filters",
     "indexes",
@@ -428,7 +430,7 @@ async fn a_shell_refuses_every_data_method() {
 
     expect("io_rows", unit(shell.io_rows()));
     expect("io_pointers", unit(shell.io_pointers()));
-    expect("io_filters", unit(shell.io_filters()));
+    expect("index_store_bytes", unit(shell.index_store_bytes()));
     expect("io_sequence", unit(shell.io_sequence()));
     expect("filters", unit(shell.filters()));
     expect("indexes", unit(shell.indexes()));

@@ -22,6 +22,7 @@ use super::{Table, TableData};
 use crate::core::filter::TableFilters;
 use crate::core::index::TableIndexes;
 use crate::core::index_store::file_gate::FileGate;
+use crate::core::index_store::gate::{Proof, WriteTicket};
 use crate::core::index_store::gate_word::{GateState, SealKind, Word};
 use crate::core::index_store::identity::{Identity, VersionTuple};
 use crate::core::index_store::seal::{self, Capture, SealOutcome, SealTarget};
@@ -38,7 +39,6 @@ pub(crate) struct SealParts<S: StorageIO> {
     pub(super) gate: StdArc<FileGate>,
     pub(super) io_pointers: Arc<S>,
     pub(super) io_rows: Arc<S>,
-    pub(super) io_filters: Arc<S>,
     /// A plain table's own schema and sequence files, landed with the rest;
     /// a partition's are the logical table's and attach to no word.
     pub(super) own: Option<(Arc<S>, Arc<S>)>,
@@ -49,6 +49,11 @@ pub(crate) struct SealParts<S: StorageIO> {
     pub(super) incarnation: u128,
     /// `index::shape_of(&schema)` at open (C6).
     pub(super) shape_hash: u64,
+    /// Vacuum's clear horizon, which the FILTER section records (§2, B14).
+    pub(super) cleared_below: StdArc<CacheGuard<AtomicU64>>,
+    /// `<stem>_flt.db` may be another table's rows (a legacy pair, P19):
+    /// the evidence row of §4 cannot be read, so no snapshot is taken.
+    pub(super) legacy_flt: bool,
     /// `outcome_revocations()` at open (N26).
     pub(super) revocations_at_open: u64,
     /// Set by [`Table::retire`]: a retired instance never snapshots.
@@ -74,25 +79,19 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
         self.retired.load(Ordering::Acquire)
     }
 
-    async fn before_seal(&self) {
-        // `_flt.db`'s runtime checkpoint, brought up to date while the word
-        // is `Dirty`: otherwise its loop, finding a request or enough writes,
-        // writes it after the `CLEAN` and makes the table `Dirty` again with
-        // no user write. B14 retires the file and this with it.
-        if let Some(f) = &self.filters
-            && self.filters_ready.load(Ordering::Acquire)
-        {
-            let n = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-            if let Err(e) = f.try_checkpoint(&*self.io_filters, n).await {
-                log::warn!("{}: the filter checkpoint before a seal failed: {e}", self.name);
-            }
+    async fn before_seal(&self, ticket: &WriteTicket) {
+        // The filter's checkpoint bookkeeping, reset under the seal's
+        // transient ticket: §3 step 7 resets it on publish, but nothing may
+        // hold a ticket once `CLEAN` is written, and only the retired
+        // `_flt.db` checkpoint ever read it (B14).
+        if let Some(f) = &self.filters {
+            f.mark_checkpointed(Proof::from(ticket));
         }
     }
 
     async fn land_staged(&self) -> io::Result<()> {
         self.io_pointers.land_staged().await?;
         self.io_rows.land_staged().await?;
-        self.io_filters.land_staged().await?;
         if let Some((schema, ids)) = &self.own {
             schema.land_staged().await?;
             ids.land_staged().await?;
@@ -101,6 +100,12 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
     }
 
     fn ineligible(&self) -> Option<String> {
+        if self.legacy_flt {
+            return Some(format!(
+                "{}_flt.db may be another table's rows, so the evidence a snapshot needs cannot be read",
+                self.name
+            ));
+        }
         if !self.gate.epoch_proven() {
             return Some("rdb.ixe could not be read, so no slot epoch is proven".into());
         }
@@ -170,7 +175,11 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
         let mut sections = Vec::new();
         let mut filter_config_hash = 0;
         if let Some(f) = &self.filters {
-            sections.push((SectionKind::Filter, 0u16, f.sealed_image(n_slots)));
+            sections.push((
+                SectionKind::Filter,
+                0u16,
+                f.sealed_image(n_slots, self.cleared_below.load(Ordering::Acquire)),
+            ));
             filter_config_hash = f.config_hash();
         }
         Ok(Capture {
@@ -208,8 +217,7 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Stops this instance's background writers for shutdown (§3
-    /// Shutdown, P30): vacuum, the filter's checkpoint loop, the idle
-    /// watcher and the providers' background landing, joining any vacuum
+    /// Shutdown, P30): vacuum, the filter's backfill, the idle watcher and the providers' background landing, joining any vacuum
     /// work in flight. Unlike [`Table::retire`] the instance may still be
     /// sealed: shutdown seals it next.
     pub async fn quiesce_for_shutdown(&self) {

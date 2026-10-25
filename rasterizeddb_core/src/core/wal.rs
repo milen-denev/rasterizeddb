@@ -4487,7 +4487,9 @@ mod tests {
         }
         assert!(cut, "the log could not be checkpointed after reopening");
         let registered = wal.registered_files().len();
-        assert!(registered >= 40 * 5, "only {registered} files registered");
+        // Four files a table holds open since persistent indexes B14 retired
+        // `_flt.db`: rows, pointers, schema, sequence.
+        assert!(registered >= 40 * 4, "only {registered} files registered");
 
         let watch = crate::core::sync_audit::watch(dir.path());
         let out = exec_sql(&db, "VACUUM FULL s0;").await;
@@ -4512,8 +4514,8 @@ mod tests {
             }
             c
         });
-        // Only s0's own files: rows, pointers, filter — never the other
-        // tables, and never a `.tmp` sibling.
+        // Only s0's own files: rows, pointers — never the other tables, and
+        // never a `.tmp` sibling.
         assert!(
             data_syncs.len() <= 6,
             "a checkpoint synced {} data files for a one-table VACUUM FULL: {:?}",
@@ -4526,17 +4528,17 @@ mod tests {
         // regression is the old full pass over every registered file (800+
         // here), which the bound above already excludes. s0's own files must
         // be among them.
-        let foreign: Vec<_> = data_syncs
-            .iter()
-            .filter(|(_, p)| !p.to_string_lossy().contains("s0"))
-            .collect();
+        // `rdb.ixe` holds s0's slot epoch, which VACUUM FULL bumps through
+        // the log (persistent indexes §6): s0's, not another table's.
+        let ours = |p: &std::path::Path| p.to_string_lossy().contains("s0") || p.ends_with("rdb.ixe");
+        let foreign: Vec<_> = data_syncs.iter().filter(|(_, p)| !ours(p)).collect();
         assert!(
             foreign.len() <= 2,
             "VACUUM FULL s0 synced other tables' files: {:?}",
             foreign
         );
         assert!(
-            data_syncs.iter().any(|(_, p)| p.to_string_lossy().contains("s0")),
+            data_syncs.iter().any(|(_, p)| ours(p)),
             "VACUUM FULL s0 did not sync s0's own files: {:?}",
             data_syncs
         );

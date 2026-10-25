@@ -100,9 +100,11 @@ fn a_head_build_refuses_a_kv_batch_it_would_misread() {
     assert_eq!(DeltaBatch::decode(&with_aborts).unwrap().unwrap().aborted, vec![(41, 6)]);
 }
 
-/// `HEAD`'s filter loader accepts exactly format version 3 and rebuilds on
-/// anything else; this build writes 5. A refusal is a rebuild from the table,
-/// never a misread.
+/// `HEAD`'s filter loader reads `<t>_flt.db`, accepting exactly format
+/// version 3 and rebuilding on anything else. This build (persistent indexes
+/// B14) writes no `_flt.db` at all: a filter checkpoint is a snapshot in
+/// `<t>.ixs`, a file `HEAD` never opens, and its FILTER section is format 6.
+/// A `HEAD` build therefore rebuilds from the table, never misreads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_head_build_refuses_this_builds_filter_sidecar() {
     let _ = crate::MAX_PERMITS_THREADS.set(4);
@@ -120,15 +122,13 @@ async fn a_head_build_refuses_this_builds_filter_sidecar() {
     let table = db.table_for_tests("f").unwrap();
     table.wait_filters_ready().await.unwrap();
     table.checkpoint_filters().await.unwrap();
-    let flt = std::fs::read_dir(dir.path())
-        .unwrap()
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy() == "f_flt.db")
-        .expect("a filter sidecar");
-    let bytes = std::fs::read(flt.path()).unwrap();
-    assert_eq!(&bytes[..8], b"RDBFLT01");
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    assert_ne!(version, 3, "HEAD would read this sidecar as its own format");
+    assert!(
+        !dir.path().join("f_flt.db").exists(),
+        "this build wrote a sidecar HEAD would read"
+    );
+    let ixs = std::fs::read(dir.path().join("f.ixs")).expect("the checkpoint's snapshot");
+    assert_eq!(&ixs[..8], b"RZIXSNP1", "not a snapshot");
+    assert_ne!(crate::core::filter::persist::FORMAT_VER, 3, "HEAD would read the FILTER section as its own format");
     let _ = crate::core::wal::remove_for(&dir_str);
 }
 

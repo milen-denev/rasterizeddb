@@ -605,14 +605,78 @@ impl TableFilters {
 
     /// The FILTER section of a snapshot taken under a seal
     /// (`persist::serialize_sealed`; docs/persistent-indexes.md §3 step 5,
-    /// §5). Read guards only, and nothing is marked checkpointed: `_flt.db`
-    /// is still the filter's runtime checkpoint until B14 retires it, and
-    /// resetting its delta bookkeeping here would make its next delta skip
-    /// zones written since its last record.
-    pub fn sealed_image(&self, n_slots: u64) -> Vec<u8> {
+    /// §5), with vacuum's clear horizon `cleared_below` (§2). Read guards
+    /// only.
+    pub fn sealed_image(&self, n_slots: u64, cleared_below: u64) -> Vec<u8> {
         let guards: Vec<_> = self.columns.iter().map(|c| c.read()).collect();
         let refs: Vec<&ColumnFilter> = guards.iter().map(|g| &**g).collect();
-        persist::serialize_sealed(&refs, self.seed, n_slots)
+        persist::serialize_sealed(&refs, self.seed, n_slots, cleared_below)
+    }
+
+    /// A filter loaded from a snapshot's FILTER section (§4, B14), and the
+    /// `cleared_below` it was sealed with. `self` is the filter a rebuild
+    /// would start from (`for_table` on the live schema and settings): the
+    /// section must describe exactly its columns, in order, by write order
+    /// and type, and each restored column takes its configuration, so a
+    /// loaded filter differs from a rebuilt one only in what it has
+    /// indexed. Any rejection is `Err`: the caller rebuilds.
+    ///
+    /// The caller has proven the section is the one the marker log's
+    /// `CLEAN` vouches for, against files of the identity it records; this
+    /// checks only what the section itself says.
+    pub fn load_sealed(&self, buf: &[u8], now_slots: u64) -> Result<(TableFilters, u64), persist::LoadReject> {
+        let expected: Vec<(u32, DbType, FilterConfig)> = self
+            .columns
+            .iter()
+            .map(|c| {
+                let c = c.read();
+                (c.write_order, c.db_type.clone(), *c.config())
+            })
+            .collect();
+        let loaded = persist::deserialize_columns(buf, self.seed, &expected, now_slots)?;
+        // A sealed image has no delta records; one that replays any is not
+        // what `serialize_sealed` wrote.
+        if loaded.deltas != 0 {
+            return Err(persist::LoadReject::Truncated);
+        }
+        let mut columns = Vec::with_capacity(loaded.columns.len());
+        for col in loaded.columns {
+            columns.push(RwLock::new(col));
+        }
+        let meta = Self::meta_of(&columns);
+        let filters = Self {
+            cfg: self.cfg,
+            seed: self.seed,
+            columns,
+            meta,
+            lookup: self.lookup.clone(),
+            writes_since_checkpoint: AtomicU64::new(0),
+            slots_at_checkpoint: AtomicU64::new(loaded.n_slots),
+            disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
+            checkpoint_requested: AtomicBool::new(false),
+            // Nothing on disk for `mark_disk_dirty` to invalidate: the
+            // snapshot is the marker log's to revoke, never the filter's.
+            has_checkpoint: AtomicBool::new(false),
+            disk_len: AtomicU64::new(0),
+            deltas_since_base: AtomicU32::new(0),
+            write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
+        };
+        Ok((filters, loaded.cleared_below))
+    }
+
+    /// Resets every column's checkpoint bookkeeping (`dirty_min`,
+    /// `touched_min`): what a seal does once it has captured the filter
+    /// (§3 step 7, §5), under the seal's transient ticket, since nothing may
+    /// hold one after the `CLEAN`. Only the runtime `_flt.db` checkpoint
+    /// ever read them, and B14 retired it; whether they go is the owner's
+    /// call (§5).
+    pub fn mark_checkpointed(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::mark_checkpointed");
+        for c in &self.columns {
+            c.write().mark_checkpointed();
+        }
     }
 
     /// What a snapshot's identity records of this filter's configuration
@@ -1455,6 +1519,10 @@ pub(crate) mod checkpoint_test_hooks {
     static PARK: parking_lot::Mutex<Option<(usize, Arc<Park>)>> = parking_lot::Mutex::new(None);
 
     /// Parks the next checkpoint of `filters` that has something to write.
+    /// Unused since persistent indexes B14 retired the table's runtime
+    /// checkpoint (its one test was of `_flt.db`); kept with the library
+    /// checkpoint it parks, whose removal is the owner's call.
+    #[allow(dead_code)]
     pub(crate) fn arm(filters: &super::TableFilters) -> Arc<Park> {
         let park = Arc::new(Park::default());
         *PARK.lock() = Some((filters as *const _ as usize, park.clone()));

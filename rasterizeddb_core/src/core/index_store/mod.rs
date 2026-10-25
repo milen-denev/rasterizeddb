@@ -25,6 +25,10 @@
 //! Slice B13 adds [`seal`]: seal and publish of FILTER-only snapshots at a
 //! clean point (shutdown, `rdb_index_checkpoint`, the idle checkpoint), and
 //! the gate word carried across RENAME and MOVE ([`file_gate::FileGate::carry_to`]).
+//!
+//! Slice B14 puts the filter under T4: [`open_proof`] (the open's checks,
+//! writing nothing), the FILTER section loaded instead of rebuilt when they
+//! pass, and `_flt.db` retired ([`file_gate::FileGate::retire_flt`]).
 
 pub mod census;
 pub mod codec;
@@ -35,6 +39,7 @@ pub mod gated_io;
 pub mod gate_word;
 pub mod identity;
 pub mod marker;
+pub mod open_proof;
 pub mod seal;
 pub mod snapshot;
 

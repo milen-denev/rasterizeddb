@@ -76,11 +76,6 @@ fn scope_files(t: &DbTable) -> (Vec<usize>, Vec<PathBuf>) {
     (t.census_structures(), t.census_files())
 }
 
-/// `_flt.db` is written by the filter's runtime checkpoint loop on its own
-/// task, under no ticket (B14 retires the sidecar; B12's `GatedIo` gates it
-/// meanwhile). It still needs the durable `DIRTY`, which the census checks.
-const EXEMPT: &[&str] = &["_flt.db"];
-
 fn assert_census(events: &[super::census::Event], t: &DbTable, began_clean: bool) -> super::census::Summary {
     let (structures, files) = scope_files(t);
     let summary = check(
@@ -90,7 +85,6 @@ fn assert_census(events: &[super::census::Event], t: &DbTable, began_clean: bool
             began_clean,
             structures: &structures,
             files: &files,
-            exempt: EXEMPT,
         },
     )
     .unwrap_or_else(|e| panic!("census: {e}"));
@@ -481,11 +475,8 @@ async fn an_unknown_log_is_rewritten_before_the_first_write() {
         let db = open(dir.path(), "census_unknown").await;
         let t = seeded(&db, "u", 5).await;
         incarnation = t.schema.incarnation;
-        // A checkpoint the reopen loads: otherwise its filter backfill
-        // checkpoints `_flt.db`, which B12 gates like any write (the release
-        // slow path, under its exemption), and that write, not the INSERT,
-        // would be the first to rewrite the log.
-        t.checkpoint_filters().await.unwrap();
+        // Since B14 an open writes nothing whatever its filter does, so the
+        // INSERT is the first write with or without a snapshot to load.
         drop(t);
         close(dir.path(), db);
     }

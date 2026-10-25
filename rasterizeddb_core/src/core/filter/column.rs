@@ -1454,7 +1454,7 @@ mod planeless_tests {
         assert_eq!(planeless_zones(&c), 0);
         let mut buf = persist::serialize(&[&c], HashSeed::default(), n);
         // The version field follows the 8-byte magic.
-        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), 5);
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), persist::FORMAT_VER);
         buf[8..10].copy_from_slice(&4u16.to_le_bytes());
         let old = reload(&c, n, &buf);
         assert_eq!(old.zone_count(), c.zone_count());

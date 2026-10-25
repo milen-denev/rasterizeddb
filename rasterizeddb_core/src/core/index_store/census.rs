@@ -191,8 +191,6 @@ mod recording {
         pub ticket_mutations: usize,
         pub build_mutations: usize,
         pub writes: usize,
-        /// Writes to an exempt file (see [`Scope::exempt`]).
-        pub exempt_writes: usize,
         /// The mutators seen, in order of first appearance.
         pub mutators: Vec<&'static str>,
     }
@@ -207,11 +205,10 @@ mod recording {
         pub began_clean: bool,
         /// The addresses of the gate's structures (`Table::census_structures`).
         pub structures: &'a [usize],
-        /// The gate's files.
+        /// The gate's files. Every write to one needs a durable `DIRTY` and
+        /// a held ticket: no file is exempt since B14 retired `_flt.db`, whose
+        /// runtime checkpoint wrote under no ticket.
         pub files: &'a [PathBuf],
-        /// File-name suffixes written with no ticket held, each for a reason
-        /// the test states: they still need the durable `DIRTY` (T1).
-        pub exempt: &'a [&'a str],
     }
 
     /// Checks T1 and T2 over `events` for `scope`: before every ticket-proven
@@ -262,11 +259,6 @@ mod recording {
                             "event {i}: a write to {} was issued before DIRTY was durable",
                             file.display()
                         ));
-                    }
-                    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if scope.exempt.iter().any(|x| name.ends_with(x)) {
-                        s.exempt_writes += 1;
-                        continue;
                     }
                     s.writes += 1;
                     if held <= 0 {

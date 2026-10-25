@@ -19,10 +19,14 @@ fn plant(root: &Path, name: &str) {
     std::fs::write(root.join(name), b"leftover bytes").unwrap();
 }
 
-/// Partition `pid`'s three files and their `.tmp`s.
+/// Partition `pid`'s files and their `.tmp`s: rows and pointers, and the
+/// retired `_flt.db` and the index-store pair (persistent indexes B14), which
+/// are the partition's too.
 fn plant_partition(root: &Path, uid: u64, pid: u32) -> Vec<String> {
     let mut names = Vec::new();
-    for name in files::data_files(uid, pid) {
+    let stem = files::data_stem(uid, pid);
+    let optional = files::OPTIONAL_SUFFIXES.map(|s| format!("{stem}{s}"));
+    for name in files::data_files(uid, pid).into_iter().chain(optional) {
         for file in [name.clone(), format!("{name}.tmp")] {
             plant(root, &file);
             names.push(file);
@@ -68,6 +72,10 @@ fn plant_unmatched(root: &Path, uid: u64) -> Vec<String> {
         format!("__pt_{:016X}_00000001.db", DEAD),
         format!("__pt_{uid:016x}_map_00.db"),
         format!("__pt_{uid:016x}_schema_lower.db"),
+        format!("__pt_{uid:016x}_0000005.ixs"),
+        format!("__pt_{uid:016x}_00000005.ixs.bak"),
+        format!("__pt_{uid:016x}_schema.ixm"),
+        format!("__pt_{uid:016x}_00000005.ixe"),
         "notes.txt".to_string(),
     ];
     for name in &names {

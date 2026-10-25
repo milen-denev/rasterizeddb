@@ -8,7 +8,9 @@
 //!
 //! | name | what |
 //! |---|---|
-//! | `__pt_<u>_<pid:08x>.db`, `_pointers.db`, `_flt.db` | one partition's rows, pointers and filter |
+//! | `__pt_<u>_<pid:08x>.db`, `_pointers.db` | one partition's rows and pointers |
+//! | `__pt_<u>_<pid:08x>.ixs`, `.ixm` | its index snapshot and marker log (persistent indexes §1) |
+//! | `__pt_<u>_<pid:08x>_flt.db` | its retired filter sidecar (persistent indexes §5, B14): deleted at open, reaped as a leftover |
 //! | `__pt_<u>_schema.db`, `__pt_<u>_schema_<SIDECAR>.db` | the shared schema; sidecar names derive from the schema provider's (`schema.rs`) |
 //! | `__pt_<u>_map_<gen>.db` | the map log, one live generation |
 //! | `__pt_<u>_ids.db` | the shared row-id reservation |
@@ -16,8 +18,10 @@
 //!
 //! each with its provider's `.tmp` staging sibling. [`parse_name`] accepts
 //! exactly §12's reaper pattern
-//! `^__pt_[0-9a-f]{16}_([0-9a-f]{8}(_pointers|_flt)?|schema(_[A-Z]+)?|map_[0-9]+|ids|seq)\.db(\.tmp)?$`,
-//! narrowed in one place: a map generation must be written the way
+//! `^__pt_[0-9a-f]{16}_([0-9a-f]{8}(_pointers|_flt)?|schema(_[A-Z]+)?|map_[0-9]+|ids|seq)\.db(\.tmp)?$`
+//! and persistent indexes' second one (§10, B14)
+//! `^__pt_[0-9a-f]{16}_[0-9a-f]{8}\.(ixs|ixm)(\.tmp)?$`, both partition data
+//! files, narrowed in one place: a map generation must be written the way
 //! [`map_file`] writes it (no leading zero, fits a `u64`), so two names never
 //! parse to one generation. A name it rejects is never deleted by anything
 //! built on it, which is the safe side. Outside the pattern on purpose:
@@ -55,9 +59,16 @@ use crate::core::storage_providers::traits::StorageIO;
 /// `database::PARTITION_FILE_PREFIX`, which reserves it from table names.
 pub const PREFIX: &str = "__pt_";
 
-/// The suffixes of one partition's files, after its [`data_stem`]. The three
-/// a `Table` opens; a partition loads no `_seq.db` (§3.4).
-pub const DATA_SUFFIXES: [&str; 3] = [".db", "_pointers.db", "_flt.db"];
+/// The suffixes of one partition's files, after its [`data_stem`]. The two
+/// a `Table` opens; a partition loads no `_seq.db` (§3.4). `_flt.db` was the
+/// third until persistent indexes B14 retired it: an open deletes it.
+pub const DATA_SUFFIXES: [&str; 2] = [".db", "_pointers.db"];
+
+/// Files a partition's stem may also have, none of which must exist: the
+/// retired filter sidecar and the index-store pair (persistent indexes §1,
+/// §5). A materialization deletes them as leftovers with the data files,
+/// and the reaper and DROP read them as the partition's.
+pub const OPTIONAL_SUFFIXES: [&str; 3] = ["_flt.db", ".ixs", ".ixm"];
 
 /// The staging sibling every file provider keeps beside its file.
 const TMP: &str = ".tmp";
@@ -94,9 +105,9 @@ pub fn seq_file(uid: u64) -> String {
     format!("{PREFIX}{uid:016x}_seq.db")
 }
 
-/// The three files of partition `pid`, without their `.tmp` siblings: what
+/// The two files of partition `pid`, without their `.tmp` siblings: what
 /// [`require_existing`] checks before a materialized partition opens.
-pub fn data_files(uid: u64, pid: u32) -> [String; 3] {
+pub fn data_files(uid: u64, pid: u32) -> [String; 2] {
     let stem = data_stem(uid, pid);
     DATA_SUFFIXES.map(|s| format!("{stem}{s}"))
 }
@@ -156,6 +167,10 @@ pub fn parse_name(name: &str) -> Option<PartFile> {
     let uid = uid_prefix(name)?;
     let rest = &name[PREFIX.len() + 17..];
     let rest = rest.strip_suffix(TMP).unwrap_or(rest);
+    // A partition's index-store pair (persistent indexes §1): `.ixs`, `.ixm`.
+    if let Some(pid) = rest.strip_suffix(".ixs").or_else(|| rest.strip_suffix(".ixm")) {
+        return lower_hex(pid, 8).map(|pid| PartFile::Data { uid, pid: pid as u32 });
+    }
     let body = rest.strip_suffix(".db")?;
     match body {
         "ids" => return Some(PartFile::Ids { uid }),
@@ -282,7 +297,7 @@ fn create_all(dir: &Path, names: &[String]) -> io::Result<()> {
 }
 
 /// Materializes partition `pid`'s files in `dir` (§3.2): deletes any
-/// leftover file of that partition, creates all three and their `.tmp`s
+/// leftover file of that partition, creates both and their `.tmp`s
 /// exclusively, and fsyncs the directory once. Any failure is returned.
 ///
 /// Leftovers are deleted, never reused: files without `MATERIALIZE` may hold
@@ -297,7 +312,9 @@ fn create_all(dir: &Path, names: &[String]) -> io::Result<()> {
 /// attempt and the reaper both delete.
 pub(crate) fn create_partition_files(dir: &Path, uid: u64, pid: u32) -> io::Result<()> {
     let names = data_files(uid, pid);
-    for name in &names {
+    let stem = data_stem(uid, pid);
+    let leftovers = OPTIONAL_SUFFIXES.map(|s| format!("{stem}{s}"));
+    for name in names.iter().chain(leftovers.iter()) {
         for file in [name.clone(), format!("{name}{TMP}")] {
             let path = dir.join(&file);
             match std::fs::remove_file(&path) {
@@ -769,7 +786,6 @@ mod tests {
             [
                 "__pt_0000000000000001_ffffffff.db",
                 "__pt_0000000000000001_ffffffff_pointers.db",
-                "__pt_0000000000000001_ffffffff_flt.db",
             ]
         );
     }
@@ -780,6 +796,10 @@ mod tests {
         for pid in [0u32, 7, 0xdead_beef] {
             for n in data_files(UID, pid) {
                 names.push((n, PartFile::Data { uid: UID, pid }));
+            }
+            // The retired filter sidecar and the index-store pair (B14).
+            for s in OPTIONAL_SUFFIXES {
+                names.push((format!("{}{s}", data_stem(UID, pid)), PartFile::Data { uid: UID, pid }));
             }
         }
         names.push((format!("{}.db", schema_stem(UID)), PartFile::Schema { uid: UID }));
@@ -825,6 +845,11 @@ mod tests {
             format!("__pt_{u}_0000002a_seq.db"),
             format!("__pt_{u}_0000002a_schema.db"),
             format!("__pt_{u}_0000002a_flt_pointers.db"),
+            format!("__pt_{u}_0000002a.ixs.tmp.tmp"),
+            format!("__pt_{u}_0000002A.ixs"),
+            format!("__pt_{u}_0000002a.ixe"),
+            format!("__pt_{u}_0000002a_pointers.ixs"),
+            format!("__pt_{u}_ids.ixm"),
             format!("__pt_{u}_schema_.db"),
             format!("__pt_{u}_schema_fields.db"),
             format!("__pt_{u}_schema_FIELDS1.db"),
@@ -859,9 +884,16 @@ mod tests {
     fn create_partition_files_deletes_leftovers_and_creates_fresh_empty_files() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        let [rows, pointers, _] = data_files(UID, 5);
+        let [rows, pointers] = data_files(UID, 5);
         std::fs::write(d.join(&rows), b"stale rows of a lost transaction").unwrap();
         std::fs::write(d.join(format!("{pointers}.tmp")), b"stale staged pointers").unwrap();
+        // A leftover snapshot, log and retired sidecar of the stem go too
+        // (B14): never pair a new partition's files with an old `CLEAN`.
+        let optional: Vec<String> = OPTIONAL_SUFFIXES.iter().map(|s| format!("{}{s}", data_stem(UID, 5))).collect();
+        for o in &optional {
+            std::fs::write(d.join(o), b"leftover").unwrap();
+            std::fs::write(d.join(format!("{o}.tmp")), b"leftover").unwrap();
+        }
         // Neighbours that must survive: another partition, another uid, a
         // near-miss name and a plain table.
         let keep = [
@@ -883,6 +915,9 @@ mod tests {
         }
         for k in &keep {
             assert_eq!(std::fs::read(d.join(k)).unwrap(), b"keep", "{k} is not this partition's");
+        }
+        for o in &optional {
+            assert!(!d.join(o).exists() && !d.join(format!("{o}.tmp")).exists(), "{o} must be gone");
         }
         // A second materialization of the same pid finds the first one's
         // files as leftovers and replaces them too.
@@ -914,7 +949,7 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(names_in(d), before);
-        assert_eq!(before.len(), 6);
+        assert_eq!(before.len(), 4);
     }
 
     #[test]
@@ -923,7 +958,7 @@ mod tests {
         let d = dir.path();
         // A directory where a file must go cannot be deleted as a leftover
         // or created over.
-        let [_, pointers, _] = data_files(UID, 3);
+        let [_, pointers] = data_files(UID, 3);
         std::fs::create_dir(d.join(&pointers)).unwrap();
         let err = create_partition_files(d, UID, 3).unwrap_err();
         assert!(err.to_string().contains(&pointers), "{err}");
@@ -951,7 +986,6 @@ mod tests {
         let d = dir.path();
         let names = data_files(UID, 1).to_vec();
         std::fs::write(d.join(&names[0]), b"").unwrap();
-        std::fs::write(d.join(&names[2]), b"").unwrap();
 
         let err = require_existing(d, &names).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);

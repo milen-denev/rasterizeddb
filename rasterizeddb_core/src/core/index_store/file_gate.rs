@@ -45,13 +45,34 @@
 //!   new one reads as its successor until the truncate is durable.
 //! - **`Unknown`**: trust none of the log's bytes: rewrite it as `HEADER` +
 //!   `DIRTY` through `.ixm.tmp` (write, fsync, rename, directory fsync), or
-//!   else unlink `.ixs` and fsync the directory. (B14 then deletes a
-//!   lingering `_flt.db`; in B11 `_flt.db` is still the filter's live
-//!   checkpoint, so nothing deletes it.)
+//!   else unlink `.ixs` and fsync the directory; only then delete a
+//!   lingering `_flt.db` (§2 R9: it is the only evidence that an old binary
+//!   wrote after `CLEAN`, so it goes only once the log durably ends `DIRTY`
+//!   or `.ixs` is durably gone). The word leaves `Unknown` only once that
+//!   delete returned `Ok` (Q12).
 //! - If `DIRTY` cannot be made durable (ENOSPC, EIO), `.ixs` is unlinked and
 //!   the directory fsynced, which needs no free blocks; the write proceeds
 //!   with nothing left to protect. If that fails too, the ticket fails, and
 //!   nothing is issued.
+//!
+//! # `_flt.db`, retired (§5, B14)
+//!
+//! The filter's old sidecar is never created, trusted or written again; the
+//! filter persists only as a snapshot's FILTER section. Every open where it
+//! exists deletes it, before anything is written ([`FileGate::retire_flt`]).
+//! Beside an existing `.ixm` it is **evidence** (RV5): a binary that keeps
+//! no marker log opened the table since the last `CLEAN` and may have
+//! overwritten rows in place, which no file length shows. So the open's
+//! proof fails, and `.ixs` is unlinked and the directory fsynced **before**
+//! `_flt.db` is deleted: a crash between the two leaves the evidence, never
+//! a stale `CLEAN` with nothing to contradict it. If that unlink fails,
+//! `_flt.db` is kept and the word starts `Unknown`; if the delete fails, the
+//! word starts `Unknown` too, and its slow path retries it before the first
+//! write. The delete voids the directory log's records for the file first,
+//! or the next open's replay would write it back. A `<t>_flt.db` that may be
+//! another table's rows (a table named `<t>_flt`, which older builds
+//! accepted beside `<t>`: its schema or pointers file is there, or the file
+//! is not a filter image) is never deleted, and `<t>` takes no snapshot.
 //!
 //! # The slot epoch (§2 Deferred work, §6)
 //!
@@ -97,6 +118,114 @@ impl GateFiles {
     fn ixs_tmp(&self) -> PathBuf {
         self.dir.join(format!("{}.ixs.tmp", self.stem))
     }
+
+    /// `<stem>_flt.db`, the filter's retired sidecar (§5).
+    fn flt_name(&self) -> String {
+        format!("{}_flt.db", self.stem)
+    }
+
+    fn flt(&self) -> PathBuf {
+        self.dir.join(self.flt_name())
+    }
+
+    fn flt_tmp(&self) -> PathBuf {
+        self.dir.join(format!("{}.tmp", self.flt_name()))
+    }
+}
+
+/// The first bytes of every image the filter's old sidecar held
+/// (`filter::persist`'s magic).
+const FLT_MAGIC: &[u8; 8] = b"RDBFLT01";
+
+/// What [`FileGate::retire_flt`] found and did at open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FltAtOpen {
+    /// No `_flt.db`.
+    Absent,
+    /// Deleted, its log records voided first. `evidence`: an `.ixm` was
+    /// beside it, so `.ixs` was unlinked (durably) before it went.
+    Deleted { evidence: bool },
+    /// May be another table's rows (module documentation): kept, and the
+    /// table takes no snapshot.
+    LegacyPair,
+    /// Kept: the evidence could not be acted on or the delete failed. The
+    /// word was started `Unknown` (when it was this open's to start).
+    Kept { why: String },
+}
+
+impl FltAtOpen {
+    /// Whether the open's proof must fail because of it (§4's third row).
+    pub fn refuses_snapshot(&self) -> bool {
+        !matches!(self, FltAtOpen::Absent | FltAtOpen::Deleted { evidence: false })
+    }
+}
+
+/// Whether `<stem>_flt.db` may be another table's rows file: a table named
+/// `<stem>_flt` has its schema or pointers file beside it, or the file holds
+/// bytes that are not a filter image.
+fn flt_may_be_a_table(files: &GateFiles) -> bool {
+    let other = format!("{}_flt", files.stem);
+    if files.dir.join(format!("{other}_schema.db")).exists() || files.dir.join(format!("{other}_pointers.db")).exists() {
+        return true;
+    }
+    match std::fs::File::open(files.flt()) {
+        Ok(f) => {
+            use std::io::Read;
+            let mut head = [0u8; 8];
+            let mut got = 0;
+            let mut f = f;
+            while got < head.len() {
+                match f.read(&mut head[got..]) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    // Unreadable: it cannot be shown to be ours.
+                    Err(_) => return true,
+                }
+            }
+            got != 0 && (got < head.len() || &head != FLT_MAGIC)
+        }
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+/// Deletes `files`' `_flt.db` and its staging sibling, the directory log's
+/// records for it voided first, then fsyncs the directory. `Ok(false)` when
+/// there was none. The caller has ruled out a legacy pair.
+fn delete_flt(files: &GateFiles) -> io::Result<bool> {
+    let (flt, tmp) = (files.flt(), files.flt_tmp());
+    if !flt.exists() && !tmp.exists() {
+        return Ok(false);
+    }
+    failpoint("unknown_flt_delete_order", &flt)?;
+    // Voided first: every open replays the log, and a replayed record would
+    // write the file back.
+    if let Some(wal) = crate::core::wal::wal_for(&files.dir.to_string_lossy()) {
+        wal.forget_files(&[crate::core::wal::file_id_for_name(&files.flt_name())])?;
+    }
+    for path in [&flt, &tmp] {
+        dir_op(DirOp::Unlink(path));
+        match std::fs::remove_file(path) {
+            Ok(()) => crate::core::sync_audit::note("unlink", path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    crate::core::wal::sync_parent_dir(&flt)?;
+    Ok(true)
+}
+
+/// Counters for `_flt.db` at open, for the tests and the logs.
+static FLT_DELETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FLT_EVIDENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// `_flt.db` files deleted at open or by an `Unknown` slow path.
+pub fn flt_deleted_total() -> u64 {
+    FLT_DELETED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// `_flt.db` files found beside an `.ixm` (evidence, RV5).
+pub fn flt_evidence_total() -> u64 {
+    FLT_EVIDENCE_TOTAL.load(Ordering::Relaxed)
 }
 
 /// A file set's gate. Shared by its map slot, every instance of the table,
@@ -391,12 +520,80 @@ impl FileGate {
         let done = blocking(|| match state {
             GateState::Dirty => Ok(()),
             GateState::Clean => append_dirty(files),
-            GateState::Unknown => rewrite_unknown(files),
+            // §2 R9: only once the log durably ends `DIRTY` or `.ixs` is
+            // durably gone does a lingering `_flt.db` go, and the word leaves
+            // `Unknown` only once that delete returned `Ok` (Q12).
+            GateState::Unknown => rewrite_unknown(files).and_then(|()| {
+                if flt_may_be_a_table(files) {
+                    return Ok(());
+                }
+                if delete_flt(files)? {
+                    FLT_DELETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }),
         });
         if done.is_ok() {
             super::census::dirty_durable(self.census_id());
         }
         done
+    }
+
+    /// `_flt.db` at open (module documentation, §5): deleted before anything
+    /// is written, after `.ixs` is durably unlinked when an `.ixm` makes it
+    /// evidence; kept, with the word started `Unknown`, when either step
+    /// fails; never deleted when it may be another table's rows. A file set
+    /// with no directory has nothing here: its provider family deletes it
+    /// (the row layer's open).
+    pub(crate) fn retire_flt(&self) -> FltAtOpen {
+        let Some(files) = self.files.as_ref() else {
+            return FltAtOpen::Absent;
+        };
+        blocking(|| {
+            if !files.flt().exists() && !files.flt_tmp().exists() {
+                return FltAtOpen::Absent;
+            }
+            if flt_may_be_a_table(files) {
+                log::info!(
+                    "{} may be the rows of a table named {}_flt, so it is kept and {} takes no index                      snapshot",
+                    files.flt().display(),
+                    files.stem,
+                    files.stem
+                );
+                return FltAtOpen::LegacyPair;
+            }
+            let evidence = match files.ixm().try_exists() {
+                Ok(e) => e,
+                // Cannot tell: act as if it were there.
+                Err(_) => true,
+            };
+            if evidence {
+                FLT_EVIDENCE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "{} is beside {}: a binary without marker logs opened the table since its last                      snapshot, so the snapshot is discarded and the filter rebuilt",
+                    files.flt().display(),
+                    files.ixm().display()
+                );
+                if let Err(e) = unlink_snapshot(files).and_then(|()| failpoint("flt_evidence_before_ixs_unlink", &files.ixs())) {
+                    let why = format!("{} could not be unlinked ({e}); {} is kept as evidence", files.ixs().display(), files.flt().display());
+                    log::error!("{why}; the gate starts Unknown");
+                    self.word.start_unknown();
+                    return FltAtOpen::Kept { why };
+                }
+            }
+            match delete_flt(files) {
+                Ok(_) => {
+                    FLT_DELETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    FltAtOpen::Deleted { evidence }
+                }
+                Err(e) => {
+                    let why = format!("{} could not be deleted ({e})", files.flt().display());
+                    log::error!("{why}; the gate starts Unknown, and the first write retries it");
+                    self.word.start_unknown();
+                    FltAtOpen::Kept { why }
+                }
+            }
+        })
     }
 
     /// Appends `epoch + 1` to the directory's `rdb.ixe` as its own WAL

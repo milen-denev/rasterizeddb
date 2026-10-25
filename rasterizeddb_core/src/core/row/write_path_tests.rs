@@ -3148,18 +3148,9 @@ async fn a_provider_without_a_log_commits_successfully() {
     assert_eq!(run(&t, "").await.len(), 7);
 }
 
-/// A filter checkpoint reaches disk on a fresh table with a log installed.
-///
-/// This is the coverage a sketch from another session was reaching for, on the
-/// theory that compaction's `checkpoint_filters` — an in-place write at offset
-/// zero immediately after a truncation — was being silently dropped. It is not:
-/// the sidecar is created up front by `create_new`, and the checkpoint lands.
-///
-/// The sketch failed for a different reason, which this test deliberately does
-/// *not* assert, because it is a bug rather than a contract: after a
-/// WAL-deferred in-place write that extends a file, the writing provider's
-/// cached length is stale, so it cannot read back what it just wrote. The
-/// on-disk bytes are the ground truth here for exactly that reason.
+/// A filter checkpoint reaches disk on a fresh table with a log installed:
+/// since persistent indexes B14 it is a snapshot (`<t>.ixs`, proven by
+/// `<t>.ixm`), and no `_flt.db` is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filter_checkpoint_reaches_disk_with_a_log_installed() {
     use crate::core::database::Database;
@@ -3194,20 +3185,16 @@ async fn a_filter_checkpoint_reaches_disk_with_a_log_installed() {
         table.checkpoint_filters().await.unwrap();
     }
 
-    let on_disk = std::fs::metadata(dir.path().join("flt_flt.db"))
+    let on_disk = std::fs::metadata(dir.path().join("flt.ixs"))
         .map(|m| m.len())
         .unwrap_or(0);
     assert!(on_disk > 0, "the filter checkpoint never reached disk");
-
-    // And a reader that opens the file fresh — which is what `Table::new` does —
-    // sees it, so the next open resumes from the checkpoint rather than
+    assert!(!dir.path().join("flt_flt.db").exists(), "a retired sidecar was written");
+    // And the marker log proves it, so the next open loads rather than
     // rescanning.
-    let reopened = crate::core::storage_providers::file_sync::LocalStorageProvider::new(
-        dir.path().to_str().unwrap(),
-        Some("flt_flt.db"),
-    )
-    .await;
-    assert_eq!(reopened.get_len().await, on_disk);
+    let log = std::fs::read(dir.path().join("flt.ixm")).expect("the marker log");
+    let scan = crate::core::index_store::marker::scan(&log).expect("a readable marker log");
+    assert_eq!(scan.proven_clean().map(|c| c.snapshot_len), Some(on_disk));
 }
 
 /// Truncation has to retract the in-place high-water mark, not just the length.

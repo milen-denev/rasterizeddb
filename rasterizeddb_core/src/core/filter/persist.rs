@@ -47,9 +47,16 @@ const MAGIC: &[u8; 8] = b"RDBFLT01";
 // count. A v4 file has none, so it reads exactly as before and is accepted —
 // an upgrade costs nothing. A v4 reader refuses a v5 file by its version and
 // rebuilds, which is the safe direction.
+//
+// v6 records vacuum's clear horizon, `cleared_below`, in the superblock
+// (docs/persistent-indexes.md §2, B14): a snapshot's FILTER section carries
+// it, so a reopened table's first vacuum pass does not re-clear every
+// tombstone and take a ticket with no user write (RV2). Earlier files have
+// zeroes there and read as `cleared_below = 0`, which is what every open
+// assumed before, so v4 and v5 still read unchanged.
 /// `pub` since B13: a snapshot's identity records it
 /// (`index_store::identity::VersionTuple::filter_format_ver`).
-pub const FORMAT_VER: u16 = 5;
+pub const FORMAT_VER: u16 = 6;
 /// The oldest version this reader accepts unchanged.
 pub(super) const OLDEST_READABLE_VER: u16 = 4;
 
@@ -96,6 +103,8 @@ pub const SUPERBLOCK_LEN: usize = 64;
 pub const DIRTY_OFFSET: u64 = 13;
 /// Byte offset of `base_len` inside the superblock.
 const BASE_LEN_OFFSET: usize = 40;
+/// Byte offset of `cleared_below` inside the superblock (v6).
+const CLEARED_BELOW_OFFSET: usize = 48;
 
 /// Marks the start of a delta record. Deliberately not the file magic: a reader
 /// that finds this where a base image should be, or vice versa, is reading a
@@ -212,7 +221,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: u64) {
+fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: u64, cleared_below: u64) {
     let start = w.buf.len();
     w.bytes(MAGIC);
     w.u16(FORMAT_VER);
@@ -226,13 +235,15 @@ fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: 
     debug_assert_eq!(w.buf.len() - start, DIRTY_OFFSET as usize + 27);
     debug_assert_eq!(w.buf.len() - start, BASE_LEN_OFFSET);
     w.u64(0); // base_len — patched once the base image is complete
+    debug_assert_eq!(w.buf.len() - start, CLEARED_BELOW_OFFSET);
+    w.u64(cleared_below);
     w.pad(SUPERBLOCK_LEN - (w.buf.len() - start));
 }
 
 /// Serialize the whole catalog. Columns are written in the caller's order and
 /// validated against the live schema on load.
 pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec<u8> {
-    serialize_with(columns, seed, n_slots, ColumnFilter::persistable_valid_upto)
+    serialize_with(columns, seed, n_slots, 0, ColumnFilter::persistable_valid_upto)
 }
 
 /// [`serialize`] for a snapshot's FILTER section, taken under a seal
@@ -245,18 +256,24 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
 /// frontier at the first such slot and every clean reopen would backfill
 /// from there. Same layout as [`serialize`], so the base image `deserialize`
 /// reads.
-pub fn serialize_sealed(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec<u8> {
-    serialize_with(columns, seed, n_slots, ColumnFilter::valid_upto)
+///
+/// `cleared_below` is vacuum's clear horizon as it stands under the seal
+/// (§2): every reclaimable version whose `xmax` is below it has empty codes
+/// in `columns`. A load restores it ([`Loaded::cleared_below`]) before
+/// vacuum's first tick.
+pub fn serialize_sealed(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64, cleared_below: u64) -> Vec<u8> {
+    serialize_with(columns, seed, n_slots, cleared_below, ColumnFilter::valid_upto)
 }
 
 fn serialize_with(
     columns: &[&ColumnFilter],
     seed: HashSeed,
     n_slots: u64,
+    cleared_below: u64,
     frontier: fn(&ColumnFilter) -> u64,
 ) -> Vec<u8> {
     let mut w = Writer::new();
-    write_superblock(&mut w, seed, columns.len() as u16, n_slots);
+    write_superblock(&mut w, seed, columns.len() as u16, n_slots, cleared_below);
 
     for col in columns {
         w.u32(col.write_order);
@@ -413,6 +430,9 @@ pub struct Loaded {
     pub valid_len: u64,
     /// Delta records replayed on top of the base image.
     pub deltas: u32,
+    /// Vacuum's clear horizon when the image was sealed (v6; 0 for an
+    /// earlier file or a runtime checkpoint, which never recorded one).
+    pub cleared_below: u64,
 }
 
 /// Append a stopper so replay ends here even if a longer file preceded this
@@ -472,6 +492,20 @@ pub fn deserialize(
     cfg: super::FilterConfig,
     now_slots: u64,
 ) -> Result<Loaded, LoadReject> {
+    let expected: Vec<(u32, DbType, super::FilterConfig)> =
+        expected.iter().map(|(wo, ty)| (*wo, ty.clone(), cfg)).collect();
+    deserialize_columns(buf, seed, &expected, now_slots)
+}
+
+/// [`deserialize`] with each column's own configuration: what a snapshot's
+/// FILTER section is loaded with, so a restored column keeps the width
+/// bounds `SET FILTER … FOR COLUMN` gave it, as a rebuilt one would.
+pub fn deserialize_columns(
+    buf: &[u8],
+    seed: HashSeed,
+    expected: &[(u32, DbType, super::FilterConfig)],
+    now_slots: u64,
+) -> Result<Loaded, LoadReject> {
     if buf.is_empty() {
         return Err(LoadReject::Empty);
     }
@@ -501,7 +535,10 @@ pub fn deserialize(
     }
     let n_slots = r.u64().ok_or(LoadReject::Truncated)?;
     let base_len = r.u64().ok_or(LoadReject::Truncated)? as usize;
-    r.skip(SUPERBLOCK_LEN - BASE_LEN_OFFSET - 8)
+    let cleared_below_raw = r.u64().ok_or(LoadReject::Truncated)?;
+    // Only v6 writes it; earlier versions' bytes there mean nothing.
+    let cleared_below = if ver >= 6 { cleared_below_raw } else { 0 };
+    r.skip(SUPERBLOCK_LEN - CLEARED_BELOW_OFFSET - 8)
         .ok_or(LoadReject::Truncated)?;
 
     // The base image must at least contain the superblock and must fit in what
@@ -536,7 +573,8 @@ pub fn deserialize(
     }
 
     let mut columns = Vec::with_capacity(column_count);
-    for (exp_wo, exp_ty) in expected.iter() {
+    for (exp_wo, exp_ty, cfg) in expected.iter() {
+        let cfg = *cfg;
         let write_order = r.u32().ok_or(LoadReject::Truncated)?;
         // Compare the raw discriminant rather than decoding it: `from_byte`
         // panics on a value it does not recognise, and these bytes come from a
@@ -662,6 +700,7 @@ pub fn deserialize(
         n_slots,
         valid_len: at as u64,
         deltas: applied,
+        cleared_below,
     })
 }
 

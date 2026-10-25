@@ -292,6 +292,31 @@ pub async fn open_table(
     .await
 }
 
+/// Writes `t`'s filter through the library's own checkpoint
+/// (`TableFilters::try_checkpoint`: a base image, then delta records) to
+/// `<dir>/<table>.sidecar`. A table kept that file as `<table>_flt.db` until
+/// persistent indexes B14 retired it (the filter now persists only as an
+/// index snapshot's FILTER section); the format, and these tests of it, stay
+/// the library's.
+pub async fn checkpoint_sidecar(t: &Table<LocalStorageProvider>, dir: &std::path::Path) {
+    use rasterizeddb_core::core::storage_providers::traits::StorageIO;
+    let io = LocalStorageProvider::new(dir.to_str().unwrap(), Some(&format!("{}.sidecar", t.schema.name))).await;
+    let n = t.io_pointers().unwrap().get_len().await
+        / rasterizeddb_core::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+    t.filters()
+        .unwrap()
+        .as_ref()
+        .expect("the table has a filter")
+        .try_checkpoint(&io, n)
+        .await
+        .expect("the sidecar checkpoint");
+}
+
+/// Where [`checkpoint_sidecar`] writes `name`'s sidecar.
+pub fn sidecar_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}.sidecar"))
+}
+
 pub async fn run(table: &Table<LocalStorageProvider>, where_clause: &str) -> Vec<Row> {
     table
         .query_row(

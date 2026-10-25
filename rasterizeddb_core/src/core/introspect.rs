@@ -485,7 +485,8 @@ async fn sizes_of<S: StorageIO>(table: &crate::core::row::table::Table<S>) -> Re
         data: data.io_rows.get_len().await,
         pointers: data.io_pointers.get_len().await,
         schema: table.io_schema.get_len().await,
-        filters: data.io_filters.get_len().await,
+        // The index-store files since B14 retired `_flt.db` (§10, RV21).
+        filters: table.index_store_bytes().map_err(|e| e.to_string())?,
         sequence: data.ids.io.get_len().await,
         map: 0,
     })

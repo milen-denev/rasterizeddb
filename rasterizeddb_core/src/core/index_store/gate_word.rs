@@ -689,6 +689,21 @@ impl WriteGate {
         self as *const WriteGate as usize
     }
 
+    /// At a file set's first open, before anything can hold the word: the
+    /// state becomes `Unknown` (docs/persistent-indexes.md §5: a `_flt.db`
+    /// that could not be deleted, or whose evidence could not be acted on).
+    /// Changes nothing, returning `false`, on a word already in use (a count
+    /// or a flag), which only a live word a reload shares can be.
+    pub(crate) fn start_unknown(&self) -> bool {
+        let now = self.load();
+        now.count() == 0
+            && now.0 & FLAGS == 0
+            && self
+                .word
+                .compare_exchange(now.0, Word::new(GateState::Unknown).0, SeqCst, SeqCst)
+                .is_ok()
+    }
+
     /// Sets the state of a word no ticket, registration or seal is on: the
     /// test-only "force Clean" hook that stands in for a published `CLEAN`
     /// until B13 seals (docs/persistent-indexes.md §13 V3, B11). Waits (up

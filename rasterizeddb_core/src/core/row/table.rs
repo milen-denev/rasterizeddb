@@ -24,8 +24,8 @@ use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
 use crate::core::tokenizer::query_tokenizer::Token;
 
 use crate::core::db_type::DbType;
-use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
-use crate::core::index_store::file_gate::FileGate;
+use crate::core::filter::{CandidateBitmap, TableFilters, is_indexable, sarg};
+use crate::core::index_store::file_gate::{FileGate, FltAtOpen};
 use crate::core::index_store::gate::{self, Proof, WriteTicket};
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
@@ -228,8 +228,6 @@ pub struct Table<S: StorageIO> {
 pub(crate) struct TableData<S: StorageIO> {
     pub(crate) io_pointers: Arc<S>,
     pub(crate) io_rows: Arc<S>,
-    /// Sidecar holding the persisted filter checkpoint.
-    pub(crate) io_filters: Arc<S>,
     /// Where row ids come from. A plain table's own; every partition of one
     /// logical table holds the same one, so ids are unique across the whole
     /// table (§3.5, I12), which `locate_row_by_id` and the unique check's
@@ -242,8 +240,9 @@ pub(crate) struct TableData<S: StorageIO> {
     /// Bit-level filter index. `None` when disabled or when no column of this
     /// table has a filterable type.
     ///
-    /// Shared with the maintenance task, which owns backfilling and
-    /// checkpointing so neither ever runs on a caller's thread.
+    /// Shared with the maintenance task, which owns backfilling so it never
+    /// runs on a caller's thread. Persisted only as a snapshot's FILTER
+    /// section, at a clean point (docs/persistent-indexes.md §5, B14).
     pub(crate) filters: Option<StdArc<TableFilters>>,
     /// Secondary indexes: those `CREATE INDEX` declared, and the implicit ones
     /// of `PRIMARY KEY` and `UNIQUE`. `None` when the table has none. See
@@ -447,7 +446,7 @@ impl<S: StorageIO> IdSource<S> {
 pub(crate) struct PartitionOpen<S: StorageIO> {
     /// `__pt_<uid:016x>_<pid:08x>`: the stem its three files hang off.
     pub physical: String,
-    /// Opens `<physical>.db`, `_pointers.db` and `_flt.db` and nothing else.
+    /// Opens `<physical>.db` and `_pointers.db` and nothing else.
     /// The caller has already checked they exist (I9): providers create.
     pub seed: Arc<S>,
     /// The shell's schema provider. Shared, never written through here: the
@@ -476,7 +475,6 @@ struct Assembly<'a, S: StorageIO> {
     io_schema: Arc<S>,
     io_pointers: Arc<S>,
     io_rows: Arc<S>,
-    io_filters: Arc<S>,
     ids: StdArc<IdSource<S>>,
     table_length: u64,
     guard: Option<crate::core::partition::guard::RangeGuard>,
@@ -523,9 +521,14 @@ impl<S: StorageIO> Table<S> {
         Ok(&self.data()?.io_pointers)
     }
 
-    /// The filter checkpoint sidecar.
-    pub fn io_filters(&self) -> std::io::Result<&Arc<S>> {
-        Ok(&self.data()?.io_filters)
+    /// Bytes of the file set's index-store files (`.ixs`, `.ixm`): what the
+    /// filter (and, from B17, the indexes) costs on disk, for size
+    /// reporting (docs/persistent-indexes.md §10, RV21). 0 for a table with
+    /// no directory.
+    pub fn index_store_bytes(&self) -> std::io::Result<u64> {
+        let _ = self.data()?;
+        let len = |p: Option<std::path::PathBuf>| p.and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        Ok(len(self.gate.ixs_path()) + len(self.gate.ixm_path()))
     }
 
     /// The row-id sequence file: a plain table's own, a partition's shared one.
@@ -899,12 +902,6 @@ impl<S: StorageIO> Table<S> {
                 .await,
         );
 
-        let io_filters = Arc::new(
-            initial_io
-                .create_new(format!("{}_flt.db", table_name))
-                .await,
-        );
-
         let io_sequence = Arc::new(
             initial_io
                 .create_new(format!("{}_seq.db", table_name))
@@ -914,13 +911,13 @@ impl<S: StorageIO> Table<S> {
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
-        let io_filters_clone = io_filters.clone();
         let io_sequence_clone = io_sequence.clone();
 
         // Cleared by `Drop`. Every task spawned for this table watches it, and
         // this one has to as well: the providers' services never return on
         // their own, so a task that only joined them held an `Arc` to each
-        // provider — five files' worth of handles, an mmap and a staging
+        // provider — four files' worth of handles (five before B14 retired
+        // `_flt.db`), an mmap and a staging
         // buffer — for the life of the process, for every `Table` ever built.
         // A table rebuilt on each new JSON key leaked a generation per key, and
         // the process ran at the descriptor limit within the hour.
@@ -933,7 +930,6 @@ impl<S: StorageIO> Table<S> {
                         io_rows_clone.start_service(),
                         io_pointers_clone.start_service(),
                         io_schema_clone.start_service(),
-                        io_filters_clone.start_service(),
                         io_sequence_clone.start_service()
                     );
                 } => {}
@@ -995,7 +991,6 @@ impl<S: StorageIO> Table<S> {
             io_schema,
             io_pointers,
             io_rows,
-            io_filters,
             ids,
             table_length,
             guard: None,
@@ -1028,11 +1023,10 @@ impl<S: StorageIO> Table<S> {
         } = p;
         let io_pointers = Arc::new(seed.create_new(format!("{}_pointers.db", physical)).await);
         let io_rows = Arc::new(seed.create_new(format!("{}.db", physical)).await);
-        let io_filters = Arc::new(seed.create_new(format!("{}_flt.db", physical)).await);
 
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
         let services_alive = maintenance_alive.clone();
-        let (rows_task, pointers_task, filters_task) = (io_rows.clone(), io_pointers.clone(), io_filters.clone());
+        let (rows_task, pointers_task) = (io_rows.clone(), io_pointers.clone());
         // As in `new_with_constraints`: watches the drop signal so the task
         // does not hold the providers for the life of the process.
         tokio::spawn(async move {
@@ -1040,8 +1034,7 @@ impl<S: StorageIO> Table<S> {
                 _ = async {
                     tokio::join!(
                         rows_task.start_service(),
-                        pointers_task.start_service(),
-                        filters_task.start_service()
+                        pointers_task.start_service()
                     );
                 } => {}
                 _ = async {
@@ -1085,7 +1078,6 @@ impl<S: StorageIO> Table<S> {
             io_schema,
             io_pointers,
             io_rows,
-            io_filters,
             ids,
             table_length,
             guard: Some(guard),
@@ -1139,7 +1131,6 @@ impl<S: StorageIO> Table<S> {
             io_schema,
             io_pointers,
             io_rows,
-            io_filters,
             ids,
             table_length,
             guard,
@@ -1157,51 +1148,109 @@ impl<S: StorageIO> Table<S> {
         // is still open (a reload), else derived from `.ixm`. Writes nothing.
         let gate = FileGate::open(io_pointers.index_store_dir(), stem, schema.incarnation);
         // Every write of the file set registers on the word, at the provider
-        // (`index_store::gated_io`, B12): rows, pointers and `_flt.db`, and
-        // for a plain table its schema family (the sidecars inherit it) and
-        // `_seq.db`. A partition's schema and row ids are the logical table's,
-        // shared by every partition, so they attach to none of them.
-        // `_flt.db`'s checkpoint loop writes under no ticket until B14
-        // retires it: registered, but judged as release judges it.
+        // (`index_store::gated_io`, B12): rows and pointers, and for a plain
+        // table its schema family (the sidecars inherit it) and `_seq.db`. A
+        // partition's schema and row ids are the logical table's, shared by
+        // every partition, so they attach to none of them.
         {
-            use crate::core::index_store::gated_io::{Policy, Ungated};
+            use crate::core::index_store::gated_io::Policy;
             for io in [&io_pointers, &io_rows] {
                 io.attach_write_gate(&gate, Policy::Backstop);
             }
-            io_filters.attach_write_gate(&gate, Policy::Exempt(Ungated::FilterCheckpoint));
             if guard.is_none() {
                 io_schema.attach_write_gate(&gate, Policy::Backstop);
                 ids.io.attach_write_gate(&gate, Policy::Backstop);
             }
         }
 
+        // `_flt.db`, retired (docs/persistent-indexes.md §5, B14): deleted at
+        // every open before anything is written, after `.ixs` is durably
+        // unlinked when an `.ixm` makes it evidence. A file set with no
+        // directory has no snapshot and no gate to start `Unknown`; its
+        // provider family deletes the file.
+        let flt = if gate.has_files() {
+            gate.retire_flt()
+        } else {
+            Self::retire_flt_through_provider(&io_pointers, stem).await;
+            FltAtOpen::Absent
+        };
+
         let filter_settings = crate::core::filter::settings::settings();
-        let filters = if filter_settings.table_enabled(table_name) {
-            match Self::load_filter_checkpoint(&io_filters, &schema.fields, existing_slots).await {
-                Some(f) => {
-                    info!(
-                        "Loaded filter checkpoint; resuming indexing at slot {} of {}",
-                        f.resume_slot(),
-                        existing_slots
-                    );
-                    Some(StdArc::new(f))
+        // The filter a rebuild starts from, and what a loaded one must match.
+        let template = filter_settings
+            .table_enabled(table_name)
+            .then(|| TableFilters::for_table(table_name, &schema.fields))
+            .filter(|f| !f.is_empty());
+        // Only a file set that can be sealed pays for it: a statement's
+        // temporary relation is memory-backed and opens per statement.
+        let shape_hash = if gate.has_files() { crate::core::index::shape_of(&schema) } else { 0 };
+
+        // The open's proof (§4): every check, writing nothing. When it
+        // passes, the snapshot's FILTER section is loaded instead of
+        // rebuilt, with vacuum's clear horizon; otherwise the filter
+        // rebuilds below exactly as before. The word's state stays the
+        // marker log's either way (N21): a rejected `CLEAN` is still `Clean`,
+        // so the first write makes `DIRTY` durable, and only a load vouches.
+        let loaded: Option<Option<(TableFilters, u64)>> = if gate.has_files() {
+            use crate::core::index_store::open_proof::{self, Reject};
+            let expected = crate::core::index_store::identity::Identity {
+                incarnation: schema.incarnation,
+                slot_epoch: gate.slot_epoch(),
+                n_slots: existing_slots,
+                pointers_len: io_pointers.get_len().await,
+                rows_len: io_rows.get_len().await,
+                versions: crate::core::index_store::identity::VersionTuple::current(
+                    crate::core::filter::persist::FORMAT_VER,
+                ),
+                shape_hash,
+                filter_config_hash: template.as_ref().map_or(0, |f| f.config_hash()),
+            };
+            let outcome = open_proof::prove(&gate, &flt, &expected, template.is_some()).and_then(|proven| {
+                match (proven.filter, template.as_ref()) {
+                    (Some(bytes), Some(t)) => t
+                        .load_sealed(&bytes, existing_slots)
+                        .map(Some)
+                        .map_err(|e| Reject::FilterLoad(format!("{e:?}"))),
+                    _ => Ok(None),
                 }
-                None => {
-                    let f = TableFilters::for_table(table_name, &schema.fields);
-                    if f.is_empty() {
-                        None
-                    } else {
-                        // Rows already on disk predate the filter, so they stay
-                        // candidates until a backfill indexes them. Correct from
-                        // the first query; just not yet selective.
-                        let build = gate::build_token();
-                        f.set_unindexed_prefix(Proof::from(&build), existing_slots);
-                        Some(StdArc::new(f))
-                    }
+            });
+            match outcome {
+                Ok(l) => {
+                    open_proof::note_loaded();
+                    info!(
+                        "{}: loaded the filter from its index snapshot ({} slots); no rebuild",
+                        stem, existing_slots
+                    );
+                    Some(l)
+                }
+                Err(why) => {
+                    open_proof::note_rejected(stem, &why);
+                    // This open's structures are not the snapshot's, whatever
+                    // a live word said of the instance before it (§3 rule 2).
+                    gate.set_vouched(false);
+                    None
                 }
             }
         } else {
             None
+        };
+        let was_loaded = loaded.is_some();
+        let mut cleared_at_open = 0;
+        let filters = match (loaded, template) {
+            (Some(Some((f, cleared_below))), _) => {
+                cleared_at_open = cleared_below;
+                Some(StdArc::new(f))
+            }
+            (Some(None), _) => None,
+            (None, Some(f)) => {
+                // Rows already on disk predate the filter, so they stay
+                // candidates until a backfill indexes them. Correct from the
+                // first query; just not yet selective.
+                let build = gate::build_token();
+                f.set_unindexed_prefix(Proof::from(&build), existing_slots);
+                Some(StdArc::new(f))
+            }
+            (None, None) => None,
         };
 
         let filters_ready = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
@@ -1248,27 +1297,36 @@ impl<S: StorageIO> Table<S> {
             });
         }
 
-        // Everything the filter needs doing after this point — the initial
-        // backfill and every checkpoint — happens on this task. No caller ever
-        // pays for it: `Table::new` returns immediately and an insert never
-        // stalls behind a blob rewrite.
+        // The filter's backfill, when it has one, runs on this task. No
+        // caller ever pays for it: `Table::new` returns immediately.
         // Whether the task has anything to backfill is knowable now, so a table
         // with nothing to do reports ready immediately rather than after the
         // task has been scheduled. Otherwise `filters_ready()` races on a fresh
-        // table, where the answer is trivially yes.
+        // table, where the answer is trivially yes. A loaded filter covers
+        // every slot, so it has nothing to do.
         let needs_backfill = filters.as_ref().is_some_and(|f| {
             filter_settings.backfill_on_open() && f.resume_slot() < existing_slots
         });
+        // A load vouches for the word only when the loaded filter is all this
+        // instance has: one that still backfills differs from the snapshot,
+        // which the next clean point rewrites (§3 rule 3).
+        if was_loaded
+            && !filters.as_ref().is_some_and(|f| f.resume_slot() < existing_slots)
+            && gate.state() == crate::core::index_store::gate_word::GateState::Clean
+        {
+            gate.set_vouched(true);
+        }
 
-        if let Some(filters) = filters.clone() {
+        if filters.is_some() {
             filters_ready.store(!needs_backfill, AtomicOrdering::Release);
-
+        }
+        if let Some(filters) = filters.clone().filter(|_| needs_backfill) {
             let ready = filters_ready.clone();
             let alive = maintenance_alive.clone();
-            let io_filters_task = io_filters.clone();
             let io_pointers_task = io_pointers.clone();
             let io_rows_task = io_rows.clone();
             let fields = schema.fields.clone();
+            let stem_task = stem.to_string();
             // The backfill reads row bytes by pointer, exactly as a query does,
             // so it has to hold a reader epoch for the same reason: an extent it
             // is fetching from must not be reclaimed underneath it. Indexing
@@ -1281,49 +1339,35 @@ impl<S: StorageIO> Table<S> {
             let epoch_at_open = filters.renumber_epoch();
 
             tokio::spawn(async move {
-                if needs_backfill {
-                    let resume = filters.resume_slot();
-                    if resume < existing_slots && alive.load(AtomicOrdering::Relaxed) {
-                        match backfill_into(
-                            &filters,
-                            &io_pointers_task,
-                            &io_rows_task,
-                            &fields,
-                            resume,
-                            Some(&readers_task),
-                        )
-                        .await
-                        {
-                            // Checkpoint straight away so the next open resumes
-                            // instead of rescanning.
-                            Ok(_) => {
-                                let n = io_pointers_task.get_len().await
-                                    / ROW_POINTER_RECORD_LEN as u64;
-                                filters.checkpoint(&*io_filters_task, n).await;
-                            }
-                            Err(e) => {
-                                error!("Filter backfill failed, continuing unfiltered: {}", e)
-                            }
+                let resume = filters.resume_slot();
+                if resume < existing_slots && alive.load(AtomicOrdering::Relaxed) {
+                    let started = std::time::Instant::now();
+                    match backfill_into(
+                        &filters,
+                        &io_pointers_task,
+                        &io_rows_task,
+                        &fields,
+                        resume,
+                        Some(&readers_task),
+                    )
+                    .await
+                    {
+                        // Nothing is written: the filter persists only at a
+                        // clean point (docs/persistent-indexes.md §5).
+                        Ok(_) => info!(
+                            "{}: filter backfilled over {} slots in {:.3} s",
+                            stem_task,
+                            existing_slots - resume,
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => {
+                            error!("Filter backfill failed, continuing unfiltered: {}", e)
                         }
                     }
                 }
                 // Queries before this point are correct, just unfiltered.
                 if filters.renumber_epoch() == epoch_at_open {
                     ready.store(true, AtomicOrdering::Release);
-                }
-
-                loop {
-                    // Re-read each tick, so `SET FILTER checkpoint_interval_secs`
-                    // takes effect without restarting the table.
-                    let secs = crate::core::filter::settings::settings().checkpoint_interval_secs();
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                    if !alive.load(AtomicOrdering::Relaxed) {
-                        break;
-                    }
-                    if filters.should_checkpoint() || filters.checkpoint_requested() {
-                        let n = io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-                        filters.checkpoint(&*io_filters_task, n).await;
-                    }
                 }
             });
         }
@@ -1336,7 +1380,9 @@ impl<S: StorageIO> Table<S> {
         let dead_stamps = StdArc::new(AtomicU64::new(0));
         let versions: StdArc<ArcSwapOption<TransactionManager>> =
             StdArc::new(ArcSwapOption::empty());
-        let cleared_below = StdArc::new(CacheGuard::new(AtomicU64::new(0)));
+        // Restored from the snapshot when the filter was loaded (§2), before
+        // vacuum's first tick: its codes below the bound are already empty.
+        let cleared_below = StdArc::new(CacheGuard::new(AtomicU64::new(cleared_at_open)));
         // The sidecar counts as much as the flags: this is what decides whether
         // the write lock is taken, and a table whose only constraints are
         // table-level would otherwise be checked without it.
@@ -1387,16 +1433,15 @@ impl<S: StorageIO> Table<S> {
             gate: gate.clone(),
             io_pointers: io_pointers.clone(),
             io_rows: io_rows.clone(),
-            io_filters: io_filters.clone(),
             own: guard.is_none().then(|| (io_schema.clone(), ids.io.clone())),
             filters: filters.clone(),
             indexes: indexes.clone(),
             filters_ready: filters_ready.clone(),
             versions: versions.clone(),
             incarnation: schema.incarnation,
-            // Only a file set that can be sealed pays for it: a statement's
-            // temporary relation is memory-backed and opens per statement.
-            shape_hash: if gate.has_files() { crate::core::index::shape_of(&schema) } else { 0 },
+            shape_hash,
+            cleared_below: cleared_below.clone(),
+            legacy_flt: flt == FltAtOpen::LegacyPair,
             revocations_at_open,
             retired: AtomicBool::new(false),
         });
@@ -1410,7 +1455,6 @@ impl<S: StorageIO> Table<S> {
                 seal,
                 io_pointers,
                 io_rows,
-                io_filters,
                 ids,
                 len: AtomicU64::new(table_length).into(),
                 guard,
@@ -1444,6 +1488,12 @@ impl<S: StorageIO> Table<S> {
     /// The file set's write gate.
     pub fn gate(&self) -> &StdArc<FileGate> {
         &self.gate
+    }
+
+    /// Vacuum's clear horizon now (§2), for tests of its persistence (B14).
+    #[cfg(test)]
+    pub(crate) fn cleared_below_for_tests(&self) -> u64 {
+        self.cleared_below.load(AtomicOrdering::Acquire)
     }
 
     /// The family a write path's ticket on this file set is kept for (§2
@@ -1501,7 +1551,6 @@ impl<S: StorageIO> Table<S> {
         if let Ok(d) = self.data() {
             push(&d.io_pointers);
             push(&d.io_rows);
-            push(&d.io_filters);
             push(&d.ids.io);
         }
         out
@@ -1752,12 +1801,6 @@ impl<S: StorageIO> Table<S> {
             true,
         )
         .await?;
-
-        if report.fingerprints_cleared > 0 {
-            if let Some(filters) = d.filters.as_ref() {
-                filters.request_checkpoint();
-            }
-        }
         Ok(report)
     }
 
@@ -1870,18 +1913,15 @@ impl<S: StorageIO> Table<S> {
         // rows at new slots, and an index or filter still answering by the old
         // numbering prunes them silently. Both stay demoted until a rebuild
         // under the new numbering completes; a failed compaction leaves them
-        // demoted (the filter's demotion is persisted with its checkpoints, so
-        // a reopened table backfills it, and the indexes are rebuilt at open).
+        // demoted (no snapshot is sealed while demoted, so a reopened table
+        // rebuilds both).
         // Phase 1 is included because the open-time build and backfill read
         // rows by pointer without this gate: their epoch check is what stops
         // anything they read while rows moved from being published.
         //
-        // The checkpoint on disk describes a slot layout that is about to stop
-        // existing, so this also marks the sidecar dirty, ordered against any
-        // checkpoint already in flight (see
-        // `TableFilters::begin_renumbering_on_disk`): a crash mid-compaction
-        // leaves a sidecar that is rejected and rebuilt, rather than one that
-        // confidently indexes rows by their former addresses.
+        // A snapshot on disk describes a slot layout that is about to stop
+        // existing: the ticket taken above made `DIRTY` durable and
+        // `rdb.ixe`'s epoch moved, so no reopen trusts it.
         let n_slots_before = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         let renumbering = self.begin_renumbering(d, n_slots_before, &ticket).await;
 
@@ -2149,14 +2189,13 @@ impl<S: StorageIO> Table<S> {
         //
         // The filter has been demoted since the renumbering began. Only a
         // backfill that completes restores it: one that fails leaves the
-        // prefix untrusted, and the checkpoint records that, rather than
-        // reporting ready over planes that still hold the old numbering.
+        // prefix untrusted, so no seal can capture it, rather than reporting
+        // ready over planes that still hold the old numbering.
         if d.filters.is_some() {
             match self.backfill_filters_from(0).await {
                 Ok(_) => self.filters_ready.store(true, AtomicOrdering::Release),
                 Err(e) => error!("Compaction could not rebuild the filter; it stays unused: {}", e),
             }
-            self.checkpoint_filters().await?;
         }
 
         // The secondary indexes name slots too, every one of which moved.
@@ -2230,9 +2269,8 @@ impl<S: StorageIO> Table<S> {
         ticket: &'a WriteTicket,
     ) -> RenumberingGuard<'a> {
         self.filters_ready.store(false, AtomicOrdering::Release);
-        // Built before the first await, not after: `begin_renumbering_on_disk`
-        // makes the epoch odd and then waits on the sidecar's dirty mark, and
-        // a compaction dropped there (a cancelled statement drops its future)
+        // Built before the demotion, not after: `begin_renumbering` makes the
+        // epoch odd, and a compaction dropped after it (a cancelled statement drops its future)
         // would otherwise leave it odd with nothing to end it, refusing every
         // backfill, prefix clear and vacuum clear on this table until the
         // next compaction or a restart. Ending a renumbering that never began
@@ -2244,9 +2282,7 @@ impl<S: StorageIO> Table<S> {
             ticket,
         };
         if let Some(filters) = d.filters.as_ref() {
-            filters
-                .begin_renumbering_on_disk(Proof::from(ticket), &*d.io_filters, n_slots)
-                .await;
+            filters.begin_renumbering(Proof::from(ticket), n_slots);
         }
         if let Some(indexes) = d.indexes.as_ref() {
             indexes.invalidate(Proof::from(ticket));
@@ -3355,36 +3391,28 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
-    /// Read and validate the sidecar. Any problem returns `None` and the caller
-    /// builds an empty catalog: a rejected checkpoint costs a scan, never a
-    /// wrong answer.
-    async fn load_filter_checkpoint(
-        io_filters: &Arc<S>,
-        fields: &SmallVec<[SchemaField; 20]>,
-        now_slots: u64,
-    ) -> Option<TableFilters> {
-        let len = io_filters.get_len().await;
-        if len == 0 {
-            return None;
+    /// `_flt.db` at the open of a table with no directory (memory, key/value,
+    /// a mirrored pool; P33), deleted through the provider family (RV20): a
+    /// key/value delete, every copy of a mirror. Such a table has no gate to
+    /// start `Unknown` and no snapshot for the file to be evidence against;
+    /// it matters only to a downgraded binary, which would trust a filter
+    /// image this one no longer maintains. An empty file is left (no binary
+    /// trusts one), and so is one that is not a filter image, which may be
+    /// the rows of a table named `<stem>_flt` (P19). The delete is the
+    /// provider's best effort: it reports no error to retry on.
+    async fn retire_flt_through_provider(seed: &Arc<S>, stem: &str) {
+        let io = seed.create_new(format!("{stem}_flt.db")).await;
+        let len = io.get_len().await;
+        if len < 8 {
+            return;
         }
-
-        let mut buf = vec![0u8; len as usize];
+        let mut head = [0u8; 8];
         let mut pos = 0u64;
-        if io_filters
-            .read_data_into_buffer(&mut pos, &mut buf)
-            .await
-            .is_err()
-        {
-            return None;
+        if io.read_data_into_buffer(&mut pos, &mut head).await.is_err() || &head != b"RDBFLT01" {
+            return;
         }
-
-        match TableFilters::from_checkpoint(&buf, fields, FilterConfig::default(), now_slots) {
-            Ok(f) => Some(f),
-            Err(reason) => {
-                info!("Filter checkpoint not usable ({:?}); rebuilding", reason);
-                None
-            }
-        }
+        io.drop_io();
+        info!("{}: deleted the retired filter sidecar {}_flt.db", stem, stem);
     }
 
     /// Row fetch covering only columns the filter can index.
@@ -3438,17 +3466,28 @@ impl<S: StorageIO> Table<S> {
         .await
     }
 
-    /// Persist the current filter state. Normally the maintenance task does
-    /// this; call it directly when a checkpoint must be on disk before some
-    /// specific point, such as a controlled shutdown.
+    /// Persists the filter now: a mandatory seal of the file set
+    /// (docs/persistent-indexes.md §3), the clean point
+    /// `rdb_index_checkpoint` is. Since B14 the filter persists only as a
+    /// snapshot's FILTER section, so this is [`Table::seal_snapshot`] for
+    /// callers that predate it. A table that cannot be sealed (no
+    /// directory, no write-ahead log, bulk load, a ticket still held, an
+    /// unready filter) persists nothing and rebuilds at its next open,
+    /// which is `Ok`: nothing is lost but the rebuild's time. An I/O error
+    /// of the seal is returned.
     pub async fn checkpoint_filters(&self) -> Result<()> {
-        let d = self.data()?;
-        let Some(filters) = d.filters.as_ref() else {
-            return Ok(());
-        };
-        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        filters.checkpoint(&*d.io_filters, n_slots).await;
-        Ok(())
+        self.data()?;
+        match self
+            .seal_snapshot(crate::core::index_store::gate_word::SealKind::Mandatory)
+            .await
+        {
+            crate::core::index_store::seal::SealOutcome::Failed(e)
+            | crate::core::index_store::seal::SealOutcome::FailedAfterClean(e) => Err(e),
+            outcome => {
+                log::debug!("{}: filter checkpoint: {}", self.schema.name, outcome.describe());
+                Ok(())
+            }
+        }
     }
 
     /// The slot ceiling that answers `ORDER BY … LIMIT k` from the leading
@@ -4521,12 +4560,6 @@ impl<S: StorageIO> Table<S> {
             .unwrap();
         iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
 
-        // The checkpoint on disk is about to describe rows that no longer exist.
-        // One byte, once per statement, and never on the insert path.
-        if let Some(filters) = d.filters.as_ref() {
-            filters.mark_disk_dirty(&*d.io_filters).await;
-        }
-
         let matches = self
             .concurrent_processor
             .process_row_pointers(
@@ -4654,11 +4687,6 @@ impl<S: StorageIO> Table<S> {
 
         if deleted_count > 0 {
             self.invalidate_query_caches();
-            // Ask the maintenance task to clear the dirty flag. Rewriting the
-            // blob here would make a one-row DELETE pay for the whole index.
-            if let Some(filters) = d.filters.as_ref() {
-                filters.request_checkpoint();
-            }
         }
 
         Ok(deleted_count)
@@ -4905,10 +4933,6 @@ impl<S: StorageIO> Table<S> {
             .await
             .unwrap();
         iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
-
-        if let Some(filters) = d.filters.as_ref() {
-            filters.mark_disk_dirty(&*d.io_filters).await;
-        }
 
         let matches = self
             .concurrent_processor
@@ -5361,9 +5385,6 @@ impl<S: StorageIO> Table<S> {
 
         if updated_count > 0 {
             self.invalidate_query_caches();
-            if let Some(filters) = d.filters.as_ref() {
-                filters.request_checkpoint();
-            }
         }
 
         Ok(Some(updated_count))
@@ -5569,13 +5590,9 @@ impl Drop for RenumberingGuard<'_> {
     fn drop(&mut self) {
         let ticket = self.ticket;
         if let Some(filters) = self.filters {
-            filters.end_renumbering(Proof::from(ticket));
             // A compaction that fails from here on leaves the filter demoted
-            // in memory and the sidecar marked dirty; this persists the
-            // demotion at the next maintenance tick instead of whenever
-            // something unrelated asks. A compaction that succeeds checkpoints
-            // after its rebuild, which clears the request.
-            filters.request_checkpoint();
+            // in memory, and no seal captures a demoted filter (§3 step 3).
+            filters.end_renumbering(Proof::from(ticket));
         }
         if let Some(indexes) = self.indexes {
             indexes.invalidate(Proof::from(ticket));

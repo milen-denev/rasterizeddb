@@ -318,49 +318,41 @@ fn release_after_compaction(
     })
 }
 
-/// Finding: a checkpoint planned before the compaction began (a base image of
-/// the old numbering, `unknown_below = 0`) lands after it began and marks the
-/// sidecar clean, erasing the compaction's dirty mark. The compaction then
-/// fails in phase 2 and the database is reopened with no further checkpoint.
+/// A filter checkpoint after a failed compaction (persistent indexes B14:
+/// a mandatory seal) persists nothing: the filter is demoted, so the seal is
+/// ineligible (§3 step 3, §6 "no snapshot while demoted"), and the log the
+/// compaction's ticket made `DIRTY` stays so. The reopen rebuilds, and every
+/// predicate matches the twin. Replaces the `_flt.db` checkpoint-in-flight
+/// finding, whose sidecar B14 retired.
+///
+/// Mutation: the seal's eligibility skips the filter's completeness (a
+/// demoted filter is published, and the reopen loads old-numbered codes).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_checkpoint_in_flight_as_a_compaction_starts_does_not_persist_the_old_numbering() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn a_checkpoint_after_a_failed_compaction_persists_nothing() {
     let base = tempfile::tempdir().unwrap();
     let db = open(base.path()).await;
     create_and_fill(&db, "cf_e", false).await;
     let t = db.table_for_tests("cf_e").unwrap().clone();
     t.wait_filters_ready().await.unwrap();
     t.checkpoint_filters().await.unwrap();
-    // Marks the sidecar dirty, so the next checkpoint plans a base image.
     run(&db, &format!("DELETE FROM cf_e WHERE id = {}", ROWS - 1)).await;
-
-    let filters = t.filters().unwrap().clone().expect("the table has a filter");
-    let park = crate::core::filter::checkpoint_test_hooks::arm(&filters);
-    let cp_table = t.clone();
-    let checkpoint = tokio::spawn(async move { cp_table.checkpoint_filters().await });
-    tokio::time::timeout(Duration::from_secs(30), park.planned.notified())
-        .await
-        .expect("the checkpoint never planned a write");
-
-    let done = std::sync::Arc::new(AtomicBool::new(false));
-    // Without a fix nothing waits on the parked checkpoint, so only the
-    // compaction finishing releases it; with one the compaction waits for it.
-    let releaser = {
-        let park = park.clone();
-        release_after_compaction(move || park.release.notify_one(), done.clone(), || true)
-    };
     drop(t);
-    drop(filters);
     fail_compaction(&db, "cf_e").await;
-    done.store(true, Ordering::Release);
-    releaser.await.unwrap();
-    checkpoint.await.unwrap().unwrap();
+    let t = db.table_for_tests("cf_e").unwrap().clone();
+    let outcome = t.seal_snapshot(crate::core::index_store::gate_word::SealKind::Mandatory).await;
+    assert!(
+        matches!(outcome, crate::core::index_store::seal::SealOutcome::Skipped(_)),
+        "a demoted filter was sealed: {}",
+        outcome.describe()
+    );
+    drop(t);
 
     drop(db);
     crate::core::wal::remove_for(&path_str(base.path()));
     let db = open(base.path()).await;
-    assert_all_match(&db, "cf_e", "after reopening").await;
     let t = db.table_for_tests("cf_e").unwrap().clone();
+    assert!(!t.gate().vouched(), "a snapshot loaded after a failed compaction");
+    assert_all_match(&db, "cf_e", "after reopening").await;
     t.wait_filters_ready().await.unwrap();
     drop(t);
     assert_all_match(&db, "cf_e", "after reopening and the backfill").await;
@@ -671,52 +663,6 @@ fn the_renumber_epoch_is_odd_exactly_while_renumbering() {
     );
 }
 
-/// Review follow-up: a compaction future dropped while it waits for the
-/// sidecar's dirty mark, after its renumbering began, must not leave the
-/// epoch reading "renumbering" for good. Every backfill and prefix clear
-/// would be refused, and the filter would stay demoted until a restart.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_compaction_dropped_as_its_renumbering_begins_ends_it() {
-    use crate::core::filter::renumbering;
-    let base = tempfile::tempdir().unwrap();
-    let db = open(base.path()).await;
-    create_and_fill(&db, "cf_x", false).await;
-    let t = db.table_for_tests("cf_x").unwrap().clone();
-    t.wait_filters_ready().await.unwrap();
-    // A checkpoint exists, so the renumbering writes the dirty mark.
-    t.checkpoint_filters().await.unwrap();
-    let filters = t.filters().unwrap().clone().expect("the table has a filter");
-
-    let marking = filters.dirty_marking.lock().await;
-    let mut compaction = Box::pin(t.compact());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !renumbering(filters.renumber_epoch()) {
-        assert!(Instant::now() < deadline, "the compaction never began its renumbering");
-        tokio::select! {
-            biased;
-            outcome = &mut compaction => panic!(
-                "the compaction ran past the dirty mark it could not take: {:?}",
-                outcome.map(|_| ())
-            ),
-            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-        }
-    }
-    // A cancelled statement drops its future here.
-    drop(compaction);
-    drop(marking);
-    assert!(
-        !renumbering(filters.renumber_epoch()),
-        "a dropped compaction left the epoch renumbering, refusing every backfill"
-    );
-    t.backfill_filters_from(0).await.expect("the backfill was refused");
-    assert!(filters.is_complete(), "the backfill could not restore the filter");
-    drop(filters);
-    drop(t);
-    assert_all_match(&db, "cf_x", "after a compaction was dropped").await;
-
-    drop(db);
-    crate::core::wal::remove_for(&path_str(base.path()));
-}
 
 /// Review S4: work that read the renumber epoch *during* a renumbering, and
 /// writes before it ends, saw an unchanged epoch and was let through. Its

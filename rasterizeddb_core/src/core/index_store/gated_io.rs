@@ -20,8 +20,8 @@
 //! detached and `Dirty` for good, P33) carries a [`GatedIo`] in the commit
 //! state its clones share, and every write entry point calls
 //! [`GatedIo::admit_now`] first. A table attaches its word to the providers it
-//! owns when it is assembled ([`GatedIo::attach`]: rows, pointers, `_flt.db`,
-//! and for a plain table `_schema.db` and `_seq.db`); a provider created from
+//! owns when it is assembled ([`GatedIo::attach`]: rows and pointers, and for
+//! a plain table `_schema.db` and `_seq.db`; B14 retired `_flt.db`); a provider created from
 //! an attached one for a file named after it (`<t>_schema.db` creates
 //! `<t>_schema_FIELDS.db` and every `_schema_*` sidecar) inherits the word
 //! ([`GatedIo::inherit_from`]). A partition's schema and row-id files are the
@@ -106,8 +106,6 @@ pub enum Site {
 /// panic: the entries of [`UNGATED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ungated {
-    /// `_flt.db`, through its registered provider, judged as release does.
-    FilterCheckpoint,
     /// Staged bytes landed when a provider of a live file set opens.
     OpenLanding,
     /// An `ALTER` rewrite's files and its schema backup's restore, written
@@ -118,14 +116,6 @@ pub enum Ungated {
 /// The allowlist: every way a write reaches a live file set without a
 /// registration that panics on a ticketless write, with why that is sound.
 pub const UNGATED: &[(Ungated, &str)] = &[
-    (
-        Ungated::FilterCheckpoint,
-        "_flt.db's runtime checkpoint loop writes on its own task under no ticket until B14 \
-         retires the file (B11's census exempts it from the held-ticket rule likewise). Its \
-         provider is registered, so a seal counts the write, but a ticketless write is judged as \
-         release judges it: on a Clean or Unknown word the slow path makes DIRTY durable before \
-         the write is issued, so T1 holds; during an unpublished seal it cancels the seal.",
-    ),
     (
         Ungated::OpenLanding,
         "A provider that opens a file whose .tmp sidecar still holds staged bytes lands them \

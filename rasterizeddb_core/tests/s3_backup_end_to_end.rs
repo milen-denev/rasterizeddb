@@ -1973,12 +1973,14 @@ e2e_test!(a_restore_reproduces_every_state_file, config, {
         live.join("db_transactions.status.settled").exists(),
         "no settled sidecar was written"
     );
+    // Persistent indexes B14 retired the filter sidecar `_flt.db`: this build
+    // writes none (step 2 plants an older build's).
     assert!(
-        std::fs::read_dir(&live)
+        !std::fs::read_dir(&live)
             .unwrap()
             .flatten()
             .any(|e| e.file_name().to_string_lossy().ends_with("_flt.db")),
-        "no filter sidecar on disk"
+        "a filter sidecar on disk"
     );
 
     let expected = fingerprint(&database).await;
@@ -2015,20 +2017,21 @@ e2e_test!(a_restore_reproduces_every_state_file, config, {
     assert_restores_faithfully(&database, &expected, &source_outcomes, &target).await;
 
     // 2. The same copy as an older build's backup would leave it: no settled
-    // sidecar, and filter sidecars in a format this build refuses. It must
-    // open, rebuild what it refuses, and answer the same.
+    // sidecar, and filter sidecars (`_flt.db`, format 3) beside every table.
+    // This build never reads them: it must open, delete them, rebuild its
+    // filters, and answer the same.
     let older = root.join("restored_older");
     rasterizeddb_core::core::backup::restore_from(&config, &older, RecoveryTarget::Latest)
         .await
         .expect("restore");
     std::fs::remove_file(older.join("db_transactions.status.settled")).unwrap();
     for entry in std::fs::read_dir(&older).unwrap().flatten() {
-        if entry.file_name().to_string_lossy().ends_with("_flt.db") {
-            let mut bytes = std::fs::read(entry.path()).unwrap();
-            if bytes.len() >= 10 {
-                bytes[8..10].copy_from_slice(&3u16.to_le_bytes());
-                std::fs::write(entry.path(), bytes).unwrap();
-            }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix("_pointers.db") {
+            let mut bytes = b"RDBFLT01".to_vec();
+            bytes.extend_from_slice(&3u16.to_le_bytes());
+            bytes.resize(64, 0);
+            std::fs::write(older.join(format!("{stem}_flt.db")), bytes).unwrap();
         }
     }
     assert_restores_faithfully(&database, &expected, &source_outcomes, &older).await;

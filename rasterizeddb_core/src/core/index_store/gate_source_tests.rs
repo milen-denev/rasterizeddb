@@ -108,7 +108,7 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 62] = [
+const READ_ONLY: [(&str, &str); 63] = [
     ("LiveIndex", "method"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
@@ -174,6 +174,9 @@ const READ_ONLY: [(&str, &str); 62] = [
     // A seal's FILTER section and its identity's configuration hash (B13).
     ("TableFilters", "sealed_image"),
     ("TableFilters", "config_hash"),
+    // A new filter built from a snapshot's FILTER section (B14): reads
+    // `self`, the rebuild's template, and mutates nothing of it.
+    ("TableFilters", "load_sealed"),
 ];
 
 /// More read-only fns, kept apart only to keep the list above readable:

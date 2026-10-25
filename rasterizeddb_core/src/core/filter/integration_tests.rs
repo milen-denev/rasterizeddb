@@ -439,35 +439,44 @@ async fn reopen_after_update_finds_the_new_value() {
     assert!(rows.is_empty(), "stale value still findable after reopen");
 }
 
+/// A `_flt.db` an older binary left is never read (persistent indexes §5,
+/// B14): a filter image is deleted at open, and bytes that are not one (the
+/// rows of a table named `<t>_flt`, for all the open can tell) are kept and
+/// ignored. Either way the filter is rebuilt and answers exactly.
+///
+/// Mutation: the open's `_flt.db` delete is skipped (the image survives).
 #[tokio::test(flavor = "multi_thread")]
-async fn corrupt_sidecar_falls_back_to_a_rebuild() {
+async fn a_leftover_sidecar_is_never_read() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_corrupt").await;
         table.wait_filters_ready().await.unwrap();
         fill(&table).await;
-        table.checkpoint_filters().await.unwrap();
     }
-
-    // Scribble over the magic. A rejected sidecar must cost a rebuild, never
-    // a wrong answer.
     let path = dir.path().join("flt_corrupt_flt.db");
-    assert!(path.exists(), "sidecar was never written: {:?}", path);
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes[0..4].copy_from_slice(b"JUNK");
-    std::fs::write(&path, &bytes).unwrap();
+    // A well-formed filter image (of an empty catalog), as an old binary
+    // would have left it.
+    let empty = super::TableFilters::new(&[], Default::default());
+    let mut lie = empty.checkpoint_bytes(N);
+    lie.extend_from_slice(&[0u8; 16]);
+    std::fs::write(&path, &lie).unwrap();
 
     let table = open_table(dir.path(), "flt_corrupt").await;
+    assert!(!path.exists(), "a filter image was left beside the table");
     table.wait_filters_ready().await.unwrap();
     for target in [0u64, 1234, N - 1] {
         let rows = run(&table, &format!("id = {}", target)).await;
-        assert_eq!(
-            ids_of(&rows),
-            vec![target],
-            "id = {} after corrupt sidecar",
-            target
-        );
+        assert_eq!(ids_of(&rows), vec![target], "id = {} after a leftover sidecar", target);
     }
+    drop(table);
+
+    // Not a filter image: kept, never read.
+    std::fs::write(&path, b"JUNK and more junk, not a filter image at all").unwrap();
+    let table = open_table(dir.path(), "flt_corrupt").await;
+    assert!(path.exists(), "bytes that may be another table's rows were deleted");
+    table.wait_filters_ready().await.unwrap();
+    let rows = run(&table, "label = 'l999'").await;
+    assert_eq!(ids_of(&rows), vec![999]);
 }
 
 // ---------------------------------------------------------------------------
@@ -648,40 +657,15 @@ async fn or_still_prunes() {
     );
 }
 
+/// No runtime checkpoint (persistent indexes §5, B14): inserts, deletes and
+/// updates, with the old checkpoint interval long past, write no sidecar and
+/// no dirty byte; the filter persists only at a clean point, and a reopen
+/// answers exactly.
+///
+/// Mutation: `assemble` opens the old `_flt.db` provider again (the file
+/// appears).
 #[tokio::test(flavor = "multi_thread")]
-async fn mutation_marks_the_sidecar_dirty_on_disk() {
-    // Regression: the dirty byte must actually reach the file. Guarding this
-    // write on `io.get_len()` silently disabled it — `LocalStorageProvider`
-    // tracks length in an atomic that `write_data` does not update, so a
-    // sidecar written via `write_data` reports length 0 until reopened. The
-    // result was a stale checkpoint loading happily and pruning a row that
-    // matched: a false negative.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("flt_dirty_flt.db");
-
-    let table = open_table(dir.path(), "flt_dirty").await;
-    fill(&table).await;
-    table.checkpoint_filters().await.unwrap();
-    assert_eq!(
-        std::fs::read(&path).unwrap()[13],
-        0,
-        "fresh checkpoint should be clean"
-    );
-
-    table
-        .delete_rows("id = 42", full_fetch(&table.schema.fields), None)
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(&path).unwrap()[13],
-        1,
-        "a delete must mark the on-disk checkpoint stale"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn maintenance_runs_without_any_explicit_checkpoint() {
-    // The service does the work: no caller ever calls checkpoint_filters().
+async fn no_mutation_or_timer_writes_a_sidecar() {
     crate::core::filter::settings::settings().set_checkpoint_interval_secs(1);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("flt_svc_flt.db");
@@ -692,31 +676,25 @@ async fn maintenance_runs_without_any_explicit_checkpoint() {
             .delete_rows("id = 42", full_fetch(&table.schema.fields), None)
             .await
             .unwrap();
-        // The delete requested a checkpoint; the background task should honour
-        // it without anyone asking again.
-        // A generous deadline, not a tight one: this waits on a background
-        // timer, and machine load can starve it for far longer than the
-        // interval without anything being wrong.
-        for _ in 0..600 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if std::fs::read(&path)
-                .map(|b| b.len() > 64 && b[13] == 0)
-                .unwrap_or(false)
-            {
-                break;
-            }
-        }
-        let bytes = std::fs::read(&path).expect("maintenance task never wrote a sidecar");
-        assert!(bytes.len() > 64, "sidecar too small: {}", bytes.len());
-        assert_eq!(bytes[13], 0, "maintenance task left the sidecar dirty");
+        let updates: SmallVec<[ColumnWritePayload; 32]> =
+            smallvec::smallvec![payload(&424242u64.to_le_bytes(), 0, DbType::U64)];
+        table
+            .update_rows("id = 900", full_fetch(&table.schema.fields), updates, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        assert!(!path.exists(), "a mutation or a timer wrote a sidecar");
     }
 
     let table = open_table(dir.path(), "flt_svc").await;
     table.wait_filters_ready().await.unwrap();
+    assert!(!path.exists());
     let rows = run(&table, "id = 42").await;
     assert!(rows.is_empty(), "deleted row came back");
     let rows = run(&table, "id = 43").await;
     assert_eq!(ids_of(&rows), vec![43]);
+    let rows = run(&table, "id = 424242").await;
+    assert_eq!(rows.len(), 1, "updated value not findable after reopen");
 }
 
 // ---------------------------------------------------------------------------
