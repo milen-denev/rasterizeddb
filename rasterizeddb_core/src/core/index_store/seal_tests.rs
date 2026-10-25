@@ -238,14 +238,32 @@ async fn crash_images_around_every_seal_step_never_prove_a_missing_or_partial_sn
         let mut points: Vec<CrashPoint> = sink.lock().drain(..).filter_map(Result::ok).collect();
         points.push(rec.cut_quiescent("after the seal").unwrap());
         assert!(points.len() >= 4, "round {round}: cuts were lost: {}", points.len());
+        let published = snapshot::decode(&std::fs::read(dir.join("c.ixs")).unwrap()).unwrap().footer;
         for p in &points {
             // Cut labels start with the failpoint's name.
             let before_clean = SEAL_STEPS[..5].iter().any(|step| p.label.starts_with(step));
             if before_clean {
                 cut_before_clean += 1;
             }
+            // From the directory fsync after the rename on, the new `.ixs`
+            // is durable under its name in every image: no seed may undo
+            // the rename (in round 1 that would bring back the old `.ixs`
+            // under a `CLEAN` written after it).
+            let renamed_durably = !SEAL_STEPS[..3].iter().any(|step| p.label.starts_with(step));
             for seed in 0..24 {
                 let img = p.image(seed);
+                if renamed_durably {
+                    let ixs = img.get(Path::new("c.ixs")).unwrap_or_else(|| {
+                        panic!("round {round}, {} seed {seed}: the durable rename was undone (no c.ixs)", p.label)
+                    });
+                    let footer = snapshot::decode(ixs).map(|s| s.footer);
+                    assert_eq!(
+                        footer.ok(),
+                        Some(published),
+                        "round {round}, {} seed {seed}: the durable rename was undone (another or a torn c.ixs)",
+                        p.label
+                    );
+                }
                 let log = img.get(Path::new("c.ixm")).cloned().unwrap_or_default();
                 let Some(clean) = marker::scan(&log).ok().and_then(|s| s.proven_clean().copied()) else {
                     not += 1;

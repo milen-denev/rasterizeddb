@@ -286,6 +286,14 @@ impl Recorder {
 
     /// An action for [`super::failpoint::arm`] that cuts here and pushes the
     /// point (or why it was discarded) to `sink`.
+    ///
+    /// A `sync:<tag>` site is hit just before its sync is issued, so the
+    /// calling thread's latest sync is in flight. Any other site is plain
+    /// code the thread reached past every sync it issued, which have all
+    /// returned: cutting there as if inside a sync left the thread's last
+    /// one (a directory fsync after a rename, with no later sync noted on
+    /// that thread) in flight, and images undid a rename the code had made
+    /// durable while keeping later unsynced writes.
     pub(crate) fn cut_action(
         self: &StdArc<Self>,
         label: String,
@@ -294,7 +302,12 @@ impl Recorder {
         let me = self.clone();
         StdArc::new(move |hit: &super::failpoint::Hit<'_>| {
             let label = format!("{label}, at {} hit {} on {}", hit.name, hit.nth, hit.path.display());
-            sink.lock().push(me.cut_in_sync(label));
+            let cut = if hit.name.starts_with("sync:") {
+                me.cut_in_sync(label)
+            } else {
+                me.cut_quiescent(label)
+            };
+            sink.lock().push(cut);
             super::failpoint::Outcome::Continue
         })
     }

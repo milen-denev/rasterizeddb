@@ -199,6 +199,50 @@ fn the_failpoints_own_sync_is_in_flight_and_earlier_ones_are_not() {
     assert_eq!(cp.image(P1)[&rel("d.db")], b"2");
 }
 
+/// A failpoint that is not a sync site cuts with every sync its thread
+/// issued already returned: the code reached it past them. The seal's
+/// `clean_append_before_fsync` sits after the `.ixs` rename's directory
+/// fsync and a `CLEAN` pwrite, with no sync noted between on that thread;
+/// the model took the returned directory sync for one in flight, so seeds
+/// kept the unsynced `CLEAN` page while undoing the rename it follows (a
+/// `CLEAN` over the old `.ixs`, which only the open's footer check caught).
+/// Intermittent there because the seal's task can resume on another worker
+/// between the two steps, whose syncs the model probes instead.
+#[test]
+fn a_plain_failpoint_cuts_after_its_threads_returned_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("s.ixs");
+    let log = dir.path().join("s.ixm");
+    std::fs::write(&target, b"old snapshot").unwrap();
+    std::fs::write(&log, b"LOG").unwrap();
+    let rec = Recorder::start(dir.path());
+    let sink = StdArc::new(Mutex::new(Vec::new()));
+    let fp = failpoint::arm("test.after_dir_sync", dir.path(), 1, rec.cut_action("after".into(), sink.clone()));
+    let tmp = dir.path().join("s.ixs.tmp");
+    sync_audit::dir_op(DirOp::Create(&tmp));
+    std::fs::write(&tmp, b"new snapshot").unwrap();
+    sync_file(&tmp);
+    sync_audit::dir_op(DirOp::Rename { from: &tmp, to: &target });
+    std::fs::rename(&tmp, &target).unwrap();
+    sync_dir_of(&target);
+    // The CLEAN-like append, unsynced, then the failpoint before its sync.
+    write_at(&log, 3, b"+CLEAN");
+    failpoint!("test.after_dir_sync", &log).unwrap();
+    assert_eq!(fp.fired(), 1);
+    let cp = sink.lock().pop().unwrap().unwrap();
+    for seed in 0..40 {
+        let img = cp.image(seed);
+        assert_eq!(
+            img[&rel("s.ixs")],
+            b"new snapshot",
+            "seed {seed}: the rename was undone although its directory sync had returned"
+        );
+        assert!(!img.contains_key(&rel("s.ixs.tmp")), "seed {seed}");
+    }
+    assert_eq!(cp.image(P0)[&rel("s.ixm")], b"LOG", "the unsynced append is not durable");
+    assert_eq!(cp.image(P1)[&rel("s.ixm")], b"LOG+CLEAN");
+}
+
 #[test]
 fn announced_directory_operations_without_a_directory_sync_may_be_undone() {
     let dir = tempfile::tempdir().unwrap();
