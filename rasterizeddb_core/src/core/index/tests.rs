@@ -801,3 +801,314 @@ fn a_column_index_answer_is_counted() {
         assert!(KEY_LOOKUPS.load(Ordering::Relaxed) > before, "{expr:?} missed the process-wide count");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The sorted stream: what a snapshot captures (hook C3) and loads (hook C9)
+// ---------------------------------------------------------------------------
+
+/// What `for_each_sorted` gave, with the stream's order checked on the way:
+/// every entry, then the unkeyed slots once, then the presence words once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Captured {
+    entries: Vec<(Vec<u8>, Vec<u64>)>,
+    unkeyed: Vec<u64>,
+    present: Vec<u64>,
+}
+
+fn capture(ix: &LiveIndex) -> Captured {
+    let mut c = Captured { entries: Vec::new(), unkeyed: Vec::new(), present: Vec::new() };
+    let mut parts = 0; // closing parts seen
+    ix.for_each_sorted(|part| -> Result<(), ()> {
+        match part {
+            Sorted::Entry(key, slots) => {
+                assert_eq!(parts, 0, "an entry after the unkeyed slots");
+                c.entries.push((key.to_vec(), slots.to_vec()));
+            }
+            Sorted::Unkeyed(slots) => {
+                assert_eq!(parts, 0, "unkeyed slots twice, or after the presence bits");
+                c.unkeyed = slots.to_vec();
+                parts = 1;
+            }
+            Sorted::Present(words) => {
+                assert_eq!(parts, 1, "presence bits before the unkeyed slots, or twice");
+                c.present = words.to_vec();
+                parts = 2;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(parts, 2, "the stream did not end with the presence bits");
+    c
+}
+
+/// Presence words for a set of slots, without trailing zero words.
+fn words_of(slots: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut words = Vec::new();
+    for s in slots {
+        let w = (s / 64) as usize;
+        if words.len() <= w {
+            words.resize(w + 1, 0);
+        }
+        words[w] |= 1 << (s % 64);
+    }
+    words
+}
+
+/// What an index should list, kept beside it through every mutator.
+#[derive(Default, Clone)]
+struct Model {
+    entries: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<u64>>,
+    unkeyed: std::collections::BTreeSet<u64>,
+    present: std::collections::BTreeSet<u64>,
+}
+
+impl Model {
+    fn captured(&self) -> Captured {
+        Captured {
+            entries: self.entries.iter().map(|(k, s)| (k.clone(), s.iter().copied().collect())).collect(),
+            unkeyed: self.unkeyed.iter().copied().collect(),
+            present: words_of(self.present.iter().copied()),
+        }
+    }
+}
+
+/// Rows of an `I64` (0), a short `STRING` (1) and a document (3), with
+/// enough distinct values that a stream spans several of `for_each_sorted`'s
+/// blocks, and duplicates; a document's `k` is missing or JSON null now and
+/// then, which a path index keeps under the empty key.
+fn stream_rows(r: &mut Rng, n: usize) -> Vec<Vec<Vec<u8>>> {
+    (0..n)
+        .map(|_| {
+            let doc = match r.below(10) {
+                0 => r#"{"other":1}"#.to_string(),
+                1 => r#"{"k":null}"#.to_string(),
+                _ => format!(r#"{{"k":"v{}"}}"#, r.below(2000)),
+            };
+            vec![
+                ((r.below(2500) as i64) - 1000).to_le_bytes().to_vec(),
+                value(r, 1),
+                Vec::new(),
+                crate::core::jsonb::encode_text(&doc).unwrap(),
+            ]
+        })
+        .collect()
+}
+
+/// One index of each kind a snapshot's INDEX section holds: B-tree, hash,
+/// composite, and a path into a document.
+fn stream_indexes() -> Vec<Arc<LiveIndex>> {
+    let path = crate::core::jsonb::parse_path_expression("doc->>'k'").unwrap();
+    let decl = IndexDecl {
+        name: "k_path".into(),
+        method: Method::BTree,
+        unique: false,
+        columns: vec![FIRST_PATH_COLUMN],
+        is_deleted: false,
+    };
+    vec![
+        index("n_bt", Method::BTree, &[0]),
+        index("n_h", Method::Hash, &[0]),
+        index("ns_bt", Method::BTree, &[0, 1]),
+        index("s_h", Method::Hash, &[1]),
+        Arc::new(LiveIndex::over_path(decl, FIRST_PATH_COLUMN, 3, path.steps)),
+    ]
+}
+
+/// Fills `ix` from `rows` through every mutator a table calls, in a
+/// shuffled order, keeping `model` beside it: inserts (one in twenty
+/// unkeyed), in-place moves to a new key, and forgets with and without the
+/// key read back. A forget without its key leaves the entry listed with its
+/// presence bit clear, which the stream must still carry.
+fn churn(ix: &LiveIndex, rows: &[Vec<Vec<u8>>], r: &mut Rng, proof: Proof<'_>) -> Model {
+    let key = |row: &Vec<Vec<u8>>| ix.key_of(|wo| row.get(wo as usize).map(|v| v.as_slice()));
+    let mut model = Model::default();
+    let mut keys: Vec<Option<KeyBuf>> = vec![None; rows.len()];
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, r.below(i as u64 + 1) as usize);
+    }
+    for &slot in &order {
+        let k = if r.below(20) == 0 { None } else { key(&rows[slot]) };
+        ix.insert(proof, slot as u64, k.clone());
+        match &k {
+            Some(k) => model.entries.entry(k.to_vec()).or_default().insert(slot as u64),
+            None => model.unkeyed.insert(slot as u64),
+        };
+        model.present.insert(slot as u64);
+        keys[slot] = k;
+    }
+    for _ in 0..rows.len() / 10 {
+        let slot = r.below(rows.len() as u64);
+        let s = slot as usize;
+        if !model.present.contains(&slot) {
+            continue;
+        }
+        match r.below(3) {
+            // In place: the new key first, then the old one goes, as
+            // `on_replace` orders it.
+            0 => {
+                let Some(old) = keys[s].clone() else { continue };
+                let new = key(&rows[r.below(rows.len() as u64) as usize]);
+                let Some(new) = new.filter(|n| *n != old) else { continue };
+                ix.insert(proof, slot, Some(new.clone()));
+                ix.remove(proof, slot, &old);
+                model.entries.entry(new.to_vec()).or_default().insert(slot);
+                let emptied = model.entries.get_mut(old.as_slice()).is_some_and(|set| {
+                    set.remove(&slot);
+                    set.is_empty()
+                });
+                if emptied {
+                    model.entries.remove(old.as_slice());
+                }
+                keys[s] = Some(new);
+            }
+            // Vacuum, with the key read back.
+            1 => {
+                ix.forget(proof, slot, keys[s].as_deref());
+                if let Some(k) = &keys[s] {
+                    let emptied = model.entries.get_mut(k.as_slice()).is_some_and(|set| {
+                        set.remove(&slot);
+                        set.is_empty()
+                    });
+                    if emptied {
+                        model.entries.remove(k.as_slice());
+                    }
+                }
+                model.unkeyed.remove(&slot);
+                model.present.remove(&slot);
+            }
+            // Vacuum, the row unreadable: the entry stays.
+            _ => {
+                ix.forget(proof, slot, None);
+                model.unkeyed.remove(&slot);
+                model.present.remove(&slot);
+            }
+        }
+    }
+    model
+}
+
+/// C3 emits every entry the index lists, in key order and slot order, then
+/// the unkeyed slots and the presence bits, over B-tree, hash, composite
+/// and path indexes, across many blocks; and filters nothing by presence.
+#[test]
+fn the_sorted_stream_is_every_entry_in_order() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let mut r = Rng(0x5eed_c3c3);
+    let rows = stream_rows(&mut r, 3000);
+    for ix in stream_indexes() {
+        let model = churn(&ix, &rows, &mut r, proof);
+        let got = capture(&ix);
+        let name = &ix.decl.name;
+        assert!(got.entries.windows(2).all(|w| w[0].0 < w[1].0), "{name}: keys not strictly ascending");
+        assert!(
+            got.entries.iter().all(|(_, s)| !s.is_empty() && s.windows(2).all(|w| w[0] < w[1])),
+            "{name}: a posting list empty, unsorted or repeated"
+        );
+        assert_eq!(got, model.captured(), "{name}");
+        for slot in 0..rows.len() as u64 + 70 {
+            let bit = got.present.get((slot / 64) as usize).is_some_and(|w| w & (1 << (slot % 64)) != 0);
+            assert_eq!(bit, ix.holds(slot), "{name}: presence of slot {slot}");
+        }
+        // A forget without its key keeps the entry, and it goes out.
+        let unread = got
+            .entries
+            .iter()
+            .flat_map(|(_, s)| s.iter())
+            .filter(|s| !ix.holds(**s))
+            .count();
+        assert!(unread > 0, "{name}: no entry of a slot forgotten without its key was streamed");
+        if ix.columns[0].0 == 0 {
+            assert!(got.entries.len() > sorted::SORTED_BLOCK, "{name}: too few keys to span blocks");
+        }
+    }
+}
+
+/// Equal contents give equal streams, whatever order they arrived in and
+/// whatever hasher a hash index drew: a hash index comes out by key bytes.
+/// And a small stream, pinned.
+#[test]
+fn the_sorted_stream_depends_only_on_the_contents() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let mut r = Rng(0xde7e_c3c3);
+    let rows = stream_rows(&mut r, 2500);
+    for (ix, again) in stream_indexes().into_iter().zip(stream_indexes()) {
+        let model = churn(&ix, &rows, &mut r, proof);
+        // The same contents, entries in reverse key and slot order.
+        for (key, slots) in model.entries.iter().rev() {
+            for slot in slots.iter().rev() {
+                again.insert(proof, *slot, Some(KeyBuf::from_slice(key)));
+            }
+        }
+        for slot in model.unkeyed.iter().rev() {
+            again.insert(proof, *slot, None);
+        }
+        for (_, slots) in &model.entries {
+            for slot in slots.iter().filter(|s| !model.present.contains(s)) {
+                again.forget(proof, *slot, None);
+            }
+        }
+        assert_eq!(capture(&again), capture(&ix), "{}", ix.decl.name);
+    }
+
+    for method in [Method::BTree, Method::Hash] {
+        let ix = index("pinned", method, &[0]);
+        let key = |v: i64| {
+            let bytes = v.to_le_bytes();
+            ix.key_of(|_| Some(&bytes[..]))
+        };
+        ix.insert(proof, 3, key(5));
+        ix.insert(proof, 1, key(5));
+        ix.insert(proof, 2, key(-1));
+        ix.insert(proof, 70, None);
+        ix.insert(proof, 4, key(9));
+        ix.forget(proof, 4, None); // unreadable: listed, not held
+        ix.insert(proof, 300, key(9));
+        ix.forget(proof, 300, key(9).as_deref()); // gone everywhere
+        let hex = |h: &str| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
+        let want = Captured {
+            entries: match method {
+                // Ordered: sign-flipped big-endian.
+                Method::BTree => vec![
+                    (hex("7fffffffffffffff"), vec![2]),
+                    (hex("8000000000000005"), vec![1, 3]),
+                    (hex("8000000000000009"), vec![4]),
+                ],
+                // Canonical: the length, then the value's own bytes, so by
+                // those bytes -1 sorts last.
+                _ => vec![
+                    (hex("080000000500000000000000"), vec![1, 3]),
+                    (hex("080000000900000000000000"), vec![4]),
+                    (hex("08000000ffffffffffffffff"), vec![2]),
+                ],
+            },
+            unkeyed: vec![70],
+            // Slots 1, 2, 3 and 70; nothing of 300's word survives.
+            present: vec![0b1110, 1 << 6],
+        };
+        assert_eq!(capture(&ix), want, "{method:?}");
+    }
+}
+
+/// The stream stops at the first error and hands it back.
+#[test]
+fn the_sorted_stream_stops_at_an_error() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    for method in [Method::BTree, Method::Hash] {
+        let ix = index("e", method, &[0]);
+        for slot in 0..3000u64 {
+            let bytes = (slot as i64).to_le_bytes();
+            ix.insert(proof, slot, ix.key_of(|_| Some(&bytes[..])));
+        }
+        let mut seen = 0;
+        let got = ix.for_each_sorted(|_| {
+            seen += 1;
+            if seen == 1500 { Err("stop") } else { Ok(()) }
+        });
+        assert_eq!((got, seen), (Err("stop"), 1500), "{method:?}");
+    }
+}

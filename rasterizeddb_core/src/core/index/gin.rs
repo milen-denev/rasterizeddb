@@ -48,6 +48,7 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use crate::core::index::IndexDecl;
+use crate::core::index::sorted::{SORTED_BLOCK, Sorted};
 use crate::core::index_store::gate::Proof;
 use crate::core::jsonb::{self, GinOpclass};
 
@@ -294,6 +295,67 @@ impl GinIndex {
         self.entries.store(0, Ordering::Relaxed);
         self.forgotten.store(0, Ordering::Relaxed);
         self.forgotten_slots.lock().clear();
+    }
+
+    /// Every item's list, then the unkeyed slots, then the presence bits, as
+    /// one sorted stream (hook C3, see [`super::sorted`]): what a snapshot's
+    /// GIN section holds. Stops at the first error `f` returns, and returns
+    /// it.
+    ///
+    /// The lists go out without the slots in `forgotten_slots`, exactly
+    /// those, as a compaction would leave them (owner's invariant 3, N37).
+    /// Not fewer: a forgotten slot whose entries went out would come back
+    /// from a load with its presence bit clear and no record that it was
+    /// forgotten, so no compaction would ever take it off its lists, and
+    /// every later snapshot would carry it forward. Not more: a clear
+    /// presence bit is also a slot whose insert has written its entries and
+    /// not yet set its bit, so filtering by the bit would drop a live row
+    /// from every answer after a load (the compaction bug of de3651a). This
+    /// relies on slots never being reused until a rebuild renumbers them: a
+    /// forgotten slot's entries are all stale.
+    ///
+    /// Each list is read under its shard's lock and copied out, a block of
+    /// [`super::sorted::SORTED_BLOCK`] items at a time, never across `f`; as
+    /// for a `LiveIndex`, the stream is one state of the index only while
+    /// nothing writes it, which a seal guarantees.
+    pub fn for_each_sorted<E>(&self, mut f: impl FnMut(Sorted<'_, u64>) -> Result<(), E>) -> Result<(), E> {
+        // As a compaction marks them.
+        let gone = self.forgotten_slots.lock().clone();
+        let mut bits = vec![0u64; gone.iter().max().map_or(0, |m| (m / 64) as usize + 1)];
+        for &s in &gone {
+            bits[(s / 64) as usize] |= 1 << (s % 64);
+        }
+        let kept = |s: &u64| bits.get((*s / 64) as usize).is_none_or(|w| w & (1 << (s % 64)) == 0);
+        let mut items: Vec<u64> = Vec::new();
+        for shard in self.shards.iter() {
+            items.extend(shard.read().keys().copied());
+        }
+        items.sort_unstable();
+        let mut block: Vec<(u64, Vec<u64>)> = Vec::with_capacity(SORTED_BLOCK);
+        for chunk in items.chunks(SORTED_BLOCK) {
+            block.clear();
+            for &item in chunk {
+                let list: Vec<u64> = match self.shards[Self::shard(item)].read().get(&item) {
+                    Some(list) if gone.is_empty() => list.clone(),
+                    Some(list) => list.iter().copied().filter(kept).collect(),
+                    None => continue,
+                };
+                // A list of forgotten slots only is one a compaction drops.
+                if !list.is_empty() {
+                    block.push((item, list));
+                }
+            }
+            for (item, list) in &block {
+                f(Sorted::Entry(*item, list))?;
+            }
+        }
+        // `forget` takes a slot off the unkeyed list itself.
+        let mut unkeyed = self.unkeyed.read().clone();
+        unkeyed.sort_unstable();
+        unkeyed.dedup();
+        f(Sorted::Unkeyed(&unkeyed))?;
+        let present = self.present.read().clone();
+        f(Sorted::Present(super::sorted::trimmed(&present)))
     }
 
     /// The lists an `All` query walks, as `(length, item)`: the shortest
@@ -1215,6 +1277,93 @@ mod tests {
             let missing = (10_000..30_000u64).filter(|s| got.binary_search(s).is_err()).count();
             assert_eq!(missing, 0, "round {round}: {missing} live slots dropped");
             assert!(got.iter().all(|s| *s >= 10_000), "a forgotten slot returned");
+        }
+    }
+
+    /// What `for_each_sorted` gave, with the stream's order checked on the
+    /// way: the lists, the unkeyed slots, the presence words.
+    fn capture(g: &GinIndex) -> (Vec<(u64, Vec<u64>)>, Vec<u64>, Vec<u64>) {
+        let (mut entries, mut unkeyed, mut present) = (Vec::new(), None, None);
+        g.for_each_sorted(|part| -> Result<(), ()> {
+            match part {
+                Sorted::Entry(item, list) => {
+                    assert!(unkeyed.is_none(), "an entry after the unkeyed slots");
+                    entries.push((item, list.to_vec()));
+                }
+                Sorted::Unkeyed(slots) => {
+                    assert!(unkeyed.is_none() && present.is_none(), "unkeyed slots out of place");
+                    unkeyed = Some(slots.to_vec());
+                }
+                Sorted::Present(words) => {
+                    assert!(unkeyed.is_some() && present.is_none(), "presence bits out of place");
+                    present = Some(words.to_vec());
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        (entries, unkeyed.expect("unkeyed slots"), present.expect("presence bits"))
+    }
+
+    /// An index from [`random_index`], plus documents with an item of their
+    /// own each, so the stream spans several blocks and some lists hold only
+    /// forgotten slots, and a slot whose insert has written its entries and
+    /// not yet set its presence bit. Returns that slot.
+    fn index_for_streaming(r: &mut Rng, opclass: GinOpclass) -> (GinIndex, u64) {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        let n = 600 + r.below(400);
+        let (g, _) = random_index(r, opclass, n);
+        for slot in n..n + 1500 {
+            g.insert(proof, slot, Some(&doc(&format!(r#"{{"own":{slot}}}"#))));
+        }
+        for _ in 0..40 {
+            g.forget(proof, n + r.below(1500));
+        }
+        let under_way = n + 1500 + r.below(10);
+        let mut items = Vec::new();
+        jsonb::gin_items(&doc(r#"{"status":"s1","own":-1}"#), opclass, &mut items).unwrap();
+        items.sort_unstable();
+        items.dedup();
+        for item in &items {
+            g.shards[GinIndex::shard(*item)].write().entry(*item).or_default().push(under_way);
+        }
+        (g, under_way)
+    }
+
+    /// C3 leaves out the entries of the slots `forget` recorded, exactly
+    /// those: a slot whose presence bit is clear because its insert is under
+    /// way goes out, and a list of forgotten slots only does not.
+    #[test]
+    fn the_sorted_stream_drops_exactly_the_forgotten_slots() {
+        let mut r = Rng(0xc3_9e17);
+        for round in 0..12 {
+            let opclass = if round % 2 == 0 { GinOpclass::Ops } else { GinOpclass::PathOps };
+            let (g, under_way) = index_for_streaming(&mut r, opclass);
+            let forgotten = g.forgotten_slots.lock().clone();
+            assert!(!forgotten.is_empty(), "nothing forgotten to leave out");
+            assert_eq!(g.forgotten.load(Ordering::Relaxed) as usize, forgotten.len(), "a compaction ran");
+            let mut want: Vec<(u64, Vec<u64>)> = Vec::new();
+            for shard in g.shards.iter() {
+                for (item, list) in shard.read().iter() {
+                    let kept: Vec<u64> = list.iter().copied().filter(|s| !forgotten.contains(s)).collect();
+                    if !kept.is_empty() {
+                        want.push((*item, kept));
+                    }
+                }
+            }
+            want.sort_unstable();
+            let (entries, unkeyed, present) = capture(&g);
+            assert!(entries.len() > SORTED_BLOCK, "{opclass:?}: too few items to span blocks");
+            assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "{opclass:?}: items not ascending");
+            assert_eq!(entries, want, "{opclass:?}");
+            let listed = |s: u64| entries.iter().any(|(_, l)| l.contains(&s));
+            assert!(listed(under_way), "{opclass:?}: the slot under way was filtered by its presence bit");
+            assert!(!forgotten.iter().any(|s| listed(*s)), "{opclass:?}: a forgotten slot went out");
+            let mut want_unkeyed = g.unkeyed.read().clone();
+            want_unkeyed.sort_unstable();
+            assert_eq!(unkeyed, want_unkeyed, "{opclass:?}");
+            assert_eq!(present.as_slice(), crate::core::index::sorted::trimmed(&g.present.read()), "{opclass:?}");
         }
     }
 }

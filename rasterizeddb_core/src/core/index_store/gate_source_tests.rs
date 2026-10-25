@@ -108,7 +108,7 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 63] = [
+const READ_ONLY: [(&str, &str); 65] = [
     ("LiveIndex", "method"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
@@ -123,6 +123,8 @@ const READ_ONLY: [(&str, &str); 63] = [
     ("LiveIndex", "append_unkeyed"),
     ("LiveIndex", "listed_under"),
     ("LiveIndex", "retain_under"),
+    // The sorted stream a snapshot captures (hook C3, B16).
+    ("LiveIndex", "for_each_sorted"),
     ("GinIndex", "shape"),
     ("GinIndex", "shard"),
     ("GinIndex", "holds"),
@@ -134,6 +136,7 @@ const READ_ONLY: [(&str, &str); 63] = [
     ("GinIndex", "sizes"),
     ("GinIndex", "answers"),
     ("GinIndex", "query_for"),
+    ("GinIndex", "for_each_sorted"),
     ("TableIndexes", "is_empty"),
     ("TableIndexes", "len"),
     ("TableIndexes", "view"),

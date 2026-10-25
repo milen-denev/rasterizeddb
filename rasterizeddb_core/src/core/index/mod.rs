@@ -51,6 +51,7 @@ pub mod ddl;
 pub mod gin;
 pub mod decl;
 pub mod key;
+pub mod sorted;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
@@ -69,6 +70,7 @@ use crate::core::row::row::RowWrite;
 use crate::core::row::schema::SchemaField;
 
 pub use decl::{IndexDecl, Method};
+pub use sorted::Sorted;
 
 /// A key, inline when short (most are: an integer, a UUID, a short string).
 pub type KeyBuf = SmallVec<[u8; 24]>;
@@ -319,6 +321,76 @@ impl LiveIndex {
                 (k + s.len(), e + s.values().map(|v| v.len()).sum::<usize>())
             }),
         }
+    }
+
+    /// Every entry, then the unkeyed slots, then the presence bits, as one
+    /// sorted stream (hook C3, see [`sorted`]): what a snapshot's INDEX
+    /// section holds. Stops at the first error `f` returns, and returns it.
+    ///
+    /// A superset, never a subset: nothing is filtered by the presence bit,
+    /// so the entries of a slot forgotten without its key go out too, as a
+    /// lookup returns them too.
+    ///
+    /// The read lock is held for one block of [`sorted::SORTED_BLOCK`]
+    /// entries at a time, never across `f`. So the stream is one state of
+    /// the index only while nothing writes it, which is what a seal
+    /// guarantees: it captures under a gate no ticket holds, and a ticket
+    /// taken meanwhile cancels the capture (docs/persistent-indexes.md §3).
+    pub fn for_each_sorted<E>(&self, mut f: impl FnMut(Sorted<'_, &[u8]>) -> Result<(), E>) -> Result<(), E> {
+        match &self.data {
+            Data::BTree(map) => {
+                // Each block resumes after the last key of the one before,
+                // so it holds no position a writer could move.
+                let mut block: Vec<(KeyBuf, Slots)> = Vec::with_capacity(sorted::SORTED_BLOCK);
+                let mut after: Option<KeyBuf> = None;
+                loop {
+                    block.clear();
+                    let from = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                    block.extend(
+                        map.read()
+                            .range::<[u8], _>((from, Bound::Unbounded))
+                            .take(sorted::SORTED_BLOCK)
+                            .map(|(key, slots)| (key.clone(), slots.clone())),
+                    );
+                    for (key, slots) in &block {
+                        f(Sorted::Entry(key, slots))?;
+                    }
+                    if block.len() < sorted::SORTED_BLOCK {
+                        break;
+                    }
+                    after = block.pop().map(|(key, _)| key);
+                }
+            }
+            Data::Hash(shards, _) => {
+                // A hash map has no order, so the keys are gathered and
+                // sorted by their bytes, which the per-process hasher never
+                // reaches. A key gone since the sweep is skipped.
+                let mut keys: Vec<KeyBuf> = Vec::new();
+                for shard in shards.iter() {
+                    keys.extend(shard.read().keys().cloned());
+                }
+                keys.sort_unstable();
+                let mut block: Vec<(&KeyBuf, Slots)> = Vec::with_capacity(sorted::SORTED_BLOCK);
+                for chunk in keys.chunks(sorted::SORTED_BLOCK) {
+                    block.clear();
+                    for key in chunk {
+                        if let Some(slots) = shards[self.shard(key)].read().get(key) {
+                            block.push((key, slots.clone()));
+                        }
+                    }
+                    for (key, slots) in &block {
+                        f(Sorted::Entry(key, slots))?;
+                    }
+                }
+            }
+        }
+        // Distinct already (`insert` checks), but in arrival order.
+        let mut unkeyed = self.unkeyed.read().clone();
+        unkeyed.sort_unstable();
+        unkeyed.dedup();
+        f(Sorted::Unkeyed(&unkeyed))?;
+        let present = self.present.read().clone();
+        f(Sorted::Present(sorted::trimmed(&present)))
     }
 
     /// Appends the slots under exactly `key`. `false` when `cap` was exceeded.
