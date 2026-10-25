@@ -143,6 +143,8 @@ impl Database {
             return Ok(());
         }
         #[cfg(any(test, feature = "test_tokens"))]
+        test_hooks::note_request(name);
+        #[cfg(any(test, feature = "test_tokens"))]
         if test_hooks::parks(name, mode) {
             Box::pin(test_hooks::park(name, mode)).await;
         }
@@ -388,6 +390,28 @@ pub mod test_hooks {
     /// Every queued table-lock request since the last call, in order.
     pub fn take_waits() -> Vec<(String, TableMode)> {
         std::mem::take(&mut *WAITS.lock())
+    }
+
+    tokio::task_local! {
+        static REQUESTS: std::cell::RefCell<std::collections::HashMap<String, usize>>;
+    }
+
+    pub(super) fn note_request(table: &str) {
+        let _ = REQUESTS.try_with(|r| *r.borrow_mut().entry(table.to_string()).or_default() += 1);
+    }
+
+    /// Runs `fut`, returning how many table-lock requests (granted or
+    /// queued) it made per table name. Per task, so tests running beside it
+    /// do not count; nothing in a statement spawns a task.
+    pub async fn count_requests<F: std::future::Future>(
+        fut: F,
+    ) -> (F::Output, std::collections::HashMap<String, usize>) {
+        REQUESTS
+            .scope(std::cell::RefCell::new(std::collections::HashMap::new()), async {
+                let out = fut.await;
+                (out, REQUESTS.with(|r| std::mem::take(&mut *r.borrow_mut())))
+            })
+            .await
     }
 
     /// One parked request: the next table-lock request on its table in a

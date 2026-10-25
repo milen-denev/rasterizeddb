@@ -1039,6 +1039,59 @@ fn an_outliving_owner_is_a_live_node_of_the_graph() {
     m.commit(block);
 }
 
+/// An INSERT resolves its target once (slice B8b): one table-lock request
+/// on it per statement, however many steps read the table (the seed, the
+/// column list, generated values, the write, the foreign keys), and that
+/// one request still comes before anything reads it: behind another
+/// owner's ACCESS EXCLUSIVE the INSERT waits (55P03 under a bound) and
+/// writes nothing. `INSERT INTO t VALUES (…)` names no columns and is
+/// re-dispatched with its list supplied: one request per dispatch.
+///
+/// Mutations, each failing an assertion here: a step looking the target up
+/// again (`check_foreign_keys` in place of `check_foreign_keys_of`: two
+/// requests); the arm's resolution taken without the lock
+/// (`Database::relation`: no request on the target at all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_insert_takes_its_targets_lock_once_and_first() {
+    use crate::core::database::table_for::test_hooks::count_requests;
+    let db = db().await;
+    fixture(&db).await;
+    run(&db, "CREATE TABLE b8b_ins (id INT PRIMARY KEY, pid INT REFERENCES parent(id), g INT GENERATED ALWAYS AS (id * 2) STORED)").await;
+    for (sql, dispatches) in [
+        ("INSERT INTO b8b_ins (id, pid) VALUES (1, 1)", 1),
+        ("INSERT INTO b8b_ins VALUES (2, 2)", 2),
+        ("INSERT INTO child (id, pid) VALUES (12, 2)", 1),
+        ("INSERT INTO u (id, v) VALUES (41, 'w')", 1),
+    ] {
+        let target = sql.split_whitespace().nth(2).unwrap();
+        let (out, requests) = count_requests(executor::execute_with_sync(purpose(sql), db.clone(), false)).await;
+        assert_ok(sql, &out);
+        assert_eq!(
+            requests.get(target).copied(),
+            Some(dispatches),
+            "{sql}: lock requests on the target: {requests:?}"
+        );
+    }
+
+    let block = db.transactions.begin();
+    let release = OwnerRelease::for_root(&db.row_locks, block);
+    run_in(&db, block, "LOCK TABLE b8b_ins IN ACCESS EXCLUSIVE MODE").await;
+    let refused = crate::core::cancel::with_lock_timeout(
+        200,
+        executor::execute_with_sync(purpose("INSERT INTO b8b_ins (id, pid) VALUES (3, 1)"), db.clone(), false),
+    )
+    .await;
+    assert_eq!(refused.first(), Some(&3), "an INSERT got past another owner's ACCESS EXCLUSIVE");
+    assert!(String::from_utf8_lossy(&refused).contains("lock timeout"), "{}", String::from_utf8_lossy(&refused));
+    db.commit_transaction(block);
+    drop(release);
+    assert_eq!(
+        run(&db, "SELECT COUNT(*) FROM b8b_ins").await,
+        run(&db, "SELECT COUNT(*) FROM b8b_ins WHERE id < 3").await,
+        "the refused INSERT wrote its row"
+    );
+}
+
 // ------------------------------------------------------------- the cost
 
 /// What O costs an autocommit statement (Q4 is B3b's gate; this is the
