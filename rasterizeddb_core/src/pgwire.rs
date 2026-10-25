@@ -4227,6 +4227,14 @@ async fn describe_resolved(
         if parse_index_checkpoint(stmt).is_some() {
             return Ok(Some((vec![("rdb_index_checkpoint".to_string(), DbType::STRING)], true)));
         }
+        // Answered above the engine with one row (B18): the same columns
+        // `run_index_check` sends.
+        if parse_index_check(stmt).is_some() {
+            return Ok(Some((
+                INDEX_CHECK_COLUMNS.iter().map(|c| (c.to_string(), DbType::STRING)).collect(),
+                true,
+            )));
+        }
         if builtin {
             if lower == "select 1" || lower == "select 1::int" {
                 return Ok(Some((vec![("?column?".to_string(), DbType::I32)], true)));
@@ -6011,6 +6019,12 @@ where
     // clean point; B13): answered above the engine, with its row.
     if let Some(name) = parse_index_checkpoint(stmt) {
         return run_index_checkpoint(database, state, stream, name, omit_description).await;
+    }
+
+    // `SELECT rdb_index_check('t')` (docs/persistent-indexes.md §4 Audit;
+    // B18): the audit's check on demand, answered above the engine.
+    if let Some(name) = parse_index_check(stmt) {
+        return run_index_check(database, state, stream, name, omit_description).await;
     }
 
     if handle_builtin_query(state, stream, stmt, omit_description).await? {
@@ -8184,6 +8198,20 @@ where
 /// statement the engine misreads; `None` for any other statement. A
 /// function, not grammar (§3: new grammar has repeatedly mis-parsed here).
 fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
+    parse_regclass_call(stmt, "rdb_index_checkpoint")
+}
+
+/// The relation `SELECT rdb_index_check('t')` (or `'t'::regclass`) names,
+/// as [`parse_index_checkpoint`] reads its argument (B18).
+fn parse_index_check(stmt: &str) -> Option<Result<String, String>> {
+    parse_regclass_call(stmt, "rdb_index_check")
+}
+
+/// `SELECT <function>('t')`, `<function>` one of the index store's
+/// functions taking a `regclass`: the name, or why the argument is not one.
+/// The parenthesis right after the name keeps one function's name from
+/// matching another's that it prefixes.
+fn parse_regclass_call(stmt: &str, function: &str) -> Option<Result<String, String>> {
     // Every statement passes here: anything not opening with `s` is turned
     // away on its first byte.
     let s = stmt.trim_start();
@@ -8191,8 +8219,8 @@ fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
         return None;
     }
     let s = s.trim_end().trim_end_matches(';').trim_end();
-    let head = "select rdb_index_checkpoint(";
-    if !s.get(..head.len()).is_some_and(|h| h.eq_ignore_ascii_case(head)) || !s.ends_with(')') {
+    let head = format!("select {function}(");
+    if !s.get(..head.len()).is_some_and(|h| h.eq_ignore_ascii_case(&head)) || !s.ends_with(')') {
         return None;
     }
     let arg = s[head.len()..s.len() - 1].trim();
@@ -8204,8 +8232,8 @@ fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
         inner.replace("''", "'")
     } else {
         return Some(Err(format!(
-            "rdb_index_checkpoint takes a table name as a string literal, as in \
-             rdb_index_checkpoint('t'), not {arg}"
+            "{function} takes a table name as a string literal, as in \
+             {function}('t'), not {arg}"
         )));
     };
     // A quoted identifier inside the literal, as `regclass` input allows.
@@ -8262,6 +8290,85 @@ where
     }
     let summary = format!("{clean} of {of} clean");
     send_data_row(stream, &[Some(summary.as_bytes())]).await?;
+    send_command_complete(stream, "SELECT 1").await
+}
+
+/// `rdb_index_check`'s columns. Text, every one: the reply is built above
+/// the engine, which cannot honour a binary result format, and a text
+/// column's bytes are the same in both.
+const INDEX_CHECK_COLUMNS: [&str; 8] = [
+    "relation",
+    "file_sets",
+    "rows_checked",
+    "index_entries",
+    "missing_entries",
+    "filter_values",
+    "filter_misses",
+    "result",
+];
+
+/// `rdb_index_check(t)`: the audit's check of `t`'s file set now, or of
+/// every materialized partition of a partitioned `t`, rebuilding in place
+/// what it finds missing (B18). Superuser only, as the checkpoint is: it
+/// reads every row and may rebuild the table's indexes. One row of
+/// findings; a notice per problem found and per part not compared.
+/// Refuses an unknown name (42P01) and an index or catalogue view (42809)
+/// before reading anything.
+async fn run_index_check<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    name: Result<String, String>,
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    use crate::core::database::index_checkpoint::CheckRefusal;
+    if !state.principal.may_administer() {
+        return fail_statement(state, stream, "42501", "permission denied: rdb_index_check requires superuser").await;
+    }
+    let name = match name {
+        Ok(name) => name,
+        Err(e) => return fail_statement(state, stream, "22023", &e).await,
+    };
+    let block = state.transaction.as_ref().map(|t| t.id);
+    let report = match database.index_check(&name, block).await {
+        Ok(report) => report,
+        Err(CheckRefusal::NotFound(e)) => return fail_statement(state, stream, "42P01", &e).await,
+        Err(CheckRefusal::NotATable(e)) => return fail_statement(state, stream, "42809", &e).await,
+        Err(CheckRefusal::Other(e)) => return fail_statement(state, stream, "XX000", &e).await,
+    };
+    for c in &report.checked {
+        match c.outcome.findings() {
+            Some(f) => {
+                for e in &f.examples {
+                    send_notice(stream, "01000", &format!("{}: {e}", c.name)).await?;
+                }
+                for skipped in &f.skipped {
+                    send_notice(stream, "01000", &format!("{}: not compared: {skipped}", c.name)).await?;
+                }
+            }
+            None => send_notice(stream, "01000", &format!("{}: {}", c.name, c.outcome.describe())).await?,
+        }
+    }
+    let f = report.findings();
+    if !omit_description {
+        let fields: Vec<(&str, DbType)> = INDEX_CHECK_COLUMNS.iter().map(|c| (*c, DbType::STRING)).collect();
+        send_row_description(stream, &fields, &[]).await?;
+    }
+    let values = [
+        name,
+        report.checked.len().to_string(),
+        f.rows.to_string(),
+        f.entries.to_string(),
+        f.missing_entries.to_string(),
+        f.filter_checked.to_string(),
+        f.filter_misses.to_string(),
+        report.result(),
+    ];
+    let cells: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_bytes())).collect();
+    send_data_row(stream, &cells).await?;
     send_command_complete(stream, "SELECT 1").await
 }
 
@@ -11569,6 +11676,15 @@ mod index_store_wire_tests {
         assert!(matches!(parse_index_checkpoint("SELECT rdb_index_checkpoint(t)"), Some(Err(_))));
         assert_eq!(parse_index_checkpoint("SELECT rdb_index_checkpoints('t')"), None);
         assert_eq!(parse_index_checkpoint("SELECT 1"), None);
+        // rdb_index_check (B18): the same argument rules; neither function
+        // name matches the other.
+        let check = |s: &str| parse_index_check(s).map(|r| r.unwrap());
+        assert_eq!(check("SELECT rdb_index_check('t')"), Some("t".to_string()));
+        assert_eq!(check("select RDB_INDEX_CHECK('t'::regclass);"), Some("t".to_string()));
+        assert_eq!(check("SELECT rdb_index_check('\"Mixed\"')"), Some("Mixed".to_string()));
+        assert!(matches!(parse_index_check("SELECT rdb_index_check(t)"), Some(Err(_))));
+        assert_eq!(parse_index_check("SELECT rdb_index_checkpoint('t')"), None);
+        assert_eq!(parse_index_checkpoint("SELECT rdb_index_check('t')"), None);
         assert_eq!(parse_index_checkpoint("SELECT é"), None);
     }
 
