@@ -167,6 +167,51 @@ async fn count_in_restored(dir: &Path, sql: &str) -> usize {
     count_rows(&database, sql).await
 }
 
+/// A directory no earlier test in this process has used.
+///
+/// `temp_testdir::TempDir::default()` hands out the first free name of
+/// `rstest`, `rstest.1`, …, so a test gets the very path a finished test just
+/// deleted. The write-ahead log registry is process-wide and keyed by path,
+/// and the finished test's databases never left it: a `BackupService` at the
+/// reused path archives every log registered under it as a stream of its
+/// own, the dead test's included. That gave
+/// `archiving_suspends_when_staging_fills_and_resumes_when_it_drains`
+/// staging directories for `early` and `late`, the databases of
+/// `a_created_database_is_archived_and_restored`.
+fn fresh_root() -> temp_testdir::TempDir {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    temp_testdir::TempDir::new(
+        std::env::temp_dir().join(format!("rdb_s3_e2e_{}_{n}", std::process::id())),
+        true,
+    )
+}
+
+/// Every entry under a staging directory, with its size (or `dir`), for a
+/// failure message: which segment appeared says which checkpoint staged it.
+fn staging_listing(dir: &Path) -> String {
+    fn walk(base: &Path, at: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else { return };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let path = e.path();
+            let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+            match e.metadata() {
+                Ok(m) if m.is_dir() => {
+                    out.push(format!("{rel}/ (dir)"));
+                    walk(base, &path, out);
+                }
+                Ok(m) => out.push(format!("{rel} ({} bytes)", m.len())),
+                Err(err) => out.push(format!("{rel} (unreadable: {err})")),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    format!("[{}]", out.join(", "))
+}
+
 macro_rules! e2e_test {
     ($name:ident, $config:ident, $body:block) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -188,7 +233,7 @@ e2e_test!(
     restores_a_database_that_can_be_opened_and_queried,
     config,
     {
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -225,7 +270,7 @@ e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
     // The snapshot is taken, then more rows are written, then the log is
     // archived. A restore must pick up both halves — this is the whole point
     // of archiving the log rather than only snapshotting.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -271,7 +316,7 @@ e2e_test!(a_restore_across_a_drop_and_recreate_brings_no_old_row_back, config, {
     // were written into files that started empty. Replayed over the old
     // files, the new rows covered the start and every old row past them came
     // back under the new table.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -323,7 +368,7 @@ e2e_test!(a_restore_keeps_a_table_renamed_onto_a_dropped_name_before_the_snapsho
     // copy holds `x` as the rename made it: `y`'s bytes, copied with no log
     // record. A restore that took the barrier for one committed after the
     // copy began emptied `x`, and nothing in the log could fill it again.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -378,7 +423,7 @@ e2e_test!(a_drop_does_not_wait_for_a_snapshot_upload_in_progress, config, {
         eprintln!("skipping: the upload can only be stalled on the in-process store");
         return;
     }
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -430,7 +475,7 @@ e2e_test!(a_drop_does_not_wait_for_a_snapshot_upload_in_progress, config, {
 });
 
 e2e_test!(recovers_to_a_point_in_time, config, {
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -496,7 +541,7 @@ e2e_test!(
         // The fuzzy-copy claim, against a live engine: rows keep being inserted for
         // the whole duration of the snapshot, so the files it copies are captured
         // at inconsistent moments and only replay can reconcile them.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -549,7 +594,7 @@ e2e_test!(the_sql_surface_drives_the_same_operations, config, {
     // `BACKUP` / `SHOW BACKUPS` / `RESTORE` go through the ordinary statement
     // dispatch, so this also confirms the new grammar does not shadow anything
     // and that its results decode as a result set.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -612,7 +657,7 @@ e2e_test!(a_pruned_catalogue_still_restores, config, {
     // surviving snapshot still needs produces a catalogue that looks healthy
     // and a restore that cannot complete. So the check is not "did it delete
     // the right keys" but "does what is left still rebuild the database".
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -684,7 +729,7 @@ e2e_test!(
         // after a failure, and the emptiness check would then refuse the retry —
         // a trap rather than a safeguard. The restore is therefore assembled in a
         // sibling directory and moved into place only once it is complete.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -747,7 +792,7 @@ e2e_test!(the_background_task_archives_without_being_asked, config, {
     // The scheduled flush is what turns the configured interval into an actual
     // recovery point objective. Untested, a mistake in the loop would show up
     // as "we thought we had five-minute coverage" after an incident.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -796,12 +841,21 @@ e2e_test!(
         // The failure this guards against is an outage, not data loss: uploads stop
         // working, checkpoints keep handing segments to a directory nobody drains,
         // and the disk fills until the database stops.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
         let database = Arc::new(Database::new(live.to_str().unwrap()).await);
         run(&database, "CREATE TABLE t (id INT)").await;
+
+        // Every log the process has registered under this directory: the
+        // service archives each as a stream, so one left by an earlier test
+        // that used the same path would get a staging directory of its own.
+        let logs_here: Vec<String> = rasterizeddb_core::core::wal::registered()
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .filter(|dir| Path::new(dir).starts_with(&live))
+            .collect();
 
         let mut config = config;
         config.staging_max_bytes = 64 * 1024;
@@ -833,10 +887,13 @@ e2e_test!(
             run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
         }
         wal.checkpoint().expect("checkpoint");
+        let staged = staging_listing(&service.staging_dir());
         assert_eq!(
             std::fs::read_dir(service.staging_dir()).unwrap().count(),
             1,
-            "a suspended service must not accumulate new segments"
+            "a suspended service must not accumulate new segments; staging holds: {staged}; \
+             logs registered under {} before connect: {logs_here:?}",
+            live.display()
         );
 
         // Drain it, and the service must come back on its own.
@@ -856,7 +913,7 @@ e2e_test!(transaction_outcomes_survive_a_restore, config, {
     // the row. A snapshot that captured the rows but not the status log would
     // restore into a database that cannot tell a committed row from a rolled
     // back one — and the rows would still be *there*, so it would look fine.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -951,7 +1008,7 @@ e2e_test!(
         // So the snapshot checks the condition instead, and discards itself if it
         // does not hold. Losing a snapshot costs a retry; recording an
         // unrestorable one costs whatever depended on it.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -1010,7 +1067,7 @@ e2e_test!(
 );
 
 e2e_test!(refuses_to_restore_over_an_existing_directory, config, {
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -1032,7 +1089,7 @@ e2e_test!(refuses_to_restore_over_an_existing_directory, config, {
 });
 
 e2e_test!(a_prefix_belonging_to_another_database_is_refused, config, {
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let first = root.join("first");
     let second = root.join("second");
     std::fs::create_dir_all(&first).unwrap();
@@ -1065,7 +1122,7 @@ e2e_test!(
         // replay onto. Every deployment restarted inside the interval never got a
         // base at all, and the only thing that ever produced one was somebody
         // pressing BACKUP NOW.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -1121,7 +1178,7 @@ e2e_test!(
         // snapshot used to have its next one scheduled from process start, so a
         // server restarted more often than the interval never reached one —
         // silently, since the loop is running and the log keeps being archived.
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
 
@@ -1180,7 +1237,7 @@ e2e_test!(a_rollover_records_when_it_happened, config, {
     // A rollover leaves an ordinary snapshot behind, so without this stamp
     // nothing in the catalogue says one ever ran — and the schedule would have
     // to start from process start again, which is the bug two tests up.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -1233,7 +1290,7 @@ e2e_test!(a_rollover_removes_the_bundles_behind_it, config, {
     // because the commit sequence restarted with the log — is pinned in the
     // unit tests there. This one holds the end of it: what is deleted is gone,
     // and what is left still restores every row.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -1327,7 +1384,7 @@ e2e_test!(a_created_database_is_archived_and_restored, config, {
     // starts, and one created while it is already running.
     use rasterizeddb_core::core::database::catalog::DatabaseCatalog;
 
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let live_str = live.to_str().unwrap().to_string();
@@ -1458,7 +1515,7 @@ e2e_test!(a_restored_copy_reads_its_own_directory, config, {
     // write against the clone would have landed in the original.
     //
     // So the source is taken away before the copy is asked anything.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
 
@@ -1554,7 +1611,7 @@ e2e_test!(
     config,
     {
         let config = incremental(config);
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
         let database = incremental_source(&live).await;
@@ -1638,7 +1695,7 @@ e2e_test!(
     config,
     {
         let config = incremental(config);
-        let root = temp_testdir::TempDir::default();
+        let root = fresh_root();
         let live = root.join("live");
         std::fs::create_dir_all(&live).unwrap();
         let database = incremental_source(&live).await;
@@ -1687,7 +1744,7 @@ e2e_test!(
 
 e2e_test!(a_tampered_object_fails_the_restore, config, {
     let config = incremental(config);
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let database = incremental_source(&live).await;
@@ -1743,7 +1800,7 @@ e2e_test!(a_snapshot_and_a_rollover_succeed_while_writes_continue, config, {
     // write load the live log is never empty. Requiring it to be discarded
     // every snapshot and every rollover on a busy node ("N bytes still in the
     // live log").
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
@@ -1784,7 +1841,7 @@ e2e_test!(a_snapshot_whose_window_was_not_archived_is_refused, config, {
     // in the archive must still fail the snapshot. Archiving is taken away
     // from the log, so the checkpoints during the snapshot drop records with
     // no copy.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
@@ -1910,7 +1967,7 @@ async fn assert_restores_faithfully(
 }
 
 e2e_test!(a_restore_reproduces_every_state_file, config, {
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
@@ -2113,7 +2170,7 @@ e2e_test!(a_table_on_another_storage_location_survives_a_restore, config, {
     // the logs under it, so a table placed on a second disk was in neither —
     // and the backup reported success. The restore then came back without it,
     // which is the worst moment to find out.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     let disk2 = root.join("disk2");
     std::fs::create_dir_all(&live).unwrap();
@@ -2174,7 +2231,7 @@ e2e_test!(an_in_place_restore_puts_a_location_back_on_its_own_disk, config, {
     // `--restore-from-s3` onto the directory the backup came from: the second
     // location's tables go back to the second location, not onto the root's
     // disk — and never into a location that still holds something.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     let disk2 = root.join("disk2");
     std::fs::create_dir_all(&live).unwrap();
@@ -2243,7 +2300,7 @@ e2e_test!(an_in_place_restore_puts_a_location_back_on_its_own_disk, config, {
 e2e_test!(a_catalogue_without_locations_keeps_the_shape_older_builds_read, config, {
     // Nothing on another disk: the catalogue must be byte-for-byte the shape
     // an older build wrote and reads, and restore exactly as before.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     std::fs::create_dir_all(&live).unwrap();
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
@@ -2276,7 +2333,7 @@ e2e_test!(a_location_that_becomes_primary_later_is_archived_from_then_on, config
     // a backup, the location is not a stream then; turned primary afterwards,
     // nothing re-attached it, its checkpoints discarded what the archive
     // needed, and every snapshot was refused for want of it.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     let disk2 = root.join("disk2");
     std::fs::create_dir_all(&live).unwrap();
@@ -2350,7 +2407,7 @@ e2e_test!(a_size_triggered_upload_never_archives_an_outcome_without_its_rows, co
     // cutting the location's log: the restore held T2 and not T1, which
     // committed before it — a state the database was never in, reported as a
     // successful restore.
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     let disk2 = root.join("disk2");
     std::fs::create_dir_all(&live).unwrap();
@@ -2416,7 +2473,7 @@ e2e_test!(a_created_database_keeps_its_tables_on_other_locations, config, {
     // location is listed once for both.
     use rasterizeddb_core::core::database::catalog::DatabaseCatalog;
 
-    let root = temp_testdir::TempDir::default();
+    let root = fresh_root();
     let live = root.join("live");
     let disk2 = root.join("disk2");
     let disk3 = root.join("disk3");
