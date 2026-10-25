@@ -1020,6 +1020,101 @@ victim exists, and counts that in `rdb_index_snapshot_skipped_evict_total`, a
 v2-trigger signal (§16). Otherwise memory pressure would turn cheap reopens
 into rebuilds just as the system churns.
 
+
+**As built (B13).** Seal and publish write FILTER-only snapshots; nothing
+loads them yet (B14). `index_store::seal` is the sequence, over a
+`SealTarget` the row layer implements per open instance
+(`row::table::table_seal::SealParts`, built in `Table::assemble` from the
+instance's shared handles).
+- **The sequence**, under the file set's maintenance lock (a
+  `tokio::sync::Mutex` on `FileGate`): a word that is `Clean` and *vouched*
+  (this process published the `CLEAN`; B14's load will set it too) returns
+  "already clean"; otherwise a transient ticket is taken in every state (in
+  `Clean` or `Unknown` its slow path makes `DIRTY` durable first, §3 rule 2)
+  and, under it, `_flt.db`'s runtime checkpoint is brought up to date, so its
+  loop has nothing to write after the `CLEAN`. Then: seal (optional skips on
+  any ticket; mandatory waits `seal_timeout` for them); land every provider's
+  staged appends (`StorageIO::land_staged`, `land_staged_durably` for files)
+  under the sealer's own count (`WriteGate::seal_guard`, the `SealGuard`);
+  eligibility (indexes ready, filter ready, complete and not renumbering, no
+  bulk load, a directory log, an epoch `rdb.ixe` proves, `outcome_revocations`
+  unchanged since the instance opened); the barrier (status log flushed, then
+  the root's and the directory's logs through `Wal::sync_issued`, poison
+  checked first); capture (identity after the landing; FILTER through
+  `persist::serialize_sealed`); `.ixs.tmp` written with
+  `sync_file_range(WRITE)` every `writeback_mb`, fdatasynced; renamed,
+  directory fsynced; `INDEX_STORE_V1` set in the directory and the root; the
+  marker log compacted when missing, foreign, unreadable, not ending `DIRTY`
+  or over 64 KiB; `outcome_revocations` re-read; the `PUBLISHING`
+  compare-and-swap; `CLEAN` by `plan_append` (pwrite, fdatasync, ftruncate
+  and fdatasync when stale bytes followed); unseal to `Clean`, vouched.
+  `CANCEL` is checked before each step. A failure before `PUBLISHING`
+  unlinks `.ixs.tmp` and leaves `Dirty`; one after the `CLEAN`'s pwrite was
+  issued leaves `Unknown`. Counters: `seal::failed_total`
+  (`rdb_index_snapshot_failed_total`), `published_total`,
+  `skipped_shutdown_total`.
+- **Clean points.** `SELECT rdb_index_checkpoint('t')` (or `'t'::regclass`;
+  superuser) is answered by pgwire above the engine, with one row
+  (`"n of m clean"`) and a notice per file set left unclean; it runs
+  `Database::index_checkpoint` under the block's owner (or a statement owner
+  of its own), ACCESS SHARE on the name, a mandatory seal per file set, a
+  partitioned table's materialized partitions in turn, and a file set the
+  calling family holds a ticket on is reported, not sealed. The idle
+  checkpoint is a watcher task per instance (plain tables and partitions):
+  an optional seal once the word has been `Dirty`, unsealed and unticketed
+  at every look, and the table's committed-mutation counter
+  (`cache_generation`) still, for `index_snapshot.idle_checkpoint_secs`
+  (default 300, 0 off); it holds the instance's parts weakly. Shutdown: after
+  pgwire's drain grace the sessions still open are ended at their next idle
+  read with 57P01, their blocks rolled back (`end_remaining_sessions`, a
+  per-server signal), then `shutdown::seal_all` runs per database
+  `Database::seal_for_shutdown`: replication off, every instance quiesced
+  (vacuum, the filter loop, the watcher and the providers' landing stopped,
+  vacuum joined), then a mandatory seal of every file set, up to the core
+  count at once, the most rebuild saved per snapshot byte first, under
+  `index_snapshot.shutdown_deadline_secs` (120). `main.rs` calls it after
+  either listener returns. The four `index_snapshot.*` knobs are hot `SET
+  CONFIG` keys.
+- **RENAME and MOVE carry the word** (B11's deviation 2 closed). After the
+  data copy and before the commit point, under the source's maintenance lock,
+  `.ixm` and `.ixs` are copied under the target's stem and directory (a file
+  the source lacks is removed at the target), and `FileGate::carry_to`
+  registers a gate for the target that shares the word: state, flags and
+  count, the statement's ACCESS EXCLUSIVE ticket included. The target's open
+  finds it. The incarnation moves with `_schema.db`; within one directory
+  the slot epoch moves too, into another it is that directory's recovered
+  record. The source's pair is unlinked with its files; a failed rename or
+  move sweeps the target's copy with the rest. Renaming back finds the
+  carried log, so no stale `CLEAN` is left under either name; DROP and
+  CREATE is a new incarnation and starts from no log.
+- **`INDEX_STORE_V1` in the root** (B11's deviation 4 closed): the seal sets
+  it in the table's directory and in the database root (the status log's
+  directory) before it creates a directory's first `.ixm`.
+- **Retirement** (§7 step 2(a)): `Table::retire` marks the instance's seal
+  parts retired, cancels a running seal and waits for the maintenance lock.
+
+Deviations, as built:
+- **Dispatched in pgwire, not the executor**: the statement returns a row,
+  and the describe path must name its column (both live in pgwire).
+- **`mark_checkpointed()` is not called on publish**: `_flt.db` is still the
+  filter's live checkpoint until B14, and resetting its delta bookkeeping
+  without writing it would make its next delta skip zones. B14 adds the call
+  when it retires `_flt.db`.
+- **A table opened after a restart is `Clean` but not vouched**, so its
+  first clean point rewrites the snapshot after a `DIRTY` (rule 2) until B14
+  loads snapshots and vouches for them.
+- **Session termination only at an idle read**: a session mid-batch or
+  mid-statement ends after it; the wait is bounded (5 s), and a mandatory
+  seal then waits `seal_timeout` for whatever ticket it still holds.
+- **Not built**: the token bucket (`max_mb_per_s`), the evictor and idle
+  close (partitioning phase 3), INDEX sections (B17), the staged-append
+  landing failpoint test (`staged_tmp_at_snapshot`), and the
+  `apply_held_fails_then_shutdown` / `seal_between_commit_and_failed_sync`
+  scenarios (their checks are in place: the barrier's poison check and the
+  revocation re-read).
+- The `SealGuard` count is a counted `Hold` (census-visible), not a separate
+  type; the B10 interleaving model does not include it.
+
 ## 4. Opening
 
 The snapshot is trusted only if **every** check passes; cheap checks run in
