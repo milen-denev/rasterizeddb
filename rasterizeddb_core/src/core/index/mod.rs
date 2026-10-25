@@ -74,9 +74,13 @@ pub use sorted::{Sorted, SortedLoad, SortedReject};
 
 /// A key, inline when short (most are: an integer, a UUID, a short string).
 pub type KeyBuf = SmallVec<[u8; 24]>;
-type Slots = SmallVec<[u64; 2]>;
+pub(super) type Slots = SmallVec<[u64; 2]>;
 
 const HASH_SHARDS: usize = 64;
+
+/// Threads a hash index's load fills its shards with, at most: the shards
+/// are independent, and past this the deal before them is the bound.
+const INSTALL_WORKERS: usize = 8;
 
 /// Above this many candidates an index answer is not worth returning: the
 /// filter or a plain scan reads that many rows about as cheaply, and the
@@ -424,19 +428,15 @@ impl LiveIndex {
     /// relies on it) it is the union, which lists every version either did.
     pub fn load_sorted(&self, proof: Proof<'_>, stream: sorted::SortedLoad<KeyBuf>) -> Result<(), sorted::SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::load_sorted");
-        let (keys, slots, unkeyed, present) = stream.into_parts()?;
-        let mut start = 0;
-        let entries = keys.into_iter().map(|(key, end)| {
-            let listed = Slots::from_slice(&slots[start..end]);
-            start = end;
-            (key, listed)
-        });
+        let (entries, unkeyed, present) = stream.into_parts()?;
         match &self.data {
             Data::BTree(map) => {
                 let mut map = map.write();
                 if map.is_empty() {
-                    // In key order already, so built in one pass.
-                    *map = entries.collect();
+                    // In key order already, so built in one pass, from the
+                    // decoded vector itself (`collect` over its own
+                    // `into_iter` reuses the allocation).
+                    *map = entries.into_iter().collect();
                 } else {
                     for (key, listed) in entries {
                         merge_sorted(map.entry(key).or_default(), listed);
@@ -444,17 +444,34 @@ impl LiveIndex {
                 }
             }
             Data::Hash(shards, _) => {
-                // Dealt out to the shards first, so each is locked once.
+                // Dealt out to the shards first, so each is locked once, and
+                // the shards then filled in parallel: they share nothing, and
+                // filling 64 of them one after another was the slowest part of
+                // a load (the hash section's install, 0.14 s for 1.5M keys).
                 let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = (0..HASH_SHARDS).map(|_| Vec::new()).collect();
                 for (key, listed) in entries {
                     dealt[self.shard(&key)].push((key, listed));
                 }
-                for (shard, part) in shards.iter().zip(dealt) {
-                    let mut shard = shard.write();
-                    shard.reserve(part.len());
-                    for (key, listed) in part {
-                        merge_sorted(shard.entry(key).or_default(), listed);
+                let fill = |pairs: &mut [(&RwLock<HashMap<KeyBuf, Slots, RandomState>>, Vec<(KeyBuf, Slots)>)]| {
+                    for (shard, part) in pairs.iter_mut() {
+                        let part = std::mem::take(part);
+                        let mut shard = shard.write();
+                        shard.reserve(part.len());
+                        for (key, listed) in part {
+                            merge_sorted(shard.entry(key).or_default(), listed);
+                        }
                     }
+                };
+                let mut pairs: Vec<_> = shards.iter().zip(dealt).collect();
+                let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, INSTALL_WORKERS);
+                if workers == 1 {
+                    fill(&mut pairs);
+                } else {
+                    std::thread::scope(|scope| {
+                        for run in pairs.chunks_mut(HASH_SHARDS.div_ceil(workers)) {
+                            scope.spawn(move || fill(run));
+                        }
+                    });
                 }
             }
         }

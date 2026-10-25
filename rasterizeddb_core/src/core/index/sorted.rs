@@ -32,7 +32,7 @@
 //! adds to what the index holds and removes nothing, so beside a write that
 //! got in first its result is the union, a superset of both.
 
-use super::KeyBuf;
+use super::{KeyBuf, Slots};
 
 /// Entries `for_each_sorted` copies out under one hold of an index's read
 /// lock (§3 step 5, P15). A writer waits for at most this many to be copied,
@@ -73,19 +73,21 @@ pub enum SortedReject {
 
 /// A stream being checked, on its way into an index's `load_sorted`.
 ///
-/// Slots are kept in one list, each entry recording where its slots end, so
-/// a million single-slot keys cost no allocation each.
+/// Kept as the `(key, slots)` pairs an index holds, so the load takes them
+/// over as they are: a B-tree is built from this very vector in place, where
+/// pairs rebuilt from a separate slot list were copied into fresh pages
+/// first, 1.5M of them at a load. A key's slots sit inline up to two
+/// ([`Slots`]), so a million single-slot keys still cost no allocation each.
 pub struct SortedLoad<K> {
     n_slots: u64,
-    keys: Vec<(K, usize)>,
-    slots: Vec<u64>,
+    entries: Vec<(K, Slots)>,
     unkeyed: Option<Vec<u64>>,
     present: Option<Vec<u64>>,
 }
 
-/// A checked stream's parts: the keys, each with the end of its slots in
-/// the second list, then the unkeyed slots and the presence words.
-pub(super) type SortedParts<K> = (Vec<(K, usize)>, Vec<u64>, Vec<u64>, Vec<u64>);
+/// A checked stream's parts: the entries, then the unkeyed slots and the
+/// presence words.
+pub(super) type SortedParts<K> = (Vec<(K, Slots)>, Vec<u64>, Vec<u64>);
 
 /// Strictly ascending, and every slot below `n_slots`.
 fn check_slots(slots: &[u64], n_slots: u64, at: Option<usize>) -> Result<(), SortedReject> {
@@ -104,10 +106,18 @@ impl<K: Ord> SortedLoad<K> {
     /// table had when it was captured, so anything past that is not what
     /// was captured; it also bounds what a rotted stream can allocate.
     pub fn new(n_slots: u64) -> SortedLoad<K> {
+        Self::with_capacity(n_slots, 0)
+    }
+
+    /// [`Self::new`], with room for `entries` entries: what a section's
+    /// header says it holds, which its decoder bounds by the section's
+    /// length, so rotted bytes cannot make this allocate past the section.
+    /// The pairs' vector then grows by none of its doublings, each of which
+    /// copied every entry so far into fresh pages.
+    pub fn with_capacity(n_slots: u64, entries: usize) -> SortedLoad<K> {
         SortedLoad {
             n_slots,
-            keys: Vec::new(),
-            slots: Vec::new(),
+            entries: Vec::with_capacity(entries),
             unkeyed: None,
             present: None,
         }
@@ -115,23 +125,22 @@ impl<K: Ord> SortedLoad<K> {
 
     /// Entries taken so far.
     pub fn entries(&self) -> usize {
-        self.keys.len()
+        self.entries.len()
     }
 
     fn entry(&mut self, key: K, slots: &[u64]) -> Result<(), SortedReject> {
-        let at = self.keys.len();
+        let at = self.entries.len();
         if self.unkeyed.is_some() || self.present.is_some() {
             return Err(SortedReject::PartOrder);
         }
         if slots.is_empty() {
             return Err(SortedReject::EmptyEntry { at });
         }
-        if self.keys.last().is_some_and(|(last, _)| *last >= key) {
+        if self.entries.last().is_some_and(|(last, _)| *last >= key) {
             return Err(SortedReject::KeyOrder { at });
         }
         check_slots(slots, self.n_slots, Some(at))?;
-        self.slots.extend_from_slice(slots);
-        self.keys.push((key, self.slots.len()));
+        self.entries.push((key, Slots::from_slice(slots)));
         Ok(())
     }
 
@@ -163,7 +172,7 @@ impl<K: Ord> SortedLoad<K> {
     /// The checked parts, once both closing parts have come.
     pub(super) fn into_parts(self) -> Result<SortedParts<K>, SortedReject> {
         match (self.unkeyed, self.present) {
-            (Some(unkeyed), Some(present)) => Ok((self.keys, self.slots, unkeyed, present)),
+            (Some(unkeyed), Some(present)) => Ok((self.entries, unkeyed, present)),
             _ => Err(SortedReject::Truncated),
         }
     }
@@ -211,7 +220,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_stream_is_taken_whole() {
-        let (keys, slots, unkeyed, present) = load(
+        let (entries, unkeyed, present) = load(
             &[
                 Sorted::Entry(1, &[0, 5]),
                 Sorted::Entry(9, &[2]),
@@ -221,8 +230,8 @@ mod tests {
             6,
         )
         .unwrap();
-        assert_eq!(keys, vec![(1, 2), (9, 3)]);
-        assert_eq!(slots, vec![0, 5, 2]);
+        let entries: Vec<(u64, Vec<u64>)> = entries.into_iter().map(|(k, s)| (k, s.to_vec())).collect();
+        assert_eq!(entries, vec![(1, vec![0, 5]), (9, vec![2])]);
         assert_eq!(unkeyed, vec![3]);
         assert_eq!(present, vec![0b10_1101], "trailing zero words are dropped");
         // Nothing at all is well formed: an empty index.

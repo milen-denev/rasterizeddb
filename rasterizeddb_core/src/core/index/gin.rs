@@ -385,13 +385,11 @@ impl GinIndex {
     /// slot's entries (C3 left them out), so a compaction owes it nothing.
     pub fn load_sorted(&self, proof: Proof<'_>, stream: SortedLoad<u64>) -> Result<(), SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "GinIndex::load_sorted");
-        let (items, slots, unkeyed, present) = stream.into_parts()?;
+        let (items, unkeyed, present) = stream.into_parts()?;
         // Dealt out to the shards first, so each is locked once.
         let mut dealt: Vec<Vec<(u64, &[u64])>> = (0..SHARDS).map(|_| Vec::new()).collect();
-        let mut start = 0;
-        for (item, end) in items {
-            dealt[Self::shard(item)].push((item, &slots[start..end]));
-            start = end;
+        for (item, listed) in &items {
+            dealt[Self::shard(*item)].push((*item, &listed[..]));
         }
         let mut added = 0u64;
         for (shard, part) in self.shards.iter().zip(dealt) {

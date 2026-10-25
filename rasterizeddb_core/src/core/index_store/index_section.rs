@@ -384,7 +384,12 @@ fn p_next(prev: u64, delta: u64) -> Option<u64> {
 
 /// A section decoded into a stream an index's `load_sorted` takes.
 pub fn decode(bytes: &[u8], n_slots: u64) -> Result<SortedLoad<KeyBuf>, SectionError> {
-    let mut load = SortedLoad::<KeyBuf>::new(n_slots);
+    // Sized from the header's pair count (an upper bound on the keys), as
+    // far as the section's length can hold: `decode_into` refuses more
+    // entries than a third of the bytes, so this never asks for more.
+    let pairs = bytes.get(4..HEAD_LEN).and_then(|b| b.try_into().ok()).map_or(0, u64::from_le_bytes);
+    let capacity = usize::try_from(pairs).unwrap_or(0).min(bytes.len() / 3);
+    let mut load = SortedLoad::<KeyBuf>::with_capacity(n_slots, capacity);
     decode_into(bytes, n_slots, |part| load.push(part))?;
     Ok(load)
 }
