@@ -1413,7 +1413,7 @@ Deviations, as built:
   P33's pending-delete flag is not built.
 - **Not built**: vacuum's R11 clear-candidate rule (`xmax == NO_TX`) and
   P23's "no bound advance while the filter is unready" (both pruning
-  quality only, never rows); `main.rs`'s refusal of `test_tokens`; the
+  quality only, never rows); the
   downgrade-upgrade-downgrade cycle on KV and mirrored tables (V8); the
   failpoints `ixm_read_eio_at_open` (already B11's) and
   `backfill_batch_after_compaction` / `mid_vacuum_full_phase2` (phase 0's).
@@ -1456,6 +1456,26 @@ snapshot 0.060 s median against rebuild 0.673 s (the first snapshot round,
 1.82 s, is the database open's own recovery after a 94 s load, not the
 filter). tmpfs hides disk cost; neither venue is the consumer ext4 disk the
 gate names.
+
+**Measured again in B15** (the same tool, `b14_measure_open_time`, release
+build at e72a399 plus B15, three alternating rounds, open to filter-ready,
+medians with min-max; load average 1.2-1.7 on a 16-thread desktop with
+other sessions' work):
+
+| Rows | Rows file / snapshot | tmpfs: snapshot / rebuild | `/mnt/Volume4` (fuseblk, NVMe): snapshot / rebuild |
+|---|---|---|---|
+| 250k | 14 MB / 0.8 MB | 0.003 s (0.002-0.312) / 0.166 s (0.160-0.171) | 0.056 s (0.054-7.406) / 0.212 s (0.206-0.252) |
+| 1M (B14) | 56 MB / 3.2 MB | 0.004 s / 0.618 s | 0.060 s / 0.673 s |
+| 2M | 112 MB / 6.4 MB | 0.005 s (0.004-0.145) / 1.263 s (1.238-1.287) | 0.084 s (0.078-3.246) / 1.359 s (1.303-1.653) |
+
+The rebuild grows with the rows (0.63 µs a row on tmpfs) and the load
+does not (it reads one FILTER section, 3.2 bytes a row). Each venue's
+worst round is the first, the database open's own recovery right after the
+bulk load, not the filter. tmpfs hides disk cost (memory
+`tmpfs-hides-disk-cost`), and fuseblk is not the consumer ext4 disk of
+§12. **Phase 1's gate still needs a real ext4 run on the deployment box
+(192.168.1.7), to which no access has been granted**, and the writer-p99
+half of RV7 (§3 Cost) and RV18 are still to be measured there.
 
 **Observed, not changed**: after `VACUUM FULL` a long-lived filter prunes
 far worse than a fresh rebuild of the same rows (993 against 4 candidate
@@ -3233,6 +3253,150 @@ the first data write (RV25).
 | `mid_vacuum_full_phase2` (no power cut) | ENOSPC after compaction's first committed batch; variant: EIO in the post-compaction backfill after a successful compaction | same process: queries scan, no lookup or pruning counted, twin-equal, a composite-UNIQUE duplicate refused; a DELETE, then a clean close writes no snapshot; reopen, twin. *Mutations: skip `set_ready(false)`; demote per caller; build task ignores the generation; snapshot while demoted; set ready after a failed backfill* |
 
 The suites green through (a) and (b) are owner's invariant 8.
+
+**As built (B15): phase 1's suites.** Phase 1's power-loss suites run in
+the core crate (`core::power_loss::phase1_tests`) and over pgwire
+(`rasterizeddb_compat/tests/index_store_power_loss.rs`). They drive the
+filter and snapshot lifecycle to a crash image at every §11 failpoint that
+touches them, in the root and on a second storage location. Each image is
+reopened and compared with a twin that never restarted.
+
+- **The feature.** `index_store_failpoints` (core `Cargo.toml`) compiles
+  `core::power_loss` outside `cfg(test)` (public, `doc(hidden)`), along with
+  every failpoint site (`file_gate::failpoint` and so the seal's, the
+  keep-tail site, and the new `apply_held_fails_then_shutdown` site in
+  `Wal::apply_held`) and `sync_audit`'s crash-image recording.
+  `rasterizeddb_compat` enables it as a dev-dependency feature only, so a
+  normal build never carries it (resolver 3). The image API gained
+  `image::cut_sink`/`drain` for callers outside the crate.
+  `rasterizeddb_core::TEST_ONLY_FEATURES` names the test-only features the
+  library was built with. `main.rs` refuses to start, exit 2, when the list
+  is not empty, so it refuses `test_tokens` and now `index_store_failpoints`
+  too. `cargo test --workspace` still builds the binary with both; it does
+  not start. Correction to B14's deviations: the `test_tokens` refusal
+  existed since B13. B15 generalises it.
+- **The core suite**, one run per placement (`Place::Root`,
+  `Place::Second`). The table has no primary key, so the filter alone
+  prunes. It holds about 1,200 rows; its per-table `min_table_rows` is 0,
+  set before it exists so every open (images included) builds the
+  configuration the identity hashes. Without that, the filter is never
+  consulted below 4,096 rows and every answer is trivially right.
+- **The twin** is a model of the table fed only acknowledged statements. An
+  image's unprunable scan (no `WHERE`) must equal one of the point's states.
+  Every battery predicate must then answer as that state does: equalities on
+  touched rows' old and new values, ranges, `OR`/`AND`, absent values.
+- **The superset oracle**: every visible row's own `a`, `b` and `s`
+  equalities keep its slot in the filter's candidate mask.
+- **The right state**: whether the open loaded (`vouched`) or rebuilt, as
+  the failpoint's row says.
+- **Bounds**: `RDB_POWER_LOSS_SEEDS` images per cut (default 5, one per seed
+  kind) and `RDB_POWER_LOSS_RUNS` runs (default 1). Held bytes plus
+  directories stay under 384 MiB. Every directory is a `TempDir`.
+
+| Failpoint / scenario | How it is reached | Must open as |
+|---|---|---|
+| `snapshot_before_fsync`, `snapshot_after_fsync`, `snapshot_after_rename`, `snapshot_after_dir_fsync`, `marker_compaction_after_rename` | cut at each, on three seals: no marker log; a log ending `DIRTY` with no `.ixs`; an old `.ixs` under the name | rebuild |
+| `clean_append_before_fsync` | cut, the same three seals | either |
+| `clean_after_fsync`, and a quiescent cut after the publish | cut | load |
+| `dirty_append_before_fsync` / `dirty_after_fsync` / the statement's `sync:wal.log` / after it returned (`first_write_after_snapshot`) | the first write from a fresh clean point, in four variants: in-place UPDATE, DELETE, vacuum forget with its filter clear, `neutralize_aborted` | either / rebuild / rebuild for a statement / rebuild if the word left `Clean` |
+| `clean_fsync_fails`, then `unknown_rewrite_after_first_write` | the `CLEAN` fsync fails with EIO (the word must be `Unknown`); cut in the next write's rewrite and after it | either / rebuild |
+| `barrier_root_sync_fails`, `barrier_dir_sync_fails` | EIO; the seal fails | rebuild |
+| `dirty_enospc_after_first_write` | ENOSPC on `DIRTY`; `.ixs` must be gone and the write go ahead | rebuild |
+| `invalidate_after_first_compaction_batch` (`rdb.ixe`) | `VACUUM FULL` from a clean point, cut at its 1st, 2nd and 4th `sync:wal.log`; `rdb.ixe` must be in the table's own directory | either (the twin judges), rebuild after it |
+| `ixm_read_eio_at_open` | EIO at open (the word must be `Unknown`), a length-preserving write, a quiescent cut, an abandoned close and reopen | rebuild |
+| `marker_rot_after_clean` | the durable `DIRTY` after `CLEAN` corrupted while closed; reopen; cut in the next append and after it | rebuild |
+| `flt_evidence_before_ixs_unlink` | an in-place UPDATE, then the clean point's stale pair put back beside a `_flt.db` image (a pre-v1 binary's run); cut in the open | rebuild |
+| `unknown_flt_delete_order` | as above, with the `.ixs` unlink failing (EACCES); the word must start `Unknown`; cut in the first write's slow path and after it | rebuild |
+
+  A suite run is 54 points and 270 images per placement, about 20 s
+  (tmpfs). `RDB_POWER_LOSS_SEEDS=32 RDB_POWER_LOSS_RUNS=4` is the widened
+  run.
+
+- **Bug (c) on a second location** (`bug_c_holds_on_a_second_location_under_synchronous_commit_off`).
+  The location has its own WAL and its own `rdb.ixe` (a compaction first,
+  asserted). Under `synchronous_commit = off`: a DELETE, the vacuum that
+  clears its codes (asserted non-zero), three UPDATEs, then a seal with
+  every step's cut. An image must hold a **prefix** of the statements and
+  answer as that prefix does.
+  - Two layers keep it: vacuum's outcome barrier (6bfed18) and the seal's
+    barrier. Removing both made 1,672 problems: the undone DELETE's rows
+    pruned (`WHERE a = 313` answering nothing where the recovered table
+    holds id 527). Each layer alone covers the scenario.
+- **Found by it: sync-off ordering across locations, fixed in e72a399.**
+  The owner's fix: an in-place overwrite only where the outcome log orders
+  it. Before e72a399, an in-place UPDATE on a second location committed
+  through that location's log, while every other outcome waits in the
+  root's log. So a power cut could keep a later in-place UPDATE and lose an
+  earlier DELETE: 29 of 40 images in
+  `sync_off_outcomes_survive_as_a_prefix_across_locations`, whose first
+  ordering is the oracle's mutation check. With e72a399, 0 of 80. Its
+  reverse ordering (an UPDATE on the location, then a root INSERT) is a
+  regression guard: an overwriting statement pre-syncs every other
+  location's log in `commit_written_transaction`.
+- **Named scenarios built here**:
+  - `apply_held_fails_then_shutdown`: a held overwrite on a second location
+    fails its apply with EIO and poisons that log; the shutdown seal must
+    not publish; the restart rebuilds. Since e72a399 the overwrite is a
+    DELETE's `xmax` stamp, the only in-place write left there; before it,
+    an UPDATE's stale load pruned the new key under the mutation.
+  - `staged_tmp_at_snapshot`: staged rows bytes landed by step 2 before the
+    capture; a clean restart loads.
+  - `retirement_cancels_a_running_seal`: a mandatory seal parked after its
+    `.ixs.tmp` fsync. Retirement must set `CANCEL`; the seal must publish
+    nothing; the reopen rebuilds. A mandatory seal, because a writer cancels
+    an optional one first: an `ALTER` there passed with `retire`'s cancel
+    removed.
+- **The compat suite** runs over pgwire (sqlx), file-backed, a server per
+  image, in the root and on a second location (`STORAGE ADD LOCATION`, then
+  `STORAGE MOVE TABLE`).
+  - (a) `SELECT rdb_index_checkpoint(...)`, then a clean close and reopen:
+    `open_proof::loaded_total` moves, the word is vouched and answers match
+    the twin. A write, then an abandoned close: the reopen rebuilds.
+  - (b) every seal step on two seals; the first write's `DIRTY` (unsynced,
+    durable) and after it; `clean_fsync_fails` then a write; on the second
+    location, bug (c) with `SET synchronous_commit = off` on the session.
+  - Default 8 seeds per cut (32, the CI figure, through
+    `RDB_POWER_LOSS_SEEDS`); 42 points and 336 images in about 25 s.
+  - A server's logs are taken out of the process-wide registry when it
+    stops. Otherwise the next server at the same image path reuses the
+    stopped one's `Wal`, its handles on replaced files and its durable
+    position, and recovers the wrong bytes: an acknowledged UPDATE read back
+    lost, which looked like an engine bug.
+- **Mutations**: each new test was failed by assertion and restored (the
+  table in the B15 slice report). `grep -rn MUTATED` is clean.
+
+Deviations, as built:
+- **The twin is a model**, not a second database: the same "never
+  restarted, fed only acknowledged statements, no filter", with predicates
+  evaluated in Rust.
+- **Sites not added**:
+  - `invalidate_after_first_compaction_batch` is reached through
+    `sync:wal.log` cuts inside `VACUUM FULL`, not a site in `compact()`
+    (`row/table.rs` is the owner's).
+  - `first_write_after_snapshot` and `marker_rot_after_clean` are scenario
+    labels over the `DIRTY` sites; the rot is injected while closed.
+- **Not built**:
+  - `seal_between_commit_and_failed_sync`: it needs a revoked outcome, and
+    `outcome_revocations` is process-wide, so one revocation refuses every
+    seal of every instance opened before it in the test binary. It needs a
+    process of its own (an integration test with the feature).
+  - The B10 loom model with `seal_guard`.
+  - Vacuum's R11 and P23 (`vacuum.rs`, owner's; pruning quality only), so
+    the suites check that the filter narrows, not R12's pruning quality.
+  - P33's pending-delete flag (the provider delete reports no error,
+    B14).
+  - The V8 downgrade cycle on KV and mirrored tables: excluded tables never
+    load a snapshot, so the cycle can only show the provider-family delete,
+    which B14's tests cover on files.
+  - The four length-preserving variants run for the first write, not for
+    every failpoint whose mutation is "a write without `DIRTY`". The
+    in-place UPDATE variant runs after `clean_fsync_fails`,
+    `ixm_read_eio_at_open`, `marker_rot_after_clean` and both `_flt.db`
+    cases.
+- **The writer-p99 half of RV7** (§3 Cost: commit p50/p99 beside optional
+  snapshots of a 3M-row table) and RV18 were not measured. B15 measured the
+  open-time half, below.
+
 
 ## 12. Phased plan (v1)
 
