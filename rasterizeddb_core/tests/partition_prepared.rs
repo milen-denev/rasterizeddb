@@ -126,6 +126,12 @@ struct Sessions {
 impl Sessions {
     fn open(server: &Server, table: &str, statements: &[&Statement]) -> Sessions {
         let mut s = Sessions { describing: server.connect(), binary: server.connect() };
+        // The repair this test follows a redefinition through is
+        // `rowdescription`'s; since B8b the default, `auto`, answers a
+        // statement's first stale use with 0A000 instead.
+        for client in [&mut s.describing, &mut s.binary] {
+            client.ok("SET rdb.shape_change = rowdescription");
+        }
         for st in statements {
             let sql = st.sql.replace("{t}", table);
             s.describing.prepare(st.name, &sql).unwrap_or_else(|e| panic!("prepare {sql}: {e}"));
