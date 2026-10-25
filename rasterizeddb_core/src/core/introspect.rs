@@ -2095,6 +2095,27 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         set_with: "SET CONFIG index_snapshot.writeback_mb = 64",
         help: "MiB of a snapshot written between two writeback starts",
     },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "index_storage",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.index_storage = snapshot",
+        help: "rebuild: indexes are built from rows at every open; snapshot: seals write B-tree, hash and path indexes, and an open loads them",
+    },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "max_concurrent_loads",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.max_concurrent_loads = 4",
+        help: "index loads at open running at once, costliest first; 0 is half the cores",
+    },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "load_wait_ms",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.load_wait_ms = 600",
+        help: "how long a query waits for an index load at open before it scans",
+    },
 ];
 
 fn config_keys() -> Vec<Row> {
@@ -2180,6 +2201,15 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
                 crate::core::index_store::seal::settings::shutdown_deadline().as_secs().to_string()
             }
             ("index_snapshot", "writeback_mb") => crate::core::index_store::seal::settings::writeback_mb().to_string(),
+            ("index_snapshot", "index_storage") => {
+                crate::core::index_store::load::settings::index_storage().name().to_string()
+            }
+            ("index_snapshot", "max_concurrent_loads") => {
+                crate::core::index_store::load::settings::max_concurrent_loads().to_string()
+            }
+            ("index_snapshot", "load_wait_ms") => {
+                crate::core::index_store::load::settings::load_wait().as_millis().to_string()
+            }
             _ => String::new(),
         }
     };
@@ -2332,6 +2362,13 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         }
         "index_snapshot" => {
             use crate::core::index_store::seal::settings;
+            if name == "index_storage" {
+                use crate::core::index_store::load::settings::{IndexStorage, set_index_storage};
+                let s = IndexStorage::parse(value)
+                    .ok_or_else(|| format!("`{}` is not rebuild or snapshot for {}", value, key))?;
+                set_index_storage(s);
+                return Ok(format!("{key} is now {}", s.name()));
+            }
             let n: u64 = value
                 .trim()
                 .trim_matches('\'')
@@ -2342,6 +2379,8 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 "seal_timeout_ms" => settings::set_seal_timeout_ms(n),
                 "shutdown_deadline_secs" => settings::set_shutdown_deadline_secs(n),
                 "writeback_mb" => settings::set_writeback_mb(n),
+                "max_concurrent_loads" => crate::core::index_store::load::settings::set_max_concurrent_loads(n),
+                "load_wait_ms" => crate::core::index_store::load::settings::set_load_wait_ms(n),
                 _ => return Err(format!("`{}` has no live setter", key)),
             }
             Ok(format!("{key} is now {n}"))

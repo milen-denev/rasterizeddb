@@ -1191,6 +1191,9 @@ impl<S: StorageIO> Table<S> {
         // rebuilds below exactly as before. The word's state stays the
         // marker log's either way (N21): a rejected `CLEAN` is still `Clean`,
         // so the first write makes `DIRTY` durable, and only a load vouches.
+        // The INDEX sections a proven snapshot holds (B17), for the index
+        // load below.
+        let mut proven_indexes = None;
         let loaded: Option<Option<(TableFilters, u64)>> = if gate.has_files() {
             use crate::core::index_store::open_proof::{self, Reject};
             let expected = crate::core::index_store::identity::Identity {
@@ -1205,14 +1208,17 @@ impl<S: StorageIO> Table<S> {
                 shape_hash,
                 filter_config_hash: template.as_ref().map_or(0, |f| f.config_hash()),
             };
-            let outcome = open_proof::prove(&gate, &flt, &expected, template.is_some()).and_then(|proven| {
-                match (proven.filter, template.as_ref()) {
+            let outcome = open_proof::prove(&gate, &flt, &expected, template.is_some()).and_then(|mut proven| {
+                let filter = proven.filter.take();
+                let l = match (filter, template.as_ref()) {
                     (Some(bytes), Some(t)) => t
                         .load_sealed(&bytes, existing_slots)
                         .map(Some)
-                        .map_err(|e| Reject::FilterLoad(format!("{e:?}"))),
-                    _ => Ok(None),
-                }
+                        .map_err(|e| Reject::FilterLoad(format!("{e:?}")))?,
+                    _ => None,
+                };
+                proven_indexes = Some(proven);
+                Ok(l)
             });
             match outcome {
                 Ok(l) => {
@@ -1265,35 +1271,56 @@ impl<S: StorageIO> Table<S> {
             let indexes = crate::core::index::for_schema(&schema);
             (!indexes.is_empty()).then(|| StdArc::new(indexes))
         };
+        // Loaded from the snapshot's INDEX sections when the proof passed and
+        // `index_snapshot.index_storage` is `snapshot`, else built from rows
+        // as before (docs/persistent-indexes.md §4, B17;
+        // `index_store::load`). A load raises the file set's barrier here,
+        // before the open returns: a write's first ticket waits for it.
+        let filter_vouches = was_loaded
+            && !filters.as_ref().is_some_and(|f| f.resume_slot() < existing_slots)
+            && gate.state() == crate::core::index_store::gate_word::GateState::Clean;
+        let index_sections = StdArc::new(AtomicBool::new(false));
+        let index_origin = StdArc::new(std::sync::atomic::AtomicU8::new(0));
+        let mut indexes_vouch = true;
+        let mut index_load = false;
         if let Some(indexes) = indexes.clone() {
+            use crate::core::index_store::load;
+            let storage = load::settings::index_storage_for(gate.dir());
+            let plan = load::plan(&indexes, storage, proven_indexes.as_ref());
+            let loading = matches!(plan, load::Plan::Load { .. });
+            // A snapshot whose INDEX sections this open does not load is not
+            // what a seal would write now (§3 rule 2).
+            indexes_vouch = !load::captures(&indexes, storage) || loading;
+            index_load = loading;
+            let opened = load::OpenIndexes {
+                name: table_name.to_string(),
+                indexes: indexes.clone(),
+                // Read now, before any compaction can start: the build reads
+                // rows without the compaction gate, so it may mark the
+                // indexes ready only if no renumbering began or ended while
+                // it ran.
+                epoch: indexes.epoch(),
+                n_slots: existing_slots,
+                gate: gate.clone(),
+                barrier: loading.then(|| gate.loads().raise()),
+                vouch: filter_vouches,
+                sections_in_snapshot: index_sections.clone(),
+                origin: index_origin.clone(),
+            };
             let io_pointers_task = io_pointers.clone();
             let io_rows_task = io_rows.clone();
             let fields = schema.fields.clone();
             let readers_task = readers.clone();
             let alive = maintenance_alive.clone();
-            let table_name_task = table_name.to_string();
-            // Read now, before any compaction can start: the build reads rows
-            // without the compaction gate, so it may mark the indexes ready
-            // only if no renumbering began or ended while it ran.
-            let epoch = indexes.epoch();
             tokio::spawn(async move {
                 if !alive.load(AtomicOrdering::Relaxed) {
                     return;
                 }
                 let build = gate::build_token();
-                match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
-                    Ok(n) if indexes.set_ready_at(Proof::from(&build), epoch) => {
-                        info!("Built {} index(es) on {} over {} rows", indexes.len(), table_name_task, n);
-                    }
-                    Ok(_) => info!(
-                        "Index build on {} overlapped a compaction; its result is not used",
-                        table_name_task
-                    ),
-                    Err(e) => error!(
-                        "Index build on {} failed; queries scan instead: {}",
-                        table_name_task, e
-                    ),
-                }
+                load::open_indexes(&build, opened, plan, || {
+                    build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task))
+                })
+                .await;
             });
         }
 
@@ -1309,11 +1336,9 @@ impl<S: StorageIO> Table<S> {
         });
         // A load vouches for the word only when the loaded filter is all this
         // instance has: one that still backfills differs from the snapshot,
-        // which the next clean point rewrites (§3 rule 3).
-        if was_loaded
-            && !filters.as_ref().is_some_and(|f| f.resume_slot() < existing_slots)
-            && gate.state() == crate::core::index_store::gate_word::GateState::Clean
-        {
+        // which the next clean point rewrites (§3 rule 3). With INDEX
+        // sections to load, their load vouches once it succeeds (B17).
+        if filter_vouches && indexes_vouch && !index_load {
             gate.set_vouched(true);
         }
 
@@ -1444,6 +1469,8 @@ impl<S: StorageIO> Table<S> {
             legacy_flt: flt == FltAtOpen::LegacyPair,
             revocations_at_open,
             retired: AtomicBool::new(false),
+            index_sections,
+            index_origin,
         });
         table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
 
@@ -3717,6 +3744,14 @@ impl<S: StorageIO> Table<S> {
             return None;
         }
         let judge_constant = sarg::worth_judging_constant(where_clause);
+        // A load of the snapshot's INDEX sections in flight (B17): waited for
+        // up to `index_snapshot.load_wait_ms` rather than scan unpruned. No
+        // write lands meanwhile (writes wait for the load), so the caller's
+        // snapshot, taken before this, sees nothing the loaded index lacks.
+        if self.gate.loads().loading() && d.indexes.as_ref().is_some_and(|i| !i.is_ready()) {
+            let wait = crate::core::index_store::load::settings::load_wait();
+            self.gate.loads().settled_within(wait).await;
+        }
         let indexes_ready = d.indexes.as_ref().is_some_and(|i| i.is_ready());
         if !judge_constant && !indexes_ready && d.filters.is_none() {
             return None;

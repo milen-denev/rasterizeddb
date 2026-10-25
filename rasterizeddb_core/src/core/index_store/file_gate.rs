@@ -250,6 +250,11 @@ pub struct FileGate {
     /// that is `Clean` without it (a log a previous run wrote, which this
     /// open did not load) is rewritten at the next clean point (§3 rule 2).
     vouched: AtomicBool,
+    /// Loads of the snapshot's INDEX sections in flight (B17): a write's
+    /// first ticket waits for them before its slow path, a reader up to
+    /// `load_wait`. Shared with the gates a RENAME or MOVE carries the word
+    /// to, as the word is.
+    loads: Arc<super::load::LoadBarrier>,
     /// Test-only: `GatedIo` judges this word's writes as a release build
     /// does (the slow path inline, `CANCEL` on a ticketless seal) instead of
     /// panicking, so tests can exercise production's verdicts (B12).
@@ -405,6 +410,7 @@ impl FileGate {
             epoch_proven: AtomicBool::new(false),
             maintenance: tokio::sync::Mutex::const_new(()),
             vouched: AtomicBool::new(false),
+            loads: Arc::default(),
             #[cfg(test)]
             release_verdicts: AtomicBool::new(false),
             #[cfg(test)]
@@ -446,6 +452,7 @@ impl FileGate {
             epoch_proven: AtomicBool::new(proven),
             maintenance: tokio::sync::Mutex::const_new(()),
             vouched: AtomicBool::new(false),
+            loads: Arc::default(),
             #[cfg(test)]
             release_verdicts: AtomicBool::new(false),
             #[cfg(test)]
@@ -700,6 +707,11 @@ impl FileGate {
         self.vouched.store(on, Ordering::Release);
     }
 
+    /// The file set's INDEX loads in flight (B17).
+    pub fn loads(&self) -> &Arc<super::load::LoadBarrier> {
+        &self.loads
+    }
+
     /// The word of this file set, carried to the stem `stem` in `dir`: what
     /// RENAME and MOVE do with the gate (§2 P6, §6; B11 deviation 2, built
     /// in B13). The new file set shares this one's word, so its state, its
@@ -737,6 +749,7 @@ impl FileGate {
             epoch_proven: AtomicBool::new(proven),
             maintenance: tokio::sync::Mutex::const_new(()),
             vouched: AtomicBool::new(false),
+            loads: self.loads.clone(),
             #[cfg(test)]
             release_verdicts: AtomicBool::new(self.release_verdicts.load(Ordering::Acquire)),
             #[cfg(test)]

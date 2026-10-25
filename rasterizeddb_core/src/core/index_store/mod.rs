@@ -29,6 +29,11 @@
 //! Slice B14 puts the filter under T4: [`open_proof`] (the open's checks,
 //! writing nothing), the FILTER section loaded instead of rebuilt when they
 //! pass, and `_flt.db` retired ([`file_gate::FileGate::retire_flt`]).
+//!
+//! Slice B17 lets an open skip its index build: seals write an INDEX
+//! section per B-tree, hash and path index ([`index_section`]) under
+//! `index_snapshot.index_storage = snapshot`, and an open whose proof
+//! passes loads them ([`load`]), writes and readers waiting for it.
 
 pub mod census;
 pub mod codec;
@@ -38,6 +43,8 @@ pub mod gate;
 pub mod gated_io;
 pub mod gate_word;
 pub mod identity;
+pub mod index_section;
+pub mod load;
 pub mod marker;
 pub mod open_proof;
 pub mod seal;

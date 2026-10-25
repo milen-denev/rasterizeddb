@@ -11,7 +11,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc as StdArc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -25,6 +25,7 @@ use crate::core::index_store::file_gate::FileGate;
 use crate::core::index_store::gate::{Proof, WriteTicket};
 use crate::core::index_store::gate_word::{GateState, SealKind, Word};
 use crate::core::index_store::identity::{Identity, VersionTuple};
+use crate::core::index_store::load;
 use crate::core::index_store::seal::{self, Capture, SealOutcome, SealTarget};
 use crate::core::index_store::snapshot::SectionKind;
 use crate::core::mvcc::TransactionManager;
@@ -58,11 +59,24 @@ pub(crate) struct SealParts<S: StorageIO> {
     pub(super) revocations_at_open: u64,
     /// Set by [`Table::retire`]: a retired instance never snapshots.
     pub(super) retired: AtomicBool,
+    /// Whether the snapshot this instance stands on holds its INDEX
+    /// sections: set by a load of them, and by a capture that wrote them
+    /// (B17). A seal asks it before "already clean" (§3 rule 2).
+    pub(super) index_sections: StdArc<AtomicBool>,
+    /// How the indexes came to be at open (`index_store::load::Origin`).
+    pub(super) index_origin: StdArc<AtomicU8>,
 }
 
 impl<S: StorageIO> SealParts<S> {
     fn dir(&self) -> Option<PathBuf> {
         self.gate.dir().map(|d| d.to_path_buf())
+    }
+
+    /// Whether a seal of this instance writes INDEX sections now (B17).
+    fn captures_indexes(&self) -> bool {
+        self.indexes
+            .as_ref()
+            .is_some_and(|ix| load::captures(ix, load::settings::index_storage_for(self.gate.dir())))
     }
 }
 
@@ -77,6 +91,14 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
 
     fn retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
+    }
+
+    async fn settle(&self) {
+        self.gate.loads().settled().await;
+    }
+
+    fn snapshot_current(&self) -> bool {
+        !self.captures_indexes() || self.index_sections.load(Ordering::Acquire)
     }
 
     async fn before_seal(&self, ticket: &WriteTicket) {
@@ -182,6 +204,20 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
             ));
             filter_config_hash = f.config_hash();
         }
+        // The INDEX sections (B17), one per B-tree, hash and path index, in
+        // `for_schema` order; none for a table with a gin index.
+        let mut with_indexes = false;
+        if let Some(ix) = self.indexes.as_ref().filter(|_| self.captures_indexes()) {
+            match load::capture_sections(ix, &self.gate)? {
+                Some(s) => sections.extend(s),
+                None => return Err(io::Error::other("the capture was cancelled")),
+            }
+            with_indexes = true;
+        }
+        // Read by the next "already clean" only after this seal published;
+        // a seal that fails after it leaves the word unvouched, which asks
+        // nothing of this.
+        self.index_sections.store(with_indexes, Ordering::Release);
         Ok(Capture {
             identity: Identity {
                 incarnation: self.incarnation,
@@ -195,6 +231,22 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
             },
             sections,
         })
+    }
+}
+
+impl<S: StorageIO> Table<S> {
+    /// How this instance's indexes came to be at open (B17).
+    pub fn index_origin(&self) -> load::Origin {
+        match self.data() {
+            Ok(d) => load::Origin::of(d.seal.index_origin.load(Ordering::Acquire)),
+            Err(_) => load::Origin::Pending,
+        }
+    }
+
+    /// Waits for a load of the snapshot's INDEX sections in flight, if any
+    /// (B17); after it, the indexes are ready, or a build from rows runs.
+    pub async fn index_load_settled(&self) {
+        self.gate.loads().settled().await;
     }
 }
 

@@ -273,6 +273,130 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot<'_>, FormatError> {
     })
 }
 
+/// A snapshot read once, front to back, and fully checked without holding
+/// it: the header, every section's crc32c and the footer xxh64, as
+/// [`decode`] checks them. Only the sections `keep` selects are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Streamed {
+    pub header: SnapshotHeader,
+    pub footer: u64,
+    /// The kept sections' entries and bytes, in table order.
+    pub kept: Vec<(SectionEntry, Vec<u8>)>,
+}
+
+/// How much of the file a streaming check reads at a time.
+const STREAM_CHUNK: usize = 1 << 20;
+
+/// Checks a snapshot of `file_len` bytes read from `src`, front to back,
+/// as [`decode`] would check it whole (B17: an open no longer buffers the
+/// file, §4 "The load"). `src` must yield exactly the file's bytes.
+pub fn verify_stream(
+    src: &mut impl std::io::Read,
+    file_len: u64,
+    keep: impl Fn(&SectionEntry) -> bool,
+) -> Result<Streamed, StreamError> {
+    let mut footer_hash = Xxh64::new(0);
+    // The fixed head, for the header's length; then the rest of the header.
+    let head = header_len(0) as usize;
+    if file_len < (head + FOOTER_LEN) as u64 {
+        return Err(FormatError::Truncated { what: WHAT, at: file_len, need: (head + FOOTER_LEN) as u64 - file_len }.into());
+    }
+    let mut header_bytes = vec![0u8; 16];
+    src.read_exact(&mut header_bytes)?;
+    let claimed = u32::from_le_bytes(header_bytes[12..16].try_into().expect("four bytes")) as u64;
+    let hlen = claimed.clamp(head as u64, header_len(MAX_SECTIONS as usize)).min(file_len - FOOTER_LEN as u64);
+    header_bytes.resize(hlen as usize, 0);
+    src.read_exact(&mut header_bytes[16..])?;
+    let header = SnapshotHeader::decode(&header_bytes, file_len)?;
+    footer_hash.update(&header_bytes);
+    let mut at = hlen;
+    let mut kept = Vec::new();
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let footer_at = file_len - FOOTER_LEN as u64;
+    // Sections are ascending and do not overlap (the header checked that);
+    // the bytes between them, if any, are hashed and skipped.
+    let mut feed = |src: &mut dyn std::io::Read, upto: u64, at: &mut u64, sink: &mut dyn FnMut(&[u8])| -> std::io::Result<()> {
+        while *at < upto {
+            let n = ((upto - *at) as usize).min(STREAM_CHUNK);
+            src.read_exact(&mut buf[..n])?;
+            footer_hash.update(&buf[..n]);
+            sink(&buf[..n]);
+            *at += n as u64;
+        }
+        Ok(())
+    };
+    for entry in &header.sections {
+        feed(src, entry.offset, &mut at, &mut |_| {})?;
+        let mut crc = super::codec::crc32c_digest();
+        let keep_it = keep(entry);
+        let mut bytes = Vec::new();
+        if keep_it {
+            bytes.reserve_exact(entry.len as usize);
+        }
+        feed(src, entry.offset + entry.len, &mut at, &mut |b| {
+            crc.update(b);
+            if keep_it {
+                bytes.extend_from_slice(b);
+            }
+        })?;
+        if crc.finalize() != entry.crc32c {
+            return Err(FormatError::BadChecksum { what: WHAT, at: entry.offset }.into());
+        }
+        if keep_it {
+            kept.push((*entry, bytes));
+        }
+    }
+    feed(src, footer_at, &mut at, &mut |_| {})?;
+    let mut tail = [0u8; FOOTER_LEN];
+    src.read_exact(&mut tail)?;
+    let footer = u64::from_le_bytes(tail);
+    if footer_hash.digest() != footer {
+        return Err(FormatError::BadChecksum { what: WHAT, at: footer_at }.into());
+    }
+    Ok(Streamed { header, footer, kept })
+}
+
+/// Why a streaming check failed: the bytes, or reading them.
+#[derive(Debug)]
+pub enum StreamError {
+    Format(FormatError),
+    Io(std::io::Error),
+}
+
+impl From<FormatError> for StreamError {
+    fn from(e: FormatError) -> StreamError {
+        StreamError::Format(e)
+    }
+}
+
+impl From<std::io::Error> for StreamError {
+    fn from(e: std::io::Error) -> StreamError {
+        // A file shorter than it said is a truncation, like `decode`'s.
+        StreamError::Io(e)
+    }
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Format(e) => write!(f, "{e}"),
+            StreamError::Io(e) => write!(f, "{WHAT}: {e}"),
+        }
+    }
+}
+
+/// Reads one section of the snapshot at `path` and checks it against its
+/// entry (length and crc32c): what the index load does per section, after
+/// the open's proof streamed the whole file once.
+pub fn read_section(path: &std::path::Path, entry: &SectionEntry) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = vec![0u8; entry.len as usize];
+    file.read_exact_at(&mut bytes, entry.offset)?;
+    verify_section(entry, &bytes).map_err(std::io::Error::other)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::codec::{digest_hex, from_hex, to_hex};
@@ -370,6 +494,49 @@ mod tests {
         let mut longer = bytes.clone();
         longer.insert(bytes.len() - FOOTER_LEN, 0);
         assert!(decode(&longer).is_err(), "a byte inserted before the footer");
+    }
+
+    /// The streaming check accepts exactly what `decode` accepts, keeps the
+    /// sections asked for, and refuses every truncation and every corrupted
+    /// byte, as the whole-file decode does (B17).
+    #[test]
+    fn the_streaming_check_agrees_with_decode() {
+        let stream = |b: &[u8], keep: &dyn Fn(&SectionEntry) -> bool| {
+            verify_stream(&mut std::io::Cursor::new(b), b.len() as u64, keep)
+        };
+        let bytes = encode(sample(), &sections());
+        let whole = decode(&bytes).unwrap();
+        let got = stream(&bytes, &|e| e.kind != SectionKind::Gin).unwrap();
+        assert_eq!(got.header, whole.header);
+        assert_eq!(got.footer, whole.footer);
+        let kept: Vec<(SectionKind, u16, &[u8])> = got.kept.iter().map(|(e, b)| (e.kind, e.ordinal, b.as_slice())).collect();
+        assert_eq!(kept, vec![(SectionKind::Filter, 0, FILTER), (SectionKind::Index, 0, INDEX0)]);
+        for n in 0..bytes.len() {
+            assert!(stream(&bytes[..n], &|_| true).is_err(), "{n} bytes");
+        }
+        for i in 0..bytes.len() {
+            let mut bad = bytes.clone();
+            bad[i] ^= 0x01;
+            assert!(stream(&bad, &|_| false).is_err(), "byte {i} was accepted");
+        }
+        // A section larger than a chunk, and a gap-free multi-chunk file.
+        let big = vec![0x5au8; (STREAM_CHUNK * 2) + 17];
+        let bytes = encode(sample(), &[(SectionKind::Index, 0, &big), (SectionKind::Index, 1, b"x")]);
+        let got = stream(&bytes, &|e| e.ordinal == 0).unwrap();
+        assert_eq!(got.kept.len(), 1);
+        assert_eq!(got.kept[0].1, big);
+        let mut bad = bytes.clone();
+        bad[STREAM_CHUNK + 100] ^= 0x80;
+        assert!(stream(&bad, &|_| false).is_err());
+        // One section read back alone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ixs");
+        std::fs::write(&path, &bytes).unwrap();
+        let entry = got.header.sections[1];
+        assert_eq!(read_section(&path, &entry).unwrap(), b"x");
+        let mut wrong = entry;
+        wrong.crc32c ^= 1;
+        assert!(read_section(&path, &wrong).is_err());
     }
 
     #[test]

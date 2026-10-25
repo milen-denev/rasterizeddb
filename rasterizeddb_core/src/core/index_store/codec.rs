@@ -20,6 +20,12 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     CRC32C.checksum(bytes)
 }
 
+/// CRC-32C over bytes fed in pieces: what [`crc32c`] gives for their
+/// concatenation.
+pub(crate) fn crc32c_digest() -> crc::Digest<'static, u32, crc::Table<16>> {
+    CRC32C.digest()
+}
+
 /// Why bytes are not a valid file of one of the index store's formats.
 ///
 /// Every decoder returns one of these for every input it cannot accept;

@@ -1,6 +1,8 @@
 //! Seal and publish: a file set's snapshot written at a clean point
 //! (docs/persistent-indexes.md §3; slice B13). Phase 1 writes the FILTER
-//! section only; B17 adds INDEX sections, B14 loads what this writes.
+//! section only; B17 adds INDEX sections (B-tree, hash and path, under
+//! `index_snapshot.index_storage = snapshot`), B14 and B17 load what this
+//! writes.
 //!
 //! # The sequence, under the file set's maintenance lock
 //!
@@ -213,6 +215,15 @@ pub trait SealTarget: Send + Sync {
     fn name(&self) -> &str;
     /// Whether the instance was retired (§7 step 2).
     fn retired(&self) -> bool;
+    /// Waits for a load of the snapshot's INDEX sections in flight (B17):
+    /// until it has finished or failed, the seal cannot tell whether the
+    /// snapshot is current, and the indexes are not ready.
+    fn settle(&self) -> impl Future<Output = ()> + Send;
+    /// Whether the snapshot the log's `CLEAN` names holds everything a seal
+    /// of this instance would write now (B17: its INDEX sections, when
+    /// `index_storage` asks for them). A vouched word whose snapshot is not
+    /// current is sealed again (§3 rule 2).
+    fn snapshot_current(&self) -> bool;
     /// Run before the seal, under a transient ticket the seal holds: what
     /// must change while the word is still `Dirty` and would otherwise
     /// change after the `CLEAN` (B14: the filter's checkpoint bookkeeping).
@@ -250,8 +261,9 @@ pub async fn seal<T: SealTarget>(t: &T, kind: SealKind) -> SealOutcome {
     if t.retired() {
         return SealOutcome::Skipped(Skip::Retired);
     }
+    t.settle().await;
     let state = gate.state();
-    if state == GateState::Clean && gate.vouched() {
+    if state == GateState::Clean && gate.vouched() && t.snapshot_current() {
         return SealOutcome::AlreadyClean;
     }
     // §3: "When the state is not Dirty, the snapshot task first takes and
@@ -398,8 +410,15 @@ async fn sealed<T: SealTarget>(t: &T, gate: &Arc<FileGate>, kind: SealKind) -> R
     // Step 4.
     blocking(|| t.barrier())?;
     check_cancel(gate)?;
-    // Step 5.
-    let capture = t.capture().await?;
+    // Step 5. A capture that a writer cancelled midway is a skip.
+    let capture = match t.capture().await {
+        Ok(c) => c,
+        Err(e) => {
+            check_cancel(gate)?;
+            return Err(e.into());
+        }
+    };
+    check_cancel(gate)?;
     let sections: Vec<(SectionKind, u16, &[u8])> =
         capture.sections.iter().map(|(k, o, b)| (*k, *o, b.as_slice())).collect();
     let bytes = snapshot::encode(capture.identity, &sections);

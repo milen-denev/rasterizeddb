@@ -251,7 +251,15 @@ pub(crate) async fn ticket(gate: &FileGate, family: Option<Family>) -> io::Resul
         // strains).
         Err(_) => {
             let slow: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Hold>> + Send + '_>> =
-                Box::pin(gate.word().acquire(|state| gate.slow_path(state)));
+                Box::pin(async move {
+                    // Writes wait for a load of the snapshot's INDEX sections
+                    // in flight (§4, B17). A load runs only on a word the
+                    // open found `Clean`, where every first ticket comes
+                    // here, so nothing is issued until it has finished or
+                    // failed, and the snapshot still equals the data.
+                    gate.loads().settled().await;
+                    gate.word().acquire(|state| gate.slow_path(state)).await
+                });
             slow.await?
         }
     };

@@ -157,6 +157,15 @@ struct Args {
     #[arg(long = "filter-checkpoint-secs", value_name = "N")]
     filter_checkpoint_secs: Option<u64>,
 
+    /// What an open does with the B-tree, hash and path indexes:
+    /// `rebuild` them from rows (the default), or load the `snapshot` a
+    /// clean shutdown, `rdb_index_checkpoint` or the idle checkpoint wrote
+    /// (docs/persistent-indexes.md §4). The startup value of `SET CONFIG
+    /// index_snapshot.index_storage`; it must be set here for the opens at
+    /// startup to load.
+    #[arg(long = "index-storage", value_name = "rebuild|snapshot")]
+    index_storage: Option<String>,
+
     /// Floor on fingerprint bits per row (4..16).
     #[arg(long = "filter-min-f", value_name = "N")]
     filter_min_f: Option<u8>,
@@ -874,6 +883,18 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(ms) = args.wal_writer_delay_ms {
         rasterizeddb_core::set_wal_writer_delay_ms(ms);
+    }
+    if let Some(spec) = args.index_storage.as_deref() {
+        use rasterizeddb_core::core::index_store::load::settings::{IndexStorage, set_index_storage};
+        match IndexStorage::parse(spec) {
+            Some(s) => set_index_storage(s),
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "--index-storage {:?}: expected rebuild or snapshot",
+                    spec
+                )));
+            }
+        }
     }
 
     // Filter tuning. These seed the same runtime state `SET FILTER ...` writes,

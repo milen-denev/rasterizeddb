@@ -17,13 +17,16 @@
 //! | 5 | `.ixm` reads, as this incarnation's log | `NoLog`, `LogUnreadable`, `ForeignLog` |
 //! | 6 | its last good record is `CLEAN` with no byte after it (B9's `proven_clean`) | `LogNotClean`, `TrailingBytes` |
 //! | 7 | the `CLEAN`'s identity equals the files and the binary, field by field: incarnation, slot epoch, slot count, pointer and row file lengths, the version tuple (`FILTER_DERIVE_VERSION` and `persist::FORMAT_VER` among it), shape hash, filter configuration hash | `Identity(field)` |
-//! | 8 | `.ixs` reads, and its length is the `CLEAN`'s | `NoSnapshot`, `SnapshotUnreadable`, `SnapshotLength` |
-//! | 9 | its header crc32c, every section's crc32c and the footer xxh64 verify | `SnapshotCorrupt` |
+//! | 8 | `.ixs` opens, and its length is the `CLEAN`'s | `NoSnapshot`, `SnapshotUnreadable`, `SnapshotLength` |
+//! | 9 | read once as a stream (B17: never held whole), its header crc32c, every section's crc32c and the footer xxh64 verify | `SnapshotCorrupt`, `SnapshotUnreadable` |
 //! | 10 | its footer is the `CLEAN`'s, and its header's identity is the `CLEAN`'s | `Footer`, `SnapshotIdentity(field)` |
 //! | 11 | it holds a FILTER section exactly when the table has a filter | `NoFilterSection`, `UnexpectedFilterSection` |
 //!
 //! The load itself (`TableFilters::load_sealed`) then checks the section's
-//! own superblock and column list; a rejection there is `FilterLoad`.
+//! own superblock and column list; a rejection there is `FilterLoad`. The
+//! INDEX sections' entries go to the index load ([`super::load`], B17),
+//! which reads each again against its crc32c; a failure there rebuilds the
+//! indexes and leaves the filter loaded.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +35,7 @@ use super::file_gate::{FileGate, FltAtOpen};
 use super::gate_word::GateState;
 use super::identity::{Identity, IdentityField};
 use super::marker;
-use super::snapshot::{self, SectionKind};
+use super::snapshot::{self, SectionEntry, SectionKind};
 
 /// Why an open did not trust its snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +155,14 @@ pub struct Proven {
     /// The FILTER section's bytes, verified; `None` when the table has no
     /// filter (and the snapshot, correctly, no section).
     pub filter: Option<Vec<u8>>,
+    /// The INDEX sections' entries, checked with the rest of the file; the
+    /// index load reads each again against its crc32c (B17).
+    pub index: Vec<SectionEntry>,
+    /// Whether the snapshot holds a GIN section (none is written in phase
+    /// 2: a table with a gin index rebuilds its indexes).
+    pub has_gin: bool,
+    /// The snapshot's path, for that read.
+    pub path: std::path::PathBuf,
 }
 
 /// Runs the checks of the module documentation against `expected`, the
@@ -193,32 +204,46 @@ fn prove_now(gate: &FileGate, flt: &FltAtOpen, expected: &Identity, has_filter: 
     if let Some(field) = clean.identity.first_mismatch(expected) {
         return Err(Reject::Identity(field));
     }
-    let bytes = match std::fs::read(&ixs) {
-        Ok(b) => b,
+    // Streamed once, front to back, never held whole (§4 "The load"): only
+    // the FILTER section is kept. The INDEX sections are read again, one at
+    // a time and each against its crc32c, by the index load (B17).
+    let mut file = match std::fs::File::open(&ixs) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Reject::NoSnapshot),
         Err(e) => return Err(Reject::SnapshotUnreadable(e.to_string())),
     };
-    if bytes.len() as u64 != clean.snapshot_len {
+    let file_len = file.metadata().map_err(|e| Reject::SnapshotUnreadable(e.to_string()))?.len();
+    if file_len != clean.snapshot_len {
         return Err(Reject::SnapshotLength {
             clean: clean.snapshot_len,
-            file: bytes.len() as u64,
+            file: file_len,
         });
     }
-    let snap = snapshot::decode(&bytes).map_err(|e| Reject::SnapshotCorrupt(e.to_string()))?;
+    let mut reader = io::BufReader::with_capacity(1 << 16, &mut file);
+    let snap = snapshot::verify_stream(&mut reader, file_len, |e| e.kind == SectionKind::Filter && e.ordinal == 0)
+        .map_err(|e| match e {
+            snapshot::StreamError::Format(f) => Reject::SnapshotCorrupt(f.to_string()),
+            snapshot::StreamError::Io(e) => Reject::SnapshotUnreadable(e.to_string()),
+        })?;
     if snap.footer != clean.footer {
         return Err(Reject::Footer);
     }
     if let Some(field) = snap.header.identity.first_mismatch(&clean.identity) {
         return Err(Reject::SnapshotIdentity(field));
     }
-    let section = snap
-        .sections
-        .iter()
-        .find(|(e, _)| e.kind == SectionKind::Filter && e.ordinal == 0)
-        .map(|(_, b)| b.to_vec());
+    let section = snap.kept.into_iter().next().map(|(_, b)| b);
+    let index: Vec<SectionEntry> =
+        snap.header.sections.iter().filter(|e| e.kind == SectionKind::Index).copied().collect();
+    let has_gin = snap.header.sections.iter().any(|e| e.kind == SectionKind::Gin);
+    let proven = |filter| Proven {
+        filter,
+        index,
+        has_gin,
+        path: ixs.clone(),
+    };
     match (section, has_filter) {
-        (Some(b), true) => Ok(Proven { filter: Some(b) }),
-        (None, false) => Ok(Proven { filter: None }),
+        (Some(b), true) => Ok(proven(Some(b))),
+        (None, false) => Ok(proven(None)),
         (None, true) => Err(Reject::NoFilterSection),
         (Some(_), false) => Err(Reject::UnexpectedFilterSection),
     }
