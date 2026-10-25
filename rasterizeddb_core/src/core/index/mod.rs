@@ -70,7 +70,7 @@ use crate::core::row::row::RowWrite;
 use crate::core::row::schema::SchemaField;
 
 pub use decl::{IndexDecl, Method};
-pub use sorted::Sorted;
+pub use sorted::{Sorted, SortedLoad, SortedReject};
 
 /// A key, inline when short (most are: an integer, a UUID, a short string).
 pub type KeyBuf = SmallVec<[u8; 24]>;
@@ -393,6 +393,77 @@ impl LiveIndex {
         f(Sorted::Present(sorted::trimmed(&present)))
     }
 
+    /// Builds this index from a sorted stream (hook C9, see [`sorted`]): a
+    /// snapshot's INDEX section, as [`Self::for_each_sorted`] gave it. The
+    /// stream was checked as it arrived and is checked complete here, before
+    /// anything is touched, so a refused one leaves the index as it was,
+    /// never part loaded; the caller then rebuilds from rows.
+    ///
+    /// Entries go in before the presence bits, as `insert` orders them. The
+    /// unkeyed slots and presence bits are restored as captured, never
+    /// inferred from the entries: a slot forgotten without its key is listed
+    /// and not held, and vacuum's `holds` must keep reading it so.
+    ///
+    /// A superset, never a subset: the load adds and removes nothing. Into
+    /// the empty index an open builds, that is the snapshot. Beside a write
+    /// that got in first (writes wait for the load, §4, but nothing here
+    /// relies on it) it is the union, which lists every version either did.
+    pub fn load_sorted(&self, proof: Proof<'_>, stream: sorted::SortedLoad<KeyBuf>) -> Result<(), sorted::SortedReject> {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::load_sorted");
+        let (keys, slots, unkeyed, present) = stream.into_parts()?;
+        let mut start = 0;
+        let entries = keys.into_iter().map(|(key, end)| {
+            let listed = Slots::from_slice(&slots[start..end]);
+            start = end;
+            (key, listed)
+        });
+        match &self.data {
+            Data::BTree(map) => {
+                let mut map = map.write();
+                if map.is_empty() {
+                    // In key order already, so built in one pass.
+                    *map = entries.collect();
+                } else {
+                    for (key, listed) in entries {
+                        merge_sorted(map.entry(key).or_default(), listed);
+                    }
+                }
+            }
+            Data::Hash(shards, _) => {
+                // Dealt out to the shards first, so each is locked once.
+                let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = (0..HASH_SHARDS).map(|_| Vec::new()).collect();
+                for (key, listed) in entries {
+                    dealt[self.shard(&key)].push((key, listed));
+                }
+                for (shard, part) in shards.iter().zip(dealt) {
+                    let mut shard = shard.write();
+                    shard.reserve(part.len());
+                    for (key, listed) in part {
+                        merge_sorted(shard.entry(key).or_default(), listed);
+                    }
+                }
+            }
+        }
+        {
+            let mut held = self.unkeyed.write();
+            if held.is_empty() {
+                *held = unkeyed;
+            } else {
+                held.extend(unkeyed);
+                held.sort_unstable();
+                held.dedup();
+            }
+        }
+        let mut bits = self.present.write();
+        if bits.len() < present.len() {
+            bits.resize(present.len(), 0);
+        }
+        for (held, loaded) in bits.iter_mut().zip(&present) {
+            *held |= *loaded;
+        }
+        Ok(())
+    }
+
     /// Appends the slots under exactly `key`. `false` when `cap` was exceeded.
     fn lookup_eq(&self, key: &[u8], out: &mut Vec<u64>, cap: usize) -> bool {
         // Measured before copying: a common key (`status = 'shipped'`) lists
@@ -533,6 +604,19 @@ fn add_sorted(slots: &mut Slots, slot: u64) {
             if let Err(at) = slots.binary_search(&slot) {
                 slots.insert(at, slot);
             }
+        }
+    }
+}
+
+/// Adds a loaded posting list, sorted and distinct, to the one already held
+/// under its key, which stays sorted and distinct: taken whole when there is
+/// none, which is every key of a load into an empty index.
+fn merge_sorted(into: &mut Slots, listed: Slots) {
+    if into.is_empty() {
+        *into = listed;
+    } else {
+        for slot in listed {
+            add_sorted(into, slot);
         }
     }
 }

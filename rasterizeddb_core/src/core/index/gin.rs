@@ -48,7 +48,7 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use crate::core::index::IndexDecl;
-use crate::core::index::sorted::{SORTED_BLOCK, Sorted};
+use crate::core::index::sorted::{SORTED_BLOCK, Sorted, SortedLoad, SortedReject};
 use crate::core::index_store::gate::Proof;
 use crate::core::jsonb::{self, GinOpclass};
 
@@ -356,6 +356,73 @@ impl GinIndex {
         f(Sorted::Unkeyed(&unkeyed))?;
         let present = self.present.read().clone();
         f(Sorted::Present(super::sorted::trimmed(&present)))
+    }
+
+    /// Builds this index from a sorted stream (hook C9, see
+    /// [`super::sorted`]): a snapshot's GIN section, as
+    /// [`Self::for_each_sorted`] gave it. Checked complete before anything
+    /// is touched, and adding without removing, as `LiveIndex::load_sorted`
+    /// does, for the same reasons: a refused stream leaves the index as it
+    /// was, and an accepted one keeps it a superset.
+    ///
+    /// The counters are recomputed, not carried over (§4, RV19). `live` is
+    /// the presence bits set, counted under their lock: it changes only in
+    /// `set_present`, so words written straight in would leave it at 0, and
+    /// the first forget would wrap it. `entries` grows by the entries added.
+    /// `forgotten` and `forgotten_slots` are left as they are, 0 and empty
+    /// on the fresh index an open builds: the stream holds no forgotten
+    /// slot's entries (C3 left them out), so a compaction owes it nothing.
+    pub fn load_sorted(&self, proof: Proof<'_>, stream: SortedLoad<u64>) -> Result<(), SortedReject> {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "GinIndex::load_sorted");
+        let (items, slots, unkeyed, present) = stream.into_parts()?;
+        // Dealt out to the shards first, so each is locked once.
+        let mut dealt: Vec<Vec<(u64, &[u64])>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        let mut start = 0;
+        for (item, end) in items {
+            dealt[Self::shard(item)].push((item, &slots[start..end]));
+            start = end;
+        }
+        let mut added = 0u64;
+        for (shard, part) in self.shards.iter().zip(dealt) {
+            let mut shard = shard.write();
+            shard.reserve(part.len());
+            for (item, listed) in part {
+                let list = shard.entry(item).or_default();
+                if list.is_empty() {
+                    list.extend_from_slice(listed);
+                    added += listed.len() as u64;
+                    continue;
+                }
+                for &slot in listed {
+                    if let Err(at) = list.binary_search(&slot) {
+                        list.insert(at, slot);
+                        added += 1;
+                    }
+                }
+            }
+        }
+        self.entries.fetch_add(added, Ordering::Relaxed);
+        {
+            let mut held = self.unkeyed.write();
+            if held.is_empty() {
+                *held = unkeyed;
+            } else {
+                held.extend(unkeyed);
+                held.sort_unstable();
+                held.dedup();
+            }
+        }
+        // Entries before presence bits, as `insert` orders them.
+        let mut bits = self.present.write();
+        if bits.len() < present.len() {
+            bits.resize(present.len(), 0);
+        }
+        for (held, loaded) in bits.iter_mut().zip(&present) {
+            *held |= *loaded;
+        }
+        let live: u64 = bits.iter().map(|w| w.count_ones() as u64).sum();
+        self.live.store(live, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The lists an `All` query walks, as `(length, item)`: the shortest
@@ -1364,6 +1431,93 @@ mod tests {
             want_unkeyed.sort_unstable();
             assert_eq!(unkeyed, want_unkeyed, "{opclass:?}");
             assert_eq!(present.as_slice(), crate::core::index::sorted::trimmed(&g.present.read()), "{opclass:?}");
+        }
+    }
+
+    /// Loads `from`'s stream into a fresh index of its kind (hook C9).
+    fn reloaded(from: &GinIndex, n_slots: u64) -> GinIndex {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        let into = GinIndex::new(decl("loaded"), from.column, from.opclass);
+        let mut load = SortedLoad::<u64>::new(n_slots);
+        from.for_each_sorted(|part| load.push(part)).unwrap();
+        into.load_sorted(proof, load).unwrap();
+        into
+    }
+
+    fn popcount(g: &GinIndex) -> u64 {
+        g.present.read().iter().map(|w| w.count_ones() as u64).sum()
+    }
+
+    /// A loaded index answers every lookup, sparse and dense, as the one
+    /// captured, and its counters are recomputed (RV19): `live` from the
+    /// presence bits, `entries` from the lists, nothing forgotten. Then it
+    /// forgets and compacts like any other: a `live` left at 0 would wrap at
+    /// the first forget.
+    #[test]
+    fn a_loaded_index_answers_as_the_one_captured() {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        let mut r = Rng(0xc9_9e17);
+        for round in 0..12 {
+            let opclass = if round % 2 == 0 { GinOpclass::Ops } else { GinOpclass::PathOps };
+            let (g, under_way) = index_for_streaming(&mut r, opclass);
+            let n_slots = under_way + 1;
+            let loaded = reloaded(&g, n_slots);
+            assert_eq!(capture(&loaded), capture(&g), "{opclass:?}: restored");
+            assert_eq!(loaded.live.load(Ordering::Relaxed), popcount(&g), "{opclass:?}: live");
+            assert_eq!(loaded.live.load(Ordering::Relaxed), g.live.load(Ordering::Relaxed), "{opclass:?}: live");
+            assert_eq!(loaded.entries.load(Ordering::Relaxed) as usize, loaded.sizes().1, "{opclass:?}: entries");
+            assert_eq!(loaded.forgotten.load(Ordering::Relaxed), 0, "{opclass:?}");
+            assert!(loaded.forgotten_slots.lock().is_empty(), "{opclass:?}");
+            for _ in 0..60 {
+                let query = random_query(&mut r, opclass);
+                assert_eq!(loaded.lookup(&query, usize::MAX), g.lookup(&query, usize::MAX), "{opclass:?} {query:?}");
+                assert_eq!(
+                    loaded.lookup_dense(&query, n_slots, usize::MAX),
+                    g.lookup_dense(&query, n_slots, usize::MAX),
+                    "{opclass:?} {query:?} dense"
+                );
+            }
+            for slot in 0..n_slots + 64 {
+                assert_eq!(loaded.holds(slot), g.holds(slot), "{opclass:?}: slot {slot}");
+            }
+            // Forgets after the load count down from the true `live`, and
+            // the compaction they trigger keeps every other slot.
+            let held: Vec<u64> = (0..n_slots).filter(|s| loaded.holds(*s)).collect();
+            let gone: Vec<u64> = held.iter().copied().filter(|s| s % 3 != 0).collect();
+            for (i, slot) in gone.iter().enumerate() {
+                loaded.forget(proof, *slot);
+                assert_eq!(loaded.live.load(Ordering::Relaxed), (held.len() - i - 1) as u64, "{opclass:?}: live after forgetting {slot}");
+            }
+            assert!(loaded.forgotten.load(Ordering::Relaxed) < gone.len() as u64, "{opclass:?}: no compaction ran");
+            assert_eq!(loaded.entries.load(Ordering::Relaxed) as usize, loaded.sizes().1, "{opclass:?}: entries after compactions");
+            let q = contains_query(&doc(r#"{"status":"s1"}"#), opclass).unwrap();
+            let got = loaded.lookup(&q, usize::MAX).unwrap();
+            let want = g.lookup(&q, usize::MAX).unwrap();
+            let kept: Vec<u64> = want.into_iter().filter(|s| s % 3 == 0).collect();
+            assert_eq!(got, kept, "{opclass:?}: a live slot lost after a load and a compaction");
+        }
+    }
+
+    /// A broken stream is refused and leaves a gin index as it was.
+    #[test]
+    fn a_broken_stream_leaves_a_gin_index_as_it_was() {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        let g = GinIndex::new(decl("b"), 0, GinOpclass::Ops);
+        g.insert(proof, 3, Some(&doc(r#"{"a":1}"#)));
+        let before = (capture(&g), g.live.load(Ordering::Relaxed), g.entries.load(Ordering::Relaxed));
+        for parts in [
+            vec![Sorted::Entry(1, &[0][..]), Sorted::Entry(2, &[2, 1]), Sorted::Unkeyed(&[]), Sorted::Present(&[0b111])],
+            vec![Sorted::Entry(1, &[0][..]), Sorted::Entry(2, &[1]), Sorted::Unkeyed(&[])],
+            vec![Sorted::Entry(1, &[0][..]), Sorted::Unkeyed(&[]), Sorted::Present(&[1 << 40])],
+        ] {
+            let mut load = SortedLoad::<u64>::new(8);
+            let result = parts.iter().try_for_each(|p| load.push(*p)).and_then(|()| g.load_sorted(proof, load));
+            assert!(result.is_err(), "{parts:?}");
+            let after = (capture(&g), g.live.load(Ordering::Relaxed), g.entries.load(Ordering::Relaxed));
+            assert_eq!(after, before, "{parts:?}");
         }
     }
 }

@@ -1112,3 +1112,416 @@ fn the_sorted_stream_stops_at_an_error() {
         assert_eq!((got, seen), (Err("stop"), 1500), "{method:?}");
     }
 }
+
+/// Loads `from`'s stream into `into` (hook C9), as a snapshot load does.
+fn reload(from: &LiveIndex, into: &LiveIndex, n_slots: u64, proof: Proof<'_>) -> Result<(), SortedReject> {
+    let mut load = SortedLoad::<KeyBuf>::new(n_slots);
+    from.for_each_sorted(|part| load.push(part))?;
+    into.load_sorted(proof, load)
+}
+
+/// The layouts of [`candidates_are_always_a_superset_of_the_matches`], built
+/// fresh each call.
+fn planner_layouts() -> Vec<Vec<Arc<LiveIndex>>> {
+    vec![
+        vec![index("n_bt", Method::BTree, &[0])],
+        vec![index("s_bt", Method::BTree, &[1]), index("f_h", Method::Hash, &[2])],
+        vec![index("ns_bt", Method::BTree, &[0, 1])],
+        vec![index("sn_bt", Method::BTree, &[1, 0]), index("n_h", Method::Hash, &[0])],
+        vec![index("fs_bt", Method::BTree, &[2, 1]), index("nsf_h", Method::Hash, &[0, 1, 2])],
+        vec![
+            index("n_h", Method::Hash, &[0]),
+            index("s_bt", Method::BTree, &[1]),
+            index("f_h", Method::Hash, &[2]),
+            index("n_bt", Method::BTree, &[0]),
+        ],
+    ]
+}
+
+/// The superset property through a snapshot: indexes filled by inserts,
+/// in-place moves and vacuum's forgets are captured (C3) and loaded into
+/// fresh ones (C9). Every query is answered by the loaded indexes exactly as
+/// by the captured ones, and every live row that matches is among the
+/// candidates. A load that dropped an entry, an unkeyed slot or a presence
+/// bit fails here.
+#[test]
+fn a_loaded_index_answers_as_the_one_captured() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let schema: Vec<SchemaField> = fields();
+    let mut r = Rng(0xC9C9_0001);
+    for (layout, fresh) in planner_layouts().into_iter().zip(planner_layouts()) {
+        let indexes = TableIndexes::new(layout);
+        let mut rows: Vec<Vec<Vec<u8>>> = (0..400).map(|_| (0..3).map(|c| value(&mut r, c)).collect()).collect();
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, r.below(i as u64 + 1) as usize);
+        }
+        for &slot in &order {
+            let row = &rows[slot];
+            for ix in &indexes.list {
+                let key = if r.below(20) == 0 { None } else { ix.key_of(|wo| Some(row[wo as usize].as_slice())) };
+                ix.insert(proof, slot as u64, key);
+            }
+        }
+        // Updated in place: each index moves the slot to its new key.
+        for _ in 0..40 {
+            let slot = r.below(rows.len() as u64);
+            let new: Vec<Vec<u8>> = (0..3).map(|c| value(&mut r, c)).collect();
+            for ix in &indexes.list {
+                let old = ix.key_of(|wo| Some(rows[slot as usize][wo as usize].as_slice()));
+                let key = ix.key_of(|wo| Some(new[wo as usize].as_slice()));
+                if old != key {
+                    ix.insert(proof, slot, key);
+                    if let Some(old) = old {
+                        ix.remove(proof, slot, &old);
+                    }
+                }
+            }
+            rows[slot as usize] = new;
+        }
+        // Reclaimed by vacuum, most with their keys read back, some not.
+        let mut live = vec![true; rows.len()];
+        for _ in 0..60 {
+            let slot = r.below(rows.len() as u64);
+            let row = rows[slot as usize].clone();
+            let get = |wo: u32| row.get(wo as usize).map(|v| v.as_slice());
+            indexes.forget(proof, slot, if r.below(4) == 0 { None } else { Some(&get) });
+            live[slot as usize] = false;
+        }
+        let loaded = TableIndexes::new(fresh);
+        for (from, into) in indexes.list.iter().zip(&loaded.list) {
+            reload(from, into, rows.len() as u64, proof).unwrap();
+        }
+        // Every query for the superset first, then each answer against the
+        // captured indexes' own.
+        let queries: Vec<(MaskExpr, usize)> =
+            (0..3_000).map(|_| (expr(&mut r, 3), if r.below(3) == 0 { 60 } else { usize::MAX })).collect();
+        let mut used = 0;
+        for (e, cap) in &queries {
+            let Some(candidates) = loaded.plan(e, &schema, *cap) else {
+                continue;
+            };
+            used += 1;
+            for (slot, row) in rows.iter().enumerate() {
+                if live[slot] && eval(row, e) {
+                    assert!(
+                        candidates.binary_search(&(slot as u64)).is_ok(),
+                        "slot {slot} matches {e:?} but the loaded index missed it (row {row:?})"
+                    );
+                }
+            }
+        }
+        for (e, cap) in &queries {
+            assert_eq!(loaded.plan(e, &schema, *cap), indexes.plan(e, &schema, *cap), "{e:?}: answered differently after a load");
+        }
+        assert!(used > 100, "the planner answered too few queries to test ({used})");
+        for slot in 0..rows.len() as u64 + 64 {
+            assert_eq!(loaded.holds(slot), indexes.holds(slot), "slot {slot}: presence after a load");
+        }
+        for (from, into) in indexes.list.iter().zip(&loaded.list) {
+            assert_eq!(capture(into), capture(from), "{}: restored", from.decl.name);
+        }
+    }
+}
+
+/// The same over the stream tests' indexes, a path index among them, with
+/// a key per document and many duplicates: every key's slots, every range,
+/// and every presence bit come back as captured.
+#[test]
+fn every_lookup_of_a_loaded_index_is_the_captured_ones() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let mut r = Rng(0xC9C9_0002);
+    let rows = stream_rows(&mut r, 3000);
+    for (ix, into) in stream_indexes().into_iter().zip(stream_indexes()) {
+        let name = ix.decl.name.clone();
+        churn(&ix, &rows, &mut r, proof);
+        reload(&ix, &into, rows.len() as u64, proof).unwrap();
+        let captured = capture(&ix);
+        assert_eq!(capture(&into), captured, "{name}");
+        assert_eq!(into.sizes(), ix.sizes(), "{name}");
+        // Equality on every key held, and on keys held nowhere.
+        for (key, _) in &captured.entries {
+            assert_eq!(into.slots_for_key(key), ix.slots_for_key(key), "{name}: {key:?}");
+        }
+        assert_eq!(into.slots_for_key(b"\x01absent"), ix.slots_for_key(b"\x01absent"), "{name}");
+        // Ranges between keys held, open and closed, both ends.
+        if ix.method() == Method::BTree {
+            for _ in 0..500 {
+                let pick = |r: &mut Rng| captured.entries[r.below(captured.entries.len() as u64) as usize].0.clone();
+                let (a, b) = (pick(&mut r), pick(&mut r));
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let bound = |v: &[u8], r: &mut Rng| match r.below(3) {
+                    0 => Bound::Included(v.to_vec()),
+                    1 => Bound::Excluded(v.to_vec()),
+                    _ => Bound::Unbounded,
+                };
+                let (lo, hi) = (bound(&lo, &mut r), bound(&hi, &mut r));
+                let range = |i: &LiveIndex| {
+                    let mut out = Vec::new();
+                    assert!(i.lookup_range(lo.as_ref().map(|v| v.as_slice()), hi.as_ref().map(|v| v.as_slice()), &mut out, usize::MAX));
+                    out.sort_unstable();
+                    out
+                };
+                assert_eq!(range(&into), range(&ix), "{name}: {lo:?}..{hi:?}");
+            }
+        }
+        for slot in 0..rows.len() as u64 + 64 {
+            assert_eq!(into.holds(slot), ix.holds(slot), "{name}: slot {slot}");
+        }
+    }
+}
+
+/// The parts of a stream, owned, so a test can break one.
+#[derive(Debug, Clone)]
+enum Part {
+    Entry(Vec<u8>, Vec<u64>),
+    Unkeyed(Vec<u64>),
+    Present(Vec<u64>),
+}
+
+impl Part {
+    fn sorted(&self) -> Sorted<'_, &[u8]> {
+        match self {
+            Part::Entry(k, s) => Sorted::Entry(k, s),
+            Part::Unkeyed(s) => Sorted::Unkeyed(s),
+            Part::Present(w) => Sorted::Present(w),
+        }
+    }
+}
+
+fn parts_of(c: &Captured) -> Vec<Part> {
+    let mut parts: Vec<Part> = c.entries.iter().map(|(k, s)| Part::Entry(k.clone(), s.clone())).collect();
+    parts.push(Part::Unkeyed(c.unkeyed.clone()));
+    parts.push(Part::Present(c.present.clone()));
+    parts
+}
+
+/// The stream's rules, written out apart from `SortedLoad`, for the fuzz
+/// test to judge it by.
+fn well_formed(parts: &[Part], n_slots: u64) -> bool {
+    let ascending = |s: &[u64]| s.windows(2).all(|w| w[0] < w[1]) && s.last().is_none_or(|l| *l < n_slots);
+    let mut last_key: Option<&Vec<u8>> = None;
+    let mut stage = 0;
+    for p in parts {
+        match p {
+            Part::Entry(k, s) => {
+                if stage != 0 || s.is_empty() || !ascending(s) || last_key.is_some_and(|l| l >= k) {
+                    return false;
+                }
+                last_key = Some(k);
+            }
+            Part::Unkeyed(s) => {
+                if stage != 0 || !ascending(s) {
+                    return false;
+                }
+                stage = 1;
+            }
+            Part::Present(w) => {
+                let past = (0..w.len() * 64).any(|b| w[b / 64] & (1 << (b % 64)) != 0 && b as u64 >= n_slots);
+                if stage != 1 || past {
+                    return false;
+                }
+                stage = 2;
+            }
+        }
+    }
+    stage == 2
+}
+
+/// Breaks a stream the ways rot and a bad writer would.
+fn break_stream(parts: &mut Vec<Part>, r: &mut Rng, n_slots: u64) {
+    let n = parts.len();
+    let at = r.below(n as u64) as usize;
+    match r.below(12) {
+        0 if n > 1 => {
+            let b = r.below(n as u64) as usize;
+            parts.swap(at, b);
+        }
+        1 => {
+            let p = parts[at].clone();
+            parts.insert(at, p);
+        }
+        2 => {
+            parts.remove(at);
+        }
+        3 => parts.truncate(at),
+        4 => match &mut parts[at] {
+            Part::Entry(k, _) if !k.is_empty() => {
+                let i = r.below(k.len() as u64) as usize;
+                k[i] ^= 1 << r.below(8);
+            }
+            Part::Entry(k, _) => k.push(r.below(256) as u8),
+            Part::Unkeyed(s) | Part::Present(s) => s.push(r.below(n_slots + 8)),
+        },
+        5 => match &mut parts[at] {
+            Part::Entry(_, s) | Part::Unkeyed(s) | Part::Present(s) if !s.is_empty() => {
+                let i = r.below(s.len() as u64) as usize;
+                s[i] = s[i].wrapping_add(r.below(5)).wrapping_sub(2);
+            }
+            _ => {}
+        },
+        6 => match &mut parts[at] {
+            Part::Entry(_, s) | Part::Unkeyed(s) => s.clear(),
+            Part::Present(w) => w.push(1),
+        },
+        7 => match &mut parts[at] {
+            Part::Entry(_, s) | Part::Unkeyed(s) if !s.is_empty() => {
+                let i = r.below(s.len() as u64) as usize;
+                s.insert(i, s[i]);
+            }
+            _ => {}
+        },
+        8 => match &mut parts[at] {
+            Part::Entry(_, s) | Part::Unkeyed(s) => s.push(n_slots + r.below(3)),
+            Part::Present(w) => {
+                let bit = n_slots + r.below(130);
+                let word = (bit / 64) as usize;
+                if w.len() <= word {
+                    w.resize(word + 1, 0);
+                }
+                w[word] |= 1 << (bit % 64);
+            }
+        },
+        9 => parts.push(Part::Entry(vec![0xFF; 3], vec![0])),
+        10 => {
+            let p = parts.remove(at);
+            let to = r.below(parts.len() as u64 + 1) as usize;
+            parts.insert(to, p);
+        }
+        // A harmless change the rules allow: a trailing zero word.
+        _ => {
+            if let Some(Part::Present(w)) = parts.last_mut() {
+                w.push(0);
+            }
+        }
+    }
+}
+
+/// A stream broken any way is refused, never panics, and never leaves part
+/// of itself behind: the index is what it was, entry for entry. A stream
+/// the rules accept loads whole, added to what was there. Judged against
+/// [`well_formed`], written apart from `SortedLoad`.
+#[test]
+fn a_broken_stream_is_refused_and_loads_nothing() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let mut r = Rng(0xC9C9_0003);
+    let n_slots = 700u64;
+    let rows: Vec<Vec<Vec<u8>>> = (0..n_slots as usize)
+        .map(|_| vec![(r.below(300) as i64).to_le_bytes().to_vec(), value(&mut r, 1)])
+        .collect();
+    let (mut refused, mut taken) = (0, 0);
+    for method in [Method::BTree, Method::Hash] {
+        let source = index("src", method, &[0]);
+        churn(&source, &rows, &mut r, proof);
+        let captured = capture(&source);
+        for case in 0..1500 {
+            let mut parts = parts_of(&captured);
+            for _ in 0..1 + r.below(3) {
+                if parts.is_empty() {
+                    break;
+                }
+                break_stream(&mut parts, &mut r, n_slots);
+            }
+            // Half into a fresh index, half into one already holding some
+            // entries, which the load must add to.
+            let target = index("dst", method, &[0]);
+            if case % 2 == 1 {
+                for slot in (0..n_slots).step_by(37) {
+                    let bytes = (slot as i64 % 50).to_le_bytes();
+                    target.insert(proof, slot, target.key_of(|_| Some(&bytes[..])));
+                }
+                target.insert(proof, 5, None);
+                target.forget(proof, 74, None);
+            }
+            let before = capture(&target);
+            let mut load = SortedLoad::<KeyBuf>::new(n_slots);
+            let result = parts
+                .iter()
+                .try_for_each(|p| load.push(p.sorted()))
+                .and_then(|()| target.load_sorted(proof, load));
+            assert_eq!(result.is_ok(), well_formed(&parts, n_slots), "{method:?} case {case}: {result:?}");
+            let after = capture(&target);
+            if result.is_err() {
+                refused += 1;
+                assert_eq!(after, before, "{method:?} case {case}: a refused stream changed the index");
+                continue;
+            }
+            taken += 1;
+            // Accepted: the union of what was there and what was loaded.
+            let mut want = std::collections::BTreeMap::<Vec<u8>, std::collections::BTreeSet<u64>>::new();
+            let mut unkeyed: std::collections::BTreeSet<u64> = before.unkeyed.iter().copied().collect();
+            let mut present = before.present.clone();
+            for (k, s) in &before.entries {
+                want.entry(k.clone()).or_default().extend(s);
+            }
+            for p in &parts {
+                match p {
+                    Part::Entry(k, s) => want.entry(k.clone()).or_default().extend(s),
+                    Part::Unkeyed(s) => unkeyed.extend(s),
+                    Part::Present(w) => {
+                        if present.len() < w.len() {
+                            present.resize(w.len(), 0);
+                        }
+                        for (h, l) in present.iter_mut().zip(w) {
+                            *h |= *l;
+                        }
+                    }
+                }
+            }
+            let want = Captured {
+                entries: want.into_iter().map(|(k, s)| (k, s.into_iter().collect())).collect(),
+                unkeyed: unkeyed.into_iter().collect(),
+                present: sorted::trimmed(&present).to_vec(),
+            };
+            assert_eq!(after, want, "{method:?} case {case}: not the union");
+        }
+    }
+    assert!(refused > 1000 && taken > 100, "the fuzz missed one side: {refused} refused, {taken} taken");
+}
+
+/// A load is a mutation the census (V3) records at the structure it fills,
+/// under the proof it was given, refused or not; a capture changes nothing
+/// and records nothing.
+#[test]
+fn a_load_is_a_mutation_the_census_sees_and_a_capture_is_not() {
+    use crate::core::index_store::census::{Census, Event};
+    use crate::core::jsonb::GinOpclass;
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let gin_decl = IndexDecl {
+        name: "g".into(),
+        method: Method::GinOps,
+        unique: false,
+        columns: vec![3],
+        is_deleted: false,
+    };
+    let (ix, into, refused) = (index("c", Method::BTree, &[0]), index("c", Method::BTree, &[0]), index("c", Method::Hash, &[0]));
+    let (g, ginto) = (gin::GinIndex::new(gin_decl.clone(), 3, GinOpclass::Ops), gin::GinIndex::new(gin_decl, 3, GinOpclass::Ops));
+    for slot in 0..10u64 {
+        let bytes = (slot as i64).to_le_bytes();
+        ix.insert(proof, slot, ix.key_of(|_| Some(&bytes[..])));
+        g.insert(proof, slot, Some(&crate::core::jsonb::encode_text(&format!(r#"{{"n":{slot}}}"#)).unwrap()));
+    }
+    let census = Census::start();
+    reload(&ix, &into, 10, proof).unwrap();
+    let mut load = SortedLoad::<u64>::new(10);
+    g.for_each_sorted(|part| load.push(part)).unwrap();
+    ginto.load_sorted(proof, load).unwrap();
+    assert!(refused.load_sorted(proof, SortedLoad::new(10)).is_err());
+    let events = census.finish();
+    let addr = |p: *const ()| p as usize;
+    let recorded = |at: usize, name: &str| {
+        events.iter().any(|e| matches!(e, Event::Mutation { at: a, what, .. } if *a == at && *what == name))
+    };
+    assert!(recorded(addr(&*into as *const LiveIndex as *const ()), "LiveIndex::load_sorted"));
+    assert!(recorded(addr(&*refused as *const LiveIndex as *const ()), "LiveIndex::load_sorted"));
+    assert!(recorded(addr(&ginto as *const gin::GinIndex as *const ()), "GinIndex::load_sorted"));
+    let read = [addr(&*ix as *const LiveIndex as *const ()), addr(&g as *const gin::GinIndex as *const ())];
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Mutation { at, .. } if read.contains(at))),
+        "a capture recorded a mutation"
+    );
+}
