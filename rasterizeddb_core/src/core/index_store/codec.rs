@@ -11,19 +11,16 @@
 
 use std::fmt;
 
-/// CRC-32C, slice-by-16. A `static`, not a `const`: the table is 16 KiB and a
-/// `const` would be copied into every use.
-static CRC32C: crc::Crc<u32, crc::Table<16>> = crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISCSI);
-
-/// CRC-32C of `bytes`.
+/// CRC-32C of `bytes` (`core::hash::crc32c`: the SSE 4.2 instruction where
+/// the CPU has it, slice-by-16 otherwise; one function).
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    CRC32C.checksum(bytes)
+    crate::core::hash::crc32c::crc32c(bytes)
 }
 
 /// CRC-32C over bytes fed in pieces: what [`crc32c`] gives for their
 /// concatenation.
-pub(crate) fn crc32c_digest() -> crc::Digest<'static, u32, crc::Table<16>> {
-    CRC32C.digest()
+pub(crate) fn crc32c_digest() -> crate::core::hash::crc32c::Digest {
+    crate::core::hash::crc32c::Digest::new()
 }
 
 /// Why bytes are not a valid file of one of the index store's formats.

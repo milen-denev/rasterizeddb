@@ -220,11 +220,13 @@ fn prove_now(gate: &FileGate, flt: &FltAtOpen, expected: &Identity, has_filter: 
         });
     }
     let mut reader = io::BufReader::with_capacity(1 << 16, &mut file);
+    let streamed = std::time::Instant::now();
     let snap = snapshot::verify_stream(&mut reader, file_len, |e| e.kind == SectionKind::Filter && e.ordinal == 0)
         .map_err(|e| match e {
             snapshot::StreamError::Format(f) => Reject::SnapshotCorrupt(f.to_string()),
             snapshot::StreamError::Io(e) => Reject::SnapshotUnreadable(e.to_string()),
         })?;
+    log::debug!("{}: {file_len} snapshot bytes read and checked in {:.3} s", ixs.display(), streamed.elapsed().as_secs_f64());
     if snap.footer != clean.footer {
         return Err(Reject::Footer);
     }

@@ -732,8 +732,19 @@ fn load_now(
     // thread per section, as the indexes are independent.
     let n_slots = o.n_slots;
     let decode_one = |e: &SectionEntry| -> Result<_, LoadError> {
+        let at = std::time::Instant::now();
         let bytes = snapshot::read_section(path, e).map_err(|err| LoadError::Read(e.ordinal, err))?;
-        index_section::decode(&bytes, n_slots).map_err(|err| LoadError::Section(e.ordinal, err))
+        let read = at.elapsed();
+        let stream = index_section::decode(&bytes, n_slots).map_err(|err| LoadError::Section(e.ordinal, err))?;
+        log::debug!(
+            "{}: INDEX section {} ({} bytes): read and checked {:.3} s, decoded {:.3} s",
+            o.name,
+            e.ordinal,
+            e.len,
+            read.as_secs_f64(),
+            (at.elapsed() - read).as_secs_f64()
+        );
+        Ok(stream)
     };
     let streams: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = sections.iter().map(|e| scope.spawn(move || decode_one(e))).collect();
@@ -748,7 +759,12 @@ fn load_now(
             .zip(o.indexes.list.iter())
             .zip(sections)
             .map(|((stream, ix), e)| {
-                scope.spawn(move || ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r)))
+                scope.spawn(move || {
+                    let at = std::time::Instant::now();
+                    let loaded = ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r));
+                    log::debug!("{}: index {} installed in {:.3} s", o.name, ix.decl.name, at.elapsed().as_secs_f64());
+                    loaded
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("an index load panicked")).collect()

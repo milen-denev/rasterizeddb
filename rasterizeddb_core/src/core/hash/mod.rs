@@ -8,8 +8,10 @@
 //! [`xxh64`] is the default, for everything persisted or routed. GIN items,
 //! alone, hash through [`ItemFeed::rapid`] (rapidhash at one frozen upstream
 //! version, in the private `rapidhash` module): see that module for why, and
-//! `source_tests` for the fence that keeps it to them.
+//! `source_tests` for the fence that keeps it to them. [`crc32c`] is the
+//! index store's file checksum.
 
+pub mod crc32c;
 pub mod xxh64;
 mod rapidhash;
 #[cfg(test)]
