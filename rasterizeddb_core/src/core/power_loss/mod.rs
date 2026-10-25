@@ -52,6 +52,8 @@ pub mod image;
 mod image_tests;
 #[cfg(test)]
 mod twin_tests;
+#[cfg(test)]
+mod phase1_tests;
 
 use std::path::{Path, PathBuf};
 

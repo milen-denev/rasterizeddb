@@ -1212,6 +1212,10 @@ impl Wal {
         let mut voided = 0usize;
 
         for w in held {
+            // Persistent indexes §11: an in-place apply failing after its
+            // commit marker is durable (the log is poisoned by the caller).
+            #[cfg(any(test, feature = "index_store_failpoints"))]
+            crate::core::power_loss::failpoint::hit("apply_held_fails_then_shutdown", &w.path)?;
             // The payload is already on stable storage in the log, so read it
             // back from there rather than having kept a second copy in memory.
             let reader = match log_reader {
