@@ -446,9 +446,9 @@ async fn serve_pgwire(
         shutdown_tx.send_replace(true);
     });
 
-    // Raised once the drain grace has passed: every session still open
-    // ends at its next idle read (`end_remaining_sessions`).
-    let (ending_tx, ending_rx) = tokio::sync::watch::channel(false);
+    // Every session this server admits, so the shutdown can end the ones
+    // still open after the drain grace (`end_remaining_sessions`).
+    let sessions = SessionsEnd::register(&catalog);
 
     // Sessions admitted, against `max_connections`.
     let active = StdArc::new(AtomicUsize::new(0));
@@ -581,9 +581,9 @@ async fn serve_pgwire(
         let tls_mode = tls.mode;
         let acceptor = acceptor.clone();
         let auth = auth.clone();
+        let registered = sessions.admit(&stream);
 
-        let ending = ending_rx.clone();
-        tokio::spawn(SESSIONS_END.scope(ending, async move {
+        tokio::spawn(async move {
             let context = ConnectionContext {
                 too_many: matches!(admission, Admission::TooMany(_)),
                 handshake_finished: StdArc::new(AtomicBool::new(false)),
@@ -596,11 +596,12 @@ async fn serve_pgwire(
             }
             // Released here at the latest; on a panic, by the unwind.
             drop(admission);
-        }));
+            drop(registered);
+        });
     }
 
     drain_pgwire_connections(&active).await;
-    end_remaining_sessions(&active, &ending_tx).await;
+    end_remaining_sessions(&active, &sessions).await;
 
     Ok(())
 }
@@ -678,11 +679,96 @@ async fn drain_pgwire_connections(active: &AtomicUsize) {
     }
 }
 
-tokio::task_local! {
-    /// The server's "end every session" signal, in each connection task
-    /// (§3 Shutdown, RV17): per server, so a test process running several
-    /// servers ends only the stopping one's sessions.
-    static SESSIONS_END: tokio::sync::watch::Receiver<bool>;
+/// Each running server's sessions, so its shutdown can end the ones still
+/// open after the drain grace (§3 Shutdown, RV17). Keyed by the server's
+/// catalogue, so a test process running several servers ends only the
+/// stopping one's.
+///
+/// Ending a session costs its statements nothing: the server shuts down the
+/// read half of each session's socket (through a duplicate of its
+/// descriptor, which keeps the socket alive until the session's entry is
+/// gone, so a reused descriptor number is never touched), the session's next
+/// read finds the end of the stream, and, seeing its server ending, it rolls
+/// its block back and says 57P01 on the write half, which stays open. A
+/// statement running when that happens finishes first. (Racing every idle
+/// read against a signal cost ~0.7% of a prepared statement's instructions.)
+struct SessionsEnd {
+    key: usize,
+    server: StdArc<ServerSessions>,
+}
+
+#[derive(Default)]
+struct ServerSessions {
+    ending: AtomicBool,
+    next: std::sync::atomic::AtomicU64,
+    open: parking_lot::Mutex<Vec<(u64, std::net::TcpStream)>>,
+}
+
+static SERVERS: parking_lot::Mutex<Vec<(usize, StdArc<ServerSessions>)>> = parking_lot::Mutex::new(Vec::new());
+
+/// One admitted session's entry; removed (its duplicate descriptor closed)
+/// when dropped.
+struct SessionEntry {
+    server: StdArc<ServerSessions>,
+    id: u64,
+}
+
+impl Drop for SessionEntry {
+    fn drop(&mut self) {
+        self.server.open.lock().retain(|(id, _)| *id != self.id);
+    }
+}
+
+impl SessionsEnd {
+    fn register(catalog: &Arc<DatabaseCatalog>) -> SessionsEnd {
+        let key = Arc::as_ptr(catalog) as usize;
+        let server = StdArc::new(ServerSessions::default());
+        SERVERS.lock().push((key, server.clone()));
+        SessionsEnd { key, server }
+    }
+
+    /// Records an admitted session's socket. `None` when its descriptor
+    /// cannot be duplicated (the session then just runs to its end).
+    fn admit(&self, stream: &TcpStream) -> Option<SessionEntry> {
+        use std::os::fd::AsFd;
+        let dup = stream.as_fd().try_clone_to_owned().ok()?;
+        let id = self.server.next.fetch_add(1, Ordering::Relaxed);
+        self.server.open.lock().push((id, std::net::TcpStream::from(dup)));
+        Some(SessionEntry {
+            server: self.server.clone(),
+            id,
+        })
+    }
+
+    /// Marks the server ending and shuts down the read half of every open
+    /// session's socket.
+    fn end_all(&self) {
+        self.server.ending.store(true, Ordering::Release);
+        for (_, socket) in self.server.open.lock().iter() {
+            let _ = socket.shutdown(std::net::Shutdown::Read);
+        }
+    }
+
+    /// Whether the server serving `catalog` is ending its sessions: what a
+    /// session asks when its read finds the end of the stream.
+    fn ending_for(catalog: &Arc<DatabaseCatalog>) -> bool {
+        let key = Arc::as_ptr(catalog) as usize;
+        SERVERS
+            .lock()
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .is_some_and(|(_, s)| s.ending.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for SessionsEnd {
+    fn drop(&mut self) {
+        let mut all = SERVERS.lock();
+        if let Some(i) = all.iter().rposition(|(k, s)| *k == self.key && StdArc::ptr_eq(s, &self.server)) {
+            all.remove(i);
+        }
+    }
 }
 
 /// After the drain grace (docs/persistent-indexes.md §3 Shutdown, RV17):
@@ -691,7 +777,7 @@ tokio::task_local! {
 /// shutdown seals anything. A statement running is not interrupted: it
 /// ends first (a commit path is never cut after its `commit()`), and the
 /// wait for that is bounded too.
-async fn end_remaining_sessions(active: &AtomicUsize, ending: &tokio::sync::watch::Sender<bool>) {
+async fn end_remaining_sessions(active: &AtomicUsize, sessions: &SessionsEnd) {
     const END_GRACE: Duration = Duration::from_secs(5);
     if active.load(Ordering::Relaxed) == 0 {
         return;
@@ -700,7 +786,7 @@ async fn end_remaining_sessions(active: &AtomicUsize, ending: &tokio::sync::watc
         "Ending {} remaining pgwire session(s) before the shutdown seals",
         active.load(Ordering::Relaxed)
     );
-    ending.send_replace(true);
+    sessions.end_all();
     let deadline = tokio::time::Instant::now() + END_GRACE;
     while active.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1764,8 +1850,6 @@ where
     // is read.
     let mut pending: std::collections::VecDeque<(u8, Vec<u8>)> = std::collections::VecDeque::new();
 
-    // The server's shutdown signal, when this session runs under one.
-    let mut ending = SESSIONS_END.try_with(|rx| rx.clone()).ok();
 
     loop {
         let (tag, payload) = match pending.pop_front() {
@@ -1782,49 +1866,29 @@ where
                 // completed has consumed nothing, so a message arriving as the timer
                 // fires is not torn.
                 let idle = if ready { state.idle_limit() } else { None };
-                // Shutdown ends an idle session here, between statements, and
-                // only here (§3 Shutdown): never mid-batch, never mid-statement.
-                let wake = {
-                    let read = async {
-                        match idle {
-                            None => Wake::Read(stream.read_exact(&mut tag).await),
-                            Some((limit, kind)) => {
-                                match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
-                                    Ok(read) => Wake::Read(read),
-                                    Err(_) => Wake::Idle(kind),
-                                }
-                            }
+                let read = match idle {
+                    None => stream.read_exact(&mut tag).await,
+                    Some((limit, kind)) => {
+                        match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
+                            Ok(read) => read,
+                            Err(_) => return terminate_idle_session(database, state, stream, kind).await,
                         }
-                    };
-                    let end = async {
-                        if let Some(rx) = ending.as_mut().filter(|_| ready)
-                            && rx.wait_for(|end| *end).await.is_ok()
-                        {
-                            return Wake::Ending;
-                        }
-                        // No signal, or its sender gone: only a read wakes.
-                        std::future::pending().await
-                    };
-                    tokio::select! {
-                        biased;
-                        w = end => w,
-                        w = read => w,
                     }
                 };
-                let read = match wake {
-                    Wake::Read(read) => read,
-                    Wake::Idle(kind) => return terminate_idle_session(database, state, stream, kind).await,
-                    Wake::Ending => {
-                        return terminate_session(
-                            database,
-                            state,
-                            stream,
-                            "57P01",
-                            "terminating connection due to administrator command",
-                        )
-                        .await;
-                    }
-                };
+                // The end of the stream (or a read the shutdown broke) while
+                // the server is ending its sessions (`SessionsEnd`): the
+                // block is rolled back and the client told 57P01, on the
+                // write half the shutdown left open.
+                if read.is_err() && SessionsEnd::ending_for(&state.catalog) {
+                    return terminate_session(
+                        database,
+                        state,
+                        stream,
+                        "57P01",
+                        "terminating connection due to administrator command",
+                    )
+                    .await;
+                }
                 match read {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -1977,14 +2041,6 @@ where
         IdleKind::Session => ("57P05", "terminating connection due to idle-session timeout"),
     };
     terminate_session(database, state, stream, sqlstate, message).await
-}
-
-/// What a read between statements woke for.
-enum Wake {
-    Read(io::Result<usize>),
-    Idle(IdleKind),
-    /// The server is shutting down (`end_remaining_sessions`).
-    Ending,
 }
 
 /// Ends the session with a FATAL `sqlstate`, its open block rolled back
@@ -8121,7 +8177,13 @@ where
 /// statement the engine misreads; `None` for any other statement. A
 /// function, not grammar (§3: new grammar has repeatedly mis-parsed here).
 fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
-    let s = stmt.trim().trim_end_matches(';').trim_end();
+    // Every statement passes here: anything not opening with `s` is turned
+    // away on its first byte.
+    let s = stmt.trim_start();
+    if !matches!(s.as_bytes().first(), Some(b's' | b'S')) {
+        return None;
+    }
+    let s = s.trim_end().trim_end_matches(';').trim_end();
     let head = "select rdb_index_checkpoint(";
     if !s.get(..head.len()).is_some_and(|h| h.eq_ignore_ascii_case(head)) || !s.ends_with(')') {
         return None;
@@ -11562,13 +11624,18 @@ mod index_store_wire_tests {
             superuser: false,
             authenticated: false,
         };
-        let (end_tx, end_rx) = tokio::sync::watch::channel(false);
-        let (mut server, mut client) = tokio::io::duplex(1 << 20);
+        // A real loopback socket: the shutdown ends a session through it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let sessions = SessionsEnd::register(&catalog);
+        let entry = sessions.admit(&server).expect("the socket is registered");
         let session_db = db.clone();
-        let session = tokio::spawn(SESSIONS_END.scope(end_rx, async move {
+        let session = tokio::spawn(async move {
+            let _entry = entry;
             let mut state = SessionState::new(catalog, session_db.name.clone(), auth, principal, ConnectionLimits::default());
             run_message_loop_inner(&session_db, &mut state, &mut server).await
-        }));
+        });
         for sql in [
             "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)",
             "BEGIN",
@@ -11580,7 +11647,7 @@ mod index_store_wire_tests {
         }
         let t = db.table_for_tests("t").unwrap();
         assert!(t.gate().word().load().count() > 0, "the block holds no ticket on t");
-        end_tx.send_replace(true);
+        sessions.end_all();
         let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
         assert!(ended.is_ok(), "an idle-in-transaction session outlived the shutdown signal");
         let fatal = frames(&mut client).await;
