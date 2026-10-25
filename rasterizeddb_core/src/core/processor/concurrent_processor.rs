@@ -976,15 +976,17 @@ impl ConcurrentProcessor {
                 // Worker-local Buffer; allocated ONCE and reused across every
                 // batch this worker processes. Same for the processor/parser
                 // and the WHERE-evaluation plan (built once per worker on its
-                // first batch).
-                let mut buffer: Buffer<'_> = Buffer {
+                // first batch). Boxed: inline it is ~11 KB of the task's
+                // future, which `spawn` copies whole at each layer it moves
+                // through before the first poll.
+                let mut buffer: Box<Buffer<'_>> = Box::new(Buffer {
                     hashtable_buffer: UnsafeCell::new(SmallVec::new()),
                     row: Row::default(),
                     transformers: SmallVec::new(),
                     intermediate_results: SmallVec::new(),
                     bool_buffer: SmallVec::new(),
                     write_order_to_col: SmallVec::new(),
-                };
+                });
 
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(
                     &mut buffer.transformers,
@@ -2723,14 +2725,16 @@ impl ConcurrentProcessor {
                 let io_rows_ref: &S = &*io_rows_batch;
                 let batch_read_start = std::time::Instant::now();
 
-                let mut buffer = Buffer {
+                // Boxed, as in `spawn_batch_tasks`: ~11 KB of the task's
+                // future otherwise.
+                let mut buffer = Box::new(Buffer {
                     hashtable_buffer: UnsafeCell::new(SmallVec::new()),
                     row,
                     transformers: SmallVec::new(),
                     intermediate_results: SmallVec::new(),
                     bool_buffer: SmallVec::new(),
                     write_order_to_col: SmallVec::new(),
-                };
+                });
 
                 // Build a processor and parser once per batch
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(

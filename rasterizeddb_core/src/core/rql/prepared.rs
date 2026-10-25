@@ -208,14 +208,16 @@ tokio::task_local! {
 }
 
 /// Runs `fut` with a capture in scope, and returns what it recorded.
-pub async fn capturing<F: std::future::Future>(fut: F) -> (F::Output, Capture) {
-    CAPTURE
-        .scope(RefCell::new(Capture::default()), async move {
-            let out = fut.await;
-            let captured = CAPTURE.with(|c| std::mem::take(&mut *c.borrow_mut()));
-            (out, captured)
-        })
-        .await
+///
+/// Not an `async fn`, and no `async` block inside: either stored `fut` twice,
+/// once as what it captured and again where it was awaited. The `map` runs
+/// inside the scope's poll, so the capture is still in scope when it is taken.
+pub fn capturing<F: std::future::Future>(fut: F) -> impl std::future::Future<Output = (F::Output, Capture)> {
+    use futures::FutureExt;
+    CAPTURE.scope(
+        RefCell::new(Capture::default()),
+        fut.map(|out| (out, CAPTURE.with(|c| std::mem::take(&mut *c.borrow_mut())))),
+    )
 }
 
 fn with(f: impl FnOnce(&mut Capture)) {

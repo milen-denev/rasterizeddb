@@ -1236,7 +1236,7 @@ fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
 /// be identical (column, type, operator, no path, cast or scale lift), and the
 /// connective between them must be `OR` for `=` and `AND` for `<>`; anything
 /// else is left as it was. Returns whether anything changed.
-pub fn collapse_in_sets(transformers: &mut SmallVec<[ColumnTransformer; 36]>) -> bool {
+pub fn collapse_in_sets<A: smallvec::Array<Item = ColumnTransformer>>(transformers: &mut SmallVec<A>) -> bool {
     let mut changed = false;
     let mut i = 0usize;
     while i < transformers.len() {
@@ -1309,7 +1309,11 @@ pub fn collapse_in_sets(transformers: &mut SmallVec<[ColumnTransformer; 36]>) ->
 
 #[derive(Debug, Clone)]
 pub struct TransformerPlan {
-    transformers: SmallVec<[ColumnTransformer; 36]>,
+    /// A `Vec`, not the processor's inline `SmallVec`: a plan is built once
+    /// per statement and moved into an `Arc`, and the 36 inline slots made
+    /// it ~9 KB, copied whole at each move, for what is usually one or two
+    /// transformers.
+    transformers: Vec<ColumnTransformer>,
     max_result_store_index: usize,
 }
 
@@ -1450,14 +1454,16 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     pub fn snapshot_plan(&self) -> TransformerPlan {
-        let mut transformers = self.transformers.clone();
+        // One inline slot, not the processor's 36: a copy of those is ~9 KB
+        // whatever the plan holds, and the plan goes to the heap anyway.
+        let mut transformers: SmallVec<[ColumnTransformer; 1]> = self.transformers.iter().cloned().collect();
         // Folded once here, in the plan every worker loads, rather than once
         // per worker: a 50,000-value list is that many hash inserts.
         if self.in_sets_enabled {
             collapse_in_sets(&mut transformers);
         }
         TransformerPlan {
-            transformers,
+            transformers: transformers.into_vec(),
             max_result_store_index: self.max_result_store_index,
         }
     }

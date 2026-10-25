@@ -100,6 +100,18 @@ struct Args {
     )]
     wal_writer_delay_ms: Option<u64>,
 
+    /// Whether statements are recorded for `SHOW QUERIES`, `SHOW QUERY STATS`
+    /// and `pg_stat_statements` (default: on)
+    ///
+    /// Off, a statement skips the record: no redaction, normalisation or hash
+    /// of its text, and no turn at the one lock every statement on the server
+    /// otherwise takes. Nothing else changes; what a statement answers is the
+    /// same either way. It can be changed on a running server with
+    /// `SET CONFIG query_stats.enabled = off`.
+    #[cfg(feature = "query_stats")]
+    #[arg(long = "query-stats", alias = "query_stats", value_name = "on|off")]
+    query_stats: Option<String>,
+
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
@@ -883,6 +895,13 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(ms) = args.wal_writer_delay_ms {
         rasterizeddb_core::set_wal_writer_delay_ms(ms);
+    }
+    #[cfg(feature = "query_stats")]
+    if let Some(spec) = args.query_stats.as_deref() {
+        match rasterizeddb_core::core::introspect::parse_bool(spec) {
+            Ok(on) => rasterizeddb_core::core::query_stats::set_enabled(on),
+            Err(e) => return Err(std::io::Error::other(format!("--query-stats: {}", e))),
+        }
     }
     if let Some(spec) = args.index_storage.as_deref() {
         use rasterizeddb_core::core::index_store::load::settings::{IndexStorage, set_index_storage};

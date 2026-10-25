@@ -2444,7 +2444,8 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
     }
 }
 
-fn parse_bool(value: &str) -> Result<bool, String> {
+/// A boolean as `SET CONFIG` takes one; also what `--query-stats` parses.
+pub fn parse_bool(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" | "1" | "t" => Ok(true),
         "false" | "off" | "no" | "0" | "f" => Ok(false),

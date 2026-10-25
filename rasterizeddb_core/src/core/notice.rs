@@ -31,8 +31,12 @@ tokio::task_local! {
 }
 
 /// Runs `fut` with a fresh notice collector.
-pub async fn collect<F: Future>(fut: F) -> F::Output {
-    NOTICES.scope(RefCell::new(Vec::new()), fut).await
+///
+/// Not an `async fn`, so `fut` is stored once rather than once as an
+/// argument and again where it is awaited: this wraps every statement, and
+/// its future is copied whole each time it moves.
+pub fn collect<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    NOTICES.scope(RefCell::new(Vec::new()), fut)
 }
 
 /// Raises a notice for the current statement's client. Returns whether a

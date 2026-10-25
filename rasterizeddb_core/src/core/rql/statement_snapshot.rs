@@ -33,8 +33,12 @@ tokio::task_local! {
 }
 
 /// Runs `f` with one snapshot for all its reads.
-pub async fn scope<F: std::future::Future>(f: F) -> F::Output {
-    READ.scope(parking_lot::Mutex::new(None), f).await
+///
+/// Not an `async fn`, so `f` is stored once rather than once as an
+/// argument and again where it is awaited: this wraps every statement, and
+/// its future is copied whole each time it moves.
+pub fn scope<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
+    READ.scope(parking_lot::Mutex::new(None), f)
 }
 
 /// The statement's snapshot for a table whose transactions `manager` keeps,

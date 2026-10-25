@@ -23,7 +23,8 @@
 //! and divide the difference by the difference in `n`, which cancels the
 //! start-up and the load (`.claude/reviews/b3b-perf/` holds the driver).
 //!
-//! Usage: `table_lock_bench workload=<w> n=<count> [rows=<count>]`.
+//! Usage: `table_lock_bench workload=<w> n=<count> [rows=<count>] [stats=on|off]`;
+//! `stats=off` is `SET CONFIG query_stats.enabled = off` from the start.
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -43,18 +44,24 @@ fn main() {
     let mut workload = "select".to_string();
     let mut n: u64 = 20_000;
     let mut rows: u64 = 10_000;
+    let mut stats = true;
     for arg in std::env::args().skip(1) {
         let (k, v) = arg.split_once('=').expect("arguments are key=value");
         match k {
             "workload" => workload = v.to_string(),
             "n" => n = v.parse().unwrap(),
             "rows" => rows = v.parse().unwrap(),
+            "stats" => stats = v == "on",
             _ => panic!("unknown argument {k}"),
         }
     }
     let _ = MAX_PERMITS_THREADS.set(4);
     let _ = BATCH_SIZE.set(512);
     let _ = ENABLE_CACHE.set(true);
+    #[cfg(feature = "query_stats")]
+    rasterizeddb_core::core::query_stats::set_enabled(stats);
+    #[cfg(not(feature = "query_stats"))]
+    let _ = stats;
 
     let dir = std::env::temp_dir().join(format!("rdb_table_lock_bench_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

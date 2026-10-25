@@ -377,8 +377,12 @@ pub fn begin() -> Option<Recording> {
 }
 
 /// Runs `fut` with `probe` as the statement's counters.
-pub async fn observe<F: Future>(probe: Arc<Probe>, fut: F) -> F::Output {
-    PROBE.scope(probe, fut).await
+///
+/// Not an `async fn`, so `fut` is stored once rather than once as an
+/// argument and again where it is awaited: this wraps every statement, and
+/// its future is copied whole each time it moves.
+pub fn observe<F: Future>(probe: Arc<Probe>, fut: F) -> impl Future<Output = F::Output> {
+    PROBE.scope(probe, fut)
 }
 
 /// Adds to what the running statement returned or affected.
@@ -987,8 +991,10 @@ fn is_internal_name(word: &str) -> bool {
     if word.starts_with("__") {
         return true;
     }
-    let lower = word.to_ascii_lowercase();
-    lower.starts_with("pg_") || lower.starts_with("information_schema.")
+    // Compared in place: this runs on every identifier of every recorded
+    // statement, and a lowercased copy per word was an allocation each.
+    let starts = |prefix: &str| word.get(..prefix.len()).is_some_and(|w| w.eq_ignore_ascii_case(prefix));
+    starts("pg_") || starts("information_schema.")
 }
 
 #[cfg(test)]

@@ -5217,7 +5217,10 @@ where
         }
         Step::Text => execute_recorded(database, state, stream, query, result_formats, omit_description, None).await,
         Step::Watch => {
-            let (result, capture) = pr::capturing(execute_recorded(
+            // Boxed: a statement is watched only while its parse is learned,
+            // twice, and held inline this arm tripled the future of every
+            // execution, which each layer above copies whole as it moves it.
+            let (result, capture) = Box::pin(pr::capturing(execute_recorded(
                 database,
                 state,
                 stream,
@@ -5225,7 +5228,7 @@ where
                 result_formats,
                 omit_description,
                 None,
-            ))
+            )))
             .await;
             if result.is_ok() && !state.statement_failed {
                 if let (Some(literals), Some(classes)) = (literals, classes) {

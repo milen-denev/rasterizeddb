@@ -285,8 +285,10 @@ impl RowSource {
                     got.iter().map(|(b, _)| crate::core::row::row::count_serialized_rows(b)).sum::<u64>() >= k
                 })
         };
-        let parts = fan
-            .each(enough, |part, visibility, cache| {
+        // Boxed: the fan-out's future is larger than a plain table's whole
+        // read, and held inline it made every single-table read's future as
+        // large, which is copied whole each time it moves.
+        let parts = Box::pin(fan.each(enough, |part, visibility, cache| {
                 let (qf, rf, order_by) = (query_row_fetch.clone(), requested_row_fetch.clone(), order_by.clone());
                 async move {
                     part.query_row_bytes_reporting_with_visibility(
@@ -301,7 +303,7 @@ impl RowSource {
                     )
                     .await
                 }
-            })
+            }))
             .await?;
         if parts.len() <= 1 {
             // One partition's answer is already one table's.
