@@ -2077,21 +2077,28 @@ impl ShapeChangeMode {
     }
 }
 
-impl SessionState {
-    /// The fixed mode `stmt_name`'s next stale use answers by: the session's
-    /// `rdb.shape_change`, with `auto` resolved for this statement (`error`
-    /// until it has been refused once, `rowdescription` after).
-    fn shape_mode_for(&self, stmt_name: &str) -> ShapeChangeMode {
-        match self.shape_change {
-            ShapeChangeMode::Auto => {
-                if self.statements.get(stmt_name).is_some_and(|info| info.shape_refused) {
-                    ShapeChangeMode::RowDescription
-                } else {
-                    ShapeChangeMode::Error
-                }
-            }
+impl ShapeChangeMode {
+    /// The fixed mode `info`'s next stale use answers by: this session mode,
+    /// with `auto` resolved for the statement (`error` until it has been
+    /// refused once, `rowdescription` after).
+    fn resolved_for(self, info: &StatementInfo) -> ShapeChangeMode {
+        match self {
+            ShapeChangeMode::Auto if info.shape_refused => ShapeChangeMode::RowDescription,
+            ShapeChangeMode::Auto => ShapeChangeMode::Error,
             fixed => fixed,
         }
+    }
+}
+
+impl SessionState {
+    /// The resolved mode for `stmt_name` ([`ShapeChangeMode::resolved_for`])
+    /// when a `Describe` told it a shape; `None` for a statement never told
+    /// one, which no change can make stale, so the common prepared path
+    /// (a client that never describes) checks nothing. One map lookup.
+    fn told_shape_mode(&self, stmt_name: &str) -> Option<ShapeChangeMode> {
+        let info = self.statements.get(stmt_name)?;
+        info.described.as_ref()?;
+        Some(self.shape_change.resolved_for(info))
     }
 
     /// Records that `stmt_name` was answered 0A000 for a stale shape, so
@@ -2841,7 +2848,7 @@ where
     // BindComplete and no portal, so a driver reading the reply sees exactly
     // PostgreSQL's sequence (slice B8, the pgjdbc and npgsql replays).
     // Execute checks again, for a change landing between Bind and Execute.
-    if state.shape_mode_for(&stmt) == ShapeChangeMode::Error
+    if state.told_shape_mode(&stmt) == Some(ShapeChangeMode::Error)
         && stale_in_error_mode(database, state, &stmt, &params).await?
     {
         state.note_shape_refused(&stmt);
@@ -3154,11 +3161,15 @@ where
         info.params.clone(),
     );
 
-    let sql: StdArc<str> = state
-        .statements
-        .get(&stmt_name)
-        .map(|s| s.sql.clone())
-        .unwrap_or_else(|| StdArc::from(""));
+    // The text, and what the client was told it returns with the mode that
+    // answers a change, in one lookup.
+    let (sql, mut told): (StdArc<str>, Option<(ShapeChangeMode, ToldShape)>) = match state.statements.get(&stmt_name) {
+        Some(info) => (
+            info.sql.clone(),
+            info.described.clone().map(|t| (state.shape_change.resolved_for(info), t)),
+        ),
+        None => (StdArc::from(""), None),
+    };
     let query: &str = &sql;
 
     if query.trim().is_empty() {
@@ -3179,13 +3190,17 @@ where
     // move came before it; this catches one between Bind and Execute. The
     // check after the build stays, for a change landing while the statement
     // waits for its locks.
-    let mode = state.shape_mode_for(&stmt_name);
-    if mode == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt_name, &params).await? {
-        state.note_shape_refused(&stmt_name);
-        return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
+    if matches!(told, Some((ShapeChangeMode::Error, _))) {
+        if stale_in_error_mode(database, state, &stmt_name, &params).await? {
+            state.note_shape_refused(&stmt_name);
+            return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
+        }
+        // Found still good at a later epoch, the told epoch moved: read it
+        // again.
+        let mode = ShapeChangeMode::Error;
+        told = state.statements.get(&stmt_name).and_then(|info| info.described.clone()).map(|t| (mode, t));
     }
-    let told = state.statements.get(&stmt_name).and_then(|info| info.described.clone());
-    let check = told.map(|told| {
+    let check = told.map(|(mode, told)| {
         StdArc::new(ShapeCheck {
             database: database.clone(),
             stmt_name: stmt_name.clone(),
@@ -3332,7 +3347,7 @@ struct ShapeCheck {
     sql: StdArc<str>,
     bound: StdArc<[BoundParam]>,
     /// The session's mode resolved for this statement
-    /// ([`SessionState::shape_mode_for`]): never `Auto`.
+    /// ([`ShapeChangeMode::resolved_for`]): never `Auto`.
     mode: ShapeChangeMode,
     /// The statement runs in a block, so an error it raises aborts the block
     /// and undoes what it wrote (R3).

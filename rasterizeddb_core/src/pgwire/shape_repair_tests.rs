@@ -212,6 +212,17 @@ impl Client {
         self.until_ready().await
     }
 
+    /// Parse alone, Sync: a client that never describes (B3b's bench).
+    async fn parse_only(&mut self, name: &str, sql: &str) -> Vec<Msg> {
+        let mut parse = Vec::new();
+        cstr(&mut parse, name);
+        cstr(&mut parse, sql);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        self.send(b'P', &parse).await;
+        self.send(b'S', &[]).await;
+        self.until_ready().await
+    }
+
     /// Describe the statement again (no Parse), Sync.
     async fn describe(&mut self, name: &str) -> Vec<Msg> {
         let mut describe = vec![b'S'];
@@ -863,5 +874,47 @@ async fn a_join_with_a_partitioned_table_repairs_by_logical_name() {
 
     a.close().await;
     b.close().await;
+    close(db, dir.path());
+}
+
+/// The B8b hot path over the wire, as the perf gate's bench drives it
+/// (Parse once, then Bind/Execute/Sync, no Describe): a prepared point
+/// SELECT, UPDATE and bigint-key INSERT each take one transaction id per
+/// statement (O is the first attempt) and register no owner as outliving
+/// its transaction (only a retry or a failure does).
+///
+/// Mutation, failing an assertion here: the commit path registering O
+/// (`owner::attempt_ended` registering).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_prepared_hot_path_takes_one_id_and_registers_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "b8b_hot").await;
+    let mut a = Client::connect_default(&db);
+    a.ok("CREATE TABLE b8bh (id BIGINT PRIMARY KEY, v BIGINT)").await;
+    a.ok("INSERT INTO b8bh (id, v) VALUES (1, 10), (2, 20)").await;
+    a.parse_only("sel", "SELECT v FROM b8bh WHERE id = $1").await;
+    a.parse_only("upd", "UPDATE b8bh SET v = $1 WHERE id = $2").await;
+    a.parse_only("ins", "INSERT INTO b8bh (id, v) VALUES ($1, $2)").await;
+    // Warm: the learned parse needs two runs.
+    for _ in 0..3 {
+        assert_eq!(error(&a.run("sel", &["1"]).await), None);
+    }
+    let registered = db.transactions.outliving_total();
+    for (stmt, params) in [("sel", vec!["2".to_string()]), ("upd", vec!["7".to_string(), "1".to_string()])]
+        .into_iter()
+        .chain((0..3).map(|i| ("ins", vec![(100 + i).to_string(), "5".to_string()])))
+    {
+        let params: Vec<&str> = params.iter().map(String::as_str).collect();
+        let before = db.transactions.next_id();
+        let got = a.run(stmt, &params).await;
+        assert_eq!(error(&got), None, "{stmt}: {got:?}");
+        assert_eq!(db.transactions.next_id() - before, 1, "{stmt}: ids per statement over the wire");
+    }
+    assert_eq!(
+        db.transactions.outliving_total(),
+        registered,
+        "a committing statement over the wire registered its owner as outliving its transaction"
+    );
+    a.close().await;
     close(db, dir.path());
 }
