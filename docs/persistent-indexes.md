@@ -1178,7 +1178,9 @@ id that was never begun, or one the bounded status log has forgotten, may not
 read as live, and then every lock the statement holds is invisible: a CREATE
 INDEX is granted AE beside a running INSERT … SELECT, which is finding 4
 again. So O reads `InProgress` for the statement's whole life, and the status
-log never forgets an in-progress id. Each retry attempt's `TxId` maps to O
+log never forgets an in-progress id. *(B8b: O is the first attempt's id, so
+it reads `InProgress` for that attempt's life; past it the scope registers O
+as live and the lock manager asks that first. See "As built (B8b)".)* Each retry attempt's `TxId` maps to O
 through `RowLocks::owner_alias`, which `owner_of` consults, so the lock and
 its graph node survive retries, and `deadlock_victim` ages the statement by
 O. A guard ends O (`release_all`, then its outcome) on every exit path,
@@ -1231,7 +1233,9 @@ through `table_for`).
   past it (counting it would close the gate for every autocommit statement).
   `end_owner` commits it with no durable record. A `WITH` statement's
   transaction is adopted as O (`owner::adopt_transaction`), a regular
-  transaction the statement ends itself.
+  transaction the statement ends itself. *(Superseded by B8b: O is the
+  statement's first attempt; `begin_owner` remains for standalone owners
+  that never write. See "As built (B8b)" below.)*
 - *Release by space (finding L4).* `RowLocks` resolves two identities: row
   and referenced-key locks belong to the **transaction** (`txn_of`, the
   top-level id) and go when it ends (`release_rows`, from
@@ -1270,7 +1274,8 @@ through `table_for`).
   between settles (two bits per id; settled blocks compress as before). O's
   own work (begin, alias one attempt, release, end) costs **~210 ns**, about
   **0.3%** of a ~68 µs point SELECT there; one plain autocommit id costs
-  ~130 ns. B3b's perf gate on ext4 decides Q4.
+  ~130 ns. B3b's perf gate on ext4 decides Q4. *(B8b took Q4's
+  alternative: one id per statement. See "As built (B8b)".)*
 
 
 **Lifetime.** A family's locks are released with its tickets, once its outcome
@@ -1405,7 +1410,7 @@ the shape:
   path: unchanged since Describe means no comparison.
 - **The reply is a per-session mode** (Q2), `rdb.shape_change`, set by a
   startup option or GUC (`options=-c rdb.shape_change=…`). In
-  `rowdescription` mode, the default, the server sends the unrequested
+  `rowdescription` mode the server sends the unrequested
   RowDescription above. sqlx needs it, and it is what today's code sends. In
   `error` mode it sends PostgreSQL's 0A000 `cached plan must not change result
   type`, which pgjdbc, npgsql and psycopg answer by re-preparing. sqlx never
@@ -1422,7 +1427,10 @@ the shape:
   names the driver (pgjdbc's default `application_name`), that sets the
   session's default; otherwise the default stays `rowdescription`, because
   sqlx sets no `application_name` by default (from memory, not checked) and is
-  the one driver shown to need it. Bind's
+  the one driver shown to need it. *(Decided otherwise, Q1, B8b: the default
+  is `auto`, by behaviour, not by `application_name`: 0A000 first, then the
+  RowDescription if the same statement is executed again without a new
+  Parse. See "As built (B8b)".)* Bind's
   result formats apply as the protocol says for the new columns: none means
   text, a single format applies to all, otherwise positionally, and a column
   past the formats given goes as text (as built; B8's pgjdbc replay sends
@@ -1991,8 +1999,8 @@ one database-wide counter (Q7), and the per-session `rdb.shape_change`
   resets the statement to `Unknown` (and does not count the run in
   `PREPARED_RUNS`). The existing reset on a moved `schema_generation`
   before the run stays.
-- *`rdb.shape_change`* (Q2). `rowdescription` (the default, unchanged) or
-  `error`; `SET`, `SET … TO`, `RESET`, `= DEFAULT`, `SHOW`, and the startup
+- *`rdb.shape_change`* (Q2). `rowdescription` (the default until B8b,
+  which made `auto` the default) or `error`; `SET`, `SET … TO`, `RESET`, `= DEFAULT`, `SHOW`, and the startup
   packet (`options=-c rdb.shape_change=error`, or the parameter on its
   own); an unknown value is 22023. `SET LOCAL` is taken as a session
   setting, as `lock_timeout`'s is. In `error` mode the stale Execute gets
@@ -2141,6 +2149,135 @@ so the Describe fallback above is not built.
   and Npgsql (downloading Java and the NuGet package) over these
   scenarios; the replays were written from the drivers' source as read
   from memory, not captured.
+
+**As built (B8b).** A performance follow-up to the lock manager, and the
+shape-change default.
+- *O is the statement's first attempt* (Q4's alternative; `owner.rs`,
+  `executor.rs:execute_autocommit`). `owner::ensure` begins O as an ordinary
+  autocommit transaction and the attempt loop's first attempt runs as it
+  (`owner::claim_attempt`): one id per autocommit statement, where B2 took
+  two. A later attempt, and every attempt of a loop whose O was already
+  taken (a nested statement, a scope's second statement, an adopted `WITH`
+  transaction), begins its own id aliased to O as before; aliasing O to
+  itself is a no-op. An O no attempt claimed (a statement that took locks
+  but ran no attempt loop) wrote nothing and is committed by the scope's
+  end; a claimed O whose statement future was dropped mid-attempt is
+  aborted by it (B2 left that attempt `InProgress`).
+- *The trap, and the rule that closes it.* O's **transaction** can now end
+  before its **scope** does: a write conflict aborts attempt 1, which is O,
+  and the statement retries still holding O's table locks and graph node.
+  Anything that judged the owner by its id's outcome would take it for
+  dead: the table locks' prune of "an aborted holder that never released"
+  would give a waiting DDL the retrying UPDATE's ROW EXCLUSIVE and let it
+  run beside the write. So **an owner is live while its scope is open**:
+  before the attempt loop aborts O's transaction with the statement going
+  on (a retry, a failure, a durability failure after the commit) it
+  registers O (`owner::outlive`, `TransactionManager::owner_outlives`); a
+  scope that acts for O again after O's transaction committed registers it
+  at that ask (`owner::ensure`); the scope's end releases O's locks and only
+  then unregisters it. A committing statement registers nothing (one atomic
+  store). Every place that read an owner's outcome, audited:
+
+  | Site | Reads | Handling |
+  |---|---|---|
+  | `TableLocks` prune of an aborted holder (`RowLocks::for_transactions`'s liveness) | owner | `outlives(o) \|\| outcome(o) != Aborted`: a registered owner is never pruned; an unregistered aborted one still is (the safety net B3b built) |
+  | wait-for graph node liveness (`RowLocks::cycle_through`, under `deadlock_victim` and `conflict_deadlock_victim`) | owner | `is_live(o) \|\| outlives(o)`: a retrying statement's O stays a node, so a younger member's walk through it finds the cycle |
+  | the callers' `live` closures (FOR UPDATE, referenced keys, `refuse_write_to_locked_rows`, `conflict_wait`) | holders and blockers: transactions | unchanged: a row or referenced-key lock and a conflict's blocker belong to a transaction, whose outcome is the right question; the same closures reach the graph only through `cycle_through`, above |
+  | `conflict_wait`'s own-family filter (`owner_of(blocker) != waiter`) | owner ids | unchanged: the waiter is O's id, and O's own attempts (O itself, aliases) map to it |
+  | victim choice (`choose_victim`, `victim_of`) and the reader role (`owner_wrote`) | ids, roles, `wrote` | no outcome read; `owner_wrote(O)` sees attempt 1's writes through O's own family while it runs, a later attempt's through its alias, and an aborted attempt's not at all, as before |
+  | release paths (`release_owner`, `release_rows`, `OwnerScope::drop`) | none | `release_rows(O)` at attempt 1's end now clears O's edge (O is its own owner); none is set then, and the back-off sets it again. The scope releases, then aborts an unended claimed O, then unregisters |
+  | settle and forget (`assert_no_running_id_settled`; B2's "O is `InProgress`, so never settled or forgotten") | running set | the assertion stands (it is about the running set). A claimed O can now be settled and forgotten while its scope still holds locks: table locks are keyed by id and read no outcome; a forgotten id reads committed, which the prune takes as live; the graph asks the registry. `end_owner`'s "O wrote nothing" assertion now applies to unclaimed O and `begin_owner` owners only |
+  | the in-place gate's owner-only marking (`try_begin_in_place_for`) | running set | a claimed O is a real transaction: excluded for itself (`own`), counted for others, as any attempt was. An unclaimed O (begun at a lookup before the loop) is not owner-only, so other writers' gates count it: conservative, never unsafe. `begin_owner` owners stay owner-only |
+  | `statement_snapshot` | none | no owner or outcome read; snapshots are attempts' |
+  | the owner probe (`probe::Record`) | owner | `owner_in_progress` became `owner_live` (`TransactionManager::owner_live`) |
+
+  Tests (`mvcc/owner_tests.rs`, each mutation-verified):
+  `a_retrying_statements_lock_survives_its_first_attempts_abort` (attempt
+  1 aborted, a DDL's request during the back-off, the block it also waits
+  for released: the DDL waits until the UPDATE's scope ends; pruning by
+  outcome fails it, first at "the DDL's request pruned the retrying UPDATE's
+  ROW EXCLUSIVE" and, with that assertion off, at "the DDL got in while the
+  UPDATE's statement still held its ROW EXCLUSIVE"),
+  `an_outliving_owners_table_lock_is_not_pruned`,
+  `an_outliving_owner_is_a_live_node_of_the_graph`,
+  `an_autocommit_statement_takes_one_id_and_registers_nothing`, and the
+  registry emptied at every scope end; `o_is_released_and_ended_on_every_exit_path`
+  now also fails if a dropped attempt is not aborted.
+- *Execute's shape check boxes only for a told shape.* `with_shape_check`
+  returns an `Either`: a statement a Describe told a shape boxes its run
+  into the task-local's scope; without one (a client that never describes)
+  the run is awaited as it is, inside `handle_execute`'s own future, with no
+  allocation per Execute.
+- *An INSERT resolves its target once.* The INSERT arm takes ROW EXCLUSIVE
+  through `relation_for` at its top and hands the relation to the seed
+  (run, boxed, only when `has_unseeded_sequence`), the column list and
+  generated values (now synchronous), the write and
+  `check_foreign_keys_of`: one lock request per dispatch where a plain
+  INSERT made five (`an_insert_takes_its_targets_lock_once_and_first`; an
+  `INSERT INTO t VALUES (…)` is re-dispatched with its column list and
+  makes one per dispatch). The lock is not weakened: it is taken before
+  anything reads the table, and O holds it to the statement's end, so no
+  reload, DROP or MOVE can swap the instance meanwhile.
+- *Q1 decided by the owner: `rdb.shape_change` defaults to `auto`*
+  (finding L10). A stale statement's first use answers as `error` (0A000
+  with `R=RevalidateCachedQuery`, at Bind, at Execute's pre-check, or after
+  the build for a read or a block); executed again without a new Parse, it
+  answers as `rowdescription` from then on. A new Parse is a new statement
+  and starts over, and so does a Describe of it, which refreshes what the
+  client caches (`StatementInfo.shape_refused`). `rowdescription` and
+  `error` stay explicit settings; `SHOW` reports `auto`; `RESET`,
+  `SET … TO DEFAULT` and `default` restore it. Under the default (no
+  option sent), the driver matrix (`driver_matrix.rs`, four executes after
+  the change, then the driver's recovery; every change alike):
+
+  | Driver | `auto` (default) |
+  |---|---|
+  | sqlx 0.9 (cached statement) | 0A000, then ok ×3, ok after: it re-executes its cached statement, which now gets the RowDescription |
+  | tokio-postgres 0.7 (kept `Statement`) | 0A000, then "unexpected message" ×3; a fresh `prepare` (a new Parse) reads the new shape, as in both fixed modes |
+  | pgjdbc 42.x (replay `pgjdbc-flip`) | identical to PostgreSQL 17: 0A000 at Bind with `R`, its retry (Close `S_1`, Parse `S_2`) heals (`pgjdbc_flip_under_the_default_answers_as_postgresql_17`) |
+  | npgsql 8 (replay `npgsql-auto-prepare`) | identical to PostgreSQL 17: 0A000 at Bind, `_auto1` heals (`npgsql_auto_prepare_under_the_default_answers_as_postgresql_17`) |
+
+  The B7 shape tests and `prepared_shape_change.rs` pin `rowdescription`,
+  the repair they test; V10 case 3 runs in both. New:
+  `shape_repair_tests::auto_refuses_a_stale_statement_once_then_repairs_it`
+  and `prepared_shape_change::sqlx_cached_returning_under_the_default_is_refused_once_then_decodes`
+  (the refused write is not applied), mutation-verified. **Condition (the
+  owner's):** `auto` is not advertised until a real-driver run (Java's
+  pgjdbc and the Npgsql package, the TODO above) confirms the replays.
+- *The perf gate, re-run* as B8 ran it (the same bench, the same `before`
+  binaries `dedd503`, `801af73`, `cc09005`; instructions per statement by
+  differencing 2,000 and 6,000 statements, three interleaved runs, medians,
+  tmpfs; W3 = (B1-B2) + (B8b tip - `cc09005`), the non-W3 run bracketed out):
+
+  | Workload | before | B8 tip | B8b base (`52c2f0b`) | B8b tip | W3, 3 runs | W3, 7 runs |
+  |---|---|---|---|---|---|---|
+  | prepared point SELECT | 69,212 | 78,372 | 80,075 | 77,447 | **+4,871 (+7.0%)** | **+3,324 (+4.8%)** |
+  | prepared point UPDATE | 198,266 | 208,982 | 209,291 | 208,564 | **+10,397 (+5.2%)** | **+9,143 (+4.6%)** |
+  | prepared bigint-PK INSERT | 131,567 | 142,384 | 142,361 | 137,717 | **+6,068 (+4.6%)** | **+5,726 (+4.4%)** |
+
+  (The 3-run row's figures; `.claude/reviews/b8b-perf/instr_final.txt` and
+  `instr_final7.txt`, load average 0.3-1.6.) Against B8's tip measured in
+  the same runs, the B8b tip is lower by 0.9-1.2k on SELECT, 4.7-4.9k on
+  INSERT and within noise on UPDATE; against its own base, which includes
+  the owner's batch-atomicity fix `52c2f0b`, by 2.6-3.2k, 4.6-5.7k and
+  0.7-1.2k. **`52c2f0b` is counted, as the owner asked**: it costs a point
+  SELECT 1.7-1.9k over B8's tip (the per-Execute read-ahead:
+  `run_message_loop_inner`, `read_frame_body`, `opens_an_implicit_block`,
+  `portal_sql`, `hold_reply` in the differenced profile), which is most of
+  what keeps SELECT near the bound under the 3-run protocol. The bracket
+  itself is noisy: `801af73` minus `before` moved by ±450 between runs,
+  enough to move SELECT's W3 between 4.8% and 7.0%. CTE, derived table and
+  `pg_class` moved +2.0%, +2.0% and +0.6% from `dedd503`, non-W3 included
+  (B8: +2.3%, +2.5%, +1.0%). What is left of W3 on a point SELECT, by the
+  differenced profile against `cc09005`: B3b's per-statement lock (the slot
+  lookup, `TableLocks::request` and `shard`, `relation_for`, about 0.6k)
+  and B6/B7's per-Execute work. Found by the gate and fixed in B8b:
+  `auto` made every Bind and Execute resolve the mode and call
+  `stale_in_error_mode` for statements no Describe told a shape
+  (`told_shape_mode` now answers `None` in one lookup), and a first attempt
+  that is its own owner took the wait graph's mutex to clear an edge it
+  never set (`waits_len`). B6's blocker capture now wraps only a statement
+  the loop can replay.
 
 **Removed**: the reload mutex (AE conflicts with itself), the slot queue and
 its `Ref` rule (the lock queue is keyed by name and survives the swap), the
@@ -2735,7 +2872,7 @@ one was mutation-verified.
 | 1 | `case_1_own_family_never_waits_on_itself` | an owner's own modes conflict (hangs) |
 | 2 | `case_2_r1_over_the_extended_protocol` (CREATE INDEX, ADD COLUMN, DROP INDEX × one-by-one, pgjdbc, sqlx framings) | rule (b) off (the DDL gets 40P01); writes take no ROW EXCLUSIVE |
 | 3 | `case_3_describe_during_a_pending_access_exclusive` | the skip path always taken (no RowDescription after ADD COLUMN) |
-| 4 | core `shape_repair_tests` (B7); compat `prepared_shape_change`; `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes` | (B7's); the skip path always taken (sqlx decodes `WRONG`) |
+| 4 | core `shape_repair_tests` (B7; B8b adds `auto_refuses_a_stale_statement_once_then_repairs_it`); compat `prepared_shape_change`; `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes` (B8b: `rowdescription`, `error` and the default `auto`) | (B7's); the skip path always taken (sqlx decodes `WRONG`); B8b: `auto` resolved as `error` always (sqlx never heals), as `rowdescription` always (pgjdbc's and npgsql's replays diverge from PostgreSQL 17) |
 | 5 | core `ddl_rewrite_tests::a_block_insert_committed_while_the_alter_waits_survives` (B5); `case_5_describe_and_select_during_a_rewrite` | reads take no ACCESS SHARE |
 | 6 | core `schema_view_tests` (B3a); `case_6_catalog_reads_during_a_pending_access_exclusive` | the catalog's figures read through `table_for` (hangs) |
 | 7 | `case_7_insert_select_against_a_blocks_create_index` | the youngest member is the victim; R3 off |
@@ -2783,11 +2920,11 @@ table OID, column number, size and modifier, other errors' messages.
 
 | Sequence | Frames | PostgreSQL 17 | This engine |
 |---|---|---|---|
-| `pgjdbc-flip` (Q2 (a)) | P"" B D(P) E S ×4; P`S_1` B D(P) E S; B`S_1` formats `[1,0,1]` E S; ADD COLUMN; B`S_1` E S; C(S)`S_1` P`S_2` B D(P) E S; B`S_2` `[1,0,1,1]` E S | as recorded, incl. `E(0A000 R=RevalidateCachedQuery) Z(I)` at the stale Bind and `3 1 2 T D C Z` for the retry | identical in `error` mode; in `rowdescription` the stale Bind answers `2 T D C Z` on every execute |
+| `pgjdbc-flip` (Q2 (a)) | P"" B D(P) E S ×4; P`S_1` B D(P) E S; B`S_1` formats `[1,0,1]` E S; ADD COLUMN; B`S_1` E S; C(S)`S_1` P`S_2` B D(P) E S; B`S_2` `[1,0,1,1]` E S | as recorded, incl. `E(0A000 R=RevalidateCachedQuery) Z(I)` at the stale Bind and `3 1 2 T D C Z` for the retry | identical in `error` mode and under the default `auto` (B8b); in `rowdescription` the stale Bind answers `2 T D C Z` on every execute |
 | `npgsql-batch` (Q2 (b)) | P B(binary) D(P) E for INSERT and SELECT, one S | `1 2 n C 1 2 T D C Z` | identical |
 | `npgsql-batch-error` (Q2 (b)) | INSERT, INSERT of a duplicate key, SELECT, one S | `1 2 n C 1 2 n E(23505) Z`: the SELECT skipped | identical, and the first INSERT is rolled back with it: a batch is one implicit transaction, as in PostgreSQL (found by B8; fixed after it, `implicit_batch_transaction.rs`, with the simple protocol's multi-statement string) |
 | `npgsql-batch-lock` | SELECT u, SELECT t (held ACCESS EXCLUSIVE elsewhere, `lock_timeout` 300 ms), SELECT u, one S | the second Parse fails: `1 2 T D C E(55P03) Z` | `1 2 T D C 1 2 T E(55P03) Z`: Parse and Describe take no lock (§7), the Execute times out; the rest skipped alike |
-| `npgsql-auto-prepare` | P B D(P) E S; P`_auto0` D(S) B E S; B E S; ADD COLUMN; B E S; P`_auto1` D(S) B E S; B E S | `E(0A000 R=RevalidateCachedQuery) Z` at the stale Bind | identical in `error` mode; `2 T D C Z` in `rowdescription` |
+| `npgsql-auto-prepare` | P B D(P) E S; P`_auto0` D(S) B E S; B E S; ADD COLUMN; B E S; P`_auto1` D(S) B E S; B E S | `E(0A000 R=RevalidateCachedQuery) Z` at the stale Bind | identical in `error` mode and under the default `auto` (B8b); `2 T D C Z` in `rowdescription` |
 
 ### Owner's invariants
 
@@ -3079,7 +3216,7 @@ stated fallback if the NULL decode cannot land in phase 0 (risk 12).
 | Q2: never-0A000 removes what pgjdbc and npgsql heal from; the fallback misses statements described before the DDL | §7 shape bullets, driver gate, V10 (4), risk 10 | per-session `rdb.shape_change` (`rowdescription` default, `error` = 0A000); per-driver default where the startup packet names it; fallback scoped to Describes during the AE; gate and case 4 run in both modes |
 | Q3: catalog builders read instance stats that `schema_view` did not expose | §7 Describe and catalog reads, V10 (6) | `schema_view` gains a lock-free stats accessor (provider lengths, `last_row_id`, `owns()` lengths), old figures during a rewrite; `pg_class` within 100 ms behind an idle reader's pending AE |
 | Q4: shadow DDL as AE makes block document writers deadlock and SELECTs stall | §7 JSON shadow DDL, Modes, V10 (11), risk 12 | metadata-only nullable shadow ADD COLUMN under an internal per-shadow lock; AE only for widenings, retryable in autocommit; case 11 requires zero 40P01 and a non-waiting SELECT; "as PostgreSQL would" removed |
-| Q5: O's liveness undefined; `live` filters ignore non-`InProgress` holders | §7 Owner, risk 11 | O is begun in `TransactionManager`, `InProgress` throughout, never forgotten while held, ended by a guard on every exit path (the reload task takes it over); mutations: O never begun, O not ended on cancel |
+| Q5: O's liveness undefined; `live` filters ignore non-`InProgress` holders | §7 Owner, risk 11 | O is begun in `TransactionManager`, `InProgress` throughout, never forgotten while held, ended by a guard on every exit path (the reload task takes it over); mutations: O never begun, O not ended on cancel. **B8b:** O is the first attempt's id, so its transaction can end (and be settled or forgotten) while its scope holds locks; liveness is the scope's (`owner_outlives`), asked by the prune and the graph before the outcome (§7 "As built (B8b)", the audit table) |
 | Q6: a capped reader can be the youngest victim against `LOCK TABLE` | §7 Victims, V10 (16) | preference: un-retired DDL, then any S/AE requester, then the youngest non-reader; every cycle through a reader holds an S/AE requester |
 | Q7: a per-instance `shape_epoch` can repeat after DROP/CREATE | §7 `shape_epoch`, V10 (17) | drawn from one database-wide monotonic counter |
 | Q8: DROP's shadow chain is locked after retirement, uncancellable | §7 step 1, V10 (18) | step 1 takes the complete lock set in name order (shadow chain, both names); no `table_for` wait after 2(a), asserted |
@@ -3109,7 +3246,7 @@ Each closed by a named test (B8's merge condition).
 | L7 Execute's shape check before the lock | B7 | `pgwire::shape_repair_tests::alter_while_execute_waits_for_its_lock_is_caught_after_the_build` |
 | L8 the reader definition | B6 | `rql::conflict_wait_tests::an_autocommit_owner_that_wrote_is_no_reader` |
 | L9 shadow DDL and a pending parent AE | B5 | `rql::shadow_lock::tests::shadow_ddl_does_not_queue_behind_a_pending_parent_access_exclusive`; `tests/shredded_shadow_ddl.rs::a_writers_shadow_ddl_does_not_queue_behind_a_pending_parent_alter` |
-| L10 the shape-change mode by driver | B8 (input; Q1 open) | compat `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes`, `wire_replay` (§7 "As built (B8)") |
+| L10 the shape-change mode by driver | B8 (input), B8b (Q1 decided: `auto` the default) | compat `driver_matrix::shape_change_mid_prepare_through_each_driver_in_both_modes` (all three modes), `wire_replay` (`…_under_the_default_answers_as_postgresql_17`), core `shape_repair_tests::auto_refuses_a_stale_statement_once_then_repairs_it` (§7 "As built (B8)", "As built (B8b)") |
 | L11 FK DDL locks the parent | B4 | `pgwire::ddl_lock_tests::fk_ddl_locks_the_other_side` |
 | L12 temporaries and the cost | B3b, B4 | `database::reload_tests::a_statement_private_temp_is_dropped_without_a_lock_or_retirement`; B3b's and B8's perf gates (§7 "As built (B3b)", below) |
 | L13 RETURNING in the shape check | B7 | `pgwire::shape_repair_tests::returning_across_an_alter_is_repaired`; compat `prepared_shape_change::sqlx_cached_returning_decodes_the_new_shape_every_time` |
@@ -3120,3 +3257,11 @@ which reproduce pgjdbc's `prepareThreshold` flip with its retry after
 0A000 and npgsql's one-Sync batching with an error mid-batch (§13 "The
 driver gate's sequences"). A real-driver run is a precondition for
 advertising persistent indexes, not for merging.
+
+**Decision (B8b, Q1, the owner's).** `rdb.shape_change` defaults to `auto`,
+the behaviour-based switch finding L10 proposed: 0A000 (with
+`R=RevalidateCachedQuery`) for a stale statement's first use, then the
+fresh RowDescription when the same statement is executed again without a
+new Parse. All four drivers of the matrix heal under it (§7 "As built
+(B8b)"). Condition: it is not advertised until a real-driver run of pgjdbc
+and Npgsql confirms the replays.
