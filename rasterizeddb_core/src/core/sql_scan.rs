@@ -146,6 +146,17 @@ pub fn skip_quoted(bytes: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// Whether `needle` occurs anywhere in `text`, ignoring ASCII case, quotes
+/// and comments included: a scanner's cheap precondition, so one that can
+/// only match where these bytes are can skip a statement that has none.
+/// `needle` must not be empty.
+pub fn contains_ignore_ascii_case(text: &str, needle: &[u8]) -> bool {
+    let b = text.as_bytes();
+    let first = needle[0];
+    memchr::memchr2_iter(first.to_ascii_uppercase(), first.to_ascii_lowercase(), b)
+        .any(|i| b.len() - i >= needle.len() && b[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
 /// If a comment opens at `i`, the index just past it (a line comment ends
 /// before its newline).
 #[inline]

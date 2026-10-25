@@ -6671,6 +6671,14 @@ async fn insert_values_tuples(
         }
     }
 
+    // The statement's target, resolved once: its ROW EXCLUSIVE is held from
+    // the statement's dispatch, so this is the lock's fast path, and each
+    // tuple goes straight to the row's half of the insert with it.
+    let target = match Box::pin(database.relation_for(&row_data.table_name, owner(), TableMode::RowExclusive)).await {
+        Ok(target) => target,
+        Err(e) => return Some(ddl_error(&e)),
+    };
+
     let mut inserted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
     let mut any_returning = false;
@@ -6696,34 +6704,41 @@ async fn insert_values_tuples(
         // from the statement's owner (slice B6, finding L1).
         let mut pacing = crate::core::rql::conflict_wait::Pacing::new(crate::core::rql::conflict_wait::Site::Batch);
         let response = loop {
-            let Some(mut purpose) = recognize_query_purpose(&stmt) else {
-                return Some(ddl_error("could not re-parse a row of the VALUES clause"));
+            // The row's statement is built here, not recognized again: it was
+            // cut from `row_data.query`, which the statement's own recognition
+            // already normalised, stripped of comments and of `ON CONFLICT`, so
+            // running the recognizer over each tuple only re-derived the table
+            // name the statement already has, copying the text three times to
+            // do it. A 1,000-row `INSERT` paid that 1,000 times.
+            //
+            // `ON CONFLICT` comes from the parsed clause, not text: it was split
+            // off before the tuples were, so a row re-read from its text said
+            // `on_conflict_do_nothing: false`, and `INSERT … VALUES (…), (…) ON
+            // CONFLICT (k) DO NOTHING` *raised* a duplicate-key error the moment
+            // any tuple conflicted, inserting none of the rest. It stalled PMS's
+            // Ultra→Cold migration on 192.168.1.7, which pages exactly this
+            // shape. The tail the splitter carries onto each row already holds
+            // `RETURNING`, and `ON CONFLICT` has to precede it.
+            let purpose = QueryPurpose::InsertRow(crate::core::rql::lexer_s1::InsertRowData {
+                table_name: row_data.table_name.clone(),
+                query: stmt.clone(),
+                on_conflict_do_nothing: row_data.on_conflict_do_nothing,
+                on_conflict_update: row_data.on_conflict_update.clone(),
+                // Checked at the statement's first dispatch (see the field).
+                on_conflict_target: Vec::new(),
+            });
+            let QueryPurpose::InsertRow(tuple) = &purpose else {
+                unreachable!("built as an InsertRow just above");
             };
-            // `ON CONFLICT` was split off the statement before the tuples were, so
-            // `row_data.query` — the text these rows were cut from — no longer
-            // carries it, and re-parsing a row yields `on_conflict_do_nothing:
-            // false`. Restoring the parsed clause is what makes a multi-row upsert
-            // behave like the single-row one.
-            //
-            // Without this, `INSERT … VALUES (…), (…) ON CONFLICT (k) DO NOTHING`
-            // *raised* a duplicate-key error the moment any tuple conflicted — and
-            // because the loop below returns on the first error, the tuples that
-            // did not conflict were never inserted either. A statement whose whole
-            // point is "insert what fits and skip the rest" instead inserted
-            // nothing and failed. It stalled PMS's Ultra→Cold migration on
-            // 192.168.1.7, which pages exactly this shape.
-            //
-            // Restored as parsed values rather than re-appended as text: the tail
-            // the splitter carries onto each row already holds `RETURNING`, and
-            // `ON CONFLICT` has to precede it.
-            if let QueryPurpose::InsertRow(ref mut data) = purpose {
-                data.on_conflict_do_nothing = row_data.on_conflict_do_nothing;
-                data.on_conflict_update = row_data.on_conflict_update.clone();
-            }
             crate::owner_probe!(crate::core::mvcc::owner::probe::Site::BatchTuple, tx, database);
-            let (response, blocker) = crate::core::rql::conflict_wait::capture(Box::pin(
-                execute_with_context(purpose, database.clone(), depth, tx),
-            ))
+            let (response, blocker) = crate::core::rql::conflict_wait::capture(Box::pin(insert_row_resolved(
+                database,
+                &purpose,
+                tuple,
+                target.clone(),
+                depth,
+                tx,
+            )))
             .await;
             if !is_retryable_conflict(&response) {
                 break response;
@@ -12502,6 +12517,368 @@ async fn execute_prepared_rows(
     execute_query_rows(query_row, crate::core::rql::row_source::RowSource::Single(table), &database, tx).await
 }
 
+/// The half of an `INSERT` that writes its one row: generated columns,
+/// RETURNING, NOT NULL, the JSON mapping, foreign keys, the write and its
+/// conflict handling. Everything before it is the statement's, done once:
+/// the conflict-target checks, the lock (`target`, resolved under ROW
+/// EXCLUSIVE), seeding sequences, the column list, `INSERT … SELECT` and
+/// the split of a multi-row `VALUES`.
+///
+/// `insert_values_tuples` calls this once per tuple. It used to send every
+/// tuple back through the whole dispatch as a statement of its own, so a
+/// 1,000-row `INSERT` ran the statement-level half 1,000 times: the
+/// recognizer, the lock lookup, the column-list and `SELECT` scans and a
+/// second batch split, each over the row's text. Its own function, boxed,
+/// also keeps these locals out of `execute_with_need`'s future.
+async fn insert_row_resolved(
+    database: &Arc<Database>,
+    query: &QueryPurpose,
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    target: Option<crate::core::database::Relation>,
+    depth: usize,
+    tx: TxId,
+) -> Vec<u8> {
+    // Generated columns, computed now that the statement is one tuple
+    // with an explicit column list. After the batch split, so each row
+    // of a multi-row insert is computed from its own values.
+    //
+    // The rewritten statement is substituted for the original here
+    // rather than re-dispatched — see `supply_generated_values`.
+    //
+    // Both `row_data` and `query` are shadowed. The row parser below
+    // reads the whole `QueryPurpose`, not the `row_data` beside it, so
+    // rebinding only one of them left the computed value in a statement
+    // nothing went on to parse — the column stayed NULL and the insert
+    // still reported success.
+    let generated_rewrite =
+        match supply_generated_values(row_data, target.as_ref().map(|t| t.schema()), &database) {
+            Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
+            Some(Err(e)) => return ddl_error(&e),
+            None => None,
+        };
+    let (row_data, query) = match &generated_rewrite {
+        Some(purpose @ QueryPurpose::InsertRow(data)) => (data, purpose),
+        _ => (row_data, query),
+    };
+
+    let table_name = &row_data.table_name;
+    debug!("Insert row into table: {}", table_name);
+    // The lookup guard is a shard read lock, and it must end here.
+    //
+    // `rewrite_json_values` below creates the table backing a JSON
+    // column, which takes a *write* lock on the shard the new table's
+    // name hashes to. Held across that await, the read lock this task
+    // owns and the write lock it waits for are the same lock whenever
+    // the two names share a shard — a deadlock with no second thread
+    // in it.
+    //
+    // It is intermittent for a reason worth stating: `tables` is keyed
+    // by `ahash::RandomState`, which seeds itself per `Database`. The
+    // shard a name lands on is therefore drawn afresh at every start-up,
+    // so a fixed statement against a fixed schema hangs on some servers
+    // and not others. It read as a flaky test — a suite stalling at a
+    // different place each run while every test in it passed alone.
+    //
+    // Cloning the `Arc` costs a refcount and owes nothing to the map.
+    //
+    // A partitioned table's rows go to its partitions (§9), so `table`
+    // is then its shell: the schema every check below reads, never the
+    // writer. Resolved through `relation`, as a shell found in `tables`
+    // by name refuses every write.
+    // The target resolved at the top of the arm, under its ROW
+    // EXCLUSIVE.
+    let (table, partitioned) = match target {
+        Some(crate::core::database::Relation::Plain(table)) => (table, None),
+        Some(crate::core::database::Relation::Partitioned(pt)) => {
+            if let Err(e) = pt.check() {
+                error!("Cannot insert into {}: {}", table_name, e);
+                return ddl_error(&e.to_string());
+            }
+            (pt.shell().clone(), Some(pt))
+        }
+        None => {
+            error!("Table not found");
+            let mut result = vec![3u8];
+            result.extend_from_slice("Table not found".as_bytes());
+            return result;
+        }
+    };
+
+    let schema = &table.schema;
+
+    // A RETURNING clause turns the write into a statement that also
+    // produces rows. Resolving it before the insert means a bad column
+    // name fails the statement instead of being reported after the row
+    // has already been written.
+    let returning = match crate::core::rql::lexer_ir::returning_columns(
+        &row_data.query,
+        &schema.fields,
+    ) {
+        Some(Ok(fields)) => Some(fields),
+        Some(Err(e)) => {
+            error!("Cannot insert row: {}", e);
+            let mut result = vec![3u8];
+            result.extend_from_slice(e.as_bytes());
+            return result;
+        }
+        None => None,
+    };
+
+    // A JSON document is stored in the table backing its column, and
+    // the statement rewritten to carry the reference — so the row that
+    // reaches the writer holds a UUID like any other.
+    // Parsed once: the foreign-key check below reads the same statement, and
+    // a multi-row insert pays this per row.
+    let parsed_assignments = crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query);
+    let insert_assignments: &[(String, String)] = parsed_assignments.as_deref().unwrap_or_default();
+
+    // A `NOT NULL` column must actually receive a value. Checked before
+    // anything is written, so a rejected row leaves nothing behind.
+    if let Err(e) = check_not_null(
+        &row_data.table_name,
+        &schema.fields,
+        &insert_assignments,
+        &schema.defaults,
+        true,
+    ) {
+        error!("{}", e);
+        return ddl_error(&e);
+    }
+    let statement = match rewrite_json_values(
+        &database,
+        &row_data.table_name,
+        &row_data.query,
+        &insert_assignments,
+        &schema.json_columns,
+        tx,
+    )
+    .await
+    {
+        Ok(sql) => sql,
+        Err(e) => {
+            error!("{}", e);
+            return ddl_error(&e);
+        }
+    };
+    if let Some(sql) = statement {
+        let Some(rewritten) = recognize_query_purpose(&sql) else {
+            return ddl_error("could not parse the statement after JSON mapping");
+        };
+        return Box::pin(execute_with_context(rewritten, database.clone(), depth, tx))
+            .await;
+    }
+
+    // Foreign keys are checked before the row is written, so a
+    // violation leaves nothing behind to undo.
+    match &parsed_assignments {
+        // Built only for a table that has foreign keys, and boxed: the
+        // check's future is most of this one's, which a multi-row insert
+        // builds and copies once per row. Without any it answers `Ok` at
+        // once, after the probe noted here in its place.
+        Some(_) if table.schema.foreign_keys.is_empty() => {
+            crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
+        }
+        Some(assignments) => {
+            if let Err(e) =
+                Box::pin(check_foreign_keys_of(&database, Some(&table.schema), table_name, assignments, tx)).await
+            {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
+        }
+        None => {
+            // Falls through to the parser below, which reports why.
+        }
+    }
+
+    // Handle insert row
+    if let Some(insert_row) = crate::core::rql::lexer_ir::insert_row_with_defaults(
+        &query,
+        &schema.fields,
+        &schema.defaults,
+        &schema.type_modifiers,
+        database.id,
+    ) {
+        // Every `CHECK` the table declares, evaluated against the row
+        // as it will be stored. Before the write, so a violation
+        // leaves nothing behind to undo.
+        //
+        // The row it judges is built inside the helper, not here. This
+        // arm's locals are the ones that overflowed a worker's stack
+        // once already, and a `Row` plus a loop in it was enough to do
+        // so again.
+        if let Err(e) = check_constraints_hold(
+            table_name,
+            &table.schema,
+            &insert_row.columns_writing_data,
+        ) {
+            error!("{}", e);
+            return ddl_error(&e);
+        }
+
+        // The returned row is built from the payload about to be
+        // written, so it reflects exactly what was stored without
+        // reading the row back off disk.
+        // The returned row is the payload about to be written, every
+        // column of it, so RETURNING reports exactly what was stored
+        // without reading the row back. It goes through the same
+        // builder UPDATE and DELETE use, which evaluates a computed
+        // item against the row. Echoing payloads by the item's write
+        // order instead returned NULL for `RETURNING id AS k`, whose
+        // item is a computed echo with a synthetic write order, and
+        // for any expression.
+        let returned_row = returning.as_ref().map(|_| crate::core::row::row::Row {
+            position: 0,
+            columns: insert_row
+                .columns_writing_data
+                .iter()
+                .map(|c| crate::core::row::row::Column {
+                    schema_id: crate::core::row::row::schema_id_of(c.write_order as u64),
+                    data: c.data.clone(),
+                    column_type: c.column_type.clone(),
+                })
+                .collect(),
+            length: 0,
+        });
+
+        // A partitioned table routes the final row, defaults and
+        // generated values included, to its partition, materializing
+        // it on first write; the partition's own unique check is exact
+        // because every unique key holds every key column (§1b). Boxed:
+        // routing adds a materialization to this arm's future.
+        let outcome = match &partitioned {
+            Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
+            None => table.insert_row_in_txn(insert_row, tx).await,
+        };
+        if outcome.is_ok() {
+            // Recorded here, with the statement as it actually ran: by
+            // this point a JSON rewrite has already happened and its
+            // generated identifiers are literals in the text, so a
+            // replica writes the same values rather than new ones.
+            note_write(&database, tx, depth, &row_data.query, Some(table_name));
+            if let Some(row) = returned_row {
+                // JSON columns still hold the reference the rewrite put
+                // there; the builder hydrates them into documents.
+                let built = Box::pin(returning_rows_for_write(
+                    &table,
+                    &row_data.query,
+                    vec![row],
+                    None,
+                    &[],
+                    &database,
+                    tx,
+                ))
+                .await;
+                return match built {
+                    Ok(Some(rows)) => {
+                        let mut result = vec![2u8];
+                        for row in &rows {
+                            row.extend_serialized(&mut result);
+                        }
+                        result
+                    }
+                    Ok(None) => ddl_ok(1),
+                    Err(e) => ddl_error(&e),
+                };
+            }
+            // Keep status=0 for backward compatibility, but also include rows-affected.
+            // pgwire can use this to emit INSERT 0 <n>.
+            let mut result = vec![0u8];
+            result.extend_from_slice(&1u64.to_le_bytes());
+            return result;
+        } else if row_data.on_conflict_update.is_some()
+            && outcome
+                .as_ref()
+                .err()
+                .is_some_and(|e| is_uniqueness_violation(e))
+        {
+            // `ON CONFLICT … DO UPDATE`: the row is already there, so
+            // the statement becomes an update of it. Built from the
+            // values this insert would have written, which is what
+            // `EXCLUDED` names.
+            let spec = row_data
+                .on_conflict_update
+                .as_ref()
+                .expect("checked just above");
+            return Box::pin(apply_conflict_update(
+                &database,
+                table_name,
+                &row_data.query,
+                spec,
+                depth,
+                tx,
+            ))
+            .await;
+        } else if row_data.on_conflict_do_nothing
+            && outcome
+                .as_ref()
+                .err()
+                .is_some_and(|e| is_uniqueness_violation(e))
+        {
+            // `ON CONFLICT DO NOTHING`: the duplicate is the statement
+            // working, not failing. Reported as zero rows affected, which
+            // is what PostgreSQL returns and what a seed migration
+            // re-run against an existing database depends on. With
+            // RETURNING it is an empty row set rather than a count:
+            // PostgreSQL still sends the RowDescription, and a bare
+            // count sent only the command tag (as `INSERT … SELECT`
+            // did before dedd503).
+            if returning.is_some() {
+                return vec![2u8];
+            }
+            let mut result = vec![0u8];
+            result.extend_from_slice(&0u64.to_le_bytes());
+            return result;
+        } else {
+            // The reason has to reach the client: an application
+            // distinguishes a uniqueness violation from a genuine
+            // failure, and cannot do that with a generic message.
+            let message = outcome
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the row could not be inserted".to_string());
+            // A retryable conflict is not a failure yet — the caller
+            // above replays the statement, and either it succeeds or it
+            // exhausts its attempts and is reported then, once. Logged
+            // at `error!` it was neither: one deploy produced 593 ERROR
+            // lines in a minute for statements that all went on to
+            // succeed, and nothing in the log said so. Volume like that
+            // teaches an operator to skim exactly the level a real
+            // failure arrives at.
+            if message.ends_with(
+                <crate::core::row::table::Table<
+                    crate::core::storage_providers::backend::DbStorageProvider,
+                >>::CONFLICT_RETRYABLE,
+            ) {
+                log::debug!("insert conflicted and will be replayed: {}", message);
+            } else {
+                error!("Failed to insert row: {}", message);
+            }
+            let mut result = vec![3u8];
+            result.extend_from_slice(message.as_bytes());
+            return result;
+        }
+    } else {
+        // A value the column cannot hold is reported as PostgreSQL
+        // reports it — the reason, and through it the SQLSTATE — rather
+        // than as the generic mismatch every refusal used to become.
+        if let Some(reason) = crate::core::rql::lexer_ir::take_refusal() {
+            let mut result = vec![3u8];
+            result.extend_from_slice(reason.as_bytes());
+            return result;
+        }
+        error!("Cannot insert row due to schema mismatch");
+        let mut result: [u8; 1] = [1u8; 1];
+        result[0] = 3;
+        let mut result = result.to_vec();
+        let error_message = "Cannot insert row due to schema mismatch";
+        let mut error_message_bytes = Vec::with_capacity(error_message.len());
+        error_message_bytes.extend_from_slice(error_message.as_bytes());
+        result.extend_from_slice(&mut error_message_bytes);
+        return result.to_vec();
+    }
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
 pub(crate) async fn execute_with_need(
@@ -12866,337 +13243,10 @@ pub(crate) async fn execute_with_need(
                 None => {}
             }
 
-            // Generated columns, computed now that the statement is one tuple
-            // with an explicit column list. After the batch split, so each row
-            // of a multi-row insert is computed from its own values.
-            //
-            // The rewritten statement is substituted for the original here
-            // rather than re-dispatched — see `supply_generated_values`.
-            //
-            // Both `row_data` and `query` are shadowed. The row parser below
-            // reads the whole `QueryPurpose`, not the `row_data` beside it, so
-            // rebinding only one of them left the computed value in a statement
-            // nothing went on to parse — the column stayed NULL and the insert
-            // still reported success.
-            let generated_rewrite =
-                match supply_generated_values(row_data, target.as_ref().map(|t| t.schema()), &database) {
-                    Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
-                    Some(Err(e)) => return ddl_error(&e),
-                    None => None,
-                };
-            let (row_data, query) = match &generated_rewrite {
-                Some(purpose @ QueryPurpose::InsertRow(data)) => (data, purpose),
-                _ => (row_data, &query),
-            };
-
-            let table_name = &row_data.table_name;
-            debug!("Insert row into table: {}", table_name);
-            // The lookup guard is a shard read lock, and it must end here.
-            //
-            // `rewrite_json_values` below creates the table backing a JSON
-            // column, which takes a *write* lock on the shard the new table's
-            // name hashes to. Held across that await, the read lock this task
-            // owns and the write lock it waits for are the same lock whenever
-            // the two names share a shard — a deadlock with no second thread
-            // in it.
-            //
-            // It is intermittent for a reason worth stating: `tables` is keyed
-            // by `ahash::RandomState`, which seeds itself per `Database`. The
-            // shard a name lands on is therefore drawn afresh at every start-up,
-            // so a fixed statement against a fixed schema hangs on some servers
-            // and not others. It read as a flaky test — a suite stalling at a
-            // different place each run while every test in it passed alone.
-            //
-            // Cloning the `Arc` costs a refcount and owes nothing to the map.
-            //
-            // A partitioned table's rows go to its partitions (§9), so `table`
-            // is then its shell: the schema every check below reads, never the
-            // writer. Resolved through `relation`, as a shell found in `tables`
-            // by name refuses every write.
-            // The target resolved at the top of the arm, under its ROW
-            // EXCLUSIVE.
-            let (table, partitioned) = match target {
-                Some(crate::core::database::Relation::Plain(table)) => (table, None),
-                Some(crate::core::database::Relation::Partitioned(pt)) => {
-                    if let Err(e) = pt.check() {
-                        error!("Cannot insert into {}: {}", table_name, e);
-                        return ddl_error(&e.to_string());
-                    }
-                    (pt.shell().clone(), Some(pt))
-                }
-                None => {
-                    error!("Table not found");
-                    let mut result = vec![3u8];
-                    result.extend_from_slice("Table not found".as_bytes());
-                    return result;
-                }
-            };
-
-            let schema = &table.schema;
-
-            // A RETURNING clause turns the write into a statement that also
-            // produces rows. Resolving it before the insert means a bad column
-            // name fails the statement instead of being reported after the row
-            // has already been written.
-            let returning = match crate::core::rql::lexer_ir::returning_columns(
-                &row_data.query,
-                &schema.fields,
-            ) {
-                Some(Ok(fields)) => Some(fields),
-                Some(Err(e)) => {
-                    error!("Cannot insert row: {}", e);
-                    let mut result = vec![3u8];
-                    result.extend_from_slice(e.as_bytes());
-                    return result;
-                }
-                None => None,
-            };
-
-            // A JSON document is stored in the table backing its column, and
-            // the statement rewritten to carry the reference — so the row that
-            // reaches the writer holds a UUID like any other.
-            let insert_assignments =
-                crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query)
-                    .unwrap_or_default();
-
-            // A `NOT NULL` column must actually receive a value. Checked before
-            // anything is written, so a rejected row leaves nothing behind.
-            if let Err(e) = check_not_null(
-                &row_data.table_name,
-                &schema.fields,
-                &insert_assignments,
-                &schema.defaults,
-                true,
-            ) {
-                error!("{}", e);
-                return ddl_error(&e);
-            }
-            let statement = match rewrite_json_values(
-                &database,
-                &row_data.table_name,
-                &row_data.query,
-                &insert_assignments,
-                &schema.json_columns,
-                tx,
-            )
-            .await
-            {
-                Ok(sql) => sql,
-                Err(e) => {
-                    error!("{}", e);
-                    return ddl_error(&e);
-                }
-            };
-            if let Some(sql) = statement {
-                let Some(rewritten) = recognize_query_purpose(&sql) else {
-                    return ddl_error("could not parse the statement after JSON mapping");
-                };
-                return Box::pin(execute_with_context(rewritten, database.clone(), depth, tx))
-                    .await;
-            }
-
-            // Foreign keys are checked before the row is written, so a
-            // violation leaves nothing behind to undo.
-            match crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query) {
-                Some(assignments) => {
-                    if let Err(e) =
-                        check_foreign_keys_of(&database, Some(&table.schema), table_name, &assignments, tx).await
-                    {
-                        error!("{}", e);
-                        return ddl_error(&e);
-                    }
-                }
-                None => {
-                    // Falls through to the parser below, which reports why.
-                }
-            }
-
-            // Handle insert row
-            if let Some(insert_row) = crate::core::rql::lexer_ir::insert_row_with_defaults(
-                &query,
-                &schema.fields,
-                &schema.defaults,
-                &schema.type_modifiers,
-                database.id,
-            ) {
-                // Every `CHECK` the table declares, evaluated against the row
-                // as it will be stored. Before the write, so a violation
-                // leaves nothing behind to undo.
-                //
-                // The row it judges is built inside the helper, not here. This
-                // arm's locals are the ones that overflowed a worker's stack
-                // once already, and a `Row` plus a loop in it was enough to do
-                // so again.
-                if let Err(e) = check_constraints_hold(
-                    table_name,
-                    &table.schema,
-                    &insert_row.columns_writing_data,
-                ) {
-                    error!("{}", e);
-                    return ddl_error(&e);
-                }
-
-                // The returned row is built from the payload about to be
-                // written, so it reflects exactly what was stored without
-                // reading the row back off disk.
-                // The returned row is the payload about to be written, every
-                // column of it, so RETURNING reports exactly what was stored
-                // without reading the row back. It goes through the same
-                // builder UPDATE and DELETE use, which evaluates a computed
-                // item against the row. Echoing payloads by the item's write
-                // order instead returned NULL for `RETURNING id AS k`, whose
-                // item is a computed echo with a synthetic write order, and
-                // for any expression.
-                let returned_row = returning.as_ref().map(|_| crate::core::row::row::Row {
-                    position: 0,
-                    columns: insert_row
-                        .columns_writing_data
-                        .iter()
-                        .map(|c| crate::core::row::row::Column {
-                            schema_id: crate::core::row::row::schema_id_of(c.write_order as u64),
-                            data: c.data.clone(),
-                            column_type: c.column_type.clone(),
-                        })
-                        .collect(),
-                    length: 0,
-                });
-
-                // A partitioned table routes the final row, defaults and
-                // generated values included, to its partition, materializing
-                // it on first write; the partition's own unique check is exact
-                // because every unique key holds every key column (§1b). Boxed:
-                // routing adds a materialization to this arm's future.
-                let outcome = match &partitioned {
-                    Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
-                    None => table.insert_row_in_txn(insert_row, tx).await,
-                };
-                if outcome.is_ok() {
-                    // Recorded here, with the statement as it actually ran: by
-                    // this point a JSON rewrite has already happened and its
-                    // generated identifiers are literals in the text, so a
-                    // replica writes the same values rather than new ones.
-                    note_write(&database, tx, depth, &row_data.query, Some(table_name));
-                    if let Some(row) = returned_row {
-                        // JSON columns still hold the reference the rewrite put
-                        // there; the builder hydrates them into documents.
-                        let built = Box::pin(returning_rows_for_write(
-                            &table,
-                            &row_data.query,
-                            vec![row],
-                            None,
-                            &[],
-                            &database,
-                            tx,
-                        ))
-                        .await;
-                        return match built {
-                            Ok(Some(rows)) => {
-                                let mut result = vec![2u8];
-                                for row in &rows {
-                                    row.extend_serialized(&mut result);
-                                }
-                                result
-                            }
-                            Ok(None) => ddl_ok(1),
-                            Err(e) => ddl_error(&e),
-                        };
-                    }
-                    // Keep status=0 for backward compatibility, but also include rows-affected.
-                    // pgwire can use this to emit INSERT 0 <n>.
-                    let mut result = vec![0u8];
-                    result.extend_from_slice(&1u64.to_le_bytes());
-                    return result;
-                } else if row_data.on_conflict_update.is_some()
-                    && outcome
-                        .as_ref()
-                        .err()
-                        .is_some_and(|e| is_uniqueness_violation(e))
-                {
-                    // `ON CONFLICT … DO UPDATE`: the row is already there, so
-                    // the statement becomes an update of it. Built from the
-                    // values this insert would have written, which is what
-                    // `EXCLUDED` names.
-                    let spec = row_data
-                        .on_conflict_update
-                        .as_ref()
-                        .expect("checked just above");
-                    return Box::pin(apply_conflict_update(
-                        &database,
-                        table_name,
-                        &row_data.query,
-                        spec,
-                        depth,
-                        tx,
-                    ))
-                    .await;
-                } else if row_data.on_conflict_do_nothing
-                    && outcome
-                        .as_ref()
-                        .err()
-                        .is_some_and(|e| is_uniqueness_violation(e))
-                {
-                    // `ON CONFLICT DO NOTHING`: the duplicate is the statement
-                    // working, not failing. Reported as zero rows affected, which
-                    // is what PostgreSQL returns and what a seed migration
-                    // re-run against an existing database depends on. With
-                    // RETURNING it is an empty row set rather than a count:
-                    // PostgreSQL still sends the RowDescription, and a bare
-                    // count sent only the command tag (as `INSERT … SELECT`
-                    // did before dedd503).
-                    if returning.is_some() {
-                        return vec![2u8];
-                    }
-                    let mut result = vec![0u8];
-                    result.extend_from_slice(&0u64.to_le_bytes());
-                    return result;
-                } else {
-                    // The reason has to reach the client: an application
-                    // distinguishes a uniqueness violation from a genuine
-                    // failure, and cannot do that with a generic message.
-                    let message = outcome
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "the row could not be inserted".to_string());
-                    // A retryable conflict is not a failure yet — the caller
-                    // above replays the statement, and either it succeeds or it
-                    // exhausts its attempts and is reported then, once. Logged
-                    // at `error!` it was neither: one deploy produced 593 ERROR
-                    // lines in a minute for statements that all went on to
-                    // succeed, and nothing in the log said so. Volume like that
-                    // teaches an operator to skim exactly the level a real
-                    // failure arrives at.
-                    if message.ends_with(
-                        <crate::core::row::table::Table<
-                            crate::core::storage_providers::backend::DbStorageProvider,
-                        >>::CONFLICT_RETRYABLE,
-                    ) {
-                        log::debug!("insert conflicted and will be replayed: {}", message);
-                    } else {
-                        error!("Failed to insert row: {}", message);
-                    }
-                    let mut result = vec![3u8];
-                    result.extend_from_slice(message.as_bytes());
-                    return result;
-                }
-            } else {
-                // A value the column cannot hold is reported as PostgreSQL
-                // reports it — the reason, and through it the SQLSTATE — rather
-                // than as the generic mismatch every refusal used to become.
-                if let Some(reason) = crate::core::rql::lexer_ir::take_refusal() {
-                    let mut result = vec![3u8];
-                    result.extend_from_slice(reason.as_bytes());
-                    return result;
-                }
-                error!("Cannot insert row due to schema mismatch");
-                let mut result: [u8; 1] = [1u8; 1];
-                result[0] = 3;
-                let mut result = result.to_vec();
-                let error_message = "Cannot insert row due to schema mismatch";
-                let mut error_message_bytes = Vec::with_capacity(error_message.len());
-                error_message_bytes.extend_from_slice(error_message.as_bytes());
-                result.extend_from_slice(&mut error_message_bytes);
-                return result.to_vec();
-            }
+            // The statement-level work is done; the row is written by the
+            // half `insert_values_tuples` also calls, once per tuple, with
+            // the target resolved here.
+            Box::pin(insert_row_resolved(&database, &query, row_data, target, depth, tx)).await
         }
         QueryPurpose::UpdateRow(_) => {
             // `UPDATE t SET … FROM src WHERE …` reads one relation to write

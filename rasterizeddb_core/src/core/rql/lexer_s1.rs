@@ -132,6 +132,11 @@ pub struct ConflictUpdate {
 /// discarding the rest would have dropped it, and the caller would have got no
 /// rows back from a statement that asked for them.
 fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<String>) {
+    // The clause is found as `ON CONFLICT` in the uppercased text; a statement
+    // that holds it nowhere, in any case, skips the copy. Every `INSERT` asks.
+    if !crate::core::sql_scan::contains_ignore_ascii_case(query, b"ON CONFLICT") {
+        return (query.to_string(), false, None, Vec::new());
+    }
     let upper = query.to_ascii_uppercase();
     let Some(at) = find_top_level(&upper, "ON CONFLICT") else {
         return (query.to_string(), false, None, Vec::new());
@@ -302,6 +307,12 @@ fn normalize_table_name(raw: &str) -> String {
 /// is left alone.
 pub fn strip_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
+    // Only a `--` or a `/*` starts what this removes, so text holding neither,
+    // quoted or not, comes back as it is: one copy, where a 125 KB bulk
+    // `INSERT` was pushed byte by byte, twice per statement.
+    if memchr::memmem::find(bytes, b"--").is_none() && memchr::memmem::find(bytes, b"/*").is_none() {
+        return sql.to_string();
+    }
     // Bytes, not chars. `push(byte as char)` re-encoded every byte above 0x7F
     // as two UTF-8 bytes, so a statement carrying any non-ASCII text — an
     // accented name, a currency sign, an emoji — reached the engine
