@@ -71,7 +71,7 @@ const MINTS: [(&str, &str); 3] = [
 ];
 /// The rebuild paths that may mint a `BuildToken`: `(file, fn)`. Each builds
 /// or clears a structure that is not ready (§2, `BuildToken`).
-const BUILD_TOKEN_CALLERS: [(&str, &str); 4] = [
+const BUILD_TOKEN_CALLERS: [(&str, &str); 5] = [
     // The open path, shared by a plain table and a partition: the unindexed
     // prefix on a filter not yet installed, and the open-time index build's
     // readiness.
@@ -82,6 +82,9 @@ const BUILD_TOKEN_CALLERS: [(&str, &str); 4] = [
     ("core/row/table.rs", "backfill_into"),
     // The index build.
     ("core/row/table.rs", "build_indexes"),
+    // The audit's in-place rebuild (B18): the indexes it demoted and
+    // cleared under its write ticket, made ready again.
+    ("core/row/table_audit.rs", "rebuild_in_place"),
 ];
 /// Macros that may name `Proof` (never a token).
 const MACROS_NAMING_PROOF: [&str; 1] = ["matches"];

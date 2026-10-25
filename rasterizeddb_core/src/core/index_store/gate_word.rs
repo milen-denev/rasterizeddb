@@ -578,6 +578,13 @@ fn run<T>(mut step: impl FnMut() -> Step<T>) -> T {
 /// The gate of one file set: the word, and the wakeups around it.
 pub struct WriteGate {
     word: AtomicU64,
+    /// Tickets taken on the word, ever: every [`WriteGate::try_acquire`]
+    /// that held and every [`Hold::beside`]. Beside the word, so the ticket
+    /// that just wrote the word's line pays for this on the same line. The
+    /// audit's stability test (B18): a verdict counts only if no ticket was
+    /// held when it began and this did not move until it was reached, so
+    /// nothing a write path mutates moved under the comparison.
+    taken: AtomicU64,
     /// Woken when a seal ends: slow-path writers waiting on a mandatory seal
     /// or a `PUBLISHING` window.
     unsealed: tokio::sync::Notify,
@@ -618,6 +625,7 @@ impl Hold {
             prev.count() > 0 && prev.state() == GateState::Dirty && !prev.publishing(),
             "a sibling count beside no held ticket: {prev:?}"
         );
+        self.gate.taken.fetch_add(1, SeqCst);
         super::census::hold(self.gate.census_id());
         Hold {
             gate: self.gate.clone(),
@@ -673,6 +681,7 @@ impl WriteGate {
     pub fn new(state: GateState) -> WriteGate {
         WriteGate {
             word: AtomicU64::new(Word::new(state).0),
+            taken: AtomicU64::new(0),
             unsealed: tokio::sync::Notify::new(),
             drained: tokio::sync::Notify::new(),
             slow: tokio::sync::Mutex::new(()),
@@ -681,6 +690,14 @@ impl WriteGate {
 
     pub fn load(&self) -> Word {
         Word(self.word.load(SeqCst))
+    }
+
+    /// Tickets taken on the word so far (see the field). Read after what it
+    /// guards: a write path takes its ticket, counting here, before it
+    /// mutates anything, so a reader that saw the mutation (through the
+    /// structure's lock) sees the count.
+    pub fn tickets_taken(&self) -> u64 {
+        self.taken.load(SeqCst)
     }
 
     /// The word's address: who the census attributes a hold to.
@@ -742,6 +759,7 @@ impl WriteGate {
         let mut op = TicketOp::Add;
         match run(|| op.step(&self.word)) {
             TicketEnd::Held => {
+                self.taken.fetch_add(1, SeqCst);
                 super::census::hold(self.census_id());
                 Ok(Hold {
                     gate: self.clone(),

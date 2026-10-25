@@ -3,6 +3,9 @@
 //! materialized partitions, and shutdown's seal of every file set. The
 //! third clean point, the idle checkpoint, is each instance's own watcher
 //! (`row::table::table_seal`).
+//!
+//! Beside them, `rdb_index_check(regclass)` (§4 Audit, B18): the audit's
+//! check on demand, over the same file sets.
 
 use std::time::Duration;
 
@@ -12,6 +15,7 @@ use rclite::Arc;
 use super::Database;
 use super::relation::Relation;
 use crate::core::mvcc::table_locks::TableMode;
+use crate::core::index_store::audit::{Findings, Outcome};
 use crate::core::index_store::gate_word::SealKind;
 use crate::core::index_store::seal::{self, SealOutcome};
 use crate::core::mvcc::owner::{self, OwnerKind, StatementOwner};
@@ -42,6 +46,68 @@ impl CheckpointReport {
     pub fn clean(&self) -> (usize, usize) {
         let clean = self.sealed.iter().filter(|s| s.outcome.is_clean()).count();
         (clean, self.sealed.len() + self.own_writes.len())
+    }
+}
+
+/// One file set's check.
+#[derive(Debug)]
+pub struct Checked {
+    /// The table, or `table (partition pid)`.
+    pub name: String,
+    pub outcome: Outcome,
+}
+
+/// What `rdb_index_check` did, file set by file set.
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    pub checked: Vec<Checked>,
+}
+
+impl CheckReport {
+    /// Every file set's findings, added up (a partitioned table's).
+    pub fn findings(&self) -> Findings {
+        let mut all = Findings::default();
+        for c in &self.checked {
+            if let Some(f) = c.outcome.findings() {
+                all.absorb(f);
+            }
+        }
+        all
+    }
+
+    /// The worst outcome, as `rdb_index_check`'s `result` column says it: a
+    /// mismatch over an abandoned check over a clean one.
+    pub fn result(&self) -> String {
+        let pick = |want: fn(&Outcome) -> bool| self.checked.iter().find(|c| want(&c.outcome));
+        let worst = pick(|o| matches!(o, Outcome::Mismatch { .. }))
+            .or_else(|| pick(|o| matches!(o, Outcome::Abandoned(_))))
+            .or_else(|| self.checked.first());
+        match worst {
+            Some(c) if self.checked.len() > 1 && !matches!(c.outcome, Outcome::Clean(_)) => {
+                format!("{}: {}", c.name, c.outcome.describe())
+            }
+            Some(c) => c.outcome.describe(),
+            None => "clean: no file sets".into(),
+        }
+    }
+}
+
+/// Why `rdb_index_check` refused, before anything was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckRefusal {
+    /// Nothing is registered under the name (42P01).
+    NotFound(String),
+    /// The name is an index or a catalogue view, not a table (42809).
+    NotATable(String),
+    /// Anything else (XX000).
+    Other(String),
+}
+
+impl std::fmt::Display for CheckRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckRefusal::NotFound(m) | CheckRefusal::NotATable(m) | CheckRefusal::Other(m) => f.write_str(m),
+        }
     }
 }
 
@@ -86,6 +152,57 @@ impl Database {
             Some(root) => owner::under(&self.transactions, root, OwnerKind::Block, run).await,
             None => owner::statement(&self.transactions, &self.row_locks, OwnerKind::Statement, run).await,
         }
+    }
+
+    /// `rdb_index_check(name)` (§4 Audit, B18): the audit's check of the
+    /// table's file set now, or of each materialized partition's in turn,
+    /// with its in-place rebuild on a mismatch. Under the same owner and
+    /// ACCESS SHARE lock as [`Database::index_checkpoint`]. A file set the
+    /// calling family holds a ticket on is not checked (its own writes would
+    /// abandon the check): reported abandoned. Refuses an index, a
+    /// catalogue view and an unknown name before reading anything.
+    pub async fn index_check(&self, name: &str, block: Option<TxId>) -> Result<CheckReport, CheckRefusal> {
+        if crate::core::rql::catalog_views::is_catalog_view(name) {
+            return Err(CheckRefusal::NotATable(format!("\"{name}\" is a catalog view, not a table")));
+        }
+        let run = async {
+            let relation = match self.relation_for(name, owner::ensure(), TableMode::AccessShare).await {
+                Ok(Some(relation)) => relation,
+                Ok(None) => return Err(self.not_a_table(name)),
+                Err(e) => return Err(CheckRefusal::Other(e)),
+            };
+            let family = owner::family_for(&self.transactions);
+            let mut report = CheckReport::default();
+            for (label, table) in seal_targets(name, &relation).map_err(CheckRefusal::Other)? {
+                let outcome = match family {
+                    Some(f) if self.transactions.family_tickets().keeps_on(f, table.gate()) => {
+                        Outcome::Abandoned("this transaction has written it; run rdb_index_check after it ends".into())
+                    }
+                    _ => table.index_check().await,
+                };
+                report.checked.push(Checked { name: label, outcome });
+            }
+            Ok(report)
+        };
+        match block {
+            Some(root) => owner::under(&self.transactions, root, OwnerKind::Block, run).await,
+            None => owner::statement(&self.transactions, &self.row_locks, OwnerKind::Statement, run).await,
+        }
+    }
+
+    /// The refusal for a name no relation is registered under: an index's
+    /// name is not a table's, anything else does not exist.
+    fn not_a_table(&self, name: &str) -> CheckRefusal {
+        for table in self.relation_names() {
+            let Some(relation) = self.relation(&table) else { continue };
+            let schema = relation.schema();
+            if schema.secondary_indexes.iter().any(|d| d.name == name)
+                || schema.path_indexes.iter().any(|p| !p.is_deleted && p.name == name)
+            {
+                return CheckRefusal::NotATable(format!("\"{name}\" is an index on {table}, not a table"));
+            }
+        }
+        CheckRefusal::NotFound(format!("relation \"{name}\" does not exist"))
     }
 
     /// Shutdown's seal (§3 Shutdown), after the sessions have ended: every

@@ -2116,6 +2116,13 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         set_with: "SET CONFIG index_snapshot.load_wait_ms = 600",
         help: "how long a query waits for an index load at open before it scans",
     },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "audit_rate",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.audit_rate = 64",
+        help: "1 in this many index loads is checked against a copy read from rows in the background; 0 checks none",
+    },
 ];
 
 fn config_keys() -> Vec<Row> {
@@ -2210,6 +2217,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("index_snapshot", "load_wait_ms") => {
                 crate::core::index_store::load::settings::load_wait().as_millis().to_string()
             }
+            ("index_snapshot", "audit_rate") => crate::core::index_store::audit::settings::audit_rate().to_string(),
             _ => String::new(),
         }
     };
@@ -2381,6 +2389,7 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 "writeback_mb" => settings::set_writeback_mb(n),
                 "max_concurrent_loads" => crate::core::index_store::load::settings::set_max_concurrent_loads(n),
                 "load_wait_ms" => crate::core::index_store::load::settings::set_load_wait_ms(n),
+                "audit_rate" => crate::core::index_store::audit::settings::set_audit_rate(n),
                 _ => return Err(format!("`{}` has no live setter", key)),
             }
             Ok(format!("{key} is now {n}"))

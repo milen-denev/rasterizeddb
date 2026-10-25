@@ -1473,6 +1473,14 @@ impl<S: StorageIO> Table<S> {
             index_origin,
         });
         table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
+        // The audit of a load, 1 in `index_snapshot.audit_rate` (§4, B18).
+        table_audit::spawn_after_load(table_audit::AuditParts {
+            seal: seal.clone(),
+            fields: schema.fields.clone(),
+            readers: readers.clone(),
+            alive: maintenance_alive.clone(),
+            cache_generation: cache_generation.clone(),
+        });
 
         Self {
             schema,
@@ -5792,3 +5800,6 @@ mod snapshot_order_tests;
 
 #[path = "table_seal.rs"]
 pub(crate) mod table_seal;
+
+#[path = "table_audit.rs"]
+pub(crate) mod table_audit;

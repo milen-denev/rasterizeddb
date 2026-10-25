@@ -34,7 +34,14 @@
 //! section per B-tree, hash and path index ([`index_section`]) under
 //! `index_snapshot.index_storage = snapshot`, and an open whose proof
 //! passes loads them ([`load`]), writes and readers waiting for it.
+//!
+//! Slice B18 adds [`audit`]: 1 in `index_snapshot.audit_rate` loads is
+//! checked against a scratch copy read from rows, in the dangerous
+//! direction, and a mismatch rebuilds in place; `rdb_index_check` runs the
+//! same check on demand. A write or a reader waiting for a queued load
+//! moves it to the front of the load queue.
 
+pub mod audit;
 pub mod census;
 pub mod codec;
 pub mod epoch_log;
