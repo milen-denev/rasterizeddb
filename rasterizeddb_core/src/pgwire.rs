@@ -3308,10 +3308,20 @@ tokio::task_local! {
 }
 
 /// Runs `fut` (one `Execute`'s statement) with `check` in scope.
-async fn with_shape_check<F: std::future::Future>(check: Option<StdArc<ShapeCheck>>, fut: F) -> F::Output {
+///
+/// Only a statement a `Describe` told a shape has a check, and only its run
+/// is boxed into the task-local's scope. Without one (a client that never
+/// describes, the common prepared path) `fut` runs as it is, inside the
+/// caller's own future, with no allocation per `Execute` (slice B8b). Not an
+/// `async fn`, so `fut` is stored once rather than once as an argument and
+/// again where it is awaited.
+fn with_shape_check<F: std::future::Future>(
+    check: Option<StdArc<ShapeCheck>>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
     match check {
-        Some(check) => SHAPE_CHECK.scope(check, Box::pin(fut)).await,
-        None => Box::pin(fut).await,
+        Some(check) => futures::future::Either::Left(SHAPE_CHECK.scope(check, Box::pin(fut))),
+        None => futures::future::Either::Right(fut),
     }
 }
 
