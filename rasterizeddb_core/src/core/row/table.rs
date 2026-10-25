@@ -2384,6 +2384,28 @@ impl<S: StorageIO> Table<S> {
         // The guard holds `begin` off until the write lands. It owns an `Arc`
         // and a counter, never a lock, so carrying it across the awaits below
         // costs nothing and cannot deadlock.
+        // An overwrite keeps no prior version, so it commits through the log
+        // its bytes go to, not through a transaction outcome. Every other write
+        // commits through its outcome record in the database's own log, and
+        // with `synchronous_commit = off` two logs reach the disk in no order a
+        // power cut respects: a table on another location could keep this
+        // overwrite and lose an earlier statement's outcome, or lose this and
+        // keep a later one, which is no suffix of the commits (PostgreSQL's
+        // promise for an asynchronous commit is that a crash loses only the
+        // most recent ones). In the outcome log itself, the overwrite is one
+        // more record in commit order. Elsewhere it is written as a version,
+        // whose outcome is.
+        if let Some(manager) = self.versions.load_full()
+            && let Some(outcomes) = manager.outcome_log()
+            && !d
+                .io_rows
+                .get_location()
+                .and_then(|dir| crate::core::wal::wal_for(&dir))
+                .is_some_and(|own| std::sync::Arc::ptr_eq(&own, &outcomes))
+        {
+            return false;
+        }
+
         let _in_place = match self.versions.load_full() {
             // The writer's own transaction is not a reader to be protected from
             // its own write. Testing for an empty `running` set instead would

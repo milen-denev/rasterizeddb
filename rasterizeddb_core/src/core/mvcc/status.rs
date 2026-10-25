@@ -687,6 +687,12 @@ impl StatusLog {
         }
     }
 
+    /// The log the outcome records go to, or `None` when there is none (the
+    /// file is written and synced directly).
+    pub fn outcome_wal(&self) -> Option<Arc<Wal>> {
+        self.inner.lock().wal.as_ref().map(|(w, _)| w.clone())
+    }
+
     /// Copies over any staged range the log has since made durable.
     ///
     /// Call after the sync that [`StatusLog::flush_deferred`] left owed.

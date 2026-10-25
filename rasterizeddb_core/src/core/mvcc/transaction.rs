@@ -1635,6 +1635,12 @@ impl TransactionManager {
         self.status.flush_deferred()
     }
 
+    /// The log every transaction outcome is recorded in: the database's own
+    /// (root) log, or `None` when outcomes go straight to a synced file.
+    pub fn outcome_log(&self) -> Option<std::sync::Arc<crate::core::wal::Wal>> {
+        self.status.outcome_wal()
+    }
+
     /// Copies staged outcome bytes into the file, once the log holds them.
     ///
     /// Call after the sync that [`TransactionManager::flush_deferred`] left

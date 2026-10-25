@@ -1026,3 +1026,48 @@ async fn replication_apply_does_not_record_what_it_could_not_make_durable() {
     drop(db);
     let _ = fx.crash_and_recover(CANDIDATES).await;
 }
+
+/// An UPDATE that could overwrite in place does so only where its bytes go
+/// to the log that records every transaction outcome. An overwrite keeps no
+/// prior version, so it commits through its own log; on a second location
+/// that log reaches the disk in no order a power cut respects against the
+/// database's own, and with `synchronous_commit = off` a cut could keep the
+/// overwrite and lose an earlier statement's outcome (rasterizeddb-eb's B15
+/// crash images: a later UPDATE kept, an earlier DELETE undone, 7 seeds of
+/// 10), which is no suffix of the commits. There it is written as a version,
+/// whose outcome orders it, and the row still changes.
+///
+/// Mutation: the outcome-log check in `write_columns_in_place` removed; the
+/// second location's table then overwrites in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_place_overwrite_happens_only_in_the_outcome_log() {
+    let f = Fixture::new().await;
+    let root = f.db.table_for_tests(ROOT_TABLE).unwrap();
+    let disk = f.db.table_for_tests(DISK_TABLE).unwrap();
+    let (root_before, disk_before) = (root.in_place_column_updates(), disk.in_place_column_updates());
+
+    for table in [ROOT_TABLE, DISK_TABLE] {
+        let sql = format!("UPDATE {table} SET id = 7 WHERE id = 1");
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql).unwrap();
+        let out = crate::core::rql::executor::execute(purpose, f.db.clone()).await;
+        assert!(!out.is_empty() && out[0] != 3, "{sql}: {}", String::from_utf8_lossy(&out));
+    }
+
+    assert!(
+        root.in_place_column_updates() > root_before,
+        "the control: an UPDATE beside the outcome records did not overwrite in place"
+    );
+    assert_eq!(
+        disk.in_place_column_updates(),
+        disk_before,
+        "an UPDATE on the second location overwrote in place, outside the outcome log"
+    );
+    // And it still changed the row.
+    for table in [ROOT_TABLE, DISK_TABLE] {
+        let sql = format!("SELECT id FROM {table} WHERE id = 7");
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql).unwrap();
+        let out = crate::core::rql::executor::execute(purpose, f.db.clone()).await;
+        let rows = crate::core::row::row::vec_into_rows(&out[1..]).unwrap();
+        assert_eq!(rows.len(), 1, "{table}: the UPDATE did not change its row");
+    }
+}
