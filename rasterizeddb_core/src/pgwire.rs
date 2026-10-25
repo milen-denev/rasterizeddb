@@ -1809,11 +1809,14 @@ where
                 // transaction in PostgreSQL: they commit together at the
                 // Sync, or an error rolls back every one. Whether this
                 // statement starts such a batch is read off the frames after
-                // it, so a lone statement keeps its own autocommit path.
+                // it, so a lone statement keeps its own autocommit path. The
+                // frames are read first: the Sync after a lone statement is
+                // read either way, and only a batch pays for looking at the
+                // statement (a portal lookup, its first word).
                 if state.transaction.is_none()
                     && !state.error_in_batch
-                    && portal_sql(state, &payload).is_some_and(|sql| opens_an_implicit_block(&sql))
                     && read_ahead(stream, &mut pending).await? == Some(b'E')
+                    && portal_sql(state, &payload).is_some_and(|sql| opens_an_implicit_block(&sql))
                 {
                     open_implicit_block(database, state);
                 }
@@ -9950,8 +9953,10 @@ where
 /// The statement text the portal an `Execute` payload names will run, if
 /// the portal is known.
 fn portal_sql(state: &SessionState, execute: &[u8]) -> Option<StdArc<str>> {
-    let (portal, _) = read_cstring_owned(execute, 0).ok()?;
-    let info = state.portals.get(&portal)?;
+    // The portal's name, borrowed from the payload.
+    let end = execute.iter().position(|b| *b == 0)?;
+    let portal = std::str::from_utf8(&execute[..end]).ok()?;
+    let info = state.portals.get(portal)?;
     state.statements.get(&info.stmt_name).map(|s| s.sql.clone())
 }
 
