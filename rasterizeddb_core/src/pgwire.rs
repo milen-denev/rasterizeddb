@@ -1955,9 +1955,16 @@ where
                 // frames are read first: the Sync after a lone statement is
                 // read either way, and only a batch pays for looking at the
                 // statement (a portal lookup, its first word).
+                //
+                // The end of input before any boundary is a batch too: the
+                // client went (or the shutdown ended the session) before its
+                // Sync, and PostgreSQL commits only at the Sync, so the
+                // statement runs in the implicit block the session's end
+                // then rolls back. Autocommitted, it would have kept the
+                // first statement of a batch cut off after it.
                 if state.transaction.is_none()
                     && !state.error_in_batch
-                    && read_ahead(stream, &mut pending).await? == Some(b'E')
+                    && matches!(read_ahead(stream, &mut pending).await?, Some(b'E') | None)
                     && portal_sql(state, &payload).is_some_and(|sql| opens_an_implicit_block(&sql))
                 {
                     open_implicit_block(database, state);
@@ -10228,7 +10235,8 @@ const READ_AHEAD_LIMIT: usize = 16 << 20;
 /// Reads frames past an `Execute` into `pending` until one says whether
 /// another statement follows before the `Sync` (see `is_batch_boundary`),
 /// and returns that frame's tag. `None` at end of input or past
-/// [`READ_AHEAD_LIMIT`].
+/// [`READ_AHEAD_LIMIT`]: the caller treats both as a batch, since no Sync
+/// has said the statement stands alone.
 ///
 /// Safe to wait on: a client may not count on any reply before it sends
 /// `Sync` or `Flush` (PostgreSQL buffers until then), so after an `Execute`
@@ -11661,6 +11669,68 @@ mod index_store_wire_tests {
         assert!(outcome.is_clean(), "{}", outcome.describe());
         assert!(started.elapsed() < Duration::from_secs(3), "the seal waited for a ticket");
         drop(t);
+        drop(db);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
+    /// A statement whose Sync never came, in a session the shutdown ends
+    /// (its read half shut, its write half open, so no peer watch fires):
+    /// PostgreSQL commits only at the Sync, so the statement is rolled back
+    /// with the session. Autocommitted, the INSERT of a batch cut off after
+    /// its first Execute was kept (`read_ahead`'s end of input).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_rolls_back_a_statement_whose_sync_never_came() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::try_new_named(&dir.path().to_string_lossy(), false, "pg_no_sync").await.unwrap());
+        let catalog = DatabaseCatalog::single(db.clone());
+        let auth = AuthConfig {
+            method: crate::auth::AuthMethod::Trust,
+            ..AuthConfig::default()
+        };
+        let principal = Principal {
+            name: "rasterized".to_string(),
+            superuser: false,
+            authenticated: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let sessions = SessionsEnd::register(&catalog);
+        let entry = sessions.admit(&server).expect("the socket is registered");
+        let session_db = db.clone();
+        let session = tokio::spawn(async move {
+            let _entry = entry;
+            let mut state = SessionState::new(catalog, session_db.name.clone(), auth, principal, ConnectionLimits::default());
+            run_message_loop_inner(&session_db, &mut state, &mut server).await
+        });
+        send_query(&mut client, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)").await;
+        let got = frames(&mut client).await;
+        assert!(!got.iter().any(|(tag, _)| *tag == b'E'), "CREATE failed: {got:?}");
+
+        // Parse, Bind, Execute of an INSERT, and no Sync.
+        let frame = |tag: u8, body: &[u8]| {
+            let mut f = vec![tag];
+            f.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            f.extend_from_slice(body);
+            f
+        };
+        let mut bytes = frame(b'P', b"\0INSERT INTO t (id, v) VALUES (1, 1)\0\0\0");
+        bytes.extend(frame(b'B', b"\0\0\0\0\0\0\0\0"));
+        bytes.extend(frame(b'E', b"\0\0\0\0\0"));
+        client.write_all(&bytes).await.unwrap();
+        // Long enough to reach the Execute, which waits for what follows it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sessions.end_all();
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "the session outlived the shutdown signal");
+
+        let mut probe = super::owner_tests::session(&db);
+        assert_eq!(
+            super::owner_tests::ok(&db, &mut probe, "SELECT id FROM t").await,
+            0,
+            "a statement whose Sync never came was committed"
+        );
+        drop(probe);
         drop(db);
         crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }

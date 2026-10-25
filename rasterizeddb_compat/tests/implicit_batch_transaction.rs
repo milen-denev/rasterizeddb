@@ -110,6 +110,20 @@ async fn a_batch_and_a_multi_statement_string_are_one_transaction() {
     admin.simple_ok("INSERT INTO ib (id) VALUES (10)").await;
     admin.simple_ok("DELETE FROM ib WHERE id = 10").await;
 
+    // So is a lone statement whose Sync never comes: PostgreSQL commits at
+    // the Sync, and a session that ends first rolls its statement back. A
+    // client that is gone is also caught by the peer watch; the server's
+    // shutdown, which leaves the peer connected, is pinned in pgwire's
+    // `shutdown_rolls_back_a_statement_whose_sync_never_came`.
+    let mut cut = Wire::connect(&addr, &params).await;
+    cut.write(&statement("INSERT INTO ib (id) VALUES (15)")).await;
+    let _ = cut.next_within(std::time::Duration::from_millis(300)).await;
+    drop(cut);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(ids(&mut admin).await, ["1", "2", "3", "4", "7", "8", "9"], "a statement with no Sync committed");
+    admin.simple_ok("INSERT INTO ib (id) VALUES (15)").await;
+    admin.simple_ok("DELETE FROM ib WHERE id = 15").await;
+
     // A multi-statement simple query: a failure rolls back the statements
     // before it and skips the rest.
     let r = c

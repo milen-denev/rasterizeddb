@@ -45,9 +45,39 @@ async fn columns(pool: &sqlx::PgPool, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `SELECT *` on `pool`, its column names, or the error's SQLSTATE.
+async fn try_columns(pool: &sqlx::PgPool, table: &str) -> Result<Vec<String>, String> {
+    use sqlx::{Column, Row};
+    sqlx::query(AssertSqlSafe(format!("SELECT * FROM {}", table)))
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.first()
+                .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default()
+        })
+        .map_err(|e| e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+}
+
+/// One connection, so a statement it cached before a DDL is the one it runs
+/// after it (a pool of several picks whichever is free, which made the stale
+/// path this test is about run only sometimes).
+async fn one_connection(server: &TestServer, shape_change: Option<&str>) -> sqlx::PgPool {
+    use std::str::FromStr;
+    let mut options = sqlx::postgres::PgConnectOptions::from_str(&server.url()).expect("url");
+    if let Some(mode) = shape_change {
+        options = options.options([("rdb.shape_change", mode)]);
+    }
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn alter_table_adds_renames_and_drops_columns() {
-    let (_s, pool) = server().await;
+    let (s, pool) = server().await;
 
     run(&pool, "CREATE TABLE t (id UUID NOT NULL, name TEXT NOT NULL)")
         .await
@@ -69,18 +99,35 @@ async fn alter_table_adds_renames_and_drops_columns() {
 
     assert_eq!(columns(&pool, "t").await, vec!["id", "name", "remark", "amount"]);
 
+    // sqlx caches a statement's column list and never asks again, nor
+    // re-prepares on 0A000 (memory: sqlx ignores 0A000). Each connection
+    // below caches `SELECT *` before the DROP and runs that same statement
+    // after it.
+    let auto = one_connection(&s, None).await;
+    let rowdescription = one_connection(&s, Some("rowdescription")).await;
+    for client in [&auto, &rowdescription] {
+        assert_eq!(try_columns(client, "t").await, Ok(["id", "name", "remark", "amount"].map(String::from).to_vec()));
+    }
+
     run(&pool, "ALTER TABLE t DROP COLUMN remark").await.expect("drop");
 
-    // A client caches the column list it was described and does not ask again,
-    // so this is only true because the server notices the shape has changed and
-    // puts a fresh `RowDescription` in front of the rows. Without that the
-    // dropped column keeps appearing and every column after it is decoded from
-    // the wrong place.
+    let after = ["id", "name", "amount"].map(String::from).to_vec();
+    // `rowdescription`: the server notices the shape changed and puts a fresh
+    // `RowDescription` in front of the rows, so sqlx sees the dropped column
+    // gone at once. Without it the dropped column keeps appearing and every
+    // column after it is decoded from the wrong place.
     assert_eq!(
-        columns(&pool, "t").await,
-        vec!["id", "name", "amount"],
+        try_columns(&rowdescription, "t").await,
+        Ok(after.clone()),
         "a dropped column must disappear from the client's view"
     );
+    // `auto`, the default (B8b, L10): the stale statement's first use is
+    // refused as PostgreSQL refuses it (0A000), and the same statement run
+    // again without a new Parse gets the fresh description. One error per
+    // stale statement per connection, where PostgreSQL gives sqlx that
+    // error every time; never a row under the old columns.
+    assert_eq!(try_columns(&auto, "t").await, Err("0A000".to_string()), "auto: the first stale use");
+    assert_eq!(try_columns(&auto, "t").await, Ok(after), "auto: the same statement run again");
 }
 
 /// A row is a fixed-width record, so a column added to a table that already
