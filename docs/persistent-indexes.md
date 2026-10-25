@@ -722,6 +722,93 @@ Deviations, as built:
   B14). Schema-family and `.tmp` writes outside a write path are B12's
   `GatedIo`'s.
 
+**As built (B12).** Layer 2 is wired in (`index_store::gated_io`).
+- **Where it sits.** Not a `GatedIo<S>` wrapper type: a table's providers are
+  `Arc<S>` throughout the row layer, and wrapping them would change every
+  signature that takes one. Each file provider (`LocalStorageProvider`, the
+  only backend with a directory, so the only one whose word can be `Clean`;
+  memory, key/value and mirrored tables have a detached word, P33) carries a
+  `GatedIo` in the commit state its clones share, and every write entry point
+  registers on it first: `write_data_txn` (so `write_data`), `append_data_txn`
+  (so an immediate `append_data`), a staged append into the `.tmp`,
+  `write_data_seek`, `truncate`, the commit's landing of staged bytes, and
+  `swap_temp`. The background landing keeps B11's fast-path count.
+- **What is attached.** `Table::assemble` attaches the word to rows, pointers
+  and `_flt.db`, and for a plain table to `_schema.db` and `_seq.db`. A
+  provider opened from an attached one for a file named after it inherits the
+  word (`create_new`: `<t>_schema.db` opens `<t>_schema_FIELDS.db` and every
+  `_schema_*` sidecar), so the schema family is covered wherever its writers
+  open it; `rdb.ixe` or a rename intent opened from a table provider is not.
+  A partition's schema and row-id files are the logical table's, shared by
+  every partition, and attach to none. The provider holds the word strongly
+  and the file set weakly: a provider clone a background task keeps for a
+  moment after its table is dropped must not keep the file set in the
+  registry, or the next open would reuse the old word instead of deriving
+  one from `.ixm`.
+- **Verdicts** (the table in the module documentation): the registration is
+  the B10 `IoOp` (`WriteGate::register_write`, a guard that borrows the word:
+  one `fetch_add` in, one `fetch_sub` out, no `Arc` clone). Tests panic, naming
+  the entry point and the file, on `Clean`, `Unknown`, `PUBLISHING`, and a
+  ticketless write during an unpublished seal (count zero). Release takes the
+  slow path inline for the first three (`acquire`: wait out the window, make
+  `DIRTY` durable or rewrite the log) and cancels the seal for the last.
+  `SEALED` with `CANCEL` (a writer preempted an optional seal) issues without a
+  verdict. A registration is not a ticket: the census records no hold for it,
+  so B11's check still sees a ticketless write as one.
+- **`failed_appends`, widened** (`pub(crate)`, and keyed by transaction). A
+  release slow path that fails skips the write and records the error: under
+  its transaction, keyed by the directory and the transaction id rather than
+  by the file, so whichever file of the directory commits that transaction
+  reports it (an `INSERT` writes its row and commits through the pointers);
+  or, for a write with no transaction, under the directory's gate key, which
+  the next commit in the directory reports once. `truncate` and the landing
+  return it. `abort_txn` forgets what its transaction recorded. Keying by
+  transaction also fixes a bug that predates B12: a row append that failed
+  part-way was recorded under the rows file, where no commit looked, so the
+  pointer committed naming bytes that had been cut back off, and the next
+  append landed on them.
+- **DDL takes its tickets.** The backstop found two missed ticket sites,
+  both fixed: a DDL's own schema-family writes (the reload's work), and a
+  parent's DDL rewriting its foreign-key children's sidecars. Every table a
+  statement is granted ACCESS EXCLUSIVE on now gets a family ticket there
+  (`Database::ticket_exclusive`, in `lock_table`: the lock set is exactly what
+  a DDL may change, finding L11); a reload also takes one of its own for its
+  work, which is what covers a reload outside every statement.
+- **The allowlist** (`gated_io::UNGATED`, each entry with its reason): `_flt.db`
+  is registered but judged as release judges it, tests included
+  (`FilterCheckpoint`: its checkpoint loop writes under no ticket until B14);
+  staged bytes landed when a provider of a live file set opens
+  (`OpenLanding`); an ALTER rewrite's files and its schema backup's restore,
+  written through the database's seed under the table's names while the old
+  word is live (`SchemaRewrite`, under the reload's ticket). In tests a
+  provider with no word that writes a file of a live file set
+  (`file_gate::live_gate_for`) outside an `ungated` scope panics if that word
+  is `Clean` or `Unknown`, so a missed attach is caught like a missed ticket.
+  Outside `GatedIo` by construction, since no table's provider writes them:
+  `.ixm`, `.ixm.tmp` and `.ixs` (the gate's own), `rdb.ixe`, the directory's
+  log, floors file and status log, a table's files before its word exists
+  (CREATE TABLE's, a RENAME's or MOVE's target, a rewrite's backup copy), and
+  a partitioned table's own files.
+
+Deviations, as built:
+- **Not a wrapper type**, as above.
+- **An open whose filter backfills makes the table `Dirty`**: the backfill
+  checkpoints `_flt.db`, which now passes the gate, so on a `Clean` or
+  `Unknown` word it makes `DIRTY` durable (or rewrites the log) first. T1 holds;
+  "an open writes nothing" holds only for an open that loads its filter
+  checkpoint. B14 retires `_flt.db` and its checkpoint. (B11's `Unknown`-rewrite
+  test now checkpoints the filter before its reopen, so the INSERT is still the
+  first write.)
+- **`PUBLISHING` panics in tests at once** rather than waiting first: no ticket
+  can be held while it is set, so any write that sees it is ticketless.
+- **A gate failure on a write with no transaction** is recorded under a
+  directory-wide gate key, not the file's `STAGED` key, which only a landing
+  commit of the same file reads: an `INSERT` committing through its pointers
+  would never have reported it.
+- **The in-place apply at commit is not registered**: it runs inside
+  `commit_durable` after the logging write registered, and the family's ticket,
+  held until the outcome is final, is what covers it (§2 Ticket lifetime).
+
 ## 3. Taking a snapshot
 
 **Clean points.** Two optional ones: partitioning phase 3's exclusive idle
