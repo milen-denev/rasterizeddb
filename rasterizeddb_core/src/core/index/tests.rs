@@ -1113,6 +1113,84 @@ fn the_sorted_stream_stops_at_an_error() {
     }
 }
 
+/// Inserts land in the middle of a capture, with no seal gate to keep them
+/// out: one under a key the sweep has passed, one under a key still ahead,
+/// one unkeyed, in every block. The stream must stay a superset in the
+/// sense a load relies on: every slot it marks present is findable after
+/// the load (listed under a key or unkeyed), so a loaded index never holds
+/// a slot no lookup returns. Killed by reading the presence bits after the
+/// sweep, as C3 did before B17.
+#[test]
+fn a_capture_overlapping_inserts_never_holds_a_slot_it_cannot_find() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    for method in [Method::BTree, Method::Hash] {
+        let ix = index("mid", method, &[0]);
+        let key = |v: i64| {
+            let bytes = v.to_le_bytes();
+            ix.key_of(|_| Some(&bytes[..]))
+        };
+        // Keys 0, 2, 4, ...: a mid-stream insert can land between them.
+        let n = 3 * sorted::SORTED_BLOCK as u64;
+        for slot in 0..n {
+            ix.insert(proof, slot, key(2 * slot as i64));
+        }
+        let mut next = n;
+        let mut load = SortedLoad::<KeyBuf>::new(n + 64 * sorted::SORTED_BLOCK as u64);
+        let mut seen = 0usize;
+        let mut behind = Vec::new();
+        ix.for_each_sorted(|part| {
+            if let Sorted::Entry(k, _) = part {
+                seen += 1;
+                if seen % 97 == 0 {
+                    // Behind the sweep: the key just streamed, plus one.
+                    let passed = i64::from_le_bytes(decode_i64_key(method, k));
+                    ix.insert(proof, next, key(passed + 1));
+                    behind.push(next);
+                    // Ahead of it, and unkeyed.
+                    ix.insert(proof, next + 1, key(2 * n as i64 + seen as i64));
+                    ix.insert(proof, next + 2, None);
+                    next += 3;
+                }
+            }
+            load.push(part)
+        })
+        .unwrap();
+        assert!(behind.len() > 10, "{method:?}: too few inserts landed mid-stream");
+        let loaded = index("mid", method, &[0]);
+        loaded.load_sorted(proof, load).unwrap();
+        let got = capture(&loaded);
+        let findable: std::collections::BTreeSet<u64> =
+            got.entries.iter().flat_map(|(_, s)| s.iter().copied()).chain(got.unkeyed.iter().copied()).collect();
+        let held_not_found: Vec<u64> = (0..next).filter(|s| loaded.holds(*s) && !findable.contains(s)).collect();
+        assert!(
+            held_not_found.is_empty(),
+            "{method:?}: the loaded index holds {} slot(s) no lookup finds, e.g. {:?}",
+            held_not_found.len(),
+            &held_not_found[..held_not_found.len().min(8)]
+        );
+        // Everything present before the capture began is held and found.
+        for slot in 0..n {
+            assert!(loaded.holds(slot), "{method:?}: slot {slot} was present before the capture");
+            assert!(loaded.slots_for_key(&key(2 * slot as i64).unwrap()).contains(&slot), "{method:?}: slot {slot}");
+        }
+    }
+}
+
+/// The `i64` an index key over one `I64` column holds, back as its
+/// little-endian bytes: B-tree keys are sign-flipped big-endian, hash keys
+/// a length and then the value's own bytes.
+fn decode_i64_key(method: Method, key: &[u8]) -> [u8; 8] {
+    match method {
+        Method::BTree => {
+            let mut be: [u8; 8] = key.try_into().expect("an ordered i64 key");
+            be[0] ^= 0x80;
+            i64::from_be_bytes(be).to_le_bytes()
+        }
+        _ => key[4..12].try_into().expect("a canonical i64 key"),
+    }
+}
+
 /// Loads `from`'s stream into `into` (hook C9), as a snapshot load does.
 fn reload(from: &LiveIndex, into: &LiveIndex, n_slots: u64, proof: Proof<'_>) -> Result<(), SortedReject> {
     let mut load = SortedLoad::<KeyBuf>::new(n_slots);

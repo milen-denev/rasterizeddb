@@ -314,6 +314,16 @@ impl GinIndex {
     /// relies on slots never being reused until a rebuild renumbers them: a
     /// forgotten slot's entries are all stale.
     ///
+    /// The presence bits are read before the lists are swept, though they
+    /// go out last, as `LiveIndex::for_each_sorted` reads them and for the
+    /// same reason: `insert` lists a slot's items before it sets its bit, so
+    /// every slot whose bit the stream carries is on its lists when the
+    /// sweep begins, and a loaded index never holds a slot it cannot find,
+    /// whether or not the seal's gate kept writers out. They are read after
+    /// `forgotten_slots`: a forget between the two then leaves the slot's
+    /// bit clear and its items in, a stale superset (N37's leak), never a
+    /// held slot whose items were dropped.
+    ///
     /// Each list is read under its shard's lock and copied out, a block of
     /// [`super::sorted::SORTED_BLOCK`] items at a time, never across `f`; as
     /// for a `LiveIndex`, the stream is one state of the index only while
@@ -321,6 +331,8 @@ impl GinIndex {
     pub fn for_each_sorted<E>(&self, mut f: impl FnMut(Sorted<'_, u64>) -> Result<(), E>) -> Result<(), E> {
         // As a compaction marks them.
         let gone = self.forgotten_slots.lock().clone();
+        // Before the sweep, after `gone`: see above.
+        let present = self.present.read().clone();
         let mut bits = vec![0u64; gone.iter().max().map_or(0, |m| (m / 64) as usize + 1)];
         for &s in &gone {
             bits[(s / 64) as usize] |= 1 << (s % 64);
@@ -354,7 +366,6 @@ impl GinIndex {
         unkeyed.sort_unstable();
         unkeyed.dedup();
         f(Sorted::Unkeyed(&unkeyed))?;
-        let present = self.present.read().clone();
         f(Sorted::Present(super::sorted::trimmed(&present)))
     }
 
@@ -1497,6 +1508,55 @@ mod tests {
             let want = g.lookup(&q, usize::MAX).unwrap();
             let kept: Vec<u64> = want.into_iter().filter(|s| s % 3 == 0).collect();
             assert_eq!(got, kept, "{opclass:?}: a live slot lost after a load and a compaction");
+        }
+    }
+
+    /// Inserts land in the middle of a capture with no seal gate to keep
+    /// them out: documents whose items the sweep has already passed (they
+    /// share the first streamed item), and unreadable ones. Every slot the
+    /// stream marks present must be findable after the load, on a list or
+    /// unkeyed. Killed by reading the presence bits after the sweep.
+    #[test]
+    fn a_capture_overlapping_inserts_never_holds_a_slot_it_cannot_find() {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        let mut r = Rng(0xb17_9e17);
+        for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+            let (g, under_way) = index_for_streaming(&mut r, opclass);
+            let n = under_way + 1;
+            let mut next = n + 10;
+            let mut load = SortedLoad::<u64>::new(n + 100_000);
+            let mut seen = 0usize;
+            let mut added = Vec::new();
+            g.for_each_sorted(|part| {
+                if let Sorted::Entry(..) = part {
+                    seen += 1;
+                    if seen % 37 == 0 {
+                        // Every item of this document sorts somewhere in the
+                        // stream; most of them behind the sweep by now.
+                        g.insert(proof, next, Some(&doc(&format!(r#"{{"status":"s1","mid":{next}}}"#))));
+                        g.insert(proof, next + 1, None);
+                        added.push(next);
+                        next += 2;
+                    }
+                }
+                load.push(part)
+            })
+            .unwrap();
+            assert!(added.len() > 5, "{opclass:?}: too few inserts landed mid-stream");
+            let loaded = GinIndex::new(decl("loaded"), g.column, g.opclass);
+            loaded.load_sorted(proof, load).unwrap();
+            let (entries, unkeyed, _) = capture(&loaded);
+            let findable: std::collections::BTreeSet<u64> =
+                entries.iter().flat_map(|(_, l)| l.iter().copied()).chain(unkeyed.iter().copied()).collect();
+            // A document with no items is held and on no list, in the
+            // index captured too; only a slot listed there counts.
+            let (g_entries, g_unkeyed, _) = capture(&g);
+            let listed: std::collections::BTreeSet<u64> =
+                g_entries.iter().flat_map(|(_, l)| l.iter().copied()).chain(g_unkeyed.iter().copied()).collect();
+            let lost: Vec<u64> =
+                (0..next).filter(|s| loaded.holds(*s) && listed.contains(s) && !findable.contains(s)).collect();
+            assert!(lost.is_empty(), "{opclass:?}: the loaded index holds {lost:?}, which no lookup finds");
         }
     }
 

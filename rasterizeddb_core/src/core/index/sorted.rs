@@ -20,6 +20,12 @@
 //! its entries and not yet set it. The one exception is gin's entries of the
 //! slots `forget` recorded, exactly those (see `GinIndex::for_each_sorted`).
 //!
+//! The presence bits are read before the entries are swept and go out last.
+//! A writer lists a slot's entries before it sets the slot's bit, so every
+//! bit the stream carries names a slot whose entries the sweep finds: a
+//! loaded index holds no slot it cannot find, with or without the seal's
+//! gate keeping writers out of the capture.
+//!
 //! What goes back in is the whole stream or nothing. [`SortedLoad`] checks
 //! each part as it arrives and refuses the first one out of order, and an
 //! index is touched only once the stream has been checked to its end. A load

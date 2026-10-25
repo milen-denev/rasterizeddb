@@ -331,12 +331,27 @@ impl LiveIndex {
     /// so the entries of a slot forgotten without its key go out too, as a
     /// lookup returns them too.
     ///
+    /// The presence bits are read **before** the entries are swept, though
+    /// they go out last. `insert` lists a slot's entry before it sets the
+    /// slot's bit, so every slot whose bit the stream carries had its entry
+    /// listed before the sweep began, and the sweep finds it: a loaded index
+    /// never holds a slot it cannot find. Read after the sweep, the bits
+    /// would also carry a slot inserted under a key the sweep had already
+    /// passed, held and listed nowhere. That much no longer depends on the
+    /// seal's gate; a slot inserted during the sweep goes out with its bit
+    /// clear, and its entry if the sweep reached it, which is a superset too.
+    ///
     /// The read lock is held for one block of [`sorted::SORTED_BLOCK`]
     /// entries at a time, never across `f`. So the stream is one state of
     /// the index only while nothing writes it, which is what a seal
     /// guarantees: it captures under a gate no ticket holds, and a ticket
     /// taken meanwhile cancels the capture (docs/persistent-indexes.md §3).
+    /// An in-place move during the sweep (the new key behind it, the old
+    /// one ahead) can still leave a slot listed under neither, so a capture
+    /// that a write overlapped is never published.
     pub fn for_each_sorted<E>(&self, mut f: impl FnMut(Sorted<'_, &[u8]>) -> Result<(), E>) -> Result<(), E> {
+        // Before the sweep: see above.
+        let present = self.present.read().clone();
         match &self.data {
             Data::BTree(map) => {
                 // Each block resumes after the last key of the one before,
@@ -389,7 +404,6 @@ impl LiveIndex {
         unkeyed.sort_unstable();
         unkeyed.dedup();
         f(Sorted::Unkeyed(&unkeyed))?;
-        let present = self.present.read().clone();
         f(Sorted::Present(sorted::trimmed(&present)))
     }
 
