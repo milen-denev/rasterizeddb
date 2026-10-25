@@ -646,6 +646,82 @@ first write ([partitioning §7.2](partitioning.md#72-lazy-open-and-idle-close)
 point 1); plus one at the clean point that rewrites a snapshot this open
 rejected (§3).
 
+**As built (B11).** The gate is wired in. No snapshot is written yet (B13
+seals), so in production the state reaches `Clean` only from a log a later
+binary wrote; until then every file set starts `Dirty` (no log) and pays one
+`fetch_add` per ticket. Tests reach `Clean` through a test-only "force Clean"
+hook (`FileGate::force_clean_for_tests`: a durable `HEADER` + `CLEAN`, the word
+set `Clean`).
+- **Where the word lives.** `index_store::file_gate::FileGate` holds the word,
+  the file set's paths and incarnation, and its slot epoch. `FileGate::open`
+  is called once per instance in `Table::assemble` (plain tables and
+  partitions alike, keyed by directory, stem and incarnation): the first open
+  derives the state from `.ixm` (the §1 table; an open writes nothing),
+  later opens of the same live file set get the same word. The map slot keeps
+  it (`Slot.gate`, swapped only for another file set's word), as does every
+  instance and ticket; the vacuum service holds it weakly. Partitions have
+  one word each (own stem). Backends with no directory (memory, key/value,
+  mirrored pools) get a detached word, `Dirty` for good (P33).
+- **The mint.** `gate::ticket(&FileGate, Option<Family>)` is the one
+  production `WriteTicket` mint; the B10 `Hold` is wrapped (owner's decision
+  (c)) and `test_mint` counts on a detached word of its own. With a family
+  (the task's owner scope, `owner::family_for`: a block's root, a statement's
+  O, a named owner), the first ticket on a file set is also kept in
+  `TransactionManager::family_tickets()` (allowlisted field
+  `FamilyShard.held`), and later tickets of the family are sibling counts
+  that never wait. `RowLocks::release_owner` gives the family's tickets back
+  first, before the table locks, so after the outcome is final on every exit
+  path the owner guards already cover. The slow path is boxed so its state
+  machine stays out of every statement future's type.
+- **Where tickets are taken.** `insert_row_in_txn`, `insert_version`,
+  `delete_rows_as_of`, `update_rows_locked` (in-place overwrites included) and
+  `compact` take one at entry, after the table lock and before
+  `compaction_gate`; `apply_pending_filters` and the renumbering guard
+  borrow it. Vacuum (`run_once`) takes a transient ticket only when the sweep
+  has a change (`TableFilters::any_codes_in_runs`, `TableIndexes::holds`),
+  letting the compaction gate go and re-checking both renumber epochs after;
+  `neutralize_aborted` takes one per pass with candidates, before the gate,
+  rescanning under it. A provider's background landing of staged bytes takes
+  the fast path or waits a round (`StorageIO::attach_write_gate`).
+- **`DIRTY`.** The `Clean` slow path runs `MarkerScan::plan_append`: `pwrite`,
+  fdatasync, and when stale bytes follow, `ftruncate` and fdatasync, nothing in
+  between (owner's decision (a)); ENOSPC or EIO unlinks `.ixs` and fsyncs the
+  directory, and a failure there fails the ticket with nothing issued. The
+  `Unknown` slow path sets `INDEX_STORE_V1`, rewrites through `.ixm.tmp`, or
+  unlinks `.ixs`. Single flight is `WriteGate::acquire`'s mutex.
+- **`rdb.ixe`.** `FileGate::bump_epoch` appends the record through a provider
+  opened beside the table (so through the directory's WAL), commits it
+  durably, and only then does `compact` take its first effect; the open reads
+  the recovered record. The file is a fixed-record file in `torn_tail`
+  (header 16, stride 32) with its durable floor (owner's decision (b)).
+- **The census** (`index_store::census`, test builds only): holds and
+  releases on a word, `DIRTY` made durable, every raw mutator of the four
+  structures (each calls `census::mutation` with its proof) and every write
+  entry of `DbStorageProvider` plus landings. `census::check` asserts a durable
+  `DIRTY` and a held ticket on the table's own gate before each of the gate's
+  mutations and writes. `_flt.db` is exempt from the held-ticket rule only
+  (its runtime checkpoint loop writes under no ticket until B14 retires it).
+
+Deviations, as built:
+- **DELETE and UPDATE take their ticket at entry**, before the scan, so one
+  that matches no row still marks the table `Dirty` once. Taking it between
+  scan and write would put it under `compaction_gate`.
+- **RENAME and MOVE do not carry the word** (P6): the stem changes, `.ixm`
+  and `.ixs` are not renamed with the table, and the renamed file set opens
+  with a fresh word (no log, `Dirty`). DROP, and RENAME's and MOVE's source,
+  unlink the stem's `.ixm`, `.ixs` and their `.tmp`s in the sweep, so a rename
+  back cannot find a `CLEAN` that vouches for rows changed under the other
+  name. B13 renames the pair and carries the word.
+- **The reopen-then-vacuum test** sees no ticket on the *second* pass: an open
+  rebuilds the filter and the indexes from every pointer, dead versions
+  included, so the first sweep after a reopen has real clears and forgets to
+  make. B14/B17's loads make the first pass the empty one.
+- `incompat::require` is set in the `.ixm` directory; for tables in pool
+  directories that is not the root `check` reads (B13 creates the first log).
+- The `Unknown` path does not delete `_flt.db` (still the live checkpoint until
+  B14). Schema-family and `.tmp` writes outside a write path are B12's
+  `GatedIo`'s.
+
 ## 3. Taking a snapshot
 
 **Clean points.** Two optional ones: partitioning phase 3's exclusive idle
