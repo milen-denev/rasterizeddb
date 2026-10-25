@@ -246,6 +246,7 @@ impl LiveIndex {
 
     /// Adds `slot` under `key`, or to the unkeyed list when there is no key.
     pub fn insert(&self, _proof: Proof<'_>, slot: u64, key: Option<KeyBuf>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "LiveIndex::insert");
         match key {
             None => {
                 let mut unkeyed = self.unkeyed.write();
@@ -264,6 +265,7 @@ impl LiveIndex {
     /// Removes `slot` from under `key`. Removing a pair that is not there is a
     /// no-op, which is what makes a late or repeated removal harmless.
     pub fn remove(&self, _proof: Proof<'_>, slot: u64, key: &[u8]) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "LiveIndex::remove");
         fn drop_slot<M: MapLike>(map: &mut M, key: &[u8], slot: u64) {
             let empty = match map.slots_mut(key) {
                 Some(slots) => {
@@ -287,6 +289,7 @@ impl LiveIndex {
     /// Forgets a slot that is gone for everyone: under `key` (read back from
     /// the row before its space was freed) and from the unkeyed list.
     pub fn forget(&self, proof: Proof<'_>, slot: u64, key: Option<&[u8]>) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::forget");
         if let Some(key) = key {
             self.remove(proof, slot, key);
         }
@@ -295,6 +298,7 @@ impl LiveIndex {
     }
 
     pub fn clear(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "LiveIndex::clear");
         match &self.data {
             Data::BTree(map) => map.write().clear(),
             Data::Hash(shards, _) => shards.iter().for_each(|s| s.write().clear()),
@@ -877,6 +881,7 @@ impl TableIndexes {
     }
 
     pub fn set_ready(&self, _proof: Proof<'_>, ready: bool) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::set_ready");
         let _ = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !1) | ready as u64));
@@ -894,6 +899,7 @@ impl TableIndexes {
     /// its epoch before it, cannot mark ready a structure keyed by slots
     /// that moved. Returns the new epoch.
     pub fn invalidate(&self, _proof: Proof<'_>) -> u64 {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::invalidate");
         let prev = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(((s >> 1) + 1) << 1))
@@ -904,6 +910,7 @@ impl TableIndexes {
     /// Marks ready, but only if the epoch is still `epoch`: no renumbering
     /// began or ended since the caller read it. Returns whether it did.
     pub fn set_ready_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::set_ready_at");
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| (s >> 1 == epoch).then_some(s | 1))
             .is_ok()
@@ -943,6 +950,7 @@ impl TableIndexes {
 
     /// Indexes a freshly written version.
     pub fn on_insert(&self, proof: Proof<'_>, slot: u64, row: &RowWrite) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::on_insert");
         for index in &self.list {
             index.insert(proof, slot, index.key_of_row(row));
         }
@@ -958,6 +966,7 @@ impl TableIndexes {
         slot: u64,
         get: &dyn Fn(u32) -> Option<&'a [u8]>,
     ) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::index_row");
         for index in &self.list {
             index.insert(proof, slot, index.key_of(get));
         }
@@ -968,6 +977,7 @@ impl TableIndexes {
 
     /// A version whose columns could not be read: a candidate everywhere.
     pub fn index_unreadable(&self, proof: Proof<'_>, slot: u64) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::index_unreadable");
         for index in &self.list {
             index.insert(proof, slot, None);
         }
@@ -984,6 +994,7 @@ impl TableIndexes {
     /// An in-place overwrite, now durable: the slot moves from its old keys
     /// to its new ones.
     pub fn on_replace(&self, proof: Proof<'_>, slot: u64, old: &[Option<KeyBuf>], row: &RowWrite) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::on_replace");
         for (i, index) in self.list.iter().enumerate() {
             let new = index.key_of_row(row);
             let old = old.get(i).cloned().flatten();
@@ -1017,6 +1028,7 @@ impl TableIndexes {
         slot: u64,
         get: Option<&dyn Fn(u32) -> Option<&'a [u8]>>,
     ) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::forget");
         for index in &self.list {
             let key = get.and_then(|g| index.key_of(g));
             index.forget(proof, slot, key.as_deref());
@@ -1027,6 +1039,7 @@ impl TableIndexes {
     }
 
     pub fn clear(&self, proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableIndexes::clear");
         self.list.iter().for_each(|i| i.clear(proof));
         self.gin.iter().for_each(|g| g.clear(proof));
     }

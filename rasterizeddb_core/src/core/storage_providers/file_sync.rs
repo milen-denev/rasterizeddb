@@ -42,6 +42,12 @@ pub enum FastPathResult {
 /// can share one.
 #[derive(Default)]
 struct CommitState {
+    /// The write gate of the file set this file belongs to, once its table
+    /// is assembled (`StorageIO::attach_write_gate`): the background landing
+    /// of staged bytes takes a count on it for each landing, or waits for the
+    /// next round (docs/persistent-indexes.md §2: `.tmp` landing passes the
+    /// gate). Shared across clones, like the rest of this.
+    landing_gate: OnceLock<std::sync::Arc<crate::core::index_store::gate_word::WriteGate>>,
     /// Appends whose `write` has completed. Bumped under the append lock, so it
     /// can never run ahead of the bytes it stands for.
     ///
@@ -1138,6 +1144,7 @@ impl LocalStorageProvider {
             self.temp_has_data.store(false, Ordering::Release);
             return Ok(0);
         }
+        crate::core::index_store::census::write(&self.location, &self.table_name);
 
         // The sync's outcome, reported only after the bytes are published: they
         // are in the main file either way, and leaving them unpublished would
@@ -2396,6 +2403,19 @@ impl StorageIO for LocalStorageProvider {
             loop {
                 // Fast path: only flush when we know there's staged data
                 if p.temp_has_data.load(Ordering::Acquire) {
+                    // A landing is a write of the file set: it holds a count
+                    // on the gate word while it runs, taken by the ticket's
+                    // fast path. When that would need the slow path (the log
+                    // ends `CLEAN`, a seal is publishing), the bytes stay
+                    // staged, readable from the mirror, until the next round.
+                    let _landing = match p.commit.landing_gate.get().map(|g| g.try_acquire()) {
+                        Some(Err(_)) => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        Some(Ok(hold)) => Some(hold),
+                        None => None,
+                    };
                     let res = p.flush_temp_to_main().await; // ignore errors for now
                     if res.is_err() {
                         error!("Error flushing temp to main: {:?}", res.err());
@@ -2412,6 +2432,14 @@ impl StorageIO for LocalStorageProvider {
 
     fn get_name(&self) -> String {
         self.table_name.clone()
+    }
+
+    fn index_store_dir(&self) -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(&self.location))
+    }
+
+    fn attach_write_gate(&self, gate: &std::sync::Arc<crate::core::index_store::gate_word::WriteGate>) {
+        let _ = self.commit.landing_gate.set(gate.clone());
     }
 }
 

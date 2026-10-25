@@ -1,14 +1,14 @@
 //! The write gate's packed word and its state machine
 //! (docs/persistent-indexes.md §2 T1/T2, §3 steps 1, 6 and 7, §7 step 2).
 //!
-//! # Not wired yet
+//! # Where it is used
 //!
-//! This is slice B10: the word, every transition on it, and an exhaustive
-//! model of their interleavings, used by nothing. B11 puts a [`WriteGate`]
-//! in each table's map slot and makes `WriteGate::ticket` the mint of
-//! `gate::WriteTicket`, which then holds a [`Hold`]; until then the phase-0
-//! stub `gate::ticket()` stays the only `WriteTicket` mint, and
-//! `gate_source_tests.rs`'s allowlist is unchanged. B12's `GatedIo` calls
+//! Slice B10 built the word, every transition on it, and an exhaustive
+//! model of their interleavings. Slice B11 wired it in: each file set's
+//! [`WriteGate`] sits in its `index_store::file_gate::FileGate`, which the
+//! table's map slot and every instance of the table share, and
+//! `gate::ticket` (the `WriteTicket` mint) takes a [`Hold`] through
+//! [`WriteGate::acquire`] and wraps it. B12's `GatedIo` calls
 //! [`WriteGate::register_io`].
 //!
 //! # The word
@@ -603,10 +603,37 @@ impl Hold {
     pub fn ticketless(&self) -> bool {
         self.ticketless
     }
+
+    /// A second count on the same word, beside this one: one `fetch_add`,
+    /// judged on nothing. Sound only because this hold is a ticket: while it
+    /// is held the state is `Dirty` and `PUBLISHING` cannot be set (its
+    /// compare-and-swap needs a count of zero), so the count added here is
+    /// as good as one `ticket()`'s fast path would have taken, and it never
+    /// waits. A family's kept ticket and the ticket its statement mutates
+    /// under are two such counts (`gate::ticket`).
+    pub fn beside(&self) -> Hold {
+        debug_assert!(!self.ticketless, "a sibling of a ticketless registration");
+        let prev = Word(self.gate.word.fetch_add(1, SeqCst));
+        debug_assert!(
+            prev.count() > 0 && prev.state() == GateState::Dirty && !prev.publishing(),
+            "a sibling count beside no held ticket: {prev:?}"
+        );
+        super::census::hold(self.gate.census_id());
+        Hold {
+            gate: self.gate.clone(),
+            ticketless: false,
+        }
+    }
+
+    /// The word this hold counts on.
+    pub fn gate(&self) -> &Arc<WriteGate> {
+        &self.gate
+    }
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
+        super::census::release(self.gate.census_id());
         self.gate.give_back();
     }
 }
@@ -632,6 +659,39 @@ impl WriteGate {
         Word(self.word.load(SeqCst))
     }
 
+    /// The word's address: who the census attributes a hold to.
+    #[inline]
+    pub fn census_id(&self) -> usize {
+        self as *const WriteGate as usize
+    }
+
+    /// Sets the state of a word no ticket, registration or seal is on: the
+    /// test-only "force Clean" hook that stands in for a published `CLEAN`
+    /// until B13 seals (docs/persistent-indexes.md §13 V3, B11). Waits (up
+    /// to ten seconds, then panics) for a moment when nothing is counted and
+    /// no flag is set: a background sweep's or landing's transient ticket.
+    #[cfg(test)]
+    pub fn force_state_for_tests(&self, state: GateState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = self.load();
+            if now.count() == 0
+                && now.0 & FLAGS == 0
+                && self
+                    .word
+                    .compare_exchange(now.0, Word::new(state).0, SeqCst, SeqCst)
+                    .is_ok()
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a forced state change on a word that stayed in use: {now:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     fn give_back(&self) {
         if release(&self.word) {
             self.drained.notify_waiters();
@@ -642,10 +702,13 @@ impl WriteGate {
     pub fn try_acquire(self: &Arc<Self>) -> Result<Hold, SlowReason> {
         let mut op = TicketOp::Add;
         match run(|| op.step(&self.word)) {
-            TicketEnd::Held => Ok(Hold {
-                gate: self.clone(),
-                ticketless: false,
-            }),
+            TicketEnd::Held => {
+                super::census::hold(self.census_id());
+                Ok(Hold {
+                    gate: self.clone(),
+                    ticketless: false,
+                })
+            }
             TicketEnd::Slow { reason, last_out } => {
                 if last_out {
                     self.drained.notify_waiters();
@@ -700,10 +763,13 @@ impl WriteGate {
     pub fn register_io(self: &Arc<Self>) -> Result<Hold, SlowReason> {
         let mut op = IoOp::Add;
         match run(|| op.step(&self.word)) {
-            IoEnd::Issued { ticketless } => Ok(Hold {
-                gate: self.clone(),
-                ticketless,
-            }),
+            IoEnd::Issued { ticketless } => {
+                super::census::hold(self.census_id());
+                Ok(Hold {
+                    gate: self.clone(),
+                    ticketless,
+                })
+            }
             IoEnd::Slow(reason) => Err(reason),
         }
     }

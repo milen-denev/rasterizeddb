@@ -724,6 +724,12 @@ pub struct ReclaimContext<'a> {
     /// `deferred` and publishes nothing. `None` where nothing retires the
     /// storage (tests driving `run_once` directly).
     pub alive: Option<&'a AtomicBool>,
+    /// The file set's write gate. A sweep takes a transient ticket on it
+    /// only when it has a change to make (RV2): some clear candidate still
+    /// has fingerprints, or some reclaimed slot is still held by an index.
+    /// `None` where nothing gates the storage (tests driving `run_once`
+    /// directly): the sweep then takes its ticket on a detached word.
+    pub gate: Option<&'a crate::core::index_store::file_gate::FileGate>,
 }
 
 impl ReclaimContext<'_> {
@@ -1089,13 +1095,13 @@ async fn sweep_pointers_until<S: StorageIO, F: FnMut(&RowPointer)>(
 /// rows hold. A row that cannot be read is forgotten without its key, which
 /// leaves at most a stale entry: a candidate the scan will find invisible.
 async fn forget_reclaimed<S: StorageIO>(
+    ticket: &gate::WriteTicket,
     indexes: &crate::core::index::TableIndexes,
     fetch: &crate::core::row::row::RowFetch,
     io_rows: &S,
     dead: &[(u64, crate::core::row::row_pointer::RowPointer)],
 ) {
     let mut row = crate::core::row::row::Row::default();
-    let ticket = gate::ticket();
     for (slot, pointer) in dead {
         if pointer.fetch_row_reuse_async(io_rows, fetch, &mut row).await.is_ok() {
             let get = |wo: u32| {
@@ -1104,9 +1110,9 @@ async fn forget_reclaimed<S: StorageIO>(
                     .find(|c| c.schema_id as u32 == wo)
                     .map(|c| c.data.into_slice())
             };
-            indexes.forget(Proof::from(&ticket), *slot, Some(&get));
+            indexes.forget(Proof::from(ticket), *slot, Some(&get));
         } else {
-            indexes.forget(Proof::from(&ticket), *slot, None);
+            indexes.forget(Proof::from(ticket), *slot, None);
         }
     }
 }
@@ -1371,17 +1377,35 @@ pub(crate) mod barrier_test_hooks {
 /// Nor when the slots were renumbered (`VACUUM FULL`) since the sweep began:
 /// its slot numbers then name other rows. `epoch` is the filter's
 /// renumbering epoch read before the sweep.
-fn apply_filter_clears(ctx: &ReclaimContext<'_>, epoch: Option<u64>, runs: &[(u64, u64)]) -> Option<u64> {
+fn apply_filter_clears(
+    ctx: &ReclaimContext<'_>,
+    ticket: Option<&gate::WriteTicket>,
+    epoch: Option<u64>,
+    runs: &[(u64, u64)],
+) -> Option<u64> {
     let n: u64 = runs.iter().map(|r| r.1).sum();
-    match (ctx.filters, epoch) {
-        (Some(filters), Some(epoch)) if n > 0 => {
-            let ticket = gate::ticket();
-            filters
-                .on_delete_runs_at(Proof::from(&ticket), epoch, runs)
-                .then_some(n)
-        }
+    match (ctx.filters, epoch, ticket) {
+        (Some(filters), Some(epoch), Some(ticket)) if n > 0 => filters
+            .on_delete_runs_at(Proof::from(ticket), epoch, runs)
+            .then_some(n),
+        // Nothing to clear: every candidate's fingerprints are already empty
+        // (the sweep took no ticket for them), so each counts as cleared and
+        // the bound may advance past them.
         _ => Some(0),
     }
+}
+
+/// Whether a sweep has anything to change in memory (RV2): a clear candidate
+/// whose fingerprints are not all empty yet, or a reclaimed slot an index
+/// still holds. A pass with neither takes no ticket and changes nothing.
+fn sweep_has_changes(ctx: &ReclaimContext<'_>, scan: &ScanResult) -> bool {
+    let clears = ctx
+        .filters
+        .is_some_and(|f| !scan.clear_runs.is_empty() && f.any_codes_in_runs(&scan.clear_runs));
+    let forgets = ctx
+        .indexes
+        .is_some_and(|(ix, _)| scan.index_dead.iter().any(|(slot, _)| ix.holds(*slot)));
+    clears || forgets
 }
 
 /// Appends a reclaimable extent to the sweep's dead list, coalescing as it
@@ -1611,7 +1635,7 @@ pub async fn run_once<S: StorageIO>(
     // `ReclaimContext::compaction_gate`. Released before the drain wait, so a
     // compaction does not queue behind a slow query and stall every new one;
     // what is published after that is fenced by `layout` instead.
-    let gate = match ctx.compaction_gate {
+    let mut gate = match ctx.compaction_gate {
         Some(gate) => Some(gate.read().await),
         None => None,
     };
@@ -1624,6 +1648,8 @@ pub async fn run_once<S: StorageIO>(
     // Before the sweep reads a slot: clears are applied only if no
     // renumbering began or ended since.
     let clear_epoch = ctx.filters.map(|f| f.renumber_epoch());
+    // And forgets only if the indexes were not renumbered either.
+    let forget_epoch = ctx.indexes.map(|(ix, _)| ix.epoch());
     let scan = scan_pointers(
         io_pointers,
         free_space,
@@ -1661,8 +1687,37 @@ pub async fn run_once<S: StorageIO>(
                 false
             }
         };
-    let fingerprints_cleared = if durable {
-        apply_filter_clears(ctx, clear_epoch, &scan.clear_runs)
+    // A transient ticket, only when there is a change to make (RV2): a
+    // reopen restarts the bound at 0 and its first tick sweeps every
+    // tombstone, whose fingerprints the open's backfill left empty, so a
+    // ticket taken regardless would make every churned table `DIRTY` with no
+    // write at all. Taken before the compaction gate (§2 lock order), so the
+    // gate is let go and taken again; a compaction that ran in between moved
+    // the epochs, and then nothing the scan found is applied.
+    let mut ticket = None;
+    let mut renumbered = false;
+    if durable && sweep_has_changes(ctx, &scan) {
+        let detached;
+        let file_gate = match ctx.gate {
+            Some(g) => g,
+            None => {
+                detached = crate::core::index_store::file_gate::FileGate::detached();
+                &*detached
+            }
+        };
+        let had_gate = gate.take().is_some();
+        ticket = Some(gate::ticket(file_gate, None).await?);
+        if had_gate {
+            gate = match ctx.compaction_gate {
+                Some(g) => Some(g.read().await),
+                None => None,
+            };
+        }
+        renumbered = ctx.filters.map(|f| f.renumber_epoch()) != clear_epoch
+            || ctx.indexes.map(|(ix, _)| ix.epoch()) != forget_epoch;
+    }
+    let fingerprints_cleared = if durable && !renumbered {
+        apply_filter_clears(ctx, ticket.as_ref(), clear_epoch, &scan.clear_runs)
     } else {
         None
     };
@@ -1677,8 +1732,10 @@ pub async fn run_once<S: StorageIO>(
     // Before anything below can publish an extent: these versions' bytes are
     // still theirs, so their keys read back true. Once published, the space
     // could hold another row's bytes.
-    if let Some((indexes, fetch)) = ctx.indexes {
-        forget_reclaimed(indexes, fetch, io_rows, &scan.index_dead).await;
+    if let (Some((indexes, fetch)), Some(ticket)) = (ctx.indexes, ticket.as_ref())
+        && !renumbered
+    {
+        forget_reclaimed(ticket, indexes, fetch, io_rows, &scan.index_dead).await;
     }
     drop(gate);
     let live_bytes = scan.live_bytes;
@@ -1929,6 +1986,13 @@ pub struct VacuumService<S: StorageIO> {
     pub cache_generation: Arc<CacheGuard<AtomicU64>>,
     /// Set when versioning is enabled.
     pub forget: Arc<std::sync::OnceLock<crate::core::mvcc::transaction::ForgetHandle>>,
+    /// The file set's write gate (`ReclaimContext::gate`), weakly: the
+    /// service outlives its table by up to one interval, and a strong
+    /// reference would keep the word, and so the registry's entry, alive
+    /// past the table, so a later first open of the file set (a database
+    /// reopened in the process) would inherit a word it should derive from
+    /// `.ixm`. A tick whose gate is gone has no table to sweep.
+    pub gate: std::sync::Weak<crate::core::index_store::file_gate::FileGate>,
 }
 
 impl<S: StorageIO> VacuumService<S> {
@@ -2020,6 +2084,9 @@ impl<S: StorageIO> VacuumService<S> {
                     if !self.alive.load(Ordering::Acquire) {
                         return ControlFlow::Break(());
                     }
+                    let Some(file_gate) = self.gate.upgrade() else {
+                        return ControlFlow::Break(());
+                    };
                     let parts = NeutralizeParts {
                         io_pointers: &*self.io_pointers,
                         write_lock: &self.write_lock,
@@ -2030,6 +2097,7 @@ impl<S: StorageIO> VacuumService<S> {
                         dead_stamps: &self.dead_stamps,
                         drain_timeout: self.config.drain_timeout,
                         alive: Some(&self.alive),
+                        gate: Some(&file_gate),
                     };
                     match neutralize_aborted(&parts, &manager, handle).await {
                         Ok(report) if report.tombstoned + report.cleared > 0 => info!(
@@ -2098,6 +2166,9 @@ impl<S: StorageIO> VacuumService<S> {
             return ControlFlow::Break(());
         }
 
+        let Some(file_gate) = self.gate.upgrade() else {
+            return ControlFlow::Break(());
+        };
         let horizon = match self.versions.load_full() {
             Some(manager) => VersionHorizon::sample(&manager),
             None => VersionHorizon::unversioned(),
@@ -2109,6 +2180,7 @@ impl<S: StorageIO> VacuumService<S> {
             indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
             compaction_gate: Some(&self.compaction_gate),
             alive: Some(&self.alive),
+            gate: Some(&file_gate),
         };
 
         match run_once(
@@ -2245,6 +2317,9 @@ pub struct NeutralizeParts<'a, S: StorageIO> {
     /// boundary without advancing (RV14), so retirement waits for one batch,
     /// not one sweep. `None` for an explicit sweep, which runs to its end.
     pub alive: Option<&'a AtomicBool>,
+    /// The file set's write gate: one transient ticket per pass that has
+    /// something to rewrite, taken before the compaction gate (P24).
+    pub gate: Option<&'a crate::core::index_store::file_gate::FileGate>,
 }
 
 /// Whether `pointer` carries the id of a transaction below `bound` that did
@@ -2293,20 +2368,39 @@ pub async fn neutralize_aborted<S: StorageIO>(
     if bound <= handle.horizon() {
         return Ok(report);
     }
-    let _gate = parts.compaction_gate.read().await;
+    let mut _gate = parts.compaction_gate.read().await;
 
     // 2. Find them.
-    let mut candidates: Vec<u64> = Vec::new();
-    let mut slot = 0u64;
-    sweep_pointers(parts.io_pointers, |pointer| {
-        let (bad_xmin, bad_xmax) = carries_unfinished(pointer, bound, manager);
-        if bad_xmin || bad_xmax {
-            candidates.push(slot * ROW_POINTER_RECORD_LEN as u64);
+    let scan = || async {
+        let mut candidates: Vec<u64> = Vec::new();
+        let mut slot = 0u64;
+        sweep_pointers(parts.io_pointers, |pointer| {
+            let (bad_xmin, bad_xmax) = carries_unfinished(pointer, bound, manager);
+            if bad_xmin || bad_xmax {
+                candidates.push(slot * ROW_POINTER_RECORD_LEN as u64);
+            }
+            slot += 1;
+        })
+        .await
+        .map(|()| (candidates, slot))
+    };
+    let (mut candidates, mut slots) = scan().await?;
+    // One ticket for the pass, only when it has something to rewrite, and
+    // before the compaction gate (P24): a ticket per batch would be taken
+    // under it. So the gate is let go, the ticket taken, the gate taken
+    // again and the scan repeated under it (a compaction may have moved
+    // records in between).
+    let _ticket = match parts.gate {
+        Some(file_gate) if !candidates.is_empty() => {
+            drop(_gate);
+            let ticket = gate::ticket(file_gate, None).await?;
+            _gate = parts.compaction_gate.read().await;
+            (candidates, slots) = scan().await?;
+            Some(ticket)
         }
-        slot += 1;
-    })
-    .await?;
-    report.scanned = slot;
+        _ => None,
+    };
+    report.scanned = slots;
 
     // 3. Rewrite them.
     let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
@@ -2575,6 +2669,8 @@ mod tests {
         let stats = Arc::new(VacuumStats::default());
         stats.inject_panics.store(2, Ordering::Release);
         let alive = Arc::new(CacheGuard::new(AtomicBool::new(true)));
+        // Held for the test: the service keeps only a weak reference.
+        let detached_gate = crate::core::index_store::file_gate::FileGate::detached();
 
         VacuumService {
             table_name: "supervised".to_string(),
@@ -2599,6 +2695,7 @@ mod tests {
             compaction_gate: Arc::new(tokio::sync::RwLock::new(())),
             cache_generation: Arc::new(CacheGuard::new(AtomicU64::new(0))),
             forget: Arc::new(std::sync::OnceLock::new()),
+            gate: Arc::downgrade(&detached_gate),
         }
         .spawn();
 

@@ -157,6 +157,19 @@ impl DbStorageProvider {
     }
 }
 
+impl DbStorageProvider {
+    /// Records a write issued to this file in the census journal
+    /// (`index_store::census`, test builds only): every write entry point
+    /// below calls it first.
+    #[inline(always)]
+    fn census_write(&self) {
+        #[cfg(test)]
+        if let Self::File(p) = self {
+            crate::core::index_store::census::write(&p.location, &p.table_name);
+        }
+    }
+}
+
 impl StorageIO for DbStorageProvider {
     async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         match self {
@@ -170,6 +183,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn write_data(&self, position: u64, buffer: &[u8]) {
+        self.census_write();
         match self {
             Self::File(p) => p.write_data(position, buffer).await,
             Self::Memory(p) => p.write_data(position, buffer).await,
@@ -181,6 +195,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
+        self.census_write();
         match self {
             Self::File(p) => p.write_data_seek(seek, buffer).await,
             Self::Memory(p) => p.write_data_seek(seek, buffer).await,
@@ -232,6 +247,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn append_data(&self, buffer: &[u8], immediate: bool) {
+        self.census_write();
         match self {
             Self::File(p) => p.append_data(buffer, immediate).await,
             Self::Memory(p) => p.append_data(buffer, immediate).await,
@@ -243,6 +259,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
+        self.census_write();
         match self {
             Self::File(p) => p.append_data_returning_offset(buffer, immediate).await,
             Self::Memory(p) => p.append_data_returning_offset(buffer, immediate).await,
@@ -265,6 +282,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn append_data_txn(&self, txn: u64, buffer: &[u8]) -> (u64, u64) {
+        self.census_write();
         match self {
             Self::File(p) => p.append_data_txn(txn, buffer).await,
             Self::Memory(p) => p.append_data_txn(txn, buffer).await,
@@ -276,6 +294,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
+        self.census_write();
         match self {
             Self::File(p) => p.write_data_txn(txn, position, buffer).await,
             Self::Memory(p) => p.write_data_txn(txn, position, buffer).await,
@@ -320,6 +339,7 @@ impl StorageIO for DbStorageProvider {
     }
 
     async fn truncate(&self, len: u64) -> super::traits::IOResult<()> {
+        self.census_write();
         match self {
             Self::File(p) => p.truncate(len).await,
             Self::Memory(p) => p.truncate(len).await,
@@ -447,6 +467,21 @@ impl StorageIO for DbStorageProvider {
             Self::KeyValue(p) => p.get_name(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_name(),
+        }
+    }
+
+    fn index_store_dir(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::File(p) => p.index_store_dir(),
+            // No directory of its own (memory, key/value), or several copies
+            // of one (a mirrored pool): excluded from snapshots (P33).
+            _ => None,
+        }
+    }
+
+    fn attach_write_gate(&self, gate: &std::sync::Arc<crate::core::index_store::gate_word::WriteGate>) {
+        if let Self::File(p) = self {
+            p.attach_write_gate(gate);
         }
     }
 }

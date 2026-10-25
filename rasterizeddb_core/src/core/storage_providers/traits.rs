@@ -253,4 +253,18 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn start_service(&self) -> impl Future<Output = ()> + Send + Sync;
 
     fn get_name(&self) -> String;
+
+    /// The directory a table on this provider keeps its index-store files in
+    /// (`.ixm`, `.ixs`, the directory's `rdb.ixe`;
+    /// docs/persistent-indexes.md §1), or `None` for a provider excluded
+    /// from snapshots: memory, a key/value store, a mirrored pool (P33).
+    /// Such a table's write gate is detached and never `Clean`.
+    fn index_store_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Hands the provider its file set's write gate. A provider that lands
+    /// staged bytes in the background takes a count on the word for each
+    /// landing (§2: `.tmp` landing passes the gate); the rest ignore it.
+    fn attach_write_gate(&self, _gate: &std::sync::Arc<crate::core::index_store::gate_word::WriteGate>) {}
 }

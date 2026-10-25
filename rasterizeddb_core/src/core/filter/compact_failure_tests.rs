@@ -540,6 +540,7 @@ async fn a_batch_quarantined_before_a_compaction_is_never_published() {
         cleared_below: &cleared_below,
         compaction_gate: None,
         alive: None,
+        gate: None,
     };
     let report = crate::core::vacuum::run_once(
         &*d.io_pointers,

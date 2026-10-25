@@ -833,6 +833,70 @@ mod tests {
         assert_eq!(row_count(&database).await, 3);
     }
 
+    /// Replication apply passes the write gate (docs/persistent-indexes.md
+    /// §2, slice B11): from a forced clean point, the census sees a durable
+    /// `DIRTY` and a ticket on the table's gate before every mutation and
+    /// write the apply makes, and the apply's owner gives its ticket back once
+    /// the record's outcome is final.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replication_apply_passes_the_write_gate() {
+        use crate::core::index_store::census::{Census, Scope, check};
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_gate").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.replication.open_storage(None).unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        let table = database.table_for_tests("repl_t").unwrap();
+        table.wait_filters_ready().await.unwrap();
+        table.gate().force_clean_for_tests();
+
+        let census = Census::start();
+        let outcome = apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                1,
+                vec![
+                    "INSERT INTO repl_t (id, name) VALUES (1, 'ada')",
+                    "INSERT INTO repl_t (id, name) VALUES (2, 'bob')",
+                    "UPDATE repl_t SET name = 'carol' WHERE id = 2",
+                ],
+            ),
+            NO_SENDER,
+        )
+        .await;
+        let events = census.finish();
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        let summary = check(
+            &events,
+            &Scope {
+                gate: table.gate().census_id(),
+                began_clean: true,
+                structures: &table.census_structures(),
+                files: &table.census_files(),
+                exempt: &["_flt.db"],
+            },
+        )
+        .unwrap_or_else(|e| panic!("census: {e}"));
+        assert_eq!(summary.dirty_durable, 1);
+        assert!(summary.writes > 0 && summary.ticket_mutations > 0, "{summary:?}");
+        assert_eq!(table.gate().word().load().count(), 0, "the apply's owner kept its ticket");
+        assert_eq!(row_count(&database).await, 2);
+        drop(table);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
     /// The property the whole design rests on: applying a record must not make
     /// this node re-originate it.
     #[tokio::test]

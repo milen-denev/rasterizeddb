@@ -166,11 +166,18 @@ const DROPPED: u8 = 1;
 /// `Arc`, whatever is stored into the slot after. A reload and a MOVE build
 /// the new instance, then [`Slot::swap`] it in (slice B4), so the slot, and
 /// the name's place in the map, never go away during the change: a lockless
-/// reader sees the old instance or the new one, never 42P01. B11 adds the
-/// gate here.
+/// reader sees the old instance or the new one, never 42P01. The file set's
+/// write gate lives here too (slice B11).
 pub(crate) struct Slot {
     table: ArcSwapAny<TableRef>,
     state: AtomicU8,
+    /// The file set's write gate (docs/persistent-indexes.md §2, "the gate
+    /// belongs to the file set, not the `Table` instance"): the slot keeps
+    /// the word alive across a reload, whatever happens to the instances, so
+    /// a reload's open finds it (`FileGate::open`) and keeps its count and
+    /// flags. An instance of another file set (an ALTER rewrite's new
+    /// incarnation) brings a new word, which the swap installs here.
+    gate: parking_lot::Mutex<std::sync::Arc<crate::core::index_store::file_gate::FileGate>>,
     /// The shape epoch this name's instance was installed or last reshaped
     /// under, drawn from the database-wide counter (§7 `shape_epoch`, Q7).
     /// Written only under ACCESS EXCLUSIVE on the name (an install, a swap),
@@ -181,9 +188,11 @@ pub(crate) struct Slot {
 
 impl Slot {
     pub(super) fn new(table: Arc<DbTable>, shape_epoch: u64) -> Self {
+        let gate = parking_lot::Mutex::new(table.gate().clone());
         Slot {
             table: ArcSwapAny::new(ArcRef(table)),
             state: AtomicU8::new(LIVE),
+            gate,
             shape_epoch: AtomicU64::new(shape_epoch),
         }
     }
@@ -204,7 +213,19 @@ impl Slot {
     /// A reader sees the old instance or the new one, never neither, and one
     /// that already loaded the old keeps it.
     pub(crate) fn swap(&self, table: Arc<DbTable>) -> Arc<DbTable> {
+        {
+            let mut gate = self.gate.lock();
+            if !std::sync::Arc::ptr_eq(&gate, table.gate()) {
+                *gate = table.gate().clone();
+            }
+        }
         self.table.swap(ArcRef(table)).0
+    }
+
+    /// The file set's write gate.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn gate(&self) -> std::sync::Arc<crate::core::index_store::file_gate::FileGate> {
+        self.gate.lock().clone()
     }
 
     /// False once the name no longer owns this slot (DROP, the old name of a

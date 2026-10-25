@@ -863,12 +863,14 @@ impl TableFilters {
     /// Mark slots `[0, slots)` as predating the filter. They stay candidates
     /// until [`Self::clear_unindexed_prefix`] follows a backfill.
     pub fn set_unindexed_prefix(&self, _proof: Proof<'_>, slots: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::set_unindexed_prefix");
         for c in &self.columns {
             c.write().set_unindexed_prefix(slots);
         }
     }
 
     pub fn clear_unindexed_prefix(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::clear_unindexed_prefix");
         for c in &self.columns {
             c.write().clear_unindexed_prefix();
         }
@@ -892,6 +894,7 @@ impl TableFilters {
     /// lock is taken after the bump, so an epoch-checked write that saw the
     /// old epoch has landed before the demotion and before any slot moves.
     pub fn begin_renumbering(&self, _proof: Proof<'_>, n_slots: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::begin_renumbering");
         // To the next odd value: always a change, always "running".
         let _ = self
             .renumber_epoch
@@ -919,6 +922,7 @@ impl TableFilters {
         io: &S,
         n_slots: u64,
     ) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableFilters::begin_renumbering_on_disk");
         let _gate = self.write_gate.lock().await;
         self.begin_renumbering(proof, n_slots);
         if self.has_checkpoint.load(Ordering::Acquire) {
@@ -932,6 +936,7 @@ impl TableFilters {
     /// renumbering finished or failed: work that read its epoch during it
     /// read a mix of both numberings.
     pub fn end_renumbering(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::end_renumbering");
         // To the next even value: always a change, never "running".
         let _ = self
             .renumber_epoch
@@ -942,6 +947,7 @@ impl TableFilters {
     /// renumbered since `epoch` was read. Returns whether every column was
     /// cleared.
     pub fn clear_unindexed_prefix_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::clear_unindexed_prefix_at");
         if renumbering(epoch) {
             return false;
         }
@@ -967,6 +973,7 @@ impl TableFilters {
     /// checked under the numbering it was written in, and the caller re-clears
     /// on the next sweep.
     pub fn on_delete_runs_at(&self, _proof: Proof<'_>, epoch: u64, runs: &[(u64, u64)]) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_delete_runs_at");
         if renumbering(epoch) {
             return false;
         }
@@ -1004,12 +1011,27 @@ impl TableFilters {
         self.columns.iter().all(|c| c.read().is_complete())
     }
 
+    /// Whether any slot in `runs` (`(first, count)` pairs) still holds a
+    /// fingerprint in any column: whether [`TableFilters::on_delete_runs_at`]
+    /// would change anything. Read-only. Vacuum asks it before it takes a
+    /// write ticket for its clears (docs/persistent-indexes.md §2, RV2), so a
+    /// sweep that would only re-clear empty codes (the first after a reopen)
+    /// takes none and writes nothing.
+    pub fn any_codes_in_runs(&self, runs: &[(u64, u64)]) -> bool {
+        self.columns.iter().any(|cell| {
+            let g = cell.read();
+            runs.iter()
+                .any(|&(first, count)| (first..first.saturating_add(count)).any(|s| g.holds_code(s)))
+        })
+    }
+
     /// Index every column of a freshly written row.
     ///
     /// Columns absent from `row_write` are explicitly cleared rather than left
     /// alone: a slot that is reused by a relocating update must not keep the
     /// previous occupant's fingerprint.
     pub fn on_insert(&self, _proof: Proof<'_>, slot: u64, row_write: &RowWrite) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_insert");
         for (i, m) in self.meta.iter().enumerate() {
             // Both of these used to run inside the lock. Finding the payload is
             // a scan of the row's columns, which made maintenance quadratic in
@@ -1055,6 +1077,7 @@ impl TableFilters {
     /// reclamation all write into zones long past the frontier, so there is no
     /// immutable tail to publish by pointer swap.
     pub fn on_insert_batch(&self, _proof: Proof<'_>, rows: &[(u64, &RowWrite)]) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_insert_batch");
         if rows.is_empty() {
             return;
         }
@@ -1087,6 +1110,7 @@ impl TableFilters {
     /// Clear every column at `slot`. Exact — unlike a Bloom filter, deleting
     /// *improves* the false-positive rate rather than degrading it.
     pub fn on_delete(&self, _proof: Proof<'_>, slot: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_delete");
         for cell in &self.columns {
             cell.write().set(slot, None);
         }
@@ -1286,6 +1310,7 @@ impl TableFilters {
         slot: u64,
         columns: &SmallVec<[(u32, Vec<u8>); 32]>,
     ) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::backfill_row");
         for (i, m) in self.meta.iter().enumerate() {
             let bytes = columns
                 .iter()
@@ -1301,6 +1326,7 @@ impl TableFilters {
     /// is the one place where lock acquisitions dominate rather than merely
     /// appear — see [`Self::on_insert_batch`] for the measurement.
     pub fn backfill_batch(&self, proof: Proof<'_>, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableFilters::backfill_batch");
         self.backfill_batch_at(proof, self.renumber_epoch(), rows);
     }
 
@@ -1313,6 +1339,7 @@ impl TableFilters {
         epoch: u64,
         rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)],
     ) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::backfill_batch_at");
         if renumbering(epoch) {
             return false;
         }

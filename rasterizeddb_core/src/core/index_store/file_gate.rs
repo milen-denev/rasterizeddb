@@ -1,0 +1,634 @@
+//! A file set's write gate (docs/persistent-indexes.md §2, §3, §6; slice
+//! B11): the packed [`WriteGate`] word, the marker log it mirrors, the I/O
+//! its slow path does, and the file set's slot epoch.
+//!
+//! # One word per file set
+//!
+//! The gate belongs to the file set, not to a `Table` instance (RV1, RV14).
+//! [`FileGate::open`] is how every instance gets it: the **first** open of a
+//! file set reads `.ixm` and derives the state (N21); every later open of the
+//! same file set while the word is alive, a reload's included, gets the same
+//! word, count and flags, untouched (P6). The table's map slot keeps a strong
+//! reference (`database::slots::Slot`), so the word outlives any one
+//! instance; a ticket keeps one too, so a ticket that outlives a DROP gives
+//! its count back to a detached word. A file set is its directory, its stem
+//! (the physical name its rows file uses, never `schema.name`, P32) and its
+//! incarnation (C7): a DROP and CREATE of the name, or an ALTER rewrite, is a
+//! new incarnation and so a new word, derived afresh.
+//!
+//! A partition is its own file set (its own stem), so each partition has its
+//! own word. A table on a backend with no directory (memory, a key/value
+//! store, a mirrored pool) is excluded from snapshots (P33): its word is
+//! detached, `Dirty` for good, and its slow path never runs.
+//!
+//! # The state at open (§1, §2, N21)
+//!
+//! | `.ixm` | state |
+//! |---|---|
+//! | missing | `Dirty`: no `CLEAN` was ever durable |
+//! | another incarnation's `HEADER` | `Dirty`: a leftover of a dropped table proves nothing about this one |
+//! | last good record `CLEAN` (bytes after it or not) | `Clean` |
+//! | last good record `DIRTY` or `HEADER` | `Dirty` |
+//! | unreadable, or a bad first record | `Unknown` |
+//!
+//! An open writes nothing.
+//!
+//! # The slow path (T1)
+//!
+//! Run single-flight by [`WriteGate::acquire`] before the first ticket after
+//! `Clean` or `Unknown`, before anything is issued:
+//! - **`Clean`**: append `DIRTY` after the last good record by
+//!   `marker::MarkerScan::plan_append`: `pwrite`, fdatasync, and when stale
+//!   bytes follow it, `ftruncate` past it and fdatasync again, with nothing
+//!   issued in between (owner's decision (a)): `rec_seq` binds a record to
+//!   its position, so a stale record that is valid and sits right after the
+//!   new one reads as its successor until the truncate is durable.
+//! - **`Unknown`**: trust none of the log's bytes: rewrite it as `HEADER` +
+//!   `DIRTY` through `.ixm.tmp` (write, fsync, rename, directory fsync), or
+//!   else unlink `.ixs` and fsync the directory. (B14 then deletes a
+//!   lingering `_flt.db`; in B11 `_flt.db` is still the filter's live
+//!   checkpoint, so nothing deletes it.)
+//! - If `DIRTY` cannot be made durable (ENOSPC, EIO), `.ixs` is unlinked and
+//!   the directory fsynced, which needs no free blocks; the write proceeds
+//!   with nothing left to protect. If that fails too, the ticket fails, and
+//!   nothing is issued.
+//!
+//! # The slot epoch (§2 Deferred work, §6)
+//!
+//! [`FileGate::bump_epoch`] appends `epoch + 1` to the directory's `rdb.ixe`
+//! as its own WAL transaction and waits for the directory log's sync, before
+//! `VACUUM FULL`'s first effect. The open reads the recovered record.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+
+use parking_lot::Mutex;
+
+use super::epoch_log::{self, EPOCH_LOG_FILE, NO_PID};
+use super::gate_word::{GateState, WriteGate};
+use super::marker::{self, Append};
+use crate::core::storage_providers::traits::StorageIO;
+
+/// Where a file set's index-store files are, and whose they are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GateFiles {
+    dir: PathBuf,
+    stem: String,
+    incarnation: u128,
+    pid: u32,
+}
+
+impl GateFiles {
+    fn ixm(&self) -> PathBuf {
+        self.dir.join(format!("{}.ixm", self.stem))
+    }
+
+    fn ixm_tmp(&self) -> PathBuf {
+        self.dir.join(format!("{}.ixm.tmp", self.stem))
+    }
+
+    fn ixs(&self) -> PathBuf {
+        self.dir.join(format!("{}.ixs", self.stem))
+    }
+}
+
+/// A file set's gate. Shared by its map slot, every instance of the table,
+/// and every ticket on it.
+pub struct FileGate {
+    word: Arc<WriteGate>,
+    /// `None`: excluded from snapshots, the word detached and `Dirty`.
+    files: Option<GateFiles>,
+    /// The slot epoch: the `rdb.ixe` record's, or 0 where none was ever
+    /// written; one more after each `VACUUM FULL`.
+    slot_epoch: AtomicU64,
+    /// Whether `slot_epoch` is the recovered record's. False when `rdb.ixe`
+    /// could not be read or decoded: no snapshot can then prove its epoch.
+    epoch_proven: AtomicBool,
+}
+
+impl std::fmt::Debug for FileGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileGate")
+            .field("word", &self.word.load())
+            .field("files", &self.files)
+            .field("slot_epoch", &self.slot_epoch.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Every file set's live word, so a later open of a file set finds it.
+static GATES: Mutex<Registry> = Mutex::new(Registry {
+    map: None,
+    pruned_at: 0,
+});
+
+struct Registry {
+    map: Option<HashMap<GateFiles, Weak<FileGate>>>,
+    /// The map's size after the last sweep of dead entries.
+    pruned_at: usize,
+}
+
+/// Runs blocking file I/O from async code without stalling a runtime worker
+/// where the runtime can spare one.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// A named failpoint (`core::power_loss::failpoint`); nothing outside tests.
+#[inline]
+fn failpoint(name: &str, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        crate::core::power_loss::failpoint::hit(name, path)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (name, path);
+        Ok(())
+    }
+}
+
+/// Announces a directory operation to the crash-image recorder.
+#[inline]
+fn dir_op(op: DirOp<'_>) {
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(match op {
+        DirOp::Create(p) => crate::core::sync_audit::DirOp::Create(p),
+        DirOp::Rename { from, to } => crate::core::sync_audit::DirOp::Rename { from, to },
+        DirOp::Unlink(p) => crate::core::sync_audit::DirOp::Unlink(p),
+    });
+    #[cfg(not(test))]
+    let _ = op;
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum DirOp<'a> {
+    Create(&'a Path),
+    Rename { from: &'a Path, to: &'a Path },
+    Unlink(&'a Path),
+}
+
+/// The sync tag of the marker log's appends and truncates.
+pub const SYNC_MARKER: &str = "index_store.marker";
+/// The sync tag of `.ixm.tmp`, before it is renamed over the log.
+pub const SYNC_MARKER_TMP: &str = "index_store.marker_tmp";
+/// The sync tag of `rdb.ixe` in a directory with no log.
+pub const SYNC_EPOCH: &str = "index_store.epoch";
+
+/// What `.ixm` says, read at a file set's first open (see the module table).
+fn state_at_open(files: &GateFiles) -> GateState {
+    let path = files.ixm();
+    if let Err(e) = failpoint("ixm_read_eio_at_open", &path) {
+        log::warn!("{}: {e}; the marker log proves nothing", path.display());
+        return GateState::Unknown;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return GateState::Dirty,
+        Err(e) => {
+            log::warn!("{} could not be read ({e}); the marker log proves nothing", path.display());
+            return GateState::Unknown;
+        }
+    };
+    match marker::scan(&bytes) {
+        Ok(scan) if scan.incarnation != files.incarnation => GateState::Dirty,
+        Ok(scan) => match scan.state() {
+            marker::LogState::Clean => GateState::Clean,
+            marker::LogState::Dirty => GateState::Dirty,
+        },
+        Err(e) => {
+            log::warn!("{} is not a marker log this build reads ({e}); it proves nothing", path.display());
+            GateState::Unknown
+        }
+    }
+}
+
+/// The recovered slot epoch of `files`, and whether it is proven.
+fn epoch_at_open(files: &GateFiles) -> (u64, bool) {
+    let path = files.dir.join(EPOCH_LOG_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => match epoch_log::decode(&bytes) {
+            Ok(log) => (log.epoch_of(files.incarnation, files.pid).unwrap_or(0), true),
+            Err(e) => {
+                log::warn!("{} cannot be read ({e}); no snapshot here can prove its slot epoch", path.display());
+                (0, false)
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (0, true),
+        Err(e) => {
+            log::warn!("{} cannot be read ({e}); no snapshot here can prove its slot epoch", path.display());
+            (0, false)
+        }
+    }
+}
+
+/// The partition id a partition's stem `__pt_<uid:016x>_<pid:08x>` carries,
+/// or [`NO_PID`] for a plain table's stem.
+pub fn pid_of_stem(stem: &str) -> u32 {
+    let Some(rest) = stem.strip_prefix(crate::core::database::PARTITION_FILE_PREFIX) else {
+        return NO_PID;
+    };
+    match rest.split_once('_') {
+        Some((uid, pid)) if uid.len() == 16 && pid.len() == 8 => u32::from_str_radix(pid, 16).unwrap_or(NO_PID),
+        _ => NO_PID,
+    }
+}
+
+impl FileGate {
+    /// A word for a table with no snapshot: `Dirty` for good, no files.
+    pub fn detached() -> Arc<FileGate> {
+        Arc::new(FileGate {
+            word: Arc::new(WriteGate::new(GateState::Dirty)),
+            files: None,
+            slot_epoch: AtomicU64::new(0),
+            epoch_proven: AtomicBool::new(false),
+        })
+    }
+
+    /// The gate of the file set `stem` in `dir` at `incarnation`: the live
+    /// word if an earlier open of the same file set still holds it,
+    /// otherwise a new one derived from `.ixm` and `rdb.ixe`. `dir` is `None`
+    /// for a table excluded from snapshots. Writes nothing.
+    pub fn open(dir: Option<PathBuf>, stem: &str, incarnation: u128) -> Arc<FileGate> {
+        let Some(dir) = dir else {
+            return FileGate::detached();
+        };
+        let files = GateFiles {
+            dir,
+            stem: stem.to_string(),
+            incarnation,
+            pid: pid_of_stem(stem),
+        };
+        if let Some(live) = GATES
+            .lock()
+            .map
+            .as_ref()
+            .and_then(|m| m.get(&files))
+            .and_then(Weak::upgrade)
+        {
+            return live;
+        }
+        // Read outside the registry lock; a racing first open of the same
+        // file set is settled under it below, and both read the same files.
+        let state = state_at_open(&files);
+        let (epoch, proven) = epoch_at_open(&files);
+        let gate = Arc::new(FileGate {
+            word: Arc::new(WriteGate::new(state)),
+            files: Some(files.clone()),
+            slot_epoch: AtomicU64::new(epoch),
+            epoch_proven: AtomicBool::new(proven),
+        });
+        let mut reg = GATES.lock();
+        let pruned_at = reg.pruned_at;
+        let map = reg.map.get_or_insert_with(HashMap::new);
+        if let Some(live) = map.get(&files).and_then(Weak::upgrade) {
+            return live;
+        }
+        map.insert(files, Arc::downgrade(&gate));
+        if map.len() >= 2 * pruned_at + 64 {
+            map.retain(|_, w| w.strong_count() > 0);
+            let len = map.len();
+            reg.pruned_at = len;
+        }
+        gate
+    }
+
+    /// The word.
+    #[inline]
+    pub fn word(&self) -> &Arc<WriteGate> {
+        &self.word
+    }
+
+    /// The state the word holds now.
+    pub fn state(&self) -> GateState {
+        self.word.load().state()
+    }
+
+    /// Whether this file set can have a snapshot.
+    pub fn has_files(&self) -> bool {
+        self.files.is_some()
+    }
+
+    /// The marker log's path, for a file set that has one.
+    pub fn ixm_path(&self) -> Option<PathBuf> {
+        self.files.as_ref().map(GateFiles::ixm)
+    }
+
+    /// The snapshot's path, for a file set that has one.
+    pub fn ixs_path(&self) -> Option<PathBuf> {
+        self.files.as_ref().map(GateFiles::ixs)
+    }
+
+    /// The slot epoch now.
+    pub fn slot_epoch(&self) -> u64 {
+        self.slot_epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether the slot epoch is the recovered `rdb.ixe` record's.
+    pub fn epoch_proven(&self) -> bool {
+        self.epoch_proven.load(Ordering::Acquire)
+    }
+
+    /// Who the census attributes this gate's holds to.
+    pub fn census_id(&self) -> usize {
+        self.word.census_id()
+    }
+
+    /// The slow path's I/O for `state` (module documentation, T1). Called by
+    /// `gate::ticket` through [`WriteGate::acquire`], single-flight; the word
+    /// moves to `Dirty` only once this returned `Ok`.
+    pub(crate) async fn slow_path(&self, state: GateState) -> io::Result<()> {
+        let Some(files) = self.files.as_ref() else {
+            return Ok(());
+        };
+        let done = blocking(|| match state {
+            GateState::Dirty => Ok(()),
+            GateState::Clean => append_dirty(files),
+            GateState::Unknown => rewrite_unknown(files),
+        });
+        if done.is_ok() {
+            super::census::dirty_durable(self.census_id());
+        }
+        done
+    }
+
+    /// Appends `epoch + 1` to the directory's `rdb.ixe` as its own WAL
+    /// transaction and waits for the directory log's sync (§6 step 2): what
+    /// `VACUUM FULL` does under its exclusive gate before its first effect.
+    /// `seed` is any provider of the file set, which `rdb.ixe` is opened
+    /// beside. Returns the new epoch; a file set with no snapshot moves only
+    /// its in-memory epoch.
+    pub(crate) async fn bump_epoch<S: StorageIO>(&self, seed: &S) -> io::Result<u64> {
+        let Some(files) = self.files.as_ref() else {
+            return Ok(self.slot_epoch.fetch_add(1, Ordering::AcqRel) + 1);
+        };
+        let epoch = bump_in_epoch_log(seed, files, self.slot_epoch()).await?;
+        self.slot_epoch.store(epoch, Ordering::Release);
+        self.epoch_proven.store(true, Ordering::Release);
+        Ok(epoch)
+    }
+
+    /// Test-only "force Clean" (B11, until B13 publishes `CLEAN`s): writes a
+    /// log of `HEADER` + `CLEAN` durably and sets the word `Clean`. Panics on
+    /// a word in use or a file set with no files.
+    #[cfg(test)]
+    pub fn force_clean_for_tests(&self) {
+        let files = self.files.as_ref().expect("a file set with no snapshot cannot be clean");
+        let mut log = marker::new_log(files.incarnation);
+        log.extend_from_slice(&marker::encode_record(1, &marker::MarkerRecord::Clean(dummy_clean(files.incarnation))));
+        write_durably(&files.ixm(), &log);
+        self.word.force_state_for_tests(GateState::Clean);
+    }
+
+    /// Test-only: sets the word `Unknown`, as an unreadable log at open does.
+    #[cfg(test)]
+    pub fn force_unknown_for_tests(&self) {
+        self.word.force_state_for_tests(GateState::Unknown);
+    }
+}
+
+/// A `CLEAN` that vouches for a snapshot that does not exist: what the
+/// force-Clean hook writes.
+#[cfg(test)]
+pub(crate) fn dummy_clean(incarnation: u128) -> marker::CleanRecord {
+    use super::identity::{Identity, VersionTuple};
+    marker::CleanRecord {
+        identity: Identity {
+            incarnation,
+            slot_epoch: 0,
+            n_slots: 0,
+            pointers_len: 0,
+            rows_len: 0,
+            versions: VersionTuple::current(0),
+            shape_hash: 0,
+            filter_config_hash: 0,
+        },
+        snapshot_len: 0,
+        footer: 0,
+    }
+}
+
+#[cfg(test)]
+fn write_durably(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).expect("create the marker log");
+    f.write_all(bytes).expect("write the marker log");
+    f.sync_all().expect("sync the marker log");
+    crate::core::wal::sync_parent_dir(path).expect("sync the directory");
+}
+
+/// The `Clean` slow path: `DIRTY` after the last good record (module
+/// documentation). Falls back to unlinking `.ixs` when it cannot be made
+/// durable.
+fn append_dirty(files: &GateFiles) -> io::Result<()> {
+    match try_append_dirty(files) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::error!(
+                "{}: DIRTY could not be made durable ({e}); the snapshot is unlinked instead",
+                files.ixm().display()
+            );
+            unlink_snapshot(files).map_err(|u| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: DIRTY could not be made durable ({e}), and the snapshot could not be \
+                         unlinked either ({u}); nothing was written",
+                        files.ixm().display()
+                    ),
+                )
+            })
+        }
+    }
+}
+
+fn try_append_dirty(files: &GateFiles) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let path = files.ixm();
+    let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        // Gone since the open read it: no CLEAN is left to revoke.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        (&file).read_to_end(&mut bytes)?;
+    }
+    let scan = match marker::scan(&bytes) {
+        Ok(scan) if scan.incarnation == files.incarnation => scan,
+        // Another incarnation's log, or one that no longer reads: trust none
+        // of it.
+        _ => {
+            drop(file);
+            return rewrite_unknown(files);
+        }
+    };
+    // Already `DIRTY` (a past run's, durable since it is what the file
+    // reads after a restart, or this run's, synced before it returned).
+    if scan.state() == marker::LogState::Dirty {
+        return Ok(());
+    }
+    for op in scan.plan_append(Append::Dirty).ops {
+        match op {
+            marker::MarkerOp::Write { offset, bytes } => {
+                file.write_all_at(&bytes, offset)?;
+                failpoint("dirty_append_before_fsync", &path)?;
+                failpoint("dirty_enospc_after_first_write", &path)?;
+            }
+            marker::MarkerOp::Truncate { len } => {
+                file.set_len(len)?;
+            }
+        }
+        // After every step, before the next one is issued: until the
+        // truncate is durable a stale record past the new one could read as
+        // its successor (owner's decision (a)).
+        crate::core::sync_audit::note("index_store.marker", &path);
+        file.sync_data()?;
+    }
+    failpoint("dirty_after_fsync", &path)?;
+    Ok(())
+}
+
+/// The `Unknown` slow path: the log rewritten as `HEADER` + `DIRTY`, or
+/// `.ixs` unlinked.
+fn rewrite_unknown(files: &GateFiles) -> io::Result<()> {
+    match try_rewrite(files) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::error!(
+                "{}: the marker log could not be rewritten ({e}); the snapshot is unlinked instead",
+                files.ixm().display()
+            );
+            unlink_snapshot(files).map_err(|u| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: the marker log could not be rewritten ({e}), and the snapshot could \
+                         not be unlinked either ({u}); nothing was written",
+                        files.ixm().display()
+                    ),
+                )
+            })
+        }
+    }
+}
+
+fn try_rewrite(files: &GateFiles) -> io::Result<()> {
+    use std::io::Write;
+    #[cfg(feature = "persistent_indexes")]
+    crate::core::database::incompat::require(&files.dir, crate::core::database::incompat::INDEX_STORE_V1)?;
+    let tmp = files.ixm_tmp();
+    let path = files.ixm();
+    dir_op(DirOp::Create(&tmp));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&marker::compacted_log(files.incarnation))?;
+        crate::core::sync_audit::note("index_store.marker_tmp", &tmp);
+        f.sync_all()?;
+    }
+    failpoint("unknown_rewrite_after_first_write", &path)?;
+    dir_op(DirOp::Rename { from: &tmp, to: &path });
+    std::fs::rename(&tmp, &path)?;
+    crate::core::wal::sync_parent_dir(&path)
+}
+
+/// Unlinks `.ixs` and fsyncs the directory: with no snapshot, nothing is
+/// left for a `CLEAN` to vouch for.
+fn unlink_snapshot(files: &GateFiles) -> io::Result<()> {
+    let ixs = files.ixs();
+    dir_op(DirOp::Unlink(&ixs));
+    match std::fs::remove_file(&ixs) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    crate::core::sync_audit::note("unlink", &ixs);
+    crate::core::wal::sync_parent_dir(&ixs)
+}
+
+/// Unlinks the index-store files of the stem `stem` in `dir` (`.ixm`, `.ixs`
+/// and their `.tmp`s), the directory sync left to the caller's sweep: what a
+/// DROP, and a RENAME's or MOVE's source, leaves of the file set. Failures
+/// are logged; a leftover is rejected by its incarnation at the next open of
+/// the name, unless the same table comes back to it, which is why it is
+/// removed here.
+pub fn remove_files(dir: &Path, stem: &str) {
+    for suffix in [".ixm", ".ixm.tmp", ".ixs", ".ixs.tmp"] {
+        let path = dir.join(format!("{stem}{suffix}"));
+        if !path.exists() {
+            continue;
+        }
+        dir_op(DirOp::Unlink(&path));
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::error!("Could not remove {}: {e}", path.display());
+            }
+        }
+    }
+}
+
+/// Serialises appends to every directory's `rdb.ixe` in the process: a bump
+/// reads the file to choose its offset and epoch. Bumps are rare (one per
+/// `VACUUM FULL`), so one lock for all directories costs nothing.
+static EPOCH_APPEND: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn bump_in_epoch_log<S: StorageIO>(seed: &S, files: &GateFiles, in_memory: u64) -> io::Result<u64> {
+    let _serial = EPOCH_APPEND.lock().await;
+    let io = seed.create_new(EPOCH_LOG_FILE.to_string()).await;
+    let len = io.get_len().await;
+    let mut bytes = vec![0u8; len as usize];
+    if len > 0 {
+        let mut pos = 0u64;
+        io.read_data_into_buffer(&mut pos, &mut bytes).await?;
+    }
+    let path = files.dir.join(EPOCH_LOG_FILE);
+    let log = epoch_log::decode(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} cannot be read ({e}), so VACUUM FULL cannot record its slot epoch and \
+                 moved nothing. The file is WAL'd, so a bad record is damage: restore it, or \
+                 remove it (every index snapshot in {} is then rebuilt once)",
+                path.display(),
+                files.dir.display()
+            ),
+        )
+    })?;
+    let mut record = log.bump(files.incarnation, files.pid);
+    record.slot_epoch = record.slot_epoch.max(in_memory + 1);
+    let mut out = Vec::with_capacity(epoch_log::HEADER_LEN + epoch_log::RECORD_LEN);
+    if len == 0 {
+        out.extend_from_slice(&epoch_log::header());
+    }
+    out.extend_from_slice(&record.encode());
+    let txn = io.begin_txn();
+    let token = io.write_data_txn(txn, len, &out).await;
+    if let Err(e) = io.commit_durable(token).await {
+        // Ended either way, as compaction's own batches are: a transaction
+        // left open holds the log's pending count up and it never
+        // checkpoints again. Nothing has moved yet, and a bump that did reach
+        // the disk only rejects snapshots, which is safe.
+        io.abort_txn(txn).await;
+        return Err(e);
+    }
+    if token == 0 {
+        // No log in this directory: the provider wrote in place, and the
+        // record must be durable before the first effect all the same.
+        crate::core::sync_audit::note("index_store.epoch", &path);
+        std::fs::File::options().write(true).open(&path)?.sync_data()?;
+    }
+    Ok(record.slot_epoch)
+}
+
+#[cfg(test)]
+#[path = "file_gate_tests.rs"]
+mod tests;

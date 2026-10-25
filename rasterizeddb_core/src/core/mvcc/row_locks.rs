@@ -648,6 +648,13 @@ impl RowLocks {
     /// path.
     pub fn release_owner(&self, owner: LockOwner) {
         let id = owner.id();
+        // The family's write tickets first, with nothing else changed yet:
+        // its outcome is final and its post-commit work done (§2 Ticket
+        // lifetime), and by the time a strong lock its table locks held off
+        // is granted, no ticket of this family counts on a gate word.
+        if let Some(transactions) = &self.transactions {
+            transactions.family_tickets().release(id);
+        }
         if self.alias_count.load(Ordering::Acquire) > 0 {
             let before = self.aliases.len();
             self.aliases.retain(|_, o| *o != id);

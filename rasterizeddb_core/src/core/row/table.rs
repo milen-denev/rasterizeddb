@@ -25,7 +25,8 @@ use crate::core::tokenizer::query_tokenizer::Token;
 
 use crate::core::db_type::DbType;
 use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
-use crate::core::index_store::gate::{self, Proof};
+use crate::core::index_store::file_gate::FileGate;
+use crate::core::index_store::gate::{self, Proof, WriteTicket};
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
@@ -213,6 +214,13 @@ pub struct Table<S: StorageIO> {
     /// waits on, so a retired instance has no vacuum still writing through
     /// its providers (§7 step 2(b), RV14).
     maintenance_tick: StdArc<tokio::sync::Mutex<()>>,
+    /// The file set's write gate (docs/persistent-indexes.md §2, slice B11):
+    /// one word per file set, shared by every instance of this table, its
+    /// map slot and every ticket on it ([`FileGate::open`]). Every write path
+    /// takes a ticket on it before its first
+    /// in-memory index or filter mutation and its first data-file write
+    /// (see [`Table::family`]).
+    gate: StdArc<FileGate>,
 }
 
 /// A table's row storage and what indexes it: the part a partition shell does
@@ -458,6 +466,9 @@ pub(crate) struct PartitionOpen<S: StorageIO> {
 struct Assembly<'a, S: StorageIO> {
     /// The name filter settings are looked up under: the logical name.
     settings_name: &'a str,
+    /// The physical name the rows file uses (a partition's
+    /// `__pt_<uid>_<pid>`), which names the file set's index-store files.
+    stem: &'a str,
     schema: TableSchema,
     schema_unreadable: bool,
     io_schema: Arc<S>,
@@ -704,30 +715,29 @@ impl<S: StorageIO> TableData<S> {
     /// Applies filter-index changes staged during a batch, now that the batch's
     /// `commit_durable` has made the writes they describe durable. A no-op with
     /// no filter index, and it always empties `pending`.
-    fn apply_pending_filters(&self, pending: &mut Vec<PendingFilterOp>) {
+    fn apply_pending_filters(&self, ticket: &WriteTicket, pending: &mut Vec<PendingFilterOp>) {
         if pending.is_empty() {
             return;
         }
-        let ticket = gate::ticket();
         for op in pending.drain(..) {
             match op {
                 PendingFilterOp::Delete(slot) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_delete(Proof::from(&ticket), slot);
+                        filters.on_delete(Proof::from(ticket), slot);
                     }
                     // A secondary index keeps the slot: vacuum forgets it once
                     // nothing can reach the version, reading its key back then.
                 }
                 PendingFilterOp::Insert(slot, row_write, old_keys) => {
                     if let Some(filters) = self.filters.as_ref() {
-                        filters.on_insert(Proof::from(&ticket), slot, &row_write);
+                        filters.on_insert(Proof::from(ticket), slot, &row_write);
                     }
                     if let Some(indexes) = self.indexes.as_ref() {
                         match old_keys {
                             Some(old) => {
-                                indexes.on_replace(Proof::from(&ticket), slot, &old, &row_write)
+                                indexes.on_replace(Proof::from(ticket), slot, &old, &row_write)
                             }
-                            None => indexes.on_insert(Proof::from(&ticket), slot, &row_write),
+                            None => indexes.on_insert(Proof::from(ticket), slot, &row_write),
                         }
                     }
                 }
@@ -854,6 +864,8 @@ impl<S: StorageIO> Table<S> {
             // Nothing watches it: the shell spawns no task.
             maintenance_alive: StdArc::new(CacheGuard::new(AtomicBool::new(false))),
             maintenance_tick: StdArc::new(tokio::sync::Mutex::new(())),
+            // No rows, so nothing to gate: its partitions have their own.
+            gate: FileGate::detached(),
         }
     }
 
@@ -975,6 +987,7 @@ impl<S: StorageIO> Table<S> {
 
         Self::assemble(Assembly {
             settings_name: table_name,
+            stem: table_name,
             schema,
             schema_unreadable,
             io_schema,
@@ -1064,6 +1077,7 @@ impl<S: StorageIO> Table<S> {
 
         Ok(Self::assemble(Assembly {
             settings_name: &settings_name,
+            stem: &physical,
             schema,
             schema_unreadable: false,
             io_schema,
@@ -1117,6 +1131,7 @@ impl<S: StorageIO> Table<S> {
     async fn assemble(a: Assembly<'_, S>) -> Self {
         let Assembly {
             settings_name: table_name,
+            stem,
             schema,
             schema_unreadable,
             io_schema,
@@ -1131,6 +1146,16 @@ impl<S: StorageIO> Table<S> {
         } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+
+        // The file set's word: the live one when an instance of this file set
+        // is still open (a reload), else derived from `.ixm`. Writes nothing.
+        let gate = FileGate::open(io_pointers.index_store_dir(), stem, schema.incarnation);
+        // A landing of staged bytes is a write of the file set: each takes a
+        // count on the word, or waits for the next round (see
+        // `StorageIO::attach_write_gate`).
+        for io in [&io_pointers, &io_rows, &io_filters] {
+            io.attach_write_gate(gate.word());
+        }
 
         let filter_settings = crate::core::filter::settings::settings();
         let filters = if filter_settings.table_enabled(table_name) {
@@ -1332,6 +1357,7 @@ impl<S: StorageIO> Table<S> {
                 compaction_gate: compaction_gate.clone(),
                 cache_generation: cache_generation.clone(),
                 forget: forget.clone(),
+                gate: StdArc::downgrade(&gate),
             }
             .spawn();
         }
@@ -1370,7 +1396,74 @@ impl<S: StorageIO> Table<S> {
             filters_ready,
             maintenance_alive,
             maintenance_tick,
+            gate,
         }
+    }
+
+    /// The file set's write gate.
+    pub fn gate(&self) -> &StdArc<FileGate> {
+        &self.gate
+    }
+
+    /// The family a write path's ticket on this file set is kept for (§2
+    /// layer 1, Ticket ownership): inside an owner scope of this database,
+    /// the scope's lock owner, whose record keeps a ticket on the file set
+    /// until the owner is released, after the outcome is final; the ticket a
+    /// write path holds is then a second count beside it, for its mutations'
+    /// proofs. `None` outside every scope (a table written with no statement
+    /// around it: tests, tools): the ticket is transient, given back when the
+    /// caller drops it.
+    ///
+    /// Every write path takes `gate::ticket(&self.gate, self.family())` after
+    /// the table lock and before `compaction_gate`, `write_lock`, the key
+    /// stripes and row locks, and before its first in-memory index or filter
+    /// mutation and its first data-file write. In `Clean` or `Unknown` the
+    /// ticket makes `DIRTY` durable first (T1).
+    #[inline]
+    pub(crate) fn family(&self) -> Option<gate::Family> {
+        let manager = self.versions.load_full()?;
+        let owner = crate::core::mvcc::owner::family_for(&manager)?;
+        Some(gate::Family { manager, owner })
+    }
+
+    /// The addresses of this table's in-memory structures, for the census
+    /// (`index_store::census`): the filter, the indexes and every index in
+    /// them.
+    #[cfg(test)]
+    pub(crate) fn census_structures(&self) -> Vec<usize> {
+        let Ok(d) = self.data() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(f) = d.filters.as_ref() {
+            out.push(StdArc::as_ptr(f) as usize);
+        }
+        if let Some(ix) = d.indexes.as_ref() {
+            out.push(StdArc::as_ptr(ix) as usize);
+            out.extend(ix.list.iter().map(|l| StdArc::as_ptr(l) as usize));
+            out.extend(ix.gin.iter().map(|g| StdArc::as_ptr(g) as usize));
+        }
+        out
+    }
+
+    /// The paths of this table's own files, for the census: rows, pointers,
+    /// filter sidecar and, for a plain table, schema and sequence.
+    #[cfg(test)]
+    pub(crate) fn census_files(&self) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut push = |io: &S| {
+            if let Some(dir) = io.get_location() {
+                out.push(std::path::Path::new(&dir).join(io.get_name()));
+            }
+        };
+        push(&self.io_schema);
+        if let Ok(d) = self.data() {
+            push(&d.io_pointers);
+            push(&d.io_rows);
+            push(&d.io_filters);
+            push(&d.ids.io);
+        }
+        out
     }
 
     /// Retires this instance (§7 step 2): its maintenance stops, and any
@@ -1455,6 +1548,7 @@ impl<S: StorageIO> Table<S> {
             dead_stamps: &self.dead_stamps,
             drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
             alive: None,
+            gate: Some(&self.gate),
         };
         crate::core::vacuum::neutralize_aborted(&parts, &manager, handle).await
     }
@@ -1596,6 +1690,7 @@ impl<S: StorageIO> Table<S> {
             indexes: d.indexes.as_deref().zip(index_fetch.as_ref()),
             compaction_gate: Some(&self.compaction_gate),
             alive: Some(&self.maintenance_alive),
+            gate: Some(&self.gate),
         };
         let report = crate::core::vacuum::run_once(
             &*d.io_pointers,
@@ -1659,6 +1754,11 @@ impl<S: StorageIO> Table<S> {
         #[cfg(feature = "s3_backup")]
         let _backup = crate::core::backup::compaction_permit().await;
 
+        // A ticket first, before the exclusive gate (§6 step 1, §2 lock order:
+        // readers never queue behind a seal through compaction's exclusive
+        // hold), so `DIRTY` is durable before anything below is issued.
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
+
         // Exclusive: rows are about to move, so nothing may be holding a pointer
         // to one. Every read and write path takes this shared.
         #[cfg(test)]
@@ -1684,6 +1784,19 @@ impl<S: StorageIO> Table<S> {
                 self.schema.name, e
             );
             return Err(e.into());
+        }
+
+        // The slot epoch, durably, before the first effect (§6 step 2): its
+        // own WAL transaction in the directory's `rdb.ixe`, synced with the
+        // directory log, so any replay that contains a move contains the
+        // bump, and a snapshot taken under the old numbering never matches
+        // the data again. Nothing has moved if it fails.
+        if let Err(e) = self.gate.bump_epoch(&*d.io_pointers).await {
+            error!(
+                "Compaction of {}: the slot epoch could not be recorded ({}); nothing was moved",
+                self.schema.name, e
+            );
+            return Err(e);
         }
 
         // Nothing on the free list survives compaction — every extent it names
@@ -1720,7 +1833,7 @@ impl<S: StorageIO> Table<S> {
         // leaves a sidecar that is rejected and rebuilt, rather than one that
         // confidently indexes rows by their former addresses.
         let n_slots_before = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        let renumbering = self.begin_renumbering(d, n_slots_before).await;
+        let renumbering = self.begin_renumbering(d, n_slots_before, &ticket).await;
 
         let rows_len = d.io_rows.get_len().await;
         let (live, dead_rows) = collect_live(&*d.io_pointers, rows_len, &horizon).await?;
@@ -2060,7 +2173,12 @@ impl<S: StorageIO> Table<S> {
     /// cannot run while `compact` holds its gate, and an open-time build that
     /// publishes ready meanwhile is made unready by the drop); the begin-time
     /// one here is defence in depth.
-    async fn begin_renumbering<'a>(&'a self, d: &'a TableData<S>, n_slots: u64) -> RenumberingGuard<'a> {
+    async fn begin_renumbering<'a>(
+        &'a self,
+        d: &'a TableData<S>,
+        n_slots: u64,
+        ticket: &'a WriteTicket,
+    ) -> RenumberingGuard<'a> {
         self.filters_ready.store(false, AtomicOrdering::Release);
         // Built before the first await, not after: `begin_renumbering_on_disk`
         // makes the epoch odd and then waits on the sidecar's dirty mark, and
@@ -2073,15 +2191,15 @@ impl<S: StorageIO> Table<S> {
         let guard = RenumberingGuard {
             filters: d.filters.as_deref(),
             indexes: d.indexes.as_deref(),
+            ticket,
         };
-        let ticket = gate::ticket();
         if let Some(filters) = d.filters.as_ref() {
             filters
-                .begin_renumbering_on_disk(Proof::from(&ticket), &*d.io_filters, n_slots)
+                .begin_renumbering_on_disk(Proof::from(ticket), &*d.io_filters, n_slots)
                 .await;
         }
         if let Some(indexes) = d.indexes.as_ref() {
-            indexes.invalidate(Proof::from(&ticket));
+            indexes.invalidate(Proof::from(ticket));
         }
         guard
     }
@@ -3597,6 +3715,9 @@ impl<S: StorageIO> Table<S> {
     /// commits.
     pub async fn insert_row_in_txn(&self, row_write: RowWrite, written_by: TxId) -> Result<()> {
         let d = self.data()?;
+        // Before the gate below and before anything is written (§2 lock order,
+        // T1).
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         // Compaction relies on the live set not changing under it, so an insert
         // holds the gate too. It is shared, so concurrent inserts still run.
         let _gate = self.compaction_gate.read().await;
@@ -3667,7 +3788,6 @@ impl<S: StorageIO> Table<S> {
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
-        let ticket = gate::ticket();
         if let Some(filters) = d.filters.as_ref() {
             filters.on_insert(
                 Proof::from(&ticket),
@@ -3705,6 +3825,7 @@ impl<S: StorageIO> Table<S> {
     /// insert.
     pub(crate) async fn insert_version(&self, row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         if let Some(manager) = self.versions.load().as_ref() {
             // The transaction that will end these versions must know it wrote
@@ -3739,7 +3860,6 @@ impl<S: StorageIO> Table<S> {
                 .map_err(std::io::Error::from)?;
         }
 
-        let ticket = gate::ticket();
         let slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
         if let Some(filters) = d.filters.as_ref() {
             filters.on_insert(Proof::from(&ticket), slot, &row_write);
@@ -4315,6 +4435,9 @@ impl<S: StorageIO> Table<S> {
 
         self.note_write(deleted_by);
 
+        // Taken at the statement's entry, before the gate and the write lock
+        // (§2 lock order), so a DELETE that matches nothing still takes one.
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         let _read = d.read_guard();
 
@@ -4459,7 +4582,7 @@ impl<S: StorageIO> Table<S> {
             // all-or-nothing property, which is the price of a reclaimable log.
             if crate::core::wal::should_break_transaction(&*d.io_pointers) {
                 d.io_pointers.commit_durable(txn).await?;
-                d.apply_pending_filters(&mut pending_filters);
+                d.apply_pending_filters(&ticket, &mut pending_filters);
                 txn = d.io_pointers.begin_txn();
             }
         }
@@ -4471,7 +4594,7 @@ impl<S: StorageIO> Table<S> {
         // that is not durable is a row that comes back, and telling the caller
         // otherwise is the difference between a failed delete and a silent one.
         d.io_pointers.commit_durable(txn).await?;
-        d.apply_pending_filters(&mut pending_filters);
+        d.apply_pending_filters(&ticket, &mut pending_filters);
 
         // Published before the lock is released, so anyone who takes it next
         // sees a generation that already accounts for everything above.
@@ -4699,6 +4822,8 @@ impl<S: StorageIO> Table<S> {
 
         self.note_write(written_by);
 
+        // As in `delete_rows_as_of`: at entry, before the gate and every lock.
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         let _read = d.read_guard();
 
@@ -5037,7 +5162,7 @@ impl<S: StorageIO> Table<S> {
                 // report: the caller can retry a rejected UPDATE, but it cannot
                 // do anything about rows it was told had landed and had not.
                 d.io_pointers.commit_durable(txn).await?;
-                d.apply_pending_filters(&mut pending_filters);
+                d.apply_pending_filters(&ticket, &mut pending_filters);
                 self.dead_stamps
                     .fetch_add(updated_count, AtomicOrdering::Relaxed);
                 self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
@@ -5173,13 +5298,13 @@ impl<S: StorageIO> Table<S> {
             // `overwrote_in_place`).
             if !overwrote_in_place && crate::core::wal::should_break_transaction(&*d.io_pointers) {
                 d.io_pointers.commit_durable(txn).await?;
-                d.apply_pending_filters(&mut pending_filters);
+                d.apply_pending_filters(&ticket, &mut pending_filters);
                 txn = d.io_pointers.begin_txn();
             }
         }
 
         d.io_pointers.commit_durable(txn).await?;
-        d.apply_pending_filters(&mut pending_filters);
+        d.apply_pending_filters(&ticket, &mut pending_filters);
         self.dead_stamps
             .fetch_add(updated_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
@@ -5385,13 +5510,16 @@ async fn build_indexes<S: StorageIO>(
 struct RenumberingGuard<'a> {
     filters: Option<&'a TableFilters>,
     indexes: Option<&'a crate::core::index::TableIndexes>,
+    /// The compaction's ticket, held across the whole renumbering: the end
+    /// is a mutation like the beginning.
+    ticket: &'a WriteTicket,
 }
 
 impl Drop for RenumberingGuard<'_> {
     fn drop(&mut self) {
-        let ticket = gate::ticket();
+        let ticket = self.ticket;
         if let Some(filters) = self.filters {
-            filters.end_renumbering(Proof::from(&ticket));
+            filters.end_renumbering(Proof::from(ticket));
             // A compaction that fails from here on leaves the filter demoted
             // in memory and the sidecar marked dirty; this persists the
             // demotion at the next maintenance tick instead of whenever
@@ -5400,7 +5528,7 @@ impl Drop for RenumberingGuard<'_> {
             filters.request_checkpoint();
         }
         if let Some(indexes) = self.indexes {
-            indexes.invalidate(Proof::from(&ticket));
+            indexes.invalidate(Proof::from(ticket));
         }
     }
 }

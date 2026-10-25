@@ -66,6 +66,7 @@
 //! | `<t>_schema_TYP.db` | `TYPE_MODIFIER_SIZE` (134) |
 //! | `<t>_schema_GEN.db` | `GENERATED_SIZE` (643) |
 //! | `<t>_schema_CHK.db` | `CHECK_SIZE` (643) |
+//! | `rdb.ixe` | 32, after a 16-byte header (the slot-epoch log, one per directory) |
 //!
 //! The catalogue's own `db_data_pointers.db` and `db_data_schema_FIELDS.db`
 //! are the first two for the table `db_data`.
@@ -131,6 +132,17 @@ impl FixedRecordFile {
     }
 }
 
+/// `rdb.ixe`, the directory's slot-epoch log (docs/persistent-indexes.md
+/// §1; `index_store::epoch_log`): a 16-byte header, then 32-byte records
+/// appended at its length through the directory's log. One per directory,
+/// named by no table (no table file ends `.ixe`), so it needs no schema
+/// beside it to be recognised.
+pub const EPOCH_LOG: FixedRecordFile = FixedRecordFile {
+    kind: crate::core::index_store::epoch_log::EPOCH_LOG_FILE,
+    header: crate::core::index_store::epoch_log::HEADER_LEN as u64,
+    stride: crate::core::index_store::epoch_log::RECORD_LEN as u64,
+};
+
 /// Every fixed-record file kind, by the suffix after the table name. See the
 /// module documentation for the ones deliberately absent.
 const FIXED_RECORD_SUFFIXES: &[(&str, u64)] = &[
@@ -151,8 +163,12 @@ const FIXED_RECORD_SUFFIXES: &[(&str, u64)] = &[
 ];
 
 /// What `name`, a file in `dir`, is, if it is a fixed-record file: its
-/// suffix names a kind and its table's schema file is beside it.
+/// suffix names a kind and its table's schema file is beside it, or it is the
+/// directory's slot-epoch log.
 pub fn classify(dir: &Path, name: &str) -> Option<FixedRecordFile> {
+    if name == crate::core::index_store::epoch_log::EPOCH_LOG_FILE {
+        return Some(EPOCH_LOG);
+    }
     for &(suffix, stride) in FIXED_RECORD_SUFFIXES {
         let Some(table) = name.strip_suffix(suffix) else {
             continue;

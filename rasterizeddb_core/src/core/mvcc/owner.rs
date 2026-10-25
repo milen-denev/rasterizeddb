@@ -252,6 +252,27 @@ pub fn current() -> Option<StatementOwner> {
         .flatten()
 }
 
+/// The family a write in this task belongs to, for the database whose
+/// transactions `transactions` are: the scope's owner id (a block's root, a
+/// statement's O, a named owner), whose lock-owner record keeps the family's
+/// write tickets (docs/persistent-indexes.md §2 Ticket ownership). `None`
+/// outside a scope of that database, or before a lazy scope minted O (a
+/// table is always looked up, and O minted, before it is written). Never
+/// mints. One task-local read.
+#[inline]
+pub fn family_for(transactions: &TransactionManager) -> Option<TxId> {
+    SCOPE
+        .try_with(|scope| {
+            if std::ptr::eq(Arc::as_ptr(&scope.transactions), transactions) {
+                scope.resolved().map(|o| o.id())
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
+}
+
 /// The scope's owner, beginning O now if this is an autocommit scope that has
 /// none yet. `None` only outside every scope.
 pub fn ensure() -> Option<StatementOwner> {

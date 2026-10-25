@@ -10,10 +10,18 @@
 //!
 //! Slice B10 adds [`gate_word`]: the packed gate word, every transition on
 //! it as a one-atomic-operation-per-step machine, [`gate_word::WriteGate`]
-//! over them, and an exhaustive interleaving model; also used by nothing yet.
+//! over them, and an exhaustive interleaving model.
+//!
+//! Slice B11 wires the gate in: [`file_gate`] (each file set's word, the
+//! marker log's state at open, the slow path's `DIRTY`, the `Unknown`
+//! rewrite, and the slot epoch in `rdb.ixe`), the real [`gate::ticket`] mint
+//! with tickets kept on lock owners ([`gate::FamilyTickets`]), and the
+//! [`census`] journal tests check T1 and T2 with.
 
+pub mod census;
 pub mod codec;
 pub mod epoch_log;
+pub mod file_gate;
 pub mod gate;
 pub mod gate_word;
 pub mod identity;
@@ -22,3 +30,5 @@ pub mod snapshot;
 
 #[cfg(test)]
 mod gate_source_tests;
+#[cfg(test)]
+mod wiring_tests;

@@ -4464,10 +4464,19 @@ async fn sweep_files_durably(
 }
 
 /// Deletes every file derived from `name`, the log left as it is.
+///
+/// The index-store files of the stem go too (`.ixm`, `.ixs` and their
+/// `.tmp`s; docs/persistent-indexes.md §1): a DROP's, and a RENAME's or a
+/// MOVE's source, which opens under its new name with a fresh word (B11).
+/// Left behind, a log ending `CLEAN` would vouch for a snapshot of rows
+/// that a rename back to this name brings home changed.
 async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
     for suffix in RENAMED_SUFFIXES {
         let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
         io.drop_io();
+    }
+    if let Some(dir) = io_pointers.index_store_dir() {
+        crate::core::index_store::file_gate::remove_files(&dir, name);
     }
 }
 

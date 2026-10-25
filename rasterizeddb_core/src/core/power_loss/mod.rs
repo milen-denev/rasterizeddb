@@ -86,6 +86,7 @@ pub(crate) fn temp_synced_for(tag: &str, path: &Path) -> Option<PathBuf> {
         "wal.floors" => Some(path.with_extension(crate::core::torn_tail::FLOORS_PARTIAL_EXTENSION)),
         // `database::rewrite::write_intent`.
         "rewrite.intent" => Some(path.with_extension("partial")),
+        // `index_store::file_gate::try_rewrite` notes `.ixm.tmp` itself.
         _ => None,
     }
 }
@@ -135,4 +136,13 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `database::rewrite::write_intent`: a temporary file, a rename over the
     // intent and a directory sync.
     ("rewrite.intent", true),
+    // `index_store::file_gate`: the marker log's DIRTY append and its
+    // truncate past it, each fdatasynced before the next step is issued.
+    ("index_store.marker", true),
+    // `index_store::file_gate`: the `Unknown` rewrite's `.ixm.tmp`, then a
+    // rename over the log and a directory sync.
+    ("index_store.marker_tmp", true),
+    // `index_store::file_gate`: `rdb.ixe` written in place in a directory
+    // with no log.
+    ("index_store.epoch", true),
 ];

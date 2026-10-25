@@ -24,6 +24,14 @@ use crate::memory_pool::MEMORY_POOL;
 /// `pub`/`pub(crate)` methods of `impl Table` that touch only the schema,
 /// the transaction wiring or a counter, and so may run on a shell.
 const SCHEMA_ONLY: &[&str] = &[
+    // The file set's write gate and the family a ticket on it is kept for
+    // (slice B11): a shell has a detached gate and nothing to write.
+    "gate",
+    "family",
+    // The census's file list and structures (tests): a shell's schema file,
+    // and no data or structures.
+    "census_files",
+    "census_structures",
     "scope_cache_to_database",
     "enable_versioning",
     "visibility_for",

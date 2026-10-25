@@ -7,7 +7,7 @@ use crate::core::db_type::DbType;
 
 use super::bloom::{self, SuperBloom};
 use super::hash::{CODE_EMPTY, HashSeed, canonical_hash, fingerprint, is_fingerprintable};
-use super::kernels::{MAX_F, MIN_F, ZONE_ROWS, ZONE_WORDS, probe_fn, write_slot};
+use super::kernels::{MAX_F, MIN_F, ZONE_ROWS, ZONE_WORDS, probe_fn, read_slot, write_slot};
 use super::zonemap::{SargOp, ZoneMap, zones_for};
 
 /// Tuning knobs. Defaults are the ones argued for in the design doc.
@@ -601,6 +601,24 @@ impl ColumnFilter {
                 self.gens.push(g);
                 0
             }
+        }
+    }
+
+    /// Whether `slot` holds a fingerprint other than `CODE_EMPTY`: whether
+    /// clearing it would change a plane. Read-only; vacuum asks before it
+    /// takes a write ticket for a clear (docs/persistent-indexes.md §2, RV2).
+    /// A bounds-only column, a plane-less zone and a zone never written have
+    /// nothing to clear. A wrong `false` would cost selectivity only: a
+    /// fingerprint left on a dead slot keeps it a candidate.
+    pub fn holds_code(&self, slot: u64) -> bool {
+        if !self.fingerprints {
+            return false;
+        }
+        let zone = slot / ZONE_ROWS as u64;
+        let local = (slot % ZONE_ROWS as u64) as usize;
+        match self.gens.iter().find(|g| g.contains(zone)) {
+            Some(g) if g.f > 0 => read_slot(g.zone(zone), g.f, local) != CODE_EMPTY,
+            _ => false,
         }
     }
 

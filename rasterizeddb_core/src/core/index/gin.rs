@@ -183,6 +183,7 @@ impl GinIndex {
 
     /// Indexes the document a version holds (its bytes; empty for `NULL`).
     pub fn insert(&self, _proof: Proof<'_>, slot: u64, document: Option<&[u8]>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::insert");
         let mut items = Vec::new();
         match document.map(|d| jsonb::gin_items(d, self.opclass, &mut items)) {
             Some(Some(())) => {}
@@ -223,6 +224,7 @@ impl GinIndex {
     /// Forgets a reclaimed slot. See the module notes on why the lists keep
     /// it until a compaction.
     pub fn forget(&self, proof: Proof<'_>, slot: u64) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "GinIndex::forget");
         if !self.holds(slot) {
             return;
         }
@@ -250,6 +252,7 @@ impl GinIndex {
     /// also a slot whose insert has written its entries and not yet set its
     /// bit, and removing those would drop a live row from every answer.
     pub fn compact(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::compact");
         let gone = std::mem::take(&mut *self.forgotten_slots.lock());
         let Some(&max) = gone.iter().max() else {
             return;
@@ -279,6 +282,7 @@ impl GinIndex {
     }
 
     pub fn clear(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::clear");
         for shard in self.shards.iter() {
             shard.write().clear();
         }

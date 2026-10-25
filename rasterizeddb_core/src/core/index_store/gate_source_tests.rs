@@ -85,9 +85,11 @@ const BUILD_TOKEN_CALLERS: [(&str, &str); 4] = [
 ];
 /// Macros that may name `Proof` (never a token).
 const MACROS_NAMING_PROOF: [&str; 1] = ["matches"];
-/// Fields that may store a token or a `Proof`: `(struct, field)`. Phase 1
-/// adds the family's lock-owner record (§2, Ticket ownership).
-const FIELDS_HOLDING_A_TOKEN: [(&str, &str); 0] = [];
+/// Fields that may store an already-minted token: `(struct, field)`. The
+/// family's lock-owner record (§2, Ticket ownership; slice B11), and
+/// `VACUUM FULL`'s renumbering guard, which borrows the compaction's ticket
+/// for the mutation its drop makes.
+const FIELDS_HOLDING_A_TOKEN: [(&str, &str); 2] = [("FamilyShard", "held"), ("RenumberingGuard", "ticket")];
 
 /// The types whose every fn takes a `Proof` unless listed below.
 const GUARDED: [&str; 4] = ["LiveIndex", "GinIndex", "TableIndexes", "TableFilters"];
@@ -106,7 +108,7 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 59] = [
+const READ_ONLY: [(&str, &str); 60] = [
     ("LiveIndex", "method"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
@@ -166,6 +168,9 @@ const READ_ONLY: [(&str, &str); 59] = [
     ("TableFilters", "bytes"),
     ("TableFilters", "stats"),
     ("TableFilters", "evaluate"),
+    // Whether a clear would change a plane: vacuum asks before it takes a
+    // ticket (RV2).
+    ("TableFilters", "any_codes_in_runs"),
 ];
 
 /// More read-only fns, kept apart only to keep the list above readable:

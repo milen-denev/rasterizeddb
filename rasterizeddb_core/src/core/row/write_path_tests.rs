@@ -644,6 +644,7 @@ async fn a_running_query_defers_publication() {
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
         compaction_gate: None,
         alive: None,
+        gate: None,
     };
     let report = crate::core::vacuum::run_once(
         &*t.data().unwrap().io_pointers,
@@ -1167,6 +1168,7 @@ async fn the_capped_path_never_rehands_a_reused_extent() {
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
             compaction_gate: None,
             alive: None,
+            gate: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,
@@ -1833,6 +1835,7 @@ async fn a_permanently_busy_table_still_reclaims() {
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
             compaction_gate: None,
             alive: None,
+            gate: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,

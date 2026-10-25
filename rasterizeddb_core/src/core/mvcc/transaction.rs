@@ -378,6 +378,10 @@ pub struct TransactionManager {
     /// Registrations ever made: diagnostic, and what the test that a
     /// committing statement registers nothing reads.
     outliving_total: AtomicU64,
+    /// The write tickets each lock owner keeps, one per file set it wrote
+    /// (docs/persistent-indexes.md §2 Ticket ownership, slice B11). Given
+    /// back by `RowLocks::release_owner`, with the owner's table locks.
+    family_tickets: crate::core::index_store::gate::FamilyTickets,
 }
 
 /// Counts one wait among [`TransactionManager`]'s end watchers until dropped.
@@ -679,7 +683,14 @@ impl TransactionManager {
             outliving: parking_lot::Mutex::new(SmallVec::new()),
             outliving_count: AtomicUsize::new(0),
             outliving_total: AtomicU64::new(0),
+            family_tickets: crate::core::index_store::gate::FamilyTickets::new(),
         }
+    }
+
+    /// The write tickets lock owners keep (see the field).
+    #[inline]
+    pub fn family_tickets(&self) -> &crate::core::index_store::gate::FamilyTickets {
+        &self.family_tickets
     }
 
     /// Watches transaction ends (see [`EndWatch`]) until the guard drops.
