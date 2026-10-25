@@ -184,14 +184,11 @@ pub const PG17_AUTO_PREPARE: &[(&str, &str)] = &[
 ///   catalog reads take no lock: a deliberate deviation") and answer at
 ///   once, and the Execute waits and fails with the same 55P03. Either way
 ///   the error skips the rest of the batch until the Sync.
-/// - **`after the error`**: the statements of one batch are NOT one
-///   implicit transaction here; each Execute outside a block commits on its
-///   own, so the INSERT before the failing one stays (`D['4']`). A known
-///   divergence from PostgreSQL, not a lock-manager one (the simple
-///   protocol's multi-statement string has the same gap, `pgwire.rs`
-///   `handle_simple_query`); listed in §13 as found by B8 and not fixed.
+///
+/// `after the error` answers as PostgreSQL does: a batch is one implicit
+/// transaction, so the failing INSERT rolled back the one before it
+/// (`implicit_batch_transaction.rs`; it kept `D['4']` until then).
 pub const OURS_BATCH: &[(&str, &str)] = &[
-    ("after the error", "T[id/23/0] D['1'] D['2'] D['3'] D['4'] C(SELECT 4) Z(I)"),
     (
         "batch with a lock timeout",
         "1 2 T[id/23/1] D[00000001] C(SELECT 1) 1 2 T[a/25/1] E(55P03) Z(I)",

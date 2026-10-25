@@ -1718,32 +1718,44 @@ where
     // one, so the session begins idle.
     let mut ready = true;
 
+    // Frames already read off the socket, ahead of the one being handled
+    // (`read_ahead`, at an `Execute`): handled, in order, before anything more
+    // is read.
+    let mut pending: std::collections::VecDeque<(u8, Vec<u8>)> = std::collections::VecDeque::new();
+
     loop {
-        let mut tag = [0u8; 1];
-        // The timer covers only this wait — the read of the first byte of the
-        // next message. A statement that runs for an hour is never subject to
-        // it, because nothing is being read while it runs. Output is already
-        // flushed here (`ReadyForQuery` flushes), so the timer is not spent
-        // waiting on a slow reader either.
-        //
-        // Cancelling the read is safe: a one-byte `read_exact` that has not
-        // completed has consumed nothing, so a message arriving as the timer
-        // fires is not torn.
-        let idle = if ready { state.idle_limit() } else { None };
-        let read = match idle {
-            None => stream.read_exact(&mut tag).await,
-            Some((limit, kind)) => {
-                match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
-                    Ok(read) => read,
-                    Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+        let (tag, payload) = match pending.pop_front() {
+            Some((tag, payload)) => ([tag], payload),
+            None => {
+                let mut tag = [0u8; 1];
+                // The timer covers only this wait — the read of the first byte of the
+                // next message. A statement that runs for an hour is never subject to
+                // it, because nothing is being read while it runs. Output is already
+                // flushed here (`ReadyForQuery` flushes), so the timer is not spent
+                // waiting on a slow reader either.
+                //
+                // Cancelling the read is safe: a one-byte `read_exact` that has not
+                // completed has consumed nothing, so a message arriving as the timer
+                // fires is not torn.
+                let idle = if ready { state.idle_limit() } else { None };
+                let read = match idle {
+                    None => stream.read_exact(&mut tag).await,
+                    Some((limit, kind)) => {
+                        match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
+                            Ok(read) => read,
+                            Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+                        }
+                    }
+                };
+                match read {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
                 }
+                let payload = read_frame_body(stream, tag[0]).await?;
+                (tag, payload)
             }
         };
-        match read {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
-        }
         // Whether handling this message ends with a `ReadyForQuery`: a simple
         // query and a `Sync` always do, the batch messages never do, and an
         // unknown message does unless it falls in a discard window, where it
@@ -1753,20 +1765,6 @@ where
             b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => false,
             _ => !state.error_in_batch,
         };
-
-        let len = read_i32_be(stream).await?;
-        // Checked against the type's limit before anything is allocated, as
-        // PostgreSQL does: a length is only a claim, and allocating whatever
-        // an authenticated client claims let one message pin up to 2 GB.
-        let body = i64::from(len) - 4;
-        if body < 0 || body as u64 > frontend_message_limit(tag[0]) {
-            let _ = send_fatal_error_response(stream, "08P01", "invalid message length").await;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid message length",
-            ));
-        }
-        let payload = read_message_body(stream, body as usize).await?;
 
         // An error opens a discard window that only `Sync` closes.
         //
@@ -1807,6 +1805,18 @@ where
                 handle_describe(database, state, stream, &payload).await?;
             }
             b'E' => {
+                // Several `Execute`s before one `Sync` are one implicit
+                // transaction in PostgreSQL: they commit together at the
+                // Sync, or an error rolls back every one. Whether this
+                // statement starts such a batch is read off the frames after
+                // it, so a lone statement keeps its own autocommit path.
+                if state.transaction.is_none()
+                    && !state.error_in_batch
+                    && portal_sql(state, &payload).is_some_and(|sql| opens_an_implicit_block(&sql))
+                    && read_ahead(stream, &mut pending).await? == Some(b'E')
+                {
+                    open_implicit_block(database, state);
+                }
                 handle_execute(database, state, stream, &payload).await?;
             }
             b'C' => {
@@ -1820,6 +1830,9 @@ where
                 // This is also what closes the discard window opened by an
                 // error earlier in the batch.
                 state.error_in_batch = false;
+                // And the batch's implicit transaction, if it had one:
+                // committed, or rolled back when a statement in it failed.
+                close_implicit_block(database, state, stream).await?;
                 // Outside a block, Sync ends the implicit transaction and with
                 // it every portal's suspended result, as in PostgreSQL. Inside
                 // one, a suspended portal lives until the block ends.
@@ -2189,6 +2202,14 @@ struct SessionTransaction {
     /// clients depend on it: the alternative is a transaction that commits
     /// having silently skipped the statement that did not work.
     failed: bool,
+    /// The block is PostgreSQL's implicit transaction, not a `BEGIN`: the
+    /// statements of one extended-query batch (several `Execute`s before one
+    /// `Sync`) or of one multi-statement simple query, which commit together
+    /// at the batch's end or, on an error, roll back together. Each used to
+    /// commit on its own, so a batch whose third statement failed kept its
+    /// first two, where PostgreSQL keeps neither. A `BEGIN` inside one makes
+    /// it explicit (`implicit` false), as PostgreSQL does.
+    implicit: bool,
     /// The block's transaction was aborted at its error (R3, slice B6): with
     /// no savepoint open, an error ends the block at once, as PostgreSQL's
     /// TBLOCK_ABORT does, releasing its locks, its keys in flight and its
@@ -6573,6 +6594,19 @@ where
     };
     let statements = split_statements(&normalized);
 
+    // Several statements outside a block are one implicit transaction, as in
+    // PostgreSQL: they commit together, or a failure rolls back the ones
+    // before it too. Each used to commit as it ran, so a string whose third
+    // statement failed kept its first two. A string holding transaction
+    // control, or a statement that refuses a block, runs statement by
+    // statement as before (`opens_an_implicit_block`).
+    if statements.len() > 1
+        && state.transaction.is_none()
+        && statements.iter().all(|stmt| opens_an_implicit_block(stmt))
+    {
+        open_implicit_block(database, state);
+    }
+
     for stmt in statements {
         execute_recorded(database, state, stream, &stmt, &[], false, None).await?;
         // PostgreSQL stops a multi-statement string at the first failure.
@@ -6580,15 +6614,11 @@ where
         // did, so a migration sent as one string had its first statement fail
         // and the remainder applied anyway — a partial migration reported,
         // statement by statement, as an error followed by successes.
-        //
-        // What PostgreSQL also does, and this does not yet: run the whole
-        // string as one implicit transaction, so the statements *before* the
-        // failure are rolled back too. Outside a block each one here has
-        // already committed.
         if state.statement_failed {
             break;
         }
     }
+    close_implicit_block(database, state, stream).await?;
 
     let status = state.ready_status();
     send_ready_for_query(stream, status).await?;
@@ -6719,10 +6749,183 @@ fn open_block(
         read_only,
         savepoints: Vec::new(),
         failed: false,
+        implicit: false,
         aborted: false,
         database: database.clone(),
         owner: crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, id),
     });
+}
+
+/// Opens the implicit block a batch's statements share (see
+/// `SessionTransaction::implicit`), with the session's characteristics.
+fn open_implicit_block(database: &Arc<Database>, state: &mut SessionState) {
+    open_block(database, state, state.default_isolation, state.default_read_only);
+    if let Some(t) = state.transaction.as_mut() {
+        t.implicit = true;
+    }
+}
+
+/// Whether `sql` may run inside an implicit block with the rest of its batch.
+///
+/// Not transaction control, which manages blocks itself (a batch that opens
+/// with `BEGIN` is that block, characteristics and all), and not a statement
+/// that refuses to run inside one or acts outside the database's
+/// transactions: `CREATE`/`DROP`/`ALTER DATABASE`, `IMPORT`, `VACUUM`,
+/// `CHECKPOINT`, `COPY`. A batch holding any of those runs statement by
+/// statement, as before.
+fn opens_an_implicit_block(sql: &str) -> bool {
+    // Asked at every `Execute` outside a block, so it allocates nothing.
+    let mut words = sql
+        .trim_start()
+        .trim_start_matches('(')
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty());
+    let first = words.next().unwrap_or("");
+    let is = |word: &str, any: &[&str]| any.iter().any(|w| word.eq_ignore_ascii_case(w));
+    let control = is(
+        first,
+        &["BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE"],
+    );
+    let outside = is(first, &["IMPORT", "VACUUM", "CHECKPOINT", "COPY"])
+        || (is(first, &["CREATE", "DROP", "ALTER"]) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("DATABASE")));
+    !first.is_empty() && !control && !outside
+}
+
+/// Commits a block that has not failed: the block's rows on the other
+/// storage locations synced first, then the outcome record, then (unless
+/// this session set `synchronous_commit = off`) the sync durability was
+/// promised at, the owner's table locks released after the last durability
+/// step (finding L4), and the writes published. Shared by `COMMIT` and the
+/// `Sync` that ends an implicit block.
+///
+/// On a failure the transaction is rolled back and released, and the error
+/// to report is returned: a commit whose rows or outcome could not be made
+/// durable is not a commit.
+async fn commit_block(
+    database: &Arc<Database>,
+    state: &SessionState,
+    t: SessionTransaction,
+) -> Result<(), (&'static str, String)> {
+    // Did the block put anything on disk? Asked before the commit, which
+    // retires the transaction and forgets the answer.
+    //
+    // A block that only read needs no durable outcome record: nothing on disk
+    // carries its id, so a restart that finds no record of it reads it as
+    // aborted, which is the truth. A read-only block therefore commits
+    // without touching the disk at all. This is the runtime answer, not the
+    // `READ ONLY` the session may have declared — a block that declared
+    // nothing and wrote nothing gets the same saving.
+    let wrote = database.transactions.wrote_family(t.id);
+
+    if !wrote {
+        let family = database.commit_transaction(t.id);
+        t.owner.release();
+        database.publish_transaction(family).await;
+        return Ok(());
+    }
+
+    // The block's rows on the other storage locations are synced before the
+    // commit: once committed, any session's root flush can carry the outcome
+    // to disk, and it must not get there ahead of them. See
+    // `Database::commit_written_transaction`.
+    let family = match database.commit_written_transaction(t.id) {
+        Ok(family) => family,
+        Err(e) => {
+            log::error!("Could not make the block's rows durable: {}", e);
+            database.abort_transaction(t.id);
+            flush_outcomes(database);
+            t.owner.release();
+            let message = format!("could not commit: the rows written could not be made durable ({})", e);
+            // 58030 unless the message names a better code: a refused id
+            // reservation on a full disk is 53100.
+            let code = match sqlstate_for(&message) {
+                "XX000" => "58030",
+                code => code,
+            };
+            return Err((code, message));
+        }
+    };
+
+    // The outcome record goes into the log without a sync of its own, and
+    // the sync below covers it along with the block's rows. Everything
+    // written inside the block deferred its sync so the block pays one
+    // instead of one per row, and the outcome now rides along on that same
+    // one rather than adding a second.
+    //
+    // A commit whose outcome record cannot be written is not a commit: a
+    // restart would read the transaction as unfinished and its rows as
+    // debris. Reporting success would be reporting a write that silently is
+    // not there, so this fails and rolls back — which is what the restart
+    // would have concluded anyway.
+    if let Err(e) = database.transactions.flush_deferred() {
+        log::error!("Could not record the transaction outcome: {}", e);
+        database.abort_transaction(t.id);
+        t.owner.release();
+        return Err((
+            "58030",
+            format!(
+                "could not commit: the transaction outcome could not be made durable ({}); it has \
+                 been rolled back",
+                e
+            ),
+        ));
+    }
+
+    // This is the point durability was promised, so this is where it is
+    // taken. A failure is reported as a failed commit rather than silently
+    // downgraded.
+    //
+    // Unless this session set `synchronous_commit = off`, in which case the
+    // promise was never made: the records are in the log and the log writer
+    // syncs them within `wal_writer_delay_ms`.
+    if state.synchronous_commit() {
+        if let Err(e) = database.sync_own_location() {
+            log::error!("Could not make the block's rows durable: {}", e);
+            database.abort_transaction(t.id);
+            flush_outcomes(database);
+            t.owner.release();
+            return Err((
+                "58030",
+                format!("could not commit: the rows written could not be made durable ({})", e),
+            ));
+        }
+    }
+
+    // The last durability step is done: the block's table locks go now,
+    // before the reply (finding L4).
+    t.owner.release();
+    // Durable, so the block's writes may now go to the other instances.
+    // Before the flush they could have been published and then rolled back
+    // here.
+    database.publish_transaction(family).await;
+    Ok(())
+}
+
+/// Ends the implicit block open at a batch's end, if one is: committed, or,
+/// when a statement in it failed, rolled back (its error has already
+/// aborted it, R3). A failed commit is reported here, before the batch's
+/// `ReadyForQuery`.
+async fn close_implicit_block<S>(database: &Arc<Database>, state: &mut SessionState, stream: &mut S) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !state.transaction.as_ref().is_some_and(|t| t.implicit) {
+        return Ok(());
+    }
+    let Some(t) = state.transaction.take() else {
+        return Ok(());
+    };
+    state.end_block_settings(&t);
+    if t.failed {
+        t.abort_unless_aborted(database);
+        t.owner.release();
+        return Ok(());
+    }
+    if let Err((code, message)) = commit_block(database, state, t).await {
+        state.statement_failed = false;
+        send_error_response(stream, code, &message).await?;
+    }
+    Ok(())
 }
 
 /// Returns `Ok(true)` when the statement was transaction control.
@@ -6794,7 +6997,22 @@ where
                 return Ok(true);
             }
         };
-        if state.transaction.is_some() {
+        if let Some(t) = state.transaction.as_mut().filter(|t| t.implicit) {
+            // A batch's implicit block becomes the explicit one this opens, as
+            // in PostgreSQL: what the batch ran so far is the block's, and it
+            // ends at COMMIT or ROLLBACK, not at the Sync. The characteristics
+            // named here apply to it.
+            t.implicit = false;
+            if let Some(read_only) = modes.read_only {
+                t.read_only = read_only;
+            }
+            if let Some(level) = modes.level.filter(|level| *level != t.level) {
+                t.level = level;
+                if level == IsolationLevel::RepeatableRead {
+                    database.transactions.pin_snapshot(t.id);
+                }
+            }
+        } else if state.transaction.is_some() {
             // PostgreSQL warns and carries on rather than failing: nesting is
             // not supported, but neither is losing the block already open.
             send_notice(
@@ -6843,120 +7061,12 @@ where
             }
             Some(t) => {
                 state.end_block_settings(&t);
-                // Did the block put anything on disk? Asked before the commit,
-                // which retires the transaction and forgets the answer.
-                //
-                // A block that only read needs no durable outcome record:
-                // nothing on disk carries its id, so a restart that finds no
-                // record of it reads it as aborted, which is the truth. A
-                // read-only block therefore commits without touching the disk
-                // at all. This is the runtime answer, not the `READ ONLY` the
-                // session may have declared — a block that declared nothing and
-                // wrote nothing gets the same saving.
-                let wrote = database.transactions.wrote_family(t.id);
-
-                if !wrote {
-                    let family = database.commit_transaction(t.id);
-                    t.owner.release();
-                    database.publish_transaction(family).await;
-                    if let Some((level, read_only)) = chain_into {
-                        open_block(database, state, level, read_only);
-                    }
-                    send_command_complete(stream, "COMMIT").await?;
+                if let Err((code, message)) = commit_block(database, state, t).await {
+                    send_error_response(stream, code, &message).await?;
+                    state.transaction = None;
+                    state.statement_failed = false;
                     return Ok(true);
                 }
-
-                // The block's rows on the other storage locations are synced
-                // before the commit: once committed, any session's root flush
-                // can carry the outcome to disk, and it must not get there
-                // ahead of them. See `Database::commit_written_transaction`.
-                let family = match database.commit_written_transaction(t.id) {
-                    Ok(family) => family,
-                    Err(e) => {
-                        log::error!("Could not make the block's rows durable: {}", e);
-                        database.abort_transaction(t.id);
-                        flush_outcomes(database);
-                        t.owner.release();
-                        let message = format!(
-                            "could not commit: the rows written could not be made durable ({})",
-                            e
-                        );
-                        // 58030 unless the message names a better code: a
-                        // refused id reservation on a full disk is 53100.
-                        let code = match sqlstate_for(&message) {
-                            "XX000" => "58030",
-                            code => code,
-                        };
-                        send_error_response(stream, code, &message).await?;
-                        state.transaction = None;
-                        state.statement_failed = false;
-                        return Ok(true);
-                    }
-                };
-
-                // The outcome record goes into the log without a sync of its
-                // own, and the sync below covers it along with the block's
-                // rows. Everything written inside the block deferred its sync
-                // so the block pays one instead of one per row, and the outcome
-                // now rides along on that same one rather than adding a second.
-                //
-                // A commit whose outcome record cannot be written is not a
-                // commit: a restart would read the transaction as unfinished and
-                // its rows as debris. Reporting success would be reporting a
-                // write that silently is not there, so this fails and rolls back
-                // — which is what the restart would have concluded anyway.
-                if let Err(e) = database.transactions.flush_deferred() {
-                    log::error!("Could not record the transaction outcome: {}", e);
-                    database.abort_transaction(t.id);
-                    t.owner.release();
-                    send_error_response(
-                        stream,
-                        "58030",
-                        &format!(
-                            "could not commit: the transaction outcome could not be made \
-                             durable ({}); it has been rolled back",
-                            e
-                        ),
-                    )
-                    .await?;
-                    return Ok(true);
-                }
-
-                // This is the point durability was promised, so this is where it
-                // is taken. A failure is reported as a failed commit rather than
-                // silently downgraded.
-                //
-                // Unless this session set `synchronous_commit = off`, in which
-                // case the promise was never made: the records are in the log
-                // and the log writer syncs them within `wal_writer_delay_ms`.
-                if state.synchronous_commit() {
-                    if let Err(e) = database.sync_own_location() {
-                        log::error!("Could not make the block's rows durable: {}", e);
-                        database.abort_transaction(t.id);
-                        flush_outcomes(database);
-                        t.owner.release();
-                        send_error_response(
-                            stream,
-                            "58030",
-                            &format!(
-                                "could not commit: the rows written could not be made durable ({})",
-                                e
-                            ),
-                        )
-                        .await?;
-                        state.transaction = None;
-                        state.statement_failed = false;
-                        return Ok(true);
-                    }
-                }
-
-                // The last durability step is done: the block's table locks go
-                // now, before the reply (finding L4).
-                t.owner.release();
-                // Durable, so the block's writes may now go to the other
-                // instances. Before the flush they could have been
-                // published and then rolled back here.
-                database.publish_transaction(family).await;
                 if let Some((level, read_only)) = chain_into {
                     open_block(database, state, level, read_only);
                 }
@@ -9738,6 +9848,84 @@ fn frontend_message_limit(tag: u8) -> u64 {
 /// client that claims 900 MB and sends nothing would otherwise pin 900 MB for
 /// as long as it keeps the socket open. The buffer starts small and grows by
 /// what has actually been read.
+/// The rest of a frame whose tag has been read: its length, checked against
+/// the type's limit before anything is allocated (as PostgreSQL does: a
+/// length is only a claim, and allocating whatever an authenticated client
+/// claims let one message pin up to 2 GB), then its body.
+async fn read_frame_body<S>(stream: &mut S, tag: u8) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let len = read_i32_be(stream).await?;
+    let body = i64::from(len) - 4;
+    if body < 0 || body as u64 > frontend_message_limit(tag) {
+        let _ = send_fatal_error_response(stream, "08P01", "invalid message length").await;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid message length",
+        ));
+    }
+    read_message_body(stream, body as usize).await
+}
+
+/// The statement text the portal an `Execute` payload names will run, if
+/// the portal is known.
+fn portal_sql(state: &SessionState, execute: &[u8]) -> Option<StdArc<str>> {
+    let (portal, _) = read_cstring_owned(execute, 0).ok()?;
+    let info = state.portals.get(&portal)?;
+    state.statements.get(&info.stmt_name).map(|s| s.sql.clone())
+}
+
+/// The frames that say where an extended-query batch stands after an
+/// `Execute`: another `Execute` (the batch goes on), or `Sync`, `Flush`, a
+/// simple `Query` or `Terminate` (it does not).
+fn is_batch_boundary(tag: u8) -> bool {
+    matches!(tag, b'E' | b'S' | b'H' | b'Q' | b'X')
+}
+
+/// How much [`read_ahead`] buffers before giving up and answering "no
+/// batch": a client that streams frames with no `Execute`, `Sync` or `Flush`
+/// in them must not make the session hold them all.
+const READ_AHEAD_LIMIT: usize = 16 << 20;
+
+/// Reads frames past an `Execute` into `pending` until one says whether
+/// another statement follows before the `Sync` (see `is_batch_boundary`),
+/// and returns that frame's tag. `None` at end of input or past
+/// [`READ_AHEAD_LIMIT`].
+///
+/// Safe to wait on: a client may not count on any reply before it sends
+/// `Sync` or `Flush` (PostgreSQL buffers until then), so after an `Execute`
+/// one of those, or another `Execute`, always comes.
+async fn read_ahead<S>(
+    stream: &mut S,
+    pending: &mut std::collections::VecDeque<(u8, Vec<u8>)>,
+) -> io::Result<Option<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(tag) = pending.iter().map(|(tag, _)| *tag).find(|tag| is_batch_boundary(*tag)) {
+        return Ok(Some(tag));
+    }
+    let mut held: usize = pending.iter().map(|(_, payload)| payload.len() + 5).sum();
+    loop {
+        if held > READ_AHEAD_LIMIT {
+            return Ok(None);
+        }
+        let mut tag = [0u8; 1];
+        match stream.read_exact(&mut tag).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let payload = read_frame_body(stream, tag[0]).await?;
+        held += payload.len() + 5;
+        pending.push_back((tag[0], payload));
+        if is_batch_boundary(tag[0]) {
+            return Ok(Some(tag[0]));
+        }
+    }
+}
+
 async fn read_message_body<S>(stream: &mut S, len: usize) -> io::Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
