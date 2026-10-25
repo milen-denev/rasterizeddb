@@ -965,6 +965,19 @@ impl TableFilters {
         self.index_of(write_order).is_some()
     }
 
+    /// Whether `col = value` keeps `slot` a candidate in the column at
+    /// `write_order` (see [`ColumnFilter::admits_eq`]); `None` for a column
+    /// this filter does not index. Read-only.
+    ///
+    /// The superset invariant, per row: a visible row's own value must be
+    /// admitted at its slot, or an equality on that value prunes the row.
+    /// The index snapshot's audit asks exactly this of every visible row
+    /// (docs/persistent-indexes.md §4, B18).
+    pub fn admits_eq(&self, write_order: u32, slot: u64, value: &[u8], n_slots: u64) -> Option<bool> {
+        let idx = self.index_of(write_order)?;
+        Some(self.columns[idx].read().admits_eq(slot, value, n_slots))
+    }
+
     /// Mark slots `[0, slots)` as predating the filter. They stay candidates
     /// until [`Self::clear_unindexed_prefix`] follows a backfill.
     pub fn set_unindexed_prefix(&self, _proof: Proof<'_>, slots: u64) {

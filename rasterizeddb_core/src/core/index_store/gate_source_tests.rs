@@ -108,7 +108,7 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 65] = [
+const READ_ONLY: [(&str, &str); 66] = [
     ("LiveIndex", "method"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
@@ -180,6 +180,8 @@ const READ_ONLY: [(&str, &str); 65] = [
     // A new filter built from a snapshot's FILTER section (B14): reads
     // `self`, the rebuild's template, and mutates nothing of it.
     ("TableFilters", "load_sealed"),
+    // The audit's per-slot question, the probe's bit for one slot (B18).
+    ("TableFilters", "admits_eq"),
 ];
 
 /// More read-only fns, kept apart only to keep the list above readable:

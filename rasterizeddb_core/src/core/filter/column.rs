@@ -989,6 +989,59 @@ impl ColumnFilter {
 
         mask_tail(out, n_slots);
     }
+
+    /// Whether `col = value` keeps `slot` a candidate: bit `slot` of what
+    /// [`Self::probe_pred_into`] writes for `SargOp::Eq` over `n_slots`,
+    /// for one slot, without the bitmap. Read-only.
+    ///
+    /// For the index snapshot's audit (docs/persistent-indexes.md §4, B18):
+    /// a row's own value must keep its slot a candidate, or the filter
+    /// prunes a matching row. That is the filter's meaning, and what the
+    /// audit compares; codes are not comparable across builds, since each
+    /// zone's width is chosen from history (`gen_index_for`, the HLL in
+    /// completion order). Each step mirrors the probe's, in its order, and
+    /// `admits_eq_is_the_probes_bit` pins the two equal.
+    pub fn admits_eq(&self, slot: u64, value: &[u8], n_slots: u64) -> bool {
+        if slot >= n_slots {
+            // `mask_tail` clears every bit past the table.
+            return false;
+        }
+        // Slots the column does not vouch for stay candidates in every
+        // branch of the probe (`force_range`, the frontier's `break`).
+        if slot < self.unknown_below || slot >= self.valid_upto {
+            return true;
+        }
+        let zone = slot / ZONE_ROWS as u64;
+        let local = (slot % ZONE_ROWS as u64) as usize;
+        // The zone bounds, as `intersect_zonemap` applies them: zones below
+        // `zones_for(min(valid_upto, n_slots))`, and none wholly unknown
+        // (this slot is known, so its zone is not).
+        let bounds_admit = |zm: &ZoneMap| -> bool {
+            zone >= zones_for(self.valid_upto.min(n_slots)) || zm.zone_may_match(zone, SargOp::Eq, value)
+        };
+        if self.fingerprints && !self.gated_out {
+            let Some(h) = canonical_hash(&self.db_type, value, self.seed) else {
+                return true;
+            };
+            let first = zone * ZONE_ROWS as u64;
+            // `probe_hash_into`: a zone in no generation is never visited
+            // and stays a candidate.
+            if let Some(g) = self.gens.iter().find(|g| g.contains(zone)) {
+                if self.bloom.as_ref().is_some_and(|b| !b.may_contain(bloom::superzone_of(first), h)) {
+                    return false;
+                }
+                if !g.is_planeless() && read_slot(g.zone(zone), g.f, local) != fingerprint(h, g.f) {
+                    return false;
+                }
+            }
+            return self.zonemap.as_ref().is_none_or(bounds_admit);
+        }
+        // Bounds alone: a gated-out or bounds-only column.
+        match self.zonemap.as_ref() {
+            Some(zm) if zm.probes_with(value) => bounds_admit(zm),
+            _ => true,
+        }
+    }
 }
 
 /// The part of one column an incremental checkpoint carries.
@@ -1506,5 +1559,106 @@ mod planeless_tests {
                 survivors / 100
             );
         }
+    }
+}
+
+/// `admits_eq` is the probe, one slot at a time (B18): the audit's verdict
+/// on the filter is the filter's own answer, never a second opinion.
+#[cfg(test)]
+mod admits_eq_tests {
+    use super::*;
+    use crate::core::filter::hash::HashSeed;
+
+    fn bit(bm: &[u64], slot: u64) -> bool {
+        (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1
+    }
+
+    /// Columns of every shape the probe has a branch for: planes at widths
+    /// that grow with the table (so older zones keep a narrower width),
+    /// plane-less clustered zones, a gated-out column, a bounds-only `BOOL`,
+    /// the span summary on and off, zone bounds on and off; then deletes,
+    /// in-place overwrites, out-of-order writes past the frontier, and an
+    /// unindexed prefix. For every slot, its own value and values no slot
+    /// holds, `admits_eq` equals bit `slot` of `probe_pred_into(Eq)`, at
+    /// two table lengths.
+    #[test]
+    fn admits_eq_is_the_probes_bit() {
+        let mut rng = fastrand::Rng::with_seed(0xb18);
+        let mut checked = 0u64;
+        let mut rejected = 0u64;
+        for case in 0..14u32 {
+            let ty = if case == 13 { DbType::BOOL } else { DbType::I64 };
+            let bounds = case % 4 != 3;
+            let summary = case % 3 == 1;
+            let mut c = ColumnFilter::with_options(0, ty.clone(), HashSeed::default(), FilterConfig::default(), bounds, summary);
+            let n = 6_000 + rng.u64(0..4_000);
+            let value = |slot: u64, rng: &mut fastrand::Rng| -> Vec<u8> {
+                match case {
+                    13 => vec![(slot % 2) as u8],
+                    // Clustered: an id-like sequence (plane-less zones).
+                    0 | 4 => (slot as i64).to_le_bytes().to_vec(),
+                    // Gated out: twelve values.
+                    5 => ((slot % 12) as i64).to_le_bytes().to_vec(),
+                    // Cardinality that grows, so the width moves.
+                    _ => (rng.u64(0..(slot + 64)) as i64).to_le_bytes().to_vec(),
+                }
+            };
+            let mut held: Vec<Option<Vec<u8>>> = vec![None; n as usize];
+            let prefix = if case % 5 == 2 { 700 } else { 0 };
+            c.set_unindexed_prefix(prefix);
+            // A few slots are written late, out of order (pending past the
+            // frontier until it reaches them); the last of them never is,
+            // so the frontier stops there.
+            let late: Vec<u64> = (0..n).filter(|s| s % 997 == 11).collect();
+            for slot in 0..n {
+                if late.contains(&slot) {
+                    continue;
+                }
+                let v = value(slot, &mut rng);
+                c.set(slot, Some(&v));
+                held[slot as usize] = Some(v);
+            }
+            for &slot in &late[..late.len() - 1] {
+                let v = value(slot, &mut rng);
+                c.set(slot, Some(&v));
+                held[slot as usize] = Some(v);
+            }
+            for _ in 0..200 {
+                let slot = rng.u64(0..n);
+                if rng.u8(0..3) == 0 {
+                    c.set(slot, None);
+                    held[slot as usize] = None;
+                } else {
+                    let v = value(rng.u64(0..n), &mut rng);
+                    c.set(slot, Some(&v));
+                    held[slot as usize] = Some(v);
+                }
+            }
+            let mut probes: Vec<Vec<u8>> = held.iter().flatten().step_by(7).cloned().collect();
+            if case != 13 {
+                probes.extend([-1i64, 77_777_777, i64::MAX].map(|v| v.to_le_bytes().to_vec()));
+            }
+            probes.sort();
+            probes.dedup();
+            for len in [n, n - n / 3] {
+                let mut bm = vec![0u64; bitmap_words(len)];
+                for v in &probes {
+                    c.probe_pred_into(SargOp::Eq, v, len, &mut bm);
+                    for slot in 0..len {
+                        let want = bit(&bm, slot);
+                        assert_eq!(
+                            c.admits_eq(slot, v, len),
+                            want,
+                            "case {case}: slot {slot} of {len}, value {v:?}: admits_eq disagrees with the probe"
+                        );
+                        checked += 1;
+                        rejected += u64::from(!want);
+                    }
+                    assert!(!c.admits_eq(len, v, len), "a slot past the table is a candidate");
+                }
+            }
+        }
+        // The cases above must exercise rejection, not just "candidate".
+        assert!(rejected > checked / 4, "{rejected} of {checked} rejected");
     }
 }
