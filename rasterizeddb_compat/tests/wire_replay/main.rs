@@ -105,9 +105,9 @@ async fn validate_against_postgresql_17() {
     let addr = std::env::var("PG17_ADDR").expect("PG17_ADDR");
     let pg = Target { addr, user: "postgres" };
     let checks: Vec<(&str, Trace, Vec<(&'static str, String)>)> = vec![
-        ("pgjdbc", pgjdbc::replay(&pg, true).await, with_differences(pgjdbc::PG17_FLIP, &[])),
+        ("pgjdbc", pgjdbc::replay(&pg, Some("error")).await, with_differences(pgjdbc::PG17_FLIP, &[])),
         ("npgsql batch", npgsql::batch(&pg).await, with_differences(npgsql::PG17_BATCH, &[])),
-        ("npgsql auto-prepare", npgsql::auto_prepare(&pg, true).await, with_differences(npgsql::PG17_AUTO_PREPARE, &[])),
+        ("npgsql auto-prepare", npgsql::auto_prepare(&pg, Some("error")).await, with_differences(npgsql::PG17_AUTO_PREPARE, &[])),
     ];
     for (name, got, _) in &checks {
         println!("== {name} (PostgreSQL 17)");

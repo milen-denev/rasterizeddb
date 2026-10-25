@@ -2024,14 +2024,23 @@ struct SessionState {
 /// is not the shape its `Describe` told the client (`docs/persistent-indexes.md`
 /// §7, Q2; findings L7, L10, L13).
 ///
-/// The default stays `rowdescription` until the driver gate (B8, open
-/// question Q1) decides otherwise: sqlx is the one driver shown to need it,
-/// and it never re-prepares on 0A000 (memory `sqlx-ignores-0a000`).
+/// The default is `auto` (Q1, decided by the owner after B8's driver matrix,
+/// finding L10): no driver works in both fixed modes. sqlx never re-prepares
+/// on 0A000 (memory `sqlx-ignores-0a000`) and needs the `RowDescription`;
+/// pgjdbc and npgsql heal from 0A000 by preparing again and fail on a
+/// `RowDescription` they did not ask for. `auto` answers each by what it does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ShapeChangeMode {
+    /// Behaviour-based (slice B8b): a statement's first stale use answers as
+    /// `error` (0A000 with `R=RevalidateCachedQuery`); executed again without
+    /// a new Parse (a driver that does not re-prepare, sqlx), it answers as
+    /// `rowdescription` from then on. A new Parse is a new statement and
+    /// starts over; so does a new `Describe` of it, which refreshes what the
+    /// client caches.
+    #[default]
+    Auto,
     /// A fresh `RowDescription` ahead of the rows, on every `Execute` until
     /// the client describes again. Never 0A000.
-    #[default]
     RowDescription,
     /// PostgreSQL's `0A000 cached plan must not change result type`, which
     /// pgjdbc, npgsql and psycopg answer by preparing again. Raised before
@@ -2048,7 +2057,9 @@ impl ShapeChangeMode {
 
     fn parse(value: &str) -> Option<Self> {
         let v = value.trim().trim_matches('\'').trim_matches('"').trim();
-        if v.eq_ignore_ascii_case("rowdescription") || v.eq_ignore_ascii_case("default") {
+        if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("default") {
+            Some(ShapeChangeMode::Auto)
+        } else if v.eq_ignore_ascii_case("rowdescription") {
             Some(ShapeChangeMode::RowDescription)
         } else if v.eq_ignore_ascii_case("error") {
             Some(ShapeChangeMode::Error)
@@ -2059,8 +2070,36 @@ impl ShapeChangeMode {
 
     fn name(self) -> &'static str {
         match self {
+            ShapeChangeMode::Auto => "auto",
             ShapeChangeMode::RowDescription => "rowdescription",
             ShapeChangeMode::Error => "error",
+        }
+    }
+}
+
+impl SessionState {
+    /// The fixed mode `stmt_name`'s next stale use answers by: the session's
+    /// `rdb.shape_change`, with `auto` resolved for this statement (`error`
+    /// until it has been refused once, `rowdescription` after).
+    fn shape_mode_for(&self, stmt_name: &str) -> ShapeChangeMode {
+        match self.shape_change {
+            ShapeChangeMode::Auto => {
+                if self.statements.get(stmt_name).is_some_and(|info| info.shape_refused) {
+                    ShapeChangeMode::RowDescription
+                } else {
+                    ShapeChangeMode::Error
+                }
+            }
+            fixed => fixed,
+        }
+    }
+
+    /// Records that `stmt_name` was answered 0A000 for a stale shape, so
+    /// `auto` answers its next stale use without a new Parse with a
+    /// `RowDescription`.
+    fn note_shape_refused(&mut self, stmt_name: &str) {
+        if let Some(info) = self.statements.get_mut(stmt_name) {
+            info.shape_refused = true;
         }
     }
 }
@@ -2436,6 +2475,11 @@ struct StatementInfo {
     /// the old one for the next, so treating it as told left every execute
     /// after the first decoding against the old shape.
     described: Option<ToldShape>,
+    /// This statement was answered 0A000 for a stale shape since its Parse
+    /// or its last `Describe`: under `rdb.shape_change = auto` its next
+    /// stale use answers with a `RowDescription` (slice B8b; see
+    /// [`ShapeChangeMode::Auto`]).
+    shape_refused: bool,
     /// Remembered `Describe` answers, at most one per kind. See
     /// [`DescribeCacheEntry`].
     describe_cache: Vec<DescribeCacheEntry>,
@@ -2692,6 +2736,7 @@ where
         stmt_name,
         StatementInfo {
             described: None,
+            shape_refused: false,
             // Shared with every other session that prepared the same text.
             sql: statement_intern::sql(&query),
             param_oids,
@@ -2796,7 +2841,10 @@ where
     // BindComplete and no portal, so a driver reading the reply sees exactly
     // PostgreSQL's sequence (slice B8, the pgjdbc and npgsql replays).
     // Execute checks again, for a change landing between Bind and Execute.
-    if state.shape_change == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt, &params).await? {
+    if state.shape_mode_for(&stmt) == ShapeChangeMode::Error
+        && stale_in_error_mode(database, state, &stmt, &params).await?
+    {
+        state.note_shape_refused(&stmt);
         return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
     }
 
@@ -2915,6 +2963,7 @@ where
                 kind,
                 fields: fields.clone(),
             });
+            info.shape_refused = false;
         }
         send_row_description(stream, &fields, &result_formats).await?;
         return Ok(());
@@ -3130,7 +3179,9 @@ where
     // move came before it; this catches one between Bind and Execute. The
     // check after the build stays, for a change landing while the statement
     // waits for its locks.
-    if state.shape_change == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt_name, &params).await? {
+    let mode = state.shape_mode_for(&stmt_name);
+    if mode == ShapeChangeMode::Error && stale_in_error_mode(database, state, &stmt_name, &params).await? {
+        state.note_shape_refused(&stmt_name);
         return fail_statement(state, stream, "0A000", CACHED_PLAN_CHANGED).await;
     }
     let told = state.statements.get(&stmt_name).and_then(|info| info.described.clone());
@@ -3140,7 +3191,7 @@ where
             stmt_name: stmt_name.clone(),
             sql: sql.clone(),
             bound: if told.kind == b'P' { params.clone() } else { StdArc::from(Vec::new()) },
-            mode: state.shape_change,
+            mode,
             in_block: state.transaction.is_some(),
             told,
             still_good_at: std::sync::Mutex::new(None),
@@ -3280,6 +3331,8 @@ struct ShapeCheck {
     /// shape it could be told now is computed the same way.
     sql: StdArc<str>,
     bound: StdArc<[BoundParam]>,
+    /// The session's mode resolved for this statement
+    /// ([`SessionState::shape_mode_for`]): never `Auto`.
     mode: ShapeChangeMode,
     /// The statement runs in a block, so an error it raises aborts the block
     /// and undoes what it wrote (R3).
@@ -3425,8 +3478,9 @@ async fn reconcile_with(
         return Ok(ShapeReply::Omit);
     }
     Ok(match check.mode {
-        ShapeChangeMode::RowDescription => ShapeReply::Describe,
+        ShapeChangeMode::RowDescription | ShapeChangeMode::Auto => ShapeReply::Describe,
         ShapeChangeMode::Error if check.in_block || matches!(purpose_kind, PurposeKind::QueryRows) => {
+            state.note_shape_refused(&check.stmt_name);
             ShapeReply::Refuse
         }
         ShapeChangeMode::Error => ShapeReply::Describe,
@@ -7750,7 +7804,7 @@ where
                         stream,
                         "22023",
                         &format!(
-                            "invalid value for parameter \"{}\": \"{}\" (use rowdescription or error)",
+                            "invalid value for parameter \"{}\": \"{}\" (use auto, rowdescription or error)",
                             ShapeChangeMode::SETTING,
                             value
                         ),

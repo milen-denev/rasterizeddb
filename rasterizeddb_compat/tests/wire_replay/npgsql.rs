@@ -105,7 +105,10 @@ const STAR: &str = "SELECT * FROM npg_a WHERE id = $1";
 /// replay re-prepares as `_auto1`, which is what a driver that answers it
 /// by re-preparing sends (whether Npgsql does so by itself, or surfaces the
 /// error once and re-prepares on the next use, is for the real-driver run).
-pub async fn auto_prepare(t: &Target, error_mode: bool) -> Trace {
+///
+/// `mode` is sent as `rdb.shape_change` when given; `None` is the server's
+/// default.
+pub async fn auto_prepare(t: &Target, mode: Option<&str>) -> Trace {
     let mut admin = Wire::connect(&t.addr, &[("user", t.user), ("database", "postgres")]).await;
     admin.simple("DROP TABLE IF EXISTS npg_a").await;
     for sql in [
@@ -116,9 +119,10 @@ pub async fn auto_prepare(t: &Target, error_mode: bool) -> Trace {
         admin.simple_ok(sql).await;
     }
     let mut params = startup(t);
-    if error_mode {
-        // PostgreSQL takes it as a placeholder setting and ignores it.
-        params.push(("options", "-c rdb.shape_change=error"));
+    // PostgreSQL takes it as a placeholder setting and ignores it.
+    let options = mode.map(|m| format!("-c rdb.shape_change={m}"));
+    if let Some(o) = options.as_deref() {
+        params.push(("options", o));
     }
     let mut n = Wire::connect(&t.addr, &params).await;
     let mut trace: Trace = Vec::new();
@@ -195,7 +199,7 @@ pub const OURS_BATCH: &[(&str, &str)] = &[
     ),
 ];
 
-/// The default `rowdescription` mode in [`auto_prepare`]: the stale Bind
+/// `rowdescription` mode in [`auto_prepare`]: the stale Bind
 /// runs and its rows come behind a RowDescription of the new columns (the
 /// one result format applies to all). Npgsql decodes a prepared
 /// statement's rows by its cached description and does not expect a
@@ -217,16 +221,32 @@ async fn npgsql_batches_answer_as_postgresql_17() {
 #[tokio::test]
 async fn npgsql_auto_prepare_in_error_mode_answers_as_postgresql_17() {
     let server = TestServer::start().await.expect("server");
-    let got = tokio::time::timeout(super::BOUND, auto_prepare(&Target::ours(&server), true))
+    let got = tokio::time::timeout(super::BOUND, auto_prepare(&Target::ours(&server), Some("error")))
         .await
         .expect("the replay hung");
     super::assert_trace("npgsql auto-prepare, error mode", &got, &super::with_differences(PG17_AUTO_PREPARE, &[]));
 }
 
+/// The default, `auto` (slice B8b, Q1): the stale `_auto0` is refused at
+/// Bind as PostgreSQL 17 refuses it, and the re-prepared `_auto1` (a new
+/// Parse) is a fresh statement.
+#[tokio::test]
+async fn npgsql_auto_prepare_under_the_default_answers_as_postgresql_17() {
+    let server = TestServer::start().await.expect("server");
+    let got = tokio::time::timeout(super::BOUND, auto_prepare(&Target::ours(&server), None))
+        .await
+        .expect("the replay hung");
+    super::assert_trace(
+        "npgsql auto-prepare, default (auto)",
+        &got,
+        &super::with_differences(PG17_AUTO_PREPARE, &[]),
+    );
+}
+
 #[tokio::test]
 async fn npgsql_auto_prepare_in_rowdescription_mode_repairs_the_stale_run() {
     let server = TestServer::start().await.expect("server");
-    let got = tokio::time::timeout(super::BOUND, auto_prepare(&Target::ours(&server), false))
+    let got = tokio::time::timeout(super::BOUND, auto_prepare(&Target::ours(&server), Some("rowdescription")))
         .await
         .expect("the replay hung");
     super::assert_trace(

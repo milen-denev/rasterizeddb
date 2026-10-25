@@ -177,10 +177,12 @@ async fn run(conn: &mut PgConnection) -> Result<Vec<String>, (Option<String>, St
 /// One driver, one mode, one change: four executes after the change, then
 /// what the driver's own recovery gives (sqlx: the same cached statement
 /// again; tokio-postgres: a fresh `prepare`).
-async fn shape_cell(driver: &str, error_mode: bool, change: &Change) -> (Vec<String>, String, Vec<String>) {
+async fn shape_cell(driver: &str, mode: &str, change: &Change) -> (Vec<String>, String, Vec<String>) {
     let server = TestServer::start().await.expect("server");
-    let options: &[&str] = if error_mode { &["rdb.shape_change=error"] } else { &[] };
-    let url = url_with(&server, options);
+    // `default` sends nothing: the server's default (`auto` since B8b).
+    let option = format!("rdb.shape_change={mode}");
+    let options: Vec<&str> = if mode == "default" { Vec::new() } else { vec![option.as_str()] };
+    let url = url_with(&server, &options);
     let mut admin = PgConnection::connect(&server.url()).await.expect("admin");
     for sql in change.setup {
         admin.execute(*sql).await.expect("setup");
@@ -251,11 +253,21 @@ async fn shape_cell(driver: &str, error_mode: bool, change: &Change) -> (Vec<Str
 ///   connection stays usable and a fresh `prepare` reads the new shape.
 ///   Error mode is the PostgreSQL-compatible one (an application already
 ///   written for PostgreSQL handles it).
+/// - the default, `auto` (slice B8b, Q1 as the owner decided it, finding
+///   L10), sent as nothing: each stale statement's first use answers 0A000,
+///   as PostgreSQL does; executed again without a new Parse, it answers with
+///   the RowDescription. sqlx re-executes its cached statement and is healed
+///   from the second execute on; tokio-postgres gets PostgreSQL's 0A000
+///   first, and its fresh `prepare` (a new Parse) reads the new shape, as in
+///   both fixed modes. pgjdbc and npgsql re-Parse after the 0A000 (the
+///   replays' `…_under_the_default_answers_as_postgresql_17`).
 const EXPECTED: &[(&str, &str, [&str; 4], &str)] = &[
     ("sqlx", "rowdescription", ["ok", "ok", "ok", "ok"], "ok"),
     ("sqlx", "error", ["E0A000", "E0A000", "E0A000", "E0A000"], "E0A000"),
+    ("sqlx", "default", ["E0A000", "ok", "ok", "ok"], "ok"),
     ("tokio-postgres", "rowdescription", ["protocol", "protocol", "protocol", "protocol"], "ok"),
     ("tokio-postgres", "error", ["E0A000", "E0A000", "E0A000", "E0A000"], "ok"),
+    ("tokio-postgres", "default", ["E0A000", "protocol", "protocol", "protocol"], "ok"),
 ];
 
 #[tokio::test]
@@ -265,7 +277,7 @@ async fn shape_change_mid_prepare_through_each_driver_in_both_modes() {
     for (driver, mode, want, want_healed) in EXPECTED {
         for change in CHANGES {
             let (got, healed, detail) =
-                bounded(&format!("{driver}/{mode}/{}", change.name), shape_cell(driver, *mode == "error", change)).await;
+                bounded(&format!("{driver}/{mode}/{}", change.name), shape_cell(driver, mode, change)).await;
             table.push(format!("{driver:15} {mode:15} {:14} {:?} then {healed}", change.name, got));
             if got.iter().any(|c| c == "WRONG") {
                 bad.push(format!("{driver}/{mode}/{}: rows decoded under the old columns: {got:?}", change.name));

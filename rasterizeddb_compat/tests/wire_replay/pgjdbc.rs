@@ -45,20 +45,21 @@ fn startup<'a>(t: &'a Target, options: Option<&'a str>) -> Vec<(&'a str, &'a str
     p
 }
 
-/// Runs the flip against `t`, in `rdb.shape_change = error` when
-/// `error_mode` (sent as a startup option, which PostgreSQL accepts as a
-/// placeholder setting and ignores). In error mode the retry is replayed
-/// after 0A000, as pgjdbc would; otherwise execution 7's frames are sent
-/// twice, as a driver that never re-describes keeps sending them.
-pub async fn replay(t: &Target, error_mode: bool) -> Trace {
+/// Runs the flip against `t`, with `rdb.shape_change = <mode>` when `mode`
+/// names one (sent as a startup option, which PostgreSQL accepts as a
+/// placeholder setting and ignores) and the server's default otherwise.
+/// What follows execution 7 is what pgjdbc does with its answer: after
+/// 0A000 the retry is replayed; after rows, execution 7's frames are sent
+/// again, as a driver that never re-describes keeps sending them.
+pub async fn replay(t: &Target, mode: Option<&str>) -> Trace {
     let mut admin = Wire::connect(&t.addr, &[("user", t.user), ("database", "postgres")]).await;
     admin.simple("DROP TABLE IF EXISTS jdbc_t").await;
     admin.simple_ok("CREATE TABLE jdbc_t (id INT PRIMARY KEY, a TEXT, b INT)").await;
     admin.simple_ok("INSERT INTO jdbc_t (id, a, b) VALUES (1, 'x', 10)").await;
     admin.simple_ok("INSERT INTO jdbc_t (id, a, b) VALUES (2, 'y', 20)").await;
 
-    let options = error_mode.then_some("-c rdb.shape_change=error");
-    let mut j = Wire::connect(&t.addr, &startup(t, options)).await;
+    let options = mode.map(|m| format!("-c rdb.shape_change={m}"));
+    let mut j = Wire::connect(&t.addr, &startup(t, options.as_deref())).await;
     let mut trace: Trace = Vec::new();
 
     let one_shot = |k: i32| {
@@ -97,7 +98,7 @@ pub async fn replay(t: &Target, error_mode: bool) -> Trace {
     let r = j.exchange(&named("S_1", 1, &[1, 0, 1])).await;
     let refused = r.iter().any(|m| matches!(m, Reply::Error { code, .. } if code == "0A000"));
     trace.push(("exec7 Bind S_1", wire::render(&r)));
-    if error_mode {
+    if refused {
         let r = j
             .exchange(&[
                 wire::close_s("S_1"),
@@ -111,7 +112,6 @@ pub async fn replay(t: &Target, error_mode: bool) -> Trace {
         trace.push(("retry Close S_1 Parse S_2", wire::render(&r)));
         trace.push(("exec8 Bind S_2", wire::render(&j.exchange(&named("S_2", 1, &[1, 0, 1, 1])).await)));
     } else {
-        assert!(!refused, "rowdescription mode answered 0A000");
         trace.push(("exec8 Bind S_1", wire::render(&j.exchange(&named("S_1", 1, &[1, 0, 1])).await)));
     }
     admin.simple("DROP TABLE IF EXISTS jdbc_t").await;
@@ -138,7 +138,7 @@ pub const PG17_FLIP: &[(&str, &str)] = &[
     ("exec8 Bind S_2", "2 D[00000001|'x'|0000000a|NULL] C(SELECT 1) Z(I)"),
 ];
 
-/// `rdb.shape_change = rowdescription` (the default): execution 7 and every
+/// `rdb.shape_change = rowdescription`: execution 7 and every
 /// one after it carry a RowDescription of the new columns ahead of the rows
 /// where PostgreSQL refuses. The three result formats pgjdbc sent apply to
 /// the first three of the four columns, the fourth goes as text, and the
@@ -156,16 +156,29 @@ pub const OURS_ROWDESCRIPTION: &[(&str, &str)] = &[
 #[tokio::test]
 async fn pgjdbc_flip_in_error_mode_answers_as_postgresql_17() {
     let server = TestServer::start().await.expect("server");
-    let got = tokio::time::timeout(super::BOUND, replay(&Target::ours(&server), true))
+    let got = tokio::time::timeout(super::BOUND, replay(&Target::ours(&server), Some("error")))
         .await
         .expect("the replay hung");
     super::assert_trace("pgjdbc flip, error mode", &got, &super::with_differences(PG17_FLIP, &[]));
 }
 
+/// The default, `auto` (slice B8b, Q1): pgjdbc's stale Bind is refused at
+/// Bind with `R=RevalidateCachedQuery`, its retry under a new name (a new
+/// Parse) is a fresh statement, and the whole flip answers token for token
+/// as PostgreSQL 17 does.
+#[tokio::test]
+async fn pgjdbc_flip_under_the_default_answers_as_postgresql_17() {
+    let server = TestServer::start().await.expect("server");
+    let got = tokio::time::timeout(super::BOUND, replay(&Target::ours(&server), None))
+        .await
+        .expect("the replay hung");
+    super::assert_trace("pgjdbc flip, default (auto)", &got, &super::with_differences(PG17_FLIP, &[]));
+}
+
 #[tokio::test]
 async fn pgjdbc_flip_in_rowdescription_mode_repairs_every_execute() {
     let server = TestServer::start().await.expect("server");
-    let got = tokio::time::timeout(super::BOUND, replay(&Target::ours(&server), false))
+    let got = tokio::time::timeout(super::BOUND, replay(&Target::ours(&server), Some("rowdescription")))
         .await
         .expect("the replay hung");
     let mut want = super::with_differences(&PG17_FLIP[..7], OURS_ROWDESCRIPTION);

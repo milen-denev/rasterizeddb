@@ -325,14 +325,23 @@ async fn case_2_r1_over_the_extended_protocol() {
 /// holds nothing on `t` (it holds `u`), both answer while the DDL waits,
 /// with the old shape. Their Executes then wait; once H commits and the
 /// DDL runs, each Execute carries a RowDescription of the new shape for ADD
-/// COLUMN, and none for CREATE INDEX (it changes no shape).
+/// COLUMN, and none for CREATE INDEX (it changes no shape). That is
+/// `rdb.shape_change = rowdescription`; under the default, `auto` (B8b), the
+/// ADD COLUMN Executes are each their statement's first stale use and are
+/// refused with 0A000 after the build, no rows, as PostgreSQL refuses a
+/// stale cached plan; CREATE INDEX sends rows alone in both.
 ///
 /// Mutation: `reconcile_shape` always omits the description (the skip path
 /// taken whatever the epoch): the ADD COLUMN Executes send rows with no
 /// RowDescription, and the assertion on it fails.
 #[tokio::test]
 async fn case_3_describe_during_a_pending_access_exclusive() {
-    for (ddl, changes_shape) in [("ALTER TABLE t ADD COLUMN c INT", true), ("CREATE INDEX t_x ON t (x)", false)] {
+    for (ddl, changes_shape, mode) in [
+        ("ALTER TABLE t ADD COLUMN c INT", true, Some("rowdescription")),
+        ("CREATE INDEX t_x ON t (x)", false, Some("rowdescription")),
+        ("ALTER TABLE t ADD COLUMN c INT", true, None),
+        ("CREATE INDEX t_x ON t (x)", false, None),
+    ] {
         let server = TestServer::start().await.expect("server");
         let admin = unbounded(&server).await;
         for sql in [
@@ -353,6 +362,10 @@ async fn case_3_describe_during_a_pending_access_exclusive() {
 
             let mut detached = raw(&server).await;
             let mut block = raw(&server).await;
+            if let Some(mode) = mode {
+                detached.simple_ok(&format!("SET rdb.shape_change = {mode}")).await;
+                block.simple_ok(&format!("SET rdb.shape_change = {mode}")).await;
+            }
             block.simple_ok("BEGIN").await;
             block.simple_ok("SELECT * FROM u").await;
             let old = Reply::RowDesc(vec![("id".into(), 23, 0), ("x".into(), 23, 0)]);
@@ -375,6 +388,11 @@ async fn case_3_describe_during_a_pending_access_exclusive() {
             assert_eq!(d.await.unwrap(), Ok(()), "{ddl}");
             for (who, w) in [("detached", &mut detached), ("block", &mut block)] {
                 let r = w.until_ready().await;
+                if changes_shape && mode.is_none() {
+                    assert_eq!(wire::error_code(&r).as_deref(), Some("0A000"), "{ddl}: {who}, default mode: {r:?}");
+                    assert!(wire::text_rows(&r).is_empty(), "{ddl}: {who}: rows after the 0A000: {r:?}");
+                    continue;
+                }
                 assert_eq!(wire::error_code(&r), None, "{ddl}: {who}: {r:?}");
                 let described = r.iter().any(|m| matches!(m, Reply::RowDesc(_)));
                 assert_eq!(described, changes_shape, "{ddl}: {who}: RowDescription sent = {described}: {r:?}");
@@ -388,7 +406,8 @@ async fn case_3_describe_during_a_pending_access_exclusive() {
                     assert_eq!(wire::text_rows(&r), [[Some("1".into()), Some("10".into())]], "{ddl}: {who}");
                 }
             }
-            block.simple_ok("COMMIT").await;
+            // The block's 0A000 (default mode) ended it (R3): ROLLBACK.
+            block.simple_ok(if changes_shape && mode.is_none() { "ROLLBACK" } else { "COMMIT" }).await;
         })
         .await;
     }

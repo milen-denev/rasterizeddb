@@ -15,7 +15,12 @@
 //!
 //! The rule pinned here: the shape a client knows is the one it was last told
 //! at `Describe`, and every `Execute` whose shape differs from it carries a
-//! `RowDescription`, until the client describes again.
+//! `RowDescription`, until the client describes again. That is
+//! `rdb.shape_change = rowdescription`, which every session here asks for
+//! ([`ROWDESCRIPTION`]); since B8b the default is `auto`, which answers a
+//! stale statement's first use with 0A000 and its re-executes without a new
+//! Parse this way (`sqlx_cached_returning_under_the_default_…` below, and
+//! `driver_matrix.rs`).
 //!
 //! Every check compares a prepared statement's rows with an unprepared twin
 //! (the same text as a simple query). The twins' answers are PostgreSQL 17's.
@@ -55,12 +60,20 @@ async fn read_msg(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     (t[0], body)
 }
 
+/// The startup option every session in this file connects with.
+const ROWDESCRIPTION: &str = "-c rdb.shape_change=rowdescription";
+
+/// `server.url()` asking for [`ROWDESCRIPTION`].
+fn pinned_url(server: &TestServer) -> String {
+    format!("{}&options=-c%20rdb.shape_change%3Drowdescription", server.url())
+}
+
 async fn connect(server: &TestServer) -> TcpStream {
     let mut stream = TcpStream::connect(("127.0.0.1", server.port()))
         .await
         .expect("connect");
     let mut body = 196608i32.to_be_bytes().to_vec();
-    for s in ["user", "postgres", "database", "postgres"] {
+    for s in ["user", "postgres", "database", "postgres", "options", ROWDESCRIPTION] {
         body.extend_from_slice(&cstr(s));
     }
     body.push(0);
@@ -544,7 +557,7 @@ async fn sqlx_cached_statement_decodes_the_new_shape_every_time() {
     for change in CHANGES {
         for sql in sqls {
             let server = TestServer::start().await.expect("server");
-            let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+            let mut conn = PgConnection::connect(&pinned_url(&server)).await.expect("connect");
             for setup in change.setup {
                 conn.execute(*setup).await.expect("setup");
             }
@@ -573,7 +586,7 @@ async fn sqlx_cached_statement_decodes_the_new_shape_every_time() {
 async fn the_twins_are_postgresql_answers() {
     for change in CHANGES {
         let server = TestServer::start().await.expect("server");
-        let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+        let mut conn = PgConnection::connect(&pinned_url(&server)).await.expect("connect");
         for sql in change.setup.iter().chain(change.alter) {
             conn.execute(*sql).await.expect("setup");
         }
@@ -610,7 +623,7 @@ async fn sqlx_point_lookups_after_a_change_run_from_the_cached_parse() {
     use std::sync::atomic::Ordering;
     let _counted = COUNTED.lock().await;
     let server = TestServer::start().await.expect("server");
-    let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+    let mut conn = PgConnection::connect(&pinned_url(&server)).await.expect("connect");
     conn.execute("CREATE TABLE t (id INT, a INT)").await.expect("create");
     for k in 1..=8 {
         conn.execute(AssertSqlSafe(format!("INSERT INTO t (id, a) VALUES ({k}, {})", 100 + k)))
@@ -642,7 +655,7 @@ async fn sqlx_point_lookups_after_a_change_run_from_the_cached_parse() {
 static COUNTED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn tp(server: &TestServer) -> tokio_postgres::Client {
-    let (client, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls)
+    let (client, conn) = tokio_postgres::connect(&pinned_url(server), tokio_postgres::NoTls)
         .await
         .expect("tokio-postgres connects");
     tokio::spawn(conn);
@@ -732,7 +745,7 @@ async fn tp_twin(client: &tokio_postgres::Client) -> Vec<Vec<(String, Option<Str
 async fn sqlx_cached_returning_decodes_the_new_shape_every_time() {
     let _counted = COUNTED.lock().await;
     let server = TestServer::start().await.expect("server");
-    let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+    let mut conn = PgConnection::connect(&pinned_url(&server)).await.expect("connect");
     conn.execute("CREATE TABLE t (id INT, a INT)").await.expect("create");
     conn.execute("INSERT INTO t (id, a) VALUES (1, 10)").await.expect("insert");
     let sql = "UPDATE t SET a = a + 1 WHERE id = $1 RETURNING *";
@@ -749,6 +762,37 @@ async fn sqlx_cached_returning_decodes_the_new_shape_every_time() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     let twin_rows = twin(&mut conn, "SELECT * FROM t").await;
     assert_eq!(twin_rows, ["id=Some(1) a=Some(14) c=Some(7)"]);
+}
+
+/// The default, `auto` (slice B8b), through sqlx's cached `UPDATE …
+/// RETURNING *`: the first execute after the ADD COLUMN is refused before the
+/// write runs (PostgreSQL's 0A000; the row is not updated); sqlx executes
+/// its cached statement again without a new Parse, and from then on every
+/// execute is applied once and decodes the new shape, as the twin does.
+///
+/// Mutation, failing an assertion here: `auto` resolved as `error` always
+/// (sqlx fails every execute: it never re-prepares).
+#[tokio::test]
+async fn sqlx_cached_returning_under_the_default_is_refused_once_then_decodes() {
+    let _counted = COUNTED.lock().await;
+    let server = TestServer::start().await.expect("server");
+    let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
+    let shown = sqlx::query("SHOW rdb.shape_change").fetch_one(&mut conn).await.expect("show");
+    assert_eq!(shown.get::<String, _>(0), "auto");
+    conn.execute("CREATE TABLE t (id INT, a INT)").await.expect("create");
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 10)").await.expect("insert");
+    let sql = "UPDATE t SET a = a + 1 WHERE id = $1 RETURNING *";
+    assert_eq!(cached(&mut conn, sql).await.expect("first execute"), ["id=Some(1) a=Some(11)"]);
+    conn.execute("ALTER TABLE t ADD COLUMN c INT DEFAULT 7").await.expect("alter");
+    let refused = cached(&mut conn, sql).await.expect_err("the first stale execute ran");
+    assert!(refused.contains("cached plan must not change result type"), "{refused}");
+    assert_eq!(twin(&mut conn, "SELECT * FROM t").await, ["id=Some(1) a=Some(11) c=Some(7)"], "the refused write was applied");
+    for n in 1..=3 {
+        let got = cached(&mut conn, sql).await;
+        let expected = vec![format!("id=Some(1) a=Some({}) c=Some(7)", 11 + n)];
+        assert_eq!(got.as_ref(), Ok(&expected), "execute {n} after the refusal");
+    }
+    assert_eq!(twin(&mut conn, "SELECT * FROM t").await, ["id=Some(1) a=Some(14) c=Some(7)"]);
 }
 
 /// `rdb.shape_change = error` set in the startup packet (Q2), as a JVM or

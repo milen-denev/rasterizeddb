@@ -21,7 +21,14 @@
 //!   tables are ALTERed one after the other repairs both times, and a DROP
 //!   and CREATE never repeats an epoch a learned parse was taken under.
 //! - `rdb.shape_change = error` answers 0A000 with PostgreSQL's message;
-//!   SHOW reports the mode and RESET restores `rowdescription` (Q2).
+//!   SHOW reports the mode and RESET restores the default (Q2).
+//! - The default `auto` (slice B8b, Q1, finding L10) answers a stale
+//!   statement's first use as `error` and its re-executes without a new
+//!   Parse as `rowdescription`; a new Parse or Describe starts over.
+//!
+//! The B7 tests pin `rowdescription`, the repair they test
+//! ([`Client::connect`]); the default's own tests connect with
+//! [`Client::connect_default`].
 //! - A partitioned table refuses ALTER, and a plain table joined with one
 //!   still repairs, by logical name.
 
@@ -49,6 +56,12 @@ fn close(db: Arc<Database>, root: &std::path::Path) {
 }
 
 fn state(db: &Arc<Database>) -> SessionState {
+    let mut st = default_state(db);
+    st.shape_change = ShapeChangeMode::RowDescription;
+    st
+}
+
+fn default_state(db: &Arc<Database>) -> SessionState {
     SessionState::new(
         DatabaseCatalog::single(db.clone()),
         db.name.clone(),
@@ -85,11 +98,22 @@ fn cstr(buf: &mut Vec<u8>, s: &str) {
 }
 
 impl Client {
+    /// A session in `rdb.shape_change = rowdescription`, the repair B7's
+    /// tests are about.
     fn connect(db: &Arc<Database>) -> Client {
+        Client::connect_with(db, state)
+    }
+
+    /// A session in the server's default mode (`auto`).
+    fn connect_default(db: &Arc<Database>) -> Client {
+        Client::connect_with(db, default_state)
+    }
+
+    fn connect_with(db: &Arc<Database>, make: fn(&Arc<Database>) -> SessionState) -> Client {
         let (mut server, client) = tokio::io::duplex(1 << 20);
         let db = db.clone();
         let handle = tokio::spawn(async move {
-            let mut st = state(&db);
+            let mut st = make(&db);
             let _ = Box::pin(run_message_loop_inner(&db, &mut st, &mut server)).await;
         });
         Client { s: client, server: Some(handle) }
@@ -181,6 +205,15 @@ impl Client {
         cstr(&mut parse, sql);
         parse.extend_from_slice(&0i16.to_be_bytes());
         self.send(b'P', &parse).await;
+        let mut describe = vec![b'S'];
+        cstr(&mut describe, name);
+        self.send(b'D', &describe).await;
+        self.send(b'S', &[]).await;
+        self.until_ready().await
+    }
+
+    /// Describe the statement again (no Parse), Sync.
+    async fn describe(&mut self, name: &str) -> Vec<Msg> {
         let mut describe = vec![b'S'];
         cstr(&mut describe, name);
         self.send(b'D', &describe).await;
@@ -591,10 +624,10 @@ async fn a_join_across_two_altered_tables_repairs_by_one_counter() {
     close(db, dir.path());
 }
 
-/// Q2: `rdb.shape_change`. SHOW reports `rowdescription` by default; SET to
+/// Q2: `rdb.shape_change`. SHOW reports `auto` by default (B8b); SET to
 /// `error` makes the stale Execute fail with 0A000 and PostgreSQL's message,
 /// before a write runs (the row is not updated); re-preparing heals it;
-/// RESET restores `rowdescription`; an unknown value is refused. In `error`
+/// RESET restores `auto`; an unknown value is refused. In `error`
 /// mode an ALTER landing while a SELECT waits for its lock still gets 0A000,
 /// and one landing while an autocommit write waits gets the RowDescription
 /// (the write has committed).
@@ -605,14 +638,14 @@ async fn a_join_across_two_altered_tables_repairs_by_one_counter() {
 async fn shape_change_error_mode_show_and_reset() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "b7_mode").await;
-    let mut a = Client::connect(&db);
+    let mut a = Client::connect_default(&db);
     let mut b = Client::connect(&db);
     b.ok("CREATE TABLE b7m (id INT, a INT)").await;
     b.ok("INSERT INTO b7m (id, a) VALUES (1, 10)").await;
     b.ok("INSERT INTO b7m (id, a) VALUES (2, 20)").await;
 
     let shown = |t: &[Msg]| rows(t).first().and_then(|r| r[0].clone());
-    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("rowdescription"));
+    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("auto"));
     let refused = a.simple("SET rdb.shape_change = sometimes").await;
     assert_eq!(error(&refused).map(|e| e.0).as_deref(), Some("22023"), "{refused:?}");
     a.ok("SET rdb.shape_change = error").await;
@@ -670,12 +703,18 @@ async fn shape_change_error_mode_show_and_reset() {
     );
     assert_eq!(rows(&got), vec![r(&["2", "21", "1", "2", "3"])]);
 
-    // RESET: back to the RowDescription.
+    // RESET: back to the default, `auto`. `s` was refused (0A000) since it
+    // was last described, so its next stale use, without a new Parse, gets
+    // the RowDescription.
     a.ok("RESET rdb.shape_change").await;
-    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("rowdescription"));
+    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("auto"));
     b.ok("ALTER TABLE b7m DROP COLUMN c").await;
     let got = a.run("s", &[]).await;
     assert_repaired("after RESET", &got, &cols(&[("id", INT4), ("a", INT4), ("d", INT4), ("e", INT4)]));
+    a.ok("SET rdb.shape_change = rowdescription").await;
+    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("rowdescription"));
+    a.ok("SET rdb.shape_change TO DEFAULT").await;
+    assert_eq!(shown(&a.ok("SHOW rdb.shape_change").await).as_deref(), Some("auto"));
 
     a.close().await;
     b.close().await;
@@ -697,7 +736,77 @@ fn shape_change_from_the_startup_packet() {
     );
     assert_eq!(startup_shape_change(&p(&[("rdb.shape_change", "ERROR")])), Some(ShapeChangeMode::Error));
     assert_eq!(startup_shape_change(&p(&[("options", "-c rdb.shape_change=bogus")])), None);
-    assert_eq!(ShapeChangeMode::default(), ShapeChangeMode::RowDescription);
+    assert_eq!(startup_shape_change(&p(&[("rdb.shape_change", "auto")])), Some(ShapeChangeMode::Auto));
+    assert_eq!(ShapeChangeMode::default(), ShapeChangeMode::Auto);
+}
+
+/// The default, `auto` (slice B8b; Q1 as the owner decided it, finding L10):
+/// a stale statement's first use is refused as PostgreSQL refuses it (0A000
+/// at Bind, nothing run, a write not applied); executed again without a new
+/// Parse, as sqlx re-executes its cached statement, it gets the fresh
+/// RowDescription every time; a re-Describe or a new Parse starts over, so
+/// the next change is refused first again.
+///
+/// Mutations, each failing an assertion here: `auto` resolved as `error`
+/// always (the re-execute gets 0A000 again: sqlx never heals); as
+/// `rowdescription` always (the first stale use runs: pgjdbc and npgsql get
+/// a RowDescription they did not ask for); the refusal not remembered; a
+/// Describe not starting over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_refuses_a_stale_statement_once_then_repairs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "b8b_auto").await;
+    let mut a = Client::connect_default(&db);
+    let mut b = Client::connect(&db);
+    b.ok("CREATE TABLE b8ba (id INT, a INT)").await;
+    b.ok("INSERT INTO b8ba (id, a) VALUES (1, 10)").await;
+    b.ok("INSERT INTO b8ba (id, a) VALUES (2, 20)").await;
+    let refused = |what: &str, got: &[Msg]| {
+        assert_eq!(
+            error(got),
+            Some(("0A000".to_string(), "cached plan must not change result type".to_string())),
+            "{what}: {got:?}"
+        );
+        assert!(rows(got).is_empty(), "{what}: rows after the 0A000: {got:?}");
+    };
+
+    a.prepare("s", "SELECT * FROM b8ba ORDER BY id").await;
+    a.prepare("u", "UPDATE b8ba SET a = a + 1 WHERE id = $1 RETURNING *").await;
+    assert_plain("before", &a.run("s", &[]).await);
+
+    b.ok("ALTER TABLE b8ba ADD COLUMN c INT DEFAULT 1").await;
+    let three = cols(&[("id", INT4), ("a", INT4), ("c", INT4)]);
+    refused("the first stale use", &a.run("s", &[]).await);
+    for n in 1..=2 {
+        let got = a.run("s", &[]).await;
+        assert_repaired(&format!("re-execute {n} without a new Parse"), &got, &three);
+        assert_eq!(rows(&got), vec![r(&["1", "10", "1"]), r(&["2", "20", "1"])]);
+    }
+
+    // A write: refused first, before it runs, then applied exactly once.
+    refused("the first stale write", &a.run("u", &["1"]).await);
+    assert_eq!(rows(&b.ok("SELECT a FROM b8ba WHERE id = 1").await), vec![r(&["10"])], "the refused UPDATE was applied");
+    let got = a.run("u", &["1"]).await;
+    assert_repaired("the write re-executed", &got, &three);
+    assert_eq!(rows(&got), vec![r(&["1", "11", "1"])]);
+
+    // Described again (no Parse): the client caches the new shape, and the
+    // next change is refused first again.
+    assert_eq!(description(&a.describe("s").await), Some(three.clone()));
+    assert_plain("described again", &a.run("s", &[]).await);
+    b.ok("ALTER TABLE b8ba ADD COLUMN d INT DEFAULT 2").await;
+    refused("after a re-Describe", &a.run("s", &[]).await);
+    assert_repaired("and re-executed", &a.run("s", &[]).await, &cols(&[("id", INT4), ("a", INT4), ("c", INT4), ("d", INT4)]));
+
+    // A new Parse of the same name is a new statement: refused first too.
+    a.prepare("s", "SELECT * FROM b8ba ORDER BY id").await;
+    assert_plain("re-prepared", &a.run("s", &[]).await);
+    b.ok("ALTER TABLE b8ba DROP COLUMN d").await;
+    refused("after a new Parse", &a.run("s", &[]).await);
+
+    a.close().await;
+    b.close().await;
+    close(db, dir.path());
 }
 
 /// A partitioned table refuses ALTER, and its shape is reached by logical
