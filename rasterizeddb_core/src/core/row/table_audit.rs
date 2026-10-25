@@ -82,8 +82,6 @@ pub(super) fn spawn_after_load<S: StorageIO>(parts: AuditParts<S>) {
         if !loaded || parts.gone() || !audit::chosen(parts.seal.gate.dir()) {
             return;
         }
-        // Behind the opens, never ahead of a load someone waits for.
-        let _slot = load::admit_audit().await;
         let outcome = check(&parts, Kind::AfterLoad).await;
         if let Outcome::Abandoned(why) = &outcome {
             info!("{}: the index snapshot audit was abandoned: {why}", parts.seal.name);
@@ -146,6 +144,12 @@ async fn run<S: StorageIO>(parts: &AuditParts<S>, kind: Kind) -> Outcome {
     let seal = &parts.seal;
     let gate = &seal.gate;
     let word = gate.word();
+    // The scratch doubles the table's index memory while it lives, so it
+    // takes a slot on the load queue, as a load does, at the lowest rank:
+    // behind the opens, never ahead of a load someone waits for. Given back
+    // with the scratch, before any rebuild: the rebuild's ticket may wait
+    // for a load of this file set, which may wait for a slot.
+    let queue_slot = load::admit_audit().await;
     if kind == Kind::AfterLoad && gate.state() != GateState::Clean {
         return Outcome::Abandoned("the table was written after its load".into());
     }
@@ -281,6 +285,7 @@ async fn run<S: StorageIO>(parts: &AuditParts<S>, kind: Kind) -> Outcome {
     let _ = Point::Scanned;
 
     audit::compare_indexes(&list, scratch, &mut findings);
+    drop(queue_slot);
 
     // The verdict counts only if nothing moved under it.
     if parts.gone() {

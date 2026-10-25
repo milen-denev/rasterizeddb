@@ -227,7 +227,8 @@ impl Outcome {
     /// One line, for logs and `rdb_index_check`'s `result` column.
     pub fn describe(&self) -> String {
         match self {
-            Outcome::Clean(_) => "clean".into(),
+            Outcome::Clean(f) if f.skipped.is_empty() => "clean".into(),
+            Outcome::Clean(f) => format!("clean; not compared: {}", f.skipped.join("; ")),
             Outcome::Mismatch { rebuilt: true, .. } => "mismatch: rebuilt".into(),
             Outcome::Mismatch { rebuilt: false, .. } => "mismatch: rebuild did not finish".into(),
             Outcome::Abandoned(why) => format!("abandoned: {why}"),
