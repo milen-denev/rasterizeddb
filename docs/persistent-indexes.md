@@ -3443,6 +3443,66 @@ Items 1-10 and the traps of item 11 are adopted verbatim as acceptance
 criteria (§13), and `core/index_store` reaches into `LiveIndex` only through
 these hooks.
 
+**As built (B16): C3 and C9** (`core/index/sorted.rs`, with the methods in
+`index/mod.rs` and `index/gin.rs`). Nothing calls them yet; B17 does.
+- **The stream**, `Sorted<'_, K>` (`K` = key bytes `&[u8]`, or the gin item
+  `u64`): every `Entry(key, slots)`, keys strictly ascending (bytes for
+  B-tree, hash and path, so a hash index streams in one order whatever its
+  `RandomState`), slots strictly ascending and never none; then
+  `Unkeyed(slots)` once, sorted; then `Present(words)` once, without
+  trailing zero words. Equal contents give equal streams.
+- **C3**, `LiveIndex::for_each_sorted` and `GinIndex::for_each_sorted`
+  (`fn for_each_sorted<E>(&self, f: impl FnMut(Sorted<'_, K>) -> Result<(), E>) -> Result<(), E>`),
+  on the gate source test's `READ_ONLY` list. Nothing is filtered by presence;
+  gin leaves out the entries of `forgotten_slots`, exactly those (a list left
+  empty goes with them). A read lock is held for one block of
+  `SORTED_BLOCK` = 1024 entries, never across `f` (P15); a hash index sorts its
+  swept keys first. The stream is one state only while nothing writes, which
+  the seal guarantees. `f`'s error stops it and is returned (`CANCEL`, I/O).
+- **C9**, `SortedLoad<K>` (`KeyBuf` or `u64`) checks each part as it arrives:
+  key order, empty entries, slot order, a slot or presence bit at or past the
+  identity's `n_slots`, part order and repetition, and a missing `UNKEYED` or
+  `PRESENT` (`SortedReject`). `LiveIndex::load_sorted` and
+  `GinIndex::load_sorted` (`(&self, Proof<'_>, SortedLoad<K>) -> Result<(), SortedReject>`)
+  record their census line, then install only a stream checked to its end, so
+  a refusal leaves the index untouched. Entries before presence bits;
+  `UNKEYED` and `PRESENT` restored as captured, never inferred. Gin sets
+  `live` to the popcount of `PRESENT` under its lock and adds the entries it
+  added to `entries`.
+
+Deviations, as built:
+- **A load adds, it does not replace.** Into the empty index an open builds
+  that is the snapshot; beside a write that got in first it is the union, so
+  the superset holds without relying on writes waiting for the load (§4).
+  Gin's `forgotten` and `forgotten_slots` are therefore left as they are
+  rather than reset: 0 and empty on a fresh index, as §4 requires, and still
+  owed to a compaction otherwise.
+- **`n_slots` is part of well-formed**, beyond §4's list: the index lists
+  only slots the table had at capture, and the bound keeps a rotted
+  `PRESENT` or slot from allocating.
+- **`PRESENT` is streamed as words.** The run-length code, the INDEX/GIN
+  section bytes, their version and golden byte vectors are B17's with the
+  encoding; B16 has no byte format, so no history row. The stream order is
+  pinned by a small literal stream (B-tree and hash) instead.
+- **No `TableIndexes` wrapper.** B17 loads per index and marks ready with the
+  existing `set_ready_at(epoch)`.
+
+Tests (`index/tests.rs`, `index/gin.rs`, `index/sorted.rs`, each
+mutation-verified): the stream is a model of every entry, unkeyed slot and
+presence bit through inserts, in-place moves and forgets with and without
+the key, over B-tree, hash, composite and path indexes across blocks;
+contents give the stream, pinned for one small index; gin drops exactly the
+forgotten slots and keeps a slot whose insert is under way; the planner's
+superset property and identical answers after C3 then C9
+(`a_loaded_index_answers_as_the_one_captured`, killed at its superset
+assertion by a load that drops an entry or the unkeyed slots); every key,
+range and presence bit of a loaded index; each rule of the stream, and a
+differential fuzz of 3,000 broken streams against a separately written
+checker (refused exactly when malformed, nothing left behind, the union
+when accepted); a gin load's lookups and counters, then forgets and a
+compaction after it (RV19; killed by `live` left at 0); the census sees
+every load and no capture.
+
 ## 16. v2 requirements: online persistence
 
 v2 serves a hot set larger than RAM: immutable runs behind today's in-memory
