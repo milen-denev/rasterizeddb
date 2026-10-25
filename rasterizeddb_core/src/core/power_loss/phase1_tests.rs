@@ -1274,39 +1274,6 @@ async fn the_filter_survives_power_cuts_at_every_phase_1_failpoint_on_a_second_l
     suite(Place::Second).await;
 }
 
-/// Every model reachable by applying any subset of the steps in order,
-/// where each step is the model after one statement, applied to the one
-/// before it: the rows a step changed relative to its predecessor.
-fn subsets(base: &Model, steps: &[Model]) -> Vec<Model> {
-    let mut deltas: Vec<(Vec<i64>, BTreeMap<i64, ModelRow>)> = Vec::new();
-    let mut prev = base;
-    for s in steps {
-        let removed: Vec<i64> = prev.rows.keys().filter(|k| !s.rows.contains_key(k)).copied().collect();
-        let changed: BTreeMap<i64, ModelRow> =
-            s.rows.iter().filter(|(k, v)| prev.rows.get(k) != Some(v)).map(|(k, v)| (*k, v.clone())).collect();
-        deltas.push((removed, changed));
-        prev = s;
-    }
-    let mut out = Vec::new();
-    for mask in 0u32..(1 << steps.len()) {
-        let mut m = base.clone();
-        for (i, (removed, changed)) in deltas.iter().enumerate() {
-            if mask & (1 << i) != 0 {
-                for k in removed {
-                    m.rows.remove(k);
-                }
-                for (k, v) in changed {
-                    m.rows.insert(*k, v.clone());
-                }
-            }
-        }
-        if !out.contains(&m) {
-            out.push(m);
-        }
-    }
-    out
-}
-
 /// Bug (c) on a second location (§5, §11, phase 1's gate): a table whose
 /// directory has its own WAL and `rdb.ixe`, written under
 /// `synchronous_commit = off`, so each statement's outcome waits in the
@@ -1384,10 +1351,11 @@ async fn bug_c_holds_on_a_second_location_under_synchronous_commit_off() {
 
         // Under synchronous_commit = off: a DELETE, vacuum's clear of its
         // codes, then in-place UPDATEs to fresh values.
-        // Each statement's outcome is durable on its own path (the root's
-        // status log, or the location's commit marker for an in-place
-        // write), so an image may hold any combination of them: the states
-        // are every subset, applied in order.
+        // Every statement commits through its outcome in the root's log
+        // (an overwrite in place only where that log is the rows' log,
+        // e72a399), so an image holds a prefix of them: under
+        // `synchronous_commit = off` a power cut loses transactions off the
+        // end, never one before a survivor.
         let s0 = run.model.clone();
         let mut steps: Vec<Model> = Vec::new();
         let (del, s1, mut touched) = run.delete_some(4);
@@ -1404,7 +1372,8 @@ async fn bug_c_holds_on_a_second_location_under_synchronous_commit_off() {
             run.model = after.clone();
             steps.push(after);
         }
-        let states = subsets(&s0, &steps);
+        let mut states = vec![s0];
+        states.extend(steps);
         let state_refs: Vec<&Model> = states.iter().collect();
         let preds = run.battery(&state_refs, &touched);
         let sink: Sink = StdArc::new(Mutex::new(Vec::new()));
@@ -1687,4 +1656,111 @@ async fn retirement_cancels_a_running_seal() {
     let db = run.db.take().unwrap();
     close(&dirs, db);
     assert_no_problems(&run, "retirement_cancels_a_running_seal");
+}
+
+/// Under `synchronous_commit = off`, statements on a table in a second
+/// location and on one in the root survive a power cut as a prefix of the
+/// order they were acknowledged in, in both directions:
+/// - a DELETE on the location's table, then an UPDATE of one of its rows
+///   that could be written in place: never the UPDATE without the DELETE;
+/// - an UPDATE on the location's table, then an INSERT into a root table:
+///   never the INSERT without the UPDATE. A **regression guard**, not a
+///   reproduction: today an overwriting statement commits through
+///   `commit_written_transaction`, which syncs every other location's log
+///   first, so this order cannot break (it did not before e72a399 either).
+///   It catches a future commit path that skips that pre-sync, or a write
+///   family reported as not having written for an overwrite.
+/// An overwrite in place commits through the log its bytes are written to;
+/// on a second location that is not the outcome log, and the two reach the
+/// disk in no order. e72a399 confines in-place overwrites to tables whose
+/// rows log is the outcome log. Quiescent cuts right after the statements,
+/// before the log writer's round, `RDB_POWER_LOSS_SEEDS` × 8 images each
+/// (40 by default).
+///
+/// Mutation: the code before e72a399 (an in-place overwrite on any
+/// location): the first ordering recovered "UPDATE only" in 29 of 40
+/// images.
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_off_outcomes_survive_as_a_prefix_across_locations() {
+    const ROOT_TABLE: &str = "pl1r";
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024) * 8;
+    let mut non_prefix = Vec::new();
+    let mut seen: BTreeMap<(&str, bool, bool), usize> = BTreeMap::new();
+    for ordering in ["delete, then an in-place update", "an in-place update, then a root insert"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Second };
+        std::fs::create_dir_all(dirs.root()).unwrap();
+        let db = create(&dirs).await;
+        exec(&db, &format!("CREATE TABLE {ROOT_TABLE} (id BIGINT)")).await.unwrap();
+        let mut run = Run {
+            dirs: dirs.clone(),
+            db: Some(db),
+            rec: Recorder::start(&dirs.base),
+            model: Model::default(),
+            rng: Rng::new(0x0D0E),
+            next_id: 0,
+            points: Vec::new(),
+            tally: Tally::default(),
+            problems: Vec::new(),
+            held: 0,
+            run_seed: 0,
+        };
+        run.insert(300).await;
+        run.db().sync_durable().unwrap();
+        drop(std::mem::replace(&mut run.rec, Recorder::start(&dirs.base)));
+        let s0 = run.model.clone();
+        // (first statement's effect present?, second's?) read back from an
+        // image.
+        let first_kept: Box<dyn Fn(&BTreeMap<i64, ModelRow>, usize) -> bool>;
+        let second_kept: Box<dyn Fn(&BTreeMap<i64, ModelRow>, usize) -> bool>;
+        if ordering.starts_with("delete") {
+            let (del, s1, _) = run.delete_some(4);
+            exec_sync(run.db(), &del, false).await.unwrap();
+            run.model = s1.clone();
+            let (upd, s2, _) = run.in_place();
+            exec_sync(run.db(), &upd, false).await.unwrap();
+            let n1 = s1.rows.len();
+            first_kept = Box::new(move |got, _| got.len() == n1);
+            let s0c = s0.clone();
+            let s2c = s2.clone();
+            second_kept = Box::new(move |got, _| {
+                got.iter().any(|(k, v)| s0c.rows.get(k).is_some_and(|o| o != v) && s2c.rows.get(k) == Some(v))
+            });
+        } else {
+            let (upd, s1, _) = run.in_place();
+            exec_sync(run.db(), &upd, false).await.unwrap();
+            run.model = s1.clone();
+            exec_sync(run.db(), &format!("INSERT INTO {ROOT_TABLE} (id) VALUES (1)"), false).await.unwrap();
+            let s0c = s0.clone();
+            first_kept = Box::new(move |got, _| got != &s0c.rows);
+            second_kept = Box::new(|_, root_rows| root_rows == 1);
+        }
+        let cp = run.rec.cut_quiescent(ordering).unwrap();
+        let db = run.db.take().unwrap();
+        close(&dirs, db);
+        drop(run);
+        let img = dirs.at(&tmp.path().join("image"));
+        for seed in 0..seeds {
+            let _ = std::fs::remove_dir_all(&img.base);
+            cp.write_image(seed, &img.base);
+            let db = open(&img).await.unwrap();
+            let got = scan(&db).await.unwrap();
+            let root_rows = decode(&exec(&db, &format!("SELECT id FROM {ROOT_TABLE}")).await.unwrap()).unwrap().len();
+            let (a, b) = (first_kept(&got, root_rows), second_kept(&got, root_rows));
+            *seen.entry((ordering, a, b)).or_default() += 1;
+            if b && !a {
+                non_prefix.push(format!("{ordering}: seed {seed} kept the second statement and lost the first"));
+            }
+            close(&img, db);
+        }
+        let _ = std::fs::remove_dir_all(&img.base);
+    }
+    eprintln!("sync-off ordering, (ordering, first kept, second kept) -> images: {seen:?}");
+    assert!(
+        non_prefix.is_empty(),
+        "{} images recovered a non-prefix:\n{}",
+        non_prefix.len(),
+        non_prefix.join("\n")
+    );
 }
