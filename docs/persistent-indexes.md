@@ -1403,6 +1403,288 @@ byte-exact; `grep -rn MUTATED` clean):
 - `gin::tests::the_sorted_stream_drops_exactly_the_forgotten_slots` still
   kills "C3 keeps forgotten GIN slots".
 
+**As built (B18): the audit, `rdb_index_check`, the priority bump.**
+- **The audit after a load** (`row/table_audit.rs`, `index_store::audit`).
+  1 in `index_snapshot.audit_rate` loads (64, a hot `SET CONFIG` key; 0
+  audits none; process-wide: the process's first load, then every 64th) is
+  checked on a task of the instance once the load has installed. Every
+  check, on demand too, holds a slot on the load queue at the lowest rank
+  (`load::admit_audit`) while its scratch lives, and gives it back before
+  any rebuild (whose ticket may wait for a load of the same file set,
+  which may wait for a slot). A build from rows is the source of truth and
+  is not audited.
+  - **The scratch** is every row visible to a snapshot taken when the
+    check begins, read back as `build_indexes` reads it (one fetch of the
+    indexed and filtered columns). Visible only: a build re-adds versions
+    vacuum already forgot, which the live indexes rightly lack, and a
+    version no snapshot sees is never returned, so a missing entry for it
+    misleads nobody.
+  - **Indexes, the dangerous direction**: per B-tree, hash and path index,
+    the row's key (`LiveIndex::key_of`, as the build keys it) and its slot
+    are collected, sorted, and merged with the live index's own C3 stream
+    (`audit::missing_from`, one thread per index): a pair is missing unless
+    the slot is listed under its key or among the live unkeyed slots; a
+    slot the scratch could not key is missing unless the live index lists
+    it unkeyed or holds it. What the live index has beyond the scratch is
+    the superset the design allows. Gin is not compared.
+  - **The filter, on its meaning**: each visible row's own value must keep
+    its slot a candidate for `col = value` in the live filter
+    (`TableFilters::admits_eq`, owner hunk in `core/filter`). That is bit
+    `slot` of `probe_pred_into(Eq)`, computed for one slot: the zone's own
+    generation width (the snapshot's), its plane-less state, the
+    SuperBloom, the zone bounds, the untrusted range. No scratch filter is
+    built; `admits_eq_is_the_probes_bit` pins the per-slot form to the
+    probe over every branch.
+  - **When a verdict counts**: no ticket held when the check begins, and
+    none taken until the verdict. `WriteGate::tickets_taken` counts every
+    ticket (`try_acquire` that held, `Hold::beside`) beside the word. A
+    write takes its ticket before it writes a row or touches an index
+    (T1), so a row written after the load, before or during the scratch
+    scan, or between the scan and the merge, abandons the check, counted
+    (`audit::abandoned_total`) and logged, never a mismatch: an in-place
+    update that moved a key the scan read, a version vacuum forgot after
+    the scan read it, a reused slot. After a load the word is `Clean`,
+    where every first ticket takes the slow path, so this is the design's
+    "only while the gate stays `Clean`".
+  - **A mismatch** (`mismatch_total`): a transient `WriteTicket` makes
+    `DIRTY` durable, so the bad snapshot never loads again; under it the
+    failed structures are demoted and cleared (indexes `set_ready(false)`
+    and `clear`; the filter's prefix unindexed and `filters_ready` off),
+    the word unvouched, the query caches retired; then the open's own
+    `build_indexes` and `backfill_into` rebuild them in place, into the
+    installed structures writes keep feeding, and mark them ready (the
+    indexes at the epoch read before the demotion). Never the scratch. One
+    check per file set at a time.
+- **`rdb_index_check(regclass)`**: `Database::index_check` runs the same
+  check, and its rebuild, over a table's file set or each materialized
+  partition, under `rdb_index_checkpoint`'s owner and ACCESS SHARE; a
+  file set the caller's family has written is reported abandoned. Over
+  pgwire (owner hunk), superuser only, one row: `relation`, `file_sets`,
+  `rows_checked`, `index_entries`, `missing_entries`, `filter_values`,
+  `filter_misses`, `result` (`clean`, `mismatch: rebuilt`, `abandoned:
+  …`), a notice per problem found, per part not compared and per
+  abandoned file set. 42P01 for an unknown name, 42809 for an index or a
+  catalogue view, 22023 for an argument that is not a string literal.
+- **The priority bump** (owner's decision). A write whose first ticket
+  meets a load not yet granted a slot (`LoadBarrier::settled_for_write` in
+  `gate::ticket`), or a reader about to wait for one (`settled_within`),
+  marks the file set's load urgent. The queue ranks its waiters at each
+  grant: marked first (the earliest marked first), then the costliest,
+  then arrival. Only the order changes: the slots stay
+  `max_concurrent_loads`, and the write still waits for the load to
+  finish, so nothing writes an index before its load installs and a load
+  meets exactly the snapshot. `load::bumped_total`.
+- **CRC-32C by the SSE 4.2 instruction** (`core::hash::crc32c`; the table
+  where the CPU lacks it; one function, `the_instruction_is_the_table`).
+  The proof reads and checks the whole snapshot, and the load each
+  section again; at 1.5M rows × 3 indexes the proof went from 0.026 s to
+  0.017 s and the hash section's re-check from 0.022 s to 0.017 s. In
+  `core::hash` because `index_store` admits no `unsafe`.
+- **The bench** (`examples/index_rebuild_bench.rs`, committed): `load`,
+  `ddl`, `open [--snapshot] [--cold]` (open to indexes ready, rebuild or
+  load, same binary and data; `--cold` is `syncfs` then
+  `posix_fadvise(DONTNEED)` on every file, with `mincore` reporting what
+  stayed resident), `ptload`/`ptopen`, `bumpload`/`bumpopen`, `mb2`. The
+  load logs each phase at debug.
+
+Deviations, as built:
+- **The stability rule is "no ticket held at the start, none taken until
+  the verdict"**, not the state `Clean`: the same thing after a load, and
+  it lets `rdb_index_check` check a table written since its open,
+  provided nobody writes it during the check.
+- **The filter check is the probe's answer for one slot**, not the
+  design's three conditions spelled out (code at the snapshot's width or
+  `CODE_NULL`, SuperBloom, bounds); they are the probe's steps, and the
+  per-slot form is pinned to the probe. A NULL is not checked: the
+  filter records none (`set(slot, None)`), and no equality matches one.
+- **`rdb_index_snapshot_soft_divergence_total` is not built**: with the
+  meaning compared and no scratch filter, there is nothing to call soft.
+- **The remediation holds its ticket only for the demotion**: `DIRTY` is
+  durable once it is taken, and a seal refuses unready structures, so
+  the rebuild needs none.
+- **Scratch memory is not counted against `partition_resident_budget`**
+  (phase 4), only a queue slot; it is one `(key, slot)` vector per index
+  over the visible rows, freed after the merge.
+- **A residual window**: a shutdown seal between a mismatch verdict and
+  the audit's ticket finds the word `Clean` and vouched and keeps the bad
+  snapshot, which loads once more after the restart (and is audited with
+  probability 1/64).
+- **`rdb_index_check`'s columns are text**: the reply is built above the
+  engine, which cannot honour a binary result format.
+
+Tests (each mutation-verified, `// MUTATED`, failed by assertion, restored
+byte-exact; `grep -rn MUTATED` clean):
+- `audit::tests::an_audit_after_a_load_finds_a_dropped_entry_and_rebuilds_in_place`
+  (an INDEX section re-encoded without one entry under valid checksums
+  loads and answers `a = …` without that row through the index; the
+  audit finds exactly one missing, `DIRTY` is durable, the rebuild
+  answers as the twin; a close without a seal builds on reopen, the
+  build counter moving; a seal and a reopen load and audit clean.
+  Mutations: the safe direction checked; a mismatch that neither demotes
+  nor rebuilds);
+- `rdb_index_check_finds_dropped_entries_and_reports_a_healthy_table_clean`
+  (four indexes and every filtered column compared on a healthy table; a
+  dropped hash entry and a row's dropped filter codes found and rebuilt;
+  partitions; refusals. Mutations: raw filter codes compared, at the
+  column's current width (9,171 false misses on the healthy table);
+  invisible versions compared (1,480 false missing entries));
+- `a_write_during_a_check_abandons_it` (the audit after a load held after
+  its scan while 39 in-place updates move keys and rows are deleted and
+  vacuumed: abandoned; the same on demand. Mutation: the verdict ignores
+  the tickets taken: a false mismatch of 78 entries);
+- `checks_under_concurrent_writes_never_report_a_mismatch` (checks back to
+  back for 4 s beside bursts of inserts, in-place and new-version updates,
+  deletes and vacuums: none a mismatch, some clean, some abandoned);
+- `a_mismatch_rebuilds_in_place_keeping_what_writes_added_meanwhile`
+  (held at its verdict while 300 rows are inserted and others updated.
+  Mutation: the scratch swapped in, and those rows are missing);
+- `missing_from_checks_the_dangerous_direction_only`;
+  `column::admits_eq_tests::admits_eq_is_the_probes_bit`;
+  `crc32c::tests::the_instruction_is_the_table`;
+- `load::tests::a_load_someone_waits_for_is_granted_next_and_never_past_the_limit`
+  (mutations: the bump removed; the queue ignoring the mark; a marked
+  load granted past the limit) and `a_write_moves_its_queued_load_to_the_front`
+  (four sealed tables, one slot, the first load held: the written
+  table's load is granted second and the write never goes ahead of it.
+  Mutation: the bump removed puts it last);
+- compat `index_check` (one row over the wire, Describe's columns the
+  reply's, a partitioned table, the three refusals).
+
+**Measured (B18)**, `examples/index_rebuild_bench.rs`, release, one process
+per open, the snapshot pair put back before each; five runs per cell,
+rebuild and load interleaved (the order alternating by round); medians with
+min-max. Rows from the bench's `load` (`id` bigint primary key, `tenant_id
+= i % 1000`, a 33-byte unique `email`); then `(tenant_id, id)` and a hash
+index on `email` added by `ddl`, each set sealed under `snapshot`. Cold is
+`syncfs`, then `posix_fadvise(DONTNEED)` on every file of the table
+(`mincore` found 0 bytes still resident on ext4; on tmpfs the pages are the
+storage and nothing can be evicted, so cold is warm there). Load average
+(1 min) 0.95-1.16 on ext4 and tmpfs, 1.55-1.69 on fuseblk; the box is
+shared. Raw logs and scripts: `.claude/reviews/b18-perf/`.
+
+1.5M rows (rows 91.5 MB, pointers 55.5 MB), open to indexes and filter
+ready:
+
+| Indexes | Venue | Cold: rebuild | Cold: load | Ratio | Warm: rebuild | Warm: load | Ratio | Snapshot |
+|---|---|---|---|---|---|---|---|---|
+| PK | ext4 `/var/tmp` | 0.417 (0.405-0.574) | 0.164 (0.163-0.169) | 39% | 0.395 (0.388-0.405) | 0.160 (0.158-0.173) | 41% | 14.7 MB |
+| PK | tmpfs* | 0.369 (0.368-0.379) | 0.140 (0.137-0.153) | 38% | 0.369 (0.365-0.379) | 0.139 (0.137-0.140) | 38% | |
+| PK | fuseblk | 0.427 (0.423-0.524) | 0.177 (0.170-0.202) | 41% | 0.432 (0.406-0.447) | 0.182 (0.178-0.188) | 42% | |
+| PK + (tenant_id, id) | ext4 | 0.857 (0.841-0.878) | 0.192 (0.190-0.210) | 22% | 0.838 (0.812-0.879) | 0.182 (0.176-0.216) | 22% | 26.5 MB |
+| | tmpfs* | 0.787 (0.783-0.801) | 0.164 (0.155-0.167) | 21% | 0.800 (0.790-0.811) | 0.159 (0.157-0.167) | 20% | |
+| | fuseblk | 0.856 (0.843-0.889) | 0.201 (0.193-0.208) | 23% | 0.876 (0.835-0.891) | 0.213 (0.200-0.224) | 24% | |
+| PK + (tenant_id, id) + hash | ext4 | 1.358 (1.353-1.363) | **0.329** (0.318-0.336) | **24%** | 1.322 (1.291-1.336) | **0.278** (0.277-0.283) | **21%** | 65.8 MB |
+| | tmpfs* | 1.285 (1.271-1.298) | **0.266** (0.264-0.272) | **21%** | 1.282 (1.276-1.294) | **0.262** (0.261-0.266) | **20%** | |
+| | fuseblk | 1.361 (1.348-1.384) | **0.303** (0.292-0.319) | **22%** | 1.446 (1.354-1.528) | **0.328** (0.326-0.381) | **23%** | |
+
+\* tmpfs hides fsync and read cost (200-695× on ext4 elsewhere in this
+repo): its numbers are a CPU floor, not a disk result.
+
+- **Instructions** (`perf stat`, user + kernel, the whole process; tmpfs,
+  warm, three indexes): rebuild 12.04 G, load 4.54 G (38%). Wall time
+  favours the load more than instructions do: it installs one index per
+  thread, where the rebuild is one pass over the rows.
+- **RSS after** (VmRSS, three indexes): load 404 MiB (anon 393), rebuild
+  684 MiB (anon 533, plus the rows and pointers mapped: 140 MiB shmem on
+  tmpfs, 150 MiB file on ext4). The load's peak is 579 MiB, every decoded
+  section at once, still below the rebuild's. PK alone: 106 against 320;
+  two indexes: 192 against 476. As at B17, about half a rebuild's, not
+  "within noise".
+- **Where the load's 0.26 s goes** (tmpfs, warm, three indexes, the load's
+  debug log): the proof reads and checks all 65.8 MB, 0.017 s (0.026 s
+  before the CRC change); then per section, one thread each: read and
+  check 0.005 / 0.005 / 0.017 s, decode 0.047 / 0.047 / 0.085 s (the hash
+  index's 39 MB section, 1.5M 33-byte keys, the slowest); then per index,
+  one thread each: install 0.091-0.099 s (both B-trees) and 0.134-0.144 s
+  (the hash index). Critical path ≈ 0.017 + 0.105 + 0.137 + the open. A
+  `perf record` puts the install (`LiveIndex::load_sorted`) at 46% of
+  samples with page faults, and `SortedLoad::push` with its allocations at
+  16%: 19% of all samples are `malloc` and the kernel paging in fresh
+  memory. Both are `core/index`'s.
+- **12M rows, tmpfs* only** (CPU floor; rows 732 MB, pointers 444 MB,
+  snapshot 556 MB; warm; load average 1.22-1.36): three indexes, rebuild
+  12.30 s (12.25-12.45), RSS 5,324 MiB; load 2.31 s (2.29-2.33), 19%, RSS
+  2,883 MiB (peak 4,246); decode 0.84 s, install 1.33 s, proof 0.14 s.
+- **Partitioned**, 64 partitions × 25k rows (1.6M), a `(tenant_id, id)`
+  primary key, after `seal_for_shutdown`; startup to every partition's
+  indexes ready (snapshots 12.6 MB in 64 files):
+
+| Venue | Cold: rebuild | Cold: load | Warm: rebuild | Warm: load | RSS: rebuild / load | CPU (task-clock): rebuild / load |
+|---|---|---|---|---|---|---|
+| ext4 | 0.136 (0.134-0.330) | 0.129 (0.120-0.133) | 0.112 (0.105-0.123) | 0.106 (0.085-0.109) | 306 / 129 MiB | 546 / 167 ms |
+| tmpfs* | 0.075 (0.067-0.077) | 0.064 (0.055-0.081) | 0.076 (0.069-0.079) | 0.060 (0.053-0.061) | 315 / 135 MiB | 650 / 214 ms |
+
+  The database open of 64 partitions (0.05-0.13 s) dominates both: 25k-row
+  rebuilds run on every core at once and finish within ~20 ms of it, where
+  loads take `max_concurrent_loads` (8 here) slots. The load saves two
+  thirds of the CPU and 57% of the memory, not the wall time.
+- **The priority bump**: B big tables sealed with three indexes and a
+  2,000-row `hot` table; a fresh process opens them (every load queued,
+  costliest first) and writes one row into `hot` at once; time from before
+  the open to that write's commit, five runs each, interleaved:
+
+| Venue, tables | `max_concurrent_loads` | Bump off | Bump on | All tables ready (either) |
+|---|---|---|---|---|
+| tmpfs*, 8 × 250k rows | 1 | 0.295 (0.292-0.301) | 0.059 (0.054-0.062) | 0.30 s |
+| | 2 | 0.203 (0.193-0.212) | 0.067 (0.066-0.070) | 0.21 s |
+| ext4 (warm), 6 × 150k rows | 1 | 0.252 (0.245-0.256) | 0.148 (0.145-0.185) | 0.24-0.25 s |
+| | 2 | 0.211 (0.209-0.214) | 0.155 (0.152-0.156) | 0.19-0.21 s |
+
+  Without the bump the write waits for every bigger load; with it, for the
+  load running when it arrived and its own (the ext4 open itself is 0.13
+  s of either). The total is unchanged.
+- **MB2** (B15's open item, RV7): autocommit single-row INSERTs into a
+  bigint-PK table `w`, each waiting for its commit's sync, for 60 s, beside
+  the 1.5M-row three-index table `t`; with snapshots on, at 30 s a row goes
+  into `t` and `t` gets an optional seal (its 65.8 MB snapshot captured,
+  written and synced on the same device; 0.98-1.30 s on ext4, 0.86-0.88 s
+  on tmpfs, every one published). Three runs each, alternating; device
+  flushes from `/proc/diskstats` (nvme1n1, which also holds `/`):
+
+| Venue | Snapshots | Commits | p50 ms | p99 ms (min-max of runs) | p99.9 ms | max ms | Flushes |
+|---|---|---|---|---|---|---|---|
+| ext4 | off | 11,066-11,439 | 4.92 | 9.31 (8.96-9.98) | 10.08-11.29 | 19-23 | 11,099-11,471 |
+| ext4 | on | 10,371-11,437 | 4.91 | 10.38 (10.02-11.11) | 13.19-17.28 | 46-213 | 10,429-11,478 |
+| tmpfs* | off | 5.1-5.8 M | 0.010 | 0.018 (0.017-0.018) | 0.024-0.026 | 6-2,003 | 14-19 |
+| tmpfs* | on | 5.0-5.7 M | 0.009 | 0.017 (0.016-0.017) | 0.023-0.025 | 497-2,090 | 16-21 |
+
+  On ext4 the p99 with snapshots (10.0-11.1 ms) is within the no-snapshot
+  range plus one fdatasync (p50 4.9 ms is one), MB2's pass; the p99.9 and
+  the max carry the seal's write and sync on the same consumer disk (load
+  average 0.75-2.11 over the runs). `w` is another file set, so no write
+  ever waited at a gate: this measures the device, not the gate. On tmpfs
+  a commit's sync is free and the seconds-long maxima come with snapshots
+  off too (the box, not the seal). The 12M-row form needs .7.
+
+**The gate (§12 phase 2): not met.** A clean reopen of 1.5M rows × 3
+indexes loads in 0.262-0.329 s, 20-24% of the re-measured rebuild, on every
+venue. Under 0.3 s holds on tmpfs (0.262/0.266) and warm ext4 (0.278), not
+cold ext4 (0.329) nor fuseblk (0.303/0.328); under 10% holds nowhere. The
+load is bounded by building the in-memory structures, which a rebuild also
+builds: installing the primary key's B-tree from its sorted stream alone
+(0.09 s) is a quarter of the primary key's whole rebuild (0.37 s), so 10%
+is out of reach while the load fills `BTreeMap<KeyBuf, Slots>` and
+sharded `HashMap`s entry by entry. Inside `index_store` only the
+checksums were worth changing (above). What would close the gap, all in
+`core/index` (proposals to the owner, not built):
+1. **`LiveIndex::load_sorted` for a hash index fills its 64 shards in
+   parallel**, each into an empty, pre-sized map with `insert` rather than
+   `entry().or_default()` + `merge_sorted`, without the dealt
+   intermediate vectors: the hash install is the critical path (0.135 s of
+   0.26 s).
+2. **`SortedLoad::with_capacity(n_slots, n_entries)`**: the section header
+   carries the entry count; the key and slot vectors now grow by doubling
+   (`realloc` and `memmove` are 8% of samples).
+3. **`SortedLoad` keys in one arena** instead of a `KeyBuf` per key: a key
+   over 24 bytes (every email here) is a heap allocation, 1.5M of them in
+   the hash section's 0.085 s decode.
+4. **Decode-then-install per index** (index_store, possible once 1-3
+   land): the slowest section then overlaps the others' installs; today
+   the hash index is slowest in both phases, so it would save nothing.
+   With 1-3 the estimate is ~0.15 s (≈12%) at 1.5M × 3; under 10% would
+   need the B-tree install itself cheaper (a bulk-built, arena-backed
+   tree, or the v2 mapped sections, §16).
+
 ## 5. The filter under the same rule (T4)
 
 Today the sidecar is trusted when its dirty byte is clear. Deletes and updates
@@ -3595,6 +3877,19 @@ phase 3 alone.
 | **2** | **Index sections** (B-tree, hash, path) behind `index_storage = snapshot`: C3, C9, full identity, load at routed open, fallback, audit (Clean-only, in-place rebuild on mismatch), `rdb_index_check`. Tables with gin wait for phase 3 | suites through (a) and (b); clean reopen of 1.53M rows × 3 indexes under 0.3 s and under 10% of (e); RSS after load within noise of after rebuild; a version bump followed by two read-only reopens moves the build counter once; audit with concurrent INSERT/UPDATE (mutation: swap the side build); an injected dropped entry, audit, clean close and reopen moves the build counter |
 | **3** | **GIN sections** once 99's `gin.rs` work settles | `json_indexes.rs` through (a) and (b), dense gin included; `ITEM_DERIVE_VERSION` bump rebuilds once, then loads; forget, clean close, reopen: the superset check passes and `sizes()` equals the live sizes before the close (a rebuild re-adds forgotten versions, RV11); load, forget, compact: `live` never wraps (RV19) |
 | **4** | **Partitioning phase 3 hooks**: index sections on idle close with the bandwidth bucket and the evictor's clean-victim preference; load at routed opens with `load_wait`; fan-out opens read the FILTER section only; C11 `resident_bytes()` feeding `partition_resident_budget`; load semaphore; default `snapshot` | first-touch p99 of a clean partition under 0.5 s cold, asserted so the scan-first behaviour would fail it; 10⁴ open/close cycles, no fd or file leak; RSS tracks the open set by `resident_bytes`; snapshot MB/s at the measured window; shutdown within `shutdown_deadline`; §16 counters exported |
+
+**Phase 2, measured (B18; tables and method in §4, "Measured (B18)").**
+A clean reopen of 1.5M rows × 3 indexes (a bigint primary key, `(tenant_id,
+id)`, a hash index on a 33-byte email): load 0.329 s cold and 0.278 s warm
+on ext4 (`/var/tmp`, a consumer NVMe under `/`), 0.266 / 0.262 s on tmpfs
+(which hides read and fsync cost), 0.303 / 0.328 s on fuseblk; the rebuild
+re-measured beside it, same binary and data, 1.28-1.45 s. 20-24%: **the
+gate is not met** (under 0.3 s only on tmpfs and warm ext4; under 10%
+nowhere). 12M rows on tmpfs: 2.31 s against 12.30 s (19%). RSS after a
+load is about half a rebuild's (404 against 684 MiB), not "within noise".
+The load is bounded by `core/index`'s installs; §4 lists what would close
+the gap. Not measured on 192.168.1.7 (§12's venue): it needs the owner's
+leave.
 
 ## 13. Invariants and the tests that pin them
 
