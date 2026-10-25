@@ -155,7 +155,11 @@ impl Drop for OwnerScope {
             row_locks.release_owner(owner);
             self.transactions.end_owner(id);
         } else {
+            // `ended` is set by the attempt loop once it has decided O's end,
+            // with no await before the commit or abort it then makes; unset,
+            // the outcome says whether the attempt ever ended.
             if !self.adopted.load(Ordering::Acquire)
+                && !self.ended.load(Ordering::Acquire)
                 && self.transactions.outcome(id) == super::TxOutcome::InProgress
             {
                 // The attempt running as O never ended: the statement's
@@ -302,9 +306,11 @@ pub fn outlive(tx: TxId) {
     });
 }
 
-/// Called once the attempt loop has decided `tx`'s end: when `tx` is the
-/// scope's O, a later ask for the owner registers O then ([`ensure`]). One
-/// atomic store, so the committing path registers nothing.
+/// Called once the attempt loop has decided `tx`'s end, with no await
+/// between this and the commit or abort: when `tx` is the scope's O, a later
+/// ask for the owner registers O then ([`ensure`]), and the scope's end
+/// knows the attempt was ended. One atomic store, so the committing path
+/// registers nothing.
 pub fn attempt_ended(tx: TxId) {
     let _ = SCOPE.try_with(|scope| {
         if scope.fixed.is_none() && scope.minted.get().is_some_and(|o| o.id() == tx) {

@@ -227,6 +227,11 @@ pub struct RowLocks {
     /// does, so the graph stays empty unless something is actually stuck. A
     /// mutex of its own: lock operations never take it.
     waits: Mutex<HashMap<TxId, SmallVec<[TxId; 4]>>>,
+    /// `waits.len()`, published under its mutex: clearing an owner's edge
+    /// when the graph is empty (every statement's end, and since B8b every
+    /// first attempt's, which is its own owner) costs one load, not the
+    /// mutex.
+    waits_len: AtomicUsize,
     /// Attempt id → its statement's owner O ([`RowLocks::owner_alias`]).
     aliases: dashmap::DashMap<TxId, TxId>,
     /// `aliases.len()`, readable without touching the map: with no alias in
@@ -760,6 +765,7 @@ impl RowLocks {
         } else {
             waits.insert(waiter, blockers.iter().map(|b| self.owner_of(*b)).collect());
         }
+        self.waits_len.store(waits.len(), Ordering::Release);
     }
 
     /// `waiter` is no longer waiting — it got the lock, gave up, or ended.
@@ -768,8 +774,15 @@ impl RowLocks {
     }
 
     fn clear_waiting_owner(&self, waiter: TxId) {
+        // An edge of `waiter`'s was entered by `waiter`'s own task, after
+        // which the count it published is at least one: zero means it has
+        // none to clear.
+        if self.waits_len.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut waits = self.waits.lock().expect("wait graph poisoned");
         waits.remove(&waiter);
+        self.waits_len.store(waits.len(), Ordering::Release);
         if waits.is_empty() && waits.capacity() > 64 {
             waits.shrink_to(0);
         }
@@ -1346,6 +1359,31 @@ mod tests {
         assert_eq!(locks.table_deadlock_check(old_owner), None);
         assert_eq!(wait.outcome(), WaitOutcome::Waiting);
         locks.table_locks().abandon(&wait);
+    }
+
+    /// A wait's edge goes when the wait does: cleared, its guard dropped,
+    /// its owner released. Clearing reads the graph's count first (B8b), so
+    /// a count left behind would leave edges a later waiter finds a cycle in.
+    #[test]
+    fn a_waits_edge_goes_with_the_wait() {
+        let locks = RowLocks::default();
+        locks.set_waiting(10, &[20]);
+        assert_eq!(locks.waiting_on(10).as_slice(), &[20]);
+        locks.clear_waiting(10);
+        assert!(locks.waiting_on(10).is_empty(), "a cleared edge stayed");
+        {
+            let _guard = locks.waiting_guard(11);
+            locks.set_waiting(11, &[21]);
+            locks.set_waiting(12, &[11]);
+        }
+        assert!(locks.waiting_on(11).is_empty(), "an edge outlived its guard");
+        assert_eq!(locks.waiting_on(12).as_slice(), &[11], "another waiter's edge went with it");
+        locks.release_owner(LockOwner::block(12).unwrap());
+        assert!(locks.waiting_on(12).is_empty(), "an edge outlived its owner's release");
+        locks.set_waiting(13, &[14]);
+        locks.set_waiting(14, &[13]);
+        locks.clear_waiting(13);
+        assert!(!locks.deadlock_victim(14, &|_| true), "a cycle through a cleared edge");
     }
 
     #[test]
