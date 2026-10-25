@@ -1065,9 +1065,12 @@ instance's shared handles).
   at every look, and the table's committed-mutation counter
   (`cache_generation`) still, for `index_snapshot.idle_checkpoint_secs`
   (default 300, 0 off); it holds the instance's parts weakly. Shutdown: after
-  pgwire's drain grace the sessions still open are ended at their next idle
-  read with 57P01, their blocks rolled back (`end_remaining_sessions`, a
-  per-server signal), then `shutdown::seal_all` runs per database
+  pgwire's drain grace the sessions still open are ended with 57P01, their
+  blocks rolled back (`end_remaining_sessions`: the server shuts down the read
+  half of each session's socket through a dup'ed descriptor it kept at
+  admission, and a session whose read then fails while its server is ending
+  terminates; nothing is raced on the statement path, which an earlier
+  version paid ~0.7% for), then `shutdown::seal_all` runs per database
   `Database::seal_for_shutdown`: replication off, every instance quiesced
   (vacuum, the filter loop, the watcher and the providers' landing stopped,
   vacuum joined), then a mandatory seal of every file set, up to the core
@@ -1103,9 +1106,10 @@ Deviations, as built:
 - **A table opened after a restart is `Clean` but not vouched**, so its
   first clean point rewrites the snapshot after a `DIRTY` (rule 2) until B14
   loads snapshots and vouches for them.
-- **Session termination only at an idle read**: a session mid-batch or
-  mid-statement ends after it; the wait is bounded (5 s), and a mandatory
-  seal then waits `seal_timeout` for whatever ticket it still holds.
+- **Session termination at the session's next read**: a statement running
+  finishes first (its commit path is never cut); a session mid-batch ends at
+  its next read; the wait is bounded (5 s), and a mandatory seal then waits
+  `seal_timeout` for whatever ticket it still holds.
 - **Not built**: the token bucket (`max_mb_per_s`), the evictor and idle
   close (partitioning phase 3), INDEX sections (B17), the staged-append
   landing failpoint test (`staged_tmp_at_snapshot`), and the
