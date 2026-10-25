@@ -315,7 +315,7 @@ impl GatedIo {
         use crate::core::storage_providers::file_sync::failed_appends;
         match on_fail {
             Failure::Txn(txn) => failed_appends::record(location, file, txn, e),
-            Failure::Untokened => failed_appends::record_gate(location, e),
+            Failure::Untokened => failed_appends::record_gate(location, file, e),
         }
     }
 

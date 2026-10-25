@@ -261,6 +261,31 @@ pub fn file_id_for_name(name: &str) -> u64 {
 /// Creating a file writes a directory entry, and that entry is only durable once
 /// the *directory* is flushed. Without this a crash can lose the log file
 /// itself — leaving nothing to replay, which defeats the whole mechanism.
+/// Starts writeback of `len` bytes at `offset` of `file` without waiting
+/// for it (`sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux, nothing
+/// elsewhere): an index snapshot's capture calls it as it writes, so the
+/// fdatasync after has little left (docs/persistent-indexes.md §3 step 5,
+/// P12). Durability is the fdatasync's; this only spreads the I/O, so its
+/// result is ignored.
+pub fn start_writeback(file: &File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a plain syscall on a descriptor the caller owns; it
+        // reads nothing from this process's memory.
+        unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                offset as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+}
+
 pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -1379,6 +1404,18 @@ impl Wal {
             return Ok(());
         }
         self.commit_through(owed)
+    }
+
+    /// Makes every record issued so far durable, refusing a poisoned log
+    /// first: an index snapshot's barrier (docs/persistent-indexes.md §3
+    /// step 4, RV4, P26). Never [`Wal::sync_pending`], which returns `Ok` on
+    /// a poisoned log that owes nothing, so a snapshot would be captured
+    /// over memory a failed commit left without its key.
+    pub fn sync_issued(&self) -> io::Result<()> {
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
+        self.commit_through(self.issued.load(Ordering::Acquire))
     }
 
     /// Highest commit sequence assigned so far.

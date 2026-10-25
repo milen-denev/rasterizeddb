@@ -108,7 +108,7 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 60] = [
+const READ_ONLY: [(&str, &str); 62] = [
     ("LiveIndex", "method"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
@@ -171,6 +171,9 @@ const READ_ONLY: [(&str, &str); 60] = [
     // Whether a clear would change a plane: vacuum asks before it takes a
     // ticket (RV2).
     ("TableFilters", "any_codes_in_runs"),
+    // A seal's FILTER section and its identity's configuration hash (B13).
+    ("TableFilters", "sealed_image"),
+    ("TableFilters", "config_hash"),
 ];
 
 /// More read-only fns, kept apart only to keep the list above readable:

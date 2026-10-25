@@ -470,6 +470,14 @@ impl StorageIO for DbStorageProvider {
             p.attach_write_gate(gate, policy);
         }
     }
+
+    async fn land_staged(&self) -> io::Result<()> {
+        // Only a file provider can be sealed (`index_store_dir`).
+        match self {
+            Self::File(p) => p.land_staged().await,
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

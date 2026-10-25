@@ -257,6 +257,8 @@ pub(crate) struct TableData<S: StorageIO> {
     pub(crate) readers: StdArc<ReaderRegistry>,
     /// Running totals for the reclamation service.
     pub(crate) vacuum_stats: StdArc<VacuumStats>,
+    /// What a seal of this instance reads (`table_seal`, B13).
+    pub(crate) seal: StdArc<table_seal::SealParts<S>>,
 }
 
 /// A row-id sequence: the counter ids are drawn from and its reservation on
@@ -1146,6 +1148,10 @@ impl<S: StorageIO> Table<S> {
         } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        // Before anything is built from rows: a revocation after this point
+        // may have removed a version the structures below never saw come
+        // back, so a seal of this instance refuses (N26).
+        let revocations_at_open = crate::core::mvcc::status::outcome_revocations();
 
         // The file set's word: the live one when an instance of this file set
         // is still open (a reload), else derived from `.ixm`. Writes nothing.
@@ -1374,11 +1380,34 @@ impl<S: StorageIO> Table<S> {
             .spawn();
         }
 
+        // What a seal of this instance reads, and the idle checkpoint's
+        // watcher over it (docs/persistent-indexes.md §3, B13).
+        let seal = StdArc::new(table_seal::SealParts {
+            name: stem.to_string(),
+            gate: gate.clone(),
+            io_pointers: io_pointers.clone(),
+            io_rows: io_rows.clone(),
+            io_filters: io_filters.clone(),
+            own: guard.is_none().then(|| (io_schema.clone(), ids.io.clone())),
+            filters: filters.clone(),
+            indexes: indexes.clone(),
+            filters_ready: filters_ready.clone(),
+            versions: versions.clone(),
+            incarnation: schema.incarnation,
+            // Only a file set that can be sealed pays for it: a statement's
+            // temporary relation is memory-backed and opens per statement.
+            shape_hash: if gate.has_files() { crate::core::index::shape_of(&schema) } else { 0 },
+            revocations_at_open,
+            retired: AtomicBool::new(false),
+        });
+        table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
+
         Self {
             schema,
             schema_unreadable,
             io_schema,
             data: Some(TableData {
+                seal,
                 io_pointers,
                 io_rows,
                 io_filters,
@@ -1492,6 +1521,15 @@ impl<S: StorageIO> Table<S> {
     pub async fn retire(&self) {
         self.maintenance_alive.store(false, AtomicOrdering::Release);
         let _joined = self.maintenance_tick.lock().await;
+        // §7 step 2(a): a retired instance never snapshots. A running seal
+        // of it is cancelled (a no-op once it is publishing) and waited for,
+        // so none is still writing the file set's `.ixs` or `.ixm` when the
+        // caller goes on to copy, rewrite or drop the files (B13).
+        if let Ok(d) = self.data() {
+            d.seal.retired.store(true, AtomicOrdering::Release);
+            let _ = self.gate.word().cancel_seal();
+            let _sealed = self.gate.maintenance().lock().await;
+        }
     }
 
     /// Whether [`Table::retire`] has run (or the table was dropped, or is a
@@ -5677,3 +5715,6 @@ mod candidate_mask_tests {
 #[cfg(test)]
 #[path = "snapshot_order_tests.rs"]
 mod snapshot_order_tests;
+
+#[path = "table_seal.rs"]
+pub(crate) mod table_seal;

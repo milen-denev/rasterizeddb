@@ -1609,6 +1609,11 @@ impl TransactionManager {
         self.inner.read().running.is_empty()
     }
 
+    /// The log the status log stages outcomes in: the database root's.
+    pub fn status_wal(&self) -> Option<std::sync::Arc<crate::core::wal::Wal>> {
+        self.status.wal()
+    }
+
     /// Flushes the durable record of outcomes.
     pub fn flush(&self) -> std::io::Result<()> {
         self.status.flush()

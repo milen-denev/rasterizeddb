@@ -276,4 +276,14 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         _policy: crate::core::index_store::gated_io::Policy,
     ) {
     }
+
+    /// Lands every staged append in the main file and makes it durable,
+    /// waiting out a background landing already in flight: what a seal does
+    /// for each provider of its file set before it samples the file lengths
+    /// (docs/persistent-indexes.md §3 step 2), so the background landing has
+    /// nothing left to land after a `CLEAN`. A provider that stages nothing
+    /// has nothing to do; only a provider with a directory can be sealed.
+    fn land_staged(&self) -> impl Future<Output = IOResult<()>> + Send + Sync {
+        async move { Ok(()) }
+    }
 }

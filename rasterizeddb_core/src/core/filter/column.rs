@@ -467,6 +467,13 @@ impl ColumnFilter {
         self.valid_upto.min(self.dirty_min)
     }
 
+    /// The width bounds this column was built with (`SET FILTER … FOR
+    /// COLUMN` included): part of a snapshot's filter configuration hash.
+    #[inline]
+    pub fn config(&self) -> &FilterConfig {
+        &self.cfg
+    }
+
     /// Called after a successful checkpoint: the on-disk copy now includes
     /// every modification made so far.
     ///

@@ -812,6 +812,27 @@ impl WriteGate {
         }
     }
 
+    /// The sealer's own count while it lands staged appends (§3 step 2, its
+    /// `SealGuard`): one `fetch_add`, judged on nothing, as [`Hold::beside`]
+    /// is. Sound only on a word this caller sealed and drained: while the
+    /// count is above zero a `GatedIo` write is issued without a verdict
+    /// (the landing's own writes among them), a writer still cancels an
+    /// optional seal and still queues behind a mandatory one, and the
+    /// `PUBLISHING` compare-and-swap cannot succeed, so the guard is dropped
+    /// before it is tried.
+    pub fn seal_guard(self: &Arc<Self>) -> Hold {
+        let prev = Word(self.word.fetch_add(1, SeqCst));
+        debug_assert!(
+            prev.sealed() && !prev.publishing() && prev.state() == GateState::Dirty,
+            "a seal guard on a word with no running, unpublished seal: {prev:?}"
+        );
+        super::census::hold(self.census_id());
+        Hold {
+            gate: self.clone(),
+            ticketless: false,
+        }
+    }
+
     /// §3 step 1. The caller holds the maintenance lock.
     pub fn seal(&self, kind: SealKind) -> SealStart {
         seal(&self.word, kind)

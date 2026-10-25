@@ -2066,6 +2066,34 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         set_with: "SET CONFIG vacuum.enabled = on",
         help: "background reclamation, for every table in this database",
     },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "idle_checkpoint_secs",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.idle_checkpoint_secs = 300",
+        help: "seconds a table goes unwritten before its index snapshot is taken; 0 turns the idle checkpoint off",
+    },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "seal_timeout_ms",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.seal_timeout_ms = 5000",
+        help: "how long a mandatory snapshot (shutdown, rdb_index_checkpoint) waits for writers in flight",
+    },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "shutdown_deadline_secs",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.shutdown_deadline_secs = 120",
+        help: "the whole of shutdown's snapshots; keep it below the service manager's stop timeout",
+    },
+    ConfigKey {
+        section: "index_snapshot",
+        key: "writeback_mb",
+        hot: true,
+        set_with: "SET CONFIG index_snapshot.writeback_mb = 64",
+        help: "MiB of a snapshot written between two writeback starts",
+    },
 ];
 
 fn config_keys() -> Vec<Row> {
@@ -2141,6 +2169,16 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             #[cfg(not(feature = "query_stats"))]
             ("query_stats", _) => "not built".to_string(),
             ("vacuum", "enabled") => "per table".to_string(),
+            ("index_snapshot", "idle_checkpoint_secs") => {
+                crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
+            }
+            ("index_snapshot", "seal_timeout_ms") => {
+                crate::core::index_store::seal::settings::seal_timeout().as_millis().to_string()
+            }
+            ("index_snapshot", "shutdown_deadline_secs") => {
+                crate::core::index_store::seal::settings::shutdown_deadline().as_secs().to_string()
+            }
+            ("index_snapshot", "writeback_mb") => crate::core::index_store::seal::settings::writeback_mb().to_string(),
             _ => String::new(),
         }
     };
@@ -2290,6 +2328,22 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 }
                 _ => Err(format!("`{}` has no live setter", key)),
             }
+        }
+        "index_snapshot" => {
+            use crate::core::index_store::seal::settings;
+            let n: u64 = value
+                .trim()
+                .trim_matches('\'')
+                .parse()
+                .map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
+            match name {
+                "idle_checkpoint_secs" => settings::set_idle_checkpoint_secs(n),
+                "seal_timeout_ms" => settings::set_seal_timeout_ms(n),
+                "shutdown_deadline_secs" => settings::set_shutdown_deadline_secs(n),
+                "writeback_mb" => settings::set_writeback_mb(n),
+                _ => return Err(format!("`{}` has no live setter", key)),
+            }
+            Ok(format!("{key} is now {n}"))
         }
         "vacuum" => {
             let enabled = parse_bool(value)?;

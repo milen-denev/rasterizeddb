@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod incompat;
+pub mod index_checkpoint;
 #[cfg(test)]
 mod incarnation_tests;
 #[cfg(test)]
@@ -2383,6 +2384,28 @@ impl Database {
             return Err(e);
         }
 
+        // The file set's index-store pair and its write gate go with it
+        // (docs/persistent-indexes.md §2 P6, §6; B13): the pair copied
+        // under the new stem like the rest, and the word carried, with the
+        // family's ACCESS EXCLUSIVE ticket still counted on it, so the
+        // renamed table opens with it rather than a fresh one. Held to the
+        // end of the rename, so the open below finds it.
+        let to_dir = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name)
+            .await
+            .index_store_dir();
+        let _carried = match &table {
+            Some(t) => match carry_index_store(t, to_dir, new_name).await {
+                Ok(carried) => carried,
+                Err(e) => {
+                    self.abandon_copy(old_name, new_name).await;
+                    self.reopen_fresh(old_name).await;
+                    error!("Rename of {} to {}: the index-store files could not be carried: {}", old_name, new_name, e);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         if let Err(e) = self.rewrite_schema_name(new_name).await {
             self.abandon_copy(old_name, new_name).await;
             if table.is_some() {
@@ -2869,6 +2892,34 @@ impl Database {
                 );
                 return Err(e);
             }
+        };
+
+        // The index-store pair and the write gate go with the files when the
+        // destination is a directory (B13): see `rename_table`. Into
+        // memory or a key/value store the table has no snapshot (P33), and
+        // opens with a detached word.
+        let _carried = match &table {
+            Some(t) => match carry_index_store(t, to.index_store_dir(), table_name).await {
+                Ok(carried) => carried,
+                Err(e) => {
+                    discard_files(
+                        &Arc::new(to.without_backups()),
+                        &self.storage,
+                        self.location.as_deref(),
+                        table_name,
+                    )
+                    .await;
+                    self.reopen_fresh(table_name).await;
+                    error!(
+                        "Could not move {} to {}: the index-store files could not be carried: {}",
+                        table_name,
+                        destination.as_spec(),
+                        e
+                    );
+                    return Err(e);
+                }
+            },
+            None => None,
         };
 
         // The flip. Everything before it is reversible by deleting copies;
@@ -4463,13 +4514,36 @@ async fn sweep_files_durably(
     }
 }
 
+/// Copies `table`'s index-store pair to the stem `stem` in `to_dir` and
+/// carries its write gate there (B13; `FileGate::carry_to`), under the
+/// file set's maintenance lock, so no seal writes either file meanwhile.
+/// `None` when either side has no directory: nothing is carried, and the
+/// target opens its own word.
+async fn carry_index_store(
+    table: &Table<DbStorageProvider>,
+    to_dir: Option<std::path::PathBuf>,
+    stem: &str,
+) -> io::Result<Option<StdArc<crate::core::index_store::file_gate::FileGate>>> {
+    let gate = table.gate().clone();
+    let Some(to_dir) = to_dir else {
+        return Ok(None);
+    };
+    if !gate.has_files() {
+        return Ok(None);
+    }
+    let _maintenance = gate.maintenance().lock().await;
+    crate::core::index_store::file_gate::copy_files(&gate, &to_dir, stem)?;
+    Ok(gate.carry_to(to_dir, stem))
+}
+
 /// Deletes every file derived from `name`, the log left as it is.
 ///
 /// The index-store files of the stem go too (`.ixm`, `.ixs` and their
 /// `.tmp`s; docs/persistent-indexes.md §1): a DROP's, and a RENAME's or a
-/// MOVE's source, which opens under its new name with a fresh word (B11).
-/// Left behind, a log ending `CLEAN` would vouch for a snapshot of rows
-/// that a rename back to this name brings home changed.
+/// MOVE's source, whose pair and word were carried to the target first
+/// (B13, `carry_index_store`). Left behind, a log ending `CLEAN` would
+/// vouch for a snapshot of rows that a rename back to this name brings home
+/// changed.
 async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
     for suffix in RENAMED_SUFFIXES {
         let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;

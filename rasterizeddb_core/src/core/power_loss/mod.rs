@@ -145,4 +145,10 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `index_store::file_gate`: `rdb.ixe` written in place in a directory
     // with no log.
     ("index_store.epoch", true),
+    // `index_store::seal`: `.ixs.tmp`, fdatasynced before it is renamed
+    // over `.ixs` and the directory synced.
+    ("index_store.snapshot", true),
+    // `index_store::file_gate::copy_files`: a RENAME's or MOVE's copy of
+    // `.ixm` and `.ixs` under the target's stem, then a directory sync.
+    ("index_store.carry", true),
 ];

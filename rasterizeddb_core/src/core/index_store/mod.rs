@@ -21,6 +21,10 @@
 //! Slice B12 adds [`gated_io`]: the provider backstop, every write of a
 //! table's providers registered on its word (§2 layer 2), and the allowlist
 //! of writes that are not.
+//!
+//! Slice B13 adds [`seal`]: seal and publish of FILTER-only snapshots at a
+//! clean point (shutdown, `rdb_index_checkpoint`, the idle checkpoint), and
+//! the gate word carried across RENAME and MOVE ([`file_gate::FileGate::carry_to`]).
 
 pub mod census;
 pub mod codec;
@@ -31,6 +35,7 @@ pub mod gated_io;
 pub mod gate_word;
 pub mod identity;
 pub mod marker;
+pub mod seal;
 pub mod snapshot;
 
 #[cfg(test)]

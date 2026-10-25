@@ -1216,6 +1216,8 @@ fn main() -> std::io::Result<()> {
                     eprintln!("{e}");
                     std::process::exit(2);
                 }
+                // The shutdown clean point (docs/persistent-indexes.md §3).
+                rasterizeddb_core::shutdown::seal_all(&catalog).await;
             }
             Protocol::Pgwire => {
                 // Run a PostgreSQL-wire-compatible server.
@@ -1285,6 +1287,7 @@ fn main() -> std::io::Result<()> {
                 // accept is retried rather than returned. That used to be
                 // discarded here, and the process exited 0 having served
                 // nothing, which a supervisor reads as a clean stop.
+                let sealing = catalog.clone();
                 if let Err(e) = rasterizeddb_core::pgwire::start_pgwire_with_limits(
                     catalog,
                     &args.pg_addr,
@@ -1300,6 +1303,9 @@ fn main() -> std::io::Result<()> {
                     rasterizeddb_core::shutdown::finalize();
                     std::process::exit(2);
                 }
+                // The listener has drained and ended its sessions: the
+                // shutdown clean point (docs/persistent-indexes.md §3).
+                rasterizeddb_core::shutdown::seal_all(&sealing).await;
             }
         }
 

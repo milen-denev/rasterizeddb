@@ -47,7 +47,9 @@ const MAGIC: &[u8; 8] = b"RDBFLT01";
 // count. A v4 file has none, so it reads exactly as before and is accepted —
 // an upgrade costs nothing. A v4 reader refuses a v5 file by its version and
 // rebuilds, which is the safe direction.
-pub(super) const FORMAT_VER: u16 = 5;
+/// `pub` since B13: a snapshot's identity records it
+/// (`index_store::identity::VersionTuple::filter_format_ver`).
+pub const FORMAT_VER: u16 = 5;
 /// The oldest version this reader accepts unchanged.
 pub(super) const OLDEST_READABLE_VER: u16 = 4;
 
@@ -230,6 +232,29 @@ fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: 
 /// Serialize the whole catalog. Columns are written in the caller's order and
 /// validated against the live schema on load.
 pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec<u8> {
+    serialize_with(columns, seed, n_slots, ColumnFilter::persistable_valid_upto)
+}
+
+/// [`serialize`] for a snapshot's FILTER section, taken under a seal
+/// (docs/persistent-indexes.md §5, "The frontier"): each column's frontier
+/// is recorded as it stands (`valid_upto`), not dragged back to the first
+/// slot modified since the last `_flt.db` checkpoint. Under the seal no
+/// ticket is held, so memory equals the data the snapshot's identity
+/// describes, and `dirty_min` (which only the runtime checkpoint resets)
+/// says nothing about it; reused as it is, every snapshot would record the
+/// frontier at the first such slot and every clean reopen would backfill
+/// from there. Same layout as [`serialize`], so the base image `deserialize`
+/// reads.
+pub fn serialize_sealed(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec<u8> {
+    serialize_with(columns, seed, n_slots, ColumnFilter::valid_upto)
+}
+
+fn serialize_with(
+    columns: &[&ColumnFilter],
+    seed: HashSeed,
+    n_slots: u64,
+    frontier: fn(&ColumnFilter) -> u64,
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_superblock(&mut w, seed, columns.len() as u16, n_slots);
 
@@ -239,8 +264,10 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
         w.u8(col.current_f());
         w.u16(0);
         // The persisted frontier is the *effective* one: a slot modified since
-        // the last checkpoint drags it back so the stale region is never trusted.
-        w.u64(col.persistable_valid_upto());
+        // the last checkpoint drags it back so the stale region is never trusted
+        // (`serialize`); a sealed snapshot's is the frontier as it stands
+        // (`serialize_sealed`).
+        w.u64(frontier(col));
         // And the prefix below it that was never indexed at all, which is a
         // separate fact: a table opened with `backfill_on_open = off` has one
         // for its whole life, and a checkpoint that forgot to say so would come

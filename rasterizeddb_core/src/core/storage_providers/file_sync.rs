@@ -612,10 +612,20 @@ pub(crate) mod failed_appends {
         insert(Key::File(file.to_string(), STAGED), error);
     }
 
-    /// Records a gate failure on a write with no transaction in `location`:
-    /// the next commit of any file in the directory reports it.
-    pub(crate) fn record_gate(location: &str, error: io::Error) {
-        insert(Key::Dir(crate::core::wal::dir_key(location), GATE), error);
+    /// Records a gate failure on a write of `file` with no transaction in
+    /// `location`: the next commit of any file in the directory reports it.
+    /// That commit may be another table's statement, so the error names the
+    /// file whose write was skipped, and says so: otherwise an operator reads
+    /// the failure as the committing table's.
+    pub(crate) fn record_gate(location: &str, file: &str, error: io::Error) {
+        let named = io::Error::new(
+            error.kind(),
+            format!(
+                "a write to {file} outside any transaction was skipped (reported by the next commit in its \
+                 directory, whichever table that is): {error}"
+            ),
+        );
+        insert(Key::Dir(crate::core::wal::dir_key(location), GATE), named);
     }
 
     /// The failure a commit of `token` through `file` in `location` must
@@ -655,6 +665,21 @@ pub(crate) mod failed_appends {
                 })
                 .count()
         })
+    }
+
+    /// The directory-wide gate record names the file whose write was
+    /// skipped, so a commit of another table that reports it does not read as
+    /// that table's failure.
+    #[test]
+    fn a_gate_failure_reported_by_another_file_names_the_skipped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_string_lossy().into_owned();
+        record_gate(&location, "orders_pointers.db", io::Error::other("DIRTY could not be made durable"));
+        let reported = take(&location, "customers_pointers.db", 0).expect("the next commit in the directory reports it");
+        let text = reported.to_string();
+        assert!(text.contains("orders_pointers.db"), "{text}");
+        assert!(text.contains("DIRTY could not be made durable"), "{text}");
+        assert!(take(&location, "customers_pointers.db", 0).is_none(), "reported twice");
     }
 
     /// Forgets what `token`'s transaction recorded: it is being aborted, so
@@ -2620,6 +2645,10 @@ impl StorageIO for LocalStorageProvider {
         policy: crate::core::index_store::gated_io::Policy,
     ) {
         self.commit.gated.attach(gate, policy);
+    }
+
+    async fn land_staged(&self) -> io::Result<()> {
+        self.land_staged_durably().await
     }
 }
 

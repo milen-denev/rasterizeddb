@@ -93,6 +93,10 @@ impl GateFiles {
     fn ixs(&self) -> PathBuf {
         self.dir.join(format!("{}.ixs", self.stem))
     }
+
+    fn ixs_tmp(&self) -> PathBuf {
+        self.dir.join(format!("{}.ixs.tmp", self.stem))
+    }
 }
 
 /// A file set's gate. Shared by its map slot, every instance of the table,
@@ -107,6 +111,16 @@ pub struct FileGate {
     /// Whether `slot_epoch` is the recovered record's. False when `rdb.ixe`
     /// could not be read or decoded: no snapshot can then prove its epoch.
     epoch_proven: AtomicBool,
+    /// The maintenance lock (§3, P15): held by a seal for its whole run, and
+    /// waited for by another seal, by retirement (§7 step 2) and by a
+    /// RENAME's or MOVE's carry of the file set. No writer path takes it.
+    maintenance: tokio::sync::Mutex<()>,
+    /// Whether the `CLEAN` the log ends in describes the in-memory
+    /// structures of this process: set by a publish (B13), and by B14's load.
+    /// A word that is `Clean` and vouched has nothing a seal could add; one
+    /// that is `Clean` without it (a log a previous run wrote, which this
+    /// open did not load) is rewritten at the next clean point (§3 rule 2).
+    vouched: AtomicBool,
     /// Test-only: `GatedIo` judges this word's writes as a release build
     /// does (the slow path inline, `CANCEL` on a ticketless seal) instead of
     /// panicking, so tests can exercise production's verdicts (B12).
@@ -143,7 +157,7 @@ struct Registry {
 
 /// Runs blocking file I/O from async code without stalling a runtime worker
 /// where the runtime can spare one.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(super) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
@@ -152,7 +166,7 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
 
 /// A named failpoint (`core::power_loss::failpoint`); nothing outside tests.
 #[inline]
-fn failpoint(name: &str, path: &Path) -> io::Result<()> {
+pub(super) fn failpoint(name: &str, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
         crate::core::power_loss::failpoint::hit(name, path)
@@ -166,7 +180,7 @@ fn failpoint(name: &str, path: &Path) -> io::Result<()> {
 
 /// Announces a directory operation to the crash-image recorder.
 #[inline]
-fn dir_op(op: DirOp<'_>) {
+pub(super) fn dir_op(op: DirOp<'_>) {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(match op {
         DirOp::Create(p) => crate::core::sync_audit::DirOp::Create(p),
@@ -179,7 +193,7 @@ fn dir_op(op: DirOp<'_>) {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(test), allow(dead_code))]
-enum DirOp<'a> {
+pub(super) enum DirOp<'a> {
     Create(&'a Path),
     Rename { from: &'a Path, to: &'a Path },
     Unlink(&'a Path),
@@ -259,6 +273,8 @@ impl FileGate {
             files: None,
             slot_epoch: AtomicU64::new(0),
             epoch_proven: AtomicBool::new(false),
+            maintenance: tokio::sync::Mutex::const_new(()),
+            vouched: AtomicBool::new(false),
             #[cfg(test)]
             release_verdicts: AtomicBool::new(false),
             #[cfg(test)]
@@ -298,6 +314,8 @@ impl FileGate {
             files: Some(files.clone()),
             slot_epoch: AtomicU64::new(epoch),
             epoch_proven: AtomicBool::new(proven),
+            maintenance: tokio::sync::Mutex::const_new(()),
+            vouched: AtomicBool::new(false),
             #[cfg(test)]
             release_verdicts: AtomicBool::new(false),
             #[cfg(test)]
@@ -406,6 +424,7 @@ impl FileGate {
         let mut log = marker::new_log(files.incarnation);
         log.extend_from_slice(&marker::encode_record(1, &marker::MarkerRecord::Clean(dummy_clean(files.incarnation))));
         write_durably(&files.ixm(), &log);
+        self.set_vouched(false);
         self.word.force_state_for_tests(GateState::Clean);
     }
 
@@ -446,6 +465,159 @@ impl FileGate {
     pub fn dir(&self) -> Option<&Path> {
         self.files.as_ref().map(|f| f.dir.as_path())
     }
+    /// The file set's stem, for a file set that has one.
+    pub fn stem(&self) -> Option<&str> {
+        self.files.as_ref().map(|f| f.stem.as_str())
+    }
+
+    /// The incarnation the file set was opened at (0 for a detached word).
+    pub fn incarnation(&self) -> u128 {
+        self.files.as_ref().map_or(0, |f| f.incarnation)
+    }
+
+    /// `.ixs.tmp`, for a file set that has one.
+    pub fn ixs_tmp_path(&self) -> Option<PathBuf> {
+        self.files.as_ref().map(GateFiles::ixs_tmp)
+    }
+
+    /// `.ixm.tmp`, for a file set that has one.
+    pub fn ixm_tmp_path(&self) -> Option<PathBuf> {
+        self.files.as_ref().map(GateFiles::ixm_tmp)
+    }
+
+    /// The maintenance lock (§3, P15). See the field.
+    pub fn maintenance(&self) -> &tokio::sync::Mutex<()> {
+        &self.maintenance
+    }
+
+    /// Whether the `CLEAN` the log ends in describes this process's
+    /// structures (a publish of this process, or B14's load).
+    pub fn vouched(&self) -> bool {
+        self.vouched.load(Ordering::Acquire)
+    }
+
+    /// Records that a publish (or a load) made the log's `CLEAN` describe
+    /// this process's structures.
+    pub(crate) fn set_vouched(&self, on: bool) {
+        self.vouched.store(on, Ordering::Release);
+    }
+
+    /// The word of this file set, carried to the stem `stem` in `dir`: what
+    /// RENAME and MOVE do with the gate (§2 P6, §6; B11 deviation 2, built
+    /// in B13). The new file set shares this one's word, so its state, its
+    /// flags and its count (the caller family's ACCESS EXCLUSIVE ticket
+    /// among them, which the target's seals then wait for until the
+    /// outcome is final, N26) move with it. The incarnation moves too: a
+    /// RENAME or MOVE keeps `_schema.db`'s. Registered under the new key,
+    /// replacing whatever was there, so the target's open
+    /// ([`FileGate::open`]) finds it while the caller holds the returned
+    /// gate. Within one directory the slot epoch moves as it is; into
+    /// another it is that directory's recovered `rdb.ixe` record, which is
+    /// what a snapshot there must match. Not vouched: the target's open
+    /// rebuilds its structures rather than loading the snapshot (§3 rule 2).
+    ///
+    /// The caller copies `.ixm` and `.ixs` with [`copy_files`] first, under
+    /// the maintenance lock. A word with no files carries nothing: the
+    /// target opens its own.
+    pub fn carry_to(&self, dir: PathBuf, stem: &str) -> Option<Arc<FileGate>> {
+        let from = self.files.as_ref()?;
+        let files = GateFiles {
+            dir,
+            stem: stem.to_string(),
+            incarnation: from.incarnation,
+            pid: pid_of_stem(stem),
+        };
+        let (epoch, proven) = if files.dir == from.dir {
+            (self.slot_epoch(), self.epoch_proven())
+        } else {
+            epoch_at_open(&files)
+        };
+        let gate = Arc::new(FileGate {
+            word: self.word.clone(),
+            files: Some(files.clone()),
+            slot_epoch: AtomicU64::new(epoch),
+            epoch_proven: AtomicBool::new(proven),
+            maintenance: tokio::sync::Mutex::const_new(()),
+            vouched: AtomicBool::new(false),
+            #[cfg(test)]
+            release_verdicts: AtomicBool::new(self.release_verdicts.load(Ordering::Acquire)),
+            #[cfg(test)]
+            fail_slow_path: AtomicBool::new(false),
+        });
+        GATES
+            .lock()
+            .map
+            .get_or_insert_with(HashMap::new)
+            .insert(files, Arc::downgrade(&gate));
+        Some(gate)
+    }
+}
+
+/// Copies the index-store pair of `from` (its `.ixm` and `.ixs`) to the stem
+/// `to_stem` in `to_dir`, each made durable, then the target directory: a
+/// RENAME's or MOVE's carry (B13), before its commit point, so the
+/// recovery of a rename that did not commit sweeps the copies with the rest
+/// of the target's files. A file the source lacks is removed at the target,
+/// so a leftover there never pairs with the carried one; the target's
+/// `.tmp`s go too. The caller holds `from`'s maintenance lock, so no seal is
+/// writing either file meanwhile.
+pub fn copy_files(from: &FileGate, to_dir: &Path, to_stem: &str) -> io::Result<()> {
+    use std::io::Write;
+    let Some(files) = from.files.as_ref() else {
+        return Ok(());
+    };
+    let mut last = None;
+    for (src, ext) in [(files.ixm(), ".ixm"), (files.ixs(), ".ixs")] {
+        let dst = to_dir.join(format!("{to_stem}{ext}"));
+        if src == dst {
+            continue;
+        }
+        let tmp = to_dir.join(format!("{to_stem}{ext}.tmp"));
+        if tmp.exists() {
+            dir_op(DirOp::Unlink(&tmp));
+            let _ = std::fs::remove_file(&tmp);
+        }
+        match std::fs::read(&src) {
+            Ok(bytes) => {
+                dir_op(DirOp::Create(&dst));
+                let mut f = std::fs::File::create(&dst)?;
+                f.write_all(&bytes)?;
+                crate::core::sync_audit::note("index_store.carry", &dst);
+                f.sync_data()?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::remove_file(&dst) {
+                Ok(()) => dir_op(DirOp::Unlink(&dst)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+        last = Some(dst);
+    }
+    match last {
+        Some(dst) => crate::core::wal::sync_parent_dir(&dst),
+        None => Ok(()),
+    }
+}
+
+/// Sets `INDEX_STORE_V1` in `dir`, and in the database's root when that is
+/// another directory (a storage pool's): the root is the one directory
+/// `incompat::check` reads at open (B11 deviation 4, fixed in B13). Called
+/// before the first `.ixm` of a directory is created.
+pub fn require_v1(dir: &Path, root: Option<&Path>) -> io::Result<()> {
+    #[cfg(feature = "persistent_indexes")]
+    {
+        use crate::core::database::incompat::{INDEX_STORE_V1, require};
+        require(dir, INDEX_STORE_V1)?;
+        if let Some(root) = root
+            && root != dir
+        {
+            require(root, INDEX_STORE_V1)?;
+        }
+    }
+    #[cfg(not(feature = "persistent_indexes"))]
+    let _ = (dir, root);
+    Ok(())
 }
 
 /// Test-only: the live word of the file set `file` (a file name in `dir`)
@@ -631,6 +803,9 @@ fn unlink_snapshot(files: &GateFiles) -> io::Result<()> {
     crate::core::wal::sync_parent_dir(&ixs)
 }
 
+/// Every index-store file a stem has (§1).
+pub const INDEX_STORE_SUFFIXES: [&str; 4] = [".ixm", ".ixm.tmp", ".ixs", ".ixs.tmp"];
+
 /// Unlinks the index-store files of the stem `stem` in `dir` (`.ixm`, `.ixs`
 /// and their `.tmp`s), the directory sync left to the caller's sweep: what a
 /// DROP, and a RENAME's or MOVE's source, leaves of the file set. Failures
@@ -638,7 +813,7 @@ fn unlink_snapshot(files: &GateFiles) -> io::Result<()> {
 /// the name, unless the same table comes back to it, which is why it is
 /// removed here.
 pub fn remove_files(dir: &Path, stem: &str) {
-    for suffix in [".ixm", ".ixm.tmp", ".ixs", ".ixs.tmp"] {
+    for suffix in INDEX_STORE_SUFFIXES {
         let path = dir.join(format!("{stem}{suffix}"));
         if !path.exists() {
             continue;

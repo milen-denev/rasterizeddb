@@ -446,6 +446,10 @@ async fn serve_pgwire(
         shutdown_tx.send_replace(true);
     });
 
+    // Raised once the drain grace has passed: every session still open
+    // ends at its next idle read (`end_remaining_sessions`).
+    let (ending_tx, ending_rx) = tokio::sync::watch::channel(false);
+
     // Sessions admitted, against `max_connections`.
     let active = StdArc::new(AtomicUsize::new(0));
     // Connections over the cap that are still being told so. They need their
@@ -578,7 +582,8 @@ async fn serve_pgwire(
         let acceptor = acceptor.clone();
         let auth = auth.clone();
 
-        tokio::spawn(async move {
+        let ending = ending_rx.clone();
+        tokio::spawn(SESSIONS_END.scope(ending, async move {
             let context = ConnectionContext {
                 too_many: matches!(admission, Admission::TooMany(_)),
                 handshake_finished: StdArc::new(AtomicBool::new(false)),
@@ -591,10 +596,11 @@ async fn serve_pgwire(
             }
             // Released here at the latest; on a panic, by the unwind.
             drop(admission);
-        });
+        }));
     }
 
     drain_pgwire_connections(&active).await;
+    end_remaining_sessions(&active, &ending_tx).await;
 
     Ok(())
 }
@@ -669,6 +675,41 @@ async fn drain_pgwire_connections(active: &AtomicUsize) {
         }
 
         tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+tokio::task_local! {
+    /// The server's "end every session" signal, in each connection task
+    /// (§3 Shutdown, RV17): per server, so a test process running several
+    /// servers ends only the stopping one's sessions.
+    static SESSIONS_END: tokio::sync::watch::Receiver<bool>;
+}
+
+/// After the drain grace (docs/persistent-indexes.md §3 Shutdown, RV17):
+/// the sessions still open are ended, each at its next idle read, with
+/// 57P01 and its open block rolled back, releasing its tickets before
+/// shutdown seals anything. A statement running is not interrupted: it
+/// ends first (a commit path is never cut after its `commit()`), and the
+/// wait for that is bounded too.
+async fn end_remaining_sessions(active: &AtomicUsize, ending: &tokio::sync::watch::Sender<bool>) {
+    const END_GRACE: Duration = Duration::from_secs(5);
+    if active.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    log::info!(
+        "Ending {} remaining pgwire session(s) before the shutdown seals",
+        active.load(Ordering::Relaxed)
+    );
+    ending.send_replace(true);
+    let deadline = tokio::time::Instant::now() + END_GRACE;
+    while active.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if active.load(Ordering::Relaxed) > 0 {
+        log::warn!(
+            "{} pgwire session(s) were still running a statement when the shutdown seals began",
+            active.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -1723,6 +1764,9 @@ where
     // is read.
     let mut pending: std::collections::VecDeque<(u8, Vec<u8>)> = std::collections::VecDeque::new();
 
+    // The server's shutdown signal, when this session runs under one.
+    let mut ending = SESSIONS_END.try_with(|rx| rx.clone()).ok();
+
     loop {
         let (tag, payload) = match pending.pop_front() {
             Some((tag, payload)) => ([tag], payload),
@@ -1738,13 +1782,47 @@ where
                 // completed has consumed nothing, so a message arriving as the timer
                 // fires is not torn.
                 let idle = if ready { state.idle_limit() } else { None };
-                let read = match idle {
-                    None => stream.read_exact(&mut tag).await,
-                    Some((limit, kind)) => {
-                        match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
-                            Ok(read) => read,
-                            Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+                // Shutdown ends an idle session here, between statements, and
+                // only here (§3 Shutdown): never mid-batch, never mid-statement.
+                let wake = {
+                    let read = async {
+                        match idle {
+                            None => Wake::Read(stream.read_exact(&mut tag).await),
+                            Some((limit, kind)) => {
+                                match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
+                                    Ok(read) => Wake::Read(read),
+                                    Err(_) => Wake::Idle(kind),
+                                }
+                            }
                         }
+                    };
+                    let end = async {
+                        if let Some(rx) = ending.as_mut().filter(|_| ready)
+                            && rx.wait_for(|end| *end).await.is_ok()
+                        {
+                            return Wake::Ending;
+                        }
+                        // No signal, or its sender gone: only a read wakes.
+                        std::future::pending().await
+                    };
+                    tokio::select! {
+                        biased;
+                        w = end => w,
+                        w = read => w,
+                    }
+                };
+                let read = match wake {
+                    Wake::Read(read) => read,
+                    Wake::Idle(kind) => return terminate_idle_session(database, state, stream, kind).await,
+                    Wake::Ending => {
+                        return terminate_session(
+                            database,
+                            state,
+                            stream,
+                            "57P01",
+                            "terminating connection due to administrator command",
+                        )
+                        .await;
                     }
                 };
                 match read {
@@ -1898,6 +1976,29 @@ where
         ),
         IdleKind::Session => ("57P05", "terminating connection due to idle-session timeout"),
     };
+    terminate_session(database, state, stream, sqlstate, message).await
+}
+
+/// What a read between statements woke for.
+enum Wake {
+    Read(io::Result<usize>),
+    Idle(IdleKind),
+    /// The server is shutting down (`end_remaining_sessions`).
+    Ending,
+}
+
+/// Ends the session with a FATAL `sqlstate`, its open block rolled back
+/// first: an idle timeout's, or shutdown's 57P01.
+async fn terminate_session<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    sqlstate: &str,
+    message: &str,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     if let Some(t) = state.transaction.take() {
         log::info!("{}; rolling back transaction {}", message, t.id);
         state.end_block_settings(&t);
@@ -4059,6 +4160,10 @@ async fn describe_resolved(
             || lower.starts_with("show ")
             || lower.starts_with("reset "))
             || recognize_query_purpose(stmt).is_none() && parse_database_statement(stmt).is_none();
+        // Answered above the engine with one row (B13).
+        if parse_index_checkpoint(stmt).is_some() {
+            return Ok(Some((vec![("rdb_index_checkpoint".to_string(), DbType::STRING)], true)));
+        }
         if builtin {
             if lower == "select 1" || lower == "select 1::int" {
                 return Ok(Some((vec![("?column?".to_string(), DbType::I32)], true)));
@@ -5837,6 +5942,12 @@ where
             .await?;
             return Ok(());
         }
+    }
+
+    // `SELECT rdb_index_checkpoint('t')` (docs/persistent-indexes.md §3, a
+    // clean point; B13): answered above the engine, with its row.
+    if let Some(name) = parse_index_checkpoint(stmt) {
+        return run_index_checkpoint(database, state, stream, name, omit_description).await;
     }
 
     if handle_builtin_query(state, stream, stmt, omit_description).await? {
@@ -8003,6 +8114,86 @@ where
     }
 
     Ok(false)
+}
+
+/// The relation `SELECT rdb_index_checkpoint('t')` (or `'t'::regclass`)
+/// names, as a `Result` so a malformed argument is an error rather than a
+/// statement the engine misreads; `None` for any other statement. A
+/// function, not grammar (§3: new grammar has repeatedly mis-parsed here).
+fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
+    let s = stmt.trim().trim_end_matches(';').trim_end();
+    let head = "select rdb_index_checkpoint(";
+    if !s.get(..head.len()).is_some_and(|h| h.eq_ignore_ascii_case(head)) || !s.ends_with(')') {
+        return None;
+    }
+    let arg = s[head.len()..s.len() - 1].trim();
+    let arg = match arg.len().checked_sub("::regclass".len()) {
+        Some(at) if arg.is_char_boundary(at) && arg[at..].eq_ignore_ascii_case("::regclass") => arg[..at].trim_end(),
+        _ => arg,
+    };
+    let name = if let Some(inner) = arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')) {
+        inner.replace("''", "'")
+    } else {
+        return Some(Err(format!(
+            "rdb_index_checkpoint takes a table name as a string literal, as in \
+             rdb_index_checkpoint('t'), not {arg}"
+        )));
+    };
+    // A quoted identifier inside the literal, as `regclass` input allows.
+    let name = match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => name,
+    };
+    Some(Ok(name))
+}
+
+/// `rdb_index_checkpoint(t)`: a mandatory seal of `t`'s file set, or of
+/// every materialized partition of a partitioned `t` (B13). Superuser only:
+/// a mandatory seal stalls the table's writers for its run. One row, a
+/// summary; a notice for each file set not left clean, and for each this
+/// transaction has written (§3: it would otherwise wait `seal_timeout` on
+/// its own ticket).
+async fn run_index_checkpoint<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    name: Result<String, String>,
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !state.principal.may_administer() {
+        return fail_statement(state, stream, "42501", "permission denied: rdb_index_checkpoint requires superuser").await;
+    }
+    let name = match name {
+        Ok(name) => name,
+        Err(e) => return fail_statement(state, stream, "22023", &e).await,
+    };
+    let block = state.transaction.as_ref().map(|t| t.id);
+    let report = match database.index_checkpoint(&name, block).await {
+        Ok(report) => report,
+        Err(e) if e.contains("does not exist") => return fail_statement(state, stream, "42P01", &e).await,
+        Err(e) => return fail_statement(state, stream, "XX000", &e).await,
+    };
+    for own in &report.own_writes {
+        send_notice(
+            stream,
+            "01000",
+            &format!("{own} was not checkpointed: this transaction has written it; run rdb_index_checkpoint after it ends"),
+        )
+        .await?;
+    }
+    for sealed in report.sealed.iter().filter(|s| !s.outcome.is_clean()) {
+        send_notice(stream, "01000", &format!("{}: {}", sealed.name, sealed.outcome.describe())).await?;
+    }
+    let (clean, of) = report.clean();
+    if !omit_description {
+        send_row_description(stream, &[("rdb_index_checkpoint", DbType::STRING)], &[]).await?;
+    }
+    let summary = format!("{clean} of {of} clean");
+    send_data_row(stream, &[Some(summary.as_bytes())]).await?;
+    send_command_complete(stream, "SELECT 1").await
 }
 
 /// The value of a run-time parameter as `SHOW` reports it, or `None` for one
@@ -11288,5 +11479,122 @@ mod cross_dir_commit_order_tests {
         drop(db);
         crate::core::wal::remove_for(&root_s);
         crate::core::wal::remove_for(&disk_s);
+    }
+}
+
+/// The wire side of the index store's clean points (slice B13):
+/// `rdb_index_checkpoint` parsed and described, and shutdown ending a
+/// session that sits idle inside a block that wrote.
+#[cfg(test)]
+mod index_store_wire_tests {
+    use super::*;
+
+    #[test]
+    fn rdb_index_checkpoint_parses_its_one_argument() {
+        let ok = |s: &str| parse_index_checkpoint(s).map(|r| r.unwrap());
+        assert_eq!(ok("SELECT rdb_index_checkpoint('t')"), Some("t".to_string()));
+        assert_eq!(ok("select RDB_INDEX_CHECKPOINT( 'a.b'::regclass );"), Some("a.b".to_string()));
+        assert_eq!(ok("SELECT rdb_index_checkpoint('\"Mixed\"')"), Some("Mixed".to_string()));
+        assert_eq!(ok("SELECT rdb_index_checkpoint('it''s')"), Some("it's".to_string()));
+        assert!(matches!(parse_index_checkpoint("SELECT rdb_index_checkpoint(t)"), Some(Err(_))));
+        assert_eq!(parse_index_checkpoint("SELECT rdb_index_checkpoints('t')"), None);
+        assert_eq!(parse_index_checkpoint("SELECT 1"), None);
+        assert_eq!(parse_index_checkpoint("SELECT é"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rdb_index_checkpoint_describes_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::try_new_named(&dir.path().to_string_lossy(), false, "pg_ckpt_describe").await.unwrap());
+        let (fields, is_select) = describe_query(&db, "SELECT rdb_index_checkpoint('t')")
+            .await
+            .unwrap()
+            .expect("described as returning no columns");
+        assert!(is_select);
+        assert_eq!(fields, vec![("rdb_index_checkpoint".to_string(), DbType::STRING)]);
+        drop(db);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
+    async fn send_query<S: AsyncWrite + Unpin>(client: &mut S, sql: &str) {
+        let mut frame = vec![b'Q'];
+        frame.extend_from_slice(&((4 + sql.len() + 1) as i32).to_be_bytes());
+        frame.extend_from_slice(sql.as_bytes());
+        frame.push(0);
+        client.write_all(&frame).await.unwrap();
+    }
+
+    /// Frames up to and including the next `ReadyForQuery`, or to the end
+    /// of the stream: `(tag, payload)`.
+    async fn frames<S: AsyncRead + Unpin>(client: &mut S) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        loop {
+            let mut head = [0u8; 5];
+            if client.read_exact(&mut head).await.is_err() {
+                return out;
+            }
+            let len = i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len - 4];
+            client.read_exact(&mut payload).await.unwrap();
+            let done = head[0] == b'Z';
+            out.push((head[0], payload));
+            if done {
+                return out;
+            }
+        }
+    }
+
+    /// §3 Shutdown (RV17): once the server ends its sessions, one sitting
+    /// idle in a block that wrote a table is ended with 57P01 and its block
+    /// rolled back, so its ticket is given back and the table's mandatory
+    /// seal publishes instead of waiting `seal_timeout` for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_ends_an_idle_in_transaction_session_and_frees_its_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::try_new_named(&dir.path().to_string_lossy(), false, "pg_shutdown").await.unwrap());
+        let catalog = DatabaseCatalog::single(db.clone());
+        let auth = AuthConfig {
+            method: crate::auth::AuthMethod::Trust,
+            ..AuthConfig::default()
+        };
+        let principal = Principal {
+            name: "rasterized".to_string(),
+            superuser: false,
+            authenticated: false,
+        };
+        let (end_tx, end_rx) = tokio::sync::watch::channel(false);
+        let (mut server, mut client) = tokio::io::duplex(1 << 20);
+        let session_db = db.clone();
+        let session = tokio::spawn(SESSIONS_END.scope(end_rx, async move {
+            let mut state = SessionState::new(catalog, session_db.name.clone(), auth, principal, ConnectionLimits::default());
+            run_message_loop_inner(&session_db, &mut state, &mut server).await
+        }));
+        for sql in [
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)",
+            "BEGIN",
+            "INSERT INTO t (id, v) VALUES (1, 1)",
+        ] {
+            send_query(&mut client, sql).await;
+            let got = frames(&mut client).await;
+            assert!(!got.iter().any(|(tag, _)| *tag == b'E'), "{sql} failed: {got:?}");
+        }
+        let t = db.table_for_tests("t").unwrap();
+        assert!(t.gate().word().load().count() > 0, "the block holds no ticket on t");
+        end_tx.send_replace(true);
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "an idle-in-transaction session outlived the shutdown signal");
+        let fatal = frames(&mut client).await;
+        assert!(
+            fatal.iter().any(|(tag, p)| *tag == b'E' && String::from_utf8_lossy(p).contains("57P01")),
+            "no 57P01: {fatal:?}"
+        );
+        assert_eq!(t.gate().word().load().count(), 0, "the ended block's ticket is still held");
+        let started = std::time::Instant::now();
+        let outcome = t.seal_snapshot(crate::core::index_store::gate_word::SealKind::Mandatory).await;
+        assert!(outcome.is_clean(), "{}", outcome.describe());
+        assert!(started.elapsed() < Duration::from_secs(3), "the seal waited for a ticket");
+        drop(t);
+        drop(db);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }
 }

@@ -603,6 +603,47 @@ impl TableFilters {
         persist::serialize(&refs, self.seed, n_slots)
     }
 
+    /// The FILTER section of a snapshot taken under a seal
+    /// (`persist::serialize_sealed`; docs/persistent-indexes.md §3 step 5,
+    /// §5). Read guards only, and nothing is marked checkpointed: `_flt.db`
+    /// is still the filter's runtime checkpoint until B14 retires it, and
+    /// resetting its delta bookkeeping here would make its next delta skip
+    /// zones written since its last record.
+    pub fn sealed_image(&self, n_slots: u64) -> Vec<u8> {
+        let guards: Vec<_> = self.columns.iter().map(|c| c.read()).collect();
+        let refs: Vec<&ColumnFilter> = guards.iter().map(|g| &**g).collect();
+        persist::serialize_sealed(&refs, self.seed, n_slots)
+    }
+
+    /// What a snapshot's identity records of this filter's configuration
+    /// (§4, "filter configuration hash equal"): the hash seed, the table's
+    /// width bounds, and per filtered column, in order, its write order,
+    /// type, width bounds, and whether it keeps zone bounds and a span
+    /// summary. A column taken out of the filter, a width changed by `SET
+    /// FILTER`, or a new column all move it. Frozen like the keys: xxh64,
+    /// seed 0, over little-endian fields.
+    pub fn config_hash(&self) -> u64 {
+        let mut b: Vec<u8> = Vec::with_capacity(32 + self.columns.len() * 24);
+        let cfg_bytes = |b: &mut Vec<u8>, c: &FilterConfig| {
+            b.extend_from_slice(&[c.min_f, c.default_f, c.max_f]);
+            b.extend_from_slice(&c.min_selectivity.to_bits().to_le_bytes());
+            b.extend_from_slice(&c.min_table_rows.to_le_bytes());
+        };
+        b.extend_from_slice(&self.seed.k0.to_le_bytes());
+        b.extend_from_slice(&self.seed.k1.to_le_bytes());
+        cfg_bytes(&mut b, &self.cfg);
+        b.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
+        for c in &self.columns {
+            let c = c.read();
+            b.extend_from_slice(&c.write_order.to_le_bytes());
+            b.push(c.db_type.to_byte());
+            cfg_bytes(&mut b, c.config());
+            b.push(c.zonemap().is_some() as u8);
+            b.push(c.span_summary().is_some() as u8);
+        }
+        crate::core::hash::xxh64(&b, 0)
+    }
+
     /// Decide between rewriting the base image and appending a delta, produce
     /// the bytes, and mark every column checkpointed — all under one set of
     /// write guards.
