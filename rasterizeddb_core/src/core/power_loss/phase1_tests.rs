@@ -114,6 +114,10 @@ pub(super) enum Place {
 pub(super) struct Dirs {
     pub base: PathBuf,
     pub place: Place,
+    /// The table has B-tree and hash indexes, and the directory runs under
+    /// `index_storage = snapshot`, so a seal writes INDEX sections and an
+    /// image that proves its snapshot loads them (B17).
+    pub indexed: bool,
 }
 
 impl Dirs {
@@ -134,6 +138,7 @@ impl Dirs {
         Dirs {
             base: base.to_path_buf(),
             place: self.place,
+            indexed: self.indexed,
         }
     }
 }
@@ -172,6 +177,15 @@ async fn create(dirs: &Dirs) -> Arc<Database> {
     exec(&db, &format!("CREATE TABLE {TABLE} (id BIGINT, a BIGINT, b BIGINT, s TEXT, f DOUBLE)"))
         .await
         .expect("create the table");
+    if dirs.indexed {
+        for sql in [
+            format!("CREATE INDEX {TABLE}_a ON {TABLE} (a)"),
+            format!("CREATE INDEX {TABLE}_s ON {TABLE} USING hash (s)"),
+            format!("CREATE INDEX {TABLE}_ba ON {TABLE} (b, a)"),
+        ] {
+            exec(&db, &sql).await.expect("create an index");
+        }
+    }
     db
 }
 
@@ -204,9 +218,18 @@ pub(super) fn table(db: &Database) -> Arc<DbTable> {
 
 pub(super) async fn ready(t: &DbTable) -> Result<(), String> {
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    if tokio::time::timeout(READY_TIMEOUT, t.index_load_settled()).await.is_err() {
+        return Err("the index load never settled".into());
+    }
     while !t.filters_ready().map_err(|e| e.to_string())? {
         if std::time::Instant::now() > deadline {
             return Err("the filter never became ready".into());
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    while t.indexes().map_err(|e| e.to_string())?.is_some_and(|ix| !ix.is_ready()) {
+        if std::time::Instant::now() > deadline {
+            return Err("the indexes never became ready".into());
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -481,6 +504,8 @@ async fn superset(t: &DbTable, label: &str, problems: &mut Vec<String>) -> usize
 pub(super) struct Seen {
     pub loaded: bool,
     pub narrowed: usize,
+    /// The open loaded the table's INDEX sections (B17).
+    pub indexes_loaded: bool,
 }
 
 /// Compares an opened subject with whichever of `states` its rows match.
@@ -492,11 +517,41 @@ pub(super) async fn check(
     expect: Expect,
     problems: &mut Vec<String>,
 ) -> Seen {
+    check_opened(db, label, states, preds, expect, true, problems).await
+}
+
+/// [`check`], where `fresh` says whether `db` was opened just now (an
+/// image, a reopen): only then does `vouched` say whether its snapshot
+/// loaded, rather than that this instance published one.
+pub(super) async fn check_opened(
+    db: &Arc<Database>,
+    label: &str,
+    states: &[Model],
+    preds: &[Pred],
+    expect: Expect,
+    fresh: bool,
+    problems: &mut Vec<String>,
+) -> Seen {
     let Some(t) = db.table_for_tests(TABLE) else {
         problems.push(format!("{label}: the table is gone"));
         return Seen::default();
     };
+    // An image that loads its INDEX sections vouches once that load is done.
+    if tokio::time::timeout(READY_TIMEOUT, t.index_load_settled()).await.is_err() {
+        problems.push(format!("{label}: the index load never settled"));
+    }
     let loaded = t.gate().vouched();
+    let indexed = t.indexes().ok().flatten().is_some_and(|ix| !ix.list().is_empty());
+    let indexes_loaded = indexed && t.index_origin() == crate::core::index_store::load::Origin::Loaded;
+    if indexed && fresh {
+        let origin = t.index_origin();
+        if loaded && origin != crate::core::index_store::load::Origin::Loaded {
+            problems.push(format!("{label}: the snapshot loaded, its INDEX sections did not ({origin:?})"));
+        }
+        if !loaded && origin == crate::core::index_store::load::Origin::Loaded {
+            problems.push(format!("{label}: INDEX sections loaded from a snapshot the open did not vouch for"));
+        }
+    }
     match (expect, loaded) {
         (Expect::Load, false) => problems.push(format!("{label}: expected the snapshot to load, the open rebuilt")),
         (Expect::Rebuild, true) => problems.push(format!("{label}: expected a rebuild, the open loaded the snapshot")),
@@ -504,13 +559,13 @@ pub(super) async fn check(
     }
     if let Err(e) = ready(&t).await {
         problems.push(format!("{label}: {e}"));
-        return Seen { loaded, narrowed: 0 };
+        return Seen { loaded, narrowed: 0, indexes_loaded: false };
     }
     let got = match scan(db).await {
         Ok(r) => r,
         Err(e) => {
             problems.push(format!("{label}: scan: {e}"));
-            return Seen { loaded, narrowed: 0 };
+            return Seen { loaded, narrowed: 0, indexes_loaded: false };
         }
     };
     let Some(state) = states.iter().find(|s| s.rows == got) else {
@@ -527,7 +582,7 @@ pub(super) async fn check(
             got.len(),
             diffs.join("; ")
         ));
-        return Seen { loaded, narrowed: 0 };
+        return Seen { loaded, narrowed: 0, indexes_loaded: false };
     };
     for p in preds {
         let want = state.answer(p);
@@ -546,7 +601,52 @@ pub(super) async fn check(
         }
     }
     let narrowed = superset(&t, label, problems).await;
-    Seen { loaded, narrowed }
+    if indexed {
+        index_superset(&t, label, problems).await;
+    }
+    Seen { loaded, narrowed, indexes_loaded }
+}
+
+/// The superset at the indexes (B17): every visible row is listed, in
+/// every index, under the key its own values give (or unkeyed), whether the
+/// index was loaded or rebuilt.
+async fn index_superset(t: &DbTable, label: &str, problems: &mut Vec<String>) {
+    let Ok(d) = t.data() else { return };
+    let Some(indexes) = d.indexes.clone() else { return };
+    if !indexes.is_ready() {
+        problems.push(format!("{label}: the indexes are not ready"));
+        return;
+    }
+    let _read = d.readers.enter();
+    let visibility = t.visibility_for(FROZEN_TX);
+    let cols: Vec<u32> = t.schema.fields.iter().map(|f| f.write_order as u32).collect();
+    let fetch = DbTable::build_fetch_for(&t.schema.fields, &cols);
+    let Ok(mut it) = RowPointerIterator::new(d.io_pointers.clone()).await else {
+        problems.push(format!("{label}: the pointers could not be read"));
+        return;
+    };
+    let mut row = Row::default();
+    let mut missing = 0usize;
+    while let Ok(Some((offset, pointer))) = it.next_row_pointer_with_offset().await {
+        if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+            continue;
+        }
+        let slot = offset / ROW_POINTER_RECORD_LEN as u64;
+        if pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await.is_err() {
+            continue;
+        }
+        let get = |w: u32| row.columns.iter().find(|c| c.schema_id as u32 == w).map(|c| c.data.into_slice());
+        for ix in &indexes.list {
+            if let Some(key) = ix.key_of(get)
+                && !ix.slots_for_key(&key).contains(&slot)
+            {
+                missing += 1;
+                if missing <= 8 {
+                    problems.push(format!("{label}: index {} does not find visible slot {slot}", ix.decl.name));
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +668,8 @@ pub(super) struct Tally {
     pub loads: usize,
     pub rebuilds: usize,
     pub narrowed: usize,
+    /// Images whose open loaded the table's INDEX sections.
+    pub index_loads: usize,
     /// Point label prefixes (failpoint or scenario names) that were imaged.
     pub covered: std::collections::BTreeSet<String>,
 }
@@ -718,7 +820,7 @@ impl Run {
         let label = self.label(what);
         let db = self.db().clone();
         let model = self.model.clone();
-        let seen = check(&db, &label, &[model], &preds, expect, &mut self.problems).await;
+        let seen = check_opened(&db, &label, &[model], &preds, expect, false, &mut self.problems).await;
         self.tally.narrowed += seen.narrowed;
     }
 }
@@ -1099,12 +1201,20 @@ async fn flt_evidence(run: &mut Run) {
     }
 }
 
-/// One run of every phase-1 scenario on one placement.
-async fn run(place: Place, run_seed: u64) -> Tally {
+/// One run of every phase-1 scenario on one placement; `indexed`, with
+/// the table's B-tree and hash indexes in the snapshot (B17).
+async fn run(place: Place, indexed: bool, run_seed: u64) -> Tally {
     let tmp = tempfile::tempdir().unwrap();
+    let _storage = indexed.then(|| {
+        crate::core::index_store::load::storage_override::set(
+            tmp.path(),
+            crate::core::index_store::load::settings::IndexStorage::Snapshot,
+        )
+    });
     let dirs = Dirs {
         base: tmp.path().join("subject"),
         place,
+        indexed,
     };
     std::fs::create_dir_all(dirs.root()).unwrap();
     let db = create(&dirs).await;
@@ -1190,6 +1300,7 @@ async fn run(place: Place, run_seed: u64) -> Tally {
                     } else {
                         tally.rebuilds += 1;
                     }
+                    tally.index_loads += seen.indexes_loaded as usize;
                     tally.narrowed += seen.narrowed;
                     close(&img, db);
                 }
@@ -1242,36 +1353,61 @@ const COVERED: &[&str] = &[
     "unknown_flt_delete_order",
 ];
 
-async fn suite(place: Place) {
+async fn suite(place: Place, indexed: bool) {
     let runs = env_count("RDB_POWER_LOSS_RUNS", 1, 256);
     let started = std::time::Instant::now();
     let mut total = Tally::default();
     for r in 0..runs {
-        let t = run(place, r).await;
+        let t = run(place, indexed, r).await;
         total.points += t.points;
         total.disturbed += t.disturbed;
         total.images += t.images;
         total.loads += t.loads;
         total.rebuilds += t.rebuilds;
         total.narrowed += t.narrowed;
+        total.index_loads += t.index_loads;
         total.covered.extend(t.covered);
     }
-    eprintln!("phase 1 suite {place:?}: {runs} runs in {:.1}s: {total:?}", started.elapsed().as_secs_f64());
+    eprintln!(
+        "phase 1 suite {place:?}{}: {runs} runs in {:.1}s: {total:?}",
+        if indexed { " (indexed)" } else { "" },
+        started.elapsed().as_secs_f64()
+    );
     let missing: Vec<&&str> = COVERED.iter().filter(|n| !total.covered.contains(**n)).collect();
     assert!(missing.is_empty(), "{place:?}: never imaged: {missing:?} (covered {:?})", total.covered);
     assert!(total.loads > 0 && total.rebuilds > 0, "{place:?}: the images missed one side: {total:?}");
+    if indexed {
+        assert_eq!(total.index_loads, total.loads, "{place:?}: every image that loaded must load its INDEX sections");
+    } else {
+        assert_eq!(total.index_loads, 0, "{place:?}: a table with no index loaded INDEX sections");
+    }
     assert!(total.narrowed > 20 * total.images.max(1) / 4, "{place:?}: the filter narrowed too few probes: {total:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_filter_survives_power_cuts_at_every_phase_1_failpoint_in_the_root() {
-    suite(Place::Root).await;
+    suite(Place::Root, false).await;
 }
 
 #[cfg(feature = "storage_pools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_filter_survives_power_cuts_at_every_phase_1_failpoint_on_a_second_location() {
-    suite(Place::Second).await;
+    suite(Place::Second, false).await;
+}
+
+/// B17: the same suite with the table's B-tree, hash and composite indexes
+/// captured as INDEX sections. An image that proves its snapshot loads them
+/// too (never the filter alone), answers as the twin, and every index finds
+/// every visible row; one that does not rebuilds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_indexes_survive_power_cuts_at_every_phase_1_failpoint_in_the_root() {
+    suite(Place::Root, true).await;
+}
+
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_indexes_survive_power_cuts_at_every_phase_1_failpoint_on_a_second_location() {
+    suite(Place::Second, true).await;
 }
 
 /// Bug (c) on a second location (§5, §11, phase 1's gate): a table whose
@@ -1306,6 +1442,7 @@ async fn bug_c_holds_on_a_second_location_under_synchronous_commit_off() {
     let dirs = Dirs {
         base: tmp.path().join("subject"),
         place: Place::Second,
+        indexed: false,
     };
     std::fs::create_dir_all(dirs.root()).unwrap();
     let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024).max(5);
@@ -1484,7 +1621,7 @@ fn assert_no_problems(run: &Run, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_held_fails_then_shutdown() {
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Second };
+    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Second, indexed: false };
     std::fs::create_dir_all(dirs.root()).unwrap();
     let mut run = loaded_run(&dirs, 0xA11).await;
     clean_point(run.db(), "apply_held: the clean point").await;
@@ -1536,7 +1673,7 @@ async fn apply_held_fails_then_shutdown() {
 async fn staged_tmp_at_snapshot() {
     use crate::core::storage_providers::traits::StorageIO;
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Root };
+    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Root, indexed: false };
     std::fs::create_dir_all(dirs.root()).unwrap();
     let mut run = loaded_run(&dirs, 0x57A).await;
     let (sql, after, touched) = run.in_place();
@@ -1586,7 +1723,7 @@ async fn staged_tmp_at_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retirement_cancels_a_running_seal() {
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Root };
+    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Root, indexed: false };
     std::fs::create_dir_all(dirs.root()).unwrap();
     let mut run = loaded_run(&dirs, 0x8E7).await;
     let (sql, after, touched) = run.in_place();
@@ -1689,7 +1826,7 @@ async fn sync_off_outcomes_survive_as_a_prefix_across_locations() {
     let mut seen: BTreeMap<(&str, bool, bool), usize> = BTreeMap::new();
     for ordering in ["delete, then an in-place update", "an in-place update, then a root insert"] {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Second };
+        let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Second, indexed: false };
         std::fs::create_dir_all(dirs.root()).unwrap();
         let db = create(&dirs).await;
         exec(&db, &format!("CREATE TABLE {ROOT_TABLE} (id BIGINT)")).await.unwrap();

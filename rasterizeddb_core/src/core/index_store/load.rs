@@ -738,3 +738,7 @@ pub fn capture_sections(indexes: &TableIndexes, gate: &FileGate) -> io::Result<O
         Ok(Some(out))
     })
 }
+
+#[cfg(test)]
+#[path = "load_tests.rs"]
+mod tests;

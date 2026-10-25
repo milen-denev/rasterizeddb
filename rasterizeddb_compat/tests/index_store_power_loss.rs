@@ -16,6 +16,14 @@
 //! predicate (nothing to prune), must equal one of the states the twin
 //! passed through, and every filtered answer must then be that state's.
 //!
+//! **With INDEX sections** (slice B17): the same suites on a table with a
+//! B-tree, a hash and a composite index, under `index_storage = snapshot`
+//! (set process-wide in this binary; it changes nothing for a table with
+//! no index). An image that proves its snapshot must load the INDEX
+//! sections too, never the filter alone; every answer goes through the
+//! loaded (or rebuilt) indexes, and a sample of every image's rows must be
+//! found through each index (no false negatives).
+//!
 //! Bounded: ~1,000 rows, `RDB_POWER_LOSS_SEEDS` images per cut (default 8;
 //! the doc's CI figure is 32, `RDB_POWER_LOSS_SEEDS=32`), data under the
 //! shared tmpfs, every directory removed on every path.
@@ -26,6 +34,8 @@ use std::sync::Arc as StdArc;
 
 use rasterizeddb_compat::TestServer;
 use rasterizeddb_core::core::power_loss::failpoint::{self, Hit, Outcome};
+use rasterizeddb_core::core::index_store::load::Origin;
+use rasterizeddb_core::core::index_store::load::settings::{IndexStorage, set_index_storage};
 use rasterizeddb_core::core::power_loss::image::{self, CrashPoint, Recorder};
 use sqlx::{AssertSqlSafe, Row};
 
@@ -92,6 +102,7 @@ enum Pred {
     B(i64),
     S(String),
     ARange(i64, i64),
+    BA(i64, i64),
 }
 
 impl Pred {
@@ -101,6 +112,7 @@ impl Pred {
             Pred::B(v) => format!("b = {v}"),
             Pred::S(v) => format!("s = '{v}'"),
             Pred::ARange(lo, hi) => format!("a BETWEEN {lo} AND {hi}"),
+            Pred::BA(b, a) => format!("b = {b} AND a = {a}"),
         }
     }
     fn matches(&self, r: &ModelRow) -> bool {
@@ -109,6 +121,7 @@ impl Pred {
             Pred::B(v) => r.b == *v,
             Pred::S(v) => r.s == *v,
             Pred::ARange(lo, hi) => r.a >= *lo && r.a <= *hi,
+            Pred::BA(b, a) => r.b == *b && r.a == *a,
         }
     }
 }
@@ -166,17 +179,29 @@ impl Subject {
         sqlx::query(AssertSqlSafe(sql)).execute(self.pool()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
-    /// The table's word says the open loaded its snapshot.
-    fn vouched(&self) -> bool {
-        self.server.as_ref().unwrap().database().table_for_tests(self.table).expect("the table").gate().vouched()
+    /// The table's word says the open loaded its snapshot (once a load of
+    /// its INDEX sections, which vouches when it succeeds, has settled).
+    async fn vouched(&self) -> bool {
+        let t = self.server.as_ref().unwrap().database().table_for_tests(self.table).expect("the table");
+        tokio::time::timeout(std::time::Duration::from_secs(30), t.index_load_settled())
+            .await
+            .expect("the index load never settled");
+        t.gate().vouched()
     }
 
-    /// Waits for the filter (a rebuilt one backfills).
+    /// How the table's indexes came to be at this open, if it has any.
+    fn origin(&self) -> Option<Origin> {
+        let t = self.server.as_ref().unwrap().database().table_for_tests(self.table).expect("the table");
+        let has = t.indexes().ok().flatten().is_some_and(|ix| !ix.list().is_empty());
+        has.then(|| t.index_origin())
+    }
+
+    /// Waits for the filter (a rebuilt one backfills) and the indexes.
     async fn ready(&self) {
         let t = self.server.as_ref().unwrap().database().table_for_tests(self.table).expect("the table");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !t.filters_ready().unwrap() {
-            assert!(std::time::Instant::now() < deadline, "the filter never became ready");
+        while !t.filters_ready().unwrap() || t.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+            assert!(std::time::Instant::now() < deadline, "the filter or the indexes never became ready");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
@@ -239,10 +264,17 @@ impl Subject {
 /// Compares the subject with the state its rows match; returns whether it
 /// loaded.
 async fn check(s: &Subject, label: &str, states: &[Model], preds: &[Pred], expect: Expect, problems: &mut Vec<String>) -> bool {
-    let loaded = s.vouched();
+    let loaded = s.vouched().await;
     match (expect, loaded) {
         (Expect::Load, false) => problems.push(format!("{label}: expected a load, the open rebuilt")),
         (Expect::Rebuild, true) => problems.push(format!("{label}: expected a rebuild, the open loaded")),
+        _ => {}
+    }
+    match (s.origin(), loaded) {
+        (Some(o), true) if o != Origin::Loaded => {
+            problems.push(format!("{label}: the snapshot loaded, its INDEX sections did not ({o:?})"))
+        }
+        (Some(Origin::Loaded), false) => problems.push(format!("{label}: INDEX sections loaded from an unvouched snapshot")),
         _ => {}
     }
     s.ready().await;
@@ -268,7 +300,16 @@ async fn check(s: &Subject, label: &str, states: &[Model], preds: &[Pred], expec
         ));
         return loaded;
     };
-    for p in preds {
+    let mut preds = preds.to_vec();
+    if s.origin().is_some() {
+        // Every index asked for a sample of the image's own rows.
+        for r in state.values().step_by(50) {
+            preds.push(Pred::A(r.a));
+            preds.push(Pred::S(r.s.clone()));
+            preds.push(Pred::BA(r.b, r.a));
+        }
+    }
+    for p in &preds {
         let want = answer(state, p);
         let have = s.ids(&p.sql()).await;
         if have != want {
@@ -284,14 +325,22 @@ async fn check(s: &Subject, label: &str, states: &[Model], preds: &[Pred], expec
     loaded
 }
 
-/// A fresh subject with `ROWS` rows, some deleted and some updated in place.
-async fn populated(dirs: &Dirs, place: Place, table: &'static str) -> (Subject, Model) {
+/// A fresh subject with `ROWS` rows, some deleted and some updated in place;
+/// `indexed`, with a B-tree on `a`, a hash on `s` and a B-tree on `(b, a)`,
+/// under `index_storage = snapshot` (B17).
+async fn populated(dirs: &Dirs, place: Place, table: &'static str, indexed: bool) -> (Subject, Model) {
     std::fs::create_dir_all(dirs.root()).unwrap();
     // The filter consulted from the first row, set before the table exists
     // so every open builds the configuration the snapshot's identity names.
     rasterizeddb_core::core::filter::settings::settings().update_table(table, |o| o.min_table_rows = Some(0));
     let s = Subject::start(dirs, table).await;
     s.exec(&format!("CREATE TABLE {table} (id BIGINT, a BIGINT, b BIGINT, s TEXT)")).await;
+    if indexed {
+        set_index_storage(IndexStorage::Snapshot);
+        s.exec(&format!("CREATE INDEX {table}_a ON {table} (a)")).await;
+        s.exec(&format!("CREATE INDEX {table}_s ON {table} USING hash (s)")).await;
+        s.exec(&format!("CREATE INDEX {table}_ba ON {table} (b, a)")).await;
+    }
     if place == Place::Second {
         std::fs::create_dir_all(dirs.disk()).unwrap();
         s.exec(&format!("STORAGE ADD LOCATION '{}'", dirs.disk().display())).await;
@@ -354,10 +403,10 @@ fn tmp_base() -> TmpBase {
 /// (a) A clean close and reopen: the filter loads from the snapshot (the
 /// load counter moves), answers as the twin, and a write after the reopen
 /// with an abandoned close rebuilds.
-async fn clean_reopen(place: Place, table: &'static str) {
+async fn clean_reopen(place: Place, table: &'static str, indexed: bool) {
     let tmp = tmp_base();
     let dirs = Dirs { base: tmp.path().join("subject") };
-    let (s, mut model) = populated(&dirs, place, table).await;
+    let (s, mut model) = populated(&dirs, place, table, indexed).await;
     let answered = s.checkpoint().await;
     assert_eq!(answered, "1 of 1 clean", "rdb_index_checkpoint answered {answered}");
     s.stop().await;
@@ -365,8 +414,14 @@ async fn clean_reopen(place: Place, table: &'static str) {
     let s = Subject::start(&dirs, table).await;
     let mut problems = Vec::new();
     let preds = battery(&[&model], &[]);
+    let index_loads = rasterizeddb_core::core::index_store::load::loaded_total();
     let loaded = check(&s, &format!("{place:?} clean reopen"), &[model.clone()], &preds, Expect::Load, &mut problems).await;
     assert!(loaded && rasterizeddb_core::core::index_store::open_proof::loaded_total() > loads, "the reopen did not load");
+    if indexed {
+        // The load counter moved and this open built nothing.
+        assert_eq!(s.origin(), Some(Origin::Loaded), "{place:?}: the clean reopen built its indexes");
+        assert!(rasterizeddb_core::core::index_store::load::loaded_total() > index_loads, "the index load counter did not move");
+    }
     s.exec(&format!("UPDATE {table} SET a = 999999 WHERE id = 20")).await;
     model.get_mut(&20).unwrap().a = 999_999;
     s.stop().await;
@@ -379,12 +434,22 @@ async fn clean_reopen(place: Place, table: &'static str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clean_reopen_loads_the_filter_in_the_root() {
-    clean_reopen(Place::Root, "pic_clean_root").await;
+    clean_reopen(Place::Root, "pic_clean_root", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clean_reopen_loads_the_filter_on_a_second_location() {
-    clean_reopen(Place::Second, "pic_clean_disk").await;
+    clean_reopen(Place::Second, "pic_clean_disk", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_reopen_loads_the_indexes_in_the_root() {
+    clean_reopen(Place::Root, "pic_iclean_root", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_reopen_loads_the_indexes_on_a_second_location() {
+    clean_reopen(Place::Second, "pic_iclean_disk", true).await;
 }
 
 const SEAL_STEPS: &[(&str, Expect)] = &[
@@ -425,10 +490,10 @@ fn collect(sink: &image::CutSink, states: &[&Model], preds: &[Pred], expect_of: 
 /// `CLEAN` fsync followed by a length-preserving write, and, on the second
 /// location, bug (c): a DELETE and its vacuum clear under
 /// `synchronous_commit = off` sealed before the outcomes reach the root.
-async fn power_cuts(place: Place, table: &'static str) {
+async fn power_cuts(place: Place, table: &'static str, indexed: bool) {
     let tmp = tmp_base();
     let dirs = Dirs { base: tmp.path().join("subject") };
-    let (s, mut model) = populated(&dirs, place, table).await;
+    let (s, mut model) = populated(&dirs, place, table, indexed).await;
     let rec = Recorder::start(&dirs.base);
     let mut points: Vec<Point> = Vec::new();
     let sink = image::cut_sink();
@@ -540,12 +605,22 @@ async fn power_cuts(place: Place, table: &'static str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_filter_survives_power_cuts_over_pgwire_in_the_root() {
-    power_cuts(Place::Root, "pic_cuts_root").await;
+    power_cuts(Place::Root, "pic_cuts_root", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_filter_survives_power_cuts_over_pgwire_on_a_second_location() {
-    power_cuts(Place::Second, "pic_cuts_disk").await;
+    power_cuts(Place::Second, "pic_cuts_disk", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_indexes_survive_power_cuts_over_pgwire_in_the_root() {
+    power_cuts(Place::Root, "pic_icuts_root", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_indexes_survive_power_cuts_over_pgwire_on_a_second_location() {
+    power_cuts(Place::Second, "pic_icuts_disk", true).await;
 }
 
 /// A server built with the test-only features refuses to start: the
