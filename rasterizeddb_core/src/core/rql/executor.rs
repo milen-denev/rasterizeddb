@@ -953,15 +953,26 @@ async fn check_foreign_keys(
     assignments: &[(String, String)],
     tx: TxId,
 ) -> Result<(), String> {
-    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
     // The child is the statement's write target: its RX is held (or taken).
-    let foreign_keys = match database.table_for(table_name, owner(), TableMode::RowExclusive).await? {
-        None => return Ok(()),
-        Some(t) => t.schema.foreign_keys.clone(),
+    let table = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
+    check_foreign_keys_of(database, table.as_ref().map(|t| &t.schema), table_name, assignments, tx).await
+}
+
+/// [`check_foreign_keys`] for a target the caller already resolved under its
+/// ROW EXCLUSIVE (slice B8b): `schema` is the child's, `None` when no table
+/// is registered under `table_name`.
+async fn check_foreign_keys_of(
+    database: &Arc<Database>,
+    schema: Option<&crate::core::row::schema::TableSchema>,
+    table_name: &str,
+    assignments: &[(String, String)],
+    tx: TxId,
+) -> Result<(), String> {
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
+    let foreign_keys = match schema {
+        Some(schema) if !schema.foreign_keys.is_empty() => schema.foreign_keys.clone(),
+        _ => return Ok(()),
     };
-    if foreign_keys.is_empty() {
-        return Ok(());
-    }
 
     for fk in foreign_keys.iter() {
         let Some((_, literal)) = assignments
@@ -6036,20 +6047,16 @@ async fn insert_from_select(
 /// The statement with its column list supplied, for an `INSERT … VALUES`
 /// that named none; `None` when it already had one or is another form.
 ///
-/// In its own function so its locals — a copy of the schema — live on the
-/// heap under `Box::pin` rather than in `execute_with_context`'s frame.
-async fn supply_insert_column_list(
+/// `schema` is the target's, resolved once by the INSERT arm under its ROW
+/// EXCLUSIVE (slice B8b): no lookup or lock of its own. Synchronous, so its
+/// locals (a copy of the schema) live on the stack for the call only, never
+/// in `execute_with_context`'s future.
+fn supply_insert_column_list(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
-    database: &Arc<Database>,
+    schema: Option<&crate::core::row::schema::TableSchema>,
 ) -> Option<Result<QueryPurpose, String>> {
-    let entry = match database.table_for(&row_data.table_name, owner(), TableMode::RowExclusive).await {
-        Ok(entry) => entry?,
-        Err(e) => return Some(Err(e)),
-    };
-    let (fields, generated) = {
-        let schema = &entry.schema;
-        (schema.fields.clone(), schema.generated.clone())
-    };
+    let schema = schema?;
+    let (fields, generated) = (schema.fields.clone(), schema.generated.clone());
     // A generated column takes no value from the client, so it is not one of
     // the positions `INSERT INTO t VALUES (…)` fills — PostgreSQL maps the
     // tuple across the columns that *can* be written. Leaving it in the list
@@ -6100,16 +6107,15 @@ async fn supply_insert_column_list(
 /// `{"has 'quote'"}`. Here there is no second encoder: the literal the client
 /// wrote reaches the same encoder it always would, having been through an
 /// arithmetic fold in between.
-async fn supply_generated_values(
+///
+/// `schema` is the target's, resolved once by the INSERT arm (slice B8b).
+fn supply_generated_values(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    schema: Option<&crate::core::row::schema::TableSchema>,
     database: &Arc<Database>,
 ) -> Option<Result<crate::core::rql::lexer_s1::InsertRowData, String>> {
     let (fields, generated, defaults) = {
-        let entry = match database.table_for(&row_data.table_name, owner(), TableMode::RowExclusive).await {
-            Ok(entry) => entry?,
-            Err(e) => return Some(Err(e)),
-        };
-        let schema = &entry.schema;
+        let schema = schema?;
         if schema.generated.is_empty() {
             return None;
         }
@@ -8310,14 +8316,19 @@ fn condition_reads_a_null(
 /// after every restart: a silent duplicate on a column with no unique key.
 /// So a partitioned table that cannot be read is an error here, which the
 /// insert reports; a plain table's failure is only logged, as it always was.
-async fn seed_sequences(database: &Arc<Database>, table_name: &str) -> Result<(), String> {
-    // The INSERT's target, ROW EXCLUSIVE; a partitioned one by its name.
-    let (table, partitioned) = match database
-        .relation_for(table_name, owner(), TableMode::RowExclusive)
-        .await?
-    {
-        Some(crate::core::database::Relation::Plain(table)) => (table, None),
-        Some(crate::core::database::Relation::Partitioned(pt)) => (pt.shell().clone(), Some(pt)),
+///
+/// `target` is the INSERT's target, resolved by the caller under its ROW
+/// EXCLUSIVE (a partitioned one by its name); callers ask
+/// [`has_unseeded_sequence`] first, so the common insert neither boxes nor
+/// runs this.
+async fn seed_sequences(
+    database: &Arc<Database>,
+    table_name: &str,
+    target: Option<&crate::core::database::Relation>,
+) -> Result<(), String> {
+    let (table, partitioned) = match target {
+        Some(crate::core::database::Relation::Plain(table)) => (table.clone(), None),
+        Some(crate::core::database::Relation::Partitioned(pt)) => (pt.shell().clone(), Some(pt.clone())),
         None => return Ok(()),
     };
 
@@ -8396,6 +8407,20 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) -> Result<()
         crate::core::rql::sequence::seed(database.id, &name, last);
     }
     Ok(())
+}
+
+/// Whether `schema` declares a serial column whose sequence this process
+/// has not seeded yet: what [`seed_sequences`] would do anything for. One
+/// pass over the defaults, no allocation; false for nearly every insert.
+fn has_unseeded_sequence(database: &Database, schema: &crate::core::row::schema::TableSchema) -> bool {
+    if schema.defaults.is_empty() {
+        return false;
+    }
+    schema.fields.iter().filter(|f| !f.is_deleted).any(|field| {
+        crate::core::rql::column_default::expression_for(&field.name, &schema.defaults)
+            .and_then(crate::core::rql::sequence::parse_nextval)
+            .is_some_and(|name| !crate::core::rql::sequence::is_seeded(database.id, &name))
+    })
 }
 
 async fn existing_rows_break_unique(
@@ -12094,14 +12119,18 @@ pub(crate) async fn insert_loaded_row(
     if database.is_partitioned(table_name) {
         return None;
     }
-    Box::pin(seed_sequences(database, table_name)).await.ok()?;
     // The import batch's owner takes ROW EXCLUSIVE, as the statement path's
-    // INSERT would; on a lock failure the ordinary path reports it.
+    // INSERT would; on a lock failure the ordinary path reports it. Resolved
+    // once for the seed, the checks and the write (slice B8b).
     let table = database
         .table_for(table_name, owner(), TableMode::RowExclusive)
         .await
         .ok()
         .flatten()?;
+    if has_unseeded_sequence(database, &table.schema) {
+        let target = crate::core::database::Relation::Plain(table.clone());
+        Box::pin(seed_sequences(database, table_name, Some(&target))).await.ok()?;
+    }
     let schema = &table.schema;
     if !schema.json_columns.is_empty() {
         return None;
@@ -12129,7 +12158,7 @@ pub(crate) async fn insert_loaded_row(
     )
     .ok()?;
     if let Some(assignments) = assignments.as_deref() {
-        check_foreign_keys(database, table_name, assignments, tx)
+        check_foreign_keys_of(database, Some(schema), table_name, assignments, tx)
             .await
             .ok()?;
     }
@@ -12744,22 +12773,37 @@ pub(crate) async fn execute_with_need(
                 return ddl_error(&e);
             }
 
+            // The target, ROW EXCLUSIVE (a partitioned one by its logical
+            // name): held from the statement's set, or taken here, once.
+            // Resolved once for every step below that reads it (the seed,
+            // the column list, generated values, the write, the foreign
+            // keys; slice B8b) rather than looked up and confirmed at each.
+            // Nothing can swap it meanwhile: a reload, DROP or MOVE needs the
+            // ACCESS EXCLUSIVE this statement's ROW EXCLUSIVE excludes, and
+            // the owner holds it to the statement's end.
+            let target = match Box::pin(database.relation_for(&row_data.table_name, owner(), TableMode::RowExclusive)).await {
+                Ok(target) => target,
+                Err(e) => return ddl_error(&e),
+            };
+
             // Before anything reads a default: a `SERIAL` column's counter is
             // in memory and a reopened database has not yet learned what the
-            // table already holds. Returns immediately for a table with no
-            // serial column, and after the first insert for one that has.
-            if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name)).await {
-                error!("{}", e);
-                return ddl_error(&e);
+            // table already holds. Skipped for a table with no serial column,
+            // and after the first insert for one that has.
+            if target.as_ref().is_some_and(|t| has_unseeded_sequence(&database, t.schema())) {
+                if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name, target.as_ref())).await {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
             }
 
             // `INSERT INTO t VALUES (…)` names no columns, so the list is
             // supplied from the schema and the statement re-dispatched in the
             // one shape every parser below understands. First, so that the
-            // multi-row split and the `SELECT` source see the list too. Boxed
-            // for the reason `insert_values_batch` is: this frame is near the
-            // worker's stack limit, and the schema copy does not belong in it.
-            match Box::pin(supply_insert_column_list(row_data, &database)).await {
+            // multi-row split and the `SELECT` source see the list too.
+            // Synchronous: the schema copy lives on the stack for the call,
+            // never in this frame's future.
+            match supply_insert_column_list(row_data, target.as_ref().map(|t| t.schema())) {
                 Some(Ok(purpose)) => {
                     return Box::pin(execute_with_context(purpose, database.clone(), depth, tx))
                         .await;
@@ -12820,7 +12864,7 @@ pub(crate) async fn execute_with_need(
             // nothing went on to parse — the column stayed NULL and the insert
             // still reported success.
             let generated_rewrite =
-                match Box::pin(supply_generated_values(row_data, &database)).await {
+                match supply_generated_values(row_data, target.as_ref().map(|t| t.schema()), &database) {
                     Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
                     Some(Err(e)) => return ddl_error(&e),
                     None => None,
@@ -12854,13 +12898,9 @@ pub(crate) async fn execute_with_need(
             // is then its shell: the schema every check below reads, never the
             // writer. Resolved through `relation`, as a shell found in `tables`
             // by name refuses every write.
-            // ROW EXCLUSIVE on the target (a partitioned one by its logical
-            // name): held from the statement's set, or taken here.
-            let relation = match Box::pin(database.relation_for(table_name, owner(), TableMode::RowExclusive)).await {
-                Ok(relation) => relation,
-                Err(e) => return ddl_error(&e),
-            };
-            let (table, partitioned) = match relation {
+            // The target resolved at the top of the arm, under its ROW
+            // EXCLUSIVE.
+            let (table, partitioned) = match target {
                 Some(crate::core::database::Relation::Plain(table)) => (table, None),
                 Some(crate::core::database::Relation::Partitioned(pt)) => {
                     if let Err(e) = pt.check() {
@@ -12945,7 +12985,7 @@ pub(crate) async fn execute_with_need(
             match crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query) {
                 Some(assignments) => {
                     if let Err(e) =
-                        check_foreign_keys(&database, table_name, &assignments, tx).await
+                        check_foreign_keys_of(&database, Some(&table.schema), table_name, &assignments, tx).await
                     {
                         error!("{}", e);
                         return ddl_error(&e);
