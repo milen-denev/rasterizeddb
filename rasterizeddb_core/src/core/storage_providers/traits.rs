@@ -263,8 +263,17 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         None
     }
 
-    /// Hands the provider its file set's write gate. A provider that lands
-    /// staged bytes in the background takes a count on the word for each
-    /// landing (§2: `.tmp` landing passes the gate); the rest ignore it.
-    fn attach_write_gate(&self, _gate: &std::sync::Arc<crate::core::index_store::gate_word::WriteGate>) {}
+    /// Hands the provider its file set's write gate. A file provider
+    /// registers every write it issues on the word (`index_store::gated_io`,
+    /// §2 layer 2, B12), judged by `policy`, passes the word on to the
+    /// providers it opens for files named after its own (the schema
+    /// sidecars), and takes a count for each background landing of staged
+    /// bytes (§2: `.tmp` landing passes the gate). The rest ignore it: their
+    /// word is detached and never `Clean` (P33).
+    fn attach_write_gate(
+        &self,
+        _gate: &std::sync::Arc<crate::core::index_store::file_gate::FileGate>,
+        _policy: crate::core::index_store::gated_io::Policy,
+    ) {
+    }
 }

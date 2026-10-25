@@ -142,6 +142,21 @@ impl Database {
                 "Table not found",
             )));
         };
+        // The reload's ticket on the file set's word (B12), after the lock
+        // and before anything below: `work` writes the schema family
+        // through the old instance's providers (and a rewrite the table's
+        // files under its own names), and every one of those writes needs a
+        // durable `DIRTY` and a held ticket first (T1, §2 layer 2). Kept by
+        // the statement's owner until its outcome is final, like a write
+        // path's; an ALTER rewrite's new file set gets a word of its own.
+        let _ticket = crate::core::index_store::gate::ticket(old.gate(), old.family())
+            .await
+            .map_err(|e| {
+                ReloadFailure::Reopen(io::Error::new(
+                    e.kind(),
+                    format!("\"{table_name}\" could not be marked dirty before its schema changed: {e}"),
+                ))
+            })?;
         // After the lock: the database's forgotten horizon must not move
         // between the retirement and the swap, or the reopened files could
         // carry ids it forgot (`ForgetRegistry`).

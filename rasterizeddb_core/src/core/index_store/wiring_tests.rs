@@ -481,6 +481,11 @@ async fn an_unknown_log_is_rewritten_before_the_first_write() {
         let db = open(dir.path(), "census_unknown").await;
         let t = seeded(&db, "u", 5).await;
         incarnation = t.schema.incarnation;
+        // A checkpoint the reopen loads: otherwise its filter backfill
+        // checkpoints `_flt.db`, which B12 gates like any write (the release
+        // slow path, under its exemption), and that write, not the INSERT,
+        // would be the first to rewrite the log.
+        t.checkpoint_filters().await.unwrap();
         drop(t);
         close(dir.path(), db);
     }

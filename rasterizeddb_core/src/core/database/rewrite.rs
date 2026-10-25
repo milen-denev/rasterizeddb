@@ -392,7 +392,12 @@ impl Database {
         FiFut: Future<Output = Result<T, String>>,
     {
         let _relocating = super::relocation_permit(self.location.is_some(), table_name).await;
-        self.reload_with_instance(table_name, |old| async move {
+        // The new files are written, and on failure the old ones put back,
+        // through the database's seed under the table's own names while the
+        // old file set's word is live: a listed exemption (`gated_io`,
+        // `Ungated::SchemaRewrite`), under the reload's ticket on that word.
+        use crate::core::index_store::gated_io::{Ungated, ungated};
+        self.reload_with_instance(table_name, |old| ungated(Ungated::SchemaRewrite, async move {
             // After the lock and the retirement: every committed write is in
             // the files, and nothing writes them now.
             let (create, plan) = read(old).await?;
@@ -471,7 +476,7 @@ impl Database {
                     Err(e)
                 }
             }
-        })
+        }))
         .await
     }
 
@@ -526,7 +531,14 @@ impl Database {
                     Ok((out, None))
                 }
                 Err(e) => {
-                    if let Err(restore) = self.backup_restore(backup).await {
+                    // The schema backup goes back over the live names
+                    // through the database's seed (`Ungated::SchemaRewrite`).
+                    let restored = crate::core::index_store::gated_io::ungated(
+                        crate::core::index_store::gated_io::Ungated::SchemaRewrite,
+                        self.backup_restore(backup),
+                    )
+                    .await;
+                    if let Err(restore) = restored {
                         error!(
                             "A change to {} failed ({}) and its schema could not be put back yet ({}); \
                              the next open restores it",

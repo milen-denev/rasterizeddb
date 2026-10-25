@@ -17,12 +17,17 @@
 //! rewrite, and the slot epoch in `rdb.ixe`), the real [`gate::ticket`] mint
 //! with tickets kept on lock owners ([`gate::FamilyTickets`]), and the
 //! [`census`] journal tests check T1 and T2 with.
+//!
+//! Slice B12 adds [`gated_io`]: the provider backstop, every write of a
+//! table's providers registered on its word (§2 layer 2), and the allowlist
+//! of writes that are not.
 
 pub mod census;
 pub mod codec;
 pub mod epoch_log;
 pub mod file_gate;
 pub mod gate;
+pub mod gated_io;
 pub mod gate_word;
 pub mod identity;
 pub mod marker;

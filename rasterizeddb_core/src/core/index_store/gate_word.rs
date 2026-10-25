@@ -8,8 +8,8 @@
 //! [`WriteGate`] sits in its `index_store::file_gate::FileGate`, which the
 //! table's map slot and every instance of the table share, and
 //! `gate::ticket` (the `WriteTicket` mint) takes a [`Hold`] through
-//! [`WriteGate::acquire`] and wraps it. B12's `GatedIo` calls
-//! [`WriteGate::register_io`].
+//! [`WriteGate::acquire`] and wraps it. B12's `GatedIo` registers every
+//! provider write through [`WriteGate::register_write`], the same [`IoOp`].
 //!
 //! # The word
 //!
@@ -638,6 +638,30 @@ impl Drop for Hold {
     }
 }
 
+/// A provider write's registration on a [`WriteGate`] (§2 layer 2): its
+/// count keeps a seal from publishing until the write returns (RV15).
+/// Dropping it gives the count back. Not `Clone`.
+#[derive(Debug)]
+pub struct IoRegistration<'a> {
+    gate: &'a WriteGate,
+    ticketless: bool,
+}
+
+impl IoRegistration<'_> {
+    /// No ticket existed anywhere and the registration cancelled an
+    /// unpublished seal to go ahead: tests panic with the call site there.
+    pub fn ticketless(&self) -> bool {
+        self.ticketless
+    }
+}
+
+impl Drop for IoRegistration<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.gate.give_back();
+    }
+}
+
 impl std::fmt::Debug for WriteGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteGate").field("word", &self.load()).finish()
@@ -770,6 +794,20 @@ impl WriteGate {
                     ticketless,
                 })
             }
+            IoEnd::Slow(reason) => Err(reason),
+        }
+    }
+
+    /// Registers a `GatedIo` write as [`WriteGate::register_io`] does, by the
+    /// same [`IoOp`], held by a guard that borrows the gate rather than
+    /// cloning its `Arc`: what a provider's write takes on its hot path (B12),
+    /// one `fetch_add` in and one `fetch_sub` out. Not a ticket: the census
+    /// records no hold for it.
+    #[inline]
+    pub fn register_write(&self) -> Result<IoRegistration<'_>, SlowReason> {
+        let mut op = IoOp::Add;
+        match run(|| op.step(&self.word)) {
+            IoEnd::Issued { ticketless } => Ok(IoRegistration { gate: self, ticketless }),
             IoEnd::Slow(reason) => Err(reason),
         }
     }

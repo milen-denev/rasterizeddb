@@ -273,7 +273,7 @@ impl TransactionFamily {
 /// `_pointers.db`), so a suffix missing here is a pair of names the guard lets
 /// through. `sidecar_clash_tests` reads every `.db` name built anywhere in
 /// `src/` and fails on one whose suffix is not listed.
-const RENAMED_SUFFIXES: &[&str] = &[
+pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     // Row data. First deliberately: it is the one whose absence is silent.
     ".db",
     "_pointers.db",

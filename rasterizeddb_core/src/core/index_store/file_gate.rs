@@ -107,6 +107,16 @@ pub struct FileGate {
     /// Whether `slot_epoch` is the recovered record's. False when `rdb.ixe`
     /// could not be read or decoded: no snapshot can then prove its epoch.
     epoch_proven: AtomicBool,
+    /// Test-only: `GatedIo` judges this word's writes as a release build
+    /// does (the slow path inline, `CANCEL` on a ticketless seal) instead of
+    /// panicking, so tests can exercise production's verdicts (B12).
+    #[cfg(test)]
+    release_verdicts: AtomicBool,
+    /// Test-only: the next slow path fails with nothing written, as one
+    /// whose `DIRTY` could not be made durable and whose `.ixs` could not be
+    /// unlinked does (B12: the failure goes through `failed_appends`).
+    #[cfg(test)]
+    fail_slow_path: AtomicBool,
 }
 
 impl std::fmt::Debug for FileGate {
@@ -249,6 +259,10 @@ impl FileGate {
             files: None,
             slot_epoch: AtomicU64::new(0),
             epoch_proven: AtomicBool::new(false),
+            #[cfg(test)]
+            release_verdicts: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_slow_path: AtomicBool::new(false),
         })
     }
 
@@ -284,6 +298,10 @@ impl FileGate {
             files: Some(files.clone()),
             slot_epoch: AtomicU64::new(epoch),
             epoch_proven: AtomicBool::new(proven),
+            #[cfg(test)]
+            release_verdicts: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_slow_path: AtomicBool::new(false),
         });
         let mut reg = GATES.lock();
         let pruned_at = reg.pruned_at;
@@ -345,6 +363,10 @@ impl FileGate {
     /// `gate::ticket` through [`WriteGate::acquire`], single-flight; the word
     /// moves to `Dirty` only once this returned `Ok`.
     pub(crate) async fn slow_path(&self, state: GateState) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_slow_path.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected slow-path failure: DIRTY not durable, .ixs not unlinked"));
+        }
         let Some(files) = self.files.as_ref() else {
             return Ok(());
         };
@@ -392,6 +414,60 @@ impl FileGate {
     pub fn force_unknown_for_tests(&self) {
         self.word.force_state_for_tests(GateState::Unknown);
     }
+
+    /// Test-only: `GatedIo` judges this word's writes as a release build
+    /// does (B12).
+    #[cfg(test)]
+    pub fn set_release_verdicts_for_tests(&self, on: bool) {
+        self.release_verdicts.store(on, Ordering::Release);
+    }
+
+    /// Whether `GatedIo` judges this word's writes as a release build does:
+    /// always outside tests.
+    #[inline(always)]
+    pub fn release_verdicts(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.release_verdicts.load(Ordering::Acquire)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Test-only: the next slow path fails with nothing written (B12).
+    #[cfg(test)]
+    pub fn fail_next_slow_path_for_tests(&self) {
+        self.fail_slow_path.store(true, Ordering::Release);
+    }
+
+    /// The file set's directory, for a file set that has one.
+    pub fn dir(&self) -> Option<&Path> {
+        self.files.as_ref().map(|f| f.dir.as_path())
+    }
+}
+
+/// Test-only: the live word of the file set `file` (a file name in `dir`)
+/// belongs to, if one is open: what `GatedIo` asks when a provider with no
+/// word writes, to catch a write that reaches a live file set around its
+/// gate (B12). A file belongs to a stem when it is the stem plus one of a
+/// table's file suffixes (`database::RENAMED_SUFFIXES`); the database's
+/// clash guard keeps that unambiguous among live tables.
+#[cfg(test)]
+pub fn live_gate_for(dir: &Path, file: &str) -> Option<Arc<FileGate>> {
+    let reg = GATES.lock();
+    let map = reg.map.as_ref()?;
+    map.iter()
+        .filter(|(f, _)| f.dir == dir && owns(&f.stem, file))
+        .find_map(|(_, w)| w.upgrade())
+}
+
+/// Whether `file` is one of the stem's files.
+#[cfg(test)]
+fn owns(stem: &str, file: &str) -> bool {
+    file.strip_prefix(stem)
+        .is_some_and(|rest| crate::core::database::RENAMED_SUFFIXES.contains(&rest))
 }
 
 /// A `CLEAN` that vouches for a snapshot that does not exist: what the

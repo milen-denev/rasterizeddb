@@ -150,7 +150,7 @@ impl Database {
         }
         let key = self.lock_key(name);
         let role = role_for(owner, mode);
-        match self.row_locks.table_locks().request(owner.owner, &key, mode, role) {
+        let granted = match self.row_locks.table_locks().request(owner.owner, &key, mode, role) {
             Request::Granted => Ok(()),
             Request::Queued(wait) => {
                 // Finding L8: a reader is an owner that has written nothing.
@@ -170,7 +170,38 @@ impl Database {
                 );
                 Box::pin(self.wait_queued(wait, mode)).await
             }
+        };
+        if granted.is_ok() && mode == TableMode::AccessExclusive {
+            return Box::pin(self.ticket_exclusive(name)).await;
         }
+        granted
+    }
+
+    /// A ticket on the file set of the table ACCESS EXCLUSIVE was just
+    /// granted on, kept by the statement's family (B12). ACCESS EXCLUSIVE is
+    /// what a DDL takes on every table it may change, its own and the FK
+    /// children whose sidecars it rewrites (finding L11), so this is where
+    /// each of them gets a durable `DIRTY` and a held ticket before the DDL
+    /// writes its schema family (T1, §2 layer 2), whichever arm does the
+    /// writing. After the lock, as the lock order wants. Given back with
+    /// the family's other tickets when the owner is released, after its
+    /// outcome is final. A table that does not exist yet (a `CREATE`'s or a
+    /// `RENAME`'s target) has no word to ticket.
+    async fn ticket_exclusive(&self, name: &str) -> Result<(), String> {
+        let Some(slot) = self.slot(name) else {
+            return Ok(());
+        };
+        if !slot.is_live() {
+            return Ok(());
+        }
+        let table = slot.load();
+        let Some(family) = table.family() else {
+            return Ok(());
+        };
+        crate::core::index_store::gate::ticket(table.gate(), Some(family))
+            .await
+            .map(drop)
+            .map_err(|e| format!("\"{name}\" could not be marked dirty before it changed: {e}"))
     }
 
     /// The wait of a request [`Database::lock_table`] queued.

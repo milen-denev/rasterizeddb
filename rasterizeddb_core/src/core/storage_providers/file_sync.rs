@@ -27,6 +27,7 @@ use smallvec::SmallVec;
 // Removed chunk cache; no longer need helpers::Chunk
 
 use super::{CRC, traits::StorageIO};
+use crate::core::index_store::gated_io::{Failure, Site};
 
 pub enum FastPathResult {
     Done,              // fully satisfied
@@ -43,11 +44,14 @@ pub enum FastPathResult {
 #[derive(Default)]
 struct CommitState {
     /// The write gate of the file set this file belongs to, once its table
-    /// is assembled (`StorageIO::attach_write_gate`): the background landing
-    /// of staged bytes takes a count on it for each landing, or waits for the
-    /// next round (docs/persistent-indexes.md §2: `.tmp` landing passes the
-    /// gate). Shared across clones, like the rest of this.
-    landing_gate: OnceLock<std::sync::Arc<crate::core::index_store::gate_word::WriteGate>>,
+    /// is assembled (`StorageIO::attach_write_gate`) or inherited from the
+    /// provider this one was opened from (a schema sidecar): every write
+    /// entry point registers on it first (`index_store::gated_io`, B12), and
+    /// the background landing of staged bytes takes a count on it for each
+    /// landing, or waits for the next round (docs/persistent-indexes.md §2:
+    /// `.tmp` landing passes the gate). Shared across clones, like the rest
+    /// of this.
+    gated: crate::core::index_store::gated_io::GatedIo,
     /// Appends whose `write` has completed. Bumped under the append lock, so it
     /// can never run ahead of the bytes it stands for.
     ///
@@ -343,7 +347,7 @@ impl LocalStorageProvider {
         }
         // An append in this transaction failed and was rolled back. Taken
         // before the refusals below, which would otherwise leave it recorded.
-        let failed = failed_appends::take(&self.file_str, token);
+        let failed = failed_appends::take(&self.location, &self.file_str, token);
         // A sibling file in the same directory failing its flush is this
         // commit's failure too: the pointer committed here may name bytes in
         // that file which never reached the disk.
@@ -389,10 +393,16 @@ impl LocalStorageProvider {
             // A staged append that failed: its bytes are in neither the file
             // nor the mirror, so landing the rest would call a short copy
             // durable.
-            if let Some(e) = failed_appends::take(&self.file_str, failed_appends::STAGED) {
+            if let Some(e) = failed_appends::take_staged(&self.file_str) {
                 return Err(e);
             }
             if self.temp_has_data.load(Ordering::Acquire) {
+                // A landing writes the main file: registered like any write.
+                let _registered = self
+                    .commit
+                    .gated
+                    .admit(Site::Land, &self.location, &self.table_name)
+                    .await?;
                 self.land_staged_durably().await?;
             }
         }
@@ -494,14 +504,26 @@ impl LocalStorageProvider {
     }
 }
 
-/// Appends that failed and were rolled back, until their transaction's
-/// `commit_durable` reports them.
+/// Writes that failed and were rolled back, or were skipped, until a commit
+/// reports them.
 ///
-/// Process-wide and keyed by file and transaction, because the trait's append
-/// returns no error and the provider struct is shared with other work: this
-/// keeps the failure on the one path every writer takes before reporting
-/// success. Empty — one atomic load — unless something failed.
-mod failed_appends {
+/// Process-wide, because the trait's appends and writes return no error and
+/// the provider struct is shared with other work: this keeps the failure on
+/// the one path every writer takes before reporting success. Empty — one
+/// atomic load — unless something failed.
+///
+/// **Keyed by the transaction, not the file** (slice B12). A transaction's
+/// writes span files: an `INSERT` appends its row to the rows file and its
+/// pointer to the pointers file, and commits through the pointers. Keyed by
+/// file, a failed row append was recorded where no commit ever looked: the
+/// pointer committed, naming bytes that were cut back off, and the next
+/// append landed on them. A transaction id is its directory log's (`Wal::
+/// begin`), so a failure under one is keyed by the directory and the id, and
+/// any file's commit of that transaction in the directory takes it.
+/// `GatedIo` records a skipped write the same way, which is what lets a gate
+/// failure on the rows fail the statement. A write with no log (`txn` 0)
+/// stays keyed by its file, as it was.
+pub(crate) mod failed_appends {
     use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -509,46 +531,138 @@ mod failed_appends {
     use parking_lot::Mutex;
 
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    static FAILED: Mutex<Option<HashMap<(String, u64), io::Error>>> = Mutex::new(None);
+    static FAILED: Mutex<Option<HashMap<Key, io::Error>>> = Mutex::new(None);
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Key {
+        /// A file's own: a log-less write (`txn` 0), or a staged append.
+        File(String, u64),
+        /// A directory's: a transaction of its log, or the gate key.
+        Dir(String, u64),
+    }
 
     /// The key for a failed staged append (`append_data(.., false)`), which
-    /// belongs to no transaction: reported by the next `commit_durable` that
-    /// lands staged bytes. No transaction id reaches it — they count up from 1.
+    /// belongs to no transaction: reported by the next `commit_durable` of
+    /// the same file that lands staged bytes. No transaction id reaches it —
+    /// they count up from 1.
     pub(super) const STAGED: u64 = u64::MAX;
 
-    pub(super) fn record(file: &str, txn: u64, error: io::Error) {
+    /// The key for a gate failure on a write with no transaction (B12:
+    /// `write_data_seek`, a staged append, `swap_temp`): per directory,
+    /// reported by the next `commit_durable` of any file in it.
+    const GATE: u64 = u64::MAX - 1;
+
+    fn txn_key(location: &str, file: &str, txn: u64) -> Key {
+        if txn == 0 {
+            Key::File(file.to_string(), 0)
+        } else {
+            Key::Dir(crate::core::wal::dir_key(location), txn)
+        }
+    }
+
+    fn insert(key: Key, error: io::Error) {
         let mut map = FAILED.lock();
         let map = map.get_or_insert_with(HashMap::new);
-        if map.insert((file.to_string(), txn), error).is_none() {
+        if map.insert(key, error).is_none() {
             COUNT.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    pub(super) fn take(file: &str, token: u64) -> Option<io::Error> {
-        if COUNT.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let taken = FAILED.lock().as_mut()?.remove(&(file.to_string(), token));
+    fn remove(map: &mut HashMap<Key, io::Error>, key: &Key) -> Option<io::Error> {
+        let taken = map.remove(key);
         if taken.is_some() {
             COUNT.fetch_sub(1, Ordering::AcqRel);
         }
-        taken.map(|e| io::Error::new(e.kind(), format!("append failed and was rolled back: {e}")))
+        taken
+    }
+
+    fn reported(e: io::Error) -> io::Error {
+        io::Error::new(e.kind(), format!("append failed and was rolled back: {e}"))
+    }
+
+    /// Records a failed write of `file` in `location` under `txn`: the commit
+    /// of `txn` through any file of the directory reports it (`txn` 0: the
+    /// next commit of `file` with token 0).
+    pub(crate) fn record(location: &str, file: &str, txn: u64, error: io::Error) {
+        insert(txn_key(location, file, txn), error);
+    }
+
+    /// Records a failed staged append of `file`.
+    pub(super) fn record_staged(file: &str, error: io::Error) {
+        insert(Key::File(file.to_string(), STAGED), error);
+    }
+
+    /// Records a gate failure on a write with no transaction in `location`:
+    /// the next commit of any file in the directory reports it.
+    pub(crate) fn record_gate(location: &str, error: io::Error) {
+        insert(Key::Dir(crate::core::wal::dir_key(location), GATE), error);
+    }
+
+    /// The failure a commit of `token` through `file` in `location` must
+    /// report: one recorded under its transaction, by any file of the
+    /// directory, or else the directory's gate failure.
+    pub(super) fn take(location: &str, file: &str, token: u64) -> Option<io::Error> {
+        if COUNT.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut guard = FAILED.lock();
+        let map = guard.as_mut()?;
+        let taken = remove(map, &txn_key(location, file, token))
+            .or_else(|| remove(map, &Key::Dir(crate::core::wal::dir_key(location), GATE)));
+        taken.map(reported)
+    }
+
+    /// A failed staged append of `file`, for the commit that lands staged
+    /// bytes.
+    pub(super) fn take_staged(file: &str) -> Option<io::Error> {
+        if COUNT.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let taken = remove(FAILED.lock().as_mut()?, &Key::File(file.to_string(), STAGED));
+        taken.map(reported)
+    }
+
+    /// Test-only: how many failures are recorded for `location`'s directory
+    /// or for files in it.
+    #[cfg(test)]
+    pub(crate) fn pending_in(location: &str) -> usize {
+        let dir = crate::core::wal::dir_key(location);
+        FAILED.lock().as_ref().map_or(0, |m| {
+            m.keys()
+                .filter(|k| match k {
+                    Key::Dir(d, _) => *d == dir,
+                    Key::File(f, _) => std::path::Path::new(f).parent() == Some(std::path::Path::new(&dir)),
+                })
+                .count()
+        })
+    }
+
+    /// Forgets what `token`'s transaction recorded: it is being aborted, so
+    /// nothing will commit it, and a record left behind would sit in the map
+    /// for good (every later commit then paying the lock).
+    pub(super) fn discard(location: &str, token: u64) {
+        if token == 0 || COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if let Some(map) = FAILED.lock().as_mut() {
+            let _ = remove(map, &Key::Dir(crate::core::wal::dir_key(location), token));
+        }
     }
 
     #[cfg(test)]
     thread_local! {
         /// Makes the next append on this thread write only this many bytes
         /// and then fail.
-        pub(super) static SHORT_APPEND: std::cell::Cell<Option<usize>> =
+        pub(crate) static SHORT_APPEND: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
 
         /// Makes the next log-less in-place write on this thread write only
         /// this many bytes and then fail.
-        pub(super) static SHORT_INPLACE: std::cell::Cell<Option<usize>> =
+        pub(crate) static SHORT_INPLACE: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
 
         /// Skips the undo image, for measuring what it costs.
-        pub(super) static NO_UNDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(crate) static NO_UNDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
@@ -1144,7 +1258,7 @@ impl LocalStorageProvider {
             self.temp_has_data.store(false, Ordering::Release);
             return Ok(0);
         }
-        crate::core::index_store::census::write(&self.location, &self.table_name);
+        self.commit.gated.note_write(&self.location, &self.table_name);
 
         // The sync's outcome, reported only after the bytes are published: they
         // are in the main file either way, and leaving them unpublished would
@@ -1601,6 +1715,17 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
+        // Registered on the file set's word until the write returns (B12).
+        // A gate failure (release only) skips the write and fails `txn`'s
+        // commit.
+        let Some(_registered) = self
+            .commit
+            .gated
+            .admit_or_record(Site::WriteInPlace, &self.location, &self.table_name, Failure::Txn(txn))
+            .await
+        else {
+            return txn;
+        };
         // Recorded now, applied to `file_len` at commit — see `inplace_end`.
         // Raising the length here instead would publish a length whose bytes
         // are not in the file yet, since the apply is deferred to commit.
@@ -1634,7 +1759,7 @@ impl StorageIO for LocalStorageProvider {
                 // the caller thinks it is in. The transaction fails instead,
                 // with the file untouched.
                 error!("WAL in-place log for {} failed: {}", self.file_str, e);
-                failed_appends::record(&self.file_str, txn, e);
+                failed_appends::record(&self.location, &self.file_str, txn, e);
                 return txn;
             }
             None => {}
@@ -1660,7 +1785,7 @@ impl StorageIO for LocalStorageProvider {
             // `commit_durable` takes the failure under the token returned —
             // `txn`, which is 0 when there is no log.
             error!("in-place write to {} failed: {}", self.file_str, e);
-            failed_appends::record(&self.file_str, txn, e);
+            failed_appends::record(&self.location, &self.file_str, txn, e);
             return txn;
         }
         self.flush_self(self.commit.issue());
@@ -1668,6 +1793,16 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn append_data_txn(&self, txn: u64, buffer: &[u8]) -> (u64, u64) {
+        // As `write_data_txn`: a skipped append reports the allocator's end,
+        // which nothing may use, since `txn`'s commit fails.
+        let Some(_registered) = self
+            .commit
+            .gated
+            .admit_or_record(Site::Append, &self.location, &self.table_name, Failure::Txn(txn))
+            .await
+        else {
+            return (self.file_len.load(Ordering::Acquire), txn);
+        };
         let mut file = self.append_file.write();
         // `file_len` is the append allocator, and this is where these bytes go.
         let at = self.file_len.load(Ordering::Acquire);
@@ -1695,7 +1830,7 @@ impl StorageIO for LocalStorageProvider {
             }
             drop(file);
             error!("append to {} failed: {}", self.file_str, e);
-            failed_appends::record(&self.file_str, txn, e);
+            failed_appends::record(&self.location, &self.file_str, txn, e);
             return (at, txn);
         }
         let offset = self
@@ -1752,6 +1887,8 @@ impl StorageIO for LocalStorageProvider {
         if token == 0 {
             return;
         }
+        // Nothing will commit it now; its failures go with it.
+        failed_appends::discard(&self.location, token);
         crate::core::wal::with_wal_for(&self.location, |w| {
             if let Some(w) = w {
                 w.abort_txn(token);
@@ -1760,6 +1897,11 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn truncate(&self, len: u64) -> io::Result<()> {
+        let _registered = self
+            .commit
+            .gated
+            .admit(Site::Truncate, &self.location, &self.table_name)
+            .await?;
         // Staged appends live past the current end, so they are exactly the
         // bytes a truncation would drop. Land them first and let the caller see
         // a length that accounts for them, rather than silently discarding
@@ -1846,6 +1988,17 @@ impl StorageIO for LocalStorageProvider {
             return offset;
         }
 
+        // A staged write is a write of the file set too (its `.tmp`). A gate
+        // failure is reported by the next commit in the directory.
+        let Some(_registered) = self
+            .commit
+            .gated
+            .admit_or_record(Site::Stage, &self.location, &self.table_name, Failure::Untokened)
+            .await
+        else {
+            return self.file_len.load(Ordering::Acquire) + self.temp_file_len.load(Ordering::Acquire);
+        };
+
         // If a flush is ongoing, wait briefly until it completes to keep ordering simple.
         while self.append_blocked.load(Ordering::Acquire) {
             yield_now().await;
@@ -1900,7 +2053,7 @@ impl StorageIO for LocalStorageProvider {
             drop(tf);
             drop(mem);
             error!("staged append to {} failed: {}", self.temp_file_str, e);
-            failed_appends::record(&self.file_str, failed_appends::STAGED, e);
+            failed_appends::record_staged(&self.file_str, e);
             return self.file_len.load(Ordering::Acquire) + staged_at;
         }
         let _ = tf.flush();
@@ -2079,6 +2232,14 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
+        let Some(_registered) = self
+            .commit
+            .gated
+            .admit_or_record(Site::WriteSeek, &self.location, &self.table_name, Failure::Untokened)
+            .await
+        else {
+            return;
+        };
         let mut file = self.write_file.write();
         let written = file
             .seek(seek)
@@ -2221,6 +2382,15 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn swap_temp(&self, _temp_io_sync: &mut Self) {
+        // Replaces this file's bytes wholesale: a write of the file set.
+        let Some(_registered) = self
+            .commit
+            .gated
+            .admit_or_record(Site::SwapTemp, &self.location, &self.table_name, Failure::Untokened)
+            .await
+        else {
+            return;
+        };
         yield_now().await;
 
         let delimiter = if cfg!(unix) {
@@ -2364,8 +2534,18 @@ impl StorageIO for LocalStorageProvider {
         };
 
         if staged_len > 0 {
-            let _ = local_storage_provider.flush_temp_to_main().await;
+            let _ = crate::core::index_store::gated_io::ungated(
+                crate::core::index_store::gated_io::Ungated::OpenLanding,
+                local_storage_provider.flush_temp_to_main(),
+            )
+            .await;
         }
+        // A file named after this one (`<t>_schema.db`'s `_schema_*`
+        // sidecars) is the same file set's: it registers on the same word.
+        local_storage_provider
+            .commit
+            .gated
+            .inherit_from(&self.commit.gated, &self.table_name, &name);
 
         local_storage_provider.register_with_wal();
         local_storage_provider
@@ -2408,7 +2588,7 @@ impl StorageIO for LocalStorageProvider {
                     // fast path. When that would need the slow path (the log
                     // ends `CLEAN`, a seal is publishing), the bytes stay
                     // staged, readable from the mirror, until the next round.
-                    let _landing = match p.commit.landing_gate.get().map(|g| g.try_acquire()) {
+                    let _landing = match p.commit.gated.word().map(|w| w.try_acquire()) {
                         Some(Err(_)) => {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             continue;
@@ -2438,8 +2618,12 @@ impl StorageIO for LocalStorageProvider {
         Some(std::path::PathBuf::from(&self.location))
     }
 
-    fn attach_write_gate(&self, gate: &std::sync::Arc<crate::core::index_store::gate_word::WriteGate>) {
-        let _ = self.commit.landing_gate.set(gate.clone());
+    fn attach_write_gate(
+        &self,
+        gate: &std::sync::Arc<crate::core::index_store::file_gate::FileGate>,
+        policy: crate::core::index_store::gated_io::Policy,
+    ) {
+        self.commit.gated.attach(gate, policy);
     }
 }
 

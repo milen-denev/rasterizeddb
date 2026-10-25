@@ -12,7 +12,8 @@
 //!   `LiveIndex`, `GinIndex`, `TableIndexes` and `TableFilters`, which has the
 //!   proof in hand, with the structure's address and the proof's kind;
 //! - **a write issued** ([`Event::Write`]), at the storage provider's write
-//!   entry points and where a provider lands staged bytes.
+//!   entry points and where a provider lands staged bytes, with the word it
+//!   registered on (`gated_io`, B12).
 //!
 //! [`check`] then asserts what T1 and T2 promise for one gate: a durable
 //! `DIRTY` and a held ticket preceded every ticket-proven mutation of its
@@ -70,15 +71,34 @@ pub fn mutation(proof: Proof<'_>, at: usize, what: &'static str) {
     let _ = (proof, at, what);
 }
 
-/// Records a write issued to `name` in `location`.
+/// A write issued, as `GatedIo` saw it (slice B12).
+#[derive(Debug, Clone, Copy)]
+pub struct Written<'a> {
+    pub location: &'a str,
+    pub file: &'a str,
+    /// The word the write registered on (its address), if its provider has
+    /// one.
+    pub gate: Option<usize>,
+    /// For a provider with no word: the live file set the file belongs to,
+    /// if one is open.
+    pub live: Option<usize>,
+    /// The `gated_io::UNGATED` entry the write ran under: its provider's
+    /// exempt policy, or the `gated_io::ungated` scope around it.
+    pub ungated: Option<super::gated_io::Ungated>,
+}
+
+/// Records a write issued.
 #[inline(always)]
-pub fn write(location: &str, name: &str) {
+pub fn write(w: Written<'_>) {
     #[cfg(test)]
     recording::push(|| Event::Write {
-        file: Path::new(location).join(name),
+        file: Path::new(w.location).join(w.file),
+        gate: w.gate,
+        live: w.live,
+        ungated: w.ungated,
     });
     #[cfg(not(test))]
-    let _ = (location, name, Path::new(""));
+    let _ = (w, Path::new(""));
 }
 
 #[cfg(test)]
@@ -97,7 +117,15 @@ mod recording {
         Release { gate: usize },
         DirtyDurable { gate: usize },
         Mutation { at: usize, kind: ProofKind, what: &'static str },
-        Write { file: PathBuf },
+        /// A write issued: the word it registered on, or for a provider with
+        /// no word the live file set it reached; and the `UNGATED` entry it
+        /// ran under, if any (B12).
+        Write {
+            file: PathBuf,
+            gate: Option<usize>,
+            live: Option<usize>,
+            ungated: Option<crate::core::index_store::gated_io::Ungated>,
+        },
     }
 
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -228,7 +256,7 @@ mod recording {
                         }
                     }
                 }
-                Event::Write { file } if scope.files.contains(file) => {
+                Event::Write { file, .. } if scope.files.contains(file) => {
                     if !dirty {
                         return Err(format!(
                             "event {i}: a write to {} was issued before DIRTY was durable",

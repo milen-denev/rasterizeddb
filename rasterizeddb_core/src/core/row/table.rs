@@ -1150,11 +1150,23 @@ impl<S: StorageIO> Table<S> {
         // The file set's word: the live one when an instance of this file set
         // is still open (a reload), else derived from `.ixm`. Writes nothing.
         let gate = FileGate::open(io_pointers.index_store_dir(), stem, schema.incarnation);
-        // A landing of staged bytes is a write of the file set: each takes a
-        // count on the word, or waits for the next round (see
-        // `StorageIO::attach_write_gate`).
-        for io in [&io_pointers, &io_rows, &io_filters] {
-            io.attach_write_gate(gate.word());
+        // Every write of the file set registers on the word, at the provider
+        // (`index_store::gated_io`, B12): rows, pointers and `_flt.db`, and
+        // for a plain table its schema family (the sidecars inherit it) and
+        // `_seq.db`. A partition's schema and row ids are the logical table's,
+        // shared by every partition, so they attach to none of them.
+        // `_flt.db`'s checkpoint loop writes under no ticket until B14
+        // retires it: registered, but judged as release judges it.
+        {
+            use crate::core::index_store::gated_io::{Policy, Ungated};
+            for io in [&io_pointers, &io_rows] {
+                io.attach_write_gate(&gate, Policy::Backstop);
+            }
+            io_filters.attach_write_gate(&gate, Policy::Exempt(Ungated::FilterCheckpoint));
+            if guard.is_none() {
+                io_schema.attach_write_gate(&gate, Policy::Backstop);
+                ids.io.attach_write_gate(&gate, Policy::Backstop);
+            }
         }
 
         let filter_settings = crate::core::filter::settings::settings();
