@@ -28,6 +28,14 @@
 //!   `index_snapshot.max_concurrent_loads` slots, granted by rebuild cost
 //!   (slots × indexes), the highest first: at startup every table and
 //!   partition opens, and queues its load, before the first slot frees.
+//! - **A load someone waits for goes first** (the priority bump, B18). A
+//!   write whose first ticket meets a load not yet granted, or a reader
+//!   about to wait for one, marks it urgent ([`LoadBarrier::bump`]); the
+//!   next free slot goes to the earliest marked, ahead of every costlier
+//!   load. Only the order changes: the slots stay `max_concurrent_loads`,
+//!   and the write still waits for the load to finish, so nothing writes
+//!   an index before its load installs and a load still meets exactly the
+//!   snapshot (no union, no write let through).
 //! - **Each section** is read alone against its crc32c
 //!   ([`snapshot::read_section`]), decoded ([`index_section::decode`]) into
 //!   a checked stream, and only once every section decoded is any index
@@ -54,7 +62,7 @@
 //! the bits before the sweep, B17), so a loaded index holds no slot it
 //! cannot find.
 
-use std::collections::BinaryHeap;
+use std::cmp::Reverse;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -110,6 +118,7 @@ pub mod settings {
     static STORAGE: AtomicU8 = AtomicU8::new(0);
     static MAX_CONCURRENT_LOADS: AtomicU64 = AtomicU64::new(0);
     static LOAD_WAIT_MS: AtomicU64 = AtomicU64::new(600);
+    static PRIORITY_BUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
     /// `index_snapshot.index_storage`: `rebuild` (the default) or
     /// `snapshot`.
@@ -159,6 +168,18 @@ pub mod settings {
     pub fn set_load_wait_ms(ms: u64) {
         LOAD_WAIT_MS.store(ms, Ordering::Relaxed);
     }
+
+    /// Whether a load someone waits for is moved to the front of the queue
+    /// (the module documentation's priority bump). On; turned off only to
+    /// measure what it saves (`examples/index_rebuild_bench.rs`).
+    pub fn priority_bump() -> bool {
+        PRIORITY_BUMP.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn set_priority_bump(on: bool) {
+        PRIORITY_BUMP.store(on, Ordering::Relaxed);
+    }
 }
 
 /// Test-only: `index_storage` for tables under one directory, so a test can
@@ -199,6 +220,7 @@ pub(crate) mod storage_override {
 static LOADED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BUILT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BUMPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// `rdb_index_snapshot_index_loads_total`: opens whose indexes were loaded
 /// from INDEX sections.
@@ -215,6 +237,12 @@ pub fn built_total() -> u64 {
 /// `rdb_index_snapshot_load_failed_total`: loads that fell back to a build.
 pub fn failed_total() -> u64 {
     FAILED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// `rdb_index_snapshot_load_bumped_total`: loads moved to the front of the
+/// queue because a write or a reader waited for them.
+pub fn bumped_total() -> u64 {
+    BUMPED_TOTAL.load(Ordering::Relaxed)
 }
 
 /// How an instance's indexes came to be, for tests and diagnostics.
@@ -252,7 +280,15 @@ impl Origin {
 pub struct LoadBarrier {
     inflight: AtomicUsize,
     done: tokio::sync::Notify,
+    /// 0, or the order in which a waiter marked this file set's queued load
+    /// urgent ([`LoadBarrier::bump`]): the queue grants the lowest first,
+    /// ahead of every unmarked load. Cleared when the load is granted and
+    /// when the last load ends.
+    urgent: AtomicU64,
 }
+
+/// The order of bumps, process-wide: the earliest marked is granted first.
+static BUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One load in flight on a [`LoadBarrier`]; released on drop, on every path
 /// (a panic included), so nothing waits on a load that is gone.
@@ -262,6 +298,7 @@ pub struct LoadGuard(StdArc<LoadBarrier>);
 impl Drop for LoadGuard {
     fn drop(&mut self) {
         if self.0.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.urgent.store(0, Ordering::Release);
             self.0.done.notify_waiters();
         }
     }
@@ -292,12 +329,43 @@ impl LoadBarrier {
         }
     }
 
-    /// Waits until no load is in flight, up to `limit`. Whether none is.
+    /// A reader about to wait: marks a load still queued urgent, then waits
+    /// until no load is in flight, up to `limit`. Whether none is.
     pub async fn settled_within(&self, limit: Duration) -> bool {
         if !self.loading() {
             return true;
         }
+        self.bump();
         tokio::time::timeout(limit, self.settled()).await.is_ok()
+    }
+
+    /// A write's first ticket: marks a load still queued urgent, then waits
+    /// until no load is in flight (`gate::ticket`, before its slow path).
+    pub async fn settled_for_write(&self) {
+        if self.loading() {
+            self.bump();
+        }
+        self.settled().await
+    }
+
+    /// Marks this file set's load urgent, if one is in flight: when it is
+    /// still queued, the next free slot is its, ahead of every costlier
+    /// load (the module documentation's priority bump). A load already
+    /// running is unaffected. The earliest marked goes first among several.
+    pub fn bump(&self) {
+        if !settings::priority_bump() || !self.loading() {
+            return;
+        }
+        let seq = BUMP_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.urgent.compare_exchange(0, seq, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            BUMPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a waiter marked the load in flight urgent and it has not been
+    /// granted yet. For tests and diagnostics.
+    pub fn bumped(&self) -> bool {
+        self.urgent.load(Ordering::Acquire) != 0
     }
 }
 
@@ -308,35 +376,33 @@ impl LoadBarrier {
 struct Waiter {
     cost: u64,
     seq: u64,
+    /// The load's file set barrier, which a waiting write or reader marks
+    /// urgent; `None` for an audit's scratch build, which nobody waits for.
+    barrier: Option<StdArc<LoadBarrier>>,
     grant: tokio::sync::oneshot::Sender<()>,
 }
 
-impl PartialEq for Waiter {
-    fn eq(&self, other: &Self) -> bool {
-        (self.cost, self.seq) == (other.cost, other.seq)
-    }
-}
-impl Eq for Waiter {}
-impl PartialOrd for Waiter {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Waiter {
-    /// The costliest first; among equals, the first to queue.
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cost.cmp(&other.cost).then(other.seq.cmp(&self.seq))
+impl Waiter {
+    /// The order slots are granted in, highest first: a load marked urgent
+    /// before any other (the earliest marked first); then the costliest;
+    /// among equals, the first to queue.
+    fn rank(&self) -> (bool, Reverse<u64>, u64, Reverse<u64>) {
+        let urgent = self.barrier.as_ref().map_or(0, |b| b.urgent.load(Ordering::Acquire));
+        (urgent != 0, Reverse(urgent), self.cost, Reverse(self.seq))
     }
 }
 
 struct Queue {
     running: usize,
     seq: u64,
-    waiting: BinaryHeap<Waiter>,
+    /// Ranked at each grant, since a waiter's urgency changes while it
+    /// waits. Few at a time (the opens that queued), so a vector.
+    waiting: Vec<Waiter>,
 }
 
 /// A queue of loads: at most `limit()` hold a slot at once; a freed slot
-/// goes to the costliest waiter.
+/// goes to the waiter a write or a reader marked urgent first, else to the
+/// costliest.
 pub(crate) struct LoadQueue {
     inner: Mutex<Queue>,
     limit: fn() -> usize,
@@ -353,19 +419,23 @@ impl LoadQueue {
             inner: Mutex::new(Queue {
                 running: 0,
                 seq: 0,
-                waiting: BinaryHeap::new(),
+                waiting: Vec::new(),
             }),
             limit,
             peak: AtomicUsize::new(0),
         }
     }
 
-    /// Grants free slots to the costliest waiters. A waiter whose load was
-    /// dropped meanwhile is skipped.
+    /// Grants free slots to the highest-ranked waiters ([`Waiter::rank`]).
+    /// A waiter whose load was dropped meanwhile is skipped.
     fn grant_locked(&self, q: &mut Queue) {
         let limit = (self.limit)().max(1);
         while q.running < limit {
-            let Some(w) = q.waiting.pop() else { break };
+            let Some(best) = (0..q.waiting.len()).max_by_key(|&i| q.waiting[i].rank()) else { break };
+            let w = q.waiting.swap_remove(best);
+            if let Some(b) = &w.barrier {
+                b.urgent.store(0, Ordering::Release);
+            }
             if w.grant.send(()).is_ok() {
                 q.running += 1;
                 self.peak.fetch_max(q.running, Ordering::Relaxed);
@@ -377,14 +447,31 @@ impl LoadQueue {
         self.grant_locked(&mut self.inner.lock());
     }
 
-    /// Waits for a slot; `cost` orders the waiters.
+    /// Waits for a slot; `cost` orders the waiters. Nobody can mark it
+    /// urgent.
     pub(crate) async fn admit(&self, cost: u64) -> Slot<'_> {
+        self.admit_with(cost, None).await
+    }
+
+    /// Waits for a slot for the load behind `barrier`: `cost` orders the
+    /// waiters, and a write or a reader waiting on `barrier` moves it to
+    /// the front ([`LoadBarrier::bump`]).
+    pub(crate) async fn admit_load(&self, cost: u64, barrier: StdArc<LoadBarrier>) -> Slot<'_> {
+        self.admit_with(cost, Some(barrier)).await
+    }
+
+    async fn admit_with(&self, cost: u64, barrier: Option<StdArc<LoadBarrier>>) -> Slot<'_> {
         let rx = {
             let mut q = self.inner.lock();
             let (tx, rx) = tokio::sync::oneshot::channel();
             q.seq += 1;
             let seq = q.seq;
-            q.waiting.push(Waiter { cost, seq, grant: tx });
+            q.waiting.push(Waiter {
+                cost,
+                seq,
+                barrier,
+                grant: tx,
+            });
             self.grant_locked(&mut q);
             rx
         };
@@ -416,6 +503,14 @@ impl LoadQueue {
 /// Re-reads the limit after `max_concurrent_loads` changed.
 fn regrant() {
     QUEUE.regrant();
+}
+
+/// A slot on the process's queue for an audit's scratch build (B18): the
+/// scratch copy doubles a table's index memory while it runs, so it counts
+/// against `max_concurrent_loads` as a load does. Lowest priority: no
+/// write or reader waits for an audit.
+pub(crate) async fn admit_audit() -> Slot<'static> {
+    QUEUE.admit(0).await
 }
 
 /// A slot on a queue, given back on drop.
@@ -553,6 +648,39 @@ pub(crate) mod hooks {
 
     static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static VERSION: Mutex<Vec<(PathBuf, u16)>> = Mutex::new(Vec::new());
+    static QUEUES: Mutex<Vec<(PathBuf, &'static super::LoadQueue)>> = Mutex::new(Vec::new());
+    static GRANTS: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+    /// Loads of file sets under `dir` queue on `queue` instead of the
+    /// process's, while this lives; each grant is logged ([`grants`]).
+    pub(crate) struct Queue(PathBuf);
+
+    impl Drop for Queue {
+        fn drop(&mut self) {
+            QUEUES.lock().retain(|(d, _)| *d != self.0);
+            GRANTS.lock().retain(|(d, _)| !d.starts_with(&self.0));
+        }
+    }
+
+    pub(crate) fn queue(dir: &Path, queue: &'static super::LoadQueue) -> Queue {
+        QUEUES.lock().push((dir.to_path_buf(), queue));
+        Queue(dir.to_path_buf())
+    }
+
+    pub(super) fn queue_for(dir: &Path) -> Option<&'static super::LoadQueue> {
+        QUEUES.lock().iter().find(|(d, _)| dir.starts_with(d)).map(|(_, q)| *q)
+    }
+
+    pub(super) fn note_grant(dir: &Path, name: &str) {
+        if QUEUES.lock().iter().any(|(d, _)| dir.starts_with(d)) {
+            GRANTS.lock().push((dir.to_path_buf(), name.to_string()));
+        }
+    }
+
+    /// The loads under `dir` granted a slot so far, in order.
+    pub(crate) fn grants(dir: &Path) -> Vec<String> {
+        GRANTS.lock().iter().filter(|(d, _)| d.starts_with(dir)).map(|(_, n)| n.clone()).collect()
+    }
 
     /// Loads of file sets under `dir` wait while this lives.
     pub(crate) struct Hold(PathBuf);
@@ -649,9 +777,14 @@ where
         }
         Plan::Load { path, sections } => {
             let cost = o.n_slots.saturating_mul(o.indexes.list.len() as u64);
-            let slot = QUEUE.admit(cost).await;
+            #[cfg(test)]
+            let queue = o.gate.dir().and_then(hooks::queue_for).unwrap_or(&QUEUE);
+            #[cfg(not(test))]
+            let queue = &QUEUE;
+            let slot = queue.admit_load(cost, o.gate.loads().clone()).await;
             #[cfg(test)]
             if let Some(dir) = o.gate.dir() {
+                hooks::note_grant(dir, &o.name);
                 while hooks::held(dir) {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }

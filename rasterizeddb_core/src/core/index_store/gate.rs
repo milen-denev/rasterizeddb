@@ -256,8 +256,10 @@ pub(crate) async fn ticket(gate: &FileGate, family: Option<Family>) -> io::Resul
                     // in flight (§4, B17). A load runs only on a word the
                     // open found `Clean`, where every first ticket comes
                     // here, so nothing is issued until it has finished or
-                    // failed, and the snapshot still equals the data.
-                    gate.loads().settled().await;
+                    // failed, and the snapshot still equals the data. A load
+                    // not yet granted a slot is moved to the front of the
+                    // queue first (B18): the order changes, never the wait.
+                    gate.loads().settled_for_write().await;
                     gate.word().acquire(|state| gate.slow_path(state)).await
                 });
             slow.await?
