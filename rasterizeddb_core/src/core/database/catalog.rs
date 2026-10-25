@@ -539,6 +539,13 @@ pub struct DatabaseListing {
 /// written, which is how PostgreSQL treats every identifier.
 pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, String>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
+    // Every form names `DATABASE[S]` as its second word. Asked of the text as
+    // it is (uppercasing moves no whitespace), so the statements that are not
+    // one, which is every other statement the server runs, skip the copy.
+    let noun = trimmed.split_whitespace().nth(1)?;
+    if !noun.eq_ignore_ascii_case("DATABASE") && !noun.eq_ignore_ascii_case("DATABASES") {
+        return None;
+    }
     let upper = trimmed.to_ascii_uppercase();
 
     let mut words = upper.split_whitespace();

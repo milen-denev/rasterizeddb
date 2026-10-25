@@ -623,6 +623,11 @@ fn is_ident_byte(b: u8) -> bool {
 
 pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
     let bytes = sql.as_bytes();
+    // No `RETURNING` anywhere, in any case, literals included, is none to
+    // find: found by `memchr` for the statements, nearly all, that have none.
+    if !memchr::memchr2_iter(b'r', b'R', bytes).any(|p| bytes.len() - p >= 9 && bytes[p..p + 9].eq_ignore_ascii_case(b"RETURNING")) {
+        return None;
+    }
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -643,7 +648,10 @@ pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
         }
 
         const KW: usize = "RETURNING".len();
-        if i + KW <= bytes.len()
+        // The first byte first: it rules out nearly every position, where
+        // the nine-byte comparison ran at each one.
+        if bytes[i] | 0x20 == b'r'
+            && i + KW <= bytes.len()
             && bytes[i..i + KW].eq_ignore_ascii_case(b"RETURNING")
             && (i == 0 || !is_ident_byte(bytes[i - 1]))
             && (i + KW == bytes.len() || !is_ident_byte(bytes[i + KW]))
@@ -683,7 +691,8 @@ pub fn returning_columns(
             }
             _ => {
                 const KW: &[u8] = b"RETURNING";
-                if i + KW.len() <= bytes.len()
+                if bytes[i] | 0x20 == b'r'
+                    && i + KW.len() <= bytes.len()
                     && bytes[i..i + KW.len()].eq_ignore_ascii_case(KW)
                     && (i == 0 || !is_ident_byte(bytes[i - 1]))
                     && (i + KW.len() == bytes.len() || !is_ident_byte(bytes[i + KW.len()]))
@@ -2170,9 +2179,8 @@ mod tests {
 /// writes lost rows with no error anywhere. Refusing a statement that was only
 /// partly understood is strictly better than executing the part that was.
 pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
-    let upper = sql.to_ascii_uppercase();
     // The `VALUES` that introduces the tuples, not one inside a string.
-    let values_at = find_values_keyword(sql, &upper)?;
+    let values_at = find_values_keyword(sql)?;
 
     let head = &sql[..values_at];
     let mut rest = sql[values_at + "VALUES".len()..].trim_start();
@@ -2246,7 +2254,7 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
 ///
 /// Skips any occurrence inside a quoted string, so a row containing the word
 /// does not derail the split.
-fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
+fn find_values_keyword(sql: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
@@ -2257,9 +2265,11 @@ fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             _ if !in_single && !in_double => {
-                // Bytes, not `upper[i..]`, which panics inside a multi-byte
-                // character of an unquoted identifier.
-                if upper.as_bytes()[i..].starts_with(b"VALUES") {
+                // Bytes, never a `str` slice, which panics inside a
+                // multi-byte character of an unquoted identifier; compared
+                // in place, ignoring ASCII case, rather than against an
+                // uppercased copy of the statement.
+                if c | 0x20 == b'v' && bytes[i..].len() >= 6 && bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES") {
                     // An identifier byte on either side means this is inside a
                     // name — `raw_values`, `order_values`, `valuesx` — not the
                     // keyword. `_`, `$` and non-ASCII bytes are identifier bytes

@@ -1064,6 +1064,24 @@ async fn commit_and_chain_opens_the_next_block() {
     assert_eq!(count(&pool, "SELECT * FROM t").await, 2);
 }
 
+/// A statement that merely ends `AND chain` is not a misplaced `AND CHAIN`.
+/// Every statement used to be matched against the suffix, so a filter on a
+/// boolean column named `chain` was refused with 42601, as was an `UPDATE`
+/// with that `WHERE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_named_chain_is_not_and_chain() {
+    let (server, pool) = server().await;
+    run(&pool, "CREATE TABLE links (id INT PRIMARY KEY, chain BOOLEAN)").await.expect("create");
+    run(&pool, "INSERT INTO links (id, chain) VALUES (1, true), (2, false)").await.expect("insert");
+
+    let mut c = conn(&server).await;
+    exec(&mut c, "SELECT id FROM links WHERE id = 1 AND chain").await.expect("a filter on `chain`");
+    exec(&mut c, "UPDATE links SET id = id WHERE id > 0 and chain").await.expect("an update filtered on `chain`");
+    assert_eq!(count(&pool, "SELECT id FROM links WHERE id > 0 AND chain").await, 1);
+    // The real one is still refused off COMMIT and ROLLBACK, as PostgreSQL does.
+    assert!(exec(&mut c, "BEGIN AND CHAIN").await.is_err());
+}
+
 /// `SHOW` answers the parameters drivers read at start-up from the session,
 /// and refuses one this server does not have rather than answering "".
 #[tokio::test(flavor = "multi_thread")]

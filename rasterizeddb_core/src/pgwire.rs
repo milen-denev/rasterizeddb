@@ -7211,6 +7211,18 @@ async fn handle_transaction_control<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // Every form below opens with one of these words, so any other statement
+    // is not transaction control, decided before the lowercased, re-spaced
+    // copy every statement used to pay for. It is also what keeps a statement
+    // that merely ends `… AND chain` (a column named `chain`) from being
+    // refused below as a misplaced `AND CHAIN`.
+    let first = stmt.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    if !["begin", "start", "commit", "end", "rollback", "abort", "set", "savepoint", "release"]
+        .iter()
+        .any(|w| first.eq_ignore_ascii_case(w))
+    {
+        return Ok(false);
+    }
     let lower = stmt
         .trim()
         .trim_end_matches(';')

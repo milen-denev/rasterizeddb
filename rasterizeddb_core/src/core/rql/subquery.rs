@@ -28,8 +28,23 @@ pub struct InSubquery {
     pub negated_start: Option<usize>,
 }
 
+/// Whether `sql` has a `(` and holds `word` (uppercase) anywhere, ignoring
+/// ASCII case: what each finder below needs before it can find anything, so
+/// a `false` is exactly their `None`. Literals are not skipped, so a word in
+/// one only costs the full scan it always had. Every statement passes all
+/// three, and most hold neither.
+fn may_hold(sql: &str, word: &[u8]) -> bool {
+    let b = sql.as_bytes();
+    memchr::memchr(b'(', b).is_some()
+        && memchr::memchr2_iter(word[0], word[0].to_ascii_lowercase(), b)
+            .any(|i| b.len() - i >= word.len() && b[i..i + word.len()].eq_ignore_ascii_case(word))
+}
+
 /// Finds the first `IN (SELECT …)` in a statement, ignoring string literals.
 pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
+    if !may_hold(sql, b"SELECT") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -121,6 +136,9 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
 /// It must return exactly one row of one column, which then behaves as a
 /// constant — the same shape a literal select item takes.
 pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
+    if !may_hold(sql, b"SELECT") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
 
@@ -370,6 +388,9 @@ pub struct ExistsClause {
 
 /// Finds the first `[NOT] EXISTS (SELECT …)`, ignoring string literals.
 pub fn find_exists(sql: &str) -> Option<ExistsClause> {
+    if !may_hold(sql, b"EXISTS") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -1505,5 +1526,20 @@ mod tests {
     #[test]
     fn empty_results_render_as_an_empty_list() {
         assert_eq!(rows_to_value_list(&[], false).unwrap(), ("()".to_string(), false));
+    }
+
+    /// The cheap guard must never turn a finding into `None`: lower case,
+    /// mixed case and a keyword only after the parenthesis all still match.
+    #[test]
+    fn the_guard_keeps_every_subquery_the_scan_finds() {
+        assert!(find_in_subquery("select a from t where b in (select c from u)").is_some());
+        assert!(find_in_subquery("SELECT a FROM t WHERE b IN (SeLeCt c FROM u)").is_some());
+        assert!(find_scalar_subquery("update t set a = (select max(b) from u)").is_some());
+        assert!(find_exists("select 1 from t where exists (select 1 from u)").is_some());
+        assert!(find_exists("SELECT 1 FROM t WHERE NOT EXISTS (SELECT 1 FROM u)").is_some());
+        // And it says no exactly where the scan could not say yes.
+        for sql in ["UPDATE acc SET balance = 70 WHERE id = 10", "SELECT selection FROM t", "INSERT INTO t VALUES (1)"] {
+            assert!(find_in_subquery(sql).is_none() && find_scalar_subquery(sql).is_none() && find_exists(sql).is_none());
+        }
     }
 }

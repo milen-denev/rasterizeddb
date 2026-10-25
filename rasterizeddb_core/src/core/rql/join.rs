@@ -2123,9 +2123,28 @@ fn is_constant_term(term: &str) -> bool {
 /// does not report a problem, it reports *no relations*, which surfaces
 /// somewhere else entirely as "EXISTS must correlate…".
 pub fn find_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
-    let upper = sql.to_ascii_uppercase();
-    let bytes = upper.as_bytes();
+    // The text as uppercase, compared byte by byte in place: the same bytes
+    // at the same positions (only ASCII letters change), without a copy of
+    // the statement and a `memcmp` at every position. A statement's dispatch
+    // calls this a dozen times or more.
+    let bytes = sql.as_bytes();
     let kw = keyword.as_bytes();
+    // Most calls ask for a clause the statement does not have. The scan can
+    // only answer where the keyword's bytes match ignoring case, so if no such
+    // place exists at all, found by `memchr` rather than byte by byte, there
+    // is nothing for it to find.
+    if let Some(&k0) = kw.first() {
+        let rest = bytes.get(start..).unwrap_or_default();
+        let anywhere = memchr::memchr2_iter(k0.to_ascii_uppercase(), k0.to_ascii_lowercase(), rest)
+            .any(|p| rest.len() - p >= kw.len() && rest[p..p + kw.len()].eq_ignore_ascii_case(kw));
+        if !anywhere {
+            return None;
+        }
+    }
+    let is_kw_at = |i: usize| {
+        kw.first().is_none_or(|k| bytes[i].to_ascii_uppercase() == *k)
+            && bytes[i..i + kw.len()].iter().zip(kw).all(|(b, k)| b.to_ascii_uppercase() == *k)
+    };
     let mut quote: Option<u8> = None;
     let mut depth = 0usize;
     let mut i = start;
@@ -2145,7 +2164,7 @@ pub fn find_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
                 } else if c == b')' {
                     depth = depth.saturating_sub(1);
                 } else if depth == 0
-                    && &bytes[i..i + kw.len()] == kw
+                    && is_kw_at(i)
                     && (i == 0
                         || bytes[i - 1].is_ascii_whitespace()
                         || bytes[i - 1] == b')'
@@ -4398,39 +4417,37 @@ fn build_aggregate_stage(
 
 /// Splits a comma-separated list on commas outside parentheses and quotes.
 fn split_top_level(list: &str) -> Vec<String> {
+    // Each item is the slice between two separating commas, copied once.
+    // Every character used to be pushed onto a growing `String`, and every
+    // statement's dispatch splits a list or three. Byte-wise is exact: the
+    // quotes, parentheses and commas are ASCII, and no byte of a multi-byte
+    // character equals one.
     let mut out = Vec::new();
-    let mut current = String::new();
+    let mut start = 0usize;
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-
-    for c in list.chars() {
+    let mut quote: Option<u8> = None;
+    for (i, b) in list.bytes().enumerate() {
         match quote {
             Some(q) => {
-                current.push(c);
-                if c == q {
+                if b == q {
                     quote = None;
                 }
             }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    current.push(c);
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(list[start..i].to_string());
+                    start = i + 1;
                 }
-                '(' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(c);
-                }
-                ',' if depth == 0 => out.push(std::mem::take(&mut current)),
-                _ => current.push(c),
+                _ => {}
             },
         }
     }
-    if !current.trim().is_empty() {
-        out.push(current);
+    let rest = &list[start..];
+    if !rest.trim().is_empty() {
+        out.push(rest.to_string());
     }
     out
 }
@@ -5226,6 +5243,138 @@ mod tests {
         let plan = two_relation_plan(JoinKind::Left);
         let out = project(&plan, combine(&plan, &sets(vec![users(), Vec::new()])).expect("join"));
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|"]);
+    }
+
+    /// Statements the text-scan fast paths were checked against: quotes,
+    /// parentheses, case, non-ASCII text and keywords as substrings.
+    const SCAN_CORPUS: &[&str] = &[
+        "UPDATE acc SET balance = 70 WHERE id = 10",
+        "update acc set balance = 70 where id = 10",
+        "SELECT a FROM t WHERE b IN (SELECT c FROM u)",
+        "select a from t where b in (select c from u) order by a",
+        "SELECT 'FROM' FROM t",
+        "SELECT \"from\" FROM t WHERE x = ')'",
+        "SELECT a\nFROM t\nWHERE x = 1\nORDER BY a",
+        "INSERT INTO t (a, b) VALUES (1, 'x FROM y') RETURNING a",
+        "SELECT (SELECT max(a) FROM t) FROM u WHERE EXISTS (SELECT 1 FROM v)",
+        "SELECT ünïcödé, 'ß' FROM tëst WHERE naïve = 'FROM'",
+        "WITH x AS (SELECT 1) SELECT * FROM x",
+        "DELETE FROM t WHERE a = 1",
+        "",
+        "FROM",
+        "from(",
+        "SELECT a,FROM b",
+    ];
+
+    /// `find_keyword` as it was, uppercasing the whole text per call: the
+    /// in-place comparison must answer exactly as it did.
+    fn find_keyword_reference(sql: &str, keyword: &str, start: usize) -> Option<usize> {
+        let upper = sql.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        let kw = keyword.as_bytes();
+        let mut quote: Option<u8> = None;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i + kw.len() <= bytes.len() {
+            let c = bytes[i];
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if c == b'\'' || c == b'"' {
+                        quote = Some(c);
+                    } else if c == b'(' {
+                        depth += 1;
+                    } else if c == b')' {
+                        depth = depth.saturating_sub(1);
+                    } else if depth == 0
+                        && &bytes[i..i + kw.len()] == kw
+                        && (i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')' || bytes[i - 1] == b',')
+                        && bytes.get(i + kw.len()).is_none_or(|n| n.is_ascii_whitespace() || *n == b'(')
+                    {
+                        return Some(i);
+                    }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `split_top_level` as it was, pushing every character.
+    fn split_top_level_reference(list: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        for c in list.chars() {
+            match quote {
+                Some(q) => {
+                    current.push(c);
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => match c {
+                    '\'' | '"' => {
+                        quote = Some(c);
+                        current.push(c);
+                    }
+                    '(' => {
+                        depth += 1;
+                        current.push(c);
+                    }
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        current.push(c);
+                    }
+                    ',' if depth == 0 => out.push(std::mem::take(&mut current)),
+                    _ => current.push(c),
+                },
+            }
+        }
+        if !current.trim().is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    #[test]
+    fn split_top_level_answers_as_the_pushing_split_did() {
+        let lists = [
+            "a, b, c",
+            "count(*), coalesce(a, 0) AS x, 'a,b', \"q,\"",
+            "f(g(1, 2), 3), ', ', ü, 'ß,'",
+            "a,,b,",
+            ",",
+            "",
+            "  ",
+            "(a, b",
+            "a), b",
+        ];
+        for list in lists.iter().chain(SCAN_CORPUS) {
+            assert_eq!(super::split_top_level(list), split_top_level_reference(list), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn find_keyword_answers_as_the_uppercasing_scan_did() {
+        for sql in SCAN_CORPUS {
+            // Never an empty keyword: both versions index past the end for
+            // one, and no caller passes it.
+            for kw in ["FROM", "WHERE", "ORDER BY", "RETURNING", "SELECT", "from", "F"] {
+                for start in [0, 1, 5, sql.len()] {
+                    assert_eq!(
+                        super::find_keyword(sql, kw, start),
+                        find_keyword_reference(sql, kw, start),
+                        "{sql:?} {kw:?} {start}"
+                    );
+                }
+            }
+        }
     }
 }
 

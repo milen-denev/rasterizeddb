@@ -204,6 +204,13 @@ pub fn matching_close(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
+        // Only these bytes can open a quoted run or a comment or change the
+        // depth; every other one is stepped over without the two probes,
+        // which ran at each byte of every statement's several scans.
+        if !matches!(bytes[i], b'(' | b'[' | b')' | b']' | b'\'' | b'"' | b'$' | b'-' | b'/') {
+            i += 1;
+            continue;
+        }
         if i > open {
             if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
                 i = end;

@@ -1270,41 +1270,37 @@ fn unsupported_expression(expr: &str) -> Option<String> {
 
 /// Splits a SELECT list on commas that are not inside parentheses or quotes.
 fn split_select_items(list: &str) -> Vec<String> {
+    // Each item is the slice between two separating commas, copied once.
+    // Every character used to be pushed onto a growing `String`, and every
+    // statement's dispatch splits a list or three. Byte-wise is exact: the
+    // quotes, parentheses and commas are ASCII, and no byte of a multi-byte
+    // character equals one.
     let mut out = Vec::new();
-    let mut current = String::new();
+    let mut start = 0usize;
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-
-    for c in list.chars() {
+    let mut quote: Option<u8> = None;
+    for (i, b) in list.bytes().enumerate() {
         match quote {
             Some(q) => {
-                current.push(c);
-                if c == q {
+                if b == q {
                     quote = None;
                 }
             }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    current.push(c);
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(list[start..i].to_string());
+                    start = i + 1;
                 }
-                '(' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(std::mem::take(&mut current));
-                }
-                _ => current.push(c),
+                _ => {}
             },
         }
     }
-    if !current.trim().is_empty() {
-        out.push(current);
+    let rest = &list[start..];
+    if !rest.trim().is_empty() {
+        out.push(rest.to_string());
     }
     out
 }

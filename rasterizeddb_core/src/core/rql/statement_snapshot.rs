@@ -84,13 +84,15 @@ pub(crate) fn in_scope() -> bool {
 /// SHARE`) anywhere outside a quoted string or identifier. A column named
 /// `update` costs only the sharing, never correctness.
 pub fn is_read_only(sql: &str) -> bool {
-    let words = words_outside_quotes(sql);
-    let Some(first) = words.first() else {
+    // The first word alone settles every statement that is not a read, which
+    // is every write this asks about, without a `String` per word of it.
+    let Some(first) = first_word_outside_quotes(sql) else {
         return false;
     };
     if !["SELECT", "VALUES", "TABLE", "WITH"].contains(&first.as_str()) {
         return false;
     }
+    let words = words_outside_quotes(sql);
     let writes = ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"];
     if words.iter().any(|w| writes.contains(&w.as_str())) {
         return false;
@@ -98,6 +100,31 @@ pub fn is_read_only(sql: &str) -> bool {
     !words
         .windows(2)
         .any(|w| w[0] == "FOR" && ["SHARE", "NO", "KEY"].contains(&w[1].as_str()))
+}
+
+/// The first of [`words_outside_quotes`], found without the rest.
+fn first_word_outside_quotes(sql: &str) -> Option<String> {
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for c in sql.chars() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c.to_ascii_uppercase());
+            continue;
+        }
+        if !word.is_empty() {
+            return Some(word);
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+        }
+    }
+    (!word.is_empty()).then_some(word)
 }
 
 /// The bare words of `sql`, upper-cased, skipping quoted strings and
@@ -194,6 +221,24 @@ mod tests {
             "",
         ] {
             assert!(!is_read_only(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_first_word_is_the_first_of_the_words() {
+        for sql in [
+            "SELECT 1",
+            "  update t set a = 1",
+            "'quoted' SELECT",
+            "\"ident\" with",
+            "",
+            "   ",
+            "(SELECT 1)",
+            "ünïcödé FROM t",
+            "a",
+            "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+        ] {
+            assert_eq!(first_word_outside_quotes(sql), words_outside_quotes(sql).into_iter().next(), "{sql:?}");
         }
     }
 }

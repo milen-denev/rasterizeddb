@@ -183,7 +183,24 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
 /// The same test [`materialize`] applies, so a statement that merely contains
 /// the word does not match.
 pub fn view_of_statement(sql: &str) -> Option<&'static str> {
+    if !may_name_a_view(sql) {
+        return None;
+    }
     VIEWS.iter().copied().find(|view| names_relation(sql, view))
+}
+
+/// Whether `sql` could name any of [`VIEWS`]: each is `pg_…`, or is matched
+/// only under an `information_schema.` or `pg_catalog.` qualifier
+/// ([`needs_qualifier`]), so a statement holding neither `pg_` nor
+/// `information_schema.`, in any case, names none. One pass, where
+/// [`names_relation`] lowercases the whole statement once per view.
+fn may_name_a_view(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let at = |word: &[u8]| {
+        memchr::memchr2_iter(word[0], word[0].to_ascii_uppercase(), b)
+            .any(|i| b.len() - i >= word.len() && b[i..i + word.len()].eq_ignore_ascii_case(word))
+    };
+    at(b"pg_") || at(b"information_schema.")
 }
 
 /// A schema equivalent to the one the materialised view will have, for
@@ -254,6 +271,9 @@ pub async fn materialize(
     // for a process serving one.
     catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
 ) -> Result<Option<Materialized>, String> {
+    if !may_name_a_view(sql) {
+        return Ok(None);
+    }
     let mut wanted: Vec<String> = Vec::new();
     for view in VIEWS.iter().copied() {
         if names_relation(sql, view) {
@@ -1534,6 +1554,18 @@ mod tests {
             );
         }
         assert!(!is_catalog_view("users"));
+    }
+
+    /// `may_name_a_view` relies on every view being `pg_…` or matched only
+    /// under a qualifier. A view added outside that would be skipped by it.
+    #[test]
+    fn every_view_is_one_the_cheap_guard_can_see() {
+        for view in VIEWS {
+            assert!(view.starts_with("pg_") || needs_qualifier(view), "{view}");
+            assert!(may_name_a_view(&format!("SELECT * FROM {}", if needs_qualifier(view) { format!("information_schema.{view}") } else { view.to_uppercase() })));
+        }
+        assert!(!may_name_a_view("UPDATE acc SET balance = 70 WHERE id = 10"));
+        assert!(may_name_a_view("SELECT * FROM PG_CATALOG.tables"));
     }
 }
 
