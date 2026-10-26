@@ -29,8 +29,8 @@ const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator 
 /// Opens the incarnation record that follows the header in `_schema.db`.
 ///
 /// The first byte is one a header cannot start with — a header starts with the
-/// table name, filtered to `[A-Za-z0-9_]`, or with the `0` of an empty one — so
-/// a reader walking several headers ([`TableSchemaIterator`]) can tell the two
+/// table name in UTF-8, which never holds `0xFF`, or with the `0` of an empty
+/// one — so a reader walking several headers ([`TableSchemaIterator`]) can tell the two
 /// apart. Version 1 in the last byte.
 const INCARNATION_MAGIC: [u8; 8] = [0xFF, b'R', b'Z', b'I', b'N', b'C', 0, 1];
 
@@ -133,16 +133,17 @@ impl SchemaField {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut vec = vec![0; SCHEMA_FIELD_SIZE as usize];
 
-        // Filter name to contain only ASCII letters and numbers
-        let filtered_name: String = self
-            .name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-
-        // Copy filtered name bytes into vec (max 128 chars)
-        let name_bytes = filtered_name.as_bytes();
-        let copy_len = std::cmp::min(name_bytes.len(), 128);
+        // The column's name as it is, UTF-8, cut only at a character
+        // boundary within 128 bytes. Filtered to ASCII letters and digits,
+        // as it was, `naïve` came back from the next open as `nave` and
+        // `"日本"` as "", so every statement naming the column failed, and
+        // every insert into a NOT NULL one was refused as a NULL. A record
+        // written that way reads back as written.
+        let name_bytes = self.name.as_bytes();
+        let mut copy_len = name_bytes.len().min(128);
+        while !self.name.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
         vec[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
         // Name is already null terminated by the initial zeroes
@@ -621,29 +622,29 @@ impl TableSchema {
         // Always create a buffer of TABLE_SIZE (129*2) bytes, initialized with zeros
         let mut vec = vec![0; TABLE_SIZE];
 
-        // Filter name to contain only ASCII letters and numbers
-        let filtered_name: String = self
-            .name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-
-        // Copy filtered name bytes into vec (max 128 chars)
-        let name_bytes = filtered_name.as_bytes();
-        let copy_len = std::cmp::min(name_bytes.len(), 128);
+        // The table's name as it is, UTF-8, cut only at a character boundary
+        // within 128 bytes, as the column names are.
+        let name_bytes = self.name.as_bytes();
+        let mut copy_len = name_bytes.len().min(128);
+        while !self.name.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
         vec[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
         // The null terminator is already there from initializing with zeros
 
-        // Primary key bytes (starting at position 129)
+        // Primary key bytes (starting at position 129): the column's name as
+        // it is, UTF-8, cut only at a character boundary within 128 bytes.
+        // It must name the column exactly. Filtered to ASCII letters and
+        // digits, as it was, `"日本"` was recorded as "" and `naïve` as
+        // `nave`, and from the next open every insert was refused as a NULL
+        // in a column of that name. A header written that way reads back as
+        // written.
         if let Some(primary_key) = &self.primary_key {
-            // Filter primary key to ASCII letters and numbers
-            let filtered_pk: String = primary_key
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-
-            let pk_bytes = filtered_pk.as_bytes();
-            let pk_copy_len = std::cmp::min(pk_bytes.len(), 128);
+            let pk_bytes = primary_key.as_bytes();
+            let mut pk_copy_len = pk_bytes.len().min(128);
+            while !primary_key.is_char_boundary(pk_copy_len) {
+                pk_copy_len -= 1;
+            }
             vec[129..(129 + pk_copy_len)].copy_from_slice(&pk_bytes[..pk_copy_len]);
             // The null terminator is already there from initializing with zeros
         }
@@ -1679,6 +1680,21 @@ mod tests {
         assert_eq!(schema.is_immutable, false);
     }
 
+    /// A column's name reads back exactly as written: a quoted identifier may
+    /// hold any character, and the record is what every open reads it from.
+    #[test]
+    fn a_column_name_reads_back_as_written() {
+        for name in ["naïve", "日本", "with space", "a-b", &"é".repeat(70)] {
+            let field = create_test_schema_field(name, DbType::I32, 0, 0, false);
+            let back = SchemaField::from_vec(&field.into_vec()).unwrap().name;
+            if name.len() <= 128 {
+                assert_eq!(back, name);
+            } else {
+                assert_eq!(back, "é".repeat(64));
+            }
+        }
+    }
+
     #[test]
     fn test_table_schema_special_chars() {
         // Create schema with special characters in name and primary key
@@ -1691,9 +1707,21 @@ mod tests {
         // Deserialize
         let deserialized = TableSchema::from_vec(&vec).unwrap();
 
-        // Verify filtered content (only alphanumeric characters)
-        assert_eq!(deserialized.name, "users123");
-        assert_eq!(deserialized.primary_key, Some("id123".to_string()));
+        // Both names read back exactly as written.
+        assert_eq!(deserialized.name, "users!@#123");
+        assert_eq!(deserialized.primary_key, Some("id!@#123".to_string()));
+
+        for pk in ["日本", "naïve", "with space", &"é".repeat(70)] {
+            let mut s = TableSchema::new("t".to_string(), false);
+            s.set_primary_key(pk.to_string());
+            let back = TableSchema::from_vec(&s.into_vec()).unwrap().primary_key.unwrap();
+            if pk.len() <= 128 {
+                assert_eq!(back, pk);
+            } else {
+                // Cut at a character boundary within 128 bytes, never inside one.
+                assert_eq!(back, "é".repeat(64));
+            }
+        }
     }
 
     #[tokio::test]
@@ -2239,10 +2267,10 @@ mod tests {
     }
 
     /// The record's first byte is one no header can start with, whatever the
-    /// table's name: names are filtered to `[A-Za-z0-9_]`, or empty.
+    /// table's name: names are UTF-8, which never holds `0xFF`, or empty.
     #[test]
     fn no_header_starts_like_an_incarnation_record() {
-        for name in ["", "a", "Z9", "_x", "weird-name.with dots", "\u{ff}x"] {
+        for name in ["", "a", "Z9", "_x", "weird-name.with dots", "\u{ff}x", "日本", "\u{10ffff}"] {
             let header = TableSchema::new(name.into(), false).into_vec();
             assert_ne!(header[0], INCARNATION_MAGIC[0], "{name:?}");
         }
