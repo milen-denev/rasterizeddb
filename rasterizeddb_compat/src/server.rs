@@ -47,6 +47,12 @@ impl TestServer {
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> {
         &self.catalog
     }
+
+    /// Whether `RASTERIZEDDB_TEST_FILE_BACKED` put this server's databases in
+    /// files rather than memory.
+    pub fn is_file_backed(&self) -> bool {
+        self.scratch.is_some()
+    }
 }
 
 /// Stops the server when the test that started it is done.

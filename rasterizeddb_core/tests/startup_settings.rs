@@ -118,6 +118,9 @@ fn start(dir: &str, extra: &[&str]) -> (Server, u16) {
         .args(["--location", dir, "--protocol", "pgwire", "--pg-tls", "disable", "--pg-auth", "trust"])
         .args(["--pg-port", &port.to_string(), "--log-level", "error"])
         .args(extra)
+        // The suite may be run with every index paged; this test is about
+        // where a value comes from, so the default must be the default.
+        .env_remove("RASTERIZEDDB_INDEX_RESIDENCY")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
