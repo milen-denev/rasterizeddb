@@ -98,7 +98,10 @@ const FIELDS_HOLDING_A_TOKEN: [(&str, &str); 2] = [("FamilyShard", "held"), ("Re
 const GUARDED: [&str; 4] = ["LiveIndex", "GinIndex", "TableIndexes", "TableFilters"];
 
 /// Fns that build a new structure, which nothing else can reach yet.
-const CONSTRUCTORS: [(&str, &str); 13] = [
+const CONSTRUCTORS: [(&str, &str); 16] = [
+    ("GinIndex", "new_in"),
+    ("GinIndex", "new_paged"),
+    ("GinIndex", "build"),
     ("LiveIndex", "new"),
     ("LiveIndex", "over_path"),
     // The residency's choice of storage (docs/disk-indexes.md), at
@@ -118,7 +121,10 @@ const CONSTRUCTORS: [(&str, &str); 13] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 70] = [
+const READ_ONLY: [(&str, &str); 73] = [
+    ("GinIndex", "is_paged"),
+    ("GinIndex", "list"),
+    ("GinIndex", "list_len"),
     ("LiveIndex", "method"),
     // Writes a sealed run file for a snapshot; changes nothing the index holds.
     ("LiveIndex", "seal_run"),

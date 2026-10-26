@@ -1796,9 +1796,8 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexe
     for_schema_in(schema, None)
 }
 
-/// [`for_schema`], with B-tree, hash and path indexes paged under `placement`
-/// when the residency asks for it (docs/disk-indexes.md). Gin indexes stay in
-/// memory (phase 3).
+/// [`for_schema`], with every index paged under `placement` when the
+/// residency asks for it (docs/disk-indexes.md; gin from phase 3).
 pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: Option<&paged::Placement>) -> TableIndexes {
     let live = |wo: u32| {
         schema
@@ -1854,7 +1853,7 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
             let column = decl.columns.first().copied();
             match column.and_then(live) {
                 Some(f) if decl.columns.len() == 1 && f.db_type == DbType::JSONB => {
-                    gins.push(Arc::new(gin::GinIndex::new(decl.clone(), f.write_order as u32, opclass)));
+                    gins.push(Arc::new(gin::GinIndex::new_in(decl.clone(), f.write_order as u32, opclass, placement)));
                 }
                 _ => log::warn!(
                     "gin index {} on {} no longer names one jsonb column; not built",
