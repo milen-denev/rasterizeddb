@@ -5642,18 +5642,24 @@ fn fold_on_clauses(sql: &str) -> String {
 /// folded or left alone.
 fn fold_constants_in_predicate(text: &str) -> String {
     fn fold_operand(operand: &str) -> String {
-        let trimmed = operand.trim();
-        if trimmed.is_empty() || !crate::core::rql::expr::needs_evaluation(trimmed) {
-            return operand.to_string();
-        }
+        // The statement's own `;` is not part of its last operand: left on
+        // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
+        // `ts < NOW();` were never folded.
+        let trimmed = operand.trim().trim_end_matches(';').trim_end();
         // The surrounding whitespace is part of the statement, not of the
         // operand. Dropping it ran the substituted literal straight into the
         // next keyword — `< '2026-…'ORDER BY id` — so the clause splitter no
         // longer found ` ORDER BY ` and handed `ORDER` to the tokenizer as a
         // column name.
         let lead = &operand[..operand.len() - operand.trim_start().len()];
-        let tail = &operand[operand.trim_end().len()..];
+        let tail = &operand[lead.len() + trimmed.len()..];
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
+        if let Some(value) = fold_integer_arithmetic(trimmed) {
+            return wrap(value);
+        }
+        if trimmed.is_empty() || !crate::core::rql::expr::needs_evaluation(trimmed) {
+            return operand.to_string();
+        }
         let Ok(expr) = crate::core::rql::expr::parse(trimmed, &[]) else {
             return operand.to_string();
         };
@@ -5714,6 +5720,113 @@ fn fold_constants_in_predicate(text: &str) -> String {
         }
     }
     out
+}
+
+/// `text` as one integer literal, when it is nothing but integer literals
+/// joined by `+`, `-` and `*`, with parentheses and a minus on a literal.
+///
+/// Left as text, `id <= 500000 + 100` was evaluated on every row and could
+/// use no index: ~170 times slower than `id <= 500100`, which is what an ORM
+/// sends whenever it offsets a bound parameter. Folded, it is that literal.
+///
+/// Computed as PostgreSQL computes it, or not at all. A literal is `int4`
+/// when it fits and `int8` otherwise; an operation takes the wider of its
+/// two; a result outside its type is PostgreSQL's "integer out of range",
+/// so the text is left for the engine, which reports exactly that. Nothing
+/// else is folded: `/` and `%` (integer division), a literal beyond `int8`
+/// (`numeric`), any other character. `None` also for a lone literal, which
+/// needs no folding.
+fn fold_integer_arithmetic(text: &str) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq, PartialOrd)]
+    enum Ty {
+        Int4,
+        Int8,
+    }
+    fn typed(v: i64) -> Ty {
+        if i32::try_from(v).is_ok() { Ty::Int4 } else { Ty::Int8 }
+    }
+    fn apply(l: (i64, Ty), r: (i64, Ty), op: u8) -> Option<(i64, Ty)> {
+        let ty = if l.1 > r.1 { l.1 } else { r.1 };
+        let v = match op {
+            b'+' => l.0.checked_add(r.0)?,
+            b'-' => l.0.checked_sub(r.0)?,
+            _ => l.0.checked_mul(r.0)?,
+        };
+        (ty == Ty::Int8 || i32::try_from(v).is_ok()).then_some((v, ty))
+    }
+    struct P<'a> {
+        b: &'a [u8],
+        i: usize,
+        ops: usize,
+    }
+    impl P<'_> {
+        fn peek(&mut self) -> Option<u8> {
+            while self.b.get(self.i).is_some_and(u8::is_ascii_whitespace) {
+                self.i += 1;
+            }
+            self.b.get(self.i).copied()
+        }
+        fn expr(&mut self) -> Option<(i64, Ty)> {
+            let mut acc = self.term()?;
+            while let Some(op @ (b'+' | b'-')) = self.peek() {
+                self.i += 1;
+                self.ops += 1;
+                let rhs = self.term()?;
+                acc = apply(acc, rhs, op)?;
+            }
+            Some(acc)
+        }
+        fn term(&mut self) -> Option<(i64, Ty)> {
+            let mut acc = self.factor()?;
+            while self.peek() == Some(b'*') {
+                self.i += 1;
+                self.ops += 1;
+                let rhs = self.factor()?;
+                acc = apply(acc, rhs, b'*')?;
+            }
+            Some(acc)
+        }
+        fn literal(&mut self, negative: bool) -> Option<(i64, Ty)> {
+            let start = self.i;
+            while self.b.get(self.i).is_some_and(u8::is_ascii_digit) {
+                self.i += 1;
+            }
+            // `1.5`, `1e3`, `1_000` and `12abc` are not integer literals.
+            if self.i == start || self.b.get(self.i).is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_')) {
+                return None;
+            }
+            let digits = std::str::from_utf8(&self.b[start..self.i]).ok()?;
+            // Negated as part of the literal, as PostgreSQL's parser does, so
+            // `-2147483648` is the `int4` it is there.
+            let v: i64 = if negative { format!("-{digits}").parse().ok()? } else { digits.parse().ok()? };
+            Some((v, typed(v)))
+        }
+        fn factor(&mut self) -> Option<(i64, Ty)> {
+            match self.peek()? {
+                b'(' => {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    if self.peek()? != b')' {
+                        return None;
+                    }
+                    self.i += 1;
+                    Some(v)
+                }
+                b'-' => {
+                    self.i += 1;
+                    if !self.b.get(self.i).is_some_and(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    self.literal(true)
+                }
+                b'0'..=b'9' => self.literal(false),
+                _ => None,
+            }
+        }
+    }
+    let mut p = P { b: text.as_bytes(), i: 0, ops: 0 };
+    let (v, _) = p.expr()?;
+    (p.peek().is_none() && p.ops > 0).then(|| v.to_string())
 }
 
 /// A predicate term that is nothing but `TRUE` or `FALSE`, as the equivalent
@@ -15463,6 +15576,69 @@ mod predicate_extraction_tests {
 #[cfg(test)]
 mod predicate_folding_tests {
     use super::*;
+
+    /// Integer arithmetic folds to PostgreSQL's answer, or not at all.
+    #[test]
+    fn integer_arithmetic_folds_as_postgres_computes_it() {
+        for (text, want) in [
+            ("500000 + 100", Some("500100")),
+            ("499999 + 1", Some("500000")),
+            ("3 - 10", Some("-7")),
+            ("2 + 3 * 4", Some("14")),
+            ("(2 + 3) * 4", Some("20")),
+            ("5 - -3", Some("8")),
+            ("-2147483648 + 0", Some("-2147483648")),
+            // int8 because a literal is: no overflow there.
+            ("3000000000 + 1", Some("3000000001")),
+            ("2147483648 * 2", Some("4294967296")),
+            // int4 + int4 overflows in PostgreSQL ("integer out of range"):
+            // left for the engine, which says the same.
+            ("2000000000 + 2000000000", None),
+            ("2147483647 + 1", None),
+            ("46341 * 46341", None),
+            // Beyond int8 is numeric; division and modulo are not folded.
+            ("9223372036854775807 + 1", None),
+            ("99999999999999999999 + 1", None),
+            ("7 / 2", None),
+            ("7 % 2", None),
+            // Not integer literals, or nothing to fold.
+            ("1.5 + 1", None),
+            ("1e3 + 1", None),
+            ("id + 1", None),
+            ("'5' + 3", None),
+            ("$1 + 1", None),
+            ("5", None),
+            ("-5", None),
+            ("(5)", None),
+            ("- 5 + 1", None),
+            ("5 +", None),
+            ("(5 + 1", None),
+            ("", None),
+        ] {
+            assert_eq!(fold_integer_arithmetic(text).as_deref(), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_where_bound_with_arithmetic_folds_to_a_literal() {
+        assert_eq!(
+            fold_where_constants("SELECT id FROM t WHERE id >= 500000 AND id <= 500000 + 100 ORDER BY id"),
+            "SELECT id FROM t WHERE id >= 500000 AND id <= 500100 ORDER BY id"
+        );
+        assert_eq!(fold_where_constants("SELECT id FROM t WHERE id + 1 = 5"), "SELECT id FROM t WHERE id + 1 = 5");
+        // The statement's `;` stays where it was.
+        assert_eq!(
+            fold_where_constants("SELECT id FROM t WHERE id >= 5 AND id <= 5 + 100;"),
+            "SELECT id FROM t WHERE id >= 5 AND id <= 105;"
+        );
+        assert_eq!(fold_where_constants("SELECT id FROM t WHERE id = 7 ;  "), "SELECT id FROM t WHERE id = 7 ;  ");
+        assert_eq!(fold_where_constants("SELECT id FROM t WHERE 2 * 3 < id"), "SELECT id FROM t WHERE 6 < id");
+        // Only the WHERE: the select list and LIMIT are not predicates.
+        assert_eq!(
+            fold_where_constants("SELECT 1 + 1 FROM t WHERE a = 1 + 1 LIMIT 2"),
+            "SELECT 1 + 1 FROM t WHERE a = 2 LIMIT 2"
+        );
+    }
 
     #[test]
     fn a_folded_constant_keeps_the_space_before_the_next_clause() {

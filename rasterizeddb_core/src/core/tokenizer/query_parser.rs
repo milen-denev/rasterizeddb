@@ -1166,8 +1166,31 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                         | DbType::U128
                 )
         };
+        // So is an integer literal outside an integer column's range:
+        // `smallint_col = 40001` is a comparison PostgreSQL answers (false,
+        // and `< 40001` true), and `promote_numeric` makes it one by widening
+        // the column. Refusing it also refused `= 40000 + 1` once that was
+        // folded to a literal.
+        let int_vs_int = |lit: &DbType, col: &DbType| {
+            let int = |t: &DbType| {
+                matches!(
+                    t,
+                    DbType::I8
+                        | DbType::I16
+                        | DbType::I32
+                        | DbType::I64
+                        | DbType::I128
+                        | DbType::U8
+                        | DbType::U16
+                        | DbType::U32
+                        | DbType::U64
+                        | DbType::U128
+                )
+            };
+            int(lit) && int(col)
+        };
         let keeps_fraction = |lit: &MemoryBlock, from: &DbType, to: &DbType| {
-            float_vs_int(from, to)
+            (float_vs_int(from, to) || int_vs_int(from, to))
                 && crate::core::value_codec::coerce_literal(lit.into_slice(), from, to).is_none()
         };
         match (&left_op, &right_op) {
