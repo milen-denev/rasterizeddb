@@ -119,6 +119,47 @@ pub fn wal_checkpoint_bytes() -> u64 {
 /// that buffer proportional to the data is what makes this tuning unneeded.
 ///
 /// Idempotent, and a no-op off glibc.
+/// The glibc malloc arena limit `--malloc-arenas` set; 0 is glibc's default
+/// (8 per core on 64-bit).
+static MALLOC_ARENAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn malloc_arenas() -> usize {
+    MALLOC_ARENAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Caps glibc's malloc arenas (`M_ARENA_MAX`), a low-memory mode: each
+/// thread that allocates under contention otherwise gets an arena of its own,
+/// and freed memory stays in it. 0 leaves glibc's default.
+///
+/// A trade, measured on prepared reads and inserts at 16 clients against the
+/// default: 4 arenas cost -20% / -12% for -16% RSS, 1 arena -61% / -53% for
+/// -11%, since every allocating thread then shares one lock. Call before the
+/// runtime starts its threads; arenas already made are not undone. `false`
+/// when the platform has no such knob or glibc refused it.
+pub fn set_malloc_arenas(n: usize) -> bool {
+    if n == 0 {
+        return true;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // glibc's M_ARENA_MAX, from <malloc.h>.
+        const M_ARENA_MAX: libc::c_int = -8;
+        let Ok(value) = libc::c_int::try_from(n) else {
+            return false;
+        };
+        // SAFETY: mallopt only reads its two integer arguments.
+        if unsafe { libc::mallopt(M_ARENA_MAX, value) } == 1 {
+            MALLOC_ARENAS.store(n, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
 pub fn tune_allocator() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

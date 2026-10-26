@@ -1,3 +1,5 @@
+pub mod saved;
+
 pub struct Configuration {
     pub location: Option<String>,
     pub batch_size: Option<usize>,
