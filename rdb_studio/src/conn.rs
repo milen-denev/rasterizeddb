@@ -169,6 +169,13 @@ fn describe(error: &str, profile: &Connection) -> String {
 }
 
 impl Session {
+    /// The driver underneath, for the benchmark, which has to send a statement
+    /// without building a grid of its answer each time — that would be
+    /// measuring this console's allocator rather than the server.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Runs one statement and returns its rows.
     ///
     /// Everything the console itself sends goes through here; a statement that
@@ -276,7 +283,7 @@ impl Session {
 ///
 /// `tokio_postgres::Error` displays as "db error: ERROR: <message>", and the
 /// prefix is noise in a panel that is already labelled as an error.
-fn sql_error(error: &tokio_postgres::Error) -> String {
+pub(crate) fn sql_error(error: &tokio_postgres::Error) -> String {
     let text = error
         .as_db_error()
         .map(|db| db.message().to_string())

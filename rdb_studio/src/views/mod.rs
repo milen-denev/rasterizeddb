@@ -8,6 +8,7 @@
 
 pub mod activity;
 pub mod backup;
+pub mod bench;
 pub mod config;
 pub mod dashboard;
 pub mod connect;
@@ -161,6 +162,7 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Data => data::view(studio),
         Tab::Query => query::view(studio),
         Tab::Activity => activity::view(studio),
+        Tab::Bench => bench::view(studio),
         Tab::Backup => backup::view(studio),
         Tab::Storage => storage::view(studio),
         Tab::Replication => replication::view(studio),

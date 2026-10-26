@@ -5,6 +5,7 @@
 //! `dialect` and `conn` directly, which a binary-only crate cannot expose.
 
 pub mod app;
+pub mod bench;
 pub mod conn;
 pub mod dialect;
 pub mod export;

@@ -130,6 +130,10 @@ pub struct Studio {
     /// Everything the activity page reads, or `None` before the first load.
     pub activity: Option<ActivitySnapshot>,
 
+    // --- benchmark
+    /// The benchmark page's own state; see [`crate::views::bench`].
+    pub bench: views::bench::Page,
+
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
     pub peer_name: String,
@@ -180,6 +184,7 @@ pub enum Tab {
     Data,
     Query,
     Activity,
+    Bench,
     Backup,
     Storage,
     Replication,
@@ -188,7 +193,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 12] = [
+    pub const ALL: [Tab; 13] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -200,6 +205,9 @@ impl Tab {
         // every statement the server has already answered, this console's
         // included.
         Tab::Activity,
+        // After ACTIVITY: what the server has done, then how fast it can do
+        // one thing again.
+        Tab::Bench,
         Tab::Backup,
         // Next to BACKUP rather than next to CONFIG: both pages are about where
         // the bytes are and what happens when a disk goes, and an operator
@@ -219,6 +227,7 @@ impl Tab {
             Tab::Data => "DATA",
             Tab::Query => "QUERY",
             Tab::Activity => "ACTIVITY",
+            Tab::Bench => "BENCH",
             Tab::Backup => "BACKUP",
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
@@ -479,6 +488,9 @@ pub enum Message {
     ReloadActivity,
     ActivityLoaded(Box<ActivitySnapshot>),
     ResetStatementStats,
+
+    // --- benchmark
+    Bench(views::bench::BenchMessage),
 
     // --- replication
     ReloadReplication,
@@ -817,6 +829,7 @@ impl Studio {
             import_running: false,
             import_report: Vec::new(),
             activity: None,
+            bench: views::bench::Page::default(),
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -1041,6 +1054,9 @@ impl Studio {
                 Task::none()
             }
             Message::Disconnect => {
+                // Its workers have connections of their own; they would carry
+                // on against a server the console has left.
+                self.bench.stop();
                 self.session = None;
                 self.flavor_warning = None;
                 self.backup = None;
@@ -1485,6 +1501,7 @@ impl Studio {
             Message::DismissStorageReport => { self.storage_report.clear(); Task::none() }
 
             // ---- activity -----------------------------------------------------
+            Message::Bench(message) => self.update_bench(message),
             Message::ReloadActivity => self.load_activity(),
             Message::ActivityLoaded(snapshot) => {
                 self.activity = Some(*snapshot);
