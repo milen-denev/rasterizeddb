@@ -1889,7 +1889,11 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         section: "wal",
         key: "enabled",
         hot: false,
-        set_with: "--wal BOOL (restart)",
+        // No flag sets it: the log-off mode was never reachable or tested,
+        // and later durability work (in-place writes, the outcome log)
+        // assumes the log. Advertising `--wal` named a flag that does not
+        // exist, so a server configured by this row would not start.
+        set_with: "fixed: always on",
         help: "route durable writes through the log",
     },
     ConfigKey {

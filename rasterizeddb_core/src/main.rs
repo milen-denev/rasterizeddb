@@ -112,6 +112,13 @@ struct Args {
     #[arg(long = "query-stats", alias = "query_stats", value_name = "on|off")]
     query_stats: Option<String>,
 
+    /// Log bytes between checkpoints (default: 67108864, 64 MiB)
+    ///
+    /// A checkpoint flushes every data file and discards the log. Larger
+    /// means fewer checkpoints and a longer replay after a crash.
+    #[arg(long = "wal-checkpoint-bytes", alias = "wal_checkpoint_bytes", value_name = "N")]
+    wal_checkpoint_bytes: Option<u64>,
+
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
@@ -895,6 +902,13 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(ms) = args.wal_writer_delay_ms {
         rasterizeddb_core::set_wal_writer_delay_ms(ms);
+    }
+    // Before any database opens: the log's checkpoint trigger reads it.
+    if let Some(bytes) = args.wal_checkpoint_bytes {
+        if bytes == 0 {
+            return Err(std::io::Error::other("--wal-checkpoint-bytes must be above 0"));
+        }
+        let _ = rasterizeddb_core::WAL_CHECKPOINT_BYTES.set(bytes);
     }
     #[cfg(feature = "query_stats")]
     if let Some(spec) = args.query_stats.as_deref() {

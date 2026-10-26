@@ -3515,7 +3515,14 @@ impl Database {
         // pg_indexes listed none and its uniqueness checks scanned. Reopened
         // from the sidecars just written, it has them; the table is empty, so
         // the reopen builds nothing.
-        let reopen = (!create_table.unique_keys.is_empty()).then(|| create_table.table_name.clone());
+        //
+        // So for a PRIMARY KEY: recorded in the header only after the table
+        // opened, its index was named for the column's UNIQUE flag
+        // (`<table>_<column>_key`) until a restart renamed it `<table>_pkey`.
+        // pg_indexes showed a name `DROP INDEX` and `DROP CONSTRAINT` did not
+        // know, and the name changed under the client at the next restart.
+        let reopen = (!create_table.unique_keys.is_empty() || create_table.primary_key.is_some())
+            .then(|| create_table.table_name.clone());
         self.install_table(create_table.table_name, Arc::new(table));
         if let Some(name) = reopen {
             self.reload_table(&name).await?;
