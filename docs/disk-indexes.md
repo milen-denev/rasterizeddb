@@ -1,7 +1,8 @@
 # Disk-resident indexes
 
-Status: **phases 1 and 2 built.** Covers B-tree, hash and path indexes
-(`LiveIndex`). Gin indexes follow in phase 3.
+Status: **phases 1-3 built.** B-tree, hash and path indexes (`LiveIndex`)
+page and survive a clean restart; gin indexes page too, and rebuild at open
+as they always have.
 
 Today every index lives in memory, whole ([Indexes](indexes.md), "Lifetime").
 [Persistent indexes](persistent-indexes.md) v1 snapshots that memory at clean
@@ -15,7 +16,9 @@ changes are kept in memory.
 ## The knob
 
 `--index-residency memory|hybrid|disk`, process-wide, read at each table
-open. It is a startup setting, shown by `SHOW CONFIG` as `index.residency`.
+open. It is a startup setting, shown by `SHOW CONFIG` as `index.residency`
+(with `index.cache_mb` and `index.delta_mb`), and `SET CONFIG` saves any of
+the three for the next start (`rasterizeddb.conf`; a flag still wins).
 
 | Residency | Entries live in | Block cache | Memory part spills at |
 |---|---|---|---|
@@ -176,7 +179,13 @@ untrusted (`DIRTY`, made durable before the write), exactly as in v1.
    snapshot, load and power-loss suites pass, the loads adopting runs; three
    audit tests that plant faults by editing the memory format's entries run
    with memory forced (`paged::force_memory_under`).
-3. **Gin indexes paged**, on the same run format with `u64` items as keys.
+3. **Gin indexes paged** (built), on the same run format with each `u64`
+   item's big-endian bytes as the key. Insert sets the bit first; forget
+   only clears it (merges drop the slot, lookups skip it), so compaction and
+   its forgotten-slot list stay in-memory only. Every list is read through one
+   helper; one that cannot be read declines the lookup. List lengths are upper
+   bounds, which only decline more or leave a list out of a walk. Gin indexes
+   are still not snapshotted.
 4. **Measured tuning:** block size, merge fan-in, and a second fence level
    if fence memory matters at the target.
 

@@ -853,6 +853,9 @@ fn apply_saved_settings(args: &mut Args) {
     one("server.malloc_arenas", &mut args.malloc_arenas, &stored, "0");
     one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
     one("cache.enabled", &mut args.enable_cache, &stored, "false");
+    one("index.residency", &mut args.index_residency, &stored, "memory");
+    one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
+    one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
 }
 
 fn main() -> std::io::Result<()> {

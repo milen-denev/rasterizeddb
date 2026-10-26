@@ -119,6 +119,16 @@ pub fn set_residency(r: Residency) {
     cache().resize(cache_bytes());
 }
 
+/// `--index-cache-mb` as set: 0 is the residency's default.
+pub fn cache_mb_setting() -> u64 {
+    CACHE_MB.load(Ordering::Relaxed)
+}
+
+/// `--index-delta-mb` as set: 0 is the residency's default.
+pub fn delta_mb_setting() -> u64 {
+    DELTA_MB.load(Ordering::Relaxed)
+}
+
 /// `--index-cache-mb`; 0 restores the residency's default.
 pub fn set_cache_mb(mb: u64) {
     CACHE_MB.store(mb, Ordering::Relaxed);

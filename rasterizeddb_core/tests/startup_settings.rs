@@ -155,6 +155,10 @@ fn a_saved_setting_waits_for_the_next_start_and_a_flag_beats_it() {
         // Saved, not applied: the running value is unchanged and the saved
         // one is pending.
         assert_eq!(pg.config("server", "batch_size"), ("10000".into(), "5000".into(), "default".into()));
+        // The index residency is a startup key like any other.
+        assert_eq!(pg.config("index", "residency"), ("memory".into(), "".into(), "default".into()));
+        pg.query("SET CONFIG index.residency = 'disk'").expect("saved");
+        assert!(pg.query("SET CONFIG index.residency = 'tape'").is_err());
         // Refused values are refused now, not at the next start.
         assert!(pg.query("SET CONFIG server.batch_size = lots").is_err());
         assert!(pg.query("SET CONFIG wal.enabled = false").is_err());
@@ -168,6 +172,19 @@ fn a_saved_setting_waits_for_the_next_start_and_a_flag_beats_it() {
         let (_server, port) = start(&dir, &[]);
         let mut pg = Pg::connect(port);
         assert_eq!(pg.config("server", "batch_size"), ("5000".into(), "".into(), "saved".into()));
+        assert_eq!(pg.config("index", "residency"), ("disk".into(), "".into(), "saved".into()));
+        // And it does what it says: a table's index pages into `.idxr`.
+        pg.query("CREATE TABLE paged_t (id BIGINT PRIMARY KEY, v INT)").expect("create");
+        let values: Vec<String> = (1..=2000).map(|i| format!("({i}, {i})")).collect();
+        pg.query(&format!("INSERT INTO paged_t (id, v) VALUES {}", values.join(","))).expect("insert");
+        assert_eq!(pg.query("SELECT v FROM paged_t WHERE id = 1234").expect("lookup"), vec![vec![Some("1234".into())]]);
+        fn has_idxr(dir: &std::path::Path) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+                let p = e.path();
+                p.extension().is_some_and(|x| x == "idxr") || (p.is_dir() && has_idxr(&p))
+            })
+        }
+        assert!(has_idxr(std::path::Path::new(&dir)), "no paged index directory under {dir}");
     }
     {
         // A flag wins, and the saved value shows as what it would be.

@@ -1899,6 +1899,33 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "workers a query may use",
     },
     ConfigKey {
+        section: "index",
+        key: "residency",
+        hot: false,
+        set_with: "--index-residency memory|hybrid|disk (restart)",
+        options: "memory|hybrid|disk",
+        help: "where B-tree, hash, path and gin indexes keep their entries: memory, or sorted runs on \
+               disk behind a block cache (hybrid: large cache and memory part; disk: small ones)",
+    },
+    ConfigKey {
+        section: "index",
+        key: "cache_mb",
+        hot: false,
+        set_with: "--index-cache-mb N (restart)",
+        options: "",
+        help: "the paged indexes' block cache in MiB, shared by every table; 0 is the residency's \
+               default (1024 hybrid, 64 disk)",
+    },
+    ConfigKey {
+        section: "index",
+        key: "delta_mb",
+        hot: false,
+        set_with: "--index-delta-mb N (restart)",
+        options: "",
+        help: "the memory part each paged index holds before writing it as a run, in MiB; 0 is the \
+               residency's default (256 hybrid, 16 disk)",
+    },
+    ConfigKey {
         section: "server",
         key: "malloc_arenas",
         hot: false,
@@ -2215,6 +2242,9 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("server", "batch_size") => crate::batch_size().to_string(),
             ("server", "concurrent_threads") => crate::max_permits_threads().to_string(),
             ("server", "malloc_arenas") => crate::malloc_arenas().to_string(),
+            ("index", "residency") => crate::core::index::paged::residency().name().to_string(),
+            ("index", "cache_mb") => crate::core::index::paged::cache_mb_setting().to_string(),
+            ("index", "delta_mb") => crate::core::index::paged::delta_mb_setting().to_string(),
             ("wal", "enabled") => crate::wal_enabled().to_string(),
             ("wal", "checkpoint_bytes") => crate::wal_checkpoint_bytes().to_string(),
             // `on`/`off`, not `true`/`false`: it carries a PostgreSQL setting's
@@ -2342,6 +2372,10 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
         ("server", "malloc_arenas") => number(0, 4096),
         ("wal", "checkpoint_bytes") => number(1, u64::MAX),
         ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
+        ("index", "residency") => crate::core::index::paged::Residency::parse(v)
+            .map(|r| r.name().to_string())
+            .ok_or_else(|| format!("`{v}` is not a residency (memory, hybrid or disk)")),
+        ("index", "cache_mb") | ("index", "delta_mb") => number(0, 1 << 20),
         ("wal", "enabled") => Err("wal.enabled is fixed: the log is always on".to_string()),
         _ => Err(format!("{section}.{name} cannot be saved for the next start")),
     }
