@@ -195,6 +195,28 @@ struct Args {
     #[arg(long = "index-storage", value_name = "rebuild|snapshot")]
     index_storage: Option<String>,
 
+    /// Where B-tree, hash and path indexes keep their entries (default:
+    /// memory)
+    ///
+    /// `memory` holds every entry in RAM, as always. `hybrid` and `disk` keep
+    /// them in sorted files beside the table, searched through a block cache,
+    /// with only recent changes in memory: `hybrid` with a large cache and
+    /// memory part, `disk` with small ones. Takes effect for tables opened
+    /// after it is set; a paged index is rebuilt at every open
+    /// (docs/disk-indexes.md).
+    #[arg(long = "index-residency", value_name = "memory|hybrid|disk")]
+    index_residency: Option<String>,
+
+    /// The paged indexes' block cache, in MiB, shared by every table
+    /// (default: 1024 for hybrid, 64 for disk)
+    #[arg(long = "index-cache-mb", value_name = "MIB")]
+    index_cache_mb: Option<u64>,
+
+    /// The memory part each paged index holds before writing it out as a
+    /// run, in MiB (default: 256 for hybrid, 16 for disk)
+    #[arg(long = "index-delta-mb", value_name = "MIB")]
+    index_delta_mb: Option<u64>,
+
     /// Floor on fingerprint bits per row (4..16).
     #[arg(long = "filter-min-f", value_name = "N")]
     filter_min_f: Option<u8>,
@@ -987,6 +1009,26 @@ fn main() -> std::io::Result<()> {
         match rasterizeddb_core::core::introspect::parse_bool(spec) {
             Ok(on) => rasterizeddb_core::core::query_stats::set_enabled(on),
             Err(e) => return Err(std::io::Error::other(format!("--query-stats: {}", e))),
+        }
+    }
+    {
+        use rasterizeddb_core::core::index::paged;
+        if let Some(spec) = args.index_residency.as_deref() {
+            match paged::Residency::parse(spec) {
+                Some(r) => paged::set_residency(r),
+                None => {
+                    return Err(std::io::Error::other(format!(
+                        "--index-residency {:?}: expected memory, hybrid or disk",
+                        spec
+                    )));
+                }
+            }
+        }
+        if let Some(mb) = args.index_cache_mb {
+            paged::set_cache_mb(mb);
+        }
+        if let Some(mb) = args.index_delta_mb {
+            paged::set_delta_mb(mb);
         }
     }
     if let Some(spec) = args.index_storage.as_deref() {

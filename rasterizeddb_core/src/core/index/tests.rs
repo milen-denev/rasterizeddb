@@ -116,6 +116,30 @@ fn index(name: &str, method: Method, columns: &[u32]) -> Arc<LiveIndex> {
 
 #[test]
 fn candidates_are_always_a_superset_of_the_matches() {
+    superset_with(&|name, method, columns| index(name, method, columns), false);
+}
+
+/// The same, paged with budgets so small that every layout spills, writes
+/// and merges runs while it is being read, under key changes and vacuum's
+/// forgets (docs/disk-indexes.md): a paged index may list too much, never
+/// too little.
+#[test]
+fn paged_candidates_are_always_a_superset_of_the_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let placement = paged::Placement::for_table(dir.path(), "t");
+    let budgets = paged::Budgets { delta_bytes: 512, block_bytes: 128, runs_max: 3 };
+    let make = |name: &str, method: Method, columns: &[u32]| {
+        Arc::new(LiveIndex::new_paged(
+            IndexDecl { name: name.into(), method, unique: false, columns: columns.to_vec(), is_deleted: false },
+            columns.iter().map(|c| (*c, ty(*c))).collect(),
+            &placement,
+            budgets,
+        ))
+    };
+    superset_with(&make, true);
+}
+
+fn superset_with(make: &dyn Fn(&str, Method, &[u32]) -> Arc<LiveIndex>, churn: bool) {
     let ticket = test_mint();
     let proof = Proof::from(&ticket);
     let schema: Vec<SchemaField> = fields();
@@ -123,23 +147,24 @@ fn candidates_are_always_a_superset_of_the_matches() {
     // Several index layouts, so every planner branch is reached: whole-key
     // hash, single-column B-trees, composite B-trees led by each type.
     let layouts: Vec<Vec<Arc<LiveIndex>>> = vec![
-        vec![index("n_bt", Method::BTree, &[0])],
-        vec![index("s_bt", Method::BTree, &[1]), index("f_h", Method::Hash, &[2])],
-        vec![index("ns_bt", Method::BTree, &[0, 1])],
-        vec![index("sn_bt", Method::BTree, &[1, 0]), index("n_h", Method::Hash, &[0])],
-        vec![index("fs_bt", Method::BTree, &[2, 1]), index("nsf_h", Method::Hash, &[0, 1, 2])],
+        vec![make("n_bt", Method::BTree, &[0])],
+        vec![make("s_bt", Method::BTree, &[1]), make("f_h", Method::Hash, &[2])],
+        vec![make("ns_bt", Method::BTree, &[0, 1])],
+        vec![make("sn_bt", Method::BTree, &[1, 0]), make("n_h", Method::Hash, &[0])],
+        vec![make("fs_bt", Method::BTree, &[2, 1]), make("nsf_h", Method::Hash, &[0, 1, 2])],
         // Whole keys on every column, so a conjunction's answer from one is
         // filtered by the others (step 3).
         vec![
-            index("n_h", Method::Hash, &[0]),
-            index("s_bt", Method::BTree, &[1]),
-            index("f_h", Method::Hash, &[2]),
-            index("n_bt", Method::BTree, &[0]),
+            make("n_h", Method::Hash, &[0]),
+            make("s_bt", Method::BTree, &[1]),
+            make("f_h", Method::Hash, &[2]),
+            make("n_bt", Method::BTree, &[0]),
         ],
     ];
     for layout in layouts {
         let indexes = TableIndexes::new(layout);
-        let rows: Vec<Vec<Vec<u8>>> = (0..400).map(|_| (0..3).map(|c| value(&mut r, c)).collect()).collect();
+        let mut rows: Vec<Option<Vec<Vec<u8>>>> =
+            (0..400).map(|_| Some((0..3).map(|c| value(&mut r, c)).collect())).collect();
         // Slots in a shuffled order, as concurrent writers deliver them, and
         // one in twenty unkeyed in each index: a slot whose key could not be
         // built must come back from every lookup of that index.
@@ -148,14 +173,41 @@ fn candidates_are_always_a_superset_of_the_matches() {
             order.swap(i, r.below(i as u64 + 1) as usize);
         }
         for &slot in &order {
-            let row = &rows[slot];
+            let row = rows[slot].as_ref().unwrap();
             for ix in &indexes.list {
                 let key = if r.below(20) == 0 { None } else { ix.key_of(|wo| Some(row[wo as usize].as_slice())) };
                 ix.insert(proof, slot as u64, key);
             }
         }
         let mut used = 0;
-        for _ in 0..3_000 {
+        for round in 0..3_000 {
+            if churn && round % 10 == 0 {
+                let slot = r.below(rows.len() as u64) as usize;
+                if let Some(old) = rows[slot].clone() {
+                    if r.below(4) == 0 {
+                        // Vacuum retires the version for everyone.
+                        for ix in &indexes.list {
+                            let key = ix.key_of(|wo| Some(old[wo as usize].as_slice()));
+                            ix.forget(proof, slot as u64, key.as_deref());
+                        }
+                        rows[slot] = None;
+                    } else {
+                        // An in-place update: the new key in, the old one out.
+                        let new: Vec<Vec<u8>> = (0..3).map(|c| value(&mut r, c)).collect();
+                        for ix in &indexes.list {
+                            let old_key = ix.key_of(|wo| Some(old[wo as usize].as_slice()));
+                            let new_key = ix.key_of(|wo| Some(new[wo as usize].as_slice()));
+                            if old_key != new_key {
+                                ix.insert(proof, slot as u64, new_key);
+                                if let Some(k) = old_key {
+                                    ix.remove(proof, slot as u64, &k);
+                                }
+                            }
+                        }
+                        rows[slot] = Some(new);
+                    }
+                }
+            }
             let e = expr(&mut r, 3);
             // A small cap as well: a broad key declined in step 1 is still a
             // filter in step 3.
@@ -165,6 +217,7 @@ fn candidates_are_always_a_superset_of_the_matches() {
             };
             used += 1;
             for (slot, row) in rows.iter().enumerate() {
+                let Some(row) = row else { continue };
                 if eval(row, &e) {
                     assert!(
                         candidates.binary_search(&(slot as u64)).is_ok(),
@@ -174,6 +227,13 @@ fn candidates_are_always_a_superset_of_the_matches() {
             }
         }
         assert!(used > 100, "the planner answered too few queries to test ({used})");
+        if churn {
+            // The background writer really ran: runs exist on disk.
+            assert!(
+                indexes.list.iter().any(|ix| ix.paged_disk().is_some_and(|(bytes, _)| bytes > 0)),
+                "no run was written; the paged path was not exercised"
+            );
+        }
     }
 }
 

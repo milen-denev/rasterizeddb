@@ -51,6 +51,7 @@ pub mod ddl;
 pub mod gin;
 pub mod decl;
 pub mod key;
+pub mod paged;
 pub mod sorted;
 
 use std::collections::{BTreeMap, HashMap};
@@ -107,6 +108,9 @@ pub fn dense_cap(n_slots: u64) -> usize {
 enum Data {
     BTree(RwLock<BTreeMap<KeyBuf, Slots>>),
     Hash(Box<[RwLock<HashMap<KeyBuf, Slots, RandomState>>]>, RandomState),
+    /// On disk, under `hybrid` or `disk` residency (docs/disk-indexes.md).
+    /// May list a slot under a key it no longer holds, never the reverse.
+    Paged(paged::PagedStore),
 }
 
 /// One index, live.
@@ -119,7 +123,8 @@ pub struct LiveIndex {
     data: Data,
     /// One bit per slot this index holds an entry for. Vacuum uses it to find
     /// the reclaimed versions whose keys must go, whatever retired them.
-    present: RwLock<Vec<u64>>,
+    /// Shared with a paged store, whose merges drop the slots it clears.
+    present: Arc<RwLock<Vec<u64>>>,
     /// Slots whose key could not be built. Returned with every lookup.
     unkeyed: RwLock<Vec<u64>>,
     /// For an index over a path into a document (`((doc->>'k'))`): the
@@ -131,7 +136,81 @@ pub struct LiveIndex {
 
 impl LiveIndex {
     pub fn new(decl: IndexDecl, columns: Vec<(u32, DbType)>, implicit: bool) -> LiveIndex {
-        let data = match decl.method {
+        Self::new_in(decl, columns, implicit, None)
+    }
+
+    /// [`Self::new`], paged under `placement` when the residency is `hybrid`
+    /// or `disk` (docs/disk-indexes.md). Without a placement (a table with no
+    /// directory of its own) or when the store cannot be opened, in memory.
+    pub fn new_in(
+        decl: IndexDecl,
+        columns: Vec<(u32, DbType)>,
+        implicit: bool,
+        placement: Option<&paged::Placement>,
+    ) -> LiveIndex {
+        let budgets = placement
+            .filter(|_| paged::residency() != paged::Residency::Memory)
+            .map(|p| (p, paged::Budgets::current()));
+        Self::build(decl, columns, implicit, budgets)
+    }
+
+    /// A paged index under `placement` with `budgets` of its own, whatever
+    /// the process's residency: for tests, which share one process and must
+    /// not page each other's indexes.
+    #[cfg(test)]
+    pub(crate) fn new_paged(
+        decl: IndexDecl,
+        columns: Vec<(u32, DbType)>,
+        placement: &paged::Placement,
+        budgets: paged::Budgets,
+    ) -> LiveIndex {
+        let index = Self::build(decl, columns, false, Some((placement, budgets)));
+        assert!(index.is_paged(), "the store must open");
+        index
+    }
+
+    fn build(
+        decl: IndexDecl,
+        columns: Vec<(u32, DbType)>,
+        implicit: bool,
+        paged: Option<(&paged::Placement, paged::Budgets)>,
+    ) -> LiveIndex {
+        let present: Arc<RwLock<Vec<u64>>> = Arc::new(RwLock::new(Vec::new()));
+        let paged = paged.and_then(|(placement, budgets)| {
+            paged::PagedStore::open(placement, &decl.name, budgets, present.clone())
+                .map_err(|e| log::error!("index {}: cannot page it, kept in memory: {e}", decl.name))
+                .ok()
+        });
+        let data = match paged {
+            Some(store) => Data::Paged(store),
+            None => Self::memory_data(decl.method),
+        };
+        LiveIndex {
+            decl,
+            columns,
+            implicit,
+            data,
+            present,
+            unkeyed: RwLock::new(Vec::new()),
+            path: None,
+        }
+    }
+
+    /// Whether this index's entries live on disk.
+    pub fn is_paged(&self) -> bool {
+        matches!(self.data, Data::Paged(_))
+    }
+
+    /// Bytes of runs on disk and how many, for a paged index.
+    pub fn paged_disk(&self) -> Option<(u64, usize)> {
+        match &self.data {
+            Data::Paged(store) => Some(store.disk()),
+            _ => None,
+        }
+    }
+
+    fn memory_data(method: Method) -> Data {
+        match method {
             Method::BTree => Data::BTree(RwLock::new(BTreeMap::new())),
             // An inverted index is a `gin::GinIndex`, never one of these;
             // `for_schema` routes it there. A hash is the harmless reading.
@@ -141,15 +220,6 @@ impl LiveIndex {
                     .collect(),
                 RandomState::new(),
             ),
-        };
-        LiveIndex {
-            decl,
-            columns,
-            implicit,
-            data,
-            present: RwLock::new(Vec::new()),
-            unkeyed: RwLock::new(Vec::new()),
-            path: None,
         }
     }
 
@@ -161,7 +231,18 @@ impl LiveIndex {
         document_column: u32,
         steps: Vec<crate::core::jsonb::Step>,
     ) -> LiveIndex {
-        let mut index = LiveIndex::new(decl, vec![(virtual_column, DbType::STRING)], false);
+        Self::over_path_in(decl, virtual_column, document_column, steps, None)
+    }
+
+    /// [`Self::over_path`], paged under `placement` as [`Self::new_in`] is.
+    pub fn over_path_in(
+        decl: IndexDecl,
+        virtual_column: u32,
+        document_column: u32,
+        steps: Vec<crate::core::jsonb::Step>,
+        placement: Option<&paged::Placement>,
+    ) -> LiveIndex {
+        let mut index = LiveIndex::new_in(decl, vec![(virtual_column, DbType::STRING)], false, placement);
         index.path = Some((document_column, steps));
         index
     }
@@ -224,7 +305,7 @@ impl LiveIndex {
     fn shard(&self, key: &[u8]) -> usize {
         match &self.data {
             Data::Hash(_, state) => (state.hash_one(key) as usize) % HASH_SHARDS,
-            Data::BTree(_) => 0,
+            Data::BTree(_) | Data::Paged(_) => 0,
         }
     }
 
@@ -263,6 +344,14 @@ impl LiveIndex {
             Some(key) => match &self.data {
                 Data::BTree(map) => add_sorted(map.write().entry(key).or_default(), slot),
                 Data::Hash(shards, _) => add_sorted(shards[self.shard(&key)].write().entry(key).or_default(), slot),
+                Data::Paged(store) => {
+                    // The bit before the entry, the reverse of the maps: a
+                    // merge drops the slots whose bit it reads clear, so an
+                    // entry must never reach a run ahead of its bit
+                    // (`paged`'s module docs).
+                    self.set_present(slot, true);
+                    store.insert(slot, key);
+                }
             },
         }
         self.set_present(slot, true);
@@ -289,6 +378,7 @@ impl LiveIndex {
         match &self.data {
             Data::BTree(map) => drop_slot(&mut *map.write(), key, slot),
             Data::Hash(shards, _) => drop_slot(&mut *shards[self.shard(key)].write(), key, slot),
+            Data::Paged(store) => store.remove(slot, key),
         }
     }
 
@@ -308,6 +398,7 @@ impl LiveIndex {
         match &self.data {
             Data::BTree(map) => map.write().clear(),
             Data::Hash(shards, _) => shards.iter().for_each(|s| s.write().clear()),
+            Data::Paged(store) => store.clear(),
         }
         self.present.write().clear();
         self.unkeyed.write().clear();
@@ -324,6 +415,8 @@ impl LiveIndex {
                 let s = s.read();
                 (k + s.len(), e + s.values().map(|v| v.len()).sum::<usize>())
             }),
+            // An upper bound: a key or slot may sit in more than one run.
+            Data::Paged(store) => store.sizes(),
         }
     }
 
@@ -402,6 +495,26 @@ impl LiveIndex {
                     }
                 }
             }
+            Data::Paged(store) => {
+                // Merged across every source, a superset like the maps'. A
+                // read that fails ends the stream before its closing parts,
+                // which a `SortedLoad` refuses as truncated: a partial
+                // stream can never pass for a whole one.
+                let mut stopped: Option<E> = None;
+                let read = store.for_each_key(false, |key, slots| {
+                    f(Sorted::Entry(key, slots)).map_err(|e| {
+                        stopped = Some(e);
+                        std::io::Error::other("stopped")
+                    })
+                });
+                if let Some(e) = stopped {
+                    return Err(e);
+                }
+                if let Err(e) = read {
+                    log::error!("index {}: reading its runs: {e}; the stream ends short", self.decl.name);
+                    return Ok(());
+                }
+            }
         }
         // Distinct already (`insert` checks), but in arrival order.
         let mut unkeyed = self.unkeyed.read().clone();
@@ -429,6 +542,31 @@ impl LiveIndex {
     pub fn load_sorted(&self, proof: Proof<'_>, stream: sorted::SortedLoad<KeyBuf>) -> Result<(), sorted::SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::load_sorted");
         let (entries, unkeyed, present) = stream.into_parts()?;
+        if let Data::Paged(store) = &self.data {
+            // Bits and unkeyed slots first, then the entries as a run: the
+            // order `insert` keeps for a paged index (`paged`'s module docs).
+            {
+                let mut held = self.unkeyed.write();
+                held.extend(unkeyed);
+                held.sort_unstable();
+                held.dedup();
+            }
+            {
+                let mut bits = self.present.write();
+                if bits.len() < present.len() {
+                    bits.resize(present.len(), 0);
+                }
+                for (held, loaded) in bits.iter_mut().zip(&present) {
+                    *held |= *loaded;
+                }
+            }
+            if let Err(e) = store.load(entries) {
+                // The caller treats a refused load as "rebuild from rows".
+                log::error!("index {}: writing its loaded entries: {e}", self.decl.name);
+                return Err(sorted::SortedReject::Truncated);
+            }
+            return Ok(());
+        }
         match &self.data {
             Data::BTree(map) => {
                 let mut map = map.write();
@@ -474,6 +612,7 @@ impl LiveIndex {
                     });
                 }
             }
+            Data::Paged(_) => unreachable!("loaded above"),
         }
         {
             let mut held = self.unkeyed.write();
@@ -511,14 +650,31 @@ impl LiveIndex {
         match &self.data {
             Data::BTree(map) => take(map.read().get(key)),
             Data::Hash(shards, _) => take(shards[self.shard(key)].read().get(key)),
+            // A read that fails is "over the cap": the planner then answers
+            // without this index, by a scan, never with a short list.
+            Data::Paged(store) => store
+                .collect(Bound::Included(key), Bound::Included(key), out, cap)
+                .unwrap_or_else(|e| {
+                    log::error!("index {}: {e}; answering without it", self.decl.name);
+                    false
+                }),
         }
     }
 
     /// Appends the slots with keys in a range (B-tree only). `false` when `cap`
     /// was exceeded or the index is not ordered.
     fn lookup_range(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>, out: &mut Vec<u64>, cap: usize) -> bool {
-        let Data::BTree(map) = &self.data else {
-            return false;
+        let map = match &self.data {
+            Data::BTree(map) => map,
+            // Ordered only for a B-tree; a hash's run order is its key bytes,
+            // which bound nothing.
+            Data::Paged(store) if self.decl.method == Method::BTree => {
+                return store.collect(lo, hi, out, cap).unwrap_or_else(|e| {
+                    log::error!("index {}: {e}; answering without it", self.decl.name);
+                    false
+                });
+            }
+            _ => return false,
         };
         // An inverted or empty range is legitimately empty: `BTreeMap::range`
         // panics on one, so it is answered here.
@@ -540,12 +696,27 @@ impl LiveIndex {
     /// Every slot that may hold exactly `key`: those under it, and the
     /// unkeyed ones.
     pub fn slots_for_key(&self, key: &[u8]) -> Vec<u64> {
+        self.try_slots_for_key(key)
+            .unwrap_or_else(|| panic!("index {}: its runs could not be read", self.decl.name))
+    }
+
+    /// [`Self::slots_for_key`], or `None` when a paged index's runs could not
+    /// be read: the caller must then answer without the index (a UNIQUE
+    /// check by scan), never from a short list.
+    pub fn try_slots_for_key(&self, key: &[u8]) -> Option<Vec<u64>> {
         let mut out = Vec::new();
-        self.lookup_eq(key, &mut out, usize::MAX);
+        if let Data::Paged(store) = &self.data {
+            out = store
+                .posting(key)
+                .map_err(|e| log::error!("index {}: {e}; answering without it", self.decl.name))
+                .ok()?;
+        } else {
+            self.lookup_eq(key, &mut out, usize::MAX);
+        }
         self.append_unkeyed(&mut out);
         out.sort_unstable();
         out.dedup();
-        out
+        Some(out)
     }
 
     fn append_unkeyed(&self, out: &mut Vec<u64>) {
@@ -557,6 +728,8 @@ impl LiveIndex {
         match &self.data {
             Data::BTree(map) => map.read().get(key).map_or(0, |s| s.len()),
             Data::Hash(shards, _) => shards[self.shard(key)].read().get(key).map_or(0, |s| s.len()),
+            // An upper bound; a failed read reads as "too many to use".
+            Data::Paged(store) => store.listed_under(key).unwrap_or(usize::MAX),
         }
     }
 
@@ -594,6 +767,11 @@ impl LiveIndex {
         match &self.data {
             Data::BTree(map) => keep(map.read().get(key), candidates),
             Data::Hash(shards, _) => keep(shards[self.shard(key)].read().get(key), candidates),
+            Data::Paged(store) => match store.posting(key) {
+                Ok(listed) => keep(Some(&Slots::from_vec(listed)), candidates),
+                // Narrowing nothing is a superset; a short list would not be.
+                Err(e) => log::error!("index {}: {e}; not narrowing by it", self.decl.name),
+            },
         }
     }
 }
@@ -1555,6 +1733,13 @@ pub fn shape_of(schema: &crate::core::row::schema::TableSchema) -> u64 {
 }
 
 pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexes {
+    for_schema_in(schema, None)
+}
+
+/// [`for_schema`], with B-tree, hash and path indexes paged under `placement`
+/// when the residency asks for it (docs/disk-indexes.md). Gin indexes stay in
+/// memory (phase 3).
+pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: Option<&paged::Placement>) -> TableIndexes {
     let live = |wo: u32| {
         schema
             .fields
@@ -1594,7 +1779,7 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexe
         match choose_method(requested, &types) {
             Ok(method) => {
                 let decl = IndexDecl { method, ..decl };
-                out.push(Arc::new(LiveIndex::new(decl, columns, implicit)));
+                out.push(Arc::new(LiveIndex::new_in(decl, columns, implicit, placement)));
             }
             Err(e) => {
                 if !implicit {
@@ -1649,11 +1834,12 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexe
             columns: vec![next_path_column],
             is_deleted: false,
         };
-        out.push(Arc::new(LiveIndex::over_path(
+        out.push(Arc::new(LiveIndex::over_path_in(
             decl,
             next_path_column,
             document.write_order as u32,
             path.steps,
+            placement,
         )));
         next_path_column -= 1;
     }

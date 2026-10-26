@@ -559,7 +559,13 @@ pub enum Plan {
 /// Whether a seal of `indexes` writes INDEX sections, and an open loads
 /// them, under `storage`: B-tree, hash and path indexes, and no gin index.
 pub fn captures(indexes: &TableIndexes, storage: settings::IndexStorage) -> bool {
-    storage == settings::IndexStorage::Snapshot && !indexes.list.is_empty() && indexes.gin.is_empty()
+    // A paged index (docs/disk-indexes.md) is not captured: an INDEX section
+    // would copy its whole run set at every seal. It is rebuilt at open until
+    // phase 2 records its runs instead.
+    storage == settings::IndexStorage::Snapshot
+        && !indexes.list.is_empty()
+        && indexes.gin.is_empty()
+        && !indexes.list.iter().any(|i| i.is_paged())
 }
 
 /// The open's decision (module documentation). `proven` is the proof's
