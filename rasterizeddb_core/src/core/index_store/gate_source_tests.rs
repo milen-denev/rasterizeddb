@@ -118,8 +118,10 @@ const CONSTRUCTORS: [(&str, &str); 13] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 69] = [
+const READ_ONLY: [(&str, &str); 70] = [
     ("LiveIndex", "method"),
+    // Writes a sealed run file for a snapshot; changes nothing the index holds.
+    ("LiveIndex", "seal_run"),
     ("LiveIndex", "is_paged"),
     ("LiveIndex", "paged_disk"),
     ("LiveIndex", "try_slots_for_key"),

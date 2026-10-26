@@ -126,10 +126,16 @@ impl TestServer {
         // in a directory of its own, so the whole suite can run on real files:
         // what paged indexes (`RASTERIZEDDB_INDEX_RESIDENCY=disk`) need, since
         // an in-memory table has no directory to page into.
-        if std::env::var("RASTERIZEDDB_TEST_FILE_BACKED").is_ok_and(|v| v == "1") {
+        // `=1` puts them under /var/tmp; a path, under that path (a suite's
+        // worth of servers can outgrow a small root filesystem).
+        if let Some(base) = std::env::var("RASTERIZEDDB_TEST_FILE_BACKED")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|v| if v == "1" { "/var/tmp".to_string() } else { v })
+        {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dir = std::path::PathBuf::from(format!(
-                "/var/tmp/rdb_compat_{}_{}",
+                "{base}/rdb_compat_{}_{}",
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));

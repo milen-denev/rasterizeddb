@@ -1,6 +1,6 @@
 # Disk-resident indexes
 
-Status: **phase 1 in progress.** Covers B-tree, hash and path indexes
+Status: **phases 1 and 2 built.** Covers B-tree, hash and path indexes
 (`LiveIndex`). Gin indexes follow in phase 3.
 
 Today every index lives in memory, whole ([Indexes](indexes.md), "Lifetime").
@@ -121,16 +121,43 @@ simply age out of the cache.
 Run files live beside the table, in `<table>.idxr/`, named
 `<index>.<generation>.run`, and are written to a temporary name and renamed.
 
-**Phase 1 trusts nothing on disk across a restart:** every open of a paged
-table deletes the old runs and rebuilds from rows, as `memory` residency does
-under `--index-storage rebuild`. The build is the normal insert path, so it
-spills runs and merges like any other write load: an external sort, never
-the whole index in RAM. Queries scan until the build has covered the
-existing rows, exactly as today.
+**Working runs are trusted only by the process that wrote them:** they are
+not synced, and every open deletes what an earlier process left in its
+instance directories. Without a snapshot (`--index-storage rebuild`, the
+default, or after a crash) a paged table rebuilds from rows. The build is the
+normal insert path, so it spills runs and merges like any other write load:
+an external sort, never the whole index in RAM. Queries scan until the build
+has covered the existing rows, exactly as today.
 
-v1 snapshots (`--index-storage snapshot`) do not capture paged indexes; their
-INDEX sections would copy the whole index at every seal. Phase 2 replaces
-that with run references.
+### Across a clean restart (phase 2)
+
+Under `--index-storage snapshot`, a seal captures a paged index as a **run
+reference** rather than its entries, in the same INDEX section a memory index
+fills ([Persistent indexes](persistent-indexes.md) §3), so the snapshot's
+format, proof and plan are unchanged:
+
+- **The seal** (writers held off by its gate) merges every source into one
+  run in `<stem>.idxr/sealed/<index>.<n>.run`, written whole, synced, renamed
+  and its directory synced before the snapshot that names it is. It is the
+  index's sorted stream exactly, dropping nothing, as a memory index's section
+  is. The section holds the file's name, length and CRC-32C, then the unkeyed
+  slots and presence words. A cancelled seal leaves no file.
+- **The open** whose v1 proof passes reads each section. A paged index takes a
+  run reference whole: the length and the whole file's CRC-32C must match, the
+  bits and unkeyed slots must lie inside the table, then the bits are restored
+  before the run is adopted (the order a paged insert keeps). Anything else
+  (a missing or short file, a mismatch) fails the load, and the table
+  rebuilds, as every v1 load failure does.
+- **Mixed residencies:** a run reference starts with a magic that is not an
+  INDEX-section version, so a memory index refuses it and rebuilds; a paged
+  index given a memory index's entries writes them as a run.
+- **Sealed runs are kept, not deleted when dropped.** A seal keeps the two
+  newest earlier ones (a seal may be skipped after writing its run, so the
+  published snapshot can name the one before) and removes any older. A
+  missing one costs a rebuild, never an answer: an adoption checks the file.
+
+A crash is still a rebuild: a write after the seal makes the snapshot
+untrusted (`DIRTY`, made durable before the write), exactly as in v1.
 
 ## Phases
 
@@ -141,12 +168,14 @@ that with run references.
    checks every lookup: the paged answer contains the memory answer, and
    anything beyond it was once listed under that key. The compat model test
    for secondary indexes runs under `disk` residency as well.
-2. **Persist across clean restarts.** A seal flushes the memory part to a run
-   and records the run set, by name, size and checksum, in the v1 snapshot in
-   place of INDEX entries. An open whose v1 proof passes adopts those runs
-   instead of rebuilding. A crash, or any write after the seal, rebuilds as
-   v1 does. That is the crash model chosen: **rebuild after a crash**, no log
-   replay.
+2. **Persist across clean restarts** (built). A seal writes one sealed run
+   and its reference in the INDEX section; an open whose v1 proof passes
+   adopts it instead of rebuilding. A crash, or any write after the seal,
+   rebuilds as v1 does. That is the crash model chosen: **rebuild after a
+   crash**, no log replay. Under `RASTERIZEDDB_INDEX_RESIDENCY=disk` the v1
+   snapshot, load and power-loss suites pass, the loads adopting runs; three
+   audit tests that plant faults by editing the memory format's entries run
+   with memory forced (`paged::force_memory_under`).
 3. **Gin indexes paged**, on the same run format with `u64` items as keys.
 4. **Measured tuning:** block size, merge fan-in, and a second fence level
    if fence memory matters at the target.

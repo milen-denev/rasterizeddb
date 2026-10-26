@@ -405,6 +405,8 @@ struct Fence {
 pub struct Run {
     id: u64,
     path: PathBuf,
+    /// A sealed run's file outlives it: the snapshot names it (phase 2).
+    keep: bool,
     file: File,
     fences: Vec<Fence>,
     n_entries: u64,
@@ -419,7 +421,9 @@ fn next_run_id() -> u64 {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -459,7 +463,7 @@ impl Run {
             let blen = get_varint(&raw, &mut at)? as u32;
             fences.push(Fence { first, offset, len: blen });
         }
-        Ok(Run { id: next_run_id(), path, file, fences, n_entries, n_keys, bytes: len })
+        Ok(Run { id: next_run_id(), path, keep: false, file, fences, n_entries, n_keys, bytes: len })
     }
 
     /// Block `b`, verified, through the cache. `cached` false reads around
@@ -577,6 +581,8 @@ impl Run {
 /// takes its final name at [`RunWriter::finish`].
 struct RunWriter {
     out: BufWriter<File>,
+    /// CRC-32C of every byte written, for a sealed run's reference.
+    digest: crate::core::hash::crc32c::Digest,
     tmp: PathBuf,
     path: PathBuf,
     offset: u64,
@@ -600,8 +606,11 @@ impl RunWriter {
         header.extend_from_slice(&RUN_VERSION.to_le_bytes());
         header.extend_from_slice(&0u32.to_le_bytes());
         out.write_all(&header)?;
+        let mut digest = crate::core::hash::crc32c::Digest::new();
+        digest.update(&header);
         Ok(RunWriter {
             out,
+            digest,
             tmp,
             path,
             offset: HEADER_LEN,
@@ -663,6 +672,7 @@ impl RunWriter {
         let sum = crc(&framed);
         framed.extend_from_slice(&sum.to_le_bytes());
         self.out.write_all(&framed)?;
+        self.digest.update(&framed);
         let first = self.block_first.take().expect("a block with entries has a first key");
         self.fences.push((first, self.offset, framed.len() as u32));
         self.offset += framed.len() as u64;
@@ -671,7 +681,14 @@ impl RunWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<Run> {
+    fn finish(self) -> io::Result<Run> {
+        self.finish_with(false).map(|(run, _)| run)
+    }
+
+    /// Finishes the file and, when `durable`, syncs it and its directory
+    /// before and after the rename: a sealed run must be on disk before the
+    /// snapshot naming it is. Returns the run and the whole file's CRC-32C.
+    fn finish_with(mut self, durable: bool) -> io::Result<(Run, u32)> {
         self.finish_block()?;
         let mut raw = Vec::with_capacity(self.fences.len() * 32 + 8);
         put_varint(&mut raw, self.fences.len() as u64);
@@ -682,6 +699,7 @@ impl RunWriter {
             put_varint(&mut raw, *len as u64);
         }
         self.out.write_all(&raw)?;
+        self.digest.update(&raw);
         let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
         footer.extend_from_slice(&self.offset.to_le_bytes());
         footer.extend_from_slice(&(raw.len() as u64).to_le_bytes());
@@ -690,14 +708,24 @@ impl RunWriter {
         footer.extend_from_slice(&crc(&raw).to_le_bytes());
         footer.extend_from_slice(FOOTER_MAGIC);
         self.out.write_all(&footer)?;
+        self.digest.update(&footer);
         self.out.flush()?;
-        // Not synced: a run is trusted only for the life of the process that
-        // wrote it (phase 1), and that process outlives none of its writes.
-        // Renamed with the handle still open, which Unix allows; the drop
-        // that follows then finds no temporary to remove.
+        // A working run is not synced: it is trusted only for the life of the
+        // process that wrote it, which outlives none of its writes. Renamed
+        // with the handle still open, which Unix allows; the drop that
+        // follows then finds no temporary to remove.
+        if durable {
+            self.out.get_ref().sync_all()?;
+        }
         let path = self.path.clone();
         std::fs::rename(&self.tmp, &path)?;
-        Run::open(path)
+        if durable {
+            if let Some(dir) = path.parent() {
+                File::open(dir)?.sync_all()?;
+            }
+        }
+        let digest = std::mem::take(&mut self.digest).finalize();
+        Ok((Run::open(path)?, digest))
     }
 }
 
@@ -812,7 +840,9 @@ impl PagedStore {
             for e in entries.flatten() {
                 let n = e.file_name();
                 let n = n.to_string_lossy();
-                if !n.starts_with(token) {
+                // `sealed/` holds what a snapshot names; an open adopts or
+                // ignores it, and a seal replaces it.
+                if !n.starts_with(token) && n != SEALED_DIR {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
@@ -1044,6 +1074,103 @@ impl PagedStore {
         Ok(())
     }
 
+    /// Writes every entry this store lists, merged into one run, durably, in
+    /// `<stem>.idxr/sealed/`, for a snapshot to name (phase 2): called by a
+    /// seal's capture, under the gate, so nothing writes meanwhile. Keeps the
+    /// one earlier sealed run of this index that a published snapshot may
+    /// still name (the newest two), and removes any older. `Ok(None)` when `cancelled` turned
+    /// true midway; the partial file is removed.
+    pub fn seal(&self, cancelled: &dyn Fn() -> bool) -> io::Result<Option<SealedRun>> {
+        let sealed = self.sealed_dir();
+        std::fs::create_dir_all(&sealed)?;
+        let prefix = format!("{}.", safe_name(&self.inner.name));
+        let mut existing: Vec<(u64, PathBuf)> = std::fs::read_dir(&sealed)?
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                let seq = n.strip_prefix(&prefix)?.strip_suffix(".run")?.parse::<u64>().ok()?;
+                Some((seq, e.path()))
+            })
+            .collect();
+        existing.sort();
+        let next = existing.last().map_or(1, |(seq, _)| seq + 1);
+        // The published snapshot names the newest sealed run whose seal was
+        // published, and a seal may still be skipped after writing its run,
+        // so the newest two are kept; anything older no snapshot can name.
+        // Removing one a snapshot does name would cost a rebuild, not an
+        // answer: an adoption checks the file and refuses a missing one.
+        if existing.len() > 2 {
+            for (_, path) in &existing[..existing.len() - 2] {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if cancelled() {
+            return Ok(None);
+        }
+        let name = format!("{prefix}{next}.run");
+        let mut w = RunWriter::create(sealed.join(&name), self.inner.budgets.block_bytes)?;
+        let mut keys = 0usize;
+        let mut stopped = false;
+        // Exactly the index's sorted stream (`for_each_sorted`), dropping
+        // nothing: a snapshot is that stream, a superset, as the in-memory
+        // indexes write theirs. Background merges are what drop forgotten
+        // slots.
+        let written = self.for_each_key(false, |k, slots| {
+            keys += 1;
+            if keys % 1024 == 0 && cancelled() {
+                stopped = true;
+                return Err(io::Error::other("cancelled"));
+            }
+            w.add(k, slots)
+        });
+        // Checked again at the end: a small index never reaches the check
+        // inside the loop. The writer's drop removes the partial file.
+        if stopped || cancelled() {
+            return Ok(None);
+        }
+        written?;
+        let (run, crc) = w.finish_with(true)?;
+        let mut run = run;
+        run.keep = true;
+        Ok(Some(SealedRun { name, len: run.bytes, crc }))
+    }
+
+    /// Takes a sealed run, checked whole against its length and CRC-32C, as
+    /// this store's first run (phase 2). `Err` when it is missing, short or
+    /// does not match: the caller rebuilds from rows instead.
+    pub fn adopt(&self, sealed: &SealedRun) -> io::Result<()> {
+        if sealed.name.contains('/') || sealed.name.contains("..") {
+            return Err(corrupt("a sealed run's name names another directory"));
+        }
+        let path = self.sealed_dir().join(&sealed.name);
+        let file = File::open(&path)?;
+        let len = file.metadata()?.len();
+        if len != sealed.len {
+            return Err(corrupt("a sealed run's length does not match its snapshot"));
+        }
+        let mut digest = crate::core::hash::crc32c::Digest::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut at = 0u64;
+        while at < len {
+            let n = ((len - at) as usize).min(buf.len());
+            file.read_exact_at(&mut buf[..n], at)?;
+            digest.update(&buf[..n]);
+            at += n as u64;
+        }
+        if digest.finalize() != sealed.crc {
+            return Err(corrupt("a sealed run's checksum does not match its snapshot"));
+        }
+        let mut run = Run::open(path)?;
+        run.keep = true;
+        let mut s = self.inner.state.write();
+        s.runs.insert(0, Arc::new(run));
+        Ok(())
+    }
+
+    fn sealed_dir(&self) -> PathBuf {
+        self.inner.dir.parent().map_or_else(|| self.inner.dir.join(SEALED_DIR), |p| p.join(SEALED_DIR))
+    }
+
     /// Waits for the background writer to finish what it has (tests). Kicks
     /// it only when it is not running: `kick` raises the busy flag itself, so
     /// kicking on every look would never see it down.
@@ -1062,6 +1189,114 @@ impl PagedStore {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+}
+
+/// Whether paging is turned off for tables under `dir`: a test's override,
+/// for the tests of the in-memory snapshot format, which edit or drop that
+/// format's entries and would otherwise run paged under
+/// `RASTERIZEDDB_INDEX_RESIDENCY`. Always `false` outside tests.
+pub fn memory_forced(dir: &Path) -> bool {
+    #[cfg(test)]
+    {
+        return FORCED.lock().iter().any(|d| dir.starts_with(d));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+#[cfg(test)]
+static FORCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Keeps every index of a table under `dir` in memory until dropped.
+#[cfg(test)]
+pub(crate) struct ForcedMemory(PathBuf);
+
+#[cfg(test)]
+impl Drop for ForcedMemory {
+    fn drop(&mut self) {
+        FORCED.lock().retain(|d| *d != self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn force_memory_under(dir: &Path) -> ForcedMemory {
+    FORCED.lock().push(dir.to_path_buf());
+    ForcedMemory(dir.to_path_buf())
+}
+
+/// The subdirectory of `<stem>.idxr/` holding sealed runs.
+const SEALED_DIR: &str = "sealed";
+
+fn safe_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect()
+}
+
+/// A sealed run, as a snapshot's INDEX section names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRun {
+    /// The file's name inside `<stem>.idxr/sealed/`.
+    pub name: String,
+    pub len: u64,
+    /// CRC-32C of the whole file.
+    pub crc: u32,
+}
+
+/// The payload a paged index puts in its INDEX section instead of entries:
+/// its sealed run, unkeyed slots and presence words. The magic is not an
+/// INDEX-section version, so an in-memory index refuses it (and rebuilds),
+/// while a paged index refuses nothing else that is not one of these.
+pub const RUN_REF_MAGIC: &[u8; 8] = b"RDBRUNRF";
+
+pub fn encode_run_ref(run: &SealedRun, unkeyed: &[u64], present: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + run.name.len() + 8 * (unkeyed.len() + present.len()));
+    out.extend_from_slice(RUN_REF_MAGIC);
+    put_varint(&mut out, run.name.len() as u64);
+    out.extend_from_slice(run.name.as_bytes());
+    out.extend_from_slice(&run.len.to_le_bytes());
+    out.extend_from_slice(&run.crc.to_le_bytes());
+    put_varint(&mut out, unkeyed.len() as u64);
+    for s in unkeyed {
+        put_varint(&mut out, *s);
+    }
+    put_varint(&mut out, present.len() as u64);
+    for w in present {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+/// A run reference's parts; `None` when `bytes` are not one.
+pub fn decode_run_ref(bytes: &[u8]) -> io::Result<Option<(SealedRun, Vec<u64>, Vec<u64>)>> {
+    let Some(rest) = bytes.strip_prefix(RUN_REF_MAGIC.as_slice()) else {
+        return Ok(None);
+    };
+    let mut at = 0usize;
+    let nlen = get_varint(rest, &mut at)? as usize;
+    let name = rest.get(at..at + nlen).ok_or_else(|| corrupt("run reference name"))?;
+    let name = std::str::from_utf8(name).map_err(|_| corrupt("run reference name"))?.to_string();
+    at += nlen;
+    let fixed = rest.get(at..at + 12).ok_or_else(|| corrupt("run reference length"))?;
+    let len = u64::from_le_bytes(fixed[..8].try_into().unwrap());
+    let crc = u32::from_le_bytes(fixed[8..12].try_into().unwrap());
+    at += 12;
+    let n_unkeyed = get_varint(rest, &mut at)? as usize;
+    if n_unkeyed > rest.len() {
+        return Err(corrupt("run reference unkeyed count"));
+    }
+    let mut unkeyed = Vec::with_capacity(n_unkeyed);
+    for _ in 0..n_unkeyed {
+        unkeyed.push(get_varint(rest, &mut at)?);
+    }
+    let n_words = get_varint(rest, &mut at)? as usize;
+    let words = rest.get(at..at + n_words * 8).ok_or_else(|| corrupt("run reference presence"))?;
+    let present = words.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    if at + n_words * 8 != rest.len() {
+        return Err(corrupt("run reference trailing bytes"));
+    }
+    Ok(Some((SealedRun { name, len, crc }, unkeyed, present)))
 }
 
 fn range_ok(lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> bool {
@@ -1414,6 +1649,75 @@ mod tests {
         // A cap stops early.
         let mut capped = Vec::new();
         assert!(!s.collect(Bound::Unbounded, Bound::Unbounded, &mut capped, 10).unwrap());
+    }
+
+    /// Phase 2: a sealed run outlives its store, and a store opened later
+    /// (a process restart: a new instance under the same placement) adopts
+    /// it and answers as the first did. Anything not exactly what was sealed
+    /// is refused.
+    #[test]
+    fn a_sealed_run_is_adopted_by_the_next_store_and_nothing_else_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let placement = Placement::for_table(dir.path(), "t");
+        let budgets = Budgets { delta_bytes: 2048, block_bytes: 128, runs_max: 3 };
+        let present = Arc::new(RwLock::new(Vec::new()));
+        let first = PagedStore::open(&placement, "ix", budgets, present.clone()).unwrap();
+        for slot in 0..3000u64 {
+            set(&present, slot, true);
+            first.insert(slot, k(slot % 97));
+        }
+        first.settle();
+        let sealed = first.seal(&|| false).unwrap().expect("not cancelled");
+        let want: Vec<Vec<u64>> = (0..97).map(|key| first.posting(&k(key)).unwrap()).collect();
+        drop(first);
+        assert!(placement.dir.join(SEALED_DIR).join(&sealed.name).exists(), "the sealed run outlives its store");
+
+        let second = PagedStore::open(&placement, "ix", budgets, Arc::new(RwLock::new(Vec::new()))).unwrap();
+        assert!(placement.dir.join(SEALED_DIR).join(&sealed.name).exists(), "an open leaves sealed/ alone");
+        second.adopt(&sealed).unwrap();
+        for key in 0..97u64 {
+            assert_eq!(second.posting(&k(key)).unwrap(), want[key as usize], "key {key}");
+        }
+
+        // A reference that does not match the file is refused.
+        let refuse = |r: &SealedRun| {
+            let s = PagedStore::open(&placement, "ix", budgets, Arc::new(RwLock::new(Vec::new()))).unwrap();
+            assert!(s.adopt(r).is_err(), "{r:?} was adopted");
+        };
+        refuse(&SealedRun { crc: sealed.crc ^ 1, ..sealed.clone() });
+        refuse(&SealedRun { len: sealed.len + 1, ..sealed.clone() });
+        refuse(&SealedRun { name: "../x.run".into(), ..sealed.clone() });
+        refuse(&SealedRun { name: "ix.999.run".into(), ..sealed.clone() });
+        // A flipped byte in the file itself: a copy, under its own name, so
+        // the run the second store adopted stays sound.
+        let path = placement.dir.join(SEALED_DIR).join(&sealed.name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[100] ^= 0xff;
+        std::fs::write(placement.dir.join(SEALED_DIR).join("ix.0.run"), &bytes).unwrap();
+        refuse(&SealedRun { name: "ix.0.run".into(), ..sealed.clone() });
+        std::fs::remove_file(placement.dir.join(SEALED_DIR).join("ix.0.run")).unwrap();
+
+        // Sealing again keeps the newest earlier run and no older; a
+        // cancelled seal leaves nothing behind.
+        for _ in 0..3 {
+            second.seal(&|| false).unwrap().unwrap();
+        }
+        let runs = || std::fs::read_dir(placement.dir.join(SEALED_DIR)).unwrap().count();
+        assert_eq!(runs(), 3, "the run just sealed and the two before it");
+        assert!(second.seal(&|| true).unwrap().is_none(), "cancelled");
+        assert_eq!(runs(), 2, "a cancelled seal leaves no file of its own");
+    }
+
+    #[test]
+    fn a_run_reference_round_trips_and_refuses_garbage() {
+        let run = SealedRun { name: "ix.3.run".into(), len: 12345, crc: 0xDEAD_BEEF };
+        let bytes = encode_run_ref(&run, &[2, 9], &[0b101, 0, 1]);
+        assert_eq!(decode_run_ref(&bytes).unwrap(), Some((run, vec![2, 9], vec![0b101, 0, 1])));
+        assert_eq!(decode_run_ref(b"\x01\x00 an index section").unwrap(), None);
+        assert!(decode_run_ref(&bytes[..bytes.len() - 3]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode_run_ref(&longer).is_err());
     }
 
     #[test]

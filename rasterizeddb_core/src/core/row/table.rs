@@ -1273,6 +1273,7 @@ impl<S: StorageIO> Table<S> {
             // key/value, a mirrored pool) keeps its indexes in memory.
             let placement = io_pointers
                 .index_store_dir()
+                .filter(|dir| !crate::core::index::paged::memory_forced(dir))
                 .map(|dir| crate::core::index::paged::Placement::for_table(&dir, stem));
             let indexes = crate::core::index::for_schema_in(&schema, placement.as_ref());
             (!indexes.is_empty()).then(|| StdArc::new(indexes))

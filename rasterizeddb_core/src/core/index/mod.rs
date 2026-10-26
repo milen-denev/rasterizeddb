@@ -201,6 +201,66 @@ impl LiveIndex {
         matches!(self.data, Data::Paged(_))
     }
 
+    /// A paged index's INDEX-section payload for a seal (phase 2): its
+    /// entries written as one durable sealed run, and the reference to it
+    /// with the unkeyed slots and presence words. `Ok(None)` for an index in
+    /// memory, or when `cancelled` turned true midway.
+    ///
+    /// The bits are read before the run is written, as `for_each_sorted`
+    /// reads them before its sweep; under the seal's gate nothing writes
+    /// meanwhile either way.
+    pub fn seal_run(&self, cancelled: &dyn Fn() -> bool) -> std::io::Result<Option<Vec<u8>>> {
+        let Data::Paged(store) = &self.data else {
+            return Ok(None);
+        };
+        let present = self.present.read().clone();
+        let mut unkeyed = self.unkeyed.read().clone();
+        unkeyed.sort_unstable();
+        unkeyed.dedup();
+        Ok(store
+            .seal(cancelled)?
+            .map(|run| paged::encode_run_ref(&run, &unkeyed, sorted::trimmed(&present))))
+    }
+
+    /// Takes a sealed run a snapshot names (phase 2): the presence bits and
+    /// unkeyed slots first, then the run, the order a paged insert keeps.
+    /// `Err` (the caller rebuilds) when `payload` is not a run reference, a
+    /// slot or bit is past `n_slots`, or the run does not check out.
+    pub fn adopt_run(&self, _proof: Proof<'_>, payload: &[u8], n_slots: u64) -> Result<(), String> {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "LiveIndex::adopt_run");
+        let Data::Paged(store) = &self.data else {
+            return Err("a run reference for an index kept in memory".to_string());
+        };
+        let (run, unkeyed, present) = paged::decode_run_ref(payload)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not a run reference".to_string())?;
+        if unkeyed.iter().any(|s| *s >= n_slots) {
+            return Err("an unkeyed slot past the table's length".to_string());
+        }
+        if let Some(&last) = present.last() {
+            let slot = (present.len() as u64 - 1) * 64 + 63 - last.leading_zeros() as u64;
+            if last != 0 && slot >= n_slots {
+                return Err("a presence bit past the table's length".to_string());
+            }
+        }
+        {
+            let mut held = self.unkeyed.write();
+            held.extend(unkeyed);
+            held.sort_unstable();
+            held.dedup();
+        }
+        {
+            let mut bits = self.present.write();
+            if bits.len() < present.len() {
+                bits.resize(present.len(), 0);
+            }
+            for (held, loaded) in bits.iter_mut().zip(&present) {
+                *held |= *loaded;
+            }
+        }
+        store.adopt(&run).map_err(|e| e.to_string())
+    }
+
     /// Bytes of runs on disk and how many, for a paged index.
     pub fn paged_disk(&self) -> Option<(u64, usize)> {
         match &self.data {

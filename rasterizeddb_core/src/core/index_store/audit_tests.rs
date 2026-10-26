@@ -380,6 +380,9 @@ fn log_refuses_snapshot(d: &Path, stem: &str) -> bool {
 async fn an_audit_after_a_load_finds_a_dropped_entry_and_rebuilds_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
+    // It plants its fault by editing the in-memory format's entries, which a
+    // paged index's run cannot have dropped in place.
+    let _memory = crate::core::index::paged::force_memory_under(d);
     let _snap = storage_override::set(d, IndexStorage::Snapshot);
     let _never = hooks::rate(d, 0);
     let mut model = Model::default();
@@ -475,6 +478,9 @@ async fn an_audit_after_a_load_finds_a_dropped_entry_and_rebuilds_in_place() {
 async fn rdb_index_check_finds_dropped_entries_and_reports_a_healthy_table_clean() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
+    // It plants its fault by editing the in-memory format's entries, which a
+    // paged index's run cannot have dropped in place.
+    let _memory = crate::core::index::paged::force_memory_under(d);
     let _snap = storage_override::set(d, IndexStorage::Snapshot);
     let _never = hooks::rate(d, 0);
     let mut model = Model::default();
@@ -707,6 +713,9 @@ async fn checks_under_concurrent_writes_never_report_a_mismatch() {
 async fn a_mismatch_rebuilds_in_place_keeping_what_writes_added_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
+    // It plants its fault by editing the in-memory format's entries, which a
+    // paged index's run cannot have dropped in place.
+    let _memory = crate::core::index::paged::force_memory_under(d);
     let _snap = storage_override::set(d, IndexStorage::Snapshot);
     let _never = hooks::rate(d, 0);
     let mut model = Model::default();
