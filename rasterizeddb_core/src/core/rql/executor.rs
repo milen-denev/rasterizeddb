@@ -1400,15 +1400,7 @@ fn referencing_keys(
     database: &Arc<Database>,
     parent_table: &str,
 ) -> Vec<(String, crate::core::rql::foreign_key::ForeignKey)> {
-    let mut out = Vec::new();
-    database.each_schema(|table, schema| {
-        for fk in schema.foreign_keys.iter() {
-            if fk.parent_table.eq_ignore_ascii_case(parent_table) {
-                out.push((table.to_string(), fk.clone()));
-            }
-        }
-    });
-    out
+    database.referencing_keys(parent_table)
 }
 
 /// The literal `ON DELETE SET DEFAULT` should write into `column`.

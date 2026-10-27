@@ -56,6 +56,7 @@ use super::Database;
 use super::relation::Relation;
 use crate::core::partition::table::PartitionedTable;
 use crate::core::row::schema::TableSchema;
+use crate::core::rql::foreign_key::ForeignKey;
 use crate::core::row::table::Table;
 use crate::core::storage_providers::backend::DbStorageProvider;
 use crate::core::storage_providers::traits::StorageIO;
@@ -517,9 +518,17 @@ impl Database {
     /// the store, so a reader that sees the moved counter sees the new
     /// instance (§7 "Generation order"). Index-only changes keep the epoch.
     pub(crate) fn swap_instance(&self, name: &str, table: Arc<DbTable>) -> Option<Arc<DbTable>> {
-        match self.resolve(name, |key| self.table_slots.get(key).map(|slot| slot.value().clone())) {
-            Some(slot) => {
-                let old = slot.swap(table.clone());
+        match self.resolve(name, |key| self.table_slots.get(key).map(|slot| (key.to_string(), slot.value().clone()))) {
+            Some((key, slot)) => {
+                // The instance and the reverse index move together, under the
+                // index's write lock: a walk under its read lock sees both
+                // before or both after (`fk_reverse`).
+                let old = {
+                    let mut reverse = self.fk_reverse.write();
+                    let old = slot.swap(table.clone());
+                    reverse.set_child(&key, &table.schema.foreign_keys);
+                    old
+                };
                 if !same_result_shape(&old.schema, &table.schema) && !super::table_for::lock_exempt(name) {
                     slot.shape_epoch.store(self.draw_shape_epoch(), Ordering::Release);
                     self.shape_epoch.fetch_add(1, Ordering::AcqRel);
@@ -544,7 +553,12 @@ impl Database {
         let name = Self::canonical_key(name);
         let private = super::table_for::lock_exempt(&name);
         let epoch = if private { 0 } else { self.draw_shape_epoch() };
-        if let Some(old) = self.table_slots.insert(name, Arc::new(Slot::new(table, epoch))) {
+        let replaced = {
+            let mut reverse = self.fk_reverse.write();
+            reverse.set_child(&name, &table.schema.foreign_keys);
+            self.table_slots.insert(name, Arc::new(Slot::new(table, epoch)))
+        };
+        if let Some(old) = replaced {
             old.mark_dropped();
         }
         if !private {
@@ -576,7 +590,15 @@ impl Database {
 
     /// Removes `name`'s slot and returns its instance.
     pub(crate) fn take_table(&self, name: &str) -> Option<Arc<DbTable>> {
-        self.table_slots.remove(name).map(|(_, slot)| {
+        let removed = {
+            let mut reverse = self.fk_reverse.write();
+            let removed = self.table_slots.remove(name);
+            if let Some((key, _)) = &removed {
+                reverse.remove_child(key);
+            }
+            removed
+        };
+        removed.map(|(_, slot)| {
             slot.mark_dropped();
             slot.load()
         })
@@ -621,12 +643,176 @@ impl Database {
     /// holds `table`'s shell.
     pub(crate) fn take_partitioned(&self, name: &str, table: &Arc<PartitionedTable>) {
         self.partitioned_tables.remove(name);
-        if let Some((_, slot)) = self
-            .table_slots
-            .remove_if(name, |_, slot| Arc::ptr_eq(&slot.load(), table.shell()))
-        {
+        let removed = {
+            let mut reverse = self.fk_reverse.write();
+            let removed = self
+                .table_slots
+                .remove_if(name, |_, slot| Arc::ptr_eq(&slot.load(), table.shell()));
+            if let Some((key, _)) = &removed {
+                reverse.remove_child(key);
+            }
+            removed
+        };
+        if let Some((_, slot)) = removed {
             slot.mark_dropped();
         }
+    }
+
+    /// Rebuilds [`Database::fk_reverse`] from every slot's schema: at open,
+    /// once every table and partitioned shell is in place (the plain tables
+    /// go into the map before the database exists, so no mutator saw them).
+    pub(crate) fn rebuild_fk_reverse(&self) {
+        let mut reverse = self.fk_reverse.write();
+        *reverse = FkReverse::default();
+        for entry in self.table_slots.iter() {
+            let table = entry.value().table.load();
+            reverse.set_child(entry.key(), &table.0.schema.foreign_keys);
+        }
+    }
+
+    /// Every foreign key in the database whose referenced table is `parent`
+    /// (compared without ASCII case, as every FK lookup compares it), with the
+    /// table that declares it: from [`Database::fk_reverse`], in child-name
+    /// order and each child's keys in declaration order. Replaces the walk
+    /// of every schema the lookups used to make (O(tables) per DELETE and
+    /// per parent-key UPDATE); the walk itself is what debug and test builds
+    /// compare the answer with, under the index's read lock, so the two can
+    /// never disagree unnoticed.
+    pub(crate) fn referencing_keys(&self, parent: &str) -> Vec<(String, ForeignKey)> {
+        let reverse = self.fk_reverse.read();
+        let found = reverse.referencing(parent);
+        #[cfg(any(test, debug_assertions))]
+        self.assert_fk_reverse_matches_walk(parent, &found);
+        found
+    }
+
+    /// The names of the tables whose live foreign keys reference `parent`
+    /// (any column when `columns` is `None`), sorted and deduplicated:
+    /// `fk_children_on`'s answer, from the reverse index.
+    pub(crate) fn fk_children_from_reverse(&self, parent: &str, columns: Option<&[&str]>) -> Vec<String> {
+        let mut children: Vec<String> = self
+            .referencing_keys(parent)
+            .into_iter()
+            .filter(|(_, fk)| {
+                !fk.is_deleted && columns.is_none_or(|cs| cs.iter().any(|c| fk.parent_column.eq_ignore_ascii_case(c)))
+            })
+            .map(|(child, _)| child)
+            .collect();
+        children.sort();
+        children.dedup();
+        children
+    }
+
+    /// The whole reverse index against a walk of every schema: every
+    /// referenced table either names (the index's or the schemas'), compared
+    /// as [`Database::referencing_keys`] compares one. For tests that change
+    /// keys by DDL and check nothing was left behind or missed.
+    #[cfg(test)]
+    pub(crate) fn assert_fk_reverse_complete(&self) {
+        let reverse = self.fk_reverse.read();
+        let mut parents: std::collections::BTreeSet<String> = reverse.by_parent.keys().cloned().collect();
+        self.each_schema(|_, schema| {
+            for fk in schema.foreign_keys.iter() {
+                parents.insert(FkReverse::parent_key(&fk.parent_table));
+            }
+        });
+        for parent in parents {
+            let found = reverse.referencing(&parent);
+            self.assert_fk_reverse_matches_walk(&parent, &found);
+        }
+        for child in reverse.by_child.keys() {
+            assert!(self.has_table(child), "fk_reverse files keys of \"{child}\", which has no slot");
+        }
+    }
+
+    /// The consistency check behind [`Database::referencing_keys`]: the
+    /// reverse index's answer for `parent` is exactly what a walk of every
+    /// slot's schema finds, as multisets. Called with the index's read lock
+    /// held, so no mutator is between its slot change and its index change.
+    #[cfg(any(test, debug_assertions))]
+    fn assert_fk_reverse_matches_walk(&self, parent: &str, found: &[(String, ForeignKey)]) {
+        let mut walked: Vec<(String, ForeignKey)> = Vec::new();
+        self.each_schema(|table, schema| {
+            for fk in schema.foreign_keys.iter() {
+                if fk.parent_table.eq_ignore_ascii_case(parent) {
+                    walked.push((table.to_string(), fk.clone()));
+                }
+            }
+        });
+        let key = |(child, fk): &(String, ForeignKey)| format!("{child}\u{0}{fk:?}");
+        let mut a: Vec<String> = found.iter().map(key).collect();
+        let mut b: Vec<String> = walked.iter().map(key).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(
+            a, b,
+            "fk_reverse disagrees with the schemas for referenced table \"{parent}\" (left: the index, right: a walk)"
+        );
+    }
+}
+
+/// `Database.fk_reverse`: every foreign key by the table it references, so
+/// a DELETE or UPDATE of a parent finds its children without walking every
+/// table's schema (docs/partitioning.md §10, phase 3 P4).
+///
+/// Derived data, never persisted: it mirrors the schemas of the instances in
+/// the slots, and is changed only where a slot's instance is, by the slot
+/// primitives (`install_table`, `swap_instance`, `take_table`,
+/// `take_partitioned`) under its write lock, and rebuilt at open. So every
+/// DDL that changes a table's keys (CREATE, DROP, RENAME TO, ADD and DROP
+/// CONSTRAINT, DROP COLUMN, a reload, the partitioned forms, which reload the
+/// shell) keeps it, because each ends by putting an instance with the new
+/// schema in the slot.
+#[derive(Default)]
+pub(crate) struct FkReverse {
+    /// Referenced table, ASCII-lowercased (the lookups compare without
+    /// ASCII case), to `(child slot key, key)` in insertion order.
+    by_parent: std::collections::HashMap<String, Vec<(String, ForeignKey)>>,
+    /// Child slot key to the referenced tables its keys are filed under.
+    by_child: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl FkReverse {
+    fn parent_key(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    fn remove_child(&mut self, child: &str) {
+        let Some(parents) = self.by_child.remove(child) else {
+            return;
+        };
+        for parent in parents {
+            if let Some(list) = self.by_parent.get_mut(&parent) {
+                list.retain(|(c, _)| c != child);
+                if list.is_empty() {
+                    self.by_parent.remove(&parent);
+                }
+            }
+        }
+    }
+
+    /// `child`'s keys are now `fks`, replacing whatever it had.
+    fn set_child(&mut self, child: &str, fks: &[ForeignKey]) {
+        self.remove_child(child);
+        if fks.is_empty() {
+            return;
+        }
+        let mut parents: Vec<String> = Vec::new();
+        for fk in fks {
+            let parent = Self::parent_key(&fk.parent_table);
+            self.by_parent.entry(parent.clone()).or_default().push((child.to_string(), fk.clone()));
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+        self.by_child.insert(child.to_string(), parents);
+    }
+
+    fn referencing(&self, parent: &str) -> Vec<(String, ForeignKey)> {
+        let mut out = self.by_parent.get(&Self::parent_key(parent)).cloned().unwrap_or_default();
+        // Stable: one child's keys stay in declaration order.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 

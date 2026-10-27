@@ -1133,6 +1133,10 @@ pub struct Database {
     /// has a slot too (unless its schema could not be read); resolve a name
     /// through [`Database::relation`], which asks here first.
     partitioned_tables: DashMap<String, Arc<crate::core::partition::table::PartitionedTable>, ahash::RandomState>,
+    /// Every foreign key by the table it references (`slots::FkReverse`),
+    /// changed only with the slot it mirrors, under this lock. Named only in
+    /// `slots.rs`.
+    fk_reverse: parking_lot::RwLock<slots::FkReverse>,
     /// Names a CREATE or a partitioned DROP is working on (see
     /// [`Database::claim_name`]).
     name_claims: DashMap<String, (), ahash::RandomState>,
@@ -1575,6 +1579,7 @@ impl Database {
             name: name.to_string(),
             table_slots,
             partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
+            fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),
             name_claims: DashMap::with_hasher(ahash::RandomState::new()),
             partition_ddl: tokio::sync::Mutex::new(()),
             db_io_pointers: io_pointers,
@@ -1603,6 +1608,8 @@ impl Database {
             },
         };
         database.open_partitioned_rows(partitioned_rows).await;
+        // The plain tables went into the map before the database existed.
+        database.rebuild_fk_reverse();
         Ok(database)
     }
 
