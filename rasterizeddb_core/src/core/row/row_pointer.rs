@@ -763,6 +763,28 @@ impl<S: StorageIO> RowPointerIterator<S> {
     }
 }
 
+/// Where a string column's bytes start: the row's position plus the offset
+/// its 12-byte header holds.
+///
+/// The header is read from disk, and not always from a row: the open-time
+/// filter backfill and index build read rows by pointer without the
+/// compaction gate (their epoch checks discard what they read while rows
+/// move), and a dead slot's extent may hold another row's bytes. An offset
+/// that does not fit is a misread header, the error the range check after
+/// this reports, not an overflow: `+` panicked in debug builds, killing the
+/// backfill and leaving the table unfiltered (`partition_twin` hit it in
+/// most runs). In release it wrapped, and the range check refused it.
+#[inline]
+fn string_position(row_position: u64, header: &[u8]) -> std::io::Result<u64> {
+    let offset = u64::from_le_bytes(header[0..8].try_into().unwrap());
+    row_position.checked_add(offset).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid string offset {offset} in a row at {row_position} (likely misread header)"),
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RowPointer {
     #[cfg(feature = "enable_long_row")]
@@ -1937,8 +1959,7 @@ impl RowPointer {
                 .chunks_exact(12)
                 .zip(string_col_indices.iter())
             {
-                let string_row_position =
-                    self.position + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let string_row_position = string_position(self.position, chunk)?;
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
                 let col = &mut columns[col_idx];
@@ -2090,8 +2111,7 @@ impl RowPointer {
                 .chunks_exact(12)
                 .zip(string_col_indices.iter())
             {
-                let string_row_position =
-                    self.position + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let string_row_position = string_position(self.position, chunk)?;
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
                 let col = &mut columns[col_idx];
@@ -2751,6 +2771,32 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// A string header whose offset does not fit past the row's position is
+    /// a misread header, refused as one by both fetch paths, not an add that
+    /// overflows (a panic in debug builds, killing the filter backfill).
+    #[tokio::test]
+    async fn a_string_header_offset_past_u64_is_an_error_not_an_overflow() {
+        let position = 64u64;
+        let mut data = vec![0u8; 128];
+        data[64..72].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
+        data[72..76].copy_from_slice(&5u32.to_le_bytes());
+        let io = InMemoryIo { data: std::sync::Arc::new(data), declared_len: None };
+        let pointer = create_test_row_pointer(1, position, 32, false);
+        let fetch = RowFetch {
+            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+                column_offset: 0,
+                column_type: DbType::STRING,
+                size: 12,
+                schema_id: 0,
+            }],
+        };
+        let mut row = Row::default();
+        let reused = pointer.fetch_row_reuse_async(&io, &fetch, &mut row).await;
+        assert_eq!(reused.err().map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        let fetched = pointer.fetch_row(Arc::new(io), &fetch).await;
+        assert!(fetched.is_err(), "fetch_row read a header past u64 as a string");
     }
 
     #[tokio::test]
