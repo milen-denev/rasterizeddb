@@ -521,6 +521,7 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(round 3)* the CHECK clause read across a quoted name | the ADD CONSTRAINT arm | `…::constraint_names_are_stored_as_given_and_dropped_by_them` (`"my check"` not stored) |
 | *(round 3)* the CHECK name read by whitespace | `add_check_constraint` | the same (stored as `my`) |
 | *(round 3)* a UNIQUE INDEX name not re-quoted | `lexer_alter::unique_index_as_constraint` | `lexer_alter` tests, the same |
+| *(round 3)* the import's primary key named `<table>_<cols>_key` again | `migrate::plan` | `migrate::run::load_tests` (42704 on the drop; this is the state the fix found) |
 | *(round 3)* one case's snapshot pass run in rebuild mode (test-side: a production mutation that drops every load of one case alone was not found, since a case's images from before the DDL load whatever the DDL does) | `pddl_crash_tests::run_case` | `pddl_crash_tests` (RENAME TO: `loaded: 0`; the summed check alone passes) |
 
 **Twin runs:** all four configurations green at the default seeds
@@ -572,6 +573,13 @@ with 1,500 statements each, after round 2 and again after round 3.
 - **The crash test's snapshot pass loads an image in every case** that has
   rows (`loaded > 0` per case, not only summed), so one case whose images
   all rebuild cannot hide behind the others.
+
+The 42704 found one caller that relied on the silent success: the import
+(`migrate::plan`) dropped and re-added the primary key as
+`<table>_<cols>_key`, a name no primary key has, so its DROP matched
+nothing and every bulk load ran with the key in place. It uses
+`<table>_pkey` now, the engine's and PostgreSQL's name
+(`load_tests` failed with 42704 before the change).
 
 The twin's `DropUniqueIndex` now fails 42704 on both sides when its name is
 gone, and gains a round trip (add, drop, drop again) so every run has a drop
