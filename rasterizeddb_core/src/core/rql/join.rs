@@ -2255,6 +2255,14 @@ pub struct UnionParts {
 /// last branch, and the `LIMIT` behind it was not found.
 pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
     let (branches, distinct_prefix, tail) = union_pieces(sql)?;
+    // A row lock on any branch, or on the whole, locks rows a union's output
+    // does not name: PostgreSQL refuses it, and so does this. The last
+    // branch's clause used to lock that branch's rows alone.
+    for text in branches.iter().map(String::as_str).chain(std::iter::once(tail.as_str())) {
+        if let Ok((_, Some(lock))) = crate::core::rql::row_lock::split_locking_clause(text) {
+            return Some(Err(lock.not_allowed_with(crate::core::rql::row_lock::SET_OPERATIONS)));
+        }
+    }
     let mut parts = UnionParts {
         branches,
         distinct_prefix,

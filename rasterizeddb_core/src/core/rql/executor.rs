@@ -4345,7 +4345,11 @@ async fn delete_using_join(
         source_clause,
         condition
     );
-    let rows = run_subquery(&select, database, tx).await?;
+    // Unnormalised: each column at the scale it is stored at, which
+    // `scales` gives. Normalising to the engine's nine places rounded a
+    // `NUMERIC(20,12)` key, so two rows deduplicated into one written back
+    // by a value matching neither (`DELETE 0` where 2 were due).
+    let (rows, scales) = run_subquery_scaled(&select, database, tx, SubqueryNeed::All, false).await?;
     if rows.is_empty() {
         // With RETURNING, an empty row set: the client is owed a
         // RowDescription even when nothing matched, as dedd503 gives an
@@ -4373,7 +4377,7 @@ async fn delete_using_join(
             return Err("the join returned no key".to_string());
         }
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
-        if seen.insert(key.row_key(&cells, CellScale::Engine)?) {
+        if seen.insert(key.row_key(&cells)?) {
             named_rows.push((row, key.predicate(&cells)?));
         }
     }
@@ -4391,7 +4395,7 @@ async fn delete_using_join(
                 .columns
                 .get(width + offset)
                 .ok_or_else(|| "the join returned fewer values than the delete needs".to_string())?;
-            let literal = crate::core::rql::subquery::value_to_literal(&carried.column_type, carried.data.into_slice())
+            let literal = joined_literal(carried, scales.as_deref(), width + offset)
                 .ok_or_else(|| "a joined value cannot be written back".to_string())?;
             bindings.push((reference.clone(), literal));
         }
@@ -4583,7 +4587,9 @@ async fn update_from_join(
         join_condition
     );
 
-    let rows = run_subquery(&select, database, tx).await?;
+    // Unnormalised, as `delete_using_join` reads its join: every carried
+    // value is written back at the scale it is stored at (`scales`).
+    let (rows, scales) = run_subquery_scaled(&select, database, tx, SubqueryNeed::All, false).await?;
     if rows.is_empty() {
         // With RETURNING, an empty row set: the client is owed a
         // RowDescription even when nothing matched, as dedd503 gives an
@@ -4643,11 +4649,8 @@ async fn update_from_join(
             let mut bindings: Vec<(String, String)> = Vec::with_capacity(carried.len());
             for (offset, reference) in carried.iter().enumerate() {
                 let column = &row.columns[carried_at + offset];
-                let literal = crate::core::rql::subquery::value_to_literal(
-                    &column.column_type,
-                    column.data.into_slice(),
-                )
-                .ok_or_else(|| "a joined value cannot be written".to_string())?;
+                let literal = joined_literal(column, scales.as_deref(), carried_at + offset)
+                    .ok_or_else(|| "a joined value cannot be written".to_string())?;
                 bindings.push((reference.clone(), literal));
             }
             for (term, declared_document) in correlated.iter().zip(&documents) {
@@ -4698,7 +4701,7 @@ async fn update_from_join(
     let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
     for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
-        if seen.insert(key.row_key(&cells, CellScale::Engine)?) {
+        if seen.insert(key.row_key(&cells)?) {
             named_rows.push((row, key.predicate(&cells)?));
         }
     }
@@ -4706,12 +4709,8 @@ async fn update_from_join(
     let mut returned: Vec<u8> = Vec::new();
     for (row, named) in named_rows {
         let literal_at = |index: usize| -> Result<String, String> {
-            let column = &row.columns[index];
-            crate::core::rql::subquery::value_to_literal(
-                &column.column_type,
-                column.data.into_slice(),
-            )
-            .ok_or_else(|| "a joined value cannot be written".to_string())
+            joined_literal(&row.columns[index], scales.as_deref(), index)
+                .ok_or_else(|| "a joined value cannot be written".to_string())
         };
 
         let mut sets: Vec<String> = Vec::with_capacity(assignments.len());
@@ -4946,6 +4945,24 @@ async fn run_per_row_write(
         statement = key_only.clone();
     }
     unreachable!("the loop returns on its second pass")
+}
+
+/// The literal a value read by an unnormalised join (`run_subquery_scaled`
+/// with `normalize` false) is written back as: a sixteen-byte decimal at the
+/// scale `scales` gives its output slot, exactly, every place kept; anything
+/// else as `value_to_literal` renders it. Rendering such a cell as if at the
+/// engine's nine places would misplace its point, and normalising it first
+/// rounded away the places past nine.
+fn joined_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, at: usize) -> Option<String> {
+    let bytes = cell.data.into_slice();
+    if cell.column_type == crate::core::db_type::DbType::DECIMAL {
+        if let (Some(&scale), Some((v, None))) =
+            (scales.and_then(|s| s.get(at)), crate::core::value_codec::split_decimal_cell(bytes))
+        {
+            return Some(crate::core::value_codec::format_decimal_scaled(v, scale));
+        }
+    }
+    crate::core::rql::subquery::value_to_literal(&cell.column_type, bytes)
 }
 
 /// Whether a per-row write's error ends `run_per_row_write` rather than
@@ -5277,6 +5294,11 @@ async fn lock_selected_rows(
         return Err(format!("internal error: {} rows but {} row keys to lock them by", rows.len(), keys.len()));
     }
 
+    // Under REPEATABLE READ or SERIALIZABLE the snapshot is pinned, and
+    // scanning again would see the same versions: a row newly locked whose
+    // latest committed version is not the one the snapshot saw fails the
+    // statement with 40001, as PostgreSQL's does.
+    let pinned = database.transactions.has_pinned_snapshot(database.row_locks.txn_of(tx));
     let mut kept = Vec::with_capacity(rows.len());
     let mut newly = false;
     for (row, cells) in rows.into_iter().zip(keys) {
@@ -5286,7 +5308,7 @@ async fn lock_selected_rows(
             }
         }
         let cells: Vec<&crate::core::row::row::Column> = cells.iter().collect();
-        let row_key = key.row_key(&cells, CellScale::Declared)?;
+        let row_key = key.row_key(&cells)?;
         let held = database.row_locks.holds(table_name, &row_key, tx);
 
         let outcome = acquire_row_lock(
@@ -5301,6 +5323,15 @@ async fn lock_selected_rows(
 
         match outcome {
             Acquired::Yes => {
+                if pinned && !held {
+                    if let Some(since) = since {
+                        if changed_since_pinned(database, table_name, key, &cells, since, tx).await? {
+                            return Err(
+                                "could not serialize access due to concurrent update".to_string(),
+                            );
+                        }
+                    }
+                }
                 newly |= !held;
                 kept.push(row);
             }
@@ -5325,10 +5356,62 @@ async fn lock_selected_rows(
             },
         }
     }
-    if newly && since.is_some_and(|since| committed_since(database, since)) {
+    if newly && !pinned && since.is_some_and(|since| committed_since(database, since)) {
         return Err(LOCKED_ROWS_STALE.to_string());
     }
     Ok(kept)
+}
+
+/// Whether the row these key cells name has a latest committed version other
+/// than the one `pinned` (a pinned snapshot) sees, or none: read by key
+/// under both, in row mode, and compared by position, which names a version.
+/// Only that row: a commit elsewhere in the table is no conflict.
+async fn changed_since_pinned(
+    database: &Arc<Database>,
+    table_name: &str,
+    key: &IdentifyingKey,
+    cells: &[&crate::core::row::row::Column],
+    pinned: &crate::core::mvcc::Visibility,
+    tx: TxId,
+) -> Result<bool, String> {
+    let Some(relation) = database.relation_for(table_name, owner(), TableMode::RowExclusive).await? else {
+        return Ok(false);
+    };
+    let named = key.predicate(cells)?;
+    let fields: Vec<crate::core::row::schema::SchemaField> = relation.schema().fields.to_vec();
+    let calc = crate::core::row::schema::SchemaCalculator::default();
+    let fetch = crate::core::row::row::RowFetch {
+        columns_fetching_data: key
+            .fields
+            .iter()
+            .map(|f| {
+                let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, &fields);
+                crate::core::row::row::ColumnFetchingData {
+                    column_offset,
+                    column_type: f.db_type.physical(),
+                    size: f.size,
+                    schema_id,
+                }
+            })
+            .collect(),
+    };
+    let now = crate::core::mvcc::Visibility::for_snapshot(
+        database.transactions.snapshot_now(tx),
+        database.transactions.clone(),
+    );
+    let read = |visibility: crate::core::mvcc::Visibility| {
+        crate::core::rql::row_source::RowSource::rows_as_of(
+            relation.clone(),
+            &named,
+            &fields,
+            fetch.clone(),
+            visibility,
+            tx,
+        )
+    };
+    let seen = read(pinned.clone()).await.map_err(|e| e.to_string())?;
+    let latest = read(now).await.map_err(|e| e.to_string())?;
+    Ok(seen.first().map(|r| r.position) != latest.first().map(|r| r.position))
 }
 
 /// Asks for `strength` on the row `key` ([`IdentifyingKey::row_key`]) of
@@ -5619,7 +5702,10 @@ async fn refuse_write_to_locked_rows(
         },
         where_clause.trim()
     );
-    let rows = run_subquery(&select, database, tx).await?;
+    // Unnormalised, so each key cell is at its declared scale, as the
+    // locker's are: normalising rounded a `NUMERIC(20,12)` key to nine places
+    // and the writer met no lock.
+    let (rows, _) = run_subquery_scaled(&select, database, tx, SubqueryNeed::All, false).await?;
 
     for row in &rows {
         let cells: Vec<&crate::core::row::row::Column> = row.columns.iter().collect();
@@ -5628,8 +5714,7 @@ async fn refuse_write_to_locked_rows(
         }
         // A row whose key holds a NULL cannot have been locked: `FOR UPDATE`
         // refuses to name it.
-        // `run_subquery` normalised its decimals to the engine scale.
-        let Ok(row_key) = key.row_key(&cells[..key.fields.len()], CellScale::Engine) else {
+        let Ok(row_key) = key.row_key(&cells[..key.fields.len()]) else {
             continue;
         };
         // Asked for, not merely inspected: this transaction is about to write
@@ -11612,22 +11697,8 @@ struct IdentifyingKey {
     /// the write-back predicate use.
     fields: Vec<crate::core::row::schema::SchemaField>,
     /// Each field's declared `NUMERIC` scale (`type_modifier::scale_of`),
-    /// the scale a [`CellScale::Declared`] decimal cell is at.
+    /// the scale every key cell this is given is at.
     scales: Vec<u32>,
-}
-
-/// The scale a row's decimal key cells are at, which depends on the path
-/// that produced them and cannot be read off a sixteen-byte cell: the select
-/// pipeline leaves a column at its declared scale (`NUMERIC(10,2)`'s 1.50 is
-/// 150), and `run_subquery` normalises to the engine's (1500000000). A lock
-/// keyed by one and checked by the other never met (`IdentifyingKey::row_key`
-/// canonicalises from what the producer states).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CellScale {
-    /// The select pipeline's cells: each column at its declared scale.
-    Declared,
-    /// `run_subquery`'s: every decimal at `value_codec::DECIMAL_SCALE`.
-    Engine,
 }
 
 impl IdentifyingKey {
@@ -11647,11 +11718,16 @@ impl IdentifyingKey {
     /// admits any number of NULLs), and the bytes a NULL travels as would
     /// name every NULL row at once.
     ///
-    /// A decimal is keyed by its value, not its cell: the unscaled integer
-    /// with trailing zeros stripped, and the scale left, from the scale `at`
-    /// says the producer's cells are at (or the one a seventeen-byte cell
-    /// carries). 1.50 at scale 2 and 1.500000000 at scale 9 are one key.
-    fn row_key(&self, cells: &[&crate::core::row::row::Column], at: CellScale) -> Result<Vec<u8>, String> {
+    /// **Every cell must be at its column's declared scale**, never rescaled:
+    /// the select pipeline's, and `run_subquery_scaled` with `normalize`
+    /// false. A sixteen-byte decimal does not say its scale, and the paths
+    /// differ: `NUMERIC(10,2)`'s 1.50 is 150 in the pipeline and was
+    /// 1500000000 through a normalising subquery, so a lock keyed by one and
+    /// checked by the other never met; normalising also rounds past nine
+    /// places, so two `NUMERIC(20,12)` keys became one. A decimal is keyed by
+    /// its value: the unscaled integer with trailing zeros stripped, and the
+    /// scale left (a seventeen-byte cell's own scale where it carries one).
+    fn row_key(&self, cells: &[&crate::core::row::row::Column]) -> Result<Vec<u8>, String> {
         if let Some((field, _)) =
             self.fields.iter().zip(cells).find(|(_, c)| c.column_type == crate::core::db_type::DbType::NULL)
         {
@@ -11668,10 +11744,7 @@ impl IdentifyingKey {
             let Some((mut v, own)) = crate::core::value_codec::split_decimal_cell(bytes) else {
                 return bytes.to_vec();
             };
-            let mut scale = own.unwrap_or(match at {
-                CellScale::Declared => self.scales[i],
-                CellScale::Engine => crate::core::value_codec::DECIMAL_SCALE,
-            });
+            let mut scale = own.unwrap_or(self.scales[i]);
             while scale > 0 && v % 10 == 0 {
                 v /= 10;
                 scale -= 1;
@@ -11703,11 +11776,14 @@ impl IdentifyingKey {
     /// cells (in [`Self::fields`] order) belong to. On a partitioned table it
     /// pins every partition-key column, so the write it guards is routed to
     /// that row's one partition.
+    ///
+    /// A decimal is written at its declared scale, every place kept, so the
+    /// predicate names exactly the stored value.
     fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
-        self.row_key(cells, CellScale::Engine)?;
+        self.row_key(cells)?;
         let mut terms = Vec::with_capacity(self.fields.len());
-        for (field, cell) in self.fields.iter().zip(cells) {
-            let literal = crate::core::rql::subquery::value_to_literal(&cell.column_type, cell.data.into_slice())
+        for ((field, cell), scale) in self.fields.iter().zip(cells).zip(&self.scales) {
+            let literal = joined_literal(cell, Some(std::slice::from_ref(scale)), 0)
                 .ok_or_else(|| "a joined key cannot be written back".to_string())?;
             terms.push(format!("{} = {}", field.name, literal));
         }

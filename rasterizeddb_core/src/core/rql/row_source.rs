@@ -137,6 +137,42 @@ impl RowSource {
         }
     }
 
+    /// The rows of `relation` matching `where_clause` as `visibility` sees
+    /// them, read in row mode so each keeps its position: the version a
+    /// snapshot sees is named by where it is. For a locking read under a
+    /// pinned snapshot, which compares the version it saw with the latest
+    /// (`lock_selected_rows`).
+    pub(crate) async fn rows_as_of(
+        relation: Relation,
+        where_clause: &str,
+        schema_fields: &Vec<SchemaField>,
+        fetch: RowFetch,
+        visibility: Visibility,
+        tx: TxId,
+    ) -> io::Result<Vec<Row>> {
+        match relation {
+            Relation::Plain(table) => {
+                table
+                    .query_row_with_visibility_cached(
+                        where_clause,
+                        schema_fields,
+                        fetch.clone(),
+                        fetch,
+                        None,
+                        None,
+                        visibility,
+                        false,
+                    )
+                    .await
+            }
+            Relation::Partitioned(table) => {
+                RowSource::partitioned_with(table, where_clause, visibility)?
+                    .query_rows(where_clause, schema_fields, fetch.clone(), fetch, None, None, tx)
+                    .await
+            }
+        }
+    }
+
     /// The snapshot a partitioned source was planned under; `None` for a
     /// plain table, whose scan takes its own when it runs.
     pub(crate) fn planned_visibility(&self) -> Option<Visibility> {

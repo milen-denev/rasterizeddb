@@ -4733,6 +4733,10 @@ where
         // over DISTINCT values inside an expression: feature_not_supported,
         // not a syntax error.
         "0A000"
+    } else if message.contains(" is not allowed with ") {
+        // A row lock on rows that are not table rows ("FOR UPDATE is not
+        // allowed with DISTINCT clause"): PostgreSQL's feature_not_supported.
+        "0A000"
     } else if message.contains(" types ") && message.ends_with(" cannot be matched") {
         // `CASE types integer and text cannot be matched` — PostgreSQL's
         // datatype_mismatch.
@@ -6756,6 +6760,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     } else if has("can only be updated to default") || has("cannot insert a non-default value") {
         // `generated_always`: a value written to a generated column.
         "428C9"
+    } else if has(" is not allowed with ") {
+        // A row lock on rows that are not table rows: "FOR UPDATE is not
+        // allowed with DISTINCT clause", PostgreSQL's 0A000.
+        "0A000"
     } else if has("not supported") || has("unsupported") || has("not a supported") {
         // The last is the row-lock parser's: "'FOR UPDATE NOWAIT SKIP
         // LOCKED' is not a supported locking clause", which was XX000.

@@ -2416,6 +2416,31 @@ pub fn row_fetch_from_select_query(
         select_items,
     };
 
+    // A row lock names table rows, and these produce rows that are not one
+    // table row each: PostgreSQL refuses the lock (0A000), in this order.
+    // `SELECT DISTINCT state … FOR UPDATE` locked one row per value and left
+    // the rest unlocked, and `SELECT COUNT(*) … FOR UPDATE` locked nothing.
+    if let Some(lock) = &query_rows.row_lock {
+        let refused = if query_rows.distinct {
+            Some("DISTINCT clause")
+        } else if let Some(plan) = &query_rows.aggregate {
+            Some(if !plan.group_by.is_empty() || !plan.computed_keys.is_empty() {
+                "GROUP BY clause"
+            } else if plan.having.is_some() {
+                "HAVING clause"
+            } else {
+                "aggregate functions"
+            })
+        } else if !query_rows.window_slots.is_empty() {
+            Some("window functions")
+        } else {
+            None
+        };
+        if let Some(what) = refused {
+            return Err(lock.not_allowed_with(what));
+        }
+    }
+
     // Debug, not info: this prints the whole `QueryRows` — every fetched
     // column, every select item, the full schema of each — for *every*
     // statement. At the default level it buried the log under kilobytes per

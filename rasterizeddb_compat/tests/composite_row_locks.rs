@@ -1028,3 +1028,218 @@ async fn a_locking_read_that_waited_returns_the_rows_as_the_holder_left_them() {
         );
     }
 }
+
+/// Keys past nine places and keys of thirty-eight digits are never rescaled
+/// on the way to a lock or a write-back: a subquery that normalised decimals
+/// to nine places rounded `NUMERIC(20,12)`'s 1.000000000001 and
+/// 1.000000000002 to one value, so the writer met no lock, `UPDATE … FROM`
+/// deduplicated both rows into one and wrote it back by a value matching
+/// neither (`UPDATE 0` where 2 were due). Read back by exact value.
+#[tokio::test(flavor = "multi_thread")]
+async fn wide_decimal_keys_lock_and_write_back_exactly() {
+    let dir = root("wide_decimals");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut c = connect(&server).await;
+    // Thirty-five digits: past what an i128 holds at nine places (about
+    // 1.7e29), so normalising one overflowed and left it at scale 0 read as
+    // scale 9. (A 38-digit value is refused by NUMERIC(38,0) with 22003, a
+    // separate precision-check finding.)
+    let big1 = "12345678901234567890123456789012345";
+    let big2 = "12345678901234567890123456789012344";
+    let cases = [
+        ("n12", "NUMERIC(20,12)", "1.000000000001", "1.000000000002"),
+        ("n38", "NUMERIC(38,0)", big1, big2),
+    ];
+    for (name, ty, k1, k2) in cases {
+        for (kind, partitioning) in [("plain", ""), ("part", " PARTITION BY HASH (tag) PARTITIONS 4")] {
+            let (t, s) = (format!("{name}_{kind}"), format!("{name}_src_{kind}"));
+            exec(&mut c, &format!("CREATE TABLE {t} (tag BIGINT NOT NULL, amt {ty} NOT NULL, n INT, PRIMARY KEY (tag, amt)){partitioning}"))
+                .await
+                .unwrap_or_else(|e| panic!("{t}: {e}"));
+            exec(&mut c, &format!("INSERT INTO {t} (tag, amt, n) VALUES (1, {k1}, 0), (1, {k2}, 0)")).await.unwrap();
+            exec(&mut c, &format!("CREATE TABLE {s} (tag BIGINT NOT NULL, amt {ty} NOT NULL, v INT NOT NULL)")).await.unwrap();
+            exec(&mut c, &format!("INSERT INTO {s} (tag, amt, v) VALUES (1, {k1}, 11), (1, {k2}, 22)")).await.unwrap();
+            let n_of = |k: &str| format!("SELECT n FROM {t} WHERE tag = 1 AND amt = {k}");
+            // A predicate literal past about 29 integer digits is out of the
+            // evaluator's range ("numeric literal … is out of range"), so a
+            // 35-digit key is locked and checked through `tag` alone, and a
+            // write-back by its key must fail rather than miscount.
+            let addressable = name != "n38";
+            let (lock_where, write_where) = if addressable {
+                (format!("tag = 1 AND amt = {k1}"), format!("tag = 1 AND amt = {k1}"))
+            } else {
+                ("tag = 1".to_string(), "tag = 1".to_string())
+            };
+
+            // The lock.
+            let mut a = connect(&server).await;
+            exec(&mut a, "BEGIN").await.unwrap();
+            let got = sqlx::query(AssertSqlSafe(format!("SELECT n FROM {t} WHERE {lock_where} FOR UPDATE")))
+                .fetch_all(&mut a)
+                .await
+                .unwrap_or_else(|e| panic!("{t}: lock: {e}"));
+            assert_eq!(got.len(), if addressable { 1 } else { 2 }, "{t}");
+            let mut b = connect(&server).await;
+            let e = exec(&mut b, &format!("UPDATE {t} SET n = 9 WHERE {write_where}"))
+                .await
+                .expect_err(&format!("{t}: a writer ran past the held row"));
+            assert!(e.to_string().contains("is locked by transaction"), "{t}: {e}");
+            if addressable {
+                assert_eq!(exec(&mut b, &format!("UPDATE {t} SET n = 0 WHERE tag = 1 AND amt = {k2}")).await.expect("other"), 1, "{t}");
+            }
+            exec(&mut a, "COMMIT").await.unwrap();
+
+            // UPDATE … FROM over both rows: two writes, each its own value.
+            let outcome = exec(&mut c, &format!("UPDATE {t} SET n = {s}.v FROM {s} WHERE {t}.tag = {s}.tag AND {t}.amt = {s}.amt")).await;
+            if !addressable {
+                match outcome {
+                    Err(e) => assert!(e.to_string().contains("out of range"), "{t}: {e}"),
+                    Ok(n) => {
+                        assert_eq!(n, 2, "{t}: UPDATE … FROM's count");
+                        let ns: BTreeSet<i32> = sqlx::query(AssertSqlSafe(format!("SELECT n FROM {t}")))
+                            .fetch_all(&mut c)
+                            .await
+                            .unwrap()
+                            .iter()
+                            .map(|r| r.get::<i32, _>(0))
+                            .collect();
+                        assert_eq!(ns, BTreeSet::from([11, 22]), "{t}");
+                    }
+                }
+                continue;
+            }
+            let n = outcome.unwrap_or_else(|e| panic!("{t}: UPDATE … FROM: {e}"));
+            assert_eq!(n, 2, "{t}: UPDATE … FROM's count");
+            for (k, want) in [(k1, 11), (k2, 22)] {
+                let got = sqlx::query(AssertSqlSafe(n_of(k))).fetch_one(&mut c).await.unwrap().get::<i32, _>(0);
+                assert_eq!(got, want, "{t}: {k}");
+            }
+            // DELETE … USING one of them, by its exact key.
+            let n = exec(&mut c, &format!("DELETE FROM {t} USING {s} WHERE {t}.tag = {s}.tag AND {t}.amt = {s}.amt AND {s}.v = 22"))
+                .await
+                .unwrap_or_else(|e| panic!("{t}: DELETE … USING: {e}"));
+            assert_eq!(n, 1, "{t}: DELETE … USING's count");
+            let left: Vec<i32> = sqlx::query(AssertSqlSafe(format!("SELECT n FROM {t}")))
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<i32, _>(0))
+                .collect();
+            assert_eq!(left, vec![11], "{t}: the wrong row was deleted");
+        }
+    }
+}
+
+/// A row lock on rows that are not one table row each is refused with
+/// 0A000 and PostgreSQL's message, before anything is locked: `SELECT
+/// DISTINCT state … FOR UPDATE` used to lock one row per value, and `SELECT
+/// COUNT(*) … FOR UPDATE` none, and a lock on a union's last branch locked
+/// that branch's rows alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_lock_on_rows_that_are_not_table_rows_is_refused() {
+    let dir = root("refused_shapes");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    for (kind, partitioning) in KINDS {
+        let t = queue(&mut setup, kind, partitioning).await;
+        for clause in ["FOR UPDATE", "FOR NO KEY UPDATE", "FOR SHARE", "FOR KEY SHARE"] {
+            for (what, sql) in [
+                ("DISTINCT clause", format!("SELECT DISTINCT state FROM {t} WHERE tenant_id = 1 {clause}")),
+                ("GROUP BY clause", format!("SELECT state FROM {t} WHERE tenant_id = 1 GROUP BY state {clause}")),
+                ("GROUP BY clause", format!("SELECT state, COUNT(*) FROM {t} GROUP BY state HAVING COUNT(*) > 1 {clause}")),
+                ("HAVING clause", format!("SELECT COUNT(*) FROM {t} HAVING COUNT(*) > 1 {clause}")),
+                ("aggregate functions", format!("SELECT COUNT(*) FROM {t} WHERE tenant_id = 1 {clause}")),
+                ("aggregate functions", format!("SELECT MAX(id) FROM {t} {clause} SKIP LOCKED")),
+                ("window functions", format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM {t} WHERE tenant_id = 1 {clause}")),
+                (
+                    "UNION/INTERSECT/EXCEPT",
+                    format!("SELECT id FROM {t} WHERE tenant_id = 1 UNION SELECT id FROM {t} WHERE tenant_id = 2 {clause}"),
+                ),
+                (
+                    "UNION/INTERSECT/EXCEPT",
+                    format!("SELECT id FROM {t} WHERE tenant_id = 1 UNION ALL SELECT id FROM {t} WHERE tenant_id = 2 LIMIT 3 {clause}"),
+                ),
+                (
+                    "UNION/INTERSECT/EXCEPT",
+                    format!("SELECT id FROM {t} WHERE tenant_id = 1 INTERSECT SELECT id FROM {t} WHERE tenant_id = 2 {clause}"),
+                ),
+                (
+                    "UNION/INTERSECT/EXCEPT",
+                    format!("SELECT id FROM {t} WHERE tenant_id = 1 EXCEPT SELECT id FROM {t} WHERE tenant_id = 2 {clause}"),
+                ),
+            ] {
+                let mut a = connect(&server).await;
+                exec(&mut a, "BEGIN").await.unwrap();
+                let e = exec(&mut a, &sql).await.expect_err(&format!("{t}: `{sql}` was not refused"));
+                assert_eq!(code(&e).as_deref(), Some("0A000"), "{t}: `{sql}`: {e}");
+                let want = format!("{clause} is not allowed with {what}");
+                assert!(e.to_string().contains(&want), "{t}: `{sql}`: {e} (wanted \"{want}\")");
+                exec(&mut a, "ROLLBACK").await.unwrap();
+            }
+        }
+        // Nothing was locked: every row is writable.
+        let n = exec(&mut setup, &format!("UPDATE {t} SET claimed_by = 1 WHERE tenant_id <= 2")).await.expect("unlocked");
+        assert_eq!(n as i64, 2 * IDS, "{t}");
+    }
+}
+
+/// Under REPEATABLE READ a locking read cannot see a newer version by
+/// scanning again (its snapshot is pinned), so a row it newly locks whose
+/// latest committed version is not the one its snapshot saw fails the
+/// statement with 40001, as PostgreSQL's does; it used to come back stale.
+/// A holder that only locked, or that changed and committed another row,
+/// leaves the row as the snapshot saw it: no error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeatable_read_locking_read_fails_on_a_row_changed_while_it_waited() {
+    let dir = root("rr_waited");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    for (kind, partitioning) in KINDS {
+        let t = queue(&mut setup, kind, partitioning).await;
+        for (case, holder_write, fails) in [
+            ("changed", Some(format!("UPDATE {t} SET state = 'done' WHERE tenant_id = 1 AND id = 1")), true),
+            ("deleted", Some(format!("DELETE FROM {t} WHERE tenant_id = 1 AND id = 1")), true),
+            ("only locked", None, false),
+            ("another row changed", Some(format!("UPDATE {t} SET state = 'done' WHERE tenant_id = 2 AND id = 7")), false),
+        ] {
+            exec(&mut setup, &format!("DELETE FROM {t} WHERE tenant_id = 1 AND id = 1")).await.unwrap();
+            exec(&mut setup, &format!("INSERT INTO {t} (tenant_id, id, state) VALUES (1, 1, 'new')")).await.unwrap();
+            let mut a = connect(&server).await;
+            exec(&mut a, "BEGIN").await.unwrap();
+            keys(&mut a, &format!("SELECT tenant_id, id FROM {t} WHERE tenant_id = 1 AND id = 1 FOR UPDATE")).await.expect("lock");
+            let mut b = connect(&server).await;
+            exec(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ").await.unwrap();
+            // The snapshot is taken (and pinned) here, before the holder commits.
+            let seen = keys(&mut b, &format!("SELECT tenant_id, id FROM {t} WHERE tenant_id = 1 AND id = 1")).await.unwrap();
+            assert_eq!(seen, vec![(1, 1)], "{t} {case}");
+            let t2 = t.clone();
+            let hb = tokio::spawn(async move {
+                let r = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT tenant_id, id, state FROM {t2} WHERE tenant_id = 1 AND id = 1 FOR UPDATE"
+                )))
+                .fetch_all(&mut b)
+                .await
+                .map(|rows| rows.iter().map(|r| r.get::<String, _>(2)).collect::<Vec<_>>());
+                let _ = exec(&mut b, "ROLLBACK").await;
+                r
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!hb.is_finished(), "{t} {case}: the locking read did not wait");
+            if let Some(w) = &holder_write {
+                exec(&mut a, w).await.unwrap_or_else(|e| panic!("{t} {case}: {e}"));
+            }
+            exec(&mut a, "COMMIT").await.unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(20), hb).await.expect("the waiter hung").expect("join");
+            if fails {
+                let e = got.expect_err(&format!("{t} {case}: a stale row came back under REPEATABLE READ"));
+                assert_eq!(code(&e).as_deref(), Some("40001"), "{t} {case}: {e}");
+                assert!(e.to_string().contains("could not serialize access due to concurrent update"), "{t} {case}: {e}");
+            } else {
+                let states = got.unwrap_or_else(|e| panic!("{t} {case}: an unchanged row failed: {e}"));
+                assert_eq!(states, vec!["new".to_string()], "{t} {case}");
+            }
+            exec(&mut setup, &format!("UPDATE {t} SET state = 'new' WHERE tenant_id = 2 AND id = 7")).await.unwrap();
+        }
+    }
+}

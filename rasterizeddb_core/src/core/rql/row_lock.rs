@@ -38,7 +38,21 @@ pub enum LockWait {
 pub struct RowLock {
     pub strength: LockStrength,
     pub behaviour: LockWait,
+    /// The clause as PostgreSQL names it (`FOR NO KEY UPDATE`), for the
+    /// refusals that quote it: the four spellings share two strengths here.
+    pub clause: &'static str,
 }
+
+impl RowLock {
+    /// PostgreSQL's refusal of this clause on a statement whose rows are not
+    /// table rows (0A000): "FOR UPDATE is not allowed with DISTINCT clause".
+    pub fn not_allowed_with(&self, what: &str) -> String {
+        format!("{} is not allowed with {}", self.clause, what)
+    }
+}
+
+/// What PostgreSQL's refusal names a set operation as.
+pub const SET_OPERATIONS: &str = "UNION/INTERSECT/EXCEPT";
 
 /// Splits a trailing locking clause off a `SELECT`.
 ///
@@ -55,18 +69,18 @@ pub fn split_locking_clause(sql: &str) -> Result<(String, Option<RowLock>), Stri
     let tail = trimmed[at + "FOR".len()..].trim_start();
     let upper = tail.to_ascii_uppercase();
 
-    let (strength, rest) = if upper.starts_with("UPDATE") {
-        (LockStrength::Update, &tail["UPDATE".len()..])
+    let (strength, clause, rest) = if upper.starts_with("UPDATE") {
+        (LockStrength::Update, "FOR UPDATE", &tail["UPDATE".len()..])
     } else if upper.starts_with("NO KEY UPDATE") {
         // Weaker than `FOR UPDATE` in PostgreSQL, but the difference only shows
         // against foreign-key locks, which this engine does not take. Treated as
         // the stronger one, which can refuse where PostgreSQL would allow but
         // never allows where PostgreSQL would refuse.
-        (LockStrength::Update, &tail["NO KEY UPDATE".len()..])
+        (LockStrength::Update, "FOR NO KEY UPDATE", &tail["NO KEY UPDATE".len()..])
     } else if upper.starts_with("SHARE") {
-        (LockStrength::Share, &tail["SHARE".len()..])
+        (LockStrength::Share, "FOR SHARE", &tail["SHARE".len()..])
     } else if upper.starts_with("KEY SHARE") {
-        (LockStrength::Share, &tail["KEY SHARE".len()..])
+        (LockStrength::Share, "FOR KEY SHARE", &tail["KEY SHARE".len()..])
     } else {
         // A `FOR` that begins no locking clause is left alone rather than
         // guessed at.
@@ -128,19 +142,21 @@ pub fn split_locking_clause(sql: &str) -> Result<(String, Option<RowLock>), Stri
     }
 
     let head = trimmed[..at].trim_end();
+    let lock = RowLock { strength, behaviour, clause };
+    // A set operation's rows are not table rows; PostgreSQL refuses the lock.
+    if ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|k| crate::core::rql::join::find_keyword(head, k, 0).is_some())
+    {
+        return Err(lock.not_allowed_with(SET_OPERATIONS));
+    }
     let statement = if rest.is_empty() {
         head.to_string()
     } else {
         format!("{} {}", head, rest)
     };
 
-    Ok((
-        statement,
-        Some(RowLock {
-            strength,
-            behaviour,
-        }),
-    ))
+    Ok((statement, Some(lock)))
 }
 
 #[cfg(test)]

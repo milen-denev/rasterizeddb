@@ -637,6 +637,23 @@ mod tests {
         assert!(crate::core::rql::join::split_union("SELECT a FROM x").is_none());
     }
 
+    /// A row lock on a union's branch or tail is PostgreSQL's 0A000 refusal,
+    /// whichever clause it is: the last branch's used to lock that branch's
+    /// rows alone. (The statement path refuses it first, in
+    /// `split_locking_clause`; this pins the split's own guard.)
+    #[test]
+    fn a_row_lock_on_a_union_is_refused_by_the_split() {
+        for (sql, clause) in [
+            ("SELECT a FROM x UNION SELECT a FROM y FOR UPDATE", "FOR UPDATE"),
+            ("SELECT a FROM x UNION ALL SELECT a FROM y LIMIT 2 FOR NO KEY UPDATE", "FOR NO KEY UPDATE"),
+            ("(SELECT a FROM x FOR SHARE) UNION SELECT a FROM y", "FOR SHARE"),
+            ("SELECT a FROM x UNION SELECT a FROM y FOR KEY SHARE SKIP LOCKED", "FOR KEY SHARE"),
+        ] {
+            let e = crate::core::rql::join::split_union(sql).unwrap().expect_err(sql);
+            assert_eq!(e, format!("{clause} is not allowed with UNION/INTERSECT/EXCEPT"), "{sql}");
+        }
+    }
+
     #[test]
     fn a_widened_row_reads_back_as_the_wider_type() {
         let row = serialized(vec![
