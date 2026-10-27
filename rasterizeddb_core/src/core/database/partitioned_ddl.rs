@@ -319,10 +319,16 @@ impl Database {
     pub(super) fn unfinished_partitioned_rename(&self, uid: Option<u64>) -> Option<String> {
         let root = self.location.as_deref()?;
         let path = std::path::Path::new(root).join(RENAME_INTENT);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let text = match std::fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-            Err(e) => return Some(format!("a partitioned rename's intent {} cannot be read: {e}", path.display())),
+            Err(e) => {
+                return Some(format!(
+                    "a partitioned rename's intent {} cannot be read ({e}), so it may name this table; a restart \
+                     retries it, or check the catalogue holds each partitioned table once and move the file aside",
+                    path.display()
+                ));
+            }
         };
         let named = parse_rename(&text);
         if let (Some(uid), Some((intent_uid, _, _))) = (uid, &named)
@@ -330,10 +336,18 @@ impl Database {
         {
             return None;
         }
-        let what = named
-            .map(|(_, old, new)| format!("the rename of partitioned table \"{old}\" to \"{new}\""))
-            .unwrap_or_else(|| "a partitioned rename".to_string());
-        Some(format!("{what} has not finished (its intent is kept until the next open settles it); restart first"))
+        Some(match named {
+            Some((_, old, new)) => format!(
+                "the rename of partitioned table \"{old}\" to \"{new}\" has not finished (its intent {} is kept \
+                 until the next open settles it); restart first",
+                path.display()
+            ),
+            None => format!(
+                "a partitioned rename's intent {} does not parse, so it may name this table; a restart moves it \
+                 aside, or check the catalogue holds each partitioned table once and move the file aside",
+                path.display()
+            ),
+        })
     }
 
     /// The in-memory half of a partitioned RENAME: `old` (retired) leaves
@@ -438,6 +452,33 @@ fn parse_rename(text: &str) -> Option<(u64, String, String)> {
     Some((uid, old_name.to_string(), new_name.to_string()))
 }
 
+/// Moves a malformed rename intent to the first free
+/// `__prename.intent.bad-<n>`, durably, and logs it at error level; a move
+/// that fails leaves it, logged too.
+fn set_aside_malformed(path: &std::path::Path, text: &str) {
+    let mut n = 1u32;
+    let aside = loop {
+        let candidate = path.with_file_name(format!("{RENAME_INTENT}.bad-{n}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    match std::fs::rename(path, &aside).and_then(|()| crate::core::wal::sync_parent_dir(&aside)) {
+        Ok(()) => error!(
+            "Malformed partitioned rename intent {} ({text:?}) moved aside to {}: it does not parse, so nothing \
+             was done with it. Check the catalogue holds each partitioned table once, then remove the file.",
+            path.display(),
+            aside.display()
+        ),
+        Err(e) => error!(
+            "Malformed partitioned rename intent {} ({text:?}) could not be moved aside ({e}); partitioned RENAME \
+             and DROP stay refused until it is moved",
+            path.display()
+        ),
+    }
+}
+
 /// Finishes or abandons a partitioned RENAME a crash interrupted, before the
 /// catalogue is read for the table list: by the catalogue alone, touching no
 /// table file (a partitioned table has none under either name). Both rows
@@ -459,16 +500,24 @@ pub(super) async fn recover_interrupted_rename(
     if partial.exists() && std::fs::remove_file(&partial).is_ok() {
         let _ = crate::core::wal::sync_parent_dir(&partial);
     }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return,
         Err(e) => {
-            warn!("A partitioned rename intent {} could not be read ({e}); leaving it in place", path.display());
+            // Unreadable now is not malformed: the next open tries again,
+            // and meanwhile RENAME and DROP say where it is.
+            error!("A partitioned rename intent {} could not be read ({e}); leaving it in place", path.display());
             return;
         }
     };
+    let text = String::from_utf8_lossy(&bytes);
     let Some((uid, old_name, new_name)) = parse_rename(&text) else {
-        warn!("Malformed partitioned rename intent {}: {text:?}; leaving it in place", path.display());
+        // Renamed into place whole, so never torn: one that does not parse
+        // was not written by this engine, and says nothing to act on. Left
+        // in place it would refuse every partitioned RENAME and DROP for
+        // good, since nothing removes it, so it is moved aside, kept for an
+        // operator.
+        set_aside_malformed(&path, &text);
         return;
     };
     let schema = super::load_db_data_schema(io_schema.clone()).await;

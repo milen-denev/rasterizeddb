@@ -519,3 +519,101 @@ async fn a_failed_header_rewrite_puts_the_schema_files_back() {
     assert_eq!(count(&exec(&db, "SELECT id FROM pt2 WHERE v >= 0").await), 60);
     close(d, db);
 }
+
+/// Constraint names that start with a multi-byte character, bare or quoted,
+/// and quoted names holding a space or a keyword, on a plain and a
+/// partitioned table: CHECK, UNIQUE and IF NOT EXISTS all run (or are
+/// refused for the partitioned rule) and none panics; `"my key"` is an
+/// enforced UNIQUE named `my key`; `"unique"` naming an EXCLUDE is accepted
+/// as before, unenforced.
+///
+/// Mutations: the keyword match slicing by bytes again (a panic); the
+/// unread-UNIQUE scan reading the name too (`"unique" EXCLUDE` refused); the
+/// name read by whitespace again (`"my key"` refused).
+#[tokio::test(flavor = "multi_thread")]
+async fn non_ascii_and_quoted_constraint_names_on_both_table_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = open(d).await;
+    exec(
+        &db,
+        "CREATE TABLE pk (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, PRIMARY KEY (a, c)) \
+         PARTITION BY HASH (a) PARTITIONS 4",
+    )
+    .await;
+    exec(&db, "CREATE TABLE pl (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, PRIMARY KEY (a, c))").await;
+    let names = |db: &Database, t: &str| -> (Vec<String>, Vec<String>) {
+        let schema = match db.partitioned_table(t) {
+            Some(pt) => pt.shell().schema.clone(),
+            None => db.table_for_tests(t).unwrap().schema.clone(),
+        };
+        (
+            schema.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| k.name.clone()).collect(),
+            schema.checks.iter().filter(|c| !c.is_deleted).map(|c| c.name.clone()).collect(),
+        )
+    };
+    for t in ["pl", "pk"] {
+        exec(&db, &format!("INSERT INTO {t} (a, c, d) VALUES (1, 10, 100), (2, 20, 200)")).await;
+        for ddl in [
+            format!("ALTER TABLE {t} ADD CONSTRAINT 価格_chk CHECK (c > 0)"),
+            format!("ALTER TABLE {t} ADD CONSTRAINT aé_chk CHECK (c < 100000)"),
+            format!("ALTER TABLE {t} ADD CONSTRAINT \"名\" UNIQUE (a, d)"),
+            format!("ALTER TABLE {t} ADD CONSTRAINT IF NOT EXISTS \"名\" UNIQUE (a, d)"),
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS 索引 ON {t} (a, c, d)"),
+            format!("ALTER TABLE {t} ADD CONSTRAINT \"my key\" UNIQUE (a, c, d)"),
+            format!("ALTER TABLE {t} ADD CONSTRAINT \"unique\" EXCLUDE USING gist (c WITH =)"),
+        ] {
+            try_exec(&db, &ddl).await.unwrap_or_else(|e| panic!("`{ddl}`: {e}"));
+        }
+        let (uniques, checks) = names(&db, t);
+        // A unique key's name is stored filtered to ASCII letters, digits
+        // and `_` (`unique_key::write_name`, older than this slice), so
+        // `名` reads back empty and `my key` as `mykey`: the keys exist and
+        // are enforced, under those names.
+        let stored = |n: &str| n.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>();
+        for n in ["名", "索引", "my key"] {
+            assert!(uniques.iter().any(|u| *u == stored(n)), "{t}: no unique key for {n:?} in {uniques:?}");
+        }
+        assert!(uniques.len() >= 4, "{t}: {uniques:?}");
+        // CHECK names too (`check::append`).
+        for n in ["価格_chk", "aé_chk"] {
+            assert!(checks.iter().any(|c| *c == stored(n)), "{t}: no check for {n:?} in {checks:?}");
+        }
+        let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d) VALUES (3, -1, 300)")).await.expect_err("the CHECK");
+        assert!(e.to_ascii_lowercase().contains("check"), "{t}: {e}");
+        let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d) VALUES (1, 11, 100)")).await.expect_err("名");
+        assert!(e.to_ascii_lowercase().contains("duplicate"), "{t}: {e}");
+    }
+    for ddl in ["ALTER TABLE pk ADD CONSTRAINT 価格_u UNIQUE (d)", "CREATE UNIQUE INDEX IF NOT EXISTS 価格_v ON pk (d)"] {
+        let e = try_exec(&db, ddl).await.expect_err(ddl);
+        assert!(e.contains("does not contain partition key column"), "`{ddl}`: {e}");
+    }
+    close(d, db);
+}
+
+/// A rename intent that does not parse refuses partitioned RENAME and DROP
+/// while the process runs, naming the file and what to do; the next open
+/// moves it aside (`__prename.intent.bad-1`), and they run again.
+///
+/// Mutation: the open leaves a malformed intent in place (RENAME stays
+/// refused after the restart).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_rename_intent_is_set_aside_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = populated(d).await;
+    std::fs::write(d.join("__prename.intent"), b"\xff not an intent\n").unwrap();
+    let e = db.rename_table("pt", "pt2").await.expect_err("a rename beside a malformed intent");
+    assert!(e.to_string().contains("__prename.intent") && e.to_string().contains("move the file aside"), "{e}");
+    let e = db.drop_table("pt").await.expect_err("a drop beside a malformed intent");
+    assert!(e.to_string().contains("__prename.intent"), "{e}");
+    close(d, db);
+
+    let db = open(d).await;
+    assert!(!d.join("__prename.intent").exists(), "the open left the malformed intent in place");
+    assert_eq!(std::fs::read(d.join("__prename.intent.bad-1")).unwrap(), b"\xff not an intent\n");
+    db.rename_table("pt", "pt2").await.expect("a rename after the intent was set aside");
+    assert_eq!(count(&exec(&db, "SELECT id FROM pt2").await), 60);
+    assert!(db.drop_table("pt2").await.unwrap());
+    close(d, db);
+}
