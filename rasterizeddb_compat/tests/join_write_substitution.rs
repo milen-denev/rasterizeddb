@@ -335,6 +335,8 @@ async fn every_place_a_value_lands(partitioning: &str) {
         ("w = t.x - -s.neg", "w", ["2", "8"]),
         ("txt = s.neg::text", "txt", ["-3", "3"]),
         ("d = s.d::numeric", "d", ["-1.50", "2.25"]),
+        ("l = s.d::text", "l", ["-1.50", "2.25"]),
+        ("l = (s.d * 2)::text", "l", ["-3.00", "4.50"]),
         ("w = s.neg::bigint", "w", ["-3", "3"]),
         ("w = s.neg * 2", "w", ["-6", "6"]),
         ("w = 2 * s.neg", "w", ["-6", "6"]),

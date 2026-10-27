@@ -5130,7 +5130,15 @@ fn joined_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, 
         if let (Some(&scale), Some((v, None))) =
             (scales.and_then(|s| s.get(at)), crate::core::value_codec::split_decimal_cell(bytes))
         {
-            return Some(crate::core::value_codec::format_decimal_scaled(v, scale));
+            let digits = crate::core::value_codec::format_decimal_scaled(v, scale);
+            // Typed, so the statement it is written into reads it at that
+            // scale: a bare `-1.50` is a literal at the engine's scale, and
+            // `s.d::text` on a NUMERIC(6,2) stored '-1.5' where PostgreSQL
+            // stores '-1.50'.
+            if scale > 0 {
+                return Some(format!("CAST({digits} AS NUMERIC(38, {scale}))"));
+            }
+            return Some(digits);
         }
     }
     crate::core::rql::subquery::value_to_literal(&cell.column_type, bytes)
