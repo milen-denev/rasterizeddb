@@ -194,7 +194,21 @@ a plain table with a composite `PRIMARY KEY` (§1b).
   changed one comes back as it is now (PostgreSQL re-reads a locked row's
   latest version). A claim query no longer hands out a job its holder has
   finished, so a queue may write its claim back by key alone. Under
-  `REPEATABLE READ` the pinned snapshot makes every round the same.
+  `REPEATABLE READ` or `SERIALIZABLE` the snapshot is pinned and a scan
+  again would see the same versions, so instead a row newly locked whose
+  latest committed version is not the one the snapshot saw (changed or
+  deleted) fails the statement with 40001 ("could not serialize access due
+  to concurrent update"), as PostgreSQL's does. The row's version is
+  compared (read by key at the pinned and at a fresh snapshot, by
+  position), so a commit elsewhere in the table is no conflict.
+- A row lock on rows that are not one table row each is refused with
+  0A000 and PostgreSQL's message ("FOR UPDATE is not allowed with DISTINCT
+  clause"; likewise `GROUP BY clause`, `HAVING clause`, `aggregate
+  functions`, `window functions`, `UNION/INTERSECT/EXCEPT`, naming the
+  clause as written: `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`).
+  `SELECT DISTINCT state … FOR UPDATE` used to lock one row per value,
+  `SELECT COUNT(*) … FOR UPDATE` nothing, and a lock on a union's last
+  branch that branch's rows alone.
 - A row is locked by the framed tuple of its key under the table's
   **logical name**: one `RowLocks` entry whichever partition the row is in
   and whichever route found it, so a lock taken through a routed read blocks
@@ -241,10 +255,17 @@ NULL-keyed row back by `= NULL` and silently skip it. A one-column key locks by
 the column's stored bytes; a composite one by each component's
 `encode_canonical`, which is length-prefixed, so `(1, 23)` and `(12, 3)`
 cannot meet. A decimal is keyed by its value (unscaled with trailing zeros
-stripped, and its scale), from the scale its producer states
-(`CellScale`): the select pipeline leaves `NUMERIC(10,2)`'s 1.50 at 150 and
-a subquery normalises it to 1500000000, and the first build keyed the two
-apart, so a writer never met a lock on a `NUMERIC(p,s)` key with `s ≠ 9`.
+stripped, and its scale), and **no key cell is ever rescaled**: the locker
+reads the select pipeline's cells, the writer check and both join paths
+read with `run_subquery_scaled(normalize = false)`, all at the column's
+declared scale, and the write-back renders a key, and every value the join
+carries, at its stored scale with every place kept (`joined_literal`). The
+first build keyed `NUMERIC(10,2)`'s 1.50 as 150 on one side and the
+subquery's normalised 1500000000 on the other, so a writer never met the
+lock; normalising also rounded a `NUMERIC(20,12)` key to nine places, so
+1.000000000001 and 1.000000000002 deduplicated into one row written back by
+a value matching neither (`UPDATE 0` where 2 were due), and a value past
+about 1.7·10²⁹ overflowed the rescale and was read as nine places.
 A primary key declared with a `CONSTRAINT` name of its own is not
 recognised as the primary key: the schema records a composite key only as a
 `UniqueKey` (name, columns, predicate), with no constraint kind, and only a
@@ -277,6 +298,19 @@ returning what the holder left. Each invariant was mutation-verified.
   updated and the client gets 23514.
 - A column of a table-level `PRIMARY KEY (a, b)` written without `NOT NULL`
   accepts NULL (PostgreSQL makes it `NOT NULL`).
+- `amt::text` on a `NUMERIC(20,12)` column prints 1.000000000000 for both
+  1.000000000001 and 1.000000000002 (reported by the P3 review; not
+  investigated).
+- A predicate literal past about 29 integer digits is "numeric literal … is
+  out of range" (the evaluator holds decimals at nine places), so no
+  `WHERE` can name a 35-digit `NUMERIC(38,0)` key; and a 38-digit value is
+  refused by `NUMERIC(38,0)` itself with 22003 ("does not fit the column's
+  precision").
+- Left for the correctness slice: `refuse_write_to_locked_rows` returns
+  early while no row lock exists anywhere, a window between that check and
+  a `FOR UPDATE` taken after it; locks from a locking read's earlier round
+  on rows a later round drops are kept until the transaction ends;
+  `committed_since` is conservative past 4,096 ids (it rescans).
 
 ## 1. Model
 
