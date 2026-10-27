@@ -29,7 +29,8 @@ fn code(e: &sqlx::Error) -> String {
 }
 
 async fn values(pool: &sqlx::PgPool, table: &str) -> Vec<(i64, i64)> {
-    sqlx::query(AssertSqlSafe(format!("SELECT id, v FROM {table} ORDER BY id")))
+    let column = if table == "rp" { "n" } else { "v" };
+    sqlx::query(AssertSqlSafe(format!("SELECT id, {column} FROM {table} ORDER BY id")))
         .fetch_all(pool)
         .await
         .unwrap()
@@ -52,6 +53,10 @@ async fn returning_after_the_write(partitioning: &str) {
     for (sql, want) in [
         ("UPDATE t2 SET v = 7 WHERE id = 1 RETURNING 10/(v-7)", "22012"),
         ("UPDATE t2 SET v = v + 10 RETURNING 10/(v-17)", "22012"),
+        // A second word that continues the expression, not an alias.
+        ("UPDATE t2 SET v = 7 WHERE id = 1 RETURNING v /(v-7)", "22012"),
+        ("UPDATE t2 SET v = 7 WHERE id = 1 RETURNING id, v /(v-7)", "22012"),
+        ("INSERT INTO t2 VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET v = 7 RETURNING v /(v-7)", "22012"),
         ("INSERT INTO t2 VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET v = 7 RETURNING 10/(v-7)", "22012"),
         // Fanned out: the row past the CHECK may be in a later partition
         // than rows already written.
@@ -71,4 +76,28 @@ async fn a_failed_statement_leaves_no_write_on_a_plain_table() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_statement_leaves_no_write_on_a_hash_partitioned_table() {
     returning_after_the_write(" PARTITION BY HASH (id) PARTITIONS 4").await;
+}
+
+/// RETURNING items whose second word continues the expression: `n /(n-5)`
+/// was read as the column `n` aliased, so the UPDATE overwrote in place,
+/// failed with 22012, and kept n = 5.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_returning_expression_with_a_space_is_one_expression() {
+    let dir = Root::new("spaced");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql(
+        "CREATE TABLE rp (id BIGINT PRIMARY KEY, n BIGINT, m BIGINT); INSERT INTO rp VALUES (1, 1, 0), (2, 2, 0);",
+    ))
+    .await
+    .unwrap();
+    for sql in [
+        "UPDATE rp SET n = 5 WHERE id = 1 RETURNING n /(n-5)",
+        "UPDATE rp SET n = 5 WHERE id = 1 RETURNING id, n /(m)",
+        "INSERT INTO rp VALUES (1, 9, 0) ON CONFLICT (id) DO UPDATE SET n = 5 RETURNING n /(m)",
+    ] {
+        let e = pool.execute(AssertSqlSafe(sql)).await.expect_err(sql);
+        assert_eq!(code(&e), "22012", "{sql}: {e}");
+        assert_eq!(values(&pool, "rp").await, [(1, 1), (2, 2)].map(|(i, n)| (i, n)), "{sql}: its write survived");
+    }
 }

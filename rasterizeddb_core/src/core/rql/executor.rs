@@ -5156,6 +5156,31 @@ mod per_row_error_tests {
         assert!(!per_row_error_is_final("column 'q.x' does not exist"));
     }
 
+    /// What computes in a RETURNING list, and so may fail after the write.
+    #[test]
+    fn returning_can_fail_reads_items_not_words() {
+        use super::returning_can_fail as f;
+        for sql in [
+            "UPDATE t SET n = 5 RETURNING n /(n-5)",
+            "UPDATE t SET n = 5 RETURNING id, n /(m)",
+            "UPDATE t SET n = 5 RETURNING 10/(n-5)",
+            "UPDATE t SET n = 5 RETURNING n + 1 AS x",
+            "UPDATE t SET n = 5 RETURNING n AND m",
+            "UPDATE t SET n = 5 RETURNING n IS NULL",
+            "INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET n = 5 RETURNING n /(m)",
+        ] {
+            assert!(f(sql), "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET n = 5",
+            "UPDATE t SET n = 5 RETURNING *",
+            "UPDATE t SET n = 5 RETURNING id, n",
+            "UPDATE t SET n = 5 RETURNING t.id, n AS m, n m, \"N\" \"x\"",
+        ] {
+            assert!(!f(sql), "{sql}");
+        }
+    }
+
     async fn exec(db: &rclite::Arc<crate::core::database::Database>, sql: &str) -> Vec<u8> {
         let purpose = super::recognize_query_purpose(sql).expect("parses");
         super::execute_with_sync(purpose, db.clone(), true).await
@@ -5204,25 +5229,50 @@ fn returning_can_fail(sql: &str) -> bool {
     let Some((_, list)) = crate::core::rql::lexer_ir::returning_split(sql) else {
         return false;
     };
+    // A plain identifier, or a quoted one.
+    fn identifier(word: &str) -> bool {
+        if let Some(inner) = word.strip_prefix('"') {
+            return inner.ends_with('"') && inner.len() > 1;
+        }
+        !word.is_empty()
+            && !word.starts_with(|c: char| c.is_ascii_digit())
+            && word.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }
+    // Words that continue an expression rather than name an alias.
+    const OPERATOR_WORDS: &[&str] = &[
+        "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "COLLATE", "SIMILAR", "AT", "OVERLAPS",
+        "ISNULL", "NOTNULL", "ESCAPE",
+    ];
     crate::core::rql::lexer_ct::split_definitions(list).iter().any(|item| {
         let item = item.trim().trim_end_matches(';').trim();
-        // `col AS name` / `col name`: the alias is not part of the value.
+        // `value AS alias`, `value alias` or `value`. Anything else, and any
+        // value that is not a column or `*`, computes. A second word is an
+        // alias only when it is an identifier and no operator word: `n
+        // /(n-5)` is one expression (and failed with 22012 after storing n).
         let value = match crate::core::rql::join::find_keyword(item, "AS", 0) {
-            Some(at) => item[..at].trim(),
-            None => item.split_whitespace().next().unwrap_or(""),
+            Some(at) => {
+                let alias = item[at + 2..].trim();
+                if !identifier(alias) {
+                    return true;
+                }
+                item[..at].trim()
+            }
+            None => {
+                let words: Vec<&str> = item.split_whitespace().collect();
+                match words.as_slice() {
+                    [value] => *value,
+                    [value, alias]
+                        if identifier(alias)
+                            && !OPERATOR_WORDS.iter().any(|w| w.eq_ignore_ascii_case(alias)) =>
+                    {
+                        *value
+                    }
+                    _ => return true,
+                }
+            }
         };
-        let plain = value == "*"
-            || (!value.is_empty()
-                && value.split('.').all(|part| {
-                    let part = part.trim_matches('"');
-                    part == "*"
-                        || (!part.is_empty()
-                            && !part.starts_with(|c: char| c.is_ascii_digit())
-                            && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                }));
-        // An item with more than one word that is not `x AS y` computes.
-        let words = item.split_whitespace().count();
-        !plain || (words > 1 && crate::core::rql::join::find_keyword(item, "AS", 0).is_none() && words != 2)
+        !(value == "*"
+            || value.split('.').all(|part| part == "*" || identifier(part)))
     })
 }
 
