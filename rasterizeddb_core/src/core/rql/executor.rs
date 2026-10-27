@@ -10328,6 +10328,24 @@ async fn execute_alter_table_action(
                     if currently_nullable {
                         return ddl_ok(0);
                     }
+                    // A partitioned table here holds no rows (a populated one
+                    // was refused above): the companion is a metadata change,
+                    // as ADD COLUMN on an empty table adds one.
+                    if database.is_partitioned(&plan.table_name) {
+                        let flag = nullable::flag_column_name(&name);
+                        return match database
+                            .reload_atomic(&plan.table_name, |old| async move {
+                                let mut schema = schema;
+                                retire_tombstoned_name(&mut schema, &flag, old.io_schema.clone()).await?;
+                                schema.add_field(old.io_schema.clone(), flag, nullable::FLAG_TYPE, false).await;
+                                Ok(())
+                            })
+                            .await
+                        {
+                            Ok(()) => ddl_ok(0),
+                            Err(failure) => reload_failed(failure, ""),
+                        };
+                    }
                     // Making a column nullable means giving it a `__null_`
                     // companion, which is an ordinary fixed-width column — so
                     // the same rewrite `ADD COLUMN` uses does the work.
@@ -10351,24 +10369,6 @@ async fn execute_alter_table_action(
                     // The fill now asks the *row* whether it carries a value for
                     // the tracked column rather than asking the schema about
                     // defaults. See `rewrite_table_with_columns`.
-                    // A partitioned table here holds no rows (a populated one
-                    // was refused above): the companion is a metadata change,
-                    // as ADD COLUMN on an empty table adds one.
-                    if database.is_partitioned(&plan.table_name) {
-                        let flag = nullable::flag_column_name(&name);
-                        return match database
-                            .reload_atomic(&plan.table_name, |old| async move {
-                                let mut schema = schema;
-                                retire_tombstoned_name(&mut schema, &flag, old.io_schema.clone()).await?;
-                                schema.add_field(old.io_schema.clone(), flag, nullable::FLAG_TYPE, false).await;
-                                Ok(())
-                            })
-                            .await
-                        {
-                            Ok(()) => ddl_ok(0),
-                            Err(failure) => reload_failed(failure, ""),
-                        };
-                    }
                     let companion = crate::core::rql::lexer_ct::CreateColumnData {
                         name: nullable::flag_column_name(&name),
                         data_type: nullable::FLAG_TYPE,
