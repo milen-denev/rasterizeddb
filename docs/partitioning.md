@@ -534,11 +534,18 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(round 4)* a CHECK name collision not numbered | `check::unnamed_name` | the same (the second `v` CHECK: already exists) |
 | *(round 4)* string literals read as columns | `check::columns_read` | `check::tests::an_added_unnamed_check_is_named_as_postgres_names_it` |
 | *(round 4)* an unnamed UNIQUE's collision not numbered | the ADD CONSTRAINT arm | `long_and_unnamed_constraint_names` (42710) |
+| *(round 5)* the original spin: the label cut after joining, the search unbounded | `unique_key::name_with_label`, `choose_name` | `partition_alter::long_names_number_repeated_unnamed_constraints_and_return` (no return within its 120 s bound) |
+| *(round 5)* the label cut after joining, the search bounded | `unique_key::name_with_label` | the same (the bounded error: "could not choose a name"), `a_numbered_name_keeps_its_label_and_number` |
+| *(round 5)* a derived `<table>_pkey` cut after joining | `unique_key::parse_clause` | `a_numbered_name_keeps_its_label_and_number` |
+| *(round 5)* DROP `<table>_pkey` matches a key added as `k1` | the DROP CONSTRAINT arm | `partition_alter::a_primary_key_answers_to_its_own_name_only` |
+| *(round 5)* an inline key matched as `<table>_<col>_key` | the DROP CONSTRAINT arm | the same |
+| *(round 5)* a named composite primary key accepted | the ADD CONSTRAINT arm | the same (0A000 expected) |
+| *(round 5)* a one-column key always taken as `<table>_pkey` | `primary_key_constraint` | the same |
 | *(round 3)* one case's snapshot pass run in rebuild mode (test-side: a production mutation that drops every load of one case alone was not found, since a case's images from before the DDL load whatever the DDL does) | `pddl_crash_tests::run_case` | `pddl_crash_tests` (RENAME TO: `loaded: 0`; the summed check alone passes) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
-with 1,500 statements each, after rounds 2, 3 and 4.
+with 1,500 statements each, after rounds 2 to 5.
 
 **Round 3** (2026-10-27), three items from review:
 
@@ -642,6 +649,43 @@ that took effect.
   do not change. `CREATE TABLE`'s table-level unnamed CHECK is still
   `<table>_check<n>` (`lexer_ct.rs`, left alone for the correctness slice).
 - SET NOT NULL over a NULL now answers 23502, as the finding below asked.
+
+**Round 5** (2026-10-27), from the round-4 re-review:
+
+- **Choosing a name could spin forever (merge-blocker, fixed).** Round
+  4's numbering cut `<stem>_check<n>` to 128 bytes after joining. Once the
+  stem neared the limit, the cut took the number off, every candidate was
+  the same taken name, and the loop spun under ACCESS EXCLUSIVE; a new
+  connection's startup then hung. Repro: a 125-byte table name and `ADD
+  CHECK (a > 0)` twice (`ADD UNIQUE (b)` likewise). Names are now built as
+  PostgreSQL's `makeObjectName`/`ChooseConstraintName` build them
+  (`unique_key::name_with_label`, `choose_name`): the stem is cut at a
+  character boundary so the label and its number stay whole, and the
+  search errors after 10,000 candidates rather than spin. The derived
+  `<table>_pkey` and `<table>_<cols>_key` are built the same way. The
+  partitioned rename intent's set-aside search (`__prename.intent.bad-<n>`)
+  is bounded too: its suffix could not be cut, but the search had no end.
+  No other loop here builds a name and tests it. Unnamed `CREATE INDEX`
+  derives `<t>_<cols>_idx` without numbering (by reading).
+- **The primary key answers to its own name only**
+  (`primary_key_constraint`, derived from what the schema records; no
+  format change):
+  - An inline key is `<table>_pkey`. `DROP CONSTRAINT <table>_<col>_key`
+    no longer drops it (42704, or a no-op under IF EXISTS); it used to, and
+    duplicates went in.
+  - `ADD CONSTRAINT k1 PRIMARY KEY (a)` is `k1`, so `DROP CONSTRAINT
+    <table>_pkey` is 42704. It used to clear the header while `k1` went on
+    enforcing.
+  - A composite key is the sidecar named `<table>_pkey`. The sidecar has no
+    "primary" field, so a composite key named otherwise could not be told
+    from a UNIQUE. `ADD CONSTRAINT k PRIMARY KEY (a, b)` is therefore
+    refused (0A000, naming the rule) rather than accepted beside a second
+    PRIMARY KEY. `CREATE TABLE … CONSTRAINT k PRIMARY KEY (a, b)` goes
+    through `lexer_ct.rs`, left alone: it is still accepted and not seen as
+    the primary key.
+  - When a table-level one-column key has two one-column sidecars on its
+    column, the one named `<table>_pkey` wins, else the first declared. The
+    schema cannot say which one the PRIMARY KEY was.
 
 **Deviations from the plan.**
 
