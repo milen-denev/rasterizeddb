@@ -3119,6 +3119,27 @@ impl<S: StorageIO> Table<S> {
         usize::MAX - position
     }
 
+    /// Whether a statement assigning the columns `assigned` (by
+    /// `write_order`) can change a unique key: a UNIQUE column, a column of a
+    /// table-level key, or any column of a table with a partial key, whose
+    /// predicate may bring a row under it.
+    fn assigns_unique(&self, assigned: &std::collections::HashSet<u32>) -> bool {
+        self.schema
+            .fields
+            .iter()
+            .any(|f| f.is_unique && !f.is_deleted && assigned.contains(&(f.write_order as u32)))
+            || self.schema.unique_keys.iter().any(|key| {
+                key.predicate.is_some()
+                    || key.columns.iter().any(|name| {
+                        self.schema.fields.iter().any(|f| {
+                            !f.is_deleted
+                                && f.name.eq_ignore_ascii_case(name)
+                                && assigned.contains(&(f.write_order as u32))
+                        })
+                    })
+            })
+    }
+
     /// The columns of a table-level unique key, or `None` when one was
     /// dropped (and the constraint is no longer enforced; see `check_unique`).
     fn unique_key_fields(&self, key: &crate::core::rql::unique_key::UniqueKey) -> Option<SmallVec<[&SchemaField; 4]>> {
@@ -5178,8 +5199,15 @@ impl<S: StorageIO> Table<S> {
         // first overwrite are harmless. The cost is a log that cannot be cut
         // while one huge in-place UPDATE runs.
         let mut overwrote_in_place = false;
-        // What this statement has written, for its own uniqueness checks.
+        // What this statement has written, for its own uniqueness checks:
+        // kept only when it writes a column some unique key covers (or a
+        // partial key's predicate may), since no other statement's check
+        // reads it. Every row id of a large UPDATE was otherwise kept.
         let mut own_keys = OwnKeys::default();
+        let checks_own_keys = self.has_unique && {
+            let assigned: std::collections::HashSet<u32> = updates.iter().map(|u| u.write_order).collect();
+            self.assigns_unique(&assigned)
+        };
         let mut row = Row::default();
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
@@ -5482,7 +5510,9 @@ impl<S: StorageIO> Table<S> {
                 }
                 updated_count = updated_count.saturating_add(1);
                 overwrote_in_place = true;
-                own_keys.updated.insert(row_id);
+                if checks_own_keys {
+                    own_keys.updated.insert(row_id);
+                }
                 if let Some(collect) = collect.as_deref_mut() {
                     collect.push(row.clone());
                 }
@@ -5540,7 +5570,9 @@ impl<S: StorageIO> Table<S> {
 
             if update_result.is_ok() {
                 updated_count = updated_count.saturating_add(1);
-                own_keys.updated.insert(row_id);
+                if checks_own_keys {
+                    own_keys.updated.insert(row_id);
+                }
                 if let Some(collect) = collect.as_deref_mut() {
                     collect.push(row.clone());
                 }
