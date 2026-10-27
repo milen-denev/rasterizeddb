@@ -5776,8 +5776,8 @@ where
         Ok(m) => m,
         Err(e) => {
             // 0A000 is `feature_not_supported`, which is what an unsupported
-            // CTE shape is.
-            fail_statement(state, stream, "0A000", &e).await?;
+            // CTE shape is; a body that ran and failed keeps its own class.
+            fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
             return Ok(());
         }
     };
@@ -5797,7 +5797,7 @@ where
                 if let Some(m) = &materialized {
                     crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
                 }
-                fail_statement(state, stream, "0A000", &e).await?;
+                fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
                 return Ok(());
             }
         };
@@ -5825,7 +5825,7 @@ where
             if let Some(m) = &materialized {
                 crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
             }
-            fail_statement(state, stream, "0A000", &e).await?;
+            fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
             return Ok(());
         }
     };
@@ -6621,6 +6621,22 @@ fn read_only_message(verb: &str) -> String {
 /// application cannot tell from a crash. Classified here, at the one place the
 /// engine's answer is turned into a wire message, by the phrases the engine
 /// uses — which are PostgreSQL's own where the condition has one.
+/// The SQLSTATE of a statement whose CTEs or derived tables could not be
+/// built: `feature_not_supported` for a shape that is not, and the body's
+/// own class when it ran and failed. A data-modifying CTE that met a
+/// duplicate key reached the client as 0A000 ("the WITH clause 'w' failed:
+/// duplicate value …"), and a client branching on 23505 never saw one.
+/// Integrity (23), data (22), transaction rollback (40), cancellation (57),
+/// lock (55) and resource (53, 58) classes pass through.
+pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
+    let code = sqlstate_for(message);
+    if ["23", "22", "40", "57", "55", "53", "58"].iter().any(|class| code.starts_with(class)) {
+        code
+    } else {
+        "0A000"
+    }
+}
+
 pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
     let has = |needle: &str| m.contains(needle);
