@@ -886,6 +886,20 @@ impl TransactionManager {
         })
     }
 
+    /// Takes `tx` out of the statement-scoped set, so no write of it is ever
+    /// an in-place overwrite again ([`Self::try_begin_in_place_for`]).
+    ///
+    /// For a statement that writes through statements of its own (`UPDATE …
+    /// FROM` writes each joined row back with a per-row `UPDATE`): each of
+    /// those commits its storage transaction as it returns, and a later one
+    /// can still fail the statement. An overwrite keeps no previous version,
+    /// so the abort that follows could not take it back: `p` kept two rows'
+    /// new values after an `UPDATE … FROM` reported 23514. A new version is
+    /// what the abort makes invisible.
+    pub fn forbid_in_place(&self, tx: TxId) {
+        self.inner.write().statement_scoped.remove(&tx);
+    }
+
     /// Starts a transaction that ends with the statement that opened it.
     ///
     /// This is autocommit. Marking it matters because such a transaction can

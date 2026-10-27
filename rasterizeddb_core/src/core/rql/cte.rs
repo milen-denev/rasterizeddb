@@ -1076,6 +1076,23 @@ async fn materialize_inner(
             None => body.as_str(),
         };
 
+        // A later CTE or the statement itself can still fail after this body
+        // wrote, and an in-place overwrite would outlive the abort
+        // (`TransactionManager::forbid_in_place`).
+        if modifies {
+            database.transactions.forbid_in_place(tx);
+        }
+        // A data-modifying CTE with no `RETURNING` is legal and runs purely for
+        // its effect. It publishes no columns, so it cannot be referenced and
+        // needs no temporary table — running it is the whole job. Decided
+        // before the body runs: it was checked after the run below, which had
+        // already executed it, so the body ran twice (`n = n + 1` added 2).
+        if modifies && crate::core::rql::lexer_ir::returning_split(body).is_none() {
+            crate::core::rql::executor::run_statement(body, database, tx)
+                .await
+                .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
+            continue;
+        }
         let (rows, scales) = if modifies {
             // Returned cells are read straight from storage, at the scales
             // the client's copy of them is rendered by.
@@ -1088,16 +1105,6 @@ async fn materialize_inner(
             crate::core::rql::executor::run_query_rows_scaled(body, database, tx).await
         }
         .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
-
-        // A data-modifying CTE with no `RETURNING` is legal and runs purely for
-        // its effect. It publishes no columns, so it cannot be referenced and
-        // needs no temporary table — running it is the whole job.
-        if modifies && crate::core::rql::lexer_ir::returning_split(body).is_none() {
-            crate::core::rql::executor::run_statement(body, database, tx)
-                .await
-                .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
-            continue;
-        }
 
         let labels: Vec<String> = if modifies {
             returning_labels(&body).ok_or_else(|| {

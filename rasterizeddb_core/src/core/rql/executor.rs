@@ -4724,6 +4724,12 @@ async fn update_from_join(
     }
     let mut written = 0u64;
     let mut returned: Vec<u8> = Vec::new();
+    // Each row is written by a statement of its own, which commits its
+    // storage transaction as it returns, and a later row can still fail this
+    // one (a CHECK, a key, a foreign key). An autocommit statement's writes
+    // may otherwise overwrite in place, which its abort cannot undo: the rows
+    // before the failure kept their new values.
+    database.transactions.forbid_in_place(tx);
     for (row, named) in named_rows {
         let literal_at = |index: usize| -> Result<String, String> {
             joined_literal(&row.columns[index], scales.as_deref(), index)
@@ -6996,6 +7002,13 @@ async fn insert_values_tuples(
                 }
             }
         }
+    }
+
+    // Each tuple is written by a statement of its own, and a conflicting
+    // one's `DO UPDATE` may overwrite its row in place, which the abort of a
+    // later tuple's failure could not undo (`forbid_in_place`).
+    if statements.len() > 1 && row_data.on_conflict_update.is_some() {
+        database.transactions.forbid_in_place(tx);
     }
 
     // The statement's target, resolved once: its ROW EXCLUSIVE is held from
