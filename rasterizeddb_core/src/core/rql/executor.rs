@@ -4538,6 +4538,7 @@ async fn update_from_join(
     // For each assignment: either the output slot its value occupies, or the
     // expression to evaluate and the slots its columns landed in.
     let mut sources: Vec<AssignedValue> = Vec::with_capacity(assignments.len());
+    let from_aliases = source_aliases(source_clause);
 
     for (_, value) in &assignments {
         let stripped = strip_qualifier(value, target_alias);
@@ -4557,8 +4558,19 @@ async fn update_from_join(
                     projection.push(format!("{}.{}", target_alias, field.name));
                 }
                 let _ = slots;
+                // The source's columns it reads, projected so each write
+                // substitutes the joined row's values. Written as text into a
+                // single-relation `UPDATE`, `s.big` would name the target's
+                // own `big`: the parse above resolves a column by name, and so
+                // does that statement, so `SET v = s.big / 100.0` stored
+                // `t.big / 100.0` and reported success.
+                let source_refs = qualified_refs(&stripped, &from_aliases);
+                let source_at = projection.len();
+                projection.extend(source_refs.iter().cloned());
                 sources.push(AssignedValue::Computed {
                     text: stripped.clone(),
+                    source_refs,
+                    source_at,
                 });
             }
             None => {
@@ -4733,8 +4745,12 @@ async fn update_from_join(
                 // directly and gets this right; the parse above is kept only to
                 // decide that the value *is* an expression and to learn which
                 // columns it reads.
-                AssignedValue::Computed { text, .. } => {
-                    sets.push(format!("{} = {}", column, text));
+                AssignedValue::Computed { text, source_refs, source_at } => {
+                    let mut bindings: Vec<(String, String)> = Vec::with_capacity(source_refs.len());
+                    for (offset, reference) in source_refs.iter().enumerate() {
+                        bindings.push((reference.clone(), literal_at(source_at + offset)?));
+                    }
+                    sets.push(format!("{} = {}", column, substitute_outer_refs(text, &bindings)));
                     continue;
                 }
             };
@@ -5030,8 +5046,14 @@ enum AssignedValue {
     /// evaluated by the per-row `UPDATE` this path generates — the same path a
     /// plain `UPDATE` takes, and the only one that can see whether a column is
     /// NULL. The columns it reads are still projected, so the join's output
-    /// slots line up with the assignments beside it.
-    Computed { text: String },
+    /// slots line up with the assignments beside it. The source's columns it
+    /// reads (`source_refs`, as written) are projected from `source_at` on,
+    /// and substituted with each joined row's values before it is written.
+    Computed {
+        text: String,
+        source_refs: Vec<String>,
+        source_at: usize,
+    },
 }
 
 /// Turns a conflicting `INSERT … ON CONFLICT … DO UPDATE` into the `UPDATE` it
