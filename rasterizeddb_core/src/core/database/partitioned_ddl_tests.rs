@@ -275,12 +275,10 @@ async fn a_unique_key_without_every_key_column_is_refused() {
 
 /// With `index_storage = snapshot`: partitions that loaded their indexes
 /// from a snapshot taken before a CREATE INDEX never load that snapshot
-/// after it (its identity's shape no longer matches), so after a crash the
-/// new index is built from rows and answers as a scan; after a clean
-/// shutdown under the new shape they load again.
-///
-/// Mutation: the snapshot identity unchanged by the new index (the index
-/// list left out of `shape_hash`): the partitions load the stale snapshot.
+/// after it, so after a crash the new index is built from rows and answers
+/// as a scan; after a clean shutdown under the new shape they load again.
+/// (A changed index count is refused by the load plan as well as by the
+/// identity; the next test keeps the count.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partition_snapshot_from_before_a_schema_change_is_never_loaded_after_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -327,6 +325,53 @@ async fn a_partition_snapshot_from_before_a_schema_change_is_never_loaded_after_
     for (pid, part) in partitions(&db, "pt") {
         settled(&part).await;
         assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid} did not load under the new shape");
+    }
+    close(d, db);
+}
+
+/// The same, with the index count kept: a snapshot sealed with an index
+/// on `v`, then that index dropped and one on `s` created, then a crash.
+/// Only the identity's shape tells the old sections from the new index's,
+/// so the partitions must rebuild, and the index on `s` answer as a scan.
+///
+/// Mutation: the snapshot identity unchanged by the index change (the index
+/// list left out of `shape_hash`): the partitions load `v`'s sections as
+/// the index on `s`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swapped_index_never_loads_the_old_index_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let _snap = storage_override::set(d, IndexStorage::Snapshot);
+    {
+        let db = populated(d).await;
+        exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+        for (_, part) in partitions(&db, "pt") {
+            settled(&part).await;
+        }
+        let report = db.seal_for_shutdown(Duration::from_secs(60)).await;
+        assert!(report.skipped.is_empty() && report.sealed.iter().all(|s| s.outcome.is_clean()));
+        close(d, db);
+    }
+    let db = open(d).await;
+    for (pid, part) in partitions(&db, "pt") {
+        settled(&part).await;
+        assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid} did not load before the change");
+    }
+    exec(&db, "DROP INDEX pt_v").await;
+    exec(&db, "CREATE INDEX pt_s ON pt (s)").await;
+    for (_, part) in partitions(&db, "pt") {
+        settled(&part).await;
+    }
+    close(d, db);
+    let db = open(d).await;
+    for (pid, part) in partitions(&db, "pt") {
+        settled(&part).await;
+        assert_ne!(part.index_origin(), Origin::Loaded, "partition {pid} loaded the sections of a dropped index");
+    }
+    for s in ["w0", "w1", "w2", "nope"] {
+        let indexed = count(&exec(&db, &format!("SELECT id FROM pt WHERE s = '{s}'")).await);
+        let scanned = count(&exec(&db, &format!("SELECT id FROM pt WHERE s || '' = '{s}'")).await);
+        assert_eq!(indexed, scanned, "s = {s}");
     }
     close(d, db);
 }

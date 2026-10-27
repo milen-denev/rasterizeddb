@@ -624,3 +624,68 @@ fn set_not_null_marks_its_own_companion() {
     pair.compare("restarted");
 }
 
+
+/// What the studio and other clients introspect with (`SHOW TABLES`, `SHOW
+/// COLUMNS`, `SHOW TABLE STATS`, `SHOW SCHEMA MAP`, `SHOW PARTITIONS`,
+/// `pg_indexes`, `information_schema.columns`) shows the logical table's new
+/// state after DDL, under its new name, before and after a restart, and
+/// never a partition.
+#[test]
+fn introspection_shows_the_new_state_and_never_a_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path().to_str().unwrap());
+    seed_one(&server, 5);
+    {
+        let mut c = server.connect();
+        for ddl in [
+            "CREATE INDEX pa_n ON pa (n)",
+            "ALTER TABLE pa RENAME COLUMN s TO label",
+            "ALTER TABLE pa DROP COLUMN f",
+            "ALTER TABLE pa RENAME TO pa2",
+        ] {
+            c.ok(ddl);
+        }
+    }
+    for pass in ["live", "restarted"] {
+        let mut c = server.connect();
+        let text = |r: &Reply| format!("{:?} {:?}", r.columns, r.rows);
+        let tables = c.ok("SHOW TABLES");
+        let t = text(&tables);
+        assert!(t.contains("pa2") && !t.contains("\"pa\"") && !t.contains("__pt_"), "{pass}: SHOW TABLES {t}");
+        let shown = c.ok("SHOW COLUMNS FROM pa2");
+        let at = |name: &str| shown.columns.iter().position(|c| c == name).unwrap();
+        let (name_at, dropped_at) = (at("column_name"), at("is_dropped"));
+        let live: Vec<String> = shown
+            .rows
+            .iter()
+            .filter(|r| r[dropped_at].as_deref() == Some("f"))
+            .filter_map(|r| r[name_at].clone())
+            .filter(|n| !n.starts_with("__null_"))
+            .collect();
+        assert_eq!(live, ["tenant_id", "id", "n", "label", "j"], "{pass}: SHOW COLUMNS {:?}", shown.rows);
+        let stats = text(&c.ok("SHOW TABLE STATS pa2"));
+        assert!(stats.contains("pa2") && !stats.contains("__pt_"), "{pass}: SHOW TABLE STATS {stats}");
+        let map = text(&c.ok("SHOW SCHEMA MAP"));
+        // Foreign-key edges: none here, and never a partition.
+        assert!(!map.contains("__pt_"), "{pass}: SHOW SCHEMA MAP {map}");
+        assert_eq!(c.ok("SHOW PARTITIONS pa2").rows.len(), 5, "{pass}: SHOW PARTITIONS");
+        assert!(c.simple("SHOW PARTITIONS pa").is_err(), "{pass}: the old name still answers");
+        let idx = text(&c.ok("SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'pa2'"));
+        assert!(idx.contains("pa_n"), "{pass}: pg_indexes {idx}");
+        let all = text(&c.ok("SELECT tablename FROM pg_indexes"));
+        assert!(!all.contains("__pt_"), "{pass}: pg_indexes lists a partition: {all}");
+        let names: Vec<String> = c
+            .ok("SELECT column_name FROM information_schema.columns WHERE table_name = 'pa2' ORDER BY ordinal_position")
+            .rows
+            .into_iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect();
+        assert_eq!(names, ["tenant_id", "id", "n", "label", "j"], "{pass}: information_schema.columns");
+        let classes = text(&c.ok("SELECT relname FROM pg_class"));
+        assert!(!classes.contains("__pt_") && classes.contains("pa2"), "{pass}: pg_class {classes}");
+        drop(c);
+        if pass == "live" {
+            server = server.restart();
+        }
+    }
+}
