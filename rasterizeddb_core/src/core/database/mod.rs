@@ -19,6 +19,7 @@ mod drop_recreate_replay_tests;
 mod cross_dir_commit_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
+mod foreign_keys;
 mod partitioned;
 mod partitioned_ddl;
 #[cfg(test)]
@@ -3569,22 +3570,12 @@ impl Database {
                 "Table already exists",
             ));
         }
-        // FKs onto a partitioned parent are phase 3's: the check would read
-        // the shell, which holds no rows.
-        if let Some(fk) = create_table.foreign_keys.iter().find(|fk| {
-            self.partitioned_tables_all()
-                .iter()
-                .any(|p| p.name().eq_ignore_ascii_case(&fk.parent_table))
-        }) {
-            // InvalidInput, which the CREATE arm reports with its text.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "FOREIGN KEY {} references the partitioned table \"{}\"; a partitioned table as the \
-                     parent of a FOREIGN KEY is not supported yet",
-                    fk.name, fk.parent_table
-                ),
-            ));
+        // Its foreign keys, and the ones naming it, as PostgreSQL checks
+        // them (a parent partitioned or not, phase 3 P4). InvalidInput,
+        // which the CREATE arm reports with its text.
+        if let Some(why) = self.create_foreign_key_refusal(&create_table, None) {
+            warn!("CREATE TABLE refused: {}", why);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
         }
         // Before the catalogue row: a refusal after it would leave a row naming
         // a table that was never built.

@@ -185,6 +185,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         let mut columns = Vec::new();
         let mut nullable_columns: Vec<String> = Vec::new();
         let mut foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey> = Vec::new();
+        // Which of `foreign_keys` were declared without a name: named after
+        // the loop, once every other constraint's name is known.
+        let mut unnamed_foreign_keys: Vec<usize> = Vec::new();
         let mut defaults: Vec<crate::core::rql::column_default::ColumnDefault> = Vec::new();
         let mut json_columns: Vec<crate::core::rql::json_map::JsonColumn> = Vec::new();
         let mut type_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier> = Vec::new();
@@ -223,9 +226,22 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                     continue;
                 }
                 if let Some(fk_clause) = foreign_key_clause(col_def) {
+                    // Bare or quoted, as a UNIQUE's name is read: a quoted
+                    // name keeps its spaces and non-ASCII characters.
+                    let fk_name = match crate::core::rql::unique_key::split_constraint_name(col_def) {
+                        Ok((name, _)) => name,
+                        Err(reason) => {
+                            rejection.replace(reason);
+                            return None;
+                        }
+                    };
+                    if fk_name.is_none() {
+                        unnamed_foreign_keys.push(foreign_keys.len());
+                    }
                     match crate::core::rql::foreign_key::parse_clause(
                         fk_clause,
-                        constraint_name(col_def),
+                        &table_name,
+                        fk_name,
                         None,
                     ) {
                         Ok(fk) => foreign_keys.push(fk),
@@ -396,7 +412,8 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
 
             // `REFERENCES` written on the column itself.
             if let Some(fk_clause) = foreign_key_clause(col_def) {
-                match crate::core::rql::foreign_key::parse_clause(fk_clause, None, Some(&name)) {
+                unnamed_foreign_keys.push(foreign_keys.len());
+                match crate::core::rql::foreign_key::parse_clause(fk_clause, &table_name, None, Some(&name)) {
                     Ok(fk) => foreign_keys.push(fk),
                     Err(reason) => {
                         rejection.replace(reason);
@@ -498,6 +515,44 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         // b)` left both nullable, and `INSERT … VALUES (NULL, 1)` was stored.
         // Nullability is the companion column, so a key column gets none.
         nullable_columns.retain(|c| !key_columns.iter().any(|k| k == c));
+
+        // An unnamed foreign key is `<table>_<column>_fkey`, numbered past
+        // every other constraint name the statement declares, as
+        // PostgreSQL's `ChooseConstraintName` numbers it: two unnamed keys on
+        // one column are `t_c_fkey` and `t_c_fkey1`.
+        if !unnamed_foreign_keys.is_empty() {
+            let mut taken: Vec<String> = checks
+                .iter()
+                .map(|c| c.name.clone())
+                .chain(unique_keys.iter().map(|k| k.name.clone()))
+                .chain(unique_columns.iter().map(|c| crate::core::rql::unique_key::implicit_key_name(&table_name, c)))
+                .chain(primary_key.iter().map(|_| crate::core::rql::unique_key::pkey_name(&table_name)))
+                .chain(
+                    foreign_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !unnamed_foreign_keys.contains(i))
+                        .map(|(_, fk)| fk.name.clone()),
+                )
+                .collect();
+            for i in unnamed_foreign_keys {
+                let stem = crate::core::rql::foreign_key::key_stem(&table_name, &foreign_keys[i].column);
+                match crate::core::rql::unique_key::choose_name(
+                    &stem,
+                    crate::core::rql::foreign_key::FKEY_LABEL,
+                    |candidate| taken.iter().any(|t| t.eq_ignore_ascii_case(candidate)),
+                ) {
+                    Ok(name) => {
+                        taken.push(name.clone());
+                        foreign_keys[i].name = name;
+                    }
+                    Err(reason) => {
+                        rejection.replace(reason);
+                        return None;
+                    }
+                }
+            }
+        }
 
         // Companion columns come after every declared column, so the user's
         // columns keep write orders 0..n-1 and `SELECT *` needs no reordering.
@@ -1895,6 +1950,20 @@ mod partitioning_refusal_tests {
             assert_eq!(ct.foreign_keys[0].parent_table, "u");
             assert_eq!(ct.foreign_keys[0].parent_column, "id");
         }
+
+        // Phase 3 P4: an unnamed key is PostgreSQL's `<t>_<col>_fkey`,
+        // numbered past every other name the statement declares; a named
+        // one keeps its name as written, quoted, spaced and non-ASCII.
+        let (ct, _) = parse(
+            "CREATE TABLE t (a INT REFERENCES u(id), b INT, \
+             FOREIGN KEY (a) REFERENCES v(id), CONSTRAINT \"外部 key\" FOREIGN KEY (b) REFERENCES u(id), \
+             CONSTRAINT t_b_fkey CHECK (b > 0), FOREIGN KEY (b) REFERENCES v(id))",
+        );
+        let ct = ct.expect("named and unnamed keys");
+        assert_eq!(
+            ct.foreign_keys.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["t_a_fkey", "t_a_fkey1", "外部 key", "t_b_fkey1"]
+        );
 
         let (ct, _) =
             parse("CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)");

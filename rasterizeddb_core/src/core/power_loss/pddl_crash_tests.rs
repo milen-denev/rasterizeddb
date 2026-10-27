@@ -72,6 +72,17 @@ async fn index_contents(db: &Arc<Database>, name: &str, table: &crate::core::par
     Ok(())
 }
 
+/// A plain parent holding every tenant `populated` writes.
+const FK_PARENT: &[&str] = &[
+    "CREATE TABLE pp (id BIGINT NOT NULL PRIMARY KEY)",
+    "INSERT INTO pp (id) VALUES (1), (2), (3), (4), (5), (6)",
+];
+const FK_PARENT_AND_KEY: &[&str] = &[
+    "CREATE TABLE pp (id BIGINT NOT NULL PRIMARY KEY)",
+    "INSERT INTO pp (id) VALUES (1), (2), (3), (4), (5), (6)",
+    "ALTER TABLE pt ADD CONSTRAINT pt_fk FOREIGN KEY (tenant_id) REFERENCES pp (id)",
+];
+
 const REOPENS: [(&str, u64); 4] = [
     ("test.pddl.before_work", 1),
     ("test.pddl.after_work", 1),
@@ -96,14 +107,18 @@ async fn fingerprint(db: &Arc<Database>) -> Result<String, String> {
         return Err(format!("broken: {why}"));
     }
     let schema = &table.shell().schema;
+    // The foreign keys too (phase 3 P4), and what the reverse index says of
+    // the parent: rebuilt at open, it must be the schemas'.
+    let referencing: Vec<String> = db.referencing_keys("pp").into_iter().map(|(child, fk)| format!("{child}.{}", fk.name)).collect();
     let shell = format!(
-        "{} {:?} idx {:?} uk {:?} chk {:?} def {:?}",
+        "{} {:?} idx {:?} uk {:?} chk {:?} def {:?} fk {:?} reverse {referencing:?}",
         schema.name,
         schema.fields.iter().map(|f| (&f.name, f.write_order, f.is_deleted)).collect::<Vec<_>>(),
         schema.secondary_indexes.iter().filter(|i| !i.is_deleted).map(|i| &i.name).collect::<Vec<_>>(),
         schema.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| &k.name).collect::<Vec<_>>(),
         schema.checks.iter().filter(|c| !c.is_deleted).map(|c| &c.name).collect::<Vec<_>>(),
         schema.defaults.iter().filter(|d| !d.is_deleted).map(|d| (&d.column, &d.expression)).collect::<Vec<_>>(),
+        schema.foreign_keys.iter().filter(|f| !f.is_deleted).map(|f| (&f.name, &f.parent_table)).collect::<Vec<_>>(),
     );
     let epoch = table.epoch().map_err(|e| e.to_string())?;
     for (pid, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).map_err(|e| e.to_string())? {
@@ -321,6 +336,13 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
             ..case("ALTER TABLE pt DROP CONSTRAINT pt_c", &REOPENS)
         },
         case("ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (tenant_id, id, v)", &REOPENS),
+        // A foreign key from the partitioned table (phase 3 P4): its
+        // record is the shell's sidecar, its rows validated before it.
+        Case { prep: FK_PARENT, ..case("ALTER TABLE pt ADD CONSTRAINT pt_fk FOREIGN KEY (tenant_id) REFERENCES pp (id)", &REOPENS) },
+        Case {
+            prep: FK_PARENT_AND_KEY,
+            ..case("ALTER TABLE pt DROP CONSTRAINT pt_fk", &REOPENS)
+        },
         case("ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'", &REOPENS),
         Case {
             prep: &["ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'"],

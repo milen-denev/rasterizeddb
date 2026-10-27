@@ -542,6 +542,28 @@ pub(crate) async fn write_partitions<F, Fut>(
     table: &PartitionedTable,
     where_clause: &str,
     tx: TxId,
+    collect: Option<&mut Vec<Row>>,
+    write: F,
+) -> io::Result<u64>
+where
+    F: FnMut(Arc<PartTable>, Option<Visibility>, bool) -> Fut,
+    Fut: std::future::Future<Output = PartWrite>,
+{
+    write_partitions_as_of(table, where_clause, tx, None, collect, write).await
+}
+
+/// [`write_partitions`] under `statement`, a snapshot the caller took
+/// before it: the one a statement's foreign-key work read the rows it judged
+/// under (the keys a `DELETE` removes, what an `UPDATE` changes; phase 3
+/// P4), so the rows written are exactly those rows. Every partition is then
+/// written under it, a lone partition too, as a plain table's write is given
+/// the statement's `Visibility` in the same case. `None` is
+/// [`write_partitions`].
+pub(crate) async fn write_partitions_as_of<F, Fut>(
+    table: &PartitionedTable,
+    where_clause: &str,
+    tx: TxId,
+    statement: Option<Visibility>,
     mut collect: Option<&mut Vec<Row>>,
     mut write: F,
 ) -> io::Result<u64>
@@ -550,14 +572,15 @@ where
     Fut: std::future::Future<Output = PartWrite>,
 {
     table.check()?;
-    let visibility = table.visibility_for(tx);
+    let pinned = statement.is_some();
+    let visibility = statement.unwrap_or_else(|| table.visibility_for(tx));
     let epoch = table.epoch()?;
     let route = table.route_where(where_clause)?;
     let parts = table.materialized(&epoch, &route)?;
     #[cfg(test)]
     test_hooks::note_writes(table.uid(), parts.iter().map(|(pid, _)| *pid));
     let collecting = collect.is_some();
-    if parts.len() <= 1 {
+    if parts.len() <= 1 && !pinned {
         drop(visibility);
         let Some((_, part)) = parts.into_iter().next() else {
             return Ok(0);
