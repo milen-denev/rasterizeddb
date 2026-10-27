@@ -238,3 +238,129 @@ async fn substituted_values_work_in_every_predicate_shape_on_a_plain_target() {
 async fn substituted_values_work_in_every_predicate_shape_on_a_hash_partitioned_target() {
     predicate_shapes(" PARTITION BY HASH (id) PARTITIONS 4").await;
 }
+
+/// One rendering of a substituted value for every place it lands: after a
+/// binary minus (the `--` comment), under a unary minus, before a cast, in
+/// `IN`/`NOT IN`/`BETWEEN`/`LIKE`/`IS DISTINCT FROM`, in arithmetic and
+/// calls, and in `||`; in assignments, rechecks and correlated subqueries,
+/// with positive and negative values. A space before every value broke the
+/// unary minus (`- 7` is read as literal text in an assignment, `- -3`
+/// nowhere) and casts (`-3::text` is `-(3::text)`); parentheses around every
+/// value broke `IN (…)` and its kin.
+async fn every_place_a_value_lands(partitioning: &str) {
+    let dir = Root::new(if partitioning.is_empty() { "lands_plain" } else { "lands_hash" });
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    let p = partitioning;
+    run(
+        &pool,
+        &format!(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT, neg BIGINT, d NUMERIC(10,2), name TEXT, l TEXT, w BIGINT, \
+             txt TEXT, v BIGINT, lo BIGINT, hi BIGINT, flag BIGINT){p}"
+        ),
+    )
+    .await;
+    run(
+        &pool,
+        "CREATE TABLE s (id BIGINT PRIMARY KEY, x BIGINT, neg BIGINT, d NUMERIC(10,2), name TEXT, l TEXT);
+         CREATE TABLE c (cid BIGINT PRIMARY KEY, v BIGINT, name TEXT, txt TEXT);
+         INSERT INTO s VALUES (1, 7, -3, -1.50, 'Ap%', 'L'), (2, -7, 3, 2.25, 'B%', 'M');
+         INSERT INTO c VALUES (1, -3, 'Apple', '-3'), (2, 50, 'zz', 'Lx');",
+    )
+    .await;
+    let reset = "DELETE FROM t; INSERT INTO t VALUES (1, 5, 3, 0, 'Ap%', 'L', 0, '', -3, -5, -1, 0), \
+                 (2, 5, 7, 0, 'Q%', 'M', 0, '', 7, 0, 10, 0)";
+    run(&pool, reset).await;
+    // Rechecks and correlated subqueries, by the rows they keep. A unary
+    // minus over a source column (`t.x = -s.x + 12`) is refused by the join
+    // itself, which reads the condition before any value is substituted
+    // ("expected a number after '-'"), so it is pinned in correlated
+    // subqueries and assignments, where a value is.
+    for (cond, want) in [
+        ("t.x > 4 - s.neg", &["2"][..]),
+        ("t.x > 4-s.neg", &["2"]),
+        ("t.name || s.neg::text = 'Ap%-3'", &["1"]),
+        ("t.v = s.neg::bigint", &["1"]),
+        ("t.d = s.d::numeric + 1.50", &["1"]),
+        ("t.v IN (s.neg, 99)", &["1"]),
+        ("t.v NOT IN (s.neg)", &["2"]),
+        ("t.v IS DISTINCT FROM s.neg", &["2"]),
+        ("t.v = s.neg * 1", &["1"]),
+        ("t.v = 2 * s.neg + 3", &["1"]),
+        ("t.v = s.neg % 2 - 2", &["1"]),
+        ("t.v = COALESCE(s.neg, 0)", &["1"]),
+        ("t.l || s.l = 'LL'", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v BETWEEN t.lo AND t.hi) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v IN (t.v, 99)) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v NOT IN (t.v)) > 1", &["2"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v IS DISTINCT FROM t.v) > 1", &["2"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = -t.v - 6) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = -t.neg) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.txt = t.v::text) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.name LIKE t.name) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = t.v * 2 + 3) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = abs(t.v) - 6) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = COALESCE(t.v, 0)) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.txt = t.l || 'x') > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v % 2 = t.v % 2) > 0", &["1"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v = t.lo-t.v - 1) > 0", &["1"]),
+    ] {
+        run(&pool, "UPDATE t SET flag = 0").await;
+        let n = run(&pool, &format!("UPDATE t SET flag = 1 FROM s WHERE t.id = s.id AND {cond}")).await;
+        assert_eq!(texts(&pool, "SELECT id::text FROM t WHERE flag = 1 ORDER BY id").await, want, "{p} UPDATE … FROM … AND {cond}");
+        assert_eq!(n as usize, want.len(), "{p} UPDATE … FROM … AND {cond}: the count");
+        if cond.starts_with("(SELECT") {
+            continue;
+        }
+        let mut c = pool.acquire().await.unwrap();
+        c.execute("BEGIN").await.unwrap();
+        let deleted: std::collections::BTreeSet<String> = sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM t USING s WHERE t.id = s.id AND {cond} RETURNING t.id"
+        )))
+        .fetch_all(&mut *c)
+        .await
+        .unwrap_or_else(|e| panic!("{p} DELETE … USING … AND {cond}: {e}"))
+        .iter()
+        .map(|r| r.get::<i64, _>(0).to_string())
+        .collect();
+        assert_eq!(deleted.into_iter().collect::<Vec<_>>(), want, "{p} DELETE … USING … AND {cond}");
+        c.execute("ROLLBACK").await.unwrap();
+    }
+    // Assignments, by the values they store (source row 1 holds the
+    // negatives, row 2 their opposites).
+    for (set, col, want) in [
+        ("w = t.x-s.neg", "w", ["8", "2"]),
+        ("w = -s.x", "w", ["-7", "7"]),
+        ("w = -s.neg", "w", ["3", "-3"]),
+        ("w = t.x - -s.neg", "w", ["2", "8"]),
+        ("txt = s.neg::text", "txt", ["-3", "3"]),
+        ("d = s.d::numeric", "d", ["-1.50", "2.25"]),
+        ("w = s.neg::bigint", "w", ["-3", "3"]),
+        ("w = s.neg * 2", "w", ["-6", "6"]),
+        ("w = 2 * s.neg", "w", ["-6", "6"]),
+        ("w = s.neg % 2", "w", ["-1", "1"]),
+        ("w = abs(s.neg)", "w", ["3", "3"]),
+        ("w = COALESCE(s.neg, 0)", "w", ["-3", "3"]),
+        ("txt = s.l || 'x'", "txt", ["Lx", "Mx"]),
+        ("w = t.neg - s.neg", "w", ["6", "4"]),
+    ] {
+        run(&pool, reset).await;
+        let n = run(&pool, &format!("UPDATE t SET {set} FROM s WHERE t.id = s.id")).await;
+        assert_eq!(n, 2, "{p} SET {set}");
+        assert_eq!(
+            texts(&pool, &format!("SELECT CAST({col} AS TEXT) FROM t ORDER BY id")).await,
+            want,
+            "{p} SET {set}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_substituted_value_reads_as_one_value_wherever_it_lands_on_a_plain_target() {
+    every_place_a_value_lands("").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_substituted_value_reads_as_one_value_wherever_it_lands_on_a_hash_partitioned_target() {
+    every_place_a_value_lands(" PARTITION BY HASH (id) PARTITIONS 4").await;
+}

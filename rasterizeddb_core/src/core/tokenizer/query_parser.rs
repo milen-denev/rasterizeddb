@@ -1429,7 +1429,55 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             // the identical positive literal parsed. A leading `+` is accepted
             // for symmetry and means nothing.
             Token::Op(ref op) if op == "-" || op == "+" => {
-                let negate = op == "-";
+                let mut negate = op == "-";
+                // Signs repeat, and the number may sit in one pair of
+                // parentheses: `- -3`, `-(-3)`, `-(3)`. That is what a unary
+                // minus over a substituted negative value is (`-s.neg` in an
+                // UPDATE … FROM recheck), and PostgreSQL reads all three. The
+                // group is taken only when it holds a signed number and
+                // nothing else; anything more is left to fail as before.
+                let mut start = self.pos;
+                let mut close = false;
+                if matches!(self.toks.get(start), Some(Token::LPar)) {
+                    let mut j = start + 1;
+                    while matches!(self.toks.get(j), Some(Token::Op(o)) if o == "-" || o == "+") {
+                        j += 1;
+                    }
+                    let number = matches!(self.toks.get(j), Some(Token::Number(_)))
+                        || matches!(self.toks.get(j), Some(Token::StringLit(t)) if crate::core::value_codec::parse_decimal(t).is_some());
+                    if number && matches!(self.toks.get(j + 1), Some(Token::RPar)) {
+                        start += 1;
+                        close = true;
+                    }
+                }
+                while let Some(Token::Op(o)) = self.toks.get(start) {
+                    match o.as_str() {
+                        "-" => negate = !negate,
+                        "+" => {}
+                        _ => break,
+                    }
+                    start += 1;
+                }
+                // Only when a number follows the signs: otherwise nothing is
+                // consumed beyond the first sign, as before.
+                let number_next = matches!(self.toks.get(start), Some(Token::Number(_)))
+                    || matches!(self.toks.get(start), Some(Token::StringLit(t)) if crate::core::value_codec::parse_decimal(t).is_some());
+                if number_next {
+                    self.pos = start;
+                } else {
+                    negate = op == "-";
+                    close = false;
+                }
+                let closed = |parser: &mut Self| -> Result<(), String> {
+                    if close {
+                        match parser.next() {
+                            Some(Token::RPar) => Ok(()),
+                            _ => Err("expected a closing parenthesis after a signed number".to_string()),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                };
                 // A fraction beside a NUMERIC that a float cannot hold comes
                 // as its text (see the tokenizer's `number_token`), and takes
                 // its sign the same way.
@@ -1441,12 +1489,14 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                             (true, None) => format!("-{}", text),
                             (false, _) => text,
                         };
+                        closed(self)?;
                         return Ok((ComparisonOperand::Direct(str_to_mb(&signed)), DbType::STRING));
                     }
                 }
                 let Some(Token::Number(n)) = self.next() else {
                     return Err(format!("expected a number after '{}'", op));
                 };
+                closed(self)?;
                 let n = if negate {
                     Self::negate_numeric_inner(&n)
                         .ok_or_else(|| "numeric literal is out of range".to_string())?

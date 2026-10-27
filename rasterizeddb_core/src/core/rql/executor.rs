@@ -4174,28 +4174,14 @@ fn ref_key(qualifier: &str, column: &str) -> (String, String) {
     (qualifier.to_ascii_lowercase(), column.to_string())
 }
 
-/// Replaces each outer reference in `sql` with the literal it resolved to,
-/// separated from what precedes it by a space.
+/// Replaces each outer reference in `sql` with the literal it resolved to
+/// (rendered by [`render_substituted`]).
 ///
 /// One pass over `sql`, quote-aware: a reference inside a string literal is
 /// text, not a reference (`'see s.x ' || s.x` stored `see 7 7`), and what
 /// is substituted is never scanned again (a substituted string holding
 /// `s.l` broke the statement). Whole references only, so `fwd.id` inside
 /// `fwd.id_extra` is left alone, in any quoting (`"s".big`, `s."big"`).
-///
-/// The literal lands beside whatever the text had there: `t.x-s.neg` with
-/// `-3` became `x--3`, and `--` starts a comment, which dropped the rest of
-/// the statement (its other assignments and its `WHERE`, so every row was
-/// updated). A space before it keeps it a token of its own: `x- -3`, minus
-/// negative three. Parentheses did that too, but the predicate parser takes
-/// a bare literal, not a parenthesised one, in `IN (…)`, `BETWEEN`, `LIKE`
-/// and `IS DISTINCT FROM`, and every such recheck and correlated subquery
-/// failed. Nothing after the literal can fuse with it: a reference ends
-/// where no word character, `.` or quote follows, and a rendered literal
-/// (a number, a quoted string, `NULL`) ends in a digit, a quote or a
-/// letter. No rendered literal starts with `*`, `=` or `-` but a negative
-/// number, so the space is the only separation needed (`/*`, `!=`, `<-`,
-/// `--` all need the two characters adjacent).
 fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
     let keyed: Vec<((String, String), &str)> = bindings
         .iter()
@@ -4210,15 +4196,45 @@ fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
         let key = ref_key(&span.qualifier, &span.column);
         if let Some((_, literal)) = keyed.iter().find(|(k, _)| *k == key) {
             out.push_str(&sql[cursor..span.start]);
-            if !out.ends_with(|c: char| c.is_ascii_whitespace()) && !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(literal);
+            render_substituted(&mut out, literal, &sql[span.end..]);
             cursor = span.end;
         }
     }
     out.push_str(&sql[cursor..]);
     out
+}
+
+/// Appends `literal`, a value substituted for a reference, to `out` (the
+/// text before it), given the text after it (`rest`), so that it reads as
+/// the one value it is wherever it lands.
+///
+/// What the engine's two parsers take, measured: an assignment's expression
+/// parser takes a parenthesised literal anywhere and a bare one anywhere but
+/// after a lone sign (`w = - 7` and `w = - -3` are read as literal text);
+/// the predicate parser takes a bare literal anywhere, but a parenthesised
+/// one not in `IN (…)`, `BETWEEN`, `LIKE` or `IS DISTINCT FROM`. And `::`
+/// binds tighter than a sign (`-3::text` is `-(3::text)`). So:
+/// - a value that does not begin with `-` (a positive number, a string,
+///   `NULL`) goes in bare, as it did before any of this: `-s.x` is `-7`;
+/// - a negative number goes in parenthesised before a cast (`(-3)::text`)
+///   and after a sign (`x-(-3)`, never `x--3`, a comment; `-(-3)`, which
+///   the predicate parser reads since this change), and bare elsewhere,
+///   set apart by a space unless an opening parenthesis or a comma comes
+///   before it (`IN (-3, 99)`, `BETWEEN -5 AND -1`, `2 * -3`).
+fn render_substituted(out: &mut String, literal: &str, rest: &str) {
+    let negative = literal.starts_with('-');
+    let before = out.trim_end().chars().last();
+    let cast_follows = rest.trim_start().starts_with("::");
+    if negative && (cast_follows || matches!(before, Some('-') | Some('+'))) {
+        out.push('(');
+        out.push_str(literal);
+        out.push(')');
+    } else if negative && !matches!(before, None | Some('(') | Some(',')) && !out.ends_with(|c: char| c.is_whitespace()) {
+        out.push(' ');
+        out.push_str(literal);
+    } else {
+        out.push_str(literal);
+    }
 }
 
 /// True when the scalar the subquery returned satisfies `<value> <op> <literal>`.
@@ -17034,12 +17050,13 @@ mod update_from_tests {
         assert!(err.contains("compared against a constant"), "got: {}", err);
     }
 
-    /// A literal is set apart by a space (`x- -3`, never `x--3`, a comment),
-    /// a reference in a string literal is text, every quoting of a reference
-    /// is one, and substituted text is never scanned again.
+    /// A negative value is rendered to read as one value wherever it lands
+    /// (`x-(-3)`, never `x--3`, a comment), a reference in a string literal
+    /// is text, every quoting of a reference is one, and substituted text is
+    /// never scanned again.
     ///
-    /// Mutation: the space dropped, or `qualified_ref_spans` not skipping
-    /// string literals, fails this.
+    /// Mutation: `render_substituted` pushing the literal bare, or
+    /// `qualified_ref_spans` not skipping string literals, fails this.
     #[test]
     fn source_references_are_substituted_quote_aware_and_parenthesised() {
         let bindings = vec![
@@ -17047,8 +17064,12 @@ mod update_from_tests {
             ("s.l".to_string(), "'has s.neg -- in it'".to_string()),
             ("s.big".to_string(), "123".to_string()),
         ];
-        assert_eq!(substitute_outer_refs("x-s.neg, label = 'z'", &bindings), "x- -3, label = 'z'");
-        assert_eq!(substitute_outer_refs("v IN (s.neg, 99)", &bindings), "v IN ( -3, 99)");
+        assert_eq!(substitute_outer_refs("x-s.neg, label = 'z'", &bindings), "x-(-3), label = 'z'");
+        assert_eq!(substitute_outer_refs("v IN (s.neg, 99)", &bindings), "v IN (-3, 99)");
+        assert_eq!(substitute_outer_refs("-s.neg", &bindings), "-(-3)");
+        assert_eq!(substitute_outer_refs("s.neg::text", &bindings), "(-3)::text");
+        assert_eq!(substitute_outer_refs("v BETWEEN s.neg AND 2*s.neg", &bindings), "v BETWEEN -3 AND 2* -3");
+        assert_eq!(substitute_outer_refs("-s.big", &bindings), "-123");
         assert_eq!(
             substitute_outer_refs("'see s.neg ' || s.l || 'it''s s.neg'", &bindings),
             "'see s.neg ' || 'has s.neg -- in it' || 'it''s s.neg'"
