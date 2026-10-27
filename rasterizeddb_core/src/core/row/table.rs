@@ -2408,6 +2408,7 @@ impl<S: StorageIO> Table<S> {
         updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
         txn: u64,
         written_by: TxId,
+        undo: &mut Vec<(u64, Vec<u8>)>,
     ) -> bool {
         // The long-row layout stores a checksum over the whole row, which this
         // path does not have the bytes to recompute. Rewriting the row is what
@@ -2492,6 +2493,32 @@ impl<S: StorageIO> Table<S> {
             writes.push((pointer.position + offset, bytes));
         }
 
+        // With no log the overwrite goes straight to the data file, where the
+        // statement's abort cannot reach it: a later row failing the
+        // statement (a CHECK) left this one changed, and the filter, whose
+        // maintenance is staged until the commit, kept describing the old
+        // value, so `WHERE col = <new>` pruned it. The bytes replaced are
+        // kept for `update_rows_locked` to put back on that failure. With a
+        // log the write is applied at the commit, which a failure never
+        // reaches.
+        let logless = d
+            .io_rows
+            .get_location()
+            .and_then(|dir| crate::core::wal::wal_for(&dir))
+            .is_none();
+        if logless {
+            let kept = undo.len();
+            for (position, bytes) in &writes {
+                let mut old = vec![0u8; bytes.len()];
+                let mut at = *position;
+                if d.io_rows.read_data_into_buffer(&mut at, &mut old).await.is_err() {
+                    // Nothing written yet: the general path writes a version.
+                    undo.truncate(kept);
+                    return false;
+                }
+                undo.push((*position, old));
+            }
+        }
         for (position, bytes) in writes {
             let _ = d.io_rows.write_data_txn(txn, position, bytes).await;
         }
@@ -4936,7 +4963,55 @@ impl<S: StorageIO> Table<S> {
         written_by: TxId,
         visibility: Option<Visibility>,
         point: Option<usize>,
+        collect: Option<&mut Vec<Row>>,
+    ) -> Result<Option<u64>> {
+        // Bytes a log-less in-place overwrite replaced (`write_columns_in_place`),
+        // put back, newest first, if the statement fails after writing them.
+        let mut undo: Vec<(u64, Vec<u8>)> = Vec::new();
+        let result = self
+            .update_rows_locked_writing(
+                where_clause,
+                query_row_fetch,
+                updates,
+                expressions,
+                limit,
+                written_by,
+                visibility,
+                point,
+                collect,
+                &mut undo,
+            )
+            .await;
+        if result.is_err() && !undo.is_empty() {
+            let d = self.data()?;
+            for (position, old) in undo.iter().rev() {
+                d.io_rows.write_data(*position, old).await;
+            }
+            error!(
+                "{}: an UPDATE failed after overwriting {} column(s) in place with no log; the old bytes \
+                 were put back",
+                self.schema.name,
+                undo.len()
+            );
+        }
+        result
+    }
+
+    /// [`Self::update_rows_locked`]'s writing half; `undo` collects what a
+    /// log-less in-place overwrite replaced.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_rows_locked_writing(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        point: Option<usize>,
         mut collect: Option<&mut Vec<Row>>,
+        undo: &mut Vec<(u64, Vec<u8>)>,
     ) -> Result<Option<u64>> {
         let d = self.data()?;
         // A caller that brings its own snapshot is a statement with work left
@@ -5364,7 +5439,7 @@ impl<S: StorageIO> Table<S> {
                 && !assigns_key
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
-                    .write_columns_in_place(d, &pointer, updates, txn, written_by)
+                    .write_columns_in_place(d, &pointer, updates, txn, written_by, undo)
                     .await
             {
                 if d.maintains_indexes() {
