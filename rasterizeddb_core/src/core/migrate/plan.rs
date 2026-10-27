@@ -352,13 +352,13 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
             } else {
                 let columns = table.primary_key.join(", ");
                 definitions.push(format!("PRIMARY KEY ({})", columns));
-                // The name the engine gives an unnamed table-level key. It has
-                // to match, because the constraint is dropped and re-added by
-                // name.
-                let name = crate::core::rql::unique_key::UniqueKey::default_name(
-                    &table.name,
-                    &table.primary_key,
-                );
+                // The name the engine gives a primary key, PostgreSQL's
+                // `<table>_pkey`. It has to match, because the constraint is
+                // dropped and re-added by name. It was `<table>_<cols>_key`,
+                // which no primary key is called: the DROP matched nothing and
+                // reported success, so every load ran with its key in place,
+                // until a DROP of nothing became 42704.
+                let name = format!("{}_pkey", table.name);
                 drop_constraints.push(format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}",
                     table.name, name
@@ -699,14 +699,14 @@ mod tests {
         assert_eq!(
             plan.drop_constraints,
             vec![
-                "ALTER TABLE users DROP CONSTRAINT users_id_key",
+                "ALTER TABLE users DROP CONSTRAINT users_pkey",
                 "ALTER TABLE users DROP CONSTRAINT users_email_key",
             ]
         );
         assert_eq!(
             plan.add_constraints,
             vec![
-                "ALTER TABLE users ADD CONSTRAINT users_id_key PRIMARY KEY (id)",
+                "ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id)",
                 "ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email)",
             ]
         );
@@ -749,7 +749,8 @@ mod tests {
                 name
             );
             assert!(
-                plan.create.contains(name) || name.contains("_key"),
+                // The primary key's name is the engine's, `<table>_pkey`.
+                plan.create.contains(name) || name.contains("_key") || name == "t_pkey",
                 "{} is dropped but the CREATE never declared it: {}",
                 name,
                 plan.create
