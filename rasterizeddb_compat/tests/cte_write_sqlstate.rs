@@ -32,3 +32,23 @@ async fn a_cte_writes_failure_keeps_its_sqlstate() {
         assert_eq!(code(&e), want, "{sql}: {e}");
     }
 }
+
+/// The SQLSTATE comes from the error, not from the text it quotes: a value
+/// or a statement quoting a retryable error's words is not that error.
+#[tokio::test(flavor = "multi_thread")]
+async fn quoted_text_does_not_choose_the_sqlstate() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql("CREATE TABLE qt (id BIGINT PRIMARY KEY, m BIGINT); INSERT INTO qt VALUES (1, 1);"))
+        .await
+        .unwrap();
+    for (sql, want) in [
+        ("UPDATE qt SET m = 'deadlock detected' WHERE id = 1", "22P02"),
+        ("UPDATE qt SET m = 'could not serialize access' WHERE id = 1", "22P02"),
+        ("WITH w AS (UPDATE qt SET m = 'could not serialize access' WHERE id = 1 RETURNING id) SELECT * FROM w", "22P02"),
+        ("WITH w AS (UPDATE qt SET m = 'canceling statement' WHERE id = 1 RETURNING id) SELECT * FROM w", "22P02"),
+    ] {
+        let e = sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await.expect_err(sql);
+        assert_eq!(code(&e), want, "{sql}: {e}");
+    }
+}

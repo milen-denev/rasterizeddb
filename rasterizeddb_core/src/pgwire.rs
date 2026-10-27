@@ -6621,6 +6621,46 @@ fn read_only_message(verb: &str) -> String {
 /// application cannot tell from a crash. Classified here, at the one place the
 /// engine's answer is turned into a wire message, by the phrases the engine
 /// uses — which are PostgreSQL's own where the condition has one.
+/// `message` with every quoted span (`"…"`, and `'…'` opened after a
+/// non-word character, so an apostrophe in a word opens nothing) replaced
+/// by a space. A quote that is never closed leaves the rest as it is.
+fn unquoted(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let opens = c == '"' || (c == '\'' && (i == 0 || !chars[i - 1].is_alphanumeric()));
+        if opens {
+            // The closing quote: the same character, not doubled, and for
+            // `'` not followed by a word character (an apostrophe inside).
+            let mut j = i + 1;
+            let mut close = None;
+            while j < chars.len() {
+                if chars[j] == c {
+                    if chars.get(j + 1) == Some(&c) {
+                        j += 2;
+                        continue;
+                    }
+                    if c == '"' || !chars.get(j + 1).is_some_and(|n| n.is_alphanumeric()) {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if let Some(end) = close {
+                out.push(' ');
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// The SQLSTATE of a statement whose CTEs or derived tables could not be
 /// built: `feature_not_supported` for a shape that is not, and the body's
 /// own class when it ran and failed. A data-modifying CTE that met a
@@ -6638,8 +6678,15 @@ pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
 }
 
 pub(crate) fn sqlstate_for(message: &str) -> &'static str {
-    let m = message.to_ascii_lowercase();
+    let raw = message.to_ascii_lowercase();
+    // Matched outside quoted text: a message quotes the value or statement
+    // it is about, and that text is the client's. `'deadlock detected'`
+    // written to an integer column read as 40P01, and a CTE quoting
+    // `'could not serialize access'::int` as 40001, so a retry loop resent a
+    // statement that fails the same way every time.
+    let m = unquoted(&raw);
     let has = |needle: &str| m.contains(needle);
+    let has_raw = |needle: &str| raw.contains(needle);
 
     // A write refused at commit because its transaction id could not be
     // reserved (`TransactionManager::check_ids_reserved`). Decided first: the
@@ -6677,12 +6724,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `not_null_violation`: SET NOT NULL or ADD PRIMARY KEY over a NULL, in
     // PostgreSQL's words; ahead of the relation rule, which "of relation"
     // would otherwise reach.
-    if has("\" of relation \"") && has("contains null values") {
+    if has_raw("\" of relation \"") && has("contains null values") {
         return "23502";
     }
     // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
     // `DROP CONSTRAINT`'s "of relation" too, ahead of the relation rule.
-    if has("constraint \"") && (has("\" for table \"") || has("\" of relation \"")) && has("does not exist") {
+    if has_raw("constraint \"") && (has_raw("\" for table \"") || has_raw("\" of relation \"")) && has("does not exist") {
         return "42704";
     }
     // `DROP INDEX` of an index a constraint owns (a primary key's, a unique
