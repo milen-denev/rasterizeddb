@@ -122,3 +122,28 @@ async fn source_values_are_substituted_whole_on_a_plain_target() {
 async fn source_values_are_substituted_whole_on_a_hash_partitioned_target() {
     substitution(" PARTITION BY HASH (id) PARTITIONS 4").await;
 }
+
+/// `2147483647 + 1` overflows int4, PostgreSQL's 22003, which the evaluator
+/// raises against an INT column. The decimal folder folded it into a value
+/// first, and the comparison answered rows.
+///
+/// Against a BIGINT column the evaluator itself computes the literals at the
+/// column's width and answers (PostgreSQL still raises): not the folder's,
+/// and left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn int4_overflow_in_a_where_literal_is_an_error() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    run(&pool, "CREATE TABLE o (id BIGINT PRIMARY KEY, b BIGINT, i INT); INSERT INTO o VALUES (1, 4294967296, 7)").await;
+    for sql in [
+        "SELECT id FROM o WHERE i < 2147483647 + 1",
+        "SELECT id FROM o WHERE id > 0 AND (i < 2147483647 + 1)",
+        "SELECT id FROM o WHERE i < 0.5 + 2147483647 * 2",
+    ] {
+        let e = sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await.expect_err(sql);
+        assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("22003"), "{sql}: {e}");
+    }
+    // Integer division folds, truncating; int8 arithmetic does not overflow.
+    assert_eq!(texts(&pool, "SELECT id::text FROM o WHERE b = 8589934592 / 2").await, ["1"]);
+    assert_eq!(texts(&pool, "SELECT id::text FROM o WHERE id > 0 AND (i = 15 / 2)").await, ["1"]);
+}

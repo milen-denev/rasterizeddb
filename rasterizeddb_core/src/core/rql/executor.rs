@@ -6102,15 +6102,22 @@ fn fold_constants_in_predicate(text: &str) -> String {
 
 /// Whether `text` is numeric literals joined by `+ - * /`, with parentheses:
 /// nothing a column, a quote or a call could hide in, and at least one
-/// operator past a leading sign.
+/// operator past a leading sign. At least one literal is a decimal (`0.5`),
+/// so the arithmetic is NUMERIC: integers alone are
+/// [`fold_integer_arithmetic`]'s, which leaves an `int4` overflow
+/// (`2147483647 + 1`) and integer division to the evaluator, which raises
+/// PostgreSQL's 22003 for the first. Folded here, the overflow became a
+/// value and the comparison answered rows.
 fn literal_arithmetic(text: &str) -> bool {
-    text.bytes().all(|b| b.is_ascii_digit() || b".+-*/() \t".contains(&b))
+    text.contains('.')
+        && text.bytes().all(|b| b.is_ascii_digit() || b".+-*/() \t".contains(&b))
         && text.trim_start().trim_start_matches(['-', '+', '(']).bytes().any(|b| b"+-*/".contains(&b))
         && text.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// `text` as one integer literal, when it is nothing but integer literals
-/// joined by `+`, `-` and `*`, with parentheses and a minus on a literal.
+/// joined by `+`, `-`, `*`, `/` and `%`, with parentheses and a minus on a
+/// literal.
 ///
 /// Left as text, `id <= 500000 + 100` was evaluated on every row and could
 /// use no index: ~170 times slower than `id <= 500100`, which is what an ORM
@@ -6119,8 +6126,8 @@ fn literal_arithmetic(text: &str) -> bool {
 /// Computed as PostgreSQL computes it, or not at all. A literal is `int4`
 /// when it fits and `int8` otherwise; an operation takes the wider of its
 /// two; a result outside its type is PostgreSQL's "integer out of range",
-/// so the text is left for the engine, which reports exactly that. Nothing
-/// else is folded: `/` and `%` (integer division), a literal beyond `int8`
+/// so the text is left for the engine, which reports exactly that, as is a
+/// zero divisor. Nothing else is folded: a literal beyond `int8`
 /// (`numeric`), any other character. `None` also for a lone literal, which
 /// needs no folding.
 fn fold_integer_arithmetic(text: &str) -> Option<String> {
@@ -6137,6 +6144,10 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
         let v = match op {
             b'+' => l.0.checked_add(r.0)?,
             b'-' => l.0.checked_sub(r.0)?,
+            // Integer division truncates toward zero, as PostgreSQL's does;
+            // a zero divisor is left to the evaluator, which raises 22012.
+            b'/' => l.0.checked_div(r.0)?,
+            b'%' => l.0.checked_rem(r.0)?,
             _ => l.0.checked_mul(r.0)?,
         };
         (ty == Ty::Int8 || i32::try_from(v).is_ok()).then_some((v, ty))
@@ -6165,11 +6176,11 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
         }
         fn term(&mut self) -> Option<(i64, Ty)> {
             let mut acc = self.factor()?;
-            while self.peek() == Some(b'*') {
+            while let Some(op @ (b'*' | b'/' | b'%')) = self.peek() {
                 self.i += 1;
                 self.ops += 1;
                 let rhs = self.factor()?;
-                acc = apply(acc, rhs, b'*')?;
+                acc = apply(acc, rhs, op)?;
             }
             Some(acc)
         }
@@ -16733,11 +16744,18 @@ mod predicate_folding_tests {
             ("2000000000 + 2000000000", None),
             ("2147483647 + 1", None),
             ("46341 * 46341", None),
-            // Beyond int8 is numeric; division and modulo are not folded.
+            // Beyond int8 is numeric.
             ("9223372036854775807 + 1", None),
             ("99999999999999999999 + 1", None),
-            ("7 / 2", None),
-            ("7 % 2", None),
+            // Integer division truncates toward zero; a zero divisor (22012)
+            // and int4's `-2147483648 / -1` (22003) are the evaluator's.
+            ("7 / 2", Some("3")),
+            ("-7 / 2", Some("-3")),
+            ("7 % 2", Some("1")),
+            ("100 / 4 * 2", Some("50")),
+            ("7 / 0", None),
+            ("7 % 0", None),
+            ("-2147483648 / -1", None),
             // Not integer literals, or nothing to fold.
             ("1.5 + 1", None),
             ("1e3 + 1", None),
@@ -16789,6 +16807,16 @@ mod predicate_folding_tests {
         assert_eq!(
             fold_where_constants("UPDATE t SET a = 1 WHERE id = 1 AND ((v < 2 * 3) AND (w > 1 + 1))"),
             "UPDATE t SET a = 1 WHERE id = 1 AND ((v < 6) AND (w > 2))"
+        );
+        // int4 overflow is the evaluator's 22003, never a folded value; nor is
+        // integer arithmetic the decimal folder's.
+        assert_eq!(
+            fold_where_constants("SELECT id FROM t WHERE b = 2147483647 + 1"),
+            "SELECT id FROM t WHERE b = 2147483647 + 1"
+        );
+        assert_eq!(
+            fold_where_constants("SELECT id FROM t WHERE (b = 2147483647 * 2 - 1)"),
+            "SELECT id FROM t WHERE (b = 2147483647 * 2 - 1)"
         );
         let folded = fold_where_constants("SELECT id FROM t WHERE (v < 0.1234 * 100)");
         assert!(!folded.contains('*'), "{folded}");
