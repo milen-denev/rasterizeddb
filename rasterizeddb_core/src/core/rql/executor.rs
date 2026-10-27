@@ -3767,16 +3767,18 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
 /// to `DROP INDEX` itself (`execute_drop_partial_unique`).
 fn constraint_index(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
     let named = |n: &str| n.eq_ignore_ascii_case(name);
-    (schema.primary_key.is_some() && named(&format!("{table}_pkey")))
+    (schema.primary_key.is_some() && named(&crate::core::rql::unique_key::pkey_name(table)))
         || schema.unique_keys.iter().any(|k| !k.is_deleted && k.predicate.is_none() && named(&k.name))
-        || implicit_unique_column(name, &schema.fields).is_some()
+        || implicit_unique_column(name, table, &schema.fields).is_some()
 }
 
 fn implicit_unique_column(
     constraint: &str,
+    table: &str,
     fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
 ) -> Option<String> {
-    let lower = constraint.trim().trim_matches('"').to_ascii_lowercase();
+    let given = constraint.trim().trim_matches('"');
+    let lower = given.to_ascii_lowercase();
     let stem = lower.strip_suffix("_key")?;
     fields
         .iter()
@@ -3784,6 +3786,9 @@ fn implicit_unique_column(
         .find(|f| {
             stem.ends_with(&format!("_{}", f.name.to_ascii_lowercase()))
                 || stem == f.name.to_ascii_lowercase()
+                // The name as this table's own derivation cuts it: a long
+                // one has lost its column to the cut.
+                || given.eq_ignore_ascii_case(&crate::core::rql::unique_key::implicit_key_name(table, &f.name))
         })
         .map(|f| f.name.clone())
 }
@@ -5219,7 +5224,7 @@ fn constraint_columns(
     {
         return Some(key.columns.clone());
     }
-    if name.eq_ignore_ascii_case(&format!("{}_pkey", table_name)) {
+    if name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(table_name)) {
         if let Some(pk) = schema.primary_key.as_deref() {
             return Some(vec![pk.to_string()]);
         }
@@ -10044,7 +10049,7 @@ async fn execute_alter_table_action(
                     // calls it, and a key added as `k1` is not `<table>_pkey`.
                     let pk = primary_key_constraint(&schema, &plan.table_name);
                     let pk_named = pk.as_ref().is_some_and(|p| named(&p.name));
-                    let implicit = implicit_unique_column(&name, &schema.fields).filter(|column| {
+                    let implicit = implicit_unique_column(&name, &plan.table_name, &schema.fields).filter(|column| {
                         !pk.as_ref().is_some_and(|p| p.inline && p.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(column)))
                     });
                     // An inline primary key: the header's column and its
@@ -10229,13 +10234,15 @@ async fn execute_alter_table_action(
                     // beside it. Refused rather than taken for what it is not.
                     if primary
                         && key.columns.len() > 1
-                        && !key.name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name))
+                        && !key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&plan.table_name))
                     {
                         return ddl_error(&format!(
                             "a composite PRIMARY KEY named \"{}\" is not supported: a key over several columns is \
-                             recognised as the primary key of \"{}\" only by the name \"{}_pkey\"; name it that or \
+                             recognised as the primary key of \"{}\" only by the name \"{}\"; name it that or \
                              leave it unnamed",
-                            key.name, plan.table_name, plan.table_name
+                            key.name,
+                            plan.table_name,
+                            crate::core::rql::unique_key::pkey_name(&plan.table_name)
                         ));
                     }
                     // An unnamed UNIQUE whose derived name is taken gets the
@@ -10642,7 +10649,7 @@ struct PrimaryKeyConstraint {
 }
 
 fn primary_key_constraint(schema: &crate::core::row::schema::TableSchema, table: &str) -> Option<PrimaryKeyConstraint> {
-    let pkey = format!("{table}_pkey");
+    let pkey = crate::core::rql::unique_key::pkey_name(table);
     let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
     let Some(column) = schema.primary_key.clone() else {
         return whole()
@@ -10676,7 +10683,7 @@ fn constraint_name_taken(schema: &crate::core::row::schema::TableSchema, table: 
         || schema.checks.iter().any(|c| !c.is_deleted && named(&c.name))
         || schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
         || primary_key_constraint(schema, table).is_some_and(|p| named(&p.name))
-        || implicit_unique_column(name, &schema.fields).is_some()
+        || implicit_unique_column(name, table, &schema.fields).is_some()
 }
 
 /// A reload's failure (§7 steps 2-4) as a DDL reports it: its own work's
@@ -12050,7 +12057,7 @@ fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<Ide
     if let Some(field) = schema.primary_key.as_deref().and_then(live) {
         return Some(key(vec![field]));
     }
-    let pkey = format!("{}_pkey", schema.name);
+    let pkey = crate::core::rql::unique_key::pkey_name(&schema.name);
     if let Some(fields) = whole().find(|k| k.name.eq_ignore_ascii_case(&pkey)).and_then(|k| resolve(&k.columns)) {
         return Some(key(fields));
     }
@@ -12102,7 +12109,10 @@ fn schema_after_for_identity(
             if primary && has_primary_key(&after, &plan.table_name) {
                 return None; // refused: 42P16
             }
-            if primary && key.columns.len() > 1 && !key.name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name)) {
+            if primary
+                && key.columns.len() > 1
+                && !key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&plan.table_name))
+            {
                 return None; // refused: 0A000
             }
             if after.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&key.name)) {
@@ -12136,7 +12146,7 @@ fn schema_after_for_identity(
                 key.is_deleted = true;
             }
             let inline_pk = pk.as_ref().filter(|p| p.inline).and_then(|p| p.column.clone());
-            let implicit = implicit_unique_column(&name, &after.fields)
+            let implicit = implicit_unique_column(&name, &plan.table_name, &after.fields)
                 .filter(|c| !inline_pk.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(c)));
             let unflag = implicit.or_else(|| inline_pk.filter(|_| pk_named));
             if let Some(column) = unflag {

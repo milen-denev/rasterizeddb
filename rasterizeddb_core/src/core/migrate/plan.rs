@@ -358,7 +358,7 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
                 // which no primary key is called: the DROP matched nothing and
                 // reported success, so every load ran with its key in place,
                 // until a DROP of nothing became 42704.
-                let name = format!("{}_pkey", table.name);
+                let name = crate::core::rql::unique_key::pkey_name(&table.name);
                 drop_constraints.push(format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}",
                     table.name, name
@@ -652,6 +652,19 @@ mod tests {
             .unwrap()
             .tables
             .remove(0)
+    }
+
+    /// A long table's primary key is dropped and re-added by the name the
+    /// engine gives it, cut so `_pkey` survives (`unique_key::pkey_name`).
+    #[test]
+    fn a_long_tables_primary_key_is_named_as_the_engine_names_it() {
+        let name = "t".repeat(125);
+        let mut source = table(&name, vec![column("a", "int4", true)]);
+        source.primary_key = vec!["a".to_string()];
+        let plan = plan_one(source);
+        let pkey = format!("{}_pkey", &name[..123]);
+        assert_eq!(plan.drop_constraints, vec![format!("ALTER TABLE {name} DROP CONSTRAINT {pkey}")]);
+        assert_eq!(plan.add_constraints, vec![format!("ALTER TABLE {name} ADD CONSTRAINT {pkey} PRIMARY KEY (a)")]);
     }
 
     #[test]

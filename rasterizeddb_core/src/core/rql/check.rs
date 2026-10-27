@@ -197,13 +197,14 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
 
 /// The name PostgreSQL would give an unnamed check on `table`.
 pub fn derived_name(table: &str, column: Option<&str>, ordinal: usize) -> String {
+    // Cut as every derived name is cut: the label survives.
+    let label = crate::core::rql::unique_key::name_with_label;
     match column {
-        Some(column) => format!(
-            "{}_{}_check",
-            table.to_ascii_lowercase(),
-            column.to_ascii_lowercase()
+        Some(column) => label(
+            &format!("{}_{}", table.to_ascii_lowercase(), column.to_ascii_lowercase()),
+            "_check",
         ),
-        None => format!("{}_check{}", table.to_ascii_lowercase(), ordinal),
+        None => label(&table.to_ascii_lowercase(), &format!("_check{ordinal}")),
     }
 }
 
@@ -406,5 +407,10 @@ mod tests {
             "orders_status_check"
         );
         assert_eq!(derived_name("orders", None, 2), "orders_check2");
+        // A long table's derived names keep their labels within the limit.
+        let long = "t".repeat(125);
+        for (name, label) in [(derived_name(&long, Some("a"), 0), "_check"), (derived_name(&long, None, 3), "_check3")] {
+            assert!(name.len() <= 128 && name.ends_with(label), "{name}");
+        }
     }
 }

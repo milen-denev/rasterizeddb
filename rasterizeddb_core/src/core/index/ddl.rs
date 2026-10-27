@@ -38,7 +38,13 @@ impl CreateIndex {
     pub fn name_or_default(&self) -> String {
         self.name
             .clone()
-            .unwrap_or_else(|| format!("{}_{}_idx", self.table, self.columns.join("_")))
+            .unwrap_or_else(|| {
+                // Cut as every derived name is cut: the label survives.
+                crate::core::rql::unique_key::name_with_label(
+                    &format!("{}_{}", self.table, self.columns.join("_")),
+                    "_idx",
+                )
+            })
     }
 }
 
@@ -267,6 +273,10 @@ mod tests {
         assert_eq!(c.name, None);
         assert_eq!(c.columns, vec!["a", "b"]);
         assert_eq!(c.name_or_default(), "t_a_b_idx");
+        // A long table's derived name keeps its label within the limit.
+        let long = format!("CREATE INDEX ON {} (a)", "t".repeat(125));
+        let name = ok(&long).name_or_default();
+        assert!(name.len() <= 128 && name.ends_with("_idx"), "{name}");
     }
 
     #[test]

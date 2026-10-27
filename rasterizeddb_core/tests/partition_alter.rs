@@ -1096,3 +1096,93 @@ fn a_primary_key_answers_to_its_own_name_only() {
         c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 2)"));
     }
 }
+
+/// `<stem><label>` within 128 bytes, the stem cut so the label survives (as
+/// the engine's `name_with_label`; ASCII here).
+fn cut_name(stem: &str, label: &str) -> String {
+    format!("{}{}", &stem[..stem.len().min(128 - label.len())], label)
+}
+
+/// With a 125-byte table name, `<table>_pkey` is cut to keep its label, and
+/// every site that names or compares it agrees: an unnamed composite or
+/// one-column PRIMARY KEY, by CREATE TABLE or ADD, is the primary key (a
+/// second is 42P16, not 42710 or 0A000), it drops by its cut name, an
+/// inline UNIQUE drops by its cut `<table>_<col>_key`, and row locks frame
+/// their key from it.
+#[test]
+fn a_long_table_names_its_keys_as_it_compares_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (lead, part) in [("q", ""), ("p", " PARTITION BY HASH (a) PARTITIONS 4")] {
+        // A composite key from CREATE TABLE, and a narrower NOT NULL UNIQUE
+        // that would be the row locks' key if the primary key went unseen.
+        let t = format!("{lead}{}", "y".repeat(124));
+        let pk = cut_name(&t, "_pkey");
+        c.ok(&format!(
+            "CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, \
+             PRIMARY KEY (a, b), CONSTRAINT {lead}_v_u UNIQUE (a)){part}"
+        ));
+        c.ok(&format!("INSERT INTO {t} (a, b, v) VALUES (1, 1, 1), (2, 2, 2)"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        // The row locks' key is the primary key: dropping the other UNIQUE
+        // under a lock does not change it, so it is not refused (55006).
+        c.ok("BEGIN");
+        c.ok(&format!("SELECT * FROM {t} WHERE a = 1 AND b = 1 FOR UPDATE"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {lead}_v_u"));
+        c.ok("COMMIT");
+        let mut other = server.connect();
+        other.ok("SET lock_timeout = '300ms'");
+        c.ok("BEGIN");
+        c.ok(&format!("SELECT * FROM {t} WHERE a = 1 AND b = 1 FOR UPDATE"));
+        let e = other.simple(&format!("UPDATE {t} SET v = 9 WHERE a = 1 AND b = 1")).expect_err("a locked row");
+        assert!(e.message.contains("is locked by transaction"), "{t}: {e}");
+        other.ok(&format!("UPDATE {t} SET v = 9 WHERE a = 2 AND b = 2"));
+        c.ok("COMMIT");
+        drop(other);
+        // Dropped by its cut name; added again unnamed, by ADD.
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {pk}"));
+        c.ok(&format!("ALTER TABLE {t} ADD PRIMARY KEY (a, b)"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {pk}"));
+        // One column: by ADD, then by CREATE TABLE.
+        c.ok(&format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"));
+        assert!(is_primary(&mut c, &t, "a"), "{t}: ADD PRIMARY KEY (a)");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a, b)"), "42P16");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {pk}"));
+        assert!(!is_primary(&mut c, &t, "a"), "{t}: dropped");
+
+        let s = format!("{lead}{}", "z".repeat(124));
+        // An inline UNIQUE without the partition key is plain-only.
+        let w = if part.is_empty() { "w BIGINT UNIQUE" } else { "w BIGINT" };
+        c.ok(&format!("CREATE TABLE {s} (a BIGINT NOT NULL, v BIGINT, {w}, PRIMARY KEY (a)){part}"));
+        assert!(is_primary(&mut c, &s, "a"), "{s}: CREATE TABLE … PRIMARY KEY (a)");
+        expect_code(&mut c, &format!("ALTER TABLE {s} ADD PRIMARY KEY (a, v)"), "42P16");
+        // Its index, its ON CONFLICT target, its index's DROP refusal: all
+        // by the cut name.
+        let pk_s = cut_name(&s, "_pkey");
+        let indexes = c.ok(&format!("SELECT indexname FROM pg_indexes WHERE tablename = '{s}'")).rows;
+        assert!(indexes.iter().any(|r| r[0].as_deref() == Some(pk_s.as_str())), "{s}: {indexes:?}");
+        c.ok(&format!("INSERT INTO {s} (a, v) VALUES (1, 1)"));
+        let r = c.ok(&format!("INSERT INTO {s} (a, v) VALUES (1, 5) ON CONFLICT ON CONSTRAINT {pk_s} DO NOTHING"));
+        assert_eq!(r.tags, vec!["INSERT 0 0".to_string()], "{s}");
+        expect_code(&mut c, &format!("DROP INDEX {pk_s}"), "2BP01");
+        c.ok(&format!("ALTER TABLE {s} DROP CONSTRAINT {pk_s}"));
+        assert!(!is_primary(&mut c, &s, "a"), "{s}: dropped");
+        // An inline UNIQUE, by its cut `<table>_<col>_key`.
+        if part.is_empty() {
+            c.ok(&format!("INSERT INTO {s} (a, v, w) VALUES (3, 3, 1)"));
+            expect_code(&mut c, &format!("INSERT INTO {s} (a, v, w) VALUES (4, 4, 1)"), "23505");
+            c.ok(&format!("ALTER TABLE {s} DROP CONSTRAINT {}", cut_name(&format!("{s}_w"), "_key")));
+            c.ok(&format!("INSERT INTO {s} (a, v, w) VALUES (4, 4, 1)"));
+        }
+
+        // Inline, in CREATE TABLE.
+        let i = format!("{lead}{}", "i".repeat(124));
+        c.ok(&format!("CREATE TABLE {i} (a BIGINT PRIMARY KEY, v BIGINT){part}"));
+        assert!(is_primary(&mut c, &i, "a"), "{i}: inline");
+        expect_code(&mut c, &format!("ALTER TABLE {i} ADD PRIMARY KEY (a, v)"), "42P16");
+        c.ok(&format!("ALTER TABLE {i} DROP CONSTRAINT {}", cut_name(&i, "_pkey")));
+        assert!(!is_primary(&mut c, &i, "a"), "{i}: dropped");
+    }
+}

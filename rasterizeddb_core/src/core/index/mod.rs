@@ -1910,11 +1910,14 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
         is_deleted: false,
     };
     if let Some(pk) = schema.primary_key.as_deref().and_then(by_name) {
-        add(implicit(format!("{}_pkey", schema.name), vec![pk]), true, &mut out);
+        add(implicit(crate::core::rql::unique_key::pkey_name(&schema.name), vec![pk]), true, &mut out);
     }
     for f in schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
         add(
-            implicit(format!("{}_{}_key", schema.name, f.name), vec![f.write_order as u32]),
+            implicit(
+                crate::core::rql::unique_key::implicit_key_name(&schema.name, &f.name),
+                vec![f.write_order as u32],
+            ),
             true,
             &mut out,
         );

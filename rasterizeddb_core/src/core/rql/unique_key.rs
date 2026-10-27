@@ -420,7 +420,7 @@ impl UniqueKey {
     /// The name PostgreSQL would give an unnamed constraint: the table, its
     /// columns, and `key`.
     pub fn default_name(table: &str, columns: &[String]) -> String {
-        format!("{}_key", key_stem(table, columns))
+        name_with_label(&key_stem(table, columns), "_key")
     }
 }
 
@@ -813,6 +813,21 @@ fn stored_name_within(name: &str, limit: usize) -> String {
     name[..len].to_string()
 }
 
+/// The name of `table`'s primary key when it was not given one:
+/// `<table>_pkey`, the table's name cut so the label survives. The one
+/// spelling every site builds and compares it by: with a table name over 123
+/// bytes, a comparison against the uncut `format!("{table}_pkey")` missed
+/// the key the parser had named.
+pub fn pkey_name(table: &str) -> String {
+    name_with_label(table, "_pkey")
+}
+
+/// The name of the UNIQUE a column declared inline carries:
+/// `<table>_<column>_key`, cut as [`name_with_label`] cuts it.
+pub fn implicit_key_name(table: &str, column: &str) -> String {
+    UniqueKey::default_name(table, std::slice::from_ref(&column.to_string()))
+}
+
 /// How many numbered names [`choose_name`] tries before it gives up.
 pub const NAME_ATTEMPTS: usize = 10_000;
 
@@ -923,7 +938,7 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // all named a constraint PostgreSQL would not have.
     let name = name.unwrap_or_else(|| {
         if rest_upper.starts_with("PRIMARY KEY") {
-            name_with_label(table, "_pkey")
+            pkey_name(table)
         } else {
             name_with_label(&key_stem(table, &columns), "_key")
         }
