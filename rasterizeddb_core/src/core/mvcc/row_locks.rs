@@ -490,6 +490,27 @@ impl RowLocks {
         self.acquire_in(Space::Row, table, key, tx, strength, is_live)
     }
 
+    /// Whether `tx`'s transaction already holds a row lock on this row, of
+    /// either strength. A locking read asks before it acquires: a row it
+    /// locked earlier cannot have changed under it since, and one it locks
+    /// now may have been changed after its scan's snapshot (the executor's
+    /// `lock_selected_rows`).
+    pub fn holds(&self, table: &str, key: &[u8], tx: TxId) -> bool {
+        if self.row_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let tx = self.txn_of(tx);
+        let inner = self.lock();
+        let Some(name_id) = inner.names.get(table).copied() else {
+            return false;
+        };
+        match inner.rows.get(&(name_id, Key::from_slice(key))) {
+            Some(Holder::Exclusive(owner)) => *owner == tx,
+            Some(Holder::Shared(owners)) => owners.contains(&tx),
+            None => false,
+        }
+    }
+
     /// Who holds a conflicting lock on this row, without taking one.
     ///
     /// The read-only half of [`RowLocks::acquire`], for callers that must not

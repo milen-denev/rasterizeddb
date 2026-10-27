@@ -153,12 +153,13 @@ async fn nowait_and_skip_locked_see_the_whole_composite_key() {
     }
 }
 
-/// A `FOR UPDATE` holder blocks an `UPDATE` of the same row through another
-/// session, routed or fanned out, until it commits; a row sharing its first
-/// key column is written at once.
+/// A `FOR UPDATE` holder refuses an `UPDATE` of the same row through another
+/// session, routed or fanned out, at once and until it commits (a writer
+/// does not wait: it could not re-evaluate what it writes after the wait); a
+/// row sharing the held key's first column is written at once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_held_row_blocks_a_writer_until_commit() {
-    let dir = root("blocks");
+async fn a_held_row_refuses_a_writer_until_commit() {
+    let dir = root("refuses");
     let server = TestServer::start_file_backed(&dir.0).await.expect("server");
     let mut setup = connect(&server).await;
     for (kind, partitioning) in KINDS {
@@ -166,8 +167,10 @@ async fn a_held_row_blocks_a_writer_until_commit() {
         for (what, writer) in [
             ("routed", format!("UPDATE {t} SET state = 'stolen' WHERE tenant_id = 1 AND id = 1 AND state = 'new'")),
             ("fanned out", format!("UPDATE {t} SET state = 'stolen' WHERE id = 1 AND state = 'new'")),
+            ("deleted", format!("DELETE FROM {t} WHERE id = 1 AND state = 'new'")),
         ] {
             exec(&mut setup, &format!("UPDATE {t} SET state = 'new' WHERE id = 1")).await.unwrap();
+            let before = states(&mut setup, &t).await;
             let mut a = connect(&server).await;
             exec(&mut a, "BEGIN").await.unwrap();
             keys(&mut a, &format!("SELECT tenant_id, id FROM {t} WHERE tenant_id = 1 AND id = 1 FOR UPDATE"))
@@ -176,54 +179,44 @@ async fn a_held_row_blocks_a_writer_until_commit() {
 
             let mut b = connect(&server).await;
             let started = Instant::now();
-            let blocked = tokio::spawn(async move { (exec(&mut b, &writer).await, started.elapsed()) });
+            let e = exec(&mut b, &writer).await.expect_err(&format!("{t} {what}: a writer ran past a held row"));
+            assert!(e.to_string().contains("is locked by transaction"), "{t} {what}: {e}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{t} {what}: the writer waited {:?}", started.elapsed());
+            assert_eq!(states(&mut setup, &t).await, before, "{t} {what}: a refused writer wrote");
 
             // Another row of the same tenant is not held.
-            let mut c = connect(&server).await;
-            let quick = Instant::now();
-            let n = exec(&mut c, &format!("UPDATE {t} SET claimed_by = 7 WHERE tenant_id = 1 AND id = 2"))
+            let n = exec(&mut b, &format!("UPDATE {t} SET claimed_by = 7 WHERE tenant_id = 1 AND id = 2"))
                 .await
                 .unwrap_or_else(|e| panic!("{t} {what}: a row sharing the held key's first column: {e}"));
             assert_eq!(n, 1, "{t} {what}");
-            assert!(
-                quick.elapsed() < Duration::from_secs(2),
-                "{t} {what}: a row sharing the held key's first column waited {:?}",
-                quick.elapsed()
-            );
-
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            assert!(!blocked.is_finished(), "{t} {what}: the writer ran past a row held FOR UPDATE");
 
             exec(&mut a, &format!("UPDATE {t} SET state = 'claimed' WHERE tenant_id = 1 AND id = 1"))
                 .await
                 .unwrap_or_else(|e| panic!("{t}: the holder's own write: {e}"));
-            let held_for = Instant::now();
             exec(&mut a, "COMMIT").await.unwrap();
-            let (outcome, waited) = tokio::time::timeout(Duration::from_secs(20), blocked)
-                .await
-                .expect("the writer never finished")
-                .expect("join");
-            let n = outcome.unwrap_or_else(|e| panic!("{t} {what}: the writer failed after the commit: {e}"));
-            assert!(waited >= Duration::from_millis(600), "{t} {what}: finished after {waited:?}");
-            assert!(held_for.elapsed() < Duration::from_secs(10), "{t} {what}");
-
-            // The writer re-read the row after the holder committed: (1, 1) is
-            // the holder's, and only the other tenants' rows were stolen.
+            // Released: the writer runs, and finds (1, 1) claimed.
+            let n = exec(&mut b, &writer).await.unwrap_or_else(|e| panic!("{t} {what}: after COMMIT: {e}"));
             let after = states(&mut setup, &t).await;
-            assert_eq!(after[&(1, 1)].0, "claimed", "{t} {what}: the writer overwrote the holder's claim");
-            let stolen: Vec<(i64, i64)> = after.iter().filter(|(_, (s, _))| s == "stolen").map(|(k, _)| *k).collect();
-            let want: Vec<(i64, i64)> =
-                if what == "routed" { vec![] } else { (2..=TENANTS).map(|tenant| (tenant, 1)).collect() };
-            assert_eq!(stolen, want, "{t} {what}");
-            assert_eq!(n, want.len() as u64, "{t} {what}: the writer's count");
+            assert_eq!(after.get(&(1, 1)).map(|s| s.0.as_str()), Some("claimed"), "{t} {what}");
+            let others: u64 = if what == "routed" { 0 } else { (TENANTS - 1) as u64 };
+            assert_eq!(n, others, "{t} {what}: the writer's count");
             assert_eq!(after[&(1, 2)].1, Some(7), "{t} {what}");
+            if what == "deleted" {
+                assert_eq!(after.len() as i64, TENANTS * IDS - (TENANTS - 1), "{t}");
+                for tenant in 2..=TENANTS {
+                    exec(&mut setup, &format!("INSERT INTO {t} (tenant_id, id, state) VALUES ({tenant}, 1, 'new')"))
+                        .await
+                        .unwrap();
+                }
+            }
         }
     }
 }
 
-/// A cycle through a row lock and a table lock, either way round and with
-/// either a locking read or a writer waiting on the row, ends in exactly one
-/// 40P01 within a few seconds.
+/// A cycle through a row lock and a table lock, with a locking read (the
+/// key in its select list or not) waiting on the row, ends in exactly one
+/// 40P01 within a few seconds. A writer never waits on a row lock, so it
+/// cannot close such a cycle.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cycle_through_a_composite_row_lock_and_a_table_lock_is_one_deadlock() {
     let dir = root("deadlock");
@@ -234,7 +227,7 @@ async fn a_cycle_through_a_composite_row_lock_and_a_table_lock_is_one_deadlock()
         let t = queue(&mut setup, kind, partitioning).await;
         for waiter in [
             format!("SELECT tenant_id, id FROM {t} WHERE tenant_id = 3 AND id = 4 FOR UPDATE"),
-            format!("UPDATE {t} SET claimed_by = 1 WHERE tenant_id = 3 AND id = 4"),
+            format!("SELECT id, claimed_by FROM {t} WHERE id = 4 AND tenant_id = 3 FOR NO KEY UPDATE"),
         ] {
             let mut a = connect(&server).await;
             exec(&mut a, "BEGIN").await.unwrap();
@@ -270,8 +263,11 @@ async fn a_cycle_through_a_composite_row_lock_and_a_table_lock_is_one_deadlock()
 }
 
 /// The job-queue pattern: workers claim with `FOR UPDATE SKIP LOCKED LIMIT
-/// k` and mark what they claimed, each in its own block. Every job is claimed
-/// exactly once, and what is stored names the worker that claimed it.
+/// k` and mark what they claimed by key alone, each in its own block. Every
+/// job is claimed exactly once, and what is stored names the worker that
+/// claimed it. The mark has no `AND state = 'new'`: only the locking read
+/// keeps a worker from a job another has finished, so a lock taken on a row
+/// changed since the scan's snapshot must not return the row as scanned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_skip_locked_job_queue_claims_every_job_exactly_once() {
     const WORKERS: i64 = 6;
@@ -305,7 +301,7 @@ async fn a_skip_locked_job_queue_claims_every_job_exactly_once() {
                                 &mut c,
                                 &format!(
                                     "UPDATE {t} SET state = 'done', claimed_by = {w} \
-                                     WHERE tenant_id = {tenant} AND id = {id} AND state = 'new'"
+                                     WHERE tenant_id = {tenant} AND id = {id}"
                                 ),
                             )
                             .await?;
@@ -727,5 +723,308 @@ async fn delete_using_returns_each_row_once_under_a_concurrent_writer() {
             .await
             .unwrap();
         assert_eq!(n, 0, "{t}");
+    }
+}
+
+/// The value table of the lost-update repros: `(tag, k)` keyed, `v = 0`,
+/// and a source giving tag 1 the weight 100.
+async fn lost_update_tables(conn: &mut PgConnection, kind: &str, partitioning: &str) -> (String, String) {
+    let (t, s) = (format!("ft_{kind}"), format!("fsrc_{kind}"));
+    let partitioning = partitioning.replace("tenant_id", "tag");
+    exec(
+        conn,
+        &format!("CREATE TABLE {t} (tag BIGINT NOT NULL, k BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (tag, k)){partitioning}"),
+    )
+    .await
+    .unwrap();
+    exec(conn, &format!("INSERT INTO {t} (tag, k, v) VALUES (1, 1, 0)")).await.unwrap();
+    exec(conn, &format!("CREATE TABLE {s} (tag BIGINT NOT NULL, w BIGINT NOT NULL)")).await.unwrap();
+    exec(conn, &format!("INSERT INTO {s} (tag, w) VALUES (1, 100)")).await.unwrap();
+    (t, s)
+}
+
+async fn value_of(conn: &mut PgConnection, t: &str) -> i64 {
+    sqlx::query(AssertSqlSafe(format!("SELECT v FROM {t} WHERE tag = 1 AND k = 1")))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read back")
+        .get::<i64, _>(0)
+}
+
+/// The holder of a row lock sets `v = 5` and commits `after` into the
+/// writer's run (or as soon as the writer has finished, if sooner); returns
+/// the writer's outcome.
+async fn write_against_a_holder(
+    server: &TestServer,
+    t: &str,
+    writer: String,
+    after: Duration,
+) -> Result<u64, sqlx::Error> {
+    let mut a = connect(server).await;
+    exec(&mut a, "BEGIN").await.unwrap();
+    keys(&mut a, &format!("SELECT tag, k FROM {t} WHERE tag = 1 AND k = 1 FOR UPDATE")).await.expect("lock");
+    let mut b = connect(server).await;
+    let mut hb = tokio::spawn(async move { exec(&mut b, &writer).await });
+    let early = tokio::time::timeout(after, &mut hb).await;
+    exec(&mut a, &format!("UPDATE {t} SET v = 5 WHERE tag = 1 AND k = 1")).await.expect("the holder's write");
+    exec(&mut a, "COMMIT").await.expect("commit");
+    match early {
+        Ok(joined) => joined.expect("join"),
+        Err(_) => tokio::time::timeout(Duration::from_secs(30), hb).await.expect("the writer hung").expect("join"),
+    }
+}
+
+/// An `UPDATE … FROM` meeting a row another transaction holds never writes
+/// the values it computed from its join over the holder's commit: it fails,
+/// or it writes `v + w` over the holder's `v`. It used to wait for the
+/// holder, then write 0 + 100 over the holder's 5 and report success.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_never_writes_over_a_holders_commit() {
+    let dir = root("lost_update");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    for (kind, partitioning) in KINDS {
+        let (t, s) = lost_update_tables(&mut setup, kind, partitioning).await;
+        let writer = format!("UPDATE {t} AS t SET v = t.v + s.w FROM {s} s WHERE t.tag = s.tag");
+        let outcome = write_against_a_holder(&server, &t, writer, Duration::from_secs(3)).await;
+        let v = value_of(&mut setup, &t).await;
+        match outcome {
+            Err(e) => {
+                assert!(e.to_string().contains("is locked by transaction"), "{t}: {e}");
+                assert_eq!(v, 5, "{t}: the refused writer changed the row");
+            }
+            Ok(n) => assert_eq!((n, v), (1, 105), "{t}: the writer's join values landed over the holder's commit"),
+        }
+    }
+}
+
+/// The per-row recheck of `UPDATE … FROM` (`… AND t.v = 0`) is never
+/// dropped because the row was locked: the write that followed a lock
+/// timeout used to retry by key alone, without it, and land once the holder
+/// had committed `v = 5` (`UPDATE 1`, v = 100, where 0 rows and v = 5 were
+/// right).
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_keeps_its_recheck_when_the_row_is_locked() {
+    let dir = root("recheck_kept");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    for (kind, partitioning) in KINDS {
+        let (t, s) = lost_update_tables(&mut setup, kind, partitioning).await;
+        let writer = format!("UPDATE {t} AS t SET v = t.v + s.w FROM {s} s WHERE t.tag = s.tag AND t.v = 0");
+        let outcome = write_against_a_holder(&server, &t, writer, Duration::from_secs(13)).await;
+        let v = value_of(&mut setup, &t).await;
+        match outcome {
+            Err(e) => assert!(e.to_string().contains("is locked by transaction"), "{t}: {e}"),
+            Ok(n) => assert_eq!(n, 0, "{t}: a write landed without its recheck"),
+        }
+        assert_eq!(v, 5, "{t}");
+    }
+}
+
+/// Every key type locks one row however the statement reached it: the
+/// locker's cells come from the select pipeline at the column's declared
+/// scale and the writer's through a subquery at the engine's, and a
+/// `NUMERIC(10,2)` key used to differ between the two (150 and 1500000000),
+/// so the writer never met the lock. Select lists name the key columns out
+/// of their declared order, or not at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_key_type_is_locked_and_checked_by_the_same_bytes() {
+    let dir = root("key_types");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    let u1 = "6f1c0d6e-9a1b-4a55-8a0b-2d7f3c1e9a01";
+    let u2 = "6f1c0d6e-9a1b-4a55-8a0b-2d7f3c1e9a02";
+    // (table, create, rows, select list, held key, other key)
+    let cases: Vec<(&str, String, String, &str, String, String)> = vec![
+        (
+            "num_one",
+            "CREATE TABLE num_one (amt NUMERIC(10,2) PRIMARY KEY, n INT)".into(),
+            "INSERT INTO num_one (amt, n) VALUES (1.50, 0), (2.25, 0)".into(),
+            "n, amt",
+            "amt = 1.50".into(),
+            "amt = 2.25".into(),
+        ),
+        (
+            "num_two",
+            "CREATE TABLE num_two (tag BIGINT NOT NULL, amt NUMERIC(10,2) NOT NULL, n INT, PRIMARY KEY (tag, amt))".into(),
+            "INSERT INTO num_two (tag, amt, n) VALUES (1, 1.50, 0), (1, 2.25, 0)".into(),
+            "amt, n, tag",
+            "tag = 1 AND amt = 1.50".into(),
+            "tag = 1 AND amt = 2.25".into(),
+        ),
+        (
+            "num_part",
+            "CREATE TABLE num_part (tag BIGINT NOT NULL, amt NUMERIC(10,2) NOT NULL, n INT, PRIMARY KEY (tag, amt)) \
+             PARTITION BY HASH (tag) PARTITIONS 4"
+                .into(),
+            "INSERT INTO num_part (tag, amt, n) VALUES (1, 1.50, 0), (1, 2.25, 0)".into(),
+            "n",
+            "tag = 1 AND amt = 1.50".into(),
+            "tag = 1 AND amt = 2.25".into(),
+        ),
+        (
+            "num_nine",
+            "CREATE TABLE num_nine (amt NUMERIC(10,9) PRIMARY KEY, n INT)".into(),
+            "INSERT INTO num_nine (amt, n) VALUES (1.5, 0), (2.25, 0)".into(),
+            "amt, n",
+            "amt = 1.5".into(),
+            "amt = 2.25".into(),
+        ),
+        (
+            "txt",
+            "CREATE TABLE txt (tag BIGINT NOT NULL, name TEXT NOT NULL, n INT, PRIMARY KEY (tag, name))".into(),
+            "INSERT INTO txt (tag, name, n) VALUES (1, 'it''s', 0), (1, 'b', 0)".into(),
+            "n, name, tag",
+            "tag = 1 AND name = 'it''s'".into(),
+            "tag = 1 AND name = 'b'".into(),
+        ),
+        (
+            "uid",
+            "CREATE TABLE uid (id UUID NOT NULL PRIMARY KEY, n INT)".into(),
+            format!("INSERT INTO uid (id, n) VALUES ('{u1}', 0), ('{u2}', 0)"),
+            "n, id",
+            format!("id = '{u1}'"),
+            format!("id = '{u2}'"),
+        ),
+    ];
+    for (t, create, rows, list, held, other) in cases {
+        exec(&mut setup, &create).await.unwrap_or_else(|e| panic!("{t}: {e}"));
+        exec(&mut setup, &rows).await.unwrap_or_else(|e| panic!("{t}: {e}"));
+        let mut a = connect(&server).await;
+        exec(&mut a, "BEGIN").await.unwrap();
+        let got = sqlx::query(AssertSqlSafe(format!("SELECT {list} FROM {t} WHERE {held} FOR UPDATE")))
+            .fetch_all(&mut a)
+            .await
+            .unwrap_or_else(|e| panic!("{t}: lock: {e}"));
+        assert_eq!(got.len(), 1, "{t}");
+        assert_eq!(got[0].len(), list.split(',').count(), "{t}: the key fetch reached the client");
+
+        let mut b = connect(&server).await;
+        let e = exec(&mut b, &format!("UPDATE {t} SET n = 9 WHERE {held}"))
+            .await
+            .expect_err(&format!("{t}: a writer ran past the held row"));
+        assert!(e.to_string().contains("is locked by transaction"), "{t}: {e}");
+        exec(&mut b, "BEGIN").await.unwrap();
+        let e = exec(&mut b, &format!("SELECT {list} FROM {t} WHERE {held} FOR UPDATE NOWAIT"))
+            .await
+            .expect_err(&format!("{t}: NOWAIT on the held row succeeded"));
+        assert_eq!(code(&e).as_deref(), Some("55P03"), "{t}: {e}");
+        exec(&mut b, "ROLLBACK").await.unwrap();
+        assert_eq!(exec(&mut b, &format!("UPDATE {t} SET n = 3 WHERE {other}")).await.expect("other row"), 1, "{t}");
+
+        exec(&mut a, "COMMIT").await.unwrap();
+        assert_eq!(exec(&mut b, &format!("UPDATE {t} SET n = 9 WHERE {held}")).await.expect("released"), 1, "{t}");
+        let ns: BTreeSet<i32> = sqlx::query(AssertSqlSafe(format!("SELECT n FROM {t}")))
+            .fetch_all(&mut b)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<i32, _>(0))
+            .collect();
+        assert_eq!(ns, BTreeSet::from([3, 9]), "{t}");
+    }
+}
+
+/// A locking read need not select the key: the table keeps one identifying
+/// key (here the primary key `id`, not the inline UNIQUE `email`; for the
+/// partitioned queue, both key columns), and the scan fetches it for the
+/// lock without returning it. A nullable key fetched that way still refuses
+/// a NULL row rather than keying every NULL row alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locking_read_need_not_select_the_key() {
+    let dir = root("hidden_key");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    exec(&mut setup, "CREATE TABLE hk (id BIGINT PRIMARY KEY, email TEXT UNIQUE, n INT)").await.unwrap();
+    exec(&mut setup, "INSERT INTO hk (id, email, n) VALUES (1, 'a', 0), (2, 'b', 0)").await.unwrap();
+    let q = queue(&mut setup, "part", KINDS[1].1).await;
+    for (t, read, held_write, other_write) in [
+        ("hk", "SELECT email FROM hk WHERE email = 'a' FOR UPDATE", "UPDATE hk SET n = 1 WHERE id = 1", "UPDATE hk SET n = 1 WHERE id = 2"),
+        (
+            q.as_str(),
+            "SELECT state FROM q_part WHERE tenant_id = 2 AND id = 3 FOR UPDATE",
+            "UPDATE q_part SET claimed_by = 1 WHERE tenant_id = 2 AND id = 3",
+            "UPDATE q_part SET claimed_by = 1 WHERE tenant_id = 2 AND id = 4",
+        ),
+    ] {
+        let mut a = connect(&server).await;
+        exec(&mut a, "BEGIN").await.unwrap();
+        let got = sqlx::query(AssertSqlSafe(read.to_string()))
+            .fetch_all(&mut a)
+            .await
+            .unwrap_or_else(|e| panic!("{t}: a locking read without the key: {e}"));
+        assert_eq!(got.len(), 1, "{t}");
+        assert_eq!(got[0].len(), 1, "{t}: the key fetch reached the client");
+        let mut b = connect(&server).await;
+        let e = exec(&mut b, held_write).await.expect_err(&format!("{t}: the row was not locked"));
+        assert!(e.to_string().contains("is locked by transaction"), "{t}: {e}");
+        assert_eq!(exec(&mut b, other_write).await.expect("other row"), 1, "{t}");
+        exec(&mut a, "COMMIT").await.unwrap();
+        assert_eq!(exec(&mut b, held_write).await.expect("released"), 1, "{t}");
+    }
+
+    exec(&mut setup, "CREATE TABLE hk_null (u BIGINT UNIQUE, n INT)").await.unwrap();
+    exec(&mut setup, "INSERT INTO hk_null (u, n) VALUES (1, 0), (NULL, 1), (NULL, 2)").await.unwrap();
+    exec(&mut setup, "BEGIN").await.unwrap();
+    let e = exec(&mut setup, "SELECT n FROM hk_null WHERE n = 1 FOR UPDATE")
+        .await
+        .expect_err("a NULL row was keyed by its key");
+    assert!(e.to_string().contains("is NULL"), "{e}");
+    exec(&mut setup, "ROLLBACK").await.unwrap();
+    exec(&mut setup, "BEGIN").await.unwrap();
+    let got = sqlx::query("SELECT n FROM hk_null WHERE n = 0 FOR UPDATE").fetch_all(&mut setup).await.expect("non-NULL");
+    assert_eq!(got.len(), 1);
+    exec(&mut setup, "COMMIT").await.unwrap();
+}
+
+/// A locking read that waited for a holder returns what the holder left:
+/// a row the holder changed so it no longer matches is left out, and a row
+/// it changed otherwise comes back as changed. It used to come back as the
+/// waiter's scan saw it, handing a claim query a job already done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locking_read_that_waited_returns_the_rows_as_the_holder_left_them() {
+    let dir = root("waited");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let mut setup = connect(&server).await;
+    for (kind, partitioning) in KINDS {
+        let t = queue(&mut setup, kind, partitioning).await;
+        let mut a = connect(&server).await;
+        exec(&mut a, "BEGIN").await.unwrap();
+        keys(&mut a, &format!("SELECT tenant_id, id FROM {t} WHERE tenant_id = 1 AND id <= 2 FOR UPDATE"))
+            .await
+            .expect("lock");
+        let mut b = connect(&server).await;
+        let t2 = t.clone();
+        let hb = tokio::spawn(async move {
+            exec(&mut b, "BEGIN").await.unwrap();
+            let rows = sqlx::query(AssertSqlSafe(format!(
+                "SELECT id, state, claimed_by, tenant_id FROM {t2} WHERE tenant_id = 1 AND id <= 3 AND state = 'new' \
+                 FOR UPDATE"
+            )))
+            .fetch_all(&mut b)
+            .await;
+            let _ = exec(&mut b, "COMMIT").await;
+            rows.map(|rows| {
+                rows.iter()
+                    .map(|r| (r.get::<i64, _>(0), r.get::<String, _>(1), r.get::<Option<i64>, _>(2)))
+                    .collect::<Vec<_>>()
+            })
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!hb.is_finished(), "{t}: the locking read did not wait for the holder");
+        exec(&mut a, &format!("UPDATE {t} SET state = 'done' WHERE tenant_id = 1 AND id = 1")).await.unwrap();
+        exec(&mut a, &format!("UPDATE {t} SET claimed_by = 7 WHERE tenant_id = 1 AND id = 2")).await.unwrap();
+        exec(&mut a, "COMMIT").await.unwrap();
+        let mut got = tokio::time::timeout(Duration::from_secs(20), hb)
+            .await
+            .expect("the waiter hung")
+            .expect("join")
+            .unwrap_or_else(|e| panic!("{t}: {e}"));
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(2, "new".to_string(), Some(7)), (3, "new".to_string(), None)],
+            "{t}: the waiter returned rows as its scan saw them"
+        );
     }
 }

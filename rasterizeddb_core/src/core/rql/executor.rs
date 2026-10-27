@@ -4373,7 +4373,7 @@ async fn delete_using_join(
             return Err("the join returned no key".to_string());
         }
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
-        if seen.insert(key.row_key(&cells)?) {
+        if seen.insert(key.row_key(&cells, CellScale::Engine)?) {
             named_rows.push((row, key.predicate(&cells)?));
         }
     }
@@ -4698,7 +4698,7 @@ async fn update_from_join(
     let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
     for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
-        if seen.insert(key.row_key(&cells)?) {
+        if seen.insert(key.row_key(&cells, CellScale::Engine)?) {
             named_rows.push((row, key.predicate(&cells)?));
         }
     }
@@ -4934,18 +4934,70 @@ async fn run_per_row_write(
         if response.first() != Some(&3u8) || attempt == 1 || statement == key_only {
             return Ok(response);
         }
-        // A conflict is the statement's to retry whole, never the fallback's.
+        // A conflict is the statement's to retry whole, never the fallback's;
+        // and a lock, a deadlock or a cancellation says nothing about whether
+        // the recheck could run: the key-only write that followed one used to
+        // land without the recheck once the holder had committed.
         let text = String::from_utf8_lossy(&response[1..]);
-        let marker = crate::core::row::table::Table::<
-            crate::core::storage_providers::file_sync::LocalStorageProvider,
-        >::CONFLICT_RETRYABLE;
-        if text.contains("could not serialize") || text.contains(marker) {
+        if per_row_error_is_final(&text) {
             return Ok(response);
         }
         debug!("per-row recheck could not run ({}); writing by key alone", text);
         statement = key_only.clone();
     }
     unreachable!("the loop returns on its second pass")
+}
+
+/// Whether a per-row write's error ends `run_per_row_write` rather than
+/// letting it retry by key alone without the join's recheck. The fallback is
+/// for a recheck the single-relation `UPDATE`/`DELETE` cannot evaluate; every
+/// error here is about the row or the statement, and the key-only write
+/// would meet it too, or worse, succeed once the cause has passed and write
+/// a row the recheck would have refused.
+fn per_row_error_is_final(text: &str) -> bool {
+    let marker = crate::core::row::table::Table::<
+        crate::core::storage_providers::file_sync::LocalStorageProvider,
+    >::CONFLICT_RETRYABLE;
+    [
+        "could not serialize",
+        marker,
+        // `refuse_write_to_locked_rows`.
+        "is locked by transaction",
+        // A lock wait's ends: NOWAIT, the timeout, a deadlock.
+        "could not obtain lock",
+        "timed out waiting",
+        "deadlock detected",
+        // `statement_timeout`, a client gone, `lock_timeout`.
+        "canceling statement",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
+#[cfg(test)]
+mod per_row_error_tests {
+    use super::per_row_error_is_final;
+
+    /// A lock, a lock wait's end, a deadlock, a cancellation and a conflict
+    /// each end the per-row write; only a recheck the single-relation write
+    /// could not evaluate falls back to the key. The write that fell back on
+    /// a lock error landed without its recheck once the holder committed.
+    #[test]
+    fn lock_deadlock_cancel_and_conflict_errors_never_fall_back_to_the_key() {
+        for text in [
+            "row of 't' is locked by transaction 9; the statement that locked it must finish first",
+            "could not obtain lock on a row of 't': held by another transaction",
+            "timed out waiting 10s for a lock on a row of 't' held by transaction 9",
+            "deadlock detected: transaction 5 waits for transaction 9",
+            "canceling statement due to statement timeout",
+            "canceling statement due to lock timeout",
+            "canceling statement because the client closed the connection",
+            "could not serialize access due to concurrent update",
+        ] {
+            assert!(per_row_error_is_final(text), "{text}");
+        }
+        assert!(!per_row_error_is_final("column 'q.x' does not exist"));
+    }
 }
 
 /// Where one assigned value comes from once the join has run.
@@ -5176,19 +5228,31 @@ fn constraint_columns(
 /// and `NOWAIT` (which either lock everything or fail), and only the ones this
 /// transaction could lock for `SKIP LOCKED`.
 ///
-/// The lock key is the row's unique column. A table without one cannot be
-/// locked row-by-row here, and that is refused rather than silently locking
-/// nothing — a claim query that locks nothing hands every worker the same rows.
+/// The lock key is the table's identifying key ([`identifying_key`]), whose
+/// cells the scan fetched for every row whether or not the select list names
+/// them (`keys`, one entry per row, in the key's order, at their declared
+/// scale). A table without one cannot be locked row-by-row here, and that is
+/// refused rather than silently locking nothing — a claim query that locks
+/// nothing hands every worker the same rows.
+///
+/// When a lock this transaction did not already hold was taken and a
+/// transaction `since` could not see has committed since, the rows may be
+/// older than their latest versions: `Err(LOCKED_ROWS_STALE)`, and
+/// [`execute_query_rows`] scans again.
+#[allow(clippy::too_many_arguments)]
 async fn lock_selected_rows(
     database: &Arc<Database>,
     table_name: &str,
     rows: Vec<crate::core::row::row::Row>,
+    keys: Vec<Vec<crate::core::row::row::Column>>,
+    key: Option<&IdentifyingKey>,
     lock: crate::core::rql::row_lock::RowLock,
     // How many rows the statement will actually return. Locking stops there:
     // PostgreSQL locks the rows it hands back and no others, and locking the
     // whole scan would let one worker reserve the entire queue while claiming
     // two rows of it.
     wanted: Option<usize>,
+    since: Option<&crate::core::mvcc::Visibility>,
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
     use crate::core::mvcc::row_locks::Acquired;
@@ -5198,48 +5262,32 @@ async fn lock_selected_rows(
         return Ok(rows);
     }
 
-    // The table's identifying key; on a partitioned table, the shell's, under
-    // the logical name every partition's rows are locked by (§6.2).
-    let key = {
-        let entry = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
-        let table = entry
-            .as_ref()
-            .clone()
-            .ok_or_else(|| format!("relation '{}' does not exist", table_name))?;
-        identifying_key(&table.schema).ok_or_else(|| {
-            format!(
-                "FOR UPDATE needs a unique column on '{}' to identify the rows it locks",
-                table_name
-            )
-        })?
+    // ROW EXCLUSIVE on the table, a partitioned one under its logical name,
+    // which every partition's rows are locked by (§6.2).
+    if database.table_for(table_name, owner(), TableMode::RowExclusive).await?.is_none() {
+        return Err(format!("relation '{}' does not exist", table_name));
+    }
+    let Some(key) = key else {
+        return Err(format!(
+            "FOR UPDATE needs a unique column on '{}' to identify the rows it locks",
+            table_name
+        ));
     };
-
-    // The key has to be in the row, which means the statement has to have
-    // selected it. Refused rather than approximated: locking the wrong row is
-    // worse than not locking.
-    let key_at = |row: &crate::core::row::row::Row| -> Option<Result<Vec<u8>, String>> {
-        let cells = key
-            .fields
-            .iter()
-            .map(|f| row.columns.iter().find(|c| u64::from(c.schema_id) == f.write_order))
-            .collect::<Option<Vec<_>>>()?;
-        Some(key.row_key(&cells))
-    };
+    if keys.len() != rows.len() {
+        return Err(format!("internal error: {} rows but {} row keys to lock them by", rows.len(), keys.len()));
+    }
 
     let mut kept = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut newly = false;
+    for (row, cells) in rows.into_iter().zip(keys) {
         if let Some(cap) = wanted {
             if kept.len() >= cap {
                 break;
             }
         }
-        let Some(row_key) = key_at(&row) else {
-            return Err(format!(
-                "FOR UPDATE needs '{}' in the select list to identify the rows it locks",
-                key.names().collect::<Vec<_>>().join("', '")
-            ));
-        };
-        let row_key = row_key?;
+        let cells: Vec<&crate::core::row::row::Column> = cells.iter().collect();
+        let row_key = key.row_key(&cells, CellScale::Declared)?;
+        let held = database.row_locks.holds(table_name, &row_key, tx);
 
         let outcome = acquire_row_lock(
             database,
@@ -5252,7 +5300,10 @@ async fn lock_selected_rows(
         .await?;
 
         match outcome {
-            Acquired::Yes => kept.push(row),
+            Acquired::Yes => {
+                newly |= !held;
+                kept.push(row);
+            }
             Acquired::Held(owner) => match lock.behaviour {
                 // The row belongs to someone else's claim; leaving it out is
                 // exactly what the clause asks for.
@@ -5273,6 +5324,9 @@ async fn lock_selected_rows(
                 }
             },
         }
+    }
+    if newly && since.is_some_and(|since| committed_since(database, since)) {
+        return Err(LOCKED_ROWS_STALE.to_string());
     }
     Ok(kept)
 }
@@ -5515,11 +5569,14 @@ fn check_not_null(
 /// checked under its logical name with its shell's key, as `FOR UPDATE`
 /// through it locks, whichever partition the row is in.
 ///
-/// A held row is waited for, as PostgreSQL's `UPDATE` waits for a `FOR UPDATE`
-/// holder, through the same bounded wait `FOR UPDATE` takes
-/// ([`acquire_row_lock`]): until the holder ends, `statement_timeout`, a
-/// deadlock (40P01) or [`LOCK_WAIT_TIMEOUT`]. It used to fail at once, which
-/// handed a job queue's writers an error where they should have queued.
+/// A held row fails the write at once rather than being waited for, unlike
+/// PostgreSQL, whose `UPDATE` waits and then re-evaluates its row. Waiting is
+/// sound only for a writer that re-reads the row and recomputes what it
+/// writes after the wait, and not every writer here does: `UPDATE … FROM`
+/// computes its `SET` values from the join before it writes, so a writer
+/// that waited for the holder's `COMMIT` then wrote those values over the
+/// holder's (`SET v = t.v + s.w` stored 100 where 105 was right). A locking
+/// read waits ([`acquire_row_lock`]); a writer only asks.
 #[inline(never)]
 async fn refuse_write_to_locked_rows(
     database: &Arc<Database>,
@@ -5571,13 +5628,14 @@ async fn refuse_write_to_locked_rows(
         }
         // A row whose key holds a NULL cannot have been locked: `FOR UPDATE`
         // refuses to name it.
-        let Ok(row_key) = key.row_key(&cells[..key.fields.len()]) else {
+        // `run_subquery` normalised its decimals to the engine scale.
+        let Ok(row_key) = key.row_key(&cells[..key.fields.len()], CellScale::Engine) else {
             continue;
         };
         // Asked for, not merely inspected: this transaction is about to write
         // the row, so it should hold the lock while it does.
         if let Acquired::Held(owner) =
-            acquire_row_lock(database, table_name, &row_key, LockStrength::Update, true, tx).await?
+            acquire_row_lock(database, table_name, &row_key, LockStrength::Update, false, tx).await?
         {
             return Err(format!(
                 "row of '{}' is locked by transaction {}; the statement that locked it must \
@@ -11553,6 +11611,23 @@ struct IdentifyingKey {
     /// In the key's declared order, which is the order the framed tuple and
     /// the write-back predicate use.
     fields: Vec<crate::core::row::schema::SchemaField>,
+    /// Each field's declared `NUMERIC` scale (`type_modifier::scale_of`),
+    /// the scale a [`CellScale::Declared`] decimal cell is at.
+    scales: Vec<u32>,
+}
+
+/// The scale a row's decimal key cells are at, which depends on the path
+/// that produced them and cannot be read off a sixteen-byte cell: the select
+/// pipeline leaves a column at its declared scale (`NUMERIC(10,2)`'s 1.50 is
+/// 150), and `run_subquery` normalises to the engine's (1500000000). A lock
+/// keyed by one and checked by the other never met (`IdentifyingKey::row_key`
+/// canonicalises from what the producer states).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellScale {
+    /// The select pipeline's cells: each column at its declared scale.
+    Declared,
+    /// `run_subquery`'s: every decimal at `value_codec::DECIMAL_SCALE`.
+    Engine,
 }
 
 impl IdentifyingKey {
@@ -11571,7 +11646,12 @@ impl IdentifyingKey {
     /// `Err` for a row whose key holds a NULL: it names no row (a unique key
     /// admits any number of NULLs), and the bytes a NULL travels as would
     /// name every NULL row at once.
-    fn row_key(&self, cells: &[&crate::core::row::row::Column]) -> Result<Vec<u8>, String> {
+    ///
+    /// A decimal is keyed by its value, not its cell: the unscaled integer
+    /// with trailing zeros stripped, and the scale left, from the scale `at`
+    /// says the producer's cells are at (or the one a seventeen-byte cell
+    /// carries). 1.50 at scale 2 and 1.500000000 at scale 9 are one key.
+    fn row_key(&self, cells: &[&crate::core::row::row::Column], at: CellScale) -> Result<Vec<u8>, String> {
         if let Some((field, _)) =
             self.fields.iter().zip(cells).find(|(_, c)| c.column_type == crate::core::db_type::DbType::NULL)
         {
@@ -11580,15 +11660,40 @@ impl IdentifyingKey {
                 field.name
             ));
         }
+        let value = |i: usize, cell: &crate::core::row::row::Column| -> Vec<u8> {
+            let bytes = cell.data.into_slice();
+            if self.fields[i].db_type != crate::core::db_type::DbType::DECIMAL {
+                return bytes.to_vec();
+            }
+            let Some((mut v, own)) = crate::core::value_codec::split_decimal_cell(bytes) else {
+                return bytes.to_vec();
+            };
+            let mut scale = own.unwrap_or(match at {
+                CellScale::Declared => self.scales[i],
+                CellScale::Engine => crate::core::value_codec::DECIMAL_SCALE,
+            });
+            while scale > 0 && v % 10 == 0 {
+                v /= 10;
+                scale -= 1;
+            }
+            if v == 0 {
+                scale = 0;
+            }
+            let mut out = v.to_le_bytes().to_vec();
+            out.push(scale as u8);
+            out
+        };
         if let [only] = cells {
-            return Ok(only.data.into_slice().to_vec());
+            return Ok(value(0, only));
         }
         let mut out = Vec::new();
-        for (field, cell) in self.fields.iter().zip(cells) {
-            let bytes = cell.data.into_slice();
-            if crate::core::index::key::encode_canonical(&field.db_type, bytes, &mut out).is_none() {
+        for (i, (field, cell)) in self.fields.iter().zip(cells).enumerate() {
+            let bytes = value(i, cell);
+            let canonical = field.db_type != crate::core::db_type::DbType::DECIMAL
+                && crate::core::index::key::encode_canonical(&field.db_type, &bytes, &mut out).is_some();
+            if !canonical {
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
+                out.extend_from_slice(&bytes);
             }
         }
         Ok(out)
@@ -11599,7 +11704,7 @@ impl IdentifyingKey {
     /// pins every partition-key column, so the write it guards is routed to
     /// that row's one partition.
     fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
-        self.row_key(cells)?;
+        self.row_key(cells, CellScale::Engine)?;
         let mut terms = Vec::with_capacity(self.fields.len());
         for (field, cell) in self.fields.iter().zip(cells) {
             let literal = crate::core::rql::subquery::value_to_literal(&cell.column_type, cell.data.into_slice())
@@ -11638,12 +11743,19 @@ fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<Ide
     let resolve = |columns: &[String]| columns.iter().map(|c| live(c)).collect::<Option<Vec<_>>>();
     let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
 
-    if let Some(key) = schema.primary_key.as_deref().and_then(live) {
-        return Some(IdentifyingKey { fields: vec![key] });
+    let key = |fields: Vec<crate::core::row::schema::SchemaField>| {
+        let scales = fields
+            .iter()
+            .map(|f| u32::from(crate::core::rql::type_modifier::scale_of(&f.name, &schema.type_modifiers)))
+            .collect();
+        IdentifyingKey { fields, scales }
+    };
+    if let Some(field) = schema.primary_key.as_deref().and_then(live) {
+        return Some(key(vec![field]));
     }
     let pkey = format!("{}_pkey", schema.name);
     if let Some(fields) = whole().find(|k| k.name.eq_ignore_ascii_case(&pkey)).and_then(|k| resolve(&k.columns)) {
-        return Some(IdentifyingKey { fields });
+        return Some(key(fields));
     }
 
     let candidates = || {
@@ -11663,8 +11775,7 @@ fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<Ide
             best = Some(fields);
         }
     }
-    best.or_else(|| candidates().find(|fields| fields.len() == 1))
-        .map(|fields| IdentifyingKey { fields })
+    best.or_else(|| candidates().find(|fields| fields.len() == 1)).map(key)
 }
 
 /// How many times a write replays a conflict before reporting it.
@@ -14737,13 +14848,146 @@ async fn execute_partitioned_delete(
 /// A parsed single-table `SELECT`, run: the half of the `QueryRows` arm that
 /// reads only the parse, never the statement text. A prepared statement
 /// enters here with a parse it cached at its first execution.
+///
+/// A locking read (`FOR UPDATE`/`SHARE`) scans under a snapshot, then locks
+/// what it found. A row it locks only then may have been changed and
+/// committed after the snapshot, by the holder it waited for or by one that
+/// finished between the scan and the lock (`SKIP LOCKED` never waits, and
+/// meets that just the same): returning the row as scanned handed a claim
+/// query a job its holder had already finished. So when a lock this
+/// transaction did not already hold was taken and some transaction the scan
+/// could not see has committed since, the statement is scanned again at a
+/// fresh snapshot, as PostgreSQL re-reads a locked row's latest version: a
+/// row gone or no longer matching drops out, a changed one comes back as it
+/// is now. The rows locked by an earlier round stay locked, so a later round
+/// takes new locks only for rows newly reached, and the rounds end. Under
+/// `REPEATABLE READ` the snapshot is pinned and every round sees the same
+/// rows.
 pub(crate) async fn execute_query_rows(
     query_row: crate::core::rql::lexer_query::QueryRows,
     source: crate::core::rql::row_source::RowSource,
     database: &Arc<Database>,
     tx: TxId,
 ) -> Vec<u8> {
+    if query_row.row_lock.is_none() || query_row.aggregate.is_some() {
+        return execute_query_rows_once(query_row, source, database, tx, None).await;
+    }
+    let relation = source.relation();
+    let mut source = Some(source);
+    for _ in 0..MAX_LOCKING_ROUNDS {
+        let source = match source.take() {
+            Some(source) => source,
+            None => match crate::core::rql::row_source::RowSource::for_select(
+                relation.clone(),
+                &query_row.where_clause,
+                None,
+                tx,
+            ) {
+                Ok(source) => source,
+                Err(e) => return ddl_error(&e.to_string()),
+            },
+        };
+        // What the scan can see, taken no later than its own snapshot: a
+        // partitioned source's planned one, else one taken now (a plain
+        // table's scan takes its own after this, so this one is no newer).
+        let since = source.planned_visibility().unwrap_or_else(|| {
+            crate::core::mvcc::Visibility::for_snapshot(database.transactions.snapshot(tx), database.transactions.clone())
+        });
+        let out = execute_query_rows_once(query_row.clone(), source, database, tx, Some(&since)).await;
+        if out.first() != Some(&3u8) || &out[1..] != LOCKED_ROWS_STALE.as_bytes() {
+            return out;
+        }
+    }
+    ddl_error(
+        "could not serialize access due to concurrent update: the rows a locking read found kept changing \
+         as it locked them",
+    )
+}
+
+/// How many times a locking read scans before it gives up on rows that keep
+/// changing under it ([`execute_query_rows`]).
+const MAX_LOCKING_ROUNDS: usize = 4;
+
+/// What `lock_selected_rows` reports when a row it newly locked may have
+/// changed since the scan: the caller scans again. Never reaches a client.
+const LOCKED_ROWS_STALE: &str = "\u{0}locked rows stale";
+
+/// Whether a transaction `since` could not see has committed since: then a
+/// row read under it may no longer be the row's latest version. Conservative
+/// past a wide id range.
+fn committed_since(database: &Arc<Database>, since: &crate::core::mvcc::Visibility) -> bool {
+    let crate::core::mvcc::Visibility::AsOf { snapshot, .. } = since else {
+        return false;
+    };
+    let (from, to) = (snapshot.xmin, database.transactions.next_id());
+    if to.saturating_sub(from) > 4096 {
+        return true;
+    }
+    (from..to).any(|id| {
+        matches!(
+            database.transactions.status().outcome(id),
+            crate::core::mvcc::transaction::TxOutcome::Committed
+        ) && !since.visible(false, id, crate::core::mvcc::transaction::NO_TX)
+    })
+}
+
+/// Boxed and type-erased, so [`execute_query_rows`]'s loop around it does not
+/// deepen every caller's future type (it overflowed the trait solver's
+/// recursion limit at `process_incoming_queries`).
+fn execute_query_rows_once<'a>(
+    query_row: crate::core::rql::lexer_query::QueryRows,
+    source: crate::core::rql::row_source::RowSource,
+    database: &'a Arc<Database>,
+    tx: TxId,
+    // A locking read's round: the snapshot its scan reads no later than.
+    since: Option<&'a crate::core::mvcc::Visibility>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+    Box::pin(execute_query_rows_body(query_row, source, database, tx, since))
+}
+
+async fn execute_query_rows_body(
+    mut query_row: crate::core::rql::lexer_query::QueryRows,
+    source: crate::core::rql::row_source::RowSource,
+    database: &Arc<Database>,
+    tx: TxId,
+    since: Option<&crate::core::mvcc::Visibility>,
+) -> Vec<u8> {
     let schema = source.schema();
+    // A locking read keys each row by the table's identifying key, which the
+    // select list need not name: its columns (and a nullable one's NULL
+    // companion) ride after everything else the scan returns, are read off
+    // each row before it is trimmed, and never reach the client. One key per
+    // table, whichever columns a statement selects, so every locker and
+    // writer of a row names it alike.
+    let lock_fetch: Option<(IdentifyingKey, Vec<(u64, Option<u64>)>)> = match &query_row.row_lock {
+        Some(_) if query_row.aggregate.is_none() => {
+            let Some(key) = identifying_key(schema) else {
+                return ddl_error(&format!(
+                    "FOR UPDATE needs a unique column on '{}' to identify the rows it locks",
+                    schema.name
+                ));
+            };
+            let calc = crate::core::row::schema::SchemaCalculator::default();
+            let mut ids = Vec::with_capacity(key.fields.len());
+            for field in &key.fields {
+                let companion = crate::core::rql::nullable::flag_field(&field.name, &schema.fields).cloned();
+                for f in std::iter::once(field).chain(companion.as_ref()) {
+                    let (offset, schema_id) = calc.calculate_schema_offset(&f.name, &schema.fields);
+                    query_row.requested_row_fetch.columns_fetching_data.push(
+                        crate::core::row::row::ColumnFetchingData {
+                            column_offset: offset,
+                            column_type: f.db_type.physical(),
+                            size: f.size,
+                            schema_id,
+                        },
+                    );
+                }
+                ids.push((field.write_order, companion.map(|c| c.write_order)));
+            }
+            Some((key, ids))
+        }
+        _ => None,
+    };
     // An aggregate query folds the scanned rows into groups, so it
     // takes the row-mode path: the bytes path never materialises a
     // `Vec<Row>` for the fold to read.
@@ -15242,6 +15486,8 @@ pub(crate) async fn execute_query_rows(
                             } else {
                                 Vec::with_capacity(source.remaining_hint(&rows_bytes))
                             };
+                            // A locking read's key cells, one entry per kept row.
+                            let mut kept_keys: Vec<Vec<crate::core::row::row::Column>> = Vec::new();
                             // Sized only when `DISTINCT` will use it:
                             // a hash table with room for every row is
                             // tens of megabytes on a large result.
@@ -15320,8 +15566,34 @@ pub(crate) async fn execute_query_rows(
                                 // many the client is owed.
                                 let overfetched = row.columns.len() > visible_columns
                                     && (visible_columns > 0 || has_literals);
+                                // A locking read's key cells, read before the
+                                // trim drops them: the last of each schema id
+                                // is the one the lock fetch appended.
+                                let row_key_cells: Option<Vec<crate::core::row::row::Column>> =
+                                    lock_fetch.as_ref().map(|(_, ids)| {
+                                        let last = |id: u64| {
+                                            row.columns.iter().rev().find(|c| u64::from(c.schema_id) == id)
+                                        };
+                                        ids.iter()
+                                            .map(|(id, companion)| {
+                                                let null = companion
+                                                    .and_then(|c| last(c))
+                                                    .is_some_and(|c| {
+                                                        crate::core::rql::nullable::flag_is_set(c.data.into_slice())
+                                                    });
+                                                match last(*id) {
+                                                    Some(c) if !null => c.deep_clone(),
+                                                    _ => crate::core::row::row::Column {
+                                                        schema_id: *id as u32,
+                                                        data: crate::memory_pool::MemoryBlock::default(),
+                                                        column_type: crate::core::db_type::DbType::NULL,
+                                                    },
+                                                }
+                                            })
+                                            .collect()
+                                    });
                                 let mut row =
-                                    if trim_sort_key || has_nullable || overfetched {
+                                    if trim_sort_key || has_nullable || overfetched || lock_fetch.is_some() {
                                         let mut trimmed = row;
                                         trimmed.columns.truncate(visible_columns);
                                         trimmed
@@ -15552,6 +15824,9 @@ pub(crate) async fn execute_query_rows(
                                     continue;
                                 }
                                 kept.push(row);
+                                if let Some(cells) = row_key_cells {
+                                    kept_keys.push(cells);
+                                }
                             }
                             if streaming {
                                 out
@@ -15629,11 +15904,14 @@ pub(crate) async fn execute_query_rows(
                                     &database,
                                     &lock_table_name,
                                     kept,
+                                    std::mem::take(&mut kept_keys),
+                                    lock_fetch.as_ref().map(|(key, _)| key),
                                     lock,
                                     // Everything the client will see:
                                     // the page plus whatever OFFSET
                                     // discards ahead of it.
                                     written_limit.map(|l| l as usize + offset as usize),
+                                    since,
                                     tx,
                                 ))
                                 .await

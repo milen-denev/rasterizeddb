@@ -128,6 +128,24 @@ impl RowSource {
         Ok(RowSource::Partitioned(Box::new(FanOut::plan_with(table, where_clause, visibility)?)))
     }
 
+    /// The relation this source reads, for a locking read that scans it again
+    /// at a fresh snapshot (`execute_query_rows`, phase 3 P3).
+    pub(crate) fn relation(&self) -> Relation {
+        match self {
+            RowSource::Single(table) => Relation::Plain(table.clone()),
+            RowSource::Partitioned(fan) => Relation::Partitioned(fan.table.clone()),
+        }
+    }
+
+    /// The snapshot a partitioned source was planned under; `None` for a
+    /// plain table, whose scan takes its own when it runs.
+    pub(crate) fn planned_visibility(&self) -> Option<Visibility> {
+        match self {
+            RowSource::Single(_) => None,
+            RowSource::Partitioned(fan) => Some(fan.visibility.clone()),
+        }
+    }
+
     /// The declared schema: the plain table's, or the partitioned table's
     /// shell's, which every partition's is a clone of.
     pub(crate) fn schema(&self) -> &TableSchema {
