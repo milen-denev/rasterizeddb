@@ -684,23 +684,6 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
 /// `CONSTRAINT`, [`parse_clause`] took `IF` for the constraint's name, found
 /// no `UNIQUE` after it, and the statement succeeded enforcing nothing.
 pub fn strip_if_not_exists(description: &str) -> (String, bool) {
-    fn starts_with_words(text: &str, words: &[&str]) -> Option<usize> {
-        let mut at = 0;
-        for word in words {
-            let rest = &text[at..];
-            let skipped = rest.len() - rest.trim_start().len();
-            let rest = rest.trim_start();
-            if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word) {
-                return None;
-            }
-            let after = &rest[word.len()..];
-            if after.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return None;
-            }
-            at += skipped + word.len();
-        }
-        Some(at)
-    }
     const IF_NOT_EXISTS: [&str; 3] = ["IF", "NOT", "EXISTS"];
     if let Some(end) = starts_with_words(description, &IF_NOT_EXISTS) {
         return (description[end..].trim_start().to_string(), true);
@@ -714,6 +697,70 @@ pub fn strip_if_not_exists(description: &str) -> (String, bool) {
     (description.to_string(), false)
 }
 
+/// The byte length of `text`'s prefix that is `words`, each a whole ASCII
+/// keyword matched without case, separated by whitespace; `None` when it is
+/// not. Compares bytes and never slices `text`, so a name starting with a
+/// multi-byte character (`価格_chk`, `aé`) is simply not a keyword: an end
+/// index inside a character would panic.
+fn starts_with_words(text: &str, words: &[&str]) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    for word in words {
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        let end = at + word.len();
+        if !bytes.get(at..end).is_some_and(|b| b.eq_ignore_ascii_case(word.as_bytes())) {
+            return None;
+        }
+        if bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || !b.is_ascii()) {
+            return None;
+        }
+        at = end;
+    }
+    Some(at)
+}
+
+/// A leading `CONSTRAINT <name>` split off `clause`: the name, unquoted
+/// (a quoted name keeps its spaces and non-ASCII characters, and `""` is a
+/// quote), and the text after it. `None` for the name when the clause does
+/// not start with `CONSTRAINT`; `Err` when it does and names nothing.
+/// What `parse_clause` and the ALTER arm's fall-through read the name by,
+/// so a scan of "what kind of constraint is this" never reads the name.
+pub fn split_constraint_name(clause: &str) -> Result<(Option<String>, &str), String> {
+    let trimmed = clause.trim_start();
+    let Some(after) = starts_with_words(trimmed, &["CONSTRAINT"]) else {
+        return Ok((None, trimmed));
+    };
+    let body = trimmed[after..].trim_start();
+    if let Some(quoted) = body.strip_prefix('"') {
+        let mut name = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c != '"' {
+                name.push(c);
+                continue;
+            }
+            if quoted[i + 1..].starts_with('"') {
+                name.push('"');
+                chars.next();
+                continue;
+            }
+            if name.is_empty() {
+                return Err("CONSTRAINT is missing its name".to_string());
+            }
+            return Ok((Some(name), quoted[i + 1..].trim_start()));
+        }
+        return Err("CONSTRAINT's quoted name is not closed".to_string());
+    }
+    let end = body.find(char::is_whitespace).unwrap_or(body.len());
+    let name = &body[..end];
+    if name.is_empty() {
+        return Err("CONSTRAINT is missing its name".to_string());
+    }
+    Ok((Some(name.to_string()), body[end..].trim_start()))
+}
+
 /// Parses a table-level `UNIQUE (…)` or `PRIMARY KEY (…)` clause, with or
 /// without a leading `CONSTRAINT <name>`.
 ///
@@ -724,22 +771,11 @@ pub fn strip_if_not_exists(description: &str) -> (String, bool) {
 /// a constraint that is not there.
 pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, String> {
     let trimmed = clause.trim();
-    let upper = trimmed.to_ascii_uppercase();
 
-    // `CONSTRAINT name UNIQUE (…)` names the constraint first.
-    let (name, rest) = if upper.starts_with("CONSTRAINT") {
-        let mut words = trimmed.splitn(3, char::is_whitespace);
-        words.next();
-        let given = words
-            .next()
-            .map(|n| n.trim_matches('"').to_string())
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| "CONSTRAINT is missing its name".to_string())?;
-        let rest = words.next().unwrap_or("").trim();
-        (Some(given), rest)
-    } else {
-        (None, trimmed)
-    };
+    // `CONSTRAINT name UNIQUE (…)` names the constraint first; a quoted name
+    // may hold spaces, `""` and non-ASCII characters.
+    let (name, rest) = split_constraint_name(trimmed)?;
+    let rest = rest.trim();
 
     let rest_upper = rest.to_ascii_uppercase();
     // `PRIMARY KEY` is `UNIQUE NOT NULL`; the uniqueness half is what is
@@ -1243,8 +1279,52 @@ mod strip_if_not_exists_tests {
         ] {
             assert_eq!(strip_if_not_exists(given), (want.to_string(), tolerant), "{given}");
         }
+        // A name beginning with a multi-byte character is a name, never a
+        // keyword, and never a panic.
+        for given in [
+            "CONSTRAINT 価格_chk CHECK (a > 0)",
+            "CONSTRAINT aé_chk CHECK (a > 0)",
+            "CONSTRAINT \"名\" UNIQUE (c)",
+            "CONSTRAINT éif UNIQUE (c)",
+            "価格 UNIQUE (c)",
+            "CONSTRAINTé x UNIQUE (c)",
+            "IF NOT EXISTSé",
+            "IFé NOT EXISTS CONSTRAINT x UNIQUE (c)",
+        ] {
+            assert_eq!(strip_if_not_exists(given), (given.to_string(), false), "{given}");
+        }
+        assert_eq!(
+            strip_if_not_exists("CONSTRAINT IF NOT EXISTS 価格 UNIQUE (c)"),
+            ("CONSTRAINT 価格 UNIQUE (c)".to_string(), true)
+        );
         let (stripped, _) = strip_if_not_exists("CONSTRAINT IF NOT EXISTS u UNIQUE (c)");
         let key = parse_clause(&stripped, "t").unwrap().expect("a unique key");
         assert_eq!((key.name.as_str(), key.columns.as_slice()), ("u", &["c".to_string()][..]));
+    }
+}
+
+#[cfg(test)]
+mod constraint_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_constraint_name_is_read_quoted_or_bare_and_never_sliced() {
+        for (given, name, rest) in [
+            ("CONSTRAINT u UNIQUE (c)", "u", "UNIQUE (c)"),
+            ("CONSTRAINT \"my key\" UNIQUE (d)", "my key", "UNIQUE (d)"),
+            ("CONSTRAINT \"a \"\"q\"\" b\" UNIQUE (d)", "a \"q\" b", "UNIQUE (d)"),
+            ("CONSTRAINT \"名 前\" UNIQUE (c)", "名 前", "UNIQUE (c)"),
+            ("CONSTRAINT 価格_uq UNIQUE (c)", "価格_uq", "UNIQUE (c)"),
+            ("constraint \"unique\" EXCLUDE USING gist (c WITH =)", "unique", "EXCLUDE USING gist (c WITH =)"),
+        ] {
+            assert_eq!(split_constraint_name(given).unwrap(), (Some(name.to_string()), rest), "{given}");
+        }
+        assert_eq!(split_constraint_name("UNIQUE (c)").unwrap(), (None, "UNIQUE (c)"));
+        assert!(split_constraint_name("CONSTRAINT \"open UNIQUE (c)").is_err());
+        let key = parse_clause("CONSTRAINT \"my key\" UNIQUE (d)", "t").unwrap().expect("a unique key");
+        assert_eq!((key.name.as_str(), key.columns.as_slice()), ("my key", &["d".to_string()][..]));
+        let key = parse_clause("CONSTRAINT \"名\" UNIQUE (c)", "t").unwrap().expect("a unique key");
+        assert_eq!(key.name, "名");
+        assert!(parse_clause("CONSTRAINT \"unique\" EXCLUDE USING gist (c WITH =)", "t").unwrap().is_none());
     }
 }

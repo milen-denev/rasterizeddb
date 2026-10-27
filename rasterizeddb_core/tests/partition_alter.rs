@@ -689,3 +689,33 @@ fn introspection_shows_the_new_state_and_never_a_partition() {
         }
     }
 }
+
+/// Over the wire, through the statement's lock set and the partitioned
+/// refusal it asks before any lock: constraint names starting with a
+/// multi-byte character, bare and quoted, a quoted name with a space, and a
+/// keyword as a quoted name, on both tables alike; the partitioned rule
+/// still refuses a UNIQUE without the key, IF NOT EXISTS too. None panics.
+#[test]
+fn non_ascii_and_quoted_constraint_names_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pair = Pair::start(dir.path());
+    create(&mut pair, 3, true);
+    for ddl in [
+        "ALTER TABLE {t} ADD CONSTRAINT 価格_chk CHECK (id >= 0)",
+        "ALTER TABLE {t} ADD CONSTRAINT aé_chk CHECK (id < 100000)",
+        "ALTER TABLE {t} ADD CONSTRAINT \"名\" UNIQUE (tenant_id, id, s)",
+        "ALTER TABLE {t} ADD CONSTRAINT IF NOT EXISTS \"名2\" UNIQUE (tenant_id, id, n)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS {t}_索引 ON {t} (tenant_id, id, f)",
+        "ALTER TABLE {t} ADD CONSTRAINT \"my key\" UNIQUE (tenant_id, id, n, s)",
+        "ALTER TABLE {t} ADD CONSTRAINT \"unique\" EXCLUDE USING gist (id WITH =)",
+    ] {
+        pair.ok(ddl);
+    }
+    pair.fails_alike("INSERT INTO {t} (tenant_id, id) VALUES (1, -5)");
+    pair.compare("non-ASCII names");
+    pair.refused("ALTER TABLE {t} ADD CONSTRAINT 価格_u UNIQUE (id)", "partition key column");
+    pair.refused("CREATE UNIQUE INDEX IF NOT EXISTS {t}_価格 ON {t} (id)", "partition key column");
+    pair.refused("ALTER TABLE {t} ADD CONSTRAINT IF NOT EXISTS \"価 格\" UNIQUE (n)", "partition key column");
+    pair.restart();
+    pair.compare("non-ASCII names, restarted");
+}

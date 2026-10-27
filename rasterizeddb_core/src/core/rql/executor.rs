@@ -10217,8 +10217,12 @@ async fn execute_alter_table_action(
 
             // A UNIQUE or PRIMARY KEY that was not read as one is an error:
             // reported as done, it enforced nothing, and a duplicate went in.
-            let words = crate::core::rql::unique_key::strip_if_not_exists(&description).0.to_ascii_uppercase();
-            if words.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "UNIQUE" || w == "PRIMARY") {
+            // Read after the constraint's name, which may be any word.
+            let after_name = match crate::core::rql::unique_key::split_constraint_name(&description) {
+                Ok((_, rest)) => rest.to_ascii_uppercase(),
+                Err(e) => return ddl_error(&e),
+            };
+            if after_name.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "UNIQUE" || w == "PRIMARY") {
                 return ddl_error(&format!(
                     "the constraint `{}` on '{}' could not be read as a UNIQUE or PRIMARY KEY, and an unenforced \
                      one is not supported",
