@@ -832,4 +832,49 @@ fn a_ddl_that_would_orphan_the_blocks_row_locks_is_refused() {
         run(case, false, true, true);
         run(case, false, false, false);
     }
+    drop(run);
+    // Another session's row locks are not this check's: B's RENAME waits for
+    // A's ROW EXCLUSIVE and times out (55P03), as in PostgreSQL, and goes
+    // through once A ends.
+    for partitioned in [false, true] {
+        let t = next(if partitioned { "p" } else { "q" });
+        let mut setup = server.connect();
+        setup.ok(&format!("CREATE TABLE {t} {pk}{}", if partitioned { part } else { "" }));
+        setup.ok(&rows.replace("{t}", &t));
+        let mut a = server.connect();
+        let mut b = server.connect();
+        b.ok("SET lock_timeout = '300ms'");
+        a.ok("BEGIN");
+        a.ok(&format!("SELECT * FROM {t} WHERE a = 1 AND b = 1 FOR UPDATE"));
+        let e = b.simple(&format!("ALTER TABLE {t} RENAME TO {t}_2")).expect_err("B's RENAME under A's row locks");
+        assert_eq!(e.code, "55P03", "partitioned {partitioned}: B's RENAME under A's row locks: {e}");
+        a.ok("COMMIT");
+        b.ok(&format!("ALTER TABLE {t} RENAME TO {t}_2"));
+        drop((a, b, setup));
+    }
+}
+
+/// `DROP CONSTRAINT` of a name that is not there is PostgreSQL's 42704,
+/// bare or quoted, plain or partitioned; `IF EXISTS` makes it a no-op. It
+/// used to report success, so a client that misspelled a key, or named one
+/// with a space, believed it gone while it went on refusing rows.
+#[test]
+fn dropping_a_constraint_that_is_not_there_is_42704() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (t, part) in [("dc_q", ""), ("dc_p", " PARTITION BY HASH (a) PARTITIONS 4")] {
+        c.ok(&format!("CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT, PRIMARY KEY (a)){part}"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT \"my key\" UNIQUE (a, b)"));
+        for name in ["nope", "\"my\"", "\"my key 2\"", "\"名\""] {
+            let e = c.simple(&format!("ALTER TABLE {t} DROP CONSTRAINT {name}")).expect_err(name);
+            assert_eq!(e.code, "42704", "{t} {name}: {e}");
+            let bare = name.trim_matches('"');
+            assert_eq!(e.message, format!("constraint \"{bare}\" of relation \"{t}\" does not exist"), "{t}");
+            c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {name}"));
+        }
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT \"my key\""));
+        let e = c.simple(&format!("ALTER TABLE {t} DROP CONSTRAINT \"my key\"")).expect_err("dropped twice");
+        assert_eq!(e.code, "42704", "{t}: {e}");
+    }
 }
