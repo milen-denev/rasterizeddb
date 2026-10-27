@@ -4936,10 +4936,17 @@ fn affected_by(response: &[u8]) -> Option<u64> {
     }
 }
 
-/// Runs one generated per-row write. When it carries a recheck of the join
-/// condition and that cannot run per row (the condition names a column the
-/// rewritten statement cannot resolve), the key-only form is run instead,
-/// which is what this path did before it rechecked.
+/// Runs one generated per-row write, `with_recheck`: the key and the join
+/// condition's recheck against the row as it is when written. `key_only` is
+/// the same write by key alone, which is what runs when there is nothing to
+/// recheck (the two are then equal).
+///
+/// A recheck that cannot run is an error, never a write by key alone. That
+/// fallback used to follow any error not known to be about the row: an
+/// evaluator failure on the recheck's literal arithmetic (`t.v < 5 * 100` on
+/// a NUMERIC column, "operand size does not match") silently wrote the row
+/// with no recheck, which is the write a concurrently changed row must not
+/// get.
 async fn run_per_row_write(
     with_recheck: String,
     key_only: String,
@@ -4947,31 +4954,43 @@ async fn run_per_row_write(
     depth: usize,
     tx: TxId,
 ) -> Result<Vec<u8>, String> {
-    let mut statement = with_recheck;
-    for attempt in 0..2 {
-        let response = match recognize_query_purpose(&statement) {
-            Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
-            None => {
-                let mut refused = vec![3u8];
-                refused.extend_from_slice(format!("could not parse the rewritten '{}'", statement).as_bytes());
-                refused
-            }
-        };
-        if response.first() != Some(&3u8) || attempt == 1 || statement == key_only {
-            return Ok(response);
+    // Folded as the wire folds a statement, which this generated one never
+    // passes through: the recheck's substituted values meet literal
+    // arithmetic (`v < 0.1234 * 100`), which only the fold computes at a
+    // width a NUMERIC column compares with.
+    let (with_recheck, key_only) = (fold_where_constants(&with_recheck), fold_where_constants(&key_only));
+    let response = match recognize_query_purpose(&with_recheck) {
+        Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+        None => {
+            let mut refused = vec![3u8];
+            refused.extend_from_slice(format!("could not parse the rewritten '{}'", with_recheck).as_bytes());
+            refused
         }
-        // A conflict is the statement's to retry whole, never the fallback's;
-        // and a lock, a deadlock or a cancellation says nothing about whether
-        // the recheck could run: the key-only write that followed one used to
-        // land without the recheck once the holder had committed.
-        let text = String::from_utf8_lossy(&response[1..]);
-        if per_row_error_is_final(&text) {
-            return Ok(response);
-        }
-        debug!("per-row recheck could not run ({}); writing by key alone", text);
-        statement = key_only.clone();
+    };
+    if response.first() != Some(&3u8) || with_recheck == key_only {
+        return Ok(response);
     }
-    unreachable!("the loop returns on its second pass")
+    let text = String::from_utf8_lossy(&response[1..]).into_owned();
+    if per_row_error_is_final(&text) {
+        return Ok(response);
+    }
+    // Whether the failure was the recheck's or the write's own (a CHECK, a
+    // key) is told by the write by key alone: its error is the statement's.
+    // If it succeeds the recheck was what failed, and the statement fails
+    // with it; the row it wrote is a version of this statement's
+    // transaction, which that failure aborts (an `UPDATE … FROM` never
+    // overwrites in place, `forbid_in_place`).
+    let keyed = match recognize_query_purpose(&key_only) {
+        Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+        None => return Ok(response),
+    };
+    if keyed.first() == Some(&3u8) {
+        return Ok(keyed);
+    }
+    Err(format!(
+        "the join condition could not be rechecked on the row being written ({text}), and writing \
+         it without the recheck is not supported"
+    ))
 }
 
 /// The literal a value read by an unnormalised join (`run_subquery_scaled`
@@ -5041,6 +5060,43 @@ mod per_row_error_tests {
             assert!(per_row_error_is_final(text), "{text}");
         }
         assert!(!per_row_error_is_final("column 'q.x' does not exist"));
+    }
+
+    async fn exec(db: &rclite::Arc<crate::core::database::Database>, sql: &str) -> Vec<u8> {
+        let purpose = super::recognize_query_purpose(sql).expect("parses");
+        super::execute_with_sync(purpose, db.clone(), true).await
+    }
+
+    /// A recheck that cannot run is an error, never a write by key alone;
+    /// a write that fails by itself still fails with its own error. The
+    /// statement's abort takes back the key-only write the check made.
+    ///
+    /// Mutation: `run_per_row_write` returning the key-only write's response
+    /// (the old fallback) makes the first call succeed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recheck_that_cannot_run_is_an_error_not_a_write_by_key() {
+        let db = rclite::Arc::new(crate::core::database::Database::new_with_backend("recheck_cannot_run", true).await);
+        assert_eq!(exec(&db, "CREATE TABLE rr (id BIGINT PRIMARY KEY, v BIGINT, CHECK (v < 100))").await[0], 0);
+        assert_eq!(exec(&db, "INSERT INTO rr (id, v) VALUES (1, 5)").await[0], 0);
+        let tx = db.transactions.begin();
+        let broken = "UPDATE rr SET v = 7 WHERE id = 1 AND (nosuch_column < 3)".to_string();
+        let keyed = "UPDATE rr SET v = 7 WHERE id = 1".to_string();
+        let got = super::run_per_row_write(broken.clone(), keyed, &db, 0, tx).await;
+        let e = got.expect_err("an unrunnable recheck wrote by key");
+        assert!(e.contains("could not be rechecked"), "{e}");
+        db.abort_transaction(tx);
+        // The write's own failure is reported as itself.
+        let tx = db.transactions.begin();
+        let failing = "UPDATE rr SET v = 500 WHERE id = 1".to_string();
+        let got = super::run_per_row_write(broken.replace("v = 7", "v = 500"), failing, &db, 0, tx).await;
+        let response = got.expect("the write's own error is a response, not the recheck's");
+        assert_eq!(response.first(), Some(&3u8));
+        assert!(String::from_utf8_lossy(&response[1..]).to_lowercase().contains("check"), "{:?}", String::from_utf8_lossy(&response));
+        db.abort_transaction(tx);
+        // Still 5: the aborted key-only write left nothing.
+        let out = exec(&db, "DELETE FROM rr WHERE id = 1 AND v = 5").await;
+        assert_eq!(out.first(), Some(&0u8), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(u64::from_le_bytes(out[1..9].try_into().unwrap()), 1, "the row's value changed");
     }
 }
 
@@ -5877,7 +5933,11 @@ fn fold_constants_in_predicate(text: &str) -> String {
         if let Some(value) = fold_integer_arithmetic(trimmed) {
             return wrap(value);
         }
-        if trimmed.is_empty() || !crate::core::rql::expr::needs_evaluation(trimmed) {
+        // Arithmetic over numeric literals alone (`0.1234 * 100`) is folded
+        // too, at the exact decimal the evaluator computes. Left as text it
+        // was evaluated against the column, and a NUMERIC column refused the
+        // result's width: "operand size does not match".
+        if trimmed.is_empty() || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed)) {
             return operand.to_string();
         }
         let Ok(expr) = crate::core::rql::expr::parse(trimmed, &[]) else {
@@ -5926,6 +5986,20 @@ fn fold_constants_in_predicate(text: &str) -> String {
                     out.push_str(&equivalent);
                     continue;
                 }
+                // A parenthesised group is folded inside. Read as one
+                // comparison, `(v < 0.1234 * 100)` split into `(v ` and
+                // ` 0.1234 * 100)`, neither of which folds, and the
+                // arithmetic reached the evaluator, which compares its
+                // result to a NUMERIC column at the wrong width ("operand
+                // size does not match"). `UPDATE … FROM`'s per-row recheck
+                // is written as `AND (<terms>)`, so its recheck failed the
+                // same way.
+                if let Some((lead, inner, tail)) = parenthesised(term) {
+                    out.push_str(lead);
+                    out.push_str(&fold_constants_in_predicate(inner));
+                    out.push_str(tail);
+                    continue;
+                }
                 // Fold each side of the comparison independently: only one of
                 // them is usually constant.
                 match find_comparison(term) {
@@ -5940,6 +6014,15 @@ fn fold_constants_in_predicate(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `text` is numeric literals joined by `+ - * /`, with parentheses:
+/// nothing a column, a quote or a call could hide in, and at least one
+/// operator past a leading sign.
+fn literal_arithmetic(text: &str) -> bool {
+    text.bytes().all(|b| b.is_ascii_digit() || b".+-*/() \t".contains(&b))
+        && text.trim_start().trim_start_matches(['-', '+', '(']).bytes().any(|b| b"+-*/".contains(&b))
+        && text.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// `text` as one integer literal, when it is nothing but integer literals
@@ -6073,6 +6156,41 @@ enum BooleanPiece<'a> {
     Separator(&'a str),
 }
 
+/// `term` as `(`, what its outer parentheses hold, and `)` (each with the
+/// whitespace around it), when one pair encloses the whole term. Quotes are
+/// skipped; `(a) < (b)` is not one group.
+fn parenthesised(term: &str) -> Option<(&str, &str, &str)> {
+    let open = term.len() - term.trim_start().len();
+    let close = term.trim_end().len().checked_sub(1)?;
+    let bytes = term.as_bytes();
+    if bytes.get(open) != Some(&b'(') || bytes.get(close) != Some(&b')') || close <= open {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate().take(close + 1).skip(open) {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && i != close {
+                        return None;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    (depth == 0).then(|| (&term[..open + 1], &term[open + 1..close], &term[close..]))
+}
+
 /// Splits a predicate into terms and the `AND`/`OR` between them.
 fn split_boolean_terms(text: &str) -> Vec<BooleanPiece<'_>> {
     let upper = text.to_ascii_uppercase();
@@ -6103,20 +6221,19 @@ fn split_boolean_terms(text: &str) -> Vec<BooleanPiece<'_>> {
                 _ => {}
             },
         }
-        if depth == 0 {
-            for keyword in [" AND ", " OR "] {
-                if upper[i..].starts_with(keyword) {
-                    out.push(BooleanPiece::Term(&text[start..i]));
-                    out.push(BooleanPiece::Separator(&text[i..i + keyword.len()]));
-                    i += keyword.len();
-                    start = i;
-                    break;
-                }
-            }
+        if depth == 0
+            && let Some(keyword) = [" AND ", " OR "].into_iter().find(|k| upper[i..].starts_with(k))
+        {
+            out.push(BooleanPiece::Term(&text[start..i]));
+            out.push(BooleanPiece::Separator(&text[i..i + keyword.len()]));
+            i += keyword.len();
+            start = i;
+            // The next term's first byte is read by the next pass, not
+            // stepped over: it was, so the `(` opening `((a) AND (b))` went
+            // uncounted and the term was split at its inner `AND`.
+            continue;
         }
-        if i < bytes.len() && start <= i {
-            i += 1;
-        }
+        i += 1;
     }
     out.push(BooleanPiece::Term(&text[start..]));
     out
@@ -16542,6 +16659,26 @@ mod predicate_folding_tests {
             fold_where_constants("SELECT 1 + 1 FROM t WHERE a = 1 + 1 LIMIT 2"),
             "SELECT 1 + 1 FROM t WHERE a = 2 LIMIT 2"
         );
+    }
+
+    /// A parenthesised comparison is folded inside: `UPDATE … FROM`'s
+    /// recheck is written as `AND (<terms>)`. Mutation: `parenthesised`
+    /// returning `None` leaves every one of these unfolded.
+    #[test]
+    fn a_parenthesised_comparison_folds_inside() {
+        assert_eq!(
+            fold_where_constants("SELECT id FROM t WHERE id > 0 AND (v < 5 * 4) ORDER BY id"),
+            "SELECT id FROM t WHERE id > 0 AND (v < 20) ORDER BY id"
+        );
+        assert_eq!(
+            fold_where_constants("UPDATE t SET a = 1 WHERE id = 1 AND ((v < 2 * 3) AND (w > 1 + 1))"),
+            "UPDATE t SET a = 1 WHERE id = 1 AND ((v < 6) AND (w > 2))"
+        );
+        let folded = fold_where_constants("SELECT id FROM t WHERE (v < 0.1234 * 100)");
+        assert!(!folded.contains('*'), "{folded}");
+        // Not one group, and not a comparison's own parentheses.
+        assert_eq!(fold_where_constants("SELECT id FROM t WHERE (a) < (b)"), "SELECT id FROM t WHERE (a) < (b)");
+        assert_eq!(fold_where_constants("SELECT id FROM t WHERE (a = ')')"), "SELECT id FROM t WHERE (a = ')')");
     }
 
     #[test]
