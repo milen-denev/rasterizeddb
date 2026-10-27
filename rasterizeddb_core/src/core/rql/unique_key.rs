@@ -390,13 +390,19 @@ fn strip_outer_parens(text: &str) -> &str {
     text
 }
 
+/// A name as UTF-8, cut at a character boundary within 128 bytes, as
+/// `020dd0e` stores table and column names. It used to keep only ASCII
+/// letters, digits and `_`: `"my key"` was stored as `mykey` and `名` as an
+/// empty name, so a DROP CONSTRAINT by the name a client used matched
+/// nothing, and two such names collided. Records written that way still
+/// read back as written ([`read_name`] always decoded UTF-8), so the format
+/// is unchanged, and an older binary reads the new names too.
 fn write_name(out: &mut [u8], at: usize, name: &str) {
-    let filtered: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    let bytes = filtered.as_bytes();
-    let len = bytes.len().min(128);
+    let bytes = name.as_bytes();
+    let mut len = bytes.len().min(128);
+    while !name.is_char_boundary(len) {
+        len -= 1;
+    }
     out[at..at + len].copy_from_slice(&bytes[..len]);
 }
 
@@ -759,6 +765,21 @@ pub fn split_constraint_name(clause: &str) -> Result<(Option<String>, &str), Str
         return Err("CONSTRAINT is missing its name".to_string());
     }
     Ok((Some(name.to_string()), body[end..].trim_start()))
+}
+
+/// The name `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE | RESTRICT]`
+/// drops, read as [`split_constraint_name`] reads an added one (bare or
+/// quoted, spaces, `""` and non-ASCII), and whether `IF EXISTS` was given.
+pub fn dropped_constraint(description: &str) -> Result<(String, bool), String> {
+    let after = starts_with_words(description, &["CONSTRAINT"]).ok_or("DROP CONSTRAINT names no constraint")?;
+    let (rest, if_exists) = match starts_with_words(&description[after..], &["IF", "EXISTS"]) {
+        Some(end) => (&description[after + end..], true),
+        None => (&description[after..], false),
+    };
+    match split_constraint_name(&format!("CONSTRAINT {}", rest.trim_start()))? {
+        (Some(name), _) => Ok((name, if_exists)),
+        (None, _) => Err("DROP CONSTRAINT names no constraint".to_string()),
+    }
 }
 
 /// Parses a table-level `UNIQUE (…)` or `PRIMARY KEY (…)` clause, with or
@@ -1326,5 +1347,39 @@ mod constraint_name_tests {
         let key = parse_clause("CONSTRAINT \"名\" UNIQUE (c)", "t").unwrap().expect("a unique key");
         assert_eq!(key.name, "名");
         assert!(parse_clause("CONSTRAINT \"unique\" EXCLUDE USING gist (c WITH =)", "t").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod stored_name_tests {
+    use super::*;
+
+    #[test]
+    fn names_are_stored_as_utf8_and_dropped_by_the_name_given() {
+        for name in ["my key", "名", "价格 x", "a\"b", "plain_name"] {
+            let key = UniqueKey {
+                name: name.to_string(),
+                columns: vec!["名前".to_string(), "c".to_string()],
+                is_deleted: false,
+                predicate: None,
+                compiled: Default::default(),
+            };
+            let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
+            assert_eq!((back.name.as_str(), back.columns.as_slice()), (name, key.columns.as_slice()), "{name}");
+        }
+        // Cut within 128 bytes at a character boundary, never inside one.
+        let long = "名".repeat(50);
+        let key = UniqueKey { name: long.clone(), columns: vec!["c".into()], is_deleted: false, predicate: None, compiled: Default::default() };
+        let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
+        assert!(long.starts_with(&back.name) && back.name.len() <= 128 && back.name.len() % 3 == 0);
+        for (given, name, if_exists) in [
+            ("CONSTRAINT \"my key\"", "my key", false),
+            ("CONSTRAINT IF EXISTS \"名\" CASCADE", "名", true),
+            ("CONSTRAINT 価格_uq", "価格_uq", false),
+            ("constraint if exists plain RESTRICT", "plain", true),
+            ("CONSTRAINT \"if\"", "if", false),
+        ] {
+            assert_eq!(dropped_constraint(given).unwrap(), (name.to_string(), if_exists), "{given}");
+        }
     }
 }

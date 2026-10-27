@@ -722,6 +722,14 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
+    // Quoted again when it is not a bare identifier (a space, a quote): the
+    // constraint arm reads the name it is given (`split_constraint_name`),
+    // and `"mix é 1"` unquoted would be three words.
+    let name = if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    };
 
     let mut rest = after[on_at + "ON".len()..].trim_start();
     if rest.to_ascii_uppercase().starts_with("ONLY ") {
@@ -1236,6 +1244,14 @@ mod tests {
         // made the second run of a migration fail with "constraint already
         // exists" — precisely what the clause is there to prevent, and what a
         // migration that seeds rows relies on to be re-runnable.
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON t (a)").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a)")
+        );
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX 名 ON t (a)").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a)")
+        );
         assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"idx\" ON \"t\" (\"a\")"

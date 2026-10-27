@@ -9333,9 +9333,10 @@ async fn add_check_constraint(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Vec<u8> {
-    let named = {
-        let words: Vec<&str> = description.split_whitespace().collect();
-        (words.len() > 1 && words[0].eq_ignore_ascii_case("CONSTRAINT")).then(|| words[1].trim_matches('"').to_string())
+    // Bare or quoted, as a UNIQUE's name is read (`split_constraint_name`).
+    let named = match crate::core::rql::unique_key::split_constraint_name(description) {
+        Ok((named, _)) => named,
+        Err(e) => return ddl_error(&e),
     };
     let ordinal = schema.checks.iter().filter(|c| !c.is_deleted).count() + 1;
     let name = named.unwrap_or_else(|| crate::core::rql::check::derived_name(table_name, None, ordinal));
@@ -9996,12 +9997,17 @@ async fn execute_alter_table_action(
 
             let upper = description.to_ascii_uppercase();
 
-            // `DROP CONSTRAINT <name>`. Both sidecars are tried, since the name
-            // alone does not say which kind it was. A name matching neither is
-            // not an error: the constraint is gone either way, which is what
-            // the statement asked for.
+            // `DROP CONSTRAINT [IF EXISTS] <name>`. Both sidecars are tried,
+            // since the name alone does not say which kind it was. A name
+            // matching neither is PostgreSQL's 42704, unless `IF EXISTS`
+            // makes it a no-op: reported as done, a key a client meant to drop
+            // went on refusing rows.
             if drop {
-                if let Some(name) = dropped_constraint_name(&description) {
+                let (dropped, if_exists) = match crate::core::rql::unique_key::dropped_constraint(&description) {
+                    Ok((name, if_exists)) => (Some(name), if_exists),
+                    Err(e) => return ddl_error(&e),
+                };
+                if let Some(name) = dropped.clone() {
                     // What the name matches, read from the open schema (the
                     // sidecars' loaded copy, which nothing changes while this
                     // statement holds ACCESS EXCLUSIVE): a name matching
@@ -10082,11 +10088,18 @@ async fn execute_alter_table_action(
                     }
                 }
 
-                warn!(
-                    "ALTER TABLE {}: no stored constraint matched ({})",
-                    plan.table_name, description
-                );
-                return ddl_ok(0);
+                if if_exists {
+                    info!(
+                        "ALTER TABLE {}: no stored constraint matched ({}); IF EXISTS makes that a no-op",
+                        plan.table_name, description
+                    );
+                    return ddl_ok(0);
+                }
+                return ddl_error(&format!(
+                    "constraint \"{}\" of relation \"{}\" does not exist",
+                    dropped.unwrap_or_default(),
+                    plan.table_name
+                ));
             }
 
             // A foreign key is enforced, so it is stored rather than noted.
@@ -10222,7 +10235,13 @@ async fn execute_alter_table_action(
             // declared in `CREATE TABLE` is. It used to fall through to the
             // warning below: accepted, stored nowhere, and a violating insert
             // then succeeded.
-            let (_, check_expression) = crate::core::rql::check::split_clause(&description);
+            // Read after the constraint's name: a quoted name holding the
+            // word (`"my check"`) is not the clause.
+            let after_name = match crate::core::rql::unique_key::split_constraint_name(&description) {
+                Ok((_, rest)) => rest.to_string(),
+                Err(e) => return ddl_error(&e),
+            };
+            let (_, check_expression) = crate::core::rql::check::split_clause(&after_name);
             if let Some(expression) = check_expression {
                 return add_check_constraint(&plan.table_name, &schema, &description, expression, database, tx)
                     .await;
@@ -10231,10 +10250,7 @@ async fn execute_alter_table_action(
             // A UNIQUE or PRIMARY KEY that was not read as one is an error:
             // reported as done, it enforced nothing, and a duplicate went in.
             // Read after the constraint's name, which may be any word.
-            let after_name = match crate::core::rql::unique_key::split_constraint_name(&description) {
-                Ok((_, rest)) => rest.to_ascii_uppercase(),
-                Err(e) => return ddl_error(&e),
-            };
+            let after_name = after_name.to_ascii_uppercase();
             if after_name.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "UNIQUE" || w == "PRIMARY") {
                 return ddl_error(&format!(
                     "the constraint `{}` on '{}' could not be read as a UNIQUE or PRIMARY KEY, and an unenforced \
@@ -12223,10 +12239,7 @@ pub(crate) fn alter_lock_set(
 /// The name `ALTER TABLE … DROP CONSTRAINT [IF EXISTS] <name>` drops, read
 /// as the constraint arm reads it.
 fn dropped_constraint_name(description: &str) -> Option<String> {
-    description
-        .split_whitespace()
-        .find(|w| !matches!(w.to_ascii_uppercase().as_str(), "CONSTRAINT" | "IF" | "EXISTS"))
-        .map(|n| n.trim_matches('"').to_string())
+    crate::core::rql::unique_key::dropped_constraint(description).ok().map(|(name, _)| name)
 }
 
 /// The parent an `ADD [CONSTRAINT n] FOREIGN KEY … REFERENCES p` names,

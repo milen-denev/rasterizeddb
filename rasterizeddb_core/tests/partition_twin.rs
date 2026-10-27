@@ -1502,6 +1502,17 @@ impl Gen {
                 }
             }
             DropUniqueIndex => {
+                // A name that may not exist fails 42704 on both, as in
+                // PostgreSQL; the round trip drops one that does, so every
+                // run has a drop that took effect.
+                if self.rng.u8(..3) == 0 {
+                    let inner = vec![
+                        self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_uq3 UNIQUE (grp, id, tenant_id, n)".into()),
+                        self.simple(kind, "ALTER TABLE {t} DROP CONSTRAINT {t}_uq3".into()),
+                        self.simple(kind, "ALTER TABLE {t} DROP CONSTRAINT {t}_uq3".into()),
+                    ];
+                    return Op { kind, step: Step::Sequence(inner), ordered: false };
+                }
                 let name = if self.rng.bool() { "{t}_uq" } else { "{t}_uq2" };
                 self.simple(kind, format!("ALTER TABLE {{t}} DROP CONSTRAINT {name}"))
             }

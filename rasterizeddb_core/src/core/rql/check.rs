@@ -46,13 +46,15 @@ impl CheckConstraint {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut out = vec![0u8; CHECK_SIZE as usize];
 
-        let filtered: String = self
-            .name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        let name = filtered.as_bytes();
-        let name_len = name.len().min(128);
+        // UTF-8, cut at a character boundary within 128 bytes: a name a
+        // client gives (`"my check"`, `価格_chk`) is the name stored, so a DROP
+        // by it finds it. Records written ASCII-filtered still read back as
+        // written; the layout is unchanged.
+        let name = self.name.as_bytes();
+        let mut name_len = name.len().min(128);
+        while !self.name.is_char_boundary(name_len) {
+            name_len -= 1;
+        }
         out[..name_len].copy_from_slice(&name[..name_len]);
 
         let expression = self.expression.as_bytes();

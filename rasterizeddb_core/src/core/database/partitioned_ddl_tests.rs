@@ -566,18 +566,13 @@ async fn non_ascii_and_quoted_constraint_names_on_both_table_kinds() {
             try_exec(&db, &ddl).await.unwrap_or_else(|e| panic!("`{ddl}`: {e}"));
         }
         let (uniques, checks) = names(&db, t);
-        // A unique key's name is stored filtered to ASCII letters, digits
-        // and `_` (`unique_key::write_name`, older than this slice), so
-        // `名` reads back empty and `my key` as `mykey`: the keys exist and
-        // are enforced, under those names.
-        let stored = |n: &str| n.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>();
+        // Stored as given (UTF-8), so IF NOT EXISTS found `名` and added no
+        // second key.
         for n in ["名", "索引", "my key"] {
-            assert!(uniques.iter().any(|u| *u == stored(n)), "{t}: no unique key for {n:?} in {uniques:?}");
+            assert_eq!(uniques.iter().filter(|u| *u == n).count(), 1, "{t}: unique key {n:?} in {uniques:?}");
         }
-        assert!(uniques.len() >= 4, "{t}: {uniques:?}");
-        // CHECK names too (`check::append`).
         for n in ["価格_chk", "aé_chk"] {
-            assert!(checks.iter().any(|c| *c == stored(n)), "{t}: no check for {n:?} in {checks:?}");
+            assert!(checks.iter().any(|c| c == n), "{t}: no check {n:?} in {checks:?}");
         }
         let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d) VALUES (3, -1, 300)")).await.expect_err("the CHECK");
         assert!(e.to_ascii_lowercase().contains("check"), "{t}: {e}");
@@ -615,5 +610,77 @@ async fn a_malformed_rename_intent_is_set_aside_at_open() {
     db.rename_table("pt", "pt2").await.expect("a rename after the intent was set aside");
     assert_eq!(count(&exec(&db, "SELECT id FROM pt2").await), 60);
     assert!(db.drop_table("pt2").await.unwrap());
+    close(d, db);
+}
+
+/// Constraint names with a space, non-ASCII only, and mixed: created, used,
+/// read back after a restart as given, IF NOT EXISTS on one a no-op (not a
+/// second key), and dropped by the same name, on a plain and a partitioned
+/// table; a DROP CONSTRAINT that matches nothing is 42704 unless IF EXISTS.
+///
+/// Mutations: `write_name` filtering to ASCII again (the names read back
+/// filtered, `名` collides with `検`); the DROP's name read up to whitespace
+/// again (`"my key"` is not dropped); a DROP matching nothing a success again.
+#[tokio::test(flavor = "multi_thread")]
+async fn constraint_names_are_stored_as_given_and_dropped_by_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = open(d).await;
+    exec(
+        &db,
+        "CREATE TABLE pk (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, e BIGINT, PRIMARY KEY (a, c)) \
+         PARTITION BY HASH (a) PARTITIONS 4",
+    )
+    .await;
+    exec(&db, "CREATE TABLE pl (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, e BIGINT, PRIMARY KEY (a, c))").await;
+    let declared = |db: &Database, t: &str| -> (Vec<String>, Vec<String>) {
+        let schema = match db.partitioned_table(t) {
+            Some(pt) => pt.shell().schema.clone(),
+            None => db.table_for_tests(t).unwrap().schema.clone(),
+        };
+        (
+            schema.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| k.name.clone()).collect(),
+            schema.checks.iter().filter(|c| !c.is_deleted).map(|c| c.name.clone()).collect(),
+        )
+    };
+    let names = ["my key", "名", "検", "mix é 1"];
+    for t in ["pl", "pk"] {
+        exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 10, 100, 1000), (2, 20, 200, 2000)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"my key\" UNIQUE (a, d)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"名\" UNIQUE (a, e)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"検\" UNIQUE (a, d, e)")).await;
+        exec(&db, &format!("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON {t} (a, c, d)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT IF NOT EXISTS \"名\" UNIQUE (a, e)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"my check\" CHECK (d >= 0)")).await;
+        exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT 検査 CHECK (e >= 0)")).await;
+    }
+    close(d, db);
+    let db = open(d).await;
+    for t in ["pl", "pk"] {
+        let (uniques, checks) = declared(&db, t);
+        for n in names {
+            assert_eq!(uniques.iter().filter(|u| *u == n).count(), 1, "{t}: {n:?} in {uniques:?}");
+        }
+        for n in ["my check", "検査"] {
+            assert!(checks.iter().any(|c| c == n), "{t}: {n:?} in {checks:?}");
+        }
+        let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 11, 100, 1)")).await.expect_err("my key");
+        assert!(e.to_ascii_lowercase().contains("duplicate"), "{t}: {e}");
+        let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 12, 5, 1000)")).await.expect_err("名");
+        assert!(e.to_ascii_lowercase().contains("duplicate"), "{t}: {e}");
+        for n in names {
+            exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT \"{n}\"")).await;
+        }
+        exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT \"my check\"")).await;
+        exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT 検査")).await;
+        let (uniques, checks) = declared(&db, t);
+        assert!(!uniques.iter().any(|u| names.contains(&u.as_str())), "{t}: {uniques:?} after the drops");
+        assert!(!checks.iter().any(|c| c == "my check" || c == "検査"), "{t}: {checks:?} after the drops");
+        // The keys are gone, so the rows they refused go in.
+        exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 11, 100, -1)")).await;
+        let e = try_exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT \"my key\"")).await.expect_err("a second drop");
+        assert!(e.contains("does not exist") && e.contains("my key"), "{t}: {e}");
+        exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT IF EXISTS \"my key\"")).await;
+    }
     close(d, db);
 }

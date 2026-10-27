@@ -6654,7 +6654,8 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return "42P10";
     }
     // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
-    if has("constraint \"") && has("\" for table \"") && has("does not exist") {
+    // `DROP CONSTRAINT`'s "of relation" too, ahead of the relation rule.
+    if has("constraint \"") && (has("\" for table \"") || has("\" of relation \"")) && has("does not exist") {
         return "42704";
     }
     // `DROP INDEX` of an index a constraint owns (a primary key's, a unique
