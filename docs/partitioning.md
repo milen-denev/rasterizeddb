@@ -1,7 +1,8 @@
 # Hash partitioning
 
 Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **not
-advertised**, and **phases 3 to 7 designed, not built.** Phases 0 and 1 are
+advertised**, and **phases 3 to 7 designed, not built**, except phase 3's P3
+(composite identifying keys, [as built](#phase-3-p3-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -124,7 +125,7 @@ idle-box wall-clock A/B is still to run.
 
 | Refused | Phase |
 |---|---|
-| `UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` | 3 (composite identifying keys, §1b) |
+| ~~`UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT`~~ | built in phase 3 P3 ([as built](#phase-3-p3-as-built)) |
 | `ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`; FKs onto or from a partitioned table | 3 (§10, §11); physical-rewrite `ALTER` 6 |
 | A key change: an `UPDATE` or `DO UPDATE` assigning a key column anything its `WHERE` does not pin to the same value | 6 (row moves, §9) |
 | Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`) and reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`) | 5 |
@@ -140,9 +141,10 @@ idle-box wall-clock A/B is still to run.
   partitions and the scan returns no rows. Only a clause
   `clause_is_constant_false` proves false (a comparison of constants, such
   as `1 = 0`) routes to none.
-- **A partitioned target of `UPDATE … FROM` / `DELETE … USING` is refused**
-  (phase 3), as is any statement that addresses rows by one identifying
-  column: a partitioned table has only composite unique keys (§1b).
+- **A partitioned target of `UPDATE … FROM` / `DELETE … USING` was refused**
+  in 2b, as was any statement that addresses rows by one identifying
+  column: a partitioned table has only composite unique keys (§1b). Phase 3
+  P3 built them ([as built](#phase-3-p3-as-built)).
 - **The WHERE-arithmetic gap** reported with S18 is a plain-table evaluator
   limit and the owner's (rasterizeddb-47) to fix:
   `… ON CONFLICT … DO UPDATE SET … WHERE t.n IS NOT NULL AND EXCLUDED.n > t.n - 100`
@@ -165,6 +167,90 @@ four configurations at the default seeds (0x5eed0001, 0x5eed7a11, 300
 statements), at 0x5eed2b20 and at 0x5eedf1a1 with 1,500 statements each;
 `KNOWN_DIVERGENCES` is empty, and `REFUSED` holds only the phase 3 and 6
 kinds above. Every `partition_*` suite, core and compat, passes.
+
+## Phase 3 P3 as built
+
+Built on `feat/p3-identifying-keys` (2026-10-27), over a9854ec: **composite
+identifying keys**, so every row-addressing statement works on a table whose
+only unique keys span several columns, which is every partitioned table and
+a plain table with a composite `PRIMARY KEY` (§1b).
+
+**What works, on plain and partitioned tables alike:**
+
+- `SELECT … FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`,
+  with `SKIP LOCKED` or `NOWAIT` (55P03), routed or fanned out, with `ORDER BY
+  … LIMIT`, in blocks and prepared. The engine maps the four strengths onto
+  two, as it did on a one-column key (`NO KEY UPDATE` is `UPDATE`, `KEY
+  SHARE` is `SHARE`). The select list must hold every key column, as it had
+  to hold the one before.
+- A row is locked by the framed tuple of its key under the table's
+  **logical name**: one `RowLocks` entry whichever partition the row is in
+  and whichever route found it, so a lock taken through a routed read blocks
+  a fanned-out writer and the reverse (§6.2's last paragraph).
+- A writer (`UPDATE`, `DELETE`, the per-row write of `UPDATE … FROM` /
+  `DELETE … USING`) of a row another transaction holds **waits** for it, as
+  PostgreSQL's does, through the same bounded wait `FOR UPDATE` takes:
+  until the holder ends, `statement_timeout`, a deadlock or the 10 s lock
+  timeout. It used to fail at once. The wait is an edge of the wait-for graph
+  table locks share, keyed as the lock is, so a cycle through a row lock and
+  a table lock ends in exactly one 40P01.
+- `UPDATE … FROM` and `DELETE … USING` with a partitioned **target** (plain
+  or partitioned source, derived tables, `RETURNING`, expressions over the
+  target): the join reads every relation and partition under its one
+  snapshot (S19), then each target row is written back by its key, which
+  pins every partition-key column and so routes to one partition, with the
+  join's target terms rechecked as before (2c10025). Every row is named
+  before any is written.
+- **Each target row is written once**, however many source rows it joins,
+  as PostgreSQL does. `UPDATE … FROM` used to write once per joined row:
+  `SET n = n + 1` applied twice, and the count and `RETURNING` held the row
+  twice (plain tables too; `DELETE … USING` already deduplicated).
+
+**The identifying key** (`identifying_key`, `core/rql/executor.rs`), chosen
+as PostgreSQL names a row:
+
+1. the primary key: `schema.primary_key` (one column), or the table-level key
+   named `<table>_pkey` (a composite one, which `lexer_ct` records only as a
+   unique key);
+2. else a `UNIQUE` (inline or table-level, not partial) whose every column is
+   `NOT NULL`, the fewest columns first, then the first declared;
+3. else, as before composite keys counted, a one-column `UNIQUE` that may hold
+   NULL.
+
+A row whose key holds a NULL names no row (a unique key admits any number of
+NULLs): `FOR UPDATE` and the write-back refuse it with an error rather than
+name every NULL row by the bytes a NULL travels as, which used to write a
+NULL-keyed row back by `= NULL` and silently skip it. A one-column key locks by
+the column's stored bytes, exactly as before; a composite one by each
+component's `encode_canonical`, which is length-prefixed, so `(1, 23)` and
+`(12, 3)` cannot meet. A primary key declared with a `CONSTRAINT` name of its
+own is not recognised as the primary key; it is still chosen by rule 2 when
+its columns are `NOT NULL`.
+
+**Pinned by** `tests/partition_twin.rs` (`ForUpdate`, `SkipLocked`,
+`ForUpdateNoWait`, `UpdateFrom`, `DeleteUsing` compared with the twin, in
+blocks too; `REFUSED` holds only phase 6 kinds), `tests/partition_shell_sites.rs`,
+and `rasterizeddb_compat/tests/composite_row_locks.rs` over pgwire on a plain
+composite-key table and a partitioned one: a `SKIP LOCKED` job queue
+claiming every job exactly once, `NOWAIT` 55P03, a holder blocking a writer
+until `COMMIT`, one 40P01 across a row and a table lock, `UPDATE … FROM`
+under one snapshot with a concurrent writer, `DELETE … USING` returning each
+row once under a concurrent inserter, write-once, and the key choice. Each
+invariant was mutation-verified.
+
+**Found, not fixed** (engine behaviour outside P3, on plain tables too):
+
+- A failed autocommit `UPDATE … FROM` keeps its earlier per-row writes: with
+  a `CHECK` violated by the third joined row, the first two rows stay
+  updated and the client gets 23514.
+- A column of a table-level `PRIMARY KEY (a, b)` written without `NOT NULL`
+  accepts NULL (PostgreSQL makes it `NOT NULL`).
+- A `FOR UPDATE` that waited for a holder returns the row as its scan saw
+  it, and does not recheck its `WHERE` against the version the holder
+  committed (PostgreSQL's EvalPlanQual): a claim query re-reads a job the
+  holder already finished. A queue that writes back with its state in the
+  `WHERE` (`… AND state = 'new'`) claims each job once; one that writes back
+  by key alone can claim it twice.
 
 ## 1. Model
 
@@ -381,19 +467,19 @@ key rules out `PRIMARY KEY (tenant_id, asset_id)`. The error says so and names
 the alternative, partitioning by `(tenant_id)` alone (isolatable, not
 sub-splittable). An opt-in is §17.6.
 
-**Row-addressing statements need a composite identifying key.** `FOR
-UPDATE`/`SHARE`, `SKIP LOCKED`, `UPDATE … FROM` and `DELETE … USING` name each
-row by one column (`identifying_field`, `core/rql/executor.rs:8968`: an inline
-`UNIQUE` column, a one-column `PRIMARY KEY` or unique key), refusing composite
-keys; `PRIMARY KEY (a, b)` leaves `schema.primary_key` empty
-(`core/rql/lexer_ct.rs:229-233`). By the rule above a composite-keyed table has
-no one-column unique key, and a one-column key's only candidate is the key
-itself, one row per tenant. So these are refused on essentially every
-partitioned table, as on plain tables with a composite primary key (so the twin
-test cannot notice), until `identifying_field` accepts a composite key, with
-`RowLocks` keyed by the framed tuple (`encode_canonical` is already
-length-prefixed) and `refuse_write_to_locked_rows` using it: a phase 3
-prerequisite that fixes plain tables too.
+**Row-addressing statements use a composite identifying key** (phase 3 P3,
+[as built](#phase-3-p3-as-built)). `FOR UPDATE`/`SHARE`, `SKIP LOCKED`,
+`NOWAIT`, `UPDATE … FROM` and `DELETE … USING` used to name each row by one
+column (`identifying_field`: an inline `UNIQUE` column, a one-column `PRIMARY
+KEY` or unique key) and refuse composite keys; `PRIMARY KEY (a, b)` leaves
+`schema.primary_key` empty (`core/rql/lexer_ct.rs:229-233`). By the rule above
+a composite-keyed table has no one-column unique key, so they were refused on
+essentially every partitioned table, and on plain tables with a composite
+primary key. `identifying_key` now accepts a composite primary key or a
+`UNIQUE` whose columns are all `NOT NULL`; `RowLocks` keys a row by the framed
+tuple (`encode_canonical`, length-prefixed) under the logical name, and
+`refuse_write_to_locked_rows` and the deadlock detector use the same key. The
+change fixes plain tables too.
 
 ### Co-location
 
@@ -438,7 +524,7 @@ SET partition_trace = on;   -- a NOTICE per statement: partitions routed, and wh
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
 | Temporary partitioned tables; KV-backed partitions | KV until measured |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
-| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5); FKs either way (phase 3, §10); `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, partitioned targets of `UPDATE … FROM`/`DELETE … USING` (phase 3: composite identifying keys, §1b); conversion and reshapes (phase 5) | §15 |
+| Until their phase: `ALTER`, `RENAME`, `CREATE`/`DROP INDEX` on partitioned tables (phase 3; physical-rewrite `ALTER` phase 6, §11); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5); FKs either way (phase 3, §10); conversion and reshapes (phase 5). `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` and partitioned targets of `UPDATE … FROM`/`DELETE … USING` are built (phase 3 P3, §1b) | §15 |
 
 **What phase 2b refuses, as built (S20).** Each with 0A000 and "not
 supported" and a reason, before anything is read or written; the twin's
@@ -448,8 +534,8 @@ answers like a plain table (below).
 
 | Refused on a partitioned table | Where it is refused | Lifted by |
 |---|---|---|
-| `UPDATE … FROM` and `DELETE … USING` with a partitioned **target** | their executor entry, before the join runs | phase 3 (composite identifying keys, §1b) |
-| `SELECT … FOR UPDATE`/`FOR SHARE`, `SKIP LOCKED`, `NOWAIT` | `refuse_partitioned_row_lock`, before routing | phase 3 |
+| ~~`UPDATE … FROM` and `DELETE … USING` with a partitioned **target**~~ | ~~their executor entry, before the join runs~~ | lifted by phase 3 P3 (composite identifying keys, §1b) |
+| ~~`SELECT … FOR UPDATE`/`FOR SHARE`, `SKIP LOCKED`, `NOWAIT`~~ | ~~`refuse_partitioned_row_lock`, before routing~~ (removed) | lifted by phase 3 P3 |
 | `ALTER TABLE` in every form (columns, defaults, `NOT NULL`, constraints, `RENAME`, `RENAME TO` onto the name, the verbs a plain table takes as no-ops), `CREATE INDEX` in every form | the DDL arms, before any sidecar is written | phase 3 (metadata DDL, §11); physical-rewrite forms phase 6 |
 | `FOREIGN KEY` from a partitioned table (`CREATE … PARTITION BY`, `ADD CONSTRAINT`), and onto one (`REFERENCES`, `ADD CONSTRAINT`) | `CREATE` and the DDL arms | phase 3 (§10) |
 | An `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value (`SET tenant_id = 5 WHERE tenant_id = 1`, `SET g = g + 1`), and a `DO UPDATE` that does so when its conflict happens | `assignments_keep_point` before routing (`DO UPDATE`: before the update writes); the range guard on every merged row behind it | phase 6 (row moves, §9) |
@@ -1619,8 +1705,10 @@ section specifying the mechanism.
     maps with enforced equal boundaries would not, for more code.
 12. **Checkpoints grow with active partitions** and can stall a location's
     writers for seconds (§5).
-13. **Row-addressing statements wait on composite identifying keys**, an
-    every-table change (§1b); ORMs and job queues use them, so phase 3 cannot
-    be advertised without it.
+13. ~~**Row-addressing statements wait on composite identifying keys**~~:
+    built in phase 3 P3 ([as built](#phase-3-p3-as-built)). Left open there: a
+    waited `FOR UPDATE` does not recheck its `WHERE` against the version the
+    holder committed, so a job queue must keep its state in the write-back's
+    `WHERE`.
 14. **Replica apply skips a transient `53xxx`** under `Skip` and
     `LastWriterWins` until `replication/server.rs` retries it (§12).
