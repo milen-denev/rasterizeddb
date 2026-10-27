@@ -10134,18 +10134,9 @@ async fn execute_alter_table_action(
             // `CREATE UNIQUE INDEX IF NOT EXISTS` becomes this statement, and
             // the tolerance has to survive the rewrite: with it, a constraint
             // that is already there is success rather than an error.
-            let (description, tolerate_existing) = {
-                let trimmed = description.trim_start();
-                let upper = trimmed.to_ascii_uppercase();
-                if upper.starts_with("IF NOT EXISTS") {
-                    (
-                        trimmed["IF NOT EXISTS".len()..].trim_start().to_string(),
-                        true,
-                    )
-                } else {
-                    (description.clone(), false)
-                }
-            };
+            // Taken out in front or after `CONSTRAINT`, where the rewrite
+            // puts it (`unique_key::strip_if_not_exists`).
+            let (description, tolerate_existing) = crate::core::rql::unique_key::strip_if_not_exists(&description);
 
             match crate::core::rql::unique_key::parse_clause(&description, &plan.table_name) {
                 Err(e) => return ddl_error(&e),
@@ -10224,6 +10215,16 @@ async fn execute_alter_table_action(
                     .await;
             }
 
+            // A UNIQUE or PRIMARY KEY that was not read as one is an error:
+            // reported as done, it enforced nothing, and a duplicate went in.
+            let words = crate::core::rql::unique_key::strip_if_not_exists(&description).0.to_ascii_uppercase();
+            if words.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "UNIQUE" || w == "PRIMARY") {
+                return ddl_error(&format!(
+                    "the constraint `{}` on '{}' could not be read as a UNIQUE or PRIMARY KEY, and an unenforced \
+                     one is not supported",
+                    description, plan.table_name
+                ));
+            }
             // Anything left — `EXCLUDE` — is accepted so a migration can
             // proceed, and reported as unenforced rather than as done.
             warn!(

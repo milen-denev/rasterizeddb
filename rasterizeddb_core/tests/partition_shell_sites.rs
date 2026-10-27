@@ -173,6 +173,14 @@ fn pg_indexes(r: &Reply, _: &Database) -> Result<(), String> {
     Ok(())
 }
 
+/// `site_p_kn` is declared on the shell (and so on every partition), as a
+/// unique key the writes enforce.
+fn kn_declared(_: &Reply, db: &Database) -> Result<(), String> {
+    let pt = db.partitioned_table(T).ok_or("not partitioned")?;
+    let declared = pt.shell().schema.unique_keys.iter().any(|k| !k.is_deleted && k.name == "site_p_kn");
+    if declared { Ok(()) } else { Err("site_p_kn is not declared".into()) }
+}
+
 /// Every site, in the order run. The `DROP` sites are last.
 const SITES: &[Site] = &[
     // CREATE.
@@ -244,8 +252,24 @@ const SITES: &[Site] = &[
     site("CREATE INDEX site_p_n ON site_p (n)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("CREATE INDEX IF NOT EXISTS site_p_n ON site_p (n)", Expect::Check(|_, _| Ok(())), "IF NOT EXISTS"),
     site("SELECT * FROM site_p WHERE n = 20", Expect::LikeTwinAnswered, "through the index"),
-    site("CREATE UNIQUE INDEX site_p_kn ON site_p (tenant_id, asset_group_id, n)", Expect::Check(|_, _| Ok(())), "§1b"),
+    site("CREATE UNIQUE INDEX site_p_kn ON site_p (tenant_id, asset_group_id, n)", Expect::Check(kn_declared), "§1b"),
+    site(
+        "CREATE UNIQUE INDEX IF NOT EXISTS site_p_kn ON site_p (tenant_id, asset_group_id, n)",
+        Expect::Check(kn_declared),
+        "an existing name: a no-op",
+    ),
+    site(
+        "INSERT INTO site_p (tenant_id, asset_group_id, asset_id, n, label) VALUES (1, 1, 99, 10, 'dup')",
+        Expect::Error("23505"),
+        "site_p_kn enforced: (1, 1, 10) is taken",
+    ),
     site("CREATE UNIQUE INDEX site_p_bad ON site_p (n)", Expect::Refused, "§1b: every key column"),
+    site("CREATE UNIQUE INDEX IF NOT EXISTS site_p_bad ON site_p (n)", Expect::Refused, "§1b, IF NOT EXISTS too"),
+    site(
+        "ALTER TABLE site_p ADD CONSTRAINT IF NOT EXISTS site_p_bad UNIQUE (n)",
+        Expect::Refused,
+        "§1b, IF NOT EXISTS after CONSTRAINT too",
+    ),
     site("CREATE INDEX site_p_l ON site_p USING hash (label)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX site_p_l", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),

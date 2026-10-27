@@ -676,6 +676,44 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
     Ok(false)
 }
 
+/// An `ADD CONSTRAINT` description with its `IF NOT EXISTS` taken out, and
+/// whether there was one: in front (`IF NOT EXISTS CONSTRAINT c …`, `IF NOT
+/// EXISTS UNIQUE (…)`) or after `CONSTRAINT` (`CONSTRAINT IF NOT EXISTS c …`,
+/// what `CREATE UNIQUE INDEX IF NOT EXISTS` is rewritten into). The one place
+/// both the ALTER arm and the partitioned refusal read it: left in after
+/// `CONSTRAINT`, [`parse_clause`] took `IF` for the constraint's name, found
+/// no `UNIQUE` after it, and the statement succeeded enforcing nothing.
+pub fn strip_if_not_exists(description: &str) -> (String, bool) {
+    fn starts_with_words(text: &str, words: &[&str]) -> Option<usize> {
+        let mut at = 0;
+        for word in words {
+            let rest = &text[at..];
+            let skipped = rest.len() - rest.trim_start().len();
+            let rest = rest.trim_start();
+            if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word) {
+                return None;
+            }
+            let after = &rest[word.len()..];
+            if after.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            at += skipped + word.len();
+        }
+        Some(at)
+    }
+    const IF_NOT_EXISTS: [&str; 3] = ["IF", "NOT", "EXISTS"];
+    if let Some(end) = starts_with_words(description, &IF_NOT_EXISTS) {
+        return (description[end..].trim_start().to_string(), true);
+    }
+    if let Some(after_constraint) = starts_with_words(description, &["CONSTRAINT"]) {
+        if let Some(end) = starts_with_words(&description[after_constraint..], &IF_NOT_EXISTS) {
+            let rest = description[after_constraint + end..].trim_start();
+            return (format!("CONSTRAINT {rest}"), true);
+        }
+    }
+    (description.to_string(), false)
+}
+
 /// Parses a table-level `UNIQUE (…)` or `PRIMARY KEY (…)` clause, with or
 /// without a leading `CONSTRAINT <name>`.
 ///
@@ -1185,5 +1223,28 @@ mod tests {
                 .unwrap_err()
                 .contains("at most")
         );
+    }
+}
+
+#[cfg(test)]
+mod strip_if_not_exists_tests {
+    use super::*;
+
+    #[test]
+    fn if_not_exists_is_taken_out_wherever_the_rewrite_puts_it() {
+        for (given, want, tolerant) in [
+            ("CONSTRAINT IF NOT EXISTS u UNIQUE (c)", "CONSTRAINT u UNIQUE (c)", true),
+            ("constraint if  not exists \"u\" UNIQUE (a, b) WHERE c", "CONSTRAINT \"u\" UNIQUE (a, b) WHERE c", true),
+            ("IF NOT EXISTS CONSTRAINT u UNIQUE (c)", "CONSTRAINT u UNIQUE (c)", true),
+            ("IF NOT EXISTS UNIQUE (c)", "UNIQUE (c)", true),
+            ("CONSTRAINT u UNIQUE (c)", "CONSTRAINT u UNIQUE (c)", false),
+            ("CONSTRAINT if_x UNIQUE (c)", "CONSTRAINT if_x UNIQUE (c)", false),
+            ("CONSTRAINT ifnot UNIQUE (c)", "CONSTRAINT ifnot UNIQUE (c)", false),
+        ] {
+            assert_eq!(strip_if_not_exists(given), (want.to_string(), tolerant), "{given}");
+        }
+        let (stripped, _) = strip_if_not_exists("CONSTRAINT IF NOT EXISTS u UNIQUE (c)");
+        let key = parse_clause(&stripped, "t").unwrap().expect("a unique key");
+        assert_eq!((key.name.as_str(), key.columns.as_slice()), ("u", &["c".to_string()][..]));
     }
 }
