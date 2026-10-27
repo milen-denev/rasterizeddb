@@ -16,12 +16,60 @@ use parking_lot::Mutex;
 use std::sync::Arc as StdArc;
 
 const CREATE: &str = "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, s TEXT, \
-                      PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS 8";
+                      m BIGINT NOT NULL, PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS 8";
 
 /// One DDL and the cut points it must reach.
 struct Case {
     ddl: &'static str,
     points: &'static [(&'static str, u64)],
+    /// Run before the recorder starts: what the DDL undoes.
+    prep: &'static [&'static str],
+    /// No row: the metadata-only forms of ADD COLUMN and DROP NOT NULL.
+    empty: bool,
+}
+
+const fn case(ddl: &'static str, points: &'static [(&'static str, u64)]) -> Case {
+    Case { ddl, points, prep: &[], empty: false }
+}
+
+/// Every partition's indexes built or loaded, and ready.
+async fn settled(t: &Table<DbStorageProvider>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    tokio::time::timeout(std::time::Duration::from_secs(60), t.index_load_settled())
+        .await
+        .map_err(|_| "the index load never settled".to_string())?;
+    while !t.filters_ready().map_err(|e| e.to_string())?
+        || t.indexes().map_err(|e| e.to_string())?.is_some_and(|ix| !ix.is_ready())
+    {
+        if std::time::Instant::now() > deadline {
+            return Err("the indexes never became ready".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+/// Each index's contents, not only its declaration: once every partition's
+/// indexes are ready, an equality its index serves answers as the same
+/// predicate the index cannot serve (`v + 0`, `s || ''`). A column a change
+/// dropped or renamed fails both, alike.
+async fn index_contents(db: &Arc<Database>, name: &str, table: &crate::core::partition::table::PartitionedTable) -> Result<(), String> {
+    let epoch = table.epoch().map_err(|e| e.to_string())?;
+    for (_, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).map_err(|e| e.to_string())? {
+        settled(&part).await?;
+    }
+    let probes = [0i64, 3, 30, 93, 141].map(|v| (format!("v = {v}"), format!("v + 0 = {v}")));
+    let words = ["w0", "w1", "w2", "w3"].map(|w| (format!("s = '{w}'"), format!("s || '' = '{w}'")));
+    for (served, scanned) in probes.iter().chain(words.iter()) {
+        let a = rows(db, &format!("SELECT id FROM {name} WHERE {served}")).await;
+        let b = rows(db, &format!("SELECT id FROM {name} WHERE {scanned}")).await;
+        match (a, b) {
+            (Ok(a), Ok(b)) if a == b => {}
+            (Err(_), Err(_)) => {}
+            (a, b) => return Err(format!("`{served}` answers {a:?}, its scan {b:?}")),
+        }
+    }
+    Ok(())
 }
 
 const REOPENS: [(&str, u64); 4] = [
@@ -67,6 +115,7 @@ async fn fingerprint(db: &Arc<Database>) -> Result<String, String> {
             return Err(format!("partition {pid} holds another schema than the shell"));
         }
     }
+    index_contents(db, name, &table).await?;
     // Every tenant routes to its partition and reads; the rows, hashed.
     let key = table.key_columns().map_err(|e| e.to_string())?.remove(0);
     let mut per_tenant = Vec::new();
@@ -77,12 +126,18 @@ async fn fingerprint(db: &Arc<Database>) -> Result<String, String> {
     Ok(format!("{name} | {shell} | {per_tenant:?}"))
 }
 
-async fn populated(dir: &Path) -> Arc<Database> {
+async fn populated(dir: &Path, case: &Case) -> Arc<Database> {
     let db = open(dir, "pddl_cut").await.unwrap();
     exec(&db, CREATE).await.unwrap();
-    let values: Vec<String> = (0..48i64).map(|i| format!("({}, {i}, {}, 'w{}')", i % 6 + 1, i * 3, i % 4)).collect();
-    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v, s) VALUES {}", values.join(", "))).await.unwrap();
-    exec(&db, "DELETE FROM pt WHERE id % 11 = 3").await.unwrap();
+    if !case.empty {
+        let values: Vec<String> =
+            (0..48i64).map(|i| format!("({}, {i}, {}, 'w{}', {i})", i % 6 + 1, i * 3, i % 4)).collect();
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v, s, m) VALUES {}", values.join(", "))).await.unwrap();
+        exec(&db, "DELETE FROM pt WHERE id % 11 = 3").await.unwrap();
+    }
+    for sql in case.prep {
+        exec(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
     db.sync_durable().unwrap();
     db
 }
@@ -92,7 +147,7 @@ async fn populated(dir: &Path) -> Arc<Database> {
 async fn run_case(case: &Case, seeds: u64) -> (usize, usize) {
     let base = tempfile::tempdir().unwrap();
     let dir = base.path().join("db");
-    let db = populated(&dir).await;
+    let db = populated(&dir, case).await;
     let old = fingerprint(&db).await.unwrap();
 
     let rec = Recorder::start(&dir);
@@ -190,24 +245,39 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
         ("test.pddl.partition_reopened", 1),
         ("test.pddl.partition_reopened", 2),
     ];
+    // An empty table has no open partition to reopen.
+    let atomic_empty: &[(&str, u64)] = &[("test.rewrite.metadata_after_work", 1), ("test.pddl.after_work", 1)];
     let cases = [
-        Case { ddl: "CREATE INDEX pt_v ON pt (v)", points: &REOPENS },
-        Case { ddl: "ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)", points: &REOPENS },
-        Case { ddl: "ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (tenant_id, id, v)", points: &REOPENS },
-        Case { ddl: "ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'", points: &REOPENS },
-        Case { ddl: "ALTER TABLE pt RENAME COLUMN s TO label", points: atomic },
-        Case { ddl: "ALTER TABLE pt RENAME COLUMN tenant_id TO tid", points: atomic },
-        Case { ddl: "ALTER TABLE pt DROP COLUMN s", points: atomic },
-        Case { ddl: "ALTER TABLE pt ALTER COLUMN s SET NOT NULL", points: atomic },
+        case("CREATE INDEX pt_v ON pt (v)", &REOPENS),
+        case("CREATE INDEX pt_s ON pt USING hash (s)", &REOPENS),
+        Case { prep: &["CREATE INDEX pt_v ON pt (v)"], ..case("DROP INDEX pt_v", &REOPENS) },
+        case("ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)", &REOPENS),
         Case {
-            ddl: "ALTER TABLE pt RENAME TO pt2",
-            points: &[
+            prep: &["ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)"],
+            ..case("ALTER TABLE pt DROP CONSTRAINT pt_c", &REOPENS)
+        },
+        case("ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (tenant_id, id, v)", &REOPENS),
+        case("ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'", &REOPENS),
+        Case {
+            prep: &["ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'"],
+            ..case("ALTER TABLE pt ALTER COLUMN s DROP DEFAULT", &REOPENS)
+        },
+        case("ALTER TABLE pt RENAME COLUMN s TO label", atomic),
+        case("ALTER TABLE pt RENAME COLUMN tenant_id TO tid", atomic),
+        case("ALTER TABLE pt DROP COLUMN s", atomic),
+        case("ALTER TABLE pt ALTER COLUMN s SET NOT NULL", atomic),
+        // The metadata-only forms, on a table with no row.
+        Case { empty: true, ..case("ALTER TABLE pt ADD COLUMN extra INT DEFAULT 5", atomic_empty) },
+        Case { empty: true, ..case("ALTER TABLE pt ALTER COLUMN m DROP NOT NULL", atomic_empty) },
+        case(
+            "ALTER TABLE pt RENAME TO pt2",
+            &[
                 ("test.pddl.rename_after_intent", 1),
                 ("test.pddl.rename_after_commit", 1),
                 ("test.pddl.rename_after_header", 1),
                 ("test.pddl.partition_reopened", 1),
             ],
-        },
+        ),
     ];
     let mut total = (0, 0);
     for case in &cases {
