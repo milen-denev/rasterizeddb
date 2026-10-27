@@ -507,10 +507,75 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(round 2)* the constraint name read up to whitespace | `parse_clause` | the same (`"my key" UNIQUE` refused) |
 | *(round 2)* a malformed rename intent left in place at open | `recover_interrupted_rename` | `…::a_malformed_rename_intent_is_set_aside_at_open` |
 | *(round 2)* the snapshot identity unchanged by an index swap | `TableIndexes::shape_hash` | `pddl_crash_tests` (the swap case under `index_storage = snapshot`: `s = 'w0'` answers nothing, its scan the rows) |
+| *(round 3)* the orphan check off in ALTER | `execute_alter_table_action` | `tests/partition_alter.rs::a_ddl_that_would_orphan_the_blocks_row_locks_is_refused` (RENAME TO succeeds under the block's lock) |
+| *(round 3)* the orphan check off in DROP TABLE | `execute_drop_table` | the same (DROP TABLE succeeds) |
+| *(round 3)* the identifying key never compared | `orphans_row_locks` | the same (DROP CONSTRAINT `_pkey` succeeds) |
+| *(round 3)* every key-touching ALTER refused | `orphans_row_locks` | the same (ADD UNIQUE that does not win refused) |
+| *(round 3)* 55006 not mapped | `pgwire::sqlstate_for` | the same (XX000) |
+| *(round 3)* any session's row locks counted | `RowLocks::txn_holds_rows_on` | **survives, equivalent:** the check runs after ACCESS EXCLUSIVE is granted, which another transaction's row locks (and the table lock they come with) prevent, so only the issuer's locks can be there. The wait itself is pinned (B's RENAME: 55P03) |
+| *(round 3)* a UNIQUE name ASCII-filtered again | `unique_key::write_name` | `partitioned_ddl_tests::constraint_names_are_stored_as_given_and_dropped_by_them`, `unique_key::stored_name_tests` |
+| *(round 3)* a CHECK name ASCII-filtered again | `CheckConstraint::into_vec` | `…::constraint_names_are_stored_as_given_and_dropped_by_them` (`価格_chk` stored as `_chk`) |
+| *(round 3)* the DROP name read by whitespace | `unique_key::dropped_constraint` | the same, `stored_name_tests` |
+| *(round 3)* a DROP matching nothing reported as done | the DROP CONSTRAINT arm | the same (a second drop succeeds); `tests/partition_alter.rs::dropping_a_constraint_that_is_not_there_is_42704` |
+| *(round 3)* 42704 not mapped for "of relation" | `pgwire::sqlstate_for` | `…::dropping_a_constraint_that_is_not_there_is_42704` (42P01) |
+| *(round 3)* the CHECK clause read across a quoted name | the ADD CONSTRAINT arm | `…::constraint_names_are_stored_as_given_and_dropped_by_them` (`"my check"` not stored) |
+| *(round 3)* the CHECK name read by whitespace | `add_check_constraint` | the same (stored as `my`) |
+| *(round 3)* a UNIQUE INDEX name not re-quoted | `lexer_alter::unique_index_as_constraint` | `lexer_alter` tests, the same |
+| *(round 3)* one case's snapshot pass run in rebuild mode (test-side: a production mutation that drops every load of one case alone was not found, since a case's images from before the DDL load whatever the DDL does) | `pddl_crash_tests::run_case` | `pddl_crash_tests` (RENAME TO: `loaded: 0`; the summed check alone passes) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
-with 1,500 statements each.
+with 1,500 statements each, after round 2 and again after round 3.
+
+**Round 3** (2026-10-27), three items from review:
+
+- **A DDL that would orphan the block's own row locks is refused** with
+  55006 (object_in_use: "cannot … because it is being used by active
+  queries in this session: the transaction holds row locks on the table,
+  which this would orphan"). A row lock is keyed by (table name,
+  identifying-key bytes), so a `RENAME TO` in the same block left the lock
+  under a name no row has, and a change to the key that identifies a row
+  made every later lookup frame a different key: a second session could
+  update the "locked" row before the block ended. Refused, when the issuing
+  transaction holds row locks on the table (`RowLocks::txn_holds_rows_on`):
+  `RENAME TO`, `DROP TABLE`, and any ALTER whose predicted schema
+  (`schema_after_for_identity`: ADD/DROP of a UNIQUE or PRIMARY KEY,
+  SET/DROP NOT NULL, DROP COLUMN, built in memory) makes `identifying_key`
+  answer differently, compared as columns and scales
+  (`identifying_shape`), not by statement kind. ADD CHECK, a UNIQUE that
+  does not become the identifying key, and CREATE INDEX keep the locks and
+  go through. Another session's locks are not this check's: its DDL waits
+  for ROW EXCLUSIVE and times out with 55P03, as in PostgreSQL. Plain and
+  partitioned alike; checked under the DDL's lock, before a sidecar is
+  written.
+- **Constraint names are kept as written.** UNIQUE and CHECK names are
+  stored as UTF-8, cut at a char boundary within the 128-byte slot.
+  **No format change:** the readers (`read_name`, `CheckConstraint::from_vec`)
+  already decoded UTF-8, so a binary from before reads the new names, and a
+  record written filtered reads back as it was written (a DROP by the
+  original, unfiltered name of such a record now gets 42704 rather than a
+  silent no-op; dropping it by the stored name works). `DROP CONSTRAINT [IF
+  EXISTS]` reads its name with `split_constraint_name`
+  (`unique_key::dropped_constraint`), and a name matching neither sidecar is
+  42704 ("constraint "x" of relation "t" does not exist") unless `IF
+  EXISTS`, on both table kinds; it used to report success. Two of the same
+  shape, found by the pins: `ADD CONSTRAINT "my check" CHECK (…)` was not
+  stored (`check::split_clause` found CHECK inside the quoted name; the
+  clause is now read after the name), and `CREATE UNIQUE INDEX "mix é 1"`
+  lost its quotes in the rewrite to ADD CONSTRAINT (`lexer_alter`
+  re-quotes a name that is not bare). The studio sources on this branch
+  issue no `DROP CONSTRAINT`; `fc3849c`'s pins (`constraint_drops.rs`) and
+  every compat test that drops a constraint drop a name that exists or use
+  `IF EXISTS`. An FK's name is still stored filtered (findings), so `DROP
+  CONSTRAINT "my fk"` is now 42704 where it was a silent no-op that kept the
+  key.
+- **The crash test's snapshot pass loads an image in every case** that has
+  rows (`loaded > 0` per case, not only summed), so one case whose images
+  all rebuild cannot hide behind the others.
+
+The twin's `DropUniqueIndex` now fails 42704 on both sides when its name is
+gone, and gains a round trip (add, drop, drop again) so every run has a drop
+that took effect.
 
 **Deviations from the plan.**
 
@@ -557,12 +622,17 @@ with 1,500 statements each.
   `unique_key::strip_if_not_exists` now takes it out for the arm and the
   partitioned refusal, and a UNIQUE or PRIMARY KEY that still does not parse
   is an error (0A000), never that success.
-- **Constraint names are stored ASCII-filtered.** `unique_key::write_name`
-  (and the CHECK sidecar) keep only ASCII letters, digits and `_`: `名`
-  is stored as an empty name, `"my key"` as `mykey`, `価格_chk` as `_chk`.
-  The keys are enforced; `IF NOT EXISTS` on such a name does not find it
-  and adds a second key. The schema's names were fixed the same way in
-  `020dd0e`; these sidecars were not. Older than this slice, on both table
+- **Constraint names were stored ASCII-filtered** (fixed in P1 round 3 for
+  UNIQUE and CHECK, below). `unique_key::write_name` and the CHECK sidecar
+  kept only ASCII letters, digits and `_`: `名` was stored as an empty name,
+  `"my key"` as `mykey`, `価格_chk` as `_chk`, and a DROP by the name given
+  matched nothing and reported success. Still filtering, and not changed
+  here: `foreign_key::write_name` (an FK's constraint, table and column
+  names), and the column name in the DEFAULT, GENERATED and JSON-map
+  sidecars (`column_default`, `generated`, `json_map`) and
+  `migrate::plan`. A non-ASCII column name is refused by `rename_field`, so
+  the column sidecars may be unreachable that way; an FK named `"my fk"` is
+  not, and would be stored as `myfk`. Older than this slice, on both table
   kinds.
 - `SET NOT NULL` over a NULL answers XX000 (PostgreSQL: 23502), and a
   missing column in a select list 42601 (42703), on both table kinds.
