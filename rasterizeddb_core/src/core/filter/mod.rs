@@ -1467,7 +1467,7 @@ impl TableFilters {
     /// [`TableFilters::backfill_batch`], unless the slots were renumbered
     /// since `epoch` was read: rows read under one numbering must not be
     /// written under another. Returns whether the batch was applied.
-    pub fn backfill_batch_at(
+    pub(crate) fn backfill_batch_at(
         &self,
         _proof: Proof<'_>,
         epoch: u64,
