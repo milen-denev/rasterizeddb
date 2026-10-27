@@ -5438,9 +5438,12 @@ impl<S: StorageIO> Table<S> {
                 // it; the versions it holds were invisible either way.
                 // A conflict marked retryable keeps its marker, and the
                 // executor replays the statement: safe, because nothing of
-                // this attempt survives the abort. The overwrites were held
-                // for the commit (`defers_in_place_writes`), and the versions
-                // are invisible once the transaction aborts.
+                // this attempt survives the abort. An overwrite in place is
+                // taken only where the storage holds it for the commit
+                // (`defers_in_place_writes`: a file with a write-ahead log, a
+                // key/value store; never a log-less file, memory or a
+                // mirror), so the abort drops it; and the versions are
+                // invisible once the transaction aborts.
                 if overwrote_in_place {
                     d.io_pointers.abort_txn(txn).await;
                     return Err(e);

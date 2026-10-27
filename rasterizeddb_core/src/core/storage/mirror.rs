@@ -53,6 +53,14 @@ pub struct MirrorStorageProvider {
     /// because cloning a provider re-maps its file and a mirror would otherwise
     /// pay that once per backup on every clone.
     backups: Arc<Vec<LocalStorageProvider>>,
+    /// In-place writes made under a transaction, per transaction, for the
+    /// backups: applied to them when the primary commits it, dropped when it
+    /// aborts. Written at once, an aborted UPDATE's pointer stamps stayed in
+    /// the backup while the primary's log rolled them back, and the copy
+    /// differed from the primary at the same length, which `resync` (by
+    /// length) never repairs. Appends still go at once, in the primary's
+    /// order: a commit-order append would not land at the primary's offset.
+    staged: Arc<parking_lot::Mutex<std::collections::HashMap<u64, Vec<(u64, Vec<u8>)>>>>,
 }
 
 impl std::fmt::Debug for MirrorStorageProvider {
@@ -80,6 +88,7 @@ impl MirrorStorageProvider {
         Self {
             primary,
             backups: Arc::new(backups),
+            staged: Default::default(),
         }
     }
 
@@ -261,16 +270,34 @@ impl StorageIO for MirrorStorageProvider {
     }
 
     fn defers_in_place_writes(&self) -> bool {
-        // The primary's write is the statement's (see `commit_durable`).
-        self.primary.defers_in_place_writes()
+        // Never: whatever the primary does, `write_data_txn` writes every
+        // backup at once, outside the transaction. An UPDATE that overwrote a
+        // row in place and then failed left the backup holding the new bytes
+        // and the primary the old.
+        false
     }
 
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         let token = self.primary.write_data_txn(txn, position, buffer).await;
-        for backup in self.backups.iter() {
-            backup.write_data(position, buffer).await;
+        if token == 0 {
+            // The primary wrote it at once (no log): so do the backups.
+            for backup in self.backups.iter() {
+                backup.write_data(position, buffer).await;
+            }
+        } else {
+            self.staged.lock().entry(token).or_default().push((position, buffer.to_vec()));
         }
         token
+    }
+
+    /// The primary's transaction, which the primary's log holds. Without
+    /// this the trait's no-op ran: an aborted UPDATE's transaction stayed
+    /// pending in the log for the life of the process, and every checkpoint
+    /// after it declined, so the log grew without bound. A backup holds no
+    /// transaction of its own (its writes go straight to its files).
+    async fn abort_txn(&self, token: u64) {
+        self.staged.lock().remove(&token);
+        self.primary.abort_txn(token).await
     }
 
     async fn commit_durable(&self, token: u64) -> IOResult<()> {
@@ -279,6 +306,20 @@ impl StorageIO for MirrorStorageProvider {
         // statement as failed for it would turn a redundant copy into a second
         // way to lose a write.
         let outcome = self.primary.commit_durable(token).await;
+        let staged = self.staged.lock().remove(&token).unwrap_or_default();
+        if outcome.is_ok() {
+            for (position, bytes) in &staged {
+                for backup in self.backups.iter() {
+                    backup.write_data(*position, bytes).await;
+                }
+            }
+        } else if !staged.is_empty() {
+            error!(
+                "the primary {} did not commit transaction {token}; its {} in-place write(s) were not copied",
+                self.primary.get_name(),
+                staged.len()
+            );
+        }
         for backup in self.backups.iter() {
             if let Err(e) = backup.commit_durable(backup.begin_txn()).await {
                 error!("backup copy at {} is not durable: {}", backup.get_name(), e);
@@ -324,6 +365,7 @@ impl StorageIO for MirrorStorageProvider {
         Self {
             primary: self.primary.create_temp().await,
             backups: Arc::new(Vec::new()),
+            staged: Default::default(),
         }
     }
 
@@ -350,6 +392,7 @@ impl StorageIO for MirrorStorageProvider {
         Self {
             primary,
             backups: Arc::new(backups),
+            staged: Default::default(),
         }
     }
 
@@ -367,6 +410,7 @@ impl StorageIO for MirrorStorageProvider {
         Self {
             primary,
             backups: Arc::new(backups),
+            staged: Default::default(),
         }
     }
 

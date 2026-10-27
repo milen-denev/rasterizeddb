@@ -713,3 +713,74 @@ async fn moving_a_table_through_sql_takes_its_rows_with_it() {
     // would not.
     insert(&db, "relocated", 2, "after the move").await;
 }
+
+async fn exec(db: &Arc<Database>, sql: &str) -> Result<Vec<u8>, String> {
+    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse {sql}"))?;
+    let out = crate::core::rql::executor::execute_with_sync(purpose, db.clone(), true).await;
+    if out.is_empty() || out[0] == 3 {
+        return Err(format!("{sql}: {}", String::from_utf8_lossy(&out)));
+    }
+    Ok(out)
+}
+
+/// On a mirrored table an UPDATE that fails leaves no transaction behind in
+/// the log and the backup as the primary is. The mirror answered the
+/// primary's `defers_in_place_writes` while writing every backup at once,
+/// and had no `abort_txn`: `UPDATE mq SET m = 7, n = 5000 WHERE id < 10`
+/// overwrote one row in place and failed 23505; the primary's rows were
+/// unchanged, the backup's were not, the log held the aborted transaction
+/// as pending for good, and no checkpoint ran again.
+///
+/// Mutations: the mirror answering the primary's `defers_in_place_writes`
+/// leaves the backup changed; its `abort_txn` removed leaves the
+/// transaction pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_update_on_a_mirrored_table_leaves_nothing_pending_or_diverged() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let backup_path = backup.path().to_string_lossy().into_owned();
+    let root_path = root.path().to_string_lossy().into_owned();
+    {
+        let db = open(root.path()).await;
+        db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+        drop(db);
+        crate::core::wal::remove_for(&root_path);
+        crate::core::wal::remove_for(&backup_path);
+    }
+    let db = open(root.path()).await;
+    exec(&db, "CREATE TABLE mq (id BIGINT PRIMARY KEY, n BIGINT UNIQUE, m BIGINT, CHECK (m + id < 100))").await.unwrap();
+    let values: Vec<String> = (0..20).map(|i| format!("({i}, {i}, 0)")).collect();
+    exec(&db, &format!("INSERT INTO mq (id, n, m) VALUES {}", values.join(", "))).await.unwrap();
+    db.sync_durable().unwrap();
+    let wal = crate::core::wal::wal_for(&root_path).expect("the root's log");
+    assert_eq!(wal.pending_transactions(), 0);
+    let table = db.table_for_tests("mq").unwrap();
+    let in_place = table.in_place_column_updates();
+
+    let e = exec(&db, "UPDATE mq SET m = 7, n = 5000 WHERE id < 10").await.expect_err("n repeats");
+    assert!(e.contains("duplicate value"), "{e}");
+    assert_eq!(table.in_place_column_updates(), in_place, "a mirrored table overwrote in place");
+    assert_eq!(wal.pending_transactions(), 0, "the failed UPDATE's transaction is still pending in the log");
+    assert!(wal.checkpoint().unwrap(), "a checkpoint declined after the failed UPDATE");
+    // A failure that abandons the storage transaction after rows were
+    // written (a CHECK only a later row breaks): the abort must reach the
+    // primary's log, or the transaction stays pending.
+    let e = exec(&db, "UPDATE mq SET m = 90 WHERE id < 15").await.expect_err("row 10 breaks the CHECK");
+    assert!(e.contains("check constraint"), "{e}");
+    assert_eq!(wal.pending_transactions(), 0, "the aborted UPDATE's transaction is still pending in the log");
+    assert!(wal.checkpoint().unwrap(), "a checkpoint declined after the aborted UPDATE");
+
+    // A successful one still works, and the copy keeps up.
+    exec(&db, "UPDATE mq SET m = 8 WHERE id = 3").await.unwrap();
+    db.sync_durable().unwrap();
+    drop(table);
+    drop(db);
+    crate::core::wal::remove_for(&root_path);
+    crate::core::wal::remove_for(&backup_path);
+    for name in ["mq.db", "mq_pointers.db"] {
+        let primary = std::fs::read(root.path().join(name)).unwrap();
+        let copy = std::fs::read(backup.path().join(name)).unwrap();
+        assert_eq!(primary.len(), copy.len(), "{name}: the backup's length differs from the primary's");
+        assert!(primary == copy, "{name}: the backup differs from the primary");
+    }
+}
