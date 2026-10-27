@@ -4072,39 +4072,142 @@ fn outer_references(sql: &str, aliases: &[String]) -> Vec<String> {
     out
 }
 
-/// Replaces each outer reference in `sql` with the literal it resolved to.
-///
-/// Whole-word only, and longest first, so `fwd.id` inside `fwd.id_extra` is
-/// left alone.
-fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
-    let mut ordered: Vec<&(String, String)> = bindings.iter().collect();
-    ordered.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+/// One `qualifier.column` reference in SQL text: its byte span and both
+/// names with their quotes removed (`"s"."big"`, `s."big"`, `"s".big` and
+/// `s.big` all name `s` and `big`).
+struct QualifiedRef {
+    start: usize,
+    end: usize,
+    qualifier: String,
+    column: String,
+}
 
-    let mut out = sql.to_string();
-    for (name, literal) in ordered {
-        let mut result = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        while let Some(at) = rest.find(name.as_str()) {
-            let before_ok = at == 0 || {
-                let b = rest.as_bytes()[at - 1];
-                !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-            };
-            let end = at + name.len();
-            let after_ok = end >= rest.len() || {
-                let b = rest.as_bytes()[end];
-                !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-            };
-            result.push_str(&rest[..at]);
-            if before_ok && after_ok {
-                result.push_str(literal);
-            } else {
-                result.push_str(&rest[at..end]);
+/// Every two-part `qualifier.column` reference in `text`, outside string
+/// literals, in order. A three-part name, and one following a `.`, is none.
+fn qualified_ref_spans(text: &str) -> Vec<QualifiedRef> {
+    let b = text.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || !c.is_ascii();
+    // One identifier at `i`: its end and its name, unquoted.
+    let ident = |i: usize| -> Option<(usize, String)> {
+        match b.get(i)? {
+            b'"' => {
+                let mut j = i + 1;
+                let mut name = Vec::new();
+                loop {
+                    match b.get(j)? {
+                        b'"' if b.get(j + 1) == Some(&b'"') => {
+                            name.push(b'"');
+                            j += 2;
+                        }
+                        b'"' => return Some((j + 1, String::from_utf8(name).ok()?)),
+                        &c => {
+                            name.push(c);
+                            j += 1;
+                        }
+                    }
+                }
             }
-            rest = &rest[end..];
+            &c if is_word(c) && !c.is_ascii_digit() => {
+                let mut j = i;
+                while b.get(j).is_some_and(|&c| is_word(c)) {
+                    j += 1;
+                }
+                Some((j, text[i..j].to_string()))
+            }
+            _ => None,
         }
-        result.push_str(rest);
-        out = result;
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            // A string literal, `''` an escaped quote inside it.
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let boundary = i == 0 || !(is_word(b[i - 1]) || b[i - 1] == b'.' || b[i - 1] == b'"');
+        if boundary && (c == b'"' || (is_word(c) && !c.is_ascii_digit())) {
+            let Some((e1, qualifier)) = ident(i) else {
+                i += 1;
+                continue;
+            };
+            if b.get(e1) == Some(&b'.')
+                && let Some((e2, column)) = ident(e1 + 1)
+            {
+                if b.get(e2) != Some(&b'.') {
+                    out.push(QualifiedRef { start: i, end: e2, qualifier, column });
+                }
+                // The rest of a longer dotted name is read on as its parts
+                // follow a `.`, which no reference starts after.
+                i = e2;
+                continue;
+            }
+            i = e1;
+            continue;
+        }
+        if is_word(c) {
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
     }
+    out
+}
+
+/// A reference's identity for matching: the qualifier compared as the
+/// aliases are (ASCII case folded), the column exactly.
+fn ref_key(qualifier: &str, column: &str) -> (String, String) {
+    (qualifier.to_ascii_lowercase(), column.to_string())
+}
+
+/// Replaces each outer reference in `sql` with the literal it resolved to,
+/// in parentheses.
+///
+/// One pass over `sql`, quote-aware: a reference inside a string literal is
+/// text, not a reference (`'see s.x ' || s.x` stored `see 7 7`), and what
+/// is substituted is never scanned again (a substituted string holding
+/// `s.l` broke the statement). Whole references only, so `fwd.id` inside
+/// `fwd.id_extra` is left alone, in any quoting (`"s".big`, `s."big"`).
+///
+/// Parenthesised because the literal lands beside whatever the text had
+/// there: `t.x-s.neg` with `-3` became `x--3`, and `--` starts a comment,
+/// which dropped the rest of the statement (its other assignments and its
+/// `WHERE`, so every row was updated).
+fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
+    let keyed: Vec<((String, String), &str)> = bindings
+        .iter()
+        .filter_map(|(name, literal)| {
+            let span = qualified_ref_spans(name).into_iter().next()?;
+            Some((ref_key(&span.qualifier, &span.column), literal.as_str()))
+        })
+        .collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0usize;
+    for span in qualified_ref_spans(sql) {
+        let key = ref_key(&span.qualifier, &span.column);
+        if let Some((_, literal)) = keyed.iter().find(|(k, _)| *k == key) {
+            out.push_str(&sql[cursor..span.start]);
+            out.push('(');
+            out.push_str(literal);
+            out.push(')');
+            cursor = span.end;
+        }
+    }
+    out.push_str(&sql[cursor..]);
     out
 }
 
@@ -4409,7 +4512,7 @@ async fn delete_using_join(
                 "DELETE FROM {} WHERE {} AND ({}){}",
                 table,
                 named,
-                strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
+                substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings),
                 returning_text
             ),
             None => key_only.clone(),
@@ -4778,7 +4881,7 @@ async fn update_from_join(
                 table,
                 sets.join(", "),
                 named,
-                strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
+                substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings),
                 returning_text
             ),
             None => key_only.clone(),
@@ -4819,39 +4922,20 @@ fn source_aliases(source_clause: &str) -> Vec<String> {
 }
 
 /// The `alias.column` references in `text` qualified by one of `aliases`,
-/// each once, in order. Quoted text is skipped.
+/// each once, in order, in any quoting (`"s"."big"`), as written. String
+/// literals are skipped.
 fn qualified_refs(text: &str, aliases: &[String]) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii();
+    let mut seen: Vec<(String, String)> = Vec::new();
     let mut found: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'\'' {
-                i += 1;
-            }
-            i += 1;
+    for span in qualified_ref_spans(text) {
+        if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&span.qualifier)) {
             continue;
         }
-        if is_word(bytes[i]) && (i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.')) {
-            let start = i;
-            while i < bytes.len() && (is_word(bytes[i]) || bytes[i] == b'.') {
-                i += 1;
-            }
-            let word = &text[start..i];
-            if let Some((qualifier, column)) = word.split_once('.') {
-                if !column.is_empty()
-                    && !column.contains('.')
-                    && aliases.iter().any(|a| a.eq_ignore_ascii_case(qualifier))
-                    && !found.iter().any(|f| f == word)
-                {
-                    found.push(word.to_string());
-                }
-            }
-            continue;
+        let key = ref_key(&span.qualifier, &span.column);
+        if !seen.contains(&key) {
+            seen.push(key);
+            found.push(text[span.start..span.end].to_string());
         }
-        i += 1;
     }
     found
 }
@@ -6305,6 +6389,38 @@ fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<Stri
 
 /// Removes `<table>.` qualifiers, which an `UPDATE`'s own clauses do not carry.
 fn strip_qualifier(text: &str, table: &str) -> String {
+    // String literals are text, not references: `'see t.x'` keeps its `t.`.
+    let mut out = String::with_capacity(text.len());
+    let b = text.as_bytes();
+    let (mut i, mut from) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] == b'\'' {
+            out.push_str(&strip_qualifier_unquoted(&text[from..i], table));
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(b.len());
+            out.push_str(&text[start..i]);
+            from = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&strip_qualifier_unquoted(&text[from..], table));
+    out
+}
+
+/// [`strip_qualifier`] over text holding no string literal.
+fn strip_qualifier_unquoted(text: &str, table: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let quoted = format!("\"{}\".", table);
@@ -16788,6 +16904,32 @@ mod update_from_tests {
         assert!(err.contains("compared against a constant"), "got: {}", err);
     }
 
+    /// A literal is parenthesised (`x-(-3)`, never `x--3`, a comment), a
+    /// reference in a string literal is text, every quoting of a reference is
+    /// one, and substituted text is never scanned again.
+    ///
+    /// Mutation: the parentheses dropped, or `qualified_ref_spans` not
+    /// skipping string literals, fails this.
+    #[test]
+    fn source_references_are_substituted_quote_aware_and_parenthesised() {
+        let bindings = vec![
+            ("s.neg".to_string(), "-3".to_string()),
+            ("s.l".to_string(), "'has s.neg -- in it'".to_string()),
+            ("s.big".to_string(), "123".to_string()),
+        ];
+        assert_eq!(substitute_outer_refs("x-s.neg, label = 'z'", &bindings), "x-(-3), label = 'z'");
+        assert_eq!(
+            substitute_outer_refs("'see s.neg ' || s.l || 'it''s s.neg'", &bindings),
+            "'see s.neg ' || ('has s.neg -- in it') || 'it''s s.neg'"
+        );
+        assert_eq!(
+            substitute_outer_refs(r#""s".big + s."big" + "s"."big" + S.big + s.bigger + s.big.x"#, &bindings),
+            r#"(123) + (123) + (123) + (123) + s.bigger + s.big.x"#
+        );
+        assert_eq!(qualified_refs(r#"t.x - "s"."big" + 's.neg' + s.neg"#, &["s".to_string()]), [r#""s"."big""#, "s.neg"]);
+        assert_eq!(strip_qualifier("t.x || 'see t.x' || t.y", "t"), "x || 'see t.x' || y");
+    }
+
     #[test]
     fn outer_references_are_substituted_whole_word_only() {
         let bindings = vec![
@@ -16798,10 +16940,10 @@ mod update_from_tests {
             "SELECT COUNT(*) FROM t WHERE t.a = fwd.id AND t.b = fwd.id_extra",
             &bindings,
         );
-        assert!(out.contains("t.a = 7"), "got: {}", out);
+        assert!(out.contains("t.a = (7)"), "got: {}", out);
         // The trap: substituting `fwd.id` first would have turned
         // `fwd.id_extra` into `7_extra`.
-        assert!(out.contains("t.b = 9"), "got: {}", out);
+        assert!(out.contains("t.b = (9)"), "got: {}", out);
         assert!(!out.contains("7_extra"), "got: {}", out);
     }
 
