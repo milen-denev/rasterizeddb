@@ -5506,7 +5506,7 @@ async fn backfill_into<S: StorageIO>(
     let build = gate::build_token();
     // Before the first row is read: a slot a writer sets from here on keeps
     // the writer's code, never the older one this read (`watch_writers`).
-    let _watch = filters.watch_writers();
+    let _watch = filters.watch_writers(Proof::from(&build));
 
     // Read before the first slot: a batch is written, and the prefix cleared,
     // only if no renumbering (`Table::compact`, which this does not wait for)

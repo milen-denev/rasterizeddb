@@ -1069,7 +1069,8 @@ impl TableFilters {
     /// Starts keeping every slot a writer sets from the backfill about to
     /// run (`ColumnFilter::written_during_backfill`), until the guard drops.
     /// Taken before the backfill reads its first row.
-    pub fn watch_writers(&self) -> BackfillWatch<'_> {
+    pub fn watch_writers(&self, _proof: Proof<'_>) -> BackfillWatch<'_> {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::watch_writers");
         for c in &self.columns {
             c.write().begin_backfill();
         }
