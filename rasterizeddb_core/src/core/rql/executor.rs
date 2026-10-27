@@ -3778,18 +3778,35 @@ fn implicit_unique_column(
     fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
 ) -> Option<String> {
     let given = constraint.trim().trim_matches('"');
+    let unique = || fields.iter().filter(|f| f.is_unique && !f.is_deleted);
+    // The name this table derives for the column, exactly (cut where long).
+    // Matched first, and alone when it matches: the suffix test below took
+    // the first column whose name ends the constraint's, so `DROP CONSTRAINT
+    // sx_user_id_key` dropped `id`'s uniqueness and kept `user_id`'s.
+    let exact: Vec<&crate::core::row::schema::SchemaField> = unique()
+        .filter(|f| given.eq_ignore_ascii_case(&crate::core::rql::unique_key::implicit_key_name(table, &f.name)))
+        .collect();
+    if let [one] = exact.as_slice() {
+        return Some(one.name.clone());
+    }
+    if !exact.is_empty() {
+        // Two columns cut to one name, which CREATE TABLE refuses
+        // (`implicit_name_collision`); never a guess between them.
+        return None;
+    }
+    // A table renamed since keeps its old name in the constraint's:
+    // `<old table>_<column>_key`. When several columns fit (`old_user_id_key`
+    // fits `user_id` and `id`), the longest does: every shorter one is a
+    // suffix of it, so the name spells it out in full, and the table's own
+    // derivation above has already claimed every name it actually holds.
     let lower = given.to_ascii_lowercase();
     let stem = lower.strip_suffix("_key")?;
-    fields
-        .iter()
-        .filter(|f| f.is_unique && !f.is_deleted)
-        .find(|f| {
-            stem.ends_with(&format!("_{}", f.name.to_ascii_lowercase()))
-                || stem == f.name.to_ascii_lowercase()
-                // The name as this table's own derivation cuts it: a long
-                // one has lost its column to the cut.
-                || given.eq_ignore_ascii_case(&crate::core::rql::unique_key::implicit_key_name(table, &f.name))
+    unique()
+        .filter(|f| {
+            let column = f.name.to_ascii_lowercase();
+            stem.ends_with(&format!("_{column}")) || stem == column
         })
+        .max_by_key(|f| f.name.len())
         .map(|f| f.name.clone())
 }
 

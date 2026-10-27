@@ -464,6 +464,22 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             columns.push(CreateColumnData { name, data_type });
         }
 
+        // A column's inline UNIQUE is named for the table and the column, cut
+        // where long; two names that cut alike would be one constraint to
+        // `DROP CONSTRAINT`, which would then drop one of them blindly.
+        // PostgreSQL numbers the second; these names are derived, not stored,
+        // so a number could not stay with its column. Refused instead.
+        if let Some((a, b, name)) =
+            crate::core::rql::unique_key::implicit_name_collision(&table_name, &unique_columns)
+        {
+            rejection.replace(format!(
+                "UNIQUE columns \"{a}\" and \"{b}\" would both be constrained as \"{name}\"; two inline \
+                 UNIQUE constraints whose names cut alike are not supported (declare one as a named \
+                 table-level UNIQUE)"
+            ));
+            return None;
+        }
+
         // A primary key's columns are NOT NULL, as PostgreSQL makes them,
         // whichever way the key is declared: a table-level `PRIMARY KEY (a,
         // b)` left both nullable, and `INSERT … VALUES (NULL, 1)` was stored.

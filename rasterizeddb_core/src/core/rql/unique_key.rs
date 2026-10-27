@@ -828,6 +828,19 @@ pub fn implicit_key_name(table: &str, column: &str) -> String {
     UniqueKey::default_name(table, std::slice::from_ref(&column.to_string()))
 }
 
+/// Two of `columns` (declared `UNIQUE` inline on `table`) whose implicit
+/// constraint names are one name, cut where long: `DROP CONSTRAINT` could
+/// not tell their constraints apart. `None` when every name is its own.
+pub fn implicit_name_collision<'a>(table: &str, columns: &'a [String]) -> Option<(&'a str, &'a str, String)> {
+    for (i, a) in columns.iter().enumerate() {
+        let name = implicit_key_name(table, a);
+        if let Some(b) = columns[i + 1..].iter().find(|b| implicit_key_name(table, b).eq_ignore_ascii_case(&name)) {
+            return Some((a, b, name));
+        }
+    }
+    None
+}
+
 /// How many numbered names [`choose_name`] tries before it gives up.
 pub const NAME_ATTEMPTS: usize = 10_000;
 
