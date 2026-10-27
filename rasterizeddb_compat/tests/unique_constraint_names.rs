@@ -32,11 +32,54 @@ async fn drop_constraint_drops_the_column_it_names() {
     // And the other one by its own name.
     ok(&pool, "ALTER TABLE sx DROP CONSTRAINT sx_id_key").await;
     ok(&pool, "INSERT INTO sx VALUES (1, 4)").await;
-    // A renamed table's constraint keeps the old table's name in it.
+    // A renamed table's inline UNIQUE answers to the name the table derives
+    // now; the old table's name (PostgreSQL's, which keeps it) is 42704.
     ok(&pool, "CREATE TABLE ry (id BIGINT UNIQUE, user_id BIGINT UNIQUE); ALTER TABLE ry RENAME TO rz").await;
-    ok(&pool, "ALTER TABLE rz DROP CONSTRAINT ry_user_id_key").await;
+    refused(&pool, "ALTER TABLE rz DROP CONSTRAINT ry_user_id_key", "42704").await;
+    ok(&pool, "ALTER TABLE rz DROP CONSTRAINT rz_user_id_key").await;
     ok(&pool, "INSERT INTO rz VALUES (1, 1), (2, 1)").await;
     refused(&pool, "INSERT INTO rz VALUES (1, 9)", "23505").await;
+}
+
+/// A name the table does not derive is never matched by its tail. On
+/// `order_items (id, item_id)` renamed from `order_item`, `order_item_id_key`
+/// is `id`'s name in PostgreSQL and ends like `item_id`'s here: the longest
+/// column that fit was dropped, `item_id`, and `bogus_id_key` dropped `id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_the_table_does_not_derive_drops_nothing() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    let both_unique = |pool: &sqlx::PgPool, t: &'static str| {
+        let pool = pool.clone();
+        async move {
+            refused(&pool, &format!("INSERT INTO {t} VALUES (1, 99)"), "23505").await;
+            refused(&pool, &format!("INSERT INTO {t} VALUES (99, 1)"), "23505").await;
+        }
+    };
+    ok(&pool, "CREATE TABLE order_item (id BIGINT UNIQUE, item_id BIGINT UNIQUE); INSERT INTO order_item VALUES (1, 1)").await;
+    ok(&pool, "ALTER TABLE order_item RENAME TO order_items").await;
+    refused(&pool, "ALTER TABLE order_items DROP CONSTRAINT order_item_id_key", "42704").await;
+    refused(&pool, "ALTER TABLE order_items DROP CONSTRAINT bogus_id_key", "42704").await;
+    refused(&pool, "ALTER TABLE order_items DROP CONSTRAINT bogus_item_id_key", "42704").await;
+    both_unique(&pool, "order_items").await;
+    // Each by the name the table derives, and only that column.
+    ok(&pool, "ALTER TABLE order_items DROP CONSTRAINT order_items_item_id_key").await;
+    ok(&pool, "INSERT INTO order_items VALUES (2, 1)").await;
+    refused(&pool, "INSERT INTO order_items VALUES (1, 98)", "23505").await;
+
+    // The other way round: `item_id`'s old name ends like nothing else, and
+    // `id`'s old name ends like `item_id`'s.
+    ok(&pool, "CREATE TABLE line_item (item_id BIGINT UNIQUE, id BIGINT UNIQUE); INSERT INTO line_item VALUES (1, 1)").await;
+    ok(&pool, "ALTER TABLE line_item RENAME TO line_items").await;
+    refused(&pool, "ALTER TABLE line_items DROP CONSTRAINT line_item_item_id_key", "42704").await;
+    refused(&pool, "ALTER TABLE line_items DROP CONSTRAINT line_item_id_key", "42704").await;
+    both_unique(&pool, "line_items").await;
+    ok(&pool, "ALTER TABLE line_items DROP CONSTRAINT line_items_id_key").await;
+    ok(&pool, "INSERT INTO line_items VALUES (2, 1)").await;
+    refused(&pool, "INSERT INTO line_items VALUES (1, 97)", "23505").await;
+    // IF EXISTS on a name that is not derived is a no-op, not a guess.
+    ok(&pool, "ALTER TABLE line_items DROP CONSTRAINT IF EXISTS line_item_item_id_key").await;
+    refused(&pool, "INSERT INTO line_items VALUES (1, 50)", "23505").await;
 }
 
 /// Two columns whose implicit names cut alike are refused at CREATE, plain

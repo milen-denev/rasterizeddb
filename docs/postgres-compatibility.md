@@ -199,6 +199,14 @@ Single-column constraints declared inline live on `SchemaField.is_unique`;
 everything table-level lives in a per-table sidecar, because a schema flag
 carries no constraint name and `DROP CONSTRAINT` could never have found one.
 
+An inline `UNIQUE` therefore answers to the name the table derives for it now,
+`<table>_<column>_key` (cut where long), and to nothing else. **After
+`ALTER TABLE old RENAME TO new` it is dropped as `new_<column>_key`;**
+PostgreSQL keeps `old_<column>_key`, and asking for that name here is 42704
+(a no-op under `IF EXISTS`). Earlier builds matched any name ending in
+`_<column>_key`, which on a table with both `id` and `item_id` dropped the
+wrong column's constraint, and dropped one for a made-up name.
+
 Two limits remain. Uniqueness is checked against **committed** data, so two
 concurrent transactions can insert the same value and both commit — the probe was
 never an index and never locked. And `CREATE UNIQUE INDEX` is currently swallowed

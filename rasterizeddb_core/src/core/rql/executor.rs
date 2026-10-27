@@ -3755,12 +3755,6 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     }
 }
 
-/// The column an implicit unique-constraint name refers to.
-///
-/// PostgreSQL names the constraint behind a `UNIQUE` column `<table>_<column>_key`.
-/// The table part is not checked: a table renamed since the constraint was
-/// created keeps the old name in it, which is exactly the case that arises when
-/// a migration renames a table and a later one drops the constraint.
 /// Whether `name` is the index a constraint of `table` owns: its primary
 /// key's (`<table>_pkey`), a column declared `UNIQUE` (`<table>_<column>_key`),
 /// or a full unique constraint. A partial unique index is not one: it answers
@@ -3772,6 +3766,19 @@ fn constraint_index(schema: &crate::core::row::schema::TableSchema, table: &str,
         || implicit_unique_column(name, table, &schema.fields).is_some()
 }
 
+/// The column an implicit unique-constraint name refers to.
+///
+/// PostgreSQL names the constraint behind a `UNIQUE` column
+/// `<table>_<column>_key` (cut where long). An inline `UNIQUE` is a flag on
+/// the field here, with no name stored, so the name is the one the table
+/// derives now, and nothing else. After `ALTER TABLE … RENAME TO` that is the
+/// new table's name: PostgreSQL keeps the old one in the constraint, and
+/// asking for it here answers 42704 rather than guessing a column.
+///
+/// It used to guess: any `<anything>_<column>_key` matched, the longest
+/// column winning, so on `order_items (id UNIQUE, item_id UNIQUE)` renamed
+/// from `order_item`, `DROP CONSTRAINT order_item_id_key` (`id`'s name in
+/// PostgreSQL) dropped `item_id`'s, and `bogus_id_key` dropped `id`'s.
 fn implicit_unique_column(
     constraint: &str,
     table: &str,
@@ -3780,34 +3787,15 @@ fn implicit_unique_column(
     let given = constraint.trim().trim_matches('"');
     let unique = || fields.iter().filter(|f| f.is_unique && !f.is_deleted);
     // The name this table derives for the column, exactly (cut where long).
-    // Matched first, and alone when it matches: the suffix test below took
-    // the first column whose name ends the constraint's, so `DROP CONSTRAINT
-    // sx_user_id_key` dropped `id`'s uniqueness and kept `user_id`'s.
     let exact: Vec<&crate::core::row::schema::SchemaField> = unique()
         .filter(|f| given.eq_ignore_ascii_case(&crate::core::rql::unique_key::implicit_key_name(table, &f.name)))
         .collect();
-    if let [one] = exact.as_slice() {
-        return Some(one.name.clone());
+    match exact.as_slice() {
+        [one] => Some(one.name.clone()),
+        // None, or two columns cut to one name, which CREATE TABLE refuses
+        // (`implicit_name_collision`): never a guess between them.
+        _ => None,
     }
-    if !exact.is_empty() {
-        // Two columns cut to one name, which CREATE TABLE refuses
-        // (`implicit_name_collision`); never a guess between them.
-        return None;
-    }
-    // A table renamed since keeps its old name in the constraint's:
-    // `<old table>_<column>_key`. When several columns fit (`old_user_id_key`
-    // fits `user_id` and `id`), the longest does: every shorter one is a
-    // suffix of it, so the name spells it out in full, and the table's own
-    // derivation above has already claimed every name it actually holds.
-    let lower = given.to_ascii_lowercase();
-    let stem = lower.strip_suffix("_key")?;
-    unique()
-        .filter(|f| {
-            let column = f.name.to_ascii_lowercase();
-            stem.ends_with(&format!("_{column}")) || stem == column
-        })
-        .max_by_key(|f| f.name.len())
-        .map(|f| f.name.clone())
 }
 
 /// Runs `UPDATE t SET … FROM source WHERE …`.
