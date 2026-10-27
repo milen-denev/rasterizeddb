@@ -14872,7 +14872,7 @@ pub(crate) async fn execute_query_rows(
     if query_row.row_lock.is_none() || query_row.aggregate.is_some() {
         return execute_query_rows_once(query_row, source, database, tx, None).await;
     }
-    let relation = source.relation();
+    let relation = source.rescan_relation();
     let mut source = Some(source);
     for _ in 0..MAX_LOCKING_ROUNDS {
         let source = match source.take() {

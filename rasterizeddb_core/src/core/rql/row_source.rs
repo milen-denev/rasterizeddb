@@ -130,7 +130,7 @@ impl RowSource {
 
     /// The relation this source reads, for a locking read that scans it again
     /// at a fresh snapshot (`execute_query_rows`, phase 3 P3).
-    pub(crate) fn relation(&self) -> Relation {
+    pub(crate) fn rescan_relation(&self) -> Relation {
         match self {
             RowSource::Single(table) => Relation::Plain(table.clone()),
             RowSource::Partitioned(fan) => Relation::Partitioned(fan.table.clone()),
