@@ -187,11 +187,13 @@ struct Live {
     epoch: ArcSwap<MapEpoch>,
     /// By pid; phase 2a pids are `0..n`.
     slots: Box<[Slot]>,
-    log: MapLogFile,
+    /// Shared with the instance a schema change reopens this one as
+    /// ([`PartitionedTable::reopened`]): one map log, one writer at a time.
+    log: StdArc<MapLogFile>,
     /// The replayed log, kept current: a record is applied to a copy first
     /// and appended only if it applies, so the file never holds a record
-    /// replay would refuse.
-    state: tokio::sync::Mutex<MapState>,
+    /// replay would refuse. Shared like `log`.
+    state: StdArc<tokio::sync::Mutex<MapState>>,
     seed: Arc<DbStorageProvider>,
     ids: StdArc<IdSource<DbStorageProvider>>,
 }
@@ -583,8 +585,8 @@ impl PartitionedTable {
                 map,
             }),
             slots,
-            log,
-            state: tokio::sync::Mutex::new(state.clone()),
+            log: StdArc::new(log),
+            state: StdArc::new(tokio::sync::Mutex::new(state.clone())),
             seed: ctx.seed.clone(),
             ids,
         };
@@ -631,6 +633,145 @@ impl PartitionedTable {
         .await?;
         table.enable_versioning(transactions.clone());
         Ok(Arc::new(table))
+    }
+
+    /// §11's step 2 for a schema change, under ACCESS EXCLUSIVE on the
+    /// logical name: every open partition is retired (its maintenance
+    /// stopped and joined, its seals cancelled), so none writes through its
+    /// providers once the new instances open over the same files.
+    pub(crate) async fn retire_partitions(&self) {
+        if let Ok(live) = &self.live {
+            for slot in live.slots.iter() {
+                if let Some(table) = slot.open.get() {
+                    table.retire().await;
+                }
+            }
+        }
+    }
+
+    /// This table under a new schema (§11, "Phase 3 P1 as built"): the same
+    /// uid, map log, map state and epoch, its row-id source reopened from its
+    /// durable reservation (as at a start), with `shell` as its
+    /// shell and every partition this one has open opened again over its
+    /// files with `shell`'s schema (and so its indexes built from its rows),
+    /// under `name`. The caller holds ACCESS EXCLUSIVE on the logical name
+    /// and has retired this table's partitions; nothing materializes or
+    /// writes meanwhile, so the shared map log has one writer.
+    ///
+    /// An unmaterialized partition stays so, and takes `shell`'s schema when
+    /// it materializes. Never panics: a key the new schema no longer has, or
+    /// a partition that does not open, leaves the new table broken with the
+    /// reason, as a startup open would.
+    pub(crate) async fn reopened(&self, name: &str, shell: Arc<Table<DbStorageProvider>>) -> PartitionedTable {
+        let live = match &self.live {
+            Ok(live) => {
+                let opened: Result<Live, String> = async {
+                    if !shell.is_shell() {
+                        return Err("its shell is a table with rows of its own".to_string());
+                    }
+                    let spec = spec_from_header(live.state.lock().await.header(), &shell.schema)?;
+                    // The row-id source reopened from its reservation, as a
+                    // start (and a plain table's reload, over `_seq.db`) opens
+                    // it: ids resume past every id the old one could have
+                    // handed out, and `pg_stat_user_tables` counts as a plain
+                    // table's would after the same change.
+                    let ids_io = Arc::new(live.seed.create_new(files::ids_file(self.uid)).await);
+                    let ids = StdArc::new(IdSource::open_strict(ids_io).await.map_err(|e| e.to_string())?);
+                    let slots: Box<[Slot]> = live
+                        .slots
+                        .iter()
+                        .map(|s| Slot {
+                            pid: s.pid,
+                            range: s.range,
+                            open: tokio::sync::OnceCell::new(),
+                        })
+                        .collect();
+                    let next = Live {
+                        router: RangeGuard::new(spec.clone(), PointRange::FULL),
+                        spec,
+                        epoch: ArcSwap::new(live.epoch.load_full()),
+                        slots,
+                        log: live.log.clone(),
+                        state: live.state.clone(),
+                        seed: live.seed.clone(),
+                        ids,
+                    };
+                    for (old, new) in live.slots.iter().zip(next.slots.iter()) {
+                        if old.open.get().is_none() {
+                            continue;
+                        }
+                        let table = Self::open_partition(&next, self.uid, self.db_id, &self.transactions, &shell, new)
+                            .await
+                            .map_err(|err| format!("partition {}: {err}", new.pid))?;
+                        let _ = new.open.set(table);
+                        #[cfg(test)]
+                        crate::core::power_loss::failpoint::hit("test.pddl.partition_reopened", &self.root)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(next)
+                }
+                .await;
+                opened.map_err(|e| {
+                    let why = format!("partitioned table \"{name}\" ({:016x}) cannot be opened: {e}", self.uid);
+                    ::log::error!("{why}");
+                    why
+                })
+            }
+            Err(why) => Err(why.clone()),
+        };
+        PartitionedTable {
+            name: name.to_string(),
+            uid: self.uid,
+            root: self.root.clone(),
+            shell,
+            db_id: self.db_id,
+            transactions: self.transactions.clone(),
+            live,
+            declared: self.declared,
+            torn: self.torn.clone(),
+            mirrored: self.mirrored.clone(),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    /// The partition key's columns, outermost first, by their names in the
+    /// shell's schema now (a RENAME COLUMN renames a key column; the hash
+    /// only ever sees its write order).
+    pub(crate) fn key_columns(&self) -> io::Result<Vec<String>> {
+        let live = self.live()?;
+        live.spec
+            .levels()
+            .iter()
+            .map(|level| {
+                self.shell
+                    .schema
+                    .fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.write_order as u64 == level.write_order as u64)
+                    .map(|f| f.name.clone())
+                    .ok_or_else(|| invalid(format!("partition key column {} is not in the schema", level.write_order)))
+            })
+            .collect()
+    }
+
+    /// The open partitions, by pid, under the current map epoch: what a
+    /// schema change validates existing rows in.
+    pub(crate) fn open_partitions(&self) -> io::Result<Vec<(u32, Arc<Table<DbStorageProvider>>)>> {
+        let epoch = self.epoch()?;
+        self.materialized(&epoch, &Route::All)
+    }
+
+    /// Bytes in the rows files of the open partitions: what a plain table's
+    /// `len` is to its `ALTER` (a table with none is metadata-only to change).
+    pub(crate) fn rows_len(&self) -> io::Result<u64> {
+        let live = self.live()?;
+        let mut total = 0u64;
+        for slot in live.slots.iter() {
+            if let Some(table) = slot.open.get() {
+                total += table.data()?.len.load(Ordering::Relaxed);
+            }
+        }
+        Ok(total)
     }
 
     fn live(&self) -> io::Result<&Live> {

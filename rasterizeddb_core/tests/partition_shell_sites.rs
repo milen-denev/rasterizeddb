@@ -189,58 +189,68 @@ const SITES: &[Site] = &[
     ),
     site("CREATE TABLE site_p (k INT NOT NULL)", Expect::Error("42P07"), "duplicate name"),
     site("CREATE TABLE site_p (k INT NOT NULL) PARTITION BY HASH (k)", Expect::Error("42P07"), "duplicate name"),
-    // Every ALTER verb, with and without IF EXISTS: refused before writing.
-    site("ALTER TABLE IF EXISTS site_p ADD COLUMN x INT", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE IF EXISTS site_p DROP COLUMN label", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p ADD COLUMN x INT", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p ADD COLUMN IF NOT EXISTS n INT", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p DROP COLUMN label", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p DROP COLUMN IF EXISTS nope", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p RENAME COLUMN label TO tag", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p RENAME TO site_p2", Expect::Refused, "I25, phase 3"),
-    site("ALTER TABLE site_q RENAME TO site_p", Expect::Refused, "onto the partitioned name: refused first"),
-    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT USING n::bigint", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p ALTER COLUMN n SET DEFAULT 5", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p ALTER COLUMN n DROP DEFAULT", Expect::Refused, "§11, phase 3"),
-    site("ALTER TABLE site_p ALTER COLUMN n SET NOT NULL", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p ALTER COLUMN n DROP NOT NULL", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p ALTER COLUMN n SET STATISTICS 100", Expect::Refused, "a no-op on a plain table"),
-    site("ALTER TABLE site_p ADD CONSTRAINT site_p_u UNIQUE (tenant_id, asset_group_id, n)", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p ADD CONSTRAINT site_p_c CHECK (n > 0)", Expect::Refused, "§11"),
-    // The forms upstream's 4566347 made real on a plain table (an enforced
-    // CHECK, a NUMERIC scale, a computed GENERATED column, a CHECK's DROP):
-    // each writes a sidecar of the shell alone, so still refused first.
-    site("ALTER TABLE site_p ADD CHECK (n > 0)", Expect::Refused, "§11; enforced on a plain table since 4566347"),
-    site("ALTER TABLE site_p ADD COLUMN m NUMERIC(12, 3)", Expect::Refused, "§11, phase 3"),
+    // ALTER (phase 3 P1, §11): the metadata forms answer like the twin, in
+    // pairs that leave the table as it was; what would rewrite every row,
+    // a key column's change and foreign keys are refused before writing.
+    site("ALTER TABLE IF EXISTS site_p ADD COLUMN x INT", Expect::Refused, "populated: rewrites every row (physical ALTER)"),
+    site("ALTER TABLE site_p ADD COLUMN x INT", Expect::Refused, "populated: physical ALTER"),
+    site("ALTER TABLE site_p ADD COLUMN IF NOT EXISTS n INT", Expect::LikeTwin, "an existing column: a no-op on both"),
+    site("ALTER TABLE site_p DROP COLUMN IF EXISTS nope", Expect::LikeTwin, "no such column: a no-op on both"),
+    site("ALTER TABLE site_p DROP COLUMN tenant_id", Expect::Refused, "§1.5: a partition key column"),
+    site("ALTER TABLE site_p RENAME COLUMN label TO tag", Expect::LikeTwin, "phase 3 P1"),
+    site("SELECT tenant_id, tag FROM site_p WHERE tenant_id = 1", Expect::LikeTwinAnswered, "the renamed column"),
+    site("ALTER TABLE site_p RENAME COLUMN tag TO label", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_p RENAME COLUMN asset_group_id TO grp", Expect::LikeTwin, "a key column: the hash never sees names"),
+    site("SELECT * FROM site_p WHERE tenant_id = 1 AND grp = 2", Expect::LikeTwinAnswered, "routed on the renamed key"),
+    site("ALTER TABLE site_p RENAME COLUMN grp TO asset_group_id", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_q RENAME TO site_p", Expect::Error("42710"), "onto the partitioned name: as onto a plain one"),
+    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::Refused, "physical ALTER"),
+    site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE INT", Expect::Refused, "a partition key column"),
+    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT USING n::bigint", Expect::Refused, "USING: refused on both"),
+    site("ALTER TABLE site_p ALTER COLUMN n SET DEFAULT 5", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_p ALTER COLUMN n DROP DEFAULT", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_p ALTER COLUMN n SET NOT NULL", Expect::LikeTwin, "a NULL n: refused on both"),
+    site("ALTER TABLE site_p ALTER COLUMN n DROP NOT NULL", Expect::LikeTwin, "already nullable: a no-op on both"),
+    site("ALTER TABLE site_p ALTER COLUMN tenant_id DROP NOT NULL", Expect::Refused, "§1.5"),
+    site("ALTER TABLE site_p ALTER COLUMN n SET STATISTICS 100", Expect::LikeTwin, "a no-op on both"),
+    site("ALTER TABLE site_p ADD CONSTRAINT site_p_c CHECK (n > 0)", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_p DROP CONSTRAINT site_p_c", Expect::LikeTwin, "phase 3 P1"),
+    site("ALTER TABLE site_p ADD CHECK (n > 100)", Expect::LikeTwin, "violated by rows on both: 23514"),
+    site("ALTER TABLE site_p ADD CONSTRAINT site_p_u2 UNIQUE (n)", Expect::Refused, "§1b: every key column"),
+    site("ALTER TABLE site_p ADD COLUMN m NUMERIC(12, 3)", Expect::Refused, "populated: physical ALTER"),
     site(
         "ALTER TABLE site_p ADD COLUMN g INT GENERATED ALWAYS AS (n + 1) STORED",
         Expect::Refused,
-        "§11, phase 3; computed for existing rows on a plain table since 4566347",
+        "populated: physical ALTER",
     ),
-    site("ALTER TABLE site_p DROP CONSTRAINT site_p_c", Expect::Refused, "§11; retires a CHECK since 4566347"),
     site(
         "ALTER TABLE site_p ADD CONSTRAINT site_p_fk FOREIGN KEY (n) REFERENCES site_parent(id)",
         Expect::Refused,
-        "FKs refused both ways in 2a",
+        "FKs: P4",
     ),
-    site("ALTER TABLE site_p ADD PRIMARY KEY (tenant_id, asset_group_id)", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p DROP CONSTRAINT site_p_tenant_id_asset_group_id_asset_id_key", Expect::Refused, "§11"),
-    site("ALTER TABLE site_p OWNER TO rasterized", Expect::Refused, "a no-op on a plain table"),
-    site("ALTER TABLE site_p SET (fillfactor = 70)", Expect::Refused, "a no-op on a plain table"),
-    site("ALTER TABLE site_p SET SCHEMA other", Expect::Refused, "a no-op on a plain table"),
-    site("ALTER TABLE site_p ENABLE ROW LEVEL SECURITY", Expect::Refused, "a no-op on a plain table"),
-    site("ALTER TABLE site_p DISABLE TRIGGER ALL", Expect::Refused, "a no-op on a plain table"),
+    site("ALTER TABLE site_p DROP CONSTRAINT nope", Expect::LikeTwin, "no such constraint: a no-op on both"),
+    site("ALTER TABLE site_p OWNER TO rasterized", Expect::LikeTwin, "a no-op on both"),
+    site("ALTER TABLE site_p SET (fillfactor = 70)", Expect::LikeTwin, "a no-op on both"),
+    site("ALTER TABLE site_p SET SCHEMA other", Expect::LikeTwin, "a no-op on both"),
+    site("ALTER TABLE site_p ENABLE ROW LEVEL SECURITY", Expect::LikeTwin, "a no-op on both"),
+    site("ALTER TABLE site_p DISABLE TRIGGER ALL", Expect::LikeTwin, "a no-op on both"),
     site("ALTER TABLE site_p PARTITION BY HASH (tenant_id) PARTITIONS 4", Expect::Refused, "phase 5"),
     site("ALTER TABLE site_p SPLIT KEY (tenant_id = 1) INTO 4", Expect::Refused, "phase 5"),
     site("ALTER TABLE site_p ISOLATE KEY (tenant_id = 1)", Expect::Refused, "phase 5"),
     site("ALTER TABLE site_p MERGE PARTITIONS FOR (tenant_id = 1), FOR (tenant_id = 2)", Expect::Refused, "phase 5"),
     site("ALTER TABLE site_p DETACH PARTITION site_q", Expect::Refused, "never"),
-    // Indexes.
-    site("CREATE INDEX site_p_n ON site_p (n)", Expect::Refused, "reaches reload_table; §11"),
-    site("CREATE INDEX IF NOT EXISTS site_p_n ON site_p (n)", Expect::Refused, "§11"),
-    site("CREATE UNIQUE INDEX site_p_kn ON site_p (tenant_id, asset_group_id, n)", Expect::Refused, "§11"),
-    site("CREATE INDEX site_p_l ON site_p USING hash (label)", Expect::Refused, "§11"),
+    // Indexes (phase 3 P1). Index names are database-wide, so these run on
+    // the partitioned table alone, created and dropped in pairs.
+    site("CREATE INDEX site_p_n ON site_p (n)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    site("CREATE INDEX IF NOT EXISTS site_p_n ON site_p (n)", Expect::Check(|_, _| Ok(())), "IF NOT EXISTS"),
+    site("SELECT * FROM site_p WHERE n = 20", Expect::LikeTwinAnswered, "through the index"),
+    site("CREATE UNIQUE INDEX site_p_kn ON site_p (tenant_id, asset_group_id, n)", Expect::Check(|_, _| Ok(())), "§1b"),
+    site("CREATE UNIQUE INDEX site_p_bad ON site_p (n)", Expect::Refused, "§1b: every key column"),
+    site("CREATE INDEX site_p_l ON site_p USING hash (label)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    site("DROP INDEX site_p_l", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    site("DROP INDEX site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    site("DROP INDEX IF EXISTS site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site(
         "DROP INDEX site_p_tenant_id_asset_group_id_asset_id_key",
         Expect::LikeTwin,
@@ -593,13 +603,35 @@ async fn on_disk_schema(db: &Database, table: &str) -> String {
     )
 }
 
+fn schema_text(s: &TableSchema) -> String {
+    format!(
+        "fields={:?} fks={} uks={:?} idx={:?} paths={} defaults={:?} checks={:?}",
+        s.fields.iter().map(|f| format!("{}:{:?}:{}:{}", f.name, f.db_type, f.write_order, f.is_deleted)).collect::<Vec<_>>(),
+        s.foreign_keys.len(),
+        s.unique_keys.iter().map(|k| (&k.name, k.is_deleted)).collect::<Vec<_>>(),
+        s.secondary_indexes.iter().map(|i| (&i.name, i.is_deleted)).collect::<Vec<_>>(),
+        s.path_indexes.len(),
+        s.defaults.iter().map(|d| (&d.column, &d.expression, d.is_deleted)).collect::<Vec<_>>(),
+        s.checks.iter().map(|c| (&c.name, c.is_deleted)).collect::<Vec<_>>(),
+    )
+}
+
+/// The shell's schema file read back, in [`schema_text`]'s words.
+async fn on_disk_text(db: &Database, table: &str) -> String {
+    let io = db.table_for_tests(table).expect("the shell").io_schema.clone();
+    schema_text(&TableSchema::load(io).await.expect("the schema loads"))
+}
+
 async fn catalogue_len(db: &Database) -> u64 {
     db.db_io_pointers.get_len().await + db.db_io_rows.get_len().await
 }
 
 /// What must hold after every site: the partitioned table is the same one,
-/// its shell is in `tables` with no data and an unchanged schema file, and
-/// no file under its logical name exists.
+/// its shell is in `tables` with no data and its schema file read back as
+/// the shell holds it, every partition holds the shell's schema, and no
+/// file under its logical name exists. A site that failed left the schema
+/// file as it was (checked by the caller); the DDL sites come in pairs, so
+/// after the last site the schema is the one the catalogue started with.
 struct Invariant {
     uid: u64,
     schema: String,
@@ -614,7 +646,13 @@ fn check_invariant(rt: &tokio::runtime::Runtime, db: &Database, dir: &Path, inv:
     let shell = shell.unwrap_or_else(|| panic!("after `{after}`: the shell left Database.tables"));
     assert_eq!(shell.schema.name, T, "after `{after}`");
     assert!(shell.io_rows().is_err(), "after `{after}`: the entry under {T} has row storage");
-    assert_eq!(rt.block_on(on_disk_schema(db, T)), inv.schema, "after `{after}`: the shell's schema file changed");
+    let _ = &inv.schema;
+    let shell_text = schema_text(&shell.schema);
+    assert_eq!(rt.block_on(on_disk_text(db, T)), shell_text, "after `{after}`: the shell's file and memory disagree");
+    let epoch = table.epoch().expect("it opens");
+    for (pid, part) in table.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).expect("partitions") {
+        assert_eq!(schema_text(&part.schema), shell_text, "after `{after}`: partition {pid} holds another schema");
+    }
     assert_eq!(files_of_table(dir, T), Vec::<String>::new(), "after `{after}`: files under the logical name");
 }
 
@@ -740,6 +778,7 @@ fn every_site_is_correct_or_an_error() {
     let mut wrong = Vec::new();
     for site in SITES {
         let catalogue_before = rt.block_on(catalogue_len(&db));
+        let schema_before = rt.block_on(on_disk_text(&db, T));
         let p = run_site(&mut cp, site, site.sql);
         let verdict: Result<(), String> = match site.expect {
             Expect::Refused => match &p {
@@ -776,10 +815,14 @@ fn every_site_is_correct_or_an_error() {
         // A refused or failed statement writes no catalogue row.
         if p.is_err() {
             assert_eq!(rt.block_on(catalogue_len(&db)), catalogue_before, "`{}` failed and wrote a catalogue row", site.sql);
+            assert_eq!(rt.block_on(on_disk_text(&db, T)), schema_before, "`{}` failed and changed the schema", site.sql);
         }
         check_invariant(&rt, &db, dir.path(), &inv, site.sql);
     }
     assert!(wrong.is_empty(), "sites that answered wrongly:\n  {}", wrong.join("\n  "));
+    // The DDL sites came in pairs: the schema is the one the catalogue
+    // started with.
+    assert_eq!(rt.block_on(on_disk_schema(&db, T)), inv.schema, "the DDL pairs left the schema changed");
     // What the LikeTwin writes stored is the twin's, row for row.
     assert_eq!(stored_rows(&db, T), stored_rows(&db, TWIN), "the partitioned table stores other rows");
 

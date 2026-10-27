@@ -20,6 +20,9 @@ mod cross_dir_commit_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
 mod partitioned;
+mod partitioned_ddl;
+#[cfg(test)]
+mod partitioned_ddl_tests;
 #[cfg(test)]
 mod partitioned_tests;
 #[cfg(test)]
@@ -1346,6 +1349,11 @@ impl Database {
         )
         .await;
 
+        // A partitioned RENAME a crash interrupted: its own intent, which
+        // finishes or abandons it by the catalogue rows alone, touching no
+        // file (`partitioned_ddl.rs`).
+        partitioned_ddl::recover_interrupted_rename(&io_pointers, &io_rows, &io_schema).await;
+
         // Before any table opens: a change a crash interrupted is undone from
         // its backup (`rewrite.rs`), so the table opens as it was.
         rewrite::recover_interrupted_rewrites(&io_pointers, &storage, &kv_stores, &seeds).await;
@@ -2313,6 +2321,23 @@ impl Database {
         if let Some(reason) = table_name_refusal(new_name).or_else(|| table_stem_refusal(old_name))
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        // The new name taken by a partitioned table is a name taken, as by
+        // a plain one (42P07), whatever the renamed table is.
+        if self.is_partitioned(new_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a table of that name already exists",
+            ));
+        }
+        // A partitioned table moves no file: its catalogue row is re-keyed
+        // under the same uid (docs/partitioning.md §3.1, phase 3 P1).
+        if self.is_partitioned(old_name) {
+            // Type-erased: the statement future's `Send` proof is already
+            // near the compiler's recursion limit.
+            let renamed: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> =
+                Box::pin(self.rename_partitioned(old_name, new_name));
+            return renamed.await;
         }
         // Both names, held to the return, ahead of every check: a rename is a
         // CREATE of the new name, whose row a concurrent CREATE could also be
@@ -3406,7 +3431,8 @@ impl Database {
     async fn record_rename_intent(&self, old_name: &str, new_name: &str) -> io::Result<()> {
         // Recovery acts on the intent by `<name>*` files and plain rows, so
         // one naming a partitioned table would lead it to sweep or reopen it
-        // as plain.
+        // as plain. A partitioned RENAME keeps an intent of its own
+        // (`partitioned_ddl.rs`).
         self.refuse_partitioned(old_name, "RENAME")?;
         self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
         let io = self

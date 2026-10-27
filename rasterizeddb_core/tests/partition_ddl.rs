@@ -385,10 +385,12 @@ fn foreign_keys_onto_a_partitioned_table_are_refused() {
     });
 }
 
-/// ALTER, RENAME and CREATE/DROP INDEX on a partitioned table are refused
-/// with 0A000 before they write: its shell's schema file is unchanged.
+/// Metadata DDL on a partitioned table runs (phase 3 P1, §11); what would
+/// rewrite every row, a key column's change and a foreign key are refused
+/// with 0A000 before they write: the shell's schema file is unchanged and
+/// no catalogue row is written.
 #[test]
-fn schema_ddl_on_a_partitioned_table_is_refused_before_it_writes() {
+fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
     on_a_big_stack(async {
         let dir = tempfile::tempdir().expect("dir");
         let db = open(dir.path()).await;
@@ -399,32 +401,48 @@ fn schema_ddl_on_a_partitioned_table_is_refused_before_it_writes() {
         )
         .await
         .expect("partitioned");
+        run(&db, "INSERT INTO pd_alt (k, n) VALUES (1, 1), (2, 2)").await.expect("rows");
         let before = on_disk_schema(&db, "pd_alt").await;
         let len = catalogue_len(&db).await;
-        for sql in [
-            "ALTER TABLE pd_alt ADD COLUMN x INT",
-            "ALTER TABLE pd_alt RENAME COLUMN n TO m",
-            "ALTER TABLE pd_alt DROP COLUMN n",
-            "ALTER TABLE pd_alt ALTER COLUMN n SET DEFAULT 5",
-            "ALTER TABLE pd_alt ALTER COLUMN n SET NOT NULL",
-            "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (k, n)",
-            "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_fk FOREIGN KEY (n) REFERENCES pd_plain(id)",
-            "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_c CHECK (n > 0)",
-            "ALTER TABLE IF EXISTS pd_alt ADD COLUMN y INT",
-            "ALTER TABLE pd_alt RENAME TO pd_alt2",
-            "ALTER TABLE pd_plain RENAME TO pd_alt",
-            "CREATE INDEX pd_alt_n ON pd_alt (n)",
-            "CREATE UNIQUE INDEX pd_alt_kn ON pd_alt (k, n)",
-            "CREATE INDEX pd_alt_doc ON pd_alt ((doc->>'a'))",
+        for (sql, why) in [
+            ("ALTER TABLE pd_alt ADD COLUMN x INT", "rewrites every row"),
+            ("ALTER TABLE IF EXISTS pd_alt ADD COLUMN y INT", "rewrites every row"),
+            ("ALTER TABLE pd_alt ALTER COLUMN n TYPE BIGINT", "rewrites every row"),
+            ("ALTER TABLE pd_alt ALTER COLUMN k TYPE BIGINT", "partition key column"),
+            ("ALTER TABLE pd_alt ALTER COLUMN k DROP NOT NULL", "must be NOT NULL"),
+            ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
+            ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (n)", "partition key column"),
+            ("CREATE UNIQUE INDEX pd_alt_n1 ON pd_alt (n)", "partition key column"),
+            ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_fk FOREIGN KEY (n) REFERENCES pd_plain(id)", "FOREIGN KEY"),
+            ("ALTER TABLE pd_alt ADD COLUMN j JSON", "shadow tables"),
         ] {
             let e = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
             assert_0a000(sql, &e);
-            assert!(e.contains("partitioned"), "{sql}: {e}");
+            assert!(e.contains(why), "{sql}: {e}");
             assert_eq!(on_disk_schema(&db, "pd_alt").await, before, "{sql} wrote the shell's schema");
             assert!(db.is_partitioned("pd_alt"), "{sql}");
             assert!(db.table_for_tests("pd_plain").is_some(), "{sql} moved the plain table");
         }
         assert_eq!(catalogue_len(&db).await, len, "a refused statement wrote a catalogue row");
+        // A plain table cannot take the partitioned table's name.
+        let e = run(&db, "ALTER TABLE pd_plain RENAME TO pd_alt").await.expect_err("a rename onto it");
+        assert!(e.contains("already exists"), "{e}");
+        assert!(db.is_partitioned("pd_alt") && db.table_for_tests("pd_plain").is_some());
+        for sql in [
+            "ALTER TABLE pd_alt RENAME COLUMN n TO m",
+            "ALTER TABLE pd_alt ALTER COLUMN m SET DEFAULT 5",
+            "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_c CHECK (m > 0)",
+            "ALTER TABLE pd_alt ALTER COLUMN m SET NOT NULL",
+            "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (k, m)",
+            "CREATE INDEX pd_alt_m ON pd_alt (m)",
+            "CREATE INDEX pd_alt_doc ON pd_alt ((doc->>'a'))",
+            "ALTER TABLE pd_alt DROP COLUMN doc",
+            "ALTER TABLE pd_alt RENAME TO pd_alt2",
+        ] {
+            run(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        assert!(db.is_partitioned("pd_alt2") && !db.is_partitioned("pd_alt"));
+        assert_ne!(on_disk_schema(&db, "pd_alt2").await, before);
     });
 }
 

@@ -313,14 +313,18 @@ async fn a_bare_vacuum_gives_each_table_back() {
     out.expect("VACUUM after the block");
 }
 
-/// A partitioned table's ALTER and CREATE INDEX, which are refused (0A000),
-/// are refused at once, taking no lock: they never wait behind the table's
-/// readers first. DROP of it does wait, and drops.
+/// A partitioned table's metadata DDL (phase 3 P1) takes ACCESS EXCLUSIVE
+/// on its logical name, so it waits behind a block that read the table and
+/// runs once it ends; what its arm refuses (0A000: a key column made
+/// nullable, a UNIQUE without every key column) is refused at once, taking
+/// no lock. DROP of it waits, and drops.
 ///
-/// Mutation: `refused_on_a_partitioned_table` answers false (the ALTER
-/// waits for the reader before its refusal).
+/// Mutations: `refused_on_a_partitioned_table` answers false (the refused
+/// ALTER waits for the reader first); `relation_for` locking a partition's
+/// name instead of the logical one (the CREATE INDEX runs beside the
+/// reader).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn partitioned_ddl_is_refused_before_any_lock() {
+async fn partitioned_ddl_waits_for_readers_and_its_refusals_take_no_lock() {
     let dir = tempfile::tempdir().unwrap();
     let _ = crate::MAX_PERMITS_THREADS.set(4);
     let _ = crate::BATCH_SIZE.set(512);
@@ -328,17 +332,26 @@ async fn partitioned_ddl_is_refused_before_any_lock() {
     let _s = setup(
         &db,
         &["CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
-           PARTITION BY HASH (tenant_id) PARTITIONS 4"],
+           PARTITION BY HASH (tenant_id) PARTITIONS 4",
+          "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1), (2, 2, 2)"],
     )
     .await;
     let mut r = reader(&db, "pt").await;
-    for sql in ["ALTER TABLE pt ADD COLUMN w BIGINT", "CREATE INDEX pt_v ON pt (v)"] {
+    for sql in ["ALTER TABLE pt ALTER COLUMN tenant_id DROP NOT NULL", "ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (v)"] {
         let refused = spawn(&db, session(&db), sql);
         let (_, out, took) = finish(sql, refused).await;
         let e = out.expect_err(sql);
         assert_eq!(sqlstate_of(&e), "0A000", "{sql}: {e}");
         assert!(took < SETTLE * 5, "{sql}: waited {took:?} before its refusal");
     }
+    let index = spawn(&db, session(&db), "CREATE INDEX pt_v ON pt (v)");
+    tokio::time::sleep(SETTLE).await;
+    assert!(!index.is_finished(), "CREATE INDEX on a partitioned table ran beside a reader");
+    ok(&db, &mut r, "COMMIT").await;
+    let (_, out, _) = finish("CREATE INDEX", index).await;
+    out.expect("CREATE INDEX after the block");
+    ok(&db, &mut r, "BEGIN").await;
+    ok(&db, &mut r, "SELECT * FROM pt WHERE v = 2").await;
     let drop_pt = spawn(&db, session(&db), "DROP TABLE pt");
     tokio::time::sleep(SETTLE).await;
     assert!(!drop_pt.is_finished(), "DROP of a partitioned table ran beside a reader");

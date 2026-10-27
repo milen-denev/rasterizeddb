@@ -501,7 +501,7 @@ async fn broken_tables_open_loudly_and_drop() {
         let e = db.add_table(acct(name)).await.unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{name}: {e}");
         let e = db.rename_table("side", name).await.unwrap_err();
-        assert!(e.to_string().contains("partitioned"), "rename onto {name}: {e}");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "rename onto {name}: {e}");
     }
     for (name, uid) in [("no_map", no_map), ("no_schema", no_schema)] {
         assert!(db.drop_table(name).await.unwrap(), "{name}: the drop found no table");
@@ -620,9 +620,13 @@ async fn partitioned_names_are_guarded() {
 
     let e = db.check_recreatable("acct").unwrap_err();
     assert!(e.to_string().contains("partitioned"), "{e}");
-    let e = db.reload_table("acct").await.unwrap_err();
-    assert!(e.to_string().contains("partitioned"), "{e}");
-    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "a refusal removed the shell");
+    // A reload of a partitioned table reopens it whole, under its name and
+    // uid (phase 3 P1), never as a plain table over `<name>*` files.
+    let uid = partitioned(&db, "acct").uid();
+    db.reload_table("acct").await.unwrap();
+    assert_eq!(partitioned(&db, "acct").uid(), uid);
+    assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "a reload removed the shell");
+    assert_eq!(logical_files(root, "acct_"), Vec::<String>::new(), "a reload made files under the logical name");
 
     let partitioned_rows: Vec<_> = catalogue(&db).await.into_iter().filter(|(_, c)| *c != 0).collect();
     assert_eq!(partitioned_rows, rows_before, "a refused CREATE wrote a partitioned row");

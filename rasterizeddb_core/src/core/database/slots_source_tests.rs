@@ -62,7 +62,7 @@ const HELD: &[(&str, &str, usize)] = &[
     // drop, for a shadow table) took on the name.
     (MOD, "drop_table_to_depth", 1),
     // A reload's old instance (§7 steps 1-2), under the AE its DDL took.
-    ("core/database/reload.rs", "reload_with_instance", 1),
+    ("core/database/reload.rs", "reload_plain_with_instance", 1),
     // RENAME's and MOVE's own table, retired under their AE.
     ("core/database/reload.rs", "retire_current", 1),
     // A test probe at the reload's steps (compiled into test builds only).
@@ -108,7 +108,6 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "prevalidate_foreign_keys", "table_for"),
     (EXEC, "query_output_scales", "schema_view"),
     (EXEC, "referenced_values_now", "table_for"),
-    (EXEC, "refuse_if_partitioned", "schema_view"),
     (EXEC, "refuse_write_to_locked_rows", "table_for"),
     // B5: both rewrites go through `rewrite_rows`, which confirms the
     // statement's ACCESS EXCLUSIVE and reads inside the reload.
@@ -516,8 +515,9 @@ fn every_ddl_mutator_resolves_its_key_first() {
     const MUTATORS: &[(&str, &str)] = &[
         (MOD, "drop_table_to_depth"),
         (MOD, "move_table_to_backend"),
-        ("core/database/reload.rs", "reload_with_instance"),
+        ("core/database/reload.rs", "reload_plain_with_instance"),
         ("core/database/reload.rs", "reopen_fresh"),
+        ("core/database/partitioned_ddl.rs", "reinstall_partitioned"),
         (MOD, "rename_table"),
         ("core/database/partitioned.rs", "drop_partitioned"),
     ];

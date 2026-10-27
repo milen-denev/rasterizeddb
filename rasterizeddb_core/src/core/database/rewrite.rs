@@ -151,7 +151,7 @@ fn parse_intent(text: &str) -> Option<(Vec<(String, String)>, FileSet)> {
 
 /// Writes the intent durably: a temporary file, synced, renamed over the
 /// intent, and the directory synced.
-fn write_intent(path: &Path, text: &str) -> io::Result<()> {
+pub(super) fn write_intent(path: &Path, text: &str) -> io::Result<()> {
     use std::io::Write;
     let temp = path.with_extension("partial");
     {
@@ -169,7 +169,7 @@ fn write_intent(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Removes the intent durably.
-fn remove_intent(path: &Path) -> io::Result<()> {
+pub(super) fn remove_intent(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
     match std::fs::remove_file(path) {
@@ -391,13 +391,22 @@ impl Database {
         Fi: FnOnce(P, Arc<DbTable>) -> FiFut,
         FiFut: Future<Output = Result<T, String>>,
     {
+        // A partitioned table is never rewritten here: per partition it would
+        // not be all or nothing (docs/partitioning.md §11, phase 6). Its
+        // callers refuse first; this is the backstop, before anything is held.
+        if self.is_partitioned(table_name) {
+            return Err(ReloadFailure::Reopen(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("rewriting the rows of partitioned table \"{table_name}\" is not supported yet"),
+            )));
+        }
         let _relocating = super::relocation_permit(self.location.is_some(), table_name).await;
         // The new files are written, and on failure the old ones put back,
         // through the database's seed under the table's own names while the
         // old file set's word is live: a listed exemption (`gated_io`,
         // `Ungated::SchemaRewrite`), under the reload's ticket on that word.
         use crate::core::index_store::gated_io::{Ungated, ungated};
-        self.reload_with_instance(table_name, |old| ungated(Ungated::SchemaRewrite, async move {
+        self.reload_plain_with_instance(table_name, |old| ungated(Ungated::SchemaRewrite, async move {
             // After the lock and the retirement: every committed write is in
             // the files, and nothing writes them now.
             let (create, plan) = read(old).await?;
@@ -508,7 +517,9 @@ impl Database {
         Fut: Future<Output = Result<T, String>>,
     {
         let _relocating = super::relocation_permit(self.location.is_some(), table_name).await;
-        let mut tables = vec![table_name.to_string()];
+        // A partitioned table's schema files are its shell's,
+        // `__pt_<uid>_schema*`: held aside under that stem (§11).
+        let mut tables = vec![self.schema_files_stem(table_name)];
         tables.extend(also);
         self.reload_with_instance(table_name, |old| async move {
             let backup = self

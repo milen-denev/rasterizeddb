@@ -126,6 +126,34 @@ impl Database {
         // folding drops in, so every mutator removes the slot a lookup finds.
         let resolved = self.resolve_key(table_name);
         let table_name = resolved.as_deref().unwrap_or(table_name);
+        // A partitioned table: the same steps over its shell and every open
+        // partition (docs/partitioning.md §11, phase 3 P1).
+        if self.is_partitioned(table_name) {
+            debug_assert!(
+                self.exclusive_held(table_name),
+                "reload of \"{table_name}\" without ACCESS EXCLUSIVE on it (§7 step 1)"
+            );
+            return self.reload_partitioned(table_name, work).await;
+        }
+        self.reload_plain_with_instance(table_name, work).await
+    }
+
+    /// [`Database::reload_with_instance`] for a table that is not
+    /// partitioned: what an ALTER rewrite calls directly
+    /// (`rewrite_table`, which refuses a partitioned name first), so its
+    /// future, the deepest a statement awaits, does not also carry the
+    /// partitioned reload's.
+    pub(crate) async fn reload_plain_with_instance<T, F, Fut>(
+        &self,
+        table_name: &str,
+        work: F,
+    ) -> Result<T, ReloadFailure>
+    where
+        F: FnOnce(Arc<DbTable>) -> Fut,
+        Fut: Future<Output = Result<(T, Option<Arc<DbTable>>), String>>,
+    {
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
         // Step 1: the caller's lock set, asserted.
         debug_assert!(
             self.exclusive_held(table_name),
@@ -204,6 +232,89 @@ impl Database {
                 #[cfg(any(test, feature = "test_tokens"))]
                 hooks::reached(self, table_name, hooks::Step::Swapped, &old);
                 drop(changed);
+                worked.map_err(ReloadFailure::Work)
+            })
+            .await
+    }
+
+    /// [`Database::reload_with_instance`] for a partitioned table
+    /// (docs/partitioning.md §11 and "Phase 3 P1 as built"), under the
+    /// ACCESS EXCLUSIVE the caller holds on the **logical** name, which every
+    /// statement on the table takes before it reaches a partition:
+    ///
+    /// 2. every open partition is retired;
+    /// 3. `work` writes the shell's sidecars once, through the shell (the
+    ///    `old` it gets), and the schema is read back from them: one schema,
+    ///    which every partition clones, so no two partitions can hold
+    ///    different ones, in memory or after a crash (partitions have no
+    ///    schema files of their own). Then each open partition is opened
+    ///    again over its files under the new schema, its indexes built from
+    ///    its rows;
+    /// 4. the new table goes into the partitioned map and its shell into
+    ///    the name's slot (the shape epoch moves there if the columns did),
+    ///    and `schema_generation` moves once, for the whole table.
+    ///
+    /// A `work` that fails still gets the table reopened from disk, never
+    /// the retired partitions back. A reopen that fails installs the table
+    /// broken, with the reason, as a startup open would; a DROP still
+    /// reaches it. A `work` that opened an instance of its own (a rewrite)
+    /// is refused: partitioned tables are never rewritten here.
+    async fn reload_partitioned<T, F, Fut>(&self, table_name: &str, work: F) -> Result<T, ReloadFailure>
+    where
+        F: FnOnce(Arc<DbTable>) -> Fut,
+        Fut: Future<Output = Result<(T, Option<Arc<DbTable>>), String>>,
+    {
+        let Some(old) = self.partitioned_table(table_name) else {
+            return Err(ReloadFailure::Reopen(io::Error::new(io::ErrorKind::NotFound, "Table not found")));
+        };
+        // A table that cannot serve data is not changed: nothing written.
+        old.check().map_err(ReloadFailure::Reopen)?;
+        let shell = old.shell().clone();
+        let _forget_pause = self.transactions.forget_pause();
+        let changed = SchemaChanged(&self.schema_generation);
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        RELOAD_STEPS
+            .scope((), async move {
+                // Step 2: retire every open partition.
+                old.retire_partitions().await;
+                #[cfg(any(test, feature = "test_tokens"))]
+                hooks::reached(self, table_name, hooks::Step::Retired, &shell);
+
+                // Step 3: the shell's sidecars, once; then the reopen.
+                #[cfg(test)]
+                if let Some(root) = self.location.as_deref() {
+                    let _ = crate::core::power_loss::failpoint::hit("test.pddl.before_work", std::path::Path::new(root));
+                }
+                let worked = match work(shell.clone()).await {
+                    Ok((value, None)) => Ok(value),
+                    Ok((_, Some(opened))) => {
+                        opened.retire().await;
+                        Err(format!(
+                            "internal error: a schema change of partitioned table \"{table_name}\" opened a table \
+                             of its own"
+                        ))
+                    }
+                    Err(e) => Err(e),
+                };
+                #[cfg(test)]
+                if let Some(root) = self.location.as_deref() {
+                    let _ = crate::core::power_loss::failpoint::hit("test.pddl.after_work", std::path::Path::new(root));
+                }
+                let (new_shell, table) = self.reopen_partitioned(table_name, &old).await;
+                let broken = table.broken().map(str::to_string);
+
+                // Step 4: the swap, then the generation.
+                #[cfg(any(test, feature = "test_tokens"))]
+                hooks::reached(self, table_name, hooks::Step::BeforeSwap, &shell);
+                self.swap_partitioned(table_name, Arc::new(table), new_shell);
+                #[cfg(any(test, feature = "test_tokens"))]
+                hooks::reached(self, table_name, hooks::Step::Swapped, &shell);
+                drop(changed);
+                if let Some(why) = broken {
+                    return Err(ReloadFailure::Reopen(io::Error::other(why)));
+                }
                 worked.map_err(ReloadFailure::Work)
             })
             .await

@@ -597,6 +597,26 @@ impl Database {
         }
     }
 
+    /// A partitioned schema change's swap (§7 step 4 for a partitioned
+    /// table): `table` replaces `name`'s partitioned entry, then `shell`
+    /// replaces the instance in the name's slot, which stays live, so a
+    /// statement queued on the logical name finds the new table. The slot's
+    /// shape epoch moves when the shell's columns did (`swap_instance`).
+    /// `None` (the new schema did not read) removes the slot: the table is
+    /// then broken and shell-less, as at a startup that could not read it.
+    pub(crate) fn swap_partitioned(&self, name: &str, table: Arc<PartitionedTable>, shell: Option<Arc<DbTable>>) {
+        let key = self.resolve_key(name).unwrap_or_else(|| Self::canonical_key(name.to_string()));
+        self.partitioned_tables.insert(key.clone(), table);
+        match shell {
+            Some(shell) => {
+                self.swap_instance(&key, shell);
+            }
+            None => {
+                self.take_table(&key);
+            }
+        }
+    }
+
     /// Removes the partitioned table `name`, and its shell's slot if it still
     /// holds `table`'s shell.
     pub(crate) fn take_partitioned(&self, name: &str, table: &Arc<PartitionedTable>) {

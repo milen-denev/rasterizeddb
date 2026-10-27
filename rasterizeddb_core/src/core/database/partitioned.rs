@@ -114,10 +114,11 @@ pub(super) fn catalogue_duplicates(rows: &[(String, u64)]) -> Result<(), String>
             );
         }
     }
-    // PARTITION-TODO(rename): §3.1's partitioned RENAME commits by writing a
-    // second row with the same uid, and its recovery reads that as "rename
-    // committed" (keep the newer name, finish the header rewrite and the
-    // tombstone). Refused while 2a refuses RENAME; that slice replaces this.
+    // A partitioned RENAME commits by writing a second row with the same uid
+    // (§3.1), and its recovery (`partitioned_ddl::recover_interrupted_rename`,
+    // run before the catalogue is read) tombstones the old row. Two rows
+    // still sharing a uid here mean that tombstone failed, or no intent says
+    // which row is newer: refused rather than guessed at.
     let mut uids: Vec<_> = by_uid.into_iter().filter(|(_, n)| n.len() > 1).collect();
     uids.sort();
     for (uid, names) in uids {
@@ -133,6 +134,29 @@ pub(super) fn catalogue_duplicates(rows: &[(String, u64)]) -> Result<(), String>
         "{}. Opening would serve one of them and hide the other's rows; a version that ignores \
          partitioned tables can create a plain table over one. Nothing was opened or changed.",
         refusals.join("; ")
+    ))
+}
+
+/// Why a UNIQUE or PRIMARY KEY over `columns` cannot be declared on a table
+/// partitioned by `key` (§1b): uniqueness is checked inside one partition,
+/// so a constraint missing a key column would accept equal values stored in
+/// two. `None` when it contains every key column. The one wording, for
+/// `CREATE … PARTITION BY`, `ADD CONSTRAINT` and `CREATE UNIQUE INDEX`.
+pub(crate) fn unique_key_refusal<K: AsRef<str>>(key: &[K], columns: &[String]) -> Option<String> {
+    let missing = key.iter().map(AsRef::as_ref).find(|k| !columns.iter().any(|c| c.eq_ignore_ascii_case(k)))?;
+    let mut with_key: Vec<&str> = key.iter().map(AsRef::as_ref).collect();
+    with_key.extend(
+        columns
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !key.iter().any(|k| k.as_ref().eq_ignore_ascii_case(c))),
+    );
+    Some(format!(
+        "UNIQUE or PRIMARY KEY ({}) does not contain partition key column \"{missing}\"; a partitioned table \
+         enforces uniqueness per partition, so the constraint must include every partition key column, as in \
+         UNIQUE ({})",
+        columns.join(", "),
+        with_key.join(", ")
     ))
 }
 
@@ -389,16 +413,8 @@ impl Database {
             .chain(ct.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| k.columns.as_slice()))
             .chain(ct.primary_key.iter().map(std::slice::from_ref));
         for columns in constraints {
-            if let Some(missing) = key.iter().find(|k| !columns.iter().any(|c| c.eq_ignore_ascii_case(k))) {
-                let mut with_key: Vec<&str> = key.to_vec();
-                with_key.extend(columns.iter().map(String::as_str).filter(|c| !key.iter().any(|k| k.eq_ignore_ascii_case(c))));
-                return Err(unsupported(format!(
-                    "UNIQUE or PRIMARY KEY ({}) does not contain partition key column \"{missing}\"; a \
-                     partitioned table enforces uniqueness per partition, so the constraint must include \
-                     every partition key column, as in UNIQUE ({})",
-                    columns.join(", "),
-                    with_key.join(", ")
-                )));
+            if let Some(why) = unique_key_refusal(key, columns) {
+                return Err(unsupported(why));
             }
         }
         let open: Vec<Arc<PartitionedTable>> = self.partitioned_tables_all();
@@ -616,43 +632,74 @@ impl Database {
     /// Nothing is created: the schema file is checked by a never-creating
     /// open before a provider is built on it, since providers create.
     async fn open_partitioned(&self, name: &str, uid: u64) -> (Option<Arc<Table<DbStorageProvider>>>, PartitionedTable) {
+        match self.load_shell(name, uid).await {
+            Ok(shell) => {
+                let table = PartitionedTable::open(self.open_ctx(), name, uid, shell.clone()).await;
+                (Some(shell), table)
+            }
+            Err(why) => (None, self.refused_partitioned(name, uid, &why)),
+        }
+    }
+
+    /// A partitioned table refused before its map is read, for `why`.
+    fn refused_partitioned(&self, name: &str, uid: u64, why: &str) -> PartitionedTable {
+        // A memory provider stands in for the schema: building a file
+        // provider would create the file whose absence is the problem.
         let schema_file = format!("{}.db", files::schema_stem(uid));
-        let broken = |why: &str| {
-            // A memory provider stands in for the schema: building a file
-            // provider would create the file whose absence is the problem.
-            let stand_in = Arc::new(DbStorageProvider::new_memory(&schema_file));
-            let shell = Arc::new(Table::partition_shell(stand_in, TableSchema::new(name.to_string(), false)));
-            let root = self.location.as_deref().map(PathBuf::from).unwrap_or_default();
-            PartitionedTable::refused(self.open_ctx(), name, uid, root, shell, why)
-        };
-        let root = match self.partition_root() {
-            Ok(root) => root,
-            Err(e) => return (None, broken(&e.to_string())),
-        };
+        let stand_in = Arc::new(DbStorageProvider::new_memory(&schema_file));
+        let shell = Arc::new(Table::partition_shell(stand_in, TableSchema::new(name.to_string(), false)));
+        let root = self.location.as_deref().map(PathBuf::from).unwrap_or_default();
+        PartitionedTable::refused(self.open_ctx(), name, uid, root, shell, why)
+    }
+
+    /// The shell of partitioned table `uid`, read from its schema file under
+    /// the catalogue's `name`, scoped and versioned. The catalogue row is
+    /// what names the table: a schema header recording another name (a
+    /// RENAME cut between its commit point and its header rewrite, §3.1) is
+    /// read under the row's, so the name never depends on which of the two
+    /// writes a crash kept.
+    async fn load_shell(&self, name: &str, uid: u64) -> Result<Arc<Table<DbStorageProvider>>, String> {
+        let schema_file = format!("{}.db", files::schema_stem(uid));
+        let root = self.partition_root().map_err(|e| e.to_string())?;
         // Before any provider: a mirrored root would create the schema file's
         // copies in the backups.
         if !pool_mirrors(&self.storage).is_empty() {
-            return (
-                None,
-                broken("partitioned tables in a storage pool with backup mirrors are not supported yet"),
-            );
+            return Err("partitioned tables in a storage pool with backup mirrors are not supported yet".to_string());
         }
-        if let Err(e) = files::require_existing(&root, std::slice::from_ref(&schema_file)) {
-            return (None, broken(&e.to_string()));
-        }
+        files::require_existing(&root, std::slice::from_ref(&schema_file)).map_err(|e| e.to_string())?;
         let io_schema = Arc::new(self.db_io_pointers.create_new(schema_file.clone()).await);
-        let schema = match TableSchema::load(io_schema.clone()).await {
-            Ok(schema) => schema,
-            Err(e) => return (None, broken(&format!("its schema {schema_file} could not be read: {e}"))),
-        };
+        let mut schema = TableSchema::load(io_schema.clone())
+            .await
+            .map_err(|e| format!("its schema {schema_file} could not be read: {e}"))?;
         if schema.name != name {
-            warn!("partitioned table \"{name}\" ({uid:016x}) has a schema recorded under the name \"{}\"", schema.name);
+            warn!(
+                "partitioned table \"{name}\" ({uid:016x}) has a schema recorded under the name \"{}\"; it is \
+                 read under the catalogue's",
+                schema.name
+            );
+            schema.name = name.to_string();
         }
         let mut shell = Table::partition_shell(io_schema, schema);
         shell.scope_cache_to_database(self.id);
         shell.enable_versioning(self.transactions.clone());
-        let shell = Arc::new(shell);
-        let table = PartitionedTable::open(self.open_ctx(), name, uid, shell.clone()).await;
-        (Some(shell), table)
+        Ok(Arc::new(shell))
+    }
+
+    /// The reopen of a partitioned schema change (`reload_partitioned`, §11
+    /// step 3): the shell read again from its sidecars, under `name`, and
+    /// `old`'s open partitions reopened under it. When the schema does not
+    /// read, the table is broken and has no shell, as at startup.
+    pub(super) async fn reopen_partitioned(
+        &self,
+        name: &str,
+        old: &PartitionedTable,
+    ) -> (Option<Arc<Table<DbStorageProvider>>>, PartitionedTable) {
+        match self.load_shell(name, old.uid()).await {
+            Ok(shell) => {
+                let table = old.reopened(name, shell.clone()).await;
+                (Some(shell), table)
+            }
+            Err(why) => (None, self.refused_partitioned(name, old.uid(), &why)),
+        }
     }
 }

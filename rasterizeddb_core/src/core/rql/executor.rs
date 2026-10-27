@@ -7201,22 +7201,6 @@ fn partitioned_ddl_message(e: &std::io::Error) -> String {
     }
 }
 
-/// Refuses DDL that would change a partitioned table's schema, indexes or
-/// constraints: those live in its partitions as well as its shell, and phase
-/// 2a's DDL reaches neither (`docs/partitioning.md` §11). Called before
-/// anything is written, so a refusal leaves the shell's sidecars as they
-/// were. Consults `partitioned` first: a table that could not be opened has
-/// no shell in `tables` but is still partitioned.
-fn refuse_if_partitioned(database: &Database, table: &str, what: &str) -> Result<(), String> {
-    let shell = database.schema_view(table).is_some_and(|v| v.is_shell());
-    if database.is_partitioned(table) || shell {
-        return Err(format!(
-            "{what} on partitioned table \"{table}\" is not supported yet"
-        ));
-    }
-    Ok(())
-}
-
 /// Refuses an `ON CONFLICT` target on a partitioned table that leaves out a
 /// partition-key column, with PostgreSQL's 42P10 ("there is no unique or
 /// exclusion constraint matching the ON CONFLICT specification"): every
@@ -8747,6 +8731,10 @@ async fn existing_rows_break_unique(
     let Some(table) = entry.as_ref().clone() else {
         return Err(format!("relation '{}' does not exist", table_name));
     };
+    // The rows: the table's, or each open partition's. Exact per partition,
+    // since a partitioned table's unique key holds every partition key
+    // column (docs/partitioning.md §1b), so equal tuples share a partition.
+    let holders = database.row_tables_held(table_name).map_err(|e| e.to_string())?;
 
     let schema = &table.schema.fields;
     let mut fields = Vec::with_capacity(key.columns.len());
@@ -8796,15 +8784,20 @@ async fn existing_rows_break_unique(
 
     let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
     let empty = crate::core::rql::join::fetch_for(&[], schema);
-    let rows = table
-        .query_row("", &schema.to_vec(), empty, fetch, None, None)
-        .await
-        .map_err(|e| {
-            format!(
-                "could not read '{}' to validate the constraint: {}",
-                table_name, e
-            )
-        })?;
+    let mut rows = Vec::new();
+    for holder in &holders {
+        rows.extend(
+            holder
+                .query_row("", &schema.to_vec(), empty.clone(), fetch.clone(), None, None)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not read '{}' to validate the constraint: {}",
+                        table_name, e
+                    )
+                })?,
+        );
+    }
 
     let mut seen: ahash::HashSet<Vec<u8>> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
@@ -8910,15 +8903,14 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
 
     // Before `IF EXISTS`: a partitioned table that could not be opened is
     // absent from `tables` yet exists. Every action is checked before the
-    // first runs, since each writes its sidecar before it reloads.
+    // first runs, since each writes its sidecar before it reloads; each arm
+    // asks again under its ACCESS EXCLUSIVE.
     for plan in &plans {
-        if let Err(e) = refuse_if_partitioned(database, &plan.table_name, "ALTER TABLE") {
-            return ddl_error(&e);
+        if let Some(why) = database.partitioned_table(&plan.table_name).and_then(|t| t.broken().map(str::to_string)) {
+            return ddl_error(&why);
         }
-        if let lexer_alter::AlterAction::RenameTable { to } = &plan.action {
-            if let Err(e) = refuse_if_partitioned(database, to, "ALTER TABLE ... RENAME TO") {
-                return ddl_error(&e);
-            }
+        if let Some(e) = database.partitioned_alter_refusal(plan) {
+            return ddl_error(&e);
         }
     }
 
@@ -9412,19 +9404,15 @@ async fn execute_alter_table_action(
         let Some(table) = table_ref.as_ref().clone() else {
             return ddl_error(&format!("relation '{}' does not exist", plan.table_name));
         };
-        // A partitioned table's rows are in its partitions, which this does
-        // not reach: refused rather than altering the shell alone.
-        let data = match table.data() {
-            Ok(data) => data,
+        // A partitioned table's rows are in its partitions: its length is
+        // theirs, and its schema its shell's (docs/partitioning.md §11).
+        let row_count = match database.rows_len_held(&plan.table_name) {
+            Ok(len) => len,
             Err(e) => return ddl_error(&e.to_string()),
         };
         // A schema change is written to storage and the table handle rebuilt
         // from it, because `Table` owns its schema by value.
-        (
-            table.schema.clone(),
-            table.io_schema.clone(),
-            data.len.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        (table.schema.clone(), table.io_schema.clone(), row_count)
     };
 
     // The rest of the action's complete lock set (§7 step 1, finding L11):
@@ -9436,6 +9424,11 @@ async fn execute_alter_table_action(
     // edges, before a single sidecar is written. So a 55P03 or 40P01 here
     // has written nothing.
     if let Err(e) = database.lock_names(&alter_lock_set(&plan, database), owner()).await {
+        return ddl_error(&e);
+    }
+    // What a partitioned table cannot do yet, under the lock, before a
+    // sidecar is written (docs/partitioning.md §11).
+    if let Some(e) = database.partitioned_alter_refusal(&plan) {
         return ddl_error(&e);
     }
 
@@ -10358,6 +10351,24 @@ async fn execute_alter_table_action(
                     // The fill now asks the *row* whether it carries a value for
                     // the tracked column rather than asking the schema about
                     // defaults. See `rewrite_table_with_columns`.
+                    // A partitioned table here holds no rows (a populated one
+                    // was refused above): the companion is a metadata change,
+                    // as ADD COLUMN on an empty table adds one.
+                    if database.is_partitioned(&plan.table_name) {
+                        let flag = nullable::flag_column_name(&name);
+                        return match database
+                            .reload_atomic(&plan.table_name, |old| async move {
+                                let mut schema = schema;
+                                retire_tombstoned_name(&mut schema, &flag, old.io_schema.clone()).await?;
+                                schema.add_field(old.io_schema.clone(), flag, nullable::FLAG_TYPE, false).await;
+                                Ok(())
+                            })
+                            .await
+                        {
+                            Ok(()) => ddl_ok(0),
+                            Err(failure) => reload_failed(failure, ""),
+                        };
+                    }
                     let companion = crate::core::rql::lexer_ct::CreateColumnData {
                         name: nullable::flag_column_name(&name),
                         data_type: nullable::FLAG_TYPE,
@@ -10465,11 +10476,6 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         None => return ddl_error("this is not an index over a document path"),
     };
 
-    // Before the declaration is written: a partitioned table's indexes live
-    // in its partitions.
-    if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
-        return ddl_error(&e);
-    }
     let (declared, column_is_a_document) = {
         // ACCESS EXCLUSIVE before the schema is read (§7); the declaration
         // is written inside the reload, under it.
@@ -10572,11 +10578,6 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     };
     let name = statement.name_or_default();
 
-    // Before the declaration is written: a partitioned table's indexes live
-    // in its partitions.
-    if let Err(e) = refuse_if_partitioned(database, &statement.table, "CREATE INDEX") {
-        return ddl_error(&e);
-    }
     let (columns, types) = {
         // ACCESS EXCLUSIVE before the schema is read (§7); the declaration
         // is written inside the reload, under it.
@@ -10672,11 +10673,6 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
         .find(|i| i.name.eq_ignore_ascii_case(&name))
         .cloned()?;
     drop(table);
-    // Before the tombstone is written, so a refused drop leaves the
-    // declaration as it was.
-    if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
-        return Some(ddl_error(&e));
-    }
     let tombstone = crate::core::index::IndexDecl {
         is_deleted: true,
         ..decl
@@ -10786,11 +10782,6 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
         return ddl_ok(0);
     };
 
-    // Before the tombstone, so a refused drop leaves the declaration; and
-    // before the map guard below, which this would take a second time.
-    if let Err(e) = refuse_if_partitioned(database, &table_name, "DROP INDEX") {
-        return ddl_error(&e);
-    }
     match database.table_for(&table_name, owner(), TableMode::AccessExclusive).await {
         Ok(Some(_)) => {}
         Ok(None) if if_exists => return ddl_ok(0),
@@ -11964,7 +11955,7 @@ pub(crate) async fn lock_statement_set(database: &Arc<Database>, sql: &str) -> R
     if set.is_empty() {
         return Ok(());
     }
-    if refused_on_a_partitioned_table(sql, &set, database) {
+    if refused_on_a_partitioned_table(sql, database) {
         return Ok(());
     }
     let parents: Vec<(String, TableMode)> = set
@@ -12014,17 +12005,17 @@ async fn lock_create_target(
     database.lock_names(&set, owner()).await
 }
 
-/// Whether `sql` is an ALTER TABLE or CREATE INDEX on a partitioned table,
-/// which its arm refuses (0A000) before reading anything: such a statement
-/// takes no lock at all, so it is refused at once instead of first waiting
-/// for every reader of the table (§7 B4: "partitioned DDL stays refused
-/// before any lock"). DROP of a partitioned table is built, and locks.
-fn refused_on_a_partitioned_table(sql: &str, set: &[(String, TableMode)], database: &Database) -> bool {
+/// Whether `sql` is an ALTER TABLE its arm refuses on a partitioned table
+/// before reading anything (`Database::partitioned_alter_refusal`: what
+/// would rewrite every row, a key column's change, a foreign key, a UNIQUE
+/// without every key column): such a statement takes no lock, so it is
+/// refused at once instead of first waiting for every reader of the table.
+/// The metadata forms lock as on a plain table (docs/partitioning.md §11).
+fn refused_on_a_partitioned_table(sql: &str, database: &Database) -> bool {
     let first = sql.split_whitespace().next().unwrap_or("");
-    (first.eq_ignore_ascii_case("ALTER") || first.eq_ignore_ascii_case("CREATE"))
-        && set
-            .iter()
-            .any(|(name, mode)| *mode == TableMode::AccessExclusive && database.is_partitioned(name))
+    first.eq_ignore_ascii_case("ALTER")
+        && crate::core::rql::lexer_alter::parse_alter_table_actions(sql)
+            .is_ok_and(|plans| plans.iter().any(|plan| database.partitioned_alter_refusal(plan).is_some()))
 }
 
 /// What an `ALTER TABLE` or `DROP TABLE` locks beyond the names its text

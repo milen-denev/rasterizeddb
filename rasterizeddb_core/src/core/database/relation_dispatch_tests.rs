@@ -214,6 +214,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("table_for_tests", "a slot primitive: never called by the engine"),
     ("take_table", "a slot primitive: its callers dispatch"),
     ("take_partitioned", "a slot primitive: drop_partitioned's removal, after its dispatch"),
+    // Phase 3 P1 (partitioned schema changes, §11).
+    ("reload_with_instance", "the dispatch: is_partitioned sends a partitioned name to reload_partitioned"),
+    ("reload_partitioned", "the partitioned branch of reload_with_instance's dispatch"),
+    ("refused_partitioned", "builds the broken partitioned table of a uid the catalogue names; no plain file"),
+    ("load_shell", "reads the shell of a uid the catalogue names, from its __pt_ schema file"),
+    ("reopen_partitioned", "a partitioned reload's reopen, after its dispatch"),
+    ("swap_partitioned", "a slot primitive: a partitioned reload's swap; its callers dispatch"),
+    ("rename_partitioned", "the partitioned branch of rename_table's dispatch"),
+    ("reinstall_partitioned", "rename_partitioned's swap of the maps, after its dispatch"),
+    ("schema_files_stem", "asks the partitioned map itself, as relation() does"),
+    ("rewrite_partitioned_header", "rename_partitioned's header step on the shell's __pt_ schema, after its dispatch"),
 ];
 
 /// Every fn of the `impl Database {` blocks in `src` that takes one of
@@ -295,6 +306,7 @@ fn every_name_keyed_database_fn_resolves_the_relation_first() {
     fns.extend(name_keyed(include_str!("slots.rs")));
     fns.extend(name_keyed(include_str!("reload.rs")));
     fns.extend(name_keyed(include_str!("rewrite.rs")));
+    fns.extend(name_keyed(include_str!("partitioned_ddl.rs")));
 
     // A reader that found nothing would pass vacuously; and a multi-line
     // parameter list must still be read.
@@ -444,8 +456,15 @@ async fn a_shell_less_partitioned_table_is_refused_not_missing() {
 
     let db = open(root).await;
     assert!(db.table_for_tests("acct").is_none() && db.is_partitioned("acct"));
-    refused("rename of acct", &db.rename_table("acct", "acct2").await.unwrap_err().to_string());
-    refused("reload of acct", &db.reload_table("acct").await.unwrap_err().to_string());
+    // A rename and a reload reach the partitioned table, which reports why
+    // it cannot be opened (phase 3 P1 builds both), and change nothing.
+    for (what, e) in [
+        ("rename of acct", db.rename_table("acct", "acct2").await.unwrap_err().to_string()),
+        ("reload of acct", db.reload_table("acct").await.unwrap_err().to_string()),
+    ] {
+        assert!(e.contains("partitioned") && e.contains("cannot be opened"), "{what} erred without the reason: {e}");
+        assert!(db.is_partitioned("acct") && !db.is_partitioned("acct2"), "{what}");
+    }
     refused("check_recreatable(acct)", &db.check_recreatable("acct").unwrap_err().to_string());
     #[cfg(feature = "storage_pools")]
     refused("move of acct", &db.move_table_to("acct", "memory:").await.unwrap_err().to_string());
@@ -536,31 +555,50 @@ async fn the_vacuum_statement_vacuums_a_partitioned_tables_partitions() {
     }
 }
 
-/// ALTER and CREATE INDEX on a partitioned table refuse with 0A000's
-/// wording, write nothing to its schema file, and leave the shell in
-/// `tables` (reload_table refuses before it removes the entry).
+/// ALTER and CREATE INDEX on a partitioned table (phase 3 P1) reload it
+/// whole: the shell stays a shell under the name, the uid stays, the schema
+/// file changes, and no file appears under the logical name; a reload_table
+/// of it does the same, and never builds a plain table.
 #[tokio::test(flavor = "multi_thread")]
-async fn alter_on_a_partitioned_table_refuses_and_keeps_the_shell() {
+async fn alter_on_a_partitioned_table_reloads_it_and_keeps_the_shell() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let db = Arc::new(open(root).await);
     let uid = create(&db, "acct", 4).await;
-    let schema_file = root.join(format!("{}.db", crate::core::partition::files::schema_stem(uid)));
-    let before = std::fs::read(&schema_file).unwrap();
+    let stem = crate::core::partition::files::schema_stem(uid);
+    let schema_files = || {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(&stem) && n.ends_with(".db"))
+            .collect();
+        names.sort();
+        names.iter().map(|n| std::fs::read(root.join(n)).unwrap()).collect::<Vec<_>>()
+    };
+    let before = schema_files();
     for statement in [
         "ALTER TABLE acct ADD COLUMN x INT",
         "ALTER TABLE acct RENAME TO acct2",
+        "ALTER TABLE acct2 RENAME TO acct",
         "ALTER TABLE acct RENAME COLUMN n TO m",
-        "CREATE INDEX ix_acct ON acct (n)",
+        "CREATE INDEX ix_acct ON acct (m)",
     ] {
         let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(statement).unwrap();
         let reply = crate::core::rql::executor::execute(purpose, db.clone()).await;
-        assert_eq!(reply.first(), Some(&3u8), "{statement} answered on a partitioned table");
-        refused(statement, &String::from_utf8_lossy(&reply[1..]));
-        assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()), "{statement} removed the shell");
+        assert_ne!(reply.first(), Some(&3u8), "{statement}: {}", String::from_utf8_lossy(&reply[1..]));
+        let name = if statement.contains("RENAME TO acct2") { "acct2" } else { "acct" };
+        assert!(db.table_for_tests(name).is_some_and(|s| s.is_shell()), "{statement} removed the shell");
+        assert_eq!(partitioned(&db, name).uid(), uid, "{statement}");
     }
-    assert_eq!(std::fs::read(&schema_file).unwrap(), before, "a refused DDL wrote the schema file");
-    refused("reload_table", &db.reload_table("acct").await.unwrap_err().to_string());
+    assert_ne!(schema_files(), before, "the DDL wrote nothing to the schema files");
+    db.reload_table("acct").await.unwrap();
     assert!(db.table_for_tests("acct").is_some_and(|s| s.is_shell()));
+    assert_eq!(partitioned(&db, "acct").uid(), uid);
     assert!(db.relation("acct2").is_none());
+    let stray: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("acct"))
+        .collect();
+    assert!(stray.is_empty(), "files under the logical names: {stray:?}");
 }
