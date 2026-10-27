@@ -135,13 +135,10 @@ impl Database {
                 if upper.contains("FOREIGN KEY") || upper.contains("REFERENCES") {
                     return Some("FOREIGN KEY on a partitioned table is not supported yet".to_string());
                 }
-                let clause = description.trim_start();
-                let clause = if clause.to_ascii_uppercase().starts_with("IF NOT EXISTS") {
-                    clause["IF NOT EXISTS".len()..].trim_start()
-                } else {
-                    clause
-                };
-                match crate::core::rql::unique_key::parse_clause(clause, t) {
+                // As the ALTER arm reads it: `IF NOT EXISTS` out, in front
+                // or after `CONSTRAINT`.
+                let (clause, _) = crate::core::rql::unique_key::strip_if_not_exists(description);
+                match crate::core::rql::unique_key::parse_clause(&clause, t) {
                     Ok(Some(unique)) => unique_key_refusal(&key, &unique.columns).map(|why| format!("{why} {SUFFIX}")),
                     _ => None,
                 }
@@ -214,6 +211,11 @@ impl Database {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         };
         old.check()?;
+        // One partitioned rename's intent at a time: a second one would
+        // overwrite the first's while its old row may still be live.
+        if let Some(why) = self.unfinished_partitioned_rename(None) {
+            return Err(io::Error::other(why));
+        }
         if self.has_table(new_name) || self.is_partitioned(new_name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a table of that name already exists"));
         }
@@ -293,11 +295,45 @@ impl Database {
                  ({e}); the next open finishes the rename"
             ),
         }
+        // Unfinished (the intent is still there): both names are held until
+        // the next open settles it. A CREATE of either name is refused
+        // (`refuse_held_name`), and the intent itself refuses a second
+        // partitioned RENAME, and a DROP of this uid, until then.
+        if intent.exists() {
+            self.hold_intent(old_name, new_name);
+        }
 
         self.reinstall_partitioned(old_name, &old, new_name).await;
         synced?;
         info!("Renamed partitioned table {old_name} to {new_name} ({uid:016x})");
         Ok(())
+    }
+
+    /// Why a partitioned RENAME, or a DROP of the partitioned table `uid`
+    /// (`Some`), must wait for the next open: a rename's intent is still in
+    /// the database directory, so its old catalogue row may still be live.
+    /// A second rename would overwrite the intent (and the next open would
+    /// then find two rows with one uid, which it refuses); a DROP would delete
+    /// the files the surviving row still names. An intent that does not parse
+    /// is taken to name every uid. `None` when there is none.
+    pub(super) fn unfinished_partitioned_rename(&self, uid: Option<u64>) -> Option<String> {
+        let root = self.location.as_deref()?;
+        let path = std::path::Path::new(root).join(RENAME_INTENT);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+            Err(e) => return Some(format!("a partitioned rename's intent {} cannot be read: {e}", path.display())),
+        };
+        let named = parse_rename(&text);
+        if let (Some(uid), Some((intent_uid, _, _))) = (uid, &named)
+            && *intent_uid != uid
+        {
+            return None;
+        }
+        let what = named
+            .map(|(_, old, new)| format!("the rename of partitioned table \"{old}\" to \"{new}\""))
+            .unwrap_or_else(|| "a partitioned rename".to_string());
+        Some(format!("{what} has not finished (its intent is kept until the next open settles it); restart first"))
     }
 
     /// The in-memory half of a partitioned RENAME: `old` (retired) leaves
@@ -321,7 +357,17 @@ impl Database {
     /// in place and made durable under a backup of the schema files, so a
     /// failure or a crash leaves the old header or the new one, never a torn
     /// one.
+    ///
+    /// `backup_restore` asks that the instance over the changed files be
+    /// retired first. Here that is the shell, which runs no maintenance and
+    /// writes nothing on its own (a shell is retired from its construction:
+    /// `Table::partition_shell`), and every partition, which the caller
+    /// retired; under ACCESS EXCLUSIVE no statement writes through either.
+    /// Retired again here so the precondition is stated, not inferred. The
+    /// table is reopened afterwards through new providers (`load_shell`),
+    /// which read the restored files.
     async fn rewrite_partitioned_header(&self, table: &PartitionedTable, new_name: &str) -> io::Result<()> {
+        table.shell().retire().await;
         let stem = self.schema_files_stem(table.name());
         let backup = self.backup_begin(&[stem], FileSet::Schema).await?;
         let written: io::Result<()> = async {
@@ -329,6 +375,11 @@ impl Database {
             let mut schema = table.shell().schema.clone();
             schema.name = new_name.to_string();
             io_schema.write_data(0, &schema.into_vec()).await;
+            // A failure after the bytes went in, before they are durable.
+            #[cfg(test)]
+            if let Some(root) = self.location.as_deref() {
+                crate::core::power_loss::failpoint::hit("test.pddl.rename_header_write", std::path::Path::new(root))?;
+            }
             let token = io_schema.begin_txn();
             io_schema
                 .commit_durable(token)
@@ -340,7 +391,14 @@ impl Database {
         match written {
             Ok(()) => self.backup_commit(backup).await,
             Err(e) => {
-                if let Err(restore) = self.backup_restore(backup).await {
+                // Over the live names through the database's seed, as a
+                // plain table's metadata change restores (`reload_atomic`).
+                let restored = crate::core::index_store::gated_io::ungated(
+                    crate::core::index_store::gated_io::Ungated::SchemaRewrite,
+                    self.backup_restore(backup),
+                )
+                .await;
+                if let Err(restore) = restored {
                     error!(
                         "The header rewrite of {} failed ({e}) and its schema could not be put back yet ({restore}); \
                          the next open restores it",

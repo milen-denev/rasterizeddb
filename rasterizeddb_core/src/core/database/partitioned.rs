@@ -585,6 +585,16 @@ impl Database {
         let Some(table) = self.partitioned_table(name) else {
             return Ok(false);
         };
+        // A rename of this table that has not finished keeps its old row
+        // live: dropping the files now would leave that row naming none.
+        if let Some(why) = self.unfinished_partitioned_rename(Some(table.uid())) {
+            return Err(io::Error::other(why));
+        }
+        if self.held_names.lock().iter().any(|h| h == name) {
+            return Err(io::Error::other(format!(
+                "\"{name}\" is held by a rename that has not finished; restart before dropping it"
+            )));
+        }
         if let Err(e) = self.forget_in_catalogue(name).await {
             error!("Could not remove {} from the catalogue: {}", name, e);
             return Err(e);

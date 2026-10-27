@@ -384,3 +384,138 @@ async fn settled(t: &DbTable) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+/// `CREATE UNIQUE INDEX IF NOT EXISTS` and `ADD CONSTRAINT IF NOT EXISTS`
+/// (`IF NOT EXISTS` after `CONSTRAINT`, as the index is rewritten): on a
+/// partitioned table refused when a key column is missing and enforced when
+/// every one is there; on a plain table enforced, and a no-op when the name
+/// exists. A UNIQUE the arm cannot read is an error, never a success that
+/// enforces nothing.
+///
+/// Mutations: `strip_if_not_exists` leaving `IF NOT EXISTS` after
+/// `CONSTRAINT` in place (the forms succeed and enforce nothing); the
+/// unread-UNIQUE error back to the "accepted but not enforced" success.
+#[tokio::test(flavor = "multi_thread")]
+async fn if_not_exists_unique_forms_are_refused_or_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = open(d).await;
+    exec(
+        &db,
+        "CREATE TABLE pk (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, PRIMARY KEY (a, c)) \
+         PARTITION BY HASH (a) PARTITIONS 4",
+    )
+    .await;
+    exec(&db, "CREATE TABLE pl (a BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT, PRIMARY KEY (a, c))").await;
+    for t in ["pk", "pl"] {
+        exec(&db, &format!("INSERT INTO {t} (a, c, d) VALUES (1, 10, 100), (2, 20, 200)")).await;
+    }
+    let unique_names = |db: &Database, t: &str| -> Vec<String> {
+        let schema = match db.partitioned_table(t) {
+            Some(pt) => pt.shell().schema.clone(),
+            None => db.table_for_tests(t).unwrap().schema.clone(),
+        };
+        schema.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| k.name.clone()).collect()
+    };
+    // Partitioned, a key column missing: refused, with the rule.
+    for ddl in [
+        "CREATE UNIQUE INDEX IF NOT EXISTS u0 ON pk (c)",
+        "ALTER TABLE pk ADD CONSTRAINT IF NOT EXISTS u1 UNIQUE (c)",
+    ] {
+        let e = try_exec(&db, ddl).await.expect_err(ddl);
+        assert!(e.contains("does not contain partition key column") && e.contains("not supported"), "`{ddl}`: {e}");
+    }
+    assert!(!unique_names(&db, "pk").iter().any(|n| n == "u0" || n == "u1"), "a refused key was stored");
+    // Partitioned, every key column: enforced; again, a no-op.
+    exec(&db, "CREATE UNIQUE INDEX IF NOT EXISTS u2 ON pk (a, d)").await;
+    exec(&db, "CREATE UNIQUE INDEX IF NOT EXISTS u2 ON pk (a, d)").await;
+    exec(&db, "ALTER TABLE pk ADD CONSTRAINT IF NOT EXISTS u3 UNIQUE (d, a)").await;
+    assert!(unique_names(&db, "pk").iter().any(|n| n == "u2"), "{:?}", unique_names(&db, "pk"));
+    let e = try_exec(&db, "INSERT INTO pk (a, c, d) VALUES (1, 11, 100)").await.expect_err("a duplicate (a, d)");
+    assert!(e.to_ascii_lowercase().contains("duplicate"), "{e}");
+    // Plain: enforced, and a no-op on an existing name.
+    exec(&db, "CREATE UNIQUE INDEX IF NOT EXISTS u4 ON pl (d)").await;
+    exec(&db, "CREATE UNIQUE INDEX IF NOT EXISTS u4 ON pl (d)").await;
+    exec(&db, "ALTER TABLE pl ADD CONSTRAINT IF NOT EXISTS u5 UNIQUE (c)").await;
+    assert!(unique_names(&db, "pl").iter().any(|n| n == "u4"), "{:?}", unique_names(&db, "pl"));
+    let e = try_exec(&db, "INSERT INTO pl (a, c, d) VALUES (3, 30, 100)").await.expect_err("a duplicate d");
+    assert!(e.to_ascii_lowercase().contains("duplicate"), "{e}");
+    let e = try_exec(&db, "INSERT INTO pl (a, c, d) VALUES (4, 10, 400)").await.expect_err("a duplicate c");
+    assert!(e.to_ascii_lowercase().contains("duplicate"), "{e}");
+    // A UNIQUE the arm cannot read is an error, on either table.
+    for ddl in ["ALTER TABLE pl ADD CONSTRAINT IF EXISTS u6 UNIQUE (d)", "ALTER TABLE pk ADD CONSTRAINT IF EXISTS u6 UNIQUE (a, d)"] {
+        let e = try_exec(&db, ddl).await.expect_err(ddl);
+        assert!(e.contains("could not be read as a UNIQUE"), "`{ddl}`: {e}");
+    }
+    close(d, db);
+}
+
+/// A partitioned RENAME whose old catalogue row could not be tombstoned is
+/// unfinished: until the next open settles it, a second partitioned RENAME
+/// and a DROP of the table are refused, and so is a CREATE of either name;
+/// the next open finishes it, and the table, its rows and its name are the
+/// new ones.
+///
+/// Mutations: the unfinished-rename guard off in `rename_partitioned` (the
+/// second rename overwrites the intent; the next open refuses two rows
+/// with one uid); off in `drop_partitioned` (the DROP deletes the files the
+/// old row still names).
+#[tokio::test(flavor = "current_thread")]
+async fn an_unfinished_rename_blocks_a_second_rename_and_a_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = populated(d).await;
+    let uid = db.partitioned_table("pt").unwrap().uid();
+    super::test_hooks::FAIL_TOMBSTONE.with(|f| f.set(true));
+    db.rename_table("pt", "pt2").await.expect("the rename commits; its tombstone failing is left for the next open");
+    assert!(!super::test_hooks::FAIL_TOMBSTONE.with(|f| f.get()), "the tombstone was never attempted");
+    assert!(db.is_partitioned("pt2") && !db.is_partitioned("pt"));
+    let e = db.rename_table("pt2", "pt3").await.expect_err("a second rename");
+    assert!(e.to_string().contains("has not finished"), "{e}");
+    let e = db.drop_table("pt2").await.expect_err("a drop");
+    assert!(e.to_string().contains("not finished"), "{e}");
+    let e = try_exec(&db, "CREATE TABLE pt (k INT)").await.expect_err("the old name");
+    assert!(e.contains("restart") || e.contains("held") || e.contains("formerly"), "{e}");
+    assert!(db.is_partitioned("pt2"), "a refused statement changed the table");
+    close(d, db);
+
+    let db = open(d).await;
+    assert!(db.is_partitioned("pt2") && !db.is_partitioned("pt") && !db.is_partitioned("pt3"));
+    assert_eq!(db.partitioned_table("pt2").unwrap().uid(), uid);
+    assert_eq!(count(&exec(&db, "SELECT id FROM pt2").await), 60);
+    assert!(!d.join("__prename.intent").exists(), "the next open left the intent");
+    db.rename_table("pt2", "pt3").await.expect("settled: a rename runs again");
+    assert!(db.drop_table("pt3").await.unwrap());
+    close(d, db);
+}
+
+/// A RENAME whose header rewrite fails after writing puts the shell's schema
+/// files back (they were held aside), and the rename still commits: the
+/// catalogue row names the table, the files read as before, after a
+/// restart too.
+///
+/// Mutation: the failure path skips `backup_restore` (the half-written
+/// header stays in the schema file).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_header_rewrite_puts_the_schema_files_back() {
+    use crate::core::power_loss::failpoint;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let db = populated(d).await;
+    let uid = db.partitioned_table("pt").unwrap().uid();
+    let schema_file = d.join(format!("{}.db", crate::core::partition::files::schema_stem(uid)));
+    let before = std::fs::read(&schema_file).unwrap();
+    let action: failpoint::Action =
+        std::sync::Arc::new(|_| failpoint::Outcome::Fail(std::io::Error::other("injected header failure")));
+    let guard = failpoint::arm("test.pddl.rename_header_write", d, 1, action);
+    db.rename_table("pt", "pt2").await.expect("the rename commits without its header");
+    assert_eq!(guard.fired(), 1);
+    drop(guard);
+    assert_eq!(std::fs::read(&schema_file).unwrap(), before, "the failed header write was not put back");
+    assert_eq!(count(&exec(&db, "SELECT id FROM pt2 WHERE v >= 0").await), 60);
+    close(d, db);
+    let db = open(d).await;
+    assert_eq!(db.partitioned_table("pt2").unwrap().shell().schema.name, "pt2");
+    assert_eq!(count(&exec(&db, "SELECT id FROM pt2 WHERE v >= 0").await), 60);
+    close(d, db);
+}
