@@ -6745,7 +6745,14 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `lock_timeout`, or a `NOWAIT` that found the lock held. Decided before
     // 57014, whose words ("canceling statement") the timeout's message shares,
     // as PostgreSQL's does.
-    if has("canceling statement due to lock timeout") || has("could not obtain lock on") {
+    // A writer refused at a row another transaction holds (`FOR UPDATE`),
+    // which this engine refuses at once where PostgreSQL would wait: the same
+    // lock_not_available a NOWAIT gets, not XX000. Retrying it as a
+    // serialization failure would spin while the holder's block stays open.
+    if has("canceling statement due to lock timeout")
+        || has("could not obtain lock on")
+        || has("is locked by transaction")
+    {
         return "55P03";
     }
     // `57014` is `query_canceled`, which is what a driver watches for to tell
