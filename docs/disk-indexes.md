@@ -84,18 +84,20 @@ merge reads each slot's bit as it writes the slot's entries:
 ## Run file
 
 ```
-header   magic "RDBIDXR1", version u32, method u8, n_entries u64, n_blocks u64
-blocks   each: n u32, then n × (key_len varint, key, n_slots varint,
-         slots as varint deltas), crc32c u32
-fences   per block: key_len varint, first key, offset u64, length u32
-footer   fences offset u64, fences length u64, crc32c of fences u32, magic
+header   magic "RDBIDXR1", version u32, reserved u32
+blocks   each: n varint, then n × (key_len varint, key, n_slots varint,
+         slot bytes varint, slots as varint deltas), crc32c u32
+fences   n_blocks varint, then per block: key_len varint, first key,
+         offset varint, length varint
+footer   fences offset u64, fences length u64, n_entries u64, n_keys u64,
+         crc32c of fences u32, magic "RIDX"
 ```
 
-- **Blocks** target 16 KB (`hybrid`) or 64 KB (`disk`). A posting list too
+- **Blocks** target 16 KB in both `hybrid` and `disk`. A posting list too
   long for one block continues in the next under the same key, so a key may
   open several consecutive blocks.
 - **Fences** are read into memory at open: about 50 bytes per block, so 65 MB
-  for a 20 GB index at 16 KB blocks, or 16 MB at 64 KB.
+  for a 20 GB index.
 - **Reads** use `pread` against an open handle. Each block's checksum is
   verified when it is first read, and a mismatch fails the lookup with an
   error rather than returning a short answer.
@@ -195,7 +197,7 @@ untrusted (`DIRTY`, made durable before the write), exactly as in v1.
    helper; one that cannot be read declines the lookup. List lengths are upper
    bounds, which only decline more or leave a list out of a walk. Gin indexes
    are still not snapshotted.
-4. **Measured tuning** (in progress). Restart offsets within a block, first
+4. **Measured tuning**. Restart offsets within a block, first
    measured 2026-10-27. Setup: 1M rows, the primary key plus a secondary
    index on `grp`, prepared pgbench, data on tmpfs (so this is the engine's
    cost, not the disk's), the box shared with other work, three interleaved
@@ -212,11 +214,41 @@ untrusted (`DIRTY`, made durable before the write), exactly as in v1.
    insert's UNIQUE probe paid that cost too. On a quiet box, `memory` and
    `hybrid` are equal (hybrid's memory part spilled nothing here). `disk`
    holds about 100 MB less (98 MB anonymous after load, against 206 MB for
-   memory). Its point reads are about 10% below memory's at one client and
-   25-45% below at 16 clients; the cause of the 16-client gap is not yet
-   profiled.
-   Still open: block size, merge fan-in, and a second fence level if fence
-   memory matters at the target size.
+   memory).
+
+   The 16-client gap, profiled. Three interleaved rounds of each mode at 16
+   clients, same binary: memory 62-105k tps, hybrid 66-83k, disk 73-75k.
+   One mode's own runs vary more than the modes differ, so the 25-45% above
+   came from comparing single runs. A cycle profile of each mode under the
+   same load is nearly the same profile; disk spends about 2.5% more of the
+   server's cycles in the index (decoding varints, finding the block and
+   the restart) than memory's `lookup_eq` does. That is the real gap.
+
+   Block size, swept at 4, 16 and 64 KB, then 64 against 16 confirmed in
+   three interleaved rounds (two clean). With the index cached the sizes
+   measure the same. With the index larger than the cache (an 8 MB cache,
+   11 MB of runs), 64 KB loses. Every miss reads and parses a whole block,
+   and the cache keeps whole blocks per shard: an 8 MB cache is 128 KB a
+   shard, which holds one full 64 KB block but seven of 16 KB, so 64 KB had
+   about 4 MB of usable cache to 16 KB's 7 MB:
+
+   | 8 MB cache | 64 KB | 16 KB |
+   |---|---|---|
+   | point read, 1 client | 15k tps | 20-22k tps |
+   | point read, 16 clients | 62k tps | 71-91k tps |
+   | 101-row range read, 16 clients | 39-40k tps | 36-51k tps |
+
+   4 KB read a little faster again, but fences stay in memory at about 50
+   bytes a block: 12 MB per GB of index at 4 KB, which passes `disk`'s
+   whole default cache (64 MB) at about 5 GB of index. Blocks are 16 KB in
+   every residency now.
+
+   Merge fan-in (`RUNS_MAX`), swept at 4, 8 and 16 with a 1 MB memory part
+   so the load flushes about 16 runs: no difference in load time or reads
+   that survived a second round. It stays 8. An index this size makes few
+   runs, so a much larger one could still show a difference.
+   Still open: a second fence level if fence memory matters at the target
+   size.
 
 ## What this is not
 

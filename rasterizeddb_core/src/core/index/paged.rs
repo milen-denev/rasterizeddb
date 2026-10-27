@@ -189,13 +189,18 @@ pub struct Budgets {
 
 impl Budgets {
     pub fn current() -> Budgets {
-        Budgets {
-            delta_bytes: delta_bytes(),
-            block_bytes: if residency() == Residency::Disk { 64 * 1024 } else { 16 * 1024 },
-            runs_max: RUNS_MAX,
-        }
+        Budgets { delta_bytes: delta_bytes(), block_bytes: BLOCK_BYTES, runs_max: RUNS_MAX }
     }
 }
+
+/// Bytes a run block is filled to, in every residency. Measured 2026-10-27
+/// with the index larger than the cache: 64 KB blocks lost 30-45% of point
+/// reads to 16 KB. Every miss reads and parses the whole block, and a cache
+/// shard holds whole blocks only, so an 8 MB cache (128 KB a shard) kept one
+/// full 64 KB block per shard where it kept seven of 16 KB. 4 KB read a little
+/// faster again, but fences stay in memory at about 50 bytes a block, which
+/// at 4 KB is 12 MB per GB of index.
+const BLOCK_BYTES: usize = 16 * 1024;
 
 /// Runs a store keeps before merging them into one.
 const RUNS_MAX: usize = 8;
@@ -386,8 +391,8 @@ const RESTART_EVERY: usize = 16;
 
 /// A verified block and where every [`RESTART_EVERY`]th entry starts in it,
 /// so a lookup binary-searches to within that many entries instead of
-/// decoding the block from its start. A 64 KB block holds a few thousand
-/// short entries, and walking half of them was most of a point lookup's cost.
+/// decoding the block from its start. A 16 KB block holds about a thousand short
+/// entries, and walking half of them was most of a point lookup's cost.
 /// The offsets are found when the block is read, not stored in the run, so
 /// the file format is unchanged.
 struct Block {
