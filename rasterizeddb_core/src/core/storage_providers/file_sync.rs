@@ -1759,6 +1759,12 @@ impl StorageIO for LocalStorageProvider {
         crate::core::wal::with_wal_for(&self.location, |w| w.map_or(0, |w| w.begin()))
     }
 
+    fn defers_in_place_writes(&self) -> bool {
+        // Logged, the write is applied by `commit_durable`; without a log it
+        // goes straight to the file (see `write_data_txn`).
+        crate::core::wal::wal_for(&self.location).is_some()
+    }
+
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         // Registered on the file set's word until the write returns (B12).
         // A gate failure (release only) skips the write and fails `txn`'s

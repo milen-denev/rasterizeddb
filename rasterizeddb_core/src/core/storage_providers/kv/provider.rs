@@ -2464,6 +2464,11 @@ impl StorageIO for KvStorageProvider {
         (offset, txn)
     }
 
+    fn defers_in_place_writes(&self) -> bool {
+        // Staged under the transaction and stored by its commit.
+        true
+    }
+
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         self.file.write_at(txn, position, buffer);
         if txn == 0 {

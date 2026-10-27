@@ -92,6 +92,10 @@ impl StorageIO for MockStorageProvider {
         self.inner.append_data_txn(txn, buffer).await
     }
 
+    fn defers_in_place_writes(&self) -> bool {
+        self.inner.defers_in_place_writes()
+    }
+
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         self.inner.write_data_txn(txn, position, buffer).await
     }

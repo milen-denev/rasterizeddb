@@ -145,6 +145,15 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         async move { (self.append_data_returning_offset(buffer, true).await, 0) }
     }
 
+    /// Whether [`StorageIO::write_data_txn`] holds its bytes back until its
+    /// transaction commits (`true`), so an abort or a failure before the
+    /// commit leaves the old bytes; or applies them at once (`false`), where
+    /// nothing can take an in-place overwrite back. An UPDATE overwrites in
+    /// place only where this is `true`.
+    fn defers_in_place_writes(&self) -> bool {
+        false
+    }
+
     /// In-place counterpart of [`StorageIO::append_data_txn`].
     fn write_data_txn(
         &self,

@@ -260,6 +260,11 @@ impl StorageIO for MirrorStorageProvider {
         (offset, token)
     }
 
+    fn defers_in_place_writes(&self) -> bool {
+        // The primary's write is the statement's (see `commit_durable`).
+        self.primary.defers_in_place_writes()
+    }
+
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         let token = self.primary.write_data_txn(txn, position, buffer).await;
         for backup in self.backups.iter() {

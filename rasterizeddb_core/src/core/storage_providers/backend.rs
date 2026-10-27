@@ -275,6 +275,17 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    fn defers_in_place_writes(&self) -> bool {
+        match self {
+            Self::File(p) => p.defers_in_place_writes(),
+            Self::Memory(p) => p.defers_in_place_writes(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.defers_in_place_writes(),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.defers_in_place_writes(),
+        }
+    }
+
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         match self {
             Self::File(p) => p.write_data_txn(txn, position, buffer).await,

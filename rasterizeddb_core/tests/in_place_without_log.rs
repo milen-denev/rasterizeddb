@@ -1,10 +1,11 @@
-//! A failing UPDATE that overwrote rows in place, with no write-ahead log.
+//! An UPDATE with no write-ahead log never overwrites in place.
 //!
 //! Without a log an in-place overwrite goes straight to the data file. An
 //! UPDATE that overwrote rows and then failed on a later one (a CHECK) left
 //! the earlier rows changed, and the filter, whose maintenance is staged
 //! until the commit, still described their old values: `WHERE n = <new>`
-//! pruned rows the table holds. PostgreSQL changes no row.
+//! pruned rows the table holds. PostgreSQL changes no row. Such an UPDATE
+//! now writes new versions, which the failure's abort undoes.
 //!
 //! Its own binary because the log switch is process-wide (set once).
 
@@ -63,15 +64,16 @@ fn a_failing_in_place_update_without_a_log_changes_no_row() {
         let before = table.in_place_column_updates();
         let response = run(&db, "UPDATE ipc SET n = 50").await;
         assert_eq!(response[0], 3, "the update was expected to fail on its last row");
-        assert!(table.in_place_column_updates() > before, "nothing was overwritten in place, so this tests nothing");
+        assert_eq!(table.in_place_column_updates(), before, "an UPDATE with no log overwrote in place");
         for (v, want) in [(50u64, 0u64), (0, 31), (1, 30), (9, 30)] {
             let scanned = count_of(&run(&db, &format!("SELECT COUNT(*) FROM ipc WHERE n + 0 = {v}")).await);
             assert_eq!(scanned, want, "n = {v}: a failed UPDATE left rows changed");
             let filtered = count_of(&run(&db, &format!("SELECT COUNT(*) FROM ipc WHERE n = {v}")).await);
             assert_eq!(filtered, scanned, "WHERE n = {v}: the filter answered {filtered}, the table holds {scanned}");
         }
-        // And it still overwrites in place when nothing fails.
+        // And one that succeeds writes a version, read back by the filter.
         assert_ne!(run(&db, "UPDATE ipc SET n = 7 WHERE id = 3").await[0], 3);
         assert_eq!(count_of(&run(&db, "SELECT COUNT(*) FROM ipc WHERE n = 7").await), 31);
+        assert_eq!(table.in_place_column_updates(), before, "an UPDATE with no log overwrote in place");
     });
 }
