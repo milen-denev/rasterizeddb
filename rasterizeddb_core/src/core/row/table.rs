@@ -692,6 +692,57 @@ fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
     }
 }
 
+/// What one UPDATE has already written, for its uniqueness checks.
+///
+/// The check probes the table through its index or filter, whose
+/// maintenance is staged until the statement's storage transaction commits
+/// (`PendingFilterOp`), and an in-place overwrite reaches the data file only
+/// at that commit too. So a statement's own earlier rows were invisible to
+/// it: `UPDATE t SET n = 1000 WHERE id < 50` on a UNIQUE `n` wrote fifty
+/// rows holding 1000 and reported success. PostgreSQL checks each row as it
+/// is written, against every row including the statement's own.
+#[derive(Default)]
+pub(crate) struct OwnKeys {
+    /// Per constraint (`constraint_stripe`'s ids), the keys written so far.
+    written: std::collections::HashMap<usize, std::collections::HashSet<Vec<u8>>>,
+    /// Rows this statement has written. What the table shows of them until
+    /// the commit is stale: an in-place overwrite reaches the data file only
+    /// then, and an old version's deleting stamp is staged with the
+    /// transaction too, so it still looked live and a row taking the value
+    /// an earlier row gave up was refused (on disk; in memory it passed).
+    /// Their keys are the ones in `written`, so the table's view of them is
+    /// skipped.
+    updated: std::collections::HashSet<u64>,
+}
+
+impl OwnKeys {
+    /// A key as the check compares it: each value length-prefixed, a
+    /// document in its canonical form (`same_unique_value` compares documents
+    /// by value and everything else by bytes).
+    fn key<'a>(values: impl Iterator<Item = (&'a SchemaField, &'a [u8])>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (field, value) in values {
+            let mut one = Vec::new();
+            if field.db_type == DbType::JSONB
+                && crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_some()
+            {
+            } else {
+                one.clear();
+                one.extend_from_slice(value);
+            }
+            out.extend_from_slice(&(one.len() as u32).to_le_bytes());
+            out.extend_from_slice(&one);
+        }
+        out
+    }
+
+    /// Records `key` for `constraint`; `false` when an earlier row of the
+    /// statement already wrote it.
+    fn claim(&mut self, constraint: usize, key: Vec<u8>) -> bool {
+        self.written.entry(constraint).or_default().insert(key)
+    }
+}
+
 /// A filter-index change staged until the write it describes is durable.
 ///
 /// The index used to be mutated inside the write loop, before
@@ -2605,6 +2656,10 @@ impl<S: StorageIO> Table<S> {
         // was unique. PostgreSQL revalidates a constraint only when a column it
         // covers is written, and for the same reason.
         assigned: Option<&std::collections::HashSet<u32>>,
+        // What this statement has already written (an UPDATE's earlier rows),
+        // or `None` for an insert, whose earlier rows are committed to the
+        // storage before the next is checked. See `OwnKeys`.
+        mut own: Option<&mut OwnKeys>,
     ) -> Result<()> {
         if !self.has_unique {
             return Ok(());
@@ -2641,7 +2696,7 @@ impl<S: StorageIO> Table<S> {
             }
 
             if let Some((existing, in_flight)) = self
-                .find_row_with_value(field, value, exclude_id, visibility, written_by)
+                .find_row_with_value(field, value, exclude_id, own.as_deref().map(|o| &o.updated), visibility, written_by)
                 .await?
             {
                 if in_flight {
@@ -2674,12 +2729,23 @@ impl<S: StorageIO> Table<S> {
                     ),
                 ));
             }
+            if let Some(own) = own.as_deref_mut()
+                && !own.claim(field.write_order as usize, OwnKeys::key(std::iter::once((field, value))))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "duplicate value for UNIQUE column {:?} (an earlier row of this statement holds it)",
+                        field.name
+                    ),
+                ));
+            }
         }
 
         // Table-level constraints, which may span several columns. A composite
         // forbids repeating the whole tuple while leaving each column free to
         // repeat on its own, so it cannot be checked one column at a time.
-        for key in self.schema.unique_keys.iter() {
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
             let mut tuple: Vec<(&SchemaField, &[u8])> = Vec::with_capacity(key.columns.len());
             let mut skip = false;
 
@@ -2750,7 +2816,7 @@ impl<S: StorageIO> Table<S> {
             }
 
             if let Some((existing, in_flight)) = self
-                .find_row_with_tuple(&tuple, exclude_id, visibility, written_by, condition)
+                .find_row_with_tuple(&tuple, exclude_id, own.as_deref().map(|o| &o.updated), visibility, written_by, condition)
                 .await?
             {
                 // Another transaction's unfinished write: replayed, not
@@ -2793,6 +2859,17 @@ impl<S: StorageIO> Table<S> {
                     ),
                 ));
             }
+            if let Some(own) = own.as_deref_mut()
+                && !own.claim(Self::unique_key_constraint(position), OwnKeys::key(tuple.iter().copied()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "duplicate value for UNIQUE constraint {} (an earlier row of this statement holds it)",
+                        key.describe()
+                    ),
+                ));
+            }
         }
 
         Ok(())
@@ -2810,6 +2887,7 @@ impl<S: StorageIO> Table<S> {
         &self,
         tuple: &[(&SchemaField, &[u8])],
         exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
         // Only rows this statement can see may block it, exactly as for a
         // single-column check: under MVCC a deleted row keeps its `deleted`
         // flag clear until reclamation, and would otherwise go on reserving the
@@ -2923,7 +3001,7 @@ impl<S: StorageIO> Table<S> {
 
         let mut row = Row::default();
         while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
-            if Some(pointer.row_id()) == exclude_id {
+            if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
             }
             // The same occupancy rule as a single column's (see
@@ -3198,6 +3276,8 @@ impl<S: StorageIO> Table<S> {
         field: &SchemaField,
         value: &[u8],
         exclude_id: Option<u64>,
+        // Rows whose stored state is stale (`OwnKeys::updated`): skipped.
+        stale: Option<&std::collections::HashSet<u64>>,
         // Only rows this statement can see may block it. A version whose
         // deleting transaction has committed is gone, even though reclamation
         // has not yet reached it and its `deleted` flag is still clear.
@@ -3346,7 +3426,7 @@ impl<S: StorageIO> Table<S> {
                     Err(e) => return Err(e.into()),
                 },
             };
-            if Some(pointer.row_id()) == exclude_id {
+            if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
             }
             // A uniqueness check is not a query, and a snapshot is the wrong
@@ -3938,6 +4018,7 @@ impl<S: StorageIO> Table<S> {
             None,
             &self.visibility_for(written_by),
             written_by,
+            None,
             None,
         )
         .await?;
@@ -5159,6 +5240,8 @@ impl<S: StorageIO> Table<S> {
         // first overwrite are harmless. The cost is a log that cannot be cut
         // while one huge in-place UPDATE runs.
         let mut overwrote_in_place = false;
+        // What this statement has written, for its own uniqueness checks.
+        let mut own_keys = OwnKeys::default();
         let mut row = Row::default();
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
@@ -5378,9 +5461,19 @@ impl<S: StorageIO> Table<S> {
                     &self.visibility_for(written_by),
                     written_by,
                     Some(&assigned),
+                    Some(&mut own_keys),
                 )
                 .await
             {
+                // An earlier row overwritten in place is applied by the commit,
+                // and no abort can take it back afterwards: committed here, the
+                // statement failed with 23505 and kept those rows. The storage
+                // transaction is abandoned instead, as a CHECK failure abandons
+                // it; the versions it holds were invisible either way.
+                if overwrote_in_place {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
                 // Durability outranks the constraint violation as the thing to
                 // report: the caller can retry a rejected UPDATE, but it cannot
                 // do anything about rows it was told had landed and had not.
@@ -5451,6 +5544,7 @@ impl<S: StorageIO> Table<S> {
                 }
                 updated_count = updated_count.saturating_add(1);
                 overwrote_in_place = true;
+                own_keys.updated.insert(row_id);
                 if let Some(collect) = collect.as_deref_mut() {
                     collect.push(row.clone());
                 }
@@ -5508,6 +5602,7 @@ impl<S: StorageIO> Table<S> {
 
             if update_result.is_ok() {
                 updated_count = updated_count.saturating_add(1);
+                own_keys.updated.insert(row_id);
                 if let Some(collect) = collect.as_deref_mut() {
                     collect.push(row.clone());
                 }
