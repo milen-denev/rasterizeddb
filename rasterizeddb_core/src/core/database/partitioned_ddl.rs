@@ -456,13 +456,18 @@ fn parse_rename(text: &str) -> Option<(u64, String, String)> {
 /// `__prename.intent.bad-<n>`, durably, and logs it at error level; a move
 /// that fails leaves it, logged too.
 fn set_aside_malformed(path: &std::path::Path, text: &str) {
-    let mut n = 1u32;
-    let aside = loop {
-        let candidate = path.with_file_name(format!("{RENAME_INTENT}.bad-{n}"));
-        if !candidate.exists() {
-            break candidate;
-        }
-        n += 1;
+    // Bounded: past that many set-aside files, this one stays where it is
+    // (logged), rather than a search that never ends.
+    let Some(aside) = (1..=10_000u32)
+        .map(|n| path.with_file_name(format!("{RENAME_INTENT}.bad-{n}")))
+        .find(|candidate| !candidate.exists())
+    else {
+        error!(
+            "Malformed partitioned rename intent {} ({text:?}) left in place: 10000 earlier ones are already set \
+             aside beside it. Remove them, then restart.",
+            path.display()
+        );
+        return;
     };
     match std::fs::rename(path, &aside).and_then(|()| crate::core::wal::sync_parent_dir(&aside)) {
         Ok(()) => error!(

@@ -1010,3 +1010,89 @@ fn long_and_unnamed_constraint_names() {
         expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {t}_a_v_key"), "42704");
     }
 }
+
+/// With table and column names near the 128-byte limit, unnamed CHECKs and
+/// UNIQUEs added three times each get three names and every statement
+/// returns. The numbering used to cut the number off every candidate and
+/// spin under ACCESS EXCLUSIVE, so the whole run is bounded here.
+#[test]
+fn long_names_number_repeated_unnamed_constraints_and_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let long_col = "c".repeat(100);
+        for (t, part) in [
+            (format!("q{}", "x".repeat(124)), String::new()),
+            (format!("p{}", "x".repeat(124)), " PARTITION BY HASH (a) PARTITIONS 4".to_string()),
+        ] {
+            c.ok(&format!("CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT, {long_col} BIGINT){part}"));
+            c.ok(&format!("INSERT INTO {t} (a, b, {long_col}) VALUES (1, 1, 1)"));
+            for clause in ["CHECK (a > 0)", &*format!("CHECK ({long_col} > 0)"), "CHECK (a >= b)", "UNIQUE (a, b)", &*format!("UNIQUE (a, {long_col})")] {
+                for _ in 0..3 {
+                    c.ok(&format!("ALTER TABLE {t} ADD {clause}"));
+                }
+            }
+            // Enforced, each under its own name.
+            let e = c.simple(&format!("INSERT INTO {t} (a, b, {long_col}) VALUES (0, 1, 1)")).expect_err("a > 0");
+            assert_eq!(e.code, "23514", "{e}");
+            let e = c.simple(&format!("INSERT INTO {t} (a, b, {long_col}) VALUES (1, 1, 2)")).expect_err("(a, b)");
+            assert_eq!(e.code, "23505", "{e}");
+        }
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("an ALTER with a long table name never returned");
+    worker.join().unwrap();
+    // The table's lock was released: a new session reads it.
+    let mut d = server.connect();
+    d.ok(&format!("SELECT count(*) FROM q{}", "x".repeat(124)));
+}
+
+/// The primary key answers to its own name only, as in PostgreSQL: one added
+/// as `k1` is not `<table>_pkey`; an inline one's flag is not also
+/// `<table>_<column>_key`; and a composite one named other than
+/// `<table>_pkey` is refused (0A000), since nothing else could tell it from a
+/// UNIQUE and a second PRIMARY KEY would be accepted beside it.
+#[test]
+fn a_primary_key_answers_to_its_own_name_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (suffix, part) in [("q", ""), ("p", " PARTITION BY HASH (a) PARTITIONS 4")] {
+        // (a) added under a name of its own.
+        let t = format!("pkn_{suffix}");
+        c.ok(&format!("CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT, c BIGINT){part}"));
+        c.ok(&format!("INSERT INTO {t} (a, b, c) VALUES (1, 1, 1)"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT k1 PRIMARY KEY (a)"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"), "42704");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT IF EXISTS {t}_pkey"));
+        assert!(is_primary(&mut c, &t, "a"), "{t}: k1 is still the key");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a, b)"), "42P16");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, c) VALUES (1, 2, 2)"), "23505");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT k1"));
+        assert!(!is_primary(&mut c, &t, "a"), "{t}: k1 dropped");
+        c.ok(&format!("INSERT INTO {t} (a, b, c) VALUES (1, 2, 2)"));
+
+        // (c) a composite one: `<table>_pkey` or unnamed, nothing else.
+        c.ok(&format!("DELETE FROM {t} WHERE b = 2"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k2 PRIMARY KEY (a, b)"), "0A000");
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k3 PRIMARY KEY (a)"), "42P16");
+
+        // (b) inline: `<table>_pkey`, never `<table>_<column>_key`.
+        let i = format!("pki_{suffix}");
+        c.ok(&format!("CREATE TABLE {i} (a BIGINT PRIMARY KEY, v BIGINT){part}"));
+        c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 1)"));
+        expect_code(&mut c, &format!("ALTER TABLE {i} DROP CONSTRAINT {i}_a_key"), "42704");
+        c.ok(&format!("ALTER TABLE {i} DROP CONSTRAINT IF EXISTS {i}_a_key"));
+        assert!(is_primary(&mut c, &i, "a"), "{i}: still the key");
+        expect_code(&mut c, &format!("INSERT INTO {i} (a, v) VALUES (1, 2)"), "23505");
+        c.ok(&format!("ALTER TABLE {i} DROP CONSTRAINT {i}_pkey"));
+        assert!(!is_primary(&mut c, &i, "a"), "{i}: dropped");
+        c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 2)"));
+    }
+}

@@ -213,22 +213,20 @@ pub fn derived_name(table: &str, column: Option<&str>, ordinal: usize) -> String
 /// collision (`taken`) the label numbered from 1 (`t_a_check1`, …), as
 /// `ChooseConstraintName` does. A PG-written migration drops it by that
 /// name; `<table>_check<n>`, which this used to give, it never finds.
-/// Cut to the stored limit (`unique_key::stored_name`).
-pub fn unnamed_name(table: &str, expression: &str, columns: &[String], taken: impl Fn(&str) -> bool) -> String {
+/// Within the stored limit with the label whole, and bounded
+/// (`unique_key::choose_name`): an error, never a spin.
+pub fn unnamed_name(
+    table: &str,
+    expression: &str,
+    columns: &[String],
+    taken: impl Fn(&str) -> bool,
+) -> Result<String, String> {
     let read = columns_read(expression, columns);
-    let base = match read.as_slice() {
+    let stem = match read.as_slice() {
         [one] => format!("{}_{}", table.to_ascii_lowercase(), one.to_ascii_lowercase()),
         _ => table.to_ascii_lowercase(),
     };
-    let mut pass = 0usize;
-    loop {
-        let label = if pass == 0 { "check".to_string() } else { format!("check{pass}") };
-        let name = crate::core::rql::unique_key::stored_name(&format!("{base}_{label}"));
-        if !taken(&name) {
-            return name;
-        }
-        pass += 1;
-    }
+    crate::core::rql::unique_key::choose_name(&stem, "_check", taken)
 }
 
 /// The distinct `columns` an expression names, in the order first read:
@@ -365,17 +363,40 @@ mod tests {
     fn an_added_unnamed_check_is_named_as_postgres_names_it() {
         let columns: Vec<String> = ["a", "v", "Mixed"].iter().map(|c| c.to_string()).collect();
         let free = |_: &str| false;
-        assert_eq!(unnamed_name("pl", "a > 0", &columns, free), "pl_a_check");
-        assert_eq!(unnamed_name("pl", "a > 0 AND a < 9", &columns, free), "pl_a_check");
-        assert_eq!(unnamed_name("pl", "a > v", &columns, free), "pl_check");
-        assert_eq!(unnamed_name("pl", "1 = 1", &columns, free), "pl_check");
+        assert_eq!(unnamed_name("pl", "a > 0", &columns, free).unwrap(), "pl_a_check");
+        assert_eq!(unnamed_name("pl", "a > 0 AND a < 9", &columns, free).unwrap(), "pl_a_check");
+        assert_eq!(unnamed_name("pl", "a > v", &columns, free).unwrap(), "pl_check");
+        assert_eq!(unnamed_name("pl", "1 = 1", &columns, free).unwrap(), "pl_check");
         // A literal spelling a column's name, a number with letters in it,
         // a function's name: none is a column.
-        assert_eq!(unnamed_name("pl", "v > 1e5 OR 'a' = 'it''s a'", &columns, free), "pl_v_check");
-        assert_eq!(unnamed_name("pl", "length(\"Mixed\") > 0", &columns, free), "pl_mixed_check");
+        assert_eq!(unnamed_name("pl", "v > 1e5 OR 'a' = 'it''s a'", &columns, free).unwrap(), "pl_v_check");
+        assert_eq!(unnamed_name("pl", "length(\"Mixed\") > 0", &columns, free).unwrap(), "pl_mixed_check");
         // A collision numbers the label, from 1.
         let taken = |n: &str| n == "pl_a_check" || n == "pl_a_check1";
-        assert_eq!(unnamed_name("pl", "a > 0", &columns, taken), "pl_a_check2");
+        assert_eq!(unnamed_name("pl", "a > 0", &columns, taken).unwrap(), "pl_a_check2");
+    }
+
+    /// A stem at the stored limit keeps its label and number whole, so the
+    /// names differ and the choice ends (it used to spin: the cut took the
+    /// number off every candidate).
+    #[test]
+    fn a_long_table_names_distinct_checks_and_the_choice_ends() {
+        let table = "t".repeat(125);
+        let columns = vec!["a".to_string(), "c".repeat(120)];
+        let mut taken: Vec<String> = Vec::new();
+        for (expression, ends) in [
+            ("a > 0", "_check"),
+            ("a > 0", "_check1"),
+            ("a > 0", "_check2"),
+            (&*format!("{} > 0", "c".repeat(120)), "_check3"),
+        ] {
+            let name = unnamed_name(&table, expression, &columns, |n| taken.iter().any(|t| t == n)).unwrap();
+            assert!(name.len() <= 128 && name.ends_with(ends), "{name}");
+            assert!(!taken.contains(&name));
+            taken.push(name);
+        }
+        // Every candidate taken: an error, not a spin.
+        assert!(unnamed_name(&table, "a > 0", &columns, |_| true).is_err());
     }
 
     #[test]

@@ -9339,16 +9339,22 @@ async fn add_check_constraint(
         Err(e) => return ddl_error(&e),
     };
     // Unnamed, it is named as PostgreSQL names it (`check::unnamed_name`).
-    let name = named.unwrap_or_else(|| {
-        let columns: Vec<String> = crate::core::rql::nullable::visible_fields(&schema.fields)
-            .iter()
-            .filter(|f| !f.is_deleted)
-            .map(|f| f.name.clone())
-            .collect();
-        crate::core::rql::check::unnamed_name(table_name, &expression, &columns, |n| {
-            constraint_name_taken(schema, table_name, n)
-        })
-    });
+    let name = match named {
+        Some(name) => name,
+        None => {
+            let columns: Vec<String> = crate::core::rql::nullable::visible_fields(&schema.fields)
+                .iter()
+                .filter(|f| !f.is_deleted)
+                .map(|f| f.name.clone())
+                .collect();
+            match crate::core::rql::check::unnamed_name(table_name, &expression, &columns, |n| {
+                constraint_name_taken(schema, table_name, n)
+            }) {
+                Ok(name) => name,
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    };
     if schema.checks.iter().any(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name)) {
         return ddl_error(&format!("constraint \"{}\" for relation \"{}\" already exists", name, table_name));
     }
@@ -10032,23 +10038,25 @@ async fn execute_alter_table_action(
                     // against PostgreSQL asks for, silently did nothing. The
                     // constraint then outlived the migration meant to replace
                     // it and rejected rows the new one allows.
-                    let implicit = implicit_unique_column(&name, &schema.fields);
-                    // The primary key, recorded in the schema header as its
-                    // column's name and enforced through that column's UNIQUE
-                    // flag. Matched by nothing above, so `DROP CONSTRAINT
-                    // <table>_pkey` reported success and kept the key.
-                    let primary = schema
-                        .primary_key
-                        .clone()
-                        .filter(|_| named(&format!("{}_pkey", plan.table_name)));
-                    // The header's column stops being the primary key with its
-                    // constraint: a table-level `PRIMARY KEY (id)` is a
-                    // sidecar named `<table>_pkey`, removed above, and the
-                    // header used to stay, so the catalogs and the row locks
-                    // went on calling a column the key that nothing kept
-                    // unique.
-                    let header_goes = primary_header_goes(&schema, &plan.table_name, &name);
-                    if stored || implicit.is_some() || primary.is_some() {
+                    // The primary key answers to its own name only
+                    // (`primary_key_constraint`): an inline one's flag is not
+                    // also `<table>_<column>_key`, which PostgreSQL never
+                    // calls it, and a key added as `k1` is not `<table>_pkey`.
+                    let pk = primary_key_constraint(&schema, &plan.table_name);
+                    let pk_named = pk.as_ref().is_some_and(|p| named(&p.name));
+                    let implicit = implicit_unique_column(&name, &schema.fields).filter(|column| {
+                        !pk.as_ref().is_some_and(|p| p.inline && p.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(column)))
+                    });
+                    // An inline primary key: the header's column and its
+                    // UNIQUE flag, no sidecar.
+                    let primary = pk.as_ref().filter(|p| p.inline && pk_named).and_then(|p| p.column.clone());
+                    // The header's column stops being the primary key with
+                    // its constraint. A table-level `PRIMARY KEY (id)` is a
+                    // sidecar, removed above, and the header used to stay, so
+                    // the catalogs and the row locks went on calling a column
+                    // the key that nothing kept unique.
+                    let header_goes = pk_named && pk.as_ref().is_some_and(|p| p.column.is_some());
+                    if stored || implicit.is_some() || primary.is_some() || header_goes {
                         // §7 step 3: the removals are the reload's work. Both
                         // sidecars are tried, since the name alone does not say
                         // which kind it was; the sidecars are the source of
@@ -10214,17 +10222,35 @@ async fn execute_alter_table_action(
                             plan.table_name
                         ));
                     }
+                    // A composite primary key is recognised by its name,
+                    // `<table>_pkey`, alone: the sidecar has no field saying
+                    // "primary", so one named otherwise would read as a
+                    // UNIQUE, and a second PRIMARY KEY would be accepted
+                    // beside it. Refused rather than taken for what it is not.
+                    if primary
+                        && key.columns.len() > 1
+                        && !key.name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name))
+                    {
+                        return ddl_error(&format!(
+                            "a composite PRIMARY KEY named \"{}\" is not supported: a key over several columns is \
+                             recognised as the primary key of \"{}\" only by the name \"{}_pkey\"; name it that or \
+                             leave it unnamed",
+                            key.name, plan.table_name, plan.table_name
+                        ));
+                    }
                     // An unnamed UNIQUE whose derived name is taken gets the
                     // next free one, as PostgreSQL's `t_a_key1`, rather than
                     // an error; a named one keeps its "already exists".
                     let mut key = key;
                     let unnamed = matches!(crate::core::rql::unique_key::split_constraint_name(&description), Ok((None, _)));
                     if unnamed && !primary && constraint_name_taken(&schema, &plan.table_name, &key.name) {
-                        let base = key.name.clone();
-                        key.name = (1..)
-                            .map(|n| crate::core::rql::unique_key::stored_name(&format!("{base}{n}")))
-                            .find(|candidate| !constraint_name_taken(&schema, &plan.table_name, candidate))
-                            .expect("a free name");
+                        let stem = crate::core::rql::unique_key::key_stem(&plan.table_name, &key.columns);
+                        key.name = match crate::core::rql::unique_key::choose_name(&stem, "_key", |candidate| {
+                            constraint_name_taken(&schema, &plan.table_name, candidate)
+                        }) {
+                            Ok(name) => name,
+                            Err(e) => return ddl_error(&e),
+                        };
                     }
                     if schema
                         .unique_keys
@@ -10596,36 +10622,49 @@ async fn add_primary_key(
     }
 }
 
-/// Whether `schema` has a primary key: the header's column, or a whole key
-/// named `<table>_pkey` (a composite one, as `CREATE TABLE` stores it).
-fn has_primary_key(schema: &crate::core::row::schema::TableSchema, table: &str) -> bool {
-    let pkey = format!("{table}_pkey");
-    schema.primary_key.is_some()
-        || schema.unique_keys.iter().any(|k| !k.is_deleted && k.predicate.is_none() && k.name.eq_ignore_ascii_case(&pkey))
+/// A table's primary key as a constraint, derived from what the schema
+/// records (no field says which key is primary):
+///
+/// - the header's column with its UNIQUE flag set: declared inline
+///   (`id … PRIMARY KEY`), named `<table>_pkey`, no sidecar;
+/// - the header's column without it: table-level, the one-column sidecar
+///   on that column, `<table>_pkey` when there is one, else the first
+///   (`ADD CONSTRAINT k1 PRIMARY KEY (a)` is `k1`); with no sidecar either
+///   (a header an older DROP left behind), `<table>_pkey`;
+/// - no header: the whole sidecar named `<table>_pkey`, a composite key.
+///   One named otherwise is refused at ADD, as nothing could tell it from
+///   a UNIQUE.
+struct PrimaryKeyConstraint {
+    name: String,
+    /// The header's column; `None` for a composite key.
+    column: Option<String>,
+    inline: bool,
 }
 
-/// Whether DROP CONSTRAINT `name` ends the header's primary key: it names
-/// `<table>_pkey`, or it removes what kept the header's column unique (its
-/// UNIQUE flag, or the one-column key it was declared with), leaving no
-/// other whole one-column key on it.
-fn primary_header_goes(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
-    let Some(column) = schema.primary_key.as_deref() else {
-        return false;
+fn primary_key_constraint(schema: &crate::core::row::schema::TableSchema, table: &str) -> Option<PrimaryKeyConstraint> {
+    let pkey = format!("{table}_pkey");
+    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
+    let Some(column) = schema.primary_key.clone() else {
+        return whole()
+            .find(|k| k.name.eq_ignore_ascii_case(&pkey))
+            .map(|k| PrimaryKeyConstraint { name: k.name.clone(), column: None, inline: false });
     };
-    let named = |n: &str| n.eq_ignore_ascii_case(name);
-    if named(&format!("{table}_pkey")) {
-        return true;
+    let inline = schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&column));
+    if inline {
+        return Some(PrimaryKeyConstraint { name: pkey, column: Some(column), inline: true });
     }
-    let flag_stays = implicit_unique_column(name, &schema.fields).is_none_or(|c| !c.eq_ignore_ascii_case(column))
-        && schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(column));
-    let key_stays = schema.unique_keys.iter().any(|k| {
-        !k.is_deleted
-            && k.predicate.is_none()
-            && !named(&k.name)
-            && k.columns.len() == 1
-            && k.columns[0].eq_ignore_ascii_case(column)
-    });
-    !(flag_stays || key_stays)
+    let on_column = |k: &&crate::core::rql::unique_key::UniqueKey| k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(&column);
+    let name = whole()
+        .filter(on_column)
+        .find(|k| k.name.eq_ignore_ascii_case(&pkey))
+        .or_else(|| whole().find(on_column))
+        .map_or(pkey, |k| k.name.clone());
+    Some(PrimaryKeyConstraint { name, column: Some(column), inline: false })
+}
+
+/// Whether `schema` has a primary key ([`primary_key_constraint`]).
+fn has_primary_key(schema: &crate::core::row::schema::TableSchema, table: &str) -> bool {
+    primary_key_constraint(schema, table).is_some()
 }
 
 /// Whether a constraint of `table` is already called `name`: a UNIQUE,
@@ -10636,7 +10675,7 @@ fn constraint_name_taken(schema: &crate::core::row::schema::TableSchema, table: 
     schema.unique_keys.iter().any(|k| !k.is_deleted && named(&k.name))
         || schema.checks.iter().any(|c| !c.is_deleted && named(&c.name))
         || schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
-        || (has_primary_key(schema, table) && named(&format!("{table}_pkey")))
+        || primary_key_constraint(schema, table).is_some_and(|p| named(&p.name))
         || implicit_unique_column(name, &schema.fields).is_some()
 }
 
@@ -12063,6 +12102,9 @@ fn schema_after_for_identity(
             if primary && has_primary_key(&after, &plan.table_name) {
                 return None; // refused: 42P16
             }
+            if primary && key.columns.len() > 1 && !key.name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name)) {
+                return None; // refused: 0A000
+            }
             if after.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&key.name)) {
                 return None;
             }
@@ -12086,23 +12128,23 @@ fn schema_after_for_identity(
             after.unique_keys.push(key);
         }
         AlterAction::ConstraintClause { drop: true, description } => {
+            // As the DROP arm matches it: the primary key by its own name.
             let name = dropped_constraint_name(description)?;
+            let pk = primary_key_constraint(schema, &plan.table_name);
+            let pk_named = pk.as_ref().is_some_and(|p| p.name.eq_ignore_ascii_case(&name));
             for key in after.unique_keys.iter_mut().filter(|k| k.name.eq_ignore_ascii_case(&name)) {
                 key.is_deleted = true;
             }
-            if let Some(column) = implicit_unique_column(&name, &after.fields) {
+            let inline_pk = pk.as_ref().filter(|p| p.inline).and_then(|p| p.column.clone());
+            let implicit = implicit_unique_column(&name, &after.fields)
+                .filter(|c| !inline_pk.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(c)));
+            let unflag = implicit.or_else(|| inline_pk.filter(|_| pk_named));
+            if let Some(column) = unflag {
                 for f in after.fields.iter_mut().filter(|f| f.name.eq_ignore_ascii_case(&column)) {
                     f.is_unique = false;
                 }
             }
-            if name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name)) {
-                if let Some(column) = after.primary_key.take() {
-                    for f in after.fields.iter_mut().filter(|f| f.name.eq_ignore_ascii_case(&column)) {
-                        f.is_unique = false;
-                    }
-                }
-            }
-            if primary_header_goes(schema, &plan.table_name, &name) {
+            if pk_named {
                 after.primary_key = None;
             }
         }

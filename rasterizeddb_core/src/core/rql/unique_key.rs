@@ -420,15 +420,21 @@ impl UniqueKey {
     /// The name PostgreSQL would give an unnamed constraint: the table, its
     /// columns, and `key`.
     pub fn default_name(table: &str, columns: &[String]) -> String {
-        let mut name = table.to_string();
-        for column in columns {
-            name.push('_');
-            name.push_str(column);
-        }
-        name.push_str("_key");
-        name
+        format!("{}_key", key_stem(table, columns))
     }
+}
 
+/// `<table>_<col>_<col>…`, what an unnamed UNIQUE's `_key` follows.
+pub fn key_stem(table: &str, columns: &[String]) -> String {
+    let mut name = table.to_string();
+    for column in columns {
+        name.push('_');
+        name.push_str(column);
+    }
+    name
+}
+
+impl UniqueKey {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut out = vec![0u8; UNIQUE_KEY_SIZE as usize];
         write_name(&mut out, 0, &self.name);
@@ -790,6 +796,45 @@ pub fn stored_name(name: &str) -> String {
 /// A constraint name's slot in the UNIQUE and CHECK sidecars, less its NUL.
 pub const MAX_NAME_BYTES: usize = 128;
 
+/// `stem` and `label` as one name within the stored limit, the stem cut (at
+/// a character boundary) so the label survives whole, as PostgreSQL's
+/// `makeObjectName` cuts its parts and keeps the label. Cut after joining,
+/// a long stem took the label with it.
+pub fn name_with_label(stem: &str, label: &str) -> String {
+    let room = MAX_NAME_BYTES.saturating_sub(label.len());
+    format!("{}{}", stored_name_within(stem, room), stored_name_within(label, MAX_NAME_BYTES))
+}
+
+fn stored_name_within(name: &str, limit: usize) -> String {
+    let mut len = name.len().min(limit);
+    while !name.is_char_boundary(len) {
+        len -= 1;
+    }
+    name[..len].to_string()
+}
+
+/// How many numbered names [`choose_name`] tries before it gives up.
+pub const NAME_ATTEMPTS: usize = 10_000;
+
+/// The first of `<stem><label>`, `<stem><label>1`, `<stem><label>2`, … that
+/// `taken` does not hold, each within the stored limit with its number
+/// whole, as PostgreSQL's `ChooseConstraintName` numbers a label. Bounded:
+/// an error after [`NAME_ATTEMPTS`], never a spin. Numbering a name cut
+/// whole made every candidate the same taken name, and the loop that
+/// tried them, under ACCESS EXCLUSIVE, never ended.
+pub fn choose_name(stem: &str, label: &str, taken: impl Fn(&str) -> bool) -> Result<String, String> {
+    for pass in 0..NAME_ATTEMPTS {
+        let label = if pass == 0 { label.to_string() } else { format!("{label}{pass}") };
+        let name = name_with_label(stem, &label);
+        if !taken(&name) {
+            return Ok(name);
+        }
+    }
+    Err(format!(
+        "could not choose a name for a constraint on \"{stem}\": {NAME_ATTEMPTS} names ending \"{label}\" are taken"
+    ))
+}
+
 /// The name `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE | RESTRICT]`
 /// drops, read as [`split_constraint_name`] reads an added one (bare or
 /// quoted, spaces, `""` and non-ASCII), and whether `IF EXISTS` was given.
@@ -877,11 +922,11 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // pg_indexes, a duplicate's error and `ON CONFLICT ON CONSTRAINT t_pkey`
     // all named a constraint PostgreSQL would not have.
     let name = name.unwrap_or_else(|| {
-        stored_name(&if rest_upper.starts_with("PRIMARY KEY") {
-            format!("{}_pkey", table)
+        if rest_upper.starts_with("PRIMARY KEY") {
+            name_with_label(table, "_pkey")
         } else {
-            UniqueKey::default_name(table, &columns)
-        })
+            name_with_label(&key_stem(table, &columns), "_key")
+        }
     });
     Ok(Some(UniqueKey {
         predicate,
@@ -1376,6 +1421,27 @@ mod constraint_name_tests {
 #[cfg(test)]
 mod stored_name_tests {
     use super::*;
+
+    #[test]
+    fn a_numbered_name_keeps_its_label_and_number() {
+        let stem = "é".repeat(70); // 140 bytes
+        let name = name_with_label(&stem, "_key12");
+        assert!(name.len() <= 128 && name.ends_with("_key12"), "{name}");
+        assert!(name.starts_with("éé"));
+        let mut taken: Vec<String> = Vec::new();
+        for n in 0..12 {
+            let chosen = choose_name(&stem, "_key", |c| taken.iter().any(|t| t == c)).unwrap();
+            assert!(chosen.len() <= 128 && !taken.contains(&chosen), "{n}: {chosen}");
+            taken.push(chosen);
+        }
+        assert_eq!(taken[11], name_with_label(&stem, "_key11"));
+        // Bounded: every name taken is an error.
+        assert!(choose_name(&stem, "_key", |_| true).is_err());
+        // A long table's derived names keep their labels.
+        let table = "t".repeat(125);
+        assert!(parse_clause("PRIMARY KEY (a, b)", &table).unwrap().unwrap().name.ends_with("_pkey"));
+        assert!(parse_clause("UNIQUE (a)", &table).unwrap().unwrap().name.ends_with("_key"));
+    }
 
     #[test]
     fn a_name_is_cut_to_its_stored_bytes_where_it_is_read() {
