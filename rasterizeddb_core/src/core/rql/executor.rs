@@ -5184,6 +5184,38 @@ mod per_row_error_tests {
     }
 }
 
+/// Whether `sql`'s RETURNING list computes something, which can fail
+/// (`10/(v-7)`, 22012) after the write it reports on. An autocommit write
+/// may overwrite in place, which the failure's abort cannot undo: the
+/// statement failed and stored its value. Such a statement writes new
+/// versions instead (`forbid_in_place`). A list of columns and `*` cannot
+/// fail, and keeps the overwrite, which is what ORM upserts send.
+fn returning_can_fail(sql: &str) -> bool {
+    let Some((_, list)) = crate::core::rql::lexer_ir::returning_split(sql) else {
+        return false;
+    };
+    crate::core::rql::lexer_ct::split_definitions(list).iter().any(|item| {
+        let item = item.trim().trim_end_matches(';').trim();
+        // `col AS name` / `col name`: the alias is not part of the value.
+        let value = match crate::core::rql::join::find_keyword(item, "AS", 0) {
+            Some(at) => item[..at].trim(),
+            None => item.split_whitespace().next().unwrap_or(""),
+        };
+        let plain = value == "*"
+            || (!value.is_empty()
+                && value.split('.').all(|part| {
+                    let part = part.trim_matches('"');
+                    part == "*"
+                        || (!part.is_empty()
+                            && !part.starts_with(|c: char| c.is_ascii_digit())
+                            && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                }));
+        // An item with more than one word that is not `x AS y` computes.
+        let words = item.split_whitespace().count();
+        !plain || (words > 1 && crate::core::rql::join::find_keyword(item, "AS", 0).is_none() && words != 2)
+    })
+}
+
 /// Where one assigned value comes from once the join has run.
 enum AssignedValue {
     /// The join projected the value directly; this is its output slot.
@@ -14260,6 +14292,11 @@ pub(crate) async fn execute_with_need(
             response
         }
         QueryPurpose::InsertRow(row_data) => {
+            // A conflict's `DO UPDATE` may overwrite in place, and a RETURNING
+            // that computes is evaluated after it (`returning_can_fail`).
+            if row_data.on_conflict_update.is_some() && returning_can_fail(&row_data.query) {
+                database.transactions.forbid_in_place(tx);
+            }
             // A partitioned table refuses an ON CONFLICT target its unique
             // keys cannot match (42P10) before anything runs: the source of
             // an `INSERT … SELECT`, a default's sequence, or the first row of
@@ -14357,6 +14394,11 @@ pub(crate) async fn execute_with_need(
             Box::pin(insert_row_resolved(&database, &query, row_data, target, depth, tx)).await
         }
         QueryPurpose::UpdateRow(_) => {
+            if let QueryPurpose::UpdateRow(sql) = &query
+                && returning_can_fail(sql)
+            {
+                database.transactions.forbid_in_place(tx);
+            }
             // `UPDATE t SET … FROM src WHERE …` reads one relation to write
             // another, which the single-relation write path cannot express.
             // Handled by joining the two, reading the values out, and writing
