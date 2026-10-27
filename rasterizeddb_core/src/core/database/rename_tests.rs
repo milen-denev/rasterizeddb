@@ -514,3 +514,123 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
         leftovers
     );
 }
+
+// ---------------------------------------------------------------------------
+// Intents recovery must not act on
+// ---------------------------------------------------------------------------
+
+/// Opens `dir` with `intent` hand-written as the rename intent, twice (the
+/// second open is where a reaper would have taken files the first one
+/// orphaned), and returns the database.
+async fn reopen_with_intent(dir: &std::path::Path, intent: &[u8]) -> Database {
+    crate::core::wal::remove_for(&dir.to_string_lossy());
+    std::fs::write(dir.join(super::RENAME_INTENT_FILE), intent).unwrap();
+    {
+        let _db = open_db(dir).await;
+    }
+    crate::core::wal::remove_for(&dir.to_string_lossy());
+    open_db(dir).await
+}
+
+fn intent_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("__rename."))
+        .collect();
+    names.sort();
+    names
+}
+
+async fn assert_intact(db: &Database, dir: &std::path::Path, table: &str, rows: &[i32], label: &str) {
+    assert!(db.has_table(table), "{label}: the table {table} is gone");
+    assert!(db.catalogue_contains(table).await, "{label}: {table}'s catalogue row was tombstoned");
+    assert!(
+        dir.join(format!("{table}.db")).exists(),
+        "{label}: {table}'s files were deleted"
+    );
+    let mut ids = read_ids(db, table).await;
+    ids.sort();
+    assert_eq!(ids, rows, "{label}: {table} lost rows");
+}
+
+/// A power cut tore the intent of `RENAME pt TO pt2` after five bytes:
+/// `pt\npt`, which the older two-line form read as "rename pt to pt". Both
+/// catalogue lookups found the one row, so recovery took the rename for
+/// committed, tombstoned the only row and discarded `pt`'s files.
+///
+/// Mutation: `parse_intent` accepting the two-line form again (and the
+/// degenerate check gone) loses `pt`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torn_intent_naming_one_table_twice_does_not_drop_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "pt").await;
+        for i in 1..=4 {
+            insert_id(&db, "pt", i).await;
+        }
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), b"pt\npt").await;
+    assert_intact(&db, dir.path(), "pt", &[1, 2, 3, 4], "torn pt\\npt").await;
+    assert_eq!(
+        intent_files(dir.path()),
+        vec!["__rename.intent.bad-1".to_string()],
+        "a malformed intent is kept aside for an operator, not deleted or left in place"
+    );
+}
+
+/// The checksummed form naming one table twice is no rename either, and the
+/// same tombstone would follow from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checksummed_intent_naming_one_table_twice_does_not_drop_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "pt").await;
+        for i in 1..=3 {
+            insert_id(&db, "pt", i).await;
+        }
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), super::encode_intent("pt", "pt").as_bytes()).await;
+    assert_intact(&db, dir.path(), "pt", &[1, 2, 3], "checksummed pt -> pt").await;
+}
+
+/// A two-line intent is indistinguishable from a checksummed one torn just
+/// before its sum: `orders_archive\norders` may be the start of a rename of
+/// `orders_archive` to `orders_x`. Read as written, both rows exist, so
+/// recovery would tombstone `orders_archive` and discard its files. It is
+/// refused, and both tables stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_line_intent_is_not_acted_on() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "orders").await;
+        create(&db, "orders_archive").await;
+        insert_id(&db, "orders", 1).await;
+        insert_id(&db, "orders_archive", 2).await;
+        insert_id(&db, "orders_archive", 3).await;
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), b"orders_archive\norders").await;
+    assert_intact(&db, dir.path(), "orders", &[1], "two-line intent").await;
+    assert_intact(&db, dir.path(), "orders_archive", &[2, 3], "two-line intent").await;
+}
+
+/// Torn anywhere, a checksummed intent is refused: every prefix of one, and
+/// one with empty names.
+#[test]
+fn no_prefix_of_an_intent_parses() {
+    let intent = super::encode_intent("orders_archive", "orders");
+    for cut in 0..intent.len() {
+        assert_eq!(super::parse_intent(&intent[..cut]), None, "a prefix of {cut} bytes parsed");
+    }
+    assert!(super::parse_intent(&intent).is_some());
+    assert_eq!(super::parse_intent(&super::encode_intent("", "t")), None);
+    assert_eq!(super::parse_intent(&super::encode_intent("t", "")), None);
+    assert_eq!(super::parse_intent(&super::encode_intent("t", "t")), None);
+}

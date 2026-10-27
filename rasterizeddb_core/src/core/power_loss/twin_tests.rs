@@ -1431,3 +1431,6 @@ mod rewrite_crash_tests;
 
 #[path = "pddl_crash_tests.rs"]
 mod pddl_crash_tests;
+
+#[path = "rename_crash_tests.rs"]
+mod rename_crash_tests;

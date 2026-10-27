@@ -241,6 +241,19 @@ fn synced_prefix(path: &Path, events: &[SyncEvent]) -> usize {
         .iter()
         .rposition(|e| e.tag == "unlink" && e.path == path)
         .map_or(0, |at| at + 1);
+    // Written whole (`rewrite::write_intent`: the rename intent): a synced
+    // temporary file renamed over `path`, then the directory synced. Once
+    // that sync is noted the file is durable whole, and nothing writes it in
+    // place after.
+    if let Some(at) = events[since..]
+        .iter()
+        .rposition(|e| e.tag == "rewrite.intent" && e.path == path)
+        && events[since + at..]
+            .iter()
+            .any(|e| e.tag == "dir" && e.path == path)
+    {
+        return std::fs::metadata(path).map_or(0, |m| m.len() as usize);
+    }
     events[since..]
         .iter()
         .filter(|e| {
@@ -1119,8 +1132,9 @@ async fn an_interrupted_rename_after_a_longer_one_is_abandoned_after_a_crash() {
 fn a_rename_intent_parses_only_whole() {
     let intent = super::encode_intent("t", "u");
     assert_eq!(super::parse_intent(&intent), Some(("t".into(), "u".into())));
-    // An older build's intent.
-    assert_eq!(super::parse_intent("t\nu"), Some(("t".into(), "u".into())));
+    // An older build's two-line intent: the same bytes as a checksummed one
+    // torn before its sum, so refused (`rename_tests`).
+    assert_eq!(super::parse_intent("t\nu"), None);
     let longer = super::encode_intent("a_rather_long_table_name_one", "a_rather_long_table_name_two");
     let mut overlaid = longer.into_bytes();
     overlaid[..intent.len()].copy_from_slice(intent.as_bytes());

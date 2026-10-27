@@ -2380,6 +2380,7 @@ impl Database {
         // Recorded before anything moves, so a crash anywhere below is
         // recognisable on the next open rather than merely non-destructive.
         self.record_rename_intent(old_name, new_name).await?;
+        self.rename_point("after_intent");
 
         // The new name inherits the old one's directory. Done here, before the
         // copy, so every path below — the copy's destination, the cleanup of a
@@ -2407,6 +2408,7 @@ impl Database {
             error!("Rename of {} to {}: copy failed: {}", old_name, new_name, e);
             return Err(e);
         }
+        self.rename_point("after_copy");
 
         // The file set's index-store pair and its write gate go with it
         // (docs/persistent-indexes.md §2 P6, §6; B13): the pair copied
@@ -2442,6 +2444,8 @@ impl Database {
             return Err(e);
         }
 
+        self.rename_point("after_schema");
+
         // The commit point. After this the new name is the real one.
         if let Err(e) = self.remember_in_catalogue(new_name).await {
             self.abandon_copy(old_name, new_name).await;
@@ -2454,6 +2458,8 @@ impl Database {
             );
             return Err(e);
         }
+
+        self.rename_point("after_commit");
 
         // Past the commit point, a failure here is not worth unwinding: both
         // rows exist and both tables read, which is the benign window the
@@ -2484,6 +2490,7 @@ impl Database {
         // after its files are deleted, and the next open replays them into
         // whatever table takes the name next: `RENAME src TO dst; CREATE
         // TABLE src` came back from a restart with `src` holding the old rows.
+        self.rename_point("after_tombstone");
         let old_seed = seed_in(
             &self.db_io_pointers,
             &self.storage,
@@ -2521,8 +2528,10 @@ impl Database {
             // Only now: until the old files are gone, the old name still
             // describes something real, and a placement dropped earlier would
             // send the sweep above to the wrong directory.
+            self.rename_point("after_discard");
             pool_forget(&self.storage, old_name);
             self.clear_rename_intent().await;
+            self.rename_point("after_clear");
         } else {
             // The intent stays, and the placement with it, so the next open
             // finds the old files and discards them, barriers first. Until
@@ -2536,6 +2545,20 @@ impl Database {
 
         info!("Renamed table {} to {}", old_name, new_name);
         Ok(())
+    }
+
+    /// A rename's test points: the power-loss failpoint `test.rename.<label>`,
+    /// armed for the database's directory. A no-op in a server build and for
+    /// an in-memory database.
+    fn rename_point(&self, label: &str) {
+        #[cfg(test)]
+        if let Some(root) = self.location.as_deref() {
+            let _ = crate::core::power_loss::failpoint::hit(
+                &format!("test.rename.{label}"),
+                std::path::Path::new(root),
+            );
+        }
+        let _ = label;
     }
 
     /// Drops a rename's copy that never reached the catalogue. If its files
@@ -3435,19 +3458,25 @@ impl Database {
         // (`partitioned_ddl.rs`).
         self.refuse_partitioned(old_name, "RENAME")?;
         self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
-        let io = self
-            .db_io_pointers
-            .create_new(RENAME_INTENT_FILE.to_string())
-            .await;
-        io.truncate(0)
-            .await
-            .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        io.append_data(encode_intent(old_name, new_name).as_bytes(), true)
-            .await;
-        let token = io.begin_txn();
-        io.commit_durable(token)
-            .await
-            .map_err(|e| io::Error::other(format!("{e:?}")))
+        // Recovery refuses these (`parse_intent`), so one written would only
+        // be set aside at the next open.
+        if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no rename intent for {old_name:?} to {new_name:?}: it names no rename"),
+            ));
+        }
+        // Written whole: a temporary file, synced, renamed over the intent,
+        // and the directory synced (`rewrite::write_intent`). It was once a
+        // logged file truncated and appended in place, so a power cut could
+        // leave any prefix of it in the file: `pt\npt` from `pt\npt2\n…`,
+        // which the older unchecksummed form read as a rename of `pt` onto
+        // itself, and recovery dropped `pt`. In memory nothing survives a
+        // crash, so there is nothing to record.
+        let Some(path) = rename_intent_path(&self.db_io_pointers) else {
+            return Ok(());
+        };
+        rewrite::write_intent(&path, &encode_intent(old_name, new_name))
     }
 
     async fn clear_rename_intent(&self) {
@@ -3909,13 +3938,18 @@ async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
 /// Removes the marker recording a rename in progress, voiding its log records
 /// first.
 ///
-/// The marker is rewritten at offset 0 by every rename, so its records from
-/// one rename, left live, replayed under the next one's at the next open: a
-/// longer earlier intent showed through a shorter later one, and recovery
-/// acted on a name neither rename had. Callers clear it only once whatever the
-/// intent protected is durable, which the barrier's own sync also covers for
-/// everything this log holds before it.
+/// The marker is written whole now (`record_rename_intent`), but older builds
+/// logged it, rewriting it at offset 0 for every rename: their records from
+/// one rename, left live, replayed under the next one's at the next open, and
+/// a longer earlier intent showed through a shorter later one. They are
+/// voided here still, so a directory an older build wrote cannot replay one
+/// back. Callers clear it only once whatever the intent protected is durable,
+/// which the barrier's own sync also covers for everything this log holds
+/// before it.
 async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
+    let Some(path) = rename_intent_path(io_pointers) else {
+        return;
+    };
     let dir = io_pointers.get_location();
     let wal = dir.as_deref().and_then(crate::core::wal::wal_for);
     let _snapshot_gate = deletion_permit(wal.as_slice()).await;
@@ -3928,20 +3962,64 @@ async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
         // acted on.
         error!("Could not void the log's records for the rename intent: {}", e);
     }
-    let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
-    io.drop_io();
     // An unlink reaches the disk with the directory's next sync (see
     // `sweep_files_durably`), and nothing on the rename's path syncs this
     // directory after this one: a power cut could bring the intent back,
     // whole and checksummed, and the next open would act on it over a table
-    // created under the old name since. Only where a log reaches, like the
-    // sweep: a directory without one is in memory.
-    if wal.is_some()
-        && let Some(dir) = dir
-        && let Err(e) =
-            crate::core::wal::sync_parent_dir(&std::path::Path::new(&dir).join(RENAME_INTENT_FILE))
-    {
-        error!("Deleted the rename intent in {} but could not sync the directory: {}", dir, e);
+    // created under the old name since.
+    if let Err(e) = remove_rename_intent(&path) {
+        error!("Could not delete the rename intent {}: {}", path.display(), e);
+    }
+}
+
+/// Where the rename intent lives: the catalogue's directory. `None` in
+/// memory, where nothing survives a crash for an intent to describe.
+fn rename_intent_path(io_pointers: &Arc<DbStorageProvider>) -> Option<std::path::PathBuf> {
+    io_pointers
+        .get_location()
+        .map(|dir| std::path::Path::new(&dir).join(RENAME_INTENT_FILE))
+}
+
+/// Deletes `path`, durably: unlinked, then its directory synced.
+fn remove_rename_intent(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
+    match std::fs::remove_file(path) {
+        Ok(()) => crate::core::sync_audit::note("unlink", path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    crate::core::wal::sync_parent_dir(path)
+}
+
+/// Moves a rename intent recovery will not act on to the first free
+/// `__rename.intent.bad-<n>`, durably, and logs it at error level. Kept, not
+/// deleted: what it named is for an operator to judge. Left in place, it
+/// would be read again at every open.
+fn set_aside_rename_intent(path: &std::path::Path, text: &str, why: &str) {
+    let mut n = 1u32;
+    let aside = loop {
+        let candidate = path.with_file_name(format!("{RENAME_INTENT_FILE}.bad-{n}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Rename { from: path, to: &aside });
+    match std::fs::rename(path, &aside).and_then(|()| crate::core::wal::sync_parent_dir(&aside)) {
+        Ok(()) => error!(
+            "Rename intent {} ({text:?}) {why}; nothing was done with it, and it was moved aside to {}. \
+             Check that the tables it names are as expected (a rename it described may have left a \
+             copy's files or both names behind), then remove the file.",
+            path.display(),
+            aside.display()
+        ),
+        Err(e) => error!(
+            "Rename intent {} ({text:?}) {why}; nothing was done with it, and it could not be moved \
+             aside ({e}), so the next open reads it again",
+            path.display()
+        ),
     }
 }
 
@@ -3952,24 +4030,28 @@ fn encode_intent(old_name: &str, new_name: &str) -> String {
     format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
 }
 
-/// The names an intent written by [`encode_intent`] holds, or by an older
-/// build (two lines and nothing else), or `None` for anything else: stale log
-/// records replayed under it, a torn write.
+/// The names an intent written by [`encode_intent`] holds, or `None` for
+/// anything else: stale log records replayed under it, a torn write, and a
+/// record that names no rename (an empty name, or one name twice).
+///
+/// An older build's two-line form (`old\nnew`, no checksum) is refused too:
+/// it is byte for byte a checksummed intent torn just before its sum, whose
+/// second name may be a prefix of the real one. `pt\npt`, the first five
+/// bytes of `RENAME pt TO pt2`'s intent, read as a rename of `pt` onto
+/// itself: both catalogue lookups found the one row, recovery took the
+/// rename for committed, tombstoned it and discarded `pt`'s files. Ignoring
+/// any intent costs at most a copy's files or a duplicate name, never a
+/// table, so nothing that cannot be proved whole is acted on.
 fn parse_intent(text: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = text.split('\n').collect();
-    let (old_name, new_name) = match parts.as_slice() {
-        [old_name, new_name, sum, ""] => {
-            let body = format!("{old_name}\n{new_name}");
-            if *sum != format!("{:016x}", crate::core::wal::file_id_for_name(&body)) {
-                return None;
-            }
-            (*old_name, *new_name)
-        }
-        [old_name, new_name] => (*old_name, *new_name),
-        _ => return None,
+    let [old_name, new_name, sum, ""] = parts.as_slice() else {
+        return None;
     };
-    let (old_name, new_name) = (old_name.trim(), new_name.trim());
-    if old_name.is_empty() || new_name.is_empty() {
+    let body = format!("{old_name}\n{new_name}");
+    if *sum != format!("{:016x}", crate::core::wal::file_id_for_name(&body)) {
+        return None;
+    }
+    if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
         return None;
     }
     Some((old_name.to_string(), new_name.to_string()))
@@ -3993,34 +4075,49 @@ async fn recover_interrupted_rename(
     kv: &KvStores,
     seeds: &SeedCache,
 ) -> Vec<String> {
-    let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
-    let len = io.get_len().await;
-    if len == 0 {
+    let Some(path) = rename_intent_path(io_pointers) else {
         return Vec::new();
+    };
+    // A write cut before its rename into place: the rename itself never
+    // started (it waits for the intent), so nothing followed it.
+    let partial = path.with_extension("partial");
+    if partial.exists() && std::fs::remove_file(&partial).is_ok() {
+        let _ = crate::core::wal::sync_parent_dir(&partial);
     }
-
-    let mut buffer = vec![0u8; len as usize];
-    let mut position = 0u64;
-    if io
-        .read_data_into_buffer(&mut position, &mut buffer)
-        .await
-        .is_err()
-    {
-        warn!("A rename intent record exists but could not be read; leaving it in place");
+    let buffer = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!("A rename intent {} exists but could not be read ({e}); leaving it in place", path.display());
+            return Vec::new();
+        }
+    };
+    if buffer.is_empty() {
+        // What an older build left after clearing one in place.
+        let _ = remove_rename_intent(&path);
         return Vec::new();
     }
 
     let text = String::from_utf8_lossy(&buffer);
     let Some((old_name, new_name)) = parse_intent(&text) else {
-        warn!("Malformed rename intent record {:?}; discarding it", text);
-        clear_intent(io_pointers).await;
+        set_aside_rename_intent(&path, &text, "does not parse as one whole, checksummed rename");
         return Vec::new();
     };
     let (old_name, new_name) = (old_name.as_str(), new_name.as_str());
     let held = || vec![old_name.to_string(), new_name.to_string()];
 
-    let has_new = catalogue_has_row(io_pointers, io_rows, io_schema, new_name).await;
-    let has_old = catalogue_has_row(io_pointers, io_rows, io_schema, old_name).await;
+    // A plain rename names plain tables only (`record_rename_intent` refuses
+    // partitioned ones): files under `<name>*` and a row with no uid. One
+    // naming a partitioned table was not written for it, and acting on it
+    // would sweep or reopen that table as plain.
+    let old_rows = catalogue_rows(io_pointers, io_rows, io_schema, old_name).await;
+    let new_rows = catalogue_rows(io_pointers, io_rows, io_schema, new_name).await;
+    if old_rows.iter().chain(&new_rows).any(|clusters| *clusters != 0) {
+        set_aside_rename_intent(&path, &text, "names a partitioned table");
+        return Vec::new();
+    }
+    let has_new = !new_rows.is_empty();
+    let has_old = !old_rows.is_empty();
     let root = io_pointers.get_location();
 
     match (has_old, has_new) {
@@ -4156,13 +4253,27 @@ async fn catalogue_has_row(
     io_schema: &Arc<DbStorageProvider>,
     table_name: &str,
 ) -> bool {
+    !catalogue_rows(io_pointers, io_rows, io_schema, table_name)
+        .await
+        .is_empty()
+}
+
+/// The `clusters` of every live catalogue row named `table_name`: 0 for a
+/// plain table, the uid of a partitioned one's files.
+async fn catalogue_rows(
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: &str,
+) -> Vec<u64> {
     let schema = load_db_data_schema(io_schema.clone()).await;
     let fetch = create_db_data_row_fetch(&schema.fields);
 
     let Ok(mut iterator) = RowPointerIterator::new(io_pointers.clone()).await else {
-        return false;
+        return Vec::new();
     };
 
+    let mut found = Vec::new();
     while let Ok(Some((_, pointer))) = iterator.next_row_pointer_with_offset().await {
         let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
             continue;
@@ -4170,11 +4281,19 @@ async fn catalogue_has_row(
         let Some(name_column) = row.columns.iter().find(|c| c.schema_id == 0) else {
             continue;
         };
-        if String::from_utf8_lossy(name_column.data.into_slice()) == table_name {
-            return true;
+        if String::from_utf8_lossy(name_column.data.into_slice()) != table_name {
+            continue;
         }
+        let clusters = row
+            .columns
+            .iter()
+            .find(|c| c.schema_id == 1)
+            .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        found.push(clusters);
     }
-    false
+    found
 }
 
 /// Copies every file `name` owns from one seed provider to another, under the
