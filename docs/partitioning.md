@@ -229,7 +229,11 @@ its columns are `NOT NULL`.
 
 **Pinned by** `tests/partition_twin.rs` (`ForUpdate`, `SkipLocked`,
 `ForUpdateNoWait`, `UpdateFrom`, `DeleteUsing` compared with the twin, in
-blocks too; `REFUSED` holds only phase 6 kinds), `tests/partition_shell_sites.rs`,
+blocks too; `REFUSED` holds only phase 6 kinds and `KNOWN_DIVERGENCES` stays
+empty; green in all four configurations at the default seeds, 300
+statements, and at 0x5eed2b20 and 0x5eedf1a1 with 1,500 statements each),
+`tests/partition_shell_sites.rs`, `tests/partition_write.rs` and
+`row_source_join_tests.rs` (a partitioned target written like its twin),
 and `rasterizeddb_compat/tests/composite_row_locks.rs` over pgwire on a plain
 composite-key table and a partitioned one: a `SKIP LOCKED` job queue
 claiming every job exactly once, `NOWAIT` 55P03, a holder blocking a writer
