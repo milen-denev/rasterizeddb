@@ -4175,7 +4175,7 @@ fn ref_key(qualifier: &str, column: &str) -> (String, String) {
 }
 
 /// Replaces each outer reference in `sql` with the literal it resolved to,
-/// in parentheses.
+/// separated from what precedes it by a space.
 ///
 /// One pass over `sql`, quote-aware: a reference inside a string literal is
 /// text, not a reference (`'see s.x ' || s.x` stored `see 7 7`), and what
@@ -4183,10 +4183,19 @@ fn ref_key(qualifier: &str, column: &str) -> (String, String) {
 /// `s.l` broke the statement). Whole references only, so `fwd.id` inside
 /// `fwd.id_extra` is left alone, in any quoting (`"s".big`, `s."big"`).
 ///
-/// Parenthesised because the literal lands beside whatever the text had
-/// there: `t.x-s.neg` with `-3` became `x--3`, and `--` starts a comment,
-/// which dropped the rest of the statement (its other assignments and its
-/// `WHERE`, so every row was updated).
+/// The literal lands beside whatever the text had there: `t.x-s.neg` with
+/// `-3` became `x--3`, and `--` starts a comment, which dropped the rest of
+/// the statement (its other assignments and its `WHERE`, so every row was
+/// updated). A space before it keeps it a token of its own: `x- -3`, minus
+/// negative three. Parentheses did that too, but the predicate parser takes
+/// a bare literal, not a parenthesised one, in `IN (…)`, `BETWEEN`, `LIKE`
+/// and `IS DISTINCT FROM`, and every such recheck and correlated subquery
+/// failed. Nothing after the literal can fuse with it: a reference ends
+/// where no word character, `.` or quote follows, and a rendered literal
+/// (a number, a quoted string, `NULL`) ends in a digit, a quote or a
+/// letter. No rendered literal starts with `*`, `=` or `-` but a negative
+/// number, so the space is the only separation needed (`/*`, `!=`, `<-`,
+/// `--` all need the two characters adjacent).
 fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
     let keyed: Vec<((String, String), &str)> = bindings
         .iter()
@@ -4201,9 +4210,10 @@ fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
         let key = ref_key(&span.qualifier, &span.column);
         if let Some((_, literal)) = keyed.iter().find(|(k, _)| *k == key) {
             out.push_str(&sql[cursor..span.start]);
-            out.push('(');
+            if !out.ends_with(|c: char| c.is_ascii_whitespace()) && !out.is_empty() {
+                out.push(' ');
+            }
             out.push_str(literal);
-            out.push(')');
             cursor = span.end;
         }
     }
@@ -16974,12 +16984,12 @@ mod update_from_tests {
         assert!(err.contains("compared against a constant"), "got: {}", err);
     }
 
-    /// A literal is parenthesised (`x-(-3)`, never `x--3`, a comment), a
-    /// reference in a string literal is text, every quoting of a reference is
-    /// one, and substituted text is never scanned again.
+    /// A literal is set apart by a space (`x- -3`, never `x--3`, a comment),
+    /// a reference in a string literal is text, every quoting of a reference
+    /// is one, and substituted text is never scanned again.
     ///
-    /// Mutation: the parentheses dropped, or `qualified_ref_spans` not
-    /// skipping string literals, fails this.
+    /// Mutation: the space dropped, or `qualified_ref_spans` not skipping
+    /// string literals, fails this.
     #[test]
     fn source_references_are_substituted_quote_aware_and_parenthesised() {
         let bindings = vec![
@@ -16987,14 +16997,15 @@ mod update_from_tests {
             ("s.l".to_string(), "'has s.neg -- in it'".to_string()),
             ("s.big".to_string(), "123".to_string()),
         ];
-        assert_eq!(substitute_outer_refs("x-s.neg, label = 'z'", &bindings), "x-(-3), label = 'z'");
+        assert_eq!(substitute_outer_refs("x-s.neg, label = 'z'", &bindings), "x- -3, label = 'z'");
+        assert_eq!(substitute_outer_refs("v IN (s.neg, 99)", &bindings), "v IN ( -3, 99)");
         assert_eq!(
             substitute_outer_refs("'see s.neg ' || s.l || 'it''s s.neg'", &bindings),
-            "'see s.neg ' || ('has s.neg -- in it') || 'it''s s.neg'"
+            "'see s.neg ' || 'has s.neg -- in it' || 'it''s s.neg'"
         );
         assert_eq!(
             substitute_outer_refs(r#""s".big + s."big" + "s"."big" + S.big + s.bigger + s.big.x"#, &bindings),
-            r#"(123) + (123) + (123) + (123) + s.bigger + s.big.x"#
+            r#"123 + 123 + 123 + 123 + s.bigger + s.big.x"#
         );
         assert_eq!(qualified_refs(r#"t.x - "s"."big" + 's.neg' + s.neg"#, &["s".to_string()]), [r#""s"."big""#, "s.neg"]);
         assert_eq!(strip_qualifier("t.x || 'see t.x' || t.y", "t"), "x || 'see t.x' || y");
@@ -17010,10 +17021,10 @@ mod update_from_tests {
             "SELECT COUNT(*) FROM t WHERE t.a = fwd.id AND t.b = fwd.id_extra",
             &bindings,
         );
-        assert!(out.contains("t.a = (7)"), "got: {}", out);
+        assert!(out.contains("t.a = 7"), "got: {}", out);
         // The trap: substituting `fwd.id` first would have turned
         // `fwd.id_extra` into `7_extra`.
-        assert!(out.contains("t.b = (9)"), "got: {}", out);
+        assert!(out.contains("t.b = 9"), "got: {}", out);
         assert!(!out.contains("7_extra"), "got: {}", out);
     }
 

@@ -147,3 +147,94 @@ async fn int4_overflow_in_a_where_literal_is_an_error() {
     assert_eq!(texts(&pool, "SELECT id::text FROM o WHERE b = 8589934592 / 2").await, ["1"]);
     assert_eq!(texts(&pool, "SELECT id::text FROM o WHERE id > 0 AND (i = 15 / 2)").await, ["1"]);
 }
+
+/// The shapes a parenthesised substitution broke: a value inside `IN (…)`,
+/// `NOT IN`, `BETWEEN`, `LIKE`, `ILIKE` and `IS DISTINCT FROM`, which the
+/// predicate parser takes bare and not parenthesised. `IN`, `NOT IN` and
+/// `IS DISTINCT FROM` in UPDATE … FROM's recheck and DELETE … USING's; all
+/// of them in a correlated subquery; positive and negative values; and `-`
+/// before a negative. (A join condition `rt.v BETWEEN rs.lo AND rs.hi` or
+/// `rt.name LIKE rs.name` is refused by the join itself, before any
+/// substitution: "is not a comparison".)
+async fn predicate_shapes(partitioning: &str) {
+    let dir = Root::new(if partitioning.is_empty() { "shapes_plain" } else { "shapes_hash" });
+    let server = TestServer::start_file_backed(&dir.0).await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    let p = partitioning;
+    run(
+        &pool,
+        &format!("CREATE TABLE rt (id BIGINT PRIMARY KEY, v BIGINT, name TEXT, lo BIGINT, hi BIGINT, flag BIGINT){p}"),
+    )
+    .await;
+    run(
+        &pool,
+        "CREATE TABLE rs (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, lo BIGINT, hi BIGINT, name TEXT, neg BIGINT);
+         CREATE TABLE c (cid BIGINT PRIMARY KEY, tid BIGINT, v BIGINT, name TEXT);",
+    )
+    .await;
+    run(
+        &pool,
+        "INSERT INTO rt VALUES (1, 5, 'Apple', 0, 10, 0), (2, -3, 'apricot', -5, 0, 0), (3, 7, 'Banana', 6, 8, 0), \
+         (4, 100, 'x', 0, 0, 0)",
+    )
+    .await;
+    run(
+        &pool,
+        "INSERT INTO rs VALUES (1, 5, 6, 0, 10, 'Ap%', -3), (2, -3, 9, -5, -1, 'AP%', -3), (3, 1, 2, 6, 8, 'B%', -3), \
+         (4, 1, 2, 0, 1, 'zz', -3)",
+    )
+    .await;
+    run(&pool, "INSERT INTO c VALUES (1, 1, 5, 'Apple'), (3, 3, 7, 'Banana'), (5, -3, -3, 'neg')").await;
+    let flagged = |pool: sqlx::PgPool| async move {
+        texts(&pool, "SELECT id::text FROM rt WHERE flag = 1 ORDER BY id").await
+    };
+    for (cond, want) in [
+        ("rt.v IN (rs.a, rs.b)", &["1", "2"][..]),
+        ("rt.v NOT IN (rs.a)", &["3", "4"]),
+        ("rt.v IN (rs.neg, 99)", &["2"]),
+        ("rt.v IS DISTINCT FROM rs.a", &["3", "4"]),
+        ("rt.v > rt.lo-rs.neg", &["1", "4"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.tid IN (rt.id, 99)) > 0", &["1", "3"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.tid IN (rt.v, 99)) > 0", &["2"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.v BETWEEN rt.lo AND rt.hi) > 0", &["1", "2", "3"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.name LIKE rt.name) > 0", &["1", "3"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.name ILIKE rt.name) > 0", &["1", "3"]),
+        ("(SELECT COUNT(*) FROM c WHERE c.tid IS DISTINCT FROM rt.id AND c.tid NOT IN (rt.id)) > 2", &["2", "4"]),
+    ] {
+        run(&pool, "UPDATE rt SET flag = 0").await;
+        let n = run(&pool, &format!("UPDATE rt SET flag = 1 FROM rs WHERE rt.id = rs.id AND {cond}")).await;
+        assert_eq!(flagged(pool.clone()).await, want, "{p} UPDATE … FROM … AND {cond}");
+        assert_eq!(n as usize, want.len(), "{p} UPDATE … FROM … AND {cond}: the count");
+        // DELETE … USING, rolled back so every shape sees the same rows. It
+        // takes no correlated subquery in its condition (refused before any
+        // substitution).
+        if cond.starts_with("(SELECT") {
+            continue;
+        }
+        let mut c = pool.acquire().await.unwrap();
+        c.execute("BEGIN").await.unwrap();
+        let deleted: Vec<String> = sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM rt USING rs WHERE rt.id = rs.id AND {cond} RETURNING rt.id"
+        )))
+        .fetch_all(&mut *c)
+        .await
+        .unwrap_or_else(|e| panic!("{p} DELETE … USING … AND {cond}: {e}"))
+        .iter()
+        .map(|r| r.get::<i64, _>(0).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+        assert_eq!(deleted, want, "{p} DELETE … USING … AND {cond}");
+        c.execute("ROLLBACK").await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn substituted_values_work_in_every_predicate_shape_on_a_plain_target() {
+    predicate_shapes("").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn substituted_values_work_in_every_predicate_shape_on_a_hash_partitioned_target() {
+    predicate_shapes(" PARTITION BY HASH (id) PARTITIONS 4").await;
+}
