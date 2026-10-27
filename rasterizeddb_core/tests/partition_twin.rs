@@ -156,8 +156,13 @@ enum Kind {
     InSubquery,
     Union,
     Cte,
+    // Row locks (phase 3 P3), by the composite identifying key under the
+    // logical name: FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE, routed,
+    // fanned out and ordered with a LIMIT; SKIP LOCKED (with ORDER BY …
+    // LIMIT, the claim shape); NOWAIT.
     ForUpdate,
     SkipLocked,
+    ForUpdateNoWait,
     // Empty routes (I6): a never-written tenant, and a contradiction.
     EmptyRouteCount,
     EmptyRouteMax,
@@ -215,7 +220,7 @@ const ALL_KINDS: &[Kind] = &[
     CountAll, CountByPrefix, Aggregates, GroupBy, GroupByOrdered, OrderByLimit, OrderByExpr, Distinct,
     CountDistinct, Window, Join, LeftJoin,
     SelfJoin, JoinRouted, JoinFanOut, JoinPartitionedBoth, JoinAggregates, PreparedJoin, UpdateDimFromT,
-    DeleteDimUsingT, InSubquery, Union, Cte, ForUpdate, SkipLocked, EmptyRouteCount, EmptyRouteMax,
+    DeleteDimUsingT, InSubquery, Union, Cte, ForUpdate, SkipLocked, ForUpdateNoWait, EmptyRouteCount, EmptyRouteMax,
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedDescribeAlias, PreparedSelectAcrossDdl,
     PreparedInsert, PreparedUpdate, PreparedDelete, PreparedUpdateReturning, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
@@ -265,13 +270,12 @@ const REFUSED: &[Refusal] = &[
     // Vacuum and VacuumFull are compared with the twin, inside blocks too.
     // A key change moves a row between partitions (I4): phase 6.
     refused(UpdateKeyChange, "phase 6"),
-    // Phase 3: UPDATE FROM and DELETE USING with a partitioned target (a
-    // partitioned source is built since S19: UpdateDimFromT,
-    // DeleteDimUsingT), FOR UPDATE, SKIP LOCKED.
-    refused(UpdateFrom, "phase 3"),
-    refused(DeleteUsing, "phase 3"),
-    refused(ForUpdate, "phase 3"),
-    refused(SkipLocked, "phase 3"),
+    // Phase 3 P3 (composite identifying keys) is built: UpdateFrom and
+    // DeleteUsing with a partitioned target (joined to a plain or a
+    // partitioned source, RETURNING, an expression over the target), and
+    // ForUpdate, SkipLocked and ForUpdateNoWait are compared with the twin,
+    // inside blocks too. A partitioned source is built since S19
+    // (UpdateDimFromT, DeleteDimUsingT).
     // S10 (single-snapshot fan-out SELECT and COUNT) is built: every read
     // kind is compared with the twin, ORDER BY across partitions included
     // (correct by sorting the partitions' top-N together; S12 makes it
@@ -806,12 +810,31 @@ impl Gen {
             }
             UpdateFrom => {
                 let t = self.tenant();
-                self.simple(
-                    kind,
-                    format!(
+                let i = self.id();
+                let sql = match self.rng.u8(..4) {
+                    0 => format!(
                         "UPDATE {{t}} SET n = 7 FROM {{d}} WHERE {{t}}.tenant_id = {{d}}.tenant_id AND {{d}}.tenant_id = {t}"
                     ),
-                )
+                    // Partitioned × partitioned on the shared key columns,
+                    // an expression over the target, RETURNING.
+                    1 => format!(
+                        "UPDATE {{t}} SET n = {{t}}.n + 1 FROM {{u}} WHERE {{t}}.tenant_id = {{u}}.tenant_id \
+                         AND {{t}}.grp = {{u}}.grp AND {{u}}.tenant_id = {t} \
+                         RETURNING {{t}}.tenant_id, {{t}}.grp, {{t}}.id, {{t}}.n"
+                    ),
+                    // Fanned out over every tenant; a NULL source value.
+                    2 => format!(
+                        "UPDATE {{t}} SET s = {{u}}.tag FROM {{u}} WHERE {{t}}.tenant_id = {{u}}.tenant_id \
+                         AND {{t}}.grp = {{u}}.grp AND {{t}}.id = {i}"
+                    ),
+                    // Several source rows per target row (every tenant's
+                    // stage rows): each target row is written once.
+                    _ => format!(
+                        "UPDATE {{t}} SET n = {{t}}.n - 1 FROM stage WHERE {{t}}.tenant_id = stage.tenant_id \
+                         AND {{t}}.tenant_id = {t} AND {{t}}.id < {i} RETURNING {{t}}.tenant_id, {{t}}.grp, {{t}}.id, {{t}}.n"
+                    ),
+                };
+                self.simple(kind, sql)
             }
             DeleteByKey => {
                 let w = self.pk_eq();
@@ -859,13 +882,21 @@ impl Gen {
             }
             DeleteUsing => {
                 let t = self.tenant();
-                self.simple(
-                    kind,
+                let i = self.id();
+                let sql = if self.rng.bool() {
                     format!(
                         "DELETE FROM {{t}} USING {{d}} WHERE {{t}}.tenant_id = {{d}}.tenant_id AND {{d}}.tenant_id = {t} \
                          AND {{t}}.n > 90"
-                    ),
-                )
+                    )
+                } else {
+                    // Partitioned × partitioned, fanned out, RETURNING.
+                    format!(
+                        "DELETE FROM {{t}} USING {{u}} WHERE {{t}}.tenant_id = {{u}}.tenant_id AND {{t}}.grp = {{u}}.grp \
+                         AND {{u}}.w IS NULL AND {{t}}.id > {} RETURNING {{t}}.tenant_id, {{t}}.grp, {{t}}.id, {{t}}.s",
+                        i.max(20)
+                    )
+                };
+                self.simple(kind, sql)
             }
             InsertIntoSinkFromT => {
                 let g = self.grp();
@@ -1238,12 +1269,47 @@ impl Gen {
                 )
             }
             ForUpdate => {
-                let t = self.tenant();
-                self.simple(kind, format!("SELECT * FROM {{t}} WHERE tenant_id = {t} FOR UPDATE"))
+                let (t, g, i) = (self.tenant(), self.grp(), self.id());
+                match self.rng.u8(..5) {
+                    0 => self.simple(kind, format!("SELECT * FROM {{t}} WHERE tenant_id = {t} FOR UPDATE")),
+                    1 => self.simple(
+                        kind,
+                        format!("SELECT tenant_id, grp, id, n FROM {{t}} WHERE tenant_id = {t} AND grp = {g} FOR SHARE"),
+                    ),
+                    2 => self.simple(
+                        kind,
+                        format!("SELECT id, grp, tenant_id, s FROM {{t}} WHERE grp = {g} AND id = {i} FOR NO KEY UPDATE"),
+                    ),
+                    3 => {
+                        let w = self.pk_eq();
+                        self.simple(kind, format!("SELECT * FROM {{t}} WHERE {w} FOR KEY SHARE"))
+                    }
+                    _ => self.ordered(
+                        kind,
+                        format!("SELECT * FROM {{t}} WHERE n > {} ORDER BY tenant_id, grp, id LIMIT 4 FOR UPDATE", i),
+                    ),
+                }
             }
             SkipLocked => {
                 let t = self.tenant();
-                self.simple(kind, format!("SELECT * FROM {{t}} WHERE tenant_id = {t} FOR UPDATE SKIP LOCKED"))
+                if self.rng.bool() {
+                    self.simple(kind, format!("SELECT * FROM {{t}} WHERE tenant_id = {t} FOR UPDATE SKIP LOCKED"))
+                } else {
+                    self.ordered(
+                        kind,
+                        format!(
+                            "SELECT tenant_id, grp, id FROM {{t}} WHERE tenant_id >= {t} ORDER BY tenant_id, grp, id \
+                             LIMIT 3 FOR UPDATE SKIP LOCKED"
+                        ),
+                    )
+                }
+            }
+            ForUpdateNoWait => {
+                let (t, g) = (self.tenant(), self.grp());
+                self.simple(
+                    kind,
+                    format!("SELECT tenant_id, grp, id, n FROM {{t}} WHERE tenant_id = {t} AND grp = {g} FOR UPDATE NOWAIT"),
+                )
             }
             EmptyRouteCount => self.simple(kind, format!("SELECT COUNT(*) FROM {{t}} WHERE tenant_id = {NEVER}")),
             EmptyRouteMax => self.simple(kind, format!("SELECT MAX(n) FROM {{t}} WHERE tenant_id = {NEVER}")),
@@ -1391,8 +1457,9 @@ const BLOCK_KINDS: &[Kind] = &[
     UpdateRelocating, UpdateByNonKey, UpdateByFunction, UpdateKeySameValue, UpdateReturning, UpdateReturningExpr,
     DeleteByKey, DeleteByNonKey, DeleteIn, DeleteReturning, PreparedUpdateReturning, SelectByPrefix,
     SelectFunctionWhere, CountAll,
-    Aggregates, ForUpdate, SkipLocked, PreparedInsert, PreparedSelect, PreparedUpdate, InsertIntoSinkFromT,
-    ReadSinkAndDim, Join, LeftJoin, JoinRouted, JoinPartitionedBoth, UpdateDimFromT,
+    Aggregates, ForUpdate, SkipLocked, ForUpdateNoWait, PreparedInsert, PreparedSelect, PreparedUpdate,
+    InsertIntoSinkFromT, ReadSinkAndDim, Join, LeftJoin, JoinRouted, JoinPartitionedBoth, UpdateDimFromT, UpdateFrom,
+    DeleteUsing,
 ];
 
 /// How often each kind is drawn after the first pass (which draws each once).

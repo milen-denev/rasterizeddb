@@ -15,8 +15,9 @@
 //! is given the same rows (INSERT routes since S9), so the data-reading
 //! sites compare over rows. The reading sites are `LikeTwin` since S10, and
 //! the writing and maintenance ones since S11, RETURNING since S17, the
-//! ON CONFLICT ones since S18, and joins (with a partitioned source of
-//! UPDATE … FROM / DELETE … USING) since S19.
+//! ON CONFLICT ones since S18, joins (with a partitioned source of
+//! UPDATE … FROM / DELETE … USING) since S19, and row locks and a
+//! partitioned target of UPDATE … FROM / DELETE … USING since phase 3 P3.
 
 mod partition_wire;
 
@@ -270,10 +271,13 @@ const SITES: &[Site] = &[
         "a name lock; once S9/S11 write, it must block a partition's writer",
     ),
     in_block("LOCK TABLE site_p IN ACCESS EXCLUSIVE MODE", Expect::LikeTwin, "as above"),
-    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR UPDATE", Expect::Refused, "phase 3"),
-    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR SHARE", Expect::Refused, "phase 3"),
-    in_block("SELECT * FROM site_p FOR UPDATE SKIP LOCKED", Expect::Refused, "phase 3"),
-    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR UPDATE NOWAIT", Expect::Refused, "phase 3"),
+    // Row locks by the composite identifying key, under the logical name
+    // (phase 3 P3).
+    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR UPDATE", Expect::LikeTwin, "P3"),
+    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR SHARE", Expect::LikeTwin, "P3"),
+    in_block("SELECT * FROM site_p FOR UPDATE SKIP LOCKED", Expect::LikeTwin, "P3"),
+    in_block("SELECT * FROM site_p WHERE tenant_id = 1 FOR UPDATE NOWAIT", Expect::LikeTwin, "P3"),
+    in_block("SELECT asset_id, n FROM site_p WHERE asset_id = 1 FOR NO KEY UPDATE", Expect::LikeTwin, "P3: fanned out"),
     // COPY is not built for any table; the partitioned one fails alike.
     site("COPY site_p TO STDOUT", Expect::LikeTwin, "no COPY here"),
     site("COPY site_p (tenant_id, n) TO STDOUT", Expect::LikeTwin, "no COPY here"),
@@ -530,15 +534,18 @@ const SITES: &[Site] = &[
         runs: &[&["6", "1", "9", "1"], &["6", "1", "9", "2"], &["1", "1", "1", "3"]],
         columns: Some(&["asset_id", "n"]),
     },
-    site(
-        "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id",
-        Expect::Refused,
-        "UPDATE … FROM with a partitioned target: phase 3",
+    // A partitioned target, written back by its composite key (P3): in a
+    // rolled-back block, so the twin's run starts from the same rows.
+    in_block(
+        "UPDATE site_p SET n = 3 FROM site_parent WHERE site_p.asset_id = site_parent.id \
+         RETURNING site_p.tenant_id, site_p.asset_id, site_p.n",
+        Expect::LikeTwinAnswered,
+        "P3: UPDATE … FROM with a partitioned target",
     ),
-    site(
-        "DELETE FROM site_p USING site_parent WHERE site_p.asset_id = site_parent.id",
-        Expect::Refused,
-        "DELETE … USING with a partitioned target: phase 3",
+    in_block(
+        "DELETE FROM site_p USING site_parent WHERE site_p.asset_id = site_parent.id RETURNING site_p.asset_id",
+        Expect::LikeTwinAnswered,
+        "P3: DELETE … USING with a partitioned target",
     ),
     // A partitioned source writing the plain, shared site_parent: in a
     // rolled-back block, so the twin's run starts from the same rows.
