@@ -591,13 +591,33 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
 /// rounded from there.
 pub fn parse_decimal_rounded(text: &str, scale: u32) -> Option<i128> {
     let deeper = if scale + 1 == DECIMAL_SCALE { scale + 2 } else { scale + 1 };
-    let raw = parse_decimal_scaled(text, deeper)?;
+    let Some(raw) = parse_decimal_scaled(text, deeper) else {
+        // One place deeper does not fit an i128: a value of 38 digits, which
+        // a NUMERIC(38, s) holds. Refused here, the INSERT reported a
+        // precision overflow for 99999999999999999999999999999999999998.
+        // Read at the scale itself, exact when no digit past it is written
+        // (nothing to round); anything else is still refused.
+        return (!digits_past_scale(text, scale)).then(|| parse_decimal_scaled(text, scale)).flatten();
+    };
     let divisor = 10i128.pow(deeper - scale);
     let (quotient, remainder) = (raw / divisor, raw % divisor);
     if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
         quotient.checked_add(raw.signum())
     } else {
         Some(quotient)
+    }
+}
+
+/// Whether `text` writes a nonzero digit past `scale` places, or anything
+/// this cannot tell without parsing (an exponent).
+fn digits_past_scale(text: &str, scale: u32) -> bool {
+    let t = text.trim();
+    if t.contains(['e', 'E']) {
+        return true;
+    }
+    match t.split_once('.') {
+        Some((_, frac)) => frac.bytes().skip(scale as usize).any(|b| b != b'0'),
+        None => false,
     }
 }
 

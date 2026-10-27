@@ -3690,6 +3690,28 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 None => Value::Null,
             }
         }
+        // A NUMERIC(p, s) column cast to text is rendered from its stored
+        // integer at its own scale. Through the engine scale it lost every
+        // place past nine (a NUMERIC(20,12) 1.000000000001 printed
+        // 1.000000000000) and could not lift a value past ~1.7 × 10^29 at
+        // all (a NUMERIC(38,0) failed "out of range for arithmetic").
+        Expr::Cast(inner, DbType::STRING)
+            if matches!(inner.as_ref(), Expr::Column(f) if f.db_type == DbType::DECIMAL && f.scale.is_some()) =>
+        {
+            let Expr::Column(field) = inner.as_ref() else { unreachable!("matched above") };
+            let scale = field.scale.expect("matched above");
+            match column_value(field, row, schema) {
+                Value::Data { bytes, db_type: DbType::DECIMAL } if bytes.len() == 16 => Value::Data {
+                    bytes: crate::core::value_codec::format_decimal_scaled(
+                        i128::from_le_bytes(bytes.as_slice().try_into().expect("sixteen bytes")),
+                        scale,
+                    )
+                    .into_bytes(),
+                    db_type: DbType::STRING,
+                },
+                other => cast(to_engine_scale(other, field)?, &DbType::STRING)?,
+            }
+        }
         Expr::Cast(inner, target) => {
             let value = eval(inner, row, schema)?;
             // A NUMERIC rendered as text keeps the places PostgreSQL displays
