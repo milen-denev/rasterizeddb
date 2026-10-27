@@ -165,6 +165,10 @@ async fn two_renames_in_flight_cut_anywhere_leave_each_table_under_one_name() {
     let (a, b) = tokio::join!(exec(&db, "ALTER TABLE qa RENAME TO qa2"), exec(&db, "ALTER TABLE qb RENAME TO qb2"));
     a.unwrap();
     b.unwrap();
+    // Each point twice, once per rename: every armed cut was reached.
+    for g in &guards {
+        assert_eq!(g.fired(), 1, "a cut point was never reached");
+    }
     drop(guards);
     close(&dir, db);
     drop(rec);
@@ -174,7 +178,7 @@ async fn two_renames_in_flight_cut_anywhere_leave_each_table_under_one_name() {
         .drain(..)
         .filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok())
         .collect();
-    assert!(points.len() >= POINTS.len(), "too many cuts were disturbed: {}", points.len());
+    assert!(points.len() >= POINTS.len(), "too many cuts were disturbed: {} of {}", points.len(), 2 * POINTS.len());
     let img = base.path().join("image");
     let mut problems = Vec::new();
     for point in &points {

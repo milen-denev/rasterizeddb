@@ -2794,9 +2794,6 @@ mod tests {
         }
     }
 
-    /// A string header whose offset does not fit past the row's position is
-    /// a misread header, refused as one by both fetch paths, not an add that
-    /// overflows (a panic in debug builds, killing the filter backfill).
     /// A pointer whose position no column offset can be added to is a
     /// misread pointer, refused by both fetch paths before any add.
     ///
@@ -2819,6 +2816,9 @@ mod tests {
         assert!(pointer.fetch_row(Arc::new(io), &fetch).await.is_err());
     }
 
+    /// A string header whose offset does not fit past the row's position is
+    /// a misread header, refused as one by both fetch paths, not an add that
+    /// overflows (a panic in debug builds, killing the filter backfill).
     #[tokio::test]
     async fn a_string_header_offset_past_u64_is_an_error_not_an_overflow() {
         let position = 64u64;
