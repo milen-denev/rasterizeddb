@@ -142,13 +142,42 @@ async fn populated(dir: &Path, case: &Case) -> Arc<Database> {
     db
 }
 
-/// Runs `case` with its cuts armed and checks every image of every cut.
-/// Returns (images on the old side, on the new side).
-async fn run_case(case: &Case, seeds: u64) -> (usize, usize) {
+/// What one case's images came to: on the old side, on the new side, on a
+/// state between two of its statements, and the partitions that loaded
+/// their indexes from a persisted snapshot.
+#[derive(Default, Debug)]
+struct Outcomes {
+    old: usize,
+    new: usize,
+    between: usize,
+    loaded: usize,
+}
+
+/// Runs `case` with its cuts armed and checks every image of every cut,
+/// twice: rebuilding every index from rows (the default), and with
+/// `index_storage = snapshot`, loading the INDEX sections sealed before the
+/// change where the open's proof accepts them, so a persisted section that
+/// no longer matches its index would answer from stale entries.
+async fn run_case(case: &Case, seeds: u64) -> Outcomes {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
     let base = tempfile::tempdir().unwrap();
     let dir = base.path().join("db");
-    let db = populated(&dir, case).await;
-    let old = fingerprint(&db).await.unwrap();
+    // Sealed before the change, so every image holds a snapshot from then.
+    let _sealing = storage_override::set(&dir, IndexStorage::Snapshot);
+    {
+        let db = populated(&dir, case).await;
+        if let Some(pt) = db.partitioned_table("pt") {
+            let epoch = pt.epoch().unwrap();
+            for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap() {
+                settled(&part).await.unwrap();
+            }
+        }
+        let report = db.seal_for_shutdown(std::time::Duration::from_secs(60)).await;
+        assert!(report.skipped.is_empty(), "{}: the shutdown seal skipped {:?}", case.ddl, report.skipped);
+        close(&dir, db);
+    }
+    let db = open(&dir, "pddl_cut").await.unwrap();
+    let mut states = vec![fingerprint(&db).await.unwrap()];
 
     let rec = Recorder::start(&dir);
     let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
@@ -166,13 +195,18 @@ async fn run_case(case: &Case, seeds: u64) -> (usize, usize) {
         .iter()
         .map(|(site, nth)| failpoint::arm(site, &dir, *nth, rec.cut_action(format!("{site} #{nth}"), sink.clone())))
         .collect();
-    exec(&db, case.ddl).await.unwrap_or_else(|e| panic!("{}: {e}", case.ddl));
+    // A case may be several statements: an image may hold the state after
+    // any of them.
+    for sql in case.ddl.split("; ") {
+        exec(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        states.push(fingerprint(&db).await.unwrap());
+    }
     for (g, (point, nth)) in guards.iter().zip(case.points) {
         assert_eq!(g.fired(), 1, "{}: the cut point {point} #{nth} was never reached", case.ddl);
     }
     drop(guards);
     drop(optional);
-    let new = fingerprint(&db).await.unwrap();
+    let (old, new) = (states[0].clone(), states.last().unwrap().clone());
     assert_ne!(old, new, "{}: the change changed nothing a client sees", case.ddl);
     close(&dir, db);
     drop(rec);
@@ -184,58 +218,79 @@ async fn run_case(case: &Case, seeds: u64) -> (usize, usize) {
         .collect();
     assert!(points.len() >= case.points.len(), "{}: too many cuts were disturbed: {}", case.ddl, points.len());
     let img = base.path().join("image");
-    let (mut olds, mut news) = (0, 0);
+    let mut out = Outcomes::default();
     let mut problems = Vec::new();
-    for point in &points {
-        for seed in 0..seeds {
-            point.write_image(seed, &img);
-            let label = format!("{}: {} seed {seed}", case.ddl, point.label);
-            match open(&img, "pddl_cut").await {
-                Err(e) => problems.push(format!("{label}: does not open: {e}")),
-                Ok(db) => {
-                    match fingerprint(&db).await {
-                        Ok(got) if got == old => olds += 1,
-                        Ok(got) if got == new => news += 1,
-                        Ok(got) => problems.push(format!("{label}: neither the old table nor the new:\n  {got}\n  old {old}\n  new {new}")),
-                        Err(e) => {
-                            let mut files: Vec<String> = std::fs::read_dir(&img)
-                                .unwrap()
-                                .filter_map(|e| e.ok())
-                                .map(|e| format!("{}:{}", e.file_name().to_string_lossy(), e.metadata().map(|m| m.len()).unwrap_or(0)))
-                                .collect();
-                            files.sort();
-                            problems.push(format!("{label}: {e}\n  files {files:?}"))
+    for snapshot in [false, true] {
+        let _storage = snapshot.then(|| storage_override::set(&img, IndexStorage::Snapshot));
+        for point in &points {
+            for seed in 0..seeds {
+                point.write_image(seed, &img);
+                let label = format!(
+                    "{}: {} seed {seed}{}",
+                    case.ddl,
+                    point.label,
+                    if snapshot { " (index_storage = snapshot)" } else { "" }
+                );
+                match open(&img, "pddl_cut").await {
+                    Err(e) => problems.push(format!("{label}: does not open: {e}")),
+                    Ok(db) => {
+                        match fingerprint(&db).await {
+                            Ok(got) if got == old => out.old += 1,
+                            Ok(got) if got == new => out.new += 1,
+                            Ok(got) if states.contains(&got) => out.between += 1,
+                            Ok(got) => problems.push(format!(
+                                "{label}: neither the old table nor the new:\n  {got}\n  old {old}\n  new {new}"
+                            )),
+                            Err(e) => {
+                                let mut files: Vec<String> = std::fs::read_dir(&img)
+                                    .unwrap()
+                                    .filter_map(|e| e.ok())
+                                    .map(|e| format!("{}:{}", e.file_name().to_string_lossy(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+                                    .collect();
+                                files.sort();
+                                problems.push(format!("{label}: {e}\n  files {files:?}"))
+                            }
                         }
+                        if snapshot && let Some(pt) = ["pt", "pt2"].iter().find_map(|n| db.partitioned_table(n)) {
+                            if let Ok(epoch) = pt.epoch() {
+                                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap_or_default() {
+                                    out.loaded += (part.index_origin() == Origin::Loaded) as usize;
+                                }
+                            }
+                        }
+                        let leftover: Vec<_> = std::fs::read_dir(&img)
+                            .unwrap()
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .filter(|n| n.starts_with("__rewrite_"))
+                            .collect();
+                        // A backup copied before its intent was durable belongs
+                        // to nobody and is discarded by the table's next backup,
+                        // as a plain table's is; an intent must be gone.
+                        if !leftover.is_empty() {
+                            problems.push(format!("{label}: intents left after the open: {leftover:?}"));
+                        }
+                        close(&img, db);
                     }
-                    let leftover: Vec<_> = std::fs::read_dir(&img)
-                        .unwrap()
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .filter(|n| n.starts_with("__rewrite_"))
-                        .collect();
-                    // A backup copied before its intent was durable belongs
-                    // to nobody and is discarded by the table's next backup,
-                    // as a plain table's is; an intent must be gone.
-                    if !leftover.is_empty() {
-                        problems.push(format!("{label}: intents left after the open: {leftover:?}"));
-                    }
-                    close(&img, db);
                 }
+                let _ = std::fs::remove_dir_all(&img);
             }
-            let _ = std::fs::remove_dir_all(&img);
         }
     }
     assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
-    (olds, news)
+    out
 }
 
 /// Every metadata DDL kind cut at each of its steps: each image opens with
 /// every partition and holds the old table or the new one, alike in every
 /// partition.
 ///
-/// Mutation: recovery skips the schema intents (`recover_interrupted_rewrites`
+/// Mutations: recovery skips the schema intents (`recover_interrupted_rewrites`
 /// returns at once): an atomic change cut after its work opens with the
-/// sidecars half written, which is neither table.
+/// sidecars half written, which is neither table; an index build skipping
+/// rows (the index-contents check); the snapshot identity unchanged by the
+/// index swap (its images, with `index_storage = snapshot`, load the
+/// dropped index's sections for the new one, and its answers are stale).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
     let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
@@ -250,6 +305,15 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
     let cases = [
         case("CREATE INDEX pt_v ON pt (v)", &REOPENS),
         case("CREATE INDEX pt_s ON pt USING hash (s)", &REOPENS),
+        // An index swapped for another, the count kept: only the snapshot
+        // identity's shape tells the sealed sections from the new index's.
+        Case {
+            prep: &["CREATE INDEX pt_ix ON pt (v)"],
+            ..case(
+                "DROP INDEX pt_ix; CREATE INDEX pt_iy ON pt (s)",
+                &[("test.pddl.after_work", 1), ("test.pddl.before_work", 2), ("test.pddl.after_work", 2)],
+            )
+        },
         Case { prep: &["CREATE INDEX pt_v ON pt (v)"], ..case("DROP INDEX pt_v", &REOPENS) },
         case("ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)", &REOPENS),
         Case {
@@ -279,12 +343,15 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
             ],
         ),
     ];
-    let mut total = (0, 0);
+    let mut total = Outcomes::default();
     for case in &cases {
-        let (o, n) = run_case(case, seeds).await;
-        eprintln!("{}: {o} old images, {n} new images", case.ddl);
-        total.0 += o;
-        total.1 += n;
+        let o = run_case(case, seeds).await;
+        eprintln!("{}: {o:?}", case.ddl);
+        total.old += o.old;
+        total.new += o.new;
+        total.between += o.between;
+        total.loaded += o.loaded;
     }
-    assert!(total.0 > 0 && total.1 > 0, "every image fell on one side ({total:?}); the cuts test nothing");
+    assert!(total.old > 0 && total.new > 0, "every image fell on one side ({total:?}); the cuts test nothing");
+    assert!(total.loaded > 0, "no image loaded a persisted index: the snapshot pass compared nothing ({total:?})");
 }
