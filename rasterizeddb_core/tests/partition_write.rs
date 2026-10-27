@@ -174,8 +174,9 @@ fn blocks_commit_or_roll_back_every_partition_together() {
 }
 
 /// The refusals, each before anything is written, with its SQLSTATE: a key
-/// change (phase 6), UPDATE … FROM and DELETE … USING (phase 3). Assigning a
-/// key the value its WHERE pins is not a change. (RETURNING is built since
+/// change (phase 6). Assigning a key the value its WHERE pins is not a
+/// change. UPDATE … FROM and DELETE … USING with a partitioned target, refused
+/// until phase 3 P3, write what the twin's write. (RETURNING is built since
 /// S17: `partition_returning.rs`.)
 #[test]
 fn refused_writes_change_nothing() {
@@ -190,8 +191,6 @@ fn refused_writes_change_nothing() {
         "UPDATE rp SET tenant_id = 99 WHERE tenant_id = 1",
         "UPDATE rp SET tenant_id = 2 WHERE n > 10",
         "UPDATE rp SET tenant_id = tenant_id + 1 WHERE tenant_id = 1",
-        "UPDATE rp SET n = 1 FROM rdim WHERE rp.tenant_id = rdim.tenant_id",
-        "DELETE FROM rp USING rdim WHERE rp.tenant_id = rdim.tenant_id",
     ] {
         let e = c.simple(sql).expect_err(sql);
         assert_eq!(e.code, "0A000", "{sql}: {e}");
@@ -203,6 +202,15 @@ fn refused_writes_change_nothing() {
         assert_eq!(r.tags, vec!["UPDATE 3".to_string()], "{t}");
     }
     same_rows(&mut c, "rp", "rq", "a same-value key assignment");
+    for sql in [
+        "UPDATE {t} SET n = 1 FROM rdim WHERE {t}.tenant_id = rdim.tenant_id",
+        "DELETE FROM {t} USING rdim WHERE {t}.tenant_id = rdim.tenant_id",
+    ] {
+        let tags: Vec<Vec<String>> = ["rp", "rq"].iter().map(|t| c.ok(&sql.replace("{t}", t)).tags).collect();
+        assert_eq!(tags[0], tags[1], "{sql}");
+        assert_ne!(tags[0], vec![format!("{} 0", &sql[..6])], "{sql}: matched nothing, so compared nothing");
+        same_rows(&mut c, "rp", "rq", sql);
+    }
     drop(c);
     drop(server);
 }

@@ -389,14 +389,14 @@ async fn a_left_join_null_extends_and_keeps_null_companions() {
 ///   (debit tenant read first, credit after): the rows matched are those of
 ///   one snapshot, so exactly the credit tenant matches `bal = OPENING + k`.
 ///
-/// Then a partitioned target is refused with 0A000 before anything is
-/// written, `UPDATE … FROM` and `DELETE … USING` both.
+/// Then a partitioned target, `UPDATE … FROM` and `DELETE … USING` both,
+/// is written like the plain twin given the same rows (phase 3 P3; it was
+/// refused with 0A000 until then).
 ///
-/// Mutations: a snapshot per partition (`FanOut::each`): the update matches
-/// no row (the credit seen one transfer late). Drop the partitioned-target
-/// refusal in `execute_update_from`: the refused case writes.
+/// Mutation: a snapshot per partition (`FanOut::each`): the update matches
+/// no row (the credit seen one transfer late).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partitioned_source_updates_and_deletes_like_the_twin_and_a_partitioned_target_is_refused() {
+async fn a_partitioned_source_or_target_updates_and_deletes_like_the_twin() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "join_upd").await;
     accounts(&db, "acct", 7).await;
@@ -489,21 +489,40 @@ async fn a_partitioned_source_updates_and_deletes_like_the_twin_and_a_partitione
     }
     test_hooks::set_after_first(pt.uid(), None);
 
-    // A partitioned target: refused before anything is written.
-    let acct_before = table(&db, "SELECT tenant_id, bal, lim FROM acct").await;
-    let own_before = table(&db, "SELECT tenant_id, name, hits FROM own_p").await;
-    for sql in [
-        "UPDATE acct SET bal = 0 FROM own_p o WHERE acct.tenant_id = o.tenant_id",
-        "UPDATE acct SET bal = 0 FROM acct_q q WHERE acct.tenant_id = q.tenant_id RETURNING acct.tenant_id",
-        "DELETE FROM acct USING own_p o WHERE acct.tenant_id = o.tenant_id",
-        "DELETE FROM acct USING acct_q q WHERE acct.tenant_id = q.tenant_id AND q.bal > 0",
+    // A partitioned target (phase 3 P3): written back by its key, routed per
+    // row, like the plain twin given the same rows.
+    exec_ok(&db, "DELETE FROM acct_q").await;
+    exec_ok(&db, "INSERT INTO acct_q (tenant_id, bal, lim) SELECT tenant_id, bal, lim FROM acct").await;
+    let own_before = table(&db, "SELECT tenant_id, name, hits FROM own_q").await;
+    let sorted = |out: &[u8]| -> (u8, Vec<Vec<Cell>>, Vec<u8>) {
+        match out.first() {
+            Some(2) => {
+                let mut got = cells(&crate::core::row::row::vec_into_rows(&out[1..]).unwrap());
+                got.sort();
+                (2, got, Vec::new())
+            }
+            Some(&tag) => (tag, Vec::new(), out[1..].to_vec()),
+            None => (255, Vec::new(), Vec::new()),
+        }
+    };
+    for (sql, tag) in [
+        ("UPDATE {a} SET bal = {a}.bal + 1 FROM own_q o WHERE {a}.tenant_id = o.tenant_id", 0u8),
+        ("UPDATE {a} SET lim = 0 FROM own_q o WHERE {a}.tenant_id = o.tenant_id AND o.tenant_id < 5 RETURNING {a}.tenant_id, {a}.lim", 2),
+        ("DELETE FROM {a} USING own_q o WHERE {a}.tenant_id = o.tenant_id AND o.tenant_id > 10", 0),
+        ("DELETE FROM {a} USING own_q o WHERE {a}.tenant_id = o.tenant_id AND o.tenant_id = 2 RETURNING {a}.tenant_id, {a}.bal", 2),
     ] {
-        let out = exec(&db, sql).await;
-        assert_eq!(out.first(), Some(&3u8), "`{sql}` was not refused: {:?}", &out[..out.len().min(16)]);
-        let text = String::from_utf8_lossy(&out[1..]).to_string();
-        assert!(text.contains("not supported"), "`{sql}`: {text}");
-        assert_eq!(table(&db, "SELECT tenant_id, bal, lim FROM acct").await, acct_before, "`{sql}` wrote the target");
-        assert_eq!(table(&db, "SELECT tenant_id, name, hits FROM own_p").await, own_before, "`{sql}` wrote elsewhere");
+        let p = exec(&db, &sql.replace("{a}", "acct")).await;
+        let q = exec(&db, &sql.replace("{a}", "acct_q")).await;
+        assert_eq!(p.first(), Some(&tag), "`{sql}`: {}", String::from_utf8_lossy(&p));
+        assert_eq!(sorted(&p), sorted(&q), "`{sql}`: the partitioned target answered unlike the twin");
+        let (mut sp, mut sq) = (
+            table(&db, "SELECT tenant_id, bal, lim FROM acct").await,
+            table(&db, "SELECT tenant_id, bal, lim FROM acct_q").await,
+        );
+        sp.sort();
+        sq.sort();
+        assert_eq!(sp, sq, "`{sql}`: the targets hold different rows");
+        assert_eq!(table(&db, "SELECT tenant_id, name, hits FROM own_q").await, own_before, "`{sql}` wrote the source");
     }
     drop(pt);
     close(db, dir.path());
