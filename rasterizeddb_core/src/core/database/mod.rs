@@ -4247,6 +4247,7 @@ async fn tombstone_catalogue_row(
     Ok(false)
 }
 
+#[cfg(test)]
 async fn catalogue_has_row(
     io_pointers: &Arc<DbStorageProvider>,
     io_rows: &Arc<DbStorageProvider>,
