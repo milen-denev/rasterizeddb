@@ -857,6 +857,23 @@ fn read_stamps(buffer: &[u8]) -> (TxId, TxId) {
 }
 
 impl RowPointer {
+    /// Refuses a row position no column offset can be added to without
+    /// overflowing. A column's offset is a `u32`, so below this bound
+    /// `position + column_offset` cannot wrap; the position comes from a
+    /// pointer record whose checksum is not verified on read, so it is input
+    /// like a string header's offset (`string_position`). One compare per
+    /// fetch rather than one checked add per column.
+    #[inline]
+    fn check_column_range(&self) -> std::io::Result<()> {
+        if unlikely(self.position > u64::MAX - u32::MAX as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid row position {} (likely a misread pointer)", self.position),
+            ));
+        }
+        Ok(())
+    }
+
     /// Gets the current timestamp in milliseconds since UNIX epoch
     pub fn get_timestamp() -> u128 {
         // Get the current timestamp in milliseconds
@@ -1886,6 +1903,9 @@ impl RowPointer {
                 "Row is marked as deleted".into(),
             ));
         }
+        if let Err(e) = self.check_column_range() {
+            return Err(super::error::RowError::InvalidData(e.to_string()));
+        }
 
         // Create a vector to hold all the columns
         let mut columns: crate::core::row::row::RowColumns =
@@ -2022,6 +2042,7 @@ impl RowPointer {
         if unlikely(self.deleted) {
             return Err(std::io::Error::other("row is marked as deleted"));
         }
+        self.check_column_range()?;
 
         let columns = &mut row_reuse.columns;
 
@@ -2776,6 +2797,28 @@ mod tests {
     /// A string header whose offset does not fit past the row's position is
     /// a misread header, refused as one by both fetch paths, not an add that
     /// overflows (a panic in debug builds, killing the filter backfill).
+    /// A pointer whose position no column offset can be added to is a
+    /// misread pointer, refused by both fetch paths before any add.
+    ///
+    /// Mutation: `check_column_range` always `Ok` panics on the add.
+    #[tokio::test]
+    async fn a_row_position_past_u64_is_an_error_not_an_overflow() {
+        let io = InMemoryIo { data: std::sync::Arc::new(vec![0u8; 64]), declared_len: None };
+        let pointer = create_test_row_pointer(1, u64::MAX - 4, 16, false);
+        let fetch = RowFetch {
+            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+                column_offset: 8,
+                column_type: DbType::I64,
+                size: 8,
+                schema_id: 0,
+            }],
+        };
+        let mut row = Row::default();
+        let reused = pointer.fetch_row_reuse_async(&io, &fetch, &mut row).await;
+        assert_eq!(reused.err().map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        assert!(pointer.fetch_row(Arc::new(io), &fetch).await.is_err());
+    }
+
     #[tokio::test]
     async fn a_string_header_offset_past_u64_is_an_error_not_an_overflow() {
         let position = 64u64;
