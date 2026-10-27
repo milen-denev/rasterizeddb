@@ -128,3 +128,91 @@ async fn a_rename_cut_anywhere_leaves_the_table_under_one_name() {
     assert!(old > 0 && new > 0, "every image fell on one side (old {old}, new {new}); the cuts test nothing");
     eprintln!("rename cut: {} points, {old} old images, {new} new images", points.len());
 }
+
+/// Two renames issued at once, cut at each of either's points: one intent
+/// file serves both, so they run one after the other, and each image holds
+/// each table under exactly one of its names, every row kept, no intent and
+/// no copy left. Unserialised, a cut could find one rename's copy beside the
+/// other's intent, which recovery cannot see and so never discards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_renames_in_flight_cut_anywhere_leave_each_table_under_one_name() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "rename_pair").await.unwrap();
+    let mut want = Vec::new();
+    for t in ["qa", "qb"] {
+        exec(&db, &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, s TEXT)")).await.unwrap();
+        let values: Vec<String> = (0..20).map(|i| format!("({i}, '{t}{i}')")).collect();
+        exec(&db, &format!("INSERT INTO {t} (id, s) VALUES {}", values.join(", "))).await.unwrap();
+        want.push(rows(&db, &format!("SELECT id, s FROM {t}")).await.unwrap());
+    }
+    db.sync_durable().unwrap();
+
+    let rec = Recorder::start(&dir);
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let mut guards = Vec::new();
+    for point in POINTS {
+        for nth in [1u64, 2] {
+            let (rec, sink, label) = (rec.clone(), sink.clone(), format!("{point} #{nth}"));
+            let action: failpoint::Action = StdArc::new(move |_hit| {
+                sink.lock().push(rec.cut_quiescent(label.clone()));
+                failpoint::Outcome::Continue
+            });
+            guards.push(failpoint::arm(point, &dir, nth, action));
+        }
+    }
+    let (a, b) = tokio::join!(exec(&db, "ALTER TABLE qa RENAME TO qa2"), exec(&db, "ALTER TABLE qb RENAME TO qb2"));
+    a.unwrap();
+    b.unwrap();
+    drop(guards);
+    close(&dir, db);
+    drop(rec);
+
+    let points: Vec<CrashPoint> = sink
+        .lock()
+        .drain(..)
+        .filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok())
+        .collect();
+    assert!(points.len() >= POINTS.len(), "too many cuts were disturbed: {}", points.len());
+    let img = base.path().join("image");
+    let mut problems = Vec::new();
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img);
+            let label = format!("{} seed {seed}", point.label);
+            match open(&img, "rename_pair").await {
+                Err(e) => problems.push(format!("{label}: does not open: {e}")),
+                Ok(db) => {
+                    let intents = names_in(&img, "__rename.");
+                    if !intents.is_empty() {
+                        problems.push(format!("{label}: intents left after the open: {intents:?}"));
+                    }
+                    for (t, want) in ["qa", "qb"].iter().zip(&want) {
+                        let moved = format!("{t}2");
+                        let under_old = rows(&db, &format!("SELECT id, s FROM {t}")).await;
+                        let under_new = rows(&db, &format!("SELECT id, s FROM {moved}")).await;
+                        match (&under_old, &under_new) {
+                            (Ok(got), Err(_)) if got == want => {
+                                let copy = names_in(&img, &moved);
+                                if !copy.is_empty() {
+                                    problems.push(format!("{label}: {t}'s abandoned copy was kept: {copy:?}"));
+                                }
+                            }
+                            (Err(_), Ok(got)) if got == want => {}
+                            _ => problems.push(format!(
+                                "{label}: {t} is not one table with its rows (old {:?}, new {:?})",
+                                under_old.as_ref().map(|r| r.len()),
+                                under_new.as_ref().map(|r| r.len())
+                            )),
+                        }
+                    }
+                    close(&img, db);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    eprintln!("rename pair cut: {} points", points.len());
+}

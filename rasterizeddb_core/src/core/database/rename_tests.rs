@@ -634,3 +634,148 @@ fn no_prefix_of_an_intent_parses() {
     assert_eq!(super::parse_intent(&super::encode_intent("t", "")), None);
     assert_eq!(super::parse_intent(&super::encode_intent("t", "t")), None);
 }
+
+// ---------------------------------------------------------------------------
+// One intent at a time
+// ---------------------------------------------------------------------------
+
+/// Eight sessions renaming their own tables back and forth at once. There is
+/// one `__rename.intent` and one `__rename.partial`: unserialised, one
+/// rename installed another's bytes or deleted its live intent, and one
+/// failed with "No such file or directory".
+///
+/// Mutation: `rename_serial` not taken fails a rename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renames_each_finish() {
+    const SESSIONS: usize = 8;
+    const ROUNDS: usize = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_db(dir.path()).await);
+    for i in 0..SESSIONS {
+        create(&db, &format!("ra{i}")).await;
+        insert_id(&db, &format!("ra{i}"), i as i32).await;
+    }
+    let mut tasks = Vec::new();
+    for i in 0..SESSIONS {
+        let db = db.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                let (from, to) = if round % 2 == 0 { ("ra", "rb") } else { ("rb", "ra") };
+                db.rename_table(&format!("{from}{i}"), &format!("{to}{i}"))
+                    .await
+                    .map_err(|e| format!("could not rename {from}{i} to {to}{i} (round {round}): {e}"))?;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+    let mut failures = Vec::new();
+    for t in tasks {
+        if let Err(e) = t.await.unwrap() {
+            failures.push(e);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    for i in 0..SESSIONS {
+        assert_eq!(read_ids(&db, &format!("ra{i}")).await, vec![i as i32]);
+    }
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new(), "an intent outlived every rename");
+}
+
+/// The intent on disk while a rename is past its copy is that rename's, with
+/// a second rename started meanwhile: it waits for the first to finish
+/// rather than writing its own over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_rename_waits_for_the_first_intent() {
+    use crate::core::power_loss::failpoint;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_db(dir.path()).await);
+    create(&db, "first").await;
+    create(&db, "second").await;
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(None::<String>));
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let parked_tx = parking_lot::Mutex::new(parked_tx);
+    let intent = dir.path().join(super::RENAME_INTENT_FILE);
+    let action: failpoint::Action = {
+        let seen = seen.clone();
+        std::sync::Arc::new(move |_hit| {
+            let _ = parked_tx.lock().send(());
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            *seen.lock() = std::fs::read_to_string(&intent).ok();
+            failpoint::Outcome::Continue
+        })
+    };
+    let guard = failpoint::arm("test.rename.after_copy", dir.path(), 1, action);
+    let first = tokio::spawn({
+        let db = db.clone();
+        async move { db.rename_table("first", "first_moved").await }
+    });
+    tokio::task::spawn_blocking(move || parked_rx.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the first rename never reached its copy");
+    let second = db.rename_table("second", "second_moved").await;
+    first.await.unwrap().expect("first rename");
+    second.expect("second rename");
+    assert_eq!(guard.fired(), 1);
+    drop(guard);
+    assert_eq!(
+        seen.lock().as_deref().and_then(super::parse_intent),
+        Some(("first".to_string(), "first_moved".to_string())),
+        "the first rename's intent was replaced while it ran"
+    );
+    assert!(db.has_table("first_moved") && db.has_table("second_moved"));
+}
+
+/// An intent whose deletion fails outlives the rename, so both names are
+/// held until the next open finishes it: a table created under the old name
+/// meanwhile would be what that open tombstones.
+///
+/// Mutation: the rename not holding the names lets the CREATE through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rename_whose_intent_stays_holds_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path()).await;
+    create(&db, "kept").await;
+    super::test_hooks::FAIL_INTENT_CLEAR.with(|f| f.set(true));
+    db.rename_table("kept", "kept2").await.expect("the rename itself succeeds");
+    assert!(!super::test_hooks::FAIL_INTENT_CLEAR.with(|f| f.get()), "the intent was never cleared");
+    assert_eq!(intent_files(dir.path()), vec!["__rename.intent".to_string()]);
+    let create_old = CreateTable {
+        table_name: "kept".to_string(),
+        columns: vec![CreateColumnData { name: "id".to_string(), data_type: DbType::I32 }],
+        unique_columns: Vec::new(),
+        foreign_keys: Vec::new(),
+        defaults: Vec::new(),
+        json_columns: Vec::new(),
+        unique_keys: Vec::new(),
+        type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
+        primary_key: None,
+        if_not_exists: false,
+        is_immutable: false,
+    };
+    assert!(db.add_table(create_old).await.is_err(), "a table was created under a name the kept intent names");
+    // The next open finishes the rename and frees the name.
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    let db = open_db(dir.path()).await;
+    assert!(db.has_table("kept2") && !db.has_table("kept"));
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new());
+}
+
+/// The intent holds one name per line: a name with a line break is refused
+/// before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_intent_refuses_control_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path()).await;
+    create(&db, "plain").await;
+    for bad in ["plain\nplain2", "tab\there", "cr\r"] {
+        let e = db.record_rename_intent("plain", bad).await.expect_err(bad);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {e}");
+        assert!(db.rename_table("plain", bad).await.is_err(), "{bad:?}");
+    }
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new());
+    assert!(db.has_table("plain"));
+}

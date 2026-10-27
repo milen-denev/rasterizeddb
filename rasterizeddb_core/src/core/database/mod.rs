@@ -65,6 +65,8 @@ pub(crate) mod test_hooks {
         /// a device error would, without poisoning the shared log: the error
         /// paths of every committer that syncs those logs before committing.
         pub static FAIL_POOL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next deletion of the rename intent on this thread.
+        pub static FAIL_INTENT_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     type Park = (String, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
@@ -1191,6 +1193,13 @@ pub struct Database {
     /// would overwrite the intent that finishes the job).
     held_names: parking_lot::Mutex<Vec<String>>,
 
+    /// Held by a plain rename from its check of `held_names` to its last word
+    /// on the intent: there is one `__rename.intent` (and one
+    /// `__rename.partial`) per database, so two renames at once synced and
+    /// installed each other's bytes, cleared each other's live intent, and
+    /// one failed with "No such file or directory".
+    rename_serial: tokio::sync::Mutex<()>,
+
     /// The Redis-compatible key/value store (`KV …` statements and the RESP
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
@@ -1550,6 +1559,7 @@ impl Database {
             kv: kv_stores,
             seeds,
             held_names: parking_lot::Mutex::new(held.into_iter().collect()),
+            rename_serial: tokio::sync::Mutex::new(()),
             #[cfg(feature = "kv_cache")]
             kv_cache: {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
@@ -2362,6 +2372,10 @@ impl Database {
             ));
         }
         self.refuse_held_name(new_name)?;
+        // One rename's intent at a time (`rename_serial`), taken before the
+        // check below, which a concurrent rename's failure could otherwise
+        // change between it and this rename's intent.
+        let _serial = self.rename_serial.lock().await;
         // A rename whose old files are kept still has its intent on disk, and
         // the next open finishes it from there; a new intent would replace it.
         if let Some(held) = self.held_names.lock().first() {
@@ -2530,7 +2544,12 @@ impl Database {
             // send the sweep above to the wrong directory.
             self.rename_point("after_discard");
             pool_forget(&self.storage, old_name);
-            self.clear_rename_intent().await;
+            if !self.clear_rename_intent().await {
+                // The intent outlives the rename: until the next open
+                // finishes it, neither name may be taken, or a table created
+                // under the old one would be what that open tombstones.
+                self.hold_intent(old_name, new_name);
+            }
             self.rename_point("after_clear");
         } else {
             // The intent stays, and the placement with it, so the next open
@@ -2566,7 +2585,9 @@ impl Database {
     async fn abandon_copy(&self, old_name: &str, new_name: &str) {
         if self.discard_table_files(new_name).await {
             pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
+            if !self.clear_rename_intent().await {
+                self.hold_intent(old_name, new_name);
+            }
         } else {
             self.hold_intent(old_name, new_name);
         }
@@ -3466,6 +3487,14 @@ impl Database {
                 format!("no rename intent for {old_name:?} to {new_name:?}: it names no rename"),
             ));
         }
+        // The intent is one name per line: a name holding a line break (or
+        // any control character) would be read back as another rename.
+        if old_name.chars().chain(new_name.chars()).any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("table names may not hold control characters: {old_name:?} to {new_name:?}"),
+            ));
+        }
         // Written whole: a temporary file, synced, renamed over the intent,
         // and the directory synced (`rewrite::write_intent`). It was once a
         // logged file truncated and appended in place, so a power cut could
@@ -3479,7 +3508,8 @@ impl Database {
         rewrite::write_intent(&path, &encode_intent(old_name, new_name))
     }
 
-    async fn clear_rename_intent(&self) {
+    /// Whether the intent is gone (or there was none).
+    async fn clear_rename_intent(&self) -> bool {
         clear_intent(&self.db_io_pointers).await
     }
 
@@ -3946,9 +3976,9 @@ async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
 /// back. Callers clear it only once whatever the intent protected is durable,
 /// which the barrier's own sync also covers for everything this log holds
 /// before it.
-async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
+async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) -> bool {
     let Some(path) = rename_intent_path(io_pointers) else {
-        return;
+        return true;
     };
     let dir = io_pointers.get_location();
     let wal = dir.as_deref().and_then(crate::core::wal::wal_for);
@@ -3969,7 +3999,9 @@ async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
     // created under the old name since.
     if let Err(e) = remove_rename_intent(&path) {
         error!("Could not delete the rename intent {}: {}", path.display(), e);
+        return false;
     }
+    true
 }
 
 /// Where the rename intent lives: the catalogue's directory. `None` in
@@ -3982,6 +4014,10 @@ fn rename_intent_path(io_pointers: &Arc<DbStorageProvider>) -> Option<std::path:
 
 /// Deletes `path`, durably: unlinked, then its directory synced.
 fn remove_rename_intent(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    if test_hooks::FAIL_INTENT_CLEAR.with(|f| f.replace(false)) {
+        return Err(io::Error::other("injected intent deletion failure"));
+    }
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
     match std::fs::remove_file(path) {
@@ -4153,7 +4189,13 @@ async fn recover_interrupted_rename(
                 // created under the name inherits it (`place` keeps a
                 // recorded one).
                 pool_forget(pool, old_name);
-                clear_intent(io_pointers).await;
+                if !clear_intent(io_pointers).await {
+                    return held();
+                }
+            } else {
+                // Kept, and the names with it, so the next open tries again
+                // and nothing is created under either meanwhile.
+                return held();
             }
         }
         (false, true) => {
@@ -4169,7 +4211,9 @@ async fn recover_interrupted_rename(
                 return held();
             }
             pool_forget(pool, old_name);
-            clear_intent(io_pointers).await;
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
         // Never committed: the catalogue still names only the original, so
         // the copy is incomplete and belongs to nobody.
@@ -4191,7 +4235,9 @@ async fn recover_interrupted_rename(
             // The placement the rename pinned for the copy, as `abandon_copy`
             // forgets it.
             pool_forget(pool, new_name);
-            clear_intent(io_pointers).await;
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
         // Neither: nothing to reconcile against, so the safest act is none.
         // Leaving both file sets costs space; deleting the wrong one costs
@@ -4202,7 +4248,9 @@ async fn recover_interrupted_rename(
                  leaving both file sets in place",
                 old_name, new_name
             );
-            clear_intent(io_pointers).await;
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
     }
     Vec::new()
