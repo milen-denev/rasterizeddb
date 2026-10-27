@@ -226,11 +226,20 @@ now on `tx`'s behalf, under ACCESS SHARE on the table's **logical** name
   probe, `ADD`'s validation, `ON UPDATE`'s "is the old key still held"):
   on a partitioned parent the probe is `k = v` or `k IN (…)` in chunks of
   at most `POINT_CAP` (256) values, so it routes to the partition of each
-  value. Before reading, the column must be the whole partition key and
-  the route must be points (`Route::Points` or `Zero`); otherwise the check
-  is refused with "cannot be checked … not supported", never read in every
-  partition and never skipped. Only a record written behind the DDL could
-  get there (`fk_partition_tests::a_check_that_cannot_route_is_refused_never_skipped`).
+  value. Before reading, the column must be the whole partition key, or the
+  check is refused with "cannot be checked … not supported", never read in
+  every partition and never skipped; only a record written behind the DDL
+  could get there (`fk_partition_tests::a_check_that_cannot_route_is_refused_never_skipped`).
+  Where `route_where` reads no key point in the predicate (a signed number:
+  `k = -7` routes everywhere, §4.1's "signed literal" limit), each value is
+  routed by its own key bytes instead (`parent_key_ranges`: an integer at
+  the column's width, a string with its doubled quotes undone, any other
+  type as `encode_literal` reads it, then `keyed_range`), and only those
+  partitions are read (`RowSource::partitioned_in`), the probe's predicate
+  still applied in each; a value that does not encode is refused. The twin
+  found this at 0x5eedf1a1 with 1,500 statements: the first build refused
+  every child of a negative tenant
+  (`fk_partition_tests::a_key_the_router_cannot_read_still_routes_by_its_bytes`).
 - *The child side* (`KeySide::Child`: a parent `DELETE`'s or `UPDATE`'s
   "does any child reference these keys", before and after its action): the
   child's fan-out, routed when the key column is the child's partition key,
@@ -382,6 +391,8 @@ its test failed by assertion, the file restored byte-exact and compared;
 | `CASCADE` keeps the dependent keys | `drop_dependent_foreign_keys` | the same |
 | 42830 not mapped | `pgwire::sqlstate_for` | `partition_fk::a_partitioned_parent_is_referenced_…` |
 | 2BP01 not mapped | `pgwire::sqlstate_for` | `partition_fk::dropping_a_referenced_parent_…` |
+| a key the router reads no point in (`k = -7`) refused | `parent_key_ranges` | `fk_partition_tests::a_key_the_router_cannot_read_still_routes_by_its_bytes` |
+| that key probed in every partition | `referenced_values_now` | the same (a negative key read more than its partition) |
 | FK children's schema files held aside by their logical names | `reload_atomic_with` | `fk_partition_tests::a_failed_parent_column_rename_puts_a_partitioned_childs_key_back` |
 
 Not pinned: the statement snapshot handed to every partition's write

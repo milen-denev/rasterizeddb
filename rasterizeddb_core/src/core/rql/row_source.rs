@@ -128,6 +128,33 @@ impl RowSource {
         Ok(RowSource::Partitioned(Box::new(FanOut::plan_with(table, where_clause, visibility)?)))
     }
 
+    /// A partitioned table's source over the partitions owning `ranges`
+    /// (each a key's point range, `PartitionedTable::keyed_range`), read
+    /// under `visibility`, a snapshot the caller took first (§4.4's order:
+    /// the snapshot, then the epoch, then the partitions). For a foreign-key
+    /// probe of a partitioned parent whose `WHERE` the router cannot read as
+    /// key points (`k = -7`: a signed number is no point to `route_where`,
+    /// which then routes everywhere): the probe still reads only the
+    /// partitions of its keys (phase 3 P4). Every partition is scanned with
+    /// the probe's own predicate, so a range only narrows what is read.
+    pub(crate) fn partitioned_in(
+        table: Arc<PartitionedTable>,
+        ranges: &[crate::core::partition::PointRange],
+        visibility: Visibility,
+    ) -> io::Result<Self> {
+        table.check()?;
+        let epoch = table.epoch()?;
+        let mut by_pid: std::collections::BTreeMap<u32, Arc<PartTable>> = std::collections::BTreeMap::new();
+        for range in ranges {
+            for (pid, part) in table.materialized_in(&epoch, *range)? {
+                by_pid.insert(pid, part);
+            }
+        }
+        let parts: Parts = by_pid.into_iter().collect();
+        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+        Ok(RowSource::Partitioned(Box::new(FanOut { table, visibility, _epoch: epoch, parts, cache })))
+    }
+
     /// The relation this source reads, for a locking read that scans it again
     /// at a fresh snapshot (`execute_query_rows`, phase 3 P3).
     pub(crate) fn rescan_relation(&self) -> Relation {

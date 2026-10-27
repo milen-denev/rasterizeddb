@@ -268,3 +268,46 @@ async fn a_failed_parent_column_rename_puts_a_partitioned_childs_key_back() {
     assert!(e.contains("violates foreign key constraint"), "{e}");
     run_ok(&db, "INSERT INTO rn_c (cid, pid) VALUES (3, 2)").await;
 }
+
+/// A key the router reads no point in: `k = -7` (a signed number is no key
+/// point to `route_where`, which then routes everywhere), and a text key
+/// holding a quote. The check routes each value by its key bytes instead,
+/// as an INSERT of it does: one partition per key, the key found, a
+/// missing one refused, never read in every partition. The twin found the
+/// negative case at 0x5eedf1a1: such a parent's children were refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_the_router_cannot_read_still_routes_by_its_bytes() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    run_ok(&db, "CREATE TABLE ng_p (id BIGINT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 16").await;
+    let parents: Vec<String> = (-40..=40).filter(|i| *i != 0).map(|i| format!("({i})")).collect();
+    run_ok(&db, &format!("INSERT INTO ng_p (id) VALUES {}", parents.join(", "))).await;
+    run_ok(&db, "CREATE TABLE ng_c (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES ng_p (id))").await;
+    let materialized = distinct(&reads_of(&db, "ng_p", "SELECT count(*) FROM ng_p").await.1);
+    let (out, reads) = reads_of(&db, "ng_p", "INSERT INTO ng_c (cid, pid) VALUES (1, -7)").await;
+    ok(out, "a negative parent key");
+    assert_eq!(distinct(&reads).len(), 1, "the key's one partition: {reads:?}");
+    let (out, reads) = reads_of(&db, "ng_p", "INSERT INTO ng_c (cid, pid) VALUES (2, -77)").await;
+    assert!(out.unwrap_err().contains("violates foreign key constraint"));
+    assert!(distinct(&reads).len() <= 1, "{reads:?}");
+    let tuples: Vec<String> = (10..20).map(|i| format!("({i}, -{})", i * 2)).collect();
+    let (out, reads) = reads_of(&db, "ng_p", &format!("INSERT INTO ng_c (cid, pid) VALUES {}", tuples.join(", "))).await;
+    ok(out, "negative keys in a batch");
+    assert!(distinct(&reads).len() <= 10 && distinct(&reads).len() < materialized.len(), "{reads:?}");
+    let e = run(&db, "DELETE FROM ng_p WHERE id = -7").await.unwrap_err();
+    assert!(e.contains("violates foreign key constraint"), "{e}");
+
+    run_ok(&db, "CREATE TABLE qt_p (code TEXT NOT NULL PRIMARY KEY) PARTITION BY HASH (code) PARTITIONS 8").await;
+    run_ok(&db, "INSERT INTO qt_p (code) VALUES ('a''b'), ('plain'), ('x y')").await;
+    run_ok(&db, "CREATE TABLE qt_c (cid BIGINT NOT NULL PRIMARY KEY, code TEXT REFERENCES qt_p (code))").await;
+    for (i, code) in ["'a''b'", "'plain'", "'x y'"].iter().enumerate() {
+        let (out, reads) = reads_of(&db, "qt_p", &format!("INSERT INTO qt_c (cid, code) VALUES ({i}, {code})")).await;
+        ok(out, code);
+        assert_eq!(distinct(&reads).len(), 1, "{code}: {reads:?}");
+    }
+    let e = run(&db, "INSERT INTO qt_c (cid, code) VALUES (9, 'a''c')").await.unwrap_err();
+    assert!(e.contains("violates foreign key constraint"), "{e}");
+    run_ok(&db, "ALTER TABLE qt_c DROP CONSTRAINT qt_c_code_fkey").await;
+    run_ok(&db, "ALTER TABLE qt_c ADD FOREIGN KEY (code) REFERENCES qt_p (code)").await;
+}

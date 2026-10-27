@@ -1336,22 +1336,31 @@ async fn referenced_values_now(
                 .map_err(|e| e.to_string())?,
             crate::core::database::Relation::Partitioned(pt) => {
                 // The snapshot first, then the route (§4.4's order, which
-                // `partitioned_with` keeps).
+                // `partitioned_with` and `partitioned_in` keep).
                 let visibility = pt.visibility_now_for(tx);
-                if side == KeySide::Parent
-                    && !matches!(
-                        pt.route_where(&rewritten).map_err(|e| e.to_string())?,
-                        crate::core::partition::Route::Points(_) | crate::core::partition::Route::Zero
-                    )
-                {
-                    return Err(format!(
-                        "a foreign key check on partitioned table \"{table_name}\" did not route to the \
-                         partitions of its keys ({predicate}); reading every partition is not supported"
-                    ));
-                }
+                let routed = matches!(
+                    pt.route_where(&rewritten).map_err(|e| e.to_string())?,
+                    crate::core::partition::Route::Points(_) | crate::core::partition::Route::Zero
+                );
                 #[cfg(test)]
                 fk_probe_hooks::note(table_name, side);
-                crate::core::rql::row_source::RowSource::partitioned_with(pt.clone(), &rewritten, visibility)
+                let source = if routed || side == KeySide::Child {
+                    crate::core::rql::row_source::RowSource::partitioned_with(pt.clone(), &rewritten, visibility)
+                } else {
+                    // The router reads no key point in the predicate (a
+                    // signed number, `k = -7`, is none to it): each value
+                    // routes by its own key bytes, as an INSERT of it would,
+                    // and a value that does not encode is refused, never
+                    // read in every partition.
+                    let ranges = parent_key_ranges(pt, &field, chunk).ok_or_else(|| {
+                        format!(
+                            "a foreign key check on partitioned table \"{table_name}\" did not route to the \
+                             partitions of its keys ({predicate}); reading every partition is not supported"
+                        )
+                    })?;
+                    crate::core::rql::row_source::RowSource::partitioned_in(pt.clone(), &ranges, visibility)
+                };
+                source
                     .map_err(|e| e.to_string())?
                     .query_rows(&rewritten, &all_fields, query_fetch, requested.clone(), limit, None, tx)
                     .await
@@ -1371,6 +1380,64 @@ async fn referenced_values_now(
         }
     }
     Ok(values)
+}
+
+/// The point range of each of `literals` as a value of partitioned table
+/// `pt`'s one key column `field`: the literal encoded at the column's type
+/// as an `INSERT` stores it (`value_codec::encode_literal`), then routed by
+/// those bytes (`keyed_range`). `None` when the key is not that one column
+/// or a value does not encode; the caller refuses the probe.
+fn parent_key_ranges(
+    pt: &crate::core::partition::table::PartitionedTable,
+    field: &crate::core::row::schema::SchemaField,
+    literals: &[String],
+) -> Option<Vec<crate::core::partition::PointRange>> {
+    let spec = pt.spec().ok()?;
+    let [level] = spec.levels() else {
+        return None;
+    };
+    if u64::from(level.write_order) != field.write_order || level.db_type != field.db_type {
+        return None;
+    }
+    literals
+        .iter()
+        .map(|literal| {
+            let bytes = key_literal_bytes(&field.db_type, literal.trim())?;
+            pt.keyed_range(pt.uid(), &[(level.write_order, level.db_type.clone(), bytes)])
+        })
+        .collect()
+}
+
+/// The bytes a key column of type `ty` stores for `literal`, as a
+/// foreign-key probe renders its values (`key_literal`): an integer, signed
+/// or not, at the column's width; a single-quoted string with its doubled
+/// quotes undone; any other type as `value_codec::encode_literal` reads it
+/// (a UUID, a date, a timestamp). `None` for anything else, which the caller
+/// refuses rather than guess at.
+fn key_literal_bytes(ty: &crate::core::db_type::DbType, literal: &str) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType::*;
+    match ty {
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => {
+            let v: i128 = literal.parse().ok()?;
+            Some(match ty {
+                I8 => i8::try_from(v).ok()?.to_le_bytes().to_vec(),
+                I16 => i16::try_from(v).ok()?.to_le_bytes().to_vec(),
+                I32 => i32::try_from(v).ok()?.to_le_bytes().to_vec(),
+                I64 => i64::try_from(v).ok()?.to_le_bytes().to_vec(),
+                I128 => v.to_le_bytes().to_vec(),
+                U8 => u8::try_from(v).ok()?.to_le_bytes().to_vec(),
+                U16 => u16::try_from(v).ok()?.to_le_bytes().to_vec(),
+                U32 => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
+                U64 => u64::try_from(v).ok()?.to_le_bytes().to_vec(),
+                _ => u128::try_from(v).ok()?.to_le_bytes().to_vec(),
+            })
+        }
+        STRING => {
+            let inner = literal.strip_prefix('\'')?.strip_suffix('\'')?;
+            Some(inner.replace("''", "'").into_bytes())
+        }
+        _ => crate::core::value_codec::encode_literal(ty, literal),
+    }
 }
 
 /// Test probe: which partitioned tables a foreign-key probe read, and on
