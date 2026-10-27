@@ -1186,8 +1186,9 @@ fn a_long_table_names_its_keys_as_it_compares_them() {
         // index's DROP refusal are found by the derived name alone.
         let pk_i = cut_name(&i, "_pkey");
         c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 1)"));
-        let r = c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 5) ON CONFLICT ON CONSTRAINT {pk_i} DO NOTHING"));
-        assert_eq!(r.tags, vec!["INSERT 0 0".to_string()], "{i}");
+        // DO UPDATE reads the constraint's columns (DO NOTHING does not).
+        c.ok(&format!("INSERT INTO {i} (a, v) VALUES (1, 5) ON CONFLICT ON CONSTRAINT {pk_i} DO UPDATE SET v = EXCLUDED.v"));
+        assert_eq!(c.ok(&format!("SELECT v FROM {i} WHERE a = 1")).rows, vec![vec![Some("5".to_string())]], "{i}");
         expect_code(&mut c, &format!("DROP INDEX {pk_i}"), "2BP01");
         c.ok(&format!("ALTER TABLE {i} DROP CONSTRAINT {pk_i}"));
         assert!(!is_primary(&mut c, &i, "a"), "{i}: dropped");
