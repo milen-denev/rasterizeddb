@@ -3820,14 +3820,10 @@ async fn execute_update_from(
         return ddl_error("UPDATE names no relation");
     };
     let table = table_token.trim_matches('"').to_string();
-    // A partitioned target writes each row back by an identifying key, which
-    // waits on composite identifying keys (§1b, phase 3). Refused before
-    // anything runs. A partitioned source is supported (S19): it is read by
-    // the join `update_from_join` runs through `run_subquery`, under that
-    // join's one snapshot, and only this plain target is written back.
-    if database.is_partitioned(&table) {
-        return ddl_error(&format!("UPDATE … FROM on partitioned table \"{table}\" is not supported yet"));
-    }
+    // A partitioned target or source (S19, phase 3 P3) is read by the join
+    // `update_from_join` runs through `run_subquery`, every relation and
+    // partition under that join's one snapshot, and the target is written
+    // back row by row by its composite identifying key (§1b).
     let target_alias = match head_words.next() {
         Some(w) if w.eq_ignore_ascii_case("AS") => head_words.next(),
         Some(w) => Some(w),
@@ -4220,11 +4216,8 @@ async fn execute_delete_using(
         return ddl_error("DELETE names no relation");
     };
     let table = table_token.trim_matches('"').to_string();
-    // As for `UPDATE … FROM`: a partitioned target is phase 3, refused
-    // before anything runs; a partitioned source is read by the join (S19).
-    if database.is_partitioned(&table) {
-        return ddl_error(&format!("DELETE … USING on partitioned table \"{table}\" is not supported yet"));
-    }
+    // As for `UPDATE … FROM`: a partitioned target or source is read by the
+    // join, and the target deleted from by its identifying key (phase 3 P3).
     let target_alias = match head_words.next() {
         Some(w) if w.eq_ignore_ascii_case("AS") => head_words.next(),
         Some(w) => Some(w),
@@ -4306,20 +4299,23 @@ async fn delete_using_join(
     tx: TxId,
 ) -> Result<Vec<u8>, String> {
     // The target's key. Without one there is no way to name the row again.
+    // Composite on every partitioned target, whose rows are written back
+    // through the partitioned `DELETE`, each routed by the key to its one
+    // partition (§1b).
     let key = {
         let table_ref = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = table_ref
             .as_ref()
             .clone()
             .ok_or_else(|| format!("relation '{}' does not exist", table))?;
-        let field = identifying_field(&handle.schema).ok_or_else(|| {
+        identifying_key(&handle.schema).ok_or_else(|| {
             format!(
                 "DELETE … USING needs a unique column on '{}' to name each row by",
                 table
             )
-        })?;
-        field.name.clone()
+        })?
     };
+    let width = key.fields.len();
 
     // The source's columns the condition reads are carried out of the join,
     // so each row's delete can recheck the condition against the target row
@@ -4339,7 +4335,7 @@ async fn delete_using_join(
         .as_deref()
         .map(|t| qualified_refs(t, &source_aliases(source_clause)))
         .unwrap_or_default();
-    let mut projection = vec![format!("{}.{}", target_alias, key)];
+    let mut projection: Vec<String> = key.names().map(|k| format!("{}.{}", target_alias, k)).collect();
     projection.extend(recheck_refs.iter().cloned());
     let select = format!(
         "SELECT {} FROM {} {}, {} WHERE {}",
@@ -4366,35 +4362,34 @@ async fn delete_using_join(
         returning.map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
 
     // One delete per DISTINCT key: several source rows may match one target
-    // row, and it can only be deleted once.
+    // row, and it can only be deleted once. Every row is named before any is
+    // deleted, so a key that cannot be written back (a NULL) refuses the
+    // statement with nothing applied.
     let mut seen: ahash::HashSet<Vec<u8>> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
+    let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if row.columns.len() < width {
+            return Err("the join returned no key".to_string());
+        }
+        let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
+        if seen.insert(key.row_key(&cells)?) {
+            named_rows.push((row, key.predicate(&cells)?));
+        }
+    }
     let mut deleted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
-    for row in &rows {
-        let column = row
-            .columns
-            .first()
-            .ok_or_else(|| "the join returned no key".to_string())?;
-        if !seen.insert(column.data.into_slice().to_vec()) {
-            continue;
-        }
-        let literal = crate::core::rql::subquery::value_to_literal(
-            &column.column_type,
-            column.data.into_slice(),
-        )
-        .ok_or_else(|| "a joined key cannot be written back".to_string())?;
-
+    for (row, named) in named_rows {
         let returning_text = match &returning_unqualified {
             Some(r) => format!(" {}", r),
             None => String::new(),
         };
-        let key_only = format!("DELETE FROM {} WHERE {} = {}{}", table, key, literal, returning_text);
+        let key_only = format!("DELETE FROM {} WHERE {}{}", table, named, returning_text);
         let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
         for (offset, reference) in recheck_refs.iter().enumerate() {
             let carried = row
                 .columns
-                .get(1 + offset)
+                .get(width + offset)
                 .ok_or_else(|| "the join returned fewer values than the delete needs".to_string())?;
             let literal = crate::core::rql::subquery::value_to_literal(&carried.column_type, carried.data.into_slice())
                 .ok_or_else(|| "a joined value cannot be written back".to_string())?;
@@ -4402,10 +4397,9 @@ async fn delete_using_join(
         }
         let with_recheck = match &recheck_text {
             Some(text) => format!(
-                "DELETE FROM {} WHERE {} = {} AND ({}){}",
+                "DELETE FROM {} WHERE {} AND ({}){}",
                 table,
-                key,
-                literal,
+                named,
                 strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
                 returning_text
             ),
@@ -4449,7 +4443,9 @@ async fn update_from_join(
     tx: TxId,
 ) -> Result<Vec<u8>, String> {
     // The target's key. Without one there is no way to name the row again, so
-    // this is refused rather than guessed at.
+    // this is refused rather than guessed at. Composite on every partitioned
+    // target, whose rows are written back through the partitioned `UPDATE`,
+    // each routed by the key to its one partition (§1b).
     let key = {
         let table_ref = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = table_ref
@@ -4457,14 +4453,14 @@ async fn update_from_join(
             .clone()
             .ok_or_else(|| format!("relation '{}' does not exist", table))?;
         // The guard is a shard read lock; it ends here, before any await.
-        let field = identifying_field(&handle.schema).ok_or_else(|| {
+        identifying_key(&handle.schema).ok_or_else(|| {
             format!(
                 "UPDATE … FROM needs a unique column on '{}' to write each row back by",
                 table
             )
-        })?;
-        field.name.clone()
+        })?
     };
+    let width = key.fields.len();
 
     let mut assignments: Vec<(String, String)> = Vec::new();
     for part in crate::core::rql::lexer_ct::split_definitions(assignments_text) {
@@ -4529,7 +4525,7 @@ async fn update_from_join(
         handle.schema.fields.to_vec()
     };
 
-    let mut projection: Vec<String> = vec![format!("{}.{}", target_alias, key)];
+    let mut projection: Vec<String> = key.names().map(|k| format!("{}.{}", target_alias, k)).collect();
     // For each assignment: either the output slot its value occupies, or the
     // expression to evaluate and the slots its columns landed in.
     let mut sources: Vec<AssignedValue> = Vec::with_capacity(assignments.len());
@@ -4691,9 +4687,24 @@ async fn update_from_join(
         }
     }
 
+    // One write per DISTINCT key, from the first joined row naming it, as
+    // PostgreSQL updates a target row once however many source rows it
+    // joins: a second write applied `SET n = n + 1` twice, and counted and
+    // returned the row twice. Every row is named before any is written, so a
+    // key that cannot be written back (a NULL) refuses the statement with
+    // nothing applied.
+    let mut seen: ahash::HashSet<Vec<u8>> =
+        ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
+    let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
+    for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
+        let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
+        if seen.insert(key.row_key(&cells)?) {
+            named_rows.push((row, key.predicate(&cells)?));
+        }
+    }
     let mut written = 0u64;
     let mut returned: Vec<u8> = Vec::new();
-    for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
+    for (row, named) in named_rows {
         let literal_at = |index: usize| -> Result<String, String> {
             let column = &row.columns[index];
             crate::core::rql::subquery::value_to_literal(
@@ -4703,7 +4714,6 @@ async fn update_from_join(
             .ok_or_else(|| "a joined value cannot be written".to_string())
         };
 
-        let key_literal = literal_at(0)?;
         let mut sets: Vec<String> = Vec::with_capacity(assignments.len());
         for ((column, _), source) in assignments.iter().zip(sources.iter()) {
             let literal = match source {
@@ -4731,25 +4741,17 @@ async fn update_from_join(
             Some(r) => format!(" {}", r),
             None => String::new(),
         };
-        let key_only = format!(
-            "UPDATE {} SET {} WHERE {} = {}{}",
-            table,
-            sets.join(", "),
-            key,
-            key_literal,
-            returning_text
-        );
+        let key_only = format!("UPDATE {} SET {} WHERE {}{}", table, sets.join(", "), named, returning_text);
         let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
         for (offset, reference) in recheck_refs.iter().enumerate() {
             bindings.push((reference.clone(), literal_at(recheck_at + offset)?));
         }
         let with_recheck = match &recheck_text {
             Some(text) => format!(
-                "UPDATE {} SET {} WHERE {} = {} AND ({}){}",
+                "UPDATE {} SET {} WHERE {} AND ({}){}",
                 table,
                 sets.join(", "),
-                key,
-                key_literal,
+                named,
                 strip_qualifier(&substitute_outer_refs(text, &bindings), target_alias),
                 returning_text
             ),
@@ -5196,13 +5198,15 @@ async fn lock_selected_rows(
         return Ok(rows);
     }
 
-    let key_field = {
+    // The table's identifying key; on a partitioned table, the shell's, under
+    // the logical name every partition's rows are locked by (§6.2).
+    let key = {
         let entry = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
         let table = entry
             .as_ref()
             .clone()
             .ok_or_else(|| format!("relation '{}' does not exist", table_name))?;
-        identifying_field(&table.schema).ok_or_else(|| {
+        identifying_key(&table.schema).ok_or_else(|| {
             format!(
                 "FOR UPDATE needs a unique column on '{}' to identify the rows it locks",
                 table_name
@@ -5213,18 +5217,13 @@ async fn lock_selected_rows(
     // The key has to be in the row, which means the statement has to have
     // selected it. Refused rather than approximated: locking the wrong row is
     // worse than not locking.
-    let key_at = |row: &crate::core::row::row::Row| -> Option<Vec<u8>> {
-        row.columns
+    let key_at = |row: &crate::core::row::row::Row| -> Option<Result<Vec<u8>, String>> {
+        let cells = key
+            .fields
             .iter()
-            .find(|c| u64::from(c.schema_id) == key_field.write_order)
-            .map(|c| c.data.into_slice().to_vec())
-    };
-
-    let live = |candidate: TxId| {
-        matches!(
-            database.transactions.status().outcome(candidate),
-            crate::core::mvcc::transaction::TxOutcome::InProgress
-        )
+            .map(|f| row.columns.iter().find(|c| u64::from(c.schema_id) == f.write_order))
+            .collect::<Option<Vec<_>>>()?;
+        Some(key.row_key(&cells))
     };
 
     let mut kept = Vec::with_capacity(rows.len());
@@ -5234,53 +5233,23 @@ async fn lock_selected_rows(
                 break;
             }
         }
-        let Some(key) = key_at(&row) else {
+        let Some(row_key) = key_at(&row) else {
             return Err(format!(
                 "FOR UPDATE needs '{}' in the select list to identify the rows it locks",
-                key_field.name
+                key.names().collect::<Vec<_>>().join("', '")
             ));
         };
+        let row_key = row_key?;
 
-        // One attempt, then act on the answer. Waiting is a loop with a bound
-        // rather than an unbounded park: a lock whose holder never finishes
-        // would otherwise hang the connection with nothing to report.
-        let mut outcome = database
-            .row_locks
-            .acquire(table_name, &key, tx, lock.strength, &live);
-        if matches!(lock.behaviour, LockWait::Wait) {
-            let started = std::time::Instant::now();
-            let deadline = started + LOCK_WAIT_TIMEOUT;
-            let _waiting = database.row_locks.waiting_guard(tx);
-            while let Acquired::Held(_) = outcome {
-                // The statement's own bound comes first: `statement_timeout`
-                // and a client that has gone both end the wait, as the same
-                // error a cancelled scan reports. An error and never the rows
-                // locked so far — a short claim would read as a complete one.
-                if let Some(reason) = crate::core::cancel::tripped() {
-                    return Err(reason.eval_error().as_str().to_string());
-                }
-                if let Some(deadlock) = deadlock_check(
-                    database,
-                    tx,
-                    started,
-                    || {
-                        database
-                            .row_locks
-                            .row_blockers(table_name, &key, tx, lock.strength, &live)
-                    },
-                    &live,
-                ) {
-                    return Err(deadlock);
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                outcome = database
-                    .row_locks
-                    .acquire(table_name, &key, tx, lock.strength, &live);
-            }
-        }
+        let outcome = acquire_row_lock(
+            database,
+            table_name,
+            &row_key,
+            lock.strength,
+            matches!(lock.behaviour, LockWait::Wait),
+            tx,
+        )
+        .await?;
 
         match outcome {
             Acquired::Yes => kept.push(row),
@@ -5306,6 +5275,65 @@ async fn lock_selected_rows(
         }
     }
     Ok(kept)
+}
+
+/// Asks for `strength` on the row `key` ([`IdentifyingKey::row_key`]) of
+/// `table_name`, a partitioned table's logical name, and, when `wait`, waits
+/// for its holder: `Held` comes back only without `wait`, or once
+/// [`LOCK_WAIT_TIMEOUT`] has passed.
+///
+/// One attempt, then act on the answer. Waiting is a loop with a bound rather
+/// than an unbounded park: a lock whose holder never finishes would otherwise
+/// hang the connection with nothing to report. Past `deadlock_timeout` the
+/// wait is an edge of the wait-for graph that table locks share, keyed as the
+/// lock is, so a cycle through it and a table lock ends in one 40P01.
+async fn acquire_row_lock(
+    database: &Arc<Database>,
+    table_name: &str,
+    key: &[u8],
+    strength: crate::core::rql::row_lock::LockStrength,
+    wait: bool,
+    tx: TxId,
+) -> Result<crate::core::mvcc::row_locks::Acquired, String> {
+    use crate::core::mvcc::row_locks::Acquired;
+
+    let live = |candidate: TxId| {
+        matches!(
+            database.transactions.status().outcome(candidate),
+            crate::core::mvcc::transaction::TxOutcome::InProgress
+        )
+    };
+    let mut outcome = database.row_locks.acquire(table_name, key, tx, strength, &live);
+    if !wait {
+        return Ok(outcome);
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + LOCK_WAIT_TIMEOUT;
+    let _waiting = database.row_locks.waiting_guard(tx);
+    while let Acquired::Held(_) = outcome {
+        // The statement's own bound comes first: `statement_timeout` and a
+        // client that has gone both end the wait, as the same error a
+        // cancelled scan reports. An error and never the rows locked so far —
+        // a short claim would read as a complete one.
+        if let Some(reason) = crate::core::cancel::tripped() {
+            return Err(reason.eval_error().as_str().to_string());
+        }
+        if let Some(deadlock) = deadlock_check(
+            database,
+            tx,
+            started,
+            || database.row_locks.row_blockers(table_name, key, tx, strength, &live),
+            &live,
+        ) {
+            return Err(deadlock);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        outcome = database.row_locks.acquire(table_name, key, tx, strength, &live);
+    }
+    Ok(outcome)
 }
 
 /// Takes the table locks a `LOCK TABLE` asks for, in the mode the statement
@@ -5479,10 +5507,19 @@ fn check_not_null(
 /// row fail with `40001`. It is a difference in *when* the conflict surfaces,
 /// as a serialization failure rather than a lock wait.
 ///
-/// The key column is [`identifying_field`], the one `FOR UPDATE` locks by. This
-/// used to pick only a column-level `UNIQUE`, so on a table identified by its
-/// primary key or a table-level `UNIQUE (col)` the writer looked for locks
-/// under no column at all and overwrote rows another transaction held.
+/// The key is [`identifying_key`], the one `FOR UPDATE` locks by, framed the
+/// same way ([`IdentifyingKey::row_key`]). This used to pick only a
+/// column-level `UNIQUE`, so on a table identified by its primary key or a
+/// table-level `UNIQUE (col)` the writer looked for locks under no column at
+/// all and overwrote rows another transaction held. A partitioned table is
+/// checked under its logical name with its shell's key, as `FOR UPDATE`
+/// through it locks, whichever partition the row is in.
+///
+/// A held row is waited for, as PostgreSQL's `UPDATE` waits for a `FOR UPDATE`
+/// holder, through the same bounded wait `FOR UPDATE` takes
+/// ([`acquire_row_lock`]): until the holder ends, `statement_timeout`, a
+/// deadlock (40P01) or [`LOCK_WAIT_TIMEOUT`]. It used to fail at once, which
+/// handed a job queue's writers an error where they should have queued.
 #[inline(never)]
 async fn refuse_write_to_locked_rows(
     database: &Arc<Database>,
@@ -5493,13 +5530,6 @@ async fn refuse_write_to_locked_rows(
     use crate::core::mvcc::row_locks::Acquired;
     use crate::core::rql::row_lock::LockStrength;
 
-    let live = |candidate: TxId| {
-        matches!(
-            database.transactions.status().outcome(candidate),
-            crate::core::mvcc::transaction::TxOutcome::InProgress
-        )
-    };
-
     // A whole-table lock (`LOCK TABLE`) is the table-lock manager's: the
     // statement holds ROW EXCLUSIVE on its target (taken before this, and
     // waited for behind any SHARE or ACCESS EXCLUSIVE holder), so only row
@@ -5508,22 +5538,22 @@ async fn refuse_write_to_locked_rows(
         return Ok(());
     }
 
-    let key_field = {
+    let key = {
         let entry = database.table_for(table_name, owner(), TableMode::RowExclusive).await?;
         let Some(table) = entry.as_ref().clone() else {
             return Ok(());
         };
         // `lock_selected_rows` refuses a table without one, so nothing here
         // can be locked row-by-row and nothing can conflict.
-        let Some(field) = identifying_field(&table.schema) else {
+        let Some(key) = identifying_key(&table.schema) else {
             return Ok(());
         };
-        field
+        key
     };
 
     let select = format!(
         "SELECT {} FROM {}{}{}",
-        key_field.name,
+        key.names().collect::<Vec<_>>().join(", "),
         table_name,
         if where_clause.trim().is_empty() {
             ""
@@ -5535,16 +5565,19 @@ async fn refuse_write_to_locked_rows(
     let rows = run_subquery(&select, database, tx).await?;
 
     for row in &rows {
-        let Some(cell) = row.columns.first() else {
+        let cells: Vec<&crate::core::row::row::Column> = row.columns.iter().collect();
+        if cells.len() < key.fields.len() {
+            continue;
+        }
+        // A row whose key holds a NULL cannot have been locked: `FOR UPDATE`
+        // refuses to name it.
+        let Ok(row_key) = key.row_key(&cells[..key.fields.len()]) else {
             continue;
         };
-        let key = cell.data.into_slice();
         // Asked for, not merely inspected: this transaction is about to write
         // the row, so it should hold the lock while it does.
         if let Acquired::Held(owner) =
-            database
-                .row_locks
-                .acquire(table_name, key, tx, LockStrength::Update, &live)
+            acquire_row_lock(database, table_name, &row_key, LockStrength::Update, true, tx).await?
         {
             return Err(format!(
                 "row of '{}' is locked by transaction {}; the statement that locked it must \
@@ -11505,17 +11538,96 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     Ok(Some(rows))
 }
 
-/// A column that identifies one row, for the statements that need to name rows
-/// they have already chosen.
+/// The columns that identify one row, for the statements that need to name
+/// rows they have already chosen (`docs/partitioning.md` §1b).
 ///
-/// `FOR UPDATE` and `UPDATE … FROM` both need to write a row back — or lock it —
-/// by something that picks it out uniquely. Only an inline `UNIQUE` used to
-/// count, so a table whose key is written `PRIMARY KEY` or as a table-level
-/// `UNIQUE (id)` — the ordinary way an ORM emits one — was refused as having no
-/// unique column at all, though it plainly had one.
-fn identifying_field(
-    schema: &crate::core::row::schema::TableSchema,
-) -> Option<crate::core::row::schema::SchemaField> {
+/// `FOR UPDATE` locks a row by them, a writer checks the same lock, and
+/// `UPDATE … FROM` and `DELETE … USING` write each joined row back by them.
+/// Only an inline `UNIQUE` used to count, so a table whose key is written
+/// `PRIMARY KEY` or as a table-level `UNIQUE (id)` — the ordinary way an ORM
+/// emits one — was refused as having no unique column at all, though it
+/// plainly had one. And only one column counted, so a composite key, which is
+/// the only kind a partitioned table has (every unique key holds every
+/// partition-key column), refused all four statements.
+struct IdentifyingKey {
+    /// In the key's declared order, which is the order the framed tuple and
+    /// the write-back predicate use.
+    fields: Vec<crate::core::row::schema::SchemaField>,
+}
+
+impl IdentifyingKey {
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.fields.iter().map(|f| f.name.as_str())
+    }
+
+    /// The bytes one row is locked and deduplicated by, from its key cells in
+    /// [`Self::fields`] order: one column's stored bytes, exactly what a
+    /// one-column key always used, or the framed tuple of several (each
+    /// component `encode_canonical`, which is length-prefixed, so `(1, 23)`
+    /// and `(12, 3)` cannot meet). The same function on every side — the
+    /// locker, the writer that checks, the deadlock detector's blockers — so
+    /// they name one row one way.
+    ///
+    /// `Err` for a row whose key holds a NULL: it names no row (a unique key
+    /// admits any number of NULLs), and the bytes a NULL travels as would
+    /// name every NULL row at once.
+    fn row_key(&self, cells: &[&crate::core::row::row::Column]) -> Result<Vec<u8>, String> {
+        if let Some((field, _)) =
+            self.fields.iter().zip(cells).find(|(_, c)| c.column_type == crate::core::db_type::DbType::NULL)
+        {
+            return Err(format!(
+                "a row whose key column '{}' is NULL cannot be identified by its key",
+                field.name
+            ));
+        }
+        if let [only] = cells {
+            return Ok(only.data.into_slice().to_vec());
+        }
+        let mut out = Vec::new();
+        for (field, cell) in self.fields.iter().zip(cells) {
+            let bytes = cell.data.into_slice();
+            if crate::core::index::key::encode_canonical(&field.db_type, bytes, &mut out).is_none() {
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `a = 1 AND b = 'x'`: the predicate that names the one row these key
+    /// cells (in [`Self::fields`] order) belong to. On a partitioned table it
+    /// pins every partition-key column, so the write it guards is routed to
+    /// that row's one partition.
+    fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
+        self.row_key(cells)?;
+        let mut terms = Vec::with_capacity(self.fields.len());
+        for (field, cell) in self.fields.iter().zip(cells) {
+            let literal = crate::core::rql::subquery::value_to_literal(&cell.column_type, cell.data.into_slice())
+                .ok_or_else(|| "a joined key cannot be written back".to_string())?;
+            terms.push(format!("{} = {}", field.name, literal));
+        }
+        Ok(terms.join(" AND "))
+    }
+}
+
+/// The key that identifies `schema`'s rows, chosen as PostgreSQL names a row
+/// by its key, or `None` when the table has none to name a row by.
+///
+/// 1. The primary key: one column (`schema.primary_key`), or a composite one,
+///    which is the table-level key named `<table>_pkey` (`lexer_ct` records
+///    only a one-column primary key as such).
+/// 2. Else a `UNIQUE` key, inline or table-level, whose every column is
+///    `NOT NULL`: the fewest columns, then the first declared.
+/// 3. Else, as before composite keys counted, a one-column `UNIQUE` that may
+///    hold NULL. Its NULL rows cannot be named, and [`IdentifyingKey::row_key`]
+///    refuses them one by one rather than naming every NULL row at once.
+///
+/// A primary key's rows hold no NULL in PostgreSQL. Here a column of a
+/// table-level `PRIMARY KEY (a, b)` written without `NOT NULL` is nullable,
+/// so the same refusal covers such a row. A partial key is never chosen:
+/// rows outside its predicate share its values, and writing back by it would
+/// reach every one of them.
+fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<IdentifyingKey> {
     let live = |name: &str| {
         schema
             .fields
@@ -11523,21 +11635,36 @@ fn identifying_field(
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
             .cloned()
     };
+    let resolve = |columns: &[String]| columns.iter().map(|c| live(c)).collect::<Option<Vec<_>>>();
+    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
 
-    if let Some(field) = schema.fields.iter().find(|f| f.is_unique && !f.is_deleted) {
-        return Some(field.clone());
+    if let Some(key) = schema.primary_key.as_deref().and_then(live) {
+        return Some(IdentifyingKey { fields: vec![key] });
     }
-    if let Some(key) = schema.primary_key.as_ref().and_then(|k| live(k)) {
-        return Some(key);
+    let pkey = format!("{}_pkey", schema.name);
+    if let Some(fields) = whole().find(|k| k.name.eq_ignore_ascii_case(&pkey)).and_then(|k| resolve(&k.columns)) {
+        return Some(IdentifyingKey { fields });
     }
-    // A composite key names no single column, so it cannot stand in for one.
-    // Nor can a partial one: rows outside its predicate share its values, and
-    // writing back by it would reach every one of them.
-    schema
-        .unique_keys
-        .iter()
-        .filter(|k| !k.is_deleted && k.columns.len() == 1 && k.predicate.is_none())
-        .find_map(|k| live(&k.columns[0]))
+
+    let candidates = || {
+        schema
+            .fields
+            .iter()
+            .filter(|f| f.is_unique && !f.is_deleted)
+            .map(|f| vec![f.clone()])
+            .chain(whole().filter_map(|k| resolve(&k.columns)))
+    };
+    let not_null = |fields: &Vec<crate::core::row::schema::SchemaField>| {
+        fields.iter().all(|f| !crate::core::rql::nullable::is_nullable(&f.name, &schema.fields))
+    };
+    let mut best: Option<Vec<crate::core::row::schema::SchemaField>> = None;
+    for fields in candidates().filter(not_null) {
+        if best.as_ref().is_none_or(|b| fields.len() < b.len()) {
+            best = Some(fields);
+        }
+    }
+    best.or_else(|| candidates().find(|fields| fields.len() == 1))
+        .map(|fields| IdentifyingKey { fields })
 }
 
 /// How many times a write replays a conflict before reporting it.
@@ -14285,9 +14412,10 @@ pub(crate) async fn execute_with_need(
 /// A prepared statement on it learns its parse like a plain table's (S15):
 /// the parse is noted here, under the logical name, and a learned execution
 /// comes back through [`execute_prepared_rows`], which routes that
-/// execution's own rendered `WHERE` (I11). Row locks are refused before any
-/// read, as phase 3 builds them, and before the parse is noted, so a
-/// locking statement fails and never teaches.
+/// execution's own rendered `WHERE` (I11). `FOR UPDATE`/`SHARE` locks each
+/// returned row under the logical name by the shell's identifying key
+/// (`lock_selected_rows`, phase 3 P3), so a lock taken through any partition
+/// is the one a writer through the logical name checks.
 async fn execute_partitioned_select(
     query: &QueryPurpose,
     pt: Arc<crate::core::partition::table::PartitionedTable>,
@@ -14310,9 +14438,6 @@ async fn execute_partitioned_select(
             return result;
         }
     };
-    if let Some(refusal) = refuse_partitioned_row_lock(&query_row, &name) {
-        return refusal;
-    }
     crate::core::rql::prepared::note_plain(&name, &query_row, database.slot_shape_epoch(&name).unwrap_or(0));
     match partitioned_source(&query_row, pt, None, tx) {
         Ok(source) => execute_query_rows(query_row, source, database, tx).await,
@@ -14320,19 +14445,10 @@ async fn execute_partitioned_select(
     }
 }
 
-/// `SELECT … FOR UPDATE/SHARE` on partitioned table `name`: refused, as
-/// phase 3 builds row locks on partitions.
-fn refuse_partitioned_row_lock(query_row: &crate::core::rql::lexer_query::QueryRows, name: &str) -> Option<Vec<u8>> {
-    query_row.row_lock.as_ref()?;
-    let e = format!("SELECT … FOR UPDATE/SHARE on partitioned table \"{name}\" is not supported yet");
-    error!("{}", e);
-    Some(ddl_error(&e))
-}
-
 /// The read half of a partitioned `SELECT`, shared by the text path and a
 /// learned parse, up to the plain table's pipeline (`execute_query_rows`,
-/// which the caller runs over the source): the row-lock refusal, then a
-/// source routed on this `query_row`'s own `WHERE`, or on a learned parse's
+/// which the caller runs over the source): a source routed on this
+/// `query_row`'s own `WHERE`, or on a learned parse's
 /// bound `key` (S16b) (one snapshot, then the map, then the flags, §4.4).
 /// `Err` is the reply. Not `async`, so the parse is not moved through one
 /// more future on its way to the scan (the S16b profile).
@@ -14342,9 +14458,6 @@ fn partitioned_source(
     key: Option<&crate::core::rql::prepared::BoundKey>,
     tx: TxId,
 ) -> Result<crate::core::rql::row_source::RowSource, Vec<u8>> {
-    if let Some(refusal) = refuse_partitioned_row_lock(query_row, pt.name()) {
-        return Err(refusal);
-    }
     // `FanOut::plan` logs a failure with the table's name, so the success
     // path neither clones the table's `Arc` nor its name.
     crate::core::rql::row_source::RowSource::for_select(
