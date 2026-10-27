@@ -215,7 +215,7 @@ const CACHE_SHARDS: usize = 64;
 
 struct CacheEntry {
     key: (u64, u32),
-    data: Arc<[u8]>,
+    data: Arc<Block>,
     referenced: bool,
 }
 
@@ -260,7 +260,7 @@ impl BlockCache {
         &self.shards[(h >> 32) as usize % CACHE_SHARDS]
     }
 
-    fn get(&self, key: (u64, u32)) -> Option<Arc<[u8]>> {
+    fn get(&self, key: (u64, u32)) -> Option<Arc<Block>> {
         let mut s = self.shard(key).lock();
         let at = *s.index.get(&key)?;
         s.entries[at].referenced = true;
@@ -268,18 +268,19 @@ impl BlockCache {
         Some(s.entries[at].data.clone())
     }
 
-    fn insert(&self, key: (u64, u32), data: Arc<[u8]>) {
+    fn insert(&self, key: (u64, u32), data: Arc<Block>) {
         let budget = self.per_shard.load(Ordering::Relaxed);
-        if data.len() as u64 > budget {
+        let size = data.held_bytes();
+        if size > budget {
             return;
         }
         let mut s = self.shard(key).lock();
         if s.index.contains_key(&key) {
             return;
         }
-        Self::evict_to(&mut s, budget - data.len() as u64);
+        Self::evict_to(&mut s, budget - size);
         let at = s.entries.len();
-        s.bytes += data.len() as u64;
+        s.bytes += size;
         s.entries.push(CacheEntry { key, data, referenced: false });
         s.index.insert(key, at);
     }
@@ -296,7 +297,7 @@ impl BlockCache {
                 continue;
             }
             let gone = s.entries.swap_remove(s.hand);
-            s.bytes -= gone.data.len() as u64;
+            s.bytes -= gone.data.held_bytes();
             s.index.remove(&gone.key);
             if s.hand < s.entries.len() {
                 let moved = s.entries[s.hand].key;
@@ -380,24 +381,89 @@ impl EntryRef<'_> {
     }
 }
 
-/// The entries of a verified block, in order.
-fn block_entries(block: &[u8], mut f: impl FnMut(EntryRef<'_>) -> io::Result<bool>) -> io::Result<()> {
-    let body = &block[..block.len() - 4];
-    let mut at = 0usize;
-    let n = get_varint(body, &mut at)?;
-    for _ in 0..n {
-        let klen = get_varint(body, &mut at)? as usize;
-        let key = body.get(at..at + klen).ok_or_else(|| corrupt("key past the end"))?;
-        at += klen;
-        let n_slots = get_varint(body, &mut at)? as usize;
-        let sbytes = get_varint(body, &mut at)? as usize;
-        let slot_bytes = body.get(at..at + sbytes).ok_or_else(|| corrupt("slots past the end"))?;
-        at += sbytes;
-        if !f(EntryRef { key, n_slots, slot_bytes })? {
-            return Ok(());
+/// Entries between two restart points of a [`Block`].
+const RESTART_EVERY: usize = 16;
+
+/// A verified block and where every [`RESTART_EVERY`]th entry starts in it,
+/// so a lookup binary-searches to within that many entries instead of
+/// decoding the block from its start. A 64 KB block holds a few thousand
+/// short entries, and walking half of them was most of a point lookup's cost.
+/// The offsets are found when the block is read, not stored in the run, so
+/// the file format is unchanged.
+struct Block {
+    /// The block without its checksum.
+    body: Box<[u8]>,
+    n: usize,
+    restarts: Box<[u32]>,
+}
+
+/// The entry at `at`, and where the next one starts.
+fn entry_at(body: &[u8], mut at: usize) -> io::Result<(EntryRef<'_>, usize)> {
+    let klen = get_varint(body, &mut at)? as usize;
+    let key = body.get(at..at + klen).ok_or_else(|| corrupt("key past the end"))?;
+    at += klen;
+    let n_slots = get_varint(body, &mut at)? as usize;
+    let sbytes = get_varint(body, &mut at)? as usize;
+    let slot_bytes = body.get(at..at + sbytes).ok_or_else(|| corrupt("slots past the end"))?;
+    at += sbytes;
+    Ok((EntryRef { key, n_slots, slot_bytes }, at))
+}
+
+impl Block {
+    /// Checks `buf`'s checksum and walks its entries once, recording the
+    /// restarts. A block that does not parse whole is refused here, so a
+    /// later walk from a restart cannot fail part way.
+    fn parse(mut buf: Vec<u8>) -> io::Result<Block> {
+        if buf.len() < 4 {
+            return Err(corrupt("block too short"));
         }
+        let (body, sum) = buf.split_at(buf.len() - 4);
+        if crc(body) != u32::from_le_bytes(sum.try_into().unwrap()) {
+            return Err(corrupt("block checksum mismatch"));
+        }
+        buf.truncate(buf.len() - 4);
+        let mut at = 0usize;
+        let n = get_varint(&buf, &mut at)? as usize;
+        // An entry is at least three varints, so a corrupt count cannot
+        // ask for more than the body could hold.
+        let mut restarts = Vec::with_capacity(n.min(buf.len() / 3).div_ceil(RESTART_EVERY));
+        for i in 0..n {
+            if i % RESTART_EVERY == 0 {
+                restarts.push(u32::try_from(at).map_err(|_| corrupt("block too long"))?);
+            }
+            at = entry_at(&buf, at)?.1;
+        }
+        Ok(Block { body: buf.into_boxed_slice(), n, restarts: restarts.into_boxed_slice() })
     }
-    Ok(())
+
+    /// What the block costs the cache.
+    fn held_bytes(&self) -> u64 {
+        (self.body.len() + self.restarts.len() * 4) as u64
+    }
+
+    /// The first restart at or before the first entry whose key is not below
+    /// `lo`. A key may repeat in consecutive entries (a long posting list
+    /// continues under it), so this is the last restart whose key is
+    /// strictly below `lo`.
+    fn restart_for(&self, lo: Bound<&[u8]>) -> usize {
+        let (Bound::Included(l) | Bound::Excluded(l)) = lo else { return 0 };
+        let key_at = |r: &u32| entry_at(&self.body, *r as usize).map(|(e, _)| e.key).unwrap_or(&[]);
+        self.restarts.partition_point(|r| key_at(r) < l).saturating_sub(1)
+    }
+
+    /// The entries from restart `r` on, in order, until `f` answers `false`.
+    fn entries_from(&self, r: usize, mut f: impl FnMut(EntryRef<'_>) -> io::Result<bool>) -> io::Result<()> {
+        let Some(&start) = self.restarts.get(r) else { return Ok(()) };
+        let mut at = start as usize;
+        for _ in r * RESTART_EVERY..self.n {
+            let (e, next) = entry_at(&self.body, at)?;
+            at = next;
+            if !f(e)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +544,7 @@ impl Run {
 
     /// Block `b`, verified, through the cache. `cached` false reads around
     /// it, for a merge's sequential pass that would only evict hot blocks.
-    fn block(&self, b: usize, cached: bool) -> io::Result<Arc<[u8]>> {
+    fn block(&self, b: usize, cached: bool) -> io::Result<Arc<Block>> {
         let key = (self.id, b as u32);
         if cached {
             if let Some(hit) = cache().get(key) {
@@ -489,14 +555,7 @@ impl Run {
         let f = &self.fences[b];
         let mut buf = vec![0u8; f.len as usize];
         self.file.read_exact_at(&mut buf, f.offset)?;
-        if buf.len() < 4 {
-            return Err(corrupt("block too short"));
-        }
-        let (body, sum) = buf.split_at(buf.len() - 4);
-        if crc(body) != u32::from_le_bytes(sum.try_into().unwrap()) {
-            return Err(corrupt("block checksum mismatch"));
-        }
-        let data: Arc<[u8]> = buf.into();
+        let data = Arc::new(Block::parse(buf)?);
         if cached {
             cache().insert(key, data.clone());
         }
@@ -539,7 +598,7 @@ impl Run {
             }
             let block = self.block(b, true)?;
             let mut done = false;
-            block_entries(&block, |e| {
+            block.entries_from(block.restart_for(lo), |e| {
                 if below_lo(e.key) {
                     return Ok(true);
                 }
@@ -565,7 +624,7 @@ impl Run {
         let mut pending: Option<(KeyBuf, Vec<u64>)> = None;
         for b in 0..self.fences.len() {
             let block = self.block(b, false)?;
-            block_entries(&block, |e| {
+            block.entries_from(0, |e| {
                 match &mut pending {
                     Some((k, slots)) if k.as_slice() == e.key => e.slots_into(slots)?,
                     _ => {
@@ -1573,6 +1632,77 @@ mod tests {
         let path = run.path.clone();
         drop(run);
         assert!(!path.exists(), "a dropped run deletes its file");
+    }
+
+    /// Lookups that start mid-block, through the restart points, against a
+    /// model: every present and absent key, and ranges with either bound kind,
+    /// in blocks of thousands of entries. One key's posting list is long
+    /// enough to repeat across several entries, which must not hide its first
+    /// chunk behind a restart.
+    #[test]
+    fn a_lookup_from_a_restart_finds_what_a_walk_from_the_start_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path().join("r.run"), 64 * 1024).unwrap();
+        let mut model: BTreeMap<KeyBuf, Vec<u64>> = BTreeMap::new();
+        for n in (0..20_000u64).step_by(2) {
+            // Every seventeenth key long enough for three entries, so some
+            // restart lands on a key's second or third chunk.
+            let slots: Vec<u64> = if n % 34 == 0 {
+                (0..2 * CHUNK_SLOTS as u64 + 1).map(|i| n * 100_000 + i).collect()
+            } else {
+                vec![n * 10, n * 10 + 1]
+            };
+            w.add(&k(n), &slots).unwrap();
+            model.insert(k(n), slots);
+        }
+        let run = w.finish().unwrap();
+        assert!(run.fences.len() < 200, "big blocks, many entries each: {}", run.fences.len());
+        // The case a wrong restart choice gets wrong must be here: a restart
+        // that opens on a key the entry before it also holds.
+        let mut continuation_restarts = 0;
+        for b in 0..run.fences.len() {
+            let block = run.block(b, true).unwrap();
+            let mut prev: Option<KeyBuf> = None;
+            let mut i = 0;
+            block
+                .entries_from(0, |e| {
+                    if i % RESTART_EVERY == 0 && i > 0 && prev.as_ref().is_some_and(|p| p.as_slice() == e.key) {
+                        continuation_restarts += 1;
+                    }
+                    prev = Some(KeyBuf::from_slice(e.key));
+                    i += 1;
+                    Ok(true)
+                })
+                .unwrap();
+        }
+        assert!(continuation_restarts > 0, "no restart opens on a continued key");
+        let lookup = |lo: Bound<&[u8]>, hi: Bound<&[u8]>| {
+            let mut got = Vec::new();
+            run.scan(lo, hi, |e| {
+                e.slots_into(&mut got)?;
+                Ok(true)
+            })
+            .unwrap();
+            got
+        };
+        for n in 0..20_001u64 {
+            let want = model.get(&k(n)).cloned().unwrap_or_default();
+            assert_eq!(lookup(Bound::Included(&k(n)), Bound::Included(&k(n))), want, "key {n}");
+        }
+        let mut x = 0x9E37_79B9u64;
+        for _ in 0..500 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let a = (x >> 33) % 20_000;
+            let b = a + 1 + (x >> 20) % 300;
+            let (ka, kb) = (k(a), k(b));
+            for (lo, hi) in [
+                (Bound::Included(ka.as_slice()), Bound::Included(kb.as_slice())),
+                (Bound::Excluded(ka.as_slice()), Bound::Excluded(kb.as_slice())),
+            ] {
+                let want: Vec<u64> = model.range::<[u8], _>((lo, hi)).flat_map(|(_, v)| v.iter().copied()).collect();
+                assert_eq!(lookup(lo, hi), want, "range {a}..{b} {lo:?}");
+            }
+        }
     }
 
     #[test]

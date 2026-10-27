@@ -106,6 +106,15 @@ footer   fences offset u64, fences length u64, crc32c of fences u32, magic
   scan blocks while their fence key is at most the key.
 - **Range** (B-tree, leading columns): the same, from the low bound to the
   high bound.
+- **Within a block:** entries are varint-encoded and can only be decoded in
+  order, so when a block is read its entries are walked once and the offset
+  of every 16th one is kept alongside it in the cache. A lookup
+  binary-searches those offsets for the last one whose key is strictly below
+  the low bound, then decodes at most 16 entries before reaching it.
+  "Strictly below" matters because a long posting list continues under the
+  same key in the next entry, so an offset can open partway through a key's
+  list. The offsets are not stored in the file, so the run format did not
+  change.
 - **The union:** memory part, then frozen parts, then runs newest first. The
   existing caps (`candidate_cap`) apply to the union, and a cap reached stops
   early, as today.
@@ -114,7 +123,7 @@ footer   fences offset u64, fences length u64, crc32c of fences u32, magic
 
 ### Block cache
 
-A process-wide CLOCK cache of verified block bytes, keyed by
+A process-wide CLOCK cache of verified blocks (their bytes and offsets), keyed by
 `(run id, block no)`, sharded 64 ways, bounded by `--index-cache-mb`. Runs
 are never modified, so an entry is never stale. A dropped run's blocks
 simply age out of the cache.
@@ -186,8 +195,28 @@ untrusted (`DIRTY`, made durable before the write), exactly as in v1.
    helper; one that cannot be read declines the lookup. List lengths are upper
    bounds, which only decline more or leave a list out of a walk. Gin indexes
    are still not snapshotted.
-4. **Measured tuning:** block size, merge fan-in, and a second fence level
-   if fence memory matters at the target.
+4. **Measured tuning** (in progress). Restart offsets within a block, first
+   measured 2026-10-27. Setup: 1M rows, the primary key plus a secondary
+   index on `grp`, prepared pgbench, data on tmpfs (so this is the engine's
+   cost, not the disk's), the box shared with other work, three interleaved
+   rounds under `disk`:
+
+   | | before | with offsets |
+   |---|---|---|
+   | load 1M rows | 26-32 s | 7-9 s (memory: 6.4 s) |
+   | point read, 1 / 16 clients | 10-11k / 31-40k tps | 13-22k / 55-77k tps |
+   | indexed count | unchanged within noise | |
+
+   Before the change, decoding entries from a block's start was 43% of the
+   server's cycles on a cached point read. Loads were slow because every
+   insert's UNIQUE probe paid that cost too. On a quiet box, `memory` and
+   `hybrid` are equal (hybrid's memory part spilled nothing here). `disk`
+   holds about 100 MB less (98 MB anonymous after load, against 206 MB for
+   memory). Its point reads are about 10% below memory's at one client and
+   25-45% below at 16 clients; the cause of the 16-client gap is not yet
+   profiled.
+   Still open: block size, merge fan-in, and a second fence level if fence
+   memory matters at the target size.
 
 ## What this is not
 
