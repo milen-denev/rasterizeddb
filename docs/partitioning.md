@@ -181,19 +181,36 @@ a plain table with a composite `PRIMARY KEY` (§1b).
   with `SKIP LOCKED` or `NOWAIT` (55P03), routed or fanned out, with `ORDER BY
   … LIMIT`, in blocks and prepared. The engine maps the four strengths onto
   two, as it did on a one-column key (`NO KEY UPDATE` is `UPDATE`, `KEY
-  SHARE` is `SHARE`). The select list must hold every key column, as it had
-  to hold the one before.
+  SHARE` is `SHARE`). The select list need not name the key: the scan
+  fetches the key columns (and a nullable one's NULL companion) for the lock
+  and never returns them, so `SELECT email … FOR UPDATE` on a table keyed by
+  `id` locks by `id`. A table has one key, whatever a statement selects, so
+  every locker and writer of a row names it alike.
+- A locking read that took a lock it did not already hold, after a
+  transaction its scan could not see has committed (the holder it waited
+  for, or one that finished between the scan and the lock, as `SKIP LOCKED`
+  meets without waiting), **scans again at a fresh snapshot**, at most four
+  times and then 40001: a row gone or no longer matching drops out, a
+  changed one comes back as it is now (PostgreSQL re-reads a locked row's
+  latest version). A claim query no longer hands out a job its holder has
+  finished, so a queue may write its claim back by key alone. Under
+  `REPEATABLE READ` the pinned snapshot makes every round the same.
 - A row is locked by the framed tuple of its key under the table's
   **logical name**: one `RowLocks` entry whichever partition the row is in
   and whichever route found it, so a lock taken through a routed read blocks
   a fanned-out writer and the reverse (§6.2's last paragraph).
 - A writer (`UPDATE`, `DELETE`, the per-row write of `UPDATE … FROM` /
-  `DELETE … USING`) of a row another transaction holds **waits** for it, as
-  PostgreSQL's does, through the same bounded wait `FOR UPDATE` takes:
-  until the holder ends, `statement_timeout`, a deadlock or the 10 s lock
-  timeout. It used to fail at once. The wait is an edge of the wait-for graph
-  table locks share, keyed as the lock is, so a cycle through a row lock and
-  a table lock ends in exactly one 40P01.
+  `DELETE … USING`) of a row another transaction holds **fails at once**
+  ("row … is locked by transaction N"), unlike PostgreSQL's, which waits and
+  re-evaluates. A writer may only wait if it re-reads the row and recomputes
+  what it writes afterwards, and `UPDATE … FROM` does not: it computes its
+  `SET` values from the join first, so the first P3 build, whose writers
+  waited, stored `v + w` computed before the holder's commit over that
+  commit (100 where 105 was right). The per-row write-back never retries by
+  key alone after a lock, deadlock, timeout or cancellation error, which
+  would drop its recheck. A locking read still waits (bounded, an edge of
+  the wait-for graph table locks share, keyed as the lock is), so a cycle
+  through a row lock and a table lock ends in exactly one 40P01.
 - `UPDATE … FROM` and `DELETE … USING` with a partitioned **target** (plain
   or partitioned source, derived tables, `RETURNING`, expressions over the
   target): the join reads every relation and partition under its one
@@ -221,11 +238,18 @@ A row whose key holds a NULL names no row (a unique key admits any number of
 NULLs): `FOR UPDATE` and the write-back refuse it with an error rather than
 name every NULL row by the bytes a NULL travels as, which used to write a
 NULL-keyed row back by `= NULL` and silently skip it. A one-column key locks by
-the column's stored bytes, exactly as before; a composite one by each
-component's `encode_canonical`, which is length-prefixed, so `(1, 23)` and
-`(12, 3)` cannot meet. A primary key declared with a `CONSTRAINT` name of its
-own is not recognised as the primary key; it is still chosen by rule 2 when
-its columns are `NOT NULL`.
+the column's stored bytes; a composite one by each component's
+`encode_canonical`, which is length-prefixed, so `(1, 23)` and `(12, 3)`
+cannot meet. A decimal is keyed by its value (unscaled with trailing zeros
+stripped, and its scale), from the scale its producer states
+(`CellScale`): the select pipeline leaves `NUMERIC(10,2)`'s 1.50 at 150 and
+a subquery normalises it to 1500000000, and the first build keyed the two
+apart, so a writer never met a lock on a `NUMERIC(p,s)` key with `s ≠ 9`.
+A primary key declared with a `CONSTRAINT` name of its own is not
+recognised as the primary key: the schema records a composite key only as a
+`UniqueKey` (name, columns, predicate), with no constraint kind, and only a
+one-column primary key in `schema.primary_key`. It is still chosen by rule 2
+when its columns are `NOT NULL`.
 
 **Pinned by** `tests/partition_twin.rs` (`ForUpdate`, `SkipLocked`,
 `ForUpdateNoWait`, `UpdateFrom`, `DeleteUsing` compared with the twin, in
@@ -235,12 +259,16 @@ statements, and at 0x5eed2b20 and 0x5eedf1a1 with 1,500 statements each),
 `tests/partition_shell_sites.rs`, `tests/partition_write.rs` and
 `row_source_join_tests.rs` (a partitioned target written like its twin),
 and `rasterizeddb_compat/tests/composite_row_locks.rs` over pgwire on a plain
-composite-key table and a partitioned one: a `SKIP LOCKED` job queue
-claiming every job exactly once, `NOWAIT` 55P03, a holder blocking a writer
-until `COMMIT`, one 40P01 across a row and a table lock, `UPDATE … FROM`
-under one snapshot with a concurrent writer, `DELETE … USING` returning each
-row once under a concurrent inserter, write-once, and the key choice. Each
-invariant was mutation-verified.
+composite-key table and a partitioned one: a `SKIP LOCKED` job queue whose
+claim writes back by key alone claiming every job exactly once, `NOWAIT`
+55P03, a holder refusing a writer until `COMMIT`, one 40P01 across a row and
+a table lock, `UPDATE … FROM` under one snapshot with a concurrent writer,
+`DELETE … USING` returning each row once under a concurrent inserter,
+write-once, the key choice, the two lost-update shapes of the first build
+(a writer's join values over a holder's commit; a write-back without its
+recheck after a lock timeout), `NUMERIC(10,2)`, `TEXT` and `UUID` keys, a
+locking read without the key in its select list, and a waited read
+returning what the holder left. Each invariant was mutation-verified.
 
 **Found, not fixed** (engine behaviour outside P3, on plain tables too):
 
@@ -249,12 +277,6 @@ invariant was mutation-verified.
   updated and the client gets 23514.
 - A column of a table-level `PRIMARY KEY (a, b)` written without `NOT NULL`
   accepts NULL (PostgreSQL makes it `NOT NULL`).
-- A `FOR UPDATE` that waited for a holder returns the row as its scan saw
-  it, and does not recheck its `WHERE` against the version the holder
-  committed (PostgreSQL's EvalPlanQual): a claim query re-reads a job the
-  holder already finished. A queue that writes back with its state in the
-  `WHERE` (`… AND state = 'new'`) claims each job once; one that writes back
-  by key alone can claim it twice.
 
 ## 1. Model
 
@@ -1710,9 +1732,7 @@ section specifying the mechanism.
 12. **Checkpoints grow with active partitions** and can stall a location's
     writers for seconds (§5).
 13. ~~**Row-addressing statements wait on composite identifying keys**~~:
-    built in phase 3 P3 ([as built](#phase-3-p3-as-built)). Left open there: a
-    waited `FOR UPDATE` does not recheck its `WHERE` against the version the
-    holder committed, so a job queue must keep its state in the write-back's
-    `WHERE`.
+    built in phase 3 P3 ([as built](#phase-3-p3-as-built)). Writers fail at
+    once on a held row rather than wait as PostgreSQL's do.
 14. **Replica apply skips a transient `53xxx`** under `Skip` and
     `LastWriterWins` until `replication/server.rs` retries it (§12).
