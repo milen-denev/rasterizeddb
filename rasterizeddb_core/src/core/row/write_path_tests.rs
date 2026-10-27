@@ -74,6 +74,27 @@ async fn open_table(dir: &std::path::Path, name: &str) -> Table<LocalStorageProv
     .await
 }
 
+/// A write-ahead log for `dir` until the guard drops. An in-place overwrite
+/// is taken only where the write waits for its commit
+/// (`StorageIO::defers_in_place_writes`), which for a file means one with a
+/// log: the tests of that path run under one.
+struct Logged(String);
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        crate::core::wal::remove_for(&self.0);
+    }
+}
+
+fn logged(dir: &std::path::Path) -> Logged {
+    let location = dir.to_str().unwrap().to_string();
+    let wal = std::sync::Arc::new(
+        crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+    );
+    crate::core::wal::install_for(&location, wal);
+    Logged(location)
+}
+
 async fn insert(t: &Table<LocalStorageProvider>, id: u64, cat: i32, label: &str) {
     let mut rw = RowWrite {
         columns_writing_data: SmallVec::new(),
@@ -2408,6 +2429,7 @@ async fn unique_and_vacuum_work_through_sql() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fixed_width_update_writes_only_the_columns_it_changes() {
     let dir = tempfile::tempdir().unwrap();
+    let _log = logged(dir.path());
     let t = open_table(dir.path(), "wp_inplace").await;
     for i in 0..40u64 {
         insert(
@@ -2667,6 +2689,7 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
     use std::sync::Arc as StdArc;
 
     let dir = tempfile::tempdir().unwrap();
+    let _log = logged(dir.path());
     let t = open_table(dir.path(), "wp_inplace_mvcc").await;
     for i in 0..20u64 {
         insert(&t, i, i as i32, "a-label-that-stays-put").await;

@@ -218,6 +218,27 @@ async fn an_insert_outside_its_range_errors() {
 
 /// A partition owning the whole space, so only the "point unchanged" rule can
 /// refuse an update, never the range.
+/// A write-ahead log for `dir` until the guard drops. An in-place overwrite
+/// is taken only where the write waits for its commit
+/// (`StorageIO::defers_in_place_writes`), which for a file means one with a
+/// log: the tests of that path run under one.
+struct Logged(String);
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        crate::core::wal::remove_for(&self.0);
+    }
+}
+
+fn logged(dir: &std::path::Path) -> Logged {
+    let location = dir.to_str().unwrap().to_string();
+    let wal = std::sync::Arc::new(
+        crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+    );
+    crate::core::wal::install_for(&location, wal);
+    Logged(location)
+}
+
 async fn quiet_partition(dir: &std::path::Path) -> Table<P> {
     init();
     let l = create_logical(dir).await;
@@ -244,6 +265,7 @@ async fn assert_untouched(t: &Table<P>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_change_on_the_in_place_path_is_refused() {
     let dir = tempfile::tempdir().unwrap();
+    let _log = logged(dir.path());
     let t = quiet_partition(dir.path()).await;
     let fast = !cfg!(feature = "enable_long_row");
 
@@ -360,6 +382,7 @@ async fn a_key_change_part_way_through_a_statement_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_key_change_leaves_nothing_after_abort() {
     let dir = tempfile::tempdir().unwrap();
+    let _log = logged(dir.path());
     let t = quiet_partition(dir.path()).await;
     let manager = StdArc::new(TransactionManager::in_memory());
     t.enable_versioning(manager.clone());
