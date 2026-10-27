@@ -878,3 +878,135 @@ fn dropping_a_constraint_that_is_not_there_is_42704() {
         assert_eq!(e.code, "42704", "{t}: {e}");
     }
 }
+
+/// How a client sees a table's keys: `pg_index`, and per column `SHOW
+/// COLUMNS`' name, nullable, is_unique and is_primary_key.
+fn keys_of(c: &mut Client, t: &str) -> (Vec<Vec<Option<String>>>, Vec<Vec<Option<String>>>) {
+    let index = c
+        .ok(&format!(
+            "SELECT i.indisunique, i.indisprimary, i.indnatts FROM pg_index i JOIN pg_class r ON i.indrelid = r.oid \
+             WHERE r.relname = '{t}' ORDER BY 1, 2, 3"
+        ))
+        .rows;
+    let shown = c.ok(&format!("SHOW COLUMNS FROM {t}"));
+    let at = |name: &str| shown.columns.iter().position(|c| c == name).unwrap();
+    let picks = [at("column_name"), at("nullable"), at("is_unique"), at("is_primary_key")];
+    (index, shown.rows.iter().map(|r| picks.iter().map(|&i| r[i].clone()).collect()).collect())
+}
+
+fn is_primary(c: &mut Client, t: &str, column: &str) -> bool {
+    let (index, columns) = keys_of(c, t);
+    let flagged = columns.iter().find(|r| r[0].as_deref() == Some(column)).unwrap()[3].as_deref() == Some("t");
+    let indexed = index.iter().any(|r| r[1].as_deref() == Some("t"));
+    assert_eq!(flagged, indexed, "{t}: SHOW COLUMNS and pg_index disagree: {columns:?} {index:?}");
+    flagged
+}
+
+fn expect_code(c: &mut Client, sql: &str, code: &str) {
+    let e = c.simple(sql).expect_err(sql);
+    assert_eq!(e.code, code, "{sql}: {e}");
+}
+
+/// `ADD [CONSTRAINT n] PRIMARY KEY (…)` makes the key the table's, as in
+/// PostgreSQL: NOT NULL (23502 over a NULL), a second one refused (42P16), a
+/// one-column one recorded as `CREATE TABLE` records it, and dropped with
+/// its constraint. Plain and partitioned read alike, across a restart.
+#[test]
+fn add_primary_key_makes_the_tables_primary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path().to_str().unwrap());
+    let kinds = [("apk_q", ""), ("apk_p", " PARTITION BY HASH (a) PARTITIONS 4")];
+    {
+        let mut c = server.connect();
+        for (t, part) in kinds {
+            // A partition key column is NOT NULL; `b` and plain-only `apk_n`
+            // below are where NOT NULL is made.
+            c.ok(&format!("CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT, v BIGINT){part}"));
+            c.ok(&format!("INSERT INTO {t} (a, b, v) VALUES (1, 1, 1), (2, NULL, 2)"));
+            expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a, b)"), "23502");
+            c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a)"));
+            assert!(is_primary(&mut c, t, "a"), "{t}");
+            expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a, v)"), "42P16");
+            expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT other PRIMARY KEY (a)"), "42P16");
+        }
+        let (q, p) = (keys_of(&mut c, "apk_q"), keys_of(&mut c, "apk_p"));
+        assert_eq!(q, p, "plain and partitioned read unlike");
+        // A nullable column made the one-column key: NOT NULL from then on.
+        c.ok("CREATE TABLE apk_n (x BIGINT, y BIGINT)");
+        c.ok("INSERT INTO apk_n (x, y) VALUES (1, 1), (NULL, 2)");
+        expect_code(&mut c, "ALTER TABLE apk_n ADD PRIMARY KEY (x)", "23502");
+        c.ok("DELETE FROM apk_n WHERE x IS NULL");
+        c.ok("ALTER TABLE apk_n ADD PRIMARY KEY (x)");
+    }
+    server = server.restart();
+    let mut c = server.connect();
+    for (t, part) in kinds {
+        assert!(is_primary(&mut c, t, "a"), "{t} after a restart");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, v) VALUES (NULL, 5, 5)"), "23502");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, v) VALUES (1, 5, 5)"), "23505");
+        // Dropped with its constraint: no longer the key, still NOT NULL.
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"));
+        assert!(!is_primary(&mut c, t, "a"), "{t} after the DROP");
+        c.ok(&format!("INSERT INTO {t} (a, b, v) VALUES (1, 5, 5)"));
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, v) VALUES (NULL, 5, 5)"), "23502");
+        // A composite one, unnamed: `<table>_pkey`, its columns NOT NULL.
+        c.ok(&format!("DELETE FROM {t} WHERE b IS NULL"));
+        c.ok(&format!("ALTER TABLE {t} ADD PRIMARY KEY (a, b)"));
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, v) VALUES (9, NULL, 9)"), "23502");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, v) VALUES (1, 5, 6)"), "23505");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"));
+        c.ok(&format!("INSERT INTO {t} (a, b, v) VALUES (1, 5, 6)"));
+        let _ = part;
+    }
+    assert!(is_primary(&mut c, "apk_n", "x"), "apk_n after a restart");
+    let (_, columns) = keys_of(&mut c, "apk_n");
+    assert_eq!(columns[0], vec![Some("x".into()), Some("f".into()), Some("t".into()), Some("t".into())]);
+    expect_code(&mut c, "INSERT INTO apk_n (x, y) VALUES (NULL, 3)", "23502");
+    let (q, p) = (keys_of(&mut c, "apk_q"), keys_of(&mut c, "apk_p"));
+    assert_eq!(q, p, "plain and partitioned read unlike at the end");
+}
+
+/// Names over the 128 bytes a sidecar keeps are cut where they are read, so
+/// the name created is the name dropped and two that share their first 128
+/// bytes are one name; unnamed CHECKs and UNIQUEs are named as PostgreSQL
+/// names them, numbered on a collision.
+#[test]
+fn long_and_unnamed_constraint_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (t, part) in [("cn_q", ""), ("cn_p", " PARTITION BY HASH (a) PARTITIONS 4")] {
+        c.ok(&format!("CREATE TABLE {t} (a BIGINT NOT NULL, b BIGINT, v BIGINT){part}"));
+        c.ok(&format!("INSERT INTO {t} (a, b, v) VALUES (1, 1, 1)"));
+        let long = "n".repeat(131);
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {long} CHECK (v > -1)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {long}"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {long}"), "42704");
+        let wide = format!("\"{}\"", "é".repeat(65));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {wide} UNIQUE (a, v)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {wide}"));
+        let (x, y) = (format!("{}x", "p".repeat(128)), format!("{}y", "p".repeat(128)));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {x} UNIQUE (a, v)"));
+        let e = c.simple(&format!("ALTER TABLE {t} ADD CONSTRAINT {y} UNIQUE (a, b)")).expect_err("a name the first took");
+        assert!(e.message.contains("already exists"), "{t}: {e}");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {y}"));
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {x}"), "42704");
+
+        // Unnamed CHECKs: one column read, none or several, a literal that
+        // spells a column's name, and a collision.
+        for check in ["v > 0", "v > -5", "a > -5 AND v > -5", "1 = 1", "v > -9 OR 'a' = 'a'"] {
+            c.ok(&format!("ALTER TABLE {t} ADD CHECK ({check})"));
+        }
+        for name in ["v_check", "v_check1", "check", "check1", "v_check2"] {
+            c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_{name}"));
+        }
+        // Unnamed UNIQUEs: `<table>_<cols>_key`, then numbered.
+        c.ok(&format!("ALTER TABLE {t} ADD UNIQUE (a, v)"));
+        c.ok(&format!("ALTER TABLE {t} ADD UNIQUE (a, v)"));
+        for name in ["a_v_key", "a_v_key1"] {
+            c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_{name}"));
+        }
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {t}_a_v_key"), "42704");
+    }
+}

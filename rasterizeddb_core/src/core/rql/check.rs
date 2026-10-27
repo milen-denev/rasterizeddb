@@ -207,6 +207,96 @@ pub fn derived_name(table: &str, column: Option<&str>, ordinal: usize) -> String
     }
 }
 
+/// The name PostgreSQL gives an unnamed `ADD CHECK (…)` on `table`:
+/// `<table>_<column>_check` when the expression reads exactly one of
+/// `columns`, `<table>_check` when it reads none or several, and on a
+/// collision (`taken`) the label numbered from 1 (`t_a_check1`, …), as
+/// `ChooseConstraintName` does. A PG-written migration drops it by that
+/// name; `<table>_check<n>`, which this used to give, it never finds.
+/// Cut to the stored limit (`unique_key::stored_name`).
+pub fn unnamed_name(table: &str, expression: &str, columns: &[String], taken: impl Fn(&str) -> bool) -> String {
+    let read = columns_read(expression, columns);
+    let base = match read.as_slice() {
+        [one] => format!("{}_{}", table.to_ascii_lowercase(), one.to_ascii_lowercase()),
+        _ => table.to_ascii_lowercase(),
+    };
+    let mut pass = 0usize;
+    loop {
+        let label = if pass == 0 { "check".to_string() } else { format!("check{pass}") };
+        let name = crate::core::rql::unique_key::stored_name(&format!("{base}_{label}"));
+        if !taken(&name) {
+            return name;
+        }
+        pass += 1;
+    }
+}
+
+/// The distinct `columns` an expression names, in the order first read:
+/// identifiers outside string literals, a bare one matched without case, a
+/// double-quoted one exactly.
+fn columns_read(expression: &str, columns: &[String]) -> Vec<String> {
+    let mut read: Vec<String> = Vec::new();
+    let mut note = |found: Option<&String>| {
+        if let Some(c) = found
+            && !read.contains(c)
+        {
+            read.push(c.clone());
+        }
+    };
+    let chars: Vec<char> = expression.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // A string literal; `''` is a quote inside it.
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if c == '"' {
+            let mut name = String::new();
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        name.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            note(columns.iter().find(|col| **col == name));
+        } else if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            note(columns.iter().find(|col| col.eq_ignore_ascii_case(&word)));
+        } else if c.is_ascii_digit() {
+            // A number, `1e5` and `0x1f` included: never a column.
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    read
+}
+
 /// Position of `keyword` as a whole word.
 fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
     fn is_word_byte(b: u8) -> bool {
@@ -269,6 +359,23 @@ mod tests {
         let (rest, expression) = split_clause(definition);
         assert_eq!(rest, definition);
         assert!(expression.is_none());
+    }
+
+    #[test]
+    fn an_added_unnamed_check_is_named_as_postgres_names_it() {
+        let columns: Vec<String> = ["a", "v", "Mixed"].iter().map(|c| c.to_string()).collect();
+        let free = |_: &str| false;
+        assert_eq!(unnamed_name("pl", "a > 0", &columns, free), "pl_a_check");
+        assert_eq!(unnamed_name("pl", "a > 0 AND a < 9", &columns, free), "pl_a_check");
+        assert_eq!(unnamed_name("pl", "a > v", &columns, free), "pl_check");
+        assert_eq!(unnamed_name("pl", "1 = 1", &columns, free), "pl_check");
+        // A literal spelling a column's name, a number with letters in it,
+        // a function's name: none is a column.
+        assert_eq!(unnamed_name("pl", "v > 1e5 OR 'a' = 'it''s a'", &columns, free), "pl_v_check");
+        assert_eq!(unnamed_name("pl", "length(\"Mixed\") > 0", &columns, free), "pl_mixed_check");
+        // A collision numbers the label, from 1.
+        let taken = |n: &str| n == "pl_a_check" || n == "pl_a_check1";
+        assert_eq!(unnamed_name("pl", "a > 0", &columns, taken), "pl_a_check2");
     }
 
     #[test]

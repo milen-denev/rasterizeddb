@@ -6653,6 +6653,17 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("no unique or exclusion constraint matching the on conflict specification") {
         return "42P10";
     }
+    // `invalid_table_definition`: a second PRIMARY KEY. Early: the message
+    // quotes the table's name.
+    if has("multiple primary keys for table") {
+        return "42P16";
+    }
+    // `not_null_violation`: SET NOT NULL or ADD PRIMARY KEY over a NULL, in
+    // PostgreSQL's words; ahead of the relation rule, which "of relation"
+    // would otherwise reach.
+    if has("\" of relation \"") && has("contains null values") {
+        return "23502";
+    }
     // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
     // `DROP CONSTRAINT`'s "of relation" too, ahead of the relation rule.
     if has("constraint \"") && (has("\" for table \"") || has("\" of relation \"")) && has("does not exist") {

@@ -755,7 +755,7 @@ pub fn split_constraint_name(clause: &str) -> Result<(Option<String>, &str), Str
             if name.is_empty() {
                 return Err("CONSTRAINT is missing its name".to_string());
             }
-            return Ok((Some(name), quoted[i + 1..].trim_start()));
+            return Ok((Some(stored_name(&name)), quoted[i + 1..].trim_start()));
         }
         return Err("CONSTRAINT's quoted name is not closed".to_string());
     }
@@ -764,8 +764,31 @@ pub fn split_constraint_name(clause: &str) -> Result<(Option<String>, &str), Str
     if name.is_empty() {
         return Err("CONSTRAINT is missing its name".to_string());
     }
-    Ok((Some(name.to_string()), body[end..].trim_start()))
+    Ok((Some(stored_name(name)), body[end..].trim_start()))
 }
+
+/// Whether an ADD's clause is a `[CONSTRAINT <name>] PRIMARY KEY`, read after
+/// the name (`"primary key"` as a quoted name is a name).
+pub fn is_primary_key_clause(description: &str) -> bool {
+    split_constraint_name(description).is_ok_and(|(_, rest)| starts_with_words(rest, &["PRIMARY", "KEY"]).is_some())
+}
+
+/// The bytes a constraint name keeps in its sidecar slot: at most 128, cut at
+/// a character boundary. Every name is put in this form once, where it is
+/// read, so what a duplicate check, a DROP's lookup and the stored record
+/// compare is the same string: a 131-byte name was stored cut and looked for
+/// whole, so it could be created and never dropped, and two names sharing
+/// their first 128 bytes were both accepted and stored alike.
+pub fn stored_name(name: &str) -> String {
+    let mut len = name.len().min(MAX_NAME_BYTES);
+    while !name.is_char_boundary(len) {
+        len -= 1;
+    }
+    name[..len].to_string()
+}
+
+/// A constraint name's slot in the UNIQUE and CHECK sidecars, less its NUL.
+pub const MAX_NAME_BYTES: usize = 128;
 
 /// The name `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE | RESTRICT]`
 /// drops, read as [`split_constraint_name`] reads an added one (bare or
@@ -854,11 +877,11 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // pg_indexes, a duplicate's error and `ON CONFLICT ON CONSTRAINT t_pkey`
     // all named a constraint PostgreSQL would not have.
     let name = name.unwrap_or_else(|| {
-        if rest_upper.starts_with("PRIMARY KEY") {
+        stored_name(&if rest_upper.starts_with("PRIMARY KEY") {
             format!("{}_pkey", table)
         } else {
             UniqueKey::default_name(table, &columns)
-        }
+        })
     });
     Ok(Some(UniqueKey {
         predicate,
@@ -1353,6 +1376,28 @@ mod constraint_name_tests {
 #[cfg(test)]
 mod stored_name_tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_cut_to_its_stored_bytes_where_it_is_read() {
+        let long = "n".repeat(131);
+        let cut = "n".repeat(128);
+        let read = |clause: &str| split_constraint_name(clause).unwrap().0.unwrap();
+        assert_eq!(read(&format!("CONSTRAINT {long} UNIQUE (a)")), cut);
+        assert_eq!(dropped_constraint(&format!("CONSTRAINT {long}")).unwrap().0, cut);
+        // A multi-byte name, cut at a character boundary.
+        let wide = "é".repeat(65);
+        assert_eq!(read(&format!("CONSTRAINT \"{wide}\" UNIQUE (a)")), "é".repeat(64));
+        assert_eq!(dropped_constraint(&format!("CONSTRAINT IF EXISTS \"{wide}\"")).unwrap(), ("é".repeat(64), true));
+        // The record holds what was read: the same string comes back.
+        let key = parse_clause(&format!("CONSTRAINT {long} UNIQUE (a)"), "t").unwrap().unwrap();
+        assert_eq!(UniqueKey::from_vec(&key.into_vec()).unwrap().name, cut);
+        // A derived name too.
+        let col = "c".repeat(130);
+        let derived = parse_clause(&format!("UNIQUE ({col})"), "t").unwrap().unwrap();
+        assert_eq!(derived.name.len(), 128);
+        assert!(is_primary_key_clause("CONSTRAINT k PRIMARY KEY (a)") && is_primary_key_clause(" primary key (a)"));
+        assert!(!is_primary_key_clause("CONSTRAINT \"primary key\" UNIQUE (a)") && !is_primary_key_clause("UNIQUE (a)"));
+    }
 
     #[test]
     fn names_are_stored_as_utf8_and_dropped_by_the_name_given() {

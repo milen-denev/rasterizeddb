@@ -9338,8 +9338,17 @@ async fn add_check_constraint(
         Ok((named, _)) => named,
         Err(e) => return ddl_error(&e),
     };
-    let ordinal = schema.checks.iter().filter(|c| !c.is_deleted).count() + 1;
-    let name = named.unwrap_or_else(|| crate::core::rql::check::derived_name(table_name, None, ordinal));
+    // Unnamed, it is named as PostgreSQL names it (`check::unnamed_name`).
+    let name = named.unwrap_or_else(|| {
+        let columns: Vec<String> = crate::core::rql::nullable::visible_fields(&schema.fields)
+            .iter()
+            .filter(|f| !f.is_deleted)
+            .map(|f| f.name.clone())
+            .collect();
+        crate::core::rql::check::unnamed_name(table_name, &expression, &columns, |n| {
+            constraint_name_taken(schema, table_name, n)
+        })
+    });
     if schema.checks.iter().any(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name)) {
         return ddl_error(&format!("constraint \"{}\" for relation \"{}\" already exists", name, table_name));
     }
@@ -10032,6 +10041,13 @@ async fn execute_alter_table_action(
                         .primary_key
                         .clone()
                         .filter(|_| named(&format!("{}_pkey", plan.table_name)));
+                    // The header's column stops being the primary key with its
+                    // constraint: a table-level `PRIMARY KEY (id)` is a
+                    // sidecar named `<table>_pkey`, removed above, and the
+                    // header used to stay, so the catalogs and the row locks
+                    // went on calling a column the key that nothing kept
+                    // unique.
+                    let header_goes = primary_header_goes(&schema, &plan.table_name, &name);
                     if stored || implicit.is_some() || primary.is_some() {
                         // §7 step 3: the removals are the reload's work. Both
                         // sidecars are tried, since the name alone does not say
@@ -10075,8 +10091,14 @@ async fn execute_alter_table_action(
                                     schema.primary_key = None;
                                     schema.rewrite_header(io_schema.clone()).await.map_err(|e| e.to_string())?;
                                     schema.set_field_unique(&column, false, io_schema).await;
-                                } else if !removed && let Some(column) = implicit {
-                                    schema.set_field_unique(&column, false, io_schema).await;
+                                } else {
+                                    if !removed && let Some(column) = implicit {
+                                        schema.set_field_unique(&column, false, io_schema.clone()).await;
+                                    }
+                                    if header_goes {
+                                        schema.primary_key = None;
+                                        schema.rewrite_header(io_schema).await.map_err(|e| e.to_string())?;
+                                    }
                                 }
                                 Ok(())
                             })
@@ -10182,6 +10204,28 @@ async fn execute_alter_table_action(
                     if let Err(e) = key.condition(&schema.fields) {
                         return ddl_error(&e);
                     }
+                    // `PRIMARY KEY` makes this key the table's, whatever its
+                    // arity, as in PostgreSQL: a second one is refused
+                    // (42P16) before its name is looked at.
+                    let primary = crate::core::rql::unique_key::is_primary_key_clause(&description);
+                    if primary && has_primary_key(&schema, &plan.table_name) {
+                        return ddl_error(&format!(
+                            "multiple primary keys for table \"{}\" are not allowed",
+                            plan.table_name
+                        ));
+                    }
+                    // An unnamed UNIQUE whose derived name is taken gets the
+                    // next free one, as PostgreSQL's `t_a_key1`, rather than
+                    // an error; a named one keeps its "already exists".
+                    let mut key = key;
+                    let unnamed = matches!(crate::core::rql::unique_key::split_constraint_name(&description), Ok((None, _)));
+                    if unnamed && !primary && constraint_name_taken(&schema, &plan.table_name, &key.name) {
+                        let base = key.name.clone();
+                        key.name = (1..)
+                            .map(|n| crate::core::rql::unique_key::stored_name(&format!("{base}{n}")))
+                            .find(|candidate| !constraint_name_taken(&schema, &plan.table_name, candidate))
+                            .expect("a free name");
+                    }
                     if schema
                         .unique_keys
                         .iter()
@@ -10211,6 +10255,10 @@ async fn execute_alter_table_action(
                             ));
                         }
                         Ok(None) => {}
+                    }
+
+                    if primary {
+                        return add_primary_key(&plan.table_name, schema, key, database, tx).await;
                     }
 
                     // §7 step 3: the declaration is the reload's work. The
@@ -10481,6 +10529,115 @@ async fn execute_alter_table_action(
             }
         }
     }
+}
+
+/// `ADD [CONSTRAINT n] PRIMARY KEY (…)`, its key already checked against the
+/// rows: its columns made NOT NULL (refused, as PostgreSQL refuses it, when
+/// one holds a NULL), the key stored, and a one-column key recorded in the
+/// header as `CREATE TABLE` records it, so the catalogs and the row locks
+/// call it the primary key. It used to be stored as a UNIQUE only: after a
+/// DROP took the header with it, the table had no primary key. A composite
+/// key is the sidecar named `<table>_pkey`, as at CREATE; the header holds
+/// one column, so a composite one under another name is not recognised as
+/// the primary key (no format change made here).
+async fn add_primary_key(
+    table_name: &str,
+    schema: crate::core::row::schema::TableSchema,
+    key: crate::core::rql::unique_key::UniqueKey,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    use crate::core::rql::nullable;
+    let mut columns = Vec::new();
+    for column in &key.columns {
+        let Some(field) = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)) else {
+            return ddl_error(&format!("column '{}' does not exist", column));
+        };
+        columns.push(field.name.clone());
+    }
+    let mut flags = Vec::new();
+    for column in &columns {
+        let Some(flag) = nullable::flag_field(column, &schema.fields) else {
+            continue;
+        };
+        let probe = format!("SELECT 1 FROM {} WHERE {} IS NULL LIMIT 1", table_name, column);
+        match run_subquery(&probe, database, tx).await {
+            Ok(rows) if rows.is_empty() => flags.push(flag.name.clone()),
+            Ok(_) => {
+                return ddl_error(&format!(
+                    "column \"{}\" of relation \"{}\" contains null values",
+                    column, table_name
+                ));
+            }
+            Err(e) => return ddl_error(&e),
+        }
+    }
+    let header = (columns.len() == 1).then(|| columns[0].clone());
+    // The reload's work, all or nothing (B5): the key, the companions
+    // retired, the header.
+    match database
+        .reload_atomic(table_name, |old| async move {
+            let io_schema = old.io_schema.clone();
+            crate::core::rql::unique_key::append(io_schema.clone(), &key).await.map_err(|e| e.to_string())?;
+            let mut schema = schema;
+            for flag in &flags {
+                schema.mark_field_as_deleted(flag, io_schema.clone()).await;
+            }
+            if let Some(column) = header {
+                schema.primary_key = Some(column);
+                schema.rewrite_header(io_schema).await.map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .await
+    {
+        Ok(()) => ddl_ok(0),
+        Err(failure) => reload_failed(failure, ""),
+    }
+}
+
+/// Whether `schema` has a primary key: the header's column, or a whole key
+/// named `<table>_pkey` (a composite one, as `CREATE TABLE` stores it).
+fn has_primary_key(schema: &crate::core::row::schema::TableSchema, table: &str) -> bool {
+    let pkey = format!("{table}_pkey");
+    schema.primary_key.is_some()
+        || schema.unique_keys.iter().any(|k| !k.is_deleted && k.predicate.is_none() && k.name.eq_ignore_ascii_case(&pkey))
+}
+
+/// Whether DROP CONSTRAINT `name` ends the header's primary key: it names
+/// `<table>_pkey`, or it removes what kept the header's column unique (its
+/// UNIQUE flag, or the one-column key it was declared with), leaving no
+/// other whole one-column key on it.
+fn primary_header_goes(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
+    let Some(column) = schema.primary_key.as_deref() else {
+        return false;
+    };
+    let named = |n: &str| n.eq_ignore_ascii_case(name);
+    if named(&format!("{table}_pkey")) {
+        return true;
+    }
+    let flag_stays = implicit_unique_column(name, &schema.fields).is_none_or(|c| !c.eq_ignore_ascii_case(column))
+        && schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(column));
+    let key_stays = schema.unique_keys.iter().any(|k| {
+        !k.is_deleted
+            && k.predicate.is_none()
+            && !named(&k.name)
+            && k.columns.len() == 1
+            && k.columns[0].eq_ignore_ascii_case(column)
+    });
+    !(flag_stays || key_stays)
+}
+
+/// Whether a constraint of `table` is already called `name`: a UNIQUE,
+/// CHECK or FOREIGN KEY, the primary key's `<table>_pkey`, or a UNIQUE
+/// column's implicit `<table>_<column>_key`.
+fn constraint_name_taken(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
+    let named = |n: &str| n.eq_ignore_ascii_case(name);
+    schema.unique_keys.iter().any(|k| !k.is_deleted && named(&k.name))
+        || schema.checks.iter().any(|c| !c.is_deleted && named(&c.name))
+        || schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
+        || (has_primary_key(schema, table) && named(&format!("{table}_pkey")))
+        || implicit_unique_column(name, &schema.fields).is_some()
 }
 
 /// A reload's failure (§7 steps 2-4) as a DDL reports it: its own work's
@@ -11902,8 +12059,29 @@ fn schema_after_for_identity(
         AlterAction::ConstraintClause { drop: false, description } => {
             let (clause, _) = crate::core::rql::unique_key::strip_if_not_exists(description);
             let key = crate::core::rql::unique_key::parse_clause(&clause, &plan.table_name).ok()??;
+            let primary = crate::core::rql::unique_key::is_primary_key_clause(&clause);
+            if primary && has_primary_key(&after, &plan.table_name) {
+                return None; // refused: 42P16
+            }
             if after.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&key.name)) {
                 return None;
+            }
+            if primary {
+                // As `add_primary_key` leaves it: NOT NULL, and a one-column
+                // key in the header.
+                for column in &key.columns {
+                    let flag = nullable::flag_column_name(column);
+                    for f in after.fields.iter_mut().filter(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag)) {
+                        f.is_deleted = true;
+                    }
+                }
+                if let [column] = key.columns.as_slice() {
+                    after.primary_key = after
+                        .fields
+                        .iter()
+                        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+                        .map(|f| f.name.clone());
+                }
             }
             after.unique_keys.push(key);
         }
@@ -11923,6 +12101,9 @@ fn schema_after_for_identity(
                         f.is_unique = false;
                     }
                 }
+            }
+            if primary_header_goes(schema, &plan.table_name, &name) {
+                after.primary_key = None;
             }
         }
         AlterAction::AlterColumn { name, detail } if detail.to_ascii_uppercase().contains("NOT NULL") => {
