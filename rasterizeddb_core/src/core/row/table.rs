@@ -5504,6 +5504,9 @@ async fn backfill_into<S: StorageIO>(
         None => ReadTicket::inert(),
     };
     let build = gate::build_token();
+    // Before the first row is read: a slot a writer sets from here on keeps
+    // the writer's code, never the older one this read (`watch_writers`).
+    let _watch = filters.watch_writers();
 
     // Read before the first slot: a batch is written, and the prefix cleared,
     // only if no renumbering (`Table::compact`, which this does not wait for)
@@ -5579,6 +5582,8 @@ async fn backfill_into<S: StorageIO>(
         }
         indexed += 1;
     }
+    #[cfg(test)]
+    backfill_test_hooks::before_last_batch(io_rows.get_location()).await;
     if !filters.backfill_batch_at(Proof::from(&build), epoch, &pending) {
         return Err(renumbered());
     }
@@ -5700,6 +5705,45 @@ pub(crate) mod compact_test_hooks {
                 p.store(state, std::sync::atomic::Ordering::Release);
             }
         });
+    }
+}
+
+/// Parks a filter backfill between the rows it read and the batch it
+/// writes, for the tests of writers in that window.
+#[cfg(test)]
+pub(crate) mod backfill_test_hooks {
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the backfill has read its rows and is parked.
+        pub read: tokio::sync::Notify,
+        /// Notify to let it write them.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(String, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Parks the next backfill of a table whose rows are in `dir` before it
+    /// writes its last batch.
+    pub(crate) fn arm(dir: &str) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((dir.to_string(), park.clone()));
+        park
+    }
+
+    pub(super) async fn before_last_batch(dir: Option<String>) {
+        let park = {
+            let mut g = PARK.lock();
+            match (g.as_ref(), dir) {
+                (Some((at, _)), Some(dir)) if *at == dir => g.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.read.notify_one();
+            park.release.notified().await;
+        }
     }
 }
 

@@ -1018,7 +1018,9 @@ impl TableFilters {
             .renumber_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e | 1) + 2 * (e & 1)));
         for c in &self.columns {
-            c.write().demote_below(n_slots);
+            let mut c = c.write();
+            c.demote_below(n_slots);
+            c.forget_backfill_writes();
         }
     }
 
@@ -1059,6 +1061,19 @@ impl TableFilters {
         let _ = self
             .renumber_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e + 2) & !1));
+        for c in &self.columns {
+            c.write().forget_backfill_writes();
+        }
+    }
+
+    /// Starts keeping every slot a writer sets from the backfill about to
+    /// run (`ColumnFilter::written_during_backfill`), until the guard drops.
+    /// Taken before the backfill reads its first row.
+    pub fn watch_writers(&self) -> BackfillWatch<'_> {
+        for c in &self.columns {
+            c.write().begin_backfill();
+        }
+        BackfillWatch { filters: self }
     }
 
     /// [`TableFilters::clear_unindexed_prefix`], unless the slots were
@@ -1478,6 +1493,19 @@ impl TableFilters {
             }
         }
         true
+    }
+}
+
+/// A backfill's hold on [`TableFilters::watch_writers`].
+pub struct BackfillWatch<'a> {
+    filters: &'a TableFilters,
+}
+
+impl Drop for BackfillWatch<'_> {
+    fn drop(&mut self) {
+        for c in &self.filters.columns {
+            c.write().end_backfill();
+        }
     }
 }
 

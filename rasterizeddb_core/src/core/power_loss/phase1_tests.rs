@@ -1901,3 +1901,51 @@ async fn sync_off_outcomes_survive_as_a_prefix_across_locations() {
         non_prefix.join("\n")
     );
 }
+
+/// The open-time filter backfill reads a run of rows, then writes their
+/// codes, re-setting each slot outright. A writer that set a slot in that
+/// window (here an in-place UPDATE, the suite's `in_place` after an open
+/// that rebuilds) had its code overwritten with the value the backfill read
+/// before it, and the filter pruned the row from its new value: the
+/// suite's intermittent "the filter prunes visible slot 199 from `a =
+/// 801002`", seen only when heavy I/O slowed the backfill past the write.
+/// Deterministic here: the backfill is parked between its read and its
+/// write while the UPDATE runs.
+///
+/// Mutation: `set_prepared_inner` not skipping the backfill's code for a
+/// slot a writer set prunes the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backfill_never_overwrites_a_code_a_writer_set_while_it_ran() {
+    const RACE: &str = "pl1race";
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs { base: tmp.path().join("subject"), place: Place::Root, indexed: false };
+    std::fs::create_dir_all(dirs.root()).unwrap();
+    crate::core::filter::settings::settings().update_table(RACE, |o| o.min_table_rows = Some(0));
+    let db = open(&dirs).await.unwrap();
+    exec(&db, &format!("CREATE TABLE {RACE} (id BIGINT, a BIGINT)")).await.unwrap();
+    let values: Vec<String> = (0..100).map(|i| format!("({i}, {i})")).collect();
+    exec(&db, &format!("INSERT INTO {RACE} (id, a) VALUES {}", values.join(", "))).await.unwrap();
+    db.sync_durable().unwrap();
+    close(&dirs, db);
+
+    // No clean point, so the reopen rebuilds the filter by backfill.
+    let park = crate::core::row::table::backfill_test_hooks::arm(&path_str(&dirs.root()));
+    let db = open(&dirs).await.unwrap();
+    tokio::time::timeout(READY_TIMEOUT, park.read.notified()).await.expect("the backfill never parked");
+    let t = db.table_for_tests(RACE).unwrap();
+    let in_place_before = t.in_place_column_updates();
+    exec(&db, &format!("UPDATE {RACE} SET a = 777777 WHERE id = 42")).await.unwrap();
+    assert!(t.in_place_column_updates() > in_place_before, "the UPDATE relocated the row, so this tests nothing");
+    park.release.notify_one();
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    while !t.filters_ready().unwrap() {
+        assert!(std::time::Instant::now() < deadline, "the filter never became ready");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let mask = t.build_candidates("a = 777777", None).await.unwrap().expect("the filter narrowed nothing");
+    assert!(mask.get(42), "the filter prunes the updated row from its new value");
+    let found = decode(&exec(&db, &format!("SELECT id FROM {RACE} WHERE a = 777777")).await.unwrap()).unwrap();
+    assert_eq!(found.len(), 1, "WHERE a = 777777 did not find the updated row");
+    drop(t);
+    close(&dirs, db);
+}

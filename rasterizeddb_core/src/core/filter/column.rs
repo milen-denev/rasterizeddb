@@ -309,6 +309,17 @@ pub struct ColumnFilter {
     /// watermark, the dirty frontier, backfill — behaves identically, because
     /// zone bounds go stale in exactly the same ways fingerprints do.
     fingerprints: bool,
+
+    /// While a backfill runs (`backfills > 0`), the slots a writer set since
+    /// it began. A backfill reads a run of rows and writes their codes later,
+    /// and [`Self::set_reindex`] re-sets a slot outright: a writer that set
+    /// the slot in between (an in-place `UPDATE`, a reused slot's insert, a
+    /// vacuum clear) was overwritten with what the backfill read before it,
+    /// and the row's new value was pruned. A writer's code is never older
+    /// than what the backfill read (it set it under this column's lock,
+    /// after the backfill began), so the backfill leaves such a slot alone.
+    backfills: u32,
+    written_during_backfill: ahash::HashSet<u64>,
 }
 
 impl ColumnFilter {
@@ -368,6 +379,8 @@ impl ColumnFilter {
             // a bounds-only column never hashes, so there is no key to record.
             bloom: (span_summary && fingerprints).then(SuperBloom::new),
             fingerprints,
+            backfills: 0,
+            written_during_backfill: Default::default(),
         }
     }
 
@@ -412,6 +425,8 @@ impl ColumnFilter {
             zonemap,
             bloom: bloom.filter(|_| fingerprints),
             fingerprints,
+            backfills: 0,
+            written_during_backfill: Default::default(),
         }
     }
 
@@ -673,6 +688,13 @@ impl ColumnFilter {
         hash: Option<u64>,
         track_dirty: bool,
     ) {
+        if track_dirty {
+            self.note_writer(slot);
+        } else if self.backfills > 0 && self.written_during_backfill.contains(&slot) {
+            // A backfill's code for a slot a writer set since it began: older
+            // than the writer's, so dropped (see `written_during_backfill`).
+            return;
+        }
         // Bounds only ever widen. A cleared slot leaves the zone's range
         // conservatively wide rather than shrinking it, because we cannot know
         // whether the removed value was the sole occupant of a bound.
@@ -703,7 +725,35 @@ impl ColumnFilter {
     }
 
     pub fn set_hash(&mut self, slot: u64, hash: Option<u64>) {
+        self.note_writer(slot);
         self.set_hash_inner(slot, hash, true)
+    }
+
+    #[inline]
+    fn note_writer(&mut self, slot: u64) {
+        if self.backfills > 0 {
+            self.written_during_backfill.insert(slot);
+        }
+    }
+
+    /// A backfill begins: from now on, slots writers set are kept from it.
+    pub fn begin_backfill(&mut self) {
+        self.backfills += 1;
+    }
+
+    /// A backfill [`Self::begin_backfill`] began has ended.
+    pub fn end_backfill(&mut self) {
+        self.backfills = self.backfills.saturating_sub(1);
+        if self.backfills == 0 {
+            self.written_during_backfill = Default::default();
+        }
+    }
+
+    /// Slots were renumbered: what writers set is named by the old numbers,
+    /// and a backfill under the new one must not skip slots by them. Every
+    /// backfill that began before is refused from here on by its epoch.
+    pub fn forget_backfill_writes(&mut self) {
+        self.written_during_backfill.clear();
     }
 
     fn set_hash_inner(&mut self, slot: u64, hash: Option<u64>, track_dirty: bool) {
