@@ -322,8 +322,8 @@ plain twin (I6). Not advertised.
 **What runs on a partitioned table**, each as on a plain table:
 
 - `CREATE [UNIQUE] INDEX` (btree, hash, gin, a path index; named or not;
-  `IF NOT EXISTS`, though `CREATE UNIQUE INDEX IF NOT EXISTS` enforces
-  nothing on either table kind: finding below) and `DROP INDEX [IF EXISTS]`, the partial unique index's
+  `IF NOT EXISTS`, read wherever the rewrite puts it:
+  `unique_key::strip_if_not_exists`) and `DROP INDEX [IF EXISTS]`, the partial unique index's
   drop included. A UNIQUE index, like `ADD CONSTRAINT … UNIQUE`/`PRIMARY KEY`,
   must contain every partition key column (§1b): otherwise 0A000 with
   `CREATE … PARTITION BY`'s wording ("does not contain partition key column
@@ -417,7 +417,12 @@ set for these, as 2b did for every ALTER):
   intent removed. Startup (`partitioned_ddl::recover_interrupted_rename`,
   before the catalogue is read) settles it from the catalogue alone: both
   rows with the uid, tombstone the old; otherwise drop the intent. It deletes
-  no file. The catalogue row names the table: a header recording another
+  no file. While an intent is left (step 4 failed), the process refuses a
+  second partitioned RENAME, a DROP of that uid, and a CREATE of either name
+  (`unfinished_partitioned_rename`, `hold_intent`) until the next open settles
+  it. The header step retires the shell before its backup (a shell runs no
+  maintenance; the partitions are retired already), so a failed header write
+  is put back under `backup_restore`'s precondition. The catalogue row names the table: a header recording another
   name is read under the row's (`load_shell`). Two rows still sharing a uid
   after recovery are refused at startup, as before.
 - *Replication.* Each DDL ships as its logical statement (§12). The refusals
@@ -439,9 +444,12 @@ partition):
 | RENAME intent written | recovery drops the intent: the old name | `test.pddl.rename_after_intent` |
 | RENAME new row written | recovery tombstones the old row: the new name | `test.pddl.rename_after_commit`, `test.pddl.rename_after_header` |
 
-The kinds cut: CREATE INDEX, ADD CHECK, ADD UNIQUE, SET DEFAULT, RENAME
-COLUMN (a value column and the key), DROP COLUMN, SET NOT NULL and RENAME
-TO. A first run of that test found the plain rename intent unsafe for this
+The kinds cut: CREATE INDEX (btree and hash), DROP INDEX, ADD and DROP
+CHECK, ADD UNIQUE, SET and DROP DEFAULT, RENAME COLUMN (a value column and
+the key), DROP COLUMN, SET NOT NULL, RENAME TO, and on a table with no row
+ADD COLUMN with a DEFAULT and the metadata DROP NOT NULL. Each image's
+indexes are compared by contents too: an equality an index serves answers
+as the same predicate it cannot serve. A first run of that test found the plain rename intent unsafe for this
 (below), which is why RENAME has its own.
 
 **Tests.** `tests/partition_twin.rs` gains twenty-one DDL kinds (indexes,
@@ -474,6 +482,13 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | the snapshot identity unchanged by an index change (index list out of the shape hash) | `TableIndexes::shape_hash` | `partitioned_ddl_tests::a_swapped_index_never_loads_the_old_index_sections` (it survived the first snapshot test, whose CREATE INDEX changes the index count, which the load plan refuses on its own; the swap keeps the count) |
 | a fan-out skips one partition (the CHECK and NOT NULL probes) | `FanOut::planned` | `partitioned_ddl_tests::validation_reads_every_partition` |
 | a UNIQUE without a key column accepted | `partitioned_alter_refusal` | `partitioned_ddl_tests::a_unique_key_without_every_key_column_is_refused` |
+| *(rework)* `IF NOT EXISTS` after `CONSTRAINT` left in place | `unique_key::strip_if_not_exists` | `partitioned_ddl_tests::if_not_exists_unique_forms_are_refused_or_enforced`; `tests/partition_shell_sites.rs` |
+| *(rework)* an unread UNIQUE accepted as unenforced | the ADD CONSTRAINT arm's fall-through | `…::if_not_exists_unique_forms_are_refused_or_enforced` |
+| *(rework)* no unfinished rename seen, names not held | `unfinished_partitioned_rename`, `rename_partitioned` | `…::an_unfinished_rename_blocks_a_second_rename_and_a_drop` (the second rename succeeds) |
+| *(rework)* a DROP ignores an unfinished rename | `drop_partitioned` | the same (the DROP succeeds) |
+| *(rework)* a failed header write not put back | `rewrite_partitioned_header` | `…::a_failed_header_rewrite_puts_the_schema_files_back` |
+| *(rework)* recovery skips the schema intents | `recover_interrupted_rewrites` | `pddl_crash_tests::a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new` |
+| *(rework)* an index build skips rows | `build_indexes` | the same (the index-contents check) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
@@ -516,11 +531,14 @@ with 1,500 statements each.
   plain table the same parse would tombstone the table's row and discard
   its files; a torn new name that is another table's name would discard
   that table's files.
-- **`CREATE UNIQUE INDEX IF NOT EXISTS` enforces nothing.** Its rewrite,
-  `ADD CONSTRAINT IF NOT EXISTS name UNIQUE (…)`, reaches the arm as
-  `CONSTRAINT IF NOT EXISTS …`, which `unique_key::parse_clause` reads as a
-  constraint named `IF`: not UNIQUE, not CHECK, so "accepted but not
-  enforced", on plain and partitioned tables alike.
+- **`CREATE UNIQUE INDEX IF NOT EXISTS` enforced nothing** (fixed in the P1
+  rework, `3fa8b1a`). Its rewrite, `ADD CONSTRAINT IF NOT EXISTS name UNIQUE
+  (…)`, reached the arm as `CONSTRAINT IF NOT EXISTS …`, which
+  `unique_key::parse_clause` read as a constraint named `IF`: "accepted but
+  not enforced", on plain and partitioned tables alike.
+  `unique_key::strip_if_not_exists` now takes it out for the arm and the
+  partitioned refusal, and a UNIQUE or PRIMARY KEY that still does not parse
+  is an error (0A000), never that success.
 - `SET NOT NULL` over a NULL answers XX000 (PostgreSQL: 23502), and a
   missing column in a select list 42601 (42703), on both table kinds.
 - Once, in the first twin run at 0x5eed2b20, a debug build's tokio worker
