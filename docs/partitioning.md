@@ -323,7 +323,10 @@ plain twin (I6). Not advertised.
 
 - `CREATE [UNIQUE] INDEX` (btree, hash, gin, a path index; named or not;
   `IF NOT EXISTS`, read wherever the rewrite puts it:
-  `unique_key::strip_if_not_exists`) and `DROP INDEX [IF EXISTS]`, the partial unique index's
+  `unique_key::strip_if_not_exists`, which matches keywords byte-safely, so
+  a constraint name starting with a multi-byte character is a name; the
+  name itself read bare or quoted, spaces, `""` and non-ASCII included, by
+  `unique_key::split_constraint_name`) and `DROP INDEX [IF EXISTS]`, the partial unique index's
   drop included. A UNIQUE index, like `ADD CONSTRAINT … UNIQUE`/`PRIMARY KEY`,
   must contain every partition key column (§1b): otherwise 0A000 with
   `CREATE … PARTITION BY`'s wording ("does not contain partition key column
@@ -422,7 +425,11 @@ set for these, as 2b did for every ALTER):
   (`unfinished_partitioned_rename`, `hold_intent`) until the next open settles
   it. The header step retires the shell before its backup (a shell runs no
   maintenance; the partitions are retired already), so a failed header write
-  is put back under `backup_restore`'s precondition. The catalogue row names the table: a header recording another
+  is put back under `backup_restore`'s precondition. An intent that does
+  not parse (renamed into place whole, so not one this engine wrote) is
+  moved aside at the next open to `__prename.intent.bad-<n>`, logged at
+  error level; until then RENAME and DROP name the file and the manual
+  step. The catalogue row names the table: a header recording another
   name is read under the row's (`load_shell`). Two rows still sharing a uid
   after recovery are refused at startup, as before.
 - *Replication.* Each DDL ships as its logical statement (§12). The refusals
@@ -447,9 +454,15 @@ partition):
 The kinds cut: CREATE INDEX (btree and hash), DROP INDEX, ADD and DROP
 CHECK, ADD UNIQUE, SET and DROP DEFAULT, RENAME COLUMN (a value column and
 the key), DROP COLUMN, SET NOT NULL, RENAME TO, and on a table with no row
-ADD COLUMN with a DEFAULT and the metadata DROP NOT NULL. Each image's
-indexes are compared by contents too: an equality an index serves answers
-as the same predicate it cannot serve. A first run of that test found the plain rename intent unsafe for this
+ADD COLUMN with a DEFAULT and the metadata DROP NOT NULL, and an index
+swapped for another with the count kept (`DROP INDEX; CREATE INDEX`, the
+state between the two accepted). Each image's indexes are compared by
+contents too: an equality an index serves answers as the same predicate it
+cannot serve. Snapshots are sealed before each change, and every image is
+opened twice: rebuilding its indexes from rows, and with `index_storage =
+snapshot`, loading the sealed INDEX sections wherever the open's proof
+accepts them, so a stale persisted section would answer from stale
+entries (the test asserts that images did load persisted indexes). A first run of that test found the plain rename intent unsafe for this
 (below), which is why RENAME has its own.
 
 **Tests.** `tests/partition_twin.rs` gains twenty-one DDL kinds (indexes,
@@ -489,6 +502,11 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(rework)* a failed header write not put back | `rewrite_partitioned_header` | `…::a_failed_header_rewrite_puts_the_schema_files_back` |
 | *(rework)* recovery skips the schema intents | `recover_interrupted_rewrites` | `pddl_crash_tests::a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new` |
 | *(rework)* an index build skips rows | `build_indexes` | the same (the index-contents check) |
+| *(round 2)* the keyword match slicing statement text by bytes | `unique_key::starts_with_words` | `strip_if_not_exists_tests`, `partitioned_ddl_tests::non_ascii_and_quoted_constraint_names_on_both_table_kinds` (a char-boundary panic) |
+| *(round 2)* the unread-UNIQUE scan reading the name too | the ADD CONSTRAINT arm | `…::non_ascii_and_quoted_constraint_names_…` (`"unique" EXCLUDE` refused) |
+| *(round 2)* the constraint name read up to whitespace | `parse_clause` | the same (`"my key" UNIQUE` refused) |
+| *(round 2)* a malformed rename intent left in place at open | `recover_interrupted_rename` | `…::a_malformed_rename_intent_is_set_aside_at_open` |
+| *(round 2)* the snapshot identity unchanged by an index swap | `TableIndexes::shape_hash` | `pddl_crash_tests` (the swap case under `index_storage = snapshot`: `s = 'w0'` answers nothing, its scan the rows) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
@@ -539,6 +557,13 @@ with 1,500 statements each.
   `unique_key::strip_if_not_exists` now takes it out for the arm and the
   partitioned refusal, and a UNIQUE or PRIMARY KEY that still does not parse
   is an error (0A000), never that success.
+- **Constraint names are stored ASCII-filtered.** `unique_key::write_name`
+  (and the CHECK sidecar) keep only ASCII letters, digits and `_`: `名`
+  is stored as an empty name, `"my key"` as `mykey`, `価格_chk` as `_chk`.
+  The keys are enforced; `IF NOT EXISTS` on such a name does not find it
+  and adds a second key. The schema's names were fixed the same way in
+  `020dd0e`; these sidecars were not. Older than this slice, on both table
+  kinds.
 - `SET NOT NULL` over a NULL answers XX000 (PostgreSQL: 23502), and a
   missing column in a select list 42601 (42703), on both table kinds.
 - Once, in the first twin run at 0x5eed2b20, a debug build's tokio worker
