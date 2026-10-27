@@ -808,7 +808,9 @@ async fn ungated_writes_are_exactly_the_listed_ones() {
     exec(&db, "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT DEFAULT 3 CHECK (v >= 0), s TEXT UNIQUE)").await;
     exec(&db, "INSERT INTO a (id, v, s) VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'z')").await;
     exec(&db, "UPDATE a SET v = 11 WHERE id = 1").await;
-    exec(&db, "UPDATE a SET s = 'yy' WHERE v > 15").await;
+    // One row: two rows given one value of the UNIQUE `s` is a violation,
+    // which this statement was before an UPDATE saw its own earlier rows.
+    exec(&db, "UPDATE a SET s = 'yy' WHERE v > 15 AND v < 25").await;
     exec(&db, "DELETE FROM a WHERE id = 3").await;
     exec(&db, "CREATE INDEX a_v ON a (v)").await;
     exec(&db, "ALTER TABLE a ADD CONSTRAINT a_ck CHECK (id > 0)").await;
