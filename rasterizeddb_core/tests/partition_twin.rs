@@ -219,7 +219,17 @@ enum Kind {
     DropKeyColumn,
     AddColumnPopulated,
     AlterType,
-    AddForeignKey,
+    // Foreign keys (phase 3 P4), each a round trip: the key added (its
+    // existing rows validated), inserts that break and keep it, a parent
+    // DELETE with the key's action (a cascade in a rolled-back block), a
+    // parent key UPDATE refused while referenced, and the key dropped by
+    // its name. From the table under test to a plain parent `{d}` (named or
+    // PostgreSQL's unnamed `<t>_tenant_id_fkey`); from it to `{k}`,
+    // partitioned on the partitioned side; and from the plain sink `{s}` to
+    // `{k}`.
+    ForeignKeyFromT,
+    ForeignKeyOntoPartitioned,
+    ForeignKeyFromSink,
     PreparedSelectAcrossAlter,
     // Structure.
     TxCommit,
@@ -250,8 +260,8 @@ const ALL_KINDS: &[Kind] = &[
     PreparedInsert, PreparedUpdate, PreparedDelete, PreparedUpdateReturning, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
     CreateIndex, DropIndex, CreateUniqueIndex, DropUniqueIndex, UniqueWithoutKey, AddCheck, DropCheck, SetDefault,
     DropDefault, SetNotNull, DropNotNull, DropNotNullKey, RenameColumnRoundTrip, RenameKeyRoundTrip,
-    RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, AddForeignKey,
-    PreparedSelectAcrossAlter,
+    RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, ForeignKeyFromT,
+    ForeignKeyOntoPartitioned, ForeignKeyFromSink, PreparedSelectAcrossAlter,
     TxCommit, TxRollback, Restart,
 ];
 
@@ -311,8 +321,10 @@ const REFUSED: &[Refusal] = &[
     // are compared with the twin. Refused for good: a UNIQUE without every
     // key column (§1b), a key column made nullable or dropped (§1.5).
     // Refused until their slice: what rewrites every row (a populated ADD
-    // COLUMN, a type change, DROP NOT NULL of a NOT NULL column: phase 6)
-    // and foreign keys (P4).
+    // COLUMN, a type change, DROP NOT NULL of a NOT NULL column: phase 6).
+    // Phase 3 P4 (foreign keys both ways) is built: ForeignKeyFromT,
+    // ForeignKeyOntoPartitioned and ForeignKeyFromSink are compared with the
+    // twin, AddForeignKey's refusal gone with them.
     refused(UniqueWithoutKey, "never (§1b)"),
     refused(DropNotNullKey, "never (§1.5)"),
     refused(DropKeyColumn, "never (§1.5)"),
@@ -329,7 +341,6 @@ const REFUSED: &[Refusal] = &[
         lifted_by: "phase 6 (physical ALTER) for a NOT NULL column",
         or_like_twin: Some("a no-op on a nullable column, as on the twin"),
     },
-    refused(AddForeignKey, "P4 (foreign keys)"),
     // S10 (single-snapshot fan-out SELECT and COUNT) is built: every read
     // kind is compared with the twin, ORDER BY across partitions included
     // (correct by sorting the partitions' top-N together; S12 makes it
@@ -379,28 +390,42 @@ struct Config {
 /// Each side's names: `{t}` the table under test, `{d}` a dimension table
 /// (keyed by tenant, so `UPDATE {d} … FROM {t}` can write each row back),
 /// `{s}` a sink, `{u}` a second table partitioned on the partitioned side
-/// (read-only, for joins of two partitioned tables, S19). The stage table is
-/// shared and read-only.
+/// (read-only, for joins of two partitioned tables, S19), `{k}` a parent
+/// keyed by tenant, partitioned by it on the partitioned side (the foreign
+/// key kinds' referenced table, phase 3 P4). The stage table is shared and
+/// read-only.
 struct Side {
     t: &'static str,
     d: &'static str,
     s: &'static str,
     u: &'static str,
+    k: &'static str,
 }
 
-const SIDE_PART: Side = Side { t: PART, d: "dim_part", s: "sink_part", u: "pair_part" };
-const SIDE_PLAIN: Side = Side { t: PLAIN, d: "dim_plain", s: "sink_plain", u: "pair_plain" };
+const SIDE_PART: Side = Side { t: PART, d: "dim_part", s: "sink_part", u: "pair_part", k: "kpar_part" };
+const SIDE_PLAIN: Side = Side { t: PLAIN, d: "dim_plain", s: "sink_plain", u: "pair_plain", k: "kpar_plain" };
 
 fn render(template: &str, side: &Side) -> String {
-    template.replace("{t}", side.t).replace("{d}", side.d).replace("{s}", side.s).replace("{u}", side.u)
+    template
+        .replace("{t}", side.t)
+        .replace("{d}", side.d)
+        .replace("{s}", side.s)
+        .replace("{u}", side.u)
+        .replace("{k}", side.k)
 }
 
 /// Undoes [`render`] in an answer, so the two sides compare.
 fn unrender(text: &str) -> String {
     let mut out = text.to_string();
     for side in [&SIDE_PART, &SIDE_PLAIN] {
-        out = out.replace(side.d, "{d}").replace(side.s, "{s}").replace(side.u, "{u}").replace(side.t, "{t}");
         out = out
+            .replace(side.k, "{k}")
+            .replace(side.d, "{d}")
+            .replace(side.s, "{s}")
+            .replace(side.u, "{u}")
+            .replace(side.t, "{t}");
+        out = out
+            .replace(&side.k.to_ascii_uppercase(), "{K}")
             .replace(&side.d.to_ascii_uppercase(), "{D}")
             .replace(&side.s.to_ascii_uppercase(), "{S}")
             .replace(&side.u.to_ascii_uppercase(), "{U}")
@@ -447,6 +472,11 @@ struct Op {
 struct Gen {
     rng: fastrand::Rng,
     key: &'static [&'static str],
+    /// Whether a `DropUniqueIndex` round trip was drawn yet: the first one
+    /// always is, so every run has a drop that took effect whatever the
+    /// seeded stream (adding the P4 kinds moved 0x5eed7a11's stream to one
+    /// whose only drops named indexes that were not there).
+    unique_dropped: bool,
 }
 
 const WORDS: &[&str] = &["alpha", "beta", "gamma", "delta", "", "x y", "it''s"];
@@ -1505,7 +1535,8 @@ impl Gen {
                 // A name that may not exist fails 42704 on both, as in
                 // PostgreSQL; the round trip drops one that does, so every
                 // run has a drop that took effect.
-                if self.rng.u8(..3) == 0 {
+                if self.rng.u8(..3) == 0 || !self.unique_dropped {
+                    self.unique_dropped = true;
                     let inner = vec![
                         self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_uq3 UNIQUE (grp, id, tenant_id, n)".into()),
                         self.simple(kind, "ALTER TABLE {t} DROP CONSTRAINT {t}_uq3".into()),
@@ -1588,10 +1619,7 @@ impl Gen {
             DropKeyColumn => self.simple(kind, "ALTER TABLE {t} DROP COLUMN tenant_id".into()),
             AddColumnPopulated => self.simple(kind, "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS extra INT".into()),
             AlterType => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT".into()),
-            AddForeignKey => self.simple(
-                kind,
-                "ALTER TABLE {t} ADD CONSTRAINT {t}_fk FOREIGN KEY (tenant_id) REFERENCES {d} (tenant_id)".into(),
-            ),
+            ForeignKeyFromT | ForeignKeyOntoPartitioned | ForeignKeyFromSink => self.foreign_key_round_trip(kind),
             PreparedSelectAcrossAlter => {
                 let mut op = self.learned(kind, "SELECT * FROM {t} WHERE tenant_id = $1 AND grp = $2", true, None);
                 if let Step::Prepared { runs, ddl_after, cached_from, .. } = &mut op.step {
@@ -1621,6 +1649,76 @@ impl Gen {
             }
             Restart => Op { kind, step: Step::Restart, ordered: false },
         }
+    }
+
+    /// A foreign-key kind's round trip (phase 3 P4), as one [`Step::Sequence`]
+    /// compared statement by statement: every row of the child has a parent
+    /// first (the missing ones added to the parent, so the ADD's validation
+    /// passes on both; the sink's are all in `{k}` already), then the key,
+    /// with a random `ON DELETE` action; a child row with no parent (23503
+    /// on both) and one with a parent; the parent's DELETE of a referenced
+    /// key, refused or cascading, in a rolled-back block whose reads show
+    /// what it did; a referenced parent key moved (refused on both: `NO
+    /// ACTION` on update; on `{k}`, whose key is its partition key, the
+    /// update is a key change, so `{k}`'s is a same-value assignment, which
+    /// changes nothing); and the key dropped by its name, a second drop
+    /// 42704 on both.
+    fn foreign_key_round_trip(&mut self, kind: Kind) -> Op {
+        let action = ["NO ACTION", "RESTRICT", "CASCADE"][self.rng.usize(..3)];
+        let t = self.tenant();
+        let (child, parent) = match kind {
+            ForeignKeyFromT => ("{t}", "{d}"),
+            ForeignKeyOntoPartitioned => ("{t}", "{k}"),
+            _ => ("{s}", "{k}"),
+        };
+        let named = self.rng.bool();
+        let name = if named { format!("{child}_fk") } else { format!("{child}_tenant_id_fkey") };
+        let add = if named {
+            format!("ALTER TABLE {child} ADD CONSTRAINT {name} FOREIGN KEY (tenant_id) REFERENCES {parent} (tenant_id) ON DELETE {action}")
+        } else {
+            format!("ALTER TABLE {child} ADD FOREIGN KEY (tenant_id) REFERENCES {parent} (tenant_id) ON DELETE {action}")
+        };
+        let mut inner = Vec::new();
+        if kind == ForeignKeyFromT {
+            let dims: Vec<String> = (-TENANTS..=TENANTS).filter(|t| *t != 0).map(|t| format!("({t}, 'fk {t}')")).collect();
+            inner.push(self.simple(kind, format!("INSERT INTO {{d}} (tenant_id, label) VALUES {} ON CONFLICT DO NOTHING", dims.join(", "))));
+        }
+        inner.push(self.simple(kind, add));
+        let (g, i) = (self.grp(), self.id());
+        let (n, s2, f) = (self.n(), self.s(), self.f());
+        if child == "{t}" {
+            inner.push(self.simple(kind, format!("INSERT INTO {{t}} (tenant_id, grp, id, n, s, f) VALUES ({NEVER}, {g}, {i}, {n}, {s2}, {f})")));
+            let r = self.row();
+            inner.push(self.simple(kind, format!("INSERT INTO {{t}} (tenant_id, grp, id, n, s, f) VALUES {r}")));
+        } else {
+            inner.push(self.simple(kind, format!("INSERT INTO {{s}} (tenant_id, id, n) VALUES ({NEVER}, {i}, {n})")));
+            inner.push(self.simple(kind, format!("INSERT INTO {{s}} (tenant_id, id, n) VALUES ({t}, {i}, {n})")));
+        }
+        let delete = vec![
+            self.simple(kind, format!("DELETE FROM {parent} WHERE tenant_id = {t}")),
+            self.simple(kind, format!("SELECT COUNT(*) FROM {child} WHERE tenant_id = {t}")),
+            self.simple(kind, format!("SELECT COUNT(*) FROM {parent}")),
+        ];
+        inner.push(Op { kind, step: Step::Block { inner: delete, commit: false }, ordered: false });
+        let update = if parent == "{d}" {
+            format!("UPDATE {{d}} SET tenant_id = {NEVER} WHERE tenant_id = {t}")
+        } else {
+            format!("UPDATE {{k}} SET tenant_id = {t}, label = 'k moved' WHERE tenant_id = {t}")
+        };
+        let moved = vec![self.simple(kind, update), self.simple(kind, format!("SELECT tenant_id, label FROM {parent} WHERE tenant_id IN ({t}, {NEVER})"))];
+        inner.push(Op { kind, step: Step::Block { inner: moved, commit: false }, ordered: false });
+        inner.push(self.simple(kind, format!("ALTER TABLE {child} DROP CONSTRAINT {name}")));
+        inner.push(self.simple(kind, format!("ALTER TABLE {child} DROP CONSTRAINT {name}")));
+        // Unconstrained again: a row with no parent goes in (and out, so
+        // `NEVER` stays unwritten for the empty-route kinds).
+        let unchecked = if child == "{t}" {
+            format!("INSERT INTO {{t}} (tenant_id, grp, id) VALUES ({NEVER}, {g}, {i})")
+        } else {
+            format!("INSERT INTO {{s}} (tenant_id, id) VALUES ({NEVER}, {i})")
+        };
+        inner.push(self.simple(kind, unchecked));
+        inner.push(self.simple(kind, format!("DELETE FROM {child} WHERE tenant_id = {NEVER}")));
+        Op { kind, step: Step::Sequence(inner), ordered: false }
     }
 
     /// Two to five runs: past the third, where the prepared-SELECT cache
@@ -1656,7 +1754,7 @@ fn weight(kind: Kind) -> u32 {
         CreateIndex | DropIndex | CreateUniqueIndex | DropUniqueIndex | UniqueWithoutKey | AddCheck | DropCheck
         | SetDefault | DropDefault | SetNotNull | DropNotNull | DropNotNullKey | RenameColumnRoundTrip
         | RenameKeyRoundTrip | RenameTableRoundTrip | DropColumn | DropKeyColumn | AddColumnPopulated | AlterType
-        | AddForeignKey | PreparedSelectAcrossAlter => 1,
+        | ForeignKeyFromT | ForeignKeyOntoPartitioned | ForeignKeyFromSink | PreparedSelectAcrossAlter => 1,
         _ => 2,
     }
 }
@@ -1694,6 +1792,9 @@ const SUCCEEDING_DDL: &[Kind] = &[
     RenameTableRoundTrip,
     DropColumn,
     PreparedSelectAcrossAlter,
+    ForeignKeyFromT,
+    ForeignKeyOntoPartitioned,
+    ForeignKeyFromSink,
 ];
 
 struct Twin {
@@ -1785,7 +1886,8 @@ fn writes_t(kind: Kind) -> bool {
             | DropKeyColumn
             | AddColumnPopulated
             | AlterType
-            | AddForeignKey
+            | ForeignKeyFromT
+            | ForeignKeyOntoPartitioned
     )
 }
 
@@ -1795,7 +1897,8 @@ fn writes_t(kind: Kind) -> bool {
 fn may_fail_on_both(kind: Kind) -> bool {
     // A prepared statement across a schema change: the first execution after
     // it refuses on both (0A000, the shape changed); the next are compared.
-    writes_t(kind) || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery | PreparedSelectAcrossAlter)
+    writes_t(kind)
+        || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery | PreparedSelectAcrossAlter | ForeignKeyFromSink)
 }
 
 /// Kinds that must fail, on both table kinds, with this SQLSTATE and
@@ -2225,6 +2328,13 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
             })
             .collect();
         setup.ok(&format!("INSERT INTO {} (tenant_id, grp, w, tag) VALUES {}", side.u, pairs.join(", ")));
+        // The foreign keys' partitioned parent (phase 3 P4): every tenant a
+        // row can have, negative ones included, and a few no row has.
+        let partitioning = if side.k == SIDE_PART.k { " PARTITION BY HASH (tenant_id) PARTITIONS 6" } else { "" };
+        setup.ok(&format!("CREATE TABLE {} (tenant_id BIGINT NOT NULL PRIMARY KEY, label TEXT){partitioning}", side.k));
+        let parents: Vec<String> =
+            (-TENANTS..=TENANTS + 4).filter(|t| *t != 0).map(|t| format!("({t}, 'k{t}')")).collect();
+        setup.ok(&format!("INSERT INTO {} (tenant_id, label) VALUES {}", side.k, parents.join(", ")));
     }
     // The shared, read-only source of INSERT … SELECT.
     setup.ok(&format!("CREATE TABLE stage {COLUMNS}"));
@@ -2248,7 +2358,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     while keys.len() < 40 {
         keys.insert((seed_rng.i64(1..=TENANTS), seed_rng.i64(1..=GROUPS), seed_rng.i64(1..=IDS)));
     }
-    let mut seeder = Gen { rng: seed_rng, key: cfg.key };
+    let mut seeder = Gen { rng: seed_rng, key: cfg.key, unique_dropped: false };
     let inserts: Vec<String> = keys
         .iter()
         .map(|(t, g, i)| {
@@ -2278,7 +2388,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     };
     // The seeded rows, before anything else runs.
     twin.compare_storage(0, Restart);
-    let mut generator = Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key };
+    let mut generator = Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key, unique_dropped: false };
 
     // First every kind once, in a seeded order; then weighted draws.
     let mut order: Vec<Kind> = ALL_KINDS.iter().copied().filter(|k| *k != Restart).collect();
