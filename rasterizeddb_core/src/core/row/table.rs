@@ -5436,6 +5436,11 @@ impl<S: StorageIO> Table<S> {
                 // statement failed with 23505 and kept those rows. The storage
                 // transaction is abandoned instead, as a CHECK failure abandons
                 // it; the versions it holds were invisible either way.
+                // A conflict marked retryable keeps its marker, and the
+                // executor replays the statement: safe, because nothing of
+                // this attempt survives the abort. The overwrites were held
+                // for the commit (`defers_in_place_writes`), and the versions
+                // are invisible once the transaction aborts.
                 if overwrote_in_place {
                     d.io_pointers.abort_txn(txn).await;
                     return Err(e);
