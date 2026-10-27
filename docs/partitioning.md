@@ -522,11 +522,23 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(round 3)* the CHECK name read by whitespace | `add_check_constraint` | the same (stored as `my`) |
 | *(round 3)* a UNIQUE INDEX name not re-quoted | `lexer_alter::unique_index_as_constraint` | `lexer_alter` tests, the same |
 | *(round 3)* the import's primary key named `<table>_<cols>_key` again | `migrate::plan` | `migrate::run::load_tests` (42704 on the drop; this is the state the fix found) |
+| *(round 4)* a one-column ADD PRIMARY KEY not put in the header | `add_primary_key` | `tests/import_primary_key.rs` (`users` reads unlike its twin) |
+| *(round 4)* the key's columns not made NOT NULL | `add_primary_key` | `partition_alter::add_primary_key_makes_the_tables_primary_key` (a NULL `b` inserted) |
+| *(round 4)* the NULL probe ignored | `add_primary_key` | the same (ADD over a NULL succeeds) |
+| *(round 4)* a second primary key accepted | the ADD CONSTRAINT arm | `import_primary_key` (42710 on the name) |
+| *(round 4)* DROP leaves the header | the DROP CONSTRAINT arm | `import_primary_key` (`indisprimary` during the load) |
+| *(round 4)* a composite primary key not seen | `has_primary_key` | `import_primary_key` (a second PK on `pairs` accepted) |
+| *(round 4)* 42P16 / 23502 not mapped | `pgwire::sqlstate_for` | `import_primary_key`, `add_primary_key_…` (XX000) |
+| *(round 4)* names not cut where read | `unique_key::stored_name` | `partition_alter::long_and_unnamed_constraint_names` (the 131-byte DROP: 42704), `stored_name_tests` |
+| *(round 4)* a one-column CHECK named `<table>_check` | `check::unnamed_name` | `long_and_unnamed_constraint_names` |
+| *(round 4)* a CHECK name collision not numbered | `check::unnamed_name` | the same (the second `v` CHECK: already exists) |
+| *(round 4)* string literals read as columns | `check::columns_read` | `check::tests::an_added_unnamed_check_is_named_as_postgres_names_it` |
+| *(round 4)* an unnamed UNIQUE's collision not numbered | the ADD CONSTRAINT arm | `long_and_unnamed_constraint_names` (42710) |
 | *(round 3)* one case's snapshot pass run in rebuild mode (test-side: a production mutation that drops every load of one case alone was not found, since a case's images from before the DDL load whatever the DDL does) | `pddl_crash_tests::run_case` | `pddl_crash_tests` (RENAME TO: `loaded: 0`; the summed check alone passes) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
-with 1,500 statements each, after round 2 and again after round 3.
+with 1,500 statements each, after rounds 2, 3 and 4.
 
 **Round 3** (2026-10-27), three items from review:
 
@@ -585,6 +597,52 @@ The twin's `DropUniqueIndex` now fails 42704 on both sides when its name is
 gone, and gains a round trip (add, drop, drop again) so every run has a drop
 that took effect.
 
+**Round 4** (2026-10-27), three items from the re-review:
+
+- **`ADD [CONSTRAINT n] PRIMARY KEY (…)` makes the table's primary key**, as
+  in PostgreSQL (`add_primary_key`). Its columns become NOT NULL, and a
+  NULL in one refuses it with 23502 ("column "c" of relation "t" contains
+  null values"). A second primary key is 42P16 ("multiple primary keys for
+  table "t" are not allowed"), checked before the name; it used to be
+  42710 on the `<table>_pkey` name. A one-column key is recorded in the
+  schema header as `CREATE TABLE` records it. A composite one is the
+  sidecar named `<table>_pkey`, as at CREATE; the header holds one column,
+  so a composite key under another name is not recognised as the primary
+  key without a format change (not made). Before, ADD stored a UNIQUE only.
+- **The review's reading was not what happened, by experiment at
+  `dd542ac`.** After the import's drop and re-add, `pg_index` showed
+  `indisprimary = t` and `SHOW COLUMNS` `is_primary_key = t` for `users.id`,
+  equal to a table created with the key. The cause was the opposite bug:
+  `DROP CONSTRAINT users_pkey` of a table-level one-column key removed its
+  sidecar and **left the header**. Through the load, and for good after a
+  DROP not followed by an ADD, `pg_index` and `SHOW COLUMNS` called `id`
+  the primary key while duplicates went in, and the row locks framed keys
+  from it. The header now goes with its constraint
+  (`primary_header_goes`): dropped as `<table>_pkey`, or when what kept its
+  column unique goes. With both halves, the import ends where `CREATE
+  TABLE … PRIMARY KEY` does (`tests/import_primary_key.rs`, which compares
+  it with a twin created with the key, across a restart). A composite key
+  is in neither `pg_index` nor `is_primary_key`, created or imported: older
+  than this slice, and the two agree. The reviewer's
+  `pg_index … WHERE indrelid = 'users'::regclass` fails because `::regclass`
+  is not implemented. The literal stays text, and comparing text with the
+  BIGINT `indrelid` fails at plan compile ("literal cannot be compared
+  against a I64 column", XX000). Joining `pg_class` on `relname` works.
+- **Constraint names are cut to their stored 128 bytes where they are
+  read** (`unique_key::stored_name`, in `split_constraint_name`,
+  `dropped_constraint` and the derived names). The ADD's duplicate check,
+  the DROP's lookup and the record now hold one string. A 131-byte name
+  could be created and never dropped (42704), and two names sharing 128
+  bytes were both accepted and stored alike.
+- **Unnamed ADD CHECKs and UNIQUEs are named as PostgreSQL names them.** A
+  CHECK is `<table>_<column>_check` when it reads one column (outside
+  string literals) and `<table>_check` otherwise, numbered from 1 on a
+  collision (`check::unnamed_name`). A UNIQUE whose `<table>_<cols>_key`
+  is taken is `<table>_<cols>_key1`, …, where it was an error. Stored names
+  do not change. `CREATE TABLE`'s table-level unnamed CHECK is still
+  `<table>_check<n>` (`lexer_ct.rs`, left alone for the correctness slice).
+- SET NOT NULL over a NULL now answers 23502, as the finding below asked.
+
 **Deviations from the plan.**
 
 - The shape epoch does not move for an index-only DDL, as on a plain table
@@ -642,7 +700,21 @@ that took effect.
   the column sidecars may be unreachable that way; an FK named `"my fk"` is
   not, and would be stored as `myfk`. Older than this slice, on both table
   kinds.
-- `SET NOT NULL` over a NULL answers XX000 (PostgreSQL: 23502), and a
+- **Reported in round 4, not fixed:**
+  - A record an older binary wrote ASCII-filtered (`mykey`) cannot be
+    dropped by its original name (`"my key"`: 42704), only by the stored
+    one.
+  - `EXCLUDE` is accepted and not stored, so a DROP of it gets 42704.
+  - After `RENAME TO`, a one-column primary key is matched as
+    `<new>_pkey`, where PostgreSQL keeps the constraint's name
+    `<old>_pkey`. A composite one keeps its sidecar name `<old>_pkey`, so
+    it is no longer seen as the primary key (`has_primary_key`,
+    `identifying_key`), and a second PRIMARY KEY would be accepted (by
+    reading, not run).
+  - A composite primary key appears in neither `pg_index` nor
+    `is_primary_key`.
+- `SET NOT NULL` over a NULL answered XX000 (PostgreSQL: 23502; 23502 since
+  P1 round 4), and a
   missing column in a select list 42601 (42703), on both table kinds.
 - Once, in the first twin run at 0x5eed2b20, a debug build's tokio worker
   panicked with "attempt to add with overflow" at
