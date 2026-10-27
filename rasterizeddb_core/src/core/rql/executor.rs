@@ -4898,7 +4898,10 @@ async fn update_from_join(
                 AssignedValue::Computed { text, source_refs, source_at } => {
                     let mut bindings: Vec<(String, String)> = Vec::with_capacity(source_refs.len());
                     for (offset, reference) in source_refs.iter().enumerate() {
-                        bindings.push((reference.clone(), literal_at(source_at + offset)?));
+                        let at = source_at + offset;
+                        let literal = assigned_literal(&row.columns[at], scales.as_deref(), at)
+                            .ok_or_else(|| "a joined value cannot be written".to_string())?;
+                        bindings.push((reference.clone(), literal));
                     }
                     sets.push(format!("{} = {}", column, substitute_outer_refs(text, &bindings)));
                     continue;
@@ -5130,18 +5133,27 @@ fn joined_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, 
         if let (Some(&scale), Some((v, None))) =
             (scales.and_then(|s| s.get(at)), crate::core::value_codec::split_decimal_cell(bytes))
         {
-            let digits = crate::core::value_codec::format_decimal_scaled(v, scale);
-            // Typed, so the statement it is written into reads it at that
-            // scale: a bare `-1.50` is a literal at the engine's scale, and
-            // `s.d::text` on a NUMERIC(6,2) stored '-1.5' where PostgreSQL
-            // stores '-1.50'.
-            if scale > 0 {
-                return Some(format!("CAST({digits} AS NUMERIC(38, {scale}))"));
-            }
-            return Some(digits);
+            return Some(crate::core::value_codec::format_decimal_scaled(v, scale));
         }
     }
     crate::core::rql::subquery::value_to_literal(&cell.column_type, bytes)
+}
+
+/// [`joined_literal`] for a value an assigned expression reads: a scaled
+/// decimal is typed at its scale, `CAST(-1.50 AS NUMERIC(38, 2))`, since the
+/// bare `-1.50` is a literal at the engine's scale and `s.d::text` on a
+/// NUMERIC(6,2) stored '-1.5' where PostgreSQL stores '-1.50'. Only here:
+/// a key predicate or a recheck compares by value, which no scale changes,
+/// and a CAST there costs a point lookup its literal. Past the engine's
+/// nine places a cast is refused, so those stay bare (and the expression
+/// reads them at nine places, as before).
+fn assigned_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, at: usize) -> Option<String> {
+    let literal = joined_literal(cell, scales, at)?;
+    let scale = scales.and_then(|s| s.get(at)).copied().unwrap_or(0);
+    let typed = cell.column_type == crate::core::db_type::DbType::DECIMAL
+        && (1..=crate::core::value_codec::DECIMAL_SCALE).contains(&scale)
+        && literal.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'.');
+    Some(if typed { format!("CAST({literal} AS NUMERIC(38, {scale}))") } else { literal })
 }
 
 /// Whether a per-row write's error ends `run_per_row_write` rather than
