@@ -197,6 +197,30 @@ enum Kind {
     Describe,
     // Reads of the other per-side tables, so a write that reached them is seen.
     ReadSinkAndDim,
+    // Schema changes (phase 3 P1, §11): each runs on both tables and is
+    // compared, or is refused by the partitioned one. The round trips run as
+    // one sequence: the change, statements under it, and its undoing.
+    CreateIndex,
+    DropIndex,
+    CreateUniqueIndex,
+    DropUniqueIndex,
+    UniqueWithoutKey,
+    AddCheck,
+    DropCheck,
+    SetDefault,
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+    DropNotNullKey,
+    RenameColumnRoundTrip,
+    RenameKeyRoundTrip,
+    RenameTableRoundTrip,
+    DropColumn,
+    DropKeyColumn,
+    AddColumnPopulated,
+    AlterType,
+    AddForeignKey,
+    PreparedSelectAcrossAlter,
     // Structure.
     TxCommit,
     TxRollback,
@@ -224,6 +248,10 @@ const ALL_KINDS: &[Kind] = &[
     EmptyRouteAggregates, EmptyRouteContradiction, EmptyRouteContradictionRows, EmptyRouteUpdateReturning,
     EmptyRouteDeleteReturning, PreparedSelect, PreparedCount, PreparedDescribeAlias, PreparedSelectAcrossDdl,
     PreparedInsert, PreparedUpdate, PreparedDelete, PreparedUpdateReturning, CatalogColumns, CatalogTables, CatalogClass, CatalogStat, CatalogIndexes, Describe, ReadSinkAndDim,
+    CreateIndex, DropIndex, CreateUniqueIndex, DropUniqueIndex, UniqueWithoutKey, AddCheck, DropCheck, SetDefault,
+    DropDefault, SetNotNull, DropNotNull, DropNotNullKey, RenameColumnRoundTrip, RenameKeyRoundTrip,
+    RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, AddForeignKey,
+    PreparedSelectAcrossAlter,
     TxCommit, TxRollback, Restart,
 ];
 
@@ -276,6 +304,32 @@ const REFUSED: &[Refusal] = &[
     // ForUpdate, SkipLocked and ForUpdateNoWait are compared with the twin,
     // inside blocks too. A partitioned source is built since S19
     // (UpdateDimFromT, DeleteDimUsingT).
+    // Phase 3 P1 (metadata DDL, §11) is built: CreateIndex, DropIndex,
+    // CreateUniqueIndex, DropUniqueIndex, AddCheck, DropCheck, SetDefault,
+    // DropDefault, SetNotNull, the RENAME round trips (a column, a key
+    // column, the table), DropColumn (marking) and PreparedSelectAcrossAlter
+    // are compared with the twin. Refused for good: a UNIQUE without every
+    // key column (§1b), a key column made nullable or dropped (§1.5).
+    // Refused until their slice: what rewrites every row (a populated ADD
+    // COLUMN, a type change, DROP NOT NULL of a NOT NULL column: phase 6)
+    // and foreign keys (P4).
+    refused(UniqueWithoutKey, "never (§1b)"),
+    refused(DropNotNullKey, "never (§1.5)"),
+    refused(DropKeyColumn, "never (§1.5)"),
+    Refusal {
+        kind: AddColumnPopulated,
+        code: "0A000",
+        lifted_by: "phase 6 (physical ALTER)",
+        or_like_twin: Some("metadata-only on a table whose partitions hold no row bytes"),
+    },
+    refused(AlterType, "phase 6 (physical ALTER)"),
+    Refusal {
+        kind: DropNotNull,
+        code: "0A000",
+        lifted_by: "phase 6 (physical ALTER) for a NOT NULL column",
+        or_like_twin: Some("a no-op on a nullable column, as on the twin"),
+    },
+    refused(AddForeignKey, "P4 (foreign keys)"),
     // S10 (single-snapshot fan-out SELECT and COUNT) is built: every read
     // kind is compared with the twin, ORDER BY across partitions included
     // (correct by sorting the partitions' top-N together; S12 makes it
@@ -308,7 +362,7 @@ fn refusal(kind: Kind) -> Option<&'static Refusal> {
 const PART: &str = "twin_part";
 const PLAIN: &str = "twin_plain";
 const COLUMNS: &str = "(tenant_id BIGINT NOT NULL, grp BIGINT NOT NULL, id BIGINT NOT NULL, n INT, s TEXT, \
-                       f DOUBLE PRECISION, PRIMARY KEY (tenant_id, grp, id))";
+                       f DOUBLE PRECISION, junk INT, PRIMARY KEY (tenant_id, grp, id))";
 const KEY_ORDER: &str = "tenant_id, grp, id";
 
 /// Tenants written to. `NEVER` is never written.
@@ -375,6 +429,10 @@ enum Step {
     },
     /// BEGIN, the inner operations, then COMMIT (true) or ROLLBACK.
     Block { inner: Vec<Op>, commit: bool },
+    /// The inner operations in autocommit, each compared, every one run
+    /// whatever the one before answered: a change, statements under it, and
+    /// its undoing.
+    Sequence(Vec<Op>),
     Restart,
 }
 
@@ -1426,6 +1484,120 @@ impl Gen {
                     self.simple(kind, "SELECT tenant_id, label FROM {d}".into())
                 }
             }
+            CreateIndex => {
+                let (col, method) = [("n", "btree"), ("s", "hash"), ("f", "btree"), ("grp", "hash"), ("s", "btree")]
+                    [self.rng.usize(..5)];
+                let ine = if self.rng.bool() { "IF NOT EXISTS " } else { "" };
+                self.simple(kind, format!("CREATE INDEX {ine}{{t}}_ix_{col} ON {{t}} USING {method} ({col})"))
+            }
+            DropIndex => {
+                let col = ["n", "s", "f", "grp"][self.rng.usize(..4)];
+                self.simple(kind, format!("DROP INDEX IF EXISTS {{t}}_ix_{col}"))
+            }
+            CreateUniqueIndex => {
+                if self.rng.bool() {
+                    self.simple(kind, "CREATE UNIQUE INDEX {t}_uq ON {t} (tenant_id, grp, id, n)".into())
+                } else {
+                    self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_uq2 UNIQUE (id, grp, tenant_id, s)".into())
+                }
+            }
+            DropUniqueIndex => {
+                let name = if self.rng.bool() { "{t}_uq" } else { "{t}_uq2" };
+                self.simple(kind, format!("ALTER TABLE {{t}} DROP CONSTRAINT {name}"))
+            }
+            UniqueWithoutKey => {
+                if self.rng.bool() {
+                    self.simple(kind, "CREATE UNIQUE INDEX {t}_bad ON {t} (id, n)".into())
+                } else {
+                    self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_bad UNIQUE (grp, id, s)".into())
+                }
+            }
+            AddCheck => match self.rng.u8(..3) {
+                // Holds for every value the generator writes.
+                0 | 1 => self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_chk CHECK (n IS NULL OR n > -1000)".into()),
+                // Broken by most tables' rows: 23514 on both.
+                _ => self.simple(kind, "ALTER TABLE {t} ADD CONSTRAINT {t}_chk_bad CHECK (n < 0)".into()),
+            },
+            DropCheck => self.simple(kind, "ALTER TABLE {t} DROP CONSTRAINT {t}_chk".into()),
+            SetDefault => match self.rng.u8(..3) {
+                0 => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN n SET DEFAULT 7".into()),
+                1 => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN s SET DEFAULT 'dflt'".into()),
+                _ => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN grp SET DEFAULT 1".into()),
+            },
+            DropDefault => {
+                let col = ["n", "s", "grp"][self.rng.usize(..3)];
+                self.simple(kind, format!("ALTER TABLE {{t}} ALTER COLUMN {col} DROP DEFAULT"))
+            }
+            SetNotNull => {
+                // A key column (already NOT NULL), or one with NULLs (refused
+                // on both while any row holds one).
+                let col = ["tenant_id", "grp", "id", "n", "f"][self.rng.usize(..5)];
+                self.simple(kind, format!("ALTER TABLE {{t}} ALTER COLUMN {col} SET NOT NULL"))
+            }
+            DropNotNull => {
+                let col = ["n", "s", "f"][self.rng.usize(..3)];
+                self.simple(kind, format!("ALTER TABLE {{t}} ALTER COLUMN {col} DROP NOT NULL"))
+            }
+            DropNotNullKey => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL".into()),
+            RenameColumnRoundTrip => {
+                let t = self.tenant();
+                let r = self.row();
+                let inner = vec![
+                    self.simple(kind, "ALTER TABLE {t} RENAME COLUMN s TO label".into()),
+                    self.simple(kind, format!("SELECT tenant_id, grp, id, label FROM {{t}} WHERE tenant_id = {t}")),
+                    self.simple(kind, format!("INSERT INTO {{t}} (tenant_id, grp, id, n, label, f) VALUES {r}")),
+                    self.simple(kind, "SELECT label, COUNT(*) FROM {t} GROUP BY label".into()),
+                    self.simple(kind, "ALTER TABLE {t} RENAME COLUMN label TO s".into()),
+                ];
+                Op { kind, step: Step::Sequence(inner), ordered: false }
+            }
+            RenameKeyRoundTrip => {
+                let (t, n) = (self.tenant(), self.n());
+                let inner = vec![
+                    self.simple(kind, "ALTER TABLE {t} RENAME COLUMN tenant_id TO tenant".into()),
+                    self.simple(kind, format!("SELECT tenant, grp, id, n FROM {{t}} WHERE tenant = {t}")),
+                    self.simple(kind, format!("UPDATE {{t}} SET n = {n} WHERE tenant = {t} AND id < 10")),
+                    self.simple(kind, "SELECT COUNT(*), SUM(id) FROM {t} WHERE tenant IN (1, 2, 3)".into()),
+                    self.simple(kind, "ALTER TABLE {t} RENAME COLUMN tenant TO tenant_id".into()),
+                ];
+                Op { kind, step: Step::Sequence(inner), ordered: false }
+            }
+            RenameTableRoundTrip => {
+                let (t, r) = (self.tenant(), self.row());
+                let inner = vec![
+                    self.simple(kind, "ALTER TABLE {t} RENAME TO {t}_r".into()),
+                    self.simple(kind, format!("SELECT * FROM {{t}}_r WHERE tenant_id = {t}")),
+                    self.simple(kind, format!("INSERT INTO {{t}}_r (tenant_id, grp, id, n, s, f) VALUES {r}")),
+                    self.simple(kind, "SELECT COUNT(*) FROM {t}".into()),
+                    self.simple(kind, "ALTER TABLE {t}_r RENAME TO {t}".into()),
+                ];
+                Op { kind, step: Step::Sequence(inner), ordered: false }
+            }
+            DropColumn => self.simple(kind, "ALTER TABLE {t} DROP COLUMN IF EXISTS junk".into()),
+            DropKeyColumn => self.simple(kind, "ALTER TABLE {t} DROP COLUMN tenant_id".into()),
+            AddColumnPopulated => self.simple(kind, "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS extra INT".into()),
+            AlterType => self.simple(kind, "ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT".into()),
+            AddForeignKey => self.simple(
+                kind,
+                "ALTER TABLE {t} ADD CONSTRAINT {t}_fk FOREIGN KEY (tenant_id) REFERENCES {d} (tenant_id)".into(),
+            ),
+            PreparedSelectAcrossAlter => {
+                let mut op = self.learned(kind, "SELECT * FROM {t} WHERE tenant_id = $1 AND grp = $2", true, None);
+                if let Step::Prepared { runs, ddl_after, cached_from, .. } = &mut op.step {
+                    while runs.len() < 6 {
+                        let (t, g) = (self.rng.i64(1..=TENANTS), self.rng.i64(1..=GROUPS));
+                        runs.push(vec![Some(t.to_string()), Some(g.to_string())]);
+                    }
+                    // A column renamed and renamed back between runs, on both
+                    // tables: each run after is compared, shape change and all.
+                    for table in [PART, PLAIN] {
+                        ddl_after.push((1, format!("ALTER TABLE {table} RENAME COLUMN s TO s_renamed")));
+                        ddl_after.push((3, format!("ALTER TABLE {table} RENAME COLUMN s_renamed TO s")));
+                    }
+                    *cached_from = None;
+                }
+                op
+            }
             TxCommit | TxRollback => {
                 let k = self.rng.usize(1..=4);
                 let inner = (0..k)
@@ -1470,6 +1642,10 @@ fn weight(kind: Kind) -> u32 {
         Restart => 0,
         CatalogColumns | CatalogTables | CatalogClass | CatalogStat | CatalogIndexes | Describe => 1,
         Vacuum | VacuumFull | Analyze => 1,
+        CreateIndex | DropIndex | CreateUniqueIndex | DropUniqueIndex | UniqueWithoutKey | AddCheck | DropCheck
+        | SetDefault | DropDefault | SetNotNull | DropNotNull | DropNotNullKey | RenameColumnRoundTrip
+        | RenameKeyRoundTrip | RenameTableRoundTrip | DropColumn | DropKeyColumn | AddColumnPopulated | AlterType
+        | AddForeignKey | PreparedSelectAcrossAlter => 1,
         _ => 2,
     }
 }
@@ -1493,6 +1669,21 @@ struct Tally {
 /// on both sides compares nothing.
 const ANSWERING_KINDS: &[Kind] =
     &[Join, LeftJoin, SelfJoin, JoinRouted, JoinFanOut, JoinPartitionedBoth, JoinAggregates, PreparedJoin];
+
+/// Schema changes that must succeed on both tables at least once per run.
+const SUCCEEDING_DDL: &[Kind] = &[
+    CreateIndex,
+    DropIndex,
+    CreateUniqueIndex,
+    DropUniqueIndex,
+    SetDefault,
+    DropDefault,
+    RenameColumnRoundTrip,
+    RenameKeyRoundTrip,
+    RenameTableRoundTrip,
+    DropColumn,
+    PreparedSelectAcrossAlter,
+];
 
 struct Twin {
     server: Option<Server>,
@@ -1564,6 +1755,26 @@ fn writes_t(kind: Kind) -> bool {
             | TxCommit
             | TxRollback
             | Restart
+            | CreateIndex
+            | DropIndex
+            | CreateUniqueIndex
+            | DropUniqueIndex
+            | UniqueWithoutKey
+            | AddCheck
+            | DropCheck
+            | SetDefault
+            | DropDefault
+            | SetNotNull
+            | DropNotNull
+            | DropNotNullKey
+            | RenameColumnRoundTrip
+            | RenameKeyRoundTrip
+            | RenameTableRoundTrip
+            | DropColumn
+            | DropKeyColumn
+            | AddColumnPopulated
+            | AlterType
+            | AddForeignKey
     )
 }
 
@@ -1571,7 +1782,9 @@ fn writes_t(kind: Kind) -> bool {
 /// something: writes, which can hit a duplicate key on both, and blocks,
 /// which end when one does.
 fn may_fail_on_both(kind: Kind) -> bool {
-    writes_t(kind) || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery)
+    // A prepared statement across a schema change: the first execution after
+    // it refuses on both (0A000, the shape changed); the next are compared.
+    writes_t(kind) || matches!(kind, InsertIntoSinkFromT | UpdateDimViaSubquery | PreparedSelectAcrossAlter)
 }
 
 /// Kinds that must fail, on both table kinds, with this SQLSTATE and
@@ -1798,6 +2011,7 @@ impl Twin {
                 let name_q = name.clone();
                 let verdict = self.judge(at, op, &sql_p, p, false, &mut |tw: &mut Twin| tw.cq().prepare(&name_q, &sql_q));
                 let mut failed = !matches!(verdict, Verdict::Agreed { failed: false });
+                let mut ran_ddl_upto: Option<usize> = None;
                 if failed {
                     self.note(op.kind, &verdict);
                 } else {
@@ -1831,11 +2045,29 @@ impl Twin {
                         self.note(op.kind, &verdict);
                         if !matches!(verdict, Verdict::Agreed { failed: false }) {
                             failed = true;
-                            break;
+                            // Across a schema change both sides may refuse
+                            // the first execution after it (0A000, the shape
+                            // changed); the next ones are compared too.
+                            if op.kind != PreparedSelectAcrossAlter {
+                                break;
+                            }
                         }
+                        ran_ddl_upto = Some(i);
                         for (_, ddl) in ddl_after.iter().filter(|(after, _)| *after == i) {
                             self.log.push(ddl.clone());
-                            self.cp().ok(ddl);
+                            if let Err(e) = self.cp().simple(ddl) {
+                                self.fail(at, op.kind, format!("`{ddl}` between the runs failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                // A change made between runs is always undone, even when a
+                // run failed and the rest were skipped.
+                if let Step::Prepared { ddl_after, .. } = &op.step {
+                    for (_, ddl) in ddl_after.iter().filter(|(after, _)| ran_ddl_upto.is_none_or(|d| *after > d)) {
+                        self.log.push(ddl.clone());
+                        if let Err(e) = self.cp().simple(ddl) {
+                            self.fail(at, op.kind, format!("`{ddl}` after the runs failed: {e}"));
                         }
                     }
                 }
@@ -1872,6 +2104,14 @@ impl Twin {
                     }
                 }
                 self.note(op.kind, &Verdict::Agreed { failed: aborted });
+                false
+            }
+            Step::Sequence(inner) => {
+                let mut failed = false;
+                for inner_op in inner {
+                    failed |= self.run(at, inner_op);
+                }
+                self.note(op.kind, &Verdict::Agreed { failed });
                 false
             }
             Step::Restart => {
@@ -2058,6 +2298,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         };
         let op = generator.op(kind);
         twin.run(at, &op);
+
         if writes_t(kind) {
             twin.compare_storage(at, kind);
         }
@@ -2086,6 +2327,11 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     for kind in ANSWERING_KINDS {
         let rows = twin.tally.get(kind).map_or(0, |t| t.rows);
         assert!(rows > 0, "{label} seed {seed:#x}: {kind:?} agreed only on empty answers, so it compared nothing");
+    }
+    // A schema change that failed on both tables every time compared nothing.
+    for kind in SUCCEEDING_DDL {
+        let agreed = twin.tally.get(kind).map_or(0, |t| t.agreed);
+        assert!(agreed > 0, "{label} seed {seed:#x}: {kind:?} never succeeded on both tables");
     }
     // A refused kind ran and was refused; a kind not in REFUSED was never refused.
     for (kind, t) in &twin.tally {
