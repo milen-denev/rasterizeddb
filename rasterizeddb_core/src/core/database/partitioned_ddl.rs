@@ -207,6 +207,12 @@ impl Database {
         let _ddl = self.partition_ddl.lock().await;
         let _new_claim = self.claim_name(new_name)?;
         let _old_claim = self.claim_name(old_name)?;
+        // One rename at a time in the database, plain or partitioned, as a
+        // plain one takes it (`rename_serial`): each reads the names the
+        // other holds (`held_names`) before writing its intent. Taken after
+        // `partition_ddl`, which a plain rename never takes, so the two
+        // cannot wait on each other.
+        let _serial = self.rename_serial.lock().await;
         let Some(old) = self.partitioned_table(old_name) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         };

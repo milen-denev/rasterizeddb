@@ -1193,8 +1193,8 @@ pub struct Database {
     /// would overwrite the intent that finishes the job).
     held_names: parking_lot::Mutex<Vec<String>>,
 
-    /// Held by a plain rename from its check of `held_names` to its last word
-    /// on the intent: there is one `__rename.intent` (and one
+    /// Held by a rename, plain or partitioned (`rename_partitioned`), from
+    /// its check of `held_names` to its last word on the intent: there is one `__rename.intent` (and one
     /// `__rename.partial`) per database, so two renames at once synced and
     /// installed each other's bytes, cleared each other's live intent, and
     /// one failed with "No such file or directory".
