@@ -559,6 +559,8 @@ pub enum Plan {
 /// Whether a seal of `indexes` writes INDEX sections, and an open loads
 /// them, under `storage`: B-tree, hash and path indexes, and no gin index.
 pub fn captures(indexes: &TableIndexes, storage: settings::IndexStorage) -> bool {
+    // A paged index (docs/disk-indexes.md) is captured too: its section names
+    // a sealed run rather than holding the entries (`LiveIndex::seal_run`).
     storage == settings::IndexStorage::Snapshot && !indexes.list.is_empty() && indexes.gin.is_empty()
 }
 
@@ -621,6 +623,8 @@ pub struct OpenIndexes {
 #[derive(Debug)]
 enum LoadError {
     Read(u16, io::Error),
+    /// A paged index's sealed run could not be adopted.
+    Run(u16, String),
     Section(u16, index_section::SectionError),
     Refused(u16, crate::core::index::sorted::SortedReject),
     Renumbered,
@@ -630,6 +634,7 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::Read(i, e) => write!(f, "INDEX section {i} could not be read: {e}"),
+            LoadError::Run(i, e) => write!(f, "INDEX section {i}'s sealed run: {e}"),
             LoadError::Section(i, e) => write!(f, "INDEX section {i}: {e}"),
             LoadError::Refused(i, r) => write!(f, "INDEX section {i} was refused by its index: {r:?}"),
             LoadError::Renumbered => write!(f, "a renumbering began or ended during the load"),
@@ -721,6 +726,13 @@ pub(crate) mod hooks {
 
 /// Reads, decodes and installs every section, or none. Returns the time
 /// spent reading and decoding, and installing.
+/// One INDEX section, decoded: entries for an index to load, or a paged
+/// index's reference to its sealed run.
+enum Decoded {
+    Stream(crate::core::index::sorted::SortedLoad<crate::core::index::KeyBuf>),
+    RunRef(Vec<u8>),
+}
+
 fn load_now(
     o: &OpenIndexes,
     path: &std::path::Path,
@@ -735,6 +747,11 @@ fn load_now(
         let at = std::time::Instant::now();
         let bytes = snapshot::read_section(path, e).map_err(|err| LoadError::Read(e.ordinal, err))?;
         let read = at.elapsed();
+        // A paged index's run reference is checked by the index that takes
+        // it; an in-memory index meets it as a version it refuses, below.
+        if bytes.starts_with(crate::core::index::paged::RUN_REF_MAGIC) {
+            return Ok(Decoded::RunRef(bytes));
+        }
         let stream = index_section::decode(&bytes, n_slots).map_err(|err| LoadError::Section(e.ordinal, err))?;
         log::debug!(
             "{}: INDEX section {} ({} bytes): read and checked {:.3} s, decoded {:.3} s",
@@ -744,7 +761,7 @@ fn load_now(
             read.as_secs_f64(),
             (at.elapsed() - read).as_secs_f64()
         );
-        Ok(stream)
+        Ok(Decoded::Stream(stream))
     };
     let streams: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = sections.iter().map(|e| scope.spawn(move || decode_one(e))).collect();
@@ -761,7 +778,12 @@ fn load_now(
             .map(|((stream, ix), e)| {
                 scope.spawn(move || {
                     let at = std::time::Instant::now();
-                    let loaded = ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r));
+                    let loaded = match stream {
+                        Decoded::Stream(stream) => ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r)),
+                        Decoded::RunRef(bytes) => {
+                            ix.adopt_run(proof, &bytes, n_slots).map_err(|r| LoadError::Run(e.ordinal, r))
+                        }
+                    };
                     log::debug!("{}: index {} installed in {:.3} s", o.name, ix.decl.name, at.elapsed().as_secs_f64());
                     loaded
                 })
@@ -862,6 +884,22 @@ pub fn capture_sections(indexes: &TableIndexes, gate: &FileGate) -> io::Result<O
     blocking(|| {
         let mut out = Vec::with_capacity(indexes.list.len());
         for (i, ix) in indexes.list.iter().enumerate() {
+            // A paged index's section is a reference to a sealed run, written
+            // here whole and durable (phase 2), not its entries.
+            if ix.is_paged() {
+                match ix.seal_run(&|| gate.word().load().cancelled())? {
+                    #[allow(unused_mut)]
+                    Some(mut bytes) => {
+                        #[cfg(test)]
+                        if let Some(v) = gate.dir().and_then(hooks::version) {
+                            bytes[..2].copy_from_slice(&v.to_le_bytes());
+                        }
+                        out.push((SectionKind::Index, i as u16, bytes));
+                        continue;
+                    }
+                    None => return Ok(None),
+                }
+            }
             let mut w = index_section::SectionWriter::new();
             let mut parts = 0usize;
             let streamed = ix.for_each_sorted(|part| {

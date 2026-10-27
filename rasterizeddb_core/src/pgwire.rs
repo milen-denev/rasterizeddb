@@ -6653,6 +6653,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("constraint \"") && has("\" for table \"") && has("does not exist") {
         return "42704";
     }
+    // `DROP INDEX` of an index a constraint owns (a primary key's, a unique
+    // constraint's): PostgreSQL's dependent_objects_still_exist.
+    if has("because constraint") && has("requires it") {
+        return "2BP01";
+    }
     // `55P03` is `lock_not_available`: a table-lock wait that outlasted
     // `lock_timeout`, or a `NOWAIT` that found the lock held. Decided before
     // 57014, whose words ("canceling statement") the timeout's message shares,

@@ -83,11 +83,17 @@ pub struct GinIndex {
     /// The document column's `write_order`.
     pub column: u32,
     pub opclass: GinOpclass,
-    /// Item to the slots holding it, each list sorted and distinct.
+    /// Item to the slots holding it, each list sorted and distinct. Unused,
+    /// and empty, when the index is paged.
     shards: Box<[RwLock<HashMap<u64, Vec<u64>, RandomState>>]>,
+    /// The lists on disk, keyed by each item's big-endian bytes, under
+    /// `hybrid` or `disk` residency (docs/disk-indexes.md, phase 3).
+    paged: Option<super::paged::PagedStore>,
     /// One bit per slot this index holds. A cleared bit is a slot vacuum has
-    /// forgotten; its entries stay in the lists until a compaction.
-    present: RwLock<Vec<u64>>,
+    /// forgotten; its entries stay in the lists until a compaction (until a
+    /// run merge, when paged). Shared with the paged store, whose merges drop
+    /// the slots it clears.
+    present: std::sync::Arc<RwLock<Vec<u64>>>,
     /// Slots whose document could not be read into items. Returned with
     /// every lookup.
     unkeyed: RwLock<Vec<u64>>,
@@ -114,12 +120,56 @@ pub enum GinQuery {
 
 impl GinIndex {
     pub fn new(decl: IndexDecl, column: u32, opclass: GinOpclass) -> GinIndex {
+        Self::new_in(decl, column, opclass, None)
+    }
+
+    /// [`Self::new`], paged under `placement` when the residency is `hybrid`
+    /// or `disk`, as `LiveIndex::new_in` decides it.
+    pub fn new_in(
+        decl: IndexDecl,
+        column: u32,
+        opclass: GinOpclass,
+        placement: Option<&super::paged::Placement>,
+    ) -> GinIndex {
+        let budgets = placement
+            .filter(|_| super::paged::residency() != super::paged::Residency::Memory)
+            .map(|p| (p, super::paged::Budgets::current()));
+        Self::build(decl, column, opclass, budgets)
+    }
+
+    /// A paged gin index with budgets of its own, for tests.
+    #[cfg(test)]
+    pub(crate) fn new_paged(
+        decl: IndexDecl,
+        column: u32,
+        opclass: GinOpclass,
+        placement: &super::paged::Placement,
+        budgets: super::paged::Budgets,
+    ) -> GinIndex {
+        let g = Self::build(decl, column, opclass, Some((placement, budgets)));
+        assert!(g.paged.is_some(), "the store must open");
+        g
+    }
+
+    fn build(
+        decl: IndexDecl,
+        column: u32,
+        opclass: GinOpclass,
+        paged: Option<(&super::paged::Placement, super::paged::Budgets)>,
+    ) -> GinIndex {
+        let present = std::sync::Arc::new(RwLock::new(Vec::new()));
+        let paged = paged.and_then(|(placement, budgets)| {
+            super::paged::PagedStore::open(placement, &decl.name, budgets, present.clone())
+                .map_err(|e| log::error!("index {}: cannot page it, kept in memory: {e}", decl.name))
+                .ok()
+        });
         GinIndex {
             decl,
             column,
             opclass,
             shards: (0..SHARDS).map(|_| RwLock::new(HashMap::with_hasher(RandomState::new()))).collect(),
-            present: RwLock::new(Vec::new()),
+            paged,
+            present,
             unkeyed: RwLock::new(Vec::new()),
             entries: AtomicU64::new(0),
             forgotten: AtomicU64::new(0),
@@ -137,6 +187,7 @@ impl GinIndex {
             column,
             opclass,
             shards: _,
+            paged: _,
             present: _,
             unkeyed: _,
             entries: _,
@@ -182,6 +233,31 @@ impl GinIndex {
         self.present.read().get(w).is_some_and(|word| word & (1 << (slot % 64)) != 0)
     }
 
+    /// Whether this index's lists live on disk.
+    pub fn is_paged(&self) -> bool {
+        self.paged.is_some()
+    }
+
+    /// `item`'s list, sorted and distinct: from its shard, or from every
+    /// source of a paged index. `Err` when a run could not be read; the
+    /// caller then answers without the index.
+    fn list(&self, item: u64) -> std::io::Result<Vec<u64>> {
+        match &self.paged {
+            Some(store) => store.posting(&item.to_be_bytes()),
+            None => Ok(self.shards[Self::shard(item)].read().get(&item).cloned().unwrap_or_default()),
+        }
+    }
+
+    /// `item`'s list length: an upper bound when paged (a slot may sit in
+    /// more than one source, and merged-away slots are counted until then);
+    /// a failed read reads as "too many to use".
+    fn list_len(&self, item: u64) -> usize {
+        match &self.paged {
+            Some(store) => store.listed_under(&item.to_be_bytes()).unwrap_or(usize::MAX),
+            None => self.shards[Self::shard(item)].read().get(&item).map_or(0, |l| l.len()),
+        }
+    }
+
     /// Indexes the document a version holds (its bytes; empty for `NULL`).
     pub fn insert(&self, _proof: Proof<'_>, slot: u64, document: Option<&[u8]>) {
         crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::insert");
@@ -201,6 +277,17 @@ impl GinIndex {
         }
         items.sort_unstable();
         items.dedup();
+        if let Some(store) = &self.paged {
+            // The bit before the entries, the reverse of the maps: a run
+            // merge drops the slots whose bit it reads clear
+            // (`paged`'s module docs).
+            self.set_present(slot, true);
+            self.entries.fetch_add(items.len() as u64, Ordering::Relaxed);
+            for item in items {
+                store.insert(slot, super::KeyBuf::from_slice(&item.to_be_bytes()));
+            }
+            return;
+        }
         let mut added = 0u64;
         for item in items {
             let mut shard = self.shards[Self::shard(item)].write();
@@ -231,6 +318,11 @@ impl GinIndex {
         }
         self.unkeyed.write().retain(|s| *s != slot);
         self.set_present(slot, false);
+        // Paged: the cleared bit is the whole record; the run merges drop the
+        // slot's entries, and lookups skip it meanwhile.
+        if self.paged.is_some() {
+            return;
+        }
         // Counted before it is listed, so a compaction that takes the slot
         // never subtracts it before it was added: the count stays at least
         // the forgotten entries on any one list, which lookups rely on.
@@ -287,6 +379,9 @@ impl GinIndex {
         for shard in self.shards.iter() {
             shard.write().clear();
         }
+        if let Some(store) = &self.paged {
+            store.clear();
+        }
         let mut present = self.present.write();
         present.clear();
         self.live.store(0, Ordering::Relaxed);
@@ -338,6 +433,25 @@ impl GinIndex {
             bits[(s / 64) as usize] |= 1 << (s % 64);
         }
         let kept = |s: &u64| bits.get((*s / 64) as usize).is_none_or(|w| w & (1 << (s % 64)) == 0);
+        if let Some(store) = &self.paged {
+            // Every source merged, a superset; a read that fails ends the
+            // stream before its closing parts, which a `SortedLoad` refuses.
+            let mut stopped: Option<E> = None;
+            let read = store.for_each_key(false, |key, slots| {
+                let item = u64::from_be_bytes(key.try_into().map_err(|_| std::io::Error::other("an item key is not 8 bytes"))?);
+                f(Sorted::Entry(item, slots)).map_err(|e| {
+                    stopped = Some(e);
+                    std::io::Error::other("stopped")
+                })
+            });
+            if let Some(e) = stopped {
+                return Err(e);
+            }
+            if let Err(e) = read {
+                log::error!("index {}: reading its runs: {e}; the stream ends short", self.decl.name);
+                return Ok(());
+            }
+        } else {
         let mut items: Vec<u64> = Vec::new();
         for shard in self.shards.iter() {
             items.extend(shard.read().keys().copied());
@@ -360,6 +474,7 @@ impl GinIndex {
             for (item, list) in &block {
                 f(Sorted::Entry(*item, list))?;
             }
+        }
         }
         // `forget` takes a slot off the unkeyed list itself.
         let mut unkeyed = self.unkeyed.read().clone();
@@ -386,6 +501,38 @@ impl GinIndex {
     pub fn load_sorted(&self, proof: Proof<'_>, stream: SortedLoad<u64>) -> Result<(), SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "GinIndex::load_sorted");
         let (items, unkeyed, present) = stream.into_parts()?;
+        if let Some(store) = &self.paged {
+            // Bits and unkeyed slots first, then the lists as a run: the
+            // order a paged insert keeps.
+            {
+                let mut held = self.unkeyed.write();
+                held.extend(unkeyed);
+                held.sort_unstable();
+                held.dedup();
+            }
+            {
+                let mut bits = self.present.write();
+                if bits.len() < present.len() {
+                    bits.resize(present.len(), 0);
+                }
+                for (held, loaded) in bits.iter_mut().zip(&present) {
+                    *held |= *loaded;
+                }
+                let live: u64 = bits.iter().map(|w| w.count_ones() as u64).sum();
+                self.live.store(live, Ordering::Relaxed);
+            }
+            let added: u64 = items.iter().map(|(_, l)| l.len() as u64).sum();
+            let entries = items
+                .into_iter()
+                .map(|(item, slots)| (super::KeyBuf::from_slice(&item.to_be_bytes()), slots))
+                .collect();
+            if let Err(e) = store.load(entries) {
+                log::error!("index {}: writing its loaded lists: {e}", self.decl.name);
+                return Err(SortedReject::Truncated);
+            }
+            self.entries.fetch_add(added, Ordering::Relaxed);
+            return Ok(());
+        }
         // Dealt out to the shards first, so each is locked once.
         let mut dealt: Vec<Vec<(u64, &[u64])>> = (0..SHARDS).map(|_| Vec::new()).collect();
         for (item, listed) in &items {
@@ -453,7 +600,7 @@ impl GinIndex {
     fn walked_lists(&self, items: &[u64], forgotten: usize) -> SmallVec<[(usize, u64); 8]> {
         let mut lists: SmallVec<[(usize, u64); 8]> = items
             .iter()
-            .map(|i| (self.shards[Self::shard(*i)].read().get(i).map_or(0, |l| l.len()), *i))
+            .map(|i| (self.list_len(*i), *i))
             .collect();
         lists.sort_unstable();
         let live = self.live.load(Ordering::Relaxed) as usize;
@@ -491,6 +638,37 @@ impl GinIndex {
                 if lists.len() == 1 && lists[0].0.saturating_sub(forgotten) > cap {
                     return None;
                 }
+                if self.paged.is_some() {
+                    // Each list read whole from its sources, then walked as
+                    // below. A list that cannot be read declines: a scan
+                    // answers instead, never a short list.
+                    let owned: Vec<Vec<u64>> = match lists.iter().map(|(_, i)| self.list(*i)).collect() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!("index {}: {e}; answering without it", self.decl.name);
+                            return None;
+                        }
+                    };
+                    let (shortest, rest) = owned.split_first().expect("an item");
+                    let mut at: SmallVec<[usize; 8]> = smallvec::smallvec![0; rest.len()];
+                    let mut out = Vec::new();
+                    'paged_slots: for &s in shortest.iter() {
+                        if !live(s) {
+                            continue;
+                        }
+                        for (k, list) in rest.iter().enumerate() {
+                            at[k] = super::gallop_to(list, at[k], s);
+                            if list.get(at[k]) != Some(&s) {
+                                continue 'paged_slots;
+                            }
+                        }
+                        out.push(s);
+                        if out.len() > cap {
+                            return None;
+                        }
+                    }
+                    out
+                } else {
                 // Every list is read at once, so their shards are locked in
                 // ascending order, each once. Another lookup takes them in
                 // the same order and a writer holds one at a time, so no two
@@ -528,6 +706,7 @@ impl GinIndex {
                     }
                 }
                 out
+                }
             }
             GinQuery::Any(items) => {
                 if items.is_empty() {
@@ -535,7 +714,18 @@ impl GinIndex {
                 }
                 let mut out = Vec::new();
                 for item in items {
-                    if let Some(list) = self.shards[Self::shard(*item)].read().get(item) {
+                    if self.paged.is_some() {
+                        if self.list_len(*item).saturating_sub(forgotten) > cap {
+                            return None;
+                        }
+                        match self.list(*item) {
+                            Ok(list) => out.extend(list.into_iter().filter(|s| live(*s))),
+                            Err(e) => {
+                                log::error!("index {}: {e}; answering without it", self.decl.name);
+                                return None;
+                            }
+                        }
+                    } else if let Some(list) = self.shards[Self::shard(*item)].read().get(item) {
                         // Every live slot of every list is in the answer.
                         if list.len().saturating_sub(forgotten) > cap {
                             return None;
@@ -592,7 +782,15 @@ impl GinIndex {
                 }
                 let lists = self.walked_lists(items, forgotten);
                 let (_, shortest) = lists[0];
-                if let Some(list) = self.shards[Self::shard(shortest)].read().get(&shortest) {
+                let first = match self.list(shortest) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        log::error!("index {}: {e}; answering without it", self.decl.name);
+                        return None;
+                    }
+                };
+                {
+                    let list = &first;
                     let listed = set(list, &mut words);
                     // As in `lookup`: one list's live slots are the answer.
                     if lists.len() == 1 && listed.saturating_sub(forgotten) > limit {
@@ -603,8 +801,14 @@ impl GinIndex {
                 for &(_, item) in &lists[1..] {
                     bits.clear();
                     bits.resize(n_words, 0u64);
-                    if let Some(list) = self.shards[Self::shard(item)].read().get(&item) {
-                        set(list, &mut bits);
+                    match self.list(item) {
+                        Ok(list) => {
+                            set(&list, &mut bits);
+                        }
+                        Err(e) => {
+                            log::error!("index {}: {e}; answering without it", self.decl.name);
+                            return None;
+                        }
                     }
                     for (w, b) in words.iter_mut().zip(&bits) {
                         *w &= *b;
@@ -616,10 +820,15 @@ impl GinIndex {
                     return None;
                 }
                 for item in items {
-                    if let Some(list) = self.shards[Self::shard(*item)].read().get(item) {
-                        if set(list, &mut words).saturating_sub(forgotten) > limit {
+                    let list = match self.list(*item) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            log::error!("index {}: {e}; answering without it", self.decl.name);
                             return None;
                         }
+                    };
+                    if set(&list, &mut words).saturating_sub(forgotten) > limit {
+                        return None;
                     }
                 }
             }
@@ -659,7 +868,7 @@ impl GinIndex {
     /// beside the `status` key list every document is on). The one with less
     /// to read is the cheaper to ask, and its lists name fewer extras.
     pub fn estimate_and_cost(&self, query: &GinQuery) -> (usize, usize) {
-        let len = |i: &u64| self.shards[Self::shard(*i)].read().get(i).map_or(0, |l| l.len());
+        let len = |i: &u64| self.list_len(*i);
         let unkeyed = self.unkeyed.read().len();
         let items = match query {
             GinQuery::All(items) | GinQuery::Any(items) if items.is_empty() => return (usize::MAX, usize::MAX),
@@ -675,6 +884,9 @@ impl GinIndex {
     }
     /// Distinct items, and entries under them.
     pub fn sizes(&self) -> (usize, usize) {
+        if let Some(store) = &self.paged {
+            return store.sizes();
+        }
         self.shards.iter().fold((0, 0), |(k, e), s| {
             let s = s.read();
             (k + s.len(), e + s.values().map(|v| v.len()).sum::<usize>())
@@ -1020,9 +1232,18 @@ mod tests {
     /// unreadable, some `NULL`, and some forgotten. Returns the documents
     /// by slot, `None` where nothing can match.
     fn random_index(r: &mut Rng, opclass: GinOpclass, n: u64) -> (GinIndex, Vec<Option<Vec<u8>>>) {
+        random_index_with(r, opclass, n, &|| GinIndex::new(decl("r"), 0, opclass))
+    }
+
+    fn random_index_with(
+        r: &mut Rng,
+        opclass: GinOpclass,
+        n: u64,
+        make: &dyn Fn() -> GinIndex,
+    ) -> (GinIndex, Vec<Option<Vec<u8>>>) {
         let ticket = test_mint();
         let proof = Proof::from(&ticket);
-        let g = GinIndex::new(decl("r"), 0, opclass);
+        let g = make();
         let mut docs = Vec::new();
         for slot in 0..n {
             let d = match r.below(40) {
@@ -1111,6 +1332,65 @@ mod tests {
                     jsonb::gin_items(d, opclass, &mut have).unwrap();
                     if items.iter().all(|i| have.contains(i)) {
                         assert!(got.contains(&(slot as u64)), "{opclass:?} {query:?} dropped slot {slot}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paged (docs/disk-indexes.md, phase 3), with budgets so small that the
+    /// lists spill into runs and merge as they are built: every lookup, list
+    /// or bitmap, still holds every slot whose document has every item, and
+    /// holds what the in-memory index answers whenever both answer.
+    #[test]
+    fn a_paged_gin_index_never_drops_a_containing_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let placement = super::super::paged::Placement::for_table(dir.path(), "t");
+        let budgets = super::super::paged::Budgets { delta_bytes: 1024, block_bytes: 128, runs_max: 3 };
+        for round in 0..12u64 {
+            let opclass = if round % 2 == 0 { GinOpclass::Ops } else { GinOpclass::PathOps };
+            let seed = 0x5eed_0000 + round;
+            let n = 300 + (round * 37) % 300;
+            let (mem, _) = random_index_with(&mut Rng(seed), opclass, n, &|| GinIndex::new(decl("m"), 0, opclass));
+            let (paged, docs) = random_index_with(&mut Rng(seed), opclass, n, &|| {
+                GinIndex::new_paged(decl(&format!("p{round}")), 0, opclass, &placement, budgets)
+            });
+            assert!(paged.is_paged());
+            paged.paged.as_ref().unwrap().settle();
+            assert!(paged.paged.as_ref().unwrap().disk().0 > 0, "no run was written; nothing was paged");
+            let mut q = Rng(seed ^ 0xabcd);
+            for _ in 0..40 {
+                let query = random_query(&mut q, opclass);
+                let (GinQuery::All(items) | GinQuery::Any(items)) = &query;
+                let any = matches!(query, GinQuery::Any(_));
+                let truth: Vec<u64> = docs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, d)| {
+                        let d = d.as_ref()?;
+                        let mut have = Vec::new();
+                        jsonb::gin_items(d, opclass, &mut have).unwrap();
+                        let hit = if any {
+                            items.iter().any(|i| have.contains(i))
+                        } else {
+                            items.iter().all(|i| have.contains(i))
+                        };
+                        hit.then_some(slot as u64)
+                    })
+                    .collect();
+                if let Some(got) = paged.lookup(&query, usize::MAX) {
+                    for s in &truth {
+                        assert!(got.binary_search(s).is_ok(), "{opclass:?} {query:?}: slot {s} dropped");
+                    }
+                    if let Some(want) = mem.lookup(&query, usize::MAX) {
+                        for s in &want {
+                            assert!(got.binary_search(s).is_ok(), "{opclass:?} {query:?}: {s} in memory, not paged");
+                        }
+                    }
+                }
+                if let Some(words) = paged.lookup_dense(&query, n, usize::MAX) {
+                    for s in &truth {
+                        assert!(words[(*s / 64) as usize] & (1 << (s % 64)) != 0, "{query:?}: bit {s} dropped");
                     }
                 }
             }

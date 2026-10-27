@@ -396,6 +396,13 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
             flag("hot_reload"),
             text("set_with"),
             text("help"),
+            // A startup key's value saved for the next start, when it differs
+            // from the running one; empty otherwise.
+            text("pending"),
+            text("options"),
+            // default | command line | saved, for a startup key; empty for a
+            // hot one, which SET CONFIG changes in place.
+            text("source"),
         ],
         // Reports what it changed, so a console can echo it.
         Introspect::SetConfig { .. } => vec![text("result")],
@@ -1867,6 +1874,10 @@ struct ConfigKey {
     /// The statement or flag that changes it, quoted verbatim so a console can
     /// offer it.
     set_with: &'static str,
+    /// The values it takes, `|`-separated, for a console's dropdown; `:N`
+    /// marks a numeric parameter (`quorum:N`). Empty for a free number or
+    /// text.
+    options: &'static str,
     help: &'static str,
 }
 
@@ -1876,6 +1887,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "batch_size",
         hot: false,
         set_with: "--batch-size N (restart)",
+        options: "",
         help: "row pointers fetched per batch",
     },
     ConfigKey {
@@ -1883,13 +1895,56 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "concurrent_threads",
         hot: false,
         set_with: "--concurrent-threads N (restart)",
+        options: "",
         help: "workers a query may use",
+    },
+    ConfigKey {
+        section: "index",
+        key: "residency",
+        hot: false,
+        set_with: "--index-residency memory|hybrid|disk (restart)",
+        options: "memory|hybrid|disk",
+        help: "where B-tree, hash, path and gin indexes keep their entries: memory, or sorted runs on \
+               disk behind a block cache (hybrid: large cache and memory part; disk: small ones)",
+    },
+    ConfigKey {
+        section: "index",
+        key: "cache_mb",
+        hot: false,
+        set_with: "--index-cache-mb N (restart)",
+        options: "",
+        help: "the paged indexes' block cache in MiB, shared by every table; 0 is the residency's \
+               default (1024 hybrid, 64 disk)",
+    },
+    ConfigKey {
+        section: "index",
+        key: "delta_mb",
+        hot: false,
+        set_with: "--index-delta-mb N (restart)",
+        options: "",
+        help: "the memory part each paged index holds before writing it as a run, in MiB; 0 is the \
+               residency's default (256 hybrid, 16 disk)",
+    },
+    ConfigKey {
+        section: "server",
+        key: "malloc_arenas",
+        hot: false,
+        set_with: "--malloc-arenas N (restart)",
+        options: "",
+        help: "glibc malloc arenas; 0 is glibc's default (8 per core). Fewer saves memory and costs \
+               throughput under concurrency: 1 measured -61% point reads and -53% inserts at 16 \
+               clients for -11% RSS",
     },
     ConfigKey {
         section: "wal",
         key: "enabled",
         hot: false,
-        set_with: "--wal BOOL (restart)",
+        // No flag sets it: the log-off mode was never reachable or tested,
+        // and later durability work (in-place writes, the outcome log)
+        // assumes the log. Advertising `--wal` named a flag that does not
+        // exist, so a server configured by this row would not start.
+        set_with: "fixed: always on",
+        options: "true",
         help: "route durable writes through the log",
     },
     ConfigKey {
@@ -1897,6 +1952,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "checkpoint_bytes",
         hot: false,
         set_with: "--wal-checkpoint-bytes N (restart)",
+        options: "",
         help: "log bytes between checkpoints",
     },
     ConfigKey {
@@ -1904,6 +1960,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "synchronous_commit",
         hot: true,
         set_with: "SET CONFIG wal.synchronous_commit = off",
+        options: "on|off",
         help: "commits wait for their fdatasync; off risks the last writes, not the database",
     },
     ConfigKey {
@@ -1911,6 +1968,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "writer_delay_ms",
         hot: true,
         set_with: "SET CONFIG wal.writer_delay_ms = 200",
+        options: "",
         help: "how long an asynchronous commit may go unsynced",
     },
     ConfigKey {
@@ -1918,6 +1976,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "enabled",
         hot: false,
         set_with: "--enable-cache BOOL (restart)",
+        options: "true|false",
         help: "serve repeated queries from a known offset",
     },
     ConfigKey {
@@ -1925,6 +1984,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "enabled",
         hot: true,
         set_with: "SET CONFIG filter.enabled = on",
+        options: "true|false",
         help: "master switch for the filter index",
     },
     ConfigKey {
@@ -1932,6 +1992,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "backfill_on_open",
         hot: true,
         set_with: "SET CONFIG filter.backfill_on_open = on",
+        options: "true|false",
         help: "index pre-existing rows at open",
     },
     ConfigKey {
@@ -1939,6 +2000,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "min_pruning_ratio",
         hot: true,
         set_with: "SET CONFIG filter.min_pruning_ratio = 0.9",
+        options: "",
         help: "skip the mask when it prunes less than this (0..1)",
     },
     ConfigKey {
@@ -1946,6 +2008,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "checkpoint_interval_secs",
         hot: true,
         set_with: "SET CONFIG filter.checkpoint_interval_secs = 60",
+        options: "",
         help: "how often the maintenance task checkpoints",
     },
     ConfigKey {
@@ -1953,6 +2016,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "min_f",
         hot: true,
         set_with: "SET CONFIG filter.min_f = 8",
+        options: "",
         help: "floor on fingerprint bits (4..16)",
     },
     ConfigKey {
@@ -1960,6 +2024,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "default_f",
         hot: true,
         set_with: "SET CONFIG filter.default_f = 12",
+        options: "",
         help: "fingerprint bits before cardinality is known",
     },
     ConfigKey {
@@ -1967,6 +2032,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "max_f",
         hot: true,
         set_with: "SET CONFIG filter.max_f = 16",
+        options: "",
         help: "ceiling on fingerprint bits (4..16)",
     },
     ConfigKey {
@@ -1974,6 +2040,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "min_selectivity",
         hot: true,
         set_with: "SET CONFIG filter.min_selectivity = 0.1",
+        options: "",
         help: "largest row fraction a predicate may match and still be indexed",
     },
     ConfigKey {
@@ -1981,6 +2048,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "min_table_rows",
         hot: true,
         set_with: "SET CONFIG filter.min_table_rows = 10000",
+        options: "",
         help: "tables smaller than this are scanned without consulting the index",
     },
     ConfigKey {
@@ -1988,6 +2056,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "zone_bounds",
         hot: true,
         set_with: "SET CONFIG filter.zone_bounds = on",
+        options: "true|false",
         help: "keep per-zone min/max for range pruning",
     },
     ConfigKey {
@@ -1995,6 +2064,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "bloom",
         hot: true,
         set_with: "SET CONFIG filter.bloom = off",
+        options: "true|false",
         help: "keep a per-superzone span summary",
     },
     ConfigKey {
@@ -2002,6 +2072,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "active",
         hot: true,
         set_with: "REPLICATION ENABLE | REPLICATION DISABLE",
+        options: "true|false",
         help: "ship committed transactions to the peers",
     },
     ConfigKey {
@@ -2009,6 +2080,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "compression",
         hot: true,
         set_with: "SET CONFIG replication.compression = 'auto:zstd:1'",
+        options: "off|zstd:N|auto:zstd:N|always:zstd:N",
         help: "none | zstd[:level] | auto[:zstd[:level]]",
     },
     ConfigKey {
@@ -2016,6 +2088,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "mode",
         hot: true,
         set_with: "SET CONFIG replication.mode = 'quorum:1'",
+        options: "async|sync|all|quorum:N",
         help: "async | sync | quorum:N | all",
     },
     ConfigKey {
@@ -2023,6 +2096,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "conflict",
         hot: true,
         set_with: "SET CONFIG replication.conflict = 'last-writer-wins'",
+        options: "abort|skip|last-writer-wins",
         help: "abort | skip | last-writer-wins",
     },
     ConfigKey {
@@ -2030,6 +2104,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "ack_timeout_ms",
         hot: true,
         set_with: "SET CONFIG replication.ack_timeout_ms = 2000",
+        options: "",
         help: "how long a synchronous commit waits for peers",
     },
     ConfigKey {
@@ -2037,6 +2112,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "batch_max_records",
         hot: true,
         set_with: "SET CONFIG replication.batch_max_records = 256",
+        options: "",
         help: "records in one outbound batch",
     },
     ConfigKey {
@@ -2044,6 +2120,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "batch_linger_us",
         hot: true,
         set_with: "SET CONFIG replication.batch_linger_us = 500",
+        options: "",
         help: "how long a sender waits for more records",
     },
     ConfigKey {
@@ -2051,6 +2128,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "enabled",
         hot: true,
         set_with: "SET CONFIG query_stats.enabled = off",
+        options: "on|off",
         help: "record what each statement cost, for SHOW QUERIES and pg_stat_statements",
     },
     ConfigKey {
@@ -2058,6 +2136,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "recent",
         hot: true,
         set_with: "SET CONFIG query_stats.recent = 256",
+        options: "",
         help: "statements kept for SHOW QUERIES; the per-shape totals are kept regardless",
     },
     ConfigKey {
@@ -2065,6 +2144,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "enabled",
         hot: true,
         set_with: "SET CONFIG vacuum.enabled = on",
+        options: "",
         help: "background reclamation, for every table in this database",
     },
     ConfigKey {
@@ -2072,6 +2152,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "idle_checkpoint_secs",
         hot: true,
         set_with: "SET CONFIG index_snapshot.idle_checkpoint_secs = 300",
+        options: "",
         help: "seconds a table goes unwritten before its index snapshot is taken; 0 turns the idle checkpoint off",
     },
     ConfigKey {
@@ -2079,6 +2160,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "seal_timeout_ms",
         hot: true,
         set_with: "SET CONFIG index_snapshot.seal_timeout_ms = 5000",
+        options: "",
         help: "how long a mandatory snapshot (shutdown, rdb_index_checkpoint) waits for writers in flight",
     },
     ConfigKey {
@@ -2086,6 +2168,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "shutdown_deadline_secs",
         hot: true,
         set_with: "SET CONFIG index_snapshot.shutdown_deadline_secs = 120",
+        options: "",
         help: "the whole of shutdown's snapshots; keep it below the service manager's stop timeout",
     },
     ConfigKey {
@@ -2093,6 +2176,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "writeback_mb",
         hot: true,
         set_with: "SET CONFIG index_snapshot.writeback_mb = 64",
+        options: "",
         help: "MiB of a snapshot written between two writeback starts",
     },
     ConfigKey {
@@ -2100,6 +2184,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "index_storage",
         hot: true,
         set_with: "SET CONFIG index_snapshot.index_storage = snapshot",
+        options: "rebuild|snapshot",
         help: "rebuild: indexes are built from rows at every open; snapshot: seals write B-tree, hash and path indexes, and an open loads them",
     },
     ConfigKey {
@@ -2107,6 +2192,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "max_concurrent_loads",
         hot: true,
         set_with: "SET CONFIG index_snapshot.max_concurrent_loads = 4",
+        options: "",
         help: "index loads at open running at once, costliest first; 0 is half the cores",
     },
     ConfigKey {
@@ -2114,6 +2200,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "load_wait_ms",
         hot: true,
         set_with: "SET CONFIG index_snapshot.load_wait_ms = 600",
+        options: "",
         help: "how long a query waits for an index load at open before it scans",
     },
     ConfigKey {
@@ -2121,6 +2208,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         key: "audit_rate",
         hot: true,
         set_with: "SET CONFIG index_snapshot.audit_rate = 64",
+        options: "",
         help: "1 in this many index loads is checked against a copy read from rows in the background; 0 checks none",
     },
 ];
@@ -2136,6 +2224,9 @@ fn config_keys() -> Vec<Row> {
                 Cell::Flag(k.hot),
                 Cell::Text(k.set_with.to_string()),
                 Cell::Text(k.help.to_string()),
+                Cell::Text(String::new()),
+                Cell::Text(k.options.to_string()),
+                Cell::Text(String::new()),
             ])
         })
         .collect()
@@ -2150,6 +2241,10 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
         match (section, key) {
             ("server", "batch_size") => crate::batch_size().to_string(),
             ("server", "concurrent_threads") => crate::max_permits_threads().to_string(),
+            ("server", "malloc_arenas") => crate::malloc_arenas().to_string(),
+            ("index", "residency") => crate::core::index::paged::residency().name().to_string(),
+            ("index", "cache_mb") => crate::core::index::paged::cache_mb_setting().to_string(),
+            ("index", "delta_mb") => crate::core::index::paged::delta_mb_setting().to_string(),
             ("wal", "enabled") => crate::wal_enabled().to_string(),
             ("wal", "checkpoint_bytes") => crate::wal_checkpoint_bytes().to_string(),
             // `on`/`off`, not `true`/`false`: it carries a PostgreSQL setting's
@@ -2177,9 +2272,11 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("filter", "zone_bounds") => resolved.zone_bounds.to_string(),
             ("filter", "bloom") => resolved.bloom.to_string(),
             ("replication", "active") => database.replication.is_active().to_string(),
-            ("replication", "compression") => format!("{:?}", replication.compression),
-            ("replication", "mode") => format!("{:?}", replication.sync_mode),
-            ("replication", "conflict") => format!("{:?}", replication.conflict),
+            // In SET CONFIG's syntax (`auto:zstd:1`, `quorum:1`), so a console
+            // can match the value to its options and copy it back.
+            ("replication", "compression") => replication.compression.to_string(),
+            ("replication", "mode") => replication.sync_mode.to_string(),
+            ("replication", "conflict") => replication.conflict.to_string(),
             ("replication", "ack_timeout_ms") => replication.ack_timeout.as_millis().to_string(),
             ("replication", "batch_max_records") => replication.batch_max_records.to_string(),
             ("replication", "batch_linger_us") => replication.batch_linger.as_micros().to_string(),
@@ -2232,9 +2329,56 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
                 Cell::Flag(k.hot),
                 Cell::Text(k.set_with.to_string()),
                 Cell::Text(k.help.to_string()),
+                Cell::Text(pending_of(k)),
+                Cell::Text(k.options.to_string()),
+                Cell::Text(source_of(k)),
             ])
         })
         .collect()
+}
+
+/// The value saved for the next start, when it differs from the running one.
+fn pending_of(k: &ConfigKey) -> String {
+    if k.hot {
+        return String::new();
+    }
+    crate::configuration::saved::pending(&format!("{}.{}", k.section, k.key)).unwrap_or_default()
+}
+
+/// Where a startup key's running value came from; empty for a hot key.
+fn source_of(k: &ConfigKey) -> String {
+    if k.hot {
+        return String::new();
+    }
+    crate::configuration::saved::source(&format!("{}.{}", k.section, k.key)).name().to_string()
+}
+
+/// A startup key's value, checked and in the spelling SHOW CONFIG shows it
+/// in, for saving. `main` reads it back with the parser it uses for the flag.
+pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, String> {
+    let v = value.trim().trim_matches('\'');
+    let number = |min: u64, max: u64| -> Result<String, String> {
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("`{v}` is not a whole number for {section}.{name}"))?;
+        if n < min || n > max {
+            return Err(format!("{section}.{name} takes {min} to {max}, not {n}"));
+        }
+        Ok(n.to_string())
+    };
+    match (section, name) {
+        ("server", "batch_size") => number(1, 10_000_000),
+        ("server", "concurrent_threads") => number(1, 4096),
+        ("server", "malloc_arenas") => number(0, 4096),
+        ("wal", "checkpoint_bytes") => number(1, u64::MAX),
+        ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
+        ("index", "residency") => crate::core::index::paged::Residency::parse(v)
+            .map(|r| r.name().to_string())
+            .ok_or_else(|| format!("`{v}` is not a residency (memory, hybrid or disk)")),
+        ("index", "cache_mb") | ("index", "delta_mb") => number(0, 1 << 20),
+        ("wal", "enabled") => Err("wal.enabled is fixed: the log is always on".to_string()),
+        _ => Err(format!("{section}.{name} cannot be saved for the next start")),
+    }
 }
 
 /// Changes one knob, where the engine can do it without a restart.
@@ -2257,10 +2401,21 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         .ok_or_else(|| format!("unknown config key `{}` (try SHOW CONFIG KEYS)", key))?;
 
     if !spec.hot {
-        return Err(format!(
-            "`{}` is read once at start-up and cannot be changed on a running server; set it with `{}`",
-            key, spec.set_with
-        ));
+        // Read once at start-up: saved for the next start rather than
+        // applied (configuration::saved), in the spelling SHOW CONFIG shows,
+        // so `pending` compares like with like.
+        let canonical = startup_value(section, name, value)?;
+        let full = format!("{section}.{name}");
+        crate::configuration::saved::save(&full, &canonical)?;
+        let mut reply = format!("{full} = {canonical} is saved and takes effect at the next start");
+        if crate::configuration::saved::shadowed_by_flag(&full) {
+            reply.push_str(&format!(
+                "; but this server was started with a flag for it (`{}`), which wins over a saved value, \
+                 so remove the flag for it to take effect",
+                spec.set_with
+            ));
+        }
+        return Ok(reply);
     }
 
     match section {

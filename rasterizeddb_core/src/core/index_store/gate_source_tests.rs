@@ -98,9 +98,19 @@ const FIELDS_HOLDING_A_TOKEN: [(&str, &str); 2] = [("FamilyShard", "held"), ("Re
 const GUARDED: [&str; 4] = ["LiveIndex", "GinIndex", "TableIndexes", "TableFilters"];
 
 /// Fns that build a new structure, which nothing else can reach yet.
-const CONSTRUCTORS: [(&str, &str); 8] = [
+const CONSTRUCTORS: [(&str, &str); 16] = [
+    ("GinIndex", "new_in"),
+    ("GinIndex", "new_paged"),
+    ("GinIndex", "build"),
     ("LiveIndex", "new"),
     ("LiveIndex", "over_path"),
+    // The residency's choice of storage (docs/disk-indexes.md), at
+    // construction, like `new`.
+    ("LiveIndex", "new_in"),
+    ("LiveIndex", "over_path_in"),
+    ("LiveIndex", "new_paged"),
+    ("LiveIndex", "build"),
+    ("LiveIndex", "memory_data"),
     ("GinIndex", "new"),
     ("TableIndexes", "new"),
     ("TableIndexes", "with_gin"),
@@ -111,8 +121,16 @@ const CONSTRUCTORS: [(&str, &str); 8] = [
 
 /// Fns that change nothing: lookups, planning, sizes, keys, readiness and
 /// epochs read, and the read-only view.
-const READ_ONLY: [(&str, &str); 66] = [
+const READ_ONLY: [(&str, &str); 73] = [
+    ("GinIndex", "is_paged"),
+    ("GinIndex", "list"),
+    ("GinIndex", "list_len"),
     ("LiveIndex", "method"),
+    // Writes a sealed run file for a snapshot; changes nothing the index holds.
+    ("LiveIndex", "seal_run"),
+    ("LiveIndex", "is_paged"),
+    ("LiveIndex", "paged_disk"),
+    ("LiveIndex", "try_slots_for_key"),
     ("LiveIndex", "leading"),
     ("LiveIndex", "key_of"),
     ("LiveIndex", "key_of_values"),

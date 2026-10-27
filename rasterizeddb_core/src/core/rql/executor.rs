@@ -3761,6 +3761,17 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
 /// The table part is not checked: a table renamed since the constraint was
 /// created keeps the old name in it, which is exactly the case that arises when
 /// a migration renames a table and a later one drops the constraint.
+/// Whether `name` is the index a constraint of `table` owns: its primary
+/// key's (`<table>_pkey`), a column declared `UNIQUE` (`<table>_<column>_key`),
+/// or a full unique constraint. A partial unique index is not one: it answers
+/// to `DROP INDEX` itself (`execute_drop_partial_unique`).
+fn constraint_index(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
+    let named = |n: &str| n.eq_ignore_ascii_case(name);
+    (schema.primary_key.is_some() && named(&format!("{table}_pkey")))
+        || schema.unique_keys.iter().any(|k| !k.is_deleted && k.predicate.is_none() && named(&k.name))
+        || implicit_unique_column(name, &schema.fields).is_some()
+}
+
 fn implicit_unique_column(
     constraint: &str,
     fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
@@ -9825,7 +9836,15 @@ async fn execute_alter_table_action(
                     // constraint then outlived the migration meant to replace
                     // it and rejected rows the new one allows.
                     let implicit = implicit_unique_column(&name, &schema.fields);
-                    if stored || implicit.is_some() {
+                    // The primary key, recorded in the schema header as its
+                    // column's name and enforced through that column's UNIQUE
+                    // flag. Matched by nothing above, so `DROP CONSTRAINT
+                    // <table>_pkey` reported success and kept the key.
+                    let primary = schema
+                        .primary_key
+                        .clone()
+                        .filter(|_| named(&format!("{}_pkey", plan.table_name)));
+                    if stored || implicit.is_some() || primary.is_some() {
                         // §7 step 3: the removals are the reload's work. Both
                         // sidecars are tried, since the name alone does not say
                         // which kind it was; the sidecars are the source of
@@ -9862,7 +9881,13 @@ async fn execute_alter_table_action(
                                     }
                                     None => removed,
                                 };
-                                if !removed && let Some(column) = implicit {
+                                if !removed && let Some(column) = primary {
+                                    // The column keeps NOT NULL, as in
+                                    // PostgreSQL; its uniqueness was the key's.
+                                    schema.primary_key = None;
+                                    schema.rewrite_header(io_schema.clone()).await.map_err(|e| e.to_string())?;
+                                    schema.set_field_unique(&column, false, io_schema).await;
+                                } else if !removed && let Some(column) = implicit {
                                     schema.set_field_unique(&column, false, io_schema).await;
                                 }
                                 Ok(())
@@ -10564,6 +10589,22 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
     });
 
     let Some(table_name) = found else {
+        // An index a constraint owns is refused, as PostgreSQL refuses it:
+        // dropping it silently did nothing, so the key it backs stayed
+        // enforced while the client was told it was gone. The constraint is
+        // what goes, by `ALTER TABLE … DROP CONSTRAINT`.
+        let mut owner: Option<String> = None;
+        database.each_schema(|table, schema| {
+            if owner.is_none() && constraint_index(schema, table, &name) {
+                owner = Some(table.to_string());
+            }
+        });
+        if let Some(table) = owner {
+            return ddl_error(&format!(
+                "cannot drop index {name} because constraint {name} on table {table} requires it \
+                 (HINT: you can drop constraint {name} on table {table} instead)"
+            ));
+        }
         // Not an error when the index is one this engine never stored: an
         // ordinary index is a no-op here, so dropping it is one too.
         return ddl_ok(0);

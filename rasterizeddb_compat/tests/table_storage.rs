@@ -67,10 +67,12 @@ async fn a_table_reports_what_is_holding_it() {
         .iter()
         .find(|r| r.get::<String, _>("table_name") == "parts")
         .expect("the table is listed");
-    // This server holds its database in memory, and that is what it must say.
-    // The value is one word from a fixed vocabulary because a console groups and
-    // colours by it — see `DbStorageProvider::kind`.
-    assert_eq!(parts.get::<String, _>("storage"), "memory");
+    // This server holds its database in memory (or in files, when the suite is
+    // run file-backed), and that is what it must say. The value is one word
+    // from a fixed vocabulary because a console groups and colours by it — see
+    // `DbStorageProvider::kind`.
+    let holding = if server.is_file_backed() { "file" } else { "memory" };
+    assert_eq!(parts.get::<String, _>("storage"), holding);
     // The values land under the right names, which is the half of the drift a
     // column-name check on its own would not catch.
     assert_eq!(parts.get::<i64, _>("row_slots"), 4);
@@ -92,8 +94,12 @@ async fn a_table_reports_what_is_holding_it() {
             .unwrap_or_else(|| panic!("no `{}` in {:?}", name, stats.iter().map(|(m, _)| m).collect::<Vec<_>>()))
     };
 
-    assert_eq!(metric("storage"), "memory");
-    assert_eq!(metric("storage_location"), "(in process memory, not persisted)");
+    assert_eq!(metric("storage"), holding);
+    if server.is_file_backed() {
+        assert!(metric("storage_location").starts_with('/'), "a file-backed table names its directory");
+    } else {
+        assert_eq!(metric("storage_location"), "(in process memory, not persisted)");
+    }
     // Figures that did not exist before: the measured average row, the
     // proportion of the table that is dead, and whether reclamation is running
     // for this table — which `SHOW CONFIG` can only answer as "per table".

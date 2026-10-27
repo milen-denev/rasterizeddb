@@ -264,10 +264,16 @@ impl Recorder {
         let mut baseline = HashMap::new();
         for rel in walk(dir) {
             let path = dir.join(&rel);
-            let f = std::fs::File::options().read(true).write(true).open(&path).unwrap();
+            // A file gone since the walk was removed by a background thread
+            // (a paged index's merge drops the runs it replaced), as the cut
+            // below allows for: it has no baseline because it no longer is.
+            let Ok(f) = std::fs::File::options().read(true).write(true).open(&path) else {
+                continue;
+            };
             f.sync_all().unwrap();
             let ino = f.metadata().unwrap().ino();
-            baseline.insert(ino, std::fs::read(&path).unwrap());
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            baseline.insert(ino, bytes);
         }
         if let Ok(d) = std::fs::File::open(dir) {
             let _ = d.sync_all();

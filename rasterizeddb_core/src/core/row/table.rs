@@ -1268,7 +1268,14 @@ impl<S: StorageIO> Table<S> {
         // maintain the indexes from this moment, and queries use them once the
         // build has covered every row that was already there.
         let indexes = {
-            let indexes = crate::core::index::for_schema(&schema);
+            // Paged under the table's own directory when the residency asks
+            // for it (docs/disk-indexes.md); a table without one (memory,
+            // key/value, a mirrored pool) keeps its indexes in memory.
+            let placement = io_pointers
+                .index_store_dir()
+                .filter(|dir| !crate::core::index::paged::memory_forced(dir))
+                .map(|dir| crate::core::index::paged::Placement::for_table(&dir, stem));
+            let indexes = crate::core::index::for_schema_in(&schema, placement.as_ref());
             (!indexes.is_empty()).then(|| StdArc::new(indexes))
         };
         // Loaded from the snapshot's INDEX sections when the proof passed and
@@ -2990,7 +2997,9 @@ impl<S: StorageIO> Table<S> {
                 .find(|(f, _)| f.write_order as u32 == wo)
                 .map(|(_, v)| *v)
         })?;
-        Some((index.slots_for_key(&key), n_slots))
+        // `None` (answer without the index) when a paged index's runs could
+        // not be read: a short list would pass a duplicate.
+        Some((index.try_slots_for_key(&key)?, n_slots))
     }
 
     /// The `unique_lock` stripe for one constraint's key.

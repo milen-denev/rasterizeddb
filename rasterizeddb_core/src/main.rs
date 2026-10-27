@@ -112,6 +112,23 @@ struct Args {
     #[arg(long = "query-stats", alias = "query_stats", value_name = "on|off")]
     query_stats: Option<String>,
 
+    /// glibc malloc arenas, a low-memory mode (default: 0, glibc's own, 8 per
+    /// core)
+    ///
+    /// Fewer arenas keep less freed memory per thread and cost throughput
+    /// under concurrency, since allocating threads share their locks.
+    /// Measured at 16 clients against the default: 4 arenas -20% point reads
+    /// and -12% inserts for -16% RSS; 1 arena -61% and -53% for -11%.
+    #[arg(long = "malloc-arenas", alias = "malloc_arenas", value_name = "N")]
+    malloc_arenas: Option<usize>,
+
+    /// Log bytes between checkpoints (default: 67108864, 64 MiB)
+    ///
+    /// A checkpoint flushes every data file and discards the log. Larger
+    /// means fewer checkpoints and a longer replay after a crash.
+    #[arg(long = "wal-checkpoint-bytes", alias = "wal_checkpoint_bytes", value_name = "N")]
+    wal_checkpoint_bytes: Option<u64>,
+
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
@@ -177,6 +194,28 @@ struct Args {
     /// startup to load.
     #[arg(long = "index-storage", value_name = "rebuild|snapshot")]
     index_storage: Option<String>,
+
+    /// Where B-tree, hash and path indexes keep their entries (default:
+    /// memory)
+    ///
+    /// `memory` holds every entry in RAM, as always. `hybrid` and `disk` keep
+    /// them in sorted files beside the table, searched through a block cache,
+    /// with only recent changes in memory: `hybrid` with a large cache and
+    /// memory part, `disk` with small ones. Takes effect for tables opened
+    /// after it is set; a paged index is rebuilt at every open
+    /// (docs/disk-indexes.md).
+    #[arg(long = "index-residency", value_name = "memory|hybrid|disk")]
+    index_residency: Option<String>,
+
+    /// The paged indexes' block cache, in MiB, shared by every table
+    /// (default: 1024 for hybrid, 64 for disk)
+    #[arg(long = "index-cache-mb", value_name = "MIB")]
+    index_cache_mb: Option<u64>,
+
+    /// The memory part each paged index holds before writing it out as a
+    /// run, in MiB (default: 256 for hybrid, 16 for disk)
+    #[arg(long = "index-delta-mb", value_name = "MIB")]
+    index_delta_mb: Option<u64>,
 
     /// Floor on fingerprint bits per row (4..16).
     #[arg(long = "filter-min-f", value_name = "N")]
@@ -763,6 +802,62 @@ fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
     rasterizeddb_core::pgwire::parse_time_setting(value, 1)
 }
 
+/// Fills each startup flag not given on the command line from the settings
+/// file, and records every startup key's running value and where it came from
+/// for SHOW CONFIG. A saved value that does not parse is reported and
+/// ignored: a bad file must never keep the server from starting.
+fn apply_saved_settings(args: &mut Args) {
+    use rasterizeddb_core::configuration::saved::{self, Source};
+    use std::collections::BTreeMap;
+    let location = if args.in_memory {
+        None
+    } else {
+        args.location
+            .clone()
+            .or_else(|| cfg!(debug_assertions).then(|| "/mnt/Volume4/test_db".to_string()))
+    };
+    let stored: BTreeMap<String, String> = match location.as_deref() {
+        Some(dir) => saved::load(std::path::Path::new(dir)).unwrap_or_else(|e| {
+            eprintln!("{e}; starting without the saved settings");
+            BTreeMap::new()
+        }),
+        None => BTreeMap::new(),
+    };
+    fn one<T: std::str::FromStr + ToString>(
+        key: &str,
+        flag: &mut Option<T>,
+        stored: &BTreeMap<String, String>,
+        default: &str,
+    ) {
+        let source = if flag.is_some() {
+            Source::CommandLine
+        } else if let Some(v) = stored.get(key) {
+            match v.parse::<T>() {
+                Ok(t) => {
+                    *flag = Some(t);
+                    Source::Saved
+                }
+                Err(_) => {
+                    eprintln!("{}: `{key} = {v}` is not a valid value; ignored", saved::FILE_NAME);
+                    Source::Default
+                }
+            }
+        } else {
+            Source::Default
+        };
+        let text = flag.as_ref().map(|v| v.to_string()).unwrap_or_else(|| default.to_string());
+        saved::record(key, text, source);
+    }
+    one("server.batch_size", &mut args.batch_size, &stored, "10000");
+    one("server.concurrent_threads", &mut args.concurrent_threads, &stored, "16");
+    one("server.malloc_arenas", &mut args.malloc_arenas, &stored, "0");
+    one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
+    one("cache.enabled", &mut args.enable_cache, &stored, "false");
+    one("index.residency", &mut args.index_residency, &stored, "memory");
+    one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
+    one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+}
+
 fn main() -> std::io::Result<()> {
     // First, before anything compiled for x86-64-v3 has a chance to run: on a
     // CPU without AVX2 the alternative is a SIGILL with no explanation.
@@ -787,7 +882,16 @@ fn main() -> std::io::Result<()> {
     }
 
     // Parse command line arguments with clap
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Startup settings `SET CONFIG` saved, under the flags: a flag given here
+    // wins (configuration::saved).
+    apply_saved_settings(&mut args);
+    // Before the runtime starts a thread: an arena made is not undone.
+    if let Some(n) = args.malloc_arenas {
+        if !rasterizeddb_core::set_malloc_arenas(n) {
+            eprintln!("--malloc-arenas {n}: this platform's allocator refused it; using its default");
+        }
+    }
 
     // Before any kernel resolves its path: the filter index's probe caches the
     // first one it sees.
@@ -896,11 +1000,38 @@ fn main() -> std::io::Result<()> {
     if let Some(ms) = args.wal_writer_delay_ms {
         rasterizeddb_core::set_wal_writer_delay_ms(ms);
     }
+    // Before any database opens: the log's checkpoint trigger reads it.
+    if let Some(bytes) = args.wal_checkpoint_bytes {
+        if bytes == 0 {
+            return Err(std::io::Error::other("--wal-checkpoint-bytes must be above 0"));
+        }
+        let _ = rasterizeddb_core::WAL_CHECKPOINT_BYTES.set(bytes);
+    }
     #[cfg(feature = "query_stats")]
     if let Some(spec) = args.query_stats.as_deref() {
         match rasterizeddb_core::core::introspect::parse_bool(spec) {
             Ok(on) => rasterizeddb_core::core::query_stats::set_enabled(on),
             Err(e) => return Err(std::io::Error::other(format!("--query-stats: {}", e))),
+        }
+    }
+    {
+        use rasterizeddb_core::core::index::paged;
+        if let Some(spec) = args.index_residency.as_deref() {
+            match paged::Residency::parse(spec) {
+                Some(r) => paged::set_residency(r),
+                None => {
+                    return Err(std::io::Error::other(format!(
+                        "--index-residency {:?}: expected memory, hybrid or disk",
+                        spec
+                    )));
+                }
+            }
+        }
+        if let Some(mb) = args.index_cache_mb {
+            paged::set_cache_mb(mb);
+        }
+        if let Some(mb) = args.index_delta_mb {
+            paged::set_delta_mb(mb);
         }
     }
     if let Some(spec) = args.index_storage.as_deref() {

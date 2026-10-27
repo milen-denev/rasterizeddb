@@ -28,6 +28,9 @@ pub struct TestServer {
     handle: Option<std::thread::JoinHandle<()>>,
     database: Arc<Database>,
     catalog: Arc<DatabaseCatalog>,
+    /// The directory a `RASTERIZEDDB_TEST_FILE_BACKED` server put its
+    /// databases in, removed once the server has stopped.
+    scratch: Option<std::path::PathBuf>,
 }
 
 impl TestServer {
@@ -43,6 +46,12 @@ impl TestServer {
     /// the default one.
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> {
         &self.catalog
+    }
+
+    /// Whether `RASTERIZEDDB_TEST_FILE_BACKED` put this server's databases in
+    /// files rather than memory.
+    pub fn is_file_backed(&self) -> bool {
+        self.scratch.is_some()
     }
 }
 
@@ -66,6 +75,9 @@ impl Drop for TestServer {
             // not this drop's business to report it — a test whose server died
             // has already failed on its own terms.
             let _ = handle.join();
+        }
+        if let Some(dir) = self.scratch.take() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -116,6 +128,35 @@ impl TestServer {
         password: Option<&str>,
         limits: ConnectionLimits,
     ) -> anyhow::Result<Self> {
+        // `RASTERIZEDDB_TEST_FILE_BACKED=1` puts every such server's databases
+        // in a directory of its own, so the whole suite can run on real files:
+        // what paged indexes (`RASTERIZEDDB_INDEX_RESIDENCY=disk`) need, since
+        // an in-memory table has no directory to page into.
+        // `=1` puts them under /var/tmp; a path, under that path (a suite's
+        // worth of servers can outgrow a small root filesystem).
+        if let Some(base) = std::env::var("RASTERIZEDDB_TEST_FILE_BACKED")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|v| if v == "1" { "/var/tmp".to_string() } else { v })
+        {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::path::PathBuf::from(format!(
+                "{base}/rdb_compat_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let root = dir.to_string_lossy().to_string();
+            let mut server = Self::start_rooted(tls_mode, method, password, Some(&root), limits).await;
+            match &mut server {
+                Ok(s) => s.scratch = Some(dir),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+            return server;
+        }
         Self::start_rooted(tls_mode, method, password, None, limits).await
     }
 
@@ -243,6 +284,7 @@ impl TestServer {
             handle: Some(handle),
             database: database_handle,
             catalog: catalog_handle,
+            scratch: None,
         };
         server.wait_until_accepting().await?;
         Ok(server)
