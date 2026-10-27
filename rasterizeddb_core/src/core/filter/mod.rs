@@ -1492,6 +1492,7 @@ impl TableFilters {
                     .map(|(_, b)| b.as_slice());
                 f.set_reindex(*slot, bytes);
             }
+            f.backfill_batch_applied();
         }
         true
     }

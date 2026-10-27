@@ -736,9 +736,27 @@ impl ColumnFilter {
         }
     }
 
+    /// How many slots the record holds, for tests.
+    #[cfg(test)]
+    pub(crate) fn backfill_record_len(&self) -> usize {
+        self.written_during_backfill.len()
+    }
+
     /// A backfill begins: from now on, slots writers set are kept from it.
     pub fn begin_backfill(&mut self) {
         self.backfills += 1;
+    }
+
+    /// A backfill applied a batch: every slot it read is now written, so
+    /// none of the record is needed for it. A slot a writer sets ahead of
+    /// what it has read is read again, newer, when it gets there. Kept while
+    /// another backfill runs, whose batch in hand may hold any of them.
+    /// Bounds the record by the writes into one batch's window, not by the
+    /// backfill's lifetime.
+    pub fn backfill_batch_applied(&mut self) {
+        if self.backfills == 1 {
+            self.written_during_backfill.clear();
+        }
     }
 
     /// A backfill [`Self::begin_backfill`] began has ended.

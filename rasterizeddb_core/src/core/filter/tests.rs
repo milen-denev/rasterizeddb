@@ -1664,3 +1664,34 @@ fn string_equality_is_byte_equality() {
         canonical_hash(&DbType::STRING, upper, seed)
     );
 }
+
+/// The record of slots writers set during a backfill: kept from the
+/// backfill's own writes, emptied when its batch lands (it is then needed by
+/// nothing), kept while a second backfill runs, and never grown without one.
+///
+/// Mutation: `backfill_batch_applied` not clearing leaves 1000 entries.
+#[test]
+fn the_backfill_record_is_bounded_by_one_batch() {
+    let mut c = u64_col();
+    for slot in 0..1000u64 {
+        c.set(slot, Some(&slot.to_le_bytes()));
+    }
+    assert_eq!(c.backfill_record_len(), 0, "recorded with no backfill running");
+    c.begin_backfill();
+    for slot in 0..1000u64 {
+        c.set(slot, Some(&(slot + 1).to_le_bytes()));
+    }
+    assert_eq!(c.backfill_record_len(), 1000);
+    // The backfill's stale code for a recorded slot is dropped.
+    c.set_reindex(7, Some(&7u64.to_le_bytes()));
+    assert!(c.admits_eq(7, &8u64.to_le_bytes(), 1000), "the backfill overwrote a writer's code");
+    c.backfill_batch_applied();
+    assert_eq!(c.backfill_record_len(), 0, "the record outlived the batch it protects");
+    c.begin_backfill();
+    c.set(3, Some(&3u64.to_le_bytes()));
+    c.backfill_batch_applied();
+    assert_eq!(c.backfill_record_len(), 1, "cleared under a second backfill's batch");
+    c.end_backfill();
+    c.end_backfill();
+    assert_eq!(c.backfill_record_len(), 0);
+}
