@@ -347,6 +347,10 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
     for case in &cases {
         let o = run_case(case, seeds).await;
         eprintln!("{}: {o:?}", case.ddl);
+        // Per case: a table with rows has open partitions whose sealed
+        // indexes the snapshot pass must have loaded, or it compared nothing
+        // for this case (the index swap above all).
+        assert!(case.empty || o.loaded > 0, "{}: no image loaded a persisted index ({o:?})", case.ddl);
         total.old += o.old;
         total.new += o.new;
         total.between += o.between;
