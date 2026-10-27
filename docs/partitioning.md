@@ -541,11 +541,21 @@ restored byte-exact from git; `grep -rn MUTATED` clean at the end):
 | *(round 5)* an inline key matched as `<table>_<col>_key` | the DROP CONSTRAINT arm | the same |
 | *(round 5)* a named composite primary key accepted | the ADD CONSTRAINT arm | the same (0A000 expected) |
 | *(round 5)* a one-column key always taken as `<table>_pkey` | `primary_key_constraint` | the same |
+| *(round 6)* `identifying_key` compares the uncut `<table>_pkey` | `identifying_key` | `partition_alter::a_long_table_names_its_keys_as_it_compares_them` (55006 dropping the narrower UNIQUE) |
+| *(round 6)* `primary_key_constraint` compares the uncut name | `primary_key_constraint` | the same (42710 for 42P16) |
+| *(round 6)* the named-composite refusal compares the uncut name | the ADD CONSTRAINT arm | the same (0A000 on an unnamed key) |
+| *(round 6)* ON CONFLICT ON CONSTRAINT compares the uncut name | `constraint_columns` | the same (DO UPDATE on the inline key; it survived DO NOTHING, which never reads the columns) |
+| *(round 6)* the DROP INDEX refusal compares the uncut name | `constraint_index` | the same (on the inline key; it survived on a sidecar key, found by name) |
+| *(round 6)* `implicit_unique_column` without the cut name | `implicit_unique_column` | the same (the inline UNIQUE's DROP: 42704) |
+| *(round 6)* the implicit index named uncut | `index::for_schema` | the same (`pg_indexes`) |
+| *(round 6)* `parse_clause` names the key uncut | `unique_key::parse_clause` | the same |
+| *(round 6)* the import names the key uncut | `migrate::plan` | `plan::tests::a_long_tables_primary_key_is_named_as_the_engine_names_it` |
+| *(round 6)* a derived CHECK / index name cut after joining | `check::derived_name`, `CreateIndex::name_or_default` | `check::tests`, `index::ddl` tests |
 | *(round 3)* one case's snapshot pass run in rebuild mode (test-side: a production mutation that drops every load of one case alone was not found, since a case's images from before the DDL load whatever the DDL does) | `pddl_crash_tests::run_case` | `pddl_crash_tests` (RENAME TO: `loaded: 0`; the summed check alone passes) |
 
 **Twin runs:** all four configurations green at the default seeds
 (0x5eed0001, 0x5eed7a11, 300 statements) and at 0x5eed2b20 and 0x5eedf1a1
-with 1,500 statements each, after rounds 2 to 5.
+with 1,500 statements each, after rounds 2 to 6.
 
 **Round 3** (2026-10-27), three items from review:
 
@@ -686,6 +696,45 @@ that took effect.
   - When a table-level one-column key has two one-column sidecars on its
     column, the one named `<table>_pkey` wins, else the first declared. The
     schema cannot say which one the PRIMARY KEY was.
+
+**Round 6** (2026-10-27): **one spelling for every derived name.** On a
+table name over 123 bytes, `parse_clause` named an unnamed primary key
+`name_with_label(table, "_pkey")`, cut so the label survives, while every
+comparison built `format!("{table}_pkey")` uncut:
+
+- an unnamed `ADD PRIMARY KEY (a, b)` was refused 0A000 as "named";
+- `CREATE TABLE … PRIMARY KEY (a, b)` was not seen as the primary key, so a
+  second ADD got 42710 rather than 42P16;
+- `identifying_key` missed it and framed row locks from another key.
+
+Every derived name is now built by one helper and compared by the same:
+
+- `unique_key::pkey_name`: the named-composite refusal and its
+  prediction, `primary_key_constraint`, `identifying_key`, `ON CONFLICT ON
+  CONSTRAINT` (`constraint_columns`), the DROP INDEX refusal
+  (`constraint_index`), the implicit index (`index::for_schema`) and the
+  import's plan;
+- `unique_key::implicit_key_name` (`<table>_<col>_key`): the implicit index
+  and `implicit_unique_column`, which also matches the name as this table
+  cuts it;
+- `UniqueKey::default_name`, `check::derived_name` and
+  `CreateIndex::name_or_default` (`_idx`).
+
+No `format!` of a derived name is left in core or the migrator.
+`src/executor.rs`, which nothing compiles, was left as it is.
+`partition_alter::a_long_table_names_its_keys_as_it_compares_them` pins it
+with a 125-byte name on both kinds:
+
+- composite and one-column keys by CREATE TABLE, ADD and inline, each the
+  primary key (42P16 on a second; `pg_index` and `is_primary_key`; not for
+  a composite, as before);
+- dropped by the cut name;
+- the implicit index in `pg_indexes`;
+- `ON CONFLICT ON CONSTRAINT` DO UPDATE and the DROP INDEX refusal on an
+  inline key;
+- an inline UNIQUE dropped by its cut `<table>_<col>_key` (plain only);
+- the row locks' key: dropping a narrower UNIQUE under a lock is not
+  refused (55006), since the primary key is the key.
 
 **Deviations from the plan.**
 
