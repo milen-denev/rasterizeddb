@@ -216,8 +216,6 @@ async fn an_insert_outside_its_range_errors() {
     assert_eq!(i64_of(&t, &found[0], "tenant_id"), 42);
 }
 
-/// A partition owning the whole space, so only the "point unchanged" rule can
-/// refuse an update, never the range.
 /// A write-ahead log for `dir` until the guard drops. An in-place overwrite
 /// is taken only where the write waits for its commit
 /// (`StorageIO::defers_in_place_writes`), which for a file means one with a
@@ -239,6 +237,8 @@ fn logged(dir: &std::path::Path) -> Logged {
     Logged(location)
 }
 
+/// A partition owning the whole space, so only the "point unchanged" rule can
+/// refuse an update, never the range.
 async fn quiet_partition(dir: &std::path::Path) -> Table<P> {
     init();
     let l = create_logical(dir).await;
