@@ -729,11 +729,19 @@ impl ColumnFilter {
         self.set_hash_inner(slot, hash, true)
     }
 
+    /// The writer's path when no backfill runs: one compare. The insert is
+    /// kept out of line, off the common path's code.
     #[inline]
     fn note_writer(&mut self, slot: u64) {
         if self.backfills > 0 {
-            self.written_during_backfill.insert(slot);
+            self.record_backfill_write(slot);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_backfill_write(&mut self, slot: u64) {
+        self.written_during_backfill.insert(slot);
     }
 
     /// How many slots the record holds, for tests.
