@@ -4124,7 +4124,7 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
                 bytes: encoded,
                 db_type: target.clone(),
             }),
-            None => Err(format!("'{}' cannot be read as {:?}", text, target)),
+            None => Err(format!("{} cannot be read as {:?}", crate::core::rql::executor::sql_literal(&text), target)),
         };
     }
 

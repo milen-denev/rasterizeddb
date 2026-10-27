@@ -389,7 +389,7 @@ async fn run_subquery_scaled(
     };
 
     let purpose =
-        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery '{}'", sql))?;
+        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery {}", sql_literal(sql)))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {
         return Err("only a SELECT may appear as a subquery".to_string());
     }
@@ -629,7 +629,7 @@ async fn run_subquery_serialized(
     let folded = fold_where_constants(sql);
     let sql = folded.as_str();
     let purpose =
-        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery '{}'", sql))?;
+        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery {}", sql_literal(sql)))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {
         return Err("only a SELECT may appear as a subquery".to_string());
     }
@@ -676,7 +676,7 @@ pub(crate) async fn run_returning_rows(
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
     crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ReturningBody, tx, database);
-    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse {}", sql_literal(sql)))?;
     // Runs inside the caller's transaction rather than opening its own. A
     // data-modifying CTE is part of one statement, so committing it separately
     // would leave its writes behind when the outer statement fails — or when
@@ -706,7 +706,7 @@ pub(crate) async fn run_statement_affected(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<u64, String> {
-    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse {}", sql_literal(sql)))?;
     let response = Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
     match response.first() {
         Some(3) => Err(String::from_utf8_lossy(&response[1..]).to_string()),
@@ -730,7 +730,7 @@ pub(crate) async fn run_statement(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<(), String> {
-    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse {}", sql_literal(sql)))?;
     // Runs inside the caller's transaction. Opening a fresh one made a CTE's
     // writes a *different* transaction from the statement they belong to, which
     // then collided with it — "could not serialize access due to concurrent
@@ -3755,6 +3755,16 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     }
 }
 
+/// `text` as a SQL string literal, its quotes doubled: how a message quotes
+/// statement or value text the client wrote. Embedded as it was, a quote
+/// inside it ended the quoted span early for anything reading the message
+/// (`sqlstate_for` skips quoted text), and the client's words after it read
+/// as the message's own: `'(could not serialize access)'::int` in a CTE
+/// came back 40001, and a retry loop resent it forever.
+pub(crate) fn sql_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
 /// Whether `name` is the index a constraint of `table` owns: its primary
 /// key's (`<table>_pkey`), a column declared `UNIQUE` (`<table>_<column>_key`),
 /// or a full unique constraint. A partial unique index is not one: it answers
@@ -5078,7 +5088,7 @@ async fn run_per_row_write(
         Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
         None => {
             let mut refused = vec![3u8];
-            refused.extend_from_slice(format!("could not parse the rewritten '{}'", with_recheck).as_bytes());
+            refused.extend_from_slice(format!("could not parse the rewritten {}", sql_literal(&with_recheck)).as_bytes());
             refused
         }
     };
@@ -5483,7 +5493,7 @@ async fn apply_conflict_update(
     );
 
     let Some(purpose) = recognize_query_purpose(&statement) else {
-        return ddl_error(&format!("could not parse the rewritten '{}'", statement));
+        return ddl_error(&format!("could not parse the rewritten {}", sql_literal(&statement)));
     };
     Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await
 }

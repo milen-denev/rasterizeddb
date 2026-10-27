@@ -52,3 +52,32 @@ async fn quoted_text_does_not_choose_the_sqlstate() {
         assert_eq!(code(&e), want, "{sql}: {e}");
     }
 }
+
+/// A quote inside the quoted text: the message embedded the statement as it
+/// was, so the quote-span detection paired the wrong quotes and read the
+/// text between them as the message's own words.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_inside_quoted_text_does_not_choose_the_sqlstate() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql("CREATE TABLE qq (id BIGINT PRIMARY KEY, m BIGINT); INSERT INTO qq VALUES (1, 1);"))
+        .await
+        .unwrap();
+    for sql in [
+        // The statement text quoted whole in "cannot parse subquery '…'".
+        "WITH w AS (SELECT '(could not serialize access)'::int AS z) SELECT * FROM w",
+        "WITH w AS (SELECT ' deadlock detected'::int AS z) SELECT * FROM w",
+        "SELECT * FROM (SELECT '(could not serialize access)'::int AS z) d",
+        "SELECT * FROM (SELECT ' deadlock detected'::int AS z) d",
+        // A value quoted in "'…' cannot be read as".
+        "WITH w AS (SELECT 'x'' deadlock detected'::int AS x FROM qq) SELECT * FROM w",
+        "SELECT * FROM (SELECT 'x'' could not serialize access'::int AS x FROM qq) d",
+        "WITH w AS (SELECT '(could not serialize access)'::int AS x FROM qq) SELECT * FROM w",
+        "WITH w AS (UPDATE qq SET m = 'it''s could not serialize access' WHERE id = 1 RETURNING id) SELECT * FROM w",
+        "WITH w AS (UPDATE qq SET m = ''' deadlock detected' WHERE id = 1 RETURNING id) SELECT * FROM w",
+    ] {
+        let e = sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await.expect_err(sql);
+        let got = code(&e);
+        assert!(!got.starts_with("40"), "{sql}: a quoted value chose {got}: {e}");
+    }
+}
