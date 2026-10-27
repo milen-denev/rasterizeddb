@@ -8240,6 +8240,11 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     {
         return ddl_error(&e);
     }
+    // This transaction's own row locks on it would outlive it, keyed by a
+    // name a table created next could take.
+    if owner().is_some_and(|o| database.row_locks.txn_holds_rows_on(&table_name, o.owner.id())) {
+        return row_locks_in_use(&table_name, "DROP TABLE");
+    }
     match database.drop_table(&table_name).await {
         Ok(true) => ddl_ok(0),
         Ok(false) if if_exists => ddl_ok(0),
@@ -9425,6 +9430,14 @@ async fn execute_alter_table_action(
     // has written nothing.
     if let Err(e) = database.lock_names(&alter_lock_set(&plan, database), owner()).await {
         return ddl_error(&e);
+    }
+    // This transaction's own row locks on the table, which a RENAME or a new
+    // identifying key would orphan (another session's make the DDL wait for
+    // its ROW EXCLUSIVE). Before a sidecar is written.
+    if database.row_locks.txn_holds_rows_on(&plan.table_name, tx) {
+        if let Some(what) = orphans_row_locks(&plan, &schema) {
+            return row_locks_in_use(&plan.table_name, what);
+        }
     }
     // What a partitioned table cannot do yet, under the lock, before a
     // sidecar is written (docs/partitioning.md §11).
@@ -11848,6 +11861,112 @@ fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<Ide
         }
     }
     best.or_else(|| candidates().find(|fields| fields.len() == 1)).map(key)
+}
+
+/// [`identifying_key`] as the columns (by write order) and scales a row
+/// lock's key is framed from: what must not change under a transaction's
+/// row locks.
+fn identifying_shape(schema: &crate::core::row::schema::TableSchema) -> Option<Vec<(u64, u32)>> {
+    identifying_key(schema).map(|k| k.fields.iter().map(|f| f.write_order).zip(k.scales).collect())
+}
+
+/// The schema `plan` would leave, for the actions that can change which key
+/// identifies a row (a UNIQUE or PRIMARY KEY added or dropped, NOT NULL set
+/// or dropped, a column dropped); `None` for every other action, which
+/// leaves the key as it is. Built in memory before anything is written, so
+/// [`orphans_row_locks`] can compare the key before and after.
+fn schema_after_for_identity(
+    plan: &crate::core::rql::lexer_alter::AlterTable,
+    schema: &crate::core::row::schema::TableSchema,
+) -> Option<crate::core::row::schema::TableSchema> {
+    use crate::core::rql::lexer_alter::AlterAction;
+    use crate::core::rql::nullable;
+    let mut after = schema.clone();
+    match &plan.action {
+        AlterAction::ConstraintClause { drop: false, description } => {
+            let (clause, _) = crate::core::rql::unique_key::strip_if_not_exists(description);
+            let key = crate::core::rql::unique_key::parse_clause(&clause, &plan.table_name).ok()??;
+            if after.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&key.name)) {
+                return None;
+            }
+            after.unique_keys.push(key);
+        }
+        AlterAction::ConstraintClause { drop: true, description } => {
+            let name = dropped_constraint_name(description)?;
+            for key in after.unique_keys.iter_mut().filter(|k| k.name.eq_ignore_ascii_case(&name)) {
+                key.is_deleted = true;
+            }
+            if let Some(column) = implicit_unique_column(&name, &after.fields) {
+                for f in after.fields.iter_mut().filter(|f| f.name.eq_ignore_ascii_case(&column)) {
+                    f.is_unique = false;
+                }
+            }
+            if name.eq_ignore_ascii_case(&format!("{}_pkey", plan.table_name)) {
+                if let Some(column) = after.primary_key.take() {
+                    for f in after.fields.iter_mut().filter(|f| f.name.eq_ignore_ascii_case(&column)) {
+                        f.is_unique = false;
+                    }
+                }
+            }
+        }
+        AlterAction::AlterColumn { name, detail } if detail.to_ascii_uppercase().contains("NOT NULL") => {
+            let flag = nullable::flag_column_name(name);
+            if detail.trim_start().to_ascii_uppercase().starts_with("DROP") {
+                if !nullable::is_nullable(name, &after.fields) {
+                    after.fields.push(crate::core::row::schema::SchemaField::new(
+                        flag,
+                        nullable::FLAG_TYPE,
+                        nullable::FLAG_TYPE.get_size(),
+                        0,
+                        u64::MAX,
+                        false,
+                    ));
+                }
+            } else {
+                for f in after.fields.iter_mut().filter(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag)) {
+                    f.is_deleted = true;
+                }
+            }
+        }
+        AlterAction::DropColumn { name, .. } => {
+            let flag = nullable::flag_column_name(name);
+            for f in after
+                .fields
+                .iter_mut()
+                .filter(|f| !f.is_deleted && (f.name.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(&flag)))
+            {
+                f.is_deleted = true;
+            }
+        }
+        _ => return None,
+    }
+    Some(after)
+}
+
+/// What `plan` would do to the row locks a transaction holds on its table:
+/// they are keyed by the table's name and its identifying key's bytes, and
+/// nothing re-keys them, so a RENAME TO, or a change of which key
+/// identifies a row (compared before and after: [`identifying_shape`]),
+/// would leave them naming rows no lookup finds, and another session could
+/// write a row this transaction holds. `None` when the locks stay valid.
+fn orphans_row_locks(
+    plan: &crate::core::rql::lexer_alter::AlterTable,
+    schema: &crate::core::row::schema::TableSchema,
+) -> Option<&'static str> {
+    if matches!(plan.action, crate::core::rql::lexer_alter::AlterAction::RenameTable { .. }) {
+        return Some("RENAME TO");
+    }
+    let after = schema_after_for_identity(plan, schema)?;
+    (identifying_shape(schema) != identifying_shape(&after)).then_some("change the key that identifies its rows")
+}
+
+/// The refusal a DDL gets from a transaction holding row locks on `table`
+/// that the DDL would orphan: PostgreSQL's 55006, object in use.
+fn row_locks_in_use(table: &str, what: &str) -> Vec<u8> {
+    ddl_error(&format!(
+        "cannot {what} on \"{table}\" because it is being used by active queries in this session: the transaction \
+         holds row locks on the table, which this would orphan; end the transaction first"
+    ))
 }
 
 /// How many times a write replays a conflict before reporting it.

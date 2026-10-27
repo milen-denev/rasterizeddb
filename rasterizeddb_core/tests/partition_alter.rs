@@ -719,3 +719,117 @@ fn non_ascii_and_quoted_constraint_names_over_the_wire() {
     pair.restart();
     pair.compare("non-ASCII names, restarted");
 }
+
+/// One row-lock case: `create` (with `{t}`), the rows, the row A locks
+/// (`lock` is the WHERE that names it), and the DDL A runs in its block.
+struct LockCase {
+    create: &'static str,
+    insert: &'static str,
+    lock: &'static str,
+    ddl: &'static str,
+}
+
+/// A FOR UPDATE row lock taken in a block, then a DDL in the same block
+/// that would leave the lock keyed by something no lookup uses: the table's
+/// old name (RENAME TO, DROP TABLE) or an identifying key that changed (a
+/// PRIMARY KEY added or dropped, NOT NULL set or dropped where that changes
+/// the chosen key). Each is refused with 55006, nothing changed, and the
+/// locked row stays protected (another session's UPDATE of it is refused
+/// while the block is open). A control runs each DDL in a block holding no
+/// row lock: it succeeds. A DDL that keeps the key (a CHECK, a UNIQUE the
+/// primary key still outranks) runs beside the lock, and the row stays
+/// protected. Plain and partitioned tables alike.
+///
+/// Mutation: the orphan check off in `execute_alter_table_action` and
+/// `execute_drop_table` (the DDL succeeds, and B's UPDATE then writes the
+/// row A holds: the lost update).
+#[test]
+fn a_ddl_that_would_orphan_the_blocks_row_locks_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let part = " PARTITION BY HASH (a) PARTITIONS 4";
+    // The key that names a row: the primary key; else the NOT NULL unique
+    // key with the fewest columns. `uq` is named by (a, b, v) until c is NOT
+    // NULL, then by (a, c); `uq_nn` the other way round.
+    let pk = "(a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT, c BIGINT, PRIMARY KEY (a, b))";
+    let uq = "(a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, c BIGINT, UNIQUE (a, b, v), UNIQUE (a, c))";
+    let uq_nn = "(a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, c BIGINT NOT NULL, UNIQUE (a, b, v), UNIQUE (a, c))";
+    let rows = "INSERT INTO {t} (a, b, v, c) VALUES (1, 1, 1, 1), (2, 2, 2, 2)";
+    let orphaning = [
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "ALTER TABLE {t} RENAME TO {t}_2" },
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "DROP TABLE {t}" },
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "ALTER TABLE {t} DROP CONSTRAINT {t}_pkey" },
+        LockCase {
+            create: uq,
+            insert: rows,
+            lock: "a = 1 AND b = 1",
+            ddl: "ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)",
+        },
+        LockCase { create: uq, insert: rows, lock: "a = 1 AND b = 1", ddl: "ALTER TABLE {t} ALTER COLUMN c SET NOT NULL" },
+    ];
+    // Plain only: on a partitioned table with rows, DROP NOT NULL rewrites
+    // and is refused (0A000) before this check.
+    let plain_only = [LockCase { create: uq_nn, insert: rows, lock: "a = 1 AND c = 1", ddl: "ALTER TABLE {t} ALTER COLUMN c DROP NOT NULL" }];
+    let keeping = [
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "ALTER TABLE {t} ADD CONSTRAINT {t}_c CHECK (v >= 0)" },
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "ALTER TABLE {t} ADD CONSTRAINT {t}_u UNIQUE (a, b, v)" },
+        LockCase { create: pk, insert: rows, lock: "a = 1 AND b = 1", ddl: "CREATE INDEX {t}_v ON {t} (v)" },
+    ];
+    let mut n = 0;
+    let mut next = |kind: &str| {
+        n += 1;
+        format!("rl_{kind}_{n}")
+    };
+    let mut run = |case: &LockCase, partitioned: bool, lock_rows: bool, expect_refused: bool| {
+        let t = next(if partitioned { "p" } else { "q" });
+        let r = |s: &str| s.replace("{t}", &t);
+        let mut setup = server.connect();
+        setup.ok(&format!("CREATE TABLE {t} {}{}", r(case.create), if partitioned { part } else { "" }));
+        setup.ok(&r(case.insert));
+        let mut a = server.connect();
+        let mut b = server.connect();
+        b.ok("SET lock_timeout = '300ms'");
+        a.ok("BEGIN");
+        if lock_rows {
+            a.ok(&format!("SELECT * FROM {t} WHERE {} FOR UPDATE", case.lock));
+        } else {
+            a.ok(&format!("SELECT * FROM {t} WHERE {}", case.lock));
+        }
+        let ddl = r(case.ddl);
+        let out = a.simple(&ddl);
+        let label = format!("{} `{ddl}` (locks {lock_rows})", if partitioned { "partitioned" } else { "plain" });
+        if expect_refused {
+            let e = out.expect_err(&label);
+            assert_eq!(e.code, "55006", "{label}: {e}");
+            assert!(e.message.contains("row locks"), "{label}: {e}");
+            a.simple("ROLLBACK").ok();
+            // Nothing changed: the table is there under its name, its row
+            // too, and B can lock and write it now that A is gone.
+            assert_eq!(setup.ok(&format!("SELECT count(*) FROM {t}")).rows, vec![vec![Some("2".to_string())]], "{label}");
+            b.ok(&format!("UPDATE {t} SET v = 9 WHERE {}", case.lock));
+        } else {
+            out.unwrap_or_else(|e| panic!("{label}: {e}"));
+            if lock_rows {
+                // The lock still holds: B cannot write A's row.
+                let target = if ddl.contains("RENAME TO") { format!("{t}_2") } else { t.clone() };
+                let e = b.simple(&format!("UPDATE {target} SET v = 9 WHERE {}", case.lock));
+                assert!(e.is_err(), "{label}: B wrote a row A holds: {e:?}");
+            }
+            a.ok("COMMIT");
+        }
+        drop((a, b, setup));
+    };
+    for partitioned in [false, true] {
+        for case in &orphaning {
+            run(case, partitioned, true, true);
+            run(case, partitioned, false, false);
+        }
+        for case in &keeping {
+            run(case, partitioned, true, false);
+        }
+    }
+    for case in &plain_only {
+        run(case, false, true, true);
+        run(case, false, false, false);
+    }
+}

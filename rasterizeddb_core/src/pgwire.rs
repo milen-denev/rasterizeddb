@@ -6663,6 +6663,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return "2BP01";
     }
     // `55P03` is `lock_not_available`: a table-lock wait that outlasted
+    // A DDL that would orphan its own transaction's row locks: object_in_use.
+    if has("holds row locks on the table") {
+        return "55006";
+    }
     // `lock_timeout`, or a `NOWAIT` that found the lock held. Decided before
     // 57014, whose words ("canceling statement") the timeout's message shares,
     // as PostgreSQL's does.

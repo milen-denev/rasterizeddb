@@ -701,6 +701,32 @@ impl RowLocks {
         LockOwner::block(owner).is_some_and(|o| self.table_locks.holds_any(o))
     }
 
+    /// Whether `tx`'s transaction holds a row lock on a row of `table`. A
+    /// DDL that would change what those locks are keyed by (the table's name,
+    /// the key that names its rows) asks first: after it, the locks would
+    /// name rows nobody looks up, and the rows would be unprotected.
+    pub fn txn_holds_rows_on(&self, table: &str, tx: TxId) -> bool {
+        if self.row_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let txn = self.txn_of(tx);
+        let inner = self.lock();
+        let Some(name_id) = inner.names.get(table).copied() else {
+            return false;
+        };
+        inner.owned.get(&txn).is_some_and(|list| {
+            list.iter().any(|(space, name, key)| {
+                matches!(space, Space::Row)
+                    && *name == name_id
+                    && match inner.rows.get(&(*name, key.clone())) {
+                        Some(Holder::Exclusive(owner)) => *owner == txn,
+                        Some(Holder::Shared(owners)) => owners.contains(&txn),
+                        None => false,
+                    }
+            })
+        })
+    }
+
     /// Whether `tx`'s transaction still holds a row or referenced-key lock.
     /// Diagnostic and for tests.
     pub fn txn_holds_rows(&self, tx: TxId) -> bool {
