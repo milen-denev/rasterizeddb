@@ -784,3 +784,154 @@ async fn a_failed_update_on_a_mirrored_table_leaves_nothing_pending_or_diverged(
         assert!(primary == copy, "{name}: the backup differs from the primary");
     }
 }
+
+/// A database with `backup` attached as a backup location, reopened so every
+/// table it makes is mirrored.
+async fn mirrored(root: &std::path::Path, backup: &std::path::Path) -> Arc<Database> {
+    let root_path = root.to_string_lossy().into_owned();
+    let backup_path = backup.to_string_lossy().into_owned();
+    {
+        let db = open(root).await;
+        db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+        drop(db);
+        crate::core::wal::remove_for(&root_path);
+        crate::core::wal::remove_for(&backup_path);
+    }
+    open(root).await
+}
+
+async fn close(db: Arc<Database>, root: &std::path::Path, backup: &std::path::Path) {
+    db.sync_durable().unwrap();
+    drop(db);
+    crate::core::wal::remove_for(&root.to_string_lossy());
+    crate::core::wal::remove_for(&backup.to_string_lossy());
+}
+
+fn assert_same(root: &std::path::Path, backup: &std::path::Path, names: &[&str], when: &str) {
+    for name in names {
+        let primary = std::fs::read(root.join(name)).unwrap();
+        let copy = std::fs::read(backup.join(name)).unwrap();
+        assert_eq!(primary.len(), copy.len(), "{when}: {name}: the backup's length differs from the primary's");
+        let first = primary.iter().zip(&copy).position(|(a, b)| a != b);
+        assert!(first.is_none(), "{when}: {name}: the backup differs from the primary at byte {first:?}");
+    }
+}
+
+/// A transaction's in-place writes to a rows file are committed through its
+/// pointers file: a compaction (VACUUM FULL), an insert into an extent a
+/// VACUUM reclaimed, and a whole-row rewrite. Copies staged per file were
+/// never made for them, and the backup's rows file kept its old bytes at
+/// the same length, which the length-only check at open does not see.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_file_writes_committed_through_the_pointers_file_reach_the_backup() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_string_lossy().into_owned();
+    let db = mirrored(root.path(), backup.path()).await;
+    for t in ["mf", "mr", "mw"] {
+        exec(&db, &format!("CREATE TABLE {t} (id BIGINT, label TEXT)")).await.unwrap();
+        let values: Vec<String> = (0..200).map(|i| format!("({i}, 'label-{i:04}')")).collect();
+        exec(&db, &format!("INSERT INTO {t} (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    }
+    // Compaction.
+    exec(&db, "DELETE FROM mf WHERE id % 3 = 0").await.unwrap();
+    exec(&db, "VACUUM mf").await.unwrap();
+    exec(&db, "VACUUM FULL mf").await.unwrap();
+    // Inserts into reclaimed extents.
+    exec(&db, "DELETE FROM mr WHERE id % 2 = 0").await.unwrap();
+    exec(&db, "VACUUM mr").await.unwrap();
+    db.sync_durable().unwrap();
+    let mr_len = std::fs::metadata(root.path().join("mr.db")).unwrap().len();
+    let values: Vec<String> = (1000..1060).map(|i| format!("({i}, 'fresh-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO mr (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    // A whole-row rewrite of the same length, outside any transaction.
+    {
+        use crate::core::row::row::{ColumnWritePayload, RowWrite};
+        use crate::core::row::row_pointer::RowPointerIterator;
+        let table = db.table_for_tests("mw").unwrap();
+        let mut it = RowPointerIterator::new(table.io_pointers().unwrap().clone()).await.unwrap();
+        for _ in 0..5 {
+            let (pos, mut pointer) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
+            let mut rw = RowWrite { columns_writing_data: smallvec::SmallVec::new() };
+            for (bytes, order, ty) in [
+                (7i64.to_le_bytes().to_vec(), 0u32, DbType::I64),
+                (b"label-ZZZZ".to_vec(), 1, DbType::STRING),
+            ] {
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                mb.into_slice_mut().copy_from_slice(&bytes);
+                let size = ty.get_size();
+                rw.columns_writing_data.push(ColumnWritePayload { data: mb, write_order: order, column_type: ty, size });
+            }
+            pointer
+                .update_with_pointer_record_pos(
+                    table.io_pointers().unwrap().clone(),
+                    table.io_rows().unwrap().clone(),
+                    pos,
+                    &table.data().unwrap().ids.last_row_id,
+                    &table.data().unwrap().len,
+                    #[cfg(feature = "enable_long_row")]
+                    0,
+                    &rw,
+                    None,
+                    None,
+                    crate::core::mvcc::transaction::FROZEN_TX,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(crate::core::storage::mirror::pending_copies_in(&root_path), 0, "copies were left waiting");
+    close(db, root.path(), backup.path()).await;
+    let contains = |name: &str, what: &[u8]| {
+        let bytes = std::fs::read(root.path().join(name)).unwrap();
+        bytes.windows(what.len()).filter(|w| *w == what).count()
+    };
+    assert_eq!(contains("mw.db", b"label-ZZZZ"), 5, "the whole-row rewrites did not land in place");
+    assert_eq!(contains("mr.db", b"fresh-10"), 60, "the inserts did not land");
+    assert_eq!(
+        std::fs::metadata(root.path().join("mr.db")).unwrap().len(),
+        mr_len,
+        "the inserts were appended, not written into reclaimed extents"
+    );
+    let names = ["mf.db", "mf_pointers.db", "mr.db", "mr_pointers.db", "mw.db", "mw_pointers.db"];
+    assert_same(root.path(), backup.path(), &names, "before a restart");
+    let db = open(root.path()).await;
+    close(db, root.path(), backup.path()).await;
+    assert_same(root.path(), backup.path(), &names, "after a restart");
+}
+
+/// The primary committed and the process died before the copy: the backup
+/// is the same length with older bytes. The mark made before the commit
+/// tells the next open to rebuild it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_cut_off_after_the_primary_committed_is_rebuilt_at_open() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let db = mirrored(root.path(), backup.path()).await;
+    exec(&db, "CREATE TABLE mc (id BIGINT, label TEXT)").await.unwrap();
+    let values: Vec<String> = (0..200).map(|i| format!("({i}, 'label-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO mc (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    exec(&db, "DELETE FROM mc WHERE id % 2 = 0").await.unwrap();
+    exec(&db, "VACUUM mc").await.unwrap();
+    db.sync_durable().unwrap();
+    let root_path = root.path().to_string_lossy().into_owned();
+    crate::core::storage::mirror::test_hooks::CUT_OFF_COPY.lock().push(root_path.clone());
+    let values: Vec<String> = (1000..1060).map(|i| format!("({i}, 'fresh-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO mc (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    let armed = crate::core::storage::mirror::test_hooks::CUT_OFF_COPY.lock().iter().any(|l| *l == root_path);
+    assert!(!armed, "the INSERT committed no in-place write, so nothing was cut off");
+    close(db, root.path(), backup.path()).await;
+    let primary = std::fs::read(root.path().join("mc.db")).unwrap();
+    let copy = std::fs::read(backup.path().join("mc.db")).unwrap();
+    assert_eq!(primary.len(), copy.len(), "the reclaimed-extent insert grew the file");
+    // Each row is its own commit, and only the first one's copy was cut off.
+    assert!(primary != copy, "the scenario left nothing for the open to find");
+    let listing: Vec<String> =
+        std::fs::read_dir(backup.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(backup.path().join("__mirror_behind.mc.db").exists(), "no mark says the backup is behind: {listing:?}");
+
+    let db = open(root.path()).await;
+    close(db, root.path(), backup.path()).await;
+    assert_same(root.path(), backup.path(), &["mc.db", "mc_pointers.db"], "after the open");
+    assert!(!backup.path().join("__mirror_behind.mc.db").exists(), "the mark outlived the rebuild");
+}

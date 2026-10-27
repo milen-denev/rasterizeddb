@@ -47,20 +47,12 @@ pub struct MirrorStorageProvider {
     /// Held by value, not behind an `Arc`: `swap_temp` needs `&mut` on the
     /// temporary's primary, and it is the same shape the plain file provider
     /// already has.
-    primary: LocalStorageProvider,
+    primary: std::sync::Arc<LocalStorageProvider>,
     /// Never empty: a mirror with no backups is just its primary, and the pool
     /// builds a plain `File` provider in that case. Shared rather than cloned,
     /// because cloning a provider re-maps its file and a mirror would otherwise
     /// pay that once per backup on every clone.
     backups: Arc<Vec<LocalStorageProvider>>,
-    /// In-place writes made under a transaction, per transaction, for the
-    /// backups: applied to them when the primary commits it, dropped when it
-    /// aborts. Written at once, an aborted UPDATE's pointer stamps stayed in
-    /// the backup while the primary's log rolled them back, and the copy
-    /// differed from the primary at the same length, which `resync` (by
-    /// length) never repairs. Appends still go at once, in the primary's
-    /// order: a commit-order append would not land at the primary's offset.
-    staged: Arc<parking_lot::Mutex<std::collections::HashMap<u64, Vec<(u64, Vec<u8>)>>>>,
 }
 
 impl std::fmt::Debug for MirrorStorageProvider {
@@ -86,9 +78,8 @@ impl MirrorStorageProvider {
         }
 
         Self {
-            primary,
+            primary: std::sync::Arc::new(primary),
             backups: Arc::new(backups),
-            staged: Default::default(),
         }
     }
 
@@ -122,6 +113,16 @@ impl MirrorStorageProvider {
 /// write reaches both providers in the same order, and a crash that leaves the
 /// lengths equal has left the same records in both.
 async fn resync(primary: &LocalStorageProvider, backup: &LocalStorageProvider, name: &str) {
+    // A copy the last run left behind its primary (`BehindMark`): the same
+    // length says nothing about the bytes, so it is rebuilt whatever its length.
+    if let Some(mark) = BehindMark::path(backup, name)
+        && mark.exists()
+    {
+        info!("backup copy of {} in {} was left behind its primary; rebuilding it", name, backup.get_location().unwrap_or_default());
+        force_resync(primary, backup).await;
+        BehindMark::forget(&mark);
+        return;
+    }
     let primary_len = primary.get_len().await;
     let backup_len = backup.get_len().await;
     if primary_len == backup_len {
@@ -285,7 +286,7 @@ impl StorageIO for MirrorStorageProvider {
                 backup.write_data(position, buffer).await;
             }
         } else {
-            self.staged.lock().entry(token).or_default().push((position, buffer.to_vec()));
+            pending::note(&self.primary, &self.backups, token, position, buffer.len() as u64);
         }
         token
     }
@@ -296,7 +297,7 @@ impl StorageIO for MirrorStorageProvider {
     /// after it declined, so the log grew without bound. A backup holds no
     /// transaction of its own (its writes go straight to its files).
     async fn abort_txn(&self, token: u64) {
-        self.staged.lock().remove(&token);
+        pending::take(&self.primary, token);
         self.primary.abort_txn(token).await
     }
 
@@ -305,19 +306,42 @@ impl StorageIO for MirrorStorageProvider {
         // commit has fallen behind, which the next open repairs; reporting the
         // statement as failed for it would turn a redundant copy into a second
         // way to lose a write.
+        // Every file of this directory's transaction, not only this one: the
+        // rows file's in-place writes (a compaction, an insert into a
+        // reclaimed extent, a whole-row rewrite) are committed through the
+        // pointers file, and a copy kept per file was never made for them.
+        let copies = pending::take(&self.primary, token);
+        // Before the primary commits: a crash between its commit and the
+        // copy leaves each backup the same length and different bytes, which
+        // no length check sees. The mark makes the next open rebuild it.
+        let marks: Vec<BehindMark> = copies.iter().flat_map(|c| c.mark_behind()).collect();
         let outcome = self.primary.commit_durable(token).await;
-        let staged = self.staged.lock().remove(&token).unwrap_or_default();
         if outcome.is_ok() {
-            for (position, bytes) in &staged {
-                for backup in self.backups.iter() {
-                    backup.write_data(*position, bytes).await;
+            let mut copied = true;
+            #[cfg(test)]
+            let cut_off = !copies.is_empty() && test_hooks::cut_off(&self.primary);
+            #[cfg(not(test))]
+            let cut_off = false;
+            if cut_off {
+                copied = false;
+            } else {
+                for copy in &copies {
+                    copied &= copy.copy().await;
                 }
             }
-        } else if !staged.is_empty() {
+            for mark in marks {
+                mark.release(copied);
+            }
+        } else if !copies.is_empty() {
+            // Whatever of the commit reached the primary's file did not reach
+            // the copies: the marks stay.
+            for mark in marks {
+                mark.release(false);
+            }
             error!(
-                "the primary {} did not commit transaction {token}; its {} in-place write(s) were not copied",
-                self.primary.get_name(),
-                staged.len()
+                "the primary {} did not commit transaction {token}; its in-place writes were not copied, and \
+                 the backups are rebuilt at the next open",
+                self.primary.get_name()
             );
         }
         for backup in self.backups.iter() {
@@ -363,14 +387,15 @@ impl StorageIO for MirrorStorageProvider {
         // would double the write cost of a compaction for a file that does not
         // outlive it.
         Self {
-            primary: self.primary.create_temp().await,
+            primary: std::sync::Arc::new(self.primary.create_temp().await),
             backups: Arc::new(Vec::new()),
-            staged: Default::default(),
         }
     }
 
     async fn swap_temp(&self, temp_io_sync: &mut Self) {
-        self.primary.swap_temp(&mut temp_io_sync.primary).await;
+        let temp = std::sync::Arc::get_mut(&mut temp_io_sync.primary)
+            .expect("a temporary's primary is held by the temporary alone");
+        self.primary.swap_temp(temp).await;
         // The primary's contents were replaced wholesale, so nothing about the
         // backups' bytes still corresponds. Copied rather than diffed.
         self.rebuild_backups().await;
@@ -390,9 +415,8 @@ impl StorageIO for MirrorStorageProvider {
             backups.push(copy);
         }
         Self {
-            primary,
+            primary: std::sync::Arc::new(primary),
             backups: Arc::new(backups),
-            staged: Default::default(),
         }
     }
 
@@ -408,9 +432,8 @@ impl StorageIO for MirrorStorageProvider {
             backups.push(copy);
         }
         Self {
-            primary,
+            primary: std::sync::Arc::new(primary),
             backups: Arc::new(backups),
-            staged: Default::default(),
         }
     }
 
@@ -439,6 +462,212 @@ impl StorageIO for MirrorStorageProvider {
         self.primary.get_name()
     }
 }
+
+/// A durable "this backup copy is behind its primary" mark: a file beside the
+/// copy, made (and its directory synced) before the primary commits writes
+/// the copy has not had, removed once no commit is between its primary's
+/// commit and its copy. `resync` rebuilds a copy with one at the next open,
+/// whatever its length.
+///
+/// Counted: two commits to one file overlap, and the first to finish its
+/// copy must not remove the mark the other is still relying on. A copy that
+/// failed leaves the mark for the rest of the process (`stuck`), so a later
+/// commit's successful copy does not remove it either.
+pub(crate) struct BehindMark {
+    path: std::path::PathBuf,
+    state: std::sync::Arc<parking_lot::Mutex<MarkState>>,
+}
+
+#[derive(Default)]
+struct MarkState {
+    in_flight: usize,
+    stuck: bool,
+}
+
+static MARKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<parking_lot::Mutex<MarkState>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+impl BehindMark {
+    const PREFIX: &'static str = "__mirror_behind.";
+
+    fn path(backup: &LocalStorageProvider, name: &str) -> Option<std::path::PathBuf> {
+        backup
+            .get_location()
+            .map(|dir| std::path::Path::new(&dir).join(format!("{}{}", Self::PREFIX, name)))
+    }
+
+    fn make(backup: &LocalStorageProvider, name: &str) -> Option<Self> {
+        let path = Self::path(backup, name)?;
+        let state = MARKS.lock().entry(path.clone()).or_default().clone();
+        let mut held = state.lock();
+        // Made while the count is held, so a commit that finds the count
+        // already raised also finds the mark already durable.
+        if held.in_flight == 0
+            && let Err(e) = std::fs::write(&path, b"")
+                .and_then(|()| crate::core::wal::sync_parent_dir(&path))
+        {
+            error!("could not mark the backup copy {} as behind its primary: {}", path.display(), e);
+        }
+        held.in_flight += 1;
+        drop(held);
+        Some(Self { path, state })
+    }
+
+    /// The commit this mark covered is done; `copied` says whether its
+    /// writes reached the copy.
+    fn release(self, copied: bool) {
+        let mut held = self.state.lock();
+        held.in_flight = held.in_flight.saturating_sub(1);
+        held.stuck |= !copied;
+        if held.in_flight == 0 && !held.stuck {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The copy was rebuilt at open: forgets the mark.
+    fn forget(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        MARKS.lock().remove(path);
+    }
+}
+
+/// In-place writes under a transaction that the backups have not had yet,
+/// per (primary directory, transaction), across every file of it: a
+/// transaction's writes to one file can be committed or aborted through
+/// another's provider. Ranges, not bytes: they are read back from the
+/// primary once it commits, so a compaction's whole-file rewrite costs a
+/// list of ranges here, not a second copy of the file.
+mod pending {
+    use super::{BehindMark, LocalStorageProvider};
+    use crate::core::storage_providers::traits::StorageIO;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    pub(super) struct Copy {
+        primary: Arc<LocalStorageProvider>,
+        backups: rclite::Arc<Vec<LocalStorageProvider>>,
+        ranges: Vec<(u64, u64)>,
+    }
+
+    const MAX_RANGES: usize = 4096;
+
+    type Key = (String, u64);
+    static PENDING: std::sync::LazyLock<parking_lot::Mutex<HashMap<Key, Vec<Copy>>>> =
+        std::sync::LazyLock::new(Default::default);
+
+    fn key(primary: &LocalStorageProvider, token: u64) -> Key {
+        (primary.get_location().unwrap_or_default(), token)
+    }
+
+    pub(super) fn note(
+        primary: &Arc<LocalStorageProvider>,
+        backups: &rclite::Arc<Vec<LocalStorageProvider>>,
+        token: u64,
+        position: u64,
+        len: u64,
+    ) {
+        let mut map = PENDING.lock();
+        let copies = map.entry(key(primary, token)).or_default();
+        let copy = match copies.iter_mut().find(|c| Arc::ptr_eq(&c.primary, primary)) {
+            Some(copy) => copy,
+            None => {
+                copies.push(Copy { primary: primary.clone(), backups: backups.clone(), ranges: Vec::new() });
+                copies.last_mut().expect("just pushed")
+            }
+        };
+        // Merged with the last range when they touch: a rewrite's writes
+        // arrive in order.
+        match copy.ranges.last_mut() {
+            Some((start, end)) if position <= *end && position + len >= *start => {
+                *start = (*start).min(position);
+                *end = (*end).max(position + len);
+            }
+            _ => copy.ranges.push((position, position + len)),
+        }
+        // Bounded: past this many scattered writes the list becomes the one
+        // span that covers them all, which copies more but holds 16 bytes.
+        if copy.ranges.len() > MAX_RANGES {
+            let start = copy.ranges.iter().map(|r| r.0).min().unwrap_or(0);
+            let end = copy.ranges.iter().map(|r| r.1).max().unwrap_or(0);
+            copy.ranges.clear();
+            copy.ranges.push((start, end));
+        }
+    }
+
+    /// Everything noted for this directory's transaction, which is then
+    /// forgotten (committed or aborted).
+    pub(super) fn take(primary: &LocalStorageProvider, token: u64) -> Vec<Copy> {
+        PENDING.lock().remove(&key(primary, token)).unwrap_or_default()
+    }
+
+    /// How many of `location`'s transactions have copies waiting, for tests.
+    #[cfg(test)]
+    pub(crate) fn waiting_in(location: &str) -> usize {
+        PENDING.lock().keys().filter(|(l, _)| l == location).count()
+    }
+
+    impl Copy {
+        pub(super) fn mark_behind(&self) -> Vec<BehindMark> {
+            let name = self.primary.get_name();
+            self.backups.iter().filter_map(|b| BehindMark::make(b, &name)).collect()
+        }
+
+        /// Copies the ranges from the primary, now committed, to every
+        /// backup; whether every read and write succeeded.
+        pub(super) async fn copy(&self) -> bool {
+            let mut buffer = Vec::new();
+            for &(start, end) in &self.ranges {
+                let mut at = start;
+                while at < end {
+                    let take = ((end - at) as usize).min(super::RESYNC_CHUNK);
+                    buffer.resize(take, 0);
+                    let mut cursor = at;
+                    if let Err(e) = self.primary.read_data_into_buffer(&mut cursor, &mut buffer).await {
+                        log::error!(
+                            "could not read {} to copy a committed write to its backups: {}; they are rebuilt at \
+                             the next open",
+                            self.primary.get_name(),
+                            e
+                        );
+                        return false;
+                    }
+                    for backup in self.backups.iter() {
+                        backup.write_data(at, &buffer).await;
+                    }
+                    at += take as u64;
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Failures no file can be made to produce on demand.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use crate::core::storage_providers::traits::StorageIO;
+
+    /// Directories whose next commit with in-place writes to copy leaves them
+    /// uncopied (and the mark in place), as a crash between the primary's
+    /// commit and the copy would. Taken by that commit.
+    pub(crate) static CUT_OFF_COPY: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(super) fn cut_off(primary: &super::LocalStorageProvider) -> bool {
+        let location = primary.get_location().unwrap_or_default();
+        let mut armed = CUT_OFF_COPY.lock();
+        match armed.iter().position(|l| *l == location) {
+            Some(i) => {
+                armed.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use pending::waiting_in as pending_copies_in;
 
 /// A backup that lands a record at a different offset than the primary is no
 /// longer a usable copy, and silently carrying on would leave a directory that
