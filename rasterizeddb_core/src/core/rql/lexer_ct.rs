@@ -191,6 +191,8 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         let mut unique_columns: Vec<String> = Vec::new();
         let mut unique_keys: Vec<crate::core::rql::unique_key::UniqueKey> = Vec::new();
         let mut primary_key: Option<String> = None;
+        // The columns a table-level `PRIMARY KEY (…)` names, of any arity.
+        let mut key_columns: Vec<String> = Vec::new();
         let mut generated: Vec<crate::core::rql::generated::GeneratedColumn> = Vec::new();
         let mut checks: Vec<crate::core::rql::check::CheckConstraint> = Vec::new();
         for col_def in split_definitions(columns_str) {
@@ -239,10 +241,11 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 // each column would forbid repeats the constraint allows.
                 match crate::core::rql::unique_key::parse_clause(col_def, &table_name) {
                     Ok(Some(key)) => {
-                        if col_def.to_ascii_uppercase().contains("PRIMARY KEY")
-                            && key.columns.len() == 1
-                        {
-                            primary_key = Some(key.columns[0].clone());
+                        if col_def.to_ascii_uppercase().contains("PRIMARY KEY") {
+                            if key.columns.len() == 1 {
+                                primary_key = Some(key.columns[0].clone());
+                            }
+                            key_columns.extend(key.columns.iter().cloned());
                         }
                         unique_keys.push(key);
                     }
@@ -460,6 +463,12 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             }
             columns.push(CreateColumnData { name, data_type });
         }
+
+        // A primary key's columns are NOT NULL, as PostgreSQL makes them,
+        // whichever way the key is declared: a table-level `PRIMARY KEY (a,
+        // b)` left both nullable, and `INSERT … VALUES (NULL, 1)` was stored.
+        // Nullability is the companion column, so a key column gets none.
+        nullable_columns.retain(|c| !key_columns.iter().any(|k| k == c));
 
         // Companion columns come after every declared column, so the user's
         // columns keep write orders 0..n-1 and `SELECT *` needs no reordering.
