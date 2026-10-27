@@ -1,0 +1,220 @@
+//! Metadata DDL on a partitioned table through a power cut
+//! (docs/partitioning.md §11, "Phase 3 P1 as built"): every image cut
+//! anywhere in the change opens, with every partition, and holds the table
+//! as it was or as the change left it, the same in every partition: never a
+//! mix, never a partition that refuses to open.
+//!
+//! The cuts: the shell's sidecar write (`test.rewrite.metadata_after_work`
+//! inside the schema backup of an atomic change, its intent's sync), right
+//! after the work (`test.pddl.after_work`), after the first and the second
+//! partition reopened (`test.pddl.partition_reopened`), and for RENAME TO
+//! each of its steps (`test.pddl.rename_after_*`). Each cut is imaged under
+//! every seed kind (`RDB_POWER_LOSS_SEEDS`).
+
+use super::*;
+use parking_lot::Mutex;
+use std::sync::Arc as StdArc;
+
+const CREATE: &str = "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, s TEXT, \
+                      PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS 8";
+
+/// One DDL and the cut points it must reach.
+struct Case {
+    ddl: &'static str,
+    points: &'static [(&'static str, u64)],
+}
+
+const REOPENS: [(&str, u64); 4] = [
+    ("test.pddl.before_work", 1),
+    ("test.pddl.after_work", 1),
+    ("test.pddl.partition_reopened", 1),
+    ("test.pddl.partition_reopened", 2),
+];
+
+/// What a client can tell apart, for the table under whichever name it has:
+/// its name, its schema as the shell holds it (which every partition must
+/// share), and its rows.
+async fn fingerprint(db: &Arc<Database>) -> Result<String, String> {
+    let names: Vec<String> = ["pt", "pt2"].into_iter().filter(|n| db.is_partitioned(n)).map(str::to_string).collect();
+    let [name] = names.as_slice() else {
+        return Err(format!(
+            "the partitioned table is under {names:?}; relations {:?}, {} partitioned",
+            db.relation_names(),
+            db.partitioned_count()
+        ));
+    };
+    let table = db.partitioned_table(name).unwrap();
+    if let Some(why) = table.broken() {
+        return Err(format!("broken: {why}"));
+    }
+    let schema = &table.shell().schema;
+    let shell = format!(
+        "{} {:?} idx {:?} uk {:?} chk {:?} def {:?}",
+        schema.name,
+        schema.fields.iter().map(|f| (&f.name, f.write_order, f.is_deleted)).collect::<Vec<_>>(),
+        schema.secondary_indexes.iter().filter(|i| !i.is_deleted).map(|i| &i.name).collect::<Vec<_>>(),
+        schema.unique_keys.iter().filter(|k| !k.is_deleted).map(|k| &k.name).collect::<Vec<_>>(),
+        schema.checks.iter().filter(|c| !c.is_deleted).map(|c| &c.name).collect::<Vec<_>>(),
+        schema.defaults.iter().filter(|d| !d.is_deleted).map(|d| (&d.column, &d.expression)).collect::<Vec<_>>(),
+    );
+    let epoch = table.epoch().map_err(|e| e.to_string())?;
+    for (pid, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).map_err(|e| e.to_string())? {
+        if part.schema.fields.len() != schema.fields.len()
+            || part.schema.fields.iter().zip(&schema.fields).any(|(a, b)| a.name != b.name || a.is_deleted != b.is_deleted)
+            || part.schema.secondary_indexes.len() != schema.secondary_indexes.len()
+            || part.schema.checks.len() != schema.checks.len()
+        {
+            return Err(format!("partition {pid} holds another schema than the shell"));
+        }
+    }
+    // Every tenant routes to its partition and reads; the rows, hashed.
+    let key = table.key_columns().map_err(|e| e.to_string())?.remove(0);
+    let mut per_tenant = Vec::new();
+    for tenant in 1..=6 {
+        let got = rows(db, &format!("SELECT * FROM {name} WHERE {key} = {tenant}")).await?;
+        per_tenant.push((got.len(), crate::core::wal::file_id_for_name(&format!("{got:?}"))));
+    }
+    Ok(format!("{name} | {shell} | {per_tenant:?}"))
+}
+
+async fn populated(dir: &Path) -> Arc<Database> {
+    let db = open(dir, "pddl_cut").await.unwrap();
+    exec(&db, CREATE).await.unwrap();
+    let values: Vec<String> = (0..48i64).map(|i| format!("({}, {i}, {}, 'w{}')", i % 6 + 1, i * 3, i % 4)).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v, s) VALUES {}", values.join(", "))).await.unwrap();
+    exec(&db, "DELETE FROM pt WHERE id % 11 = 3").await.unwrap();
+    db.sync_durable().unwrap();
+    db
+}
+
+/// Runs `case` with its cuts armed and checks every image of every cut.
+/// Returns (images on the old side, on the new side).
+async fn run_case(case: &Case, seeds: u64) -> (usize, usize) {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = populated(&dir).await;
+    let old = fingerprint(&db).await.unwrap();
+
+    let rec = Recorder::start(&dir);
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let mut guards = Vec::new();
+    for (point, nth) in case.points {
+        let (rec, sink, label) = (rec.clone(), sink.clone(), format!("{point} #{nth}"));
+        let action: failpoint::Action = StdArc::new(move |_hit| {
+            sink.lock().push(rec.cut_quiescent(label.clone()));
+            failpoint::Outcome::Continue
+        });
+        guards.push(failpoint::arm(point, &dir, *nth, action));
+    }
+    // Inside the shell's own syncs too, where there are any; not required.
+    let optional: Vec<failpoint::Guard> = [("sync:rewrite.intent", 1u64), ("sync:file.data", 1), ("sync:wal.log", 2)]
+        .iter()
+        .map(|(site, nth)| failpoint::arm(site, &dir, *nth, rec.cut_action(format!("{site} #{nth}"), sink.clone())))
+        .collect();
+    exec(&db, case.ddl).await.unwrap_or_else(|e| panic!("{}: {e}", case.ddl));
+    for (g, (point, nth)) in guards.iter().zip(case.points) {
+        assert_eq!(g.fired(), 1, "{}: the cut point {point} #{nth} was never reached", case.ddl);
+    }
+    drop(guards);
+    drop(optional);
+    let new = fingerprint(&db).await.unwrap();
+    assert_ne!(old, new, "{}: the change changed nothing a client sees", case.ddl);
+    close(&dir, db);
+    drop(rec);
+
+    let points: Vec<CrashPoint> = sink
+        .lock()
+        .drain(..)
+        .filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok())
+        .collect();
+    assert!(points.len() >= case.points.len(), "{}: too many cuts were disturbed: {}", case.ddl, points.len());
+    let img = base.path().join("image");
+    let (mut olds, mut news) = (0, 0);
+    let mut problems = Vec::new();
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img);
+            let label = format!("{}: {} seed {seed}", case.ddl, point.label);
+            match open(&img, "pddl_cut").await {
+                Err(e) => problems.push(format!("{label}: does not open: {e}")),
+                Ok(db) => {
+                    match fingerprint(&db).await {
+                        Ok(got) if got == old => olds += 1,
+                        Ok(got) if got == new => news += 1,
+                        Ok(got) => problems.push(format!("{label}: neither the old table nor the new:\n  {got}\n  old {old}\n  new {new}")),
+                        Err(e) => {
+                            let mut files: Vec<String> = std::fs::read_dir(&img)
+                                .unwrap()
+                                .filter_map(|e| e.ok())
+                                .map(|e| format!("{}:{}", e.file_name().to_string_lossy(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+                                .collect();
+                            files.sort();
+                            problems.push(format!("{label}: {e}\n  files {files:?}"))
+                        }
+                    }
+                    let leftover: Vec<_> = std::fs::read_dir(&img)
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("__rewrite_"))
+                        .collect();
+                    // A backup copied before its intent was durable belongs
+                    // to nobody and is discarded by the table's next backup,
+                    // as a plain table's is; an intent must be gone.
+                    if !leftover.is_empty() {
+                        problems.push(format!("{label}: intents left after the open: {leftover:?}"));
+                    }
+                    close(&img, db);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    (olds, news)
+}
+
+/// Every metadata DDL kind cut at each of its steps: each image opens with
+/// every partition and holds the old table or the new one, alike in every
+/// partition.
+///
+/// Mutation: recovery skips the schema intents (`recover_interrupted_rewrites`
+/// returns at once): an atomic change cut after its work opens with the
+/// sidecars half written, which is neither table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let atomic: &[(&str, u64)] = &[
+        ("test.rewrite.metadata_after_work", 1),
+        ("test.pddl.after_work", 1),
+        ("test.pddl.partition_reopened", 1),
+        ("test.pddl.partition_reopened", 2),
+    ];
+    let cases = [
+        Case { ddl: "CREATE INDEX pt_v ON pt (v)", points: &REOPENS },
+        Case { ddl: "ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)", points: &REOPENS },
+        Case { ddl: "ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (tenant_id, id, v)", points: &REOPENS },
+        Case { ddl: "ALTER TABLE pt ALTER COLUMN s SET DEFAULT 'd'", points: &REOPENS },
+        Case { ddl: "ALTER TABLE pt RENAME COLUMN s TO label", points: atomic },
+        Case { ddl: "ALTER TABLE pt RENAME COLUMN tenant_id TO tid", points: atomic },
+        Case { ddl: "ALTER TABLE pt DROP COLUMN s", points: atomic },
+        Case { ddl: "ALTER TABLE pt ALTER COLUMN s SET NOT NULL", points: atomic },
+        Case {
+            ddl: "ALTER TABLE pt RENAME TO pt2",
+            points: &[
+                ("test.pddl.rename_after_intent", 1),
+                ("test.pddl.rename_after_commit", 1),
+                ("test.pddl.rename_after_header", 1),
+                ("test.pddl.partition_reopened", 1),
+            ],
+        },
+    ];
+    let mut total = (0, 0);
+    for case in &cases {
+        let (o, n) = run_case(case, seeds).await;
+        eprintln!("{}: {o} old images, {n} new images", case.ddl);
+        total.0 += o;
+        total.1 += n;
+    }
+    assert!(total.0 > 0 && total.1 > 0, "every image fell on one side ({total:?}); the cuts test nothing");
+}

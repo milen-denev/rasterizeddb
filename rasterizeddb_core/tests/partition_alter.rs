@@ -1,0 +1,626 @@
+//! Metadata DDL on partitioned tables (`docs/partitioning.md` §11, "Phase 3
+//! P1 as built"): each kind against a plain twin over pgwire, read back
+//! after a restart, and what stays refused.
+//!
+//! Every statement runs on `pa` (partitioned) and then on `pb` (plain, the
+//! same columns and constraints): both succeed with equal answers, or both
+//! fail with one SQLSTATE. What the partitioned table refuses on purpose is
+//! checked on its side only, with 0A000 and "not supported", and runs on
+//! neither twin, so they stay equal. After each step the rows both store,
+//! read below SQL, must be equal, and so must every catalog view a client
+//! introspects with; and again after the server restarts, since a schema
+//! that is right in memory and wrong on disk shows only at a reopen.
+
+mod partition_wire;
+
+use partition_wire::*;
+
+const PART: &str = "pa";
+const PLAIN: &str = "pb";
+
+fn render(template: &str, table: &str) -> String {
+    template.replace("{t}", table)
+}
+
+fn unrender(text: &str) -> String {
+    text.replace(PART, "{t}").replace(PLAIN, "{t}")
+}
+
+/// Two sessions, one per side, over one server.
+struct Pair {
+    server: Option<Server>,
+    p: Option<Client>,
+    q: Option<Client>,
+}
+
+fn normalize(reply: &Reply, ordered: bool) -> (Vec<String>, Vec<Vec<Option<String>>>, Vec<String>) {
+    let cols = reply.columns.iter().zip(&reply.types).map(|(c, t)| format!("{}:{t}", unrender(c))).collect();
+    let mut rows: Vec<Vec<Option<String>>> =
+        reply.rows.iter().map(|r| r.iter().map(|v| v.as_deref().map(unrender)).collect()).collect();
+    if !ordered {
+        rows.sort();
+    }
+    (cols, rows, reply.tags.iter().map(|t| unrender(t)).collect())
+}
+
+impl Pair {
+    fn start(dir: &std::path::Path) -> Pair {
+        let server = Server::start(dir.to_str().unwrap());
+        let (p, q) = (server.connect(), server.connect());
+        Pair { server: Some(server), p: Some(p), q: Some(q) }
+    }
+
+    fn server(&self) -> &Server {
+        self.server.as_ref().unwrap()
+    }
+
+    fn restart(&mut self) {
+        self.p = None;
+        self.q = None;
+        let server = self.server.take().unwrap().restart();
+        self.p = Some(server.connect());
+        self.q = Some(server.connect());
+        self.server = Some(server);
+    }
+
+    /// `template` on both sides; equal answers or one SQLSTATE. Returns the
+    /// partitioned side's outcome.
+    fn both(&mut self, template: &str) -> Outcome {
+        self.both_ordered(template, false)
+    }
+
+    fn both_ordered(&mut self, template: &str, ordered: bool) -> Outcome {
+        let (sp, sq) = (render(template, PART), render(template, PLAIN));
+        let a = self.p.as_mut().unwrap().simple(&sp);
+        let b = self.q.as_mut().unwrap().simple(&sq);
+        match (&a, &b) {
+            (Ok(x), Ok(y)) => assert_eq!(normalize(x, ordered), normalize(y, ordered), "answers differ for `{template}`"),
+            (Err(x), Err(y)) => assert_eq!(x.code, y.code, "`{template}` failed differently: {x} / {y}"),
+            _ => panic!("`{template}`: partitioned {a:?}, plain {b:?}"),
+        }
+        a
+    }
+
+    /// `template` must succeed on both, alike.
+    fn ok(&mut self, template: &str) -> Reply {
+        match self.both(template) {
+            Ok(reply) => reply,
+            Err(e) => panic!("`{template}` failed on both: {e}"),
+        }
+    }
+
+    /// `template` must fail on both with `code`.
+    fn fails(&mut self, template: &str, code: &str) {
+        match self.both(template) {
+            Err(e) => assert_eq!(e.code, code, "`{template}`: {e}"),
+            Ok(r) => panic!("`{template}` succeeded on both: {r:?}"),
+        }
+    }
+
+    /// `template` must fail on both with one SQLSTATE, whichever: where the
+    /// plain table's code is not PostgreSQL's, which is not this file's to
+    /// fix.
+    fn fails_alike(&mut self, template: &str) {
+        if let Ok(r) = self.both(template) {
+            panic!("`{template}` succeeded on both: {r:?}");
+        }
+    }
+
+    /// `template` must be refused by the partitioned side alone (0A000,
+    /// "not supported", `needle` in the reason), writing nothing; the twin
+    /// does not run it.
+    fn refused(&mut self, template: &str, needle: &str) {
+        let before = self.state();
+        let sql = render(template, PART);
+        match self.p.as_mut().unwrap().simple(&sql) {
+            Err(e) => {
+                assert!(e.is_unsupported(), "`{sql}` failed, but not as a refusal: {e}");
+                assert!(e.message.contains(needle), "`{sql}`'s refusal does not say {needle:?}: {e}");
+            }
+            Ok(r) => panic!("`{sql}` was not refused: {r:?}"),
+        }
+        assert_eq!(self.state(), before, "`{sql}` was refused but changed something");
+    }
+
+    /// What a client sees of a table: its rows, its columns, its indexes,
+    /// and its rows read below SQL.
+    fn state(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (table, client) in [(PART, self.p.as_mut().unwrap())] {
+            for q in [
+                "SELECT * FROM {t} ORDER BY tenant_id, id",
+                "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+                 WHERE table_name = '{t}' ORDER BY ordinal_position",
+                "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{t}' ORDER BY indexname",
+            ] {
+                out.push(format!("{:?}", client.simple(&render(q, table)).map(|r| normalize(&r, true))));
+            }
+        }
+        out.push(format!("{:?}", stored_rows(&self.server().db, PART)));
+        out
+    }
+
+    /// Both tables read alike, through SQL, the catalogs and below SQL.
+    fn compare(&mut self, at: &str) {
+        for q in [
+            "SELECT * FROM {t} ORDER BY tenant_id, id",
+            "SELECT column_name, data_type, is_nullable, ordinal_position FROM \
+             information_schema.columns WHERE table_name = '{t}' ORDER BY ordinal_position",
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{t}' ORDER BY indexname",
+            "SELECT i.indisunique, i.indisprimary, i.indnatts FROM pg_index i JOIN pg_class r ON i.indrelid = r.oid \
+             WHERE r.relname = '{t}' ORDER BY 1, 2, 3",
+            "SHOW COLUMNS FROM {t}",
+            "DESCRIBE {t}",
+            "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'",
+            "SELECT count(*) FROM {t}",
+        ] {
+            let out = self.both_ordered(q, true);
+            assert!(out.is_ok(), "{at}: `{q}` failed: {out:?}");
+        }
+        let db = &self.server().db;
+        assert_eq!(stored_rows(db, PART), stored_rows(db, PLAIN), "{at}: the tables store different rows");
+        assert!(misplaced_rows(db, PART).is_empty(), "{at}: rows outside their partition");
+        // Every partition holds the shell's schema, field for field.
+        let pt = db.partitioned_table(PART).expect("still partitioned");
+        assert!(pt.broken().is_none(), "{at}: {:?}", pt.broken());
+    }
+}
+
+impl Drop for Pair {
+    fn drop(&mut self) {
+        self.p = None;
+        self.q = None;
+    }
+}
+
+const COLUMNS: &str = "(tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, n INT, s TEXT, f DOUBLE PRECISION, \
+                       j JSONB, PRIMARY KEY (tenant_id, id))";
+
+fn create(pair: &mut Pair, partitions: u32, rows: bool) {
+    pair.p.as_mut().unwrap().ok(&format!("CREATE TABLE {PART} {COLUMNS} PARTITION BY HASH (tenant_id) PARTITIONS {partitions}"));
+    pair.q.as_mut().unwrap().ok(&format!("CREATE TABLE {PLAIN} {COLUMNS}"));
+    if rows {
+        let values: Vec<String> = (0..48)
+            .map(|i| {
+                let n = if i % 7 == 0 { "NULL".to_string() } else { (i % 11).to_string() };
+                let s = if i % 5 == 0 { "NULL".to_string() } else { format!("'w{}'", i % 6) };
+                format!("({}, {i}, {n}, {s}, {}, '{{\"k\": {}}}')", i % 9 + 1, i as f64 * 0.5, i % 4)
+            })
+            .collect();
+        pair.ok(&format!("INSERT INTO {{t}} (tenant_id, id, n, s, f, j) VALUES {}", values.join(", ")));
+    }
+}
+
+/// Every metadata DDL kind on a populated table, each read back against the
+/// twin, through two restarts.
+#[test]
+fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pair = Pair::start(dir.path());
+    create(&mut pair, 4, true);
+    pair.compare("seeded");
+
+    // Indexes: btree, hash, gin, a path; named, unnamed, IF NOT EXISTS.
+    pair.ok("CREATE INDEX {t}_n ON {t} (n)");
+    pair.ok("CREATE INDEX IF NOT EXISTS {t}_n ON {t} (n)");
+    pair.fails("CREATE INDEX {t}_n ON {t} (s)", "42P07");
+    pair.ok("CREATE INDEX {t}_s ON {t} USING hash (s)");
+    pair.ok("CREATE INDEX ON {t} (f)");
+    pair.ok("CREATE INDEX {t}_j ON {t} USING gin (j)");
+    pair.ok("CREATE INDEX {t}_jk ON {t} ((j->>'k'))");
+    pair.compare("indexes created");
+    for q in [
+        "SELECT tenant_id, id FROM {t} WHERE n = 3",
+        "SELECT tenant_id, id FROM {t} WHERE s = 'w2'",
+        "SELECT tenant_id, id FROM {t} WHERE j @> '{\"k\": 1}'",
+        "SELECT tenant_id, id FROM {t} WHERE j->>'k' = '2'",
+        "SELECT tenant_id, id FROM {t} WHERE f > 10",
+    ] {
+        pair.ok(q);
+    }
+
+    // UNIQUE: with every key column, accepted and enforced; without, refused.
+    pair.ok("CREATE UNIQUE INDEX {t}_uq ON {t} (tenant_id, id, n)");
+    pair.refused("CREATE UNIQUE INDEX {t}_bad ON {t} (id, n)", "partition key column");
+    pair.refused("ALTER TABLE {t} ADD CONSTRAINT {t}_bad2 UNIQUE (s)", "partition key column");
+    pair.fails("ALTER TABLE {t} ADD CONSTRAINT {t}_dup UNIQUE (tenant_id, s)", "23505");
+    pair.ok("ALTER TABLE {t} ADD CONSTRAINT {t}_u2 UNIQUE (tenant_id, id, s)");
+    pair.compare("unique keys");
+    pair.restart();
+    pair.compare("unique keys, restarted");
+    pair.ok("DROP INDEX {t}_n");
+    pair.ok("DROP INDEX IF EXISTS {t}_n");
+    pair.ok("DROP INDEX {t}_jk");
+    pair.ok("ALTER TABLE {t} DROP CONSTRAINT {t}_u2");
+    pair.compare("indexes dropped");
+
+    // Defaults, on a value column and on the key.
+    pair.ok("ALTER TABLE {t} ALTER COLUMN n SET DEFAULT 42");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN tenant_id SET DEFAULT 3");
+    pair.ok("INSERT INTO {t} (id, s) VALUES (100, 'defaulted')");
+    pair.ok("SELECT tenant_id, id, n FROM {t} WHERE tenant_id = 3 AND id = 100");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN n DROP DEFAULT");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN tenant_id DROP DEFAULT");
+    pair.ok("INSERT INTO {t} (tenant_id, id) VALUES (4, 101)");
+    pair.compare("defaults");
+
+    // CHECK: validated over every partition, enforced, dropped.
+    pair.fails("ALTER TABLE {t} ADD CONSTRAINT {t}_c1 CHECK (n < 5)", "23514");
+    pair.ok("ALTER TABLE {t} ADD CONSTRAINT {t}_c2 CHECK (n IS NULL OR n >= 0)");
+    pair.fails("INSERT INTO {t} (tenant_id, id, n) VALUES (5, 102, -1)", "23514");
+    pair.fails("UPDATE {t} SET n = -5 WHERE tenant_id = 2", "23514");
+    pair.compare("check");
+    pair.restart();
+    pair.fails("INSERT INTO {t} (tenant_id, id, n) VALUES (6, 103, -1)", "23514");
+    pair.ok("ALTER TABLE {t} DROP CONSTRAINT {t}_c2");
+    pair.ok("INSERT INTO {t} (tenant_id, id, n) VALUES (6, 103, -1)");
+    pair.compare("check dropped");
+
+    // NOT NULL: validated; DROP NOT NULL rewrites a populated table, and a
+    // key column must stay NOT NULL.
+    // XX000 on both, where PostgreSQL says 23502: the plain table's code.
+    pair.fails_alike("ALTER TABLE {t} ALTER COLUMN n SET NOT NULL");
+    pair.ok("UPDATE {t} SET n = 0 WHERE n IS NULL");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN n SET NOT NULL");
+    pair.fails("INSERT INTO {t} (tenant_id, id, n) VALUES (7, 104, NULL)", "23502");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN tenant_id SET NOT NULL");
+    pair.refused("ALTER TABLE {t} ALTER COLUMN n DROP NOT NULL", "rewrites every row");
+    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.compare("not null");
+
+    // Renames: a value column, the key column, back again.
+    pair.ok("ALTER TABLE {t} RENAME COLUMN s TO label");
+    pair.ok("SELECT tenant_id, id, label FROM {t} WHERE label = 'w3'");
+    pair.ok("ALTER TABLE {t} RENAME COLUMN tenant_id TO tid");
+    pair.ok("SELECT tid, id, label FROM {t} WHERE tid = 4");
+    pair.ok("INSERT INTO {t} (tid, id, n, label) VALUES (8, 105, 1, 'renamed key')");
+    pair.ok("UPDATE {t} SET n = n + 1 WHERE tid = 8");
+    pair.restart();
+    pair.ok("SELECT tid, id, n, label FROM {t} WHERE tid = 8");
+    pair.ok("ALTER TABLE {t} RENAME COLUMN tid TO tenant_id");
+    pair.ok("ALTER TABLE {t} RENAME COLUMN label TO s");
+    pair.compare("renamed back");
+
+    // DROP COLUMN marks; the key cannot go; a populated ADD COLUMN and a type
+    // change rewrite.
+    pair.ok("ALTER TABLE {t} DROP COLUMN f");
+    pair.fails_alike("SELECT f FROM {t}");
+    pair.refused("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column");
+    pair.refused("ALTER TABLE {t} ADD COLUMN extra INT", "rewrites every row");
+    pair.refused("ALTER TABLE {t} ADD COLUMN extra INT DEFAULT 5", "rewrites every row");
+    pair.refused("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT", "rewrites every row");
+    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column");
+    pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS n INT");
+    pair.fails("ALTER TABLE {t} ADD COLUMN n INT", "42701");
+    pair.compare("columns dropped");
+
+    // RENAME TO and back, across a restart.
+    pair.ok("ALTER TABLE {t} RENAME TO {t}_r");
+    pair.fails("SELECT * FROM {t}", "42P01");
+    pair.ok("SELECT tenant_id, id, n FROM {t}_r WHERE tenant_id = 2");
+    pair.ok("INSERT INTO {t}_r (tenant_id, id, n) VALUES (9, 106, 9)");
+    pair.restart();
+    {
+        let db = &pair.server().db;
+        assert!(db.partitioned_table("pa_r").is_some() && db.partitioned_table(PART).is_none());
+    }
+    pair.ok("SELECT tenant_id, id, n FROM {t}_r WHERE tenant_id = 9");
+    pair.ok("ALTER TABLE {t}_r RENAME TO {t}");
+    pair.compare("renamed table back");
+    pair.restart();
+    pair.compare("final restart");
+    assert_eq!(files_of_table(dir.path(), PART), Vec::<String>::new(), "files under the logical name");
+    assert_eq!(files_of_table(dir.path(), "pa_r"), Vec::<String>::new(), "files under the renamed name");
+}
+
+/// On a table with no rows, ADD COLUMN in every metadata-only form (and
+/// DROP NOT NULL on a value column) runs as the plain table's does, and the
+/// rows written after read back alike, across a restart.
+#[test]
+fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pair = Pair::start(dir.path());
+    create(&mut pair, 3, false);
+    pair.ok("ALTER TABLE {t} ADD COLUMN extra INT");
+    pair.ok("ALTER TABLE {t} ADD COLUMN filled BIGINT NOT NULL DEFAULT 7");
+    pair.ok("ALTER TABLE {t} ADD COLUMN dec NUMERIC(10, 2)");
+    pair.ok("ALTER TABLE {t} ADD COLUMN twice INT GENERATED ALWAYS AS (n * 2) STORED");
+    pair.ok("ALTER TABLE {t} ADD COLUMN must INT NOT NULL");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN must DROP NOT NULL");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN filled DROP NOT NULL");
+    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.refused("ALTER TABLE {t} ADD COLUMN doc JSON", "shadow tables");
+    pair.compare("columns added");
+    pair.ok(
+        "INSERT INTO {t} (tenant_id, id, n, s, extra, dec, must) VALUES (1, 1, 5, 'a', NULL, 12.34, NULL), \
+         (2, 2, NULL, NULL, 3, NULL, 4), (3, 3, 1, 'c', 9, 0.5, 1)",
+    );
+    pair.ok("INSERT INTO {t} (tenant_id, id, filled) VALUES (4, 4, NULL)");
+    pair.compare("rows after the columns");
+    pair.restart();
+    pair.compare("restarted");
+    pair.ok("SELECT tenant_id, extra, filled, dec, twice, must FROM {t} WHERE tenant_id = 2");
+    // Once it holds rows, the same statement rewrites, and is refused.
+    pair.refused("ALTER TABLE {t} ADD COLUMN late INT", "rewrites every row");
+}
+
+/// A prepared statement made before a DDL and executed after it answers on
+/// the partitioned table as on its twin: the same columns, types and decoded
+/// values, or the same SQLSTATE (the shape change, `rdb.shape_change`), and
+/// again on the execution after that.
+#[test]
+fn prepared_statements_answer_like_the_twin_across_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pair = Pair::start(dir.path());
+    create(&mut pair, 4, true);
+    let statements = [
+        ("sel", "SELECT * FROM {t} WHERE tenant_id = $1"),
+        ("cnt", "SELECT count(*), sum(n) FROM {t} WHERE tenant_id = $1"),
+        ("ins", "INSERT INTO {t} (tenant_id, id, n) VALUES ($1, $2, $3)"),
+        ("upd", "UPDATE {t} SET n = n + 1 WHERE tenant_id = $1 RETURNING tenant_id, id, n"),
+    ];
+    let mut next_id = 1000;
+    let mut run_all = |pair: &mut Pair, at: &str| {
+        for (name, sql) in statements {
+            for tenant in [2, 5] {
+                let params: Vec<Option<String>> = if name == "ins" {
+                    next_id += 1;
+                    vec![Some(tenant.to_string()), Some(next_id.to_string()), Some("3".into())]
+                } else {
+                    vec![Some(tenant.to_string())]
+                };
+                let a = pair.p.as_mut().unwrap().execute_prepared(name, &params);
+                let b = pair.q.as_mut().unwrap().execute_prepared(name, &params);
+                match (&a, &b) {
+                    (Ok(x), Ok(y)) => assert_eq!(normalize(x, false), normalize(y, false), "{at}: `{sql}` {params:?}"),
+                    (Err(x), Err(y)) => assert_eq!(x.code, y.code, "{at}: `{sql}`: {x} / {y}"),
+                    _ => panic!("{at}: `{sql}` {params:?}: partitioned {a:?}, plain {b:?}"),
+                }
+                if let Ok(x) = &a {
+                    if name == "sel" {
+                        assert!(!x.rows.is_empty(), "{at}: no rows decoded");
+                    }
+                }
+            }
+        }
+    };
+    for (name, sql) in statements {
+        let a = pair.p.as_mut().unwrap().prepare(name, &render(sql, PART)).expect("prepare");
+        let b = pair.q.as_mut().unwrap().prepare(name, &render(sql, PLAIN)).expect("prepare");
+        assert_eq!(normalize(&a, false), normalize(&b, false), "describe of `{sql}`");
+    }
+    run_all(&mut pair, "before");
+    for ddl in [
+        "CREATE INDEX {t}_n ON {t} (n)",
+        "ALTER TABLE {t} RENAME COLUMN s TO label",
+        "ALTER TABLE {t} ADD CONSTRAINT {t}_c CHECK (n >= 0 OR n IS NULL)",
+        "ALTER TABLE {t} ALTER COLUMN n SET DEFAULT 1",
+        "ALTER TABLE {t} DROP COLUMN f",
+        "DROP INDEX {t}_n",
+        "ALTER TABLE {t} RENAME COLUMN label TO s",
+    ] {
+        pair.ok(ddl);
+        run_all(&mut pair, ddl);
+        run_all(&mut pair, &format!("{ddl}, again"));
+        pair.compare(ddl);
+    }
+    pair.restart();
+    for (name, sql) in statements {
+        pair.p.as_mut().unwrap().prepare(name, &render(sql, PART)).expect("prepare");
+        pair.q.as_mut().unwrap().prepare(name, &render(sql, PLAIN)).expect("prepare");
+    }
+    run_all(&mut pair, "after a restart");
+    pair.compare("after a restart");
+}
+
+fn seed_one(server: &Server, partitions: u32) {
+    let mut c = server.connect();
+    c.ok(&format!("CREATE TABLE {PART} {COLUMNS} PARTITION BY HASH (tenant_id) PARTITIONS {partitions}"));
+    let values: Vec<String> = (0..40).map(|i| format!("({}, {i}, {}, 'w', 1.0)", i % 8 + 1, i % 13)).collect();
+    c.ok(&format!("INSERT INTO {PART} (tenant_id, id, n, s, f) VALUES {}", values.join(", ")));
+}
+
+/// What a session can see of the table, read by a session holding nothing.
+fn snapshot(server: &Server) -> String {
+    let mut c = server.connect();
+    let mut out = Vec::new();
+    for q in [
+        "SELECT * FROM pa ORDER BY tenant_id, id",
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'pa' \
+         ORDER BY ordinal_position",
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'pa' ORDER BY indexname",
+    ] {
+        out.push(format!("{:?}", c.simple(q).map(|r| r.rows)));
+    }
+    out.push(format!("{:?}", stored_rows(&server.db, PART)));
+    out.join("\n")
+}
+
+/// The DDL takes ACCESS EXCLUSIVE on the logical name, so it queues behind
+/// a block that read the table or wrote it, as on a plain table: under
+/// `lock_timeout` it fails with 55P03, under `statement_timeout` with 57014,
+/// both having written nothing; without a bound it waits and then runs, and
+/// a reader that arrives while it waits queues behind it (PostgreSQL's
+/// rule).
+///
+/// Mutation: `relation_for` locks a partition's physical name instead of
+/// the logical one, so the statements' locks never meet the DDL's: the DDL
+/// runs beside the open block.
+#[test]
+fn a_ddl_queues_behind_the_tables_users_and_a_timeout_writes_nothing() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    seed_one(&server, 4);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    let ddls = [
+        "CREATE INDEX pa_n ON pa (n)",
+        "ALTER TABLE pa ADD CONSTRAINT pa_c CHECK (n >= 0)",
+        "ALTER TABLE pa RENAME COLUMN s TO label",
+        "ALTER TABLE pa ALTER COLUMN n SET DEFAULT 4",
+        "ALTER TABLE pa DROP COLUMN f",
+        "ALTER TABLE pa RENAME TO pa2",
+        "CREATE UNIQUE INDEX pa_u ON pa (tenant_id, id, n)",
+    ];
+    let before = snapshot(&server);
+    // A reading block, then a writing one.
+    for (open, what) in [("SELECT count(*) FROM pa", "a reader"), ("INSERT INTO pa (tenant_id, id) VALUES (3, 999)", "a writer")] {
+        a.ok("BEGIN");
+        a.ok(open);
+        b.ok("SET lock_timeout = '200ms'");
+        for ddl in ddls {
+            let e = b.simple(ddl).expect_err(ddl);
+            assert_eq!(e.code, "55P03", "`{ddl}` beside {what}: {e}");
+        }
+        b.ok("SET lock_timeout = 0");
+        b.ok("SET statement_timeout = '200ms'");
+        let e = b.simple(ddls[1]).expect_err("statement_timeout");
+        assert_eq!(e.code, "57014", "beside {what}: {e}");
+        b.ok("SET statement_timeout = 0");
+        a.ok("ROLLBACK");
+        assert_eq!(snapshot(&server), before, "a refused DDL beside {what} changed something");
+    }
+
+    // Unbounded: the DDL waits for the block, and a reader arriving after it
+    // waits for the DDL.
+    a.ok("BEGIN");
+    a.ok("SELECT count(*) FROM pa");
+    let (done_tx, done_rx) = mpsc::channel::<(&str, Outcome)>();
+    let tx = done_tx.clone();
+    let ddl_thread = std::thread::spawn(move || {
+        let r = b.simple("ALTER TABLE pa ADD CONSTRAINT pa_c CHECK (n >= 0)");
+        tx.send(("ddl", r)).unwrap();
+        b
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err(), "the DDL did not wait for the block");
+    let mut c = server.connect();
+    let reader = std::thread::spawn(move || {
+        let r = c.simple("SELECT count(*) FROM pa");
+        done_tx.send(("reader", r)).unwrap();
+        c
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err(), "the reader did not queue behind the DDL");
+    a.ok("COMMIT");
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let (who, r) = done_rx.recv_timeout(Duration::from_secs(60)).expect("both finish");
+        assert!(r.is_ok(), "{who}: {r:?}");
+        seen.push(who);
+    }
+    assert_eq!(seen, ["ddl", "reader"], "the reader ran ahead of the queued DDL");
+    let _ = (ddl_thread.join().unwrap(), reader.join().unwrap());
+    let e = a.simple("INSERT INTO pa (tenant_id, id, n) VALUES (1, 500, -1)").expect_err("the CHECK holds");
+    assert_eq!(e.code, "23514");
+}
+
+/// Writers on many tenants run through a stream of DDL: each statement
+/// waits for the DDL or completes before it, and afterwards (and after a
+/// restart) every acknowledged row is stored once with its last
+/// acknowledged value, in its partition, and the indexes answer as scans.
+#[test]
+fn writers_through_a_stream_of_ddl_lose_and_mix_nothing() {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path().to_str().unwrap());
+    seed_one(&server, 6);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4i64 {
+        let mut c = server.connect();
+        let stop = stop.clone();
+        writers.push(std::thread::spawn(move || {
+            let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+            let mut i = 0i64;
+            while !stop.load(Ordering::Relaxed) && i < 400 {
+                let tenant = 100 + w * 10 + i % 7;
+                let id = 10_000 + i;
+                c.ok(&format!("INSERT INTO pa (tenant_id, id, n) VALUES ({tenant}, {id}, {i})"));
+                model.insert((tenant, id), i);
+                if i % 3 == 0 {
+                    let prev = (tenant, 10_000 + i / 2);
+                    if let Some(n) = model.get_mut(&prev) {
+                        let r = c.ok(&format!("UPDATE pa SET n = n + 1 WHERE tenant_id = {} AND id = {}", prev.0, prev.1));
+                        assert_eq!(r.tags, ["UPDATE 1"], "{prev:?}");
+                        *n += 1;
+                    }
+                }
+                i += 1;
+            }
+            model
+        }));
+    }
+    let mut d = server.connect();
+    let ddls = [
+        "CREATE INDEX pa_n ON pa (n)",
+        "ALTER TABLE pa ADD CONSTRAINT pa_c CHECK (n >= 0)",
+        "ALTER TABLE pa ALTER COLUMN s SET DEFAULT 'dflt'",
+        "CREATE UNIQUE INDEX pa_u ON pa (tenant_id, id, n)",
+        "ALTER TABLE pa RENAME COLUMN f TO g",
+        "ALTER TABLE pa DROP CONSTRAINT pa_u",
+        "ALTER TABLE pa ALTER COLUMN s DROP DEFAULT",
+        "ALTER TABLE pa RENAME COLUMN g TO f",
+        "ALTER TABLE pa DROP CONSTRAINT pa_c",
+        "DROP INDEX pa_n",
+    ];
+    for round in 0..3 {
+        for ddl in ddls {
+            d.ok(ddl);
+            std::thread::sleep(std::time::Duration::from_millis(5 + round));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    for w in writers {
+        model.extend(w.join().expect("a writer failed"));
+    }
+    assert!(model.len() > 50, "the writers wrote too little to test anything: {}", model.len());
+    d.ok("CREATE INDEX pa_n ON pa (n)");
+    drop(d);
+    for pass in ["live", "restarted"] {
+        let mut c = server.connect();
+        let rows = c.ok("SELECT tenant_id, id, n FROM pa WHERE tenant_id >= 100 ORDER BY tenant_id, id").rows;
+        let got: BTreeMap<(i64, i64), i64> = rows
+            .iter()
+            .map(|r| {
+                let v = |i: usize| r[i].as_deref().unwrap().parse::<i64>().unwrap();
+                ((v(0), v(1)), v(2))
+            })
+            .collect();
+        assert_eq!(rows.len(), got.len(), "{pass}: a row stored twice");
+        assert_eq!(got, model, "{pass}: the stored rows are not the acknowledged ones");
+        for n in [0i64, 5, 17, 101, 250] {
+            let a = c.ok(&format!("SELECT tenant_id, id FROM pa WHERE n = {n} ORDER BY tenant_id, id")).rows;
+            let b = c.ok(&format!("SELECT tenant_id, id FROM pa WHERE n + 0 = {n} ORDER BY tenant_id, id")).rows;
+            assert_eq!(a, b, "{pass}: the index on n answers otherwise than a scan for n = {n}");
+        }
+        assert!(misplaced_rows(&server.db, PART).is_empty(), "{pass}: rows outside their partition");
+        drop(c);
+        if pass == "live" {
+            server = server.restart();
+        }
+    }
+}
+
+/// SET NOT NULL on a column followed by others, then a rename of an
+/// earlier column: the tombstoned companion must be the one marked.
+#[test]
+fn set_not_null_marks_its_own_companion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pair = Pair::start(dir.path());
+    let cols = "(tenant_id BIGINT NOT NULL, grp BIGINT NOT NULL, id BIGINT NOT NULL, n INT, s TEXT, f DOUBLE PRECISION, \
+                junk INT, PRIMARY KEY (tenant_id, grp, id))";
+    pair.p.as_mut().unwrap().ok(&format!("CREATE TABLE {PART} {cols} PARTITION BY HASH (tenant_id) PARTITIONS 7"));
+    pair.q.as_mut().unwrap().ok(&format!("CREATE TABLE {PLAIN} {cols}"));
+    pair.ok("INSERT INTO {t} (tenant_id, grp, id, n, s, f) VALUES (1, 1, 1, 1, 'a', 1.5), (2, 1, 2, NULL, NULL, 2.5)");
+    pair.ok("CREATE INDEX {t}_ix_n ON {t} USING btree (n)");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN f SET NOT NULL");
+    pair.compare("f set not null");
+    pair.ok("ALTER TABLE {t} RENAME COLUMN s TO s_renamed");
+    pair.compare("s renamed");
+    pair.restart();
+    pair.compare("restarted");
+}
+
