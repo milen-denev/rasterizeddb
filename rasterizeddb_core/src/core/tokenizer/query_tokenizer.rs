@@ -426,6 +426,9 @@ fn tokenize_inner<'a>(
     let mut expression_type_context: Option<DbType> = None;
     let mut expression_stack: Vec<Option<DbType>> = Vec::new();
     let mut in_parentheses = 0;
+    // Fractions a float does not hold, by token index, for the literal
+    // written before the NUMERIC column it is compared with (see the end).
+    let mut lossy_fractions: Vec<(usize, String)> = Vec::new();
 
     // Helper to determine if a minus sign should be considered part of a number
     #[inline(always)]
@@ -527,6 +530,9 @@ fn tokenize_inner<'a>(
                     expression_type_context = Some(num_type);
                 }
 
+                if numeric_value_is_lossy_fraction(num_str, &numeric_value) {
+                    lossy_fractions.push((out.len(), num_str.to_string()));
+                }
                 out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
@@ -556,6 +562,9 @@ fn tokenize_inner<'a>(
                     expression_type_context = Some(num_type);
                 }
 
+                if numeric_value_is_lossy_fraction(num_str, &numeric_value) {
+                    lossy_fractions.push((out.len(), num_str.to_string()));
+                }
                 out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
@@ -834,6 +843,16 @@ fn tokenize_inner<'a>(
         }
     }
 
+    // `0.12345678912300000001 > a`: read before the column, so with no
+    // NUMERIC beside it, the literal became a float that is another number.
+    // Kept as its text, as `number_token` keeps one written after the column.
+    for (at, text) in lossy_fractions {
+        let compared_with_numeric = matches!(out.get(at + 1), Some(Token::Op(_)))
+            && matches!(out.get(at + 2), Some(Token::Ident((_, DbType::DECIMAL, _))));
+        if compared_with_numeric && matches!(out.get(at), Some(Token::Number(NumericValue::F64(_)))) {
+            out[at] = Token::StringLit(text);
+        }
+    }
     Ok(out)
 }
 
@@ -886,16 +905,43 @@ fn parse_numeric_value<'a>(
 /// row instead, and so did `nm IN (SELECT nm …)`, whose values are written into
 /// the statement as text and read again here. The text is compared exactly,
 /// as a quoted number is.
+///
+/// Decided on the digits, not at the engine's nine places: past them both
+/// readings were "not a number" alike, so `a = 0.12345678912300000001`
+/// became 0.123456789123 and matched that row of a `NUMERIC(20,12)`.
 fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
     if let NumericValue::F64(f) = value {
         if numeric_context && text.contains('.') {
-            let exact = crate::core::value_codec::parse_decimal(text);
-            if exact.is_some() && exact != crate::core::value_codec::parse_decimal(&format!("{}", f)) {
+            let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+            let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
+            if written.is_some() && written != read {
                 return Token::StringLit(text.to_string());
             }
         }
     }
     Token::Number(value)
+}
+
+/// A fraction read as a float that is not the number written.
+fn numeric_value_is_lossy_fraction(text: &str, value: &NumericValue) -> bool {
+    let NumericValue::F64(f) = value else {
+        return false;
+    };
+    let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+    written.is_some() && written != crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits)
+}
+
+/// `m × 10^e` with the trailing zeros of `m` moved into `e`, so equal
+/// numbers compare equal however they were written.
+fn normalise_digits((mut m, mut e): (i128, i32)) -> (i128, i32) {
+    if m == 0 {
+        return (0, 0);
+    }
+    while m % 10 == 0 {
+        m /= 10;
+        e += 1;
+    }
+    (m, e)
 }
 
 /// Parses the literal as the type of the column it is compared with.

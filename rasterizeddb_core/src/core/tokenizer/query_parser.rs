@@ -133,6 +133,91 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         Some(ComparisonOperand::Direct(out))
     }
 
+    /// `column op literal` over a `NUMERIC` column, when the literal holds
+    /// more places than the column stores: the same question asked of a
+    /// literal the column's scale holds exactly, or a constant.
+    ///
+    /// A stored value is a whole number of the column's units, so against a
+    /// literal between two of them, `<` and `<=` are `<=` the one below,
+    /// `>` and `>=` are `>=` the one above, `=` is false and `<>` true (a NULL
+    /// is the rewriter's guard). Exact at any scale, and at the column's own,
+    /// so the filter index can still prune. It used to lift both sides to the
+    /// engine's nine places, which refused a literal of ten or more ("a
+    /// literal in NUMERIC arithmetic is not a number") and, beside a float's
+    /// rounding of the literal, matched `a = 0.12345678912300000001` to
+    /// 0.123456789123.
+    ///
+    /// `None` when the pair is not that shape or the literal is exact there.
+    #[allow(clippy::type_complexity)]
+    fn bound_inexact_decimal_literal(
+        &self,
+        left_op: &ComparisonOperand,
+        left_type: &DbType,
+        right_op: &ComparisonOperand,
+        right_type: &DbType,
+        op_str: &str,
+    ) -> Option<(ComparisonOperand, ComparisonOperand, DbType, DbType, &'static str)> {
+        let column = |o: &ComparisonOperand, t: &DbType| *t == DbType::DECIMAL && o.is_column();
+        let literal = |o: &ComparisonOperand, t: &DbType| {
+            matches!(o, ComparisonOperand::Direct(_)) && matches!(t, DbType::F32 | DbType::F64 | DbType::STRING)
+        };
+        // The column on the left; a literal on the left flips the operator.
+        let (col_op, lit_op, lit_type, op) = if column(left_op, left_type) && literal(right_op, right_type) {
+            (left_op, right_op, right_type, op_str)
+        } else if column(right_op, right_type) && literal(left_op, left_type) {
+            let flipped = match op_str {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                other => other,
+            };
+            (right_op, left_op, left_type, flipped)
+        } else {
+            return None;
+        };
+        if !matches!(op, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=") {
+            return None;
+        }
+        let scale = self.scale_of(col_op).unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+        let ComparisonOperand::Direct(mb) = lit_op else {
+            return None;
+        };
+        let text = crate::core::rql::subquery::value_to_literal(lit_type, mb.into_slice())?;
+        let text = crate::core::value_codec::unquote_sql(&text);
+        let (m, e) = crate::core::rql::expr::decimal_digits(text.trim())?;
+        // Exact at the column's scale: the ordinary path encodes it there.
+        let shift = e.checked_add(scale as i32)?;
+        if shift >= 0 {
+            return None;
+        }
+        // The literal is m·10^e; the column's units below and above it.
+        let (q, r) = match 10i128.checked_pow(shift.unsigned_abs()) {
+            Some(divisor) => (m / divisor, m % divisor),
+            None => (0, m),
+        };
+        if r == 0 {
+            return None;
+        }
+        let below = if m < 0 { q - 1 } else { q };
+        let above = below + 1;
+        let constant = |holds: bool| {
+            let one = numeric_to_mb(&NumericValue::I32(1));
+            let other = numeric_to_mb(&NumericValue::I32(i32::from(holds)));
+            Some((ComparisonOperand::Direct(one), ComparisonOperand::Direct(other), DbType::I32, DbType::I32, "="))
+        };
+        let bound = |units: i128, op: &'static str| {
+            let text = crate::core::value_codec::format_decimal_scaled(units, scale);
+            Some((col_op.clone(), ComparisonOperand::Direct(str_to_mb(&text)), DbType::DECIMAL, DbType::STRING, op))
+        };
+        match op {
+            "=" => constant(false),
+            "!=" | "<>" => constant(true),
+            "<" | "<=" => bound(below, "<="),
+            _ => bound(above, ">="),
+        }
+    }
+
     /// One operand of `NUMERIC` arithmetic, brought to the engine scale.
     ///
     /// Arithmetic over decimals runs at the engine scale, as the expression
@@ -723,6 +808,11 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // than the column is compared with both sides at the engine scale
         // instead, below — which the filter index declines to prune, as it
         // declines any literal it cannot encode exactly.
+        let (left_op, right_op, left_type, right_type, op_str) =
+            match self.bound_inexact_decimal_literal(&left_op, &left_type, &right_op, &right_type, op_str) {
+                Some(bounded) => bounded,
+                None => (left_op, right_op, left_type, right_type, op_str),
+            };
         let mut inexact_literal = false;
         let (left_op, right_op, left_type, right_type) = {
             let left_scale = self.scale_of(&left_op);

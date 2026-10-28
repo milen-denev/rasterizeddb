@@ -2758,7 +2758,7 @@ fn round_to_engine(m: i128, e: i32) -> Option<i128> {
 
 /// A written number's digits as `m × 10^e`; `None` for anything that is not
 /// a plain decimal or exponent number, or with more digits than an i128.
-fn decimal_digits(text: &str) -> Option<(i128, i32)> {
+pub(crate) fn decimal_digits(text: &str) -> Option<(i128, i32)> {
     let (negative, body) = match text.as_bytes().first()? {
         b'-' => (true, &text[1..]),
         b'+' => (false, &text[1..]),
