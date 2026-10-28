@@ -322,11 +322,20 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
         case("CREATE INDEX pt_s ON pt USING hash (s)", &REOPENS),
         // An index swapped for another, the count kept: only the snapshot
         // identity's shape tells the sealed sections from the new index's.
+        // Cut before the DROP's work too: its tombstone is durable when the
+        // work returns (sidecars are written ahead of the log since
+        // fix/p4-fk-crash), so only a cut before it leaves an image of the
+        // old table, the one whose sealed sections the snapshot pass loads.
         Case {
             prep: &["CREATE INDEX pt_ix ON pt (v)"],
             ..case(
                 "DROP INDEX pt_ix; CREATE INDEX pt_iy ON pt (s)",
-                &[("test.pddl.after_work", 1), ("test.pddl.before_work", 2), ("test.pddl.after_work", 2)],
+                &[
+                    ("test.pddl.before_work", 1),
+                    ("test.pddl.after_work", 1),
+                    ("test.pddl.before_work", 2),
+                    ("test.pddl.after_work", 2),
+                ],
             )
         },
         Case { prep: &["CREATE INDEX pt_v ON pt (v)"], ..case("DROP INDEX pt_v", &REOPENS) },
