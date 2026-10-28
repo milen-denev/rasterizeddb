@@ -577,6 +577,41 @@ validates, inserts are checked, a parent DELETE refuses or cascades, DROP
 at open (`partition_fk::foreign_keys_on_key_value_placed_tables`).
 Partitioned tables themselves are not placed on a store (§2).
 
+**A power cut inside `ADD CONSTRAINT`** (fix/p4-fk-crash, from
+`f54375e`): `pddl_crash_tests::a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new`
+failed under `RASTERIZEDDB_INDEX_RESIDENCY=disk` (`INDEX_DELTA_KB=4`): an
+image cut after the work of `ADD CONSTRAINT pt_fk` held a foreign key named
+`""` referencing `""`, neither table. The FK sidecar's record went in as a
+logged append, which writes the file first and the log after, and leaves
+the log's sync to the statement; the cut fell between them. The image kept
+the file's new length (519 bytes, one record) and dropped its page, so the
+record read back as zeros, and nothing at open removes a whole record the
+log does not account for: the torn-tail cut only removes fragments, and the
+log's own comment called append garbage harmless. Every loader takes each
+whole record as a declaration. Disk residency only moved the image's draws
+(one generator walks every file in name order, and disk residency adds
+the paged indexes' files to that walk) onto the one length in 0..=519 that keeps the record
+whole; memory residency passed 30 seeds by the same luck. Not P4's alone:
+the CHECK, UNIQUE, DEFAULT, index, type-modifier, generated-column, JSON
+and path-index sidecars were written the same way, and an all-zero UNIQUE
+record reads as a live key with no columns.
+
+The fix is at the writer: `torn_tail::append_records` is the one writer of
+those nine sidecars, an in-place write at the file's end, which the log
+holds back until its commit has synced. A cut before that sync leaves the
+file as it was, after it the replay writes the record whole; the append
+reports an error it used to drop. Each loader also skips a record of zeros
+(`torn_tail::is_unwritten`, which no declaration encodes to), for files a
+build before this wrote. Cost: one log sync per sidecar record a statement
+writes (the append deferred it to the statement's). The `FIELDS` sidecar
+and the schema header keep the logged append: they are written by `CREATE
+TABLE`, before the catalogue names the table, or under `reload_atomic` and
+`rewrite_table`, whose backup and intent put the files back after a cut.
+Pinned by `torn_tail::tests::a_schema_record_reads_whole_after_a_cut_once_appended`
+(each sidecar cut after each of its last three records, past a page
+boundary, every seed kind: exactly the records appended, whole) and
+`…::a_schema_record_of_zeros_reads_as_no_declaration`.
+
 **Behaviour changes for plain tables** (the same code serves both kinds):
 
 - `ADD CONSTRAINT … FOREIGN KEY` validates the rows already there (23503,
