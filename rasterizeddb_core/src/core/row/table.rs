@@ -2833,15 +2833,17 @@ impl<S: StorageIO> Table<S> {
                         format!("{} = {}", field.name, rendered)
                     })
                     .collect();
+                // An update names the row it moves; an insert's row has no id
+                // yet, and printed as `None` it read like a lost value.
+                let updated = exclude_id.map(|id| format!("; the row being updated is {}", id)).unwrap_or_default();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!(
-                        "duplicate value for UNIQUE constraint {} (row {} already holds it): {}; \
-                         the row being written is {:?}",
+                        "duplicate value for UNIQUE constraint {} (row {} already holds it): {}{}",
                         key.describe(),
                         existing,
                         shown.join(", "),
-                        exclude_id
+                        updated
                     ),
                 ));
             }

@@ -4737,6 +4737,12 @@ where
         // A row lock on rows that are not table rows ("FOR UPDATE is not
         // allowed with DISTINCT clause"): PostgreSQL's feature_not_supported.
         "0A000"
+    } else if message.contains(" position ")
+        && (message.contains("is not in the select list") || message.contains("is not in the UNION"))
+    {
+        // `GROUP BY 3` or `ORDER BY 3` past the select list:
+        // invalid_column_reference, as `sqlstate_for` maps it.
+        "42P10"
     } else if message.contains(" types ") && message.ends_with(" cannot be matched") {
         // `CASE types integer and text cannot be matched` — PostgreSQL's
         // datatype_mismatch.
@@ -5697,14 +5703,15 @@ where
     };
 
     // A unique index is a constraint; rewritten into the ALTER TABLE the engine
-    // enforces before anything else looks at the statement.
+    // enforces before anything else looks at the statement. It is still tagged
+    // and refused in a read-only block as the CREATE INDEX the client sent.
     let rewritten_unique;
-    let stmt = match crate::core::rql::lexer_alter::unique_index_as_constraint(stmt) {
+    let (stmt, unique_index) = match crate::core::rql::lexer_alter::unique_index_as_constraint(stmt) {
         Some(altered) => {
             rewritten_unique = altered;
-            rewritten_unique.as_str()
+            (rewritten_unique.as_str(), true)
         }
-        None => stmt,
+        None => (stmt, false),
     };
 
     // DDL does not participate in rollback here: an ALTER or DROP applied
@@ -5854,6 +5861,7 @@ where
         effective,
         result_formats,
         omit_description,
+        unique_index,
     ))
     .await;
 
@@ -5974,6 +5982,7 @@ async fn execute_single_statement_inner<S>(
     stmt: &str,
     result_formats: &[i16],
     omit_description: bool,
+    unique_index: bool,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -6176,14 +6185,19 @@ where
         QueryPurpose::UpdateRow(_) => PurposeKind::UpdateRow,
         QueryPurpose::DeleteRow(_) => PurposeKind::DeleteRow,
         QueryPurpose::QueryRows(_) => PurposeKind::QueryRows,
+        QueryPurpose::CreateIndex(_) => PurposeKind::CreateIndex,
+        QueryPurpose::DropIndex(_) => PurposeKind::DropIndex,
         _ => PurposeKind::Other,
     };
+    let purpose_kind = if unique_index { PurposeKind::CreateIndex } else { purpose_kind };
 
     if read_only {
         let verb = match purpose_kind {
             PurposeKind::CreateTable => Some("CREATE TABLE"),
             PurposeKind::DropTable => Some("DROP TABLE"),
             PurposeKind::AlterTable => Some("ALTER TABLE"),
+            PurposeKind::CreateIndex => Some("CREATE INDEX"),
+            PurposeKind::DropIndex => Some("DROP INDEX"),
             PurposeKind::InsertRow => Some("INSERT"),
             PurposeKind::UpdateRow => Some("UPDATE"),
             PurposeKind::DeleteRow => Some("DELETE"),
@@ -6814,6 +6828,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("no unique or exclusion constraint matching the on conflict specification") {
         return "42P10";
     }
+    // `invalid_column_reference` too: `GROUP BY 3` or `ORDER BY 3` past the
+    // select list, or a UNION's result.
+    if has(" position ") && (has("is not in the select list") || has("is not in the union")) {
+        return "42P10";
+    }
     // `invalid_table_definition`: a second PRIMARY KEY. Early: the message
     // quotes the table's name.
     if has("multiple primary keys for table") {
@@ -7004,6 +7023,8 @@ enum PurposeKind {
     CreateTable,
     DropTable,
     AlterTable,
+    CreateIndex,
+    DropIndex,
     Vacuum,
     LockTable,
     InsertRow,
@@ -7024,6 +7045,8 @@ fn command_tag(kind: PurposeKind, rows_affected: Option<u64>) -> String {
         (PurposeKind::DropTable, _) => "DROP TABLE".to_string(),
         // PostgreSQL tags add, drop and rename alike.
         (PurposeKind::AlterTable, _) => "ALTER TABLE".to_string(),
+        (PurposeKind::CreateIndex, _) => "CREATE INDEX".to_string(),
+        (PurposeKind::DropIndex, _) => "DROP INDEX".to_string(),
         (PurposeKind::Vacuum, _) => "VACUUM".to_string(),
         (PurposeKind::LockTable, _) => "LOCK TABLE".to_string(),
         (PurposeKind::InsertRow, Some(n)) => format!("INSERT 0 {}", n),
@@ -11184,6 +11207,9 @@ mod sqlstate_tests {
             ("value 300 is out of range for type U8", "22003"),
             ("permission denied: CREATE ROLE requires superuser", "42501"),
             ("NOT LIKE is not supported yet", "0A000"),
+            ("GROUP BY position 3 is not in the select list, which has 2 item(s)", "42P10"),
+            ("ORDER BY position 0 is not in the select list, which has 1 item(s)", "42P10"),
+            ("ORDER BY position 4 is not in the UNION's result", "42P10"),
             ("'FOR UPDATE NOWAIT SKIP LOCKED' is not a supported locking clause", "0A000"),
             (
                 "unexpected Ident(\"x\") after the end of the expression",
@@ -11348,6 +11374,8 @@ mod command_tag_tests {
         assert_eq!(command_tag(PurposeKind::CreateTable, None), "CREATE TABLE");
         assert_eq!(command_tag(PurposeKind::DropTable, None), "DROP TABLE");
         assert_eq!(command_tag(PurposeKind::AlterTable, None), "ALTER TABLE");
+        assert_eq!(command_tag(PurposeKind::CreateIndex, None), "CREATE INDEX");
+        assert_eq!(command_tag(PurposeKind::DropIndex, None), "DROP INDEX");
         assert_eq!(command_tag(PurposeKind::Vacuum, None), "VACUUM");
     }
 

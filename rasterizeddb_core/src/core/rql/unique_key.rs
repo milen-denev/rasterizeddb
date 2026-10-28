@@ -907,6 +907,11 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     let close = list_close(&rest[open..])
         .map(|i| open + i)
         .ok_or_else(|| "UNIQUE column list is not closed".to_string())?;
+    // `UNIQUE NULLS NOT DISTINCT (…)` makes two NULLs collide. The check here
+    // never compares a NULL, so it was read as a plain UNIQUE and the
+    // duplicates it exists to stop went in.
+    let keyword = if rest_upper.starts_with("UNIQUE") { "UNIQUE".len() } else { "PRIMARY KEY".len() };
+    nulls_clause(&rest[keyword..open])?;
 
     let columns: Vec<String> = split_items(&rest[open + 1..close])
         .into_iter()
@@ -928,7 +933,9 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // `UNIQUE (…) WHERE pred` is the form `CREATE UNIQUE INDEX … WHERE pred`
     // is rewritten into: a partial key.
     let tail = rest[close + 1..].trim();
-    let predicate = match crate::core::rql::join::find_keyword(tail, "WHERE", 0) {
+    let where_at = crate::core::rql::join::find_keyword(tail, "WHERE", 0);
+    nulls_clause(&tail[..where_at.unwrap_or(tail.len())])?;
+    let predicate = match where_at {
         Some(0) => {
             let text = tail["WHERE".len()..].trim();
             if text.is_empty() {
@@ -960,6 +967,20 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
         predicate,
         ..UniqueKey::new(name, columns)
     }))
+}
+
+/// Refuses `NULLS NOT DISTINCT` in the words around a key's column list.
+/// `NULLS DISTINCT` is PostgreSQL's default and what is enforced, so it
+/// passes, as does anything else there (`INCLUDE (…)`, `WITH (…)`), which
+/// changes no answer.
+fn nulls_clause(words: &str) -> Result<(), String> {
+    let upper: Vec<String> = words.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    if upper.windows(3).any(|w| w[0] == "NULLS" && w[1] == "NOT" && w[2] == "DISTINCT") {
+        return Err("UNIQUE NULLS NOT DISTINCT is not supported: NULLs are always distinct here, \
+                    so two rows with a NULL in the key never conflict"
+            .to_string());
+    }
+    Ok(())
 }
 
 /// The offset of the `)` closing the `(` that `text` starts with, outside
@@ -1376,6 +1397,24 @@ mod tests {
                 .unwrap_err()
                 .contains("at most")
         );
+    }
+
+    /// Read as a plain UNIQUE, `NULLS NOT DISTINCT` let in the duplicates it
+    /// exists to refuse. The default, spelled out, is what is enforced.
+    #[test]
+    fn nulls_not_distinct_is_refused_and_nulls_distinct_accepted() {
+        for clause in [
+            "UNIQUE NULLS NOT DISTINCT (a, b)",
+            "CONSTRAINT u UNIQUE NULLS NOT DISTINCT (a)",
+            "UNIQUE (a, b) NULLS NOT DISTINCT",
+            "UNIQUE (a) NULLS NOT DISTINCT WHERE b IS NULL",
+        ] {
+            let e = parse_clause(clause, "t").unwrap_err();
+            assert!(e.contains("not supported"), "{clause}: {e}");
+        }
+        for clause in ["UNIQUE NULLS DISTINCT (a, b)", "UNIQUE (a) WHERE note = 'NULLS NOT DISTINCT'"] {
+            assert!(parse_clause(clause, "t").unwrap().is_some(), "{clause}");
+        }
     }
 }
 

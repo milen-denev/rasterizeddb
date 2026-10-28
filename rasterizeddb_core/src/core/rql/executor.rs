@@ -9325,7 +9325,7 @@ async fn existing_rows_break_unique(
 async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8> {
     use crate::core::rql::lexer_alter;
 
-    let plans = match lexer_alter::parse_alter_table_actions(sql) {
+    let plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot parse ALTER TABLE: {}", e);
@@ -9337,7 +9337,7 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     // absent from `tables` yet exists. Every action is checked before the
     // first runs, since each writes its sidecar before it reloads; each arm
     // asks again under its ACCESS EXCLUSIVE.
-    for plan in &plans {
+    for (plan, _) in &plans {
         if let Some(why) = database.partitioned_table(&plan.table_name).and_then(|t| t.broken().map(str::to_string)) {
             return ddl_error(&why);
         }
@@ -9359,7 +9359,7 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
             .next()
             .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"));
     if if_exists {
-        if let Some(first) = plans.first() {
+        if let Some((first, _)) = plans.first() {
             if !database.has_table(&first.table_name) {
                 info!(
                     "ALTER TABLE IF EXISTS {}: relation absent, nothing to do",
@@ -9371,11 +9371,60 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     }
 
     let mut result = ddl_ok(0);
-    for plan in plans {
+    // Set while an `ADD COLUMN IF NOT EXISTS` found its column: the
+    // constraints written on it are part of that definition, and go with it.
+    let mut skipping = false;
+    // The column the last `ADD COLUMN` added, while its constraints run.
+    let mut added: Option<(String, String)> = None;
+    for (plan, inline) in plans {
+        if inline {
+            if skipping {
+                continue;
+            }
+        } else {
+            added = None;
+            skipping = match &plan.action {
+                // Under the ACCESS EXCLUSIVE the statement already holds, so
+                // the column cannot appear between this look and the add.
+                lexer_alter::AlterAction::AddColumn { name, if_not_exists: true, .. } => {
+                    match database.relation_for(&plan.table_name, owner(), TableMode::AccessExclusive).await {
+                        Ok(relation) => relation.is_some_and(|r| {
+                            r.schema().fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+                        }),
+                        Err(e) => return ddl_error(&e),
+                    }
+                }
+                _ => false,
+            };
+        }
+        let added_now = match (&plan.action, skipping) {
+            (lexer_alter::AlterAction::AddColumn { name, .. }, false) => Some((plan.table_name.clone(), name.clone())),
+            _ => None,
+        };
         result = execute_alter_table_action(plan, database, tx).await;
         // `ddl_error` frames lead with status 3.
         if result.first() == Some(&3u8) {
+            // A constraint written on the column failed — a DEFAULT the rows
+            // share breaks UNIQUE, has no parent, fails the CHECK. The column
+            // goes too: in PostgreSQL the statement changes nothing.
+            if inline && let Some((table_name, name)) = added.take() {
+                let undo = lexer_alter::AlterTable {
+                    table_name,
+                    action: lexer_alter::AlterAction::DropColumn { name, if_exists: true },
+                };
+                let undone = execute_alter_table_action(undo, database, tx).await;
+                if undone.first() == Some(&3u8) {
+                    error!(
+                        "ALTER TABLE: a constraint on an added column failed and the column could not be \
+                         dropped again: {}",
+                        String::from_utf8_lossy(&undone[1..])
+                    );
+                }
+            }
             return result;
+        }
+        if added_now.is_some() {
+            added = added_now;
         }
     }
     result

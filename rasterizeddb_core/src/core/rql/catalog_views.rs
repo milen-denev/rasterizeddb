@@ -1014,12 +1014,23 @@ async fn build(
                 // re-issue every CREATE INDEX.
                 if let Some((owned, ready)) = index_set(&relation)? {
                     let indexes = owned.view();
-                    let declared = indexes
+                    let mut declared: Vec<(String, usize)> = indexes
                         .list()
                         .iter()
                         .filter(|i| !i.implicit)
                         .map(|i| (i.decl.name.clone(), i.columns.len()))
-                        .chain(indexes.gin().iter().map(|g| (g.decl.name.clone(), 1)));
+                        .chain(indexes.gin().iter().map(|g| (g.decl.name.clone(), 1)))
+                        .collect();
+                    // A `CREATE INDEX` sharing another's columns shares its
+                    // index; listed by its own name all the same.
+                    for (index_name, unique, columns, _) in shared_declarations(&schema) {
+                        if !unique
+                            && !declared.iter().any(|(n, _)| n.eq_ignore_ascii_case(&index_name))
+                            && indexes.list().iter().any(|i| i.path.is_none() && i.decl.columns == columns)
+                        {
+                            declared.push((index_name, columns.len()));
+                        }
+                    }
                     for (index_name, columns) in declared {
                         rows.push(format!(
                             "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
@@ -1120,6 +1131,35 @@ async fn build(
                             name,
                             index.method().name(),
                             columns.join(", "),
+                            predicate.map(|p| format!(" WHERE {}", p)).unwrap_or_default()
+                        ),
+                    ));
+                }
+                // A declaration over the columns of one already built shares
+                // that index, so the loop above never met it: a second
+                // `CREATE INDEX` on the same columns, a UNIQUE over indexed
+                // columns, a primary key under an earlier `CREATE INDEX (id)`.
+                // PostgreSQL lists each by its own name, and a migration tool
+                // that cannot find its index or the table's pkey creates it
+                // again or decides the key is gone.
+                for (index_name, unique, columns, predicate) in shared_declarations(&schema) {
+                    if defs.iter().any(|(listed, _)| listed.eq_ignore_ascii_case(&index_name)) {
+                        continue;
+                    }
+                    let Some(built) = indexes.list().iter().find(|i| i.path.is_none() && i.decl.columns == columns)
+                    else {
+                        continue;
+                    };
+                    defs.push((
+                        index_name.clone(),
+                        format!(
+                            "CREATE {}INDEX {} ON {}.{} USING {} ({}){}",
+                            if unique { "UNIQUE " } else { "" },
+                            index_name,
+                            SCHEMA,
+                            name,
+                            built.method().name(),
+                            columns.iter().filter_map(|wo| column_name(*wo)).collect::<Vec<_>>().join(", "),
                             predicate.map(|p| format!(" WHERE {}", p)).unwrap_or_default()
                         ),
                     ));
@@ -1341,6 +1381,41 @@ fn live_and_dead(ids_handed_out: u64, slots: u64) -> (i64, i64) {
 /// own from the same schema and the shell builds none; they are ready once
 /// every materialized partition's are. Errs on a table that cannot serve
 /// data: "no indexes" would make a migration tool re-issue every one.
+/// Every column index a schema declares, as `(name, unique, columns by
+/// write_order, predicate)`, in the order and under the names
+/// [`crate::core::index::for_schema`] builds them: `CREATE INDEX`, then the
+/// primary key, inline UNIQUE columns and table-level keys. Gin and path
+/// indexes are left out; each is always built under its own name.
+fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(String, bool, Vec<u32>, Option<String>)> {
+    use crate::core::rql::unique_key::{implicit_key_name, pkey_name};
+    let by_name = |name: &str| {
+        schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .map(|f| f.write_order as u32)
+    };
+    let mut out = Vec::new();
+    for decl in schema.secondary_indexes.iter().filter(|d| !d.is_deleted && d.method.opclass().is_none()) {
+        out.push((decl.name.clone(), false, decl.columns.clone(), None));
+    }
+    let pk = schema.primary_key.as_deref().and_then(by_name);
+    if let Some(pk) = pk {
+        out.push((pkey_name(&schema.name), true, vec![pk], None));
+    }
+    // An inline `PRIMARY KEY` flags its column unique too; that is the
+    // primary key's index, not a `<table>_<column>_key` of its own.
+    for f in schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted && Some(f.write_order as u32) != pk) {
+        out.push((implicit_key_name(&schema.name, &f.name), true, vec![f.write_order as u32], None));
+    }
+    for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+        if let Some(columns) = key.columns.iter().map(|c| by_name(c)).collect::<Option<Vec<u32>>>() {
+            out.push((key.name.clone(), true, columns, key.predicate_display()));
+        }
+    }
+    out
+}
+
 fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::index::TableIndexes>, bool)>, String> {
     match relation {
         Relation::Plain(table) => Ok(table

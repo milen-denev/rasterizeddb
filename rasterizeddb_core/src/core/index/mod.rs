@@ -1814,9 +1814,6 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
     };
     let mut out: Vec<Arc<LiveIndex>> = Vec::new();
     let add = |decl: IndexDecl, implicit: bool, out: &mut Vec<Arc<LiveIndex>>| {
-        if out.iter().any(|i| i.decl.columns == decl.columns && i.decl.method == decl.method) {
-            return;
-        }
         let mut columns = Vec::with_capacity(decl.columns.len());
         for wo in &decl.columns {
             match live(*wo) {
@@ -1836,6 +1833,11 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
         let types: Vec<DbType> = columns.iter().map(|c| c.1.clone()).collect();
         let requested = if implicit { None } else { Some(decl.method) };
         match choose_method(requested, &types) {
+            // One index per columns and method, compared by the method built,
+            // not the one declared: an implicit key declares B-tree and may
+            // build hash, so a primary key also recorded as a unique key was
+            // built, maintained and listed twice.
+            Ok(method) if out.iter().any(|i| i.decl.columns == decl.columns && i.decl.method == method) => {}
             Ok(method) => {
                 let decl = IndexDecl { method, ..decl };
                 out.push(Arc::new(LiveIndex::new_in(decl, columns, implicit, placement)));
@@ -1944,7 +1946,14 @@ pub fn choose_method(requested: Option<Method>, types: &[DbType]) -> Result<Meth
             if types.len() == 1 && types[0] == DbType::JSONB {
                 Ok(m)
             } else {
-                Err("a gin index covers exactly one jsonb column".to_string())
+                // "not supported" is what makes it 0A000 rather than an
+                // internal error: the statement asked for a feature, it did
+                // not trip a fault.
+                Err(match types {
+                    [t] => format!("USING gin is not supported on a {t:?} column: a gin index covers exactly one jsonb column"),
+                    _ => "USING gin is not supported over several columns: a gin index covers exactly one jsonb column"
+                        .to_string(),
+                })
             }
         }
         Some(Method::BTree) => {

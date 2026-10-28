@@ -94,3 +94,38 @@ async fn a_column_that_does_not_determine_the_row_is_still_refused() {
         );
     }
 }
+
+/// `GROUP BY 1` groups by the first select item, as reporting tools and ORMs
+/// write it; it was "GROUP BY column '1' not found in schema".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_number_groups_by_that_select_item() {
+    let (_s, pool) = seeded().await;
+    let mut rows: Vec<(String, i64)> = sqlx::query("SELECT customer, COUNT(*) FROM o GROUP BY 1")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![("a".into(), 2), ("b".into(), 1), ("c".into(), 1)]);
+
+    // An expression item, and an alias beside it.
+    let mut rows: Vec<(String, i64)> = sqlx::query("SELECT upper(customer) AS c, SUM(amount) AS s FROM o GROUP BY 1")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![("A".into(), 30), ("B".into(), 5), ("C".into(), 7)]);
+
+    for sql in ["SELECT customer, COUNT(*) FROM o GROUP BY 3", "SELECT customer FROM o GROUP BY 0"] {
+        let e = sqlx::query(sql).fetch_all(&pool).await.expect_err(sql);
+        let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
+        assert_eq!(code.as_deref(), Some("42P10"), "{sql}: {e}");
+    }
+    // An aggregate's position is refused, as PostgreSQL refuses it.
+    assert!(sqlx::query("SELECT customer, COUNT(*) FROM o GROUP BY 2").fetch_all(&pool).await.is_err());
+}

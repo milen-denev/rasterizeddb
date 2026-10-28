@@ -1752,10 +1752,22 @@ pub fn row_fetch_from_select_query(
                     continue;
                 }
 
-                // A name that is no column may label a select item.
-                let labelled = select_items
-                    .iter()
-                    .position(|s| s.label().eq_ignore_ascii_case(item.trim_matches('"')));
+                // A name that is no column may label a select item, and a
+                // number is one by position: `GROUP BY 1`, as reporting tools
+                // and ORMs write it.
+                let labelled = match item.parse::<usize>() {
+                    Ok(n) if n == 0 || n > select_items.len() => {
+                        return Err(format!(
+                            "GROUP BY position {} is not in the select list, which has {} item(s)",
+                            n,
+                            select_items.len()
+                        ));
+                    }
+                    Ok(n) => Some(n - 1),
+                    Err(_) => select_items
+                        .iter()
+                        .position(|s| s.label().eq_ignore_ascii_case(item.trim_matches('"'))),
+                };
                 if let Some(position) = labelled {
                     match &select_items[position] {
                         // An alias of a plain column groups by that column.

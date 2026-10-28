@@ -138,6 +138,14 @@ fn token_at(s: &str, from: usize) -> Option<(&str, usize)> {
 /// separator, which is why `split_definitions` does the work rather than
 /// `split(',')`.
 pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
+    Ok(parse_alter_table_actions_tagged(sql)?.into_iter().map(|(action, _)| action).collect())
+}
+
+/// [`parse_alter_table_actions`], with each action marked `true` when it is a
+/// constraint written on the `ADD COLUMN` before it. Those belong to the
+/// column's definition: when `ADD COLUMN IF NOT EXISTS` finds the column
+/// already there, PostgreSQL adds neither, and neither may run here.
+pub fn parse_alter_table_actions_tagged(sql: &str) -> Result<Vec<(AlterTable, bool)>, String> {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("ALTER TABLE") {
@@ -175,7 +183,9 @@ pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
 
     let segments = crate::core::rql::lexer_ct::split_definitions(rest);
     if segments.len() <= 1 {
-        return parse_alter_table(sql).map(|action| vec![action]);
+        let action = parse_alter_table(sql)?;
+        let inline = inline_constraints(&action, rest)?;
+        return Ok(std::iter::once((action, false)).chain(inline.into_iter().map(|c| (c, true))).collect());
     }
 
     let mut actions = Vec::with_capacity(segments.len());
@@ -188,12 +198,101 @@ pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
                     .to_string(),
             );
         }
-        actions.push(parse_alter_table(&format!(
-            "ALTER TABLE {} {}",
-            table_token, segment
-        ))?);
+        let action = parse_alter_table(&format!("ALTER TABLE {} {}", table_token, segment))?;
+        let inline = inline_constraints(&action, segment)?;
+        actions.push((action, false));
+        actions.extend(inline.into_iter().map(|c| (c, true)));
     }
     Ok(actions)
+}
+
+/// The constraints written on an added column — `UNIQUE`, `PRIMARY KEY`,
+/// `REFERENCES …`, `CHECK (…)` — as the constraint actions that follow it.
+/// [`parse_alter_table`] reads only nullability from the words after the
+/// type, so each was dropped: duplicates went in, and orphans, and values
+/// the check forbids.
+///
+/// Names are PostgreSQL's: `<t>_<c>_key`, `<t>_pkey`, `<t>_<c>_check`, or
+/// the `CONSTRAINT name` written before one. A foreign key is left unnamed
+/// for its own path to name. If one fails, the executor drops the column the
+/// statement added, so the whole of it fails, as in PostgreSQL. They
+/// belong to the column: under `IF NOT EXISTS` the executor runs them only
+/// when the column is added ([`parse_alter_table_actions_tagged`]).
+fn inline_constraints(action: &AlterTable, segment: &str) -> Result<Vec<AlterTable>, String> {
+    let AlterAction::AddColumn { name, .. } = &action.action else {
+        return Ok(Vec::new());
+    };
+    let table = &action.table_name;
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let clause = |description: String| AlterTable {
+        table_name: table.clone(),
+        action: AlterAction::ConstraintClause { drop: false, description },
+    };
+    let mut out = Vec::new();
+
+    // Every clause that carries an expression or a literal comes out first,
+    // so a DEFAULT 'UNIQUE' or a CHECK naming the word is not read as a key.
+    let (text, _) = crate::core::rql::generated::split_clause(segment);
+    let (text, check) = crate::core::rql::check::split_clause(&text);
+    let (text, _) = crate::core::rql::column_default::split_clause(&text);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let Some(at) = words.iter().position(|w| bare_name(w).eq_ignore_ascii_case(name)) else {
+        return Ok(Vec::new());
+    };
+    let after: Vec<&str> = words[at + 1..].to_vec();
+    let references = after.iter().position(|w| w.eq_ignore_ascii_case("REFERENCES"));
+    // The key words are read before `REFERENCES`, and after its target and
+    // actions: `c INT REFERENCES p (id) ON DELETE CASCADE UNIQUE`.
+    let upper: Vec<String> = after.iter().map(|w| w.to_ascii_uppercase()).collect();
+    let has = |seq: &[&str]| upper.windows(seq.len()).any(|w| w.iter().map(String::as_str).eq(seq.iter().copied()));
+    // Refused before anything runs: as a constraint after the column, the
+    // refusal would leave the column added.
+    if has(&["NULLS", "NOT", "DISTINCT"]) {
+        return Err(format!(
+            "UNIQUE NULLS NOT DISTINCT is not supported: NULLs are always distinct here, so two rows \
+             with a NULL in column {} never conflict",
+            name
+        ));
+    }
+    // `CONSTRAINT x` names the constraint the next word starts.
+    let named = |keyword: usize| {
+        (keyword >= 2 && upper[keyword - 2] == "CONSTRAINT").then(|| bare_name(after[keyword - 1]))
+    };
+    let primary = upper.windows(2).position(|w| w[0] == "PRIMARY" && w[1] == "KEY");
+    let unique = upper.iter().position(|w| w == "UNIQUE");
+    if let Some(k) = primary.or(unique) {
+        let constraint = named(k).unwrap_or_else(|| {
+            if primary.is_some() {
+                crate::core::rql::unique_key::pkey_name(table)
+            } else {
+                crate::core::rql::unique_key::implicit_key_name(table, name)
+            }
+        });
+        out.push(clause(format!(
+            "CONSTRAINT {} {} ({})",
+            quote(&constraint),
+            if primary.is_some() { "PRIMARY KEY" } else { "UNIQUE" },
+            quote(name)
+        )));
+    }
+    if let Some(k) = references {
+        // From `REFERENCES` to the end: the target, its columns, the
+        // actions; the foreign key parser reads what it needs and the key
+        // words after it are already taken.
+        // Unnamed unless written: the foreign key path names it, and numbers
+        // it on a collision, as it names every other one.
+        let target = after[k..].join(" ");
+        let constraint = named(k).map(|n| format!("CONSTRAINT {} ", quote(&n))).unwrap_or_default();
+        out.push(clause(format!("{}FOREIGN KEY ({}) {}", constraint, quote(name), target)));
+    }
+    if let Some(expression) = check {
+        out.push(clause(format!(
+            "CONSTRAINT {} CHECK ({})",
+            quote(&crate::core::rql::check::derived_name(table, Some(name), 1)),
+            expression
+        )));
+    }
+    Ok(out)
 }
 
 pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
@@ -755,17 +854,27 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
         return None;
     }
     let tail = rest[close + 1..].trim();
-    let predicate = match crate::core::rql::join::find_keyword(tail, "WHERE", 0) {
+    let where_at = crate::core::rql::join::find_keyword(tail, "WHERE", 0);
+    let predicate = match where_at {
         Some(at) => Some(tail[at + "WHERE".len()..].trim()).filter(|p| !p.is_empty()),
         None => None,
     };
+    // `… (cols) NULLS NOT DISTINCT` is carried for the constraint to refuse:
+    // dropped here, the index enforced NULLs as distinct.
+    let nulls = tail[..where_at.unwrap_or(tail.len())]
+        .split_whitespace()
+        .map(|w| w.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|w| w == ["NULLS", "NOT", "DISTINCT"]);
 
     Some(format!(
-        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}",
+        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}{}",
         table,
         if if_not_exists { "IF NOT EXISTS " } else { "" },
         name,
         columns,
+        if nulls { " NULLS NOT DISTINCT" } else { "" },
         match predicate {
             Some(p) => format!(" WHERE {}", p),
             None => String::new(),
@@ -1278,6 +1387,53 @@ mod tests {
             Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) WHERE b IS NULL")
         );
         assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none());
+        // A constraint written on ADD COLUMN is the action after it, tagged
+        // as the column's; the words of a DEFAULT or CHECK are not read as one.
+        let keys = |sql: &str| -> Vec<String> {
+            parse_alter_table_actions_tagged(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(a, inline)| match a.action {
+                    AlterAction::ConstraintClause { description, .. } => {
+                        assert!(inline, "{description}");
+                        Some(description)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN e INT UNIQUE"), ["CONSTRAINT \"t_e_key\" UNIQUE (\"e\")"]);
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN IF NOT EXISTS e INT CONSTRAINT e_u UNIQUE NOT NULL DEFAULT 0"),
+            ["CONSTRAINT \"e_u\" UNIQUE (\"e\")"]
+        );
+        assert_eq!(keys("ALTER TABLE t ADD f INT PRIMARY KEY"), ["CONSTRAINT \"t_pkey\" PRIMARY KEY (\"f\")"]);
+        assert!(
+            parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b TEXT UNIQUE NULLS NOT DISTINCT")
+                .unwrap_err()
+                .contains("not supported")
+        );
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN p INT REFERENCES par (id) ON DELETE CASCADE UNIQUE CHECK (p > 0)"),
+            [
+                "CONSTRAINT \"t_p_key\" UNIQUE (\"p\")",
+                "FOREIGN KEY (\"p\") REFERENCES par (id) ON DELETE CASCADE UNIQUE",
+                "CONSTRAINT \"t_p_check\" CHECK (p > 0)",
+            ]
+        );
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'UNIQUE' CHECK (c <> 'PRIMARY KEY')"),
+            ["CONSTRAINT \"t_c_check\" CHECK (c <> 'PRIMARY KEY')"]
+        );
+        // The column's own action is never tagged.
+        assert!(!parse_alter_table_actions_tagged("ALTER TABLE t ADD COLUMN e INT UNIQUE").unwrap()[0].1);
+        assert!(keys("ALTER TABLE t ADD COLUMN unique_id INT").is_empty());
+        // `NULLS NOT DISTINCT` travels to the constraint, which refuses it;
+        // dropped here, the index enforced NULLs as distinct.
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a, b) nulls not distinct WHERE c").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) NULLS NOT DISTINCT WHERE c")
+        );
         // `pg_dump`'s spelling: a method, and a predicate in parentheses. The
         // column list ends at its own parenthesis, not the predicate's.
         assert_eq!(

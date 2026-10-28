@@ -306,6 +306,19 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             // ordinary column with an ordinary default.
             let serial = crate::core::rql::sequence::serial_type(&type_phrase);
             let constraints = parse_constraints(&tokens[1 + tokens_used..], serial.is_some());
+            // `b INT UNIQUE NULLS NOT DISTINCT`: the flag above is a plain
+            // UNIQUE, under which two NULLs never conflict.
+            if tokens[1 + tokens_used..]
+                .windows(3)
+                .any(|w| w.iter().map(|t| t.to_ascii_uppercase()).eq(["NULLS", "NOT", "DISTINCT"]))
+            {
+                rejection.replace(format!(
+                    "UNIQUE NULLS NOT DISTINCT is not supported: NULLs are always distinct here, so two rows \
+                     with a NULL in column {} never conflict",
+                    name
+                ));
+                return None;
+            }
 
             // Map SQL type to DbType (Postgres-friendly mapping; extend as needed)
             // A JSON column holds a reference to the row of a table built from
