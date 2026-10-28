@@ -220,6 +220,27 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
         entries.push(Entry { name, len });
     }
 
+    // To the end of the stream. The per-entry checksum covers an entry's
+    // bytes, not its name or length, and a decompressor verifies its frame
+    // checksum — the one check over everything — only when it reaches the
+    // frame's end. Stopping at the last entry skipped it, so a damaged byte
+    // in a name restored that file under another name and the restore
+    // reported success.
+    let mut rest = [0u8; 4096];
+    let mut trailing = 0u64;
+    loop {
+        let read = source.read(&mut rest)?;
+        if read == 0 {
+            break;
+        }
+        trailing += read as u64;
+    }
+    if trailing > 0 {
+        return Err(io::Error::other(format!(
+            "snapshot archive has {trailing} bytes after its last entry; the backup is corrupt"
+        )));
+    }
+
     Ok(entries)
 }
 
@@ -293,6 +314,45 @@ mod tests {
 
         let err = unpack(&mut buffer.as_slice(), &dir.join("out")).unwrap_err();
         assert!(err.to_string().contains("failed its checksum"), "{err}");
+    }
+
+    /// No damaged byte of a compressed snapshot unpacks into something else:
+    /// it fails, or — a bit of the frame header no content depends on — gives
+    /// back exactly the original. A flip inside a name used to restore that
+    /// file under another name: the entry checksum does not cover names, and
+    /// the decompressor's frame checksum went unread because unpacking stopped
+    /// at the last entry.
+    #[test]
+    fn no_damaged_byte_of_a_compressed_archive_unpacks_differently() {
+        let dir = temp_testdir::TempDir::default();
+        std::fs::write(dir.join("t.db"), b"rows").unwrap();
+        std::fs::write(dir.join("t_pointers.db"), vec![3u8; 64]).unwrap();
+        let mut plain = Vec::new();
+        let mut writer = ArchiveWriter::new(&mut plain, 2).unwrap();
+        writer.add_file("t.db", &dir.join("t.db")).unwrap();
+        writer.add_file("t_pointers.db", &dir.join("t_pointers.db")).unwrap();
+        writer.finish().unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let out = dir.join("out");
+        let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice()).unwrap();
+        assert_eq!(unpack(&mut decoder, &out).unwrap().len(), 2);
+        for at in 0..compressed.len() {
+            let mut damaged = compressed.clone();
+            damaged[at] ^= 0x01;
+            let _ = std::fs::remove_dir_all(&out);
+            let unpacked = zstd::stream::read::Decoder::new(damaged.as_slice())
+                .and_then(|mut decoder| unpack(&mut decoder, &out));
+            if let Ok(entries) = unpacked {
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, ["t.db", "t_pointers.db"], "byte {at} of {} damaged", compressed.len());
+                assert_eq!(std::fs::read(out.join("t.db")).unwrap(), b"rows", "byte {at}");
+                assert_eq!(std::fs::read(out.join("t_pointers.db")).unwrap(), vec![3u8; 64], "byte {at}");
+            }
+        }
     }
 
     #[test]
