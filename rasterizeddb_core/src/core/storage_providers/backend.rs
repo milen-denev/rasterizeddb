@@ -501,6 +501,15 @@ impl StorageIO for DbStorageProvider {
             _ => Ok(()),
         }
     }
+
+    async fn land_background(&self) -> bool {
+        // Only a file provider holds a partition (§3.4), and only its
+        // service lands staged bytes.
+        match self {
+            Self::File(p) => p.land_background().await,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

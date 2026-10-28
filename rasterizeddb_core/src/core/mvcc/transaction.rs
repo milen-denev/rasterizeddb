@@ -492,6 +492,34 @@ impl ForgetHandle {
             *h = (*h).max(to);
         }
     }
+
+    /// Lowers this table's horizon to `to`, if it is above it
+    /// (docs/partitioning.md §7.2): what a partitioned table does when one of
+    /// its partitions takes a first stamp after being clean, or materializes,
+    /// whose pin the table's one handle must then cover. The status log never
+    /// un-forgets (`StatusLog::forget_below` only moves forward), so this is
+    /// sound only for a `to` at or below every id the new stamps can carry;
+    /// the caller lowers to `forgotten_below()` before its writer's first
+    /// stamp, and that writer's id is at least `oldest_active`, which the
+    /// forgotten horizon never passes. Under the registry lock, so no
+    /// `try_forget` reads a minimum between the old value and this one.
+    pub fn lower_to(&self, to: TxId) {
+        let mut state = self.registry.state.lock();
+        if let Some(h) = state.tables.get_mut(&self.id) {
+            *h = (*h).min(to);
+        }
+    }
+
+    /// Sets this table's horizon to exactly `to`, lowering or raising: a
+    /// partitioned table's handle follows the minimum of its partitions'
+    /// pins (§7.2), which a `SWEPT` raises and a `DIRTY` lowers.
+    /// `TxId::MAX` pins nothing. Raising carries [`Self::advance`]'s contract.
+    pub fn set(&self, to: TxId) {
+        let mut state = self.registry.state.lock();
+        if let Some(h) = state.tables.get_mut(&self.id) {
+            *h = to;
+        }
+    }
 }
 
 impl Drop for ForgetHandle {

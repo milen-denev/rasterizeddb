@@ -782,6 +782,17 @@ pub(crate) mod failed_appends {
     }
 }
 
+/// What one round of the background landing did.
+enum LandRound {
+    /// Nothing was staged.
+    Idle,
+    /// The gate word refused the landing's hold this round; the bytes stay
+    /// staged.
+    Refused,
+    /// Staged bytes were landed (or another landing held the block).
+    Landed,
+}
+
 /// The atomics here are packed, not each in its own `CacheGuard`.
 ///
 /// Padded, the eight of them were 1 KB of the struct's 1280 bytes, and a table
@@ -1289,6 +1300,30 @@ impl LocalStorageProvider {
         _ = file_read.sync_all();
         _ = file_append.sync_all();
         _ = file_write.sync_all();
+    }
+
+    /// One round of the background landing (`start_service`'s loop, or the
+    /// shared scheduler's `land_background`): lands staged bytes if there
+    /// are any.
+    async fn land_round(&self) -> LandRound {
+        if !self.temp_has_data.load(Ordering::Acquire) {
+            return LandRound::Idle;
+        }
+        // A landing is a write of the file set: it holds a count on the gate
+        // word while it runs, taken by the ticket's fast path. When that
+        // would need the slow path (the log ends `CLEAN`, a seal is
+        // publishing), the bytes stay staged, readable from the mirror, until
+        // the next round.
+        let _landing = match self.commit.gated.word().map(|w| w.try_acquire()) {
+            Some(Err(_)) => return LandRound::Refused,
+            Some(Ok(hold)) => Some(hold),
+            None => None,
+        };
+        let res = self.flush_temp_to_main().await; // ignore errors for now
+        if res.is_err() {
+            error!("Error flushing temp to main: {:?}", res.err());
+        }
+        LandRound::Landed
     }
 
     /// Moves every staged byte into the main file and makes it durable,
@@ -2690,32 +2725,27 @@ impl StorageIO for LocalStorageProvider {
         async fn flush_loop(p: &LocalStorageProvider) {
             loop {
                 // Fast path: only flush when we know there's staged data
-                if p.temp_has_data.load(Ordering::Acquire) {
-                    // A landing is a write of the file set: it holds a count
-                    // on the gate word while it runs, taken by the ticket's
-                    // fast path. When that would need the slow path (the log
-                    // ends `CLEAN`, a seal is publishing), the bytes stay
-                    // staged, readable from the mirror, until the next round.
-                    let _landing = match p.commit.gated.word().map(|w| w.try_acquire()) {
-                        Some(Err(_)) => {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            continue;
-                        }
-                        Some(Ok(hold)) => Some(hold),
-                        None => None,
-                    };
-                    let res = p.flush_temp_to_main().await; // ignore errors for now
-                    if res.is_err() {
-                        error!("Error flushing temp to main: {:?}", res.err());
+                match p.land_round().await {
+                    // Landed: look again at once, as before.
+                    LandRound::Landed => {}
+                    // Nothing staged, or the gate refused this round: avoid
+                    // hot spinning.
+                    LandRound::Idle | LandRound::Refused => {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
-                } else {
-                    // avoid hot spinning
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
         }
 
         tokio::join!(flush_loop(self));
+    }
+
+    async fn land_background(&self) -> bool {
+        match self.land_round().await {
+            LandRound::Idle => false,
+            LandRound::Refused => true,
+            LandRound::Landed => self.temp_has_data.load(Ordering::Acquire),
+        }
     }
 
     fn get_name(&self) -> String {

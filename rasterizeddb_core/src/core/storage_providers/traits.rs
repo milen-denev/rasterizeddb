@@ -295,4 +295,15 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn land_staged(&self) -> impl Future<Output = IOResult<()>> + Send + Sync {
         async move { Ok(()) }
     }
+
+    /// One round of [`Self::start_service`]'s background landing, for a
+    /// provider whose service is not started: a partition opened
+    /// `MaintenanceMode::External`, whose database's one scheduler lands its
+    /// staged appends (docs/partitioning.md §7.3). Lands what is staged, as
+    /// the service's loop would, and returns whether staged bytes remain (the
+    /// landing was skipped or more arrived meanwhile). A provider that stages
+    /// nothing has nothing to do.
+    fn land_background(&self) -> impl Future<Output = bool> + Send + Sync {
+        async move { false }
+    }
 }

@@ -394,34 +394,94 @@ pub(super) fn spawn_idle_watcher<S: StorageIO>(
     alive: StdArc<CacheGuard<AtomicBool>>,
     generation: StdArc<CacheGuard<AtomicU64>>,
 ) {
-    if !parts.gate.has_files() {
+    let Some(mut sealer) = IdleSealer::new(parts, alive, generation) else {
         return;
-    }
-    let dir = parts.dir();
-    let parts = StdArc::downgrade(parts);
+    };
     tokio::spawn(async move {
-        let mut watch = IdleWatch::new(generation.load(Ordering::Acquire), tokio::time::Instant::now());
         loop {
-            let threshold = idle_threshold(dir.as_deref());
-            let poll = threshold
-                .map(|t| (t / 4).clamp(Duration::from_millis(50), Duration::from_secs(30)))
-                .unwrap_or(Duration::from_secs(30));
-            tokio::time::sleep(poll).await;
-            let Some(parts) = parts.upgrade() else {
+            tokio::time::sleep(sealer.poll_interval()).await;
+            if sealer.look().await == IdleLook::Gone {
                 break;
-            };
-            if !alive.load(Ordering::Acquire) || parts.retired() {
-                break;
-            }
-            let Some(threshold) = threshold else {
-                continue;
-            };
-            let now = tokio::time::Instant::now();
-            if watch.due(now, generation.load(Ordering::Acquire), parts.gate.word().load(), threshold) {
-                let outcome = seal::seal(&*parts, SealKind::Optional).await;
-                log::debug!("idle checkpoint of {}: {}", parts.name, outcome.describe());
-                watch.restart(tokio::time::Instant::now());
             }
         }
     });
+}
+
+/// What one look of an [`IdleSealer`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleLook {
+    /// The instance is retired or dropped: no more looks.
+    Gone,
+    /// Nothing for the idle checkpoint to do now or later without a write:
+    /// the word is not `Dirty`, or idle checkpoints are off.
+    Quiet,
+    /// The word is `Dirty`: a seal is due once the threshold passes quietly.
+    Pending,
+}
+
+/// The idle checkpoint's watch over one instance, without a task of its
+/// own: [`spawn_idle_watcher`]'s loop looks through one, and so does the
+/// shared scheduler for a partition opened `MaintenanceMode::External`
+/// (docs/partitioning.md §7.3). Holds the parts weakly, as the watcher
+/// always has.
+pub(crate) struct IdleSealer<S: StorageIO> {
+    parts: std::sync::Weak<SealParts<S>>,
+    dir: Option<PathBuf>,
+    alive: StdArc<CacheGuard<AtomicBool>>,
+    generation: StdArc<CacheGuard<AtomicU64>>,
+    watch: IdleWatch,
+}
+
+impl<S: StorageIO> IdleSealer<S> {
+    /// `None` for a file set with no files to seal.
+    pub(super) fn new(
+        parts: &StdArc<SealParts<S>>,
+        alive: StdArc<CacheGuard<AtomicBool>>,
+        generation: StdArc<CacheGuard<AtomicU64>>,
+    ) -> Option<Self> {
+        if !parts.gate.has_files() {
+            return None;
+        }
+        let watch = IdleWatch::new(generation.load(Ordering::Acquire), tokio::time::Instant::now());
+        Some(IdleSealer {
+            dir: parts.dir(),
+            parts: StdArc::downgrade(parts),
+            alive,
+            generation,
+            watch,
+        })
+    }
+
+    /// How long a watcher of its own waits between looks.
+    pub(crate) fn poll_interval(&self) -> Duration {
+        idle_threshold(self.dir.as_deref())
+            .map(|t| (t / 4).clamp(Duration::from_millis(50), Duration::from_secs(30)))
+            .unwrap_or(Duration::from_secs(30))
+    }
+
+    /// One look: seals when the threshold has passed quietly.
+    pub(crate) async fn look(&mut self) -> IdleLook {
+        let threshold = idle_threshold(self.dir.as_deref());
+        let Some(parts) = self.parts.upgrade() else {
+            return IdleLook::Gone;
+        };
+        if !self.alive.load(Ordering::Acquire) || parts.retired() {
+            return IdleLook::Gone;
+        }
+        let Some(threshold) = threshold else {
+            return IdleLook::Quiet;
+        };
+        let now = tokio::time::Instant::now();
+        let word = parts.gate.word().load();
+        if self.watch.due(now, self.generation.load(Ordering::Acquire), word, threshold) {
+            let outcome = seal::seal(&*parts, SealKind::Optional).await;
+            log::debug!("idle checkpoint of {}: {}", parts.name, outcome.describe());
+            self.watch.restart(tokio::time::Instant::now());
+        }
+        if parts.gate.word().load().state() == GateState::Dirty {
+            IdleLook::Pending
+        } else {
+            IdleLook::Quiet
+        }
+    }
 }

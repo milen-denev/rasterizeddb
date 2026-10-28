@@ -982,6 +982,15 @@ impl MapState {
         Ok(())
     }
 
+    /// Puts back partition `pid`'s state as it was before a record that
+    /// applied but could not be appended (`DIRTY`, `SWEPT`, `STATS`, which
+    /// change that one partition only), so the state stays the log's.
+    pub(crate) fn restore_part(&mut self, pid: u32, saved: PartState) {
+        if let Some(p) = self.parts.get_mut(&pid) {
+            *p = saved;
+        }
+    }
+
     fn part_mut(&mut self, pid: u32, live: bool) -> Result<&mut PartState, String> {
         match self.parts.get_mut(&pid) {
             Some(p) if live && p.retired => Err(format!("partition {pid} is retired")),

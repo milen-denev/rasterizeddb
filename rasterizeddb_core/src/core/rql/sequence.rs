@@ -124,6 +124,15 @@ pub fn next(database: u64, name: &str) -> i64 {
     entry.value().fetch_add(1, Ordering::SeqCst) + 1
 }
 
+/// The last value `database`'s sequence `name` handed out (its seed, before
+/// any), or `None` while it is unseeded: what a partitioned table's durable
+/// reservation is checked against (`partition::serial`).
+pub fn current(database: u64, name: &str) -> Option<i64> {
+    SEQUENCES
+        .get(&key(database, name))
+        .map(|v| v.value().load(Ordering::SeqCst))
+}
+
 /// Forgets `database`'s sequences `names`, for a table that has been dropped.
 ///
 /// Without this a table dropped and recreated under the same name would keep

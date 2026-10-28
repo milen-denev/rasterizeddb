@@ -2003,15 +2003,7 @@ impl<S: StorageIO> VacuumService<S> {
     /// scans.
     pub fn spawn(self) {
         tokio::spawn(async move {
-            let mut state = TickState {
-                // No value of the counter can equal this, so the first tick
-                // always scans — a table opened with tombstones already on disk
-                // has dead space that no mutation of ours will ever announce.
-                scanned_at_mutation: u64::MAX,
-                stamps_at_sweep: 0,
-                held_rows: 0,
-                held_min_xmax: NO_TX,
-            };
+            let mut state = TickState::new();
             let mut consecutive_panics = 0u32;
 
             loop {
@@ -2055,9 +2047,31 @@ impl<S: StorageIO> VacuumService<S> {
         });
     }
 
+    /// Whether a tick now would find nothing to do and nothing is waiting on
+    /// time alone: the last completed sweep saw the current mutation count,
+    /// held no stamp the horizon still protected, and no loan is out. What
+    /// the shared scheduler (`partition::maintenance`, §7.3) asks before it
+    /// stops servicing a partition until its next write; a first tick is
+    /// never settled, since it always scans.
+    pub(crate) fn settled(&self, state: &TickState) -> bool {
+        state.scanned_at_mutation != u64::MAX
+            && state.scanned_at_mutation == self.mutations.load(Ordering::Acquire)
+            && state.held_rows == 0
+            && self.free_space.loans_outstanding() == 0
+    }
+
+    /// The service's liveness flag: false once its table is retired or gone.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     /// One pass of the service: a forget sweep if one is due, then a
     /// reclamation sweep if one is due. `Break` when the table has gone.
-    async fn tick(&self, state: &mut TickState) -> ControlFlow<()> {
+    /// Driven by [`Self::spawn`]'s loop for a table with its own
+    /// maintenance, or by the shared scheduler for a partition opened
+    /// `MaintenanceMode::External` (§7.3), whose `forget` is never set: its
+    /// forget sweeps are its slot's (§7.2), run by the scheduler too.
+    pub(crate) async fn tick(&self, state: &mut TickState) -> ControlFlow<()> {
         #[cfg(test)]
         if self
             .stats
@@ -2235,7 +2249,7 @@ impl<S: StorageIO> VacuumService<S> {
 }
 
 /// What the service carries from one tick to the next.
-struct TickState {
+pub(crate) struct TickState {
     /// The mutation count as of the last completed sweep.
     scanned_at_mutation: u64,
     /// The dead-stamp count as of the last completed sweep, and what that
@@ -2243,6 +2257,20 @@ struct TickState {
     stamps_at_sweep: u64,
     held_rows: u64,
     held_min_xmax: TxId,
+}
+
+impl TickState {
+    pub(crate) fn new() -> Self {
+        TickState {
+            // No value of the counter can equal this, so the first tick
+            // always scans — a table opened with tombstones already on disk
+            // has dead space that no mutation of ours will ever announce.
+            scanned_at_mutation: u64::MAX,
+            stamps_at_sweep: 0,
+            held_rows: 0,
+            held_min_xmax: NO_TX,
+        }
+    }
 }
 
 /// How long the service waits before its next tick.
@@ -2292,6 +2320,10 @@ pub struct NeutralizeReport {
     pub cleared: u64,
     /// The horizon the table advanced to, if it did.
     pub advanced_to: Option<TxId>,
+    /// Records of the last pass whose `xmin` or `xmax` is a transaction id at
+    /// or above the sweep's bound: written by a transaction that may still
+    /// abort. A partition's sweep is clean (§7.2) only when this is 0.
+    pub newer: u64,
 }
 
 /// The pieces of a table a forget sweep needs.
@@ -2359,13 +2391,44 @@ pub async fn neutralize_aborted<S: StorageIO>(
     manager: &Arc<TransactionManager>,
     handle: &crate::core::mvcc::transaction::ForgetHandle,
 ) -> std::io::Result<NeutralizeReport> {
+    let report = neutralize_aborted_from(parts, manager, handle.horizon()).await?;
+    // 5.
+    if let Some(bound) = report.advanced_to {
+        handle.advance(bound);
+        manager.try_forget();
+    }
+    Ok(report)
+}
+
+/// Whether `pointer` carries a transaction id at or above `bound` (neither
+/// `NO_TX` nor `FROZEN_TX`): a stamp the sweep to `bound` leaves to a later
+/// one.
+fn carries_newer(pointer: &RowPointer, bound: TxId) -> bool {
+    if pointer.deleted {
+        return false;
+    }
+    let newer = |id: TxId| id != NO_TX && id != FROZEN_TX && id >= bound;
+    newer(pointer.xmin) || newer(pointer.xmax)
+}
+
+/// Steps 1 to 4 of [`neutralize_aborted`] for a table whose horizon is
+/// `from`: proves its records free of every non-committed id below the
+/// settle bound, and reports the bound in `advanced_to` when the proof is
+/// complete, moving nothing. The caller advances whatever horizon it keeps:
+/// a plain table its [`ForgetHandle`](crate::core::mvcc::transaction::ForgetHandle),
+/// a partition its slot's pin, after the map log's `SWEPT` (§7.2).
+pub async fn neutralize_aborted_from<S: StorageIO>(
+    parts: &NeutralizeParts<'_, S>,
+    manager: &Arc<TransactionManager>,
+    from: TxId,
+) -> std::io::Result<NeutralizeReport> {
     let mut report = NeutralizeReport::default();
     if !manager.status().settles() || !parts.free_space.is_enabled() {
         return Ok(report);
     }
     let toggles = parts.free_space.toggles();
     let bound = manager.settle_bound();
-    if bound <= handle.horizon() {
+    if bound <= from {
         return Ok(report);
     }
     let mut _gate = parts.compaction_gate.read().await;
@@ -2374,17 +2437,19 @@ pub async fn neutralize_aborted<S: StorageIO>(
     let scan = || async {
         let mut candidates: Vec<u64> = Vec::new();
         let mut slot = 0u64;
+        let mut newer = 0u64;
         sweep_pointers(parts.io_pointers, |pointer| {
             let (bad_xmin, bad_xmax) = carries_unfinished(pointer, bound, manager);
             if bad_xmin || bad_xmax {
                 candidates.push(slot * ROW_POINTER_RECORD_LEN as u64);
             }
+            newer += carries_newer(pointer, bound) as u64;
             slot += 1;
         })
         .await
-        .map(|()| (candidates, slot))
+        .map(|()| (candidates, slot, newer))
     };
-    let (mut candidates, mut slots) = scan().await?;
+    let (mut candidates, mut slots, mut newer) = scan().await?;
     // One ticket for the pass, only when it has something to rewrite, and
     // before the compaction gate (P24): a ticket per batch would be taken
     // under it. So the gate is let go, the ticket taken, the gate taken
@@ -2395,12 +2460,13 @@ pub async fn neutralize_aborted<S: StorageIO>(
             drop(_gate);
             let ticket = gate::ticket(file_gate, None).await?;
             _gate = parts.compaction_gate.read().await;
-            (candidates, slots) = scan().await?;
+            (candidates, slots, newer) = scan().await?;
             Some(ticket)
         }
         _ => None,
     };
     report.scanned = slots;
+    report.newer = newer;
 
     // 3. Rewrite them.
     let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
@@ -2451,6 +2517,18 @@ pub async fn neutralize_aborted<S: StorageIO>(
     parts
         .dead_stamps
         .fetch_add(report.tombstoned, Ordering::Relaxed);
+    // The batches' commits are deferred to a group commit
+    // (`commit_txn_deferred`), and nothing here is a statement that pays it.
+    // Forgetting can be persisted (the status sidecar) as soon as a horizon
+    // moves, so a rewrite still in the page cache would let a power cut keep
+    // the forgotten horizon and lose the tombstone: the aborted version read
+    // as committed. Synced before any horizon may move (§7.2: a partition's
+    // `SWEPT` likewise follows its sweep's durability).
+    if report.tombstoned + report.cleared > 0
+        && let Some(location) = parts.io_pointers.get_location()
+    {
+        crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))?;
+    }
 
     // 4. Readers that could hold a pointer from before the rewrite.
     let barrier = parts.readers.barrier();
@@ -2465,11 +2543,7 @@ pub async fn neutralize_aborted<S: StorageIO>(
     if !parts.free_space.is_enabled() || parts.free_space.toggles() != toggles {
         return Ok(report);
     }
-
-    // 5.
-    handle.advance(bound);
     report.advanced_to = Some(bound);
-    manager.try_forget();
     Ok(report)
 }
 
