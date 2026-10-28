@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use log::{error, warn};
+use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
 
 use super::super::traits::{BorrowedBytes, IOResult, StorageIO};
@@ -341,6 +341,9 @@ pub struct KvFamily {
     /// name's recovered state, so a second opener racing the first found none
     /// and built an empty file — which, registered first, was the table.
     opening: tokio::sync::Mutex<()>,
+    /// Where unfinished sweeps are recorded, and this store's name in it: set
+    /// by the registry that opened the family. See [`super::pending`].
+    pending: std::sync::OnceLock<(Arc<super::pending::PendingErases>, String)>,
     /// Read by everything that rewrites or deletes an object of this family —
     /// compaction, a truncation's deletes, adopting a scratch generation, a
     /// dropped file's sweep. Written by [`KvFamily::pause_maintenance`], so a
@@ -563,6 +566,7 @@ impl KvFamily {
             ledger,
             erasing: dashmap::DashMap::new(),
             opening: tokio::sync::Mutex::new(()),
+            pending: std::sync::OnceLock::new(),
             maintenance,
             declaring,
         }))
@@ -742,6 +746,87 @@ impl KvFamily {
             Some(file) => !file.dropped.load(Ordering::Acquire),
             None => self.recovered.lock().contains_key(name),
         }
+    }
+
+    /// Records unfinished sweeps in `pending` under `store`, and resumes the
+    /// ones it already lists: each name's gate is closed before this returns,
+    /// so no table opens it until its sweep is done.
+    pub fn attach_pending(self: &Arc<Self>, pending: Arc<super::pending::PendingErases>, store: &str) {
+        let names = pending.names(store);
+        if self.pending.set((pending, store.to_string())).is_err() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        for name in names {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.erasing.insert(name.clone(), gate.clone());
+            let family = self.clone();
+            handle.spawn(async move {
+                // Built from what the store holds, marked dropped, and never
+                // registered: nothing but the sweep ever sees it.
+                let file = {
+                    let _one = family.opening.lock().await;
+                    KvFile::open(&family, &name).await
+                };
+                match file {
+                    Ok(file) => {
+                        file.dropped.store(true, Ordering::Release);
+                        info!("kv: resuming the sweep of {name}, dropped before the last stop");
+                        family.sweep(file, gate).await;
+                    }
+                    Err(e) => {
+                        error!("kv: could not resume the sweep of {name}; it stays pending: {e}");
+                        gate.close();
+                        family.erasing.remove(&name);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Records that `name` is being swept. Failing to costs the resume after a
+    /// restart, not the sweep, so it is said and not refused.
+    fn note_pending(&self, name: &str) {
+        if let Some((pending, store)) = self.pending.get()
+            && let Err(e) = pending.add(store, name)
+        {
+            error!("kv: could not record the sweep of {name}; a stop before it finishes leaves its objects: {e}");
+        }
+    }
+
+    /// Deletes a dropped file's objects, after carrying the commit
+    /// declarations other files still need, retrying each until the store
+    /// lets it. Never given up: giving up the carry lost another table's
+    /// committed rows, and giving up the erase left objects a same-named table
+    /// read as its own. The name's gate stays closed meanwhile, so only an open
+    /// of that name waits. Then the gate opens and the pending record goes.
+    async fn sweep(self: Arc<Self>, file: Arc<KvFile>, gate: Arc<tokio::sync::Semaphore>) {
+        const FIRST: std::time::Duration = std::time::Duration::from_millis(200);
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut wait = FIRST;
+        while let Err(e) = self.carry_declarations(&file).await {
+            warn!("kv: carrying {}'s commit declarations failed, retrying in {wait:?}: {e}", file.name);
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(CEILING);
+        }
+        let mut wait = FIRST;
+        while let Err(e) = file.erase().await {
+            warn!("kv: erasing {} failed, retrying in {wait:?}: {e}", file.name);
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(CEILING);
+        }
+        if let Some((pending, store)) = self.pending.get()
+            && let Err(e) = pending.remove(store, &file.name)
+        {
+            warn!("kv: {} is swept but still recorded as pending; the next start sweeps it again: {e}", file.name);
+        }
+        // Closed first, then removed: a waiter holding the gate wakes either
+        // way, and one that reads the map after the removal finds nothing to
+        // wait for because there is not.
+        gate.close();
+        self.erasing.remove(&file.name);
     }
 
     /// The file `name` if it stands, opened if it has not been yet; `None` if
@@ -1931,11 +2016,15 @@ impl KvFile {
         if self.compacting.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        // Undone on every way out, a dropped future's included: every await
+        // in a compaction is a point it can already fail at, and failing
+        // unfreezes. A compaction cancelled part way used to leave the flag set
+        // and the overlay frozen, so every later one declined and a drop's
+        // sweep, which waits the flag out, spun for ever holding the
+        // maintenance gate — a backup's copy queued behind it, too.
+        let mut running = Compacting { file: self, succeeded: false };
         let result = self.compact_inner().await;
-        if result.is_err() {
-            self.abandon_freeze();
-        }
-        self.compacting.store(false, Ordering::Release);
+        running.succeeded = result.is_ok();
         result
     }
 
@@ -2525,6 +2614,21 @@ impl<'a> CompactionGuard<'a> {
     }
 }
 
+/// A compaction in progress: see [`KvFile::compact`].
+struct Compacting<'a> {
+    file: &'a KvFile,
+    succeeded: bool,
+}
+
+impl Drop for Compacting<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.file.abandon_freeze();
+        }
+        self.file.compacting.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for CompactionGuard<'_> {
     fn drop(&mut self) {
         self.file.compacting.store(false, Ordering::Release);
@@ -2604,6 +2708,60 @@ impl Clone for KvStorageProvider {
 }
 
 impl KvStorageProvider {
+    /// A handle on `name` that could not be opened: an empty file of that name,
+    /// already dropped and never registered. Reading it fails (it has no bytes
+    /// to read), a commit on it is refused and its writes go nowhere (a dropped
+    /// file stores nothing), and dropping it sweeps nothing — the real objects
+    /// of `name` are never touched through it.
+    pub(super) fn poisoned(&self, name: &str) -> Self {
+        let family = &self.family;
+        let file = Arc::new(KvFile {
+            store: family.store.clone(),
+            config: family.config.clone(),
+            cache: family.cache.clone(),
+            ledger: family.ledger.clone(),
+            maintenance: family.maintenance.clone(),
+            id: family.next_file_id.fetch_add(1, Ordering::Relaxed),
+            name: name.to_string(),
+            ledger_name: Arc::from(name),
+            gen_floor: Arc::new(AtomicU64::new(0)),
+            root: ArcSwap::from_pointee(format!("{}/{}", family.config.root, name)),
+            generation: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+            base_len: AtomicU64::new(0),
+            next_seq: Arc::new(AtomicU64::new(0)),
+            is_temp: false,
+            state: RwLock::new(State {
+                live: Overlay::new(),
+                frozen: None,
+                pending: Vec::new(),
+                in_flight: Vec::new(),
+                pending_bytes: 0,
+                committing: Vec::new(),
+                open_txns: HashMap::new(),
+                deltas: Vec::new(),
+                compacted_upto: 0,
+                reserved_seq: None,
+                delta_txns: HashMap::new(),
+                truncated_during_compaction: None,
+                aborting: Vec::new(),
+                undo: HashMap::new(),
+            }),
+            flush: tokio::sync::Mutex::new(()),
+            compacting: AtomicBool::new(false),
+            service: AtomicBool::new(false),
+            dropped: AtomicBool::new(true),
+            read_cursor: AtomicU64::new(u64::MAX),
+            prefetched_to: AtomicU64::new(0),
+            folds: AtomicU64::new(0),
+        });
+        Self {
+            family: family.clone(),
+            file,
+            hash: super::super::CRC.checksum(name.as_bytes()),
+        }
+    }
+
     /// Opens `name` in `family`, recovering whatever the store already holds.
     pub async fn open(family: Arc<KvFamily>, name: &str) -> io::Result<Self> {
         let file = family.open_file(name).await?;
@@ -2978,8 +3136,13 @@ impl StorageIO for KvStorageProvider {
         match KvStorageProvider::open(self.family.clone(), &name).await {
             Ok(provider) => provider,
             Err(e) => {
-                error!("kv: could not open {name}: {e}");
-                self.clone()
+                // The trait has no way to fail. Returning `self` used to send
+                // every read and write for `name` to this file instead: another
+                // table's bytes read as its own, and its writes landing in
+                // them. A handle that fails reads and refuses commits is
+                // loud instead, and touches nothing (see `poisoned`).
+                error!("kv: could not open {name}; every read of it fails and nothing written to it commits: {e}");
+                self.poisoned(&name)
             }
         }
     }
@@ -3026,42 +3189,21 @@ impl StorageIO for KvStorageProvider {
         // Guarded because `tokio::spawn` panics with no runtime, and a provider
         // dropped during shutdown may have outlived one. Leaving the objects
         // behind costs storage; panicking here would take the caller with it.
+        // On local disk before the sweep starts, so a server that stops
+        // before it finishes resumes it at the next open (see `pending`).
+        family.note_pending(&file.name);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
-                    // Retried: giving up loses another table's committed rows,
-                    // which is worse than a sweep that runs late.
-                    for attempt in 1..=5u64 {
-                        match family.carry_declarations(&file).await {
-                            Ok(()) => break,
-                            Err(e) if attempt < 5 => {
-                                warn!("kv: carrying {}'s commit declarations failed, retrying: {e}", file.name);
-                                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
-                            }
-                            Err(e) => error!(
-                                "kv: could not carry {}'s commit declarations before erasing it; transactions \
-                                 it declared lose their records in other files at the next restart: {e}",
-                                file.name
-                            ),
-                        }
-                    }
-                    if let Err(e) = file.erase().await {
-                        error!("kv: could not erase {}: {e}", file.name);
-                    }
-                    // Closed first, then removed: a waiter holding the gate
-                    // wakes either way, and one that reads the map after the
-                    // removal finds nothing to wait for because there is not.
-                    gate.close();
-                    family.erasing.remove(&file.name);
-                });
+                handle.spawn(family.sweep(file, gate));
             }
             Err(_) => {
-                // No runtime, so nothing will sweep and nothing must wait.
+                // No runtime, so nothing sweeps now and nothing may wait; the
+                // pending record has the next start do it.
                 gate.close();
                 family.erasing.remove(&file.name);
                 warn!(
-                    "kv: {} was dropped with no runtime to delete its objects; they are \
-                     orphaned",
+                    "kv: {} was dropped with no runtime to delete its objects; the next start \
+                     deletes them",
                     file.name
                 )
             }

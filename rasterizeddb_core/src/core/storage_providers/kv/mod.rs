@@ -10,6 +10,7 @@ pub mod cache;
 pub mod export;
 pub mod layout;
 pub mod overlay;
+pub mod pending;
 pub mod provider;
 pub mod store;
 

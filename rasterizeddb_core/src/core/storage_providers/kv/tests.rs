@@ -3311,3 +3311,154 @@ async fn a_carry_never_makes_a_dropped_name_again() {
     assert!(!family.file_names().iter().any(|n| n == "h.db"), "a gone name is registered again");
     assert!(store.list("t/h.db/").await.unwrap().is_empty());
 }
+
+/// Fails every delete while `failures` is above zero, counting down.
+struct FailingDeleteStore {
+    inner: MemoryKvStore,
+    failures: AtomicUsize,
+}
+
+impl KvStore for FailingDeleteStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get(key)
+    }
+    fn get_range<'a>(&'a self, key: &'a str, offset: u64, len: usize) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get_range(key, offset, len)
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.put(key, body)
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        if self
+            .failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Box::pin(async { Err(std::io::Error::other("store unreachable")) });
+        }
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn concurrency(&self) -> usize {
+        4
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// A compaction whose future is dropped part way clears its flag and gives
+/// its frozen overlay back. Left set, every later compaction declined and a
+/// drop's sweep, which waits the flag out, spun for ever.
+#[tokio::test]
+async fn a_cancelled_compaction_does_not_wedge_the_file() {
+    let held = HeldPutStore::holding("/a.db/g");
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let a = Arc::new(open(&family, "a.db").await);
+    let txn = a.begin_txn();
+    a.append_data_txn(txn, &vec![b'q'; 20_000]).await;
+    a.commit_durable(txn).await.unwrap();
+
+    held.armed.store(true, Ordering::Release);
+    let compaction = tokio::spawn({
+        let a = a.clone();
+        async move { a.compact_now().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    compaction.abort();
+    let _ = compaction.await;
+    held.armed.store(false, Ordering::Release);
+
+    // Still readable, and compacts again.
+    assert_eq!(read_all(&a).await, vec![b'q'; 20_000]);
+    a.compact_now().await.unwrap();
+    // And a drop's sweep finishes.
+    a.drop_io();
+    tokio::time::timeout(std::time::Duration::from_secs(5), open(&family, "a.db"))
+        .await
+        .expect("the sweep waited for a compaction that was gone");
+}
+
+/// The sweep never gives up: deletes that fail are retried until they work,
+/// with the name held meanwhile.
+#[tokio::test]
+async fn a_sweep_retries_until_the_store_lets_it() {
+    let failing = Arc::new(FailingDeleteStore {
+        inner: MemoryKvStore::new(),
+        failures: AtomicUsize::new(2),
+    });
+    let store: Arc<dyn KvStore> = failing.clone();
+    let family = open_family(store.clone()).await;
+    let a = open(&family, "a.db").await;
+    a.append_data(b"bytes", true).await;
+    a.drop_io();
+    let again = tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db"))
+        .await
+        .expect("the sweep gave up waiting");
+    assert!(read_all(&again).await.is_empty());
+    assert_eq!(failing.failures.load(Ordering::Acquire), 0, "the failures were never met");
+}
+
+/// A sweep a stop interrupted is resumed by the next open of the store, and
+/// holds the name until it is done; a finished sweep leaves no record.
+#[tokio::test]
+async fn a_sweep_interrupted_by_a_stop_resumes_at_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(super::pending::PENDING_FILE);
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+        let a = open(&family, "a.db").await;
+        a.append_data(b"left behind", true).await;
+    }
+    // What a drop records before its sweep, with the stop landing before the
+    // sweep ran.
+    super::pending::PendingErases::new(path.clone()).add("s", "a.db").unwrap();
+    assert!(!store.list("t/a.db/").await.unwrap().is_empty());
+
+    let family = open_family(store.clone()).await;
+    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+    // Opening the name waits for the resumed sweep, and finds nothing.
+    let a = tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db"))
+        .await
+        .expect("the resumed sweep did not finish");
+    assert!(read_all(&a).await.is_empty(), "the dropped bytes came back");
+    assert!(store.list("t/a.db/").await.unwrap().is_empty());
+    assert!(super::pending::PendingErases::new(path.clone()).names("s").is_empty());
+
+    // A drop in this process records the name, and its sweep clears it.
+    a.append_data(b"new", true).await;
+    a.drop_io();
+    drop(tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db")).await.unwrap());
+    assert!(super::pending::PendingErases::new(path).names("s").is_empty());
+}
+
+/// A file that cannot be opened gets a handle that fails, not the handle
+/// `create_new` was called on: reads fail, a commit is refused, and the real
+/// objects of the name are not touched, dropped or not.
+#[tokio::test]
+async fn a_handle_that_could_not_open_fails_instead_of_aliasing() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let seed = open(&family, "seed.db").await;
+    seed.append_data(b"seed bytes", true).await;
+    let real = open(&family, "b.db").await;
+    real.append_data(b"real bytes", true).await;
+
+    let poisoned = seed.poisoned("b.db");
+    let mut buffer = [0u8; 4];
+    let mut position = 0u64;
+    assert!(poisoned.read_data_into_buffer(&mut position, &mut buffer).await.is_err());
+    let txn = poisoned.begin_txn();
+    poisoned.append_data_txn(txn, b"lost").await;
+    assert!(poisoned.commit_durable(txn).await.is_err());
+    poisoned.drop_io();
+
+    assert_eq!(read_all(&seed).await, b"seed bytes".to_vec());
+    assert_eq!(read_all(&real).await, b"real bytes".to_vec());
+    assert!(!store.list("t/b.db/").await.unwrap().is_empty());
+}

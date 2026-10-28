@@ -218,6 +218,27 @@ a dropped table comes back:
 - **A reopen never gets the dropped file.** The sweep's gate is registered
   before the file leaves the map, and a dropped file still in the map is
   waited out, not returned.
+- **It never gives up, and it outlives a stop.** The carry and the erase are
+  each retried until the store lets them, backing off to 30 s; only an open of
+  that name waits meanwhile — `DROP` itself returns at once. The name is written
+  to `db_kv_erase.pending` beside `db_kv.cfg` before the sweep starts and taken
+  out when it ends, and a family that opens resumes every sweep listed there,
+  holding the name, before any table can open it. A server stopped mid-sweep
+  used to leave the objects for a same-named table to read as its own. The
+  file is left out of backup snapshots: a restored copy resuming a sweep would
+  delete from the store the live server uses.
+
+A cancelled compaction (its future dropped) unfreezes and clears its flag on
+the way out, as a failed one does; left set, every later compaction of the
+file declined and a sweep waited for it for ever.
+
+A file that cannot be opened — `KvFile::open` refuses a META whose chunk size
+it cannot use — comes back from `create_new` as a handle that fails rather
+than as the handle asked: an empty file of that name, already dropped and
+never registered, so reads fail, a commit is refused, and nothing reaches the
+name's real objects. `StorageIO::create_new` cannot return an error; the
+handle it used to return instead was the caller's own file, and a table's
+reads and writes went to another table's bytes.
 
 ## 5. The cache
 

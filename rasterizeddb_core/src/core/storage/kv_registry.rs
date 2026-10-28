@@ -286,6 +286,9 @@ pub struct KvRegistry {
     /// Held across render-write-rename, for the reason
     /// [`crate::core::storage::StorageManager::persist`] spells out.
     writing: Mutex<()>,
+    /// Unfinished sweeps of dropped files, one record for every store of this
+    /// database. See [`crate::core::storage_providers::kv::pending`].
+    pending: std::sync::OnceLock<Arc<crate::core::storage_providers::kv::pending::PendingErases>>,
 }
 
 impl std::fmt::Debug for KvRegistry {
@@ -309,6 +312,7 @@ impl KvRegistry {
             secrets: RwLock::new(HashMap::new()),
             open: tokio::sync::Mutex::new(HashMap::new()),
             writing: Mutex::new(()),
+            pending: std::sync::OnceLock::new(),
         }
     }
 
@@ -579,6 +583,16 @@ impl KvRegistry {
             "key/value store '{name}' opened ({})",
             family.store().describe()
         );
+        // Before any table can open a file of it: a sweep a stop interrupted
+        // resumes here, with its name held.
+        if let Some(root) = &self.root {
+            use crate::core::storage_providers::kv::pending::{PENDING_FILE, PendingErases};
+            let pending = self
+                .pending
+                .get_or_init(|| Arc::new(PendingErases::new(Path::new(root).join(PENDING_FILE))))
+                .clone();
+            family.attach_pending(pending, name);
+        }
         // So a backup copying this store can pause it: see
         // `kv::export`.
         crate::core::storage_providers::kv::export::register_live(&family);

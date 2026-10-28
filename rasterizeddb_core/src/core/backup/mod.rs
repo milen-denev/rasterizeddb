@@ -148,6 +148,10 @@ const EXCLUDED: &[&str] = &[
     STAGING_DIR,
     // A snapshot's copy of its cold tables, which it lists itself.
     cold::COLD_DIR,
+    // Sweeps of dropped key/value files still to finish. A restored copy that
+    // resumed one would delete from the store the live server still uses.
+    "db_kv_erase.pending",
+    "db_kv_erase.pending.tmp",
 ];
 
 /// Whether a file is left out of every snapshot: [`EXCLUDED`], and the
