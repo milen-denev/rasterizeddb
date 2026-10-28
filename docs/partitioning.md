@@ -554,6 +554,20 @@ cascade; `fk_reverse` reached only through the slot primitives):
   `user_preferences` table with a primary key, a UNIQUE, a CHECK named
   `references_check` and a key on `references_id`, plain and partitioned).
 
+**On fix/index-ddl** (rebased onto `aa2d345`): its `ALTER TABLE … ADD
+COLUMN … REFERENCES` expansion sends the key, unnamed, through this
+slice's `add_foreign_key`, which names it `<t>_<col>_fkey` (or as written
+with `CONSTRAINT n`), validates the rows (a `DEFAULT` no parent holds:
+23503, and fix/index-ddl drops the column again), refuses a type mismatch
+with 42804 (the column goes too) and honours `NOT VALID`; ADD FOREIGN KEY in
+a READ ONLY block is 25006. Both branches made the whole-word FK detection
+change at the ALTER arm, `fk_parent_of_clause` and the partitioned refusal;
+the rebase keeps fix/index-ddl's spelling there. Pinned by
+`partition_fk::add_column_references_goes_through_the_foreign_key_path` (a
+populated and an empty plain child, an empty partitioned one). Unlike
+PostgreSQL, whose column constraints take no `NOT VALID` (a syntax error
+there), `ADD COLUMN … REFERENCES … NOT VALID` is accepted here.
+
 **Behaviour changes for plain tables** (the same code serves both kinds):
 
 - `ADD CONSTRAINT … FOREIGN KEY` validates the rows already there (23503,

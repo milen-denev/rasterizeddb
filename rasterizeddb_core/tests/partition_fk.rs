@@ -959,3 +959,59 @@ fn a_name_holding_references_is_no_foreign_key() {
     }
 }
 
+
+
+/// `ALTER TABLE … ADD COLUMN … REFERENCES` (fix/index-ddl's inline
+/// expansion) through this slice's `add_foreign_key`, on a populated plain
+/// child and an empty plain and partitioned one: the key is named
+/// `<t>_<col>_fkey` (or as written) and enforced; a DEFAULT no parent holds
+/// fails validation (23503) on the populated child and the column is
+/// dropped again; a type mismatch is 42804 and the column goes; `NOT VALID`
+/// keeps the rows unchecked; and ADD FOREIGN KEY in a READ ONLY block is
+/// 25006. A populated partitioned child refuses ADD COLUMN itself (phase 6).
+#[test]
+fn add_column_references_goes_through_the_foreign_key_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    c.ok("CREATE TABLE ap (id INT NOT NULL PRIMARY KEY)");
+    c.ok("INSERT INTO ap (id) VALUES (1), (2)");
+    let code = |c: &mut Client, sql: &str| c.simple(sql).expect_err(sql).code;
+    for (t, part, rows) in [("ac", "", true), ("acr", "", false), ("acq", " PARTITION BY HASH (cid) PARTITIONS 4", false)] {
+        c.ok(&format!("CREATE TABLE {t} (cid BIGINT NOT NULL PRIMARY KEY, v INT){part}"));
+        if rows {
+            c.ok(&format!("INSERT INTO {t} (cid, v) VALUES (1, 10), (2, 20)"));
+        }
+        c.ok(&format!("ALTER TABLE {t} ADD COLUMN pid INT REFERENCES ap(id)"));
+        assert_eq!(code(&mut c, &format!("ALTER TABLE {t} ADD COLUMN tx TEXT REFERENCES ap(id)")), "42804", "{t}");
+        assert!(c.simple(&format!("SELECT tx FROM {t}")).is_err(), "{t}: the column was not dropped again");
+        c.ok(&format!("ALTER TABLE {t} ADD COLUMN s INT CONSTRAINT {t}_s_named REFERENCES ap(id)"));
+        assert_eq!(code(&mut c, &format!("INSERT INTO {t} (cid, s) VALUES (20, 7)")), "23503", "{t}");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_s_named"));
+        c.ok("BEGIN READ ONLY");
+        assert_eq!(code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT ro FOREIGN KEY (v) REFERENCES ap(id)")), "25006", "{t}");
+        c.ok("ROLLBACK");
+        assert_eq!(code(&mut c, &format!("INSERT INTO {t} (cid, v, pid) VALUES (9, 9, 9)")), "23503", "{t}");
+        c.ok(&format!("INSERT INTO {t} (cid, v, pid) VALUES (8, 8, 2)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pid_fkey"));
+        c.ok(&format!("INSERT INTO {t} (cid, v, pid) VALUES (9, 9, 9)"));
+        if !part.is_empty() {
+            // Populated now: ADD COLUMN itself is the physical rewrite
+            // phase 6 builds.
+            let e = c.simple(&format!("ALTER TABLE {t} ADD COLUMN q INT DEFAULT 5 REFERENCES ap(id)")).expect_err("populated");
+            assert!(e.is_unsupported(), "{t}: {e}");
+            continue;
+        }
+        // Rows no parent 5 covers: refused, and the column goes again.
+        assert_eq!(code(&mut c, &format!("ALTER TABLE {t} ADD COLUMN q INT DEFAULT 5 REFERENCES ap(id)")), "23503", "{t}");
+        assert!(c.simple(&format!("SELECT q FROM {t}")).is_err(), "{t}: the column was not dropped again");
+        let n = c.ok(&format!("SELECT count(*) FROM {t}")).rows;
+        c.ok(&format!("ALTER TABLE {t} ADD COLUMN r INT DEFAULT 5 REFERENCES ap(id) NOT VALID"));
+        assert_eq!(c.ok(&format!("SELECT count(*) FROM {t} WHERE r = 5")).rows, n, "{t}");
+        assert_eq!(code(&mut c, &format!("ALTER TABLE {t} VALIDATE CONSTRAINT {t}_r_fkey")), "23503", "{t}");
+        let _ = rows;
+    }
+    c.ok("CREATE TABLE acp (cid BIGINT NOT NULL PRIMARY KEY, v INT) PARTITION BY HASH (cid) PARTITIONS 4");
+    c.ok("INSERT INTO acp (cid, v) VALUES (1, 1)");
+    assert!(c.simple("ALTER TABLE acp ADD COLUMN pid INT REFERENCES ap(id)").expect_err("populated").is_unsupported());
+}
