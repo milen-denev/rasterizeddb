@@ -6725,20 +6725,46 @@ fn unquoted(message: &str) -> String {
 /// Blanking can also take the engine's own words with it, where a client
 /// text happens to repeat them: a real duplicate inserting the value
 /// `'unique column "n"'` lost "UNIQUE column "n"" from "duplicate value for
-/// UNIQUE column "n"" and answered XX000, not 23505. The blanking exists to
-/// keep a client's text from choosing a code a client acts on blindly — a
-/// retry (40xxx), a cancellation (57014), a lock wait (55P03) — so when it
-/// leaves nothing recognisable, the message's own integrity (23) or
-/// statement (42) class stands.
+/// UNIQUE column "n"" and answered XX000, not 23505. When blanking leaves
+/// nothing recognisable, an integrity violation's own phrase stands — but
+/// only an occurrence that is not wholly inside a text the statement wrote:
+/// a message echoing the client's text unescaped (`Column '…' not found`)
+/// must not let that text pick 23505 either.
 pub(crate) fn sqlstate_in(message: &str, statement: &str) -> &'static str {
     let blanked = sqlstate_for(&blank_client_texts(message, statement));
     if blanked != "XX000" {
         return blanked;
     }
-    match sqlstate_for(message) {
-        code if code.starts_with("23") || code.starts_with("42") => code,
-        _ => blanked,
-    }
+    engine_integrity_phrase(message, statement).unwrap_or(blanked)
+}
+
+/// The integrity class of `message` by a phrase of the engine's own that
+/// [`blank_client_texts`] took out with a client text overlapping it: an
+/// occurrence of the phrase reaching outside every place the message
+/// repeats a text of `statement`, or opening the message — an engine
+/// message that echoes a client's text puts its own words first
+/// (`Column '…'`, `invalid input syntax …: "…"`), so a value spelling the
+/// whole phrase (`'duplicate value for UNIQUE column "n"'`) cannot take it.
+fn engine_integrity_phrase(message: &str, statement: &str) -> Option<&'static str> {
+    const PHRASES: &[(&str, &str)] = &[
+        ("duplicate value for unique", "23505"),
+        ("duplicate key value", "23505"),
+        ("violates foreign key constraint", "23503"),
+        ("violates not-null constraint", "23502"),
+        ("violates check constraint", "23514"),
+    ];
+    let lower = message.to_lowercase();
+    let spans: Vec<(usize, usize)> = client_forms(statement)
+        .iter()
+        .filter(|f| !f.is_empty())
+        .flat_map(|f| lower.match_indices(f.as_str()).map(|(at, m)| (at, at + m.len())).collect::<Vec<_>>())
+        .collect();
+    PHRASES.iter().find_map(|(phrase, code)| {
+        lower
+            .match_indices(phrase)
+            .any(|(at, _)| at == 0 || !spans.iter().any(|&(start, end)| start <= at && at + phrase.len() <= end))
+            .then_some(*code)
+    })
 }
 
 /// [`materialize_sqlstate`] with [`sqlstate_in`]'s blanking.
@@ -6752,12 +6778,20 @@ pub(crate) fn materialize_sqlstate_in(message: &str, statement: &str) -> &'stati
 /// quote doubled (`sql_literal`, `value_codec::double_quoted`).
 fn blank_client_texts(message: &str, statement: &str) -> String {
     let mut out = message.to_lowercase();
-    let texts = quoted_client_texts(statement);
-    if texts.is_empty() {
-        return out;
+    let forms = client_forms(statement);
+    for form in forms.iter().filter(|f| !f.is_empty()) {
+        if out.contains(form.as_str()) {
+            out = out.replace(form.as_str(), &" ".repeat(form.len()));
+        }
     }
+    out
+}
+
+/// Every form a message may repeat a quote-holding text of `statement` in,
+/// lowercased, longest first ([`blank_client_texts`]).
+fn client_forms(statement: &str) -> Vec<String> {
     let mut forms: Vec<String> = Vec::new();
-    for (written, text) in texts {
+    for (written, text) in quoted_client_texts(statement) {
         let text = text.to_lowercase();
         forms.push(written.to_lowercase());
         forms.push(text.replace('\'', "''"));
@@ -6767,12 +6801,7 @@ fn blank_client_texts(message: &str, statement: &str) -> String {
     // Longest first: a shorter form is often inside a longer one.
     forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     forms.dedup();
-    for form in forms.iter().filter(|f| !f.is_empty()) {
-        if out.contains(form.as_str()) {
-            out = out.replace(form.as_str(), &" ".repeat(form.len()));
-        }
-    }
-    out
+    forms
 }
 
 /// Each `'…'` string and `"…"` identifier in `statement` that holds a quote
@@ -11194,6 +11223,27 @@ mod sqlstate_tests {
                 let code = sqlstate_for(&message);
                 assert!(!code.starts_with("40") && !code.starts_with("57") && code != "55P03", "{ty:?}: {message} -> {code}");
             }
+        }
+    }
+
+    /// When blanking leaves nothing recognisable, an integrity phrase of the
+    /// engine's own stands, and one wholly inside the client's text does not.
+    #[test]
+    fn an_integrity_phrase_counts_only_outside_the_clients_text() {
+        // The engine's phrase overlapping a client text: its own words stand.
+        let stmt = r#"INSERT INTO su VALUES (2, 1, 'unique column "n"')"#;
+        assert_eq!(sqlstate_in(r#"duplicate value for UNIQUE column "n" (row 1 already holds it)"#, stmt), "23505");
+        let stmt = r#"INSERT INTO child VALUES (1, '"child" violates foreign', 5)"#;
+        let message = r#"insert or update on table "child" violates foreign key constraint "fk": key (p)=(5) is not present"#;
+        assert_eq!(sqlstate_in(message, stmt), "23503");
+        // The phrase wholly inside the client's text, echoed unescaped by a
+        // message that is otherwise nothing: not an integrity violation.
+        for (stmt, message) in [
+            (r#"SELECT 'x" duplicate key value "y' FROM t"#, r#"internal: 'x" duplicate key value "y' broke"#),
+            (r#"SELECT 'a" violates check constraint "b' FROM t"#, r#"internal: 'a" violates check constraint "b' broke"#),
+            (r#"SELECT "c' duplicate value for unique 'd" FROM t"#, r#"internal: "c' duplicate value for unique 'd" broke"#),
+        ] {
+            assert_eq!(sqlstate_in(message, stmt), "XX000", "{stmt}: {message}");
         }
     }
 
