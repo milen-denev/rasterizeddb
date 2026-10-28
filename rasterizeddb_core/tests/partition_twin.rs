@@ -2284,6 +2284,14 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
                 t.neutralize_aborted_now().await.expect("a plain table's forget sweep");
             }
         }
+        // Every other partitioned table (the partitioned side's `{k}`) whole.
+        for name in db.table_names() {
+            if name != PART
+                && let Some(other) = db.partitioned_table(&name)
+            {
+                other.sweep_pins_now().await.expect("another partitioned table's forget sweeps");
+            }
+        }
         let (mut swept, mut left) = (Vec::new(), Vec::new());
         if let Some(pt) = db.partitioned_table(PART) {
             let epoch = pt.epoch().expect("the partitioned table opens");
@@ -2296,6 +2304,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
                 }
             }
         }
+        // A table a DDL reloaded keeps its old instance's registration until
+        // that instance's vacuum service notices, within a quarter second.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         (swept, left, db.transactions.try_forget())
     })
 }
