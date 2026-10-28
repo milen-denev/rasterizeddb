@@ -3112,3 +3112,41 @@ async fn a_family_opened_during_a_pause_is_paused_too() {
     drop(paused);
     compaction.await.unwrap().unwrap();
 }
+
+/// A file dropped while a flush is putting its records leaves nothing in the
+/// store. The sweep used to list and delete while the put was in flight, and
+/// the put then landed: an orphan delta that a table later made under the
+/// same name replayed after a restart — and an untransacted record, a schema
+/// header or the id sequence, applies with no declaration at all.
+#[tokio::test]
+async fn a_put_in_flight_when_a_file_is_dropped_leaves_nothing_behind() {
+    let held = Arc::new(HeldPutStore {
+        inner: MemoryKvStore::new(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let a = Arc::new(open(&family, "a.db").await);
+    a.append_data(b"old header", false).await;
+
+    held.armed.store(true, Ordering::Release);
+    let flush = tokio::spawn({
+        let a = a.clone();
+        async move { a.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    a.drop_io();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    held.armed.store(false, Ordering::Release);
+    held.release.add_permits(16);
+    flush.await.unwrap().unwrap();
+
+    // Reopening the name waits for the sweep.
+    let again = open(&family, "a.db").await;
+    assert!(read_all(&again).await.is_empty(), "the dropped file's bytes came back");
+    assert!(store.list("t/a.db/").await.unwrap().is_empty(), "an object outlived the drop");
+    drop(again);
+    let restarted = open(&open_family(store).await, "a.db").await;
+    assert!(read_all(&restarted).await.is_empty(), "a restart replayed the dropped file");
+}

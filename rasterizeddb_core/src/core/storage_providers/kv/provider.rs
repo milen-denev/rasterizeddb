@@ -1523,6 +1523,25 @@ impl KvFile {
 
     /// The body of [`Self::flush_locked`]. Caller holds the flush lock.
     async fn write_batch(&self, commit: Option<u64>) -> Result<(), CommitFailure> {
+        // A dropped file's objects are being swept (`erase`), or are gone. A
+        // batch put now would outlive the sweep, and a table later made under
+        // the same name would replay it after a restart. Nothing reads a
+        // dropped file, so its records go nowhere — and a commit on one, which
+        // DROP's lock should make impossible, is refused rather than claimed.
+        if self.dropped.load(Ordering::Acquire) {
+            let mut state = self.state.write();
+            state.pending.clear();
+            state.pending_bytes = 0;
+            state.committing.clear();
+            state.aborting.clear();
+            return match commit {
+                None => Ok(()),
+                Some(txn) => Err(CommitFailure {
+                    error: io::Error::other(format!("{} was dropped; transaction {txn} cannot commit on it", self.name)),
+                    rolled_back: true,
+                }),
+            };
+        }
         let (records, committed, aborted, seq, base_gen, reopen) = {
             let mut state = self.state.write();
             let mut reopen = None;
@@ -2267,6 +2286,12 @@ impl KvFile {
 
     async fn erase(&self) -> io::Result<()> {
         let _maintenance = self.maintenance.read().await;
+        // A flush already putting a batch finishes first, so its object is in
+        // the listing below rather than landing after the sweep: an orphan a
+        // same-named table replayed after a restart — an untransacted record
+        // (a schema header, the id sequence) needs no declaration to apply.
+        // Later flushes see `dropped` and put nothing.
+        let _serialised = self.flush.lock().await;
         let root = self.root();
         let prefix = if self.is_temp {
             // Scratch shares the real file's prefix. Sweeping it would take the
