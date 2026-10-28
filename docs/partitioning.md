@@ -596,20 +596,47 @@ the CHECK, UNIQUE, DEFAULT, index, type-modifier, generated-column, JSON
 and path-index sidecars were written the same way, and an all-zero UNIQUE
 record reads as a live key with no columns.
 
-The fix is at the writer: `torn_tail::append_records` is the one writer of
-those nine sidecars, an in-place write at the file's end, which the log
-holds back until its commit has synced. A cut before that sync leaves the
-file as it was, after it the replay writes the record whole; the append
-reports an error it used to drop. Each loader also skips a record of zeros
+The fix is at the writer: `torn_tail::SidecarWrites` is the one writer of
+those nine sidecars. A statement stages its records (each module's
+`stage`; `append` is a batch of one), and the commit writes each file once,
+in place at its length, which the log holds back until its commit has
+synced, all under one transaction committed once. A cut before that sync
+leaves every file as it was; after it, the replay writes every record
+whole: all of the statement's records or none, across files. The commit
+reports a write's error, which the append dropped. `CREATE TABLE` stages
+its primary-key header rewrite in the same transaction, and ADD COLUMN, a
+rewrite's carried index declarations and RENAME's sequence defaults batch
+theirs. Each loader also skips a record of zeros
 (`torn_tail::is_unwritten`, which no declaration encodes to), for files a
-build before this wrote. Cost: one log sync per sidecar record a statement
-writes (the append deferred it to the statement's). The `FIELDS` sidecar
-and the schema header keep the logged append: they are written by `CREATE
+build before this wrote.
+
+Syncs, counted with `strace -f` around each statement
+(`torn_tail::tests::sidecar_sync_count_probe`; tmpfs hides what a sync
+costs, never how many there are), log `fdatasync`s:
+
+| statement | before (`c29e3d9`) | one commit per record | batched |
+|---|---|---|---|
+| `CREATE TABLE` with a PK, 2 UNIQUE, 2 CHECK, 3 DEFAULT, 2 `NUMERIC(p,s)`, 1 FK | 2 | 12 | 2 |
+| `ADD CONSTRAINT … FOREIGN KEY` | 1 (after the statement returned, 3 runs of 3) | 1 | 1 |
+| `CREATE INDEX` | 1 | 1 | 1 |
+| `ALTER COLUMN … SET DEFAULT`, `ADD CONSTRAINT … CHECK` | 1 (after it returned, 1 run of 3) | 1 | 1 |
+
+Batched, `CREATE TABLE`'s sidecar records and header take one log sync
+on the statement's thread; the other is taken on another thread while
+the statement runs, before the batch (the schema and field records go in
+as logged appends left to a later sync). Its 29 directory syncs (two per
+file created) and the storage-config sync are the same in all three
+columns. Before, a single-record `ALTER` could return before its log sync;
+now it returns after. The `FIELDS` sidecar and the schema file's first
+write (`TableSchema::save`) keep the logged append: they are written by `CREATE
 TABLE`, before the catalogue names the table, or under `reload_atomic` and
 `rewrite_table`, whose backup and intent put the files back after a cut.
 Pinned by `torn_tail::tests::a_schema_record_reads_whole_after_a_cut_once_appended`
 (each sidecar cut after each of its last three records, past a page
-boundary, every seed kind: exactly the records appended, whole) and
+boundary, every seed kind: exactly the records appended, whole),
+`…::a_statements_sidecar_records_read_all_or_none_after_a_cut` (six
+sidecars in one batch, cut inside every log sync of its commit and after
+it: all or none, and both happen) and
 `…::a_schema_record_of_zeros_reads_as_no_declaration`.
 
 **Behaviour changes for plain tables** (the same code serves both kinds):
