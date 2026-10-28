@@ -351,19 +351,11 @@ impl Database {
     /// reference one of `columns` of `parent` (`None`: any column): the only
     /// children a column's DDL on the parent rewrites or reads, so an ADD,
     /// DROP or RENAME COLUMN waits for no other child's readers.
+    ///
+    /// Read from the reverse index (`Database::referencing_keys`), not a
+    /// walk of every schema.
     pub(crate) fn fk_children_on(&self, parent: &str, columns: Option<&[&str]>) -> Vec<String> {
-        let mut children = Vec::new();
-        self.each_schema(|name, schema| {
-            if schema.foreign_keys.iter().any(|fk| {
-                !fk.is_deleted
-                    && fk.parent_table.eq_ignore_ascii_case(parent)
-                    && columns.is_none_or(|cs| cs.iter().any(|c| fk.parent_column.eq_ignore_ascii_case(c)))
-            }) {
-                children.push(name.to_string());
-            }
-        });
-        children.sort();
-        children
+        self.fk_children_from_reverse(parent, columns)
     }
 
     /// Takes a statement's whole known table set at once (§7 Acquisition):

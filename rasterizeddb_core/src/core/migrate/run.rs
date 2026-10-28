@@ -366,7 +366,7 @@ async fn load(
     for table in &plan.tables {
         for statement in &table.foreign_keys {
             log::info!("{}", statement);
-            run_ddl(database, statement).await?;
+            add_foreign_key(database, &table.name, statement, &mut report.notes).await?;
             if let Some(entry) = report.tables.iter_mut().find(|t| t.name == table.name) {
                 entry.foreign_keys += 1;
             }
@@ -651,6 +651,36 @@ fn build_statement(
 }
 
 /// Runs one DDL statement, failing the import if it does not work.
+/// One of the plan's `ADD … FOREIGN KEY` statements. The target validates the
+/// rows already there (23503 for one with no parent), which a source can
+/// hold under a key it did validate: rows loaded with `pg_restore
+/// --disable-triggers` or `session_replication_role = replica` skip the
+/// check. Such a key is added `NOT VALID` instead, enforced on new writes as
+/// the source enforces it, and a note names the table and the key, rather
+/// than ending the import at its last step with the remaining keys unadded.
+async fn add_foreign_key(
+    database: &Arc<Database>,
+    table: &str,
+    statement: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    match run_ddl(database, statement).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.contains("violates foreign key constraint") && !statement.trim_end().ends_with("NOT VALID") => {
+            let retry = format!("{} NOT VALID", statement.trim_end());
+            log::warn!("{e}\n  retried as: {retry}");
+            run_ddl(database, &retry).await?;
+            let detail = e.lines().next().unwrap_or_default();
+            notes.push(format!(
+                "table {table}: rows in the source break a foreign key it enforces ({detail}); the key was \
+                 added NOT VALID, so it holds for new writes and the rows already there were left as they are"
+            ));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn run_ddl(database: &Arc<Database>, sql: &str) -> Result<(), String> {
     let Some(purpose) = recognize_query_purpose(sql) else {
         return Err(format!(
@@ -913,6 +943,66 @@ mod load_tests {
     async fn select(database: &Arc<Database>, sql: &str) -> Vec<u8> {
         let purpose = recognize_query_purpose(sql).expect("parse");
         executor::execute(purpose, database.clone()).await
+    }
+
+    /// A key the source enforced while its rows break it (rows let in by
+    /// `pg_restore --disable-triggers`): the import's last step adds it
+    /// `NOT VALID` with a note naming the table, never aborts, and the key
+    /// holds for new writes; a key the source never validated is added `NOT
+    /// VALID` as planned, its orphans kept; a clean key is validated as
+    /// usual, and another failure still ends the import (P4 round 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_key_broken_by_the_source_rows_is_added_not_valid_with_a_note() {
+        let database = crate::replication::test_support::in_memory_database().await;
+        for sql in [
+            "CREATE TABLE fk_p (id BIGINT NOT NULL PRIMARY KEY)",
+            "INSERT INTO fk_p (id) VALUES (1), (2)",
+            "CREATE TABLE fk_c (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_c (id, p) VALUES (1, 1), (2, 99)",
+            "CREATE TABLE fk_d (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_d (id, p) VALUES (1, 98)",
+            "CREATE TABLE fk_e (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_e (id, p) VALUES (1, 2)",
+        ] {
+            run_ddl(&database, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let mut notes = Vec::new();
+        add_foreign_key(&database, "fk_c", "ALTER TABLE fk_c ADD CONSTRAINT fk_c_p FOREIGN KEY (p) REFERENCES fk_p (id)", &mut notes)
+            .await
+            .expect("an orphan in the source does not end the import");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("fk_c") && notes[0].contains("NOT VALID") && notes[0].contains("99"), "{notes:?}");
+        let e = run_ddl(&database, "INSERT INTO fk_c (id, p) VALUES (3, 97)").await.expect_err("enforced on new writes");
+        assert!(e.contains("violates foreign key constraint"), "{e}");
+        run_ddl(&database, "INSERT INTO fk_c (id, p) VALUES (4, 2)").await.expect("a row with a parent");
+        let e = run_ddl(&database, "ALTER TABLE fk_c VALIDATE CONSTRAINT fk_c_p").await.expect_err("the orphan is there");
+        assert!(e.contains("violates foreign key constraint") && e.contains("99"), "{e}");
+        run_ddl(&database, "DELETE FROM fk_c WHERE p = 99").await.unwrap();
+        run_ddl(&database, "ALTER TABLE fk_c VALIDATE CONSTRAINT fk_c_p").await.expect("valid now");
+
+        // Planned NOT VALID (the source never validated it): no retry, no
+        // second note.
+        let mut notes = Vec::new();
+        add_foreign_key(
+            &database,
+            "fk_d",
+            "ALTER TABLE fk_d ADD CONSTRAINT fk_d_p FOREIGN KEY (p) REFERENCES fk_p (id) NOT VALID",
+            &mut notes,
+        )
+        .await
+        .expect("NOT VALID");
+        assert!(notes.is_empty(), "{notes:?}");
+        let e = run_ddl(&database, "INSERT INTO fk_d (id, p) VALUES (2, 96)").await.expect_err("enforced");
+        assert!(e.contains("violates foreign key constraint"), "{e}");
+
+        add_foreign_key(&database, "fk_e", "ALTER TABLE fk_e ADD CONSTRAINT fk_e_p FOREIGN KEY (p) REFERENCES fk_p (id)", &mut notes)
+            .await
+            .expect("clean");
+        assert!(notes.is_empty(), "{notes:?}");
+        let e = add_foreign_key(&database, "fk_e", "ALTER TABLE fk_e ADD CONSTRAINT fk_e_q FOREIGN KEY (p) REFERENCES nowhere (id)", &mut notes)
+            .await
+            .expect_err("another failure ends the import");
+        assert!(e.contains("does not exist"), "{e}");
     }
 
     /// The importer runs as a named owner, never unowned (§7 Owner): its DDL

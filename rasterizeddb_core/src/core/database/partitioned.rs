@@ -364,27 +364,11 @@ impl Database {
                 key.len()
             )));
         }
-        // FKs both ways are phase 3's: a check through a shell, or a cascade
-        // into one, has no partition to read.
-        if !ct.foreign_keys.is_empty() {
-            return Err(unsupported("FOREIGN KEY on a partitioned table is not supported yet"));
-        }
-        let mut referencing = None;
-        self.each_schema(|table, schema| {
-            if referencing.is_none()
-                && schema
-                    .foreign_keys
-                    .iter()
-                    .any(|fk| !fk.is_deleted && fk.parent_table.eq_ignore_ascii_case(name))
-            {
-                referencing = Some(table.to_string());
-            }
-        });
-        if let Some(table) = referencing {
-            return Err(unsupported(format!(
-                "table \"{table}\" has a FOREIGN KEY naming \"{name}\"; a partitioned table as the parent of a \
-                 FOREIGN KEY is not supported yet"
-            )));
+        // Foreign keys both ways (phase 3 P4): each one it declares checked
+        // as a plain CREATE checks it, and any naming it (or itself) must
+        // reference its whole partition key, so every check routes.
+        if let Some(why) = self.create_foreign_key_refusal(ct, Some(key)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
         }
         // A shredded JSON column is a shadow table the drop would have to
         // follow; refused rather than half-handled.

@@ -520,7 +520,9 @@ impl Database {
         // A partitioned table's schema files are its shell's,
         // `__pt_<uid>_schema*`: held aside under that stem (§11).
         let mut tables = vec![self.schema_files_stem(table_name)];
-        tables.extend(also);
+        // A partitioned child's too (phase 3 P4): its schema files are its
+        // shell's, under `__pt_<uid>`, never its logical name.
+        tables.extend(also.iter().map(|child| self.schema_files_stem(child)));
         self.reload_with_instance(table_name, |old| async move {
             let backup = self
                 .backup_begin(&tables, FileSet::Schema)

@@ -942,6 +942,129 @@ pub async fn substitute_in_subqueries(
 /// limit is generous next to any real schema, so hitting it means a cycle.
 const MAX_CASCADE_DEPTH: usize = 16;
 
+/// A key value moved from one side of a foreign key to the other's column
+/// type (P4 round 3), as PostgreSQL compares a cross-type key: `literal`,
+/// a value of `from`, read at `from`'s type, written at `to`'s and rendered
+/// as `to`'s literal, which the probe of `to`'s table then compares with its
+/// column at its own type (so an `INT` 7 finds a `NUMERIC(10,2)` 7.00, and a
+/// partitioned parent routes by the bytes the parent row was routed by).
+///
+/// `None` when the move loses the value (`7.50` to an integer, a
+/// non-midnight timestamp to a date, a `DOUBLE` 0.1 to a `REAL`, an `INT8`
+/// past an `INT4`): no value of `to` equals it, as PostgreSQL's comparison
+/// in the wider type finds none. Unchanged when the two columns' types and
+/// scales are one (the common case, no work), and when `literal` does not
+/// read at `from`'s type (the probe then reports it as it always did).
+fn coerce_key_literal(
+    literal: &str,
+    from: &crate::core::row::schema::SchemaField,
+    from_modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+    to: &crate::core::row::schema::SchemaField,
+    to_modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<String> {
+    if from.db_type == to.db_type && from.scale == to.scale {
+        return Some(literal.to_string());
+    }
+    let encode = |text: &str, field: &crate::core::row::schema::SchemaField, mods| {
+        let out = crate::core::rql::lexer_ir::encode_column_value(text, field, mods);
+        // An encoder's refusal is this coercion's only.
+        let _ = crate::core::rql::lexer_ir::take_refusal();
+        out.map(|block| block.into_slice().to_vec()).filter(|bytes| !bytes.is_empty())
+    };
+    let Some(from_bytes) = encode(literal.trim(), from, from_modifiers) else {
+        return Some(literal.to_string());
+    };
+    // REAL and DOUBLE compare as PostgreSQL's cross-type float operators do,
+    // in double precision: a REAL widens exactly, and a DOUBLE has a REAL
+    // equal to it only when it is one exactly (`0.1` is not: its REAL is
+    // 0.100000001490116…). Through text, the shortest renderings (`0.1` both)
+    // would call them equal.
+    use crate::core::db_type::DbType::{F32, F64};
+    match (&from.db_type, &to.db_type, from_bytes.as_slice()) {
+        (F32, F64, b) if b.len() == 4 => {
+            return Some(f64::from(f32::from_le_bytes(b.try_into().ok()?)).to_string());
+        }
+        (F64, F32, b) if b.len() == 8 => {
+            let wide = f64::from_le_bytes(b.try_into().ok()?);
+            let narrow = wide as f32;
+            return (f64::from(narrow) == wide).then(|| narrow.to_string());
+        }
+        _ => {}
+    }
+    let Ok(from_text) = key_literal(from, &from_bytes) else {
+        return Some(literal.to_string());
+    };
+    // The value as the target type's reader takes it: a number in its plain
+    // canonical form (an integer column does not read `7.00`), a date as the
+    // date part of a timestamp (whose time the comparison below then checks).
+    use crate::core::db_type::DbType as T;
+    let input = match &to.db_type {
+        T::I8 | T::I16 | T::I32 | T::I64 | T::I128 | T::U8 | T::U16 | T::U32 | T::U64 | T::U128 | T::F32 | T::F64
+        | T::DECIMAL => crate::core::rql::foreign_key::canonical_key_text(&from_text, &from.db_type),
+        T::DATE => {
+            let bare = from_text.trim().trim_matches('\'');
+            format!("'{}'", bare.split_whitespace().next().unwrap_or(bare))
+        }
+        _ => from_text.clone(),
+    };
+    let to_text = key_literal(to, &encode(&input, to, to_modifiers)?).ok()?;
+    let same = crate::core::rql::foreign_key::canonical_key_text(&from_text, &from.db_type)
+        == crate::core::rql::foreign_key::canonical_key_text(&to_text, &to.db_type);
+    same.then_some(to_text)
+}
+
+/// `fk`'s two columns, the child's in `child` and the parent's (its own
+/// table's for a self-reference), each with its table's type modifiers:
+/// what [`coerce_key_literal`] moves values between. `None` when either is
+/// not there (the probe then reports it).
+#[allow(clippy::type_complexity)]
+fn fk_key_fields(
+    database: &Arc<Database>,
+    child: &crate::core::row::schema::TableSchema,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+) -> Option<(
+    (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
+    (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
+)> {
+    let field = |schema: &crate::core::row::schema::TableSchema, name: &str| {
+        schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .map(|f| (f.clone(), schema.type_modifiers.clone()))
+    };
+    let child_side = field(child, &fk.column)?;
+    let parent_side = if fk.parent_table.eq_ignore_ascii_case(&child.name) {
+        field(child, &fk.parent_column)?
+    } else {
+        let view = database.schema_view(&fk.parent_table)?;
+        field(view.schema(), &fk.parent_column)?
+    };
+    Some((child_side, parent_side))
+}
+
+/// Parent key literals (`parent_column`'s values, as `key_literal` renders
+/// them) at `fk`'s child column's type, index for index: `None` where the
+/// value cannot equal any child value ([`coerce_key_literal`]). The parent
+/// side's probes, actions and checks match children with these.
+fn parent_literals_for_child(
+    database: &Arc<Database>,
+    child_table: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    literals: &[String],
+) -> Vec<Option<String>> {
+    let fields = database
+        .schema_view(child_table)
+        .and_then(|view| fk_key_fields(database, view.schema(), fk));
+    match fields {
+        Some(((child, child_mods), (parent, parent_mods))) => literals
+            .iter()
+            .map(|l| coerce_key_literal(l, &parent, &parent_mods, &child, &child_mods))
+            .collect(),
+        None => literals.iter().cloned().map(Some).collect(),
+    }
+}
+
 /// Checks that every foreign key on `table_name` is satisfied by `assignments`.
 ///
 /// `assignments` maps a column name to the literal being written. A `NULL` is
@@ -1032,6 +1155,19 @@ async fn check_foreign_keys_of(
         // 3. Look again under the lock. A DELETE that committed between 1 and
         //    2 released its lock before this one was granted and left nothing
         //    to wait for — only the second look sees that the parent is gone.
+        //
+        // The value at the parent column's type first (P4 round 3): one that
+        // type cannot hold unchanged equals no parent.
+        let coerced = match schema.and_then(|child| fk_key_fields(database, child, fk)) {
+            Some(((child, child_mods), (parent, parent_mods))) => {
+                coerce_key_literal(literal, &child, &child_mods, &parent, &parent_mods)
+            }
+            None => Some(literal.clone()),
+        };
+        let Some(probe) = coerced else {
+            return Err(violation());
+        };
+        let literal = &probe;
         let found = referenced_values_now(
             database,
             &fk.parent_table,
@@ -1039,6 +1175,7 @@ async fn check_foreign_keys_of(
             std::slice::from_ref(literal),
             tx,
             Some(1),
+            KeySide::Parent,
         )
         .await
         .map_err(unchecked)?;
@@ -1061,6 +1198,7 @@ async fn check_foreign_keys_of(
             std::slice::from_ref(literal),
             tx,
             Some(1),
+            KeySide::Parent,
         )
         .await
         .map_err(unchecked)?;
@@ -1114,10 +1252,11 @@ async fn prevalidate_foreign_keys(
     }
     // On a lock failure nothing is proved: each row's own check meets the
     // same lock and reports it.
-    let foreign_keys = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
-        Ok(Some(t)) => t.schema.foreign_keys.clone(),
+    let child = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
+        Ok(Some(t)) => t,
         Ok(None) | Err(_) => return verified,
     };
+    let foreign_keys = child.schema.foreign_keys.clone();
     if foreign_keys.is_empty() {
         return verified;
     }
@@ -1150,9 +1289,31 @@ async fn prevalidate_foreign_keys(
         if literals.is_empty() {
             continue;
         }
+        // At the parent column's type (P4 round 3), deduplicated again there;
+        // a value that type cannot hold is proved by nothing, and its row's
+        // own check reports it. `raw` keeps what each row's check looks up.
+        let raw = literals;
+        let mut literals: Vec<String> = Vec::new();
+        let mut proved_raw: Vec<String> = Vec::new();
+        let fields = fk_key_fields(database, &child.schema, fk);
+        for literal in &raw {
+            let coerced = match &fields {
+                Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
+                None => Some(literal.clone()),
+            };
+            if let Some(coerced) = coerced {
+                proved_raw.push(literal.clone());
+                if !literals.contains(&coerced) {
+                    literals.push(coerced);
+                }
+            }
+        }
+        if literals.is_empty() {
+            continue;
+        }
 
         let Ok(found) =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None)
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None, KeySide::Parent)
                 .await
         else {
             continue;
@@ -1182,7 +1343,7 @@ async fn prevalidate_foreign_keys(
             continue;
         }
         let Ok(still) =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None)
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None, KeySide::Parent)
                 .await
         else {
             continue;
@@ -1190,7 +1351,7 @@ async fn prevalidate_foreign_keys(
         if still.len() != literals.len() {
             continue;
         }
-        for literal in &literals {
+        for literal in &proved_raw {
             verified.insert(verified_key(&fk.parent_table, &fk.parent_column, literal));
         }
     }
@@ -1201,6 +1362,22 @@ async fn prevalidate_foreign_keys(
 /// a disjunction the evaluator tests per row, so one huge list costs more than
 /// a few moderate ones.
 const REFERENCED_PROBE_CHUNK: usize = 512;
+
+/// Which side of a foreign key a probe reads (phase 3 P4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeySide {
+    /// The referenced table, by the referenced column. On a partitioned
+    /// table that column is a unique key's, so it holds every partition key
+    /// column (§1b), and a foreign key is one column: it is the whole
+    /// partition key, and the probe routes to one partition per value. A
+    /// probe that would not route is refused, never fanned out, and never
+    /// skipped.
+    Parent,
+    /// A referencing table, by its key column: routed when that column is
+    /// the table's partition key, else read in every partition, since the
+    /// question is whether any row anywhere references the values.
+    Child,
+}
 
 /// The stored bytes of `column` in every row of `table_name` whose value is
 /// one of `literals`, deduplicated — read **as of now** on `tx`'s behalf.
@@ -1215,6 +1392,11 @@ const REFERENCED_PROBE_CHUNK: usize = 512;
 /// (…)` would produce — folded and rewritten by the same functions — rather
 /// than through the SQL entry, which cannot take a visibility, and which paid
 /// a parse and a serialise/deserialise round trip per probe.
+///
+/// A partitioned table (phase 3 P4) is read under its logical name's lock
+/// through a fan-out routed on the same predicate, every partition under one
+/// as-of-now snapshot; `side` says whether the probe must route
+/// ([`KeySide::Parent`]).
 async fn referenced_values_now(
     database: &Arc<Database>,
     table_name: &str,
@@ -1222,13 +1404,20 @@ async fn referenced_values_now(
     literals: &[String],
     tx: TxId,
     limit: Option<u64>,
+    side: KeySide,
 ) -> Result<Vec<Vec<u8>>, String> {
     // A foreign key's other side, read: ACCESS SHARE (§7's "the FK parent
-    // check"), taken here if the statement's set did not already hold it.
-    let Some(table) = database.table_for(table_name, owner(), TableMode::AccessShare).await? else {
+    // check"), taken here if the statement's set did not already hold it; a
+    // partitioned table by its logical name.
+    let Some(relation) = database.relation_for(table_name, owner(), TableMode::AccessShare).await? else {
         return Err(format!("relation \"{}\" does not exist", table_name));
     };
-    let schema = &table.schema.fields;
+    if let crate::core::database::Relation::Plain(table) = &relation {
+        // A shell with no partitioned table behind it holds no rows: its
+        // data calls refuse, which is the error, never an empty answer.
+        table.data().map_err(|e| e.to_string())?;
+    }
+    let schema = &relation.schema().fields;
     let Some(field) = schema
         .iter()
         .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
@@ -1239,12 +1428,40 @@ async fn referenced_values_now(
             column, table_name
         ));
     };
+    let chunk_size = match &relation {
+        crate::core::database::Relation::Partitioned(pt) => {
+            if side == KeySide::Parent {
+                let key = pt.key_columns().map_err(|e| e.to_string())?;
+                if !(key.len() == 1 && key[0].eq_ignore_ascii_case(&field.name)) {
+                    return Err(format!(
+                        "a foreign key referencing column \"{}\" of partitioned table \"{}\" cannot be checked: \
+                         its partition key is ({}), so the check would read every partition; this is not supported",
+                        field.name,
+                        table_name,
+                        key.join(", ")
+                    ));
+                }
+            }
+            if routes_by_column(pt, &field) {
+                // Within the router's point cap, so an `IN` list still
+                // routes per value (§1b, "Multi-column IN").
+                (crate::core::partition::route::POINT_CAP as usize).min(REFERENCED_PROBE_CHUNK)
+            } else {
+                // A child not partitioned by its key column reads every
+                // partition whatever the chunk: the plain table's chunk, so
+                // a parent's DELETE of N keys scans them about N/512 times
+                // per pass, not N/256.
+                REFERENCED_PROBE_CHUNK
+            }
+        }
+        crate::core::database::Relation::Plain(_) => REFERENCED_PROBE_CHUNK,
+    };
     let requested = crate::core::rql::join::fetch_for(std::slice::from_ref(&field), schema);
     let all_fields = schema.to_vec();
 
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut values = Vec::new();
-    for chunk in literals.chunks(REFERENCED_PROBE_CHUNK) {
+    for chunk in literals.chunks(chunk_size) {
         let predicate = if chunk.len() == 1 {
             format!("{} = {}", field.name, chunk[0])
         } else {
@@ -1271,18 +1488,67 @@ async fn referenced_values_now(
         }
         let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
 
-        let rows = table
-            .query_row_with_visibility(
-                &rewritten,
-                &all_fields,
-                query_fetch,
-                requested.clone(),
-                limit,
-                None,
-                table.visibility_now_for(tx),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let rows = match &relation {
+            crate::core::database::Relation::Plain(table) => table
+                .query_row_with_visibility(
+                    &rewritten,
+                    &all_fields,
+                    query_fetch,
+                    requested.clone(),
+                    limit,
+                    None,
+                    table.visibility_now_for(tx),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            crate::core::database::Relation::Partitioned(pt) => {
+                // The snapshot first, then the route (§4.4's order, which
+                // `partitioned_with` and `partitioned_in` keep).
+                let visibility = pt.visibility_now_for(tx);
+                // Routed once: a column the table is not partitioned by
+                // leading routes nowhere, so it is not tokenized for a route
+                // at all; otherwise the route read here is the one planned.
+                let route = if routes_by_column(pt, &field) {
+                    pt.route_where(&rewritten).map_err(|e| e.to_string())?
+                } else {
+                    crate::core::partition::Route::All
+                };
+                let routed = matches!(
+                    route,
+                    crate::core::partition::Route::Points(_) | crate::core::partition::Route::Zero
+                );
+                #[cfg(test)]
+                fk_probe_hooks::note(table_name, side);
+                let source = if routed || side == KeySide::Child {
+                    crate::core::rql::row_source::RowSource::partitioned_routed(pt.clone(), &route, visibility)
+                } else {
+                    // The router reads no key point in the predicate (a
+                    // signed number, `k = -7` or `-7::bigint`, is none to
+                    // it): each value routes by its own key bytes, as an
+                    // INSERT of it would. A value that does not encode as a
+                    // key (`7.5` for a BIGINT key) is read in every
+                    // partition, its predicate deciding, as a plain parent's
+                    // scan decides: correct, and the rare case.
+                    match parent_key_ranges(pt, &field, chunk) {
+                        Some(ranges) => {
+                            crate::core::rql::row_source::RowSource::partitioned_in(pt.clone(), &ranges, visibility)
+                        }
+                        None => {
+                            warn!(
+                                "foreign key probe of partitioned table {table_name} reads every partition: a value \
+                                 in ({predicate}) is no key of its type"
+                            );
+                            crate::core::rql::row_source::RowSource::partitioned_routed(pt.clone(), &route, visibility)
+                        }
+                    }
+                };
+                source
+                    .map_err(|e| e.to_string())?
+                    .query_rows(&rewritten, &all_fields, query_fetch, requested.clone(), limit, None, tx)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        };
         for row in &rows {
             if let Some(cell) = row.columns.first() {
                 let bytes = cell.data.into_slice();
@@ -1296,6 +1562,121 @@ async fn referenced_values_now(
         }
     }
     Ok(values)
+}
+
+/// Whether a predicate on `field` can route on partitioned table `pt`:
+/// `field` is its leading partition key column (an equality on it narrows
+/// to its value's block, §1b "What routes"). A key column below it routes
+/// nothing on its own.
+fn routes_by_column(
+    pt: &crate::core::partition::table::PartitionedTable,
+    field: &crate::core::row::schema::SchemaField,
+) -> bool {
+    pt.spec()
+        .ok()
+        .and_then(|spec| spec.levels().first().map(|level| u64::from(level.write_order) == field.write_order))
+        .unwrap_or(true)
+}
+
+/// The point range of each of `literals` as a value of partitioned table
+/// `pt`'s one key column `field`: the value encoded as an `INSERT` of it
+/// into that column stores it (`lexer_ir::encode_column_value`, the one
+/// encoder: casts, `CAST(… AS …)`, signs, quoted strings, UUIDs), so routed
+/// by the bytes the parent row was routed by (`keyed_range`). `None` when
+/// the key is not that one column or a value does not encode as one; the
+/// caller then reads every partition, the probe's predicate deciding, as a
+/// plain table's scan would.
+fn parent_key_ranges(
+    pt: &crate::core::partition::table::PartitionedTable,
+    field: &crate::core::row::schema::SchemaField,
+    literals: &[String],
+) -> Option<Vec<crate::core::partition::PointRange>> {
+    let spec = pt.spec().ok()?;
+    let [level] = spec.levels() else {
+        return None;
+    };
+    if u64::from(level.write_order) != field.write_order || level.db_type != field.db_type {
+        return None;
+    }
+    literals
+        .iter()
+        .map(|literal| {
+            let encoded = crate::core::rql::lexer_ir::encode_column_value(
+                literal.trim(),
+                field,
+                &pt.shell().schema.type_modifiers,
+            );
+            // An encoder's refusal is this probe's only, never a later
+            // statement's reason.
+            let _ = crate::core::rql::lexer_ir::take_refusal();
+            let bytes = encoded?.into_slice().to_vec();
+            // An empty block is a NULL, which no key is.
+            if bytes.is_empty() {
+                return None;
+            }
+            pt.keyed_range(pt.uid(), &[(level.write_order, level.db_type.clone(), bytes)])
+        })
+        .collect()
+}
+
+/// Test probe: which partitioned tables a foreign-key probe read, and on
+/// which side, so a test can tell a routed check from a skipped one.
+#[cfg(test)]
+pub(crate) mod fk_probe_hooks {
+    use super::KeySide;
+
+    static SEEN: parking_lot::Mutex<Vec<(String, bool)>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(super) fn note(table: &str, side: KeySide) {
+        let mut seen = SEEN.lock();
+        if seen.len() < 4096 {
+            seen.push((table.to_string(), side == KeySide::Parent));
+        }
+    }
+
+    /// The `(table, parent side)` probes of partitioned tables since the
+    /// last call.
+    pub(crate) fn take() -> Vec<(String, bool)> {
+        std::mem::take(&mut *SEEN.lock())
+    }
+}
+
+/// The rows of `target` matching `where_clause` as `visibility` sees them: a
+/// plain table's scan, or a partitioned table's fan-out routed on the same
+/// clause, every partition under that one `visibility` (phase 3 P4). What a
+/// foreign key's statement-snapshot reads use, so the rows judged are the
+/// rows the write then changes.
+#[allow(clippy::too_many_arguments)]
+async fn relation_rows_as_of(
+    target: &crate::core::database::Relation,
+    where_clause: &str,
+    all_fields: &Vec<crate::core::row::schema::SchemaField>,
+    query_row_fetch: crate::core::row::row::RowFetch,
+    requested: crate::core::row::row::RowFetch,
+    visibility: &crate::core::mvcc::Visibility,
+    tx: TxId,
+) -> Result<Vec<crate::core::row::row::Row>, String> {
+    match target {
+        crate::core::database::Relation::Plain(table) => table
+            .query_row_with_visibility(
+                where_clause,
+                all_fields,
+                query_row_fetch,
+                requested,
+                None,
+                None,
+                visibility.clone(),
+            )
+            .await
+            .map_err(|e| e.to_string()),
+        crate::core::database::Relation::Partitioned(pt) => {
+            crate::core::rql::row_source::RowSource::partitioned_with(pt.clone(), where_clause, visibility.clone())
+                .map_err(|e| e.to_string())?
+                .query_rows(where_clause, all_fields, query_row_fetch, requested, None, None, tx)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
 }
 
 /// Takes a referenced-key lock, waiting for its holder the way `FOR UPDATE`
@@ -1395,20 +1776,15 @@ fn deadlock_check(
     None
 }
 
-/// Every foreign key in the database that points at `parent_table`.
+/// Every foreign key in the database that points at `parent_table`, with the
+/// table declaring it: the reverse index's answer
+/// ([`Database::referencing_keys`], phase 3 P4), in child-name order. It used
+/// to walk every table's schema, on every DELETE.
 fn referencing_keys(
     database: &Arc<Database>,
     parent_table: &str,
 ) -> Vec<(String, crate::core::rql::foreign_key::ForeignKey)> {
-    let mut out = Vec::new();
-    database.each_schema(|table, schema| {
-        for fk in schema.foreign_keys.iter() {
-            if fk.parent_table.eq_ignore_ascii_case(parent_table) {
-                out.push((table.to_string(), fk.clone()));
-            }
-        }
-    });
-    out
+    database.referencing_keys(parent_table)
 }
 
 /// The literal `ON DELETE SET DEFAULT` should write into `column`.
@@ -1527,7 +1903,16 @@ async fn apply_on_delete(
         if referenced.literals.is_empty() {
             continue;
         }
-        let list = referenced.literals.join(", ");
+        // The keys at the child column's type (P4 round 3): a key no child
+        // value can equal (`7.50` for an integer column) references nothing.
+        let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &referenced.literals)
+            .into_iter()
+            .flatten()
+            .collect();
+        if child_literals.is_empty() {
+            continue;
+        }
+        let list = child_literals.join(", ");
         let unchecked =
             |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
         let violation = || {
@@ -1543,9 +1928,10 @@ async fn apply_on_delete(
                 database,
                 &child_table,
                 &fk.column,
-                &referenced.literals,
+                &child_literals,
                 tx,
                 Some(1),
+                KeySide::Child,
             )
             .await
             .map_err(unchecked)?;
@@ -1609,9 +1995,10 @@ async fn apply_on_delete(
             database,
             &child_table,
             &fk.column,
-            &referenced.literals,
+            &child_literals,
             tx,
             Some(1),
+            KeySide::Child,
         )
         .await
         .map_err(unchecked)?;
@@ -1646,13 +2033,17 @@ async fn apply_on_delete(
 /// separate `SELECT` with a snapshot of its own; in `READ COMMITTED` a parent
 /// row committed between that `SELECT` and the delete's scan was deleted with
 /// its children never considered.
-async fn keys_about_to_be_deleted<S: crate::core::storage_providers::traits::StorageIO>(
+///
+/// `target` is the table the `DELETE` scans: a plain one, or a partitioned
+/// one, whose routed partitions are all read under `visibility` (phase 3 P4).
+async fn keys_about_to_be_deleted(
     database: &Arc<Database>,
-    table: &crate::core::row::table::Table<S>,
+    target: &crate::core::database::Relation,
     table_name: &str,
     where_clause: &str,
     query_row_fetch: &crate::core::row::row::RowFetch,
     visibility: &crate::core::mvcc::Visibility,
+    tx: TxId,
 ) -> Result<Vec<ReferencedColumn>, String> {
     let mut columns: Vec<String> = Vec::new();
     for (_, fk) in referencing_keys(database, table_name) {
@@ -1667,7 +2058,7 @@ async fn keys_about_to_be_deleted<S: crate::core::storage_providers::traits::Sto
     let mut out = Vec::with_capacity(columns.len());
     for column in columns {
         let values =
-            column_values_as_of(table, &column, where_clause, query_row_fetch, visibility)
+            column_values_as_of(target, &column, where_clause, query_row_fetch, visibility, tx)
                 .await?;
         let mut referenced = ReferencedColumn {
             column,
@@ -1689,14 +2080,15 @@ async fn keys_about_to_be_deleted<S: crate::core::storage_providers::traits::Sto
 ///
 /// The predicate is in engine form and `query_row_fetch` is what it reads —
 /// both straight from the statement's own plan.
-async fn column_values_as_of<S: crate::core::storage_providers::traits::StorageIO>(
-    table: &crate::core::row::table::Table<S>,
+async fn column_values_as_of(
+    target: &crate::core::database::Relation,
     column: &str,
     where_clause: &str,
     query_row_fetch: &crate::core::row::row::RowFetch,
     visibility: &crate::core::mvcc::Visibility,
+    tx: TxId,
 ) -> Result<Vec<(Vec<u8>, String)>, String> {
-    let schema = &table.schema.fields;
+    let schema = &target.schema().fields;
     let Some(field) = schema
         .iter()
         .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
@@ -1704,7 +2096,8 @@ async fn column_values_as_of<S: crate::core::storage_providers::traits::StorageI
     else {
         return Err(format!(
             "column \"{}\" of relation \"{}\" does not exist",
-            column, table.schema.name
+            column,
+            target.schema().name
         ));
     };
     // The companion, if the column is nullable: a NULL's value bytes are the
@@ -1716,18 +2109,16 @@ async fn column_values_as_of<S: crate::core::storage_providers::traits::StorageI
     }
     let requested = crate::core::rql::join::fetch_for(&wanted, schema);
 
-    let rows = table
-        .query_row_with_visibility(
-            where_clause,
-            &schema.to_vec(),
-            query_row_fetch.clone(),
-            requested,
-            None,
-            None,
-            visibility.clone(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = relation_rows_as_of(
+        target,
+        where_clause,
+        &schema.to_vec(),
+        query_row_fetch.clone(),
+        requested,
+        visibility,
+        tx,
+    )
+    .await?;
 
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -1800,15 +2191,14 @@ struct KeyChange {
 /// Whether an `UPDATE` needs one snapshot for the whole statement: a foreign
 /// key references a column it assigns, or one of its own foreign-key columns
 /// is assigned an expression whose per-row values have to be checked.
-fn update_needs_statement_snapshot<S: crate::core::storage_providers::traits::StorageIO>(
+fn update_needs_statement_snapshot(
     database: &Arc<Database>,
-    table: &crate::core::row::table::Table<S>,
+    schema: &crate::core::row::schema::TableSchema,
     table_name: &str,
     plan: &crate::core::rql::lexer_ur::UpdateRow,
 ) -> bool {
     let assigned = |name: &str| {
-        table
-            .schema
+        schema
             .fields
             .iter()
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
@@ -1819,14 +2209,13 @@ fn update_needs_statement_snapshot<S: crate::core::storage_providers::traits::St
             })
     };
     let by_expression = |name: &str| {
-        table
-            .schema
+        schema
             .fields
             .iter()
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
             .is_some_and(|f| plan.expressions.iter().any(|(w, _)| *w == f.write_order as u32))
     };
-    table.schema.foreign_keys.iter().any(|fk| by_expression(&fk.column))
+    schema.foreign_keys.iter().any(|fk| by_expression(&fk.column))
         || referencing_keys(database, table_name)
             .iter()
             .any(|(_, fk)| assigned(&fk.parent_column))
@@ -1841,16 +2230,16 @@ fn update_needs_statement_snapshot<S: crate::core::storage_providers::traits::St
 /// distinct one is checked. It used to be pasted into the probe as if it were
 /// a literal, which failed to parse at best and compared against the wrong
 /// thing at worst.
-async fn check_foreign_keys_for_update<S: crate::core::storage_providers::traits::StorageIO>(
+async fn check_foreign_keys_for_update(
     database: &Arc<Database>,
-    table: &crate::core::row::table::Table<S>,
+    target: &crate::core::database::Relation,
     table_name: &str,
     plan: &crate::core::rql::lexer_ur::UpdateRow,
     assignments: &[(String, String)],
     visibility: Option<&crate::core::mvcc::Visibility>,
     tx: TxId,
 ) -> Result<(), String> {
-    let schema = &table.schema.fields;
+    let schema = &target.schema().fields;
     let expression_of = |name: &str| {
         schema
             .iter()
@@ -1870,8 +2259,8 @@ async fn check_foreign_keys_for_update<S: crate::core::storage_providers::traits
         .collect();
     check_foreign_keys(database, table_name, &constants, tx).await?;
 
-    let by_expression: Vec<_> = table
-        .schema
+    let by_expression: Vec<_> = target
+        .schema()
         .foreign_keys
         .iter()
         .filter_map(|fk| expression_of(&fk.column).map(|(f, e)| (fk.column.clone(), f, e)))
@@ -1883,19 +2272,17 @@ async fn check_foreign_keys_for_update<S: crate::core::storage_providers::traits
         return Err("an expression assigned to a foreign-key column needs a statement snapshot"
             .to_string());
     };
-    let full = crate::core::row::table::Table::<S>::build_full_row_fetch(schema);
-    let rows = table
-        .query_row_with_visibility(
-            &plan.where_clause,
-            &schema.to_vec(),
-            plan.query_row_fetch.clone(),
-            full,
-            None,
-            None,
-            visibility.clone(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let full = crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::build_full_row_fetch(schema);
+    let rows = relation_rows_as_of(
+        target,
+        &plan.where_clause,
+        &schema.to_vec(),
+        plan.query_row_fetch.clone(),
+        full,
+        visibility,
+        tx,
+    )
+    .await?;
     for (column, field, expr) in by_expression {
         let mut seen = std::collections::HashSet::new();
         for row in &rows {
@@ -1929,14 +2316,15 @@ async fn check_foreign_keys_for_update<S: crate::core::storage_providers::traits
 ///
 /// `None` when no foreign key references a column the statement assigns, so
 /// every other `UPDATE` pays one map lookup.
-async fn keys_about_to_change<S: crate::core::storage_providers::traits::StorageIO>(
+async fn keys_about_to_change(
     database: &Arc<Database>,
-    table: &crate::core::row::table::Table<S>,
+    target: &crate::core::database::Relation,
     table_name: &str,
     plan: &crate::core::rql::lexer_ur::UpdateRow,
     visibility: &crate::core::mvcc::Visibility,
+    tx: TxId,
 ) -> Result<Option<KeyChanges>, String> {
-    let schema = &table.schema.fields;
+    let schema = &target.schema().fields;
     let assigned = |write_order: u32| {
         plan.updates.iter().any(|u| u.write_order == write_order)
             || plan.expressions.iter().any(|(w, _)| *w == write_order)
@@ -1961,19 +2349,17 @@ async fn keys_about_to_change<S: crate::core::storage_providers::traits::Storage
         return Ok(None);
     }
 
-    let full = crate::core::row::table::Table::<S>::build_full_row_fetch(schema);
-    let rows = table
-        .query_row_with_visibility(
-            &plan.where_clause,
-            &schema.to_vec(),
-            plan.query_row_fetch.clone(),
-            full,
-            None,
-            None,
-            visibility.clone(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let full = crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::build_full_row_fetch(schema);
+    let rows = relation_rows_as_of(
+        target,
+        &plan.where_clause,
+        &schema.to_vec(),
+        plan.query_row_fetch.clone(),
+        full,
+        visibility,
+        tx,
+    )
+    .await?;
 
     let cell = |row: &crate::core::row::row::Row, write_order: u64| -> Option<Vec<u8>> {
         row.columns
@@ -2115,13 +2501,21 @@ async fn lock_keys_before_update(
         else {
             continue;
         };
+        let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &change.old_literals)
+            .into_iter()
+            .flatten()
+            .collect();
+        if child_literals.is_empty() {
+            continue;
+        }
         let referencing = referenced_values_now(
             database,
             &child_table,
             &fk.column,
-            &change.old_literals,
+            &child_literals,
             tx,
             Some(1),
+            KeySide::Child,
         )
         .await
         .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
@@ -2204,19 +2598,23 @@ async fn apply_on_update(
             &change.old_literals,
             tx,
             None,
+            KeySide::Parent,
         )
         .await
         .map_err(unchecked)?
         .into_iter()
         .collect();
+        // Each old key at the child column's type (P4 round 3); one no child
+        // value can equal references nothing, and is left out.
+        let old_for_child = parent_literals_for_child(database, &child_table, &fk, &change.old_literals);
         let vanished: Vec<usize> = (0..change.old_stored.len())
-            .filter(|i| !present.contains(&change.old_stored[*i]))
+            .filter(|i| !present.contains(&change.old_stored[*i]) && old_for_child[*i].is_some())
             .collect();
         if vanished.is_empty() {
             continue;
         }
         let vanished_literals: Vec<String> =
-            vanished.iter().map(|i| change.old_literals[*i].clone()).collect();
+            vanished.iter().filter_map(|i| old_for_child[*i].clone()).collect();
 
         let statement = match fk.on_update {
             // Restrict refused before the write.
@@ -2235,7 +2633,7 @@ async fn apply_on_update(
                         case.push_str(&format!(
                             " WHEN {} = {} THEN {}",
                             fk.column,
-                            change.old_literals[*i],
+                            old_for_child[*i].as_deref().unwrap_or("NULL"),
                             new_of(*i)
                         ));
                     }
@@ -2293,6 +2691,7 @@ async fn apply_on_update(
             &vanished_literals,
             tx,
             Some(1),
+            KeySide::Child,
         )
         .await
         .map_err(unchecked)?;
@@ -7732,13 +8131,310 @@ fn check_partitioned_conflict_target(
     Ok(())
 }
 
-/// Whether `parent` names a partitioned table, compared as the database's
-/// own FK check compares it.
-fn is_partitioned_parent(database: &Database, parent: &str) -> bool {
-    database
-        .partitioned_tables_all()
+/// `ALTER TABLE t ADD [CONSTRAINT name] FOREIGN KEY (c) REFERENCES p (k) …`
+/// on a plain or a partitioned table, onto a plain or a partitioned parent
+/// (phase 3 P4), under the statement's ACCESS EXCLUSIVE on `t` and SHARE on
+/// `p` (`alter_lock_set`), so neither side's rows or keys change while it
+/// runs. Checked as PostgreSQL checks it, before anything is written:
+///
+/// - the name as written (bare or quoted, cut to its stored form), 42710 when
+///   another constraint of the table has it; unnamed, PostgreSQL's
+///   `<t>_<c>_fkey`, numbered past the taken names;
+/// - the referencing column (42703), the referenced table (42P01), column
+///   (42703) and a unique key on exactly it (42830); on a partitioned parent
+///   that column is its whole partition key, so every check routes;
+/// - **every existing row** (23503): each distinct non-NULL value of `c`,
+///   in every partition of a partitioned `t`, must be a key of `p`, probed
+///   as an insert's check probes it (routed on a partitioned `p`). The plain
+///   path used to add the key unvalidated, so rows that already broke it
+///   stayed, and the table held a constraint that was never true of it.
+async fn add_foreign_key(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    description: &str,
+    tx: TxId,
+) -> Vec<u8> {
+    use crate::core::rql::foreign_key;
+
+    let (named, rest) = match crate::core::rql::unique_key::split_constraint_name(description) {
+        Ok(split) => split,
+        Err(e) => return ddl_error(&e),
+    };
+    // `NOT VALID`: the key is enforced on every write from now on, and the
+    // rows already there are left unchecked until `VALIDATE CONSTRAINT`, as
+    // in PostgreSQL. What an import uses for a source key PostgreSQL itself
+    // never validated.
+    let (rest, not_valid) = strip_not_valid(rest);
+    let clause_at = crate::core::rql::join::find_keyword(rest, "FOREIGN", 0).or_else(|| crate::core::rql::join::find_keyword(rest, "REFERENCES", 0)).unwrap_or(0);
+    let mut fk = match foreign_key::parse_clause(&rest[clause_at..], table_name, named.clone(), None) {
+        Ok(fk) => fk,
+        Err(e) => return ddl_error(&e),
+    };
+    if !crate::core::rql::nullable::visible_fields(&schema.fields)
         .iter()
-        .any(|p| p.name().eq_ignore_ascii_case(parent))
+        .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))
+    {
+        return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", fk.column));
+    }
+    if named.is_some() {
+        if constraint_name_taken(schema, table_name, &fk.name) {
+            return ddl_error(&format!("constraint \"{}\" for table \"{}\" already exists", fk.name, table_name));
+        }
+    } else {
+        let stem = foreign_key::key_stem(table_name, &fk.column);
+        fk.name = match crate::core::rql::unique_key::choose_name(&stem, foreign_key::FKEY_LABEL, |candidate| {
+            constraint_name_taken(schema, table_name, candidate)
+        }) {
+            Ok(name) => name,
+            Err(e) => return ddl_error(&e),
+        };
+    }
+    if let Err(e) = fk.storable() {
+        return ddl_error(&e);
+    }
+    let refusal = if fk.parent_table.eq_ignore_ascii_case(table_name) {
+        let key = match database.partitioned_table(table_name) {
+            Some(pt) => match pt.key_columns() {
+                Ok(key) => Some(key),
+                Err(e) => return ddl_error(&e.to_string()),
+            },
+            None => None,
+        };
+        foreign_key::referenced_key_refusal(&fk, &foreign_key::ReferencedSide::of_schema(schema, table_name, key))
+    } else {
+        database.existing_parent_refusal(&fk)
+    };
+    if let Some(why) = refusal {
+        return ddl_error(&why);
+    }
+    // The two columns' types (42804): the child's as it is, the parent's as
+    // it is (this table's own, for a self-reference).
+    let child_type = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).map(|f| f.db_type.clone());
+    let parent_type = if fk.parent_table.eq_ignore_ascii_case(table_name) {
+        schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.parent_column)).map(|f| f.db_type.clone())
+    } else {
+        database.column_type(&fk.parent_table, &fk.parent_column)
+    };
+    if let (Some(child), Some(parent)) = (child_type, parent_type)
+        && let Some(why) = foreign_key::type_refusal(&fk, &child, &parent)
+    {
+        return ddl_error(&why);
+    }
+    if not_valid {
+        info!("ALTER TABLE {table_name}: foreign key {} added NOT VALID; its existing rows are not checked", fk.name);
+    } else {
+        match existing_rows_break_foreign_key(database, table_name, &fk, tx).await {
+            Ok(None) => {}
+            Ok(Some(violation)) => return ddl_error(&violation),
+            Err(e) => return ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
+        }
+    }
+    // §7 step 3: the declaration is the reload's work, under this table's
+    // ACCESS EXCLUSIVE and SHARE on the parent (finding L11: a parent DELETE
+    // in flight finishes before the key exists, and none starts until it is
+    // enforced). The sidecar is the source of truth; reloading picks it up,
+    // and the reload's swap files it in `fk_reverse`.
+    match database
+        .reload_with(table_name, |old| async move {
+            foreign_key::append(old.io_schema.clone(), &fk).await.map_err(|e| e.to_string())
+        })
+        .await
+    {
+        Ok(()) => ddl_ok(0),
+        Err(failure) => reload_failed(failure, ""),
+    }
+}
+
+/// `clause` without a trailing `NOT VALID` (two whole words, any case),
+/// and whether it had one.
+fn strip_not_valid(clause: &str) -> (&str, bool) {
+    let trimmed = clause.trim_end().trim_end_matches(';').trim_end();
+    let mut words = trimmed.rsplitn(3, char::is_whitespace);
+    match (words.next(), words.next(), words.next()) {
+        (Some(valid), Some(not), Some(head)) if valid.eq_ignore_ascii_case("VALID") && not.eq_ignore_ascii_case("NOT") => {
+            (head.trim_end(), true)
+        }
+        _ => (clause, false),
+    }
+}
+
+/// The violation an `ADD FOREIGN KEY` (or `VALIDATE CONSTRAINT`) is refused
+/// for: the first distinct non-NULL value of the key's column, in
+/// `table_name`'s rows (every partition of a partitioned one) as of now, that
+/// is no key of the parent. `None` when every row satisfies it.
+///
+/// **Streamed, in bounded memory** (P4 round 2): the first build read the
+/// whole child into a `Vec<Row>` and a `Vec<String>`, about 630 bytes a row,
+/// so 6 GB for a ten-million-row child at an import's last step. Now each
+/// table's pointer file is walked as a scan walks it (a read ticket held
+/// against reclamation, deleted slots and invisible versions skipped by the
+/// scans' own `Visibility::visible`), only the column and its NULL companion
+/// fetched into one reused `Row`, and values gathered into a chunk of
+/// [`REFERENCED_PROBE_CHUNK`] distinct literals, probed and dropped. The
+/// dedupe set is bounded ([`VALIDATION_SEEN_CAP`]; cleared when full, so a
+/// value seen again after that is probed again, which only costs a probe).
+/// Memory is O(chunk + cap), whatever the child's size; time stays one pass.
+///
+/// Each value is probed as an insert's check probes it ([`referenced_values_now`],
+/// the child's literal against the parent's column, routed on a partitioned
+/// parent). A chunk whose values were all found proves them (the probe
+/// returns only values some literal denotes, deduplicated); one that came up
+/// short is split in halves until the missing value is alone.
+///
+/// The caller holds ACCESS EXCLUSIVE on the child (ADD, VALIDATE), so no
+/// statement writes it during the walk, and SHARE on the parent.
+async fn existing_rows_break_foreign_key(
+    database: &Arc<Database>,
+    table_name: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    tx: TxId,
+) -> Result<Option<String>, String> {
+    // Held by the statement (ACCESS EXCLUSIVE): confirmed, never waited for.
+    let Some(child) = database.relation_for(table_name, owner(), TableMode::AccessExclusive).await? else {
+        return Err(format!("relation \"{table_name}\" does not exist"));
+    };
+    let visibility = match &child {
+        crate::core::database::Relation::Plain(table) => {
+            table.data().map_err(|e| e.to_string())?;
+            table.visibility_now_for(tx)
+        }
+        crate::core::database::Relation::Partitioned(pt) => pt.visibility_now_for(tx),
+    };
+    let schema = &child.schema().fields;
+    let Some(field) = schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).cloned() else {
+        return Err(format!("column \"{}\" of relation \"{}\" does not exist", fk.column, table_name));
+    };
+    let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+    let mut wanted = vec![field.clone()];
+    wanted.extend(flag.clone());
+    let fetch = crate::core::rql::join::fetch_for(&wanted, schema);
+    let holders = database.row_tables_held(table_name).map_err(|e| e.to_string())?;
+    use crate::core::storage_providers::traits::StorageIO as _;
+
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut pending: Vec<String> = Vec::with_capacity(REFERENCED_PROBE_CHUNK);
+    let mut row = crate::core::row::row::Row::default();
+    for holder in &holders {
+        let d = holder.data().map_err(|e| e.to_string())?;
+        // A read ticket, as a scan holds: reclamation hands out no extent
+        // this walk may still fetch from.
+        let _ticket = d.free_space.is_enabled().then(|| d.readers.enter());
+        let n_slots = d.io_pointers.get_len().await / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+        let mut pointers = crate::core::row::row_pointer::RowPointerIterator::new(d.io_pointers.clone())
+            .await
+            .map_err(|e| format!("could not read \"{table_name}\" to validate the key: {e:?}"))?;
+        let mut walked = 0u64;
+        while let Some((offset, pointer)) = pointers
+            .next_row_pointer_with_offset()
+            .await
+            .map_err(|e| format!("could not read \"{table_name}\" to validate the key: {e:?}"))?
+        {
+            if offset / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64 >= n_slots {
+                break;
+            }
+            walked += 1;
+            if walked % 4096 == 0 {
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    return Err(reason.eval_error().as_str().to_string());
+                }
+                tokio::task::yield_now().await;
+            }
+            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                continue;
+            }
+            pointer
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
+                .await
+                .map_err(|e| format!("could not read a row of \"{table_name}\" to validate the key: {e}"))?;
+            let cell = |write_order: u64| row.columns.iter().find(|c| u64::from(c.schema_id) == write_order);
+            if let Some(f) = &flag
+                && cell(f.write_order).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0)
+            {
+                continue;
+            }
+            let Some(value) = cell(field.write_order) else {
+                continue;
+            };
+            let bytes = value.data.into_slice();
+            if seen.contains(bytes) {
+                continue;
+            }
+            if seen.len() >= VALIDATION_SEEN_CAP {
+                seen.clear();
+            }
+            seen.insert(bytes.to_vec());
+            pending.push(key_literal(&field, bytes)?);
+            if pending.len() >= REFERENCED_PROBE_CHUNK {
+                if let Some(violation) = first_value_without_parent(database, table_name, fk, &pending, tx).await? {
+                    return Ok(Some(violation));
+                }
+                pending.clear();
+            }
+        }
+    }
+    first_value_without_parent(database, table_name, fk, &pending, tx).await
+}
+
+/// Distinct values [`existing_rows_break_foreign_key`] remembers before it
+/// forgets them all and starts again: 64 Ki, a few megabytes.
+const VALIDATION_SEEN_CAP: usize = 64 * 1024;
+
+/// The first of `literals` (child values of `fk`'s column) that is no key of
+/// its parent, as `existing_rows_break_foreign_key` reports it, or `None`.
+async fn first_value_without_parent(
+    database: &Arc<Database>,
+    table_name: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    literals: &[String],
+    tx: TxId,
+) -> Result<Option<String>, String> {
+    let violation = |value: &str| {
+        format!(
+            "insert or update on table \"{}\" violates foreign key constraint \"{}\": key ({})=({}) is not \
+             present in table \"{}\"",
+            table_name,
+            fk.name,
+            fk.column,
+            value.trim_matches('\''),
+            fk.parent_table
+        )
+    };
+    // Each value at the parent column's type (P4 round 3); one that type
+    // cannot hold unchanged has no parent.
+    let fields = database.schema_view(table_name).and_then(|view| fk_key_fields(database, view.schema(), fk));
+    // (the child's value as it is named, the value probed)
+    let mut probes: Vec<(&String, String)> = Vec::with_capacity(literals.len());
+    for literal in literals {
+        let coerced = match &fields {
+            Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
+            None => Some(literal.clone()),
+        };
+        match coerced {
+            Some(probe) => probes.push((literal, probe)),
+            None => return Ok(Some(violation(literal))),
+        }
+    }
+    let mut pending: Vec<&[(&String, String)]> = probes.chunks(REFERENCED_PROBE_CHUNK).rev().collect();
+    while let Some(chunk) = pending.pop() {
+        if chunk.is_empty() {
+            continue;
+        }
+        let values: Vec<String> = chunk.iter().map(|(_, probe)| probe.clone()).collect();
+        let found =
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &values, tx, None, KeySide::Parent)
+                .await?;
+        if found.len() >= chunk.len() {
+            continue;
+        }
+        if chunk.len() == 1 {
+            return Ok(Some(violation(chunk[0].0)));
+        }
+        let (left, right) = chunk.split_at(chunk.len() / 2);
+        pending.push(right);
+        pending.push(left);
+    }
+    Ok(None)
 }
 
 /// Rewrites every JSON column's default in a `CREATE TABLE` into the reference
@@ -8672,6 +9368,14 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     if owner().is_some_and(|o| database.row_locks.txn_holds_rows_on(&table_name, o.owner.id())) {
         return row_locks_in_use(&table_name, "DROP TABLE");
     }
+    if let Err(e) = Box::pin(drop_dependent_foreign_keys(database, &table_name, sql)).await {
+        return ddl_error(&e);
+    }
+    // Between the two steps of `DROP … CASCADE`: the keys are gone, the
+    // table not yet (a crash here leaves a statement that runs again).
+    if let Err(e) = crate::core::database::rewrite::point(database, "fkdrop_after_keys") {
+        return ddl_error(&e);
+    }
     match database.drop_table(&table_name).await {
         Ok(true) => ddl_ok(0),
         Ok(false) if if_exists => ddl_ok(0),
@@ -8681,6 +9385,78 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
             ddl_error(&e.to_string())
         }
     }
+}
+
+/// Whether a `DROP TABLE` ends in `CASCADE`, PostgreSQL's request to drop
+/// what depends on the table too (`RESTRICT`, the default, refuses instead).
+fn drop_table_cascades(sql: &str) -> bool {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .next_back()
+        .is_some_and(|w| w.eq_ignore_ascii_case("CASCADE"))
+}
+
+/// The foreign keys of other tables that reference `table_name`, which a
+/// `DROP TABLE` of it must not leave behind (phase 3 P4, for plain and
+/// partitioned tables alike), as PostgreSQL treats them:
+///
+/// - without `CASCADE`: refused, 2BP01 ("cannot drop table p because other
+///   objects depend on it"), before anything is dropped;
+/// - with `CASCADE`: each dependent constraint is dropped (its record
+///   tombstoned, its table reloaded under ACCESS EXCLUSIVE), never the
+///   tables holding them, and only then the table.
+///
+/// The table's own self-references go with it. The drop used to leave the
+/// keys in place, so every later insert of a non-NULL value into a child
+/// failed naming a parent that did not exist, and a table created under the
+/// name became their parent. Called under the DROP's ACCESS EXCLUSIVE on
+/// `table_name`, so no key naming it can be added meanwhile (an ADD or a
+/// CREATE takes SHARE on its parent).
+async fn drop_dependent_foreign_keys(database: &Arc<Database>, table_name: &str, sql: &str) -> Result<(), String> {
+    // A name no table has (`IF EXISTS`) has nothing depending on it, whatever
+    // keys a plain table declared on it before it existed.
+    if !database.has_table(table_name) && !database.is_partitioned(table_name) {
+        return Ok(());
+    }
+    let mut dependents: Vec<(String, String)> = database
+        .referencing_keys(table_name)
+        .into_iter()
+        .filter(|(child, fk)| !fk.is_deleted && !child.eq_ignore_ascii_case(table_name))
+        .map(|(child, fk)| (child, fk.name))
+        .collect();
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    if !drop_table_cascades(sql) {
+        let (child, name) = &dependents[0];
+        return Err(format!(
+            "cannot drop table {table_name} because other objects depend on it: constraint {name} on table {child} \
+             depends on table {table_name} (HINT: use DROP ... CASCADE to drop the dependent objects too)"
+        ));
+    }
+    dependents.sort();
+    let mut children: Vec<String> = dependents.into_iter().map(|(child, _)| child).collect();
+    children.dedup();
+    // Each child is changed, so held as a DDL holds its table (taken with the
+    // statement's set when the text said CASCADE: `ddl_lock_extras`).
+    for child in &children {
+        database.table_for(child, owner(), TableMode::AccessExclusive).await?;
+    }
+    for child in children {
+        let parent = table_name.to_string();
+        database
+            .reload_with(&child, |old| async move {
+                crate::core::rql::foreign_key::remove_referencing(old.io_schema.clone(), &parent)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|failure| format!("could not drop the foreign keys of \"{child}\" naming \"{table_name}\": {failure}"))?;
+        info!("DROP TABLE {table_name} CASCADE dropped the foreign keys of {child} naming it");
+    }
+    Ok(())
 }
 
 /// Describes the first pair of rows that would break `key`, or `None` when the
@@ -9952,6 +10728,32 @@ async fn execute_alter_table_action(
             );
             return ddl_ok(0);
         }
+        // A foreign key's rows checked now, as `ADD` would have checked
+        // them without `NOT VALID` (23503 for the first orphan, nothing
+        // written either way: no record says "not valid", so validating an
+        // already-valid key checks again and passes). A CHECK, UNIQUE or
+        // primary key was checked when it was added: a no-op. A name no
+        // constraint has is 42704, as in PostgreSQL (P4 round 3): reported as
+        // done, a migration validating the wrong name (an older binary's
+        // `fk_<c>_<p>`, a typo) left a NOT VALID key's orphans unflagged.
+        AlterAction::ValidateConstraint { name } => {
+            let fk = schema.foreign_keys.iter().find(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name)).cloned();
+            let Some(fk) = fk else {
+                if constraint_name_taken(&schema, &plan.table_name, &name) {
+                    info!("ALTER TABLE {}: VALIDATE CONSTRAINT {name}: checked when it was added", plan.table_name);
+                    return ddl_ok(0);
+                }
+                return ddl_error(&format!(
+                    "constraint \"{}\" of relation \"{}\" does not exist",
+                    name, plan.table_name
+                ));
+            };
+            return match Box::pin(existing_rows_break_foreign_key(database, &plan.table_name, &fk, tx)).await {
+                Ok(None) => ddl_ok(0),
+                Ok(Some(violation)) => ddl_error(&violation),
+                Err(e) => ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
+            };
+        }
         AlterAction::AddColumn {
             name,
             db_type,
@@ -10487,8 +11289,6 @@ async fn execute_alter_table_action(
         AlterAction::ConstraintClause { drop, description } => {
             use crate::core::rql::foreign_key;
 
-            let upper = description.to_ascii_uppercase();
-
             // `DROP CONSTRAINT [IF EXISTS] <name>`. Both sidecars are tried,
             // since the name alone does not say which kind it was. A name
             // matching neither is PostgreSQL's 42704, unless `IF EXISTS`
@@ -10609,59 +11409,14 @@ async fn execute_alter_table_action(
                 ));
             }
 
-            // A foreign key is enforced, so it is stored rather than noted.
-            // By whole words outside quotes: as substrings, a constraint named
+            // A foreign key is enforced, so it is stored rather than noted, on
+            // a plain or a partitioned table, onto either (phase 3 P4). By
+            // whole words outside quotes: as substrings, a constraint named
             // `user_preferences_pkey` (pg_dump's spelling) or `"prefs_x_key"`
             // was read as a foreign key and failed to parse as one.
             let keyword = |word: &str| crate::core::rql::join::find_keyword(&description, word, 0).is_some();
             if keyword("FOREIGN") || keyword("REFERENCES") {
-                let name = if upper.starts_with("CONSTRAINT") {
-                    description
-                        .split_whitespace()
-                        .nth(1)
-                        .map(|n| n.trim_matches('"').to_string())
-                } else {
-                    None
-                };
-                let clause_at = upper
-                    .find("FOREIGN KEY")
-                    .or_else(|| upper.find("REFERENCES"))
-                    .unwrap_or(0);
-
-                let fk = match foreign_key::parse_clause(&description[clause_at..], name, None) {
-                    Ok(fk) => fk,
-                    Err(e) => return ddl_error(&e),
-                };
-                // Before the sidecar is written, as `add_table` refuses it at
-                // CREATE: the check would read the parent through its shell.
-                if is_partitioned_parent(database, &fk.parent_table) {
-                    return ddl_error(&format!(
-                        "FOREIGN KEY {} references the partitioned table \"{}\"; a partitioned table as the \
-                         parent of a FOREIGN KEY is not supported yet",
-                        fk.name, fk.parent_table
-                    ));
-                }
-                if !schema
-                    .fields
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(&fk.column))
-                {
-                    return ddl_error(&format!("column '{}' does not exist", fk.column));
-                }
-                // §7 step 3: the declaration is the reload's work, under
-                // this table's ACCESS EXCLUSIVE and SHARE on the parent
-                // (finding L11: a parent DELETE in flight finishes before the
-                // key exists, and none starts until it is enforced). The
-                // sidecar is the source of truth; reloading picks it up.
-                return match database
-                    .reload_with(&plan.table_name, |old| async move {
-                        foreign_key::append(old.io_schema.clone(), &fk).await.map_err(|e| e.to_string())
-                    })
-                    .await
-                {
-                    Ok(()) => ddl_ok(0),
-                    Err(failure) => reload_failed(failure, ""),
-                };
+                return Box::pin(add_foreign_key(database, &plan.table_name, &schema, &description, tx)).await;
             }
 
             // `UNIQUE (…)` / `PRIMARY KEY (…)`, of any arity. Enforced, so it
@@ -12875,6 +13630,20 @@ fn refused_on_a_partitioned_table(sql: &str, database: &Database) -> bool {
 fn ddl_lock_extras(sql: &str, database: &Database) -> Option<Vec<(String, TableMode)>> {
     let first = sql.split_whitespace().next()?;
     if first.eq_ignore_ascii_case("DROP") {
+        // `DROP TABLE p CASCADE` changes every table whose foreign keys name
+        // `p` (phase 3 P4): each one, ACCESS EXCLUSIVE, in the one name order.
+        if drop_table_cascades(sql) {
+            if let Ok((name, _)) = crate::core::rql::lexer_alter::parse_drop_table(sql) {
+                return Some(
+                    database
+                        .fk_children(&name)
+                        .into_iter()
+                        .filter(|child| !child.eq_ignore_ascii_case(&name))
+                        .map(|child| (child, TableMode::AccessExclusive))
+                        .collect(),
+                );
+            }
+        }
         return Some(Vec::new());
     }
     if !first.eq_ignore_ascii_case("ALTER") {
@@ -12925,6 +13694,19 @@ pub(crate) fn alter_lock_set(
         AlterAction::ConstraintClause { drop: false, description } => fk_parent_of_clause(description)
             .map(|parent| vec![(parent, TableMode::Share)])
             .unwrap_or_default(),
+        // Validating a key reads the parent: SHARE on it, as ADD takes, so
+        // no parent row goes while the child's rows are checked.
+        AlterAction::ValidateConstraint { name } => database
+            .schema_view(table)
+            .map(|view| {
+                view.schema()
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(name))
+                    .map(|fk| (fk.parent_table.clone(), TableMode::Share))
+                    .collect()
+            })
+            .unwrap_or_default(),
         AlterAction::ConstraintClause { drop: true, description } => {
             let Some(name) = dropped_constraint_name(description) else {
                 return Vec::new();
@@ -12957,7 +13739,7 @@ fn fk_parent_of_clause(description: &str) -> Option<String> {
     // Whole words outside quotes, as the constraint arm reads it.
     let find = |word: &str| crate::core::rql::join::find_keyword(description, word, 0);
     let clause_at = find("FOREIGN").or_else(|| find("REFERENCES"))?;
-    crate::core::rql::foreign_key::parse_clause(&description[clause_at..], None, None)
+    crate::core::rql::foreign_key::parse_clause(&description[clause_at..], "", None, None)
         .ok()
         .map(|fk| fk.parent_table)
 }
@@ -14806,15 +15588,16 @@ pub(crate) async fn execute_with_need(
             // be the same rows. `None` — every other UPDATE — leaves the write
             // to take its own, as before.
             let statement_visibility =
-                update_needs_statement_snapshot(&database, &table, &table_name, &update_plan)
+                update_needs_statement_snapshot(&database, &table.schema, &table_name, &update_plan)
                     .then(|| table.visibility_for(tx));
+            let target = crate::core::database::Relation::Plain(table.clone());
 
             if let Some(assignments) =
                 crate::core::rql::lexer_ur::assignments_of_update(&query_sql(&query))
             {
                 if let Err(e) = check_foreign_keys_for_update(
                     &database,
-                    &table,
+                    &target,
                     &table_name,
                     &update_plan,
                     &assignments,
@@ -14835,10 +15618,11 @@ pub(crate) async fn execute_with_need(
                 None => None,
                 Some(visibility) => match keys_about_to_change(
                     &database,
-                    &table,
+                    &target,
                     &table_name,
                     &update_plan,
                     visibility,
+                    tx,
                 )
                 .await
                 {
@@ -15237,11 +16021,12 @@ pub(crate) async fn execute_with_need(
                 Some(visibility) => {
                     keys_about_to_be_deleted(
                         &database,
-                        &table,
+                        &crate::core::database::Relation::Plain(table.clone()),
                         &table_name,
                         &delete_plan.where_clause,
                         &delete_plan.query_row_fetch,
                         visibility,
+                        tx,
                     )
                     .await
                 }
@@ -15518,22 +16303,15 @@ fn vacuum_targets(
 }
 
 /// What the partitioned `UPDATE` and `DELETE` check before they write, in
-/// common: no foreign key (S6 refuses them both ways, so none of the plain
-/// arms' foreign-key work can apply; asserted here rather than assumed), and
-/// a `RETURNING` list that resolves against the shell's schema, which every
-/// partition shares. A bad list fails as it does on a plain table, before
-/// anything is written. `Ok(true)`: the statement returns rows (S17).
+/// common: a `RETURNING` list that resolves against the shell's schema,
+/// which every partition shares. A bad list fails as it does on a plain
+/// table, before anything is written. `Ok(true)`: the statement returns rows
+/// (S17). Foreign keys, either way, are the arms' own work since phase 3 P4,
+/// as on a plain table.
 fn check_partitioned_write(
-    database: &Arc<Database>,
     shell: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>,
-    table_name: &str,
     sql: &str,
 ) -> Result<bool, String> {
-    if !shell.schema.foreign_keys.is_empty() || !referencing_keys(database, table_name).is_empty() {
-        return Err(format!(
-            "internal error: partitioned table \"{table_name}\" has a foreign key, which partitioned tables refuse"
-        ));
-    }
     returning_planned(sql, &shell.schema.fields)
 }
 
@@ -15608,24 +16386,18 @@ async fn execute_partitioned_update(
 ) -> Vec<u8> {
     crate::core::rql::prepared::note_rewritten();
     let sql = query_sql(query);
-    let returning_wanted = match check_partitioned_write(database, pt.shell(), table_name, &sql) {
+    let returning_wanted = match check_partitioned_write(pt.shell(), &sql) {
         Ok(wanted) => wanted,
         Err(e) => {
             error!("{}", e);
             return ddl_error(&e);
         }
     };
-    let crate::core::rql::lexer_ur::UpdateRow {
-        where_clause,
-        query_row_fetch,
-        updates,
-        expressions,
-        ..
-    } = update_plan;
     let keeps_point = {
-        let assigned: Vec<(u32, &[u8])> = updates.iter().map(|u| (u.write_order, u.data.into_slice())).collect();
-        let computed: Vec<u32> = expressions.iter().map(|(wo, _)| *wo).collect();
-        pt.assignments_keep_point(&where_clause, &assigned, &computed)
+        let assigned: Vec<(u32, &[u8])> =
+            update_plan.updates.iter().map(|u| (u.write_order, u.data.into_slice())).collect();
+        let computed: Vec<u32> = update_plan.expressions.iter().map(|(wo, _)| *wo).collect();
+        pt.assignments_keep_point(&update_plan.where_clause, &assigned, &computed)
     };
     match keeps_point {
         Ok(true) => {}
@@ -15638,6 +16410,26 @@ async fn execute_partitioned_update(
             return ddl_error(&e.to_string());
         }
     }
+    // Foreign keys (phase 3 P4), as the plain arm runs them and in its
+    // order: one snapshot for the statement when they need to know which
+    // rows it changes, the child side's checks, the parent side's keys
+    // locked before the write and acted on after it. Every read routes on
+    // the statement's `WHERE` over the partitions, under that snapshot.
+    let (statement_visibility, key_changes) =
+        match partitioned_update_foreign_keys(database, &pt, table_name, &update_plan, &sql, tx).await {
+            Ok(found) => found,
+            Err(e) => {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
+        };
+    let crate::core::rql::lexer_ur::UpdateRow {
+        where_clause,
+        query_row_fetch,
+        updates,
+        expressions,
+        ..
+    } = update_plan;
     // The write consumes its copies of the assignments; `RETURNING` overlays
     // these after it, as the plain arm does.
     let returning_updates: Option<smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]>> =
@@ -15653,10 +16445,11 @@ async fn execute_partitioned_update(
                 .collect()
         });
     let mut before: Vec<crate::core::row::row::Row> = Vec::new();
-    let outcome = crate::core::rql::row_source::write_partitions(
+    let outcome = crate::core::rql::row_source::write_partitions_as_of(
         &pt,
         &where_clause,
         tx,
+        statement_visibility,
         returning_wanted.then_some(&mut before),
         |part, visibility, collecting| {
             // A payload is not `Clone`; each partition consumes its own copy.
@@ -15692,6 +16485,12 @@ async fn execute_partitioned_update(
     match outcome {
         Ok(n) => {
             info!("Updated {} rows", n);
+            if let Some(changes) = key_changes.as_ref() {
+                if let Err(e) = apply_on_update(database, table_name, changes, depth, tx).await {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+            }
             note_write(database, tx, depth, &sql, Some(table_name));
             let returning = returning_updates.as_ref().map(|u| (before, Some(u), &expressions[..]));
             partitioned_write_reply(&pt, &sql, n, returning, database, tx).await
@@ -15704,6 +16503,49 @@ async fn execute_partitioned_update(
             result
         }
     }
+}
+
+/// A partitioned `UPDATE`'s foreign-key work before it writes (phase 3 P4),
+/// the plain arm's steps over the partitions: the statement snapshot when a
+/// key needs it (`update_needs_statement_snapshot`), the child side's
+/// checks (`check_foreign_keys_for_update`, every assigned key probed in
+/// its parent, which routes), and the parent side's moving keys
+/// (`keys_about_to_change`, read over the routed partitions under that
+/// snapshot) locked before the write (`lock_keys_before_update`). Returns
+/// the snapshot the write must use and the keys `apply_on_update` acts on
+/// after it.
+async fn partitioned_update_foreign_keys(
+    database: &Arc<Database>,
+    pt: &Arc<crate::core::partition::table::PartitionedTable>,
+    table_name: &str,
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+    sql: &str,
+    tx: TxId,
+) -> Result<(Option<crate::core::mvcc::Visibility>, Option<KeyChanges>), String> {
+    let schema = &pt.shell().schema;
+    let statement_visibility =
+        update_needs_statement_snapshot(database, schema, table_name, plan).then(|| pt.visibility_for(tx));
+    let target = crate::core::database::Relation::Partitioned(pt.clone());
+    if let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) {
+        check_foreign_keys_for_update(
+            database,
+            &target,
+            table_name,
+            plan,
+            &assignments,
+            statement_visibility.as_ref(),
+            tx,
+        )
+        .await?;
+    }
+    let key_changes = match statement_visibility.as_ref() {
+        None => None,
+        Some(visibility) => keys_about_to_change(database, &target, table_name, plan, visibility, tx).await?,
+    };
+    if let Some(changes) = key_changes.as_ref() {
+        lock_keys_before_update(database, table_name, changes, tx).await?;
+    }
+    Ok((statement_visibility, key_changes))
 }
 
 /// A `DELETE` on a partitioned table (§9, S11): the `RETURNING` list resolved
@@ -15724,7 +16566,7 @@ async fn execute_partitioned_delete(
 ) -> Vec<u8> {
     crate::core::rql::prepared::note_rewritten();
     let sql = query_sql(query);
-    let returning_wanted = match check_partitioned_write(database, pt.shell(), table_name, &sql) {
+    let returning_wanted = match check_partitioned_write(pt.shell(), &sql) {
         Ok(wanted) => wanted,
         Err(e) => {
             error!("{}", e);
@@ -15732,11 +16574,34 @@ async fn execute_partitioned_delete(
         }
     };
     let crate::core::rql::lexer_dr::DeleteRow { where_clause, query_row_fetch, .. } = delete_plan;
+    // Referencing rows first (phase 3 P4), as the plain arm deals with them:
+    // one snapshot for the statement when a foreign key points here, the
+    // keys the routed partitions are about to lose read under it, their
+    // referenced-key locks taken under the logical name and each child's
+    // action run, and the same snapshot handed to every partition's write.
+    let statement_visibility = (!referencing_keys(database, table_name).is_empty()).then(|| pt.visibility_for(tx));
+    if let Some(visibility) = statement_visibility.as_ref() {
+        let target = crate::core::database::Relation::Partitioned(pt.clone());
+        let keys = match keys_about_to_be_deleted(database, &target, table_name, &where_clause, &query_row_fetch, visibility, tx)
+            .await
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                error!("Could not read the rows a DELETE would affect: {}", e);
+                return ddl_error(&e);
+            }
+        };
+        if let Err(e) = apply_on_delete(database, table_name, &keys, depth, tx).await {
+            error!("{}", e);
+            return ddl_error(&e);
+        }
+    }
     let mut before: Vec<crate::core::row::row::Row> = Vec::new();
-    let outcome = crate::core::rql::row_source::write_partitions(
+    let outcome = crate::core::rql::row_source::write_partitions_as_of(
         &pt,
         &where_clause,
         tx,
+        statement_visibility,
         returning_wanted.then_some(&mut before),
         |part, visibility, collecting| {
             let (fetch, where_clause) = (query_row_fetch.clone(), &where_clause);

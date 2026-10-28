@@ -235,6 +235,58 @@ cycle is caught by a depth limit rather than recursing forever.
 Composite keys are refused outright: enforcing one column of a two-column key
 would enforce something weaker than what was declared.
 
+Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
+as built") foreign keys also run to and from hash-partitioned tables, and:
+
+- `ALTER TABLE … ADD … FOREIGN KEY` checks the rows already in the table, as
+  PostgreSQL does (23503 naming the first value with no parent; it used to add
+  the key unchecked). `… NOT VALID` skips that check and enforces new writes
+  only; `VALIDATE CONSTRAINT` checks the rows later. The PostgreSQL import adds
+  a key its source never validated `NOT VALID`, and a key whose source rows
+  break it (loaded with `--disable-triggers`) `NOT VALID` too, with a note in
+  the report, rather than stopping at its last step.
+- `DROP TABLE` of a table another table's key references is refused (2BP01)
+  unless `CASCADE`, which drops those keys and keeps their tables.
+- A key between columns PostgreSQL cannot compare is refused with 42804:
+  the integer widths, `REAL`/`DOUBLE`, `DATE`/`TIMESTAMP` and the text types
+  pair any way round; an integer child may reference a `NUMERIC`, `REAL` or
+  `DOUBLE` key and a `NUMERIC` child a `REAL` or `DOUBLE` one, not the
+  reverse; any other type only itself. Values are compared in the other
+  side's type, so an `INT` 7 finds a `NUMERIC` 7.00, a `DATE` only a
+  `TIMESTAMP` midnight; an `INT8` beyond a `DOUBLE`'s precision finds none
+  (PostgreSQL rounds it).
+- Names are kept as written (UTF-8, spaces, quotes), and an unnamed key is
+  PostgreSQL's `<table>_<column>_fkey`, numbered on a collision; a column's own
+  `CONSTRAINT n REFERENCES …` is named `n`.
+
+Still unlike PostgreSQL: a plain table may reference a column no unique key
+covers, and `CREATE TABLE` may reference a table that does not exist yet (each
+insert's check names it); identifiers are not case-folded.
+
+### Release note: foreign keys from older binaries
+
+What a database written by an older binary holds, read by this one:
+
+- **An unnamed key keeps the name it was stored under**, `fk_<column>_<parent>`
+  (the old default). New unnamed keys are `<table>_<column>_fkey`. Drop an old
+  one by its stored name: `ALTER TABLE c DROP CONSTRAINT fk_pid_p`; its
+  PostgreSQL name is 42704.
+- **Names were stored ASCII-filtered**, the referenced table and column too
+  (`"my parent"` as `myparent`). Such a key reads back as written. One whose
+  parent table or column lost characters names a relation or column that does
+  not exist: its checks fail naming it, and it is invisible to `DROP TABLE`'s
+  2BP01 check, which matches the stored parent name. Drop it by its stored name
+  and add it again.
+- **Keys an older `DROP TABLE` left behind** (it dropped a referenced table and
+  kept its children's keys) still name that table. Creating a table under the
+  name makes it their parent again, and a later `DROP TABLE` of it is refused
+  with 2BP01 naming them; drop them (`DROP CONSTRAINT`) or use `DROP TABLE …
+  CASCADE`.
+- **A key added `NOT VALID` looks like any other key after a restart**:
+  validity is not recorded and `pg_constraint` is not emulated, so nothing
+  shows which keys still have unchecked rows; run `VALIDATE CONSTRAINT` on
+  each to find their orphans.
+
 ## JSON
 
 `JSON` and `JSONB` are accepted, but nothing stores JSON. Each JSON column is

@@ -81,10 +81,15 @@ pub enum AlterAction {
         name: String,
         expression: Option<String>,
     },
+    /// `VALIDATE CONSTRAINT name`: the rows already in the table checked
+    /// against a key added `NOT VALID` (phase 3 P4 round 2).
+    ValidateConstraint {
+        name: String,
+    },
     /// Accepted and not acted on, with the reason.
     ///
-    /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)`,
-    /// `VALIDATE CONSTRAINT` — describes machinery this engine does not have.
+    /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
+    /// describes machinery this engine does not have.
     /// Failing them would stop a migration over a statement whose whole effect
     /// is advisory, and a real schema is full of them: 12 sites in the
     /// application this compatibility work is modelled on.
@@ -566,9 +571,14 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
         "RESET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
-        "VALIDATE" => AlterAction::NoOp {
-            reason: "constraints are validated when they are added",
-        },
+        "VALIDATE" if rest_upper.get(1).map(String::as_str) == Some("CONSTRAINT") => {
+            // The name read as every constraint name is (bare or quoted, cut
+            // to its stored form).
+            match crate::core::rql::unique_key::split_constraint_name(&rest[1..].join(" "))? {
+                (Some(name), _) => AlterAction::ValidateConstraint { name },
+                (None, _) => return Err("VALIDATE CONSTRAINT names no constraint".to_string()),
+            }
+        }
         "CLUSTER" | "OWNER" | "ENABLE" | "DISABLE" | "INHERIT" | "NO" => AlterAction::NoOp {
             reason: "PostgreSQL table machinery RasterizedDB does not have",
         },

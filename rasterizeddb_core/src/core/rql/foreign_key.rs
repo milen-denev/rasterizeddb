@@ -102,14 +102,22 @@ pub struct ForeignKey {
     pub is_deleted: bool,
 }
 
+/// Writes `name` into its 128-byte slot as UTF-8, cut at a character
+/// boundary (`unique_key::stored_name`'s cut), as the UNIQUE and CHECK
+/// sidecars write theirs since phase 3 P1.
+///
+/// It used to keep only ASCII letters, digits and `_`: `"my fk"` was stored
+/// as `myfk` and `外键` as an empty name, so a `DROP CONSTRAINT` by the name
+/// the client gave matched nothing. The column and table names went through
+/// the same filter. [`read_name`] always decoded UTF-8, so the format is
+/// unchanged: a record written filtered reads back as it was written, and an
+/// older binary reads the new names. A table or column name that does not
+/// fit is refused where the key is defined ([`ForeignKey::storable`]), never
+/// cut here: a cut table name would name another table.
 fn write_name(out: &mut [u8], at: usize, name: &str) {
-    let filtered: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    let bytes = filtered.as_bytes();
-    let len = bytes.len().min(128);
-    out[at..at + len].copy_from_slice(&bytes[..len]);
+    let stored = crate::core::rql::unique_key::stored_name(name);
+    let bytes = stored.as_bytes();
+    out[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
 fn read_name(raw: &[u8], at: usize) -> Result<String, String> {
@@ -122,7 +130,49 @@ fn read_name(raw: &[u8], at: usize) -> Result<String, String> {
         .map_err(|e| format!("invalid UTF-8 in foreign key record: {}", e))
 }
 
+/// The name PostgreSQL gives an unnamed foreign key on `column` of `table`:
+/// `<table>_<column>_fkey`, the stem cut so the label survives
+/// (`unique_key::name_with_label`), as every derived name is built. A
+/// collision is numbered by the caller (`unique_key::choose_name`), which
+/// knows the table's other constraints.
+pub fn default_name(table: &str, column: &str) -> String {
+    crate::core::rql::unique_key::name_with_label(&key_stem(table, column), FKEY_LABEL)
+}
+
+/// `<table>_<column>`, what an unnamed foreign key's `_fkey` follows.
+pub fn key_stem(table: &str, column: &str) -> String {
+    crate::core::rql::unique_key::key_stem(table, std::slice::from_ref(&column.to_string()))
+}
+
+/// The label of an unnamed foreign key's name.
+pub const FKEY_LABEL: &str = "_fkey";
+
 impl ForeignKey {
+    /// Refuses a key whose referencing column, referenced table or
+    /// referenced column does not fit its 128-byte slot: cut, the record
+    /// would name another relation or column, and the key would be checked
+    /// against the wrong thing or skipped. The constraint's own name is cut
+    /// where it is read (`unique_key::stored_name`), as every constraint
+    /// name is, so it always fits.
+    pub fn storable(&self) -> Result<(), String> {
+        for (what, name) in [
+            ("column", &self.column),
+            ("referenced table", &self.parent_table),
+            ("referenced column", &self.parent_column),
+        ] {
+            if name.len() > crate::core::rql::unique_key::MAX_NAME_BYTES {
+                return Err(format!(
+                    "foreign key \"{}\": a {what} name over {} bytes is not supported (\"{}\" is {} bytes)",
+                    self.name,
+                    crate::core::rql::unique_key::MAX_NAME_BYTES,
+                    name,
+                    name.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn into_vec(&self) -> Vec<u8> {
         let mut out = vec![0u8; FOREIGN_KEY_SIZE as usize];
         write_name(&mut out, 0, &self.name);
@@ -225,7 +275,7 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
         let Ok(mut fk) = ForeignKey::from_vec(&buffer) else {
             continue;
         };
-        if fk.is_deleted || !fk.name.eq_ignore_ascii_case(name) {
+        if fk.is_deleted || !fk.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::stored_name(name)) {
             continue;
         }
         fk.is_deleted = true;
@@ -239,21 +289,58 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
     Ok(false)
 }
 
+/// Marks deleted every live foreign key whose referenced table is `parent`
+/// (compared as the checks compare it): `DROP TABLE parent CASCADE`, which
+/// drops the constraints that depend on the table, never the tables that
+/// hold them, as PostgreSQL does. Returns how many it marked.
+pub async fn remove_referencing<S: StorageIO>(schema_io: Arc<S>, parent: &str) -> io::Result<usize> {
+    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
+    let len = io.get_len().await;
+    let mut marked = 0;
+    let count = len / FOREIGN_KEY_SIZE;
+    let mut buffer = vec![0u8; FOREIGN_KEY_SIZE as usize];
+    for i in 0..count {
+        let position = i * FOREIGN_KEY_SIZE;
+        let mut cursor = position;
+        if io.read_data_into_buffer(&mut cursor, &mut buffer).await.is_err() {
+            return Err(io::Error::other(format!(
+                "could not read foreign key record {i} of {}",
+                sidecar_name(&schema_io)
+            )));
+        }
+        let Ok(mut fk) = ForeignKey::from_vec(&buffer) else {
+            continue;
+        };
+        if fk.is_deleted || !fk.parent_table.eq_ignore_ascii_case(parent) {
+            continue;
+        }
+        fk.is_deleted = true;
+        // Logged, as `remove` writes it.
+        io.write_data(position, &fk.into_vec()).await;
+        marked += 1;
+    }
+    Ok(marked)
+}
+
 /// Parses a `FOREIGN KEY (…) REFERENCES parent (…) [ON DELETE …] [ON UPDATE …]`
 /// clause, with `child_columns` supplying the referencing column when the
 /// clause is written inline on a column definition.
 ///
 /// Returns an error naming what could not be handled, so a migration fails
 /// loudly rather than proceeding with a constraint that is not there.
+///
+/// `table` is the table the key is declared on: an unnamed key is called
+/// [`default_name`]`(table, column)`, PostgreSQL's `<table>_<column>_fkey`.
+/// A given `name` is cut to its stored form (`unique_key::stored_name`).
 pub fn parse_clause(
     clause: &str,
+    table: &str,
     name: Option<String>,
     inline_column: Option<&str>,
 ) -> Result<ForeignKey, String> {
-    let upper = clause.to_ascii_uppercase();
-
-    let references_at = upper
-        .find("REFERENCES")
+    // A whole word outside parentheses: `FOREIGN KEY (references_id)` holds
+    // the letters in its column list.
+    let references_at = crate::core::rql::join::find_keyword(clause, "REFERENCES", 0)
         .ok_or_else(|| "a foreign key must name what it REFERENCES".to_string())?;
 
     // Referencing column: either from the `FOREIGN KEY (…)` list, or the column
@@ -329,13 +416,210 @@ pub fn parse_clause(
     let on_update = parse_action(actions, "ON UPDATE")?;
 
     Ok(ForeignKey {
-        name: name.unwrap_or_else(|| format!("fk_{}_{}", column, parent_table)),
+        name: match name {
+            Some(name) => crate::core::rql::unique_key::stored_name(&name),
+            None => default_name(table, &column),
+        },
         column,
         parent_table,
         parent_column,
         on_delete,
         on_update,
         is_deleted: false,
+    })
+}
+
+/// The columns a referenced table offers a foreign key, as one table's
+/// declarations: its fields, which are `UNIQUE` (inline, or a one-column
+/// primary key), its header's primary key, and its unique keys.
+pub struct ReferencedSide<'a> {
+    pub table: &'a str,
+    /// `(name, deleted, unique flag)` of each field.
+    pub fields: Vec<(&'a str, bool, bool)>,
+    pub primary_key: Option<&'a str>,
+    pub unique_keys: &'a [crate::core::rql::unique_key::UniqueKey],
+    /// A partitioned table's key columns, outermost first.
+    pub partition_key: Option<Vec<String>>,
+}
+
+impl<'a> ReferencedSide<'a> {
+    pub fn of_schema(
+        schema: &'a crate::core::row::schema::TableSchema,
+        table: &'a str,
+        partition_key: Option<Vec<String>>,
+    ) -> Self {
+        ReferencedSide {
+            table,
+            fields: schema
+                .fields
+                .iter()
+                .filter(|f| !crate::core::rql::nullable::is_hidden(&f.name))
+                .map(|f| (f.name.as_str(), f.is_deleted, f.is_unique))
+                .collect(),
+            primary_key: schema.primary_key.as_deref(),
+            unique_keys: &schema.unique_keys,
+            partition_key,
+        }
+    }
+}
+
+/// Why `fk` cannot reference `parent`, in PostgreSQL's words, or `None`:
+///
+/// - its referenced column is not a live column of the parent (42703,
+///   "column … referenced in foreign key constraint does not exist");
+/// - the parent is **partitioned** and no `UNIQUE` or `PRIMARY KEY` of it is
+///   exactly that column (42830, "there is no unique constraint matching
+///   given keys for referenced table …"; a partial unique index is no such
+///   constraint), or the column is not its whole partition key. The second
+///   is implied by the first (a unique key holds every partition key column,
+///   §1b, and a foreign key is one column), and checked on its own because
+///   every check of the key then routes by it: one that could not would
+///   have to read every partition (phase 3 P4).
+///
+/// A **plain** parent's column need not be unique: the plain path has always
+/// accepted that, unlike PostgreSQL, and phase 3 P4 leaves it as it was
+/// (docs/partitioning.md, "Phase 3 P4 as built", divergences). A delete of
+/// one of two parent rows sharing the value then acts on children the other
+/// still covers.
+pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> Option<String> {
+    let column = fk.parent_column.as_str();
+    let Some(&(_, _, flagged)) = parent
+        .fields
+        .iter()
+        .find(|(name, deleted, _)| !*deleted && name.eq_ignore_ascii_case(column))
+    else {
+        return Some(format!("column \"{column}\" referenced in foreign key constraint does not exist"));
+    };
+    let unique = flagged
+        || parent.primary_key.is_some_and(|p| p.eq_ignore_ascii_case(column))
+        || parent.unique_keys.iter().any(|k| {
+            !k.is_deleted && k.predicate.is_none() && k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(column)
+        });
+    let not_unique = || {
+        format!(
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            parent.table
+        )
+    };
+    if let Some(key) = &parent.partition_key {
+        if !unique {
+            return Some(not_unique());
+        }
+        if !(key.len() == 1 && key[0].eq_ignore_ascii_case(column)) {
+            return Some(format!(
+                "{}: partitioned table \"{}\" is partitioned by ({}), and a foreign key must reference its whole \
+                 partition key",
+                not_unique(),
+                parent.table,
+                key.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Whether a referencing column of type `child` can reference a column of
+/// type `parent`, by PostgreSQL's rule (`ATAddForeignKeyConstraint`) as far
+/// as this engine's types carry it: the pair has an equality operator in the
+/// referenced key's operator family, or the child's type casts **implicitly**
+/// to the parent's.
+///
+/// - one operator family, any direction: the integer widths; `REAL` and
+///   `DOUBLE PRECISION`; `DATE` and `TIMESTAMP`; the text types (`TEXT`,
+///   `VARCHAR`, `CHAR`);
+/// - an implicit cast, child to parent only: an integer to `NUMERIC`, `REAL`
+///   or `DOUBLE`; a `NUMERIC` to `REAL` or `DOUBLE`;
+/// - any other type with itself only (`UUID`, `BOOL`, `JSONB`, `BYTEA`, …).
+///
+/// PostgreSQL refuses the reverse casts (a `NUMERIC` or `DOUBLE` child of an
+/// integer key, a `DOUBLE` child of a `NUMERIC` key): no implicit cast runs
+/// that way. Everything it accepts is accepted here (P4 round 3: the first
+/// rule refused `INT` onto `NUMERIC`, which an import of a PostgreSQL schema
+/// may hold).
+pub fn compatible_key_types(child: &crate::core::db_type::DbType, parent: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType::*;
+    #[derive(PartialEq)]
+    enum F {
+        Int,
+        Float,
+        Numeric,
+        Text,
+        Time,
+        Other,
+    }
+    let family = |t: &crate::core::db_type::DbType| match t {
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => F::Int,
+        F32 | F64 => F::Float,
+        DECIMAL => F::Numeric,
+        STRING | CHAR => F::Text,
+        DATE | DATETIME => F::Time,
+        _ => F::Other,
+    };
+    match (family(child), family(parent)) {
+        (F::Other, F::Other) => child == parent,
+        (F::Int, F::Numeric) | (F::Int, F::Float) | (F::Numeric, F::Float) => true,
+        (a, b) => a == b && a != F::Other,
+    }
+}
+
+/// `text`, a key literal as `key_literal` renders one of type `ty`, in a form
+/// two types' renderings of one value share (P4 round 3): a number with no
+/// sign on zero, no leading or trailing zeros (`7`, `7.00` and `7.0` alike;
+/// a float's shortest rendering, `0.1`), a date or timestamp as its
+/// microseconds (a date at its midnight), text as written. Two values are
+/// equal when their forms are; a coercion that changes the form lost the
+/// value (`7.5` to an integer, a non-midnight timestamp to a date).
+pub fn canonical_key_text(text: &str, ty: &crate::core::db_type::DbType) -> String {
+    use crate::core::db_type::DbType::*;
+    let bare = crate::core::rql::column_default::strip_redundant_cast(text.trim());
+    let bare = bare.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).map(|t| t.replace("''", "'")).unwrap_or_else(|| bare.to_string());
+    match ty {
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 | F32 | F64 | DECIMAL => canonical_number(&bare),
+        DATE | DATETIME => match crate::core::value_codec::parse_timestamp_us(&bare) {
+            Some(us) => format!("us:{us}"),
+            None => bare,
+        },
+        CHAR => bare.trim_end().to_string(),
+        _ => bare,
+    }
+}
+
+/// A decimal number's canonical text; anything that is not a plain decimal
+/// (an exponent, `NaN`, `Infinity`) is returned as written, so it is equal
+/// only to itself.
+fn canonical_number(text: &str) -> String {
+    let t = text.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return t.to_string();
+    }
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let body = if frac.is_empty() { int.to_string() } else { format!("{int}.{frac}") };
+    if negative && body != "0" { format!("-{body}") } else { body }
+}
+
+/// PostgreSQL's refusal (42804) of `fk` when its column's type `child` cannot
+/// reference the parent column's type `parent` ([`compatible_key_types`]).
+pub fn type_refusal(
+    fk: &ForeignKey,
+    child: &crate::core::db_type::DbType,
+    parent: &crate::core::db_type::DbType,
+) -> Option<String> {
+    (!compatible_key_types(child, parent)).then(|| {
+        format!(
+            "foreign key constraint \"{}\" cannot be implemented: key columns \"{}\" and \"{}\" are of \
+             incompatible types: {:?} and {:?}",
+            fk.name, fk.column, fk.parent_column, child, parent
+        )
     })
 }
 
@@ -372,6 +656,7 @@ mod tests {
     fn parses_a_table_level_clause() {
         let fk = parse_clause(
             "FOREIGN KEY (domain_id) REFERENCES domain (id) ON DELETE CASCADE",
+            "t",
             Some("fk_x".to_string()),
             None,
         )
@@ -387,7 +672,7 @@ mod tests {
 
     #[test]
     fn parses_an_inline_column_clause() {
-        let fk = parse_clause(r#"REFERENCES "domain" ("id")"#, None, Some("domain_id")).unwrap();
+        let fk = parse_clause(r#"REFERENCES "domain" ("id")"#, "t", None, Some("domain_id")).unwrap();
         assert_eq!(fk.column, "domain_id");
         assert_eq!(fk.parent_table, "domain");
         assert_eq!(fk.parent_column, "id");
@@ -397,6 +682,7 @@ mod tests {
     fn reads_both_actions() {
         let fk = parse_clause(
             "FOREIGN KEY (a) REFERENCES b (c) ON DELETE SET NULL ON UPDATE CASCADE",
+            "t",
             None,
             None,
         )
@@ -409,6 +695,7 @@ mod tests {
     fn strips_quoting_and_schema_qualification() {
         let fk = parse_clause(
             r#"FOREIGN KEY ("domain_id") REFERENCES "public"."domain" ("id")"#,
+            "t",
             None,
             None,
         )
@@ -421,17 +708,18 @@ mod tests {
     /// something weaker than what was declared.
     #[test]
     fn composite_keys_are_refused_rather_than_partly_enforced() {
-        let e = parse_clause("FOREIGN KEY (a, b) REFERENCES t (c, d)", None, None).unwrap_err();
+        let e = parse_clause("FOREIGN KEY (a, b) REFERENCES t (c, d)", "t", None, None).unwrap_err();
         assert!(e.contains("composite"), "{}", e);
     }
 
     #[test]
     fn malformed_clauses_name_the_problem() {
-        assert!(parse_clause("FOREIGN KEY (a)", None, None).is_err());
-        assert!(parse_clause("FOREIGN KEY (a) REFERENCES t", None, None).is_err());
+        assert!(parse_clause("FOREIGN KEY (a)", "t", None, None).is_err());
+        assert!(parse_clause("FOREIGN KEY (a) REFERENCES t", "t", None, None).is_err());
         assert!(
             parse_clause(
                 "FOREIGN KEY (a) REFERENCES t (b) ON DELETE SET SOMETHING",
+                "t",
                 None,
                 None
             )
@@ -440,10 +728,92 @@ mod tests {
         );
     }
 
+    /// PostgreSQL's name, `<table>_<column>_fkey`, built as every derived
+    /// name is: on a long table name the stem is cut at a character
+    /// boundary and the label kept whole.
     #[test]
-    fn an_unnamed_constraint_gets_a_derived_name() {
-        let fk = parse_clause("FOREIGN KEY (user_id) REFERENCES users (id)", None, None).unwrap();
-        assert_eq!(fk.name, "fk_user_id_users");
+    fn an_unnamed_constraint_gets_postgres_name() {
+        let fk = parse_clause("FOREIGN KEY (user_id) REFERENCES users (id)", "orders", None, None).unwrap();
+        assert_eq!(fk.name, "orders_user_id_fkey");
+        let inline = parse_clause("REFERENCES users (id)", "orders", None, Some("buyer")).unwrap();
+        assert_eq!(inline.name, "orders_buyer_fkey");
+        let long = "é".repeat(70);
+        let fk = parse_clause("FOREIGN KEY (a) REFERENCES u (id)", &long, None, None).unwrap();
+        assert!(fk.name.len() <= 128 && fk.name.ends_with("_fkey"), "{}", fk.name);
+        assert!(fk.name.starts_with("éé"), "{}", fk.name);
+    }
+
+    /// A name is kept as written, UTF-8, spaces and all, cut at a character
+    /// boundary within its 128-byte slot; the column and table names too.
+    #[test]
+    fn names_are_stored_as_given() {
+        let mut fk = sample();
+        fk.name = "my 外键".to_string();
+        fk.column = "Ünit col".to_string();
+        fk.parent_table = "親".to_string();
+        fk.parent_column = "id é".to_string();
+        assert_eq!(ForeignKey::from_vec(&fk.into_vec()).unwrap(), fk);
+        fk.name = "é".repeat(70);
+        let back = ForeignKey::from_vec(&fk.into_vec()).unwrap();
+        assert_eq!(back.name, "é".repeat(64), "cut at a char boundary within 128 bytes");
+        let named = parse_clause("FOREIGN KEY (a) REFERENCES u (id)", "t", Some("é".repeat(70)), None).unwrap();
+        assert_eq!(named.name, back.name, "read in the form it is stored in");
+    }
+
+    /// A record an older binary wrote ASCII-filtered reads back as written.
+    #[test]
+    fn a_filtered_record_still_reads() {
+        let mut raw = vec![0u8; FOREIGN_KEY_SIZE as usize];
+        raw[..4].copy_from_slice(b"myfk");
+        raw[129..130].copy_from_slice(b"a");
+        raw[258..259].copy_from_slice(b"p");
+        raw[387..389].copy_from_slice(b"id");
+        let fk = ForeignKey::from_vec(&raw).unwrap();
+        assert_eq!((fk.name.as_str(), fk.column.as_str(), fk.parent_table.as_str()), ("myfk", "a", "p"));
+    }
+
+    /// PostgreSQL's pairs (P4 round 3): what has an operator or an implicit
+    /// cast child to parent is accepted, the reverse casts are not.
+    #[test]
+    fn key_types_pair_as_postgres_pairs_them() {
+        use crate::core::db_type::DbType::*;
+        for (child, parent) in [
+            (I32, I64), (I64, I16), (I32, DECIMAL), (I64, F64), (I16, F32), (DECIMAL, F64), (DECIMAL, DECIMAL),
+            (F64, F32), (F32, F64), (DATE, DATETIME), (DATETIME, DATE), (STRING, CHAR), (UUID, UUID), (BOOL, BOOL),
+        ] {
+            assert!(compatible_key_types(&child, &parent), "{child:?} -> {parent:?}");
+        }
+        for (child, parent) in [
+            (DECIMAL, I32), (F64, I64), (F64, DECIMAL), (STRING, I32), (UUID, STRING), (BOOL, I32), (DATE, STRING),
+            (JSONB, STRING), (BYTEA, STRING),
+        ] {
+            assert!(!compatible_key_types(&child, &parent), "{child:?} -> {parent:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_forms_meet_across_types() {
+        use crate::core::db_type::DbType::*;
+        assert_eq!(canonical_key_text("7", &I32), canonical_key_text("7.00", &DECIMAL));
+        assert_eq!(canonical_key_text("-3", &I64), canonical_key_text("-3.0", &DECIMAL));
+        assert_ne!(canonical_key_text("7", &I32), canonical_key_text("7.50", &DECIMAL));
+        assert_eq!(canonical_key_text("-0.00", &DECIMAL), "0");
+        assert_eq!(canonical_key_text("'it''s'", &STRING), "it's");
+        assert_eq!(canonical_key_text("'2024-01-01'", &DATE), canonical_key_text("'2024-01-01 00:00:00'", &DATETIME));
+        assert_ne!(canonical_key_text("'2024-01-01'", &DATE), canonical_key_text("'2024-01-01 10:00:00'", &DATETIME));
+        assert_ne!(canonical_key_text("9007199254740993", &I64), canonical_key_text("9007199254740992", &F64));
+    }
+
+    /// A table or column name that does not fit is refused, never cut: a cut
+    /// table name names another table.
+    #[test]
+    fn an_unstorable_name_is_refused() {
+        let mut fk = sample();
+        assert!(fk.storable().is_ok());
+        fk.parent_table = "p".repeat(129);
+        assert!(fk.storable().unwrap_err().contains("not supported"));
+        fk.parent_table = "p".repeat(128);
+        assert!(fk.storable().is_ok());
     }
 
     fn sample() -> ForeignKey {

@@ -128,6 +128,49 @@ impl RowSource {
         Ok(RowSource::Partitioned(Box::new(FanOut::plan_with(table, where_clause, visibility)?)))
     }
 
+    /// A partitioned table's source over `route`, a route the caller already
+    /// read from the predicate the partitions' scans evaluate (or `All`),
+    /// read under `visibility`, a snapshot taken before it: the probe that
+    /// decided by the route does not tokenize and route the clause twice.
+    pub(crate) fn partitioned_routed(
+        table: Arc<PartitionedTable>,
+        route: &crate::core::partition::Route,
+        visibility: Visibility,
+    ) -> io::Result<Self> {
+        table.check()?;
+        let epoch = table.epoch()?;
+        let parts = Parts::from_vec(table.materialized(&epoch, route)?);
+        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+        Ok(RowSource::Partitioned(Box::new(FanOut { table, visibility, _epoch: epoch, parts, cache })))
+    }
+
+    /// A partitioned table's source over the partitions owning `ranges`
+    /// (each a key's point range, `PartitionedTable::keyed_range`), read
+    /// under `visibility`, a snapshot the caller took first (§4.4's order:
+    /// the snapshot, then the epoch, then the partitions). For a foreign-key
+    /// probe of a partitioned parent whose `WHERE` the router cannot read as
+    /// key points (`k = -7`: a signed number is no point to `route_where`,
+    /// which then routes everywhere): the probe still reads only the
+    /// partitions of its keys (phase 3 P4). Every partition is scanned with
+    /// the probe's own predicate, so a range only narrows what is read.
+    pub(crate) fn partitioned_in(
+        table: Arc<PartitionedTable>,
+        ranges: &[crate::core::partition::PointRange],
+        visibility: Visibility,
+    ) -> io::Result<Self> {
+        table.check()?;
+        let epoch = table.epoch()?;
+        let mut by_pid: std::collections::BTreeMap<u32, Arc<PartTable>> = std::collections::BTreeMap::new();
+        for range in ranges {
+            for (pid, part) in table.materialized_in(&epoch, *range)? {
+                by_pid.insert(pid, part);
+            }
+        }
+        let parts: Parts = by_pid.into_iter().collect();
+        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+        Ok(RowSource::Partitioned(Box::new(FanOut { table, visibility, _epoch: epoch, parts, cache })))
+    }
+
     /// The relation this source reads, for a locking read that scans it again
     /// at a fresh snapshot (`execute_query_rows`, phase 3 P3).
     pub(crate) fn rescan_relation(&self) -> Relation {
@@ -542,6 +585,28 @@ pub(crate) async fn write_partitions<F, Fut>(
     table: &PartitionedTable,
     where_clause: &str,
     tx: TxId,
+    collect: Option<&mut Vec<Row>>,
+    write: F,
+) -> io::Result<u64>
+where
+    F: FnMut(Arc<PartTable>, Option<Visibility>, bool) -> Fut,
+    Fut: std::future::Future<Output = PartWrite>,
+{
+    write_partitions_as_of(table, where_clause, tx, None, collect, write).await
+}
+
+/// [`write_partitions`] under `statement`, a snapshot the caller took
+/// before it: the one a statement's foreign-key work read the rows it judged
+/// under (the keys a `DELETE` removes, what an `UPDATE` changes; phase 3
+/// P4), so the rows written are exactly those rows. Every partition is then
+/// written under it, a lone partition too, as a plain table's write is given
+/// the statement's `Visibility` in the same case. `None` is
+/// [`write_partitions`].
+pub(crate) async fn write_partitions_as_of<F, Fut>(
+    table: &PartitionedTable,
+    where_clause: &str,
+    tx: TxId,
+    statement: Option<Visibility>,
     mut collect: Option<&mut Vec<Row>>,
     mut write: F,
 ) -> io::Result<u64>
@@ -550,14 +615,15 @@ where
     Fut: std::future::Future<Output = PartWrite>,
 {
     table.check()?;
-    let visibility = table.visibility_for(tx);
+    let pinned = statement.is_some();
+    let visibility = statement.unwrap_or_else(|| table.visibility_for(tx));
     let epoch = table.epoch()?;
     let route = table.route_where(where_clause)?;
     let parts = table.materialized(&epoch, &route)?;
     #[cfg(test)]
     test_hooks::note_writes(table.uid(), parts.iter().map(|(pid, _)| *pid));
     let collecting = collect.is_some();
-    if parts.len() <= 1 {
+    if parts.len() <= 1 && !pinned {
         drop(visibility);
         let Some((_, part)) = parts.into_iter().next() else {
             return Ok(0);

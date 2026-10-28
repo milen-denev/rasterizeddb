@@ -107,7 +107,7 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "lock_selected_rows", "table_for"),
     (EXEC, "prevalidate_foreign_keys", "table_for"),
     (EXEC, "query_output_scales", "schema_view"),
-    (EXEC, "referenced_values_now", "table_for"),
+    (EXEC, "referenced_values_now", "relation_for"),
     (EXEC, "refuse_write_to_locked_rows", "table_for"),
     // B5: both rewrites go through `rewrite_rows`, which confirms the
     // statement's ACCESS EXCLUSIVE and reads inside the reload.

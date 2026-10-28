@@ -819,6 +819,14 @@ impl PartitionedTable {
         Visibility::for_snapshot(self.transactions.snapshot(tx), self.transactions.clone())
     }
 
+    /// The rule for `tx` as of now, ignoring a snapshot it has pinned, as
+    /// `Table::visibility_now_for` is for a plain table: what a foreign-key
+    /// check reads a partitioned parent or child with (phase 3 P4), every
+    /// partition under this one value.
+    pub fn visibility_now_for(&self, tx: TxId) -> Visibility {
+        Visibility::for_snapshot(self.transactions.snapshot_now(tx), self.transactions.clone())
+    }
+
     /// [`Self::visibility_for`] for a query, as `Table::read_visibility_for`
     /// is for a plain table: inside a read-only statement, the snapshot every
     /// read of that statement shares (`statement_snapshot`), else a new one.

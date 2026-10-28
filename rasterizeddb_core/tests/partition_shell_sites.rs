@@ -233,9 +233,10 @@ const SITES: &[Site] = &[
     ),
     site(
         "ALTER TABLE site_p ADD CONSTRAINT site_p_fk FOREIGN KEY (n) REFERENCES site_parent(id)",
-        Expect::Refused,
-        "FKs: P4",
+        Expect::LikeTwin,
+        "phase 3 P4: the rows validated in every partition",
     ),
+    site("ALTER TABLE site_p DROP CONSTRAINT IF EXISTS site_p_fk", Expect::LikeTwin, "phase 3 P4"),
     site("ALTER TABLE site_p DROP CONSTRAINT nope", Expect::LikeTwin, "no such constraint: a no-op on both"),
     site("ALTER TABLE site_p OWNER TO rasterized", Expect::LikeTwin, "a no-op on both"),
     site("ALTER TABLE site_p SET (fillfactor = 70)", Expect::LikeTwin, "a no-op on both"),
@@ -385,20 +386,27 @@ const SITES: &[Site] = &[
     site("SELECT * FROM pg_attribute", Expect::LikeTwin, "not a view here"),
     site("SELECT pg_total_relation_size('site_p')", Expect::LikeTwin, "not a function here"),
     // FKs, both directions.
+    // Phase 3 P4: onto a partitioned table only by its whole partition key,
+    // which `tenant_id` alone is not (the key is two columns): 42830.
     site(
         "CREATE TABLE site_child (id INT, tid BIGINT REFERENCES site_p(tenant_id))",
-        Expect::Refused,
-        "FKs onto a partitioned table: phase 3",
+        Expect::Error("42830"),
+        "phase 3 P4: not its partition key",
     ),
     site(
         "ALTER TABLE site_parent ADD CONSTRAINT site_parent_fk FOREIGN KEY (id) REFERENCES site_p(tenant_id)",
-        Expect::Refused,
-        "phase 3",
+        Expect::Error("42830"),
+        "phase 3 P4: not its partition key",
     ),
     site(
         "CREATE TABLE site_fk (k INT NOT NULL REFERENCES site_parent(id)) PARTITION BY HASH (k)",
-        Expect::Refused,
-        "FKs from a partitioned table: refused in 2a",
+        Expect::Check(|_, db| if db.is_partitioned("site_fk") { Ok(()) } else { Err("not created".into()) }),
+        "phase 3 P4: FKs from a partitioned table",
+    ),
+    site(
+        "DROP TABLE site_fk",
+        Expect::Check(|_, db| if db.is_partitioned("site_fk") { Err("still there".into()) } else { Ok(()) }),
+        "phase 3 P4",
     ),
     // The data statements, through each front door.
     site("SELECT * FROM site_p", Expect::LikeTwin, "S10: a fan-out"),

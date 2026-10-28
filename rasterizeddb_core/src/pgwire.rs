@@ -6833,6 +6833,28 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has(" position ") && (has("is not in the select list") || has("is not in the union")) {
         return "42P10";
     }
+    // A foreign key's definition (phase 3 P4), in PostgreSQL's words, ahead
+    // of the "foreign key … does not exist" rule below (23503) and the
+    // relation rule, which the quoted names could reach:
+    // `invalid_foreign_key` for a referenced column no unique key is
+    // exactly, `undefined_column` for a column it names that is not there.
+    if has("there is no unique constraint matching given keys for referenced table") {
+        return "42830";
+    }
+    if has("referenced in foreign key constraint does not exist") {
+        return "42703";
+    }
+    // `datatype_mismatch`: a foreign key between columns of incompatible
+    // types, in the engine's words (never a client's quoted text).
+    if has("foreign key constraint") && has("cannot be implemented") && has("are of incompatible types") {
+        return "42804";
+    }
+    // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
+    // foreign keys reference, without CASCADE; DROP COLUMN of a referenced
+    // column. Early: the message quotes table and constraint names.
+    if has("because other objects depend on it") || (has("because constraint") && has("depends on it")) {
+        return "2BP01";
+    }
     // `invalid_table_definition`: a second PRIMARY KEY. Early: the message
     // quotes the table's name.
     if has("multiple primary keys for table") {

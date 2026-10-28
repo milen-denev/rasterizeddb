@@ -234,10 +234,6 @@ fn refused_shapes_write_nothing() {
                 "generated",
             ),
             (
-                "CREATE TABLE pr (k INT NOT NULL REFERENCES pd_parent(id)) PARTITION BY HASH (k)",
-                "FOREIGN KEY",
-            ),
-            (
                 "CREATE TABLE pr (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, d INT NOT NULL) \
                  PARTITION BY HASH (a, b, c, d)",
                 "4 columns",
@@ -350,38 +346,56 @@ fn if_not_exists_on_a_partitioned_table_writes_nothing() {
     });
 }
 
-/// FKs are refused both ways (phase 2a): a plain table cannot reference a
-/// partitioned one, at CREATE or through ALTER, and the refused ALTER leaves
-/// the child's FK sidecar empty.
+/// FKs onto a partitioned table (phase 3 P4): referencing its whole
+/// partition key, at CREATE and through ALTER (named, unnamed, and unnamed
+/// again, numbered), each stored in the
+/// child's sidecar; any other column is 42830's refusal, which writes
+/// nothing. (Refused both ways in phases 2a to 3 P1.)
 #[test]
-fn foreign_keys_onto_a_partitioned_table_are_refused() {
+fn foreign_keys_onto_a_partitioned_table_reference_its_partition_key() {
     on_a_big_stack(async {
         let dir = tempfile::tempdir().expect("dir");
         let db = open(dir.path()).await;
-        run(&db, "CREATE TABLE pd_fk_parent (id INT NOT NULL UNIQUE) PARTITION BY HASH (id) PARTITIONS 2")
+        run(&db, "CREATE TABLE pd_fk_parent (id INT NOT NULL UNIQUE, alt INT) PARTITION BY HASH (id) PARTITIONS 2")
             .await
             .expect("partitioned parent");
 
-        let sql = "CREATE TABLE pd_fk_child (id INT, parent_id INT REFERENCES pd_fk_parent(id))";
+        let sql = "CREATE TABLE pd_fk_child0 (id INT, parent_id INT REFERENCES pd_fk_parent(id))";
+        run(&db, sql).await.expect("a CREATE referencing a partitioned table's key");
+        let fks = &db.table_for_tests("pd_fk_child0").unwrap().schema.foreign_keys;
+        assert_eq!(fks.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["pd_fk_child0_parent_id_fkey"]);
+
+        let sql = "CREATE TABLE pd_fk_bad (id INT, parent_id INT REFERENCES pd_fk_parent(alt))";
         let len = catalogue_len(&db).await;
-        let e = run(&db, sql).await.expect_err("a CREATE referencing a partitioned table");
-        assert_0a000(sql, &e);
-        assert!(db.table_for_tests("pd_fk_child").is_none());
+        let e = run(&db, sql).await.expect_err("a CREATE referencing a non-key column");
+        assert!(e.contains("there is no unique constraint matching given keys"), "{sql}: {e}");
+        assert!(db.table_for_tests("pd_fk_bad").is_none());
         assert_eq!(catalogue_len(&db).await, len);
 
         run(&db, "CREATE TABLE pd_fk_child (id INT, parent_id INT)").await.expect("plain child");
         let before = on_disk_schema(&db, "pd_fk_child").await;
+        let e = run(&db, "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES pd_fk_parent (alt)")
+            .await
+            .expect_err("a non-key column");
+        assert!(e.contains("there is no unique constraint matching given keys"), "{e}");
+        assert_eq!(on_disk_schema(&db, "pd_fk_child").await, before, "a refused ALTER wrote the FK");
         for sql in [
             "ALTER TABLE pd_fk_child ADD CONSTRAINT c_fk FOREIGN KEY (parent_id) REFERENCES pd_fk_parent(id)",
             "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES pd_fk_parent (id)",
-            "ALTER TABLE pd_fk_child ADD CONSTRAINT c_fk2 FOREIGN KEY (parent_id) REFERENCES PD_FK_PARENT(id)",
+            "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES pd_fk_parent(id)",
         ] {
-            let e = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
-            assert_0a000(sql, &e);
-            assert!(e.contains("pd_fk_parent") || e.contains("PD_FK_PARENT"), "{sql}: {e}");
+            run(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
-        assert_eq!(on_disk_schema(&db, "pd_fk_child").await, before, "a refused ALTER wrote the FK");
-        assert!(db.table_for_tests("pd_fk_child").unwrap().schema.foreign_keys.is_empty());
+        // Identifiers are not case-folded here (an open finding), so the
+        // parent spelled in capitals is no table: 42P01, nothing written.
+        let e = run(&db, "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES PD_FK_PARENT(id)")
+            .await
+            .expect_err("another spelling");
+        assert!(e.contains("relation \"PD_FK_PARENT\" does not exist"), "{e}");
+        let names: Vec<String> =
+            db.table_for_tests("pd_fk_child").unwrap().schema.foreign_keys.iter().map(|f| f.name.clone()).collect();
+        assert_eq!(names, vec!["c_fk", "pd_fk_child_parent_id_fkey", "pd_fk_child_parent_id_fkey1"]);
+        assert_ne!(on_disk_schema(&db, "pd_fk_child").await, before, "the keys are in the sidecar");
     });
 }
 
@@ -413,7 +427,6 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
             ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
             ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (n)", "partition key column"),
             ("CREATE UNIQUE INDEX pd_alt_n1 ON pd_alt (n)", "partition key column"),
-            ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_fk FOREIGN KEY (n) REFERENCES pd_plain(id)", "FOREIGN KEY"),
             ("ALTER TABLE pd_alt ADD COLUMN j JSON", "shadow tables"),
         ] {
             let e = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
@@ -424,6 +437,12 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
             assert!(db.table_for_tests("pd_plain").is_some(), "{sql} moved the plain table");
         }
         assert_eq!(catalogue_len(&db).await, len, "a refused statement wrote a catalogue row");
+        // A foreign key is built (phase 3 P4); the rows already there are
+        // validated first, in every partition: 1 and 2 have no parent.
+        let sql = "ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_fk FOREIGN KEY (n) REFERENCES pd_plain(id)";
+        let e = run(&db, sql).await.expect_err("rows without a parent");
+        assert!(e.contains("violates foreign key constraint \"pd_alt_fk\""), "{e}");
+        assert_eq!(on_disk_schema(&db, "pd_alt").await, before, "{sql} wrote the shell's schema");
         // A plain table cannot take the partitioned table's name.
         let e = run(&db, "ALTER TABLE pd_plain RENAME TO pd_alt").await.expect_err("a rename onto it");
         assert!(e.contains("already exists"), "{e}");
