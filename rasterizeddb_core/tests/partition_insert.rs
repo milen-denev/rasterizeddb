@@ -104,10 +104,10 @@ fn a_multi_row_multi_tenant_insert_puts_every_row_in_its_partition() {
     drop(server);
 }
 
-/// §10 and plan fact 5: one sequence per logical table, seeded at the first
-/// insert after a restart from the maximum over every partition. Seeded from
-/// the shell, which holds no rows, it restarted at 1 after every restart: on
-/// columns with no unique key, as here, a silent duplicate.
+/// §10 and plan fact 5: one sequence per logical table. Seeded from the
+/// shell, which holds no rows, it restarted at 1 after every restart: on
+/// columns with no unique key, as here, a silent duplicate. Since phase 3
+/// P5a it resumes from its durable reservation, past every value handed out.
 #[test]
 fn serial_and_bigserial_keep_counting_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
@@ -140,8 +140,18 @@ fn serial_and_bigserial_keep_counting_across_restarts() {
         v.sort();
         v
     };
-    assert_eq!(a, (1..=10).collect::<Vec<i32>>(), "SERIAL repeated or skipped values across restarts");
-    assert_eq!(b, (1..=10).collect::<Vec<i64>>(), "BIGSERIAL repeated or skipped values across restarts");
+    // Since phase 3 P5a the high-water is reserved durably in steps of
+    // 1024 (§10), as row ids are: a restart resumes past the reservation,
+    // leaving a gap (as PostgreSQL's sequences do after a crash), and never
+    // repeats a value.
+    let step = 1024i64;
+    let check = |v: Vec<i64>, what: &str| {
+        assert_eq!(&v[..4], &[1, 2, 3, 4], "{what}: the first process's values");
+        assert!(v.windows(2).all(|w| w[0] < w[1]), "{what} repeated a value across restarts: {v:?}");
+        assert!(v[9] <= 4 + 2 * (step + 3) + 3, "{what} skipped more than a step per restart: {v:?}");
+    };
+    check(a.into_iter().map(i64::from).collect(), "SERIAL");
+    check(b, "BIGSERIAL");
     drop(server);
 }
 

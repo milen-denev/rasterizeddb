@@ -314,9 +314,15 @@ fn prepared_update_returning_stays_right_after_a_write_and_a_restart() {
         assert_eq!(shape(&Ok(dp)), shape(&Ok(dq)), "life {life}: Describe");
         for run in 0..6usize {
             let tenant = [3, 8, 3, 11, 5, 3][run];
-            // A write to the very rows the next execution changes.
+            // A write to the very rows the next execution changes. Its id is
+            // given: since phase 3 P5a a partitioned table's BIGSERIAL resumes
+            // past its durable reservation after a restart (a gap, §10),
+            // where the plain twin reseeds from its maximum, and this test is
+            // about RETURNING, not the sequence (`pin_tests` and
+            // `partition_insert` cover that).
+            let id = 10_000 + life * 100 + run as i64;
             for t in [P, Q] {
-                c.ok(&format!("INSERT INTO {t} (tenant_id, n, amt) VALUES ({tenant}, {run}, 1.25)"));
+                c.ok(&format!("INSERT INTO {t} (tenant_id, id, n, amt) VALUES ({tenant}, {id}, {run}, 1.25)"));
                 c.ok(&format!("UPDATE {t} SET amt = amt + 1 WHERE tenant_id = {tenant}"));
             }
             let params = [Some((run as i64 - 2).to_string()), Some(format!("life {life} run {run}")), Some(tenant.to_string())];

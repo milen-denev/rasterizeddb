@@ -2277,8 +2277,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
         }
         db.transactions.settle_now();
         for name in db.table_names() {
+            // A shell has no rows to sweep (`io_rows` refuses on one).
             if let Some(t) = db.table_for_tests(&name)
-                && !t.is_shell()
+                && t.io_rows().is_ok()
             {
                 t.neutralize_aborted_now().await.expect("a plain table's forget sweep");
             }
