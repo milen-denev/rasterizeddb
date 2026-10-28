@@ -1015,3 +1015,59 @@ fn add_column_references_goes_through_the_foreign_key_path() {
     c.ok("INSERT INTO acp (cid, v) VALUES (1, 1)");
     assert!(c.simple("ALTER TABLE acp ADD COLUMN pid INT REFERENCES ap(id)").expect_err("populated").is_unsupported());
 }
+
+/// Foreign keys on tables placed on a key/value store (a local directory
+/// store): a kv parent and a kv child, a kv child of a partitioned parent,
+/// and a file child moved onto the store with its key in place. ADD
+/// FOREIGN KEY validates, inserts are checked, a parent DELETE refuses or
+/// cascades, and all of it holds after a restart (the FK sidecar travels
+/// with the table, `table_owns_file`'s `_schema_FK.db`).
+#[test]
+fn foreign_keys_on_key_value_placed_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path().to_str().unwrap());
+    {
+        let mut c = server.connect();
+        c.ok(&format!("STORAGE ADD STORE p4kv DIRECTORY WITH (PATH = '{}', PREFIX = 'p4')", kv.path().display()));
+        for t in ["kvp", "kvc", "kvq"] {
+            c.ok(&format!("STORAGE PLACE TABLE {t} AT 'kv:p4kv'"));
+        }
+        c.ok("CREATE TABLE kvp (id BIGINT NOT NULL PRIMARY KEY)");
+        c.ok("INSERT INTO kvp (id) VALUES (1), (2), (3)");
+        c.ok("CREATE TABLE kvc (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT)");
+        c.ok("INSERT INTO kvc (cid, pid) VALUES (1, 1), (2, 2), (3, 9)");
+        assert_eq!(c.simple("ALTER TABLE kvc ADD FOREIGN KEY (pid) REFERENCES kvp (id) ON DELETE CASCADE").unwrap_err().code, "23503");
+        c.ok("DELETE FROM kvc WHERE pid = 9");
+        c.ok("ALTER TABLE kvc ADD FOREIGN KEY (pid) REFERENCES kvp (id) ON DELETE CASCADE");
+        assert_eq!(c.simple("INSERT INTO kvc (cid, pid) VALUES (4, 8)").unwrap_err().code, "23503");
+        c.ok("DELETE FROM kvp WHERE id = 1");
+        // A kv child of a partitioned parent.
+        c.ok("CREATE TABLE kvpp (id BIGINT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 4");
+        c.ok("INSERT INTO kvpp (id) VALUES (5), (6)");
+        c.ok("CREATE TABLE kvq (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES kvpp (id))");
+        c.ok("INSERT INTO kvq (cid, pid) VALUES (1, 5)");
+        assert_eq!(c.simple("INSERT INTO kvq (cid, pid) VALUES (2, 7)").unwrap_err().code, "23503");
+        assert_eq!(c.simple("DELETE FROM kvpp WHERE id = 5").unwrap_err().code, "23503");
+        // A file child, keyed, moved onto the store.
+        c.ok("CREATE TABLE kvm (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES kvp (id))");
+        c.ok("INSERT INTO kvm (cid, pid) VALUES (1, 3)");
+        c.ok("STORAGE MOVE TABLE kvm TO 'kv:p4kv'");
+        assert_eq!(c.simple("INSERT INTO kvm (cid, pid) VALUES (2, 8)").unwrap_err().code, "23503");
+    }
+    server = server.restart();
+    let mut c = server.connect();
+    let tables = c.ok("SHOW TABLES");
+    assert!(format!("{:?}", tables.rows).contains("kv-directory"), "{:?}", tables.rows);
+    assert_eq!(c.ok("SELECT cid, pid FROM kvc ORDER BY cid").rows, vec![vec![Some("2".to_string()), Some("2".to_string())]]);
+    assert_eq!(c.simple("INSERT INTO kvc (cid, pid) VALUES (4, 8)").unwrap_err().code, "23503");
+    c.ok("DELETE FROM kvp WHERE id = 2");
+    assert_eq!(c.ok("SELECT count(*) FROM kvc").rows, vec![vec![Some("0".to_string())]], "cascaded after the restart");
+    assert_eq!(c.simple("INSERT INTO kvq (cid, pid) VALUES (2, 7)").unwrap_err().code, "23503");
+    assert_eq!(c.simple("DELETE FROM kvpp WHERE id = 5").unwrap_err().code, "23503");
+    assert_eq!(c.simple("INSERT INTO kvm (cid, pid) VALUES (2, 8)").unwrap_err().code, "23503");
+    assert_eq!(c.simple("DELETE FROM kvp WHERE id = 3").unwrap_err().code, "23503");
+    assert_eq!(c.simple("DROP TABLE kvp").unwrap_err().code, "2BP01");
+    c.ok("DROP TABLE kvp CASCADE");
+    c.ok("INSERT INTO kvm (cid, pid) VALUES (3, 8)");
+}

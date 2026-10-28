@@ -568,6 +568,15 @@ populated and an empty plain child, an empty partitioned one). Unlike
 PostgreSQL, whose column constraints take no `NOT VALID` (a syntax error
 there), `ADD COLUMN … REFERENCES … NOT VALID` is accepted here.
 
+**Key/value-placed tables** (rebased onto `9035fb5`): a parent and a child
+placed `AT 'kv:<store>'`, a kv child of a partitioned parent, and a file
+child moved onto a store with its key in place behave as on files (ADD
+validates, inserts are checked, a parent DELETE refuses or cascades, DROP
+… CASCADE), through a restart: the FK sidecar is one of the table's files
+(`table_owns_file` takes `_schema_FK.db`), and the reverse index is rebuilt
+at open (`partition_fk::foreign_keys_on_key_value_placed_tables`).
+Partitioned tables themselves are not placed on a store (§2).
+
 **Behaviour changes for plain tables** (the same code serves both kinds):
 
 - `ADD CONSTRAINT … FOREIGN KEY` validates the rows already there (23503,
