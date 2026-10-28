@@ -7593,6 +7593,39 @@ fn validate_generated(
     crate::core::rql::generated::validate(&create_table.generated, &columns)
 }
 
+/// A `CREATE TABLE`'s `CHECK`s, each compiled against the declared columns,
+/// as `ADD CONSTRAINT` compiles one. A check that could not be compiled was
+/// stored, logged at every write and never enforced: `CHECK (COALESCE(x, 1)
+/// > 0)` took `x = -3`.
+fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Result<(), String> {
+    if create_table.checks.is_empty() {
+        return Ok(());
+    }
+    // Every column, the nullability companions included: a check is
+    // compiled against the table as a write will see it.
+    let fields: Vec<crate::core::row::schema::SchemaField> = create_table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut field =
+                crate::core::row::schema::SchemaField::new(c.name.clone(), c.data_type.clone(), 0, 0, i as u64, false);
+            field.scale = create_table
+                .type_modifiers
+                .iter()
+                .find(|m| m.column.eq_ignore_ascii_case(&c.name))
+                .map(|m| m.scale as u32);
+            field
+        })
+        .collect();
+    for check in &create_table.checks {
+        if let Err(reason) = compile_check(&check.expression, &fields) {
+            return Err(format!("check constraint \"{}\" cannot be compiled: {}", check.name, reason));
+        }
+    }
+    Ok(())
+}
+
 /// An `UPDATE` on a table with generated columns, checked and put in the shape
 /// the update parser reads.
 ///
@@ -9704,32 +9737,20 @@ fn check_constraints_hold(
     }
     let row = &row;
 
-    // The schema without the nullability companions. Handing the rewriter the
-    // full schema makes it wrap every reference in `__null_x = 0 AND …`, which
-    // turns "this column is NULL" into "the check failed" — the opposite of
-    // what a check does with NULL.
-    let visible: Vec<crate::core::row::schema::SchemaField> =
-        crate::core::rql::nullable::visible_fields(&schema.fields);
-    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
-        visible.iter().cloned().collect();
-
     for constraint in &schema.checks {
         if constraint.is_deleted {
             continue;
         }
 
-        // `BETWEEN`, `IN` and the rest are sugar the condition evaluator does
-        // not read; the predicate rewriter lowers them to the comparisons it
-        // does. A check it cannot lower is logged and skipped rather than
-        // failing every insert into the table.
-        let lowered = match crate::core::tokenizer::predicate_rewrite::rewrite_where(
-            &constraint.expression,
-            &visible_sv,
-        ) {
-            Ok(text) => text,
+        // A check that cannot be compiled is refused when it is declared
+        // (`compile_check`); one stored before that rule is logged and
+        // skipped rather than failing every insert into the table.
+        let compiled = match compile_check(&constraint.expression, &schema.fields) {
+            Ok(compiled) => compiled,
             Err(reason) => {
                 log::error!(
-                    "check constraint '{}' on '{}' could not be compiled and is not being                      enforced: {}",
+                    "check constraint '{}' on '{}' could not be compiled and is not being \
+                     enforced: {}",
                     constraint.name,
                     table_name,
                     reason
@@ -9738,32 +9759,9 @@ fn check_constraints_hold(
             }
         };
 
-        let condition = match crate::core::rql::expr::parse_cond(&lowered, &visible) {
-            Ok(condition) => condition,
-            Err(reason) => {
-                log::error!(
-                    "check constraint '{}' on '{}' could not be compiled and is not being                      enforced: {}",
-                    constraint.name,
-                    table_name,
-                    reason
-                );
-                continue;
-            }
-        };
-
-        // A check whose inputs include a NULL passes without being evaluated —
-        // PostgreSQL rejects a row only when a check is *false*, and a
-        // comparison against NULL is NULL rather than false. Unless the check
-        // tests for NULL itself, in which case that test is the point.
-        let upper = constraint.expression.to_ascii_uppercase();
-        let tests_null = upper.contains("IS NULL") || upper.contains("IS NOT NULL");
-        if !tests_null && condition_reads_a_null(&condition, &schema.fields, row) {
-            continue;
-        }
-
-        match crate::core::rql::expr::eval_cond(&condition, row, &visible) {
-            Ok(true) => {}
-            Ok(false) => {
+        match compiled.violated(row, &schema.fields) {
+            Ok(false) => {}
+            Ok(true) => {
                 return Err(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",
                     table_name, constraint.name
@@ -9771,7 +9769,8 @@ fn check_constraints_hold(
             }
             Err(reason) => {
                 log::error!(
-                    "check constraint '{}' on '{}' could not be evaluated and is not being                      enforced for this row: {}",
+                    "check constraint '{}' on '{}' could not be evaluated and is not being \
+                     enforced for this row: {}",
                     constraint.name,
                     table_name,
                     reason
@@ -9780,6 +9779,101 @@ fn check_constraints_hold(
         }
     }
     Ok(())
+}
+
+/// A `CHECK`, compiled to tell whether a row violates it.
+///
+/// PostgreSQL refuses a row only when a check is FALSE; UNKNOWN (a NULL
+/// result) passes, so `x > 0` and `x IS NULL OR x > 0` both take a NULL `x`.
+/// It used to be compiled against the table *without* its nullability
+/// companions, which made the rewriter read every column as NOT NULL:
+/// `x IS NULL` became a constant FALSE and `x IS NOT NULL` a constant TRUE.
+/// A guess about NULL inputs papered over half of that and refused the
+/// other half, so `CHECK (x IS NULL OR x > 0)` refused a NULL `x`.
+pub(crate) enum CompiledCheck {
+    /// `NOT (check)` lowered as a `WHERE` clause over the whole table, the
+    /// question `ALTER TABLE … ADD CHECK` asks of the stored rows: a row
+    /// violates the check exactly when it matches. `NOT` is pushed down
+    /// three-valued and every NULL-reading comparison is guarded, so two
+    /// values are enough to evaluate it.
+    Violation(crate::core::rql::expr::Cond),
+    /// The check as written, for what the rewriter cannot read but the
+    /// evaluator can (`COALESCE(x, 1) > 0`), evaluated with three values: a
+    /// row violates it when it is FALSE.
+    Direct(crate::core::rql::expr::Cond),
+}
+
+impl CompiledCheck {
+    /// Whether `row` violates the check. `fields` is the table's whole
+    /// schema, so a column whose companion is set reads as NULL.
+    pub(crate) fn violated(
+        &self,
+        row: &crate::core::row::row::Row,
+        fields: &[crate::core::row::schema::SchemaField],
+    ) -> Result<bool, String> {
+        match self {
+            CompiledCheck::Violation(cond) => crate::core::rql::expr::eval_cond(cond, row, fields),
+            CompiledCheck::Direct(cond) => {
+                Ok(crate::core::rql::expr::eval_cond_3vl(cond, row, fields)? == Some(false))
+            }
+        }
+    }
+
+    /// The table's columns the check reads, a nullability companion counted
+    /// as its column: `x IS NOT NULL` lowers to a test of `__null_x`, and is
+    /// a check an assignment to `x` can break.
+    fn columns(
+        &self,
+        fields: &[crate::core::row::schema::SchemaField],
+    ) -> Vec<crate::core::row::schema::SchemaField> {
+        let (CompiledCheck::Violation(cond) | CompiledCheck::Direct(cond)) = self;
+        let mut read = Vec::new();
+        collect_condition_columns(cond, &mut read);
+        let mut out: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+        for field in read {
+            let field = match field.name.get(crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..) {
+                Some(base) if crate::core::rql::nullable::is_hidden(&field.name) => fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(base))
+                    .cloned()
+                    .unwrap_or(field),
+                _ => field,
+            };
+            if !out.iter().any(|f| f.write_order == field.write_order) {
+                out.push(field);
+            }
+        }
+        out
+    }
+}
+
+/// Compiles a `CHECK`'s expression against a table's whole schema, its
+/// nullability companions included (see [`CompiledCheck`]).
+///
+/// An expression neither the rewriter nor the evaluator reads is an error,
+/// which a `CREATE TABLE` or `ADD CONSTRAINT` declaring it reports. It used
+/// to be stored, logged at every write and never enforced: `CHECK
+/// (COALESCE(x, 1) > 0)` took `x = -3`.
+pub(crate) fn compile_check(
+    expression: &str,
+    fields: &[crate::core::row::schema::SchemaField],
+) -> Result<CompiledCheck, String> {
+    let fields_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+        fields.iter().cloned().collect();
+    let lowered =
+        crate::core::tokenizer::predicate_rewrite::rewrite_where(&format!("NOT ({})", expression), &fields_sv)
+            .and_then(|lowered| crate::core::rql::expr::parse_cond(&lowered, fields));
+    match lowered {
+        Ok(condition) => Ok(CompiledCheck::Violation(condition)),
+        Err(first) => {
+            // Names resolve among the columns a client sees; the companions
+            // are read only when the row is.
+            let visible = crate::core::rql::nullable::visible_fields(&fields_sv);
+            crate::core::rql::expr::parse_cond(expression, &visible)
+                .map(CompiledCheck::Direct)
+                .map_err(|_| first)
+        }
+    }
 }
 
 /// Refuses an `UPDATE` whose assignments violate a `CHECK`.
@@ -9822,26 +9916,13 @@ fn check_constraints_hold_for_update(
         });
     }
 
-    let visible: Vec<crate::core::row::schema::SchemaField> =
-        crate::core::rql::nullable::visible_fields(&schema.fields);
-    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
-        visible.iter().cloned().collect();
-
     for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
-        let Ok(lowered) = crate::core::tokenizer::predicate_rewrite::rewrite_where(
-            &constraint.expression,
-            &visible_sv,
-        ) else {
+        let Ok(compiled) = compile_check(&constraint.expression, &schema.fields) else {
             continue;
         };
-        let Ok(condition) = crate::core::rql::expr::parse_cond(&lowered, &visible) else {
-            continue;
-        };
-
         // Every column the check reads has to be one this statement assigns,
         // or the row it would be judged against is incomplete.
-        let mut columns = Vec::new();
-        collect_condition_columns(&condition, &mut columns);
+        let columns = compiled.columns(&schema.fields);
         if columns.is_empty() || !columns.iter().all(|f| assigned.contains(&f.write_order)) {
             continue;
         }
@@ -9849,7 +9930,7 @@ fn check_constraints_hold_for_update(
             continue;
         }
 
-        if let Ok(false) = crate::core::rql::expr::eval_cond(&condition, &candidate, &visible) {
+        if let Ok(true) = compiled.violated(&candidate, &schema.fields) {
             return Err(format!(
                 "new row for relation \"{}\" violates check constraint \"{}\"",
                 table_name, constraint.name
@@ -9870,9 +9951,8 @@ fn check_constraints_hold_for_update(
 /// counts as assigned, which is what makes `CHECK (tot >= 0)` on `tot = q * p`
 /// enforceable under `SET q = 5`.
 pub(crate) struct UpdateRowChecks {
-    visible: Vec<crate::core::row::schema::SchemaField>,
-    /// Each check's name, its condition, and whether it tests for NULL itself.
-    checks: Vec<(String, crate::core::rql::expr::Cond, bool)>,
+    /// Each check's name, compiled.
+    checks: Vec<(String, CompiledCheck)>,
 }
 
 impl UpdateRowChecks {
@@ -9883,31 +9963,18 @@ impl UpdateRowChecks {
         updates: &[crate::core::row::row::ColumnWritePayload],
         expressions: &[(u32, crate::core::rql::expr::Expr)],
     ) -> Self {
-        let mut out = UpdateRowChecks {
-            visible: Vec::new(),
-            checks: Vec::new(),
-        };
+        let mut out = UpdateRowChecks { checks: Vec::new() };
         if schema.checks.is_empty() {
             return out;
         }
-        out.visible = crate::core::rql::nullable::visible_fields(&schema.fields);
-        let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
-            out.visible.iter().cloned().collect();
 
         for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
             // Compiled as `check_constraints_hold_for_update` compiles it, so
             // the two agree on which checks each one judges.
-            let Ok(lowered) = crate::core::tokenizer::predicate_rewrite::rewrite_where(
-                &constraint.expression,
-                &visible_sv,
-            ) else {
+            let Ok(compiled) = compile_check(&constraint.expression, &schema.fields) else {
                 continue;
             };
-            let Ok(condition) = crate::core::rql::expr::parse_cond(&lowered, &out.visible) else {
-                continue;
-            };
-            let mut columns = Vec::new();
-            collect_condition_columns(&condition, &mut columns);
+            let columns = compiled.columns(&schema.fields);
             let assigned = |wo: u64| updates.iter().any(|u| u.write_order as u64 == wo);
             let computed = |wo: u64| expressions.iter().any(|(e, _)| *e as u64 == wo);
             // A check reading no assigned column held before and still does.
@@ -9919,9 +9986,7 @@ impl UpdateRowChecks {
             if columns.is_empty() || !columns.iter().any(|f| assigned(f.write_order)) || judged_up_front {
                 continue;
             }
-            let upper = constraint.expression.to_ascii_uppercase();
-            let tests_null = upper.contains("IS NULL") || upper.contains("IS NOT NULL");
-            out.checks.push((constraint.name.clone(), condition, tests_null));
+            out.checks.push((constraint.name.clone(), compiled));
         }
         out
     }
@@ -9931,8 +9996,8 @@ impl UpdateRowChecks {
     }
 
     /// Refuses a row, given as the payloads about to be written, that one of
-    /// the checks finds false. NULL is handled as `check_constraints_hold`
-    /// handles it on insert: a check whose inputs include a NULL passes.
+    /// the checks finds FALSE. Three-valued, as `check_constraints_hold` is
+    /// on insert: a check that is UNKNOWN passes.
     pub(crate) fn hold(
         &self,
         table_name: &str,
@@ -9950,13 +10015,10 @@ impl UpdateRowChecks {
                 column_type: payload.column_type.clone(),
             });
         }
-        for (name, condition, tests_null) in &self.checks {
-            if !tests_null && condition_reads_a_null(condition, fields, &row) {
-                continue;
-            }
-            match crate::core::rql::expr::eval_cond(condition, &row, &self.visible) {
-                Ok(true) => {}
-                Ok(false) => {
+        for (name, compiled) in &self.checks {
+            match compiled.violated(&row, fields) {
+                Ok(false) => {}
+                Ok(true) => {
                     return Err(format!(
                         "new row for relation \"{}\" violates check constraint \"{}\"",
                         table_name, name
@@ -9992,26 +10054,6 @@ fn collect_condition_columns(
             }
         }
     }
-}
-
-/// Whether any column a condition reads holds NULL in this row.
-fn condition_reads_a_null(
-    condition: &crate::core::rql::expr::Cond,
-    schema: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
-    row: &crate::core::row::row::Row,
-) -> bool {
-    let mut columns = Vec::new();
-    collect_condition_columns(condition, &mut columns);
-
-    columns.iter().any(|field| {
-        let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema) else {
-            return false;
-        };
-        row.columns
-            .iter()
-            .find(|c| u64::from(c.schema_id) == flag.write_order)
-            .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
-    })
 }
 
 /// Works out where each of a table's sequences resumes, once per process.
@@ -10843,13 +10885,7 @@ async fn add_check_constraint(
     }
 
     // It must compile, or it would be stored and then skipped on every write.
-    let visible: Vec<crate::core::row::schema::SchemaField> =
-        crate::core::rql::nullable::visible_fields(&schema.fields);
-    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
-        visible.iter().cloned().collect();
-    let compiled = crate::core::tokenizer::predicate_rewrite::rewrite_where(&expression, &visible_sv)
-        .and_then(|lowered| crate::core::rql::expr::parse_cond(&lowered, &visible).map(|_| ()));
-    if let Err(reason) = compiled {
+    if let Err(reason) = compile_check(&expression, &schema.fields) {
         return ddl_error(&format!("check constraint \"{}\" cannot be compiled: {}", name, reason));
     }
 
@@ -15493,7 +15529,9 @@ pub(crate) async fn execute_with_need(
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
             }
-            if let Err(reason) = parsed.as_ref().map_or(Ok(()), validate_generated) {
+            if let Err(reason) =
+                parsed.as_ref().map_or(Ok(()), |ct| validate_generated(ct).and_then(|()| validate_checks(ct)))
+            {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
             }

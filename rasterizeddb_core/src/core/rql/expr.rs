@@ -1365,6 +1365,41 @@ pub fn eval_cond(cond: &Cond, row: &Row, schema: &[SchemaField]) -> Result<bool,
     })
 }
 
+/// Evaluates a condition tree with SQL's three values: `None` is UNKNOWN.
+///
+/// A comparison with NULL is UNKNOWN; `AND` is FALSE when a part is FALSE,
+/// else UNKNOWN when a part is; `OR` is TRUE when a part is TRUE, else
+/// UNKNOWN when a part is. A `CHECK` needs this: it refuses a row only when
+/// it is FALSE, so `x > 0` and `x IS NULL OR x > 0` both pass a NULL `x`,
+/// where [`eval_cond`]'s two values read the first as FALSE.
+pub fn eval_cond_3vl(cond: &Cond, row: &Row, schema: &[SchemaField]) -> Result<Option<bool>, String> {
+    Ok(match cond {
+        Cond::Cmp(c) => eval_condition_3vl(c, row, schema)?,
+        Cond::And(parts) => {
+            let mut unknown = false;
+            for part in parts {
+                match eval_cond_3vl(part, row, schema)? {
+                    Some(false) => return Ok(Some(false)),
+                    None => unknown = true,
+                    Some(true) => {}
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        Cond::Or(parts) => {
+            let mut unknown = false;
+            for part in parts {
+                match eval_cond_3vl(part, row, schema)? {
+                    Some(true) => return Ok(Some(true)),
+                    None => unknown = true,
+                    Some(false) => {}
+                }
+            }
+            if unknown { None } else { Some(false) }
+        }
+    })
+}
+
 pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, String> {
     use crate::core::rql::join::find_keyword;
 
@@ -4289,10 +4324,21 @@ pub fn eval_condition(
     row: &Row,
     schema: &[SchemaField],
 ) -> Result<bool, String> {
+    // A comparison with NULL is unknown, which is not true.
+    Ok(eval_condition_3vl(condition, row, schema)? == Some(true))
+}
+
+/// [`eval_condition`] with SQL's three values: `None` is UNKNOWN, what a
+/// comparison with NULL gives. A null test or a truth test is never UNKNOWN.
+pub fn eval_condition_3vl(
+    condition: &Condition,
+    row: &Row,
+    schema: &[SchemaField],
+) -> Result<Option<bool>, String> {
     let left = eval(&condition.left, row, schema)?;
     match condition.cmp {
-        Cmp::IsNull => return Ok(left.is_null()),
-        Cmp::IsNotNull => return Ok(!left.is_null()),
+        Cmp::IsNull => return Ok(Some(left.is_null())),
+        Cmp::IsNotNull => return Ok(Some(!left.is_null())),
         Cmp::IsTrue | Cmp::IsNotTrue | Cmp::IsFalse | Cmp::IsNotFalse => {
             // Three-valued: `None` is NULL, neither true nor false.
             let truth = match &left {
@@ -4308,12 +4354,12 @@ pub fn eval_condition(
                     ));
                 }
             };
-            return Ok(match condition.cmp {
+            return Ok(Some(match condition.cmp {
                 Cmp::IsTrue => truth == Some(true),
                 Cmp::IsNotTrue => truth != Some(true),
                 Cmp::IsFalse => truth == Some(false),
                 _ => truth != Some(false),
-            });
+            }));
         }
         _ => {}
     }
@@ -4321,9 +4367,9 @@ pub fn eval_condition(
         Some(e) => eval(e, row, schema)?,
         None => return Err("comparison has no right-hand side".to_string()),
     };
-    // A comparison with NULL is unknown, which is not true.
+    // A comparison with NULL is unknown.
     if left.is_null() || right.is_null() {
-        return Ok(false);
+        return Ok(None);
     }
     // Read both sides as the same type before ordering them.
     //
@@ -4351,9 +4397,9 @@ pub fn eval_condition(
         _ => right,
     };
     let Some(ordering) = compare(&left, &right) else {
-        return Ok(false);
+        return Ok(Some(false));
     };
-    Ok(match condition.cmp {
+    Ok(Some(match condition.cmp {
         Cmp::Eq => ordering.is_eq(),
         Cmp::Ne => !ordering.is_eq(),
         Cmp::Lt => ordering.is_lt(),
@@ -4366,7 +4412,7 @@ pub fn eval_condition(
         | Cmp::IsNotTrue
         | Cmp::IsFalse
         | Cmp::IsNotFalse => unreachable!("handled above"),
-    })
+    }))
 }
 
 /// Converts a value to another type, or says it cannot.
