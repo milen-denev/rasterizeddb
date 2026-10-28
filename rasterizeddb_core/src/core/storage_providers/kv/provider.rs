@@ -354,7 +354,9 @@ impl KvFamily {
     /// object written or deleted to get it. A live family on the same prefix
     /// should be paused around it ([`super::export`]); `listing` — the hold
     /// on its commits — is let go as soon as the objects are listed, since a
-    /// listed object never changes while maintenance is paused.
+    /// listed object never changes while maintenance is paused. (A family
+    /// opening meanwhile may delete stale deltas, but only ones folded into a
+    /// chunk already or not intact, which a reader skips anyway.)
     pub async fn open_snapshot(
         store: Arc<dyn KvStore>,
         config: KvConfig,
@@ -701,6 +703,10 @@ struct State {
     frozen: Option<Overlay>,
     /// Records not yet in any delta object.
     pending: Vec<Record>,
+    /// Transactions whose records a flush has taken from `pending` and is
+    /// putting now. Puts on a file are serialised by its flush lock, so there
+    /// is one set. See [`KvFile::holds`].
+    in_flight: Vec<u64>,
     pending_bytes: u64,
     /// Transactions to declare committed in the next delta object.
     committing: Vec<u64>,
@@ -849,6 +855,7 @@ impl KvFile {
             live: Overlay::new(),
             frozen: None,
             pending: Vec::new(),
+            in_flight: Vec::new(),
             pending_bytes: 0,
             committing: Vec::new(),
             open_txns: HashMap::new(),
@@ -925,8 +932,8 @@ impl KvFile {
         }))
     }
 
-    /// Whether this file has written for `txn` and its commit has yet to land:
-    /// records still pending, or taken by a flush whose put is in flight.
+    /// Whether this file has records of `txn` that are not yet stored:
+    /// still pending, or taken by a flush whose put is in flight.
     ///
     /// Pending alone missed the second: a background flush takes the queue
     /// before its put, so a commit landing meanwhile skipped this file and
@@ -934,10 +941,12 @@ impl KvFile {
     /// store nor the queue — torn after a crash in that window, or for good if
     /// the put failed and the records only went back on the queue. A file
     /// counted here is flushed by the commit, which waits on the flush lock
-    /// for the put in flight and writes the records again if it failed.
+    /// for the put in flight and writes the records again if it failed. A
+    /// file whose records of `txn` are already stored is not: flushing it would
+    /// only put other transactions' records on this commit's path.
     fn holds(&self, txn: u64) -> bool {
         let state = self.state.read();
-        state.open_txns.contains_key(&txn) || state.pending.iter().any(|r| r.txn == txn)
+        state.in_flight.contains(&txn) || state.pending.iter().any(|r| r.txn == txn)
     }
 
     // ---- reads -------------------------------------------------------------
@@ -1529,6 +1538,10 @@ impl KvFile {
             }
             let records = std::mem::take(&mut state.pending);
             state.pending_bytes = 0;
+            let mut in_flight: Vec<u64> = records.iter().map(|r| r.txn).filter(|&t| t != 0).collect();
+            in_flight.sort_unstable();
+            in_flight.dedup();
+            state.in_flight = in_flight;
             let committed = std::mem::take(&mut state.committing);
             let aborted = std::mem::take(&mut state.aborting);
             // Allocated under the flush lock, so sequence order is store order.
@@ -1576,6 +1589,7 @@ impl KvFile {
                 let txns = DeltaTxns::of(&batch);
                 self.ledger.register(&self.ledger_name, seq, &txns.records);
                 let mut state = self.state.write();
+                state.in_flight.clear();
                 state.deltas.push(seq);
                 state.delta_txns.insert(seq, txns);
                 Ok(())
@@ -1598,6 +1612,7 @@ impl KvFile {
                 // takes its bytes back out (`KvFile::abort_local`) after this
                 // returns, and until then a compaction must not fold them.
                 let mut state = self.state.write();
+                state.in_flight.clear();
                 let mut restored = batch.records;
                 restored.append(&mut state.pending);
                 state.pending_bytes = restored.iter().map(|r| r.weight()).sum();
@@ -2709,6 +2724,7 @@ impl StorageIO for KvStorageProvider {
                 live: Overlay::new(),
                 frozen: None,
                 pending: Vec::new(),
+                in_flight: Vec::new(),
                 pending_bytes: 0,
                 committing: Vec::new(),
                 open_txns: HashMap::new(),
