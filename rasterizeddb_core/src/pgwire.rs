@@ -6822,6 +6822,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("operator does not exist") {
         return "42883";
     }
+    // `datatype_mismatch`: a value with no assignment cast to its column's
+    // type ("column \"d\" is of type jsonb but expression is of type
+    // integer").
+    if has(" but expression is of type ") {
+        return "42804";
+    }
     // `invalid_column_reference`: an ON CONFLICT target no unique key
     // matches (a partitioned table's that leaves out a key column, S18).
     // Decided early: the message quotes the column names.

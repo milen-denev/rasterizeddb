@@ -1689,6 +1689,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         },
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::NumericCast { .. } => DbType::DECIMAL,
+        Expr::Concat(lhs, rhs) if concat_is_jsonb(lhs, rhs) => DbType::JSONB,
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
         Expr::Call(TextFunc::DateTrunc, _) => DbType::DATETIME,
@@ -2090,11 +2091,50 @@ pub(crate) fn integer_out_of_range(db_type: &DbType) -> String {
 }
 
 /// Renders a value as the text SQL would print.
+/// Whether `lhs || rhs` is `jsonb`'s concatenation rather than text's: both
+/// sides are documents, or one is and the other is a written string — an
+/// `unknown` literal, which PostgreSQL resolves to the other side's type.
+/// A typed text (a `TEXT` column, `'x'::text`) beside a document is text's
+/// `anynonarray || text`, the document rendered as JSON.
+///
+/// Concatenating as text always put the document's encoded bytes beside the
+/// literal: `SET doc = doc || '{"b":1}'` stored a document with text trailing
+/// it, which read back as the old document, and `SET doc = '{"a":1}' ||
+/// '{"b":1}'` stored text no document reader could open.
+pub(crate) fn concat_is_jsonb(lhs: &Expr, rhs: &Expr) -> bool {
+    let unknown = |e: &Expr| matches!(e, Expr::Null | Expr::Literal { db_type: DbType::STRING, .. });
+    let document = |e: &Expr| static_type(e) == DbType::JSONB;
+    (document(lhs) && (document(rhs) || unknown(rhs))) || (document(rhs) && unknown(lhs))
+}
+
+/// An operand of `jsonb ||` as an encoded document: a document as it is, a
+/// string literal read as JSON, refused as PostgreSQL's `jsonb` input
+/// refuses it.
+fn as_jsonb(value: Value) -> Result<Vec<u8>, String> {
+    match value {
+        Value::Data { bytes, db_type: DbType::JSONB } => Ok(bytes),
+        Value::Data { bytes, db_type } => {
+            let text = as_text(&Value::Data { bytes, db_type });
+            crate::core::jsonb::encode_text(&text)
+                .map_err(|_| crate::core::value_codec::refusal_message(&DbType::JSONB, &text))
+        }
+        Value::Null => Err("a NULL operand reached jsonb concatenation".to_string()),
+    }
+}
+
 fn as_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Data { bytes, db_type } => match db_type {
             DbType::STRING | DbType::CHAR => String::from_utf8_lossy(bytes).to_string(),
+            // A document's text is its JSON, not its encoding.
+            DbType::JSONB => {
+                let mut out = Vec::with_capacity(bytes.len());
+                match crate::core::jsonb::render_text_into(bytes, &mut out) {
+                    Ok(()) => String::from_utf8_lossy(&out).into_owned(),
+                    Err(_) => String::from_utf8_lossy(bytes).to_string(),
+                }
+            }
             DbType::UUID => crate::core::value_codec::format_uuid(bytes),
             // A number with a fraction has no integer reading, and its raw
             // bytes are not text: `'r' || 1.5` concatenated the float's eight
@@ -2774,6 +2814,32 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
             }
             return cast(value.clone(), &field.db_type).map_err(|_| mismatch());
         }
+    }
+    // A document column takes a document, or text it can read as one; any
+    // other value's bytes were copied into the slot as they were, so text
+    // bound for a `jsonb` column was stored where no reader could open it.
+    // A document bound for a text column is its JSON, PostgreSQL's
+    // assignment cast to a string type.
+    if field.db_type == DbType::JSONB {
+        return match value {
+            Value::Null | Value::Data { db_type: DbType::JSONB, .. } => Ok(value),
+            Value::Data { db_type: DbType::STRING | DbType::CHAR, .. } => {
+                as_jsonb(value).map(|bytes| Value::Data { bytes, db_type: DbType::JSONB })
+            }
+            Value::Data { db_type: from, .. } => Err(format!(
+                "column \"{}\" is of type jsonb but expression is of type {}",
+                field.name,
+                crate::core::value_codec::pg_input_type_name(&from)
+            )),
+        };
+    }
+    if matches!(field.db_type, DbType::STRING | DbType::CHAR)
+        && matches!(value, Value::Data { db_type: DbType::JSONB, .. })
+    {
+        return Ok(Value::Data {
+            bytes: as_text(&value).into_bytes(),
+            db_type: DbType::STRING,
+        });
     }
     // A float column takes any number as a float, as the assignment cast does.
     // A written fraction is a NUMERIC now, and its sixteen bytes in an
@@ -3587,6 +3653,11 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             // expression NULL rather than silently vanishing from the result.
             if a.is_null() || b.is_null() {
                 Value::Null
+            } else if concat_is_jsonb(lhs, rhs) {
+                Value::Data {
+                    bytes: crate::core::jsonb::concat(&as_jsonb(a)?, &as_jsonb(b)?)?,
+                    db_type: DbType::JSONB,
+                }
             } else {
                 let mut text = as_text(&a);
                 text.push_str(&as_text(&b));

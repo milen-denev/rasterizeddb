@@ -2011,6 +2011,52 @@ fn compare_numbers(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     }
 }
 
+/// PostgreSQL's `jsonb || jsonb`, over two encoded documents.
+///
+/// Two objects merge, the right one's value winning a shared key. Anything
+/// else is an array concatenation, with a side that is not an array taken as
+/// a one-element array: `[1] || 2` is `[1, 2]`, `{"a":1} || 1` is
+/// `[{"a": 1}, 1]`.
+///
+/// Built as text from the two documents' renderings and encoded once, so the
+/// result is re-sorted and deduplicated by the encoder itself and every number
+/// keeps the digits it was stored with.
+pub fn concat(left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+    let mut l = Vec::with_capacity(left.len() + 8);
+    render_text_into(left, &mut l)?;
+    let mut r = Vec::with_capacity(right.len() + 8);
+    render_text_into(right, &mut r)?;
+    let (lt, rt) = (left.first().copied(), right.first().copied());
+    // The members between a container's brackets, or the value itself.
+    let inner = |text: &[u8], container: bool| -> Vec<u8> {
+        if container { text[1..text.len() - 1].to_vec() } else { text.to_vec() }
+    };
+    let join = |open: u8, a: Vec<u8>, b: Vec<u8>, close: u8| -> Vec<u8> {
+        let mut out = Vec::with_capacity(a.len() + b.len() + 4);
+        out.push(open);
+        out.extend_from_slice(&a);
+        if !a.is_empty() && !b.is_empty() {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(&b);
+        out.push(close);
+        out
+    };
+    let text = if lt == Some(TAG_OBJ) && rt == Some(TAG_OBJ) {
+        // A duplicate key keeps its last value when encoded: the right's.
+        join(b'{', inner(&l, true), inner(&r, true), b'}')
+    } else {
+        join(
+            b'[',
+            inner(&l, lt == Some(TAG_ARR)),
+            inner(&r, rt == Some(TAG_ARR)),
+            b']',
+        )
+    };
+    let text = String::from_utf8(text).map_err(|_| "a document could not be rendered as text".to_string())?;
+    encode_text(&text)
+}
+
 /// `doc->'a'->>'b'`: a path written out, the last step with `->>` when
 /// `as_text`.
 pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {
@@ -2549,6 +2595,29 @@ mod tests {
             as_text(get_key(&encoded, "ключ").unwrap()).as_deref(),
             Some("5")
         );
+    }
+
+    #[test]
+    fn concatenation_is_postgresqls() {
+        let cat = |a: &str, b: &str| {
+            let out = concat(&encode_text(a).unwrap(), &encode_text(b).unwrap()).unwrap();
+            let mut text = Vec::new();
+            render_text_into(&out, &mut text).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        // Objects merge, the right side's value winning a shared key.
+        assert_eq!(cat(r#"{"a":1,"b":2}"#, r#"{"b":3,"c":4}"#), r#"{"a": 1, "b": 3, "c": 4}"#);
+        assert_eq!(cat("{}", r#"{"a":1}"#), r#"{"a": 1}"#);
+        // Arrays concatenate; anything else is a one-element array.
+        assert_eq!(cat("[1,2]", "[3]"), "[1, 2, 3]");
+        assert_eq!(cat("[]", "[]"), "[]");
+        assert_eq!(cat("[1]", r#"{"a":1}"#), r#"[1, {"a": 1}]"#);
+        assert_eq!(cat(r#"{"a":1}"#, "[1]"), r#"[{"a": 1}, 1]"#);
+        assert_eq!(cat(r#"{"a":1}"#, "1"), r#"[{"a": 1}, 1]"#);
+        assert_eq!(cat("1", r#""x""#), r#"[1, "x"]"#);
+        assert_eq!(cat("null", "[]"), "[null]");
+        // A number keeps every digit it was stored with.
+        assert_eq!(cat("[1.000000000000000000001]", "[]"), "[1.000000000000000000001]");
     }
 
     #[test]
