@@ -858,33 +858,10 @@ pub fn format_uuid(raw: &[u8]) -> String {
     s
 }
 
-/// Parses the canonical UUID text form (hyphens optional) into 16 bytes.
+/// Parses a UUID's text form into 16 bytes: `value_codec::parse_uuid`, so a
+/// bound parameter and a literal accept the same spellings (braces included).
 pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
-    let mut out = [0u8; 16];
-    let mut n = 0usize;
-    let mut hi: Option<u8> = None;
-    for c in text.chars() {
-        if c == '-' {
-            continue;
-        }
-        let d = c.to_digit(16)? as u8;
-        match hi {
-            None => hi = Some(d),
-            Some(h) => {
-                if n >= 16 {
-                    return None;
-                }
-                out[n] = (h << 4) | d;
-                n += 1;
-                hi = None;
-            }
-        }
-    }
-    if n == 16 && hi.is_none() {
-        Some(out)
-    } else {
-        None
-    }
+    crate::core::value_codec::parse_uuid(text)
 }
 
 /// Postgres binary `numeric`: i16 digit count, i16 weight, i16 sign,

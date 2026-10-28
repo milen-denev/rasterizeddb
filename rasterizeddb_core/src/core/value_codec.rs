@@ -29,6 +29,11 @@ pub const INET_LEN: usize = 18;
 /// matches what Postgres' input function takes for the common cases.
 pub fn parse_uuid(text: &str) -> Option<[u8; UUID_LEN]> {
     let s = text.trim();
+    // `{…}` around the whole, as `uuid_in` accepts; it was refused.
+    let s = match s.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}')?,
+        None => s,
+    };
     let mut out = [0u8; UUID_LEN];
     let mut n = 0usize;
     let mut hi: Option<u8> = None;
