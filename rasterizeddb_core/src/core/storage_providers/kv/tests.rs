@@ -3252,3 +3252,39 @@ async fn a_table_dropped_file_by_file_still_keeps_another_tables_half() {
     let restarted = open_family(store).await;
     assert_eq!(read_all(&open(&restarted, "y.db").await).await, b"kept".to_vec());
 }
+
+/// A holder dropped while the carry's declaration is being put into it: the
+/// declaration goes on to another holder (and the dropped holder's own carry
+/// takes it too), so `c.db` keeps its half. It used to count as landed and be
+/// swept with the holder.
+#[tokio::test]
+async fn a_holder_dropped_during_the_carry_passes_the_declaration_on() {
+    let held = HeldPutStore::holding("/y.db/d/");
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let a = open(&family, "a.db").await;
+    let y = open(&family, "y.db").await;
+    let c = open(&family, "c.db").await;
+    let txn = a.begin_txn();
+    // y's records stored first, so the carry tries y first.
+    y.append_data_txn(txn, b"y half").await;
+    y.flush().await.unwrap();
+    c.append_data_txn(txn, b"kept").await;
+    a.append_data_txn(txn, b"a half").await;
+    a.commit_durable(txn).await.unwrap();
+
+    // The carry's put into y is held; y is dropped meanwhile.
+    held.armed.store(true, Ordering::Release);
+    a.drop_io();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    y.drop_io();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    held.armed.store(false, Ordering::Release);
+    held.release.add_permits(16);
+    drop(open(&family, "a.db").await);
+    drop(open(&family, "y.db").await);
+    drop(c);
+
+    let restarted = open_family(store).await;
+    assert_eq!(read_all(&open(&restarted, "c.db").await).await, b"kept".to_vec());
+}

@@ -337,6 +337,10 @@ pub struct KvFamily {
     /// table off a store and back. [`KvFamily::open_file`] waits on this, which
     /// is what makes the reopen behave the way the comment claimed.
     erasing: dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Held while a file is built and registered. `KvFile::open` takes the
+    /// name's recovered state, so a second opener racing the first found none
+    /// and built an empty file — which, registered first, was the table.
+    opening: tokio::sync::Mutex<()>,
     /// Read by everything that rewrites or deletes an object of this family —
     /// compaction, a truncation's deletes, adopting a scratch generation, a
     /// dropped file's sweep. Written by [`KvFamily::pause_maintenance`], so a
@@ -558,6 +562,7 @@ impl KvFamily {
             committed: Arc::new(committed),
             ledger,
             erasing: dashmap::DashMap::new(),
+            opening: tokio::sync::Mutex::new(()),
             maintenance,
             declaring,
         }))
@@ -681,35 +686,52 @@ impl KvFamily {
     }
 
     async fn open_file(self: &Arc<Self>, name: &str) -> io::Result<Arc<KvFile>> {
-        // A file being dropped is gone, not reusable: its writes go nowhere.
-        // `drop_io` registers the sweep's gate before it takes the file out of
-        // the map, so once the map no longer holds it, the gate below does.
         loop {
+            // A file being dropped is gone, not reusable: its writes go
+            // nowhere. `drop_io` registers the sweep's gate before it takes the
+            // file out of the map, so once the map no longer holds it, the
+            // gate does.
             match self.files.get(name).map(|e| e.value().clone()) {
                 Some(existing) if !existing.dropped.load(Ordering::Acquire) => return Ok(existing),
-                Some(_) => tokio::task::yield_now().await,
-                None => break,
+                Some(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                None => {}
             }
-        }
-        // A previous incarnation of this name may still be sweeping its
-        // objects. Opening now would build a file whose first writes that task
-        // is about to delete, so wait for it — the gate is closed rather than
-        // signalled, which wakes every waiter and cannot be missed by one that
-        // arrives late.
-        let pending = self.erasing.get(name).map(|gate| gate.clone());
-        if let Some(gate) = pending {
-            let _ = gate.acquire().await;
-        }
-        let file = KvFile::open(self, name).await?;
-        // Another task may have opened the same name while we were reading the
-        // store. Whoever registered first wins, so both handles see one file.
-        Ok(match self.files.entry(name.to_string()) {
-            dashmap::Entry::Occupied(e) => e.get().clone(),
-            dashmap::Entry::Vacant(e) => {
-                e.insert(file.clone());
-                file
+            // A previous incarnation of this name may still be sweeping its
+            // objects. Opening now would build a file whose first writes that
+            // task is about to delete, so wait for it — the gate is closed
+            // rather than signalled, which wakes every waiter and cannot be
+            // missed by one that arrives late. Then look again.
+            let pending = self.erasing.get(name).map(|gate| gate.clone());
+            if let Some(gate) = pending {
+                let _ = gate.acquire().await;
+                tokio::task::yield_now().await;
+                continue;
             }
-        })
+            // Built and registered as one step, so two openers cannot both
+            // build it: the second finds the first's file.
+            let _one = self.opening.lock().await;
+            if self.files.contains_key(name) || self.erasing.contains_key(name) {
+                continue;
+            }
+            let file = KvFile::open(self, name).await?;
+            self.files.insert(name.to_string(), file.clone());
+            return Ok(file);
+        }
+    }
+
+    /// Whether `name` is a file that stands: open and not dropped, or in the
+    /// store and not yet opened — never one being swept or already gone.
+    fn standing(&self, name: &str) -> bool {
+        if self.erasing.contains_key(name) {
+            return false;
+        }
+        match self.files.get(name) {
+            Some(file) => !file.dropped.load(Ordering::Acquire),
+            None => self.recovered.lock().contains_key(name),
+        }
     }
 
     /// Before a dropped file's deltas are deleted: declares again, in a file
@@ -724,6 +746,11 @@ impl KvFamily {
     /// flush lock as `adopt` writes its own, so no other flush can take the
     /// declarations and lose them with a failed put.
     async fn carry_declarations(self: &Arc<Self>, file: &KvFile) -> io::Result<()> {
+        // A put into this file already in flight — another drop's carry
+        // declaring here — registers its delta before it lets go of the lock;
+        // read after it, so that declaration is carried too. Nothing puts here
+        // afterwards: the file is dropped.
+        drop(file.flush.lock().await);
         let declared: Vec<u64> = file
             .state
             .read()
@@ -743,9 +770,7 @@ impl KvFamily {
             let mut by_holder: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
             owed.retain_mut(|(txn, holders)| {
                 while let Some(holder) = holders.first() {
-                    let dropping = self.erasing.contains_key(&**holder)
-                        || self.files.get(&**holder).is_some_and(|f| f.dropped.load(Ordering::Acquire));
-                    if !dropping {
+                    if self.standing(holder) {
                         by_holder.entry(holder.clone()).or_default().push(*txn);
                         return true;
                     }
@@ -755,15 +780,22 @@ impl KvFamily {
                 false
             });
             for (holder, txns) in by_holder {
-                let target = self.open_file(&holder).await?;
-                let landed = {
+                // Looked at again: earlier puts in this round took time, and
+                // opening a name that has gone would make it again, empty.
+                let landed = if !self.standing(&holder) {
+                    false
+                } else {
+                    let target = self.open_file(&holder).await?;
                     let _serialised = target.flush.lock().await;
                     if target.dropped.load(Ordering::Acquire) {
                         false
                     } else {
                         target.state.write().committing.extend(txns.iter().copied());
                         target.flush_locked(None).await?;
-                        true
+                        // Dropped while the put was in flight: its own carry
+                        // reads after this lock and takes the declaration on,
+                        // but this one goes to the next holder as well.
+                        !target.dropped.load(Ordering::Acquire)
                     }
                 };
                 // Landed: done. Dropped meanwhile: on to that holder's next.
