@@ -828,9 +828,15 @@ fn backend_is_openable(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -
 /// `seed_fell_back`), since created here it would take writes that vanish.
 fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
     Arc::new(DbStorageProvider::new_memory(&format!(
-        "{table_name}_pointers.db"
+        "{table_name}_pointers.db{UNAVAILABLE}"
     )))
 }
+
+/// Marks the name of a [`fallback_seed`], so it is told apart from a table
+/// legitimately placed in memory — whose seed is also a memory provider, and
+/// which a move off memory discards while its placement already names the
+/// destination. Also keeps its buffers apart from that table's.
+const UNAVAILABLE: &str = "#unavailable";
 
 #[cfg(feature = "storage_pools")]
 async fn refuse_unopenable_store(pool: &StoragePool, kv: &KvStores, table_name: &str) -> io::Result<()> {
@@ -878,9 +884,8 @@ pub(super) async fn seed_or_unavailable(
 /// Whether `seed` is the in-memory stand-in a table placed on a key/value
 /// store got because the store could not be opened.
 #[cfg(feature = "storage_pools")]
-fn seed_fell_back(pool: &StoragePool, seed: &DbStorageProvider, table_name: &str) -> bool {
-    matches!(pool.backend_of(table_name), Some(crate::core::storage::TableBackend::KeyValue(_)))
-        && matches!(seed, DbStorageProvider::Memory(_))
+fn seed_fell_back(_pool: &StoragePool, seed: &DbStorageProvider, _table_name: &str) -> bool {
+    matches!(seed, DbStorageProvider::Memory(_)) && seed.get_name().ends_with(UNAVAILABLE)
 }
 
 #[cfg(not(feature = "storage_pools"))]
