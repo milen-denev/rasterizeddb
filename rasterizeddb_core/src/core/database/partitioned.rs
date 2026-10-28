@@ -316,7 +316,14 @@ impl Database {
     /// errors are logged, never fatal: a table left as it was resumes past
     /// its reservation, a gap.
     pub async fn record_clean_shutdown(&self) {
-        let tables: Vec<Arc<PartitionedTable>> = self.partitioned_tables.iter().map(|e| e.value().clone()).collect();
+        let tables: Vec<Arc<PartitionedTable>> = self
+            .relation_names()
+            .into_iter()
+            .filter_map(|name| match self.relation(&name) {
+                Some(super::Relation::Partitioned(t)) => Some(t),
+                _ => None,
+            })
+            .collect();
         for t in tables {
             if let Err(e) = t.record_serial_exact().await {
                 warn!("shutdown: the SERIAL high-water of \"{}\" was not recorded: {e}", t.name());
