@@ -1022,6 +1022,23 @@ fn pool_forget(pool: &StoragePool, table_name: &str) {
 #[cfg(not(feature = "storage_pools"))]
 fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 
+/// Forgets every statement-scoped relation's placement, once the open has
+/// reaped their files. Builds before `temp_seed` recorded one per CTE, and
+/// [`pool_forget`] skips these names, since nothing records them now, so
+/// the reap removed the files and the catalogue row and left the placement:
+/// `SHOW STORAGE PLACEMENTS` listed a dozen `__cte_*` tables on
+/// 192.168.1.7, forever.
+#[cfg(feature = "storage_pools")]
+fn pool_forget_statement_relations(pool: &StoragePool) {
+    let removed = pool.forget_where(|table| table.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX));
+    if removed > 0 {
+        info!("forgot {} placement(s) of statement-scoped relations left by an older build", removed);
+    }
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_forget_statement_relations(_pool: &StoragePool) {}
+
 /// The placement recorded for `table_name`, verbatim; `None` in a build
 /// without `storage_pools`, which records none.
 #[cfg(feature = "storage_pools")]
@@ -1534,6 +1551,9 @@ impl Database {
                 name, shared.owner, shared.file
             );
         }
+
+        // Every leftover's files are reaped by now; their placements go too.
+        pool_forget_statement_relations(&storage);
 
         let database = Database {
             id,

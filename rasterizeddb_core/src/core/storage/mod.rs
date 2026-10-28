@@ -608,6 +608,21 @@ impl StorageManager {
         }
     }
 
+    /// Drops every placement whose table `stale` names, persisting once.
+    /// Returns how many went.
+    pub fn forget_where(&self, stale: impl Fn(&str) -> bool) -> usize {
+        let removed = {
+            let mut state = self.state.write();
+            let before = state.placements.len();
+            state.placements.retain(|table, _| !stale(table));
+            before - state.placements.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
+    }
+
     /// Carries a placement across a rename. A renamed table does not move.
     pub fn rename(&self, old_name: &str, new_name: &str) {
         let moved = {

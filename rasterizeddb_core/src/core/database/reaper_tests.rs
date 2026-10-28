@@ -269,3 +269,29 @@ async fn an_unknown_map_generation_turns_reaping_off() {
     assert!(root.join(&later).exists());
     close(db, root);
 }
+
+/// Builds before memory-backed CTE relations recorded a placement per CTE,
+/// and the reap that removed their files skipped the placement (`pool_forget`
+/// ignores these names): `SHOW STORAGE PLACEMENTS` listed `__cte_*` tables
+/// forever. An open forgets them, and keeps every other placement.
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_forgets_placements_of_statement_relations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let root_str = super::relation_dispatch_tests::path_str(root);
+    close(open(root).await, root);
+
+    let stale = format!("{}claimed_0_ab12", crate::core::rql::cte::TEMP_TABLE_PREFIX);
+    {
+        let pool = crate::core::storage::StorageManager::open(&root_str);
+        pool.pin(&stale, &root_str).unwrap();
+        pool.pin("kept", &root_str).unwrap();
+        assert!(pool.spec_of(&stale).is_some());
+    }
+
+    let db = open(root).await;
+    assert_eq!(super::pool_spec_of(&db.storage, &stale), None, "the stale placement survived an open");
+    assert!(super::pool_spec_of(&db.storage, "kept").is_some(), "another placement went too");
+    close(db, root);
+}
