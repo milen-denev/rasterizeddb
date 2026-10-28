@@ -3,8 +3,10 @@
 Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **not
 advertised**, and **phases 3 to 7 designed, not built**, except phase 3's P3
 (composite identifying keys, [as built](#phase-3-p3-as-built)), P1
-(metadata DDL, [as built](#phase-3-p1-as-built)) and P4 (foreign keys both
-ways, [as built](#phase-3-p4-as-built)). Phases 0 and 1 are
+(metadata DDL, [as built](#phase-3-p1-as-built)), P4 (foreign keys both
+ways, [as built](#phase-3-p4-as-built)) and P5a (the lazy-open plumbing:
+shared maintenance, forget pins, `SWEPT`/`DIRTY`, the persisted `SERIAL`
+high-water and map-log generations, [as built](#phase-3-p5a-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -169,6 +171,147 @@ four configurations at the default seeds (0x5eed0001, 0x5eed7a11, 300
 statements), at 0x5eed2b20 and at 0x5eedf1a1 with 1,500 statements each;
 `KNOWN_DIVERGENCES` is empty, and `REFUSED` holds only the phase 3 and 6
 kinds above. Every `partition_*` suite, core and compat, passes.
+
+## Phase 3 P5a as built
+
+Built on `feat/p5a-lazy-plumbing` (from `f795e2a`, rebased onto
+`f54375e`, 2026-10-28), wave 3 of the phase 3 plan: **the plumbing lazy
+open and idle close need**, with behaviour unchanged. Every materialized
+partition still opens at startup and stays open (P5b opens on demand and
+closes when idle); what P5b relies on now exists, is durable, and is
+tested on its own. Not advertised.
+
+**`MaintenanceMode::External`** (§7.3; `partition::maintenance`,
+`row::table_maintenance`). A partition opens `External`: it spawns no task
+of its own (no provider service and its two-second drop poll, no vacuum
+loop, no idle-checkpoint watcher) and takes no place in the forget
+registry. Its open builds an `ExternalUnit` holding that same work
+untasked (`StorageIO::land_background`, the `VacuumService`'s `tick` once
+per vacuum interval, `table_seal::IdleSealer`), owned by the `Table` and
+held weakly by its database's one `Scheduler` (`Database::
+partition_maintenance`). Every write path of the partition first enters
+the slot's `WriteWatch` (`Table::enter_write`, one line before each of the
+five `gate::ticket` sites); the first entry after the scheduler last
+serviced the unit pushes it onto the dirty queue. The scheduler's one task
+runs a round each second, servicing queued and still-busy units four at a
+time and dropping each once it is settled (nothing staged, vacuum settled,
+no idle checkpoint pending), so an idle partition costs no wakeup; each
+round also runs every table's forget round and map compaction check. One-
+shot work at open (the index build or load, the filter backfill, the load
+audit) still runs on its own tasks, which end. Plain tables are unchanged.
+
+**Forget pins in the slot** (§7.2 point 1; `partition::pins`). The pin is
+the map log's: `MapState`'s per-partition pin, changed only by a record
+applied and then appended under the state's lock, and the `PinBoard` holds
+the table's **one** `ForgetHandle`, set to the minimum pin (`TxId::MAX`
+when every partition is clean). So a partition pins whether or not its
+`Table` is open, and a reopen or a schema change's reload never touches
+the registry.
+
+- `MATERIALIZE(pid, floor)`: pinned at `forgotten_below()`, durable before
+  the first row; the handle is lowered to it (`ForgetHandle::lower_to`)
+  before that row.
+- `DIRTY(pid, floor)`, the **first-write edge**: a clean slot's writer,
+  finding `pinned` false, takes the board's slow path under the state
+  lock, appends `DIRTY` with `append_durable` and lowers the handle,
+  before its first stamp; later writers find `pinned` true (two atomic
+  increments and a load).
+- `SWEPT(pid, h, clean)`: `PinBoard::sweep` (the scheduler's forget round
+  once a pin lags the settle bound by `FORGET_STEP`, or
+  `Table::neutralize_aborted_now` / `PartitionedTable::sweep_pin_now`)
+  runs `vacuum::neutralize_aborted_from` through the unit, then appends
+  `SWEPT` (group commit; a lost one only pins lower), moves the pin to `h`
+  or clears it, and asks the registry to forget. Clean needs the sweep to
+  have seen **no stamp at or above `h`** (`NeutralizeReport::newer`: a
+  running transaction's stamp may still abort) and **no writer inside or
+  entering**: the watch counts `active` before `seq` per entry, the sweep
+  reads `seq` before `active` when it starts, and at the end clears
+  `pinned` before reading `seq` again, so a writer that arrives afterwards
+  takes the slow path and waits for the state lock until `SWEPT` clean is
+  applied, then makes its own `DIRTY`.
+- After a restart the replayed pins are §7.2's rule, and the handle is set
+  from them before any partition opens.
+- A table that **cannot open** (a missing partition file, a map it cannot
+  read) holds a handle at the horizon forgotten when it was refused, for
+  as long as it stays broken (`broken_pin`): its pins are unknown. The
+  status log grows meanwhile.
+
+**`SERIAL` high-water** (§10; `partition::serial`). `__pt_<uid>_seq.db`
+(created at open when missing, for tables made before P5a) holds, per
+sequence name, the reserved value, CRC-framed and rewritten in place as
+one logged write. `seed_sequences` resumes a partitioned table's sequence
+from it, scanning nothing; a sequence with no entry (an older table, a
+renamed sequence) seeds from the maximum once and is reserved from there.
+The write watch covers the counters before any stamp: a counter past its
+reservation raises it to the counter plus 1024, logged in the root log
+before the row that took the value, so a committed value is never above a
+durable reservation. **A restart leaves a gap of up to one step, clean or
+not** (the counter is never written per value); values never repeat. As
+in PostgreSQL, an explicit value in a `SERIAL` column does not move the
+counter. `tests/partition_insert.rs` and `partition_shell_sites.rs` now
+assert uniqueness and the bound on the gap, not `1..=10`.
+
+**Map-log generations** (§3.2). `PinBoard::compact`, from the scheduler
+once the log passes twice its generation's opening bytes plus 1 MiB:
+clone the state and start capturing appends (under the state's lock);
+write `HEADER`, `LOCATIONS` and `SNAPSHOT` to `__pt_<uid>_map_<g+1>.db`,
+created exclusively with a directory fsync; retake the lock, append the
+captured records, **check the new generation replays to the state**,
+append `SEALED` durably, switch appends (`MapLogFile::adopt`); delete the
+old generation. A torn log (its evidence present) never compacts. Open
+takes the highest generation whose replay contains `SEALED`, else 0. A
+higher one that replays unsealed is an unfinished compaction: skipped, and
+reaped. One that **does not replay at all** is skipped too, but never
+reaped, and reaping stays off (it may be a later version's): the
+behaviour `reaper_tests::an_unknown_map_generation_turns_reaping_off`
+pinned before, kept for that case only. The reaper otherwise deletes every
+non-live generation of a live uid.
+
+**Tests.** Lib, `partition::pin_tests`: `an_unswept_partition_pins_
+forgetting_below_its_aborted_rows`, `the_pins_survive_a_restart`,
+`the_first_write_after_a_clean_sweep_pins_again`, `a_sweep_with_a_writer_
+inside_is_not_clean`, `a_sweep_that_sees_a_running_writers_stamp_is_not_
+clean`, `a_broken_table_pins_until_it_opens`, `external_partitions_spawn_
+no_tasks_of_their_own`, `the_scheduler_runs_the_idle_checkpoint_and_then_
+rests`, `compaction_keeps_every_record_and_the_pins_through_a_restart`
+(the compaction held between snapshot and switch while first writes append
+`DIRTY`s), `an_unfinished_compaction_is_ignored_and_reaped`, `serial_high_
+water_survives_restarts_without_a_scan`. Power loss, `power_loss::pins_
+crash_tests` (crash images, not kills): `a_first_write_after_a_clean_
+sweep_is_pinned_in_every_image` (the aborted writer's pages forced out as
+writeback could; with `DIRTY` group-commit only, seeds 0, 4, 5 and 8 read
+the aborted row back), `a_sweep_is_durable_before_forgetting_passes_it`,
+`a_compaction_cut_anywhere_keeps_the_map` (cuts after the snapshot, after
+`SEALED`, after the switch), `serial_values_never_repeat_after_a_power_
+cut`. The twin (`tests/partition_twin.rs`) gains `ForgetSweep`: settle,
+sweep every plain table and a seeded subset of the partitions, forget,
+then compare what both tables store, so a resurrected row is a divergence.
+
+**Measured** (`database::partition_resident_tests`, ignored, N = 1024
+materialized one-row partitions, tmpfs, after a reopen; per partition; a
+loaded shared box, so the RSS and wakeup figures carry noise of their
+own: the idle baseline with nothing open was 107/s before and 26/s
+after):
+
+| | before (`f795e2a`) | after |
+|---|---|---|
+| open time | 0.750 s (732 µs) | 0.228 s (222 µs) |
+| fds | 10.03 | 10.04 |
+| RSS | 14.7 KiB | 15.0 KiB |
+| tokio tasks | 2.09 | 0.00 (2 for the table: the scheduler's) |
+| idle wakeups (context switches/s) | 1.50 | 0.017 |
+
+**Left for P5b and after.** The open set and idle close themselves; the
+forget round reads every partition's pin each round (O(P) in memory per
+table per second; a pinned set would make it O(pinned)); the per-sweep and
+per-`DIRTY` state edits apply in place, but `MATERIALIZE` and `DROPPED`
+still clone the whole `MapState`; a sequence renamed by `RENAME TABLE`
+loses its entry and reseeds from the maximum once; reshape (`RESHAPE_
+COMMIT`'s inherited pins) is phase 5's.
+
+External maintenance takes the timers and the open's task spawns away;
+fds and heap are the providers' and the structures', which P5b's idle
+close is for.
 
 ## Phase 3 P4 as built
 
@@ -2630,7 +2773,9 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   `MAX` is unroutable, so under lazy open the first post-restart insert would
   open and scan every partition. From phase 3 the high-water is reserved
   durably in `__pt_<uid>_seq.db` in steps, like row ids (§3.5), never from
-  `MAX`; a crash leaves a gap, as in PostgreSQL.
+  `MAX`; a crash leaves a gap, as in PostgreSQL. **Built in P5a**
+  ([as built](#phase-3-p5a-as-built)): steps of 1024; with no write per
+  value, a clean restart leaves the gap too.
 - **CHECK, DEFAULT and generated columns** live on the shared sidecars and run
   before routing, so a `DEFAULT` on a key column works.
 
@@ -2856,7 +3001,7 @@ section specifying the mechanism.
 | I10 | Uniqueness holds | §1b | concurrent duplicate inserts and upserts across tenants and through reshapes; DDL refusals. **As built (S18):** `rasterizeddb_compat/tests/partition_upsert_matrix.rs`: `concurrent_upserts_on_a_partitioned_table_keep_every_key_unique_and_count_every_update` (sixteen clients over the primary key and a composite UNIQUE, `DO NOTHING` single- and multi-row and `INSERT … SELECT`, `DO UPDATE SET n = n + 1`, plain `INSERT`, in autocommit and committing and rolled-back blocks: no duplicate, every reported update applied once) and `three_hundred_keys_across_partitions_are_stored_once_under_concurrent_upserts` *(mutation: the in-flight rule off in `find_row_with_tuple`, 848 rows for 300 keys)*; `tests/partition_insert.rs`'s `duplicates_are_refused_and_racing_duplicates_store_one_row`; `tests/partition_ddl.rs`'s `a_unique_key_must_contain_every_key_column`. Reshapes wait for phase 5. |
 | I11 | A prepared statement never pins a partition | §4.1 | prepared SELECT, UPDATE, DELETE, 10 runs alternating tenants, past the learned third. *(Mutation: route before `note_plain`.)* **As built (S15):** `pgwire::prepared_partition_tests::each_execution_routes_its_own_values` (point SELECT and COUNT, two tenants in two partitions, 10 runs each: own rows, own partition's reads only, 2 parses per statement; mutations: the first execution's route kept, failed at run 3; `note_rewritten` restored, 20 parses), `a_tenant_first_written_after_learning_is_counted` (mutation: each `WHERE`'s first materialized list kept), `text_and_binary_keys_route_alike_from_the_cached_parse`, `a_learned_parse_is_not_parsed_again`; `tests/partition_prepared.rs` (writes, DROP and re-CREATE under the name, columns reordered, a type change, the name changing kind, a restart; mutation: no schema-generation reset, failed on the reordered columns); the twin's `PreparedSelect`, `PreparedCount`, `PreparedDescribeAlias` and `PreparedSelectAcrossDdl`, which fail a run past the second that the cache did not answer. |
 | I12 | Row ids are unique across the logical table | §3.5 | merge two partitions: no repeated id; ids file missing: table refused |
-| I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* |
+| I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* **As built (P5a, partitions all open):** `partition::pin_tests` (an unswept partition pins in one process and across a restart, the first-write edge, sweeps with a writer inside or a running writer's stamp, a broken table) and `power_loss::pins_crash_tests` (a crash image, not a kill, of an aborted first write after a clean sweep with its pages forced out); the twin's `ForgetSweep`. *(Mutations, each failing its test: `MATERIALIZE` not lowering the handle; the handle ignoring replayed pins; no `DIRTY` edge; `DIRTY` group-commit only (four of ten images read the aborted row); clean despite a writer inside; clean despite a newer stamp; no `broken_pin`; `follow` pinning nothing (the twin).)* Close and reshape wait for P5b and phase 5. |
 | I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers |
 | I15 | The reaper never deletes live data | §12 | corrupt one map, restart: every other table's files intact |
 | I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin |
