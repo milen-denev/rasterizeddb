@@ -30,6 +30,8 @@ mod partitioned_ddl_tests;
 #[cfg(test)]
 mod partitioned_tests;
 #[cfg(test)]
+mod partition_resident_tests;
+#[cfg(test)]
 mod relation_dispatch_tests;
 #[cfg(test)]
 mod reaper_tests;
