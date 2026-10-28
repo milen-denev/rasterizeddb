@@ -221,14 +221,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             mb
         }
         DbType::F32 => {
-            let val: f32 = parse_scalar::<f32>(value_str, db_type)?;
+            // A float's range is PostgreSQL's: `'1e400'` is out of range, not infinity.
+            let val: f32 = crate::core::value_codec::parse_float4(strip_surrounding_quotes(value_str))?;
             let bytes = val.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::F64 => {
-            let val: f64 = parse_scalar::<f64>(value_str, db_type)?;
+            // A float's range is PostgreSQL's: `'1e400'` is out of range, not infinity.
+            let val: f64 = crate::core::value_codec::parse_float8(strip_surrounding_quotes(value_str))?;
             let bytes = val.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);

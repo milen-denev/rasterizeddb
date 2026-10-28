@@ -1569,7 +1569,10 @@ pub fn coerce_literal(
                 .parse::<i128>()
                 .ok()
                 .and_then(|v| encode_integer(v, to))
-                .or_else(|| encode_float(text.trim().parse::<f64>().ok()?, to)),
+                .or_else(|| match to {
+                    DbType::F32 => parse_float4(text).map(|v| v.to_le_bytes().to_vec()),
+                    _ => encode_float(parse_float8(text)?, to),
+                }),
         };
     }
 
@@ -1677,6 +1680,36 @@ fn encode_integer(v: i128, to: &crate::core::db_type::DbType) -> Option<Vec<u8>>
         DbType::DECIMAL => v.checked_mul(DECIMAL_SCALE_FACTOR)?.to_le_bytes().to_vec(),
         _ => return None,
     })
+}
+
+/// `float8in`: a number's text as a double, or `None` past the range a
+/// double holds. `1e400` is not infinity and `1e-400` is not zero; PostgreSQL
+/// refuses both as out of range. `Infinity`, `-inf` and `NaN` are the values
+/// they spell; a subnormal is kept.
+pub fn parse_float8(text: &str) -> Option<f64> {
+    let v = text.trim().parse::<f64>().ok()?;
+    float_in_range(text, v.is_infinite(), v == 0.0).then_some(v)
+}
+
+/// [`parse_float8`] for `real` (`float4in`), against a `real`'s range.
+pub fn parse_float4(text: &str) -> Option<f32> {
+    let v = text.trim().parse::<f32>().ok()?;
+    float_in_range(text, v.is_infinite(), v == 0.0).then_some(v)
+}
+
+/// Whether a float parsed from `text` is the number written: not an
+/// overflow to infinity from a finite spelling, nor an underflow to zero
+/// from a number with a digit that is not zero.
+fn float_in_range(text: &str, infinite: bool, zero: bool) -> bool {
+    let body = text.trim().trim_start_matches(['+', '-']).to_ascii_lowercase();
+    if infinite {
+        return body == "inf" || body == "infinity";
+    }
+    if zero {
+        let mantissa = body.split('e').next().unwrap_or("");
+        return !mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b));
+    }
+    true
 }
 
 fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {

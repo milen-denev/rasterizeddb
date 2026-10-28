@@ -365,7 +365,7 @@ async fn run_subquery_scaled(
     // there: `WHERE next_attempt_at <= CURRENT_TIMESTAMP` inside a derived
     // table or a CTE still reached the tokenizer as an unknown column, and even
     // `now()` did, while both worked in the identical outer predicate.
-    let folded = fold_where_constants(sql);
+    let folded = fold_where_constants_checked(sql)?;
     let sql = folded.as_str();
 
     // A subquery inside this one is resolved here, before the statement is
@@ -626,7 +626,7 @@ async fn run_subquery_serialized(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<Vec<u8>, String> {
-    let folded = fold_where_constants(sql);
+    let folded = fold_where_constants_checked(sql)?;
     let sql = folded.as_str();
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery {}", sql_literal(sql)))?;
@@ -6465,10 +6465,29 @@ const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// `GROUP BY`, `LIMIT` or `RETURNING`: those are not predicates and a literal
 /// substituted into them would change what the statement means.
 pub fn fold_where_constants(sql: &str) -> String {
+    fold_where_constants_into(sql, &mut None)
+}
+
+/// [`fold_where_constants`], refusing a statement whose constants PostgreSQL
+/// refuses to compute: integer literals whose arithmetic overflows their own
+/// type (`2147483647 + 1` is `integer out of range` whatever column it is
+/// compared with), and a `numeric` constant this engine cannot compute with
+/// exactly. Left as text, the first was computed at the compared column's
+/// width, and against a `bigint` it answered rows.
+pub fn fold_where_constants_checked(sql: &str) -> Result<String, String> {
+    let mut refused = None;
+    let folded = fold_where_constants_into(sql, &mut refused);
+    match refused {
+        Some(e) => Err(e),
+        None => Ok(folded),
+    }
+}
+
+fn fold_where_constants_into(sql: &str, refused: &mut Option<String>) -> String {
     // A join's `ON` is a predicate too, and reaches the same tokenizer:
     // `ON n.nspname = current_schema()` arrived there as the identifier
     // `current_schema` and panicked the worker.
-    let sql = fold_on_clauses(sql);
+    let sql = fold_on_clauses(sql, refused);
     let sql = sql.as_str();
 
     use crate::core::rql::join::find_keyword;
@@ -6495,7 +6514,7 @@ pub fn fold_where_constants(sql: &str) -> String {
     format!(
         "{}{}{}",
         &sql[..body_start],
-        fold_constants_in_predicate(&body[..end]),
+        fold_constants_in_predicate_into(&body[..end], refused),
         &body[end..]
     )
 }
@@ -6504,7 +6523,7 @@ pub fn fold_where_constants(sql: &str) -> String {
 ///
 /// Each `ON` runs to whatever clause comes next, so the region folded is
 /// bounded by the following `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY` or `LIMIT`.
-fn fold_on_clauses(sql: &str) -> String {
+fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
     use crate::core::rql::join::find_keyword;
 
     let mut out = String::with_capacity(sql.len());
@@ -6528,7 +6547,7 @@ fn fold_on_clauses(sql: &str) -> String {
         .unwrap_or(rest.len());
 
         out.push_str(&sql[cursor..start]);
-        out.push_str(&fold_constants_in_predicate(&rest[..end]));
+        out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused));
         cursor = start + end;
     }
     out.push_str(&sql[cursor..]);
@@ -6543,7 +6562,13 @@ fn fold_on_clauses(sql: &str) -> String {
 /// reference fails to resolve there — so that is what decides whether a term is
 /// folded or left alone.
 fn fold_constants_in_predicate(text: &str) -> String {
-    fn fold_operand(operand: &str) -> String {
+    fold_constants_in_predicate_into(text, &mut None)
+}
+
+/// [`fold_constants_in_predicate`], noting in `refused` the first constant
+/// PostgreSQL would refuse to compute (see [`fold_where_constants_checked`]).
+fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) -> String {
+    fn fold_operand(operand: &str, refused: &mut Option<String>) -> String {
         // The statement's own `;` is not part of its last operand: left on
         // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
         // `ts < NOW();` were never folded.
@@ -6556,8 +6581,13 @@ fn fold_constants_in_predicate(text: &str) -> String {
         let lead = &operand[..operand.len() - operand.trim_start().len()];
         let tail = &operand[lead.len() + trimmed.len()..];
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
-        if let Some(value) = fold_integer_arithmetic(trimmed) {
-            return wrap(value);
+        match integer_arithmetic(trimmed) {
+            IntegerFold::Folded(value) => return wrap(value),
+            IntegerFold::Overflow(message) => {
+                refused.get_or_insert(message);
+                return operand.to_string();
+            }
+            IntegerFold::No => {}
         }
         // Arithmetic over numeric literals alone (`0.1234 * 100`) is folded
         // too, at the exact decimal the evaluator computes. Left as text it
@@ -6566,8 +6596,18 @@ fn fold_constants_in_predicate(text: &str) -> String {
         if trimmed.is_empty() || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed)) {
             return operand.to_string();
         }
-        let Ok(expr) = crate::core::rql::expr::parse(trimmed, &[]) else {
-            return operand.to_string();
+        let expr = match crate::core::rql::expr::parse(trimmed, &[]) {
+            Ok(expr) => expr,
+            Err(e) => {
+                // Arithmetic over a constant the engine can only carry as a
+                // float that is not the number written: computed by the
+                // tokenizer at the column's width, it failed as "operand size
+                // does not match" (XX000).
+                if literal_arithmetic(trimmed) && e.starts_with("numeric literal ") {
+                    refused.get_or_insert(e);
+                }
+                return operand.to_string();
+            }
         };
         let empty = crate::core::row::row::Row {
             position: 0,
@@ -6622,7 +6662,7 @@ fn fold_constants_in_predicate(text: &str) -> String {
                 // same way.
                 if let Some((lead, inner, tail)) = parenthesised(term) {
                     out.push_str(lead);
-                    out.push_str(&fold_constants_in_predicate(inner));
+                    out.push_str(&fold_constants_in_predicate_into(inner, refused));
                     out.push_str(tail);
                     continue;
                 }
@@ -6630,9 +6670,9 @@ fn fold_constants_in_predicate(text: &str) -> String {
                 // them is usually constant.
                 match find_comparison(term) {
                     Some((at, width)) => {
-                        out.push_str(&fold_operand(&term[..at]));
+                        out.push_str(&fold_operand(&term[..at], refused));
                         out.push_str(&term[at..at + width]);
-                        out.push_str(&fold_operand(&term[at + width..]));
+                        out.push_str(&fold_operand(&term[at + width..], refused));
                     }
                     None => out.push_str(term),
                 }
@@ -6673,6 +6713,27 @@ fn literal_arithmetic(text: &str) -> bool {
 /// (`numeric`), any other character. `None` also for a lone literal, which
 /// needs no folding.
 fn fold_integer_arithmetic(text: &str) -> Option<String> {
+    match integer_arithmetic(text) {
+        IntegerFold::Folded(value) => Some(value),
+        IntegerFold::Overflow(_) | IntegerFold::No => None,
+    }
+}
+
+/// What [`integer_arithmetic`] made of a text.
+enum IntegerFold {
+    /// The one integer literal it computes to.
+    Folded(String),
+    /// Integer literal arithmetic that PostgreSQL refuses as out of its type's
+    /// range, with that refusal's message.
+    Overflow(String),
+    /// Not integer literal arithmetic, or something the evaluator answers
+    /// (a zero divisor's 22012).
+    No,
+}
+
+/// [`fold_integer_arithmetic`], telling an overflow apart from text that is
+/// not integer arithmetic at all.
+fn integer_arithmetic(text: &str) -> IntegerFold {
     #[derive(Clone, Copy, PartialEq, PartialOrd)]
     enum Ty {
         Int4,
@@ -6681,23 +6742,34 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
     fn typed(v: i64) -> Ty {
         if i32::try_from(v).is_ok() { Ty::Int4 } else { Ty::Int8 }
     }
-    fn apply(l: (i64, Ty), r: (i64, Ty), op: u8) -> Option<(i64, Ty)> {
+    fn apply(l: (i64, Ty), r: (i64, Ty), op: u8, overflow: &mut Option<Ty>) -> Option<(i64, Ty)> {
         let ty = if l.1 > r.1 { l.1 } else { r.1 };
+        // A zero divisor is the evaluator's 22012; anything else that does
+        // not fit is the type's own overflow.
+        if matches!(op, b'/' | b'%') && r.0 == 0 {
+            return None;
+        }
         let v = match op {
-            b'+' => l.0.checked_add(r.0)?,
-            b'-' => l.0.checked_sub(r.0)?,
-            // Integer division truncates toward zero, as PostgreSQL's does;
-            // a zero divisor is left to the evaluator, which raises 22012.
-            b'/' => l.0.checked_div(r.0)?,
-            b'%' => l.0.checked_rem(r.0)?,
-            _ => l.0.checked_mul(r.0)?,
-        };
-        (ty == Ty::Int8 || i32::try_from(v).is_ok()).then_some((v, ty))
+            b'+' => l.0.checked_add(r.0),
+            b'-' => l.0.checked_sub(r.0),
+            // Integer division truncates toward zero, as PostgreSQL's does.
+            b'/' => l.0.checked_div(r.0),
+            b'%' => l.0.checked_rem(r.0),
+            _ => l.0.checked_mul(r.0),
+        }
+        .filter(|v| ty == Ty::Int8 || i32::try_from(*v).is_ok());
+        // Past an overflow the value no longer matters, only whether the
+        // rest of the text is arithmetic too, so the parse goes on.
+        if v.is_none() {
+            overflow.get_or_insert(ty);
+        }
+        Some((v.unwrap_or(0), ty))
     }
     struct P<'a> {
         b: &'a [u8],
         i: usize,
         ops: usize,
+        overflow: Option<Ty>,
     }
     impl P<'_> {
         fn peek(&mut self) -> Option<u8> {
@@ -6712,7 +6784,7 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
                 self.i += 1;
                 self.ops += 1;
                 let rhs = self.term()?;
-                acc = apply(acc, rhs, op)?;
+                acc = apply(acc, rhs, op, &mut self.overflow)?;
             }
             Some(acc)
         }
@@ -6722,7 +6794,7 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
                 self.i += 1;
                 self.ops += 1;
                 let rhs = self.factor()?;
-                acc = apply(acc, rhs, op)?;
+                acc = apply(acc, rhs, op, &mut self.overflow)?;
             }
             Some(acc)
         }
@@ -6764,9 +6836,14 @@ fn fold_integer_arithmetic(text: &str) -> Option<String> {
             }
         }
     }
-    let mut p = P { b: text.as_bytes(), i: 0, ops: 0 };
-    let (v, _) = p.expr()?;
-    (p.peek().is_none() && p.ops > 0).then(|| v.to_string())
+    let mut p = P { b: text.as_bytes(), i: 0, ops: 0, overflow: None };
+    match p.expr() {
+        Some(_) if p.peek().is_some() || p.ops == 0 => IntegerFold::No,
+        Some(_) if p.overflow == Some(Ty::Int4) => IntegerFold::Overflow("integer out of range".to_string()),
+        Some(_) if p.overflow == Some(Ty::Int8) => IntegerFold::Overflow("bigint out of range".to_string()),
+        Some((v, _)) => IntegerFold::Folded(v.to_string()),
+        None => IntegerFold::No,
+    }
 }
 
 /// A predicate term that is nothing but `TRUE` or `FALSE`, as the equivalent

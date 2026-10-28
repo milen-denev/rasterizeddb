@@ -5758,7 +5758,15 @@ where
     // `WHERE created_at < NOW()` reaches the predicate tokenizer as the unknown
     // column `NOW`, so the constant parts are evaluated once here, before
     // anything parses the clause.
-    let folded_where = crate::core::rql::executor::fold_where_constants(stmt);
+    // A constant PostgreSQL refuses to compute (`2147483647 + 1`) is refused
+    // here, whatever column it meets.
+    let folded_where = match crate::core::rql::executor::fold_where_constants_checked(stmt) {
+        Ok(folded) => folded,
+        Err(e) => {
+            fail_statement(state, stream, "22003", &e).await?;
+            return Ok(());
+        }
+    };
     // A fold evaluated something into the text (`CURRENT_DATE`, `now()`,
     // `1 + 1`). Its answer may not hold next time, so a parse made from it is
     // not one to keep.

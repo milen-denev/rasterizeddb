@@ -640,11 +640,11 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             if rhs.is_empty() {
                 return Err(format!("'{}' has no right operand", op.symbol()));
             }
-            return Ok(fold_float_literal_into_decimal(Expr::Arith(
-                Box::new(date_operand(parse(lhs, schema)?)),
-                op,
-                Box::new(date_operand(parse(rhs, schema)?)),
-            )));
+            let (l, r) = (date_operand(parse(lhs, schema)?), date_operand(parse(rhs, schema)?));
+            if let Some(exact) = exact_literal_arith(&l, op, &r, text) {
+                return exact;
+            }
+            return Ok(fold_float_literal_into_decimal(Expr::Arith(Box::new(l), op, Box::new(r))));
         }
 
         // No binary operator is left at the top, so a leading sign is unary:
@@ -753,6 +753,13 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     bytes: units.to_le_bytes().to_vec(),
                     db_type: DbType::DECIMAL,
                 });
+            }
+            // The float stands for the written number only when it holds
+            // every digit of it: `123456789012345678901234567890123456.50`
+            // was the float 1.2345678901234568e35 and was stored as
+            // 123456789012345680000000000000000000.00.
+            if text.bytes().any(|b| b.is_ascii_digit()) && !float_holds_literal(text, v) {
+                return Err(inexact_literal(text));
             }
         }
         return Ok(Expr::Literal {
@@ -2594,6 +2601,176 @@ fn exact_engine_decimal(text: &str) -> Option<i128> {
     )
 }
 
+/// The refusal of a `numeric` constant this engine can only carry as a
+/// float, where the float is not that number: SQLSTATE 22003, as for a
+/// `NUMERIC` column whose value the engine scale cannot hold.
+fn inexact_literal(text: &str) -> String {
+    format!("numeric literal {} is out of range for exact arithmetic", text)
+}
+
+/// Whether the float `v`, read from the numeric constant `text`, is that
+/// number: the shortest text that round-trips the float has the same digits
+/// and exponent as `text`. A literal with more significant digits than a
+/// float keeps, or past its range, is not.
+fn float_holds_literal(text: &str, v: f64) -> bool {
+    /// (negative, significant digits, exponent of the first digit), with
+    /// zeros trimmed from both ends of the digits; `None` for anything that
+    /// is not a plain decimal or exponent number.
+    fn digits(text: &str) -> Option<(bool, String, i64)> {
+        let (negative, body) = match text.as_bytes().first()? {
+            b'-' => (true, &text[1..]),
+            b'+' => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let (mantissa, exponent) = match body.find(['e', 'E']) {
+            Some(at) => (&body[..at], body[at + 1..].parse::<i64>().ok()?),
+            None => (body, 0),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let all = format!("{whole}{fraction}");
+        let leading = all.len() - all.trim_start_matches('0').len();
+        let significant = all.trim_matches('0').to_string();
+        if significant.is_empty() {
+            return Some((false, String::new(), 0));
+        }
+        Some((negative, significant, exponent + whole.len() as i64 - leading as i64))
+    }
+    v.is_finite() && digits(text).is_some_and(|written| Some(written) == digits(&format!("{:e}", v)))
+}
+
+/// `a op b` over two written numbers, at least one of them a constant the
+/// engine carries as a float, computed exactly as PostgreSQL's `numeric`
+/// does: `+`, `-` and `*` of decimals are exact. The answer is a `NUMERIC`
+/// when the engine scale holds it, a float when the float is exactly it
+/// (`0.00000000001 * 2`), and refused otherwise (`1e30 + 1`, which the float
+/// answered as 1e30). `None` for anything else, which the evaluator computes.
+fn exact_literal_arith(l: &Expr, op: ArithOp, r: &Expr, text: &str) -> Option<Result<Expr, String>> {
+    let float = |e: &Expr| matches!(e, Expr::Literal { db_type: DbType::F64, .. });
+    if !(float(l) || float(r)) || !matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) {
+        return None;
+    }
+    let value = |e: &Expr| match e {
+        Expr::Literal { bytes, db_type } => exact_decimal(&Value::Data { bytes: bytes.clone(), db_type: db_type.clone() }),
+        _ => None,
+    };
+    let (a, b) = (value(l)?, value(r)?);
+    let Some((m, e)) = exact_decimal_arith(a, op, b) else {
+        return Some(Err(inexact_literal(text)));
+    };
+    let scale = crate::core::value_codec::DECIMAL_SCALE as i32;
+    if m == 0 || e >= -scale {
+        if let Some(units) = 10i128.checked_pow((e + scale).max(0) as u32).and_then(|p| m.checked_mul(p)) {
+            return Some(Ok(Expr::Literal {
+                bytes: if m == 0 { 0i128 } else { units }.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            }));
+        }
+    }
+    let written = format!("{m}e{e}");
+    match written.parse::<f64>() {
+        Ok(v) if float_holds_literal(&written, v) => Some(Ok(Expr::Literal {
+            bytes: v.to_le_bytes().to_vec(),
+            db_type: DbType::F64,
+        })),
+        _ => Some(Err(inexact_literal(text))),
+    }
+}
+
+/// `m × 10^e`: a number value's exact decimal, for a float through its
+/// shortest text. `None` for anything that is not a number.
+fn exact_decimal(value: &Value) -> Option<(i128, i32)> {
+    let Value::Data { bytes, db_type } = value else {
+        return None;
+    };
+    // Without the zeros a NUMERIC's nine places put on it: 1e29 is 10^38
+    // units, which aligning with anything past it would overflow.
+    let normal = |(mut m, mut e): (i128, i32)| {
+        while m != 0 && m % 10 == 0 {
+            m /= 10;
+            e += 1;
+        }
+        Some((m, if m == 0 { 0 } else { e }))
+    };
+    normal(match db_type {
+        DbType::DECIMAL => Some((
+            i128::from_le_bytes(bytes.as_slice().try_into().ok()?),
+            -(crate::core::value_codec::DECIMAL_SCALE as i32),
+        )),
+        DbType::F64 | DbType::F32 => {
+            let v = as_f64(value).filter(|v| v.is_finite())?;
+            let shown = format!("{:e}", v);
+            let (mantissa, exponent) = shown.split_once('e')?;
+            let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+            let m: i128 = format!("{whole}{fraction}").parse().ok()?;
+            Some((m, exponent.parse::<i32>().ok()? - fraction.len() as i32))
+        }
+        _ => as_i64(value).map(|v| (v as i128, 0)),
+    }?)
+}
+
+/// `a op b` exactly, for `+`, `-` and `*`; `None` past `i128`.
+fn exact_decimal_arith((ma, ea): (i128, i32), op: ArithOp, (mb, eb): (i128, i32)) -> Option<(i128, i32)> {
+    let pow = |n: i32| 10i128.checked_pow(u32::try_from(n).ok()?);
+    let (mut m, mut e) = match op {
+        ArithOp::Mul => (ma.checked_mul(mb)?, ea.checked_add(eb)?),
+        ArithOp::Add | ArithOp::Sub => {
+            let e = ea.min(eb);
+            let a = ma.checked_mul(pow(ea - e)?)?;
+            let b = mb.checked_mul(pow(eb - e)?)?;
+            (if op == ArithOp::Add { a.checked_add(b)? } else { a.checked_sub(b)? }, e)
+        }
+        ArithOp::Div | ArithOp::Rem => return None,
+    };
+    while m != 0 && m % 10 == 0 {
+        m /= 10;
+        e += 1;
+    }
+    Some((m, e))
+}
+
+/// The float answer of arithmetic between a written constant the engine
+/// carries as a float (`lhs` or `rhs`) and an integer or a `NUMERIC`, which
+/// PostgreSQL computes in `numeric`: kept when it is exactly the `numeric`
+/// answer, refused (22003) when it is not. `i + 1e30` answered 1e30 for
+/// every `i`, stored as if exact. Against a float, or for `/` and `%`, the
+/// float's answer stands, as before.
+fn checked_float_literal_arith(lhs: &Expr, a: &Value, op: ArithOp, rhs: &Expr, b: &Value, got: Value) -> Result<Value, String> {
+    let float_literal = |e: &Expr| matches!(e, Expr::Literal { db_type: DbType::F64, .. });
+    let exact_typed = |v: &Value| {
+        matches!(
+            v.db_type(),
+            Some(
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                    | DbType::U64 | DbType::DECIMAL
+            )
+        )
+    };
+    let numeric = (float_literal(lhs) && exact_typed(b)) || (float_literal(rhs) && exact_typed(a));
+    if !numeric || matches!(op, ArithOp::Div | ArithOp::Rem) || !matches!(got, Value::Data { db_type: DbType::F64, .. }) {
+        return Ok(got);
+    }
+    let refused = || {
+        format!(
+            "numeric literal arithmetic {} {} {} is out of range for exact arithmetic",
+            as_text(a),
+            op.symbol(),
+            as_text(b)
+        )
+    };
+    let exact = exact_decimal(a)
+        .zip(exact_decimal(b))
+        .and_then(|(x, y)| exact_decimal_arith(x, op, y))
+        .ok_or_else(refused)?;
+    if exact_decimal(&got) == Some(exact) || (exact.0 == 0 && as_f64(&got) == Some(0.0)) {
+        Ok(got)
+    } else {
+        Err(refused())
+    }
+}
+
 /// Whether `expr` evaluates to a `NUMERIC` whenever it is not NULL — so that
 /// arithmetic against it is certain to take the decimal path.
 ///
@@ -2777,7 +2954,7 @@ pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value
 /// both reported as success. An integer that does not fit is PostgreSQL's
 /// `integer out of range`; a fraction assigned to an integer rounds half away
 /// from zero, as its `numeric → int` cast does.
-pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Value, String> {
+pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
     let number = |v: &Value| {
         matches!(
@@ -2840,6 +3017,23 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
             bytes: as_text(&value).into_bytes(),
             db_type: DbType::STRING,
         });
+    }
+    // Text bound for a number, a boolean or a UUID is read as one, or refused
+    // as that type's input refuses it. Its bytes were copied into the slot:
+    // `SET b = '5' || ''` stored 53, the code of the character `5`, and a
+    // NUMERIC(10,2) read the same byte as 0.53.
+    if matches!(value, Value::Data { db_type: DbType::STRING, .. })
+        && (number(&Value::Data { bytes: Vec::new(), db_type: field.db_type.clone() })
+            || matches!(field.db_type, DbType::BOOL | DbType::UUID))
+    {
+        let text = as_text(&value);
+        value = cast(value, &field.db_type).map_err(|e| {
+            if e.contains(" cannot be read as ") {
+                crate::core::value_codec::refusal_message(&field.db_type, &text)
+            } else {
+                e
+            }
+        })?;
     }
     // A float column takes any number as a float, as the assignment cast does.
     // A written fraction is a NUMERIC now, and its sixteen bytes in an
@@ -3684,7 +3878,8 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             if a.is_null() || b.is_null() {
                 Value::Null
             } else {
-                arith(&a, *op, &b)?
+                let got = arith(&a, *op, &b)?;
+                checked_float_literal_arith(lhs, &a, *op, rhs, &b, got)?
             }
         }
         Expr::Scalar(func) => {
@@ -4180,14 +4375,8 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             DbType::U16 => int_bytes(trimmed, 0, u16::MAX as i128, |v| (v as u16).to_le_bytes()),
             DbType::U32 => int_bytes(trimmed, 0, u32::MAX as i128, |v| (v as u32).to_le_bytes()),
             DbType::U64 => int_bytes(trimmed, 0, u64::MAX as i128, |v| (v as u64).to_le_bytes()),
-            DbType::F32 => trimmed
-                .parse::<f32>()
-                .ok()
-                .map(|v| v.to_le_bytes().to_vec()),
-            DbType::F64 => trimmed
-                .parse::<f64>()
-                .ok()
-                .map(|v| v.to_le_bytes().to_vec()),
+            DbType::F32 => crate::core::value_codec::parse_float4(trimmed).map(|v| v.to_le_bytes().to_vec()),
+            DbType::F64 => crate::core::value_codec::parse_float8(trimmed).map(|v| v.to_le_bytes().to_vec()),
             DbType::BOOL => match trimmed.to_ascii_lowercase().as_str() {
                 "t" | "true" | "1" | "yes" | "on" => Some(vec![1u8]),
                 "f" | "false" | "0" | "no" | "off" => Some(vec![0u8]),
@@ -4204,6 +4393,11 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             // engine's nine places) is an overflow, 22003, not an internal
             // error: PostgreSQL's numeric_value_out_of_range.
             None if *target == DbType::DECIMAL && trimmed.parse::<f64>().is_ok_and(f64::is_finite) => {
+                Err(crate::core::value_codec::refusal_message(target, trimmed))
+            }
+            // A number past a float's range: `"1e400" is out of range for
+            // type double precision`, 22003. It was infinity.
+            None if matches!(target, DbType::F32 | DbType::F64) && trimmed.parse::<f64>().is_ok() => {
                 Err(crate::core::value_codec::refusal_message(target, trimmed))
             }
             None => Err(format!("{} cannot be read as {:?}", crate::core::rql::executor::sql_literal(&text), target)),
