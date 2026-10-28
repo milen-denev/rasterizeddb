@@ -2288,8 +2288,7 @@ async fn check_foreign_keys_for_update(
     for (column, field, expr) in by_expression {
         let mut seen = std::collections::HashSet::new();
         for row in &rows {
-            let value = crate::core::rql::expr::eval(expr, row, schema.as_slice())
-                .and_then(|v| crate::core::rql::expr::from_engine_scale(v, &field))?;
+            let value = crate::core::rql::expr::eval_into(expr, row, schema.as_slice(), &field)?;
             let literal = match value {
                 crate::core::rql::expr::Value::Null => continue,
                 crate::core::rql::expr::Value::Data { bytes, db_type } => {
@@ -2396,8 +2395,7 @@ async fn keys_about_to_change(
             let new: Option<(Vec<u8>, crate::core::db_type::DbType)> = if let Some((_, expr)) =
                 plan.expressions.iter().find(|(w, _)| *w == wo)
             {
-                let value = crate::core::rql::expr::eval(expr, row, schema.as_slice())
-                    .and_then(|v| crate::core::rql::expr::from_engine_scale(v, &field))?;
+                let value = crate::core::rql::expr::eval_into(expr, row, schema.as_slice(), &field)?;
                 match value {
                     crate::core::rql::expr::Value::Null => None,
                     crate::core::rql::expr::Value::Data { bytes, db_type } => {
@@ -13236,14 +13234,13 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                 // a silent wrong answer. The write path fails the statement on
                 // the same evaluation error, and this runs before it, so both
                 // now fail identically.
-                let value = crate::core::rql::expr::eval(expression, row, schema)?;
-                // Back to the target's declared scale, as the write path does.
+                // At the target's declared scale, as the write path computes it.
                 let value = match schema
                     .iter()
                     .find(|f| f.write_order as u32 == *write_order as u32)
                 {
-                    Some(target) => crate::core::rql::expr::from_engine_scale(value, target)?,
-                    None => value,
+                    Some(target) => crate::core::rql::expr::eval_into(expression, row, schema, target)?,
+                    None => crate::core::rql::expr::eval(expression, row, schema)?,
                 };
                 // NULL is a value here, not an absence: without an entry the
                 // placeholder overlay reported the empty string where the

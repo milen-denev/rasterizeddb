@@ -262,7 +262,21 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     db_type,
                     crate::core::value_codec::DECIMAL_SCALE,
                 )
-                .ok_or_else(|| "a literal in NUMERIC arithmetic is not a number".to_string())?;
+                .ok_or_else(|| {
+                    // Past nine places is a number this arithmetic cannot
+                    // carry, which is not the same as no number at all
+                    // (that was XX000 for `a + 0.000000000001 > 1`).
+                    let places = Self::rescale_decimal_literal(&operand, db_type, 38).is_some();
+                    if places {
+                        format!(
+                            "a NUMERIC literal with more than {} decimal places is not supported in WHERE-clause \
+                             arithmetic",
+                            crate::core::value_codec::DECIMAL_SCALE
+                        )
+                    } else {
+                        "a literal in NUMERIC arithmetic is not a number".to_string()
+                    }
+                })?;
                 Ok((rescaled, None))
             }
             ComparisonOperand::DirectWithIndex(mb, index)

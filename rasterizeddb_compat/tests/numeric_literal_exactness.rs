@@ -50,7 +50,6 @@ async fn numeric_constants_are_exact_or_refused() {
         "UPDATE h SET h = 123456789012345678901234567890123456.50 + 0 WHERE id = 1",
         "UPDATE h SET h = 123456789012345678901234567890123456.50 - 1 WHERE id = 1",
         "UPDATE h SET w = 1e30 + 1 WHERE id = 1",
-        "UPDATE h SET w = i + 1e30 WHERE id = 1",
         "INSERT INTO h VALUES (2, 123456789012345678901234567890123456.50 + 0, 0, 0, 0, 0)",
         "SELECT id FROM h WHERE h = 123456789012345678901234567890123456.50 + 0",
     ] {
@@ -65,6 +64,11 @@ async fn numeric_constants_are_exact_or_refused() {
         .await
         .unwrap();
     assert_eq!(row().await, ["123456789012345678901234567890123456.50 5000000000000000000000000000000 2147483648 5"]);
+    // An integer column plus a constant a float holds exactly, stored in a
+    // NUMERIC: computed exactly, as PostgreSQL stores it. It was refused
+    // (22003) while expressions could only carry it as a float.
+    sqlx::query("UPDATE h SET w = i + 1e30 WHERE id = 1").execute(&pool).await.unwrap();
+    assert_eq!(texts(&pool, "SELECT w::text FROM h WHERE id = 1").await, ["1000000000000000000000000000005"]);
     // Two constants are computed exactly, whichever form carries them.
     sqlx::query("UPDATE h SET f = 0.0000000001 * 3, w = 1e30 - 1e29 WHERE id = 1").execute(&pool).await.unwrap();
     let r = sqlx::query("SELECT f, w::text AS w FROM h WHERE id = 1").fetch_one(&pool).await.unwrap();

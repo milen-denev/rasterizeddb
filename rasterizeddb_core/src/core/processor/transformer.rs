@@ -978,8 +978,11 @@ impl ComparisonOperand {
 /// answers `false` for that row, where returning an error would fail a whole
 /// scan over one unconvertible value.
 /// A `NUMERIC` stored at `scale`, moved to the engine scale as
-/// `expr::to_engine_scale` moves it: exact upward, truncated downward. Bytes
-/// that are not a decimal are passed through for the operation to refuse.
+/// `expr::to_engine_scale` moves it: exact upward; downward only when the
+/// places cut hold nothing, and otherwise refused (`InexactNumeric`): `a + 1
+/// > 1` over a NUMERIC(20,12) holding 0.000000000005 cut it to 0 and dropped
+/// the row. Bytes that are not a decimal are passed through for the
+/// operation to refuse.
 #[inline]
 fn lift_to_engine_scale<'a>(
     input: &'a [u8],
@@ -995,6 +998,12 @@ fn lift_to_engine_scale<'a>(
         crate::core::value_codec::DECIMAL_SCALE,
     )
     .ok_or(EvalError::ArithmeticOverflow)?;
+    if scale > crate::core::value_codec::DECIMAL_SCALE
+        && crate::core::rql::expr::rescale_decimal(lifted, crate::core::value_codec::DECIMAL_SCALE, scale)
+            != Some(i128::from_le_bytes(raw))
+    {
+        return Err(EvalError::InexactNumeric);
+    }
     *buf = lifted.to_le_bytes();
     Ok(&buf[..])
 }

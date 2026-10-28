@@ -155,6 +155,10 @@ pub enum EvalError {
     /// An expression evaluated per row in a `WHERE` — a `CASE`, a `||`, a
     /// `%` — failed for a reason none of the variants above names.
     ExpressionFailed,
+    /// A `NUMERIC(p, s)` value with more places than the engine's nine, met
+    /// in `WHERE`-clause arithmetic, which runs at nine: refused rather than
+    /// computed without its last digits. PostgreSQL's 0A000 by its words.
+    InexactNumeric,
 }
 
 impl EvalError {
@@ -181,6 +185,10 @@ impl EvalError {
             EvalError::PatternTooComplex => crate::core::similar_to::TOO_COMPLEX,
             EvalError::UserCanceled => "canceling statement due to user request",
             EvalError::ExpressionFailed => "an expression in the WHERE clause could not be evaluated",
+            EvalError::InexactNumeric => {
+                "a NUMERIC value with more than 9 decimal places cannot be carried exactly by arithmetic \
+                 in a WHERE clause (not supported)"
+            }
         }
     }
 
@@ -201,6 +209,7 @@ impl EvalError {
             EvalError::PatternTooComplex => 11,
             EvalError::UserCanceled => 12,
             EvalError::ExpressionFailed => 13,
+            EvalError::InexactNumeric => 14,
         }
     }
 
@@ -219,6 +228,7 @@ impl EvalError {
             11 => Some(EvalError::PatternTooComplex),
             12 => Some(EvalError::UserCanceled),
             13 => Some(EvalError::ExpressionFailed),
+            14 => Some(EvalError::InexactNumeric),
             _ => None,
         }
     }
@@ -233,6 +243,8 @@ impl EvalError {
         let lower = message.to_ascii_lowercase();
         if lower.contains("division by zero") {
             EvalError::DivisionByZero
+        } else if lower.contains("cannot carry exactly") {
+            EvalError::InexactNumeric
         } else if lower.contains("out of range") || lower.contains("overflow") {
             EvalError::ArithmeticOverflow
         } else {

@@ -2615,6 +2615,12 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     })
 }
 
+/// Whether a float's shortest digits need no more places than the engine
+/// keeps, so taking it into `NUMERIC` loses nothing.
+fn float_is_engine_exact(f: f64) -> bool {
+    crate::core::value_codec::parse_decimal(&format!("{}", f)).is_some()
+}
+
 /// A float taken into `NUMERIC` at the engine scale, at the digits it was
 /// written with: the shortest text that round-trips the float is those digits,
 /// and parsing it is exact. A float with more places than the engine keeps is
@@ -2923,7 +2929,13 @@ fn fold_float_literal_into_decimal(expr: Expr) -> Expr {
                 bytes: bytes.clone(),
                 db_type: db_type.clone(),
             };
-            if let Some(units) = as_f64(&value).and_then(float_to_engine_decimal) {
+            // Only a float the engine scale holds. One with more places is
+            // left a float: rounded to nine here, `d * 0.00000000011` was 0
+            // and `a + 0.000000000001` was `a`. As a float it is the
+            // float-carried constant `numeric_literal_arith` answers from the
+            // exact result (described as float8), and a value stored in a
+            // NUMERIC column is computed exactly by `eval_into`.
+            if let Some(units) = as_f64(&value).filter(|f| float_is_engine_exact(*f)).and_then(float_to_engine_decimal) {
                 **side = Expr::Literal {
                     bytes: units.to_le_bytes().to_vec(),
                     db_type: DbType::DECIMAL,
@@ -3022,6 +3034,238 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
     Some(q)
 }
 
+/// An expression's value, computed to be stored in `target`.
+///
+/// Expressions compute at the engine's nine places ([`eval`]), which a
+/// `NUMERIC(p, s)` column with more places cannot take back without loss:
+/// `SET a = a + 0.000000000001` on a NUMERIC(20,12) holding 0.123456789123
+/// stored 0.123456789000, its own last digits cut and the literal rounded
+/// to 0, and `SET d = d * 0.00000000011` stored 0. So a value bound for a
+/// NUMERIC column is first computed exactly ([`exact_numeric`]): `+ - * /`
+/// and `COALESCE` over NUMERIC and integer columns and written numbers, at
+/// whatever places they need, rounded once to the column's scale (half away
+/// from zero, as PostgreSQL's assignment rounds). Anything else, or a value
+/// the exact reading cannot settle, takes the engine path as before — which
+/// refuses what it cannot carry rather than truncating it
+/// ([`to_engine_scale`], [`decimal_arith`]).
+pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: &SchemaField) -> Result<Value, String> {
+    if target.db_type == DbType::DECIMAL {
+        let scale = target.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+        if let Some(value) = exact_numeric(expr, row, schema, scale)? {
+            return match value {
+                None => Ok(Value::Null),
+                Some(exact) => match exact.settle(scale) {
+                    Some(units) => Ok(Value::Data { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL }),
+                    // Not settled: the engine path's own refusal when it has
+                    // one (22003 for `i + 1e30`), and never its answer, which
+                    // is the one this could not vouch for.
+                    None => match eval(expr, row, schema).and_then(|value| from_engine_scale(value, target)) {
+                        Err(e) => Err(e),
+                        Ok(_) => Err(inexact_assignment(&target.name, scale)),
+                    },
+                },
+            };
+        }
+    }
+    eval(expr, row, schema).and_then(|value| from_engine_scale(value, target))
+}
+
+/// A number as `m × 10^e`, with an upper bound on how far it may be from the
+/// number the statement wrote: a fraction written with more digits than a
+/// float keeps is carried as the float, which is within half an ulp of it.
+#[derive(Debug, Clone, Copy)]
+struct ExactNumber {
+    m: i128,
+    e: i32,
+    err: f64,
+}
+
+impl ExactNumber {
+    fn exact(m: i128, e: i32) -> Self {
+        ExactNumber { m, e, err: 0.0 }
+    }
+
+    fn approx(self) -> f64 {
+        self.m as f64 * 10f64.powi(self.e)
+    }
+
+    /// Both at the smaller exponent; `None` past `i128`.
+    fn aligned(a: Self, b: Self) -> Option<(i128, i128, i32)> {
+        let e = a.e.min(b.e);
+        let lift = |x: Self| x.m.checked_mul(10i128.checked_pow((x.e - e) as u32)?);
+        Some((lift(a)?, lift(b)?, e))
+    }
+
+    /// `self` at `places` places, rounded half away from zero, when the bound
+    /// on its error cannot move it to another value there; `None` otherwise,
+    /// or when it does not fit.
+    fn settle(self, places: u32) -> Option<i128> {
+        // Worked fine enough to see the error bound, and two places past the
+        // target, so the bound shows which way the rounding goes.
+        let resolve = if self.err > 0.0 { (-self.err.log10()).ceil() as i64 + 2 } else { 0 };
+        let finest = (places as i64 + 2).max(-(self.e as i64)).max(resolve).min(76) as u32;
+        // Down to the target's own places when nothing finer fits.
+        let (work, m) = (places..=finest.max(places + 2)).rev().find_map(|work| {
+            let shift = work as i32 + self.e;
+            let m = if shift >= 0 {
+                self.m.checked_mul(10i128.checked_pow(shift as u32)?)?
+            } else {
+                // Places past `work` are a fraction of its last unit, which
+                // the spread below takes in.
+                10i128.checked_pow(shift.unsigned_abs()).map_or(0, |p| self.m / p)
+            };
+            Some((work, m))
+        })?;
+        let truncated = work as i32 + self.e < 0;
+        let spread = if self.err == 0.0 && !truncated {
+            0
+        } else {
+            let units = (self.err * 10f64.powi(work as i32)).ceil();
+            if !units.is_finite() || units >= 1e30 {
+                return None;
+            }
+            units as i128 + 1
+        };
+        let value = round_decimal(m, work, places)?;
+        if spread != 0
+            && (round_decimal(m.checked_sub(spread)?, work, places)? != value
+                || round_decimal(m.checked_add(spread)?, work, places)? != value)
+        {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+fn inexact_assignment(column: &str, places: u32) -> String {
+    format!(
+        "the value for column \"{column}\" cannot be computed exactly at {places} decimal places: a written \
+         number has more digits than this engine carries in an expression (not supported)"
+    )
+}
+
+/// [`eval_into`]'s exact reading of `expr`: `Ok(None)` when it has a part
+/// this does not compute, `Ok(Some(None))` for NULL. `places` is the scale
+/// the answer is wanted at, which a division works past.
+fn exact_numeric(
+    expr: &Expr,
+    row: &Row,
+    schema: &[SchemaField],
+    places: u32,
+) -> Result<Option<Option<ExactNumber>>, String> {
+    let integer = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 | DbType::U8 | DbType::U16 | DbType::U32
+                | DbType::U64
+        )
+    };
+    Ok(match expr {
+        Expr::Null => Some(None),
+        Expr::Column(field) if field.db_type == DbType::DECIMAL || integer(&field.db_type) => {
+            match column_value(field, row, schema) {
+                Value::Null => Some(None),
+                Value::Data { bytes, db_type: DbType::DECIMAL } => match <[u8; 16]>::try_from(bytes.as_slice()) {
+                    Ok(raw) => Some(Some(ExactNumber::exact(
+                        i128::from_le_bytes(raw),
+                        -(field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE) as i32),
+                    ))),
+                    Err(_) => None,
+                },
+                value => as_i64(&value).map(|v| Some(ExactNumber::exact(v as i128, 0))),
+            }
+        }
+        Expr::Literal { bytes, db_type } if *db_type == DbType::DECIMAL || integer(db_type) => {
+            let value = Value::Data { bytes: bytes.clone(), db_type: db_type.clone() };
+            exact_decimal(&value).map(|(m, e)| Some(ExactNumber::exact(m, e)))
+        }
+        // A float literal is the number written when a float holds it, which
+        // `numeric_constant` makes certain from 1e8 up; below, it may carry
+        // more digits than the float keeps, and is within an ulp of it.
+        Expr::Literal { bytes, db_type: DbType::F64 } => {
+            let value = Value::Data { bytes: bytes.clone(), db_type: DbType::F64 };
+            match (exact_decimal(&value), as_f64(&value)) {
+                (Some((m, e)), Some(v)) => Some(Some(ExactNumber {
+                    m,
+                    e,
+                    err: if v.abs() < FLOAT_KEEPS_BELOW { v.abs() * f64::EPSILON } else { 0.0 },
+                })),
+                _ => None,
+            }
+        }
+        Expr::Coalesce(args) => {
+            let mut found = Some(None);
+            for arg in args {
+                match exact_numeric(arg, row, schema, places)? {
+                    None => return Ok(None),
+                    Some(Some(v)) => {
+                        found = Some(Some(v));
+                        break;
+                    }
+                    Some(None) => {}
+                }
+            }
+            found
+        }
+        Expr::Cast(inner, DbType::DECIMAL) => exact_numeric(inner, row, schema, places)?,
+        // Integer arithmetic is the engine's own, exact already and with
+        // PostgreSQL's integer division and range: `1 / 3` is 0.
+        Expr::Arith(..) if integer(&static_type(expr)) => match eval(expr, row, schema)? {
+            Value::Null => Some(None),
+            value => as_i64(&value).map(|v| Some(ExactNumber::exact(v as i128, 0))),
+        },
+        Expr::Arith(l, op, r) if !matches!(op, ArithOp::Rem) => {
+            let (Some(a), Some(b)) = (exact_numeric(l, row, schema, places)?, exact_numeric(r, row, schema, places)?)
+            else {
+                return Ok(None);
+            };
+            let (Some(a), Some(b)) = (a, b) else {
+                return Ok(Some(None));
+            };
+            exact_arith(a, *op, b, places)?.map(Some)
+        }
+        _ => None,
+    })
+}
+
+/// `a op b` exactly for `+ - *`, and for `/` to `places + 6` places with
+/// the cut in the error bound. `None` past `i128`.
+fn exact_arith(a: ExactNumber, op: ArithOp, b: ExactNumber, places: u32) -> Result<Option<ExactNumber>, String> {
+    let (fa, fb) = (a.approx().abs(), b.approx().abs());
+    Ok(match op {
+        ArithOp::Add | ArithOp::Sub => ExactNumber::aligned(a, b).and_then(|(x, y, e)| {
+            let m = if matches!(op, ArithOp::Add) { x.checked_add(y) } else { x.checked_sub(y) }?;
+            Some(ExactNumber { m, e, err: a.err + b.err })
+        }),
+        ArithOp::Mul => a.m.checked_mul(b.m).map(|m| ExactNumber {
+            m,
+            e: a.e + b.e,
+            err: fa * b.err + fb * a.err + a.err * b.err,
+        }),
+        ArithOp::Div => {
+            if b.m == 0 {
+                return Err("division by zero".to_string());
+            }
+            // q = a / b at 10^-k: a.m · 10^(a.e - b.e + k) / b.m.
+            let k = places as i32 + 6;
+            let shift = a.e - b.e + k;
+            let numerator = if shift >= 0 {
+                10i128.checked_pow(shift as u32).and_then(|p| a.m.checked_mul(p))
+            } else {
+                10i128.checked_pow(shift.unsigned_abs()).map(|p| a.m / p)
+            };
+            numerator.map(|n| ExactNumber {
+                m: n / b.m,
+                e: -k,
+                // The cut, plus what each operand's error makes of the quotient.
+                err: 10f64.powi(-k) * if shift >= 0 { 1.0 } else { 2.0 }
+                    + if fb > 0.0 { a.err / fb + fa * b.err / (fb * fb) } else { 0.0 },
+            })
+        }
+        ArithOp::Rem => None,
+    })
+}
+
 /// Lifts a `NUMERIC(p, s)` column's stored integer to the engine scale, so
 /// arithmetic and comparisons see one scale whatever each column declared.
 ///
@@ -3045,6 +3289,23 @@ pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value
                     field.name
                 )
             })?;
+            // Places past the engine's are cut by the move down. A value
+            // that has digits there is refused rather than answered without
+            // them: `a + 1` over a NUMERIC(20,12) holding 0.123456789123 gave
+            // 1.123456789000. A value stored in the column is computed
+            // exactly instead (`eval_into`).
+            // A finished aggregate (`AVG(v) + 1`) is not a stored value: it
+            // is read at nine places, as it always was.
+            if scale > DECIMAL_SCALE
+                && !field.name.starts_with(crate::core::rql::aggregate::COMPUTED_INPUT_PREFIX)
+                && rescale_decimal(lifted, DECIMAL_SCALE, scale).is_none_or(|back| back != raw)
+            {
+                return Err(format!(
+                    "numeric value of column \"{}\" has more than {} decimal places, which an expression \
+                     here cannot carry exactly (not supported)",
+                    field.name, DECIMAL_SCALE
+                ));
+            }
             Ok(Value::Data {
                 bytes: lifted.to_le_bytes().to_vec(),
                 db_type: DbType::DECIMAL,

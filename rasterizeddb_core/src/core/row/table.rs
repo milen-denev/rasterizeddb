@@ -5492,26 +5492,20 @@ impl<S: StorageIO> Table<S> {
             // statement touched it, which is what `COALESCE(c, x)` means, and
             // then overwrite the placeholder their assignment left behind.
             for (write_order, expression) in expressions.iter() {
-                // Expressions compute at the engine scale; a `NUMERIC(p, s)`
-                // target stores at its own, so the result is put back there.
-                // The declared precision is enforced on the stored value, as
-                // PostgreSQL's assignment does: `numeric field overflow`.
-                let value =
-                    match crate::core::rql::expr::eval(expression, &row, self.schema.fields.as_slice())
-                        .and_then(|value| {
-                            match self.schema.fields.iter().find(|f| f.write_order as u32 == *write_order as u32) {
-                                Some(target) => crate::core::rql::expr::from_engine_scale(value, target)
-                                    .and_then(|value| {
-                                        crate::core::rql::expr::check_declared_precision(
-                                            &value,
-                                            target,
-                                            &self.schema.type_modifiers,
-                                        )
-                                        .map(|()| value)
-                                    }),
-                                None => Ok(value),
-                            }
-                        }) {
+                // Computed for the target, at its own scale (`eval_into`: a
+                // `NUMERIC(p, s)` value exactly, anything else at the engine
+                // scale and put back). The declared precision is enforced on
+                // the stored value, as PostgreSQL's assignment does: `numeric
+                // field overflow`.
+                let fields = self.schema.fields.as_slice();
+                let value = match fields.iter().find(|f| f.write_order as u32 == *write_order as u32) {
+                    Some(target) => crate::core::rql::expr::eval_into(expression, &row, fields, target).and_then(|value| {
+                        crate::core::rql::expr::check_declared_precision(&value, target, &self.schema.type_modifiers)
+                            .map(|()| value)
+                    }),
+                    None => crate::core::rql::expr::eval(expression, &row, fields),
+                };
+                let value = match value {
                         Ok(value) => value,
                         Err(e) => {
                             d.io_pointers.abort_txn(txn).await;
