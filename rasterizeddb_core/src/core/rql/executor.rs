@@ -6424,6 +6424,7 @@ async fn refuse_write_to_locked_rows(
     if database.row_locks.enter_fast_write(table_name, tx) {
         // Between the check and the write: where a locker's `FOR UPDATE`
         // could land unseen (compat `row_lock_fast_path.rs`).
+        #[cfg(any(test, feature = "index_store_failpoints"))]
         let _ = crate::core::power_loss::failpoint::hit("test.row_write_fast_path", std::path::Path::new(table_name));
         return Ok(());
     }
