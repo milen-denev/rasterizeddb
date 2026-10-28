@@ -6721,13 +6721,29 @@ fn unquoted(message: &str) -> String {
 /// ("column 'x' deadlock detected 'y' does not exist"). Blanking the
 /// client's own quote-holding texts closes that for every message at once;
 /// none of the engine's own words can be one, since none holds a quote.
+///
+/// Blanking can also take the engine's own words with it, where a client
+/// text happens to repeat them: a real duplicate inserting the value
+/// `'unique column "n"'` lost "UNIQUE column "n"" from "duplicate value for
+/// UNIQUE column "n"" and answered XX000, not 23505. The blanking exists to
+/// keep a client's text from choosing a code a client acts on blindly — a
+/// retry (40xxx), a cancellation (57014), a lock wait (55P03) — so when it
+/// leaves nothing recognisable, the message's own integrity (23) or
+/// statement (42) class stands.
 pub(crate) fn sqlstate_in(message: &str, statement: &str) -> &'static str {
-    sqlstate_for(&blank_client_texts(message, statement))
+    let blanked = sqlstate_for(&blank_client_texts(message, statement));
+    if blanked != "XX000" {
+        return blanked;
+    }
+    match sqlstate_for(message) {
+        code if code.starts_with("23") || code.starts_with("42") => code,
+        _ => blanked,
+    }
 }
 
 /// [`materialize_sqlstate`] with [`sqlstate_in`]'s blanking.
 pub(crate) fn materialize_sqlstate_in(message: &str, statement: &str) -> &'static str {
-    materialize_sqlstate(&blank_client_texts(message, statement))
+    materialize_class(sqlstate_in(message, statement))
 }
 
 /// `message` lowercased, with each string literal and quoted identifier of
@@ -6806,7 +6822,12 @@ fn quoted_client_texts(statement: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
-    let code = sqlstate_for(message);
+    materialize_class(sqlstate_for(message))
+}
+
+/// The code a failed CTE body or derived table is reported under, given the
+/// code of its own failure: see [`materialize_sqlstate`].
+fn materialize_class(code: &'static str) -> &'static str {
     if ["23", "22", "40", "57", "55", "53", "58"].iter().any(|class| code.starts_with(class)) {
         code
     } else {

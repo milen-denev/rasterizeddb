@@ -167,3 +167,48 @@ async fn a_quote_inside_an_identifier_does_not_choose_the_sqlstate() {
         }
     }
 }
+
+/// A client text that repeats the engine's own words: blanking it took
+/// those words out of the message, so a real duplicate inserting the value
+/// `'unique column "n"'` answered XX000, not 23505, and a real foreign-key
+/// violation quoting its table answered XX000, not 23503.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_text_repeating_the_engines_words_keeps_its_sqlstate() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql(
+        "CREATE TABLE su (id BIGINT PRIMARY KEY, n BIGINT UNIQUE, t TEXT);
+         INSERT INTO su VALUES (1, 1, 'a');
+         CREATE TABLE parent (id BIGINT PRIMARY KEY);
+         CREATE TABLE child (id BIGINT PRIMARY KEY, t TEXT, p BIGINT REFERENCES parent(id));",
+    ))
+    .await
+    .unwrap();
+    for (sql, want) in [
+        (r#"INSERT INTO su VALUES (2, 1, 'unique column "n"')"#, "23505"),
+        (r#"INSERT INTO su VALUES (2, 1, 'duplicate value for UNIQUE column "n"')"#, "23505"),
+        (r#"UPDATE su SET n = 1, t = 'unique column "n"' WHERE id = 1 AND n = 0"#, "OK"),
+        (r#"INSERT INTO child VALUES (1, '"child" violates foreign', 5)"#, "23503"),
+        (r#"WITH w AS (INSERT INTO su VALUES (2, 1, 'unique column "n"') RETURNING id) SELECT * FROM w"#, "23505"),
+    ] {
+        match sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await {
+            Ok(_) => assert_eq!(want, "OK", "{sql}"),
+            Err(e) => assert_eq!(code(&e), want, "{sql}: {e}"),
+        }
+    }
+    // The same value bound rather than written.
+    let e = sqlx::query("INSERT INTO su VALUES (2, 1, $1)")
+        .bind(r#"unique column "n""#)
+        .execute(&pool)
+        .await
+        .expect_err("bound duplicate");
+    assert_eq!(code(&e), "23505", "{e}");
+    let e = sqlx::query("INSERT INTO child VALUES (1, $1, 5)")
+        .bind(r#""child" violates foreign"#)
+        .execute(&pool)
+        .await
+        .expect_err("bound orphan");
+    assert_eq!(code(&e), "23503", "{e}");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM su").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1);
+}
