@@ -66,6 +66,7 @@ async fn wide_scale(partitioning: &str) {
         "5 0.100000000000 5.0000",
         "6 -0.666666666667 NULL",
         "7 NULL 7.0000",
+        "8 0.333333333333 0.0000",
     ];
     {
         let server = TestServer::start_file_backed(&dir.0).await.expect("server");
@@ -77,6 +78,9 @@ async fn wide_scale(partitioning: &str) {
              (4, 0.000000000005, 4), (5, 1, 5), (6, NULL, NULL), (7, NULL, 7)",
         )
         .await;
+        // An INSERT's constant expression, at the column's scale: it was
+        // 0.333333333000. Integer division stays integer division.
+        run(&pool, "INSERT INTO w VALUES (8, 1 / 3.0, 1 / 3)").await;
         for sql in [
             // A literal past nine places, the column's own last digits kept.
             "UPDATE w SET a = a + 0.000000000001 WHERE id = 1",
