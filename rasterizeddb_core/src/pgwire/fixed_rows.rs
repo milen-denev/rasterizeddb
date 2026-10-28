@@ -471,7 +471,7 @@ mod fixed_rows_tests {
                 for (i, c) in crate::core::row::row::serialized_cells(span).unwrap().enumerate() {
                     let c = c.unwrap();
                     has_null |= c.column_type == DbType::NULL;
-                    super::super::encode_result_cell(&mut want, i, &c.column_type, c.data, &fields, None, &[1]);
+                    super::super::encode_result_cell(&mut want, i, &c.column_type, c.data, &fields, None, &[1]).unwrap();
                     n += 1;
                 }
                 want[count_at..count_at + 2].copy_from_slice(&n.to_be_bytes());

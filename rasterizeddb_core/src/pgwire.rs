@@ -6623,7 +6623,7 @@ where
                     return Ok(());
                 }
             };
-            send_serialized_query_result(
+            if let Err(e) = send_serialized_query_result(
                 stream,
                 Some(&built),
                 select_scales.as_deref(),
@@ -6632,7 +6632,18 @@ where
                 &tag,
                 omit,
             )
-            .await?;
+            .await
+            {
+                // A damaged stored value fails the statement, after the rows
+                // sent before it, as PostgreSQL fails one mid-result.
+                match CellDecodeError::of(&e) {
+                    Some(bad) => {
+                        let message = bad.to_string();
+                        fail_statement(state, stream, "XX001", &message).await?;
+                    }
+                    None => return Err(e),
+                }
+            }
         }
         3 => {
             let msg = String::from_utf8_lossy(&resp[1..]).to_string();
@@ -8943,7 +8954,7 @@ where
                 col_meta,
                 scales,
                 result_formats,
-            );
+            )?;
         }
         wire_out::finish_message(&mut frame, start)?;
         stream.write_all(&frame).await?;
@@ -8957,6 +8968,11 @@ where
 ///
 /// Shared by both result senders, so a decoded row and a serialized one
 /// cannot be encoded differently.
+///
+/// A stored document that cannot be decoded is an error (`CellDecodeError`,
+/// XX001 to the client), never a NULL: it used to be logged and sent as
+/// NULL, so a damaged value read as an absent one and the statement
+/// succeeded.
 #[inline]
 fn encode_result_cell(
     frame: &mut Vec<u8>,
@@ -8966,7 +8982,7 @@ fn encode_result_cell(
     col_meta: &[(String, DbType)],
     scales: Option<&[u32]>,
     result_formats: &[i16],
-) {
+) -> io::Result<()> {
     let format_code = if result_formats.is_empty() {
         0
     } else if result_formats.len() == 1 {
@@ -9007,12 +9023,41 @@ fn encode_result_cell(
     } else {
         wire_out::encode_cell_text(db_type, data, scale, frame)
     };
+    // Only a document's encoder answers "absent" for bytes that are there;
+    // every other type's absent is a NULL or a width that holds no value.
+    if !present && *db_type == DbType::JSONB && !data.is_empty() {
+        let column = col_meta.get(i).map(|(name, _)| name.as_str()).unwrap_or("?");
+        return Err(io::Error::new(io::ErrorKind::InvalidData, CellDecodeError(column.to_string())));
+    }
     let len: i32 = if present {
         (frame.len() - len_at - 4).try_into().unwrap_or(i32::MAX)
     } else {
         -1
     };
     frame[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+/// A stored value of a result column that could not be decoded for the wire
+/// (a damaged `jsonb` document). Carried inside the `io::Error` a result
+/// sender returns, so the statement fails with XX001 (`data_corrupted`)
+/// rather than the connection, and rather than the value going out as NULL.
+#[derive(Debug)]
+pub(crate) struct CellDecodeError(String);
+
+impl std::fmt::Display for CellDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a stored jsonb value of column \"{}\" could not be decoded: the value is damaged", self.0)
+    }
+}
+
+impl std::error::Error for CellDecodeError {}
+
+impl CellDecodeError {
+    /// The decode failure inside a sender's error, if that is what it is.
+    pub(crate) fn of(e: &io::Error) -> Option<&CellDecodeError> {
+        e.get_ref().and_then(|inner| inner.downcast_ref::<CellDecodeError>())
+    }
 }
 
 /// How many rows a serialized engine result holds, after checking every row
@@ -9142,7 +9187,7 @@ where
                 col_meta,
                 scales,
                 result_formats,
-            );
+            )?;
             columns += 1;
         }
         let count: i16 = columns.try_into().unwrap_or(i16::MAX);
