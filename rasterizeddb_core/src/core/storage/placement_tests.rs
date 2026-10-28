@@ -996,6 +996,72 @@ async fn a_failed_backup_write_keeps_the_mark_and_is_rebuilt_at_open() {
     assert!(marks_in(backup.path()).is_empty(), "the mark outlived the rebuild");
 }
 
+/// A transaction of more than 4096 scattered in-place writes copies one
+/// span over most of the file. Nothing ordered its copy against another
+/// commit's: a chunk read before that commit landed after that commit's own
+/// copy, and the backup lost the later write (for a pointers file, a
+/// deleted row back on failover). Driven on the provider: DELETE and UPDATE
+/// serialise on the table's write lock, but an INSERT into a reclaimed
+/// extent does not, and the mirror's order must not rest on that. The big
+/// copy is parked between its read and its write while the other commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_read_before_a_later_commit_does_not_land_after_it() {
+    use crate::core::storage::mirror::{MirrorStorageProvider, test_hooks};
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_string_lossy().into_owned();
+    let backup_path = backup.path().to_string_lossy().into_owned();
+    {
+        let (wal, _) = crate::core::wal::open_and_recover(&root_path).unwrap();
+        crate::core::wal::install_for(&root_path, wal);
+        let io = MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "mz.db").await;
+        io.append_data(&vec![0u8; 128 * 1024], true).await;
+        io.commit_durable(io.begin_txn()).await.unwrap();
+
+        // Every 16th byte: never touching, so past 4096 ranges they collapse.
+        let txn = io.begin_txn();
+        let mut big = 0;
+        for i in 0..5000u64 {
+            big = io.write_data_txn(txn, i * 16 + 1, &[0xAA]).await;
+        }
+        assert_ne!(big, 0, "the writes were not logged, so nothing waits to be copied");
+        let parked = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        *test_hooks::PARK_AFTER_READ.lock() = Some((root_path.clone(), parked.clone(), resume.clone()));
+        let waiting_before = test_hooks::waiting_in(&root_path);
+        let first = tokio::spawn({
+            let io = io.clone();
+            async move { io.commit_durable(big).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), parked.notified())
+            .await
+            .expect("the big copy never parked");
+
+        // Inside the span the parked copy has already read.
+        let txn = io.begin_txn();
+        let small = io.write_data_txn(txn, 8, &[0xBB]).await;
+        let second = tokio::spawn({
+            let io = io.clone();
+            async move { io.commit_durable(small).await }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !second.is_finished() && test_hooks::waiting_in(&root_path) == waiting_before {
+            assert!(std::time::Instant::now() < deadline, "the second commit neither finished nor waited");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        resume.notify_one();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(crate::core::storage::mirror::pending_copies_in(&root_path), 0);
+    }
+    crate::core::wal::remove_for(&root_path);
+    let primary = std::fs::read(root.path().join("mz.db")).unwrap();
+    assert_eq!(primary[8], 0xBB, "the second commit's byte is not in the primary");
+    assert_eq!(primary[17], 0xAA, "the first commit's bytes are not in the primary");
+    assert_same(root.path(), backup.path(), &["mz.db"], "after both copies");
+    assert!(marks_in(backup.path()).is_empty(), "a mark was left: {:?}", marks_in(backup.path()));
+}
+
 /// Without a log the primary writes in place at once and so do the
 /// backups; one that fails leaves a mark, and the next attach rebuilds it.
 #[tokio::test(flavor = "multi_thread")]

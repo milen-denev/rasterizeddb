@@ -99,6 +99,7 @@ impl MirrorStorageProvider {
     /// in underneath. Copying the difference is not an option there: nothing
     /// about the new file's bytes relates to the old one's.
     async fn rebuild_backups(&self) {
+        let _copying = copy_lock(&self.primary).await;
         for backup in self.backups.iter() {
             force_resync(&self.primary, backup).await;
         }
@@ -199,6 +200,10 @@ impl StorageIO for MirrorStorageProvider {
 
     async fn write_data(&self, position: u64, buffer: &[u8]) {
         self.primary.write_data(position, buffer).await;
+        // Under the file's copy lock: a copy that read these bytes' range
+        // before the write above would otherwise land its older bytes after
+        // the ones written here.
+        let _copying = copy_lock(&self.primary).await;
         for backup in self.backups.iter() {
             write_backup_or_mark(backup, &self.primary.get_name(), position, buffer).await;
         }
@@ -206,6 +211,7 @@ impl StorageIO for MirrorStorageProvider {
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
         self.primary.write_data_seek(seek, buffer).await;
+        let _copying = copy_lock(&self.primary).await;
         for backup in self.backups.iter() {
             backup.write_data_seek(seek, buffer).await;
         }
@@ -281,7 +287,9 @@ impl StorageIO for MirrorStorageProvider {
     async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
         let token = self.primary.write_data_txn(txn, position, buffer).await;
         if token == 0 {
-            // The primary wrote it at once (no log): so do the backups.
+            // The primary wrote it at once (no log): so do the backups, under
+            // the copy lock (see `write_data`).
+            let _copying = copy_lock(&self.primary).await;
             for backup in self.backups.iter() {
                 write_backup_or_mark(backup, &self.primary.get_name(), position, buffer).await;
             }
@@ -495,6 +503,32 @@ async fn write_backup_or_mark(backup: &LocalStorageProvider, name: &str, positio
     }
 }
 
+/// One lock per mirrored file, held from reading the primary to writing the
+/// backups, by every copy and every direct backup write. Each copy reads
+/// the primary after its own commit, so with copies one at a time the last
+/// to write a range read it last, and holds every commit before it. Without
+/// it a big copy's chunk read before a later commit landed after that
+/// commit's own copy: the backup lost the later write (a deleted row back
+/// on failover). Keyed by the file, not the provider: the rows file's
+/// copies are made through more than one instance.
+static COPY_LOCKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn copy_lock(primary: &LocalStorageProvider) -> tokio::sync::OwnedMutexGuard<()> {
+    let key = std::path::Path::new(&primary.get_location().unwrap_or_default()).join(primary.get_name());
+    let lock = COPY_LOCKS.lock().entry(key).or_default().clone();
+    #[cfg(test)]
+    let lock = match lock.clone().try_lock_owned() {
+        Ok(held) => return held,
+        Err(_) => {
+            test_hooks::note_waiting(primary);
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
+
 /// A durable "this backup copy is behind its primary" mark: a file beside the
 /// copy, made (and its directory synced) before the primary commits writes
 /// the copy has not had, removed once no commit is between its primary's
@@ -648,6 +682,7 @@ mod pending {
         /// Copies the ranges from the primary, now committed, to every
         /// backup; whether every read and write succeeded.
         pub(super) async fn copy(&self) -> bool {
+            let _copying = super::copy_lock(&self.primary).await;
             let mut copied = true;
             let mut buffer = Vec::new();
             for &(start, end) in &self.ranges {
@@ -665,6 +700,8 @@ mod pending {
                         );
                         return false;
                     }
+                    #[cfg(test)]
+                    super::test_hooks::park_after_read(&self.primary).await;
                     for backup in self.backups.iter() {
                         copied &= super::write_backup(backup, at, &buffer).await;
                     }
@@ -685,6 +722,39 @@ pub(crate) mod test_hooks {
     /// uncopied (and the mark in place), as a crash between the primary's
     /// commit and the copy would. Taken by that commit.
     pub(crate) static CUT_OFF_COPY: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    /// A copy in this directory parks after reading its first chunk, before
+    /// writing it: it says so on the first `Notify` and waits for the second.
+    #[allow(clippy::type_complexity)]
+    pub(crate) static PARK_AFTER_READ: parking_lot::Mutex<
+        Option<(String, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>)>,
+    > = parking_lot::Mutex::new(None);
+
+    pub(super) async fn park_after_read(primary: &super::LocalStorageProvider) {
+        let location = primary.get_location().unwrap_or_default();
+        let armed = {
+            let mut slot = PARK_AFTER_READ.lock();
+            match slot.as_ref() {
+                Some((l, _, _)) if *l == location => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, parked, resume)) = armed {
+            parked.notify_one();
+            resume.notified().await;
+        }
+    }
+
+    /// How many writes in a directory found its file's copy lock held.
+    pub(crate) static WAITING: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(super) fn note_waiting(primary: &super::LocalStorageProvider) {
+        WAITING.lock().push(primary.get_location().unwrap_or_default());
+    }
+
+    pub(crate) fn waiting_in(location: &str) -> usize {
+        WAITING.lock().iter().filter(|l| *l == location).count()
+    }
 
     pub(super) fn cut_off(primary: &super::LocalStorageProvider) -> bool {
         let location = primary.get_location().unwrap_or_default();
