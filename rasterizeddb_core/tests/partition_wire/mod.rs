@@ -63,6 +63,10 @@ impl Server {
                         tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a free port");
                     let port = listener.local_addr().expect("the bound port").port();
                     db_tx.send((db.clone(), port)).expect("hand the database back");
+                    // A clean stop records what a clean shutdown records
+                    // (the SERIAL high-water marks), as the server's own
+                    // shutdown does after its sessions end.
+                    let closing = db.clone();
                     let catalog = DatabaseCatalog::single(db);
                     let tls = TlsConfig { mode: TlsMode::Disable, cert_path: None, key_path: None };
                     let auth = AuthConfig {
@@ -74,6 +78,7 @@ impl Server {
                         _ = start_pgwire_on_listener(catalog, listener, tls, auth, ConnectionLimits::default()) => {}
                         _ = shutdown_rx => {}
                     }
+                    closing.record_clean_shutdown().await;
                 });
                 rt.shutdown_timeout(Duration::from_secs(5));
             })

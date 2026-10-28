@@ -2053,9 +2053,20 @@ impl<S: StorageIO> VacuumService<S> {
     /// the shared scheduler (`partition::maintenance`, §7.3) asks before it
     /// stops servicing a partition until its next write; a first tick is
     /// never settled, since it always scans.
+    ///
+    /// Also settled when the last tick found the current mutation count
+    /// below the sweep threshold (the tick's due rule): only more dead
+    /// stamps make it due, and those come with a write, which pushes the
+    /// partition again. Otherwise a partition with a few updates below the
+    /// threshold would be serviced every round for good.
     pub(crate) fn settled(&self, state: &TickState) -> bool {
+        if !self.free_space.is_enabled() {
+            // Reclamation off: every tick returns at once.
+            return true;
+        }
+        let mutations = self.mutations.load(Ordering::Acquire);
         state.scanned_at_mutation != u64::MAX
-            && state.scanned_at_mutation == self.mutations.load(Ordering::Acquire)
+            && (state.scanned_at_mutation == mutations || state.quiet_at_mutation == mutations)
             && state.held_rows == 0
             && self.free_space.loans_outstanding() == 0
     }
@@ -2163,6 +2174,9 @@ impl<S: StorageIO> VacuumService<S> {
             let fresh = stamps_now.saturating_sub(state.stamps_at_sweep);
             let due = fresh >= threshold || (released && fresh + state.held_rows >= threshold);
             if !due {
+                // Below the threshold: nothing to do until more stamps
+                // arrive, which only a write brings (`settled`).
+                state.quiet_at_mutation = mutations_now;
                 return ControlFlow::Continue(());
             }
             let counted = if released { fresh + state.held_rows } else { fresh };
@@ -2257,11 +2271,14 @@ pub(crate) struct TickState {
     stamps_at_sweep: u64,
     held_rows: u64,
     held_min_xmax: TxId,
+    /// The mutation count a tick last found below the sweep threshold.
+    quiet_at_mutation: u64,
 }
 
 impl TickState {
     pub(crate) fn new() -> Self {
         TickState {
+            quiet_at_mutation: u64::MAX,
             // No value of the counter can equal this, so the first tick
             // always scans — a table opened with tombstones already on disk
             // has dead space that no mutation of ours will ever announce.
@@ -2279,7 +2296,7 @@ impl TickState {
 /// minutes: a tick that panics deterministically would otherwise fill the log
 /// at the scan interval, and one that panicked once should not slow the
 /// service down afterwards.
-fn panic_backoff(interval: std::time::Duration, consecutive_panics: u32) -> std::time::Duration {
+pub(crate) fn panic_backoff(interval: std::time::Duration, consecutive_panics: u32) -> std::time::Duration {
     const CAP: std::time::Duration = std::time::Duration::from_secs(600);
     if consecutive_panics == 0 {
         return interval;
@@ -2290,7 +2307,7 @@ fn panic_backoff(interval: std::time::Duration, consecutive_panics: u32) -> std:
 }
 
 /// The text a panic was raised with, when it was raised with text.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -2531,8 +2548,46 @@ pub async fn neutralize_aborted_from<S: StorageIO>(
     if !parts.free_space.is_enabled() || parts.free_space.toggles() != toggles {
         return Ok(report);
     }
+    #[cfg(test)]
+    neutralize_test_hooks::park_before_report(parts.io_pointers.get_location()).await;
     report.advanced_to = Some(bound);
     Ok(report)
+}
+
+/// Test-only: holds a forget sweep after its scan and drain, before it
+/// reports its bound, so a test can write behind the scan.
+#[cfg(test)]
+pub(crate) mod neutralize_test_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    type Park = (PathBuf, Arc<Notify>, Arc<Notify>);
+    static PARKS: parking_lot::Mutex<Vec<Park>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Arms one park for sweeps of files under `dir`: the first `Notify` is
+    /// signalled when a sweep reaches it, which goes on once the second is.
+    pub(crate) fn arm(dir: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PARKS.lock().push((dir.to_path_buf(), reached.clone(), resume.clone()));
+        (reached, resume)
+    }
+
+    pub(super) async fn park_before_report(location: Option<String>) {
+        let Some(location) = location else {
+            return;
+        };
+        let found = {
+            let mut parks = PARKS.lock();
+            let at = parks.iter().position(|(d, _, _)| Path::new(&location).starts_with(d));
+            at.map(|i| parks.remove(i))
+        };
+        if let Some((_, reached, resume)) = found {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
 }
 
 /// How many tables may sweep at once, process-wide.

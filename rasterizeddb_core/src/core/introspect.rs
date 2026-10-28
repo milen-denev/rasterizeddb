@@ -927,6 +927,21 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         transactions.quiescent().to_string(),
         "no transaction is running",
     );
+    push(
+        "forgotten_below",
+        transactions.status().forgotten_below().to_string(),
+        "transaction ids below this read as committed without a lookup",
+    );
+    push(
+        "forgetting_held_by",
+        database.partition_maintenance().broken_pins().join(", "),
+        "partitioned tables that cannot open and hold the forgotten horizon where they were refused",
+    );
+    push(
+        "partition_maintenance_panics",
+        database.partition_maintenance().panics().to_string(),
+        "partition maintenance rounds or units that panicked and were caught",
+    );
 
     for (metric, value, detail) in durability_metrics(&durability_locations(database)) {
         push(&metric, value, &detail);

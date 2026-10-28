@@ -97,7 +97,10 @@ pub struct PinBoard {
     /// generation; 0 for generation 0), and the slack past twice that.
     snapshot_len: AtomicU64,
     slack: AtomicU64,
-    compacting: tokio::sync::Mutex<()>,
+    /// The highest generation number a compaction of this table tried: never
+    /// tried again, even after a failed attempt deleted its file, whose
+    /// committed appends a crash could replay onto a file of the same name.
+    compacting: tokio::sync::Mutex<u64>,
 }
 
 /// What [`PinBoard::new`] builds a board over, beside the log and state.
@@ -147,7 +150,7 @@ impl PinBoard {
                 torn: files.torn,
                 snapshot_len: AtomicU64::new(0),
                 slack: AtomicU64::new(COMPACT_SLACK),
-                compacting: tokio::sync::Mutex::new(()),
+                compacting: tokio::sync::Mutex::new(0),
             }
         });
         scheduler.register_board(StdArc::downgrade(&board));
@@ -339,7 +342,7 @@ impl PinBoard {
         if self.torn {
             return Ok(false);
         }
-        let _one = self.compacting.lock().await;
+        let mut tried = self.compacting.lock().await;
         let (clone, generation) = {
             let state = self.state.lock().await;
             if state.dropped() {
@@ -348,7 +351,14 @@ impl PinBoard {
             self.log.begin_capture();
             (state.clone(), self.log.generation())
         };
-        let next = generation + 1;
+        let next = match files::next_map_generation(&self.root, self.uid, generation.max(*tried)) {
+            Ok(next) => next,
+            Err(e) => {
+                self.log.end_capture();
+                return Err(e);
+            }
+        };
+        *tried = next;
         let fresh = match self.write_generation(&clone, next).await {
             Ok(fresh) => fresh,
             Err(e) => {
@@ -364,6 +374,13 @@ impl PinBoard {
         let opening = fresh.io().get_len().await;
         let mut state = self.state.lock().await;
         let tail = self.log.end_capture();
+        if state.dropped() {
+            // Dropped meanwhile: its files go with the table.
+            drop(state);
+            drop(fresh);
+            let _ = files::remove_map_generation(&self.root, self.uid, next);
+            return Ok(false);
+        }
         let sealed = async {
             for rec in &tail {
                 fresh.append(rec).await?;

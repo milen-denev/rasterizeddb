@@ -216,6 +216,8 @@ impl Database {
     /// after the restart.
     pub async fn seal_for_shutdown(&self, deadline: Duration) -> ShutdownReport {
         let until = tokio::time::Instant::now() + deadline;
+        // The sessions are gone: partitioned tables' SERIAL marks exactly.
+        self.record_clean_shutdown().await;
         self.replication.set_active(false);
         for peer in self.replication.peers() {
             peer.stop();

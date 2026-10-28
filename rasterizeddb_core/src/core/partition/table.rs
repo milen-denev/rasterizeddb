@@ -227,7 +227,32 @@ pub struct PartitionedTable {
     /// broken: its partitions' pins are unknown, and any of them may hold an
     /// aborted stamp that forgetting past would bring back (§7.2). The
     /// status log then grows until the table opens or is dropped.
-    broken_pin: Option<crate::core::mvcc::transaction::ForgetHandle>,
+    /// Held, never read: dropping it lets forgetting go.
+    #[allow(dead_code)]
+    broken_pin: Option<BrokenPin>,
+    /// The database's maintenance scheduler, for the instance a schema
+    /// change reopens this one as.
+    scheduler: StdArc<Scheduler>,
+}
+
+/// A broken table's hold on forgetting (see `broken_pin`): its registry
+/// handle, and the token the scheduler names it by in the log and in `SHOW
+/// DATABASE STATS` (`forgetting_held_by`) for as long as it lives.
+struct BrokenPin {
+    _handle: crate::core::mvcc::transaction::ForgetHandle,
+    _token: StdArc<()>,
+}
+
+impl BrokenPin {
+    fn new(name: &str, transactions: &TransactionManager, scheduler: &StdArc<Scheduler>) -> Self {
+        let token = StdArc::new(());
+        scheduler.register_broken(name, StdArc::downgrade(&token));
+        ::log::warn!(
+            "partitioned table \"{name}\" cannot be opened: it holds the database's forgotten horizon where it is \
+             until it opens or is dropped"
+        );
+        BrokenPin { _handle: transactions.register_table(), _token: token }
+    }
 }
 
 fn invalid(e: String) -> io::Error {
@@ -483,7 +508,7 @@ impl PartitionedTable {
             ::log::error!("{why}");
             why
         });
-        let broken_pin = live.is_err().then(|| ctx.transactions.register_table());
+        let broken_pin = live.is_err().then(|| BrokenPin::new(name, ctx.transactions, ctx.scheduler));
         PartitionedTable {
             name: name.to_string(),
             uid,
@@ -497,6 +522,7 @@ impl PartitionedTable {
             mirrored: ctx.mirrored,
             dropped: AtomicBool::new(false),
             broken_pin,
+            scheduler: ctx.scheduler.clone(),
         }
     }
 
@@ -527,7 +553,8 @@ impl PartitionedTable {
             torn: None,
             mirrored: ctx.mirrored,
             dropped: AtomicBool::new(false),
-            broken_pin: Some(ctx.transactions.register_table()),
+            broken_pin: Some(BrokenPin::new(name, ctx.transactions, ctx.scheduler)),
+            scheduler: ctx.scheduler.clone(),
         }
     }
 
@@ -586,6 +613,9 @@ impl PartitionedTable {
         files::ensure_seq_file(root, uid).map_err(e)?;
         let seq_io = StdArc::new(ctx.seed.create_new(files::seq_file(uid)).await);
         let serials = SerialSource::open(ctx.db_id, seq_io).await.map_err(e)?;
+        // No entry the defaults stopped reading survives an open: a crash
+        // after a RENAME's commit and before its reopen pruned it.
+        serials.retain_read(&super::serial::sequences_read(&shell.schema)).await.map_err(e)?;
         // The pins and the table's one forget handle, set from the replayed
         // log before any partition opens (§7.2's restart rule).
         let opened_len = log.io().get_len().await;
@@ -712,6 +742,13 @@ impl PartitionedTable {
                         return Err("its shell is a table with rows of its own".to_string());
                     }
                     let spec = spec_from_header(live.board.state.lock().await.header(), &shell.schema)?;
+                    // The SERIAL entries the new defaults no longer read go
+                    // before anything can resume from them (a RENAME).
+                    live.board
+                        .serials
+                        .retain_read(&super::serial::sequences_read(&shell.schema))
+                        .await
+                        .map_err(|e| e.to_string())?;
                     // The row-id source reopened from its reservation, as a
                     // start (and a plain table's reload, over `_seq.db`) opens
                     // it: ids resume past every id the old one could have
@@ -763,7 +800,7 @@ impl PartitionedTable {
         };
         // Registered while this instance still pins: the new one, broken,
         // holds the horizon where it is (see `broken_pin`).
-        let broken_pin = live.is_err().then(|| self.transactions.register_table());
+        let broken_pin = live.is_err().then(|| BrokenPin::new(name, &self.transactions, &self.scheduler));
         PartitionedTable {
             name: name.to_string(),
             uid: self.uid,
@@ -777,6 +814,7 @@ impl PartitionedTable {
             mirrored: self.mirrored.clone(),
             dropped: AtomicBool::new(false),
             broken_pin,
+            scheduler: self.scheduler.clone(),
         }
     }
 
@@ -1194,6 +1232,15 @@ impl PartitionedTable {
     /// to forget. For tests and tools.
     pub async fn sweep_pin_now(&self, pid: u32) -> io::Result<crate::core::vacuum::NeutralizeReport> {
         self.live()?.board.sweep(pid).await
+    }
+
+    /// The clean-shutdown write of the table's `SERIAL` reservations (§10):
+    /// the exact last values, synced, so a clean restart leaves no gap.
+    pub(crate) async fn record_serial_exact(&self) -> io::Result<()> {
+        match &self.live {
+            Ok(live) => live.board.serials.record_exact().await,
+            Err(_) => Ok(()),
+        }
     }
 
     /// Forget sweeps of every open, pinned partition now, each through its

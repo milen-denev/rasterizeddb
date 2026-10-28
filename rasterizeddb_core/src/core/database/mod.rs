@@ -23,7 +23,7 @@ mod create_intent;
 #[cfg(test)]
 mod create_failure_tests;
 mod foreign_keys;
-mod partitioned;
+pub(crate) mod partitioned;
 mod partitioned_ddl;
 #[cfg(test)]
 mod partitioned_ddl_tests;
@@ -1562,6 +1562,12 @@ impl Database {
             error!("The transaction status log is not covered by the WAL: {}", e);
         }
         let transactions = StdArc::new(TransactionManager::new(status));
+        // No forgetting until every table holding rows is registered: plain
+        // tables register (and start their vacuum, which forgets) below,
+        // partitioned ones after the database exists, and a forget in the
+        // gap would pass aborted stamps a partition still holds
+        // (docs/partitioning.md §7.2). Dropped once they are all open.
+        let startup_forget_pause = transactions.forget_pause();
 
         // On the log writer's round, so a commit that did not wait for its own
         // sync still gets one shortly. Only for a database with files: an
@@ -1715,6 +1721,7 @@ impl Database {
             },
         };
         database.open_partitioned_rows(partitioned_rows).await;
+        drop(startup_forget_pause);
         // The plain tables went into the map before the database existed.
         database.rebuild_fk_reverse();
         Ok(database)

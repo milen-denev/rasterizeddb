@@ -19,7 +19,18 @@
 //! A sequence with no entry (a table created before P5a, whose file is
 //! created at its next open; a sequence a `RENAME` gave a new name) is
 //! seeded once from the maximum over every materialized partition, as
-//! before, and reserved from there.
+//! before, and reserved from there. An entry whose name the defaults no
+//! longer read is forgotten at every open and schema change
+//! ([`SerialSource::retain_read`]), so a name a later `RENAME` gives back
+//! never resumes from a reservation its counter has since passed under
+//! another name.
+//!
+//! A clean shutdown records the exact last value ([`SerialSource::
+//! record_exact`]), so only a crash leaves a gap (up to one step).
+//!
+//! Only a sequence this table's own defaults resume is reserved: one a
+//! second table shares through a hand-written `nextval` default is that
+//! table's to seed, by its own rules (a plain one from its maximum).
 //!
 //! An explicit value written into a `SERIAL` column does not move the
 //! counter, as in PostgreSQL: a later default can repeat it.
@@ -28,9 +39,8 @@
 //!
 //! `"RSQ1" ‖ len:u32 ‖ crc32:u32 ‖ payload[len]`, the CRC over the payload,
 //! `payload = n:u32 ‖ n × (name_len:u16 ‖ name ‖ reserved:i64)`, all
-//! little-endian, rewritten in place from byte 0 as one logged write. It only
-//! grows (entries are never removed), so a shorter rewrite never leaves a
-//! stale tail inside `len`. An empty file has no entries; one that does not
+//! little-endian, rewritten in place from byte 0 as one logged write; a
+//! shorter rewrite leaves stale bytes past `len`, which nothing reads. An empty file has no entries; one that does not
 //! parse is treated as empty, with a warning: every sequence then reseeds
 //! from the maximum, which never repeats a stored value.
 
@@ -209,15 +219,85 @@ impl SerialSource {
             }
             entries
         };
-        let buf = encode(&next);
-        let txn = io.begin_txn();
-        let token = io.write_data_txn(txn, 0, &buf).await;
-        io.commit_durable(token).await.map_err(|e| {
-            io::Error::new(e.kind(), format!("the SERIAL reservation in {} could not be raised: {e}", io.get_name()))
-        })?;
+        Self::write(io, &next, "raised").await?;
         *self.entries.lock() = next;
         Ok(())
     }
+
+    /// Rewrites the file as `entries`, as one logged write from byte 0.
+    async fn write(io: &StdArc<DbStorageProvider>, entries: &BTreeMap<String, i64>, what: &str) -> io::Result<()> {
+        let buf = encode(entries);
+        let txn = io.begin_txn();
+        let token = io.write_data_txn(txn, 0, &buf).await;
+        io.commit_durable(token).await.map_err(|e| {
+            io::Error::new(e.kind(), format!("the SERIAL reservation in {} could not be {what}: {e}", io.get_name()))
+        })
+    }
+
+    /// Forgets every entry the table's defaults no longer read
+    /// (`read`: the sequences of its `nextval` defaults now), durably, before
+    /// any of them can be resumed from. A `RENAME` moves a `SERIAL`'s
+    /// default to another sequence name, whose counter runs on under it; an
+    /// entry left for the old name would be stale if a later `RENAME` gave
+    /// the name back, and a restart would resume below values handed out
+    /// meanwhile. Gone, the name reseeds from the partitions' maximum once.
+    /// Run at every open and every schema change's reopen.
+    pub(crate) async fn retain_read(&self, read: &std::collections::HashSet<String>) -> io::Result<()> {
+        let _one = self.raising.lock().await;
+        let Some(io) = &self.io else {
+            return Ok(());
+        };
+        let next: BTreeMap<String, i64> =
+            self.entries.lock().iter().filter(|(n, _)| read.contains(*n)).map(|(n, v)| (n.clone(), *v)).collect();
+        if next.len() == self.entries.lock().len() {
+            return Ok(());
+        }
+        Self::write(io, &next, "pruned").await?;
+        *self.entries.lock() = next;
+        Ok(())
+    }
+
+    /// The clean-shutdown write (§10): every entry whose counter this
+    /// process has seeded lowered to the exact last value handed out, then
+    /// synced, so a clean restart resumes with no gap, as PostgreSQL's
+    /// sequences do. Sound at any moment, not only after the sessions end:
+    /// a value taken later is above the new entry, and the write path
+    /// raises it again before the row is written.
+    pub(crate) async fn record_exact(&self) -> io::Result<()> {
+        let _one = self.raising.lock().await;
+        let Some(io) = &self.io else {
+            return Ok(());
+        };
+        let current = self.entries.lock().clone();
+        let mut next = current.clone();
+        for (name, reserved) in next.iter_mut() {
+            if let Some(last) = crate::core::rql::sequence::current(self.db_id, name)
+                && last < *reserved
+            {
+                *reserved = last;
+            }
+        }
+        if next == current {
+            return Ok(());
+        }
+        Self::write(io, &next, "recorded").await?;
+        if let Some(location) = io.get_location() {
+            crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))?;
+        }
+        *self.entries.lock() = next;
+        Ok(())
+    }
+}
+
+/// The sequences `schema`'s live `nextval` defaults read, by the names
+/// `rql::sequence` keys their counters on.
+pub(crate) fn sequences_read(schema: &crate::core::row::schema::TableSchema) -> std::collections::HashSet<String> {
+    schema
+        .defaults
+        .iter()
+        .filter(|d| !d.is_deleted)
+        .filter_map(|d| crate::core::rql::sequence::parse_nextval(&d.expression))
+        .collect()
 }
 
 #[cfg(test)]

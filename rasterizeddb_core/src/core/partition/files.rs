@@ -365,13 +365,21 @@ pub(crate) fn ensure_seq_file(dir: &Path, uid: u64) -> io::Result<bool> {
 
 /// Creates map log generation `generation` of `uid` in `dir` for a
 /// compaction (§3.2 step 2), exclusively with its `.tmp`, and fsyncs the
-/// directory once, after deleting a leftover of the same generation: one an
-/// earlier compaction left unfinished, which is never live (it has no
-/// durable `SEALED`, or it would have been chosen at open) and was never
-/// appended to after its clone.
+/// directory once. An existing file is an error, never deleted or reused:
+/// the caller picks a number above every generation in the directory
+/// ([`next_map_generation`]).
 pub(crate) fn create_map_generation(dir: &Path, uid: u64, generation: u64) -> io::Result<()> {
-    remove_map_generation(dir, uid, generation)?;
     create_all(dir, &[map_file(uid, generation)])
+}
+
+/// One above the highest map log generation of `uid` in `dir`, and above
+/// `at_least`: a number no file has, so a compaction never writes over a
+/// leftover (one the reaper keeps as unreadable, or an unfinished attempt
+/// whose committed appends a crash could replay onto a new file of the same
+/// name).
+pub(crate) fn next_map_generation(dir: &Path, uid: u64, at_least: u64) -> io::Result<u64> {
+    let highest = generations_in(dir, uid)?.into_iter().max().unwrap_or(0);
+    Ok(highest.max(at_least).saturating_add(1))
 }
 
 /// Deletes map log generation `generation` of `uid` and its `.tmp` from

@@ -897,10 +897,8 @@ fn a_serial_partitioned_table_survives_seed_sequences() {
         })
         .collect();
     ids.sort();
-    // Resumed past the durable reservation (§10, phase 3 P5a): a gap, never
-    // a repeat.
-    assert_eq!(&ids[..2], &[1, 2]);
-    assert!(ids.len() == 3 && ids[2] > 2, "{ids:?}");
+    // Resumed from the exact high-water a clean stop records (§10).
+    assert_eq!(ids, vec![1, 2, 3]);
     assert_eq!(files_of_table(dir.path(), "site_serial"), Vec::<String>::new());
     drop(c);
     drop(server);

@@ -665,6 +665,7 @@ async fn a_broken_table_pins_until_it_opens() {
     std::fs::rename(&victim, &aside).unwrap();
     let db = open(&dir).await;
     assert!(pt(&db).broken().is_some(), "the table opened without a partition's file");
+    assert_eq!(db.partition_maintenance().broken_pins(), vec!["pt".to_string()], "the broken table's hold is not named");
     advance(&db);
     sweep_plain(&db).await;
     let forgotten = db.transactions.try_forget();
@@ -676,5 +677,353 @@ async fn a_broken_table_pins_until_it_opens() {
     let db = open(&dir).await;
     assert!(pt(&db).broken().is_none(), "{:?}", pt(&db).broken());
     assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "the aborted row came back after the repair");
+    close(&dir, db);
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: supervision, the queue, SERIAL renames and clean shutdowns.
+// ---------------------------------------------------------------------------
+
+/// The materialized partition holding `tenant`, as its `Table`.
+fn part_of(t: &PartitionedTable, tenant: i64) -> rclite::Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>> {
+    let pid = pid_of_tenant(t, tenant);
+    let epoch = t.epoch().unwrap();
+    t.materialized(&epoch, &Route::All).unwrap().into_iter().find(|(p, _)| *p == pid).expect("materialized").1
+}
+
+/// Two tenants in two different partitions.
+fn two_tenants(t: &PartitionedTable) -> (i64, i64) {
+    let a = 1;
+    let b = (2..100).find(|&b| pid_of_tenant(t, b) != pid_of_tenant(t, a)).unwrap();
+    (a, b)
+}
+
+/// A panic in one partition's maintenance (its vacuum tick, or the service
+/// around it) is caught and counted, and the scheduler's task goes on: a
+/// later DELETE in another partition is still swept.
+///
+/// Mutations: the vacuum tick's catch in `ExternalUnit::service_once`
+/// removed (the tick's panic is then the scheduler's, `stats.panics` stays
+/// 0); the scheduler's per-unit catch removed (the injected service panic
+/// ends the unit round, and the task with it, so rounds stop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_partition_never_stops_the_scheduler() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::core::row::table::table_maintenance::test_hooks::set_interval(&dir, Duration::from_millis(1));
+    let db = open(&dir).await;
+    let sched = db.partition_maintenance().clone();
+    sched.set_period(Duration::from_millis(20));
+    exec(&db, CREATE).await;
+    let t = pt(&db);
+    let (a, b) = two_tenants(&t);
+    for id in 0..80i64 {
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({a}, {id}, 'a'), ({b}, {id}, 'b')")).await;
+    }
+    let (pa, pb) = (part_of(&t, a), part_of(&t, b));
+    pa.vacuum_stats().unwrap().inject_panics.store(1, std::sync::atomic::Ordering::Release);
+    crate::core::row::table::table_maintenance::test_hooks::panic_once(&dir);
+    exec(&db, &format!("UPDATE pt SET v = 'x' WHERE tenant_id = {a}")).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while pa.vacuum_stats().unwrap().panics.load(std::sync::atomic::Ordering::Acquire) == 0
+        || sched.panics() == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the panics were never caught: tick {} service {}",
+            pa.vacuum_stats().unwrap().panics.load(std::sync::atomic::Ordering::Acquire),
+            sched.panics()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rounds = sched.rounds();
+    let runs = pb.vacuum_stats().unwrap().runs.load(std::sync::atomic::Ordering::Acquire);
+    exec(&db, &format!("DELETE FROM pt WHERE tenant_id = {b}")).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while pb.vacuum_stats().unwrap().runs.load(std::sync::atomic::Ordering::Acquire) == runs {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after the panics the other partition's DELETE was never swept ({} rounds since, {} panics)",
+            sched.rounds() - rounds,
+            sched.panics()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sched.rounds() > rounds, "the scheduler stopped running rounds");
+    drop((t, pa, pb));
+    close(&dir, db);
+}
+
+/// A write that a round services in its middle, and lets go as settled,
+/// pushes its partition again when it ends: what it changed (its mutation
+/// count, bumped at the statement's end) is news.
+///
+/// Mutation: no push when the write guard drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_a_round_serviced_midway_is_pushed_again_at_its_end() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Idle checkpoints at once, so no pending seal keeps the unit in the
+    // round and hides a dropped push.
+    let _idle = crate::core::row::table::table_seal::idle_override::set(&dir, Duration::from_millis(0));
+    crate::core::row::table::table_maintenance::test_hooks::set_interval(&dir, Duration::from_millis(1));
+    let db = open(&dir).await;
+    let sched = db.partition_maintenance().clone();
+    sched.set_period(Duration::from_secs(3600));
+    exec(&db, CREATE).await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a')").await;
+    let t = pt(&db);
+    let watch = t.pin_board().unwrap().watch(pid_of_tenant(&t, 1)).unwrap().clone();
+    let settle = |sched: StdArcScheduler| async move {
+        for _ in 0..200 {
+            sched.run_round().await;
+            if sched.queued_units().await == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the units never settled");
+    };
+    settle(sched.clone()).await;
+    // A statement in flight: entered (and pushed), serviced and let go
+    // while it runs, then done.
+    let inside = watch.enter().await.unwrap();
+    sched.run_round().await;
+    assert_eq!(sched.queued_units().await, 0, "the round kept a settled unit");
+    drop(inside);
+    assert!(sched.queued_units().await > 0, "the write's end pushed nothing");
+    drop((t, watch));
+    close(&dir, db);
+}
+
+type StdArcScheduler = std::sync::Arc<crate::core::partition::maintenance::Scheduler>;
+
+/// A partition with a few UPDATEs, below the vacuum's sweep threshold,
+/// settles and leaves the round instead of being serviced every round.
+///
+/// Mutation: `VacuumService::settled` without its below-threshold clause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_below_the_sweep_threshold_settles() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _idle = crate::core::row::table::table_seal::idle_override::set(&dir, Duration::from_millis(0));
+    crate::core::row::table::table_maintenance::test_hooks::set_interval(&dir, Duration::from_millis(1));
+    let db = open(&dir).await;
+    let sched = db.partition_maintenance().clone();
+    sched.set_period(Duration::from_secs(3600));
+    exec(&db, CREATE).await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a'), (1, 2, 'b'), (1, 3, 'c')").await;
+    exec(&db, "UPDATE pt SET v = 'x' WHERE tenant_id = 1 AND id = 2").await;
+    let mut rounds = 0;
+    loop {
+        sched.run_round().await;
+        rounds += 1;
+        if sched.queued_units().await == 0 {
+            break;
+        }
+        assert!(rounds < 100, "a partition below the sweep threshold never settled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    close(&dir, db);
+}
+
+/// A writer that enters after the sweep armed, stamps behind its scan and
+/// leaves before it ends: the sweep's second look at `seq` keeps it from
+/// being clean, so the stamp stays pinned and, once its transaction aborts,
+/// hidden.
+///
+/// Mutation: the sweep's clean test not re-reading `seq` (`clean = true`
+/// once `pinned` is cleared).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_behind_the_scan_keeps_the_sweep_unclean() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    exec(&db, CREATE).await;
+    let values: Vec<String> = (1..=8i64).map(|t| format!("({t}, {t}, 'c')")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    advance(&db);
+    let board = t.pin_board().unwrap().clone();
+    let (reached, resume) = crate::core::vacuum::neutralize_test_hooks::arm(&dir);
+    let sweep = {
+        let board = board.clone();
+        tokio::spawn(async move { board.sweep(p).await })
+    };
+    reached.notified().await;
+    let w = db.transactions.begin();
+    exec_in(&db, w, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 444, 'behind')").await;
+    resume.notify_one();
+    let report = sweep.await.unwrap().unwrap();
+    let bound = report.advanced_to.expect("the sweep did not advance");
+    assert_eq!(report.newer, 0, "the writer was not behind the scan: {report:?}");
+    assert_eq!(t.pin_of(p).await.unwrap(), Some(bound), "a sweep a writer entered meanwhile was clean");
+    db.abort_transaction(w);
+    drop((t, board));
+    let forgotten = forget_except(&db, &[p]).await;
+    assert!(forgotten <= w, "forgotten below {forgotten}, past the aborted {w}");
+    assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "the aborted row came back");
+    close(&dir, db);
+}
+
+/// Startup holds forgetting off from the plain tables' registration until
+/// the partitioned tables have registered: a plain table's vacuum forgetting
+/// in that window would pass an aborted stamp a partition still holds.
+///
+/// Mutation: the startup `forget_pause` dropped before the partitioned
+/// tables open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_waits_for_the_partitioned_tables_at_startup() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    let x = populated_with_an_abort(&db).await;
+    exec(&db, "CREATE TABLE plain (id BIGINT NOT NULL, v TEXT)").await;
+    exec(&db, "INSERT INTO plain (id, v) VALUES (1, 'p')").await;
+    advance(&db);
+    db.transactions.status().flush_all().unwrap();
+    db.sync_durable().unwrap();
+    close(&dir, db);
+
+    crate::core::database::partitioned::startup_hooks::forget_before_partitioned_open(&dir);
+    let db = open(&dir).await;
+    let forgotten = db.transactions.status().forgotten_below();
+    assert!(forgotten <= x, "startup forgot below {forgotten}, past the aborted {x}, before the partitions registered");
+    assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "the aborted row came back");
+    close(&dir, db);
+}
+
+async fn serial_ids(db: &Arc<Database>, table: &str) -> Vec<i64> {
+    let out = exec(db, &format!("SELECT id FROM {table}")).await;
+    let mut v: Vec<i64> = crate::core::row::row::vec_into_rows(&out[1..])
+        .unwrap()
+        .iter()
+        .map(|r| i64::from_le_bytes(r.columns[0].data.into_slice().try_into().unwrap()))
+        .collect();
+    v.sort();
+    v
+}
+
+fn assert_distinct(v: &[i64], what: &str) {
+    let mut d = v.to_vec();
+    d.dedup();
+    assert_eq!(d.len(), v.len(), "{what}: a SERIAL value repeated: {v:?}");
+}
+
+/// A `SERIAL` whose table is renamed away and back: the entry the first
+/// name left would be stale (the counter ran on under the second name), so
+/// it is forgotten at the rename, and the restart, clean or not, never
+/// resumes below a value handed out. Also renamed away only.
+///
+/// Mutation: `SerialSource::retain_read` keeping every entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_serial_renamed_away_and_back_never_repeats_a_value() {
+    for (back, clean) in [(true, true), (true, false), (false, true), (false, false)] {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("db");
+        let db = open(&dir).await;
+        exec(&db, "CREATE TABLE sa (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+        exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (1, 'a'), (2, 'a'), (3, 'a')").await;
+        exec(&db, "ALTER TABLE sa RENAME TO sb").await;
+        let rows: Vec<String> = (0..1200).map(|i| format!("({}, 'b')", i % 7)).collect();
+        exec(&db, &format!("INSERT INTO sb (tenant_id, v) VALUES {}", rows.join(", "))).await;
+        let name = if back {
+            exec(&db, "ALTER TABLE sb RENAME TO sa").await;
+            "sa"
+        } else {
+            "sb"
+        };
+        if clean {
+            db.record_clean_shutdown().await;
+        }
+        db.sync_durable().unwrap();
+        close(&dir, db);
+        let db = open(&dir).await;
+        exec(&db, &format!("INSERT INTO {name} (tenant_id, v) VALUES (5, 'after'), (6, 'after')")).await;
+        let got = serial_ids(&db, name).await;
+        assert_eq!(got.len(), 1205);
+        assert_distinct(&got, &format!("renamed {}, {} restart", if back { "away and back" } else { "away" }, if clean { "clean" } else { "crash-like" }));
+        close(&dir, db);
+    }
+}
+
+/// A clean shutdown records the exact `SERIAL` high-water: the restart
+/// resumes with no gap, as PostgreSQL's sequences do. (A restart without it,
+/// as after a crash, skips at most a step:
+/// `serial_high_water_survives_restarts_without_a_scan`.)
+///
+/// Mutation: `record_exact` writing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_shutdown_leaves_no_serial_gap() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    exec(&db, "CREATE TABLE sc (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+    exec(&db, "INSERT INTO sc (tenant_id, v) VALUES (1, 'a'), (2, 'a'), (3, 'a')").await;
+    db.record_clean_shutdown().await;
+    close(&dir, db);
+    let db = open(&dir).await;
+    exec(&db, "INSERT INTO sc (tenant_id, v) VALUES (4, 'b')").await;
+    db.record_clean_shutdown().await;
+    close(&dir, db);
+    let db = open(&dir).await;
+    exec(&db, "INSERT INTO sc (tenant_id, v) VALUES (5, 'c')").await;
+    assert_eq!(serial_ids(&db, "sc").await, vec![1, 2, 3, 4, 5], "a clean restart left a gap");
+    assert_eq!(match db.relation("sc") { Some(Relation::Partitioned(t)) => t.serial_max_scans(), _ => 99 }, 0);
+    close(&dir, db);
+}
+
+/// A compaction picks a generation number no file has: a leftover the
+/// reaper keeps (one that does not replay) is never written over or
+/// deleted.
+///
+/// Mutation: `next_map_generation` ignoring the files (live + 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compaction_never_reuses_a_generation_number() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    populated_with_an_abort(&db).await;
+    let t = pt(&db);
+    let uid = t.uid();
+    let leftover = dir.join(crate::core::partition::files::map_file(uid, 1));
+    std::fs::write(&leftover, b"not a map log").unwrap();
+    let board = t.pin_board().unwrap().clone();
+    assert!(board.compact().await.unwrap());
+    assert_eq!(board.generation(), 2, "the compaction did not step over the leftover");
+    assert_eq!(std::fs::read(&leftover).unwrap(), b"not a map log", "the leftover was touched");
+    assert!(board.compact().await.unwrap());
+    assert_eq!(board.generation(), 3);
+    drop((t, board));
+    close(&dir, db);
+}
+
+/// A unit stuck in its service holds up neither the other units of its
+/// round nor any table's forget round: the boards run on their own task.
+///
+/// Mutation: the board round run after the unit round in one task (the
+/// first design): with a unit parked, board rounds stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_partition_holds_up_no_forget_round() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = open(&dir).await;
+    let sched = db.partition_maintenance().clone();
+    sched.set_period(Duration::from_millis(20));
+    exec(&db, CREATE).await;
+    let release = crate::core::row::table::table_maintenance::test_hooks::park_once(&dir);
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a')").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (units, boards) = (sched.rounds(), sched.board_rounds());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (units_after, boards_after) = (sched.rounds(), sched.board_rounds());
+    release.notify_one();
+    assert_eq!(units_after, units, "the parked unit's round finished while it was parked");
+    assert!(boards_after >= boards + 5, "board rounds stopped behind a parked unit ({boards} then {boards_after})");
     close(&dir, db);
 }

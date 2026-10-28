@@ -310,6 +310,20 @@ impl Database {
         }
     }
 
+    /// A clean shutdown's record of every partitioned table's `SERIAL`
+    /// high-water marks, exactly (§10): after the sessions have ended, so a
+    /// clean restart resumes with no gap. Called by `seal_for_shutdown`;
+    /// errors are logged, never fatal: a table left as it was resumes past
+    /// its reservation, a gap.
+    pub async fn record_clean_shutdown(&self) {
+        let tables: Vec<Arc<PartitionedTable>> = self.partitioned_tables.iter().map(|e| e.value().clone()).collect();
+        for t in tables {
+            if let Err(e) = t.record_serial_exact().await {
+                warn!("shutdown: the SERIAL high-water of \"{}\" was not recorded: {e}", t.name());
+            }
+        }
+    }
+
     /// The scheduler this database's partitions are maintained by (§7.3).
     pub fn partition_maintenance(&self) -> &StdArc<crate::core::partition::maintenance::Scheduler> {
         &self.partition_maintenance
@@ -622,10 +636,35 @@ impl Database {
     /// plain table: one that cannot open is left broken, in the partitioned
     /// map so a DROP still reaches it, and never stops the rest.
     pub(super) async fn open_partitioned_rows(&self, rows: Vec<(String, u64)>) {
+        #[cfg(test)]
+        self.forget_before_partitioned_open().await;
         for (name, uid) in rows {
             let (shell, table) = self.open_partitioned(&name, uid).await;
             self.install_partitioned(name, Arc::new(table), shell);
         }
+    }
+
+    /// Test-only: what a plain table's vacuum could do in the window before
+    /// the partitioned tables register (settle, sweep every plain table,
+    /// forget), for a database whose location a test armed with
+    /// [`startup_hooks::forget_before_partitioned_open`].
+    #[cfg(test)]
+    async fn forget_before_partitioned_open(&self) {
+        let Some(location) = self.location.as_deref() else {
+            return;
+        };
+        if !startup_hooks::take(Path::new(location)) {
+            return;
+        }
+        self.transactions.settle_now();
+        for name in self.table_names() {
+            if let Some(t) = self.table_for_tests(&name)
+                && !t.is_shell()
+            {
+                let _ = t.neutralize_aborted_now().await;
+            }
+        }
+        self.transactions.try_forget();
     }
 
     /// One partitioned table at startup, and its shell when its schema read.
@@ -700,6 +739,31 @@ impl Database {
                 (Some(shell), table)
             }
             Err(why) => (None, self.refused_partitioned(name, old.uid(), &why)),
+        }
+    }
+}
+
+/// Test-only: arms [`Database::forget_before_partitioned_open`].
+#[cfg(test)]
+pub(crate) mod startup_hooks {
+    use std::path::{Path, PathBuf};
+
+    static ARMED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next open of the database at `dir` forgets as far as it can just
+    /// before its partitioned tables open.
+    pub(crate) fn forget_before_partitioned_open(dir: &Path) {
+        ARMED.lock().push(dir.to_path_buf());
+    }
+
+    pub(super) fn take(location: &Path) -> bool {
+        let mut armed = ARMED.lock();
+        match armed.iter().position(|d| location.starts_with(d) || d.starts_with(location)) {
+            Some(i) => {
+                armed.remove(i);
+                true
+            }
+            None => false,
         }
     }
 }
