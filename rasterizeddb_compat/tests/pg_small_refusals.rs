@@ -43,3 +43,23 @@ async fn a_braced_uuid_is_one() {
         .expect_err("half a brace");
     assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("22P02"), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_number_left_of_column_arithmetic_compares() {
+    let (_server, pool) = server().await;
+    pool.execute(sqlx::raw_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT); INSERT INTO t VALUES (1, 12), (2, 3);"))
+        .await
+        .unwrap();
+    for (sql, want) in [
+        ("SELECT id FROM t WHERE 12 = v * 1 ORDER BY id", vec![1i64]),
+        ("SELECT id FROM t WHERE 12 <> v * 1 ORDER BY id", vec![2]),
+        ("SELECT id FROM t WHERE 10 < v + 0 ORDER BY id", vec![1]),
+        ("SELECT id FROM t WHERE 6 >= v * 2 ORDER BY id", vec![2]),
+        ("SELECT id FROM t WHERE 12 = v * 1 AND 2 < v - 0 ORDER BY id", vec![1]),
+    ] {
+        let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(&pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(ids, want, "{sql}");
+    }
+    let n = sqlx::query("UPDATE t SET v = 0 WHERE 3 = v * 1").execute(&pool).await.unwrap().rows_affected();
+    assert_eq!(n, 1);
+}

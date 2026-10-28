@@ -6705,9 +6705,35 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                 // them is usually constant.
                 match find_comparison(term) {
                     Some((at, width)) => {
-                        out.push_str(&fold_operand(&term[..at], refused));
-                        out.push_str(&term[at..at + width]);
-                        out.push_str(&fold_operand(&term[at + width..], refused));
+                        let left = fold_operand(&term[..at], refused);
+                        let op = &term[at..at + width];
+                        let right = fold_operand(&term[at + width..], refused);
+                        // A number on the left of arithmetic over columns
+                        // (`12 = v * 1`) is written the other way round: the
+                        // predicate compiler reads arithmetic on the left
+                        // only, and failed on it ("unexpected Op(*) after the
+                        // end of the expression").
+                        match flipped_comparison(op) {
+                            Some(flipped)
+                                if crate::core::rql::expr::is_plain_number(left.trim())
+                                    && has_top_level_arithmetic(right.trim()) =>
+                            {
+                                let lead = &left[..left.len() - left.trim_start().len()];
+                                let tail = &right[right.trim_end().len()..];
+                                out.push_str(lead);
+                                out.push_str(right.trim());
+                                out.push(' ');
+                                out.push_str(flipped);
+                                out.push(' ');
+                                out.push_str(left.trim());
+                                out.push_str(tail);
+                            }
+                            _ => {
+                                out.push_str(&left);
+                                out.push_str(op);
+                                out.push_str(&right);
+                            }
+                        }
                     }
                     None => out.push_str(term),
                 }
@@ -7018,6 +7044,42 @@ fn find_comparison(term: &str) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// The comparison that means the same with its operands swapped.
+fn flipped_comparison(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "=" => "=",
+        "<>" => "<>",
+        "!=" => "!=",
+        "<" => ">",
+        ">" => "<",
+        "<=" => ">=",
+        ">=" => "<=",
+        _ => return None,
+    })
+}
+
+/// Whether `text` has a `+ - * / %` outside quotes and parentheses, past a
+/// leading sign.
+fn has_top_level_arithmetic(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'+' | b'-' | b'*' | b'/' | b'%' if depth == 0 && i > 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Replaces every `EXCLUDED.<column>` with the value the insert would have

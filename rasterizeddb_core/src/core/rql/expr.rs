@@ -3459,6 +3459,14 @@ fn is_one_literal(text: &str) -> bool {
 
 /// True when the whole text is a single numeric literal, sign and exponent
 /// included — so the `-` in `-5` and `1e-5` is never read as subtraction.
+/// A written number and nothing else: digits, a point, an exponent and a
+/// leading sign — not `inf` or `NaN`, which `f64` would also read.
+pub(crate) fn is_plain_number(text: &str) -> bool {
+    is_number_literal(text)
+        && text.bytes().any(|b| b.is_ascii_digit())
+        && text.bytes().all(|b| b.is_ascii_digit() || b".+-eE".contains(&b))
+}
+
 fn is_number_literal(text: &str) -> bool {
     text.parse::<i64>().is_ok() || text.parse::<f64>().is_ok()
 }
