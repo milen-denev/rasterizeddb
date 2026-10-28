@@ -724,7 +724,17 @@ impl KvFamily {
 
     /// Whether `name` is a file that stands: open and not dropped, or in the
     /// store and not yet opened — never one being swept or already gone.
-    fn standing(&self, name: &str) -> bool {
+    ///
+    /// Under `opening`: a first open takes the name out of `recovered` before
+    /// it registers the file, and looked at between the two, a table being
+    /// opened read as gone — and a carry passed it over and lost the
+    /// declaration its rows needed.
+    async fn standing(&self, name: &str) -> bool {
+        let _one = self.opening.lock().await;
+        self.standing_locked(name)
+    }
+
+    fn standing_locked(&self, name: &str) -> bool {
         if self.erasing.contains_key(name) {
             return false;
         }
@@ -732,6 +742,22 @@ impl KvFamily {
             Some(file) => !file.dropped.load(Ordering::Acquire),
             None => self.recovered.lock().contains_key(name),
         }
+    }
+
+    /// The file `name` if it stands, opened if it has not been yet; `None` if
+    /// it is being swept or is gone. Never makes a name again: `open_file`
+    /// would wait out a drop and build the name afresh, empty.
+    pub(super) async fn open_standing(self: &Arc<Self>, name: &str) -> io::Result<Option<Arc<KvFile>>> {
+        let _one = self.opening.lock().await;
+        if !self.standing_locked(name) {
+            return Ok(None);
+        }
+        if let Some(file) = self.files.get(name).map(|e| e.value().clone()) {
+            return Ok(Some(file));
+        }
+        let file = KvFile::open(self, name).await?;
+        self.files.insert(name.to_string(), file.clone());
+        Ok(Some(file))
     }
 
     /// Before a dropped file's deltas are deleted: declares again, in a file
@@ -766,36 +792,40 @@ impl KvFamily {
             .map(|txn| (txn, self.ledger.holders_of(txn, name)))
             .collect();
         while !owed.is_empty() {
-            // Each transaction to the first of its holders still standing.
+            // Each transaction to the first of its holders still standing;
+            // one whose every holder is going takes nothing with it.
             let mut by_holder: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
-            owed.retain_mut(|(txn, holders)| {
-                while let Some(holder) = holders.first() {
-                    if self.standing(holder) {
-                        by_holder.entry(holder.clone()).or_default().push(*txn);
-                        return true;
+            let mut next = Vec::with_capacity(owed.len());
+            for (txn, mut holders) in owed.drain(..) {
+                while let Some(holder) = holders.first().cloned() {
+                    if self.standing(&holder).await {
+                        by_holder.entry(holder).or_default().push(txn);
+                        break;
                     }
                     holders.remove(0);
                 }
-                // Every holder is going too: its records go with them.
-                false
-            });
+                if !holders.is_empty() {
+                    next.push((txn, holders));
+                }
+            }
+            owed = next;
             for (holder, txns) in by_holder {
-                // Looked at again: earlier puts in this round took time, and
-                // opening a name that has gone would make it again, empty.
-                let landed = if !self.standing(&holder) {
-                    false
-                } else {
-                    let target = self.open_file(&holder).await?;
-                    let _serialised = target.flush.lock().await;
-                    if target.dropped.load(Ordering::Acquire) {
-                        false
-                    } else {
-                        target.state.write().committing.extend(txns.iter().copied());
-                        target.flush_locked(None).await?;
-                        // Dropped while the put was in flight: its own carry
-                        // reads after this lock and takes the declaration on,
-                        // but this one goes to the next holder as well.
-                        !target.dropped.load(Ordering::Acquire)
+                // Opened only if it still stands: earlier puts in this round
+                // took time, and opening a name that has gone makes it again.
+                let landed = match self.open_standing(&holder).await? {
+                    None => false,
+                    Some(target) => {
+                        let _serialised = target.flush.lock().await;
+                        if target.dropped.load(Ordering::Acquire) {
+                            false
+                        } else {
+                            target.state.write().committing.extend(txns.iter().copied());
+                            target.flush_locked(None).await?;
+                            // Dropped while the put was in flight: its own carry
+                            // reads after this lock and takes the declaration on,
+                            // but this one goes to the next holder as well.
+                            !target.dropped.load(Ordering::Acquire)
+                        }
                     }
                 };
                 // Landed: done. Dropped meanwhile: on to that holder's next.

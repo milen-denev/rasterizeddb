@@ -3288,3 +3288,26 @@ async fn a_holder_dropped_during_the_carry_passes_the_declaration_on() {
     let restarted = open_family(store).await;
     assert_eq!(read_all(&open(&restarted, "c.db").await).await, b"kept".to_vec());
 }
+
+/// A carry never makes a dropped name again. Opening it the ordinary way
+/// waits out the sweep and builds the name afresh, empty — a phantom file a
+/// restart then lists — so the carry opens only a holder that still stands.
+#[tokio::test]
+async fn a_carry_never_makes_a_dropped_name_again() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let h = open(&family, "h.db").await;
+    h.append_data(b"bytes", true).await;
+    h.drop_io();
+    // The sweep runs on its own; in memory it is quick.
+    for _ in 0..100 {
+        if store.list("t/h.db/").await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(family.open_standing("h.db").await.unwrap().is_none(), "a gone name was opened again");
+    assert!(!family.file_names().iter().any(|n| n == "h.db"), "a gone name is registered again");
+    assert!(store.list("t/h.db/").await.unwrap().is_empty());
+}
