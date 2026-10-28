@@ -55,6 +55,11 @@ async fn a_number_left_of_column_arithmetic_compares() {
         ("SELECT id FROM t WHERE 12 <> v * 1 ORDER BY id", vec![2]),
         ("SELECT id FROM t WHERE 10 < v + 0 ORDER BY id", vec![1]),
         ("SELECT id FROM t WHERE 6 >= v * 2 ORDER BY id", vec![2]),
+        ("SELECT id FROM t WHERE 10 > v + 0 ORDER BY id", vec![2]),
+        ("SELECT id FROM t WHERE 12 <= v * 1 ORDER BY id", vec![1]),
+        ("SELECT id FROM t WHERE 12 != v * 1 ORDER BY id", vec![2]),
+        ("SELECT id FROM t WHERE 2 > v - 1 ORDER BY id", vec![]),
+        ("SELECT id FROM t WHERE 3 > v - 1 ORDER BY id", vec![2]),
         ("SELECT id FROM t WHERE 12 = v * 1 AND 2 < v - 0 ORDER BY id", vec![1]),
     ] {
         let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(&pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
