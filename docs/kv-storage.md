@@ -196,6 +196,29 @@ Order in `swap_temp` is the same bargain as compaction: `META` first, then the
 deletes. Dying in between orphans objects, which costs storage; the other order
 would delete the chunks the live metadata still points at.
 
+### 4.7 Dropping a file
+
+`drop_io` is synchronous and deleting is a round trip, so the sweep (`erase`)
+is spawned, and a reopen of the name waits for it. Three things have to hold or
+a dropped table comes back:
+
+- **Nothing written outlives the sweep.** `erase` takes the maintenance gate,
+  then the compaction guard, then the flush lock — the order `adopt` takes
+  them — so a flush or a compaction in flight finishes first and what it wrote
+  is in the listing. Afterwards a flush, a compaction or a truncation of a
+  dropped file writes nothing. Otherwise its objects land after the sweep, and
+  a table later made under the same name (generation 0, sequence 0 again)
+  reads them as its own or replays them at the next restart; an untransacted
+  record — a schema header, the id sequence — applies with no declaration.
+- **Declarations other files need survive it.** A transaction declared
+  committed in the dropped file's deltas may have its other half in another
+  file. Before the sweep each such declaration is written again in a file that
+  holds those records (the [`Ledger`] that compaction and `adopt` consult),
+  or that table loses the rows at the next restart.
+- **A reopen never gets the dropped file.** The sweep's gate is registered
+  before the file leaves the map, and a dropped file still in the map is
+  waited out, not returned.
+
 ## 5. The cache
 
 Budgeted in bytes and shared across every file of a database, because a working

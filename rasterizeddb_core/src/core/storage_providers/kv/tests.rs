@@ -3008,11 +3008,23 @@ async fn an_export_reads_a_store_no_family_has_open() {
     assert!(only.is_empty());
 }
 
-/// Holds every delta put to `a.db` once armed, until released.
+/// Holds every put whose key holds `pattern` once armed, until released.
 struct HeldPutStore {
     inner: MemoryKvStore,
+    pattern: &'static str,
     armed: std::sync::atomic::AtomicBool,
     release: tokio::sync::Semaphore,
+}
+
+impl HeldPutStore {
+    fn holding(pattern: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryKvStore::new(),
+            pattern,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
 }
 
 impl KvStore for HeldPutStore {
@@ -3024,7 +3036,7 @@ impl KvStore for HeldPutStore {
     }
     fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
         Box::pin(async move {
-            if self.armed.load(Ordering::Acquire) && key.contains("/a.db/d/") {
+            if self.armed.load(Ordering::Acquire) && key.contains(self.pattern) {
                 self.release.acquire().await.unwrap().forget();
             }
             self.inner.put(key, body).await
@@ -3051,11 +3063,7 @@ impl KvStore for HeldPutStore {
 /// and torn in any copy listed then.
 #[tokio::test]
 async fn a_commit_waits_for_a_flush_already_putting_its_records() {
-    let gated = Arc::new(HeldPutStore {
-        inner: MemoryKvStore::new(),
-        armed: std::sync::atomic::AtomicBool::new(false),
-        release: tokio::sync::Semaphore::new(0),
-    });
+    let gated = HeldPutStore::holding("/a.db/d/");
     let store: Arc<dyn KvStore> = gated.clone();
     let family = open_family(store.clone()).await;
     let a = Arc::new(open(&family, "a.db").await);
@@ -3120,11 +3128,7 @@ async fn a_family_opened_during_a_pause_is_paused_too() {
 /// header or the id sequence, applies with no declaration at all.
 #[tokio::test]
 async fn a_put_in_flight_when_a_file_is_dropped_leaves_nothing_behind() {
-    let held = Arc::new(HeldPutStore {
-        inner: MemoryKvStore::new(),
-        armed: std::sync::atomic::AtomicBool::new(false),
-        release: tokio::sync::Semaphore::new(0),
-    });
+    let held = HeldPutStore::holding("/a.db/d/");
     let store: Arc<dyn KvStore> = held.clone();
     let family = open_family(store.clone()).await;
     let a = Arc::new(open(&family, "a.db").await);
@@ -3149,4 +3153,61 @@ async fn a_put_in_flight_when_a_file_is_dropped_leaves_nothing_behind() {
     drop(again);
     let restarted = open(&open_family(store).await, "a.db").await;
     assert!(read_all(&restarted).await.is_empty(), "a restart replayed the dropped file");
+}
+
+/// A compaction running when its file is dropped finishes before the sweep,
+/// and is swept with the rest. It used to run alongside it and publish its
+/// chunks and META after it: objects under the name that a table made since
+/// read as its own, or a restart replayed.
+#[tokio::test]
+async fn a_compaction_in_flight_when_a_file_is_dropped_leaves_nothing_behind() {
+    let held = HeldPutStore::holding("/a.db/g");
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let a = Arc::new(open(&family, "a.db").await);
+    let txn = a.begin_txn();
+    a.append_data_txn(txn, &vec![b'c'; 20_000]).await;
+    a.commit_durable(txn).await.unwrap();
+
+    held.armed.store(true, Ordering::Release);
+    let compaction = tokio::spawn({
+        let a = a.clone();
+        async move { a.compact_now().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    a.drop_io();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    held.armed.store(false, Ordering::Release);
+    held.release.add_permits(64);
+    compaction.await.unwrap().unwrap();
+    // And one asked for on the stale handle afterwards writes nothing.
+    a.compact_now().await.unwrap();
+
+    let again = open(&family, "a.db").await;
+    assert!(read_all(&again).await.is_empty(), "the dropped file's bytes came back");
+    assert!(store.list("t/a.db/").await.unwrap().is_empty(), "an object outlived the drop");
+}
+
+/// A transaction that wrote two files and declared its commit in the one
+/// then dropped keeps its records in the other. The declaration used to be
+/// swept with the dropped file, and the other file's half was uncommitted at
+/// the next restart: a table losing rows to another table's DROP.
+#[tokio::test]
+async fn dropping_the_declaring_file_keeps_the_other_files_half_committed() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let declaring = open(&family, "a.db").await;
+    let other = open(&family, "b.db").await;
+    let txn = declaring.begin_txn();
+    other.append_data_txn(txn, b"kept").await;
+    declaring.append_data_txn(txn, b"dropped").await;
+    declaring.commit_durable(txn).await.unwrap();
+
+    declaring.drop_io();
+    // Reopening the name waits for the sweep.
+    drop(open(&family, "a.db").await);
+    drop(other);
+
+    let restarted = open_family(store).await;
+    assert_eq!(read_all(&open(&restarted, "b.db").await).await, b"kept".to_vec());
 }

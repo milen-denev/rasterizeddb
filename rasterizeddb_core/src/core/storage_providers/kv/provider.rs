@@ -219,6 +219,12 @@ impl Ledger {
         }
     }
 
+    /// A file other than `except` holding records of `txn`, if any.
+    fn holder(&self, txn: u64, except: &str) -> Option<Arc<str>> {
+        let holders = self.holders.lock();
+        holders.get(&txn)?.iter().find(|(n, _)| &**n != except).map(|(n, _)| n.clone())
+    }
+
     /// Of `declared`, the transactions some delta other than the ones
     /// `retiring` describes still holds records of.
     fn still_needed(
@@ -669,8 +675,15 @@ impl KvFamily {
     }
 
     async fn open_file(self: &Arc<Self>, name: &str) -> io::Result<Arc<KvFile>> {
-        if let Some(existing) = self.files.get(name) {
-            return Ok(existing.clone());
+        // A file being dropped is gone, not reusable: its writes go nowhere.
+        // `drop_io` registers the sweep's gate before it takes the file out of
+        // the map, so once the map no longer holds it, the gate below does.
+        loop {
+            match self.files.get(name).map(|e| e.value().clone()) {
+                Some(existing) if !existing.dropped.load(Ordering::Acquire) => return Ok(existing),
+                Some(_) => tokio::task::yield_now().await,
+                None => break,
+            }
         }
         // A previous incarnation of this name may still be sweeping its
         // objects. Opening now would build a file whose first writes that task
@@ -691,6 +704,39 @@ impl KvFamily {
                 file
             }
         })
+    }
+
+    /// Before a dropped file's deltas are deleted: declares again, in a file
+    /// holding their other records, every transaction a delta of `file`
+    /// declared that another file's records still depend on. Erasing the
+    /// declaration with the dropped file lost the other half on the next
+    /// restart: a transaction that wrote two tables and committed on the one
+    /// dropped took the other's rows with it. See [`Ledger`].
+    async fn carry_declarations(self: &Arc<Self>, file: &KvFile) -> io::Result<()> {
+        let declared: Vec<u64> = file
+            .state
+            .read()
+            .delta_txns
+            .values()
+            .flat_map(|d| d.declared.iter().copied())
+            .collect();
+        let name = &*file.ledger_name;
+        for txn in self.ledger.still_needed(declared, |n, _| n == name) {
+            let Some(holder) = self.ledger.holder(txn, name) else {
+                continue;
+            };
+            // A holder being dropped too takes its records with it; opening it
+            // would wait out its sweep and declare into a new file of that name.
+            let dropping = self.erasing.contains_key(&*holder)
+                || self.files.get(&*holder).is_some_and(|f| f.dropped.load(Ordering::Acquire));
+            if dropping {
+                continue;
+            }
+            let target = self.open_file(&holder).await?;
+            target.state.write().committing.push(txn);
+            target.flush(None).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1819,7 +1865,8 @@ impl KvFile {
         let (safe_end, generation, base_len, len, reserved_seq, may_retire) = {
             let _serialised = self.flush.lock().await;
             let mut state = self.state.write();
-            if state.frozen.is_some() || state.live.is_empty() {
+            // A dropped file's objects are swept, or being swept: see `erase`.
+            if self.dropped.load(Ordering::Acquire) || state.frozen.is_some() || state.live.is_empty() {
                 return Ok(());
             }
             let len = self.len.load(Ordering::Acquire);
@@ -2104,6 +2151,11 @@ impl KvFile {
         // base length it computed before the truncate undid the clamp, and the
         // truncated tail read back as base bytes once the file grew past it.
         let _serialised = self.flush.lock().await;
+        // A stale handle on a dropped file would delete chunk keys a table
+        // made since under the same name now owns.
+        if self.dropped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let generation = self.generation.load(Ordering::Acquire);
         let root = self.root();
         let chunk_size = self.config.chunk_size;
@@ -2179,6 +2231,11 @@ impl KvFile {
         let _quiet_temp = CompactionGuard::acquire(temp).await;
         let _one = self.flush.lock().await;
         let _two = temp.flush.lock().await;
+        // A scratch file dropped before its swap has had its generation swept;
+        // publishing it would name objects that are gone.
+        if temp.dropped.load(Ordering::Acquire) || self.dropped.load(Ordering::Acquire) {
+            return Err(io::Error::other(format!("{}: a dropped file cannot be swapped in or out", self.name)));
+        }
 
         // The old generation's deltas are about to be deleted, and with them
         // any commit declaration they make. The ones another file's records
@@ -2286,11 +2343,14 @@ impl KvFile {
 
     async fn erase(&self) -> io::Result<()> {
         let _maintenance = self.maintenance.read().await;
-        // A flush already putting a batch finishes first, so its object is in
-        // the listing below rather than landing after the sweep: an orphan a
-        // same-named table replayed after a restart — an untransacted record
-        // (a schema header, the id sequence) needs no declaration to apply.
-        // Later flushes see `dropped` and put nothing.
+        // A compaction or a flush already putting objects finishes first, so
+        // what it writes is in the listing below rather than landing after the
+        // sweep: an orphan a same-named table replayed after a restart — an
+        // untransacted record (a schema header, the id sequence) needs no
+        // declaration to apply, and a compaction's chunks and META overwrite
+        // the new table's own. Later flushes, compactions and truncations see
+        // `dropped` and write nothing. In the order `adopt` takes them.
+        let _quiet = CompactionGuard::acquire(self).await;
         let _serialised = self.flush.lock().await;
         let root = self.root();
         let prefix = if self.is_temp {
@@ -2841,12 +2901,13 @@ impl StorageIO for KvStorageProvider {
             }
             return;
         }
-        self.family.files.remove(&self.file.name);
         let file = self.file.clone();
-        // Registered before the task is spawned, so a reopen that races this
-        // sees the gate rather than an empty map.
+        // Registered before the file leaves the map, so a reopen that races
+        // this finds either the dropped file (and waits for it to go) or the
+        // gate, never neither. See `KvFamily::open_file`.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         self.family.erasing.insert(file.name.clone(), gate.clone());
+        self.family.files.remove(&self.file.name);
         let family = self.family.clone();
         // Sync in the trait, and deleting is a round trip. Reopening the name
         // meanwhile gets a fresh file, which is what unlinking a path does.
@@ -2857,6 +2918,22 @@ impl StorageIO for KvStorageProvider {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    // Retried: giving up loses another table's committed rows,
+                    // which is worse than a sweep that runs late.
+                    for attempt in 1..=5u64 {
+                        match family.carry_declarations(&file).await {
+                            Ok(()) => break,
+                            Err(e) if attempt < 5 => {
+                                warn!("kv: carrying {}'s commit declarations failed, retrying: {e}", file.name);
+                                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                            }
+                            Err(e) => error!(
+                                "kv: could not carry {}'s commit declarations before erasing it; transactions \
+                                 it declared lose their records in other files at the next restart: {e}",
+                                file.name
+                            ),
+                        }
+                    }
                     if let Err(e) = file.erase().await {
                         error!("kv: could not erase {}: {e}", file.name);
                     }
