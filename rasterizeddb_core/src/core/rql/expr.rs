@@ -4484,7 +4484,11 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             None if matches!(target, DbType::F32 | DbType::F64) && trimmed.parse::<f64>().is_ok() => {
                 Err(crate::core::value_codec::refusal_message(target, trimmed))
             }
-            None => Err(format!("{} cannot be read as {:?}", crate::core::rql::executor::sql_literal(&text), target)),
+            // In PostgreSQL's words, so the SQLSTATE is the input function's
+            // (22P02 for most): "'x' cannot be read as I32" was XX000, and
+            // `sum(t::int)` over a 'x' answered XX000 where PostgreSQL
+            // answers 22P02.
+            None => Err(crate::core::value_codec::refusal_message(target, &text)),
         };
     }
 

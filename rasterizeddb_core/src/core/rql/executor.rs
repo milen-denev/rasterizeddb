@@ -13428,23 +13428,6 @@ impl IdentifyingKey {
     }
 }
 
-/// The key that identifies `schema`'s rows, chosen as PostgreSQL names a row
-/// by its key, or `None` when the table has none to name a row by.
-///
-/// 1. The primary key: one column (`schema.primary_key`), or a composite one,
-///    which is the table-level key named `<table>_pkey` (`lexer_ct` records
-///    only a one-column primary key as such).
-/// 2. Else a `UNIQUE` key, inline or table-level, whose every column is
-///    `NOT NULL`: the fewest columns, then the first declared.
-/// 3. Else, as before composite keys counted, a one-column `UNIQUE` that may
-///    hold NULL. Its NULL rows cannot be named, and [`IdentifyingKey::row_key`]
-///    refuses them one by one rather than naming every NULL row at once.
-///
-/// A primary key's rows hold no NULL in PostgreSQL. Here a column of a
-/// table-level `PRIMARY KEY (a, b)` written without `NOT NULL` is nullable,
-/// so the same refusal covers such a row. A partial key is never chosen:
-/// rows outside its predicate share its values, and writing back by it would
-/// reach every one of them.
 /// Marks the rows an `UPDATE` or `DELETE` stamps, by their row-lock key,
 /// before each is stamped (`RowLocks::mark_row_writes`). Built once per
 /// statement by the table's write loops; `None` for a table with no key a row
@@ -13466,7 +13449,19 @@ impl RowMarker {
         schema: &crate::core::row::schema::TableSchema,
         transactions: &std::sync::Arc<crate::core::mvcc::transaction::TransactionManager>,
     ) -> Option<Self> {
-        let locks = transactions.row_locks()?;
+        let Some(locks) = transactions.row_locks() else {
+            // Every database ties its row locks to its transaction manager
+            // where it builds both (`Database::new`). A manager made anywhere
+            // else turns row marking off, and with it the lost-update guard
+            // of the no-row-lock fast path: said once, not silently. (Not a
+            // debug assertion: unit tests version tables under a bare
+            // manager, with no row locks and no lockers.)
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!("a transaction manager has no row locks tied; writes are not marked for FOR UPDATE")
+            });
+            return None;
+        };
         let key = identifying_key(schema)?;
         let flags = key
             .fields
@@ -13559,6 +13554,23 @@ impl RowMarker {
     }
 }
 
+/// The key that identifies `schema`'s rows, chosen as PostgreSQL names a row
+/// by its key, or `None` when the table has none to name a row by.
+///
+/// 1. The primary key: one column (`schema.primary_key`), or a composite one,
+///    which is the table-level key named `<table>_pkey` (`lexer_ct` records
+///    only a one-column primary key as such).
+/// 2. Else a `UNIQUE` key, inline or table-level, whose every column is
+///    `NOT NULL`: the fewest columns, then the first declared.
+/// 3. Else, as before composite keys counted, a one-column `UNIQUE` that may
+///    hold NULL. Its NULL rows cannot be named, and [`IdentifyingKey::row_key`]
+///    refuses them one by one rather than naming every NULL row at once.
+///
+/// A primary key's rows hold no NULL in PostgreSQL. Here a column of a
+/// table-level `PRIMARY KEY (a, b)` written without `NOT NULL` is nullable,
+/// so the same refusal covers such a row. A partial key is never chosen:
+/// rows outside its predicate share its values, and writing back by it would
+/// reach every one of them.
 fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<IdentifyingKey> {
     let live = |name: &str| {
         schema

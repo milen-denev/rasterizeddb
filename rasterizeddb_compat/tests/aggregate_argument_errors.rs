@@ -30,6 +30,15 @@ async fn a_failing_aggregate_argument_fails_the_statement() {
         let e = sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await.expect_err(sql);
         assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("22012"), "{sql}: {e}");
     }
+    // A cast that cannot read a row's text is the input function's 22P02,
+    // inside an aggregate and out.
+    pool.execute(sqlx::raw_sql("CREATE TABLE at (id BIGINT PRIMARY KEY, t TEXT); INSERT INTO at VALUES (1, '5'), (2, 'x');"))
+        .await
+        .unwrap();
+    for sql in ["SELECT sum(t::int) FROM at", "SELECT t::int FROM at ORDER BY id", "SELECT count(CAST(t AS BIGINT)) FROM at"] {
+        let e = sqlx::query(AssertSqlSafe(sql)).fetch_all(&pool).await.expect_err(sql);
+        assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("22P02"), "{sql}: {e}");
+    }
     // Rows that evaluate are unaffected.
     let s: rust_decimal::Decimal = sqlx::query_scalar("SELECT sum(1/(b-6)) FROM ae").fetch_one(&pool).await.unwrap();
     assert_eq!(s, rust_decimal::Decimal::from(1));

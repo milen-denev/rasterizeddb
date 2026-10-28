@@ -609,6 +609,30 @@ from one failed statement without losing the whole transaction.
 Not built: blocking-on-conflict (the second updater is told to retry rather than
 made to wait), and write-skew detection under `SERIALIZABLE`. See `docs/mvcc.md`.
 
+### Row locks (`FOR UPDATE`, `FOR SHARE`, `SKIP LOCKED`, `NOWAIT`)
+
+A locking read takes each row's lock and waits (bounded) for a holder. A
+writer honours them, but how it meets one depends on timing:
+
+- When some row is locked anywhere at the statement's start, an `UPDATE` or
+  `DELETE` asks for each row's lock first and is refused at once with
+  `55P03` on a row another transaction holds. PostgreSQL would wait.
+- When no row is locked at the start, the writer skips that pass and marks
+  each row just before writing it. A `FOR UPDATE` that locks the row after
+  the mark waits for the writer's transaction to end and then reads its
+  committed row. If the lock came first, the writer meets it at the mark:
+  having written nothing yet, the statement waits for the holder and is
+  replayed, which is PostgreSQL's wait; having already written other rows,
+  it fails with `55P03`.
+
+A writer's marks are per row until one transaction has written more than
+1,024 rows of one table. Past that they become one mark on the whole table,
+to bound memory: until that transaction ends, **every** `FOR UPDATE` on the
+table waits for it, `NOWAIT` fails with `55P03`, and `SKIP LOCKED` skips
+every row. A batch job that updates thousands of rows of a queue table in
+one block therefore holds up every worker's `SKIP LOCKED` claim on that
+table until it commits; run such a job in smaller transactions.
+
 ## Not yet supported
 
 Ordered by how much application traffic each blocks.

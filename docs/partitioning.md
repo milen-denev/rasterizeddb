@@ -770,7 +770,8 @@ returning what the holder left. Each invariant was mutation-verified.
   precision").
 - Left for the correctness slice: `refuse_write_to_locked_rows` returns
   early while no row lock exists anywhere, a window between that check and
-  a `FOR UPDATE` taken after it; locks from a locking read's earlier round
+  a `FOR UPDATE` taken after it (closed in C2: each row is marked before it
+  is stamped, see "Row locks" in `postgres-compatibility.md`); locks from a locking read's earlier round
   on rows a later round drops are kept until the transaction ends;
   `committed_since` is conservative past 4,096 ids (it rescans).
 
