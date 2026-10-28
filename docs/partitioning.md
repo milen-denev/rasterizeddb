@@ -418,6 +418,13 @@ the same tests, but the one marked; and these):
 | every pair of key types compatible | `foreign_key::compatible_key_types` | `partition_fk::a_key_between_incompatible_types_is_42804` |
 | ADD skips the type check | `add_foreign_key` | the same |
 | 42804 not mapped | `pgwire::sqlstate_for` | the same |
+| *(round 3)* the implicit-cast pairs refused again | `compatible_key_types` | `partition_fk::cross_type_keys_compare_as_postgres_compares_them` |
+| *(round 3)* no value coerced across types | `coerce_key_literal` | the same |
+| *(round 3)* the parent side's keys not coerced | `parent_literals_for_child` | the same (deleting `TIMESTAMP` 10:00 refused by the `DATE` midnight child); it survived until parents off the integer and off midnight were added |
+| *(round 3)* a `DOUBLE` narrowed to `REAL` through text | `coerce_key_literal` | the same (`DOUBLE` 0.1 found `REAL` 0.1) |
+| *(round 3)* a lossy move kept | `coerce_key_literal` | the same |
+| *(round 3)* validation probes the child's values unmoved | `first_value_without_parent` | `…::adding_a_cross_type_key_validates_as_the_insert_checks` (`TIMESTAMP` 10:00 validated against `DATE`; it survived until that case was added, since the scan reads `7` at `NUMERIC` by itself) |
+| *(round 3)* VALIDATE of an unknown name succeeds | the ALTER arm | `partition_fk::validating_an_unknown_constraint_is_42704` |
 | the table dropped before its dependent keys | `execute_drop_table` | `pddl_crash_tests::a_cascading_drop_…` (images at the log's syncs hold a key naming a dropped table) |
 
 Not pinned: the child-side chunk of 512 for a child not partitioned by its
@@ -445,8 +452,9 @@ cascade; `fk_reverse` reached only through the slot primitives):
   enforces new writes and leaves the rows already there unchecked;
   `VALIDATE CONSTRAINT n` checks them then (23503 for the first orphan),
   on both table kinds. No record says "not valid" (the sidecar has no spare
-  byte), so validating a valid key checks again and passes; a name no key
-  has is accepted as VALIDATE always was here (PostgreSQL: 42704). The
+  byte), so validating a valid key checks again and passes; a CHECK's,
+  UNIQUE's or primary key's name is a no-op, and since round 3 a name no
+  constraint has is 42704, as in PostgreSQL (it was accepted). The
   import reads `convalidated` and adds a key its source never validated
   `NOT VALID`, with a note; a validated key whose source rows break it
   (rows loaded with `pg_restore --disable-triggers`) is retried `NOT VALID`
@@ -485,15 +493,53 @@ cascade; `fk_reverse` reached only through the slot primitives):
 - **A key between incompatible types is 42804**, PostgreSQL's "foreign key
   constraint … cannot be implemented: key columns … are of incompatible
   types", at CREATE TABLE and ADD CONSTRAINT, on both table kinds
-  (`foreign_key::compatible_key_types`): integers of any width with each
-  other, the float widths with each other, `TEXT`/`VARCHAR`/`CHAR` with each
-  other, `NUMERIC` with `NUMERIC`, anything else only with its own type. A
-  `TEXT` column referencing an `INT` key used to be accepted. Pinned by
+  (`foreign_key::compatible_key_types`). A `TEXT` column referencing an `INT`
+  key used to be accepted. Pinned by
   `partition_fk::a_key_between_incompatible_types_is_42804` on the four
-  configurations; no existing test declared a cross-family key.
+  configurations; no existing test declared a cross-family key. Round 2's
+  rule was stricter than PostgreSQL's; round 3 replaced it (below).
 - The release note for databases written by older binaries is in
   `docs/postgres-compatibility.md` ("Release note: foreign keys from older
   binaries").
+
+**Round 3** (2026-10-28), from the round-2 re-reviews (nothing blocking):
+
+- **Every type pair PostgreSQL accepts is accepted** (round 2 refused `INT`
+  onto `NUMERIC`, `INT` onto `DOUBLE`, `DATE` onto `TIMESTAMP`, which a
+  PostgreSQL schema may hold). `compatible_key_types` follows
+  `ATAddForeignKeyConstraint`: an equality in the referenced key's operator
+  family (the integer widths, `REAL`/`DOUBLE`, `DATE`/`TIMESTAMP`, the text
+  types, each any way round), or an implicit cast child to parent (an
+  integer to `NUMERIC`, `REAL` or `DOUBLE`; a `NUMERIC` to `REAL` or
+  `DOUBLE`); any other type only with itself. The reverse casts stay 42804,
+  as in PostgreSQL (a `NUMERIC` or `DOUBLE` child of an integer key, a
+  `DOUBLE` child of a `NUMERIC` key).
+- **Each value is compared in the other side's type**
+  (`coerce_key_literal`): a child's value is moved to the parent column's
+  type before it is looked for (the insert and update checks, the
+  multi-row batch, ADD's and VALIDATE's validation), and a parent's value
+  to the child column's type before its children are (each DELETE and
+  UPDATE check, CASCADE, SET NULL, SET DEFAULT, ON UPDATE). A move that
+  changes the value finds nothing, as PostgreSQL's comparison in the wider
+  type finds nothing: `INT` 7 finds `NUMERIC` 7.00 and no `INT` is 7.50; a
+  `DATE` is its `TIMESTAMP` midnight and a 10:00 has no `DATE`; a `REAL`
+  widens to `DOUBLE` exactly and a `DOUBLE` has a `REAL` only when it is one
+  (0.5, not 0.1; through text both read `0.1`, the reviewer's permissive
+  case). Without the parent side's move, deleting `TIMESTAMP` 10:00 was
+  refused (or, under CASCADE, deleted the children) of the `DATE` child
+  that references midnight. One divergence, at the edge: an `INT8`
+  2⁵³+1 finds no `DOUBLE` parent here, where PostgreSQL rounds it to 2⁵³
+  and finds that one; accepting it would let the parent 2⁵³ go while the
+  child's own value matches nothing. Pinned by
+  `partition_fk::cross_type_keys_compare_as_postgres_compares_them`
+  (`INT`→`NUMERIC(10,2)` with 7 / 7.00 / 7.50 / 6.50 / -3 / -3.4,
+  `BIGINT`→`DOUBLE` with 2⁵³ and 2⁵³+1, `DATE`→`TIMESTAMP` and
+  `TIMESTAMP`→`DATE` at and off midnight, `DOUBLE`→`REAL` with 0.1 and 0.5,
+  `SMALLINT`→`BIGINT` and `VARCHAR`→`TEXT` on partitioned parents too; each
+  insert, each RESTRICT and CASCADE delete, no orphan after) and
+  `…::adding_a_cross_type_key_validates_as_the_insert_checks`.
+- `VALIDATE CONSTRAINT` of a name no constraint has is 42704 (above);
+  compat `ddl.rs` expects it.
 
 **Behaviour changes for plain tables** (the same code serves both kinds):
 

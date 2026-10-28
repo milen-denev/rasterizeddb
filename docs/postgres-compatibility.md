@@ -247,17 +247,21 @@ as built") foreign keys also run to and from hash-partitioned tables, and:
   the report, rather than stopping at its last step.
 - `DROP TABLE` of a table another table's key references is refused (2BP01)
   unless `CASCADE`, which drops those keys and keeps their tables.
-- A key between columns of incompatible types is refused with 42804, as in
-  PostgreSQL: integers of any width reference each other, text types each
-  other, `NUMERIC` only `NUMERIC`, any other type only itself.
+- A key between columns PostgreSQL cannot compare is refused with 42804:
+  the integer widths, `REAL`/`DOUBLE`, `DATE`/`TIMESTAMP` and the text types
+  pair any way round; an integer child may reference a `NUMERIC`, `REAL` or
+  `DOUBLE` key and a `NUMERIC` child a `REAL` or `DOUBLE` one, not the
+  reverse; any other type only itself. Values are compared in the other
+  side's type, so an `INT` 7 finds a `NUMERIC` 7.00, a `DATE` only a
+  `TIMESTAMP` midnight; an `INT8` beyond a `DOUBLE`'s precision finds none
+  (PostgreSQL rounds it).
 - Names are kept as written (UTF-8, spaces, quotes), and an unnamed key is
   PostgreSQL's `<table>_<column>_fkey`, numbered on a collision; a column's own
   `CONSTRAINT n REFERENCES …` is named `n`.
 
 Still unlike PostgreSQL: a plain table may reference a column no unique key
 covers, and `CREATE TABLE` may reference a table that does not exist yet (each
-insert's check names it); `VALIDATE CONSTRAINT` of a name no constraint has
-succeeds; identifiers are not case-folded.
+insert's check names it); identifiers are not case-folded.
 
 ### Release note: foreign keys from older binaries
 
@@ -278,6 +282,10 @@ What a database written by an older binary holds, read by this one:
   name makes it their parent again, and a later `DROP TABLE` of it is refused
   with 2BP01 naming them; drop them (`DROP CONSTRAINT`) or use `DROP TABLE …
   CASCADE`.
+- **A key added `NOT VALID` looks like any other key after a restart**:
+  validity is not recorded and `pg_constraint` is not emulated, so nothing
+  shows which keys still have unchecked rows; run `VALIDATE CONSTRAINT` on
+  each to find their orphans.
 
 ## JSON
 
