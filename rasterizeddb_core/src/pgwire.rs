@@ -6992,6 +6992,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "42P01"
     } else if has("column") && has("does not exist") {
         "42703"
+    } else if has("constraint") && has("already exists") {
+        // `duplicate_object`: a constraint's name is not a relation's,
+        // though the message names its relation ("constraint \"c\" for
+        // relation \"t\" already exists").
+        "42710"
     } else if has("table already exists") || (has("relation") && has("already exists")) {
         "42P07"
     } else if has("column") && has("already exists") {

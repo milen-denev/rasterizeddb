@@ -63,3 +63,14 @@ async fn a_number_left_of_column_arithmetic_compares() {
     let n = sqlx::query("UPDATE t SET v = 0 WHERE 3 = v * 1").execute(&pool).await.unwrap().rows_affected();
     assert_eq!(n, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taken_constraint_name_is_duplicate_object() {
+    let (_server, pool) = server().await;
+    pool.execute("CREATE TABLE c (id BIGINT, a BIGINT, CONSTRAINT ck CHECK (a > 0))").await.unwrap();
+    let e = sqlx::query("ALTER TABLE c ADD CONSTRAINT ck CHECK (a < 10)")
+        .execute(&pool)
+        .await
+        .expect_err("a taken constraint name");
+    assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42710"), "{e}");
+}
