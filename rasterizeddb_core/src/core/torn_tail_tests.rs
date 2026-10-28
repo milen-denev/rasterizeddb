@@ -866,3 +866,263 @@ async fn a_partitions_shrink_in_place_lowers_its_floor() {
     close(&dir, db);
     assert_eq!(len(&file), stride);
 }
+
+/// A schema sidecar kind, for the write-ahead tests below: how its `i`th
+/// record is appended through the sidecar's own `append`, and what its
+/// loader names it.
+#[derive(Debug, Clone, Copy)]
+enum Sidecar {
+    Fk,
+    Chk,
+    Uk,
+    Def,
+    Idx,
+    Typ,
+    Gen,
+    Json,
+    Pix,
+}
+
+impl Sidecar {
+    const ALL: [Sidecar; 9] =
+        [Sidecar::Fk, Sidecar::Chk, Sidecar::Uk, Sidecar::Def, Sidecar::Idx, Sidecar::Typ, Sidecar::Gen, Sidecar::Json, Sidecar::Pix];
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Sidecar::Fk => "FK.db",
+            Sidecar::Chk => "CHK.db",
+            Sidecar::Uk => "UK.db",
+            Sidecar::Def => "DEF.db",
+            Sidecar::Idx => "IDX.db",
+            Sidecar::Typ => "TYP.db",
+            Sidecar::Gen => "GEN.db",
+            Sidecar::Json => "JSON.db",
+            Sidecar::Pix => "PIX.db",
+        }
+    }
+
+    fn stride(self) -> u64 {
+        match self {
+            Sidecar::Fk => crate::core::rql::foreign_key::FOREIGN_KEY_SIZE,
+            Sidecar::Chk => crate::core::rql::check::CHECK_SIZE,
+            Sidecar::Uk => crate::core::rql::unique_key::UNIQUE_KEY_SIZE,
+            Sidecar::Def => crate::core::rql::column_default::COLUMN_DEFAULT_SIZE,
+            Sidecar::Idx => crate::core::index::decl::DECL_SIZE,
+            Sidecar::Typ => crate::core::rql::type_modifier::TYPE_MODIFIER_SIZE,
+            Sidecar::Gen => crate::core::rql::generated::GENERATED_SIZE,
+            Sidecar::Json => crate::core::rql::json_map::JSON_COLUMN_SIZE,
+            Sidecar::Pix => crate::core::rql::path_index::PATH_INDEX_SIZE,
+        }
+    }
+
+    /// The name record `i` is loaded under.
+    fn name(self, i: usize) -> String {
+        match self {
+            Sidecar::Def | Sidecar::Typ | Sidecar::Gen | Sidecar::Json => format!("c{i}"),
+            _ => format!("{}{i}", self.suffix().trim_end_matches(".db").to_ascii_lowercase()),
+        }
+    }
+
+    async fn append<S: crate::core::storage_providers::traits::StorageIO>(self, io: &Arc<S>, i: usize) -> io::Result<()> {
+        use crate::core::rql::*;
+        let io = io.clone();
+        let name = self.name(i);
+        match self {
+            Sidecar::Fk => {
+                let fk = foreign_key::ForeignKey {
+                    name,
+                    column: "v".into(),
+                    parent_table: format!("parent_{i}"),
+                    parent_column: "id".into(),
+                    on_delete: foreign_key::ReferentialAction::Cascade,
+                    on_update: foreign_key::ReferentialAction::SetNull,
+                    is_deleted: false,
+                };
+                foreign_key::append(io, &fk).await
+            }
+            Sidecar::Chk => {
+                check::append(io, &check::CheckConstraint { name, expression: format!("v > {i}"), is_deleted: false }).await
+            }
+            Sidecar::Uk => {
+                let key = unique_key::UniqueKey {
+                    name,
+                    columns: vec!["v".into(), "id".into()],
+                    is_deleted: false,
+                    predicate: None,
+                    compiled: Default::default(),
+                };
+                unique_key::append(io, &key).await
+            }
+            Sidecar::Def => {
+                column_default::append(io, &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false })
+                    .await
+            }
+            Sidecar::Idx => {
+                let decl = crate::core::index::decl::IndexDecl {
+                    name,
+                    method: crate::core::index::decl::Method::BTree,
+                    unique: false,
+                    columns: vec![1],
+                    is_deleted: false,
+                };
+                crate::core::index::decl::append(io, &decl).await
+            }
+            Sidecar::Typ => {
+                type_modifier::append(io, &type_modifier::TypeModifier { column: name, precision: 12, scale: 3, is_deleted: false })
+                    .await
+            }
+            Sidecar::Gen => {
+                generated::append(io, &generated::GeneratedColumn { column: name, expression: format!("v + {i}"), is_deleted: false })
+                    .await
+            }
+            Sidecar::Json => {
+                json_map::append(io, &json_map::JsonColumn { column: name, shadow_table: format!("shadow_{i}"), is_deleted: false })
+                    .await
+            }
+            Sidecar::Pix => {
+                path_index::append(io, &path_index::PathIndex { name, path: format!("a{i}"), is_deleted: false }).await
+            }
+        }
+    }
+
+    /// What the loader reads, each record as its name and the field that
+    /// carries the rest of it (a torn record reads with a name and a cut or
+    /// missing remainder).
+    async fn load<S: crate::core::storage_providers::traits::StorageIO>(self, io: &Arc<S>) -> Vec<(String, String)> {
+        use crate::core::rql::*;
+        let io = io.clone();
+        match self {
+            Sidecar::Fk => foreign_key::load(io)
+                .await
+                .into_iter()
+                .map(|f| (f.name, format!("{} {} {} {:?} {:?}", f.column, f.parent_table, f.parent_column, f.on_delete, f.on_update)))
+                .collect(),
+            Sidecar::Chk => check::load(io).await.into_iter().map(|c| (c.name, c.expression)).collect(),
+            Sidecar::Uk => unique_key::load(io).await.into_iter().map(|k| (k.name, k.columns.join(","))).collect(),
+            Sidecar::Def => column_default::load(io).await.into_iter().map(|d| (d.column, d.expression)).collect(),
+            Sidecar::Idx => crate::core::index::decl::load(io)
+                .await
+                .into_iter()
+                .map(|d| (d.name, format!("{:?} {:?}", d.method, d.columns)))
+                .collect(),
+            Sidecar::Typ => {
+                type_modifier::load(io).await.into_iter().map(|t| (t.column, format!("{} {}", t.precision, t.scale))).collect()
+            }
+            Sidecar::Gen => generated::load(io).await.into_iter().map(|g| (g.column, g.expression)).collect(),
+            Sidecar::Json => json_map::load(io).await.into_iter().map(|j| (j.column, j.shadow_table)).collect(),
+            Sidecar::Pix => path_index::load(io).await.into_iter().map(|p| (p.name, p.path)).collect(),
+        }
+    }
+
+    /// What the loader reads after records `0..n`.
+    async fn expected(self, n: usize) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new(path_str(dir.path()).as_str(), Some("e_schema.db")).await);
+        for i in 0..n {
+            self.append(&io, i).await.unwrap();
+        }
+        self.load(&io).await
+    }
+}
+
+/// A record of zeros in a schema sidecar (what a build before
+/// `append_records` could leave: a logged append whose length a power cut
+/// kept and whose page it dropped) is skipped by every loader, and the
+/// records around it still read.
+///
+/// Mutation: any one loader's `is_unwritten` check removed; that loader
+/// reads a declaration with no name (or no column), and the count is off.
+#[tokio::test]
+async fn a_schema_record_of_zeros_reads_as_no_declaration() {
+    for kind in Sidecar::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new(path_str(dir.path()).as_str(), Some("z_schema.db")).await);
+        let sidecar = || {
+            crate::core::storage_providers::traits::StorageIO::create_new(&*io, format!("z_schema_{}", kind.suffix()))
+        };
+        kind.append(&io, 0).await.unwrap();
+        crate::core::storage_providers::traits::StorageIO::append_data(&sidecar().await, &vec![0u8; kind.stride() as usize], true).await;
+        kind.append(&io, 1).await.unwrap();
+        assert_eq!(
+            crate::core::storage_providers::traits::StorageIO::get_len(&sidecar().await).await,
+            3 * kind.stride(),
+            "{kind:?}: the zero record is not in the file"
+        );
+        let got = kind.load(&io).await;
+        assert_eq!(got, kind.expected(2).await, "{kind:?}: a record of zeros read as a declaration");
+    }
+}
+
+/// Each schema sidecar's records, appended through its `append` with the
+/// recorder running, cut after each of the last ones (past the file's
+/// first page boundary, so one record straddles two pages): every image
+/// under every seed kind reads exactly the records appended so far, whole.
+/// None lost once its `append` returned, none torn, none of zeros.
+///
+/// Mutation: `append_records` back to a logged append (`append_data(..,
+/// true)`). The bytes reach the file before the log's sync, which the
+/// statement used to take later: an image that drops the log loses records
+/// `append` reported, and one that keeps the length and drops a page reads
+/// a record of zeros (skipped) or a page's half of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_record_reads_whole_after_a_cut_once_appended() {
+    use crate::core::power_loss::image::Recorder;
+    let seeds: u64 = std::env::var("RDB_POWER_LOSS_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, 64);
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    {
+        let db = open(&dir).await.unwrap();
+        exec(&db, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await.unwrap();
+        db.sync_durable().unwrap();
+        close(&dir, db);
+    }
+    let db = open(&dir).await.unwrap();
+    let io = db.table_held("t").unwrap().io_schema.clone();
+    let rec = Recorder::start(&dir);
+    let mut points = Vec::new();
+    let mut disturbed = 0;
+    for kind in Sidecar::ALL {
+        // Two records past the first page boundary.
+        let records = (4096 / kind.stride() + 2) as usize;
+        for i in 0..records {
+            kind.append(&io, i).await.unwrap_or_else(|e| panic!("{kind:?} #{i}: {e}"));
+            if i + 3 >= records {
+                match rec.cut_quiescent(format!("{kind:?} after record {i}")) {
+                    Ok(point) => points.push((kind, i + 1, point)),
+                    Err(why) => {
+                        eprintln!("{why}");
+                        disturbed += 1;
+                    }
+                }
+            }
+        }
+    }
+    drop(io);
+    close(&dir, db);
+    drop(rec);
+    assert!(disturbed * 4 <= points.len(), "too many cuts were disturbed: {disturbed} of {}", points.len() + disturbed);
+    eprintln!("{} cuts, {disturbed} disturbed, {seeds} seeds each", points.len());
+
+    let img = base.path().join("image");
+    let mut problems = Vec::new();
+    for (kind, n, point) in &points {
+        let want = kind.expected(*n).await;
+        for seed in 0..seeds {
+            point.write_image(seed, &img);
+            match open(&img).await {
+                Err(e) => problems.push(format!("{}: seed {seed}: does not open: {e}", point.label)),
+                Ok(db) => {
+                    let io = db.table_held("t").unwrap().io_schema.clone();
+                    let got = kind.load(&io).await;
+                    if got != want {
+                        problems.push(format!("{} seed {seed}: read {got:?}\n  appended {want:?}", point.label));
+                    }
+                    drop(io);
+                    close(&img, db);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+}

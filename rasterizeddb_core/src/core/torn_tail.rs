@@ -29,6 +29,32 @@
 //! wrote a record beyond it: the slot would hold the fragment over zeros, not
 //! the zeros a never-committed append leaves.
 //!
+//! # A whole record that never committed: the schema sidecars
+//!
+//! The cut above removes a fragment. It cannot remove a *whole* record that
+//! never committed, and the row files' append path leaves those: it writes
+//! the data file first and logs the bytes after, so a power cut before the
+//! log's sync can keep the file's new length while dropping its page. The
+//! record then reads back as zeros, or, where it straddles a page, as one
+//! page's half of the new record and zeros for the rest. A pointer file
+//! shrugs that off (no pointer record of zeros names a row), but a schema
+//! sidecar's loader takes every whole record as a declaration: an all-zero
+//! foreign key record read as a key named `""` referencing table `""`,
+//! after an `ADD CONSTRAINT` cut before its log sync (the P4 crash test,
+//! under disk index residency, whose extra files moved the image's draws onto
+//! the one length that keeps the record whole).
+//!
+//! So the `_schema_*` sidecars below are never appended that way.
+//! [`append_records`] is their one writer: the bytes go to the log first and
+//! reach the file only once the record describing them is durable (an
+//! in-place write at the file's end, which the log holds back until its
+//! commit has synced). A cut before that sync leaves the file as it was; a
+//! cut after it leaves whatever of the apply reached the disk, which the
+//! replay writes over whole (a fragment past the last whole record cut here
+//! first, as above). And because files written before that may still hold such a
+//! record, each sidecar's loader skips a record of zeros ([`is_unwritten`]),
+//! which no declaration ever encodes to.
+//!
 //! # The durable floor
 //!
 //! A cut removes less than one record, and under whole-record appends that is
@@ -203,6 +229,42 @@ fn partition_pointers(dir: &Path, name: &str) -> bool {
 pub fn classify_path(path: &Path) -> Option<FixedRecordFile> {
     let name = path.file_name()?.to_str()?;
     classify(path.parent().unwrap_or(Path::new("")), name)
+}
+
+/// Appends `bytes`, one or more whole records, to the schema sidecar `io`
+/// writes, write-ahead, and returns once they are durable (see the module
+/// documentation, "A whole record that never committed").
+///
+/// An in-place write at the file's length rather than an append: a logged
+/// append writes the file before its record is durable, and a power cut
+/// between the two leaves a whole record of zeros, or of two writes' halves,
+/// that every load reads as a declaration. An in-place write is held back
+/// until its commit has synced the log, so the file never holds bytes the
+/// log cannot account for. Without a log (a memory-backed table, a directory
+/// with none) it is written and synced at once, as the append was. The cost
+/// is the log sync each record's commit takes, which the append put off to
+/// the statement's: schema changes only.
+///
+/// The caller holds what serialises the file's writers (the DDL's ACCESS
+/// EXCLUSIVE, or a table no statement can reach yet), so the length read
+/// here is where the bytes land.
+pub async fn append_records<S: crate::core::storage_providers::traits::StorageIO>(
+    io: &S,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let at = io.get_len().await;
+    let txn = io.begin_txn();
+    let token = io.write_data_txn(txn, at, bytes).await;
+    io.commit_durable(token).await
+}
+
+/// Whether `record` is a schema sidecar record of zeros: never written by a
+/// declaration (every one names something), so the remains of an append a
+/// power cut kept the length of and dropped the page of, by a build before
+/// [`append_records`]. Its loader skips it rather than reading a constraint
+/// with no name, no column and no target.
+pub fn is_unwritten(record: &[u8]) -> bool {
+    record.iter().all(|&b| b == 0)
 }
 
 /// What [`truncate_to_whole_records`] did.

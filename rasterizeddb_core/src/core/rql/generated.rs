@@ -125,6 +125,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<GeneratedColumn> {
         {
             break;
         }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
+        }
         match GeneratedColumn::from_vec(&buffer) {
             // The newest record for a column wins, so a redefinition is an
             // append rather than a rewrite.
@@ -153,8 +158,8 @@ pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &GeneratedColumn) ->
         ));
     }
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&entry.into_vec(), true).await;
-    Ok(())
+    // Write-ahead, never a logged append (`torn_tail::append_records`).
+    crate::core::torn_tail::append_records(&io, &entry.into_vec()).await
 }
 
 /// The generation expression declared for `column`, if any.

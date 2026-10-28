@@ -231,6 +231,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<ForeignKey> {
         {
             break;
         }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
+        }
         match ForeignKey::from_vec(&buffer) {
             // A tombstoned record is kept on disk so the file keeps its stride.
             Ok(fk) if !fk.is_deleted => out.push(fk),
@@ -245,8 +250,8 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<ForeignKey> {
 /// Appends a foreign key.
 pub async fn append<S: StorageIO>(schema_io: Arc<S>, fk: &ForeignKey) -> io::Result<()> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&fk.into_vec(), true).await;
-    Ok(())
+    // Write-ahead, never a logged append (`torn_tail::append_records`).
+    crate::core::torn_tail::append_records(&io, &fk.into_vec()).await
 }
 
 /// Marks a foreign key deleted, by constraint name.

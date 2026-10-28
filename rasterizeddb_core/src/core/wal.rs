@@ -999,9 +999,14 @@ impl Wal {
 
     /// Logs an in-place overwrite, holding the data-file write until commit.
     ///
-    /// This is the "write-ahead" in write-ahead log, and it only matters for
-    /// overwrites. An append that is cut short leaves harmless garbage past the
-    /// old end of file, which replay overwrites. An *overwrite* that is cut
+    /// This is the "write-ahead" in write-ahead log, and it matters for
+    /// overwrites. An append that is cut short leaves garbage past the old end
+    /// of file, which replay overwrites when the append committed and nothing
+    /// removes when it did not: harmless only in a file whose readers find
+    /// records through something the log does account for (row bytes through
+    /// pointers). The schema sidecars are read record by record, so they are
+    /// appended through here, in place at their end
+    /// ([`crate::core::torn_tail::append_records`]). An *overwrite* that is cut
     /// short has already destroyed the previous bytes, and a redo-only log has
     /// no undo record to put them back — so the data file must not be touched
     /// until the record describing the new bytes is durable.

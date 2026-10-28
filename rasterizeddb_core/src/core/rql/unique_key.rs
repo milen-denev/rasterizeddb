@@ -575,6 +575,15 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<UniqueKey> {
         // so one left behind by a dropped key cannot attach itself to a later
         // key of the same name.
         let pending = awaiting.take();
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration: a partial
+        // key whose predicate record it stands in for has none.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            if let Some(orphan) = pending {
+                unpaired(&orphan);
+            }
+            continue;
+        }
         match decode(&buffer) {
             Ok(Record::Predicate { name, text }) => match pending {
                 Some(mut key) if key.name.eq_ignore_ascii_case(&name) && !text.trim().is_empty() => {
@@ -643,8 +652,8 @@ pub async fn append<S: StorageIO>(schema_io: Arc<S>, key: &UniqueKey) -> io::Res
     if let Some(predicate) = key.predicate_record() {
         bytes.extend_from_slice(&predicate);
     }
-    io.append_data(&bytes, true).await;
-    Ok(())
+    // Write-ahead, never a logged append (`torn_tail::append_records`).
+    crate::core::torn_tail::append_records(&io, &bytes).await
 }
 
 /// Marks a unique constraint deleted, by constraint name.

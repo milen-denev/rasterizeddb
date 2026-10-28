@@ -391,6 +391,11 @@ pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
         {
             break;
         }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
+        }
         match JsonColumn::from_vec(&buffer) {
             Ok(entry) => {
                 out.retain(|e| !e.column.eq_ignore_ascii_case(&entry.column));
@@ -411,8 +416,8 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     entry: &JsonColumn,
 ) -> std::io::Result<()> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&entry.into_vec(), true).await;
-    Ok(())
+    // Write-ahead, never a logged append (`torn_tail::append_records`).
+    crate::core::torn_tail::append_records(&io, &entry.into_vec()).await
 }
 
 /// The table backing `column`, if it is a JSON column.

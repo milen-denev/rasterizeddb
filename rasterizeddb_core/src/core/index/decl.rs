@@ -172,6 +172,11 @@ pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(schema_i
         if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
             break;
         }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
+        }
         match IndexDecl::from_vec(&buffer) {
             Ok(decl) => {
                 // Last record for a name wins, so a drop and a re-create leave
@@ -193,8 +198,8 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     decl: &IndexDecl,
 ) -> std::io::Result<()> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&decl.into_vec(), true).await;
-    Ok(())
+    // Write-ahead, never a logged append (`torn_tail::append_records`).
+    crate::core::torn_tail::append_records(&io, &decl.into_vec()).await
 }
 
 #[cfg(test)]
