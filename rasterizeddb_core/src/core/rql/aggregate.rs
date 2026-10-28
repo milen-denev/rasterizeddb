@@ -1750,8 +1750,7 @@ impl<'p> Folder<'p> {
             &self.computed_at,
             self.n_items,
             run,
-        );
-        Ok(())
+        )
     }
 
     /// Adds every group of `other` — a folder over a disjoint part of the same
@@ -2069,11 +2068,11 @@ fn accumulate_row(
     computed_at: &[usize],
     n_items: usize,
     run: &mut [Acc],
-) {
+) -> Result<(), String> {
     for (i, item) in plan.items.iter().enumerate() {
         match item {
             SelectItem::Aggregate { .. } => {
-                accumulate_aggregate(item, item_slots[i], row, positions, &mut run[i]);
+                accumulate_aggregate(item, item_slots[i], row, positions, &mut run[i])?;
             }
             SelectItem::Computed { inputs, .. } => {
                 for (j, input) in inputs.iter().enumerate() {
@@ -2100,10 +2099,11 @@ fn accumulate_row(
         for (j, item) in h.aggregates.iter().enumerate() {
             let slot = having_slots.get(j).copied().flatten();
             if let Some(acc) = run.get_mut(n_items + j) {
-                accumulate_aggregate(item, slot, row, positions, acc);
+                accumulate_aggregate(item, slot, row, positions, acc)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Folds one row into one aggregate's accumulator. `slot` is where the
@@ -2114,7 +2114,7 @@ fn accumulate_aggregate(
     row: &Row,
     positions: &ColumnPositions,
     acc: &mut Acc,
-) {
+) -> Result<(), String> {
     let SelectItem::Aggregate {
         arg,
         filter,
@@ -2122,20 +2122,20 @@ fn accumulate_aggregate(
         ..
     } = item
     else {
-        return;
+        return Ok(());
     };
     // A row the filter rejects is not counted by *this*
     // aggregate, while still counting for every other item of
-    // the same statement.
+    // the same statement. A filter that fails to evaluate fails the
+    // statement, as in PostgreSQL; it was read as "rejected".
     if let Some(filter) = filter {
         let keep = crate::core::rql::expr::eval_cond(
             &filter.condition,
             row,
             &filter.schema,
-        )
-        .unwrap_or(false);
+        )?;
         if !keep {
-            return;
+            return Ok(());
         }
     }
     let computed;
@@ -2144,38 +2144,26 @@ fn accumulate_aggregate(
         // absent value, which is what makes `SUM` skip it
         // rather than adding a zero.
         (Some(f), Some(argument)) => {
-            computed =
-                crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)
-                    .map_err(|e| {
-                        // Never swallowed into a NULL. A failed
-                        // evaluation that becomes "no value" makes SUM
-                        // report 0 and AVG report nothing — a number
-                        // that looks like an answer. Reported here so
-                        // the cause is visible even though the fold has
-                        // no way to fail the statement.
-                        log::error!("aggregate argument failed to evaluate: {}", e);
-                        e
-                    })
-                    .ok()
-                    // Coerced to the type this argument was *declared*
-                    // as, which is what the accumulator reads the bytes
-                    // by. `column_order + 1` evaluates to four bytes
-                    // while its static type is eight, and accumulating
-                    // the narrow value under the wide type summed to
-                    // **zero** — a wrong number, not an error.
-                    .and_then(|value| {
-                        if value.db_type() == Some(&f.db_type) {
-                            Some(value)
-                        } else {
-                            crate::core::rql::expr::cast(value, &f.db_type).ok()
-                        }
-                    })
-                    .and_then(|value| match value {
-                        crate::core::rql::expr::Value::Data { bytes, .. } => {
-                            Some(bytes)
-                        }
-                        crate::core::rql::expr::Value::Null => None,
-                    });
+            // A failed evaluation fails the statement, as PostgreSQL's
+            // does. It was logged and folded as "no value": the row
+            // dropped out of the aggregate, so `sum(1/(b-7))` answered
+            // the other rows' sum and `count(…)` one fewer — a number
+            // that looks like an answer.
+            let value = crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)?;
+            // Coerced to the type this argument was *declared* as, which
+            // is what the accumulator reads the bytes by. `column_order +
+            // 1` evaluates to four bytes while its static type is eight,
+            // and accumulating the narrow value under the wide type summed
+            // to **zero** — a wrong number, not an error.
+            let value = if value.is_null() || value.db_type() == Some(&f.db_type) {
+                value
+            } else {
+                crate::core::rql::expr::cast(value, &f.db_type)?
+            };
+            computed = match value {
+                crate::core::rql::expr::Value::Data { bytes, .. } => Some(bytes),
+                crate::core::rql::expr::Value::Null => None,
+            };
             (computed.as_deref(), Some(&f.db_type))
         }
         // `bytes` is `None` for a NULL or an absent column, and `ty`
@@ -2189,6 +2177,7 @@ fn accumulate_aggregate(
         _ => (None, None),
     };
     acc.accumulate(bytes, ty);
+    Ok(())
 }
 
 /// One aggregate's output cell: its bytes and type, or an empty cell typed
@@ -2741,7 +2730,7 @@ mod fold_previous {
         for (i, item) in plan.items.iter().enumerate() {
             match item {
                 SelectItem::Aggregate { .. } => {
-                    accumulate_aggregate(item, item_slots[i], row, positions, &mut entry.1[i]);
+                    let _ = accumulate_aggregate(item, item_slots[i], row, positions, &mut entry.1[i]);
                 }
                 SelectItem::Computed { inputs, .. } => {
                     for (j, input) in inputs.iter().enumerate() {
@@ -2768,7 +2757,7 @@ mod fold_previous {
             for (j, item) in h.aggregates.iter().enumerate() {
                 let slot = having_slots.get(j).copied().flatten();
                 if let Some(acc) = entry.2.get_mut(j) {
-                    accumulate_aggregate(item, slot, row, positions, acc);
+                    let _ = accumulate_aggregate(item, slot, row, positions, acc);
                 }
             }
         }
@@ -3922,8 +3911,7 @@ mod fold_reference {
                                 &filter.condition,
                                 row,
                                 &filter.schema,
-                            )
-                            .unwrap_or(false);
+                            )?;
                             if !keep {
                                 continue;
                             }
@@ -3934,19 +3922,10 @@ mod fold_reference {
                             // absent value, which is what makes `SUM` skip it
                             // rather than adding a zero.
                             (Some(f), Some(argument)) => {
+                                // A failed evaluation fails the statement, as
+                                // the fold's does.
                                 computed =
-                                    crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)
-                                        .map_err(|e| {
-                                            // Never swallowed into a NULL. A failed
-                                            // evaluation that becomes "no value" makes SUM
-                                            // report 0 and AVG report nothing — a number
-                                            // that looks like an answer. Reported here so
-                                            // the cause is visible even though the fold has
-                                            // no way to fail the statement.
-                                            log::error!("aggregate argument failed to evaluate: {}", e);
-                                            e
-                                        })
-                                        .ok()
+                                    Some(crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)?)
                                         // Coerced to the type this argument was *declared*
                                         // as, which is what the accumulator reads the bytes
                                         // by. `column_order + 1` evaluates to four bytes
