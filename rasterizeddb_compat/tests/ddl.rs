@@ -1212,10 +1212,14 @@ async fn table_storage_options_are_accepted_without_acting() {
         "ALTER TABLE c SET COMPRESSION lz4",
         "ALTER TABLE c SET (autovacuum_enabled = false)",
         "ALTER TABLE c RESET (autovacuum_enabled)",
-        "ALTER TABLE c VALIDATE CONSTRAINT some_fk",
     ] {
         run(&pool, stmt).await.unwrap_or_else(|e| panic!("{}: {}", stmt, e));
     }
+    // VALIDATE CONSTRAINT acts since foreign keys can be added NOT VALID: a
+    // name no constraint has is PostgreSQL's 42704, never a silent success
+    // that leaves a NOT VALID key's orphans unflagged.
+    let err = run(&pool, "ALTER TABLE c VALIDATE CONSTRAINT some_fk").await.expect_err("no such constraint");
+    assert!(err.contains("constraint \"some_fk\" of relation \"c\" does not exist"), "{}", err);
 
     // And the ALTER COLUMN form that *does* act still acts — the no-op arm must
     // not have swallowed it.

@@ -520,26 +520,92 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
 }
 
 /// Whether a referencing column of type `child` can reference a column of
-/// type `parent`, by PostgreSQL's rule as far as this engine's types carry it
-/// (a key needs an equality between the two in the referenced key's
-/// operator family): integers of any width with each other, the two float
-/// widths with each other, text with text (`TEXT`, `VARCHAR`, `CHAR`),
-/// `NUMERIC` with `NUMERIC`; any other type only with itself. Across those
-/// families PostgreSQL refuses the key (42804), and here a check would
-/// compare a literal of one type with a column of another.
+/// type `parent`, by PostgreSQL's rule (`ATAddForeignKeyConstraint`) as far
+/// as this engine's types carry it: the pair has an equality operator in the
+/// referenced key's operator family, or the child's type casts **implicitly**
+/// to the parent's.
+///
+/// - one operator family, any direction: the integer widths; `REAL` and
+///   `DOUBLE PRECISION`; `DATE` and `TIMESTAMP`; the text types (`TEXT`,
+///   `VARCHAR`, `CHAR`);
+/// - an implicit cast, child to parent only: an integer to `NUMERIC`, `REAL`
+///   or `DOUBLE`; a `NUMERIC` to `REAL` or `DOUBLE`;
+/// - any other type with itself only (`UUID`, `BOOL`, `JSONB`, `BYTEA`, …).
+///
+/// PostgreSQL refuses the reverse casts (a `NUMERIC` or `DOUBLE` child of an
+/// integer key, a `DOUBLE` child of a `NUMERIC` key): no implicit cast runs
+/// that way. Everything it accepts is accepted here (P4 round 3: the first
+/// rule refused `INT` onto `NUMERIC`, which an import of a PostgreSQL schema
+/// may hold).
 pub fn compatible_key_types(child: &crate::core::db_type::DbType, parent: &crate::core::db_type::DbType) -> bool {
     use crate::core::db_type::DbType::*;
+    #[derive(PartialEq)]
+    enum F {
+        Int,
+        Float,
+        Numeric,
+        Text,
+        Time,
+        Other,
+    }
     let family = |t: &crate::core::db_type::DbType| match t {
-        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => 1,
-        F32 | F64 => 2,
-        STRING | CHAR => 3,
-        DECIMAL => 4,
-        _ => 0,
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => F::Int,
+        F32 | F64 => F::Float,
+        DECIMAL => F::Numeric,
+        STRING | CHAR => F::Text,
+        DATE | DATETIME => F::Time,
+        _ => F::Other,
     };
     match (family(child), family(parent)) {
-        (0, 0) => child == parent,
-        (a, b) => a == b,
+        (F::Other, F::Other) => child == parent,
+        (F::Int, F::Numeric) | (F::Int, F::Float) | (F::Numeric, F::Float) => true,
+        (a, b) => a == b && a != F::Other,
     }
+}
+
+/// `text`, a key literal as `key_literal` renders one of type `ty`, in a form
+/// two types' renderings of one value share (P4 round 3): a number with no
+/// sign on zero, no leading or trailing zeros (`7`, `7.00` and `7.0` alike;
+/// a float's shortest rendering, `0.1`), a date or timestamp as its
+/// microseconds (a date at its midnight), text as written. Two values are
+/// equal when their forms are; a coercion that changes the form lost the
+/// value (`7.5` to an integer, a non-midnight timestamp to a date).
+pub fn canonical_key_text(text: &str, ty: &crate::core::db_type::DbType) -> String {
+    use crate::core::db_type::DbType::*;
+    let bare = crate::core::rql::column_default::strip_redundant_cast(text.trim());
+    let bare = bare.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).map(|t| t.replace("''", "'")).unwrap_or_else(|| bare.to_string());
+    match ty {
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 | F32 | F64 | DECIMAL => canonical_number(&bare),
+        DATE | DATETIME => match crate::core::value_codec::parse_timestamp_us(&bare) {
+            Some(us) => format!("us:{us}"),
+            None => bare,
+        },
+        CHAR => bare.trim_end().to_string(),
+        _ => bare,
+    }
+}
+
+/// A decimal number's canonical text; anything that is not a plain decimal
+/// (an exponent, `NaN`, `Infinity`) is returned as written, so it is equal
+/// only to itself.
+fn canonical_number(text: &str) -> String {
+    let t = text.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return t.to_string();
+    }
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let body = if frac.is_empty() { int.to_string() } else { format!("{int}.{frac}") };
+    if negative && body != "0" { format!("-{body}") } else { body }
 }
 
 /// PostgreSQL's refusal (42804) of `fk` when its column's type `child` cannot
@@ -705,6 +771,38 @@ mod tests {
         raw[387..389].copy_from_slice(b"id");
         let fk = ForeignKey::from_vec(&raw).unwrap();
         assert_eq!((fk.name.as_str(), fk.column.as_str(), fk.parent_table.as_str()), ("myfk", "a", "p"));
+    }
+
+    /// PostgreSQL's pairs (P4 round 3): what has an operator or an implicit
+    /// cast child to parent is accepted, the reverse casts are not.
+    #[test]
+    fn key_types_pair_as_postgres_pairs_them() {
+        use crate::core::db_type::DbType::*;
+        for (child, parent) in [
+            (I32, I64), (I64, I16), (I32, DECIMAL), (I64, F64), (I16, F32), (DECIMAL, F64), (DECIMAL, DECIMAL),
+            (F64, F32), (F32, F64), (DATE, DATETIME), (DATETIME, DATE), (STRING, CHAR), (UUID, UUID), (BOOL, BOOL),
+        ] {
+            assert!(compatible_key_types(&child, &parent), "{child:?} -> {parent:?}");
+        }
+        for (child, parent) in [
+            (DECIMAL, I32), (F64, I64), (F64, DECIMAL), (STRING, I32), (UUID, STRING), (BOOL, I32), (DATE, STRING),
+            (JSONB, STRING), (BYTEA, STRING),
+        ] {
+            assert!(!compatible_key_types(&child, &parent), "{child:?} -> {parent:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_forms_meet_across_types() {
+        use crate::core::db_type::DbType::*;
+        assert_eq!(canonical_key_text("7", &I32), canonical_key_text("7.00", &DECIMAL));
+        assert_eq!(canonical_key_text("-3", &I64), canonical_key_text("-3.0", &DECIMAL));
+        assert_ne!(canonical_key_text("7", &I32), canonical_key_text("7.50", &DECIMAL));
+        assert_eq!(canonical_key_text("-0.00", &DECIMAL), "0");
+        assert_eq!(canonical_key_text("'it''s'", &STRING), "it's");
+        assert_eq!(canonical_key_text("'2024-01-01'", &DATE), canonical_key_text("'2024-01-01 00:00:00'", &DATETIME));
+        assert_ne!(canonical_key_text("'2024-01-01'", &DATE), canonical_key_text("'2024-01-01 10:00:00'", &DATETIME));
+        assert_ne!(canonical_key_text("9007199254740993", &I64), canonical_key_text("9007199254740992", &F64));
     }
 
     /// A table or column name that does not fit is refused, never cut: a cut

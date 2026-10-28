@@ -691,3 +691,213 @@ fn a_key_between_incompatible_types_is_42804() {
         q.ok("DROP TABLE {c}x");
     }
 }
+
+/// Keys between columns of different types that PostgreSQL accepts (P4 round
+/// 3), compared as it compares them, on a plain and a partitioned child and,
+/// where the parent's key type may be a partition key, a partitioned parent:
+/// each child value is moved to the parent column's type before it is
+/// looked for, and each parent value to the child's before its children are,
+/// and a value the move would change finds nothing. So an `INT` 7 finds
+/// `NUMERIC` 7.00 and never 7.50; a `DATE` finds a `TIMESTAMP` midnight and
+/// never 10:00; a `DOUBLE` 0.1 finds no `REAL` 0.1 (its `REAL` is not 0.1),
+/// a `DOUBLE` 0.5 does. Each parent DELETE is blocked by exactly the
+/// children that found it, and a CASCADE removes exactly those.
+#[test]
+fn cross_type_keys_compare_as_postgres_compares_them() {
+    struct Pair {
+        parent: &'static str,
+        child: &'static str,
+        partitionable_parent: bool,
+        parents: &'static [&'static str],
+        /// (child value, finds a parent)
+        children: &'static [(&'static str, bool)],
+        /// (parent value deleted, children that reference it)
+        deletes: &'static [(&'static str, usize)],
+    }
+    let pairs = [
+        Pair {
+            parent: "NUMERIC(10, 2)",
+            child: "INT",
+            partitionable_parent: false,
+            parents: &["7.00", "-3", "7.50", "6.50", "-3.4"],
+            children: &[("7", true), ("-3", true), ("8", false), ("CAST(7 AS INT)", true)],
+            // 7.50, 6.50 and -3.4 are no integer's: deleting them touches
+            // no child, however the child column would read them.
+            deletes: &[("7.50", 0), ("6.50", 0), ("-3.4", 0), ("7.00", 2), ("-3", 1)],
+        },
+        Pair {
+            parent: "DOUBLE PRECISION",
+            child: "BIGINT",
+            partitionable_parent: false,
+            parents: &["2.0", "9007199254740992", "0.5"],
+            // 2^53+1 is not a double: PostgreSQL rounds it to 2^53 and finds
+            // that parent; here it finds none (a noted divergence).
+            children: &[("2", true), ("9007199254740992", true), ("9007199254740993", false), ("1", false)],
+            deletes: &[("0.5", 0), ("2.0", 1), ("9007199254740992", 1)],
+        },
+        Pair {
+            parent: "TIMESTAMP",
+            child: "DATE",
+            partitionable_parent: false,
+            parents: &["'2024-01-01 00:00:00'", "'2024-01-01 10:00:00'", "'2024-01-02 10:00:00'"],
+            children: &[("'2024-01-01'", true), ("'2024-01-02'", false)],
+            // 10:00 is no date's: deleting it leaves the date's child alone.
+            deletes: &[("'2024-01-01 10:00:00'", 0), ("'2024-01-02 10:00:00'", 0), ("'2024-01-01 00:00:00'", 1)],
+        },
+        Pair {
+            parent: "DATE",
+            child: "TIMESTAMP",
+            partitionable_parent: false,
+            parents: &["'2024-01-01'", "'2024-01-03'"],
+            children: &[("'2024-01-01 00:00:00'", true), ("'2024-01-03 10:00:00'", false)],
+            deletes: &[("'2024-01-03'", 0), ("'2024-01-01'", 1)],
+        },
+        Pair {
+            parent: "REAL",
+            child: "DOUBLE PRECISION",
+            partitionable_parent: false,
+            parents: &["0.1", "0.5"],
+            children: &[("0.5", true), ("0.1", false)],
+            deletes: &[("0.1", 0), ("0.5", 1)],
+        },
+        Pair {
+            parent: "BIGINT",
+            child: "SMALLINT",
+            partitionable_parent: true,
+            parents: &["7", "-3", "40000"],
+            children: &[("7", true), ("-3", true), ("8", false)],
+            deletes: &[("40000", 0), ("7", 1), ("-3", 1)],
+        },
+        Pair {
+            parent: "TEXT",
+            child: "VARCHAR(10)",
+            partitionable_parent: true,
+            parents: &["'a'", "'b c'"],
+            children: &[("'a'", true), ("'a '", false), ("'b c'", true)],
+            deletes: &[("'b c'", 1), ("'a'", 1)],
+        },
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (n, pair) in pairs.iter().enumerate() {
+        let parent_kinds: &[bool] = if pair.partitionable_parent { &[false, true] } else { &[false] };
+        for &part_parent in parent_kinds {
+            for part_child in [false, true] {
+                for action in ["RESTRICT", "CASCADE"] {
+                    let label = format!("{} -> {} ({action}, parent {part_parent}, child {part_child})", pair.child, pair.parent);
+                    c.ok(&format!("CREATE TABLE xp{n} (k {} NOT NULL PRIMARY KEY){}", pair.parent, partitioned("k", part_parent)));
+                    c.ok(&format!(
+                        "CREATE TABLE xc{n} (cid BIGINT NOT NULL PRIMARY KEY, k {} REFERENCES xp{n} (k) ON DELETE {action}){}",
+                        pair.child,
+                        partitioned("cid", part_child)
+                    ));
+                    for v in pair.parents {
+                        c.ok(&format!("INSERT INTO xp{n} (k) VALUES ({v})"));
+                    }
+                    for (i, (v, finds)) in pair.children.iter().enumerate() {
+                        let out = c.simple(&format!("INSERT INTO xc{n} (cid, k) VALUES ({i}, {v})"));
+                        match (out, finds) {
+                            (Ok(_), true) => {}
+                            (Err(e), false) => assert_eq!(e.code, "23503", "{label}: {v}: {e}"),
+                            (other, _) => panic!("{label}: {v}: {other:?}"),
+                        }
+                    }
+                    let mut children = pair.children.iter().filter(|(_, f)| *f).count();
+                    for (v, referenced) in pair.deletes {
+                        let out = c.simple(&format!("DELETE FROM xp{n} WHERE k = {v}"));
+                        match (out, action, referenced) {
+                            (Ok(_), _, 0) | (Ok(_), "CASCADE", _) => {}
+                            (Err(e), "RESTRICT", r) if *r > 0 => {
+                                assert_eq!(e.code, "23503", "{label}: deleting {v}: {e}");
+                                continue;
+                            }
+                            (other, _, _) => panic!("{label}: deleting {v}: {other:?}"),
+                        }
+                        if action == "CASCADE" {
+                            children -= referenced;
+                        }
+                        let left = c.ok(&format!("SELECT count(*) FROM xc{n}")).rows;
+                        assert_eq!(left, vec![vec![Some(children.to_string())]], "{label}: after deleting {v}");
+                    }
+                    // Whatever was refused or cascaded, no child lost its parent.
+                    let orphans = c.ok(&format!(
+                        "SELECT count(*) FROM xc{n} WHERE k IS NOT NULL AND k NOT IN (SELECT k FROM xp{n})"
+                    ));
+                    assert_eq!(orphans.rows, vec![vec![Some("0".to_string())]], "{label}: orphans");
+                    c.ok(&format!("DROP TABLE xc{n}"));
+                    c.ok(&format!("DROP TABLE xp{n}"));
+                }
+            }
+        }
+    }
+}
+
+/// `VALIDATE CONSTRAINT` of a name no constraint has is 42704 (P4 round 3),
+/// on every configuration; a CHECK's, a UNIQUE's or the primary key's name
+/// is accepted (checked when it was added).
+#[test]
+fn validating_an_unknown_constraint_is_42704() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Quad::start(dir.path());
+    create_parent(&mut q);
+    create_child(&mut q, "");
+    q.ok("ALTER TABLE {c} ADD CONSTRAINT {c}_v CHECK (v IS NULL OR v > -1000)");
+    q.ok("ALTER TABLE {c} ADD CONSTRAINT {c}_u UNIQUE (cid, v)");
+    q.err("ALTER TABLE {c} VALIDATE CONSTRAINT nope", "42704");
+    q.err("ALTER TABLE {c} VALIDATE CONSTRAINT fk_pid_fkp", "42704");
+    for name in ["{c}_pid", "{c}_v", "{c}_u", "{c}_pkey"] {
+        q.ok(&format!("ALTER TABLE {{c}} VALIDATE CONSTRAINT {name}"));
+    }
+}
+
+/// `ADD FOREIGN KEY` validates rows already there across types as the
+/// insert checks them (P4 round 3): `INT` 7 and -3 have their `NUMERIC`
+/// parents 7.00 and -3, `INT` 8 has none; a `DATE` has a `TIMESTAMP`
+/// midnight parent, not a 10:00 one. On a plain and a partitioned child.
+#[test]
+fn adding_a_cross_type_key_validates_as_the_insert_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    for (n, part) in ["", " PARTITION BY HASH (cid) PARTITIONS 4"].iter().enumerate() {
+        c.ok(&format!("CREATE TABLE vp{n} (k NUMERIC(10, 2) NOT NULL PRIMARY KEY)"));
+        c.ok(&format!("INSERT INTO vp{n} (k) VALUES (7.00), (-3), (7.50)"));
+        c.ok(&format!("CREATE TABLE vc{n} (cid BIGINT NOT NULL PRIMARY KEY, k INT){part}"));
+        c.ok(&format!("INSERT INTO vc{n} (cid, k) VALUES (1, 7), (2, -3), (3, NULL)"));
+        c.ok(&format!("ALTER TABLE vc{n} ADD CONSTRAINT a FOREIGN KEY (k) REFERENCES vp{n} (k)"));
+        c.ok(&format!("ALTER TABLE vc{n} DROP CONSTRAINT a"));
+        c.ok(&format!("INSERT INTO vc{n} (cid, k) VALUES (4, 8)"));
+        let e = c.simple(&format!("ALTER TABLE vc{n} ADD CONSTRAINT a FOREIGN KEY (k) REFERENCES vp{n} (k)")).unwrap_err();
+        assert_eq!(e.code, "23503", "{e}");
+        assert!(e.message.contains("(k)=(8)"), "{e}");
+
+        c.ok(&format!("CREATE TABLE tp{n} (t TIMESTAMP NOT NULL PRIMARY KEY)"));
+        c.ok(&format!("INSERT INTO tp{n} (t) VALUES ('2024-01-01 00:00:00'), ('2024-01-02 10:00:00')"));
+        c.ok(&format!("CREATE TABLE tc{n} (cid BIGINT NOT NULL PRIMARY KEY, d DATE){part}"));
+        c.ok(&format!("INSERT INTO tc{n} (cid, d) VALUES (1, '2024-01-01')"));
+        c.ok(&format!("ALTER TABLE tc{n} ADD CONSTRAINT b FOREIGN KEY (d) REFERENCES tp{n} (t)"));
+        c.ok(&format!("ALTER TABLE tc{n} DROP CONSTRAINT b"));
+        c.ok(&format!("INSERT INTO tc{n} (cid, d) VALUES (2, '2024-01-02')"));
+        let e = c.simple(&format!("ALTER TABLE tc{n} ADD CONSTRAINT b FOREIGN KEY (d) REFERENCES tp{n} (t)")).unwrap_err();
+        assert_eq!(e.code, "23503", "{e}");
+
+        // A TIMESTAMP's DATE parent only at midnight; a DOUBLE's REAL parent
+        // only when the DOUBLE is a REAL exactly.
+        c.ok(&format!("CREATE TABLE dp{n} (d DATE NOT NULL PRIMARY KEY)"));
+        c.ok(&format!("INSERT INTO dp{n} (d) VALUES ('2024-01-03')"));
+        c.ok(&format!("CREATE TABLE dc{n} (cid BIGINT NOT NULL PRIMARY KEY, t TIMESTAMP){part}"));
+        c.ok(&format!("INSERT INTO dc{n} (cid, t) VALUES (1, '2024-01-03 10:00:00')"));
+        let e = c.simple(&format!("ALTER TABLE dc{n} ADD FOREIGN KEY (t) REFERENCES dp{n} (d)")).unwrap_err();
+        assert_eq!(e.code, "23503", "{e}");
+        c.ok(&format!("CREATE TABLE rp{n} (r REAL NOT NULL PRIMARY KEY)"));
+        c.ok(&format!("INSERT INTO rp{n} (r) VALUES (0.1), (0.5)"));
+        c.ok(&format!("CREATE TABLE rc{n} (cid BIGINT NOT NULL PRIMARY KEY, x DOUBLE PRECISION){part}"));
+        c.ok(&format!("INSERT INTO rc{n} (cid, x) VALUES (1, 0.5)"));
+        c.ok(&format!("ALTER TABLE rc{n} ADD CONSTRAINT r FOREIGN KEY (x) REFERENCES rp{n} (r)"));
+        c.ok(&format!("ALTER TABLE rc{n} DROP CONSTRAINT r"));
+        c.ok(&format!("INSERT INTO rc{n} (cid, x) VALUES (2, 0.1)"));
+        let e = c.simple(&format!("ALTER TABLE rc{n} ADD CONSTRAINT r FOREIGN KEY (x) REFERENCES rp{n} (r)")).unwrap_err();
+        assert_eq!(e.code, "23503", "{e}");
+    }
+}

@@ -942,6 +942,129 @@ pub async fn substitute_in_subqueries(
 /// limit is generous next to any real schema, so hitting it means a cycle.
 const MAX_CASCADE_DEPTH: usize = 16;
 
+/// A key value moved from one side of a foreign key to the other's column
+/// type (P4 round 3), as PostgreSQL compares a cross-type key: `literal`,
+/// a value of `from`, read at `from`'s type, written at `to`'s and rendered
+/// as `to`'s literal, which the probe of `to`'s table then compares with its
+/// column at its own type (so an `INT` 7 finds a `NUMERIC(10,2)` 7.00, and a
+/// partitioned parent routes by the bytes the parent row was routed by).
+///
+/// `None` when the move loses the value (`7.50` to an integer, a
+/// non-midnight timestamp to a date, a `DOUBLE` 0.1 to a `REAL`, an `INT8`
+/// past an `INT4`): no value of `to` equals it, as PostgreSQL's comparison
+/// in the wider type finds none. Unchanged when the two columns' types and
+/// scales are one (the common case, no work), and when `literal` does not
+/// read at `from`'s type (the probe then reports it as it always did).
+fn coerce_key_literal(
+    literal: &str,
+    from: &crate::core::row::schema::SchemaField,
+    from_modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+    to: &crate::core::row::schema::SchemaField,
+    to_modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<String> {
+    if from.db_type == to.db_type && from.scale == to.scale {
+        return Some(literal.to_string());
+    }
+    let encode = |text: &str, field: &crate::core::row::schema::SchemaField, mods| {
+        let out = crate::core::rql::lexer_ir::encode_column_value(text, field, mods);
+        // An encoder's refusal is this coercion's only.
+        let _ = crate::core::rql::lexer_ir::take_refusal();
+        out.map(|block| block.into_slice().to_vec()).filter(|bytes| !bytes.is_empty())
+    };
+    let Some(from_bytes) = encode(literal.trim(), from, from_modifiers) else {
+        return Some(literal.to_string());
+    };
+    // REAL and DOUBLE compare as PostgreSQL's cross-type float operators do,
+    // in double precision: a REAL widens exactly, and a DOUBLE has a REAL
+    // equal to it only when it is one exactly (`0.1` is not: its REAL is
+    // 0.100000001490116…). Through text, the shortest renderings (`0.1` both)
+    // would call them equal.
+    use crate::core::db_type::DbType::{F32, F64};
+    match (&from.db_type, &to.db_type, from_bytes.as_slice()) {
+        (F32, F64, b) if b.len() == 4 => {
+            return Some(f64::from(f32::from_le_bytes(b.try_into().ok()?)).to_string());
+        }
+        (F64, F32, b) if b.len() == 8 => {
+            let wide = f64::from_le_bytes(b.try_into().ok()?);
+            let narrow = wide as f32;
+            return (f64::from(narrow) == wide).then(|| narrow.to_string());
+        }
+        _ => {}
+    }
+    let Ok(from_text) = key_literal(from, &from_bytes) else {
+        return Some(literal.to_string());
+    };
+    // The value as the target type's reader takes it: a number in its plain
+    // canonical form (an integer column does not read `7.00`), a date as the
+    // date part of a timestamp (whose time the comparison below then checks).
+    use crate::core::db_type::DbType as T;
+    let input = match &to.db_type {
+        T::I8 | T::I16 | T::I32 | T::I64 | T::I128 | T::U8 | T::U16 | T::U32 | T::U64 | T::U128 | T::F32 | T::F64
+        | T::DECIMAL => crate::core::rql::foreign_key::canonical_key_text(&from_text, &from.db_type),
+        T::DATE => {
+            let bare = from_text.trim().trim_matches('\'');
+            format!("'{}'", bare.split_whitespace().next().unwrap_or(bare))
+        }
+        _ => from_text.clone(),
+    };
+    let to_text = key_literal(to, &encode(&input, to, to_modifiers)?).ok()?;
+    let same = crate::core::rql::foreign_key::canonical_key_text(&from_text, &from.db_type)
+        == crate::core::rql::foreign_key::canonical_key_text(&to_text, &to.db_type);
+    same.then_some(to_text)
+}
+
+/// `fk`'s two columns, the child's in `child` and the parent's (its own
+/// table's for a self-reference), each with its table's type modifiers:
+/// what [`coerce_key_literal`] moves values between. `None` when either is
+/// not there (the probe then reports it).
+#[allow(clippy::type_complexity)]
+fn fk_key_fields(
+    database: &Arc<Database>,
+    child: &crate::core::row::schema::TableSchema,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+) -> Option<(
+    (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
+    (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
+)> {
+    let field = |schema: &crate::core::row::schema::TableSchema, name: &str| {
+        schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .map(|f| (f.clone(), schema.type_modifiers.clone()))
+    };
+    let child_side = field(child, &fk.column)?;
+    let parent_side = if fk.parent_table.eq_ignore_ascii_case(&child.name) {
+        field(child, &fk.parent_column)?
+    } else {
+        let view = database.schema_view(&fk.parent_table)?;
+        field(view.schema(), &fk.parent_column)?
+    };
+    Some((child_side, parent_side))
+}
+
+/// Parent key literals (`parent_column`'s values, as `key_literal` renders
+/// them) at `fk`'s child column's type, index for index: `None` where the
+/// value cannot equal any child value ([`coerce_key_literal`]). The parent
+/// side's probes, actions and checks match children with these.
+fn parent_literals_for_child(
+    database: &Arc<Database>,
+    child_table: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    literals: &[String],
+) -> Vec<Option<String>> {
+    let fields = database
+        .schema_view(child_table)
+        .and_then(|view| fk_key_fields(database, view.schema(), fk));
+    match fields {
+        Some(((child, child_mods), (parent, parent_mods))) => literals
+            .iter()
+            .map(|l| coerce_key_literal(l, &parent, &parent_mods, &child, &child_mods))
+            .collect(),
+        None => literals.iter().cloned().map(Some).collect(),
+    }
+}
+
 /// Checks that every foreign key on `table_name` is satisfied by `assignments`.
 ///
 /// `assignments` maps a column name to the literal being written. A `NULL` is
@@ -1032,6 +1155,19 @@ async fn check_foreign_keys_of(
         // 3. Look again under the lock. A DELETE that committed between 1 and
         //    2 released its lock before this one was granted and left nothing
         //    to wait for — only the second look sees that the parent is gone.
+        //
+        // The value at the parent column's type first (P4 round 3): one that
+        // type cannot hold unchanged equals no parent.
+        let coerced = match schema.and_then(|child| fk_key_fields(database, child, fk)) {
+            Some(((child, child_mods), (parent, parent_mods))) => {
+                coerce_key_literal(literal, &child, &child_mods, &parent, &parent_mods)
+            }
+            None => Some(literal.clone()),
+        };
+        let Some(probe) = coerced else {
+            return Err(violation());
+        };
+        let literal = &probe;
         let found = referenced_values_now(
             database,
             &fk.parent_table,
@@ -1116,10 +1252,11 @@ async fn prevalidate_foreign_keys(
     }
     // On a lock failure nothing is proved: each row's own check meets the
     // same lock and reports it.
-    let foreign_keys = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
-        Ok(Some(t)) => t.schema.foreign_keys.clone(),
+    let child = match database.table_for(table_name, owner(), TableMode::RowExclusive).await {
+        Ok(Some(t)) => t,
         Ok(None) | Err(_) => return verified,
     };
+    let foreign_keys = child.schema.foreign_keys.clone();
     if foreign_keys.is_empty() {
         return verified;
     }
@@ -1147,6 +1284,28 @@ async fn prevalidate_foreign_keys(
             }
             if seen.insert(literal.to_string()) {
                 literals.push(literal.to_string());
+            }
+        }
+        if literals.is_empty() {
+            continue;
+        }
+        // At the parent column's type (P4 round 3), deduplicated again there;
+        // a value that type cannot hold is proved by nothing, and its row's
+        // own check reports it. `raw` keeps what each row's check looks up.
+        let raw = literals;
+        let mut literals: Vec<String> = Vec::new();
+        let mut proved_raw: Vec<String> = Vec::new();
+        let fields = fk_key_fields(database, &child.schema, fk);
+        for literal in &raw {
+            let coerced = match &fields {
+                Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
+                None => Some(literal.clone()),
+            };
+            if let Some(coerced) = coerced {
+                proved_raw.push(literal.clone());
+                if !literals.contains(&coerced) {
+                    literals.push(coerced);
+                }
             }
         }
         if literals.is_empty() {
@@ -1192,7 +1351,7 @@ async fn prevalidate_foreign_keys(
         if still.len() != literals.len() {
             continue;
         }
-        for literal in &literals {
+        for literal in &proved_raw {
             verified.insert(verified_key(&fk.parent_table, &fk.parent_column, literal));
         }
     }
@@ -1744,7 +1903,16 @@ async fn apply_on_delete(
         if referenced.literals.is_empty() {
             continue;
         }
-        let list = referenced.literals.join(", ");
+        // The keys at the child column's type (P4 round 3): a key no child
+        // value can equal (`7.50` for an integer column) references nothing.
+        let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &referenced.literals)
+            .into_iter()
+            .flatten()
+            .collect();
+        if child_literals.is_empty() {
+            continue;
+        }
+        let list = child_literals.join(", ");
         let unchecked =
             |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
         let violation = || {
@@ -1760,7 +1928,7 @@ async fn apply_on_delete(
                 database,
                 &child_table,
                 &fk.column,
-                &referenced.literals,
+                &child_literals,
                 tx,
                 Some(1),
                 KeySide::Child,
@@ -1827,7 +1995,7 @@ async fn apply_on_delete(
             database,
             &child_table,
             &fk.column,
-            &referenced.literals,
+            &child_literals,
             tx,
             Some(1),
             KeySide::Child,
@@ -2333,11 +2501,18 @@ async fn lock_keys_before_update(
         else {
             continue;
         };
+        let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &change.old_literals)
+            .into_iter()
+            .flatten()
+            .collect();
+        if child_literals.is_empty() {
+            continue;
+        }
         let referencing = referenced_values_now(
             database,
             &child_table,
             &fk.column,
-            &change.old_literals,
+            &child_literals,
             tx,
             Some(1),
             KeySide::Child,
@@ -2429,14 +2604,17 @@ async fn apply_on_update(
         .map_err(unchecked)?
         .into_iter()
         .collect();
+        // Each old key at the child column's type (P4 round 3); one no child
+        // value can equal references nothing, and is left out.
+        let old_for_child = parent_literals_for_child(database, &child_table, &fk, &change.old_literals);
         let vanished: Vec<usize> = (0..change.old_stored.len())
-            .filter(|i| !present.contains(&change.old_stored[*i]))
+            .filter(|i| !present.contains(&change.old_stored[*i]) && old_for_child[*i].is_some())
             .collect();
         if vanished.is_empty() {
             continue;
         }
         let vanished_literals: Vec<String> =
-            vanished.iter().map(|i| change.old_literals[*i].clone()).collect();
+            vanished.iter().filter_map(|i| old_for_child[*i].clone()).collect();
 
         let statement = match fk.on_update {
             // Restrict refused before the write.
@@ -2455,7 +2633,7 @@ async fn apply_on_update(
                         case.push_str(&format!(
                             " WHEN {} = {} THEN {}",
                             fk.column,
-                            change.old_literals[*i],
+                            old_for_child[*i].as_deref().unwrap_or("NULL"),
                             new_of(*i)
                         ));
                     }
@@ -8212,27 +8390,46 @@ async fn first_value_without_parent(
     literals: &[String],
     tx: TxId,
 ) -> Result<Option<String>, String> {
-    let mut pending: Vec<&[String]> = literals.chunks(REFERENCED_PROBE_CHUNK).rev().collect();
+    let violation = |value: &str| {
+        format!(
+            "insert or update on table \"{}\" violates foreign key constraint \"{}\": key ({})=({}) is not \
+             present in table \"{}\"",
+            table_name,
+            fk.name,
+            fk.column,
+            value.trim_matches('\''),
+            fk.parent_table
+        )
+    };
+    // Each value at the parent column's type (P4 round 3); one that type
+    // cannot hold unchanged has no parent.
+    let fields = database.schema_view(table_name).and_then(|view| fk_key_fields(database, view.schema(), fk));
+    // (the child's value as it is named, the value probed)
+    let mut probes: Vec<(&String, String)> = Vec::with_capacity(literals.len());
+    for literal in literals {
+        let coerced = match &fields {
+            Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
+            None => Some(literal.clone()),
+        };
+        match coerced {
+            Some(probe) => probes.push((literal, probe)),
+            None => return Ok(Some(violation(literal))),
+        }
+    }
+    let mut pending: Vec<&[(&String, String)]> = probes.chunks(REFERENCED_PROBE_CHUNK).rev().collect();
     while let Some(chunk) = pending.pop() {
         if chunk.is_empty() {
             continue;
         }
+        let values: Vec<String> = chunk.iter().map(|(_, probe)| probe.clone()).collect();
         let found =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, chunk, tx, None, KeySide::Parent)
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &values, tx, None, KeySide::Parent)
                 .await?;
         if found.len() >= chunk.len() {
             continue;
         }
         if chunk.len() == 1 {
-            return Ok(Some(format!(
-                "insert or update on table \"{}\" violates foreign key constraint \"{}\": key ({})=({}) is not \
-                 present in table \"{}\"",
-                table_name,
-                fk.name,
-                fk.column,
-                chunk[0].trim_matches('\''),
-                fk.parent_table
-            )));
+            return Ok(Some(violation(chunk[0].0)));
         }
         let (left, right) = chunk.split_at(chunk.len() / 2);
         pending.push(right);
@@ -10535,14 +10732,22 @@ async fn execute_alter_table_action(
         // A foreign key's rows checked now, as `ADD` would have checked
         // them without `NOT VALID` (23503 for the first orphan, nothing
         // written either way: no record says "not valid", so validating an
-        // already-valid key checks again and passes). Any other constraint
-        // was checked when it was added; a name nothing has is accepted, as
-        // VALIDATE always was here (PostgreSQL: 42704).
+        // already-valid key checks again and passes). A CHECK, UNIQUE or
+        // primary key was checked when it was added: a no-op. A name no
+        // constraint has is 42704, as in PostgreSQL (P4 round 3): reported as
+        // done, a migration validating the wrong name (an older binary's
+        // `fk_<c>_<p>`, a typo) left a NOT VALID key's orphans unflagged.
         AlterAction::ValidateConstraint { name } => {
             let fk = schema.foreign_keys.iter().find(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name)).cloned();
             let Some(fk) = fk else {
-                info!("ALTER TABLE {}: VALIDATE CONSTRAINT {name}: nothing to validate", plan.table_name);
-                return ddl_ok(0);
+                if constraint_name_taken(&schema, &plan.table_name, &name) {
+                    info!("ALTER TABLE {}: VALIDATE CONSTRAINT {name}: checked when it was added", plan.table_name);
+                    return ddl_ok(0);
+                }
+                return ddl_error(&format!(
+                    "constraint \"{}\" of relation \"{}\" does not exist",
+                    name, plan.table_name
+                ));
             };
             return match Box::pin(existing_rows_break_foreign_key(database, &plan.table_name, &fk, tx)).await {
                 Ok(None) => ddl_ok(0),
