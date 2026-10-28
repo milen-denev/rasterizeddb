@@ -104,6 +104,12 @@ impl Quad {
         self.clients[i].simple(&render(template, CONFIGS[i].0))
     }
 
+    /// One table's rows, compared across configurations.
+    #[track_caller]
+    fn same_rows_of(&mut self, table: &str) {
+        self.ok(&format!("SELECT * FROM {table} ORDER BY 1"));
+    }
+
     /// The rows both tables hold, compared across configurations.
     #[track_caller]
     fn same_rows(&mut self) {
@@ -307,6 +313,17 @@ fn add_and_drop_foreign_key_answer_like_the_twin() {
     q.ok("ALTER TABLE {c} DROP CONSTRAINT \"外部 キー\"");
     q.ok("INSERT INTO {c} (cid, pid, v) VALUES (35, 447, 0)");
     q.same_rows();
+    // NOT VALID (P4 round 2): the orphan 447 stays, new writes are checked,
+    // VALIDATE CONSTRAINT finds it in every partition, then passes.
+    q.ok("ALTER TABLE {c} ADD CONSTRAINT nv FOREIGN KEY (pid) REFERENCES {p} (id) NOT VALID");
+    q.err("INSERT INTO {c} (cid, pid, v) VALUES (36, 448, 0)", "23503");
+    q.ok("INSERT INTO {c} (cid, pid, v) VALUES (36, 4, 0)");
+    q.err("ALTER TABLE {c} VALIDATE CONSTRAINT nv", "23503");
+    q.restart();
+    q.err("INSERT INTO {c} (cid, pid, v) VALUES (37, 449, 0)", "23503");
+    q.ok("DELETE FROM {c} WHERE pid = 447");
+    q.ok("ALTER TABLE {c} VALIDATE CONSTRAINT nv");
+    q.same_rows();
 }
 
 /// A partitioned parent is referenced by its whole partition key only: any
@@ -502,4 +519,105 @@ fn a_child_insert_racing_a_parent_delete_leaves_no_orphan() {
         let kept = a.ok(&render("SELECT cid, pid FROM {c} ORDER BY cid", suffix));
         assert_eq!(kept.rows, vec![vec![Some("1".to_string()), Some("7".to_string())]], "{suffix}");
     }
+}
+
+/// The value forms an ORM writes into a key column (P4 round 2): a
+/// negative id, alone, cast (`-7::bigint`, `CAST(-6 AS BIGINT)`) or quoted;
+/// a text key cast (`'x'::text`, `CAST('a' AS TEXT)`) or holding a quote; a
+/// UUID in upper case, cast, or without hyphens; a NUMERIC child column
+/// referencing a BIGINT key; and each through a prepared statement. The
+/// router reads no key point in a signed number, so a partitioned parent's
+/// check routes such a value by the bytes an INSERT of it stores; each
+/// answer must be the plain twin's.
+#[test]
+fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Quad::start(dir.path());
+    let uuid = "6f1c0b2e-8a4d-4c3b-9e7a-1d2f3a4b5c6d";
+    for (i, (_, part_parent, part_child)) in CONFIGS.iter().enumerate() {
+        for (suffix, column) in [("i", "BIGINT"), ("t", "TEXT"), ("u", "UUID")] {
+            let parent = format!(
+                "CREATE TABLE {{p}}{suffix} (k {column} NOT NULL PRIMARY KEY, label TEXT){}",
+                partitioned("k", *part_parent)
+            );
+            q.on(i, &parent).unwrap_or_else(|e| panic!("{parent}: {e}"));
+            let child = format!(
+                "CREATE TABLE {{c}}{suffix} (cid BIGINT NOT NULL PRIMARY KEY, k {column} REFERENCES {{p}}{suffix} (k)){}",
+                partitioned("cid", *part_child)
+            );
+            q.on(i, &child).unwrap_or_else(|e| panic!("{child}: {e}"));
+        }
+        let child = format!(
+            "CREATE TABLE {{c}}n (cid BIGINT NOT NULL PRIMARY KEY, k NUMERIC(10, 0) REFERENCES {{p}}i (k)){}",
+            partitioned("cid", *part_child)
+        );
+        q.on(i, &child).unwrap_or_else(|e| panic!("{child}: {e}"));
+    }
+    let ids: Vec<String> = (-12..=12).filter(|k| *k != 0).map(|k| format!("({k}, 'p{k}')")).collect();
+    q.ok(&format!("INSERT INTO {{p}}i (k, label) VALUES {}", ids.join(", ")));
+    q.ok("INSERT INTO {p}t (k, label) VALUES ('a', 'a'), ('x', 'x'), ('it''s', 'q'), ('-5', 'n')");
+    q.ok(&format!("INSERT INTO {{p}}u (k, label) VALUES ('{uuid}', 'u')"));
+
+    for (n, value) in [
+        "-7", "-7::bigint", "CAST(-6 AS BIGINT)", "'-5'", "-4::int", "(-3)", "-2::BIGINT", "+2", "-999::bigint",
+        "CAST(-998 AS BIGINT)", "'-997'", "11 - 20",
+    ]
+    .iter()
+    .enumerate()
+    {
+        q.all(&format!("INSERT INTO {{c}}i (cid, k) VALUES ({n}, {value})"));
+    }
+    for (n, value) in ["'x'::text", "'x'::varchar", "CAST('a' AS TEXT)", "'it''s'", "'-5'", "'nope'::text", "'X'"]
+        .iter()
+        .enumerate()
+    {
+        q.all(&format!("INSERT INTO {{c}}t (cid, k) VALUES ({n}, {value})"));
+    }
+    let upper = uuid.to_ascii_uppercase();
+    let bare = uuid.replace('-', "");
+    for (n, value) in [
+        format!("'{uuid}'"),
+        format!("'{upper}'"),
+        format!("'{uuid}'::uuid"),
+        format!("CAST('{uuid}' AS UUID)"),
+        format!("'{bare}'"),
+        "'00000000-0000-0000-0000-000000000001'::uuid".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        q.all(&format!("INSERT INTO {{c}}u (cid, k) VALUES ({n}, {value})"));
+    }
+    for (n, value) in ["-7", "-7.0", "-7::numeric", "CAST(-6 AS NUMERIC)", "7.4", "-999"].iter().enumerate() {
+        q.all(&format!("INSERT INTO {{c}}n (cid, k) VALUES ({n}, {value})"));
+    }
+    // Prepared, as an ORM binds `$n` (text parameters).
+    for (i, (suffix, _, _)) in CONFIGS.iter().enumerate() {
+        let sql = render("INSERT INTO {c}i (cid, k) VALUES ($1, $2)", suffix);
+        q.clients[i].prepare("ins", &sql).unwrap();
+    }
+    for (cid, k) in [("100", "-8"), ("101", "-12"), ("102", "-13")] {
+        let outcomes: Vec<Outcome> = (0..CONFIGS.len())
+            .map(|i| q.clients[i].execute_prepared("ins", &[Some(cid.to_string()), Some(k.to_string())]))
+            .collect();
+        for (i, o) in outcomes.iter().enumerate().skip(1) {
+            match (&outcomes[0], o) {
+                (Ok(a), Ok(b)) => assert_eq!(a.tags, b.tags, "prepared {k}: {}", CONFIGS[i].0),
+                (Err(a), Err(b)) => assert_eq!(a.code, b.code, "prepared {k}: {}", CONFIGS[i].0),
+                (a, b) => panic!("prepared {k}: twin {a:?}, {} {b:?}", CONFIGS[i].0),
+            }
+        }
+    }
+    for t in ["i", "t", "u", "n"] {
+        q.ok(&format!("SELECT cid, k FROM {{c}}{t} ORDER BY cid"));
+    }
+    // The parents' deletes see those children, routed and fanned out.
+    q.all("DELETE FROM {p}i WHERE k = -7");
+    q.all("DELETE FROM {p}i WHERE k IN (-1, -9)");
+    q.all("DELETE FROM {p}t WHERE k = 'x'");
+    q.all(&format!("DELETE FROM {{p}}u WHERE k = '{uuid}'"));
+    q.restart();
+    q.all("INSERT INTO {c}i (cid, k) VALUES (200, -6::bigint)");
+    q.all("INSERT INTO {c}i (cid, k) VALUES (201, -1::bigint)");
+    q.same_rows_of("{c}i");
 }

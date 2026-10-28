@@ -1283,9 +1283,17 @@ async fn referenced_values_now(
                     ));
                 }
             }
-            // Within the router's point cap, so an `IN` list still routes
-            // per value (§1b, "Multi-column IN").
-            (crate::core::partition::route::POINT_CAP as usize).min(REFERENCED_PROBE_CHUNK)
+            if routes_by_column(pt, &field) {
+                // Within the router's point cap, so an `IN` list still
+                // routes per value (§1b, "Multi-column IN").
+                (crate::core::partition::route::POINT_CAP as usize).min(REFERENCED_PROBE_CHUNK)
+            } else {
+                // A child not partitioned by its key column reads every
+                // partition whatever the chunk: the plain table's chunk, so
+                // a parent's DELETE of N keys scans them about N/512 times
+                // per pass, not N/256.
+                REFERENCED_PROBE_CHUNK
+            }
         }
         crate::core::database::Relation::Plain(_) => REFERENCED_PROBE_CHUNK,
     };
@@ -1338,27 +1346,42 @@ async fn referenced_values_now(
                 // The snapshot first, then the route (§4.4's order, which
                 // `partitioned_with` and `partitioned_in` keep).
                 let visibility = pt.visibility_now_for(tx);
+                // Routed once: a column the table is not partitioned by
+                // leading routes nowhere, so it is not tokenized for a route
+                // at all; otherwise the route read here is the one planned.
+                let route = if routes_by_column(pt, &field) {
+                    pt.route_where(&rewritten).map_err(|e| e.to_string())?
+                } else {
+                    crate::core::partition::Route::All
+                };
                 let routed = matches!(
-                    pt.route_where(&rewritten).map_err(|e| e.to_string())?,
+                    route,
                     crate::core::partition::Route::Points(_) | crate::core::partition::Route::Zero
                 );
                 #[cfg(test)]
                 fk_probe_hooks::note(table_name, side);
                 let source = if routed || side == KeySide::Child {
-                    crate::core::rql::row_source::RowSource::partitioned_with(pt.clone(), &rewritten, visibility)
+                    crate::core::rql::row_source::RowSource::partitioned_routed(pt.clone(), &route, visibility)
                 } else {
                     // The router reads no key point in the predicate (a
-                    // signed number, `k = -7`, is none to it): each value
-                    // routes by its own key bytes, as an INSERT of it would,
-                    // and a value that does not encode is refused, never
-                    // read in every partition.
-                    let ranges = parent_key_ranges(pt, &field, chunk).ok_or_else(|| {
-                        format!(
-                            "a foreign key check on partitioned table \"{table_name}\" did not route to the \
-                             partitions of its keys ({predicate}); reading every partition is not supported"
-                        )
-                    })?;
-                    crate::core::rql::row_source::RowSource::partitioned_in(pt.clone(), &ranges, visibility)
+                    // signed number, `k = -7` or `-7::bigint`, is none to
+                    // it): each value routes by its own key bytes, as an
+                    // INSERT of it would. A value that does not encode as a
+                    // key (`7.5` for a BIGINT key) is read in every
+                    // partition, its predicate deciding, as a plain parent's
+                    // scan decides: correct, and the rare case.
+                    match parent_key_ranges(pt, &field, chunk) {
+                        Some(ranges) => {
+                            crate::core::rql::row_source::RowSource::partitioned_in(pt.clone(), &ranges, visibility)
+                        }
+                        None => {
+                            warn!(
+                                "foreign key probe of partitioned table {table_name} reads every partition: a value \
+                                 in ({predicate}) is no key of its type"
+                            );
+                            crate::core::rql::row_source::RowSource::partitioned_routed(pt.clone(), &route, visibility)
+                        }
+                    }
                 };
                 source
                     .map_err(|e| e.to_string())?
@@ -1382,11 +1405,28 @@ async fn referenced_values_now(
     Ok(values)
 }
 
+/// Whether a predicate on `field` can route on partitioned table `pt`:
+/// `field` is its leading partition key column (an equality on it narrows
+/// to its value's block, §1b "What routes"). A key column below it routes
+/// nothing on its own.
+fn routes_by_column(
+    pt: &crate::core::partition::table::PartitionedTable,
+    field: &crate::core::row::schema::SchemaField,
+) -> bool {
+    pt.spec()
+        .ok()
+        .and_then(|spec| spec.levels().first().map(|level| u64::from(level.write_order) == field.write_order))
+        .unwrap_or(true)
+}
+
 /// The point range of each of `literals` as a value of partitioned table
-/// `pt`'s one key column `field`: the literal encoded at the column's type
-/// as an `INSERT` stores it (`value_codec::encode_literal`), then routed by
-/// those bytes (`keyed_range`). `None` when the key is not that one column
-/// or a value does not encode; the caller refuses the probe.
+/// `pt`'s one key column `field`: the value encoded as an `INSERT` of it
+/// into that column stores it (`lexer_ir::encode_column_value`, the one
+/// encoder: casts, `CAST(… AS …)`, signs, quoted strings, UUIDs), so routed
+/// by the bytes the parent row was routed by (`keyed_range`). `None` when
+/// the key is not that one column or a value does not encode as one; the
+/// caller then reads every partition, the probe's predicate deciding, as a
+/// plain table's scan would.
 fn parent_key_ranges(
     pt: &crate::core::partition::table::PartitionedTable,
     field: &crate::core::row::schema::SchemaField,
@@ -1402,42 +1442,22 @@ fn parent_key_ranges(
     literals
         .iter()
         .map(|literal| {
-            let bytes = key_literal_bytes(&field.db_type, literal.trim())?;
+            let encoded = crate::core::rql::lexer_ir::encode_column_value(
+                literal.trim(),
+                field,
+                &pt.shell().schema.type_modifiers,
+            );
+            // An encoder's refusal is this probe's only, never a later
+            // statement's reason.
+            let _ = crate::core::rql::lexer_ir::take_refusal();
+            let bytes = encoded?.into_slice().to_vec();
+            // An empty block is a NULL, which no key is.
+            if bytes.is_empty() {
+                return None;
+            }
             pt.keyed_range(pt.uid(), &[(level.write_order, level.db_type.clone(), bytes)])
         })
         .collect()
-}
-
-/// The bytes a key column of type `ty` stores for `literal`, as a
-/// foreign-key probe renders its values (`key_literal`): an integer, signed
-/// or not, at the column's width; a single-quoted string with its doubled
-/// quotes undone; any other type as `value_codec::encode_literal` reads it
-/// (a UUID, a date, a timestamp). `None` for anything else, which the caller
-/// refuses rather than guess at.
-fn key_literal_bytes(ty: &crate::core::db_type::DbType, literal: &str) -> Option<Vec<u8>> {
-    use crate::core::db_type::DbType::*;
-    match ty {
-        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => {
-            let v: i128 = literal.parse().ok()?;
-            Some(match ty {
-                I8 => i8::try_from(v).ok()?.to_le_bytes().to_vec(),
-                I16 => i16::try_from(v).ok()?.to_le_bytes().to_vec(),
-                I32 => i32::try_from(v).ok()?.to_le_bytes().to_vec(),
-                I64 => i64::try_from(v).ok()?.to_le_bytes().to_vec(),
-                I128 => v.to_le_bytes().to_vec(),
-                U8 => u8::try_from(v).ok()?.to_le_bytes().to_vec(),
-                U16 => u16::try_from(v).ok()?.to_le_bytes().to_vec(),
-                U32 => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
-                U64 => u64::try_from(v).ok()?.to_le_bytes().to_vec(),
-                _ => u128::try_from(v).ok()?.to_le_bytes().to_vec(),
-            })
-        }
-        STRING => {
-            let inner = literal.strip_prefix('\'')?.strip_suffix('\'')?;
-            Some(inner.replace("''", "'").into_bytes())
-        }
-        _ => crate::core::value_codec::encode_literal(ty, literal),
-    }
 }
 
 /// Test probe: which partitioned tables a foreign-key probe read, and on
@@ -8068,10 +8088,12 @@ fn strip_not_valid(clause: &str) -> (&str, bool) {
 ///
 /// Each value is probed as an insert's check probes it ([`referenced_values_now`],
 /// the child's literal against the parent's column, routed on a partitioned
-/// parent), in chunks. A chunk whose values were all found proves them (the
-/// probe returns only values some literal denotes, deduplicated); one that
-/// came up short is split in halves until the missing value is alone, so a
-/// million rows with one orphan cost about forty probes past the chunks.
+/// parent). A chunk whose values were all found proves them (the probe
+/// returns only values some literal denotes, deduplicated); one that came up
+/// short is split in halves until the missing value is alone.
+///
+/// The caller holds ACCESS EXCLUSIVE on the child (ADD, VALIDATE), so no
+/// statement writes it during the walk, and SHARE on the parent.
 async fn existing_rows_break_foreign_key(
     database: &Arc<Database>,
     table_name: &str,
@@ -9138,6 +9160,11 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
         return row_locks_in_use(&table_name, "DROP TABLE");
     }
     if let Err(e) = Box::pin(drop_dependent_foreign_keys(database, &table_name, sql)).await {
+        return ddl_error(&e);
+    }
+    // Between the two steps of `DROP … CASCADE`: the keys are gone, the
+    // table not yet (a crash here leaves a statement that runs again).
+    if let Err(e) = crate::core::database::rewrite::point(database, "fkdrop_after_keys") {
         return ddl_error(&e);
     }
     match database.drop_table(&table_name).await {

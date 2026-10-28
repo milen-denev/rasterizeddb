@@ -939,6 +939,86 @@ fn declared_scale(
 /// `database` is the id of the database the row is written into
 /// ([`crate::core::database::Database::id`]): a `SERIAL` default draws from that
 /// database's sequence, and from no other's.
+/// The stored bytes of `value`, one `VALUES` item, for `schema_field`: what an
+/// `INSERT` writes into the field's slot, a constant expression evaluated
+/// (`CAST(-6 AS BIGINT)`, `2147483647 + 1`), a literal read at the column's
+/// type and declared scale (`'x'::text`, `-7::bigint`), and fitted to its
+/// width. `None` when the value is refused; the reason is left for
+/// [`take_refusal`]. The one encoder: an `INSERT` routes a partitioned row by
+/// these bytes, and a foreign key's probe of a partitioned parent routes a
+/// value by them too (phase 3 P4).
+pub(crate) fn encode_column_value(
+    value: &str,
+    schema_field: &SchemaField,
+    modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<MemoryBlock> {
+    // A function call in VALUES is evaluated, or refused. It must not
+    // reach `value_to_mb`, which cannot parse it and yields an empty
+    // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
+    // and reported success.
+    let value_owned;
+    // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
+    // neither parentheses nor a cast, and was handed to the column's
+    // literal reader whole, which refused it as unreadable text.
+    let value = if crate::core::rql::expr::needs_evaluation(value)
+        || crate::core::rql::lexer_query::looks_like_row_expression(value)
+    {
+        // There is no row yet, so only a constant-foldable expression
+        // has meaning here — a nullary function or a literal. Its
+        // failure is the statement's answer, carried to the client as
+        // the refusal: `integer out of range` is 22003, not a schema
+        // mismatch.
+        let refuse = |e: String| {
+            error!("INSERT parse failed: {}", e);
+            REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+        };
+        let expr = crate::core::rql::expr::parse(value, &[]).map_err(refuse).ok()?;
+        let empty = crate::core::row::row::Row {
+            position: 0,
+            length: 0,
+            columns: smallvec::SmallVec::new(),
+        };
+        // An integer column takes the value at its own width here, as
+        // an assignment does, so one it cannot hold is refused instead
+        // of keeping its low bytes. A decimal stays at the engine scale:
+        // it is rendered as text below and read at the column's scale
+        // by the literal reader.
+        let evaluated = crate::core::rql::expr::eval(&expr, &empty, &[])
+            .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type))
+            .map_err(refuse)
+            .ok()?;
+        value_owned = match evaluated {
+            crate::core::rql::expr::Value::Null => "NULL".to_string(),
+            crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+        };
+        &value_owned
+    } else {
+        value
+    };
+
+    Some(fit_to_width(
+        value_to_mb_scaled(
+            value,
+            &schema_field.db_type,
+            declared_scale(&schema_field.name, modifiers),
+            crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
+        )
+        .or_else(|| {
+            // A reason already given — an overflow — is the real one.
+            if REFUSAL.with(|r| r.borrow().is_none()) {
+                note_refusal(&schema_field.name, &schema_field.db_type, value);
+            }
+            None
+        })?,
+        &schema_field.db_type,
+        schema_field.size as usize,
+        &schema_field.name,
+    ))
+}
+
 pub fn insert_row_with_defaults(
     qp: &QueryPurpose,
     schema: &[SchemaField],
@@ -1151,71 +1231,7 @@ pub fn insert_row_with_defaults(
                 value
             };
 
-            // A function call in VALUES is evaluated, or refused. It must not
-            // reach `value_to_mb`, which cannot parse it and yields an empty
-            // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
-            // and reported success.
-            let value_owned;
-            // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
-            // neither parentheses nor a cast, and was handed to the column's
-            // literal reader whole, which refused it as unreadable text.
-            let value = if crate::core::rql::expr::needs_evaluation(value)
-                || crate::core::rql::lexer_query::looks_like_row_expression(value)
-            {
-                // There is no row yet, so only a constant-foldable expression
-                // has meaning here — a nullary function or a literal. Its
-                // failure is the statement's answer, carried to the client as
-                // the refusal: `integer out of range` is 22003, not a schema
-                // mismatch.
-                let refuse = |e: String| {
-                    error!("INSERT parse failed: {}", e);
-                    REFUSAL.with(|r| *r.borrow_mut() = Some(e));
-                };
-                let expr = crate::core::rql::expr::parse(value, &[]).map_err(refuse).ok()?;
-                let empty = crate::core::row::row::Row {
-                    position: 0,
-                    length: 0,
-                    columns: smallvec::SmallVec::new(),
-                };
-                // An integer column takes the value at its own width here, as
-                // an assignment does, so one it cannot hold is refused instead
-                // of keeping its low bytes. A decimal stays at the engine scale:
-                // it is rendered as text below and read at the column's scale
-                // by the literal reader.
-                let evaluated = crate::core::rql::expr::eval(&expr, &empty, &[])
-                    .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type))
-                    .map_err(refuse)
-                    .ok()?;
-                value_owned = match evaluated {
-                    crate::core::rql::expr::Value::Null => "NULL".to_string(),
-                    crate::core::rql::expr::Value::Data { bytes, db_type } => {
-                        crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
-                            .unwrap_or_else(|| "NULL".to_string())
-                    }
-                };
-                &value_owned
-            } else {
-                value
-            };
-
-            let data = fit_to_width(
-                value_to_mb_scaled(
-                    value,
-                    &schema_field.db_type,
-                    declared_scale(&schema_field.name, modifiers),
-                    crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
-                )
-                .or_else(|| {
-                    // A reason already given — an overflow — is the real one.
-                    if REFUSAL.with(|r| r.borrow().is_none()) {
-                        note_refusal(&schema_field.name, &schema_field.db_type, value);
-                    }
-                    None
-                })?,
-                &schema_field.db_type,
-                schema_field.size as usize,
-                col_name,
-            );
+            let data = encode_column_value(value, schema_field, modifiers)?;
 
             let payload = ColumnWritePayload {
                 data,

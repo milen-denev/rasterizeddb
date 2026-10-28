@@ -412,8 +412,12 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
 
             // `REFERENCES` written on the column itself.
             if let Some(fk_clause) = foreign_key_clause(col_def) {
-                unnamed_foreign_keys.push(foreign_keys.len());
-                match crate::core::rql::foreign_key::parse_clause(fk_clause, &table_name, None, Some(&name)) {
+                // `col TYPE CONSTRAINT n REFERENCES …` names its key `n`.
+                let inline_name = inline_constraint_name(col_def);
+                if inline_name.is_none() {
+                    unnamed_foreign_keys.push(foreign_keys.len());
+                }
+                match crate::core::rql::foreign_key::parse_clause(fk_clause, &table_name, inline_name, Some(&name)) {
                     Ok(fk) => foreign_keys.push(fk),
                     Err(reason) => {
                         rejection.replace(reason);
@@ -1177,6 +1181,22 @@ fn foreign_key_clause(def: &str) -> Option<&str> {
     }
     // An inline `REFERENCES` on a column definition.
     upper.find("REFERENCES").map(|at| &def[at..])
+}
+
+/// The name a column definition gives its `REFERENCES` constraint:
+/// `CONSTRAINT <name>` (bare or quoted) directly before `REFERENCES`. A
+/// `CONSTRAINT` naming another of the column's constraints is not its.
+fn inline_constraint_name(def: &str) -> Option<String> {
+    let upper = def.to_ascii_uppercase();
+    let references = upper.find("REFERENCES")?;
+    let at = upper[..references].rfind("CONSTRAINT")?;
+    if at > 0 && !def.as_bytes()[at - 1].is_ascii_whitespace() {
+        return None;
+    }
+    match crate::core::rql::unique_key::split_constraint_name(&def[at..]) {
+        Ok((Some(name), rest)) if rest.to_ascii_uppercase().starts_with("REFERENCES") => Some(name),
+        _ => None,
+    }
 }
 
 /// The name of a `CONSTRAINT <name> …` definition.
@@ -1963,6 +1983,17 @@ mod partitioning_refusal_tests {
         assert_eq!(
             ct.foreign_keys.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
             ["t_a_fkey", "t_a_fkey1", "外部 key", "t_b_fkey1"]
+        );
+        // A column's own `CONSTRAINT n REFERENCES …` names its key (P4 round
+        // 2: the name was dropped and the key called `<t>_<col>_fkey`).
+        let (ct, reason) = parse(
+            "CREATE TABLE t (a INT CONSTRAINT a_to_u REFERENCES u(id), b INT NOT NULL CONSTRAINT \"b key\" \
+             REFERENCES u(id), c INT CONSTRAINT c_nn NOT NULL REFERENCES u(id))",
+        );
+        let ct = ct.unwrap_or_else(|| panic!("inline names: {reason:?}"));
+        assert_eq!(
+            ct.foreign_keys.iter().map(|f| (f.name.as_str(), f.column.as_str())).collect::<Vec<_>>(),
+            [("a_to_u", "a"), ("b key", "b"), ("t_c_fkey", "c")]
         );
 
         let (ct, _) =

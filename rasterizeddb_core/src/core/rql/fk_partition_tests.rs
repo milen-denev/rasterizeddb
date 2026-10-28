@@ -272,8 +272,9 @@ async fn a_failed_parent_column_rename_puts_a_partitioned_childs_key_back() {
 /// A key the router reads no point in: `k = -7` (a signed number is no key
 /// point to `route_where`, which then routes everywhere), and a text key
 /// holding a quote. The check routes each value by its key bytes instead,
-/// as an INSERT of it does: one partition per key, the key found, a
-/// missing one refused, never read in every partition. The twin found the
+/// as an INSERT of it stores them (`lexer_ir::encode_column_value`): one
+/// partition per key, the key found, a missing one refused, never read in
+/// every partition. The twin found the
 /// negative case at 0x5eedf1a1: such a parent's children were refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_the_router_cannot_read_still_routes_by_its_bytes() {
@@ -295,6 +296,15 @@ async fn a_key_the_router_cannot_read_still_routes_by_its_bytes() {
     let (out, reads) = reads_of(&db, "ng_p", &format!("INSERT INTO ng_c (cid, pid) VALUES {}", tuples.join(", "))).await;
     ok(out, "negative keys in a batch");
     assert!(distinct(&reads).len() <= 10 && distinct(&reads).len() < materialized.len(), "{reads:?}");
+    // Cast, as an ORM renders `$n::bigint`, and through CAST: each still
+    // its one partition (P4 round 2: these were refused with 0A000).
+    for (cid, value) in [(30, "-8::bigint"), (31, "CAST(-9 AS BIGINT)"), (32, "-11::int"), (33, "'-12'")] {
+        let (out, reads) = reads_of(&db, "ng_p", &format!("INSERT INTO ng_c (cid, pid) VALUES ({cid}, {value})")).await;
+        ok(out, value);
+        assert_eq!(distinct(&reads).len(), 1, "{value}: {reads:?}");
+    }
+    let e = run(&db, "INSERT INTO ng_c (cid, pid) VALUES (34, -88::bigint)").await.unwrap_err();
+    assert!(e.contains("violates foreign key constraint"), "{e}");
     let e = run(&db, "DELETE FROM ng_p WHERE id = -7").await.unwrap_err();
     assert!(e.contains("violates foreign key constraint"), "{e}");
 
@@ -310,4 +320,131 @@ async fn a_key_the_router_cannot_read_still_routes_by_its_bytes() {
     assert!(e.contains("violates foreign key constraint"), "{e}");
     run_ok(&db, "ALTER TABLE qt_c DROP CONSTRAINT qt_c_code_fkey").await;
     run_ok(&db, "ALTER TABLE qt_c ADD FOREIGN KEY (code) REFERENCES qt_p (code)").await;
+}
+
+/// Peak memory of `ADD FOREIGN KEY`'s validation over a 200,000-row child
+/// with 200,000 distinct values (P4 round 2). Measured, not asserted: the
+/// peak (`VmHWM`) is reset just before the ADD (`/proc/self/clear_refs` 5),
+/// so it is the ADD's own, over the resident set it started from.
+///
+/// `cargo test -p rasterizeddb_core --lib -- --ignored validation_peak_memory --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn validation_peak_memory() {
+    fn status(field: &str) -> u64 {
+        let text = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = text.lines().find(|l| l.starts_with(field)).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    const ROWS: usize = 200_000;
+    run_ok(&db, "CREATE TABLE pm_p (id BIGINT NOT NULL PRIMARY KEY)").await;
+    run_ok(&db, "CREATE TABLE pm_c (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT)").await;
+    for start in (0..ROWS).step_by(2000) {
+        let ids: Vec<String> = (start..start + 2000).map(|i| format!("({i})")).collect();
+        run_ok(&db, &format!("INSERT INTO pm_p (id) VALUES {}", ids.join(", "))).await;
+        let rows: Vec<String> = (start..start + 2000).map(|i| format!("({i}, {i})")).collect();
+        run_ok(&db, &format!("INSERT INTO pm_c (cid, pid) VALUES {}", rows.join(", "))).await;
+    }
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let rss = status("VmRSS:");
+    let started = std::time::Instant::now();
+    run_ok(&db, "ALTER TABLE pm_c ADD FOREIGN KEY (pid) REFERENCES pm_p (id)").await;
+    let peak = status("VmHWM:");
+    println!(
+        "validation of {ROWS} rows: {:?}, VmRSS before {rss} kB, VmHWM during {peak} kB, peak over start {} kB",
+        started.elapsed(),
+        peak.saturating_sub(rss)
+    );
+}
+
+/// One snapshot for a partitioned DELETE's FK work and its write (P4 round
+/// 2). A fan-out `DELETE … WHERE label = 'x'` of a referenced parent reads
+/// the keys it will remove partition by partition under the statement's
+/// snapshot; between two of those reads another session commits a new
+/// matching parent, in a partition read later, and a child of it. The write
+/// must use the same snapshot: the new parent, whose children were never
+/// checked, survives, and no child is left without a parent. A write taking
+/// its own snapshot would delete it and orphan the child.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_delete_writes_the_rows_its_keys_were_read_from() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    run_ok(&db, "CREATE TABLE sp_p (id BIGINT NOT NULL PRIMARY KEY, label TEXT) PARTITION BY HASH (id) PARTITIONS 8").await;
+    let parents: Vec<String> = (1..=40).map(|i| format!("({i}, 'x')")).collect();
+    run_ok(&db, &format!("INSERT INTO sp_p (id, label) VALUES {}", parents.join(", "))).await;
+    run_ok(&db, "CREATE TABLE sp_c (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES sp_p (id))").await;
+    // A key whose partition is read after the first one the DELETE reads.
+    let first = *distinct(&reads_of(&db, "sp_p", "SELECT count(*) FROM sp_p WHERE label = 'x'").await.1).first().unwrap();
+    let mut late = None;
+    for k in 1000..1200 {
+        let (_, pids) = reads_of(&db, "sp_p", &format!("SELECT id FROM sp_p WHERE id = {k}")).await;
+        if pids.first().is_some_and(|p| *p > first) {
+            late = Some(k);
+            break;
+        }
+    }
+    let late = late.expect("a key in a later partition");
+
+    let fired = std::sync::Arc::new(AtomicBool::new(false));
+    let hook: crate::core::rql::row_source::test_hooks::Hook = {
+        let (db, fired) = (db.clone(), fired.clone());
+        std::sync::Arc::new(move || {
+            let (db, fired) = (db.clone(), fired.clone());
+            Box::pin(async move {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                run_ok(&db, &format!("INSERT INTO sp_p (id, label) VALUES ({late}, 'x')")).await;
+                run_ok(&db, &format!("INSERT INTO sp_c (cid, pid) VALUES (900, {late})")).await;
+            })
+        })
+    };
+    let uid = db.partitioned_table("sp_p").unwrap().uid();
+    crate::core::rql::row_source::test_hooks::set_after_first(uid, Some(hook));
+    let out = run(&db, "DELETE FROM sp_p WHERE label = 'x'").await;
+    crate::core::rql::row_source::test_hooks::set_after_first(uid, None);
+    assert!(fired.load(Ordering::SeqCst), "the writer never ran between two partition reads");
+    ok(out, "delete");
+    assert_eq!(rows_of(&run_ok(&db, &format!("SELECT id FROM sp_p WHERE id = {late}")).await), 1, "the late parent was deleted");
+    let orphans = run_ok(&db, "SELECT cid FROM sp_c WHERE pid NOT IN (SELECT id FROM sp_p)").await;
+    assert_eq!(rows_of(&orphans), 0, "a child was left without its parent");
+    assert_eq!(rows_of(&run_ok(&db, "SELECT id FROM sp_p").await), 1);
+}
+
+/// A parent DELETE of 10,000 keys whose child (40,000 rows) is partitioned
+/// by another column, so every child-side probe reads every partition (P4
+/// round 2): the NO ACTION check probes the child for all 10,000 keys and
+/// finds none. Timed, not asserted. `cargo test -p rasterizeddb_core --lib
+/// -- --ignored child_probe_chunk_timing --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn child_probe_chunk_timing() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    const KEYS: usize = 10_000;
+    run_ok(&db, "CREATE TABLE ct_p (id BIGINT NOT NULL PRIMARY KEY)").await;
+    run_ok(&db, "CREATE TABLE ct_c (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES ct_p (id)) \
+                 PARTITION BY HASH (cid) PARTITIONS 8").await;
+    for start in (0..KEYS + 1000).step_by(1000) {
+        let ids: Vec<String> = (start..start + 1000).map(|i| format!("({i})")).collect();
+        run_ok(&db, &format!("INSERT INTO ct_p (id) VALUES {}", ids.join(", "))).await;
+    }
+    for start in (0..40_000).step_by(2000) {
+        let rows: Vec<String> = (start..start + 2000).map(|i| format!("({i}, {})", KEYS + i % 1000)).collect();
+        run_ok(&db, &format!("INSERT INTO ct_c (cid, pid) VALUES {}", rows.join(", "))).await;
+    }
+    let (out, reads) = {
+        let started = std::time::Instant::now();
+        let (out, reads) = reads_of(&db, "ct_c", &format!("DELETE FROM ct_p WHERE id < {KEYS}")).await;
+        println!("DELETE of {KEYS} parents over a fanned-out 40,000-row child: {:?}", started.elapsed());
+        (out, reads)
+    };
+    ok(out, "delete");
+    println!("child partition scans: {}", reads.len());
 }

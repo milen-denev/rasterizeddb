@@ -381,3 +381,147 @@ async fn a_partitioned_ddl_cut_anywhere_leaves_the_old_table_or_the_new() {
     assert!(total.old > 0 && total.new > 0, "every image fell on one side ({total:?}); the cuts test nothing");
     assert!(total.loaded > 0, "no image loaded a persisted index: the snapshot pass compared nothing ({total:?})");
 }
+
+/// `DROP TABLE p CASCADE` of a referenced parent through a power cut (P4
+/// round 2): the dependent keys are tombstoned in each child and the child
+/// reloaded, then the table dropped; two steps, as DDL is not transactional
+/// here. Every image must open and be one of: nothing dropped (the parent
+/// and the key), the keys gone and the parent there (the statement runs
+/// again), or both gone; never a child whose key names a parent that is not
+/// there. For a plain parent with a partitioned child and a partitioned
+/// parent with a plain child, cut between the steps, inside the child's
+/// reload, and at the log's syncs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cascading_drop_cut_anywhere_leaves_no_key_naming_a_missing_table() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let cases: [(&str, &[&str], &str, &str); 2] = [
+        (
+            "plain parent, partitioned child",
+            &[
+                "CREATE TABLE dp (id BIGINT NOT NULL PRIMARY KEY)",
+                "INSERT INTO dp (id) VALUES (1), (2), (3)",
+                "CREATE TABLE dc (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES dp (id)) \
+                 PARTITION BY HASH (cid) PARTITIONS 4",
+                "INSERT INTO dc (cid, pid) VALUES (1, 1), (2, 2), (3, 3), (4, NULL)",
+            ],
+            "dp",
+            "dc",
+        ),
+        (
+            "partitioned parent, plain child",
+            &[
+                "CREATE TABLE dp (id BIGINT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 4",
+                "INSERT INTO dp (id) VALUES (1), (2), (3)",
+                "CREATE TABLE dc (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES dp (id))",
+                "INSERT INTO dc (cid, pid) VALUES (1, 1), (2, 2), (3, 3), (4, NULL)",
+            ],
+            "dp",
+            "dc",
+        ),
+    ];
+    // (parent there, key there) for an image, or why it is none of the three.
+    async fn state(db: &Arc<Database>, parent: &str, child: &str) -> Result<(bool, bool), String> {
+        let has_parent = db.schema_view(parent).is_some() || db.is_partitioned(parent);
+        let view = db.schema_view(child).ok_or_else(|| format!("the child {child} is gone"))?;
+        let has_key = view.schema().foreign_keys.iter().any(|fk| !fk.is_deleted && fk.parent_table == parent);
+        // The reverse index, rebuilt at open, says the same.
+        let reverse = db.referencing_keys(parent).iter().any(|(c, fk)| c == child && !fk.is_deleted);
+        if reverse != has_key {
+            return Err(format!("fk_reverse says {reverse}, the schema {has_key}"));
+        }
+        // The child's rows are all there and readable.
+        let rows = rows(db, &format!("SELECT cid FROM {child}")).await?;
+        if rows.len() != 4 {
+            return Err(format!("the child holds {} rows, not 4", rows.len()));
+        }
+        if has_key && !has_parent {
+            return Err(format!("{child}'s key names {parent}, which is not there"));
+        }
+        Ok((has_parent, has_key))
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (label, setup, parent, child) in cases {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("db");
+        {
+            let db = open(&dir, "fkdrop_cut").await.unwrap();
+            for sql in setup {
+                exec(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+            db.sync_durable().unwrap();
+            close(&dir, db);
+        }
+        let db = open(&dir, "fkdrop_cut").await.unwrap();
+        assert_eq!(state(&db, parent, child).await, Ok((true, true)), "{label}: before");
+        let rec = Recorder::start(&dir);
+        let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+        let required = [("test.rewrite.fkdrop_after_keys", 1u64)];
+        let mut guards = Vec::new();
+        for (point, nth) in required {
+            let (rec, sink, l) = (rec.clone(), sink.clone(), format!("{point} #{nth}"));
+            let action: failpoint::Action = StdArc::new(move |_hit| {
+                sink.lock().push(rec.cut_quiescent(l.clone()));
+                failpoint::Outcome::Continue
+            });
+            guards.push(failpoint::arm(point, &dir, nth, action));
+        }
+        let optional: Vec<failpoint::Guard> = [
+            ("test.pddl.before_work", 1u64),
+            ("test.pddl.after_work", 1),
+            ("sync:wal.log", 1),
+            ("sync:wal.log", 2),
+            ("sync:wal.log", 3),
+            ("sync:file.data", 1),
+        ]
+        .iter()
+        .map(|(site, nth)| failpoint::arm(site, &dir, *nth, rec.cut_action(format!("{site} #{nth}"), sink.clone())))
+        .collect();
+        exec(&db, &format!("DROP TABLE {parent} CASCADE")).await.unwrap_or_else(|e| panic!("{label}: {e}"));
+        for g in &guards {
+            assert_eq!(g.fired(), 1, "{label}: the cut between the steps was never reached");
+        }
+        drop(guards);
+        drop(optional);
+        assert_eq!(state(&db, parent, child).await, Ok((false, false)), "{label}: after");
+        close(&dir, db);
+        drop(rec);
+        let points: Vec<CrashPoint> =
+            sink.lock().drain(..).filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok()).collect();
+        assert!(!points.is_empty(), "{label}: no cut was taken");
+        let img = base.path().join("image");
+        let mut problems = Vec::new();
+        for point in &points {
+            for seed in 0..seeds {
+                point.write_image(seed, &img);
+                match open(&img, "fkdrop_cut").await {
+                    Err(e) => problems.push(format!("{label}: {} seed {seed}: does not open: {e}", point.label)),
+                    Ok(db) => {
+                        match state(&db, parent, child).await {
+                            Ok(s) => {
+                                seen.insert((label, s));
+                                // The middle state is re-runnable: the DROP
+                                // goes through and leaves both gone.
+                                if s == (true, false) {
+                                    if let Err(e) = exec(&db, &format!("DROP TABLE {parent} CASCADE")).await {
+                                        problems.push(format!("{label}: {} seed {seed}: the DROP does not run again: {e}", point.label));
+                                    }
+                                }
+                            }
+                            Err(e) => problems.push(format!("{label}: {} seed {seed}: {e}", point.label)),
+                        }
+                        close(&img, db);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&img);
+            }
+        }
+        assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    }
+    eprintln!("cascading drop images: {seen:?}");
+    // The cut between the steps lands on the middle state, the last syncs on
+    // the end; every case reached at least two of the three.
+    for (label, _, _, _) in cases {
+        let states = seen.iter().filter(|(l, _)| *l == label).count();
+        assert!(states >= 2, "{label}: images fell on {states} state(s): {seen:?}");
+    }
+}

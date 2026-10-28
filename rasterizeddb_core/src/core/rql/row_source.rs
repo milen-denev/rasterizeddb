@@ -128,6 +128,22 @@ impl RowSource {
         Ok(RowSource::Partitioned(Box::new(FanOut::plan_with(table, where_clause, visibility)?)))
     }
 
+    /// A partitioned table's source over `route`, a route the caller already
+    /// read from the predicate the partitions' scans evaluate (or `All`),
+    /// read under `visibility`, a snapshot taken before it: the probe that
+    /// decided by the route does not tokenize and route the clause twice.
+    pub(crate) fn partitioned_routed(
+        table: Arc<PartitionedTable>,
+        route: &crate::core::partition::Route,
+        visibility: Visibility,
+    ) -> io::Result<Self> {
+        table.check()?;
+        let epoch = table.epoch()?;
+        let parts = Parts::from_vec(table.materialized(&epoch, route)?);
+        let cache = parts.len() <= CACHE_MAX_PARTITIONS;
+        Ok(RowSource::Partitioned(Box::new(FanOut { table, visibility, _epoch: epoch, parts, cache })))
+    }
+
     /// A partitioned table's source over the partitions owning `ranges`
     /// (each a key's point range, `PartitionedTable::keyed_range`), read
     /// under `visibility`, a snapshot the caller took first (§4.4's order:
