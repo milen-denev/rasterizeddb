@@ -1837,6 +1837,25 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
                     &crate::core::backup::timeutil::format_rfc3339(snapshot.finished_at),
                 );
                 push("newest_snapshot_end_lsn", snapshot.end_lsn.to_string(), "");
+                // Whether a restore of it brings every table back. A health
+                // check reading only the rows above saw a snapshot of a
+                // database whose cold tables were in no backup at all.
+                push(
+                    "newest_snapshot_complete",
+                    snapshot.uncovered.is_empty().to_string(),
+                    crate::core::rql::backup_exec::coverage_warning(snapshot).trim_end(),
+                );
+                push(
+                    "newest_snapshot_cold_tables",
+                    snapshot.cold_tables.len().to_string(),
+                    &match snapshot.cold_copied_at {
+                        Some(at) => format!(
+                            "tables on a key/value store, copied at {}; a restore brings them back as of then",
+                            crate::core::backup::timeutil::format_rfc3339(at)
+                        ),
+                        None => String::new(),
+                    },
+                );
             }
         }
 

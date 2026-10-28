@@ -82,6 +82,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::{RwLock, Semaphore};
 
 pub mod archive;
+pub mod cold;
 pub mod manifest;
 #[cfg(test)]
 mod pitr_tests;
@@ -145,6 +146,8 @@ const EXCLUDED: &[&str] = &[
     // dropped its `.wseg` files by suffix but kept a `.partial` copy of a log
     // that happened to be mid-flight.
     STAGING_DIR,
+    // A snapshot's copy of its cold tables, which it lists itself.
+    cold::COLD_DIR,
 ];
 
 /// Whether a file is left out of every snapshot: [`EXCLUDED`], and the
@@ -361,6 +364,10 @@ pub struct SnapshotReport {
     pub start_lsn: u64,
     pub end_lsn: u64,
     pub elapsed: Duration,
+    /// Tables on a key/value store this snapshot copied.
+    pub cold_tables: usize,
+    /// Tables it does not contain; see [`manifest::SnapshotEntry::uncovered`].
+    pub uncovered: Vec<String>,
 }
 
 impl SnapshotReport {
@@ -865,12 +872,6 @@ impl BackupService {
     /// deletes every older generation.
     async fn take_snapshot(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
         let _one_at_a_time = self.snapshot_lock.lock().await;
-        // A snapshot is a copy of a directory, so a table that is not in one is
-        // not in the snapshot. That is the intended behaviour — a table on
-        // another backend does not get the file-backed features — but it must be
-        // said out loud every time rather than discovered at a restore, which is
-        // the worst possible moment to learn what a backup does not contain.
-        self.warn_about_excluded_tables();
         let started = std::time::Instant::now();
         let started_at = timeutil::now_unix();
 
@@ -927,12 +928,32 @@ impl BackupService {
         // and its deletion follows it.
         drop(no_deletion);
 
-        let files = self.snapshot_file_list(&locations)?;
+        let mut files = self.snapshot_file_list(&locations)?;
         if files.is_empty() {
             return Err(io::Error::other(format!(
                 "{} holds no database files to snapshot",
                 self.location
             )));
+        }
+        // Tables on a key/value store, copied out as one cut while the copy
+        // runs: inside the window, so every transaction the cut holds is
+        // committed in the log a restore replays. Their names may match files
+        // the walk found — what a move to the store left behind — and the copy
+        // is the table.
+        let cold = cold::copy_cold_tables(Path::new(&self.location), timeutil::now_unix).await;
+        files.retain(|(name, _)| !cold.files.iter().any(|(copied, _)| copied == name));
+        files.extend(cold.files.iter().cloned());
+        if !cold.uncovered.is_empty() {
+            warn!(
+                "snapshot of {} does not contain {} table(s), which a restore will not bring back: {}",
+                self.location,
+                cold.uncovered.len(),
+                cold.uncovered
+                    .iter()
+                    .map(|u| format!("{} ({})", u.qualified(), u.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
         }
         #[cfg(test)]
         upload_hooks::parked_here(&self.location).await;
@@ -1062,6 +1083,9 @@ impl BackupService {
                     path: path.clone(),
                 })
                 .collect(),
+            cold_tables: cold.tables.clone(),
+            cold_copied_at: cold.copied_at,
+            uncovered: cold.uncovered.clone(),
         };
 
         // Released before the archive flush: that is network work and holding
@@ -1118,6 +1142,8 @@ impl BackupService {
             start_lsn,
             end_lsn,
             elapsed: started.elapsed(),
+            cold_tables: entry.cold_tables.len(),
+            uncovered: entry.uncovered.iter().map(|u| u.qualified()).collect(),
         };
 
         info!(
@@ -1326,38 +1352,6 @@ impl BackupService {
     /// succeeded over what remained. A restore came back with the default
     /// database and nothing else, which is the worst way to discover it.
     ///
-    /// Reports the tables this snapshot cannot contain.
-    ///
-    /// Read from `db_storage.cfg` rather than from a live `Database`, so the
-    /// backup service keeps having no dependency on the catalogue.
-    #[cfg(feature = "storage_pools")]
-    fn warn_about_excluded_tables(&self) {
-        use crate::core::storage::{StorageManager, TableBackend};
-        let pool = StorageManager::open(&self.location);
-        let mut excluded: Vec<String> = pool
-            .placements()
-            .into_iter()
-            .filter_map(|(table, spec)| {
-                let backend = TableBackend::parse(&spec);
-                (!backend.is_file_based()).then(|| format!("{table} ({})", backend.kind()))
-            })
-            .collect();
-        if excluded.is_empty() {
-            return;
-        }
-        excluded.sort_unstable();
-        warn!(
-            "snapshot of {} does not include {} table(s) that are not file-backed: {}. \
-             A restore will not bring them back.",
-            self.location,
-            excluded.len(),
-            excluded.join(", ")
-        );
-    }
-
-    #[cfg(not(feature = "storage_pools"))]
-    fn warn_about_excluded_tables(&self) {}
-
     /// Names are relative paths with `/` separators, so a restore rebuilds the
     /// same shape. A storage location's files are named under its stream key,
     /// which a restore maps back to a directory (see [`restore`]).

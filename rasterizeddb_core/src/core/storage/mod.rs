@@ -1032,6 +1032,43 @@ pub fn repoint_pool_config(
     repoint_restored_pool(written_in, final_root, source_root, &[])
 }
 
+/// Removes the key/value placements of `tables` from the pool file in
+/// `written_in`, so each opens from the directory instead: what a restore
+/// does with a table whose snapshot copy came off a store. Its placement
+/// still names the store, and for a clone that store is the live server's —
+/// opening it there would read the original and leave the copy unread, and a
+/// write would corrupt a prefix with two writers.
+pub fn drop_kv_placements(written_in: &Path, tables: &[String]) -> io::Result<()> {
+    let path = written_in.join(POOL_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let dropped = matches!(
+            line.split('\t').collect::<Vec<_>>().as_slice(),
+            ["table", spec, table]
+                if tables.iter().any(|t| t == table)
+                    && matches!(TableBackend::parse(spec), TableBackend::KeyValue(_))
+        );
+        if !dropped {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    // Through a temporary file and a rename, for the reason `persist` gives.
+    let temp = written_in.join(format!("{}.tmp", POOL_FILE));
+    std::fs::write(&temp, out.as_bytes())?;
+    if let Ok(file) = std::fs::File::open(&temp) {
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&temp, &path)?;
+    let _ = crate::core::wal::sync_parent_dir(&path);
+    Ok(())
+}
+
 /// [`repoint_pool_config`] for a snapshot that also carried storage locations
 /// outside the database directory.
 ///

@@ -573,6 +573,23 @@ impl KvRegistry {
         if let Some(existing) = open.get(name) {
             return Ok(existing.clone());
         }
+        let (store, config) = self.connect(name)?;
+        let family = KvFamily::open(store, config).await?;
+        info!(
+            "key/value store '{name}' opened ({})",
+            family.store().describe()
+        );
+        // So a backup copying this store can pause it: see
+        // `kv::export`.
+        crate::core::storage_providers::kv::export::register_live(&family);
+        open.insert(name.to_string(), family.clone());
+        Ok(family)
+    }
+
+    /// A client for store `name` and the configuration its family opens
+    /// with, without opening it. A backup opens its own read-only family from
+    /// these.
+    pub fn connect(&self, name: &str) -> io::Result<(Arc<dyn KvStore>, KvConfig)> {
         let entry = self.entries.read().get(name).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -617,13 +634,7 @@ impl KvRegistry {
         for (key, value) in &entry.tuning {
             apply_tuning(&mut config, key, *value);
         }
-        let family = KvFamily::open(store, config).await?;
-        info!(
-            "key/value store '{name}' opened ({})",
-            family.store().describe()
-        );
-        open.insert(name.to_string(), family.clone());
-        Ok(family)
+        Ok((store, config))
     }
 
     /// Refuses the database if a table is placed on a store that is not here.

@@ -450,6 +450,54 @@ async fn build(
             )
         })
         .collect();
+    // A table the snapshot copied off a key/value store is files here now,
+    // but its placement still names the store: opened as it is, it would read
+    // the live objects — the source server's, for a clone — and leave the copy
+    // unread. In place as well: the copy is what the restore was asked for.
+    for (written_in, _, _) in pool_files(target_dir, final_dir, source_root) {
+        let database = written_in
+            .strip_prefix(target_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tables: Vec<String> = snapshot
+            .cold_tables
+            .iter()
+            .filter(|c| c.database == database)
+            .map(|c| c.table.clone())
+            .collect();
+        if !tables.is_empty()
+            && let Err(e) = crate::core::storage::drop_kv_placements(&written_in, &tables)
+        {
+            return Err(io::Error::other(format!(
+                "could not point the restored copies of {} at the restored directory: {e}",
+                tables.join(", ")
+            )));
+        }
+    }
+    if let Some(at) = snapshot.cold_copied_at {
+        info!(
+            "{} table(s) that were on a key/value store come back as tables in the restored \
+             directory, as of {} when snapshot {} copied them: they have no log, so a \
+             point-in-time target does not reach them. STORAGE MOVE TABLE puts one back on a store.",
+            snapshot.cold_tables.len(),
+            super::timeutil::format_rfc3339(at),
+            snapshot.id
+        );
+    }
+    if !snapshot.uncovered.is_empty() {
+        warn!(
+            "Snapshot {} does not contain {} table(s), which will read as missing: {}",
+            snapshot.id,
+            snapshot.uncovered.len(),
+            snapshot
+                .uncovered
+                .iter()
+                .map(|u| format!("{} ({})", u.qualified(), u.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
     let mut dropped: Vec<String> = Vec::new();
     let mut repoint_failed = None;
     for (written_in, final_root, root) in pool_files(target_dir, final_dir, source_root) {
@@ -1168,6 +1216,9 @@ mod tests {
             files: Vec::new(),
             objects: Vec::new(),
             locations: Vec::new(),
+            cold_tables: Vec::new(),
+            cold_copied_at: None,
+            uncovered: Vec::new(),
         }
     }
 

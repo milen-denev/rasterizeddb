@@ -304,6 +304,15 @@ pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     "_seq.db",
 ];
 
+/// Whether `file` is one of table `table`'s: a name [`table_file_names`]
+/// gives, or a schema sidecar, which is created when first used and so is not
+/// always on that list.
+pub(crate) fn table_owns_file(table: &str, file: &str) -> bool {
+    file.strip_prefix(table).is_some_and(|rest| {
+        RENAMED_SUFFIXES.contains(&rest) || (rest.starts_with("_schema_") && rest.ends_with(".db"))
+    })
+}
+
 /// Every file a table of `name` may own: what its log records can name.
 fn table_file_names(name: &str) -> impl Iterator<Item = String> + '_ {
     RENAMED_SUFFIXES

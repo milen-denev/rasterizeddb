@@ -466,12 +466,16 @@ about such a table differs: it is the same `Table` over the same
 
 ### What a non-file table does not get
 
-Backup, relocation, the write-ahead log and the free-space policy are features
-*about files*, and a table without files does not get them:
+Relocation, the write-ahead log and the free-space policy are features *about
+files*, and a table without files does not get them. A backup is the exception:
 
-- **Not in a backup.** A snapshot is a copy of a directory. Every snapshot logs
-  the tables it could not include and says a restore will not bring them back —
-  the one thing worse than not backing them up is finding out at a restore.
+- **In a backup, as of the snapshot.** A snapshot copies every table on a store
+  out as one crash-consistent cut and carries its files like any other table's
+  ([s3-backup.md §10.14](s3-backup.md)). A restore brings it back as a table in
+  the restored directory — never onto the store, which a clone would share with
+  the live server — and as of that copy, since it has no log a point-in-time
+  target could replay. An in-memory table cannot be copied; a snapshot records
+  it as not contained, and `SHOW BACKUPS` and `SHOW BACKUP STATUS` say so.
 - **Not a `STORAGE MOVE TABLE` between directories.** It has no files to put in
   one. `STORAGE MOVE TABLE t TO '/mnt/disk2'` converts it back into a file table
   instead, which is a different operation and says so.

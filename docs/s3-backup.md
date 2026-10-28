@@ -669,6 +669,49 @@ table was in neither — and the backup reported success. Now:
   without one stays at the version it was, and snapshots taken before this
   restore exactly as they did.
 
+### 10.14 Tables on a key/value store
+
+A table placed on a key/value store ([kv-storage.md](kv-storage.md)) has no
+files in any directory and no write-ahead log. Until 2026-10-28 every snapshot
+left it out with a warning in the log, `SHOW BACKUPS` looked healthy, and a
+restore came back without it. Now each snapshot copies it
+(`backup/cold.rs`, `kv/export.rs`):
+
+* **One cut per store.** A second, read-only family is opened over the store,
+  which is exactly what a restart would recover: every transaction some batch
+  declared committed, nothing else. The live family is paused around it:
+  compaction, a truncation's deletes, adopting a scratch generation and a
+  dropped file's sweep wait for the whole copy (each would change or delete an
+  object the reader listed), and commits wait only while the reader lists and
+  fetches the deltas (a listing must see each commit whole). Writes go on
+  meanwhile; nothing on a table in a directory waits at all.
+* **Inside the window.** The copy is taken after the first log cut and before
+  the second, so every transaction it holds is committed in the log a restore
+  replays.
+* **In the archive** under the names the files would have in their database's
+  directory, so a restore needs nothing new to unpack them. A file the walk
+  found under the same name — what a move onto the store left behind — is
+  replaced by the copy.
+* **Restore** removes the table's `kv:` placement from the restored pool file,
+  in place and elsewhere, so it opens from the directory. Opened through the
+  placement, a clone would read the live server's store and leave the copy
+  unread, and its writes would give one prefix two writers. `STORAGE MOVE
+  TABLE` puts it back on a store once the copy is verified.
+* **As of the copy.** A point-in-time target does not reach these tables: there
+  is no log to replay. The restore says so and names the time. Snapshot more
+  often to narrow the gap.
+* **What still cannot be copied** — an in-memory table, a store this server
+  cannot reach — is recorded on the snapshot (`SnapshotEntry.uncovered`). Such a
+  snapshot is still published, since it protects every other table, but
+  `SHOW BACKUPS` leads its detail with `INCOMPLETE:` and the tables, and
+  `SHOW BACKUP STATUS` reports `newest_snapshot_complete = false`.
+* **Cost.** Every cold byte is read from the store at every snapshot. With
+  `incremental_min_bytes` set, a file whose copy hashes the same as the last
+  snapshot's is not uploaded again, but it is still read.
+* **Format.** A catalogue with any such snapshot is written as version 4: a
+  version-3 reader would unpack the files but leave the placement naming the
+  store, so an in-place restore would answer from the live store.
+
 ## 11. Tests
 
 | Suite | Covers |

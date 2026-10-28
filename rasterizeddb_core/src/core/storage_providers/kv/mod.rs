@@ -7,6 +7,7 @@
 //! to provide. `docs/kv-storage.md` has the operational side.
 
 pub mod cache;
+pub mod export;
 pub mod layout;
 pub mod overlay;
 pub mod provider;

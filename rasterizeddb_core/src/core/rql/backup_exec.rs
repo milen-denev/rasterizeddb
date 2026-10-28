@@ -177,11 +177,13 @@ async fn show_rows(service: &Arc<BackupService>) -> Vec<Row> {
             Cell::Number(snapshot.uncompressed_bytes),
             Cell::Number(snapshot.compressed_bytes),
             Cell::Text(format!(
-                "{} files, zstd level {}, s3://{}/{}",
+                "{}{} files, zstd level {}, s3://{}/{}{}",
+                coverage_warning(snapshot),
                 snapshot.file_count,
                 snapshot.compression_level,
                 service.config().bucket,
-                snapshot.key
+                snapshot.key,
+                cold_note(snapshot)
             )),
         ]));
     }
@@ -205,6 +207,38 @@ async fn show_rows(service: &Arc<BackupService>) -> Vec<Row> {
     }
 
     out
+}
+
+/// Leads a snapshot's detail when it is not a complete backup: a restore of
+/// it brings these tables back as missing, and a row that reads like every
+/// other would let that go unseen until then.
+pub fn coverage_warning(snapshot: &backup::manifest::SnapshotEntry) -> String {
+    if snapshot.uncovered.is_empty() {
+        return String::new();
+    }
+    format!(
+        "INCOMPLETE: {} table(s) not in this snapshot: {}. ",
+        snapshot.uncovered.len(),
+        snapshot
+            .uncovered
+            .iter()
+            .map(|u| format!("{} ({})", u.qualified(), u.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// What a snapshot holds of tables on a key/value store, which come back as
+/// of their copy rather than the restore's target.
+fn cold_note(snapshot: &backup::manifest::SnapshotEntry) -> String {
+    match snapshot.cold_copied_at {
+        Some(at) if !snapshot.cold_tables.is_empty() => format!(
+            "; {} key/value table(s) copied at {}, restored as of then",
+            snapshot.cold_tables.len(),
+            backup::timeutil::format_rfc3339(at)
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Two paths naming the same directory, as far as the filesystem is concerned.

@@ -2562,3 +2562,129 @@ e2e_test!(a_created_database_keeps_its_tables_on_other_locations, config, {
         "the default database's table on the shared location"
     );
 });
+
+/// A database with a table on a key/value store (`cold`) and one in its
+/// directory (`hot`), `rows` rows each.
+#[cfg(feature = "kv_storage")]
+async fn cold_source(live: &Path, store: &Path, rows: usize) -> Arc<Database> {
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(
+        &database,
+        &format!(
+            "STORAGE ADD STORE coldstore DIRECTORY WITH (PATH = '{}', PREFIX = 'rdb')",
+            store.display()
+        ),
+    )
+    .await;
+    run(&database, "STORAGE PLACE TABLE cold AT 'kv:coldstore'").await;
+    run(&database, "CREATE TABLE cold (id INT, note STRING)").await;
+    run(&database, "CREATE TABLE hot (id INT, note STRING)").await;
+    for i in 0..rows {
+        run(&database, &format!("INSERT INTO cold (id, note) VALUES ({i}, 'cold')")).await;
+        run(&database, &format!("INSERT INTO hot (id, note) VALUES ({i}, 'hot')")).await;
+    }
+    assert!(
+        !live.join("cold.db").exists(),
+        "the table is in the directory, not on the store: the test proves nothing"
+    );
+    database
+}
+
+#[cfg(feature = "kv_storage")]
+e2e_test!(a_table_on_a_key_value_store_is_in_the_snapshot, config, {
+    // Snapshots copied directories, so a table on a store was in none of
+    // them: each logged a warning, SHOW BACKUPS looked healthy, and a restore
+    // came back without the table.
+    let root = fresh_root();
+    let live = root.join("live");
+    let store = root.join("store");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    let database = cold_source(&live, &store, 20).await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    let report = service.snapshot_now().await.expect("snapshot");
+    assert_eq!(report.cold_tables, 1, "{report:?}");
+    assert!(report.uncovered.is_empty(), "{report:?}");
+    let (_, manifest) = read_manifest(&config).await;
+    let entry = manifest.snapshots.last().expect("a snapshot");
+    assert_eq!(entry.cold_tables.len(), 1);
+    assert_eq!(entry.cold_tables[0].table, "cold");
+    assert!(entry.cold_copied_at.is_some());
+    assert!(entry.files.iter().any(|f| f == "cold.db"), "{:?}", entry.files);
+    assert!(!live.join(rasterizeddb_core::core::backup::cold::COLD_DIR).exists(), "the copy was left behind");
+
+    // After the snapshot: the directory table's rows are in the log, the
+    // store table's in no log at all.
+    for i in 20..30 {
+        run(&database, &format!("INSERT INTO cold (id, note) VALUES ({i}, 'after')")).await;
+        run(&database, &format!("INSERT INTO hot (id, note) VALUES ({i}, 'after')")).await;
+    }
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    let pool = std::fs::read_to_string(target.join("db_storage.cfg")).unwrap_or_default();
+    assert!(!pool.contains("kv:coldstore"), "the restored table still names the store:\n{pool}");
+
+    // The copy has to stand on its own: the source and the store both gone.
+    drop(service);
+    drop(database);
+    std::fs::remove_dir_all(&live).unwrap();
+    std::fs::remove_dir_all(&store).unwrap();
+    forget_logs(&[&live]);
+
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM hot").await,
+        30,
+        "the directory table, replayed to the end of the log"
+    );
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM cold").await,
+        20,
+        "the store table, as of the snapshot's copy"
+    );
+});
+
+#[cfg(feature = "kv_storage")]
+e2e_test!(an_in_place_restore_brings_a_store_table_back_as_files, config, {
+    let root = fresh_root();
+    let live = root.join("live");
+    let store = root.join("store");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    let database = cold_source(&live, &store, 8).await;
+    // In memory: nothing for a backup to copy, so the snapshot says so.
+    run(&database, "STORAGE PLACE TABLE scratch AT 'memory:'").await;
+    run(&database, "CREATE TABLE scratch (id INT)").await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    let report = service.snapshot_now().await.expect("snapshot");
+    assert_eq!(report.cold_tables, 1, "{report:?}");
+    assert_eq!(report.uncovered, vec!["scratch".to_string()], "{report:?}");
+    let (_, manifest) = read_manifest(&config).await;
+    let entry = manifest.snapshots.last().expect("a snapshot");
+    assert!(entry.uncovered[0].reason.contains("in-memory"), "{:?}", entry.uncovered);
+
+    // The host is lost, and the store with it.
+    drop(service);
+    drop(database);
+    std::fs::remove_dir_all(&live).unwrap();
+    std::fs::remove_dir_all(&store).unwrap();
+    forget_logs(&[&live]);
+
+    rasterizeddb_core::core::backup::restore_from(&config, &live, RecoveryTarget::Latest)
+        .await
+        .expect("restore in place");
+    let pool = std::fs::read_to_string(live.join("db_storage.cfg")).unwrap_or_default();
+    assert!(!pool.contains("kv:coldstore"), "the restored table still names the store:\n{pool}");
+    assert!(live.join("cold.db").exists(), "the store table's files are not in the directory");
+    assert_eq!(count_in_restored(&live, "SELECT * FROM cold").await, 8);
+    assert_eq!(count_in_restored(&live, "SELECT * FROM hot").await, 8);
+});

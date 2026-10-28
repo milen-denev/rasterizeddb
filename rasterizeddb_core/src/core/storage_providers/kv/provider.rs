@@ -290,6 +290,12 @@ impl DeltaTxns {
 /// declarations across the whole database before applying anything, so the
 /// transaction is either everywhere or nowhere: if the final put fails, no
 /// object names the transaction and every file discards its half.
+/// A family's identity: its store and the prefix within it. See
+/// [`KvFamily::identity`].
+pub(crate) fn identity_of(store: &dyn KvStore, root: &str) -> String {
+    format!("{} @ {}", store.describe(), root)
+}
+
 pub struct KvFamily {
     store: Arc<dyn KvStore>,
     config: Arc<KvConfig>,
@@ -319,6 +325,18 @@ pub struct KvFamily {
     /// table off a store and back. [`KvFamily::open_file`] waits on this, which
     /// is what makes the reopen behave the way the comment claimed.
     erasing: dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Read by everything that rewrites or deletes an object of this family —
+    /// compaction, a truncation's deletes, adopting a scratch generation, a
+    /// dropped file's sweep. Written by [`KvFamily::pause_maintenance`], so a
+    /// reader working from the objects listed at one moment finds every one
+    /// still there and unchanged. Appends and commits never take it: they
+    /// add objects, never change one.
+    maintenance: Arc<tokio::sync::RwLock<()>>,
+    /// Read for a whole commit, written by [`KvFamily::hold_commits`]. A
+    /// listing taken under the write sees every commit whole or not at all;
+    /// without it a listing could pass a commit's first object before it was
+    /// stored and then find the declaring one.
+    declaring: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl KvFamily {
@@ -328,6 +346,18 @@ impl KvFamily {
     /// any file is opened — a per-file scan could not see the commit
     /// declarations that live in another file's deltas.
     pub async fn open(store: Arc<dyn KvStore>, config: KvConfig) -> io::Result<Arc<Self>> {
+        Self::open_with(store, config, false).await
+    }
+
+    /// The family as a restart would recover it from the objects in the store
+    /// now, for reading only: a crash-consistent copy of every file, with no
+    /// object written or deleted to get it. A live family on the same prefix
+    /// should be paused around it ([`super::export`]).
+    pub async fn open_snapshot(store: Arc<dyn KvStore>, config: KvConfig) -> io::Result<Arc<Self>> {
+        Self::open_with(store, config, true).await
+    }
+
+    async fn open_with(store: Arc<dyn KvStore>, config: KvConfig, read_only: bool) -> io::Result<Arc<Self>> {
         config.validate()?;
         let prefix = format!("{}/", config.root);
         let listed = store.list(&prefix).await?;
@@ -426,7 +456,7 @@ impl KvFamily {
                 }
             }
         }
-        if !stale.is_empty() {
+        if !stale.is_empty() && !read_only {
             let _ = store.delete(stale).await;
         }
         max_txn = max_txn.max(committed.iter().copied().max().unwrap_or(0));
@@ -494,7 +524,36 @@ impl KvFamily {
             committed: Arc::new(committed),
             ledger,
             erasing: dashmap::DashMap::new(),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
+            declaring: Arc::new(tokio::sync::RwLock::new(())),
         }))
+    }
+
+    /// Which store and prefix this family is: two families with one identity
+    /// are the same files.
+    pub fn identity(&self) -> String {
+        identity_of(self.store.as_ref(), &self.config.root)
+    }
+
+    /// Every file the store held at open or that has been opened since.
+    pub fn file_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.recovered.lock().keys().cloned().collect();
+        names.extend(self.files.iter().map(|e| e.key().clone()));
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Holds every rewrite and delete of this family's objects off until the
+    /// guard drops; waits for the ones in flight. See `maintenance`.
+    pub async fn pause_maintenance(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.maintenance.clone().write_owned().await
+    }
+
+    /// Holds commits off until the guard drops; waits for the ones in
+    /// flight. See `declaring`.
+    pub async fn hold_commits(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.declaring.clone().write_owned().await
     }
 
     pub fn store(&self) -> &Arc<dyn KvStore> {
@@ -521,6 +580,7 @@ impl KvFamily {
     /// whose object declares the transaction committed. Everything before it is
     /// stored but inert until that declaration lands.
     async fn commit(&self, txn: u64, last: &Arc<KvFile>) -> io::Result<()> {
+        let _declaring = self.declaring.read().await;
         let others: Vec<Arc<KvFile>> = self
             .open_files()
             .into_iter()
@@ -692,6 +752,9 @@ pub(crate) struct KvFile {
     /// and differs only by generation, so erasing it must not reach past its
     /// own generation.
     is_temp: bool,
+    /// The family's `maintenance` gate, read around every rewrite or delete
+    /// of an object.
+    maintenance: Arc<tokio::sync::RwLock<()>>,
     /// Shared by readers, because every read of the file takes it — once per
     /// row on the scan path — and a scan's workers serialising on a mutex
     /// here were parking each other on a cache-resident table. Nothing reads
@@ -820,6 +883,7 @@ impl KvFile {
             config,
             cache: family.cache.clone(),
             ledger: family.ledger.clone(),
+            maintenance: family.maintenance.clone(),
             id,
             name: name.to_string(),
             ledger_name: Arc::from(name),
@@ -1641,6 +1705,9 @@ impl KvFile {
     /// from. Runs in the background; a failure leaves the file readable and
     /// simply postpones the work.
     async fn compact(self: &Arc<Self>) -> io::Result<()> {
+        // Before the flag, so a compaction waiting out a pause holds nothing
+        // `adopt` waits on.
+        let _maintenance = self.maintenance.read().await;
         if self.compacting.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -1955,6 +2022,8 @@ impl KvFile {
     // ---- lifecycle ---------------------------------------------------------
 
     async fn truncate_to(&self, new_len: u64) -> io::Result<()> {
+        // It deletes the chunks past the new end.
+        let _maintenance = self.maintenance.read().await;
         let current = self.len.load(Ordering::Acquire);
         if new_len > current {
             return Err(io::Error::new(
@@ -2040,7 +2109,9 @@ impl KvFile {
         // that generation — whose chunks this is about to delete — and store
         // its base length over the new one: a table that reads correctly until
         // the restart and then comes back as the replaced bytes, or as zeros.
-        // Taken before the flush locks, in the order `compact` takes them.
+        // Taken before the flush locks, in the order `compact` takes them,
+        // and the maintenance gate before both, as `compact` takes it.
+        let _maintenance = self.maintenance.read().await;
         let _quiet = CompactionGuard::acquire(self).await;
         let _quiet_temp = CompactionGuard::acquire(temp).await;
         let _one = self.flush.lock().await;
@@ -2151,6 +2222,7 @@ impl KvFile {
     }
 
     async fn erase(&self) -> io::Result<()> {
+        let _maintenance = self.maintenance.read().await;
         let root = self.root();
         let prefix = if self.is_temp {
             // Scratch shares the real file's prefix. Sweeping it would take the
@@ -2593,6 +2665,7 @@ impl StorageIO for KvStorageProvider {
             config: file.config.clone(),
             cache: file.cache.clone(),
             ledger: file.ledger.clone(),
+            maintenance: file.maintenance.clone(),
             id: self.family.next_file_id.fetch_add(1, Ordering::Relaxed),
             name: file.name.clone(),
             ledger_name: file.ledger_name.clone(),

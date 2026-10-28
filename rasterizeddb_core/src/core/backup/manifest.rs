@@ -38,7 +38,12 @@ use serde::{Deserialize, Serialize};
 /// ([`SnapshotEntry::locations`]). A version-2 reader would unpack their files
 /// into a stray directory and restore a database whose tables on those
 /// locations read as missing — reported as a warning, not as a failure.
-pub const MANIFEST_VERSION: u32 = 3;
+///
+/// 4: a snapshot may carry tables copied off a key/value store
+/// ([`SnapshotEntry::cold_tables`]). A version-3 reader would unpack their
+/// files but leave their placements naming the store, so a restore in place
+/// would answer from the live store rather than the copy, and say nothing.
+pub const MANIFEST_VERSION: u32 = 4;
 
 /// Key of the catalogue within the configured prefix.
 pub const MANIFEST_KEY: &str = "MANIFEST.json";
@@ -140,7 +145,9 @@ impl Manifest {
     /// never takes an incremental snapshot keeps writing catalogues an older
     /// build can still restore from.
     pub fn required_version(&self) -> u32 {
-        if self.snapshots.iter().any(|s| !s.locations.is_empty()) || !self.cuts.is_empty() {
+        if self.snapshots.iter().any(|s| !s.cold_tables.is_empty()) {
+            4
+        } else if self.snapshots.iter().any(|s| !s.locations.is_empty()) || !self.cuts.is_empty() {
             3
         } else if self.snapshots.iter().any(|s| !s.objects.is_empty()) {
             2
@@ -352,6 +359,48 @@ pub struct SnapshotEntry {
     /// — whose restores drop those tables, loudly, as they always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<PoolLocation>,
+    /// Tables on a key/value store that this snapshot copied, as one
+    /// crash-consistent cut taken at [`Self::cold_copied_at`].
+    ///
+    /// They have no log, so a restore brings them back as of that moment
+    /// whatever point in time it replays the rest to, and as tables in the
+    /// restored directory rather than on the store. Their files are named in
+    /// [`Self::files`] like any other table's. Empty for every snapshot
+    /// written before they were copied, which left them out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cold_tables: Vec<ColdTable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_copied_at: Option<u64>,
+    /// Tables this snapshot does not contain, and why. A restore brings none
+    /// of them back, so a snapshot with any is not a complete backup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered: Vec<UncoveredTable>,
+}
+
+/// A table on a key/value store, copied into a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColdTable {
+    /// The database's directory relative to the backed-up one; empty for the
+    /// root database.
+    pub database: String,
+    pub table: String,
+    pub store: String,
+    pub bytes: u64,
+}
+
+/// A table a snapshot could not contain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UncoveredTable {
+    pub database: String,
+    pub table: String,
+    pub reason: String,
+}
+
+impl UncoveredTable {
+    /// `table`, or `database/table` outside the root database.
+    pub fn qualified(&self) -> String {
+        if self.database.is_empty() { self.table.clone() } else { format!("{}/{}", self.database, self.table) }
+    }
 }
 
 /// A storage location outside the database directory, as a snapshot carried it.
@@ -801,6 +850,9 @@ mod tests {
             files: Vec::new(),
             objects: Vec::new(),
             locations: Vec::new(),
+            cold_tables: Vec::new(),
+            cold_copied_at: None,
+            uncovered: Vec::new(),
         }
     }
 
@@ -856,6 +908,39 @@ mod tests {
     /// A catalogue carrying a storage location must be refused by a reader
     /// that would restore it without that location's tables. One without stays
     /// at the version it was before, and does not even mention the field.
+    /// A catalogue carrying a cold table's copy must be refused by a reader
+    /// that would restore it in place with the placement still naming the
+    /// store; one without stays at the version it was.
+    #[test]
+    fn a_reader_that_predates_cold_tables_refuses_a_catalogue_that_has_them() {
+        let mut m = manifest();
+        let plain = m.encode();
+        assert!(!String::from_utf8_lossy(&plain).contains("cold_tables"));
+        assert!(Manifest::decode_understanding(&plain, 3).is_ok());
+
+        m.snapshots[0].cold_tables = vec![ColdTable {
+            database: String::new(),
+            table: "ledger".to_string(),
+            store: "archive".to_string(),
+            bytes: 4096,
+        }];
+        m.snapshots[0].cold_copied_at = Some(1_000);
+        let bytes = m.encode();
+        let err = Manifest::decode_understanding(&bytes, 3).unwrap_err();
+        assert!(err.to_string().contains("version 4"), "{err}");
+        let back = Manifest::decode(&bytes).unwrap();
+        assert_eq!(back.snapshots[0].cold_tables, m.snapshots[0].cold_tables);
+
+        // Uncovered tables alone change nothing a restore does.
+        let mut m = manifest();
+        m.snapshots[0].uncovered = vec![UncoveredTable {
+            database: String::new(),
+            table: "scratch".to_string(),
+            reason: "an in-memory table".to_string(),
+        }];
+        assert!(Manifest::decode_understanding(&m.encode(), 1).is_ok());
+    }
+
     #[test]
     fn a_reader_that_predates_locations_refuses_a_catalogue_that_has_them() {
         let mut m = manifest();

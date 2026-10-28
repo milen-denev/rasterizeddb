@@ -2887,3 +2887,123 @@ async fn abort_txn_rolls_back_an_uncommitted_transaction() {
     let after = delta_keys(&*store, "t_pointers.db").await;
     assert!(before.iter().all(|k| !after.contains(k)), "{before:?} survived in {after:?}");
 }
+
+// ---- export (a backup's copy) ----------------------------------------------
+
+async fn exported(store: &Arc<dyn KvStore>, dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let files = super::export::export(store.clone(), tiny_config(), |_| true, dir).await.unwrap();
+    files
+        .into_iter()
+        .map(|f| {
+            let bytes = std::fs::read(&f.path).unwrap();
+            assert_eq!(bytes.len() as u64, f.bytes, "{}", f.name);
+            (f.name, bytes)
+        })
+        .collect()
+}
+
+/// The copy is what a restart would recover: every committed byte, nothing
+/// of a transaction still open, and the untransacted writes the background
+/// service had not yet stored.
+#[tokio::test]
+async fn an_export_holds_the_committed_bytes_and_no_open_transaction() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    super::export::register_live(&family);
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+    let sequence = open(&family, "t_seq.db").await;
+
+    let txn = rows.begin_txn();
+    rows.append_data_txn(txn, &vec![b'r'; 9_000]).await;
+    pointers.append_data_txn(txn, &vec![b'p'; 300]).await;
+    pointers.commit_durable(txn).await.unwrap();
+
+    let open_txn = rows.begin_txn();
+    rows.append_data_txn(open_txn, b"not committed").await;
+    pointers.append_data_txn(open_txn, b"nor this").await;
+    // Untransacted, and only in the overlay until a flush.
+    sequence.append_data(b"42", false).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let copy = exported(&store, dir.path()).await;
+    assert_eq!(copy["t.db"], vec![b'r'; 9_000]);
+    assert_eq!(copy["t_pointers.db"], vec![b'p'; 300]);
+    assert_eq!(copy["t_seq.db"], b"42".to_vec());
+
+    // The live family is untouched by it: the open transaction still commits.
+    pointers.commit_durable(open_txn).await.unwrap();
+    assert_eq!(read_all(&rows).await.len(), 9_000 + 13);
+}
+
+/// Compaction rewrites chunks the copy is reading; a pause holds it off until
+/// the pause ends, and then it runs.
+#[tokio::test]
+async fn a_compaction_asked_for_during_a_pause_waits_for_it() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let io = Arc::new(open(&family, "t.db").await);
+    let txn = io.begin_txn();
+    io.append_data_txn(txn, &vec![b'x'; 20_000]).await;
+    io.commit_durable(txn).await.unwrap();
+
+    let metas = || async {
+        store.list("t/").await.unwrap().iter().filter(|o| o.key.ends_with("/META")).count()
+    };
+    let before = metas().await;
+    let paused = family.pause_maintenance().await;
+    let compaction = tokio::spawn({
+        let io = io.clone();
+        async move { io.compact_now().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!compaction.is_finished(), "a compaction ran during a pause");
+    assert_eq!(metas().await, before);
+    drop(paused);
+    compaction.await.unwrap().unwrap();
+    assert_eq!(read_all(&io).await, vec![b'x'; 20_000]);
+}
+
+/// A listing under `hold_commits` sees every commit whole: one arriving
+/// meanwhile waits, and lands after.
+#[tokio::test]
+async fn a_commit_waits_while_commits_are_held() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let io = Arc::new(open(&family, "t.db").await);
+    let txn = io.begin_txn();
+    io.append_data_txn(txn, b"later").await;
+
+    let held = family.hold_commits().await;
+    let commit = tokio::spawn({
+        let io = io.clone();
+        async move { io.commit_durable(txn).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!commit.is_finished(), "a commit landed while commits were held");
+    drop(held);
+    commit.await.unwrap().unwrap();
+
+    drop(io);
+    let reopened = open(&open_family(store).await, "t.db").await;
+    assert_eq!(read_all(&reopened).await, b"later".to_vec());
+}
+
+/// With no server holding the store, the copy is read from the objects alone.
+#[tokio::test]
+async fn an_export_reads_a_store_no_family_has_open() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "t.db").await;
+        let txn = io.begin_txn();
+        io.append_data_txn(txn, b"settled").await;
+        io.commit_durable(txn).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let copy = exported(&store, dir.path()).await;
+    assert_eq!(copy["t.db"], b"settled".to_vec());
+    // `keep` decides what is copied.
+    let only = super::export::export(store.clone(), tiny_config(), |name| name != "t.db", dir.path()).await.unwrap();
+    assert!(only.is_empty());
+}
