@@ -251,8 +251,9 @@ async fn a_plain_table_under_the_prefix_turns_reaping_off() {
     close(db, root);
 }
 
-/// A live uid's map generation other than 0 is a later version's: nothing
-/// is reaped, since this version cannot tell its live generation.
+/// A live uid's map generation that does not replay may be a later
+/// version's: nothing is reaped, and it is kept. (One that replays unsealed
+/// is an unfinished compaction, reaped: `partition::pin_tests`.)
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_map_generation_turns_reaping_off() {
     let dir = tempfile::tempdir().unwrap();

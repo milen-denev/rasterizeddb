@@ -149,11 +149,12 @@ async fn a_first_write_after_a_clean_sweep_is_pinned_in_every_image() {
 /// A forget sweep's tombstones are durable before any horizon moves past
 /// them: the status sidecar, persisted as forgetting moves, can outlive an
 /// unsynced rewrite in a power cut, and every id below it then reads as
-/// committed.
+/// committed. (The sweep's in-place commits are durable already; this pins
+/// it for a partition's sweep, through `SWEPT`.)
 ///
-/// Mutation: no `sync_pending` after the rewrites in
-/// `neutralize_aborted_from`: images that keep the new sidecar and lose the
-/// rewrite show the aborted row.
+/// Mutation: the sweep's rewrite leaving `deleted` unset on an aborted
+/// insert (the record rewritten unchanged): every image keeps the forgotten
+/// horizon and shows the aborted row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sweep_is_durable_before_forgetting_passes_it() {
     let base = tempfile::tempdir().unwrap();
@@ -171,6 +172,9 @@ async fn a_sweep_is_durable_before_forgetting_passes_it() {
     let forgotten = forget_except(&db, &[p]).await;
     assert!(forgotten <= x);
     db.sync_durable().unwrap();
+    // Every outcome so far durable, so the sidecar may persist a horizon up
+    // to the settled one as soon as forgetting moves (`persist_sidecar`).
+    db.transactions.status().flush_all().unwrap();
     // The sidecar is a cache the next persist rewrites whole; gone, the one
     // the sweep below writes is new to the recorder, so every image keeps it
     // as written.

@@ -478,20 +478,32 @@ fn generations_in(root: &Path, uid: u64) -> io::Result<Vec<u64>> {
 /// cut. 0 when no generation is sealed, even if generation 0 is gone, so
 /// the never-creating check that follows names the missing file (I9).
 pub(crate) fn live_generation(root: &Path, uid: u64) -> Result<u64, String> {
+    live_generation_and_unreadable(root, uid).map(|(g, _)| g)
+}
+
+/// [`live_generation`], and the higher generations that do not replay at
+/// all. An unfinished compaction can leave one so (pages written out of
+/// order before its `SEALED` was synced), but so would a later version's
+/// records this one cannot read: the reaper deletes none of them.
+fn live_generation_and_unreadable(root: &Path, uid: u64) -> Result<(u64, Vec<u64>), String> {
     let gens = generations_in(root, uid).map_err(|e| format!("{} cannot be listed: {e}", root.display()))?;
+    let mut unreadable = Vec::new();
     for &g in &gens {
         if g == 0 {
-            return Ok(0);
+            return Ok((0, unreadable));
         }
         let name = map_file(uid, g);
         let buf = std::fs::read(root.join(&name)).map_err(|e| format!("its map log {name} cannot be read: {e}"))?;
         match log::replay(&buf) {
-            Ok(r) if r.state.sealed() => return Ok(g),
+            Ok(r) if r.state.sealed() => return Ok((g, unreadable)),
             Ok(_) => ::log::warn!("map log {name} is an unfinished compaction (no SEALED); the generation before it is live"),
-            Err(e) => ::log::warn!("map log {name} is an unfinished compaction ({e}); the generation before it is live"),
+            Err(e) => {
+                ::log::warn!("map log {name} does not replay ({e}); the generation before it is live");
+                unreadable.push(g);
+            }
         }
     }
-    Ok(0)
+    Ok((0, unreadable))
 }
 
 /// A live table's map log as the reaper reads it: its live generation
@@ -502,7 +514,14 @@ pub(crate) fn live_generation(root: &Path, uid: u64) -> Result<u64, String> {
 /// `DROPPED` record, or a shape this version cannot open (reshaped, retired
 /// partitions, a partition off the root). Any of these turns reaping off.
 pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<LiveMap, String> {
-    let generation = live_generation(root, uid)?;
+    let (generation, unreadable) = live_generation_and_unreadable(root, uid)?;
+    if let Some(g) = unreadable.first() {
+        return Err(format!(
+            "its map log generation {g} ({}) does not replay; it may be a later version's, so nothing is reaped until \
+             it is examined",
+            map_file(uid, *g)
+        ));
+    }
     let name = map_file(uid, generation);
     let path = root.join(&name);
     let buf = std::fs::read(&path).map_err(|e| format!("its map log {} cannot be read: {e}", path.display()))?;

@@ -235,6 +235,11 @@ enum Kind {
     TxCommit,
     TxRollback,
     Restart,
+    // Phase 3 P5a (§7.2): settle, sweep every plain table and a seeded
+    // subset of the partitions, and forget as far as the registry allows.
+    // A partition left unswept must keep its aborted rows hidden, so any
+    // resurrection shows as rows the twin does not have.
+    ForgetSweep,
 }
 
 use Kind::*;
@@ -262,7 +267,7 @@ const ALL_KINDS: &[Kind] = &[
     DropDefault, SetNotNull, DropNotNull, DropNotNullKey, RenameColumnRoundTrip, RenameKeyRoundTrip,
     RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, ForeignKeyFromT,
     ForeignKeyOntoPartitioned, ForeignKeyFromSink, PreparedSelectAcrossAlter,
-    TxCommit, TxRollback, Restart,
+    TxCommit, TxRollback, Restart, ForgetSweep,
 ];
 
 /// A kind the partitioned table refuses today: the SQLSTATE the refusal
@@ -459,6 +464,8 @@ enum Step {
     /// its undoing.
     Sequence(Vec<Op>),
     Restart,
+    /// [`ForgetSweep`]: the bits of the value pick which partitions sweep.
+    ForgetSweep(u64),
 }
 
 struct Op {
@@ -1648,6 +1655,7 @@ impl Gen {
                 Op { kind, step: Step::Block { inner, commit: kind == TxCommit }, ordered: false }
             }
             Restart => Op { kind, step: Step::Restart, ordered: false },
+            ForgetSweep => Op { kind, step: Step::ForgetSweep(self.rng.u64(..)), ordered: false },
         }
     }
 
@@ -1749,6 +1757,7 @@ fn weight(kind: Kind) -> u32 {
         InsertOne | InsertMulti | PreparedInsert | InsertSelect => 6,
         TxCommit | TxRollback => 4,
         Restart => 0,
+        ForgetSweep => 1,
         CatalogColumns | CatalogTables | CatalogClass | CatalogStat | CatalogIndexes | Describe => 1,
         Vacuum | VacuumFull | Analyze => 1,
         CreateIndex | DropIndex | CreateUniqueIndex | DropUniqueIndex | UniqueWithoutKey | AddCheck | DropCheck
@@ -1867,6 +1876,7 @@ fn writes_t(kind: Kind) -> bool {
             | TxCommit
             | TxRollback
             | Restart
+            | ForgetSweep
             | CreateIndex
             | DropIndex
             | CreateUniqueIndex
@@ -2228,6 +2238,13 @@ impl Twin {
                 self.note(op.kind, &Verdict::Agreed { failed });
                 false
             }
+            Step::ForgetSweep(pick) => {
+                let db = self.server.as_ref().unwrap().db.clone();
+                let (swept, left, forgotten) = force_forget(&db, *pick);
+                self.log.push(format!("-- forget sweep: swept {swept:?}, left {left:?}, forgotten below {forgotten}"));
+                self.note(op.kind, &Verdict::Agreed { failed: false });
+                false
+            }
             Step::Restart => {
                 self.log.push("-- restart".into());
                 self.cp = None;
@@ -2244,6 +2261,42 @@ impl Twin {
             }
         }
     }
+}
+
+/// [`ForgetSweep`]: ends enough transactions for the settle bound to pass
+/// every id so far, settles, sweeps every plain table and the partitions
+/// `pick`'s bits choose (bit `pid % 64`), and forgets. Returns the swept and
+/// the unswept pids, and the forgotten horizon.
+fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, pick: u64) -> (Vec<u32>, Vec<u32>, u64) {
+    use rasterizeddb_core::core::partition::Route;
+    let db = db.clone();
+    block_on_big(async move {
+        for _ in 0..5_000 {
+            let tx = db.transactions.begin();
+            db.transactions.commit(tx);
+        }
+        db.transactions.settle_now();
+        for name in db.table_names() {
+            if let Some(t) = db.table_for_tests(&name)
+                && !t.is_shell()
+            {
+                t.neutralize_aborted_now().await.expect("a plain table's forget sweep");
+            }
+        }
+        let (mut swept, mut left) = (Vec::new(), Vec::new());
+        if let Some(pt) = db.partitioned_table(PART) {
+            let epoch = pt.epoch().expect("the partitioned table opens");
+            for (pid, _) in pt.materialized(&epoch, &Route::All).expect("its partitions") {
+                if (pick >> (pid % 64)) & 1 == 1 {
+                    pt.sweep_pin_now(pid).await.expect("a partition's forget sweep");
+                    swept.push(pid);
+                } else {
+                    left.push(pid);
+                }
+            }
+        }
+        (swept, left, db.transactions.try_forget())
+    })
 }
 
 /// The partitioned table's rows by partition, each partition's sorted.

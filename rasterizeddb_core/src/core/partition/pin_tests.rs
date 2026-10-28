@@ -150,6 +150,12 @@ async fn an_unswept_partition_pins_forgetting_below_its_aborted_rows() {
     let db = open(&dir).await;
     let x = populated_with_an_abort(&db).await;
     let p = pid_of_tenant(&pt(&db), 1);
+    // Before any partition is swept: the handle covers every materialized
+    // partition's pin from its MATERIALIZE on.
+    advance(&db);
+    sweep_plain(&db).await;
+    let forgotten = db.transactions.try_forget();
+    assert!(forgotten <= x, "with no partition swept, forgotten below {forgotten}, past aborted {x}");
 
     for round in 0..3 {
         let forgotten = forget_except(&db, &[p]).await;
@@ -412,20 +418,30 @@ async fn compaction_keeps_every_record_and_the_pins_through_a_restart() {
     forget_except(&db, &[p]).await;
     let board = t.pin_board().unwrap().clone();
     assert_eq!(board.generation(), 0);
-    let before = pins(&t).await;
 
-    // Writers and sweeps during the compaction: their records are appended
-    // to the old generation after the clone, and must reach the new one.
-    let writer = {
-        let db = db.clone();
-        tokio::spawn(async move {
-            for tenant in 100..160i64 {
-                exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, {tenant}, 'w')")).await;
-            }
-        })
+    // Writes while the compaction is held between its snapshot and its
+    // switch: the other partitions are clean, so each one's first write
+    // appends a DIRTY to the old generation after the clone, which the new
+    // one must take from the capture (left out, those partitions would
+    // reopen clean under unswept stamps).
+    let others: Vec<u32> = materialized(&t).into_iter().filter(|&q| q != p).collect();
+    for q in &others {
+        assert_eq!(t.pin_of(*q).await.unwrap(), None, "partition {q} did not sweep clean");
+    }
+    let (reached, resume) = super::pins::test_hooks::arm(&dir);
+    let compacting = {
+        let board = board.clone();
+        tokio::spawn(async move { board.compact().await })
     };
-    assert!(board.compact().await.unwrap(), "the first compaction did not run");
-    writer.await.unwrap();
+    reached.notified().await;
+    for tenant in 100..140i64 {
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, {tenant}, 'w')")).await;
+    }
+    for q in &others {
+        assert!(t.pin_of(*q).await.unwrap().is_some(), "partition {q} took a write and stayed clean");
+    }
+    resume.notify_one();
+    assert!(compacting.await.unwrap().unwrap(), "the first compaction did not run");
     assert_eq!(board.generation(), 1);
     assert_eq!(map_generations(&dir, uid), vec![1], "the old generation was not deleted");
     let replay = board.log.replay().await.unwrap();
@@ -438,7 +454,7 @@ async fn compaction_keeps_every_record_and_the_pins_through_a_restart() {
     assert_eq!(map_generations(&dir, uid), vec![2]);
     let rows = ids(&db, "id > 0").await;
     let pins_now = pins(&t).await;
-    assert_eq!(pins_now.iter().find(|(q, _)| *q == p), before.iter().find(|(q, _)| *q == p), "the unswept partition's pin moved");
+    assert!(pins_now.iter().find(|(q, _)| *q == p).is_some_and(|(_, pin)| pin.is_some_and(|v| v <= x)), "the unswept partition's pin moved");
     drop((t, board));
     db.sync_durable().unwrap();
     close(&dir, db);
@@ -621,5 +637,44 @@ async fn a_sweep_that_sees_a_running_writers_stamp_is_not_clean() {
     let forgotten = forget_except(&db, &[]).await;
     assert!(forgotten > w);
     assert_eq!(ids(&db, "tenant_id = 1").await, vec![1]);
+    close(&dir, db);
+}
+
+/// A table that cannot open (a partition's file missing, I9) has unknown
+/// pins: it holds the forgotten horizon where it was for as long as it stays
+/// broken, so once the file is back its aborted rows are still hidden.
+///
+/// Mutation: no `broken_pin` for a table that failed to open: the broken
+/// table pins nothing, forgetting passes the aborted id, and after the
+/// repair the row comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_table_pins_until_it_opens() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    let x = populated_with_an_abort(&db).await;
+    let t = pt(&db);
+    let (uid, p) = (t.uid(), pid_of_tenant(&t, 1));
+    let other = materialized(&t).into_iter().find(|&q| q != p).expect("a second partition");
+    drop(t);
+    db.sync_durable().unwrap();
+    close(&dir, db);
+
+    let victim = dir.join(&crate::core::partition::files::data_files(uid, other)[0]);
+    let aside = base.path().join("aside");
+    std::fs::rename(&victim, &aside).unwrap();
+    let db = open(&dir).await;
+    assert!(pt(&db).broken().is_some(), "the table opened without a partition's file");
+    advance(&db);
+    sweep_plain(&db).await;
+    let forgotten = db.transactions.try_forget();
+    assert!(forgotten <= x, "a broken table let forgetting pass the aborted {x} (forgotten below {forgotten})");
+    db.sync_durable().unwrap();
+    close(&dir, db);
+
+    std::fs::rename(&aside, &victim).unwrap();
+    let db = open(&dir).await;
+    assert!(pt(&db).broken().is_none(), "{:?}", pt(&db).broken());
+    assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "the aborted row came back after the repair");
     close(&dir, db);
 }

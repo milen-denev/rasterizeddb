@@ -358,6 +358,8 @@ impl PinBoard {
             }
         };
         #[cfg(test)]
+        test_hooks::pause_after_written(&self.root).await;
+        #[cfg(test)]
         crate::core::power_loss::failpoint::hit("test.pmap.compact_written", &self.root)?;
         let opening = fresh.io().get_len().await;
         let mut state = self.state.lock().await;
@@ -423,5 +425,39 @@ impl PinBoard {
     /// nothing passed its reservation.
     pub(crate) async fn cover_serials(&self) -> io::Result<()> {
         self.serials.cover().await
+    }
+}
+
+/// Test-only: holds a compaction between writing its snapshot and taking
+/// the state's lock again, so a test can append records the new generation
+/// must take from the capture.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc as StdArc;
+
+    use tokio::sync::Notify;
+
+    type Pause = (PathBuf, StdArc<Notify>, StdArc<Notify>);
+    static PAUSES: parking_lot::Mutex<Vec<Pause>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Arms a pause for compactions under `dir`: the first `Notify` is
+    /// signalled when one reaches it, and it goes on once the second is.
+    pub(crate) fn arm(dir: &Path) -> (StdArc<Notify>, StdArc<Notify>) {
+        let (reached, resume) = (StdArc::new(Notify::new()), StdArc::new(Notify::new()));
+        PAUSES.lock().push((dir.to_path_buf(), reached.clone(), resume.clone()));
+        (reached, resume)
+    }
+
+    pub(super) async fn pause_after_written(root: &Path) {
+        let found = {
+            let mut pauses = PAUSES.lock();
+            let at = pauses.iter().position(|(d, _, _)| root.starts_with(d));
+            at.map(|i| pauses.remove(i))
+        };
+        if let Some((_, reached, resume)) = found {
+            reached.notify_one();
+            resume.notified().await;
+        }
     }
 }

@@ -1189,6 +1189,13 @@ impl PartitionedTable {
         self.live().ok()?.board.serials.reserved(name)
     }
 
+    /// A forget sweep of partition `pid` now, through its slot
+    /// (`PinBoard::sweep`): `SWEPT`, its pin moved, and the registry asked
+    /// to forget. For tests and tools.
+    pub async fn sweep_pin_now(&self, pid: u32) -> io::Result<crate::core::vacuum::NeutralizeReport> {
+        self.live()?.board.sweep(pid).await
+    }
+
     /// Forget sweeps of every open, pinned partition now, each through its
     /// slot (`PinBoard::sweep`). Returns how many advanced. For tests and
     /// tools: the scheduler sweeps a pin once it lags by `FORGET_STEP`.

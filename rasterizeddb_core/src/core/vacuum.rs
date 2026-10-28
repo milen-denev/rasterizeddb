@@ -2517,18 +2517,6 @@ pub async fn neutralize_aborted_from<S: StorageIO>(
     parts
         .dead_stamps
         .fetch_add(report.tombstoned, Ordering::Relaxed);
-    // The batches' commits are deferred to a group commit
-    // (`commit_txn_deferred`), and nothing here is a statement that pays it.
-    // Forgetting can be persisted (the status sidecar) as soon as a horizon
-    // moves, so a rewrite still in the page cache would let a power cut keep
-    // the forgotten horizon and lose the tombstone: the aborted version read
-    // as committed. Synced before any horizon may move (§7.2: a partition's
-    // `SWEPT` likewise follows its sweep's durability).
-    if report.tombstoned + report.cleared > 0
-        && let Some(location) = parts.io_pointers.get_location()
-    {
-        crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))?;
-    }
 
     // 4. Readers that could hold a pointer from before the rewrite.
     let barrier = parts.readers.barrier();
