@@ -6032,6 +6032,7 @@ async fn lock_selected_rows(
             &row_key,
             lock.strength,
             matches!(lock.behaviour, LockWait::Wait),
+            true,
             tx,
         )
         .await?;
@@ -6145,6 +6146,10 @@ async fn acquire_row_lock(
     key: &[u8],
     strength: crate::core::rql::row_lock::LockStrength,
     wait: bool,
+    // A locking read (`FOR UPDATE`/`FOR SHARE`) rather than a writer taking
+    // its rows' locks: it also waits out a fast-path writer of the table,
+    // which wrote without row locks (`RowLocks::enter_fast_write`).
+    locker: bool,
     tx: TxId,
 ) -> Result<crate::core::mvcc::row_locks::Acquired, String> {
     use crate::core::mvcc::row_locks::Acquired;
@@ -6155,8 +6160,24 @@ async fn acquire_row_lock(
             crate::core::mvcc::transaction::TxOutcome::InProgress
         )
     };
-    let mut outcome = database.row_locks.acquire(table_name, key, tx, strength, &live);
+    let owner_live = |o: TxId| database.transactions.owner_live(o);
+    let already = locker && database.row_locks.holds(table_name, key, tx);
+    // Taken first, then the fast-path writers asked about: the order
+    // `enter_fast_write` relies on. Held by the writer's owner until it ends.
+    let acquire = || match database.row_locks.acquire(table_name, key, tx, strength, &live) {
+        Acquired::Yes if locker => match database.row_locks.fast_writer_on(table_name, tx, &owner_live) {
+            Some(writer) => Acquired::Held(writer),
+            None => Acquired::Yes,
+        },
+        outcome => outcome,
+    };
+    let mut outcome = acquire();
     if !wait {
+        // Not waiting, so not keeping a lock taken on a row a fast-path
+        // writer may yet change.
+        if locker && !already && matches!(outcome, Acquired::Held(_)) {
+            database.row_locks.release_row(table_name, key, tx);
+        }
         return Ok(outcome);
     }
     let started = std::time::Instant::now();
@@ -6174,7 +6195,15 @@ async fn acquire_row_lock(
             database,
             tx,
             started,
-            || database.row_locks.row_blockers(table_name, key, tx, strength, &live),
+            || {
+                let mut blockers = database.row_locks.row_blockers(table_name, key, tx, strength, &live);
+                if let Acquired::Held(writer) = &outcome {
+                    if !blockers.contains(writer) {
+                        blockers.push(*writer);
+                    }
+                }
+                blockers
+            },
             &live,
         ) {
             return Err(deadlock);
@@ -6183,7 +6212,7 @@ async fn acquire_row_lock(
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        outcome = database.row_locks.acquire(table_name, key, tx, strength, &live);
+        outcome = acquire();
     }
     Ok(outcome)
 }
@@ -6389,7 +6418,13 @@ async fn refuse_write_to_locked_rows(
     // statement holds ROW EXCLUSIVE on its target (taken before this, and
     // waited for behind any SHARE or ACCESS EXCLUSIVE holder), so only row
     // locks are left to check.
-    if database.row_locks.is_empty() {
+    // With no row locked anywhere the rows' locks are not taken; the owner is
+    // marked as writing the table instead, and a locker that comes after the
+    // check waits for it (`RowLocks::enter_fast_write`).
+    if database.row_locks.enter_fast_write(table_name, tx) {
+        // Between the check and the write: where a locker's `FOR UPDATE`
+        // could land unseen (compat `row_lock_fast_path.rs`).
+        let _ = crate::core::power_loss::failpoint::hit("test.row_write_fast_path", std::path::Path::new(table_name));
         return Ok(());
     }
 
@@ -6435,7 +6470,7 @@ async fn refuse_write_to_locked_rows(
         // Asked for, not merely inspected: this transaction is about to write
         // the row, so it should hold the lock while it does.
         if let Acquired::Held(owner) =
-            acquire_row_lock(database, table_name, &row_key, LockStrength::Update, false, tx).await?
+            acquire_row_lock(database, table_name, &row_key, LockStrength::Update, false, false, tx).await?
         {
             return Err(format!(
                 "row of '{}' is locked by transaction {}; the statement that locked it must \

@@ -100,6 +100,12 @@ struct Inner {
     /// May name an entry the transaction no longer holds — a dead holder's
     /// lock is taken over lazily — so release checks before removing.
     owned: HashMap<TxId, Vec<(Space, NameId, Key)>>,
+    /// Owners writing a table on the fast path — with no row locked anywhere,
+    /// an `UPDATE`/`DELETE` writes without taking its rows' locks — by owner,
+    /// held to the owner's end ([`RowLocks::enter_fast_write`]). A locker
+    /// that took a row lock on such a table waits for them: the writer
+    /// checked before the lock existed and will not see it.
+    fast_writers: HashMap<TxId, SmallVec<[Box<str>; 2]>>,
 }
 
 impl Inner {
@@ -662,6 +668,79 @@ impl RowLocks {
         self.publish_counts(&inner);
     }
 
+    /// Marks `tx`'s owner as writing `table` on the fast path and answers
+    /// whether it may: true when no row is locked anywhere, so the writer need
+    /// not take its rows' locks. False leaves no new mark: the writer takes
+    /// its rows' locks instead.
+    ///
+    /// The mark is made and the locks counted under one mutex, which a
+    /// locker's lock is also inserted under before it asks
+    /// [`RowLocks::fast_writer_on`]: either the writer counts the locker's
+    /// lock and takes the slow path, or the locker finds the writer's mark and
+    /// waits for its owner to end. A bare `is_empty()` checked before the
+    /// write let a locker that came between the two lock and read the row,
+    /// and the writer then changed it and committed under the lock: a lost
+    /// update. The mark lasts to the owner's end ([`RowLocks::release_owner`])
+    /// because the write is uncommitted until then — through a block's
+    /// `COMMIT` for an explicit block's writer.
+    pub fn enter_fast_write(&self, table: &str, tx: TxId) -> bool {
+        let txn = self.txn_of(tx);
+        // Nothing ends `FROZEN_TX`, so a mark under it would never go.
+        if txn == crate::core::mvcc::transaction::FROZEN_TX {
+            return self.is_empty();
+        }
+        // A lock already counted sends the writer the slow way without the
+        // mutex, as the bare check did.
+        if !self.is_empty() {
+            return false;
+        }
+        let owner = self.owner_of(tx);
+        let mut inner = self.lock();
+        if !inner.rows.is_empty() {
+            return false;
+        }
+        let marks = inner.fast_writers.entry(owner).or_default();
+        if !marks.iter().any(|t| &**t == table) {
+            marks.push(table.into());
+        }
+        true
+    }
+
+    /// An owner other than `tx`'s marked as writing `table` on the fast path
+    /// ([`RowLocks::enter_fast_write`]) and still live: the one a locker that
+    /// has just taken a row lock on `table` must wait for before it reads the
+    /// row. `None` when there is none.
+    pub fn fast_writer_on(&self, table: &str, tx: TxId, is_live_owner: &dyn Fn(TxId) -> bool) -> Option<TxId> {
+        let (me, txn) = (self.owner_of(tx), self.txn_of(tx));
+        let inner = self.lock();
+        if inner.fast_writers.is_empty() {
+            return None;
+        }
+        inner
+            .fast_writers
+            .iter()
+            .filter(|(o, marks)| **o != me && **o != txn && marks.iter().any(|t| &**t == table))
+            .map(|(o, _)| *o)
+            .find(|o| is_live_owner(*o))
+    }
+
+    /// Gives back a row lock `tx` took and will not keep (a `SKIP LOCKED` or
+    /// `NOWAIT` that met a fast-path writer after taking it).
+    pub fn release_row(&self, table: &str, key: &[u8], tx: TxId) {
+        let tx = self.txn_of(tx);
+        let mut inner = self.lock();
+        let Some(name_id) = inner.names.get(table).copied() else {
+            return;
+        };
+        let entry = (name_id, Key::from_slice(key));
+        if let Some(holder) = inner.rows.get_mut(&entry) {
+            if let (true, true) = Inner::drop_holder(holder, tx) {
+                inner.rows.remove(&entry);
+            }
+        }
+        self.publish_counts(&inner);
+    }
+
     /// Releases everything `owner` holds: its table locks, anything its own
     /// transaction id still holds in the row spaces, its wait-for edge and
     /// any alias still pointing at it. Called once the statement's or block's
@@ -687,6 +766,9 @@ impl RowLocks {
         self.clear_waiting_owner(id);
         self.table_locks.release_owner(owner);
         let mut inner = self.lock();
+        if !inner.fast_writers.is_empty() {
+            inner.fast_writers.remove(&id);
+        }
         if !inner.owned.contains_key(&id) {
             return;
         }
