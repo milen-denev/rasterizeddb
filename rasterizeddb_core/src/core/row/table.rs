@@ -221,6 +221,16 @@ pub struct Table<S: StorageIO> {
     /// in-memory index or filter mutation and its first data-file write
     /// (see [`Table::family`]).
     gate: StdArc<FileGate>,
+    /// A partition opened `MaintenanceMode::External` (docs/partitioning.md
+    /// §7.2, §7.3): the slot's watch every write path enters before its
+    /// ticket ([`Table::enter_write`]), and the maintenance its database's
+    /// scheduler runs in place of this instance's own tasks. `None` for every
+    /// other table.
+    watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// Owned here and held weakly by the scheduler, so a dropped instance
+    /// leaves its round; never read through this field.
+    #[allow(dead_code)]
+    external: Option<StdArc<table_maintenance::ExternalUnit<S>>>,
 }
 
 /// A table's row storage and what indexes it: the part a partition shell does
@@ -461,6 +471,12 @@ pub(crate) struct PartitionOpen<S: StorageIO> {
     /// `"<db_id>\0<physical>"` (I20). Derived from the shared `schema.name`,
     /// one partition's cached rows would answer for another's.
     pub cache_scope: String,
+    /// `External`: no task of its own, its maintenance a unit `watch` hands
+    /// its database's scheduler (§7.3), and no place in the forget registry,
+    /// its pin being its slot's (§7.2). `Own` (tests): as a plain table.
+    pub mode: crate::core::partition::maintenance::MaintenanceMode,
+    /// The slot's write watch; required for `External`.
+    pub watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
 }
 
 /// What [`Table::assemble`] finishes a table from.
@@ -480,6 +496,8 @@ struct Assembly<'a, S: StorageIO> {
     guard: Option<crate::core::partition::guard::RangeGuard>,
     cache_scope: String,
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    /// `Some` for a partition opened `External` (see [`PartitionOpen::mode`]).
+    watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
 }
 
 /// The `ErrorKind` and text a partition shell refuses data access with. The
@@ -922,6 +940,8 @@ impl<S: StorageIO> Table<S> {
             maintenance_tick: StdArc::new(tokio::sync::Mutex::new(())),
             // No rows, so nothing to gate: its partitions have their own.
             gate: FileGate::detached(),
+            watch: None,
+            external: None,
         }
     }
 
@@ -1059,6 +1079,7 @@ impl<S: StorageIO> Table<S> {
             guard: None,
             cache_scope,
             maintenance_alive,
+            watch: None,
         })
         .await
     }
@@ -1083,7 +1104,17 @@ impl<S: StorageIO> Table<S> {
             ids,
             guard,
             cache_scope,
+            mode,
+            watch,
         } = p;
+        use crate::core::partition::maintenance::MaintenanceMode;
+        let watch = match (mode, watch) {
+            (MaintenanceMode::External, Some(w)) => Some(w),
+            (MaintenanceMode::External, None) => {
+                return Err(std::io::Error::other("internal error: an External partition opened without its write watch"));
+            }
+            (MaintenanceMode::Own, _) => None,
+        };
         let io_pointers = Arc::new(seed.create_new(format!("{}_pointers.db", physical)).await);
         let io_rows = Arc::new(seed.create_new(format!("{}.db", physical)).await);
 
@@ -1091,8 +1122,10 @@ impl<S: StorageIO> Table<S> {
         let services_alive = maintenance_alive.clone();
         let (rows_task, pointers_task) = (io_rows.clone(), io_pointers.clone());
         // As in `new_with_constraints`: watches the drop signal so the task
-        // does not hold the providers for the life of the process.
-        tokio::spawn(async move {
+        // does not hold the providers for the life of the process. Not for
+        // an `External` partition, whose scheduler lands its staged bytes
+        // (`StorageIO::land_background`).
+        if watch.is_none() { tokio::spawn(async move {
             tokio::select! {
                 _ = async {
                     tokio::join!(
@@ -1109,7 +1142,7 @@ impl<S: StorageIO> Table<S> {
                     }
                 } => {}
             }
-        });
+        }); }
 
         #[cfg(test)]
         let opened = if partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.replace(false)) {
@@ -1146,6 +1179,7 @@ impl<S: StorageIO> Table<S> {
             guard: Some(guard),
             cache_scope,
             maintenance_alive,
+            watch,
         })
         .await)
     }
@@ -1199,6 +1233,7 @@ impl<S: StorageIO> Table<S> {
             guard,
             cache_scope,
             maintenance_alive,
+            watch,
         } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
@@ -1490,8 +1525,9 @@ impl<S: StorageIO> Table<S> {
         let forget = StdArc::new(std::sync::OnceLock::new());
         let maintenance_tick = StdArc::new(tokio::sync::Mutex::new(()));
 
+        let mut vacuum = None;
         if crate::vacuum_enabled() {
-            VacuumService {
+            let service = VacuumService {
                 table_name: schema.name.clone(),
                 io_pointers: io_pointers.clone(),
                 io_rows: io_rows.clone(),
@@ -1517,8 +1553,13 @@ impl<S: StorageIO> Table<S> {
                 cache_generation: cache_generation.clone(),
                 forget: forget.clone(),
                 gate: StdArc::downgrade(&gate),
+            };
+            // An `External` partition's service is ticked by its scheduler.
+            if watch.is_some() {
+                vacuum = Some(service);
+            } else {
+                service.spawn();
             }
-            .spawn();
         }
 
         // What a seal of this instance reads, and the idle checkpoint's
@@ -1542,7 +1583,27 @@ impl<S: StorageIO> Table<S> {
             index_sections,
             index_origin,
         });
-        table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
+        let external = match &watch {
+            Some(watch) => {
+                let sealer = table_seal::IdleSealer::new(&seal, maintenance_alive.clone(), cache_generation.clone());
+                let unit = StdArc::new(table_maintenance::ExternalUnit::new(
+                    io_rows.clone(),
+                    io_pointers.clone(),
+                    maintenance_alive.clone(),
+                    watch.clone(),
+                    vacuum.take(),
+                    sealer,
+                ));
+                let weak: std::sync::Weak<dyn crate::core::partition::maintenance::Unit> =
+                    StdArc::downgrade(&(unit.clone() as StdArc<dyn crate::core::partition::maintenance::Unit>));
+                watch.attach(weak);
+                Some(unit)
+            }
+            None => {
+                table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
+                None
+            }
+        };
         // The audit of a load, 1 in `index_snapshot.audit_rate` (§4, B18).
         table_audit::spawn_after_load(table_audit::AuditParts {
             seal: seal.clone(),
@@ -1587,6 +1648,8 @@ impl<S: StorageIO> Table<S> {
             maintenance_alive,
             maintenance_tick,
             gate,
+            watch,
+            external,
         }
     }
 
@@ -1725,7 +1788,12 @@ impl<S: StorageIO> Table<S> {
         // handle, and a handle that never advances holds the database's
         // forget horizon down for good: the status bitmap would then grow
         // without limit. Its partitions register for themselves.
-        if !self.is_shell() {
+        //
+        // Nor for a partition opened `External`: its forget horizon is its
+        // slot's pin, which its partitioned table's one handle covers
+        // (docs/partitioning.md §7.2), so a reopen or close of the partition
+        // never moves the registry.
+        if !self.is_shell() && self.watch.is_none() {
             let _ = self.forget.set(manager.register_table());
         }
         self.versions.store(Some(manager));
@@ -1737,8 +1805,13 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Runs a forget sweep now. See [`crate::core::vacuum::neutralize_aborted`].
+    /// A partition opened `External` sweeps through its slot
+    /// (`PinBoard::sweep`), which records `SWEPT` and moves the slot's pin.
     pub async fn neutralize_aborted_now(&self) -> std::io::Result<crate::core::vacuum::NeutralizeReport> {
         let d = self.data()?;
+        if let Some(watch) = &self.watch {
+            return Box::pin(watch.sweep_now()).await;
+        }
         let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) else {
             return Ok(Default::default());
         };
@@ -1755,6 +1828,18 @@ impl<S: StorageIO> Table<S> {
             gate: Some(&self.gate),
         };
         crate::core::vacuum::neutralize_aborted(&parts, &manager, handle).await
+    }
+
+    /// Enters a partition's write watch (docs/partitioning.md §7.2, §7.3):
+    /// every write path calls this first, before its ticket, and holds the
+    /// guard to its end. A clean partition's first writer makes its pin
+    /// durable here, before any stamp. `None` on every table but a partition
+    /// opened `External`.
+    async fn enter_write(&self) -> Result<Option<crate::core::partition::maintenance::WriteGuard<'_>>> {
+        match &self.watch {
+            None => Ok(None),
+            Some(watch) => watch.enter().await.map(Some),
+        }
     }
 
     /// Notes that `written_by` has stamped a version here.
@@ -2052,6 +2137,7 @@ impl<S: StorageIO> Table<S> {
         // A ticket first, before the exclusive gate (§6 step 1, §2 lock order:
         // readers never queue behind a seal through compaction's exclusive
         // hold), so `DIRTY` is durable before anything below is issued.
+        let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
 
         // Exclusive: rows are about to move, so nothing may be holding a pointer
@@ -4084,6 +4170,7 @@ impl<S: StorageIO> Table<S> {
         let d = self.data()?;
         // Before the gate below and before anything is written (§2 lock order,
         // T1).
+        let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
         // Compaction relies on the live set not changing under it, so an insert
         // holds the gate too. It is shared, so concurrent inserts still run.
@@ -4193,6 +4280,7 @@ impl<S: StorageIO> Table<S> {
     /// insert.
     pub(crate) async fn insert_version(&self, row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         if let Some(manager) = self.versions.load().as_ref() {
@@ -4805,6 +4893,7 @@ impl<S: StorageIO> Table<S> {
 
         // Taken at the statement's entry, before the gate and the write lock
         // (§2 lock order), so a DELETE that matches nothing still takes one.
+        let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         let _read = d.read_guard();
@@ -5201,6 +5290,7 @@ impl<S: StorageIO> Table<S> {
         self.note_write(written_by);
 
         // As in `delete_rows_as_of`: at entry, before the gate and every lock.
+        let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
         let _read = d.read_guard();
@@ -6223,3 +6313,6 @@ mod occupancy_floor_tests {
         let _ = running;
     }
 }
+
+#[path = "table_maintenance.rs"]
+pub(crate) mod table_maintenance;

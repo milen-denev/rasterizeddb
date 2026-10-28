@@ -71,8 +71,13 @@ pub mod guard;
 mod hash_source_tests;
 pub mod key;
 pub mod log;
+pub mod maintenance;
 pub mod map;
+pub mod pins;
+#[cfg(test)]
+mod pin_tests;
 pub mod route;
+pub mod serial;
 pub mod table;
 #[cfg(test)]
 mod table_tests;

@@ -229,7 +229,7 @@ pub(super) fn reap_at_startup(
             kept: Some(why),
         };
     }
-    let live: HashMap<u64, Result<crate::core::partition::log::MapState, String>> = rows
+    let live: HashMap<u64, Result<files::LiveMap, String>> = rows
         .iter()
         .filter(|(_, c)| *c != 0)
         .map(|(_, uid)| (*uid, files::read_live_map(root, *uid)))
@@ -306,7 +306,13 @@ impl Database {
             db_id: self.id,
             transactions: &self.transactions,
             mirrored: self.mirrors_configured(),
+            scheduler: &self.partition_maintenance,
         }
+    }
+
+    /// The scheduler this database's partitions are maintained by (§7.3).
+    pub fn partition_maintenance(&self) -> &StdArc<crate::core::partition::maintenance::Scheduler> {
+        &self.partition_maintenance
     }
 
     /// The database directory, where phase 2a keeps every partitioned file.

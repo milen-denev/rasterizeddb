@@ -10073,6 +10073,25 @@ async fn seed_sequences(
     let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
     let empty = crate::core::rql::join::fetch_for(&[], schema);
     if let Some(pt) = partitioned {
+        // From the durable reservation when the table has one (§10, phase 3
+        // P5a): no partition is opened or read. Only a sequence it has no
+        // entry for is seeded from the maximum, and then reserved.
+        let mut unseeded = Vec::new();
+        for (name, field) in wanted {
+            if !pt
+                .resume_serial(&name)
+                .map_err(|e| format!("could not read '{}' to seed its sequences: {}", table_name, e))?
+            {
+                unseeded.push((name, field));
+            }
+        }
+        if unseeded.is_empty() {
+            return Ok(());
+        }
+        let wanted = unseeded;
+        let fetch_fields: Vec<crate::core::row::schema::SchemaField> =
+            wanted.iter().map(|(_, f)| f.clone()).collect();
+        let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
         let mut rows = Vec::new();
         let partitions = pt
             .epoch()
@@ -10095,6 +10114,8 @@ async fn seed_sequences(
                 crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
                     .unwrap_or(0);
             crate::core::rql::sequence::seed(database.id, &name, last);
+            pt.track_serial(&name, last)
+                .map_err(|e| format!("could not reserve '{}''s sequence {}: {}", table_name, name, e))?;
         }
         return Ok(());
     }

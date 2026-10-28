@@ -103,6 +103,7 @@ async fn open(f: &Fixture, uid: u64) -> PartitionedTable {
         db_id: 1,
         transactions: &f.tx,
         mirrored: f.mirrored(),
+        scheduler: &crate::core::partition::maintenance::Scheduler::new(),
     };
     PartitionedTable::open(ctx, "acct", uid, shell).await
 }
@@ -590,6 +591,7 @@ async fn in_memory_storage_is_refused() {
             db_id: 1,
             transactions: &tx,
             mirrored: unmirrored(),
+            scheduler: &crate::core::partition::maintenance::Scheduler::new(),
         },
         "acct",
         UID,
@@ -723,6 +725,7 @@ async fn a_key_the_schema_disagrees_with_refuses_the_table() {
         db_id: 1,
         transactions: &f.tx,
         mirrored: f.mirrored(),
+        scheduler: &crate::core::partition::maintenance::Scheduler::new(),
     };
     let t = PartitionedTable::open(ctx, "acct", UID, shell).await;
     let why = t.broken().expect("opened with a key of another family");
@@ -934,17 +937,24 @@ async fn count_as(t: &PartitionedTable, clause: &str, reader: TxId) -> usize {
     n
 }
 
-fn assert_registered(t: &PartitionedTable) {
+/// Since phase 3 P5a a partition takes no place in the forget registry
+/// itself: its slot pins (§7.2), and the table's one handle sits at or below
+/// every pin.
+async fn assert_registered(t: &PartitionedTable) {
     let all = t.materialized(&t.epoch().unwrap(), &Route::All).unwrap();
     assert!(!all.is_empty());
+    let handle = t.pin_board().unwrap().handle_horizon();
     for (pid, p) in all {
-        assert!(p.forget_horizon().is_some(), "partition {pid} is not in the forget registry");
+        assert!(p.forget_horizon().is_none(), "partition {pid} registered a forget handle of its own");
+        let pin = t.pin_of(pid).await.unwrap().unwrap_or_else(|| panic!("partition {pid} is written and unpinned"));
+        assert!(handle <= pin, "the table's handle {handle} is above partition {pid}'s pin {pin}");
     }
 }
 
 /// A row written under a transaction is invisible to others until it
 /// commits and to everyone once it aborts, on a freshly materialized
-/// partition and after a reopen; each partition holds a forget handle.
+/// partition and after a reopen; each partition is pinned, under the
+/// table's handle.
 #[tokio::test(flavor = "multi_thread")]
 async fn partitions_are_versioned_and_registered() {
     let f = fixture().await;
@@ -953,7 +963,7 @@ async fn partitions_are_versioned_and_registered() {
 
     let writer = f.tx.begin();
     t.insert_row_in_txn(row(&t, 42, 1), writer).await.unwrap();
-    assert_registered(&t);
+    assert_registered(&t).await;
     let other = f.tx.begin();
     assert_eq!(count_as(&t, q, writer).await, 1, "the writer cannot see its own row");
     assert_eq!(count_as(&t, q, other).await, 0, "an uncommitted row is visible to another transaction");
@@ -971,7 +981,7 @@ async fn partitions_are_versioned_and_registered() {
 
     let t = open(&f, UID).await;
     assert!(t.broken().is_none(), "{:?}", t.broken());
-    assert_registered(&t);
+    assert_registered(&t).await;
     let writer = f.tx.begin();
     t.insert_row_in_txn(row(&t, 42, 3), writer).await.unwrap();
     let reader = f.tx.begin();

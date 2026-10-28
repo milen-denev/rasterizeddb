@@ -340,6 +340,61 @@ pub(crate) fn create_parent_files(dir: &Path, uid: u64) -> io::Result<()> {
     create_all(dir, &parent_files(uid))
 }
 
+/// Makes sure the table's `SERIAL` reservations file exists in `dir`
+/// (§10, `partition::serial`): created exclusively with its `.tmp`, and the
+/// directory fsynced, when it is missing (a table created before phase 3
+/// P5a, or a new one). An existing file is kept: it is the reservation.
+/// Returns whether it was created.
+pub(crate) fn ensure_seq_file(dir: &Path, uid: u64) -> io::Result<bool> {
+    let name = seq_file(uid);
+    match std::fs::metadata(dir.join(&name)) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // A `.tmp` left by an earlier attempt holds nothing staged yet.
+            let tmp = dir.join(format!("{name}{TMP}"));
+            match std::fs::remove_file(&tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io::Error::new(e.kind(), format!("deleting leftover {}: {e}", tmp.display()))),
+            }
+            create_all(dir, &[name]).map(|()| true)
+        }
+        Err(e) => Err(io::Error::new(e.kind(), format!("checking {name}: {e}"))),
+    }
+}
+
+/// Creates map log generation `generation` of `uid` in `dir` for a
+/// compaction (§3.2 step 2), exclusively with its `.tmp`, and fsyncs the
+/// directory once, after deleting a leftover of the same generation: one an
+/// earlier compaction left unfinished, which is never live (it has no
+/// durable `SEALED`, or it would have been chosen at open) and was never
+/// appended to after its clone.
+pub(crate) fn create_map_generation(dir: &Path, uid: u64, generation: u64) -> io::Result<()> {
+    remove_map_generation(dir, uid, generation)?;
+    create_all(dir, &[map_file(uid, generation)])
+}
+
+/// Deletes map log generation `generation` of `uid` and its `.tmp` from
+/// `dir`, then fsyncs it: a compaction's old generation once appends have
+/// switched (§3.2 step 4), or its own unfinished one. Missing files are no
+/// error.
+pub(crate) fn remove_map_generation(dir: &Path, uid: u64, generation: u64) -> io::Result<()> {
+    let name = map_file(uid, generation);
+    let mut removed = false;
+    for file in [name.clone(), format!("{name}{TMP}")] {
+        let path = dir.join(&file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io::Error::new(e.kind(), format!("deleting {}: {e}", path.display()))),
+        }
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
 /// Deletes every file in `dir` that [`parse_name`] puts under `uid`, `.tmp`s
 /// included, then fsyncs `dir`; returns how many went. Partitions' files go
 /// first and the map log last, so a crash part-way leaves the parent files
@@ -396,15 +451,59 @@ pub(crate) struct ReapReport {
     pub kept: Option<String>,
 }
 
-/// A live table's map log as the reaper reads it: the generation-0 file
-/// (the only one phase 2a writes), read without building a provider, so
-/// nothing is created or cut. `Err` with why it cannot be relied on to say
+/// The map log generations of `uid` in `root`, highest first.
+fn generations_in(root: &Path, uid: u64) -> io::Result<Vec<u64>> {
+    let mut gens = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        if let Some(PartFile::Map { uid: u, generation }) = parse_name(&name)
+            && u == uid
+        {
+            gens.push(generation);
+        }
+    }
+    gens.sort_unstable_by(|a, b| b.cmp(a));
+    gens.dedup();
+    Ok(gens)
+}
+
+/// The live generation of `uid`'s map log in `root` (§3.2): the highest
+/// whose log replays to a sealed state (a compaction that reached its
+/// durable `SEALED`, whose appends then switched to it), else 0. A higher
+/// one that does not replay, or replays unsealed, is a compaction that never
+/// finished, which nothing was ever appended to after its clone; the reaper
+/// deletes it. Reads without building a provider, so nothing is created or
+/// cut. 0 when no generation is sealed, even if generation 0 is gone, so
+/// the never-creating check that follows names the missing file (I9).
+pub(crate) fn live_generation(root: &Path, uid: u64) -> Result<u64, String> {
+    let gens = generations_in(root, uid).map_err(|e| format!("{} cannot be listed: {e}", root.display()))?;
+    for &g in &gens {
+        if g == 0 {
+            return Ok(0);
+        }
+        let name = map_file(uid, g);
+        let buf = std::fs::read(root.join(&name)).map_err(|e| format!("its map log {name} cannot be read: {e}"))?;
+        match log::replay(&buf) {
+            Ok(r) if r.state.sealed() => return Ok(g),
+            Ok(_) => ::log::warn!("map log {name} is an unfinished compaction (no SEALED); the generation before it is live"),
+            Err(e) => ::log::warn!("map log {name} is an unfinished compaction ({e}); the generation before it is live"),
+        }
+    }
+    Ok(0)
+}
+
+/// A live table's map log as the reaper reads it: its live generation
+/// ([`live_generation`]), read without building a provider, so nothing is
+/// created or cut. `Err` with why it cannot be relied on to say
 /// which partitions are materialized: missing, staged bytes in its `.tmp`,
 /// a torn tail or [`TORN`] evidence, a replay error, another table's uid, a
 /// `DROPPED` record, or a shape this version cannot open (reshaped, retired
 /// partitions, a partition off the root). Any of these turns reaping off.
-pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<log::MapState, String> {
-    let name = map_file(uid, 0);
+pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<LiveMap, String> {
+    let generation = live_generation(root, uid)?;
+    let name = map_file(uid, generation);
     let path = root.join(&name);
     let buf = std::fs::read(&path).map_err(|e| format!("its map log {} cannot be read: {e}", path.display()))?;
     // Map appends go through the log, never the staging file; bytes there
@@ -439,19 +538,27 @@ pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<log::MapState, Stri
     {
         return Err(format!("its map log {name} describes a reshaped or spread map, which this version cannot read"));
     }
-    Ok(state)
+    Ok(LiveMap { generation, state })
+}
+
+/// A live table's map, as the reaper reads it: which generation is live,
+/// and what it says.
+#[derive(Debug)]
+pub(crate) struct LiveMap {
+    pub generation: u64,
+    pub state: log::MapState,
 }
 
 /// The names in `root` the reaper deletes (§12), ordered partitions first and
 /// map logs last as [`remove_all`] orders them, or why it deletes none.
 ///
 /// A name is deleted only if [`parse_name`] reads it and either its uid is
-/// not in `live` (no catalogue row holds it), or it is a partition file
-/// whose pid the live map never materialized. A live uid's schema, ids, seq
-/// and generation-0 map are kept. Nothing is deleted if any live map is
-/// `Err`, or a live uid has a map generation other than 0, which only a
-/// later version writes and this one cannot tell live from stale.
-fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<log::MapState, String>>) -> io::Result<Result<Vec<String>, String>> {
+/// not in `live` (no catalogue row holds it), it is a partition file whose
+/// pid the live map never materialized, or it is a map generation of a live
+/// uid other than its live one (a compaction's old generation, or one that
+/// never finished, §3.2). A live uid's schema, ids, seq and live map are
+/// kept. Nothing is deleted if any live map is `Err`.
+fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<LiveMap, String>>) -> io::Result<Result<Vec<String>, String>> {
     let mut failed: Vec<(&u64, &String)> = live.iter().filter_map(|(u, m)| m.as_ref().err().map(|e| (u, e))).collect();
     if !failed.is_empty() {
         failed.sort();
@@ -478,19 +585,15 @@ fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<log::MapSt
             doomed.push((rank, name));
             continue;
         };
-        let state = state.as_ref().expect("an Err map returned above");
+        let live_map = state.as_ref().expect("an Err map returned above");
         match file {
             PartFile::Data { pid, .. } => {
-                if state.part(pid).and_then(|p| p.location).is_none() {
+                if live_map.state.part(pid).and_then(|p| p.location).is_none() {
                     doomed.push((rank, name));
                 }
             }
-            PartFile::Map { generation, .. } if generation != 0 => {
-                return Ok(Err(format!(
-                    "partitioned table {:016x} has map generation {generation} ({name}), which only a later \
-                     version writes",
-                    file.uid()
-                )));
+            PartFile::Map { generation, .. } if generation != live_map.generation => {
+                doomed.push((rank, name));
             }
             _ => {}
         }
@@ -507,7 +610,7 @@ fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<log::MapSt
 /// the files stay, a leak the next start retries.
 pub(crate) fn reap(
     root: &Path,
-    live: &std::collections::HashMap<u64, Result<log::MapState, String>>,
+    live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
     void: impl FnOnce(&[String]) -> io::Result<()>,
 ) -> ReapReport {
     let names = match reapable(root, live) {
@@ -556,7 +659,14 @@ pub(crate) fn reap(
 /// issues its WAL record at append time, so a transaction outcome logged
 /// after it can never replay without it.
 pub(crate) struct MapLogFile {
-    io: Arc<DbStorageProvider>,
+    /// The live generation's provider: swapped by a compaction
+    /// ([`Self::adopt`]), under `lock`, so no append straddles two files.
+    io_slot: parking_lot::RwLock<Arc<DbStorageProvider>>,
+    /// The live generation (§3.2): 0 until the first compaction.
+    generation: std::sync::atomic::AtomicU64,
+    /// Records appended since a compaction cloned the state, for it to
+    /// append to the new generation before switching (§3.2 step 3).
+    capture: parking_lot::Mutex<Option<Vec<log::Record>>>,
     lock: tokio::sync::Mutex<()>,
     /// Set when a failed append could not be cut back out of the file: its
     /// record may replay, so nothing is appended after it in this process.
@@ -580,11 +690,50 @@ fn keep_torn_tail(kept: &Path, tail: &[u8]) -> io::Result<()> {
 
 impl MapLogFile {
     fn new(io: Arc<DbStorageProvider>) -> Self {
+        // The generation its name says (`map_file`); 0 for any other name.
+        let generation = match parse_name(&io.get_name()) {
+            Some(PartFile::Map { generation, .. }) => generation,
+            _ => 0,
+        };
         Self {
-            io,
+            io_slot: parking_lot::RwLock::new(io),
+            generation: std::sync::atomic::AtomicU64::new(generation),
+            capture: parking_lot::Mutex::new(None),
             lock: tokio::sync::Mutex::new(()),
             broken: OnceLock::new(),
         }
+    }
+
+    /// The live generation's number.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// From here on, every record appended is also kept for
+    /// [`Self::end_capture`]. Called under the map state's lock, with the
+    /// clone a compaction writes as its `SNAPSHOT`.
+    pub(crate) fn begin_capture(&self) {
+        *self.capture.lock() = Some(Vec::new());
+    }
+
+    /// The records appended since [`Self::begin_capture`], and no more
+    /// capture.
+    pub(crate) fn end_capture(&self) -> Vec<log::Record> {
+        self.capture.lock().take().unwrap_or_default()
+    }
+
+    /// Switches appends to `next`, generation `generation`, a compaction's
+    /// sealed new log (§3.2 step 3). Under the append lock, so no append is
+    /// in flight. Returns the old generation's provider, for the caller to
+    /// drop before it deletes the file.
+    pub(crate) async fn adopt(&self, next: MapLogFile, generation: u64) -> io::Result<Arc<DbStorageProvider>> {
+        let _order = self.lock.lock().await;
+        self.check()?;
+        next.check()?;
+        let new_io = next.io();
+        let old = std::mem::replace(&mut *self.io_slot.write(), new_io);
+        self.generation.store(generation, std::sync::atomic::Ordering::Release);
+        Ok(old)
     }
 
     /// A new, empty log. Refuses a file that already holds bytes: appending
@@ -604,8 +753,8 @@ impl MapLogFile {
     /// `<log>.torn` beside the log, or `None` for a provider with no
     /// directory.
     fn torn_path(&self) -> Option<std::path::PathBuf> {
-        let location = self.io.get_location()?;
-        Some(Path::new(&location).join(format!("{}{TORN}", self.io.get_name())))
+        let location = self.io().get_location()?;
+        Some(Path::new(&location).join(format!("{}{TORN}", self.io().get_name())))
     }
 
     /// Opens an existing log and replays it. Run after WAL recovery, which
@@ -623,10 +772,10 @@ impl MapLogFile {
     pub(crate) async fn open(io: Arc<DbStorageProvider>) -> io::Result<(Self, log::Replay)> {
         let file = Self::new(io);
         let buf = file.read_all().await?;
-        let mut replay = log::replay(&buf).map_err(|e| invalid(format!("{}: {e}", file.io.get_name())))?;
+        let mut replay = log::replay(&buf).map_err(|e| invalid(format!("{}: {e}", file.io().get_name())))?;
         let kept = file.torn_path();
         if replay.torn.is_some() {
-            let name = file.io.get_name();
+            let name = file.io().get_name();
             let Some(kept) = &kept else {
                 return Err(invalid(format!(
                     "partition map log {name} has a torn tail and no directory to keep it in"
@@ -635,7 +784,7 @@ impl MapLogFile {
             keep_torn_tail(kept, &buf[replay.valid_len..]).map_err(|e| {
                 io::Error::new(e.kind(), format!("keeping the torn tail of {name} in {}: {e}", kept.display()))
             })?;
-            file.io.truncate(replay.valid_len as u64).await.map_err(|e| {
+            file.io().truncate(replay.valid_len as u64).await.map_err(|e| {
                 io::Error::new(e.kind(), format!("cutting the torn tail of partition map log {name}: {e}"))
             })?;
         } else if let Some(kept) = &kept
@@ -654,16 +803,16 @@ impl MapLogFile {
         Ok((file, replay))
     }
 
-    /// The provider underneath.
-    pub(crate) fn io(&self) -> &Arc<DbStorageProvider> {
-        &self.io
+    /// The live generation's provider.
+    pub(crate) fn io(&self) -> Arc<DbStorageProvider> {
+        self.io_slot.read().clone()
     }
 
     fn check(&self) -> io::Result<()> {
         match self.broken.get() {
             Some(why) => Err(io::Error::other(format!(
                 "partition map log {} takes no more appends: {why}",
-                self.io.get_name()
+                self.io().get_name()
             ))),
             None => Ok(()),
         }
@@ -688,13 +837,16 @@ impl MapLogFile {
         let buf = log::encode(rec).map_err(invalid)?;
         let _order = self.lock.lock().await;
         self.check()?;
-        let txn = self.io.begin_txn();
-        let (at, token) = self.io.append_data_txn(txn, &buf).await;
-        let Err(e) = self.io.commit_durable(token).await else {
+        let txn = self.io().begin_txn();
+        let (at, token) = self.io().append_data_txn(txn, &buf).await;
+        let Err(e) = self.io().commit_durable(token).await else {
+            if let Some(kept) = self.capture.lock().as_mut() {
+                kept.push(rec.clone());
+            }
             return Ok(());
         };
-        self.io.abort_txn(token).await;
-        if let Err(cut) = self.io.truncate(at).await {
+        self.io().abort_txn(token).await;
+        if let Err(cut) = self.io().truncate(at).await {
             let _ = self.broken.set(format!(
                 "an append failed ({e}) and could not be cut back to byte {at} ({cut})"
             ));
@@ -710,7 +862,7 @@ impl MapLogFile {
     /// back and nothing lands after this record.
     pub(crate) async fn append_durable(&self, rec: &log::Record) -> io::Result<()> {
         self.append(rec).await?;
-        match self.io.get_location() {
+        match self.io().get_location() {
             Some(location) => {
                 crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))
             }
@@ -721,17 +873,17 @@ impl MapLogFile {
     /// Reads the whole log and replays it, without changing the file.
     pub(crate) async fn replay(&self) -> io::Result<log::Replay> {
         let buf = self.read_all().await?;
-        log::replay(&buf).map_err(|e| invalid(format!("{}: {e}", self.io.get_name())))
+        log::replay(&buf).map_err(|e| invalid(format!("{}: {e}", self.io().get_name())))
     }
 
     async fn read_all(&self) -> io::Result<Vec<u8>> {
         let _order = self.lock.lock().await;
-        let len = self.io.get_len().await;
+        let len = self.io().get_len().await;
         let len = usize::try_from(len).map_err(|_| invalid(format!("partition map log of {len} bytes")))?;
         let mut buf = vec![0u8; len];
         let mut at = 0u64;
         if len > 0 {
-            self.io.read_data_into_buffer(&mut at, &mut buf).await?;
+            self.io().read_data_into_buffer(&mut at, &mut buf).await?;
         }
         Ok(buf)
     }

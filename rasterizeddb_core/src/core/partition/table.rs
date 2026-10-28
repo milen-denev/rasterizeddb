@@ -65,8 +65,11 @@ use smallvec::SmallVec;
 
 use super::files::{self, MapLogFile};
 use super::guard::RangeGuard;
+use super::maintenance::{MaintenanceMode, Scheduler};
+use super::pins::{BoardFiles, PinBoard};
+use super::serial::SerialSource;
 use super::key::KeySpec;
-use super::log::{MapHeader, MapState, ROUTE_V1, Record};
+use super::log::{MapHeader, ROUTE_V1, Record};
 use super::map::{PointRange, RangeMap, SPACE_END};
 use super::route::{Route, route};
 use crate::core::filter::sarg;
@@ -177,6 +180,9 @@ pub(crate) struct OpenCtx<'a> {
     pub transactions: &'a StdArc<TransactionManager>,
     /// The pool's mirrors, not the seed's: see [`MirrorsConfigured`].
     pub mirrored: MirrorsConfigured,
+    /// The database's one maintenance scheduler (§7.3), which every
+    /// partition, opened `External`, is serviced by.
+    pub scheduler: &'a StdArc<Scheduler>,
 }
 
 /// Everything a table that opened has; a broken one has none of it.
@@ -187,13 +193,13 @@ struct Live {
     epoch: ArcSwap<MapEpoch>,
     /// By pid; phase 2a pids are `0..n`.
     slots: Box<[Slot]>,
-    /// Shared with the instance a schema change reopens this one as
-    /// ([`PartitionedTable::reopened`]): one map log, one writer at a time.
-    log: StdArc<MapLogFile>,
-    /// The replayed log, kept current: a record is applied to a copy first
-    /// and appended only if it applies, so the file never holds a record
-    /// replay would refuse. Shared like `log`.
-    state: StdArc<tokio::sync::Mutex<MapState>>,
+    /// The map log, its replayed state, the forget pins and the table's one
+    /// forget handle (§7.2, `partition::pins`), and the `SERIAL`
+    /// reservations: shared with the instance a schema change reopens this
+    /// one as ([`PartitionedTable::reopened`]), so one map log has one writer
+    /// at a time and the pins outlive the reopen.
+    board: StdArc<PinBoard>,
+    scheduler: StdArc<Scheduler>,
     seed: Arc<DbStorageProvider>,
     ids: StdArc<IdSource<DbStorageProvider>>,
 }
@@ -216,6 +222,12 @@ pub struct PartitionedTable {
     torn: Option<String>,
     mirrored: MirrorsConfigured,
     dropped: AtomicBool,
+    /// A broken table's place in the forget registry, held at the horizon
+    /// already forgotten when it was refused, for as long as it stays
+    /// broken: its partitions' pins are unknown, and any of them may hold an
+    /// aborted stamp that forgetting past would bring back (§7.2). The
+    /// status log then grows until the table opens or is dropped.
+    broken_pin: Option<crate::core::mvcc::transaction::ForgetHandle>,
 }
 
 fn invalid(e: String) -> io::Error {
@@ -253,7 +265,7 @@ fn refuse_mirrored(mirrored: bool) -> io::Result<()> {
 /// it as rowless (§4.3) would lose those rows silently, so it is refused
 /// until an operator has looked. An empty file is a crash between creating
 /// the files and appending the record, and is recreated as usual.
-fn refuse_torn_leftovers(root: &Path, uid: u64, pid: u32, torn: &str) -> io::Result<()> {
+fn refuse_torn_leftovers(root: &Path, uid: u64, generation: u64, pid: u32, torn: &str) -> io::Result<()> {
     let mut found = Vec::new();
     for name in files::data_files(uid, pid) {
         match std::fs::metadata(root.join(&name)) {
@@ -273,7 +285,7 @@ fn refuse_torn_leftovers(root: &Path, uid: u64, pid: u32, torn: &str) -> io::Res
          they may hold committed rows whose record was lost; examine them and the torn tail in \
          {}{}, and remove that file once resolved",
         found.join(", "),
-        files::map_file(uid, 0),
+        files::map_file(uid, generation),
         files::TORN,
     )))
 }
@@ -462,7 +474,7 @@ impl PartitionedTable {
         let mut torn = None;
         let root = file_root(ctx.seed);
         let live = match (&root, refuse_mirrored((ctx.mirrored)())) {
-            (Ok(root), Ok(())) => Self::open_live(&ctx, root, uid, &shell, &mut declared, &mut torn).await,
+            (Ok(root), Ok(())) => Self::open_live(&ctx, name, root, uid, &shell, &mut declared, &mut torn).await,
             (Err(e), _) => Err(e.to_string()),
             (_, Err(e)) => Err(e.to_string()),
         }
@@ -471,6 +483,7 @@ impl PartitionedTable {
             ::log::error!("{why}");
             why
         });
+        let broken_pin = live.is_err().then(|| ctx.transactions.register_table());
         PartitionedTable {
             name: name.to_string(),
             uid,
@@ -483,6 +496,7 @@ impl PartitionedTable {
             torn,
             mirrored: ctx.mirrored,
             dropped: AtomicBool::new(false),
+            broken_pin,
         }
     }
 
@@ -513,11 +527,13 @@ impl PartitionedTable {
             torn: None,
             mirrored: ctx.mirrored,
             dropped: AtomicBool::new(false),
+            broken_pin: Some(ctx.transactions.register_table()),
         }
     }
 
     async fn open_live(
         ctx: &OpenCtx<'_>,
+        name: &str,
         root: &Path,
         uid: u64,
         shell: &Arc<Table<DbStorageProvider>>,
@@ -528,8 +544,10 @@ impl PartitionedTable {
             return Err("its shell is a table with rows of its own".to_string());
         }
         let e = |e: io::Error| e.to_string();
-        files::require_existing(root, &[files::map_file(uid, 0)]).map_err(e)?;
-        let map_io = StdArc::new(ctx.seed.create_new(files::map_file(uid, 0)).await);
+        // The live generation (§3.2): the highest a compaction sealed.
+        let generation = files::live_generation(root, uid)?;
+        files::require_existing(root, &[files::map_file(uid, generation)]).map_err(e)?;
+        let map_io = StdArc::new(ctx.seed.create_new(files::map_file(uid, generation)).await);
         let (log, replay) = MapLogFile::open(map_io).await.map_err(e)?;
         *torn = replay.torn.as_ref().map(|t| t.reason.clone());
         let state = replay.state;
@@ -563,6 +581,28 @@ impl PartitionedTable {
         files::require_existing(root, &[files::ids_file(uid)]).map_err(e)?;
         let ids_io = Arc::new(ctx.seed.create_new(files::ids_file(uid)).await);
         let ids = StdArc::new(IdSource::open_strict(ids_io).await.map_err(e)?);
+        // The `SERIAL` reservations (§10), created here for a table that
+        // has none yet: one made before phase 3 P5a, or a new one.
+        files::ensure_seq_file(root, uid).map_err(e)?;
+        let seq_io = StdArc::new(ctx.seed.create_new(files::seq_file(uid)).await);
+        let serials = SerialSource::open(ctx.db_id, seq_io).await.map_err(e)?;
+        // The pins and the table's one forget handle, set from the replayed
+        // log before any partition opens (§7.2's restart rule).
+        let opened_len = log.io().get_len().await;
+        let board = PinBoard::new(
+            name,
+            StdArc::new(log),
+            state.clone(),
+            ctx.transactions,
+            ctx.scheduler,
+            serials,
+            BoardFiles { root: root.to_path_buf(), uid, seed: ctx.seed.clone(), torn: torn.is_some() },
+        );
+        // A compacted generation opens with its snapshot: the size the next
+        // compaction is measured against (§3.2).
+        if generation > 0 {
+            board.set_snapshot_len(opened_len);
+        }
 
         let entries = map.entries();
         let slots: Box<[Slot]> = entries
@@ -585,8 +625,8 @@ impl PartitionedTable {
                 map,
             }),
             slots,
-            log: StdArc::new(log),
-            state: StdArc::new(tokio::sync::Mutex::new(state.clone())),
+            board,
+            scheduler: ctx.scheduler.clone(),
             seed: ctx.seed.clone(),
             ids,
         };
@@ -594,7 +634,7 @@ impl PartitionedTable {
             let Some(loc) = part.location else {
                 // §4.3's skip is a proof only while the log is whole.
                 if let Some(why) = torn.as_deref() {
-                    refuse_torn_leftovers(root, uid, pid, why).map_err(e)?;
+                    refuse_torn_leftovers(root, uid, generation, pid, why).map_err(e)?;
                 }
                 continue;
             };
@@ -629,6 +669,8 @@ impl PartitionedTable {
             schema: shell.schema.clone(),
             ids: live.ids.clone(),
             guard: RangeGuard::new(live.spec.clone(), slot.range),
+            mode: MaintenanceMode::External,
+            watch: Some(live.board.watch(slot.pid)?.clone()),
         })
         .await?;
         table.enable_versioning(transactions.clone());
@@ -669,7 +711,7 @@ impl PartitionedTable {
                     if !shell.is_shell() {
                         return Err("its shell is a table with rows of its own".to_string());
                     }
-                    let spec = spec_from_header(live.state.lock().await.header(), &shell.schema)?;
+                    let spec = spec_from_header(live.board.state.lock().await.header(), &shell.schema)?;
                     // The row-id source reopened from its reservation, as a
                     // start (and a plain table's reload, over `_seq.db`) opens
                     // it: ids resume past every id the old one could have
@@ -691,8 +733,8 @@ impl PartitionedTable {
                         spec,
                         epoch: ArcSwap::new(live.epoch.load_full()),
                         slots,
-                        log: live.log.clone(),
-                        state: live.state.clone(),
+                        board: live.board.clone(),
+                        scheduler: live.scheduler.clone(),
                         seed: live.seed.clone(),
                         ids,
                     };
@@ -719,6 +761,9 @@ impl PartitionedTable {
             }
             Err(why) => Err(why.clone()),
         };
+        // Registered while this instance still pins: the new one, broken,
+        // holds the horizon where it is (see `broken_pin`).
+        let broken_pin = live.is_err().then(|| self.transactions.register_table());
         PartitionedTable {
             name: name.to_string(),
             uid: self.uid,
@@ -731,6 +776,7 @@ impl PartitionedTable {
             torn: self.torn.clone(),
             mirrored: self.mirrored.clone(),
             dropped: AtomicBool::new(false),
+            broken_pin,
         }
     }
 
@@ -977,7 +1023,7 @@ impl PartitionedTable {
         // them go unmirrored.
         refuse_mirrored((self.mirrored)())?;
         let pid = slot.pid;
-        let recorded = live.state.lock().await.part(pid).map(|p| p.location);
+        let recorded = live.board.state.lock().await.part(pid).map(|p| p.location);
         match recorded {
             None => return Err(io::Error::other(format!("internal routing error: the map has no partition {pid}"))),
             // An earlier attempt logged `MATERIALIZE` and then failed to open:
@@ -993,15 +1039,12 @@ impl PartitionedTable {
                 // Checked again here, not only at open: deleting is the step
                 // that cannot be undone.
                 if let Some(why) = self.torn.as_deref() {
-                    refuse_torn_leftovers(&self.root, self.uid, pid, why)?;
+                    refuse_torn_leftovers(&self.root, self.uid, live.board.log.generation(), pid, why)?;
                 }
                 files::create_partition_files(&self.root, self.uid, pid)?;
-                let rec = Record::Materialize {
-                    pid,
-                    floor: self.transactions.status().forgotten_below(),
-                    loc: ROOT_LOC,
-                };
-                let mut state = live.state.lock().await;
+                let floor = self.transactions.status().forgotten_below();
+                let rec = Record::Materialize { pid, floor, loc: ROOT_LOC };
+                let mut state = live.board.state.lock().await;
                 let mut next = state.clone();
                 next.apply(&rec).map_err(invalid)?;
                 // Durable before any row reaches the partition's files, once
@@ -1009,8 +1052,12 @@ impl PartitionedTable {
                 // lose the record while writeback kept row pages in the new
                 // files, and with the map's tail torn the open refuses the
                 // whole table for unexplained data (`refuse_torn_leftovers`).
-                live.log.append_durable(&rec).await?;
+                live.board.log.append_durable(&rec).await?;
                 *state = next;
+                // The new pin, covered by the table's handle before the
+                // first row (§7.2); sound since that row's writer is at
+                // least `oldest_active`.
+                live.board.materialized(pid, floor)?;
             }
         }
         Self::open_partition(live, self.uid, self.db_id, &self.transactions, &self.shell, slot).await
@@ -1058,7 +1105,7 @@ impl PartitionedTable {
             ids_handed_out: live.ids.handed_out(),
             declared: live.slots.len() as u32,
             schema: self.shell.io_schema.get_len().await,
-            map: live.log.io().get_len().await,
+            map: live.board.log.io().get_len().await,
             ids: live.ids.io.get_len().await,
             ..Totals::default()
         };
@@ -1078,7 +1125,7 @@ impl PartitionedTable {
 
     /// The map header's routing version (§4.1), as replayed.
     pub async fn route_v(&self) -> io::Result<u16> {
-        Ok(self.live()?.state.lock().await.header().route_v)
+        Ok(self.live()?.board.state.lock().await.header().route_v)
     }
 
     /// Every declared partition, by pid.
@@ -1107,6 +1154,55 @@ impl PartitionedTable {
         Ok(out)
     }
 
+    /// The table's pins, map log and forget handle (§7.2).
+    pub fn pin_board(&self) -> io::Result<&StdArc<PinBoard>> {
+        Ok(&self.live()?.board)
+    }
+
+    /// Partition `pid`'s pin as the map log's state holds it: `None` when
+    /// clean or unmaterialized.
+    pub async fn pin_of(&self, pid: u32) -> io::Result<Option<TxId>> {
+        Ok(self.live()?.board.state.lock().await.part(pid).and_then(|p| p.pin))
+    }
+
+    /// Seeds `SERIAL` sequence `name` from its durable reservation (§10):
+    /// `false` when the table has none for it, and the caller seeds it from
+    /// the partitions' maximum and then calls [`Self::track_serial`].
+    pub(crate) fn resume_serial(&self, name: &str) -> io::Result<bool> {
+        Ok(self.live()?.board.serials.resume(name))
+    }
+
+    /// Reserves `SERIAL` sequence `name` from here on, seeded at `last`.
+    pub(crate) fn track_serial(&self, name: &str, last: i64) -> io::Result<()> {
+        self.live()?.board.serials.track(name, last);
+        Ok(())
+    }
+
+    /// Sequences this instance's table has seeded from the partitions'
+    /// maximum rather than its reservations file.
+    pub fn serial_max_scans(&self) -> u64 {
+        self.live().map_or(0, |l| l.board.serials.max_scans())
+    }
+
+    /// The durable reservation of `SERIAL` sequence `name`, if any.
+    pub fn serial_reserved(&self, name: &str) -> Option<i64> {
+        self.live().ok()?.board.serials.reserved(name)
+    }
+
+    /// Forget sweeps of every open, pinned partition now, each through its
+    /// slot (`PinBoard::sweep`). Returns how many advanced. For tests and
+    /// tools: the scheduler sweeps a pin once it lags by `FORGET_STEP`.
+    pub async fn sweep_pins_now(&self) -> io::Result<usize> {
+        let live = self.live()?;
+        let mut advanced = 0;
+        for slot in live.slots.iter() {
+            if slot.open.get().is_some() && live.board.sweep(slot.pid).await?.advanced_to.is_some() {
+                advanced += 1;
+            }
+        }
+        Ok(advanced)
+    }
+
     /// §12's DROP steps 3 to 5, after the caller has tombstoned the catalogue
     /// row (the commit point) and taken the table out of both maps: `DROPPED`
     /// (skipped for a table whose log never opened), then every file of the
@@ -1126,11 +1222,11 @@ impl PartitionedTable {
     pub(crate) async fn mark_dropped(&self) -> io::Result<()> {
         self.dropped.store(true, Ordering::Release);
         if let Ok(live) = &self.live {
-            let mut state = live.state.lock().await;
+            let mut state = live.board.state.lock().await;
             if !state.dropped() {
                 let mut next = state.clone();
                 next.apply(&Record::Dropped).map_err(invalid)?;
-                live.log.append_durable(&Record::Dropped).await?;
+                live.board.log.append_durable(&Record::Dropped).await?;
                 *state = next;
             }
         }

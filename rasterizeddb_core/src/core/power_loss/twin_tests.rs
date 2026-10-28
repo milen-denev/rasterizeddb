@@ -1437,3 +1437,6 @@ mod rename_crash_tests;
 
 #[path = "create_crash_tests.rs"]
 mod create_crash_tests;
+
+#[path = "pins_crash_tests.rs"]
+mod pins_crash_tests;

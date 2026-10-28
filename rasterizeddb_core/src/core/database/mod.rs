@@ -1225,6 +1225,10 @@ pub struct Database {
     /// Serialises partitioned CREATE and DROP, so the per-database cap on
     /// declared partitions counts what is really there.
     partition_ddl: tokio::sync::Mutex<()>,
+    /// The one maintenance scheduler every partition of this database is
+    /// serviced by (docs/partitioning.md §7.3): inert until a partition
+    /// opens, then one task, whatever the partition count.
+    partition_maintenance: StdArc<crate::core::partition::maintenance::Scheduler>,
     pub db_io_pointers: Arc<DbStorageProvider>,
     pub db_io_rows: Arc<DbStorageProvider>,
     pub db_io_schema: Arc<DbStorageProvider>,
@@ -1680,6 +1684,7 @@ impl Database {
             fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),
             name_claims: DashMap::with_hasher(ahash::RandomState::new()),
             partition_ddl: tokio::sync::Mutex::new(()),
+            partition_maintenance: crate::core::partition::maintenance::Scheduler::new(),
             db_io_pointers: io_pointers,
             db_io_rows: io_rows,
             db_io_schema: io_schema,

@@ -51,7 +51,9 @@ const ALLOWED: &[&str] = &["HashMap", "HashSet", "hash_map", "hash_set"];
 
 /// `(file, path)`: a hash allowed in one file only, for something that is
 /// not routing.
-const ALLOWED_IN: &[(&str, &str)] = &[("log.rs", "crc32fast::hash")];
+// The map log's framing and the SERIAL reservations file's checksum: never a
+// routed point.
+const ALLOWED_IN: &[(&str, &str)] = &[("log.rs", "crc32fast::hash"), ("serial.rs", "crc32fast::hash")];
 
 fn names_a_hash(ident: &str) -> bool {
     let lower = ident.to_ascii_lowercase();
