@@ -295,3 +295,22 @@ async fn an_open_forgets_placements_of_statement_relations() {
     assert!(super::pool_spec_of(&db.storage, "kept").is_some(), "another placement went too");
     close(db, root);
 }
+
+/// A discard through the in-memory stand-in a key/value table gets when its
+/// store cannot be opened reports nothing discarded. It used to report the
+/// files gone: a crash recovery then cleared its intent over them, and a later
+/// table of the name read them as its own once the store was back.
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discard_through_an_unopenable_store_keeps_the_files() {
+    use crate::core::storage::TableBackend;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = open(root).await;
+    db.storage.pin_backend("cold", &TableBackend::KeyValue("archive".to_string())).unwrap();
+    let stand_in = super::fallback_seed("cold");
+    assert!(!super::discard_files(&stand_in, &db.storage, None, "cold").await);
+    assert!(!super::discard_files_in(&stand_in, &db.storage, None, "cold", super::RENAMED_SUFFIXES).await);
+    assert!(super::pool_spec_of(&db.storage, "cold").is_some(), "the placement went with a discard that did nothing");
+    close(db, root);
+}

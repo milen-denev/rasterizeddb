@@ -592,13 +592,17 @@ async fn restore_from_backup(
     set: FileSet,
 ) -> io::Result<()> {
     let suffixes = set.suffixes();
-    let table_seed = seed_in(io_pointers, pool, kv, seeds, table).await;
+    // Both on the real files or not at all: a key/value store that cannot be
+    // opened gives an empty in-memory stand-in, and "restoring" between two
+    // of those reported success — the intent went, and the table opened
+    // half changed once the store was back.
+    let table_seed = super::seed_or_unavailable(io_pointers, pool, kv, seeds, table).await?;
+    let backup_seed = super::seed_or_unavailable(io_pointers, pool, kv, seeds, backup).await?;
     if !discard_files_in(&table_seed, pool, own, table, &suffixes).await {
         return Err(io::Error::other(format!(
             "the changed files of \"{table}\" could not be released"
         )));
     }
-    let backup_seed = seed_in(io_pointers, pool, kv, seeds, backup).await;
     copy_files_between(&backup_seed, &table_seed, backup, table, &suffixes).await
 }
 

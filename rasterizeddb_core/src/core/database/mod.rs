@@ -848,6 +848,33 @@ async fn refuse_unopenable_store(_pool: &StoragePool, _kv: &KvStores, _table_nam
     Ok(())
 }
 
+/// A discard asked of the in-memory stand-in for `name` (its key/value store
+/// could not be opened): nothing is discarded, and it says so. Reported as a
+/// discard, the files in the store were left unnamed while the caller went on
+/// as if they were gone — a crash recovery cleared its intent over them, and
+/// a later table of the name read them as its own.
+fn unavailable_kept(name: &str) -> bool {
+    error!("{name}'s key/value store could not be opened, so its files there were not discarded; kept for a later try");
+    false
+}
+
+/// `name`'s seed, or an error when it is the in-memory stand-in a key/value
+/// placement falls back to: for work that must act on the real files or not
+/// at all.
+pub(super) async fn seed_or_unavailable(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    kv: &KvStores,
+    seeds: &SeedCache,
+    name: &str,
+) -> io::Result<Arc<DbStorageProvider>> {
+    let seed = seed_in(io_pointers, pool, kv, seeds, name).await;
+    if seed_fell_back(pool, &seed, name) {
+        return Err(io::Error::other(format!("{name}'s key/value store could not be opened")));
+    }
+    Ok(seed)
+}
+
 /// Whether `seed` is the in-memory stand-in a table placed on a key/value
 /// store got because the store could not be opened.
 #[cfg(feature = "storage_pools")]
@@ -4751,6 +4778,9 @@ async fn discard_files(
     own: Option<&str>,
     name: &str,
 ) -> bool {
+    if seed_fell_back(pool, io_pointers, name) {
+        return unavailable_kept(name);
+    }
     let logs = logs_holding(io_pointers, pool, own);
     let _snapshot_gate = deletion_permit(&logs).await;
     if let Err(failure) = forget_logged_files(&logs, name, Barrier::Relocation) {
@@ -4904,6 +4934,9 @@ pub(super) async fn discard_files_in(
     name: &str,
     suffixes: &[&str],
 ) -> bool {
+    if seed_fell_back(pool, io_pointers, name) {
+        return unavailable_kept(name);
+    }
     let logs = logs_holding(io_pointers, pool, own);
     let _snapshot_gate = deletion_permit(&logs).await;
     let ids: Vec<u64> = suffixes
