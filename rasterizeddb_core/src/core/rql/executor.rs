@@ -6148,7 +6148,7 @@ async fn acquire_row_lock(
     wait: bool,
     // A locking read (`FOR UPDATE`/`FOR SHARE`) rather than a writer taking
     // its rows' locks: it also waits out a fast-path writer of the table,
-    // which wrote without row locks (`RowLocks::enter_fast_write`).
+    // which writes without row locks (`RowLocks::mark_row_writes`).
     locker: bool,
     tx: TxId,
 ) -> Result<crate::core::mvcc::row_locks::Acquired, String> {
@@ -6163,9 +6163,9 @@ async fn acquire_row_lock(
     let owner_live = |o: TxId| database.transactions.owner_live(o);
     let already = locker && database.row_locks.holds(table_name, key, tx);
     // Taken first, then the fast-path writers asked about: the order
-    // `enter_fast_write` relies on. Held by the writer's owner until it ends.
+    // `mark_row_writes` relies on. Held by the writer's owner until it ends.
     let acquire = || match database.row_locks.acquire(table_name, key, tx, strength, &live) {
-        Acquired::Yes if locker => match database.row_locks.fast_writer_on(table_name, tx, &owner_live) {
+        Acquired::Yes if locker => match database.row_locks.row_writer_on(table_name, key, tx, &owner_live) {
             Some(writer) => Acquired::Held(writer),
             None => Acquired::Yes,
         },
@@ -6418,10 +6418,11 @@ async fn refuse_write_to_locked_rows(
     // statement holds ROW EXCLUSIVE on its target (taken before this, and
     // waited for behind any SHARE or ACCESS EXCLUSIVE holder), so only row
     // locks are left to check.
-    // With no row locked anywhere the rows' locks are not taken; the owner is
-    // marked as writing the table instead, and a locker that comes after the
-    // check waits for it (`RowLocks::enter_fast_write`).
-    if database.row_locks.enter_fast_write(table_name, tx) {
+    // With no row locked anywhere the rows' locks are not taken. Each row is
+    // marked as being written just before it is stamped instead, and a locker
+    // that comes after this check waits for that mark
+    // (`RowLocks::mark_row_writes`, `RowMarker`).
+    if database.row_locks.is_empty() {
         // Between the check and the write: where a locker's `FOR UPDATE`
         // could land unseen (compat `row_lock_fast_path.rs`).
         #[cfg(any(test, feature = "index_store_failpoints"))]
@@ -13444,6 +13445,120 @@ impl IdentifyingKey {
 /// so the same refusal covers such a row. A partial key is never chosen:
 /// rows outside its predicate share its values, and writing back by it would
 /// reach every one of them.
+/// Marks the rows an `UPDATE` or `DELETE` stamps, by their row-lock key,
+/// before each is stamped (`RowLocks::mark_row_writes`). Built once per
+/// statement by the table's write loops; `None` for a table with no key a row
+/// lock can name, which no locker can lock row by row either.
+pub(crate) struct RowMarker {
+    locks: std::sync::Arc<crate::core::mvcc::row_locks::RowLocks>,
+    table: String,
+    key: IdentifyingKey,
+    /// Each key field's nullability companion, by write order.
+    flags: Vec<Option<u64>>,
+    transactions: std::sync::Arc<crate::core::mvcc::transaction::TransactionManager>,
+    /// The owner's mark already covers the whole table: a row need only be
+    /// checked, and only while some row is locked.
+    table_marked: std::sync::atomic::AtomicBool,
+}
+
+impl RowMarker {
+    pub(crate) fn for_table(
+        schema: &crate::core::row::schema::TableSchema,
+        transactions: &std::sync::Arc<crate::core::mvcc::transaction::TransactionManager>,
+    ) -> Option<Self> {
+        let locks = transactions.row_locks()?;
+        let key = identifying_key(schema)?;
+        let flags = key
+            .fields
+            .iter()
+            .map(|f| crate::core::rql::nullable::flag_field(&f.name, &schema.fields).map(|g| g.write_order))
+            .collect();
+        Some(Self {
+            locks,
+            table: schema.name.clone(),
+            key,
+            flags,
+            transactions: transactions.clone(),
+            table_marked: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the next row needs [`RowMarker::mark`] at all: not once the
+    /// table is marked whole while no row is locked anywhere — a locker that
+    /// comes later finds the table's mark. Lets a bulk `DELETE` skip reading
+    /// each row's key.
+    pub(crate) fn needed(&self) -> bool {
+        !(self.table_marked.load(std::sync::atomic::Ordering::Relaxed) && self.locks.is_empty())
+    }
+
+    /// The columns [`RowMarker::mark`] reads, for a write loop that has not
+    /// fetched the row.
+    pub(crate) fn fetch(&self, fields: &[crate::core::row::schema::SchemaField]) -> crate::core::row::row::RowFetch {
+        let calc = crate::core::row::schema::SchemaCalculator::default();
+        let flags = self.flags.iter().flatten().filter_map(|wo| fields.iter().find(|f| f.write_order == *wo));
+        crate::core::row::row::RowFetch {
+            columns_fetching_data: self
+                .key
+                .fields
+                .iter()
+                .chain(flags)
+                .map(|f| {
+                    let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, fields);
+                    crate::core::row::row::ColumnFetchingData {
+                        column_offset,
+                        column_type: f.db_type.physical(),
+                        size: f.size,
+                        schema_id,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Marks `row` (its key columns fetched as stored) as being written by
+    /// `tx`, or refuses with the transaction holding its row lock. A row
+    /// whose key is NULL names no lockable row and is not marked.
+    pub(crate) fn mark(&self, row: &crate::core::row::row::Row, tx: TxId) -> Result<(), (String, TxId)> {
+        if !self.needed() {
+            return Ok(());
+        }
+        let cell = |wo: u64| row.columns.iter().find(|c| c.schema_id as u64 == wo);
+        let mut cells = Vec::with_capacity(self.key.fields.len());
+        for (field, flag) in self.key.fields.iter().zip(&self.flags) {
+            if flag.and_then(cell).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0) {
+                return Ok(());
+            }
+            match cell(field.write_order) {
+                Some(c) => cells.push(c),
+                None => return Ok(()),
+            }
+        }
+        let Ok(key) = self.key.row_key(&cells) else {
+            return Ok(());
+        };
+        let live = |candidate: TxId| {
+            matches!(
+                self.transactions.status().outcome(candidate),
+                crate::core::mvcc::transaction::TxOutcome::InProgress
+            )
+        };
+        match self.locks.mark_row_writes(&self.table, &[&key], tx, &live) {
+            Ok(crate::core::mvcc::row_locks::Marked::Rows) => Ok(()),
+            Ok(crate::core::mvcc::row_locks::Marked::Table) => {
+                self.table_marked.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(holder) => Err((
+                format!(
+                    "row of '{}' is locked by transaction {}; the statement that locked it must finish first",
+                    self.table, holder
+                ),
+                holder,
+            )),
+        }
+    }
+}
+
 fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<IdentifyingKey> {
     let live = |name: &str| {
         schema
@@ -15586,13 +15701,22 @@ pub(crate) async fn execute_with_need(
                         }
                     }
                 }
-                if let Err(e) = Box::pin(refuse_write_to_locked_rows(
-                    &database, &name, &condition, tx,
-                ))
-                .await
-                {
-                    error!("{}", e);
-                    return ddl_error(&e);
+                // A statement holding a subquery is checked once it is
+                // flattened and re-dispatched, below: checked here as well, the
+                // raw predicate ran the subquery a second time — a `FOR UPDATE
+                // SKIP LOCKED` claim's subquery among them.
+                let redispatched = crate::core::rql::subquery::find_in_subquery(sql).is_some()
+                    || crate::core::rql::subquery::find_exists(sql).is_some()
+                    || crate::core::rql::subquery::find_scalar_subquery(sql).is_some();
+                if !redispatched {
+                    if let Err(e) = Box::pin(refuse_write_to_locked_rows(
+                        &database, &name, &condition, tx,
+                    ))
+                    .await
+                    {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
                 }
             }
 

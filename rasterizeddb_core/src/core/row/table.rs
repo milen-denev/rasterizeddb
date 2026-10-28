@@ -1812,6 +1812,19 @@ impl<S: StorageIO> Table<S> {
         .into())
     }
 
+    /// A row another transaction holds `FOR UPDATE`, met as the write loop
+    /// marked it (`RowMarker::mark`). Before anything is applied the
+    /// statement is retryable, as a write conflict is: the retry waits for
+    /// the holder to end and replays, which under `READ COMMITTED` is
+    /// PostgreSQL's wait for the lock. Past that it fails (55P03).
+    fn locked_row((message, holder): (String, TxId), nothing_applied: bool) -> std::io::Error {
+        if nothing_applied && holder != NO_TX {
+            crate::core::rql::conflict_wait::note_blocker(holder);
+            return std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{}{}", message, Self::CONFLICT_RETRYABLE));
+        }
+        std::io::Error::other(message)
+    }
+
     /// The visibility rule for a statement running under `tx`.
     ///
     /// An unversioned table admits every untombstoned row, which is what it did
@@ -4767,6 +4780,16 @@ impl<S: StorageIO> Table<S> {
             )
             .await?;
 
+        // Each row is marked as being written before it is stamped, so a
+        // `FOR UPDATE` that locks it afterwards waits for this statement's
+        // owner (`RowLocks::mark_row_writes`). Its key is read for that.
+        let marker = self
+            .versions
+            .load_full()
+            .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
+        let marker_fetch = marker.as_ref().map(|m| m.fetch(&self.schema.fields));
+        let mut key_row = Row::default();
+
         // One transaction for the whole statement: every tombstone lands or
         // none does, and the flush is paid once rather than once per row.
         let mut txn = d.io_pointers.begin_txn();
@@ -4802,6 +4825,17 @@ impl<S: StorageIO> Table<S> {
                 } else {
                     e
                 });
+            }
+
+            if let (Some(marker), Some(fetch)) = (marker.as_ref().filter(|m| m.needed()), &marker_fetch) {
+                let marked = match pointer.fetch_row_reuse_async(&*d.io_rows, fetch, &mut key_row).await {
+                    Ok(()) => marker.mark(&key_row, deleted_by),
+                    Err(e) => Err((format!("could not read a row's key to mark it: {}", e), NO_TX)),
+                };
+                if let Err(refusal) = marked {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(Self::locked_row(refusal, deleted_count == 0));
+                }
             }
 
             // The row as it was, for `RETURNING`, read before the tombstone.
@@ -5211,6 +5245,12 @@ impl<S: StorageIO> Table<S> {
             self.assigns_unique(&assigned)
         };
         let mut row = Row::default();
+        // Each row is marked as being written before it is stamped
+        // (`RowLocks::mark_row_writes`); see the DELETE.
+        let marker = self
+            .versions
+            .load_full()
+            .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
         // The checks that read an expression's result, which the statement
@@ -5250,6 +5290,13 @@ impl<S: StorageIO> Table<S> {
                 .is_err()
             {
                 continue;
+            }
+
+            if let Some(marker) = &marker {
+                if let Err(refusal) = marker.mark(&row, written_by) {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(Self::locked_row(refusal, updated_count == 0));
+                }
             }
 
             // Build RowWrite from the existing row (all columns), keyed by write_order.

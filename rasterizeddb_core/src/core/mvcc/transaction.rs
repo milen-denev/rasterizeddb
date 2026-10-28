@@ -382,6 +382,11 @@ pub struct TransactionManager {
     /// (docs/persistent-indexes.md §2 Ticket ownership, slice B11). Given
     /// back by `RowLocks::release_owner`, with the owner's table locks.
     family_tickets: crate::core::index_store::gate::FamilyTickets,
+    /// The database's row locks, for the write paths: a row an `UPDATE` or
+    /// `DELETE` is about to stamp is marked there first, so a `FOR UPDATE`
+    /// that locks it afterwards waits for the writer (`RowLocks::mark_row_writes`).
+    /// Weak: the row locks hold this manager.
+    row_locks: std::sync::OnceLock<std::sync::Weak<crate::core::mvcc::row_locks::RowLocks>>,
 }
 
 /// Counts one wait among [`TransactionManager`]'s end watchers until dropped.
@@ -684,7 +689,18 @@ impl TransactionManager {
             outliving_count: AtomicUsize::new(0),
             outliving_total: AtomicU64::new(0),
             family_tickets: crate::core::index_store::gate::FamilyTickets::new(),
+            row_locks: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Ties the database's row locks to this manager, once.
+    pub fn set_row_locks(&self, row_locks: &std::sync::Arc<crate::core::mvcc::row_locks::RowLocks>) {
+        let _ = self.row_locks.set(std::sync::Arc::downgrade(row_locks));
+    }
+
+    /// The database's row locks, if tied ([`TransactionManager::set_row_locks`]).
+    pub fn row_locks(&self) -> Option<std::sync::Arc<crate::core::mvcc::row_locks::RowLocks>> {
+        self.row_locks.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// The write tickets lock owners keep (see the field).

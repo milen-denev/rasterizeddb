@@ -100,13 +100,31 @@ struct Inner {
     /// May name an entry the transaction no longer holds — a dead holder's
     /// lock is taken over lazily — so release checks before removing.
     owned: HashMap<TxId, Vec<(Space, NameId, Key)>>,
-    /// Owners writing a table on the fast path — with no row locked anywhere,
-    /// an `UPDATE`/`DELETE` writes without taking its rows' locks — by owner,
-    /// held to the owner's end ([`RowLocks::enter_fast_write`]). A locker
-    /// that took a row lock on such a table waits for them: the writer
-    /// checked before the lock existed and will not see it.
-    fast_writers: HashMap<TxId, SmallVec<[Box<str>; 2]>>,
+    /// Rows an `UPDATE`/`DELETE` is writing, by table and row-lock key, and
+    /// the owners writing them, held to each owner's end
+    /// ([`RowLocks::mark_row_writes`]). A locker that has taken a row's lock
+    /// waits for these: a writer that found no row locked does not take its
+    /// rows' locks, and stamps a row after checking only its mark.
+    row_marks: HashMap<Box<str>, HashMap<Key, SmallVec<[TxId; 1]>>>,
+    /// What each owner marked, for its release and for the escalation bound.
+    marked_by: HashMap<TxId, HashMap<Box<str>, Vec<Key>>>,
+    /// Tables an owner writes more than [`ROW_MARKS_PER_TABLE`] rows of: one
+    /// mark for the whole table instead of one per row, to bound memory.
+    table_marks: HashMap<TxId, SmallVec<[Box<str>; 2]>>,
 }
+
+/// What [`RowLocks::mark_row_writes`] left: the rows' own marks, or one mark
+/// on the whole table, which covers every later row of it — a writer then
+/// need only check a row it is about to stamp while some row is locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marked {
+    Rows,
+    Table,
+}
+
+/// Rows of one table one owner marks individually before its marks become
+/// one mark on the table ([`RowLocks::mark_row_writes`]).
+pub const ROW_MARKS_PER_TABLE: usize = 1024;
 
 impl Inner {
     fn intern(&mut self, name: &str) -> NameId {
@@ -668,60 +686,107 @@ impl RowLocks {
         self.publish_counts(&inner);
     }
 
-    /// Marks `tx`'s owner as writing `table` on the fast path and answers
-    /// whether it may: true when no row is locked anywhere, so the writer need
-    /// not take its rows' locks. False leaves no new mark: the writer takes
-    /// its rows' locks instead.
+    /// Marks the rows `tx`'s owner is about to stamp in `table`, by row-lock
+    /// key, or names the live transaction holding a row lock on one of them
+    /// (the writer is refused, as the slow path refuses it).
     ///
-    /// The mark is made and the locks counted under one mutex, which a
-    /// locker's lock is also inserted under before it asks
-    /// [`RowLocks::fast_writer_on`]: either the writer counts the locker's
-    /// lock and takes the slow path, or the locker finds the writer's mark and
-    /// waits for its owner to end. A bare `is_empty()` checked before the
-    /// write let a locker that came between the two lock and read the row,
-    /// and the writer then changed it and committed under the lock: a lost
-    /// update. The mark lasts to the owner's end ([`RowLocks::release_owner`])
-    /// because the write is uncommitted until then — through a block's
-    /// `COMMIT` for an explicit block's writer.
-    pub fn enter_fast_write(&self, table: &str, tx: TxId) -> bool {
+    /// The lock check and the mark are one critical section of the mutex a
+    /// locker's lock is inserted under before it asks
+    /// [`RowLocks::row_writer_on`]: either the writer finds the locker's lock,
+    /// or the locker finds the writer's mark and waits for its owner to end.
+    /// The fast path (no row locked anywhere at the statement's check) took
+    /// no row lock and stamped regardless, so a locker that came between the
+    /// check and the stamp locked and read a row the writer then changed and
+    /// committed: a lost update. A whole-table mark (`31f88c2`) closed that
+    /// and stopped every locker of the table, including a `SKIP LOCKED` queue
+    /// claim on other rows; a row's mark stops only that row's.
+    ///
+    /// Past [`ROW_MARKS_PER_TABLE`] rows of one table an owner's marks become
+    /// one mark on the table. The mark lasts to the owner's end
+    /// ([`RowLocks::release_owner`]): the write is uncommitted until then.
+    pub fn mark_row_writes(
+        &self,
+        table: &str,
+        keys: &[&[u8]],
+        tx: TxId,
+        is_live: &dyn Fn(TxId) -> bool,
+    ) -> Result<Marked, TxId> {
         let txn = self.txn_of(tx);
         // Nothing ends `FROZEN_TX`, so a mark under it would never go.
-        if txn == crate::core::mvcc::transaction::FROZEN_TX {
-            return self.is_empty();
-        }
-        // A lock already counted sends the writer the slow way without the
-        // mutex, as the bare check did.
-        if !self.is_empty() {
-            return false;
+        if txn == crate::core::mvcc::transaction::FROZEN_TX || keys.is_empty() {
+            return Ok(Marked::Rows);
         }
         let owner = self.owner_of(tx);
         let mut inner = self.lock();
         if !inner.rows.is_empty() {
-            return false;
+            if let Some(name_id) = inner.names.get(table).copied() {
+                for key in keys {
+                    let holder = match inner.rows.get(&(name_id, Key::from_slice(key))) {
+                        Some(Holder::Exclusive(o)) => (*o != txn && is_live(*o)).then_some(*o),
+                        Some(Holder::Shared(os)) => os.iter().find(|o| **o != txn && is_live(**o)).copied(),
+                        None => None,
+                    };
+                    if let Some(holder) = holder {
+                        return Err(holder);
+                    }
+                }
+            }
         }
-        let marks = inner.fast_writers.entry(owner).or_default();
-        if !marks.iter().any(|t| &**t == table) {
-            marks.push(table.into());
+        if inner.table_marks.get(&owner).is_some_and(|t| t.iter().any(|m| &**m == table)) {
+            return Ok(Marked::Table);
         }
-        true
+        let marked = inner.marked_by.get(&owner).and_then(|m| m.get(table)).map_or(0, Vec::len);
+        if marked + keys.len() > ROW_MARKS_PER_TABLE {
+            inner.table_marks.entry(owner).or_default().push(table.into());
+            return Ok(Marked::Table);
+        }
+        let Inner { row_marks, marked_by, .. } = &mut *inner;
+        if !row_marks.contains_key(table) {
+            row_marks.insert(table.into(), HashMap::new());
+        }
+        let rows = row_marks.get_mut(table).expect("just made");
+        let by_table = marked_by.entry(owner).or_default();
+        if !by_table.contains_key(table) {
+            by_table.insert(table.into(), Vec::new());
+        }
+        let mine = by_table.get_mut(table).expect("just made");
+        for key in keys {
+            let owners = rows.entry(Key::from_slice(key)).or_default();
+            if !owners.contains(&owner) {
+                owners.push(owner);
+                mine.push(Key::from_slice(key));
+            }
+        }
+        Ok(Marked::Rows)
     }
 
-    /// An owner other than `tx`'s marked as writing `table` on the fast path
-    /// ([`RowLocks::enter_fast_write`]) and still live: the one a locker that
-    /// has just taken a row lock on `table` must wait for before it reads the
-    /// row. `None` when there is none.
-    pub fn fast_writer_on(&self, table: &str, tx: TxId, is_live_owner: &dyn Fn(TxId) -> bool) -> Option<TxId> {
+    /// An owner other than `tx`'s that marked `key` of `table` (or the whole
+    /// table) as being written, and is still live: the one a locker that has
+    /// just taken that row's lock must wait for before it reads the row.
+    pub fn row_writer_on(
+        &self,
+        table: &str,
+        key: &[u8],
+        tx: TxId,
+        is_live_owner: &dyn Fn(TxId) -> bool,
+    ) -> Option<TxId> {
         let (me, txn) = (self.owner_of(tx), self.txn_of(tx));
         let inner = self.lock();
-        if inner.fast_writers.is_empty() {
-            return None;
+        let other = |o: &TxId| *o != me && *o != txn && is_live_owner(*o);
+        if let Some(o) = inner
+            .row_marks
+            .get(table)
+            .and_then(|rows| rows.get(key))
+            .and_then(|owners| owners.iter().find(|o| other(o)))
+        {
+            return Some(*o);
         }
         inner
-            .fast_writers
+            .table_marks
             .iter()
-            .filter(|(o, marks)| **o != me && **o != txn && marks.iter().any(|t| &**t == table))
+            .filter(|(o, tables)| other(o) && tables.iter().any(|t| &**t == table))
             .map(|(o, _)| *o)
-            .find(|o| is_live_owner(*o))
+            .next()
     }
 
     /// Gives back a row lock `tx` took and will not keep (a `SKIP LOCKED` or
@@ -766,8 +831,23 @@ impl RowLocks {
         self.clear_waiting_owner(id);
         self.table_locks.release_owner(owner);
         let mut inner = self.lock();
-        if !inner.fast_writers.is_empty() {
-            inner.fast_writers.remove(&id);
+        inner.table_marks.remove(&id);
+        if let Some(marked) = inner.marked_by.remove(&id) {
+            for (table, keys) in marked {
+                if let Some(rows) = inner.row_marks.get_mut(&*table) {
+                    for key in keys {
+                        if let Some(owners) = rows.get_mut(&key) {
+                            owners.retain(|o| *o != id);
+                            if owners.is_empty() {
+                                rows.remove(&key);
+                            }
+                        }
+                    }
+                    if rows.is_empty() {
+                        inner.row_marks.remove(&*table);
+                    }
+                }
+            }
         }
         if !inner.owned.contains_key(&id) {
             return;
@@ -1176,6 +1256,33 @@ fn referenced_name(table: &str, column: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_marks_are_per_row_until_the_bound_then_per_table() {
+        let locks = RowLocks::default();
+        let live = |_: TxId| true;
+        let (writer, locker) = (10, 20);
+        assert_eq!(locks.mark_row_writes("t", &[&[1u8][..]], writer, &live), Ok(Marked::Rows));
+        // Only the marked row's locker waits, and never the writer itself.
+        assert_eq!(locks.row_writer_on("t", &[1], locker, &live), Some(writer));
+        assert_eq!(locks.row_writer_on("t", &[2], locker, &live), None);
+        assert_eq!(locks.row_writer_on("u", &[1], locker, &live), None);
+        assert_eq!(locks.row_writer_on("t", &[1], writer, &live), None);
+        assert_eq!(locks.row_writer_on("t", &[1], locker, &|_| false), None, "a dead writer");
+        // A row another transaction has locked refuses the writer.
+        assert_eq!(locks.acquire("t", &[3], locker, LockStrength::Update, &live), Acquired::Yes);
+        assert_eq!(locks.mark_row_writes("t", &[&[3u8][..]], writer, &live), Err(locker));
+        // Past the bound, one mark on the table.
+        let keys: Vec<Vec<u8>> = (0..ROW_MARKS_PER_TABLE as u32).map(|i| (i + 100).to_le_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        assert_eq!(locks.mark_row_writes("t", &refs, writer, &live), Ok(Marked::Table));
+        assert_eq!(locks.row_writer_on("t", &[2], locker, &live), Some(writer));
+        // All of it goes with the owner.
+        locks.release_owner(LockOwner::block(writer).unwrap());
+        assert_eq!(locks.row_writer_on("t", &[1], locker, &live), None);
+        assert_eq!(locks.row_writer_on("t", &[2], locker, &live), None);
+        assert!(locks.lock().row_marks.is_empty() && locks.lock().marked_by.is_empty());
+    }
 
     const LIVE: &dyn Fn(TxId) -> bool = &|_| true;
     const DEAD: &dyn Fn(TxId) -> bool = &|_| false;

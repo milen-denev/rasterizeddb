@@ -1589,9 +1589,13 @@ impl Database {
             transactions: StdArc::clone(&transactions),
             // Resolves a savepoint's locks to its transaction, which is what
             // releases them.
-            row_locks: StdArc::new(crate::core::mvcc::row_locks::RowLocks::for_transactions(
-                StdArc::clone(&transactions),
-            )),
+            row_locks: {
+                let row_locks = StdArc::new(crate::core::mvcc::row_locks::RowLocks::for_transactions(
+                    StdArc::clone(&transactions),
+                ));
+                transactions.set_row_locks(&row_locks);
+                row_locks
+            },
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
             shape_epoch: std::sync::atomic::AtomicU64::new(0).into(),
             replication: StdArc::new(crate::replication::Replication::new()),
