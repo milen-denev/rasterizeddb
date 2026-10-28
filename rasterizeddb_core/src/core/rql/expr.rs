@@ -3851,6 +3851,23 @@ fn is_case_block(text: &str) -> bool {
     case_block_end(text) == Some(text.len())
 }
 
+/// Whether the sign at `at` is an exponent's, as in `1e-10` or `2.5E+3`:
+/// directly after an `e` that ends a number. It used to split the literal,
+/// so `1e20 * 1e-10` read "'1e' is neither a column nor a value".
+fn in_exponent(bytes: &[u8], at: usize) -> bool {
+    if at < 2 || !matches!(bytes[at - 1], b'e' | b'E') {
+        return false;
+    }
+    // The run before the `e`: digits with at most one point, starting a word.
+    let mut j = at - 1;
+    let mut digits = false;
+    while j > 0 && (bytes[j - 1].is_ascii_digit() || bytes[j - 1] == b'.') {
+        digits |= bytes[j - 1].is_ascii_digit();
+        j -= 1;
+    }
+    digits && (j == 0 || !(bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_'))
+}
+
 /// Finds the operator a binary arithmetic expression splits at, if any.
 ///
 /// Scans right to left so the split lands on the *last* operator of a run,
@@ -3901,7 +3918,7 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
                             || b == b'"'
                             || b == b'\''
                             || b == b'.');
-                    if binds {
+                    if binds && !(wanted_additive && in_exponent(bytes, i)) {
                         found = Some((i, op));
                     }
                 }

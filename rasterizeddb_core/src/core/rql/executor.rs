@@ -5881,6 +5881,34 @@ async fn apply_conflict_update(
         }
     }
 
+    // `EXCLUDED.<column>` of a column the INSERT does not write is the value
+    // the row would have taken: its DEFAULT, or NULL. It was refused (XX000,
+    // "has no value"). A default that is not a constant would be another
+    // value when computed again here (a sequence's next number), so a
+    // reference to one is refused by name.
+    let mut inserted = inserted;
+    if let Some(table) = target.as_ref().clone() {
+        let schema = &table.schema;
+        for field in schema.fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
+            if inserted.iter().any(|(name, _)| name.eq_ignore_ascii_case(&field.name)) {
+                continue;
+            }
+            let value = if crate::core::rql::generated::expression_for(&field.name, &schema.generated).is_some() {
+                None
+            } else {
+                match crate::core::rql::column_default::expression_for(&field.name, &schema.defaults) {
+                    None => Some("NULL".to_string()),
+                    Some(expression) if !expression.contains('(') => Some(format!("({})", expression.trim())),
+                    Some(_) => None,
+                }
+            };
+            inserted.push((
+                field.name.clone(),
+                value.unwrap_or_else(|| format!("{}{}", EXCLUDED_UNAVAILABLE, field.name)),
+            ));
+        }
+    }
+
     let resolve = |text: &str| -> Result<String, String> {
         let text = substitute_excluded(text, &inserted)?;
         Ok(fold_constants_in_predicate(&strip_qualifier(
@@ -7104,6 +7132,10 @@ fn has_top_level_arithmetic(text: &str) -> bool {
     false
 }
 
+/// What `apply_conflict_update` puts for an `EXCLUDED` column it cannot
+/// give a value for; never a literal anything writes.
+const EXCLUDED_UNAVAILABLE: &str = "\u{1}unavailable:";
+
 /// Replaces every `EXCLUDED.<column>` with the value the insert would have
 /// written for it.
 fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<String, String> {
@@ -7126,11 +7158,15 @@ fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<Stri
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(column))
         else {
+            return Err(format!("column excluded.{} does not exist", column));
+        };
+        if literal.starts_with(EXCLUDED_UNAVAILABLE) {
             return Err(format!(
-                "EXCLUDED.{} has no value: this INSERT does not write that column",
+                "EXCLUDED.{} of a column this INSERT does not write, whose default is computed or which is \
+                 generated, is not supported",
                 column
             ));
-        };
+        }
         out.push_str(literal);
         rest = &after[end..];
     }

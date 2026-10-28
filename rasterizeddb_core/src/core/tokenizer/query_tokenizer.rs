@@ -514,6 +514,7 @@ fn tokenize_inner<'a>(
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
+                i = exponent_end(bytes, i);
 
                 let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
@@ -546,6 +547,7 @@ fn tokenize_inner<'a>(
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
+                i = exponent_end(bytes, i);
 
                 let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
@@ -911,7 +913,7 @@ fn parse_numeric_value<'a>(
 /// became 0.123456789123 and matched that row of a `NUMERIC(20,12)`.
 fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
     if let NumericValue::F64(f) = value {
-        if numeric_context && text.contains('.') {
+        if numeric_context && text.contains(['.', 'e', 'E']) {
             let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
             let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
             if written.is_some() && written != read {
@@ -962,7 +964,7 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
     // failed to parse: `i * 2.5` and `age > 2.5` are numeric in PostgreSQL. It
     // stays a float, and the planner meets the two at a common type.
     let integer = !matches!(db_type, DbType::F32 | DbType::F64);
-    if integer && value_str.contains('.') {
+    if integer && value_str.contains(['.', 'e', 'E']) {
         return parse_default(value_str);
     }
     // An integer the column's type cannot hold keeps its own type — `int4`
@@ -1011,10 +1013,32 @@ fn fits_integer_type(value_str: &str, db_type: &DbType) -> bool {
     }
 }
 
+/// Past an exponent, `e5`, `E-10` or `e+3`, that follows a number ending at
+/// `i`; `i` itself when none does. It was read as a word of its own, so
+/// `f > 1e-10` asked for a column `e`.
+fn exponent_end(bytes: &[u8], i: usize) -> usize {
+    if !matches!(bytes.get(i), Some(b'e' | b'E')) {
+        return i;
+    }
+    let mut j = i + 1;
+    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+        j += 1;
+    }
+    let digits = j;
+    while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    // A letter after the digits makes it a word (`1e5x`), not an exponent.
+    if j == digits || bytes.get(j).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+        return i;
+    }
+    j
+}
+
 #[inline(always)]
 fn parse_default(value_str: &str) -> Result<NumericValue, String> {
     let out_of_range = || format!("numeric literal {} is out of range", value_str);
-    if value_str.contains('.') {
+    if value_str.contains(['.', 'e', 'E']) {
         Ok(NumericValue::F64(
             value_str.parse().map_err(|_| out_of_range())?,
         ))

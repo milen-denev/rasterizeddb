@@ -4747,6 +4747,14 @@ where
         // `CASE types integer and text cannot be matched` — PostgreSQL's
         // datatype_mismatch.
         "42804"
+    } else if message.ends_with(" not found in schema")
+        || message.contains("is neither a column nor a value")
+        || (message.starts_with("column \"") && message.ends_with("\" does not exist"))
+    {
+        // A name in the select list, ORDER BY or GROUP BY that is no column
+        // ("Column 'nosuch' not found in schema"): undefined_column, not a
+        // syntax error. An ORM tells a stale schema by 42703.
+        "42703"
     } else {
         sqlstate
     };
@@ -7028,7 +7036,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         || (has("table ") && has(" not found"))
     {
         "42P01"
-    } else if has("column") && has("does not exist") {
+    } else if has("column") && has("does not exist")
+        // The WHERE tokenizer's and the expression reader's words for a
+        // name that is no column.
+        || (has("unknown identifier") && has("is not defined in the schema"))
+        || has("is neither a column nor a value")
+    {
         "42703"
     } else if has("constraint") && has("already exists") {
         // `duplicate_object`: a constraint's name is not a relation's,

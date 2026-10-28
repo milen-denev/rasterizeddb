@@ -1325,6 +1325,22 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                         i += close + 2;
                     }
                 }
+                // A number's signed exponent, `1e-10` or `2.5E+3`, is part of
+                // the number: split at its sign, `f > 1e-10` asked for a
+                // column `e`.
+                let word = &bytes[start..i];
+                if word.first().is_some_and(u8::is_ascii_digit)
+                    && word.len() >= 2
+                    && matches!(word[word.len() - 1], b'e' | b'E')
+                    && word[..word.len() - 1].iter().all(|b| b.is_ascii_digit() || *b == b'.')
+                    && matches!(bytes.get(i), Some(b'+' | b'-'))
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+                {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
                 out.push(Tok::Word(clause[start..i].to_string()));
             }
             // `?`, `?|` and `?&` are JSONB key existence: `data ? 'k'` asks
@@ -3664,7 +3680,14 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
             // Anything else is a name the schema does not have. Reporting it
             // here matters: the tokenizer downstream panics on an unknown
             // identifier, which would kill the connection rather than fail the
-            // statement.
+            // statement. A word that is not called is a column, in
+            // PostgreSQL's words (42703); a called one is a function this
+            // does not read.
+            if !matches!(toks.get(i + 1), Some(Tok::LPar))
+                && raw.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                return Err(format!("column \"{}\" does not exist", raw));
+            }
             return Err(format!(
                 "unknown column or unsupported keyword '{}' in WHERE clause",
                 raw
@@ -4337,7 +4360,7 @@ mod tests {
     /// takes the connection with it. Every such name has to be caught here.
     #[test]
     fn unknown_identifiers_are_rejected_rather_than_passed_on() {
-        assert!(err("nosuchcolumn = 1").contains("unknown column"));
+        assert!(err("nosuchcolumn = 1").contains("column \"nosuchcolumn\" does not exist"));
         assert!(err("EXISTS (SELECT 1)").contains("unknown column"));
         assert!(err("NOT EXISTS (SELECT 1)").contains("NOT over"));
     }
@@ -4626,9 +4649,9 @@ mod tests {
         assert_eq!(rw("country =NULL"), "1 = 0");
 
         // A longer identifier is not `NULL` and must not be folded away.
-        assert!(err("country = NULLX").contains("unknown column"));
+        assert!(err("country = NULLX").contains("column \"NULLX\" does not exist"));
         // Too short to be `NULL` at all.
-        assert!(err("country = NU").contains("unknown column"));
+        assert!(err("country = NU").contains("column \"NU\" does not exist"));
         // A tab or newline after `NULL` was never accepted either — only a
         // literal space was — and the statement is refused rather than folded.
         // Preserved deliberately: this is behaviour, not an accident of how the
