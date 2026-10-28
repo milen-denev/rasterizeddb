@@ -5657,6 +5657,23 @@ where
         stmt
     };
 
+    // A quoted identifier holding a quote (`"a""b"`) is refused before
+    // anything reads it: every reader below dropped the name at the first
+    // inner quote, so `CREATE TABLE "t"" x ""y"` created `t`.
+    if let Some(name) = crate::core::sql_scan::normalize_string_literals(stmt)
+        .ok()
+        .and_then(|t| crate::core::sql_scan::identifier_with_doubled_quote(&t).map(str::to_string))
+    {
+        fail_statement(
+            state,
+            stream,
+            "0A000",
+            &format!("a quoted identifier containing a double quote is not supported yet: {}", name),
+        )
+        .await?;
+        return Ok(());
+    }
+
     // `INSERT INTO t WITH … SELECT …` puts its CTEs after the target; they are
     // moved to the front, where everything below expects a `WITH` to be.
     let hoisted;

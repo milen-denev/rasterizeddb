@@ -146,6 +146,42 @@ pub fn skip_quoted(bytes: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// The first quoted identifier in `sql` holding a doubled quote (`"a""b"`,
+/// the name `a"b`), as written; `None` when there is none. Strings, escape
+/// strings, dollar quotes and comments are skipped.
+///
+/// The engine's identifier readers each strip a name's quotes their own way,
+/// and none reads `""` as a quote: `CREATE TABLE "t"" x ""y" (…)` created a
+/// table named `t`, and such a column failed with an unrelated error. Until
+/// they share one reader, a statement naming such an identifier is refused
+/// where it enters, before anything is created under a different name.
+pub fn identifier_with_doubled_quote(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes[i] == b'"' {
+            let end = quoted_end(bytes, i, b'"');
+            // Between the opening quote and the closing one.
+            let inner = &bytes[i + 1..end.saturating_sub(1).max(i + 1)];
+            if memchr::memmem::find(inner, b"\"\"").is_some() {
+                return Some(&sql[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Whether `needle` occurs anywhere in `text`, ignoring ASCII case, quotes
 /// and comments included: a scanner's cheap precondition, so one that can
 /// only match where these bytes are can skip a statement that has none.
@@ -480,6 +516,18 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_doubled_quote_in_an_identifier_is_found_and_nowhere_else() {
+        use super::identifier_with_doubled_quote as found;
+        assert_eq!(found(r#"CREATE TABLE "t"" x ""y" (id INT)"#), Some(r#""t"" x ""y""#));
+        assert_eq!(found(r#"SELECT "a""b" FROM t"#), Some(r#""a""b""#));
+        assert_eq!(found(r#"SELECT "a""" FROM t"#), Some(r#""a""""#));
+        assert_eq!(found(r#"SELECT "a" FROM "b""#), None);
+        assert_eq!(found(r#"SELECT "" FROM t"#), None);
+        assert_eq!(found(r#"SELECT 'x""y', $$""$$ FROM t -- "a""b""#), None);
+        assert_eq!(found(r#"SELECT 1 /* "a""b" */"#), None);
+    }
+
     use super::*;
 
     fn norm(sql: &str) -> String {
