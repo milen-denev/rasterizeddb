@@ -200,7 +200,7 @@ impl StorageIO for MirrorStorageProvider {
     async fn write_data(&self, position: u64, buffer: &[u8]) {
         self.primary.write_data(position, buffer).await;
         for backup in self.backups.iter() {
-            backup.write_data(position, buffer).await;
+            write_backup_or_mark(backup, &self.primary.get_name(), position, buffer).await;
         }
     }
 
@@ -283,7 +283,7 @@ impl StorageIO for MirrorStorageProvider {
         if token == 0 {
             // The primary wrote it at once (no log): so do the backups.
             for backup in self.backups.iter() {
-                backup.write_data(position, buffer).await;
+                write_backup_or_mark(backup, &self.primary.get_name(), position, buffer).await;
             }
         } else {
             pending::note(&self.primary, &self.backups, token, position, buffer.len() as u64);
@@ -463,6 +463,38 @@ impl StorageIO for MirrorStorageProvider {
     }
 }
 
+/// Writes `buffer` at `position` in `backup` and commits it; whether it
+/// landed. `write_data` only logs a failure, and a copy that went on to
+/// release its `BehindMark` left a same-length divergence nothing sees.
+async fn write_backup(backup: &LocalStorageProvider, position: u64, buffer: &[u8]) -> bool {
+    let txn = backup.begin_txn();
+    let token = backup.write_data_txn(txn, position, buffer).await;
+    match backup.commit_durable(token).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                "could not write {} bytes at {} to the backup copy {} in {}: {}; it is rebuilt at the next open",
+                buffer.len(),
+                position,
+                backup.get_name(),
+                backup.get_location().unwrap_or_default(),
+                e
+            );
+            false
+        }
+    }
+}
+
+/// [`write_backup`] for a write no mark covers yet: a failure leaves one,
+/// stuck, so the next open rebuilds the copy.
+async fn write_backup_or_mark(backup: &LocalStorageProvider, name: &str, position: u64, buffer: &[u8]) {
+    if !write_backup(backup, position, buffer).await
+        && let Some(mark) = BehindMark::make(backup, name)
+    {
+        mark.release(false);
+    }
+}
+
 /// A durable "this backup copy is behind its primary" mark: a file beside the
 /// copy, made (and its directory synced) before the primary commits writes
 /// the copy has not had, removed once no commit is between its primary's
@@ -616,6 +648,7 @@ mod pending {
         /// Copies the ranges from the primary, now committed, to every
         /// backup; whether every read and write succeeded.
         pub(super) async fn copy(&self) -> bool {
+            let mut copied = true;
             let mut buffer = Vec::new();
             for &(start, end) in &self.ranges {
                 let mut at = start;
@@ -633,12 +666,12 @@ mod pending {
                         return false;
                     }
                     for backup in self.backups.iter() {
-                        backup.write_data(at, &buffer).await;
+                        copied &= super::write_backup(backup, at, &buffer).await;
                     }
                     at += take as u64;
                 }
             }
-            true
+            copied
         }
     }
 }

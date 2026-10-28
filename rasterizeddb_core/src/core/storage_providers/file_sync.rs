@@ -709,6 +709,24 @@ pub(crate) mod failed_appends {
         /// Skips the undo image, for measuring what it costs.
         pub(crate) static NO_UNDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
+
+    /// Directories whose next in-place write fails as a refused write
+    /// does: nothing written, the failure taken by the commit. One entry per
+    /// failure, keyed by directory so it reaches a write on any thread.
+    #[cfg(test)]
+    pub(crate) static FAIL_INPLACE_IN: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(super) fn injected_inplace_failure(location: &str) -> bool {
+        let mut armed = FAIL_INPLACE_IN.lock();
+        match armed.iter().position(|l| l == location) {
+            Some(i) => {
+                armed.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The atomics here are packed, not each in its own `CacheGuard`.
@@ -1773,6 +1791,11 @@ impl StorageIO for LocalStorageProvider {
             GatedIo::record_failure(&self.location, &self.table_name, Failure::Txn(txn), e);
             return txn;
         });
+        #[cfg(test)]
+        if failed_appends::injected_inplace_failure(&self.location) {
+            failed_appends::record(&self.location, &self.file_str, txn, io::Error::other("injected in-place write failure"));
+            return txn;
+        }
         // Recorded now, applied to `file_len` at commit — see `inplace_end`.
         // Raising the length here instead would publish a length whose bytes
         // are not in the file yet, since the apply is deferred to commit.

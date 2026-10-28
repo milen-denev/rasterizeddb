@@ -935,3 +935,90 @@ async fn a_copy_cut_off_after_the_primary_committed_is_rebuilt_at_open() {
     assert_same(root.path(), backup.path(), &["mc.db", "mc_pointers.db"], "after the open");
     assert!(!backup.path().join("__mirror_behind.mc.db").exists(), "the mark outlived the rebuild");
 }
+
+fn marks_in(backup: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(backup)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("__mirror_behind."))
+        .collect()
+}
+
+/// The table's own files, which every one of these tests compares.
+fn table_files(dir: &std::path::Path, table: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("{table}.")) || n.starts_with(&format!("{table}_")))
+        .filter(|n| n.ends_with(".db"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A backup write that fails during a copy: `write_data` only logged it, so
+/// the copy counted as made, its mark was removed, and the backup stayed the
+/// same length with older bytes. The mark now stays, and the next open
+/// rebuilds the copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_backup_write_keeps_the_mark_and_is_rebuilt_at_open() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let backup_path = backup.path().to_string_lossy().into_owned();
+    let db = mirrored(root.path(), backup.path()).await;
+    exec(&db, "CREATE TABLE mx (id BIGINT, label TEXT)").await.unwrap();
+    let values: Vec<String> = (0..200).map(|i| format!("({i}, 'label-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO mx (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    exec(&db, "DELETE FROM mx WHERE id % 2 = 0").await.unwrap();
+    exec(&db, "VACUUM mx").await.unwrap();
+    db.sync_durable().unwrap();
+    assert!(marks_in(backup.path()).is_empty());
+
+    crate::core::storage_providers::file_sync::failed_appends::FAIL_INPLACE_IN.lock().push(backup_path.clone());
+    let values: Vec<String> = (1000..1060).map(|i| format!("({i}, 'fresh-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO mx (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    let armed = crate::core::storage_providers::file_sync::failed_appends::FAIL_INPLACE_IN
+        .lock()
+        .iter()
+        .any(|l| *l == backup_path);
+    assert!(!armed, "the INSERT wrote nothing in place to the backup, so nothing failed");
+    close(db, root.path(), backup.path()).await;
+    let marks = marks_in(backup.path());
+    assert!(!marks.is_empty(), "the failed backup write left no mark");
+    let names = table_files(root.path(), "mx");
+    let differs = names.iter().any(|n| std::fs::read(root.path().join(n)).unwrap() != std::fs::read(backup.path().join(n)).unwrap());
+    assert!(differs, "the failed write left nothing for the open to find: {marks:?}");
+
+    let db = open(root.path()).await;
+    close(db, root.path(), backup.path()).await;
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_same(root.path(), backup.path(), &names, "after the open");
+    assert!(marks_in(backup.path()).is_empty(), "the mark outlived the rebuild");
+}
+
+/// Without a log the primary writes in place at once and so do the
+/// backups; one that fails leaves a mark, and the next attach rebuilds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_immediate_backup_write_leaves_a_mark_that_the_next_attach_honours() {
+    use crate::core::storage::mirror::MirrorStorageProvider;
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_string_lossy().into_owned();
+    let backup_path = backup.path().to_string_lossy().into_owned();
+    {
+        let io = MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "mi.db").await;
+        io.append_data(&vec![0u8; 4096], true).await;
+        io.commit_durable(io.begin_txn()).await.unwrap();
+        crate::core::storage_providers::file_sync::failed_appends::FAIL_INPLACE_IN.lock().push(backup_path.clone());
+        let token = io.write_data_txn(io.begin_txn(), 100, &[0xCC; 8]).await;
+        assert_eq!(token, 0, "the primary has a log, so this is not the immediate path");
+        io.commit_durable(token).await.unwrap();
+    }
+    assert!(marks_in(backup.path()).contains(&"__mirror_behind.mi.db".to_string()), "{:?}", marks_in(backup.path()));
+    let primary = std::fs::read(root.path().join("mi.db")).unwrap();
+    assert_eq!(&primary[100..108], &[0xCC; 8]);
+    assert_ne!(primary, std::fs::read(backup.path().join("mi.db")).unwrap(), "the failed write reached the backup");
+    drop(MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "mi.db").await);
+    assert_same(root.path(), backup.path(), &["mi.db"], "after the next attach");
+    assert!(marks_in(backup.path()).is_empty());
+}
