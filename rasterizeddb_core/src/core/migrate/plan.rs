@@ -434,6 +434,16 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
                 statement.push_str(" ON UPDATE ");
                 statement.push_str(action);
             }
+            // A key the source never validated may hold rows that break it
+            // there too: carried over as it is, enforced on new writes only.
+            if !key.validated {
+                statement.push_str(" NOT VALID");
+                notes.push(format!(
+                    "foreign key {} on {} was NOT VALID in the source and is added NOT VALID: the rows \
+                     already there are not checked against it",
+                    key.name, table.name
+                ));
+            }
             foreign_keys.push(statement);
         }
     }
@@ -807,6 +817,7 @@ mod tests {
             referenced_columns: vec!["id".to_string()],
             on_delete: 'c',
             on_update: 'a',
+            validated: true,
         }];
         let plan = plan_one(source);
         assert_eq!(
@@ -817,6 +828,31 @@ mod tests {
             ]
         );
         assert!(!plan.create.contains("FOREIGN KEY"), "{}", plan.create);
+    }
+
+    /// A key the source never validated is added `NOT VALID`, and the
+    /// report says so (P4 round 2: validated, it aborted the import).
+    #[test]
+    fn a_source_key_never_validated_is_added_not_valid() {
+        let mut source = table(
+            "child",
+            vec![column("id", "int4", true), column("parent", "int8", false)],
+        );
+        source.foreign_keys = vec![ForeignKey {
+            name: "child_parent_fkey".to_string(),
+            columns: vec!["parent".to_string()],
+            referenced_table: "users".to_string(),
+            referenced_columns: vec!["id".to_string()],
+            on_delete: 'a',
+            on_update: 'a',
+            validated: false,
+        }];
+        let plan = plan_one(source);
+        assert_eq!(
+            plan.foreign_keys,
+            vec!["ALTER TABLE child ADD CONSTRAINT child_parent_fkey FOREIGN KEY (parent) REFERENCES users (id) NOT VALID"]
+        );
+        assert!(plan.notes.iter().any(|n| n.contains("NOT VALID")), "{:?}", plan.notes);
     }
 
     #[test]
@@ -832,6 +868,7 @@ mod tests {
             referenced_columns: vec!["x".to_string(), "y".to_string()],
             on_delete: 'a',
             on_update: 'a',
+            validated: true,
         }];
         let plan = plan_one(source);
         assert!(plan.foreign_keys.is_empty());

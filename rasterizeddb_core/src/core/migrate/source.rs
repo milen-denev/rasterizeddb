@@ -55,6 +55,9 @@ pub struct ForeignKey {
     /// `a` no action, `r` restrict, `c` cascade, `n` set null, `d` set default.
     pub on_delete: char,
     pub on_update: char,
+    /// `pg_constraint.convalidated`: false for a key added `NOT VALID` and
+    /// never validated, whose rows PostgreSQL itself never checked.
+    pub validated: bool,
 }
 
 /// What one schema of a PostgreSQL database holds.
@@ -356,7 +359,8 @@ async fn read_constraints(
                 fr.relname AS reftable, \
                 fn.nspname AS refschema, \
                 con.confupdtype::text AS onupdate, \
-                con.confdeltype::text AS ondelete \
+                con.confdeltype::text AS ondelete, \
+                con.convalidated::text AS validated \
          FROM pg_constraint con \
          JOIN pg_class rel ON rel.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = rel.relnamespace \
@@ -431,6 +435,9 @@ async fn read_constraints(
                     referenced_columns,
                     on_delete: first_char(result.get(row, "ondelete"), 'a'),
                     on_update: first_char(result.get(row, "onupdate"), 'a'),
+                    // `true`/`t` as text; anything unreadable is taken as
+                    // validated, which only means the target checks the rows.
+                    validated: !matches!(result.get(row, "validated"), Some("false") | Some("f")),
                 });
             }
             _ => {}

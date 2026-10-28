@@ -7963,6 +7963,11 @@ async fn add_foreign_key(
         Ok(split) => split,
         Err(e) => return ddl_error(&e),
     };
+    // `NOT VALID`: the key is enforced on every write from now on, and the
+    // rows already there are left unchecked until `VALIDATE CONSTRAINT`, as
+    // in PostgreSQL. What an import uses for a source key PostgreSQL itself
+    // never validated.
+    let (rest, not_valid) = strip_not_valid(rest);
     let upper = rest.to_ascii_uppercase();
     let clause_at = upper.find("FOREIGN KEY").or_else(|| upper.find("REFERENCES")).unwrap_or(0);
     let mut fk = match foreign_key::parse_clause(&rest[clause_at..], table_name, named.clone(), None) {
@@ -8006,10 +8011,14 @@ async fn add_foreign_key(
     if let Some(why) = refusal {
         return ddl_error(&why);
     }
-    match existing_rows_break_foreign_key(database, table_name, &fk, tx).await {
-        Ok(None) => {}
-        Ok(Some(violation)) => return ddl_error(&violation),
-        Err(e) => return ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
+    if not_valid {
+        info!("ALTER TABLE {table_name}: foreign key {} added NOT VALID; its existing rows are not checked", fk.name);
+    } else {
+        match existing_rows_break_foreign_key(database, table_name, &fk, tx).await {
+            Ok(None) => {}
+            Ok(Some(violation)) => return ddl_error(&violation),
+            Err(e) => return ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
+        }
     }
     // §7 step 3: the declaration is the reload's work, under this table's
     // ACCESS EXCLUSIVE and SHARE on the parent (finding L11: a parent DELETE
@@ -8027,10 +8036,35 @@ async fn add_foreign_key(
     }
 }
 
-/// The violation an `ADD FOREIGN KEY` would be refused for: the first
-/// distinct non-NULL value of the key's column, in `table_name`'s rows (every
-/// partition of a partitioned one) as of now, that is no key of the parent.
-/// `None` when every row satisfies it.
+/// `clause` without a trailing `NOT VALID` (two whole words, any case),
+/// and whether it had one.
+fn strip_not_valid(clause: &str) -> (&str, bool) {
+    let trimmed = clause.trim_end().trim_end_matches(';').trim_end();
+    let mut words = trimmed.rsplitn(3, char::is_whitespace);
+    match (words.next(), words.next(), words.next()) {
+        (Some(valid), Some(not), Some(head)) if valid.eq_ignore_ascii_case("VALID") && not.eq_ignore_ascii_case("NOT") => {
+            (head.trim_end(), true)
+        }
+        _ => (clause, false),
+    }
+}
+
+/// The violation an `ADD FOREIGN KEY` (or `VALIDATE CONSTRAINT`) is refused
+/// for: the first distinct non-NULL value of the key's column, in
+/// `table_name`'s rows (every partition of a partitioned one) as of now, that
+/// is no key of the parent. `None` when every row satisfies it.
+///
+/// **Streamed, in bounded memory** (P4 round 2): the first build read the
+/// whole child into a `Vec<Row>` and a `Vec<String>`, about 630 bytes a row,
+/// so 6 GB for a ten-million-row child at an import's last step. Now each
+/// table's pointer file is walked as a scan walks it (a read ticket held
+/// against reclamation, deleted slots and invisible versions skipped by the
+/// scans' own `Visibility::visible`), only the column and its NULL companion
+/// fetched into one reused `Row`, and values gathered into a chunk of
+/// [`REFERENCED_PROBE_CHUNK`] distinct literals, probed and dropped. The
+/// dedupe set is bounded ([`VALIDATION_SEEN_CAP`]; cleared when full, so a
+/// value seen again after that is probed again, which only costs a probe).
+/// Memory is O(chunk + cap), whatever the child's size; time stays one pass.
 ///
 /// Each value is probed as an insert's check probes it ([`referenced_values_now`],
 /// the child's literal against the parent's column, routed on a partitioned
@@ -8055,12 +8089,99 @@ async fn existing_rows_break_foreign_key(
         }
         crate::core::database::Relation::Partitioned(pt) => pt.visibility_now_for(tx),
     };
-    let everything = crate::core::rql::join::fetch_for(&[], &child.schema().fields);
-    let values = column_values_as_of(&child, &fk.column, "", &everything, &visibility, tx).await?;
-    let literals: Vec<String> = values.into_iter().map(|(_, literal)| literal).collect();
+    let schema = &child.schema().fields;
+    let Some(field) = schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).cloned() else {
+        return Err(format!("column \"{}\" of relation \"{}\" does not exist", fk.column, table_name));
+    };
+    let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+    let mut wanted = vec![field.clone()];
+    wanted.extend(flag.clone());
+    let fetch = crate::core::rql::join::fetch_for(&wanted, schema);
+    let holders = database.row_tables_held(table_name).map_err(|e| e.to_string())?;
+    use crate::core::storage_providers::traits::StorageIO as _;
 
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut pending: Vec<String> = Vec::with_capacity(REFERENCED_PROBE_CHUNK);
+    let mut row = crate::core::row::row::Row::default();
+    for holder in &holders {
+        let d = holder.data().map_err(|e| e.to_string())?;
+        // A read ticket, as a scan holds: reclamation hands out no extent
+        // this walk may still fetch from.
+        let _ticket = d.free_space.is_enabled().then(|| d.readers.enter());
+        let n_slots = d.io_pointers.get_len().await / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+        let mut pointers = crate::core::row::row_pointer::RowPointerIterator::new(d.io_pointers.clone())
+            .await
+            .map_err(|e| format!("could not read \"{table_name}\" to validate the key: {e:?}"))?;
+        let mut walked = 0u64;
+        while let Some((offset, pointer)) = pointers
+            .next_row_pointer_with_offset()
+            .await
+            .map_err(|e| format!("could not read \"{table_name}\" to validate the key: {e:?}"))?
+        {
+            if offset / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64 >= n_slots {
+                break;
+            }
+            walked += 1;
+            if walked % 4096 == 0 {
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    return Err(reason.eval_error().as_str().to_string());
+                }
+                tokio::task::yield_now().await;
+            }
+            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                continue;
+            }
+            pointer
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
+                .await
+                .map_err(|e| format!("could not read a row of \"{table_name}\" to validate the key: {e}"))?;
+            let cell = |write_order: u64| row.columns.iter().find(|c| u64::from(c.schema_id) == write_order);
+            if let Some(f) = &flag
+                && cell(f.write_order).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0)
+            {
+                continue;
+            }
+            let Some(value) = cell(field.write_order) else {
+                continue;
+            };
+            let bytes = value.data.into_slice();
+            if seen.contains(bytes) {
+                continue;
+            }
+            if seen.len() >= VALIDATION_SEEN_CAP {
+                seen.clear();
+            }
+            seen.insert(bytes.to_vec());
+            pending.push(key_literal(&field, bytes)?);
+            if pending.len() >= REFERENCED_PROBE_CHUNK {
+                if let Some(violation) = first_value_without_parent(database, table_name, fk, &pending, tx).await? {
+                    return Ok(Some(violation));
+                }
+                pending.clear();
+            }
+        }
+    }
+    first_value_without_parent(database, table_name, fk, &pending, tx).await
+}
+
+/// Distinct values [`existing_rows_break_foreign_key`] remembers before it
+/// forgets them all and starts again: 64 Ki, a few megabytes.
+const VALIDATION_SEEN_CAP: usize = 64 * 1024;
+
+/// The first of `literals` (child values of `fk`'s column) that is no key of
+/// its parent, as `existing_rows_break_foreign_key` reports it, or `None`.
+async fn first_value_without_parent(
+    database: &Arc<Database>,
+    table_name: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    literals: &[String],
+    tx: TxId,
+) -> Result<Option<String>, String> {
     let mut pending: Vec<&[String]> = literals.chunks(REFERENCED_PROBE_CHUNK).rev().collect();
     while let Some(chunk) = pending.pop() {
+        if chunk.is_empty() {
+            continue;
+        }
         let found =
             referenced_values_now(database, &fk.parent_table, &fk.parent_column, chunk, tx, None, KeySide::Parent)
                 .await?;
@@ -10370,6 +10491,24 @@ async fn execute_alter_table_action(
                 plan.table_name, reason
             );
             return ddl_ok(0);
+        }
+        // A foreign key's rows checked now, as `ADD` would have checked
+        // them without `NOT VALID` (23503 for the first orphan, nothing
+        // written either way: no record says "not valid", so validating an
+        // already-valid key checks again and passes). Any other constraint
+        // was checked when it was added; a name nothing has is accepted, as
+        // VALIDATE always was here (PostgreSQL: 42704).
+        AlterAction::ValidateConstraint { name } => {
+            let fk = schema.foreign_keys.iter().find(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name)).cloned();
+            let Some(fk) = fk else {
+                info!("ALTER TABLE {}: VALIDATE CONSTRAINT {name}: nothing to validate", plan.table_name);
+                return ddl_ok(0);
+            };
+            return match Box::pin(existing_rows_break_foreign_key(database, &plan.table_name, &fk, tx)).await {
+                Ok(None) => ddl_ok(0),
+                Ok(Some(violation)) => ddl_error(&violation),
+                Err(e) => ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
+            };
         }
         AlterAction::AddColumn {
             name,
@@ -13312,6 +13451,19 @@ pub(crate) fn alter_lock_set(
         AlterAction::RenameColumn { from, to } => children(Some(&[from.as_str(), to.as_str()])),
         AlterAction::ConstraintClause { drop: false, description } => fk_parent_of_clause(description)
             .map(|parent| vec![(parent, TableMode::Share)])
+            .unwrap_or_default(),
+        // Validating a key reads the parent: SHARE on it, as ADD takes, so
+        // no parent row goes while the child's rows are checked.
+        AlterAction::ValidateConstraint { name } => database
+            .schema_view(table)
+            .map(|view| {
+                view.schema()
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(name))
+                    .map(|fk| (fk.parent_table.clone(), TableMode::Share))
+                    .collect()
+            })
             .unwrap_or_default(),
         AlterAction::ConstraintClause { drop: true, description } => {
             let Some(name) = dropped_constraint_name(description) else {
