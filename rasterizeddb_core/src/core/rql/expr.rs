@@ -2303,7 +2303,12 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                     Err(_) => return Ok(Value::Null),
                 },
                 _ => crate::core::value_codec::parse_uuid(&as_text(&args[0]))
-                    .ok_or_else(|| format!("invalid input syntax for type uuid: \"{}\"", as_text(&args[0])))?,
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid input syntax for type uuid: {}",
+                            crate::core::value_codec::double_quoted(&as_text(&args[0]))
+                        )
+                    })?,
             };
             if func == TextFunc::UuidExtractVersion {
                 match crate::core::rql::aggregate::uuid_extract_version(&uuid) {

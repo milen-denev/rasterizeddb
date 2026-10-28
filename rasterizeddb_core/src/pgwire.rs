@@ -5513,6 +5513,7 @@ where
     let result = send_engine_response(
         state,
         stream,
+        stmt,
         resp,
         PurposeKind::QueryRows,
         run.fields,
@@ -5766,7 +5767,7 @@ where
     // plain statement's set is taken at the engine's entry.
     if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::lock_set::names_a_subquery(stmt) {
         if let Err(e) = crate::core::rql::executor::lock_statement_set(database, stmt).await {
-            fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+            fail_statement(state, stream, sqlstate_in(&e, stmt), &e).await?;
             return Ok(());
         }
     }
@@ -5777,7 +5778,7 @@ where
         Err(e) => {
             // 0A000 is `feature_not_supported`, which is what an unsupported
             // CTE shape is; a body that ran and failed keeps its own class.
-            fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
+            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
             return Ok(());
         }
     };
@@ -5797,7 +5798,7 @@ where
                 if let Some(m) = &materialized {
                     crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
                 }
-                fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
+                fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
                 return Ok(());
             }
         };
@@ -5825,7 +5826,7 @@ where
             if let Some(m) = &materialized {
                 crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
             }
-            fail_statement(state, stream, materialize_sqlstate(&e), &e).await?;
+            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
             return Ok(());
         }
     };
@@ -6143,7 +6144,7 @@ where
                 // as it would have alone: a refusal inside `IN (…)` is still
                 // 0A000. Only a subquery that could not be read is 42601.
                 let code = match e.strip_prefix("subquery failed: ") {
-                    Some(inner) => sqlstate_for(inner),
+                    Some(inner) => sqlstate_in(inner, stmt),
                     None => "42601",
                 };
                 fail_statement(state, stream, code, &e).await?;
@@ -6257,6 +6258,7 @@ where
     send_engine_response(
         state,
         stream,
+        stmt,
         resp,
         purpose_kind,
         select_fields,
@@ -6489,6 +6491,7 @@ fn result_description(
 async fn send_engine_response<S>(
     state: &mut SessionState,
     stream: &mut S,
+    stmt: &str,
     resp: Vec<u8>,
     purpose_kind: PurposeKind,
     select_fields: Option<Vec<(String, DbType)>>,
@@ -6597,7 +6600,7 @@ where
             // A failure inside a block poisons it: every later statement is
             // refused until COMMIT or ROLLBACK closes it. Carrying on would
             // let the block commit with a hole in it.
-            fail_statement(state, stream, sqlstate_for(&msg), &msg).await?;
+            fail_statement(state, stream, sqlstate_in(&msg, stmt), &msg).await?;
         }
         _ => {
             fail_statement(state, stream, "XX000", "unknown engine response tag").await?;
@@ -6668,6 +6671,101 @@ fn unquoted(message: &str) -> String {
 /// duplicate value …"), and a client branching on 23505 never saw one.
 /// Integrity (23), data (22), transaction rollback (40), cancellation (57),
 /// lock (55) and resource (53, 58) classes pass through.
+/// [`sqlstate_for`] of a failure of `statement`, with every text the client
+/// wrote there that holds a quote character blanked from the message first.
+///
+/// `sqlstate_for` reads only unquoted text, which is sound while each quoted
+/// span in the message is one the message made. A string or a quoted
+/// identifier holding a quote of its own breaks that pairing wherever it is
+/// echoed unescaped, and a few hundred messages echo a name or a fragment
+/// as written: `UPDATE t SET "x' deadlock detected 'y" = 1` answered 40P01
+/// ("column 'x' deadlock detected 'y' does not exist"). Blanking the
+/// client's own quote-holding texts closes that for every message at once;
+/// none of the engine's own words can be one, since none holds a quote.
+pub(crate) fn sqlstate_in(message: &str, statement: &str) -> &'static str {
+    sqlstate_for(&blank_client_texts(message, statement))
+}
+
+/// [`materialize_sqlstate`] with [`sqlstate_in`]'s blanking.
+pub(crate) fn materialize_sqlstate_in(message: &str, statement: &str) -> &'static str {
+    materialize_sqlstate(&blank_client_texts(message, statement))
+}
+
+/// `message` lowercased, with each string literal and quoted identifier of
+/// `statement` that holds a `'` or `"` replaced by spaces, in every form a
+/// message carries it: as written, unescaped, and re-escaped with either
+/// quote doubled (`sql_literal`, `value_codec::double_quoted`).
+fn blank_client_texts(message: &str, statement: &str) -> String {
+    let mut out = message.to_lowercase();
+    let texts = quoted_client_texts(statement);
+    if texts.is_empty() {
+        return out;
+    }
+    let mut forms: Vec<String> = Vec::new();
+    for (written, text) in texts {
+        let text = text.to_lowercase();
+        forms.push(written.to_lowercase());
+        forms.push(text.replace('\'', "''"));
+        forms.push(text.replace('"', "\"\""));
+        forms.push(text);
+    }
+    // Longest first: a shorter form is often inside a longer one.
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    for form in forms.iter().filter(|f| !f.is_empty()) {
+        if out.contains(form.as_str()) {
+            out = out.replace(form.as_str(), &" ".repeat(form.len()));
+        }
+    }
+    out
+}
+
+/// Each `'…'` string and `"…"` identifier in `statement` that holds a quote
+/// character once unescaped, as (written between its quotes, unescaped).
+/// Escape and dollar-quoted strings are read as the standard strings they
+/// mean first, as the engine reads them.
+fn quoted_client_texts(statement: &str) -> Vec<(String, String)> {
+    if !statement.contains('\'') && !statement.contains('"') {
+        return Vec::new();
+    }
+    let normalized = crate::core::sql_scan::normalize_string_literals(statement)
+        .map(|t| t.into_owned())
+        .unwrap_or_else(|_| statement.to_string());
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let quote = chars[i];
+        if quote != '\'' && quote != '"' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut written = String::new();
+        let mut text = String::new();
+        while j < chars.len() {
+            if chars[j] == quote {
+                if chars.get(j + 1) == Some(&quote) {
+                    written.push(quote);
+                    written.push(quote);
+                    text.push(quote);
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            written.push(chars[j]);
+            text.push(chars[j]);
+            j += 1;
+        }
+        if text.contains(['\'', '"']) {
+            found.push((written, text));
+        }
+        i = j + 1;
+    }
+    found
+}
+
 pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
     let code = sqlstate_for(message);
     if ["23", "22", "40", "57", "55", "53", "58"].iter().any(|class| code.starts_with(class)) {
@@ -10967,7 +11065,69 @@ mod time_setting_tests {
 
 #[cfg(test)]
 mod sqlstate_tests {
-    use super::sqlstate_for;
+    use super::{sqlstate_for, sqlstate_in};
+
+    /// A double quote inside a value, escaped by doubling as the value
+    /// messages now write it: the whole value stays one quoted span.
+    #[test]
+    fn a_doubled_double_quote_stays_inside_its_span() {
+        for (message, code) in [
+            (r#"invalid input syntax for type bigint: "a"" could not serialize access ""b" for column "m""#, "22P02"),
+            (r#"invalid input syntax for type bigint: "a"" deadlock detected ""b" for column "m""#, "22P02"),
+            (r#"invalid input syntax for type bigint: "a"" canceling statement ""b" for column "m""#, "22P02"),
+            (r#"value "x"" is locked by transaction ""y" is out of range for type bigint"#, "22003"),
+        ] {
+            assert_eq!(sqlstate_for(message), code, "{message:?}");
+        }
+    }
+
+    /// The value messages double a value's own double quotes, so a stored
+    /// or bound value no statement spells stays inside its span.
+    #[test]
+    fn a_value_message_keeps_the_value_in_its_quotes() {
+        use crate::core::db_type::DbType;
+        for words in ["could not serialize access", "deadlock detected", "canceling statement", "is locked by transaction"] {
+            for ty in [DbType::I64, DbType::I32, DbType::F64, DbType::DECIMAL, DbType::DATE, DbType::ARRAY] {
+                let message = crate::core::value_codec::refusal_message(&ty, &format!(r#"'a" {words} "b'"#));
+                let code = sqlstate_for(&message);
+                assert!(!code.starts_with("40") && !code.starts_with("57") && code != "55P03", "{ty:?}: {message} -> {code}");
+            }
+        }
+    }
+
+    /// A name or fragment echoed as written, its own quotes unescaped: the
+    /// statement's quote-holding texts are blanked before classifying, and
+    /// the engine's own words are not.
+    #[test]
+    fn a_client_text_holding_a_quote_does_not_choose_the_sqlstate() {
+        let stmt = r#"UPDATE pt SET "x' deadlock detected 'y" = 1"#;
+        let message = "column 'x' deadlock detected 'y' does not exist";
+        assert_eq!(sqlstate_for(message), "40P01", "the case this guards no longer arises");
+        assert_ne!(sqlstate_in(message, stmt), "40P01");
+        for (stmt, message) in [
+            (r#"SELECT * FROM pt ORDER BY "x' canceling statement 'y""#,
+             "ORDER BY term 'x' canceling statement 'y' is not a column"),
+            (r#"WITH w AS (SELECT "x' could not serialize access 'y" FROM pt) SELECT * FROM w"#,
+             r#"the WITH clause 'w' failed: subquery failed: Column '"x' could not serialize access 'y"' not found"#),
+            (r#"UPDATE dq SET m = 'a" deadlock detected "b' WHERE id = 1"#,
+             r#"invalid input syntax for type bigint: "a" deadlock detected "b" for column "m""#),
+            (r#"UPDATE dq SET m = E'a" is locked by transaction "b' WHERE id = 1"#,
+             r#"invalid input syntax for type bigint: "a" is locked by transaction "b" for column "m""#),
+        ] {
+            let code = sqlstate_in(message, stmt);
+            assert!(!code.starts_with("40") && !code.starts_with("57") && code != "55P03", "{stmt}: {message} -> {code}");
+        }
+        // The engine's own failures keep their codes beside quoting text.
+        for (stmt, message, code) in [
+            ("UPDATE t SET note = 'it''s' WHERE id = 1", "deadlock detected: transaction 5 waits for transaction 9", "40P01"),
+            ("UPDATE t SET note = 'it''s' WHERE id = 1", "could not serialize access due to concurrent update", "40001"),
+            (r#"UPDATE "a""b" SET n = 1"#, "canceling statement due to statement timeout", "57014"),
+            ("UPDATE t SET note = 'x''y'", "row of 't' is locked by transaction 9; the statement that locked it must finish first", "55P03"),
+            ("INSERT INTO t VALUES ('o''brien')", r#"duplicate key value violates unique constraint "t_pkey""#, "23505"),
+        ] {
+            assert_eq!(sqlstate_in(message, stmt), code, "{stmt}: {message}");
+        }
+    }
 
     #[test]
     fn engine_failures_map_to_the_codes_drivers_branch_on() {

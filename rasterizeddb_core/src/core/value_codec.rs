@@ -1338,7 +1338,17 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// PostgreSQL names the offending character, which may be multi-byte.
 fn invalid_hex_digit(text: &str, at: usize) -> String {
     let ch = text[at..].chars().next().unwrap_or('?');
-    format!("invalid hexadecimal digit: \"{}\"", ch)
+    format!("invalid hexadecimal digit: {}", double_quoted(&ch.to_string()))
+}
+
+/// `text` in double quotes, its own double quotes doubled: how a message
+/// quotes a value the client wrote. Embedded as it was, a `"` inside it
+/// ended the quoted span early for anything reading the message
+/// (`sqlstate_for` skips quoted text), and the client's words after it read
+/// as the message's own: `'a" could not serialize access "b'` written to a
+/// bigint answered 40001, and a retry loop resent it forever.
+pub fn double_quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
 }
 
 /// The bytes a `bytea` column stores for a SQL literal as written in a
@@ -1990,7 +2000,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
     let text = unquote_sql(literal.trim());
     let text = text.as_ref();
     let name = pg_input_type_name(db_type);
-    let syntax = || format!("invalid input syntax for type {}: \"{}\"", name, text);
+    let syntax = || format!("invalid input syntax for type {}: {}", name, double_quoted(text));
     let integral = {
         let t = text.trim();
         let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
@@ -2008,17 +2018,17 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
         | DbType::U64
         | DbType::U128 => {
             if integral {
-                format!("value \"{}\" is out of range for type {}", text.trim(), name)
+                format!("value {} is out of range for type {}", double_quoted(text.trim()), name)
             } else {
                 syntax()
             }
         }
         DbType::F32 | DbType::F64 => match text.trim().parse::<f64>() {
-            Ok(_) => format!("\"{}\" is out of range for type {}", text.trim(), name),
+            Ok(_) => format!("{} is out of range for type {}", double_quoted(text.trim()), name),
             Err(_) => syntax(),
         },
         DbType::DECIMAL => match text.trim().parse::<f64>() {
-            Ok(_) => format!("numeric field overflow: \"{}\" does not fit the column's precision", text.trim()),
+            Ok(_) => format!("numeric field overflow: {} does not fit the column's precision", double_quoted(text.trim())),
             Err(_) => syntax(),
         },
         DbType::BYTEA => encode_bytea_sql(literal)
@@ -2033,7 +2043,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             Err(e) => format!("invalid input syntax for type json: {}", e),
             Ok(_) => syntax(),
         },
-        DbType::ARRAY => format!("malformed array literal: \"{}\"", text),
+        DbType::ARRAY => format!("malformed array literal: {}", double_quoted(text)),
         DbType::DATETIME | DbType::DATE | DbType::TIME | DbType::TIMETZ => {
             // Shaped like a date/time but not one (`2026-13-45`): a field is
             // out of range. Anything else is not a date/time at all.
@@ -2042,7 +2052,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
                     .bytes()
                     .all(|b| b.is_ascii_digit() || b" -:./T+Z".contains(&b));
             if shaped {
-                format!("date/time field value out of range: \"{}\"", text)
+                format!("date/time field value out of range: {}", double_quoted(text))
             } else {
                 syntax()
             }
