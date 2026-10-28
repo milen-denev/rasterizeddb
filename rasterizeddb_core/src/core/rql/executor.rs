@@ -15345,6 +15345,25 @@ pub(crate) async fn execute_with_need(
                 Err(e) => return ddl_error(&e),
             };
 
+            // Every column the statement names is one of the target's, before
+            // anything is computed or written: PostgreSQL's 42703. An unknown
+            // name reached the row builder, which failed the statement as a
+            // schema mismatch (XX000), or a NOT NULL check on another column
+            // (23502) did first; an `INSERT … SELECT` whose source was empty
+            // reported success.
+            if let (Some(t), Some(named)) = (target.as_ref(), crate::core::rql::lexer_ir::named_columns(&row_data.query)) {
+                if let Some(unknown) = named
+                    .iter()
+                    .find(|n| !t.schema().fields.iter().any(|f| !f.is_deleted && f.name == **n))
+                {
+                    return ddl_error(&format!(
+                        "column {} of table {} does not exist",
+                        crate::core::value_codec::double_quoted(unknown),
+                        crate::core::value_codec::double_quoted(&row_data.table_name)
+                    ));
+                }
+            }
+
             // Before anything reads a default: a `SERIAL` column's counter is
             // in memory and a reopened database has not yet learned what the
             // table already holds. Skipped for a table with no serial column,

@@ -449,6 +449,35 @@ pub fn supply_column_list(sql: &str, schema: &[SchemaField]) -> Option<String> {
     ))
 }
 
+/// The columns an `INSERT INTO t (a, b, …) …` names, unquoted as the row
+/// builder reads them; `None` when it names none (`INSERT INTO t VALUES …`,
+/// `INSERT INTO t SELECT …`) or is not an `INSERT`.
+pub fn named_columns(sql: &str) -> Option<Vec<String>> {
+    let trimmed = sql.trim_start();
+    if !trimmed.get(.."INSERT INTO".len())?.eq_ignore_ascii_case("INSERT INTO") {
+        return None;
+    }
+    let open = "INSERT INTO".len() + trimmed["INSERT INTO".len()..].find('(')?;
+    // Only a table name stands between `INSERT INTO` and the list: a `(`
+    // after VALUES, SELECT or DEFAULT is not one.
+    let head = trimmed["INSERT INTO".len()..open].trim();
+    if head.is_empty() || head.split_whitespace().count() != 1 {
+        return None;
+    }
+    let close = matching_paren(trimmed, open)?;
+    let list = &trimmed[open + 1..close];
+    let first = list.trim_start().split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+    if ["SELECT", "WITH", "VALUES"].iter().any(|k| first.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(
+        list.split(',')
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
 /// Position of `word` in `upper` at or after `from`, outside quotes and on a
 /// word boundary, or `None`. The match ignores ASCII case, so `upper` may be
 /// the statement as written.
