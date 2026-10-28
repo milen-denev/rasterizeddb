@@ -118,6 +118,15 @@ cannot answer: the switch is per table, so all it can report there is the words
 "per table". `index_bytes` is the
 persisted bit-sliced filter checkpoint, not a B-tree.
 
+`forgotten_below` is the transaction id below which outcomes are no longer
+looked up (every row stamped below it has been proven free of aborted ids by
+vacuum's forget sweeps), and `forgetting_held_by` names the hash-partitioned
+tables that cannot be opened and therefore hold it where it was when they were
+refused: until such a table opens or is dropped the transaction status log
+grows (2 bits per transaction), and the server also logs a warning naming it
+every ten minutes. `partition_maintenance_panics` counts panics the shared
+partition maintenance caught and survived.
+
 ## What `SHOW DATABASE STATS` does not report
 
 Two kinds of row used to be there and are not.

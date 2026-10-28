@@ -175,7 +175,7 @@ kinds above. Every `partition_*` suite, core and compat, passes.
 ## Phase 3 P5a as built
 
 Built on `feat/p5a-lazy-plumbing` (from `f795e2a`, rebased onto
-`f54375e`, 2026-10-28), wave 3 of the phase 3 plan: **the plumbing lazy
+`c29e3d9`, 2026-10-28; review round 2 folded in below), wave 3 of the phase 3 plan: **the plumbing lazy
 open and idle close need**, with behaviour unchanged. Every materialized
 partition still opens at startup and stays open (P5b opens on demand and
 closes when idle); what P5b relies on now exists, is durable, and is
@@ -192,11 +192,23 @@ held weakly by its database's one `Scheduler` (`Database::
 partition_maintenance`). Every write path of the partition first enters
 the slot's `WriteWatch` (`Table::enter_write`, one line before each of the
 five `gate::ticket` sites); the first entry after the scheduler last
-serviced the unit pushes it onto the dirty queue. The scheduler's one task
-runs a round each second, servicing queued and still-busy units four at a
-time and dropping each once it is settled (nothing staged, vacuum settled,
-no idle checkpoint pending), so an idle partition costs no wakeup; each
-round also runs every table's forget round and map compaction check. One-
+serviced the unit pushes it onto the dirty queue, and so does the guard's
+drop at the write's end (a round that serviced the unit while the write ran
+saw the mutation count before the statement bumped it). The scheduler runs
+two tasks, each a round per second: one services queued and still-busy
+units, four in flight at a time (`FuturesUnordered`: a slow unit holds one
+slot, not the rest), dropping each once it is settled (nothing staged,
+vacuum settled, no idle checkpoint pending), so an idle partition costs no
+wakeup; the other runs every table's forget round and map compaction
+check, so a stuck unit never holds forgetting back. "Vacuum settled" is the
+tick's own due rule: a partition whose dead stamps are below the sweep
+threshold settles until a write pushes it again. **Nothing stops the
+scheduler**: a partition's vacuum tick is caught, counted in its
+`stats.panics` and backed off exactly as a table's own service does; each
+unit's service and each board's round is caught too (`Scheduler::panics`,
+`partition_maintenance_panics` in `SHOW DATABASE STATS`; the unit kept and
+looked at again after a doubling backoff), and each task loop has a
+backstop. One-
 shot work at open (the index build or load, the filter backfill, the load
 audit) still runs on its own tasks, which end. Plain tables are unchanged.
 
@@ -234,7 +246,13 @@ the registry.
 - A table that **cannot open** (a missing partition file, a map it cannot
   read) holds a handle at the horizon forgotten when it was refused, for
   as long as it stays broken (`broken_pin`): its pins are unknown. The
-  status log grows meanwhile.
+  status log grows meanwhile (2 bits a transaction, about 200 MB a day at
+  10k transactions a second), so the table is named in a warning every ten
+  minutes and in `SHOW DATABASE STATS`'s `forgetting_held_by`.
+- **At startup** forgetting is paused from the plain tables' registration
+  (whose vacuum services forget) until every partitioned table has
+  registered: a forget in that gap would pass a partition's aborted stamps
+  (a window older than P5a, closed here).
 
 **`SERIAL` high-water** (§10; `partition::serial`). `__pt_<uid>_seq.db`
 (created at open when missing, for tables made before P5a) holds, per
@@ -245,11 +263,22 @@ renamed sequence) seeds from the maximum once and is reserved from there.
 The write watch covers the counters before any stamp: a counter past its
 reservation raises it to the counter plus 1024, logged in the root log
 before the row that took the value, so a committed value is never above a
-durable reservation. **A restart leaves a gap of up to one step, clean or
-not** (the counter is never written per value); values never repeat. As
-in PostgreSQL, an explicit value in a `SERIAL` column does not move the
-counter. `tests/partition_insert.rs` and `partition_shell_sites.rs` now
-assert uniqueness and the bound on the gap, not `1..=10`.
+durable reservation. **A clean shutdown records the exact last value**
+(`Database::record_clean_shutdown`, run by `seal_for_shutdown` after the
+sessions end, synced), so a clean restart resumes with no gap, as
+PostgreSQL does; **a crash leaves a gap of up to one step**. Lowering the
+entry is sound at any moment: a later value is above it and the write path
+raises it again. **An entry the defaults no longer read is forgotten** at
+every open and every schema change's reopen (`retain_read`): after `RENAME
+a TO b` the counter runs on as `b_id_seq`, and an `a_id_seq` entry kept
+for a later `RENAME b TO a` would resume below values handed out
+meanwhile, a silent duplicate (review round 2's repro, now pinned). As in
+PostgreSQL, **an explicit value in a `SERIAL` column does not advance the
+counter**, so a later default can repeat it (a plain table, which reseeds
+from its maximum after a restart, differs there). **A sequence a second
+table shares** through a hand-written `nextval` default is reserved only by
+the table whose defaults this file serves; the other table seeds it by its
+own rules.
 
 **Map-log generations** (§3.2). `PinBoard::compact`, from the scheduler
 once the log passes twice its generation's opening bytes plus 1 MiB:
@@ -258,7 +287,12 @@ write `HEADER`, `LOCATIONS` and `SNAPSHOT` to `__pt_<uid>_map_<g+1>.db`,
 created exclusively with a directory fsync; retake the lock, append the
 captured records, **check the new generation replays to the state**,
 append `SEALED` durably, switch appends (`MapLogFile::adopt`); delete the
-old generation. A torn log (its evidence present) never compacts. Open
+old generation. A torn log (its evidence present) never compacts, and a
+table dropped meanwhile stops before `SEALED`. **A generation number is
+never reused**: the next is one above every generation file in the
+directory and every number this process tried, so a failed attempt's
+committed appends can never be replayed onto a later file of its name, and
+a leftover the reaper keeps (one that does not replay) is never touched. Open
 takes the highest generation whose replay contains `SEALED`, else 0. A
 higher one that replays unsealed is an unfinished compaction: skipped, and
 reaped. One that **does not replay at all** is skipped too, but never
@@ -301,13 +335,33 @@ after):
 | tokio tasks | 2.09 | 0.00 (2 for the table: the scheduler's) |
 | idle wakeups (context switches/s) | 1.50 | 0.017 |
 
+**Review round 2** found two blockers, both reproduced and fixed: a panic
+in one partition's maintenance ended the scheduler's task for good (no
+vacuum, idle checkpoint or forget round for any partitioned table until a
+restart); and a `SERIAL` renamed away and back resumed from a stale entry
+after a restart, repeating a value. Their tests:
+`a_panicking_partition_never_stops_the_scheduler`,
+`a_serial_renamed_away_and_back_never_repeats_a_value` (away and back, away
+only, each across a clean and a crash-like restart). And for the rest:
+`a_write_a_round_serviced_midway_is_pushed_again_at_its_end`,
+`a_partition_below_the_sweep_threshold_settles`,
+`a_stuck_partition_holds_up_no_forget_round`,
+`a_writer_behind_the_scan_keeps_the_sweep_unclean` (a park inside the
+sweep, `vacuum::neutralize_test_hooks`),
+`forgetting_waits_for_the_partitioned_tables_at_startup`,
+`a_clean_shutdown_leaves_no_serial_gap`,
+`a_compaction_never_reuses_a_generation_number`; `partition_insert`,
+`partition_shell_sites` and `partition_returning` again assert exact
+`SERIAL` values across the harness's clean restarts.
+
 **Left for P5b and after.** The open set and idle close themselves; the
 forget round reads every partition's pin each round (O(P) in memory per
 table per second; a pinned set would make it O(pinned)); the per-sweep and
 per-`DIRTY` state edits apply in place, but `MATERIALIZE` and `DROPPED`
 still clone the whole `MapState`; a sequence renamed by `RENAME TABLE`
-loses its entry and reseeds from the maximum once; reshape (`RESHAPE_
-COMMIT`'s inherited pins) is phase 5's.
+loses its entry and reseeds from the maximum once (a scan, after the
+restart that follows); reshape (`RESHAPE_COMMIT`'s inherited pins) is
+phase 5's.
 
 External maintenance takes the timers and the open's task spawns away;
 fds and heap are the providers' and the structures', which P5b's idle
@@ -2774,8 +2828,13 @@ show in `partitions_touched` (`pg_stat_statements` and the statement ring), a
   open and scan every partition. From phase 3 the high-water is reserved
   durably in `__pt_<uid>_seq.db` in steps, like row ids (§3.5), never from
   `MAX`; a crash leaves a gap, as in PostgreSQL. **Built in P5a**
-  ([as built](#phase-3-p5a-as-built)): steps of 1024; with no write per
-  value, a clean restart leaves the gap too.
+  ([as built](#phase-3-p5a-as-built)): steps of 1024, the exact value
+  recorded at a clean shutdown (no gap then), entries a `RENAME` leaves
+  unread forgotten. As in PostgreSQL an explicit value written into the
+  column does not advance the counter (a plain table, reseeding from its
+  maximum after a restart, differs there), and a sequence a second table
+  shares through a hand-written `nextval` default is reserved only for the
+  table whose `SERIAL` made it.
 - **CHECK, DEFAULT and generated columns** live on the shared sidecars and run
   before routing, so a `DEFAULT` on a key column works.
 

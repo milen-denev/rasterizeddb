@@ -816,17 +816,25 @@ async fn a_partition_below_the_sweep_threshold_settles() {
     sched.set_period(Duration::from_secs(3600));
     exec(&db, CREATE).await;
     exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a'), (1, 2, 'b'), (1, 3, 'c')").await;
-    exec(&db, "UPDATE pt SET v = 'x' WHERE tenant_id = 1 AND id = 2").await;
-    let mut rounds = 0;
-    loop {
-        sched.run_round().await;
-        rounds += 1;
-        if sched.queued_units().await == 0 {
-            break;
+    let settle = |what: &'static str| {
+        let sched = sched.clone();
+        async move {
+            for _ in 0..100 {
+                sched.run_round().await;
+                if sched.queued_units().await == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{what}");
         }
-        assert!(rounds < 100, "a partition below the sweep threshold never settled");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    };
+    // The first tick scans whatever is there; settled after it.
+    settle("the freshly written partition never settled").await;
+    // One dead stamp, far below the threshold: the next tick is not due,
+    // and the partition must settle anyway.
+    exec(&db, "UPDATE pt SET v = 'x' WHERE tenant_id = 1 AND id = 2").await;
+    settle("a partition below the sweep threshold never settled").await;
     close(&dir, db);
 }
 

@@ -172,7 +172,14 @@ The dialect is PostgreSQL's. What is implemented:
   client-supplied value for one is refused, as PostgreSQL refuses it.
 - **Serial columns** — `SERIAL`, `SMALLSERIAL` and `BIGSERIAL`, expanded to
   what PostgreSQL expands them to: an integer column, `NOT NULL`, defaulting to
-  the next value of a sequence made with the table.
+  the next value of a sequence made with the table. As in PostgreSQL, a value
+  written explicitly into the column does not advance the sequence, so a later
+  default can repeat it. After a restart a plain table's sequence resumes above
+  the largest value stored, while a hash-partitioned table's resumes from a
+  durable reservation: exactly after a clean shutdown, and up to 1,024 values
+  further after a crash (a gap, as PostgreSQL's sequences leave). Only the
+  table whose `SERIAL` made the sequence reserves it: a second table that shares
+  it through a hand-written `DEFAULT nextval('…')` does not.
 - **DDL** — `CREATE`/`DROP TABLE`, `CREATE DATABASE`, `ALTER TABLE` including
   `ADD`/`DROP`/`RENAME COLUMN` and `ALTER … TYPE … USING`.
 - **Catalogue** — PostgreSQL's catalogue relations are produced on demand when a
