@@ -366,3 +366,31 @@ async fn a_substituted_value_reads_as_one_value_wherever_it_lands_on_a_plain_tar
 async fn a_substituted_value_reads_as_one_value_wherever_it_lands_on_a_hash_partitioned_target() {
     every_place_a_value_lands(" PARTITION BY HASH (id) PARTITIONS 4").await;
 }
+
+/// A joined NUMERIC typed at its scale for an assigned expression: one too
+/// wide for the engine's nine places fails its cast, and answers 22003 (an
+/// overflow), not XX000. Left bare it was read through a float, and
+/// `s.h + 0` stored 123456789012345680000000000000000000.00 as success. A
+/// narrower one keeps its scale.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_joined_numeric_overflows_rather_than_storing_a_rounded_value() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    run(
+        &pool,
+        "CREATE TABLE wt (id BIGINT PRIMARY KEY, h NUMERIC(38,2), l TEXT);
+         CREATE TABLE ws (id BIGINT PRIMARY KEY, h NUMERIC(38,2));
+         INSERT INTO wt VALUES (1, 0, ''), (2, 0, '');
+         INSERT INTO ws VALUES (1, 123456789012345678901234567890123456.50), (2, 12345.50);",
+    )
+    .await;
+    let e = sqlx::query("UPDATE wt SET h = ws.h + 0 FROM ws WHERE wt.id = ws.id AND ws.id = 1")
+        .execute(&pool)
+        .await
+        .expect_err("36 integer digits do not fit the engine's nine places");
+    let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string()).unwrap_or_default();
+    assert_eq!(code, "22003", "{e}");
+    assert_eq!(texts(&pool, "SELECT h::text FROM wt WHERE id = 1").await, ["0.00"], "the refused UPDATE wrote");
+    run(&pool, "UPDATE wt SET l = ws.h::text FROM ws WHERE wt.id = ws.id AND ws.id = 2").await;
+    assert_eq!(texts(&pool, "SELECT l FROM wt WHERE id = 2").await, ["12345.50"]);
+}

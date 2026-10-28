@@ -4129,6 +4129,12 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
                 bytes: encoded,
                 db_type: target.clone(),
             }),
+            // A number a NUMERIC cannot hold (36 integer digits lifted to the
+            // engine's nine places) is an overflow, 22003, not an internal
+            // error: PostgreSQL's numeric_value_out_of_range.
+            None if *target == DbType::DECIMAL && trimmed.parse::<f64>().is_ok_and(f64::is_finite) => {
+                Err(crate::core::value_codec::refusal_message(target, trimmed))
+            }
             None => Err(format!("{} cannot be read as {:?}", crate::core::rql::executor::sql_literal(&text), target)),
         };
     }
