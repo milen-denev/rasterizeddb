@@ -249,9 +249,21 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<ForeignKey> {
 
 /// Appends a foreign key.
 pub async fn append<S: StorageIO>(schema_io: Arc<S>, fk: &ForeignKey) -> io::Result<()> {
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &fk.into_vec()).await
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, fk)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `fk`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    fk: &ForeignKey,
+) -> io::Result<()> {
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "FK.db"), &fk.into_vec());
+    Ok(())
 }
 
 /// Marks a foreign key deleted, by constraint name.

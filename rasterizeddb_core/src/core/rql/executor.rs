@@ -2971,7 +2971,9 @@ where
                 async move {
                     // Declarations go in before any row, so the open that
                     // follows builds the (empty) indexes and every row is
-                    // indexed by its insert.
+                    // indexed by its insert. Staged, then committed as one
+                    // transaction (`torn_tail::SidecarWrites`).
+                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
                     for (decl, names) in carried_indexes {
                         // An index over a column this rewrite dropped goes
                         // with it, as in PostgreSQL.
@@ -2990,15 +2992,17 @@ where
                             continue;
                         };
                         let decl = crate::core::index::IndexDecl { columns, ..decl };
-                        crate::core::index::decl::append(io_schema.clone(), &decl)
-                            .await
+                        crate::core::index::decl::stage(&*io_schema, &mut writes, &decl)
                             .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
                     }
                     for path_index in &carried_path_indexes {
-                        crate::core::rql::path_index::append(io_schema.clone(), path_index)
-                            .await
+                        crate::core::rql::path_index::stage(&*io_schema, &mut writes, path_index)
                             .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
                     }
+                    writes
+                        .commit(&*io_schema)
+                        .await
+                        .map_err(|e| format!("could not carry the indexes: {e}"))?;
                     Ok(())
                 }
             },
@@ -11206,24 +11210,24 @@ async fn execute_alter_table_action(
                     for taken in [name.clone(), nullable::flag_column_name(&name)] {
                         retire_tombstoned_name(&mut schema, &taken, io_schema.clone()).await?;
                     }
+                    // The column's sidecar records, staged and committed as
+                    // one transaction at the end (`torn_tail::SidecarWrites`).
+                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
                     if let Some(expression) = default {
                         let entry = crate::core::rql::column_default::ColumnDefault {
                             column: name.clone(),
                             expression,
                             is_deleted: false,
                         };
-                        crate::core::rql::column_default::append(io_schema.clone(), &entry)
-                            .await
+                        crate::core::rql::column_default::stage(&*io_schema, &mut writes, &entry)
                             .map_err(|e| e.to_string())?;
                     }
                     if let Some(entry) = &new_modifier {
-                        crate::core::rql::type_modifier::append(io_schema.clone(), entry)
-                            .await
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, entry)
                             .map_err(|e| e.to_string())?;
                     }
                     if let Some(entry) = &new_generated {
-                        crate::core::rql::generated::append(io_schema.clone(), entry)
-                            .await
+                        crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
                             .map_err(|e| e.to_string())?;
                     }
                     schema.add_field(io_schema.clone(), name.clone(), db_type, false).await;
@@ -11247,10 +11251,10 @@ async fn execute_alter_table_action(
                             shadow_table: crate::core::rql::json_map::shadow_table_name(&table_name, &name),
                             is_deleted: false,
                         };
-                        crate::core::rql::json_map::append(io_schema.clone(), &entry)
-                            .await
+                        crate::core::rql::json_map::stage(&*io_schema, &mut writes, &entry)
                             .map_err(|e| e.to_string())?;
                     }
+                    writes.commit(&*io_schema).await.map_err(|e| e.to_string())?;
                     Ok(())
                 })
                 .await
@@ -11464,11 +11468,16 @@ async fn execute_alter_table_action(
             let defaults: Vec<_> = followed.iter().map(|(entry, _, _)| entry.clone()).collect();
             if let Err(failure) = database
                 .reload_atomic(&to, |renamed| async move {
+                    // One transaction for all of them (`torn_tail::SidecarWrites`).
+                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
                     for entry in &defaults {
-                        crate::core::rql::column_default::append(renamed.io_schema.clone(), entry)
-                            .await
+                        crate::core::rql::column_default::stage(&*renamed.io_schema, &mut writes, entry)
                             .map_err(|e| format!("sequence default for {} could not follow: {}", entry.column, e))?;
                     }
+                    writes
+                        .commit(&*renamed.io_schema)
+                        .await
+                        .map_err(|e| format!("the sequence defaults could not follow: {e}"))?;
                     Ok(())
                 })
                 .await

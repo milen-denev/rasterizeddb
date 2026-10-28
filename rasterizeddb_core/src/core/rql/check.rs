@@ -137,6 +137,19 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<CheckConstraint> {
 
 /// Appends a constraint, superseding any earlier one of the same name.
 pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &CheckConstraint) -> io::Result<()> {
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, entry)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `entry`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    entry: &CheckConstraint,
+) -> io::Result<()> {
     if entry.expression.len() > MAX_EXPRESSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -146,9 +159,9 @@ pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &CheckConstraint) ->
             ),
         ));
     }
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &entry.into_vec()).await
+
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "CHK.db"), &entry.into_vec());
+    Ok(())
 }
 
 /// Reads a `CHECK (…)` clause out of a definition, returning the definition

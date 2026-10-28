@@ -1006,7 +1006,7 @@ impl Wal {
     /// records through something the log does account for (row bytes through
     /// pointers). The schema sidecars are read record by record, so they are
     /// appended through here, in place at their end
-    /// ([`crate::core::torn_tail::append_records`]). An *overwrite* that is cut
+    /// ([`crate::core::torn_tail::SidecarWrites`]). An *overwrite* that is cut
     /// short has already destroyed the previous bytes, and a redo-only log has
     /// no undo record to put them back — so the data file must not be touched
     /// until the record describing the new bytes is durable.

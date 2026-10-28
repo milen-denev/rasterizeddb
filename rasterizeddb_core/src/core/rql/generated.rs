@@ -148,6 +148,19 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<GeneratedColumn> {
 
 /// Appends a record, superseding any earlier one for the same column.
 pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &GeneratedColumn) -> io::Result<()> {
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, entry)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `entry`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    entry: &GeneratedColumn,
+) -> io::Result<()> {
     if entry.expression.len() > MAX_EXPRESSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -157,9 +170,9 @@ pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &GeneratedColumn) ->
             ),
         ));
     }
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &entry.into_vec()).await
+
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "GEN.db"), &entry.into_vec());
+    Ok(())
 }
 
 /// The generation expression declared for `column`, if any.

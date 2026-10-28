@@ -638,6 +638,19 @@ fn unpaired(key: &UniqueKey) {
 /// A partial key and its predicate go in one write, so the key cannot reach
 /// the file without the predicate that limits it.
 pub async fn append<S: StorageIO>(schema_io: Arc<S>, key: &UniqueKey) -> io::Result<()> {
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, key)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `key`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    key: &UniqueKey,
+) -> io::Result<()> {
     if key.predicate.as_ref().is_some_and(|p| p.len() > MAX_PREDICATE_LEN) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -647,13 +660,13 @@ pub async fn append<S: StorageIO>(schema_io: Arc<S>, key: &UniqueKey) -> io::Res
             ),
         ));
     }
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
+
     let mut bytes = key.into_vec();
     if let Some(predicate) = key.predicate_record() {
         bytes.extend_from_slice(&predicate);
     }
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &bytes).await
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "UK.db"), &bytes);
+    Ok(())
 }
 
 /// Marks a unique constraint deleted, by constraint name.

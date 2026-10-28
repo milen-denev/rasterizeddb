@@ -45,7 +45,8 @@
 //! the one length that keeps the record whole).
 //!
 //! So the `_schema_*` sidecars below are never appended that way.
-//! [`append_records`] is their one writer: the bytes go to the log first and
+//! [`SidecarWrites`] is their one writer, one transaction and one log sync
+//! per statement: the bytes go to the log first and
 //! reach the file only once the record describing them is durable (an
 //! in-place write at the file's end, which the log holds back until its
 //! commit has synced). A cut before that sync leaves the file as it was; a
@@ -231,37 +232,106 @@ pub fn classify_path(path: &Path) -> Option<FixedRecordFile> {
     classify(path.parent().unwrap_or(Path::new("")), name)
 }
 
-/// Appends `bytes`, one or more whole records, to the schema sidecar `io`
-/// writes, write-ahead, and returns once they are durable (see the module
-/// documentation, "A whole record that never committed").
+/// One statement's schema sidecar records, written ahead of the log as one
+/// transaction (see the module documentation, "A whole record that never
+/// committed"): after any cut, all of them read back whole or none does.
 ///
-/// An in-place write at the file's length rather than an append: a logged
-/// append writes the file before its record is durable, and a power cut
-/// between the two leaves a whole record of zeros, or of two writes' halves,
-/// that every load reads as a declaration. An in-place write is held back
-/// until its commit has synced the log, so the file never holds bytes the
-/// log cannot account for. Without a log (a memory-backed table, a directory
-/// with none) it is written and synced at once, as the append was. The cost
-/// is the log sync each record's commit takes, which the append put off to
-/// the statement's: schema changes only.
+/// [`SidecarWrites::add`] collects each file's records in order; [`commit`]
+/// writes each file once, in place at its length (an in-place write is held
+/// back until its commit has synced the log, so the file never holds bytes
+/// the log cannot account for; a logged append writes the file first, and a
+/// power cut before the log's sync leaves a whole record of zeros, or of two
+/// writes' halves, that every load reads as a declaration), all under one
+/// transaction, and commits it once: one log sync for the statement's
+/// records, however many files and records they are. Every sidecar of a
+/// table sits where its schema file does, so the files share one log (or
+/// one key/value family, or one mirror), which commits a transaction of
+/// several files as one. Without a log (a memory-backed table) each write
+/// lands at once, as the append did.
 ///
-/// The caller holds what serialises the file's writers (the DDL's ACCESS
-/// EXCLUSIVE, or a table no statement can reach yet), so the length read
-/// here is where the bytes land.
-pub async fn append_records<S: crate::core::storage_providers::traits::StorageIO>(
-    io: &S,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let at = io.get_len().await;
-    let txn = io.begin_txn();
-    let token = io.write_data_txn(txn, at, bytes).await;
-    io.commit_durable(token).await
+/// The caller holds what serialises the files' writers (the DDL's ACCESS
+/// EXCLUSIVE, or a table no statement can reach yet), so the lengths read
+/// at the commit are where the bytes land.
+///
+/// [`commit`]: SidecarWrites::commit
+#[derive(Debug, Default)]
+pub struct SidecarWrites {
+    /// Each write: the file, where (`None`: at its end), the bytes.
+    files: Vec<(String, Option<u64>, Vec<u8>)>,
+}
+
+impl SidecarWrites {
+    /// Adds `bytes`, whole records, to the end of sidecar `file`, after any
+    /// added to it before.
+    pub fn add(&mut self, file: String, bytes: &[u8]) {
+        match self.files.iter_mut().find(|(f, at, _)| *f == file && at.is_none()) {
+            Some((_, _, pending)) => pending.extend_from_slice(bytes),
+            None => self.files.push((file, None, bytes.to_vec())),
+        }
+    }
+
+    /// Adds an overwrite of `bytes` at `offset` of `file` to the same
+    /// transaction: a fixed-width record rewritten in place, as `CREATE
+    /// TABLE`'s schema header naming its primary key.
+    pub fn write_at(&mut self, file: String, offset: u64, bytes: &[u8]) {
+        self.files.push((file, Some(offset), bytes.to_vec()));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Writes every file's records and commits them as one transaction, once.
+    /// Returns once they are durable, or the write's or the commit's error,
+    /// in which case none of them is.
+    pub async fn commit<S: crate::core::storage_providers::traits::StorageIO>(self, schema_io: &S) -> io::Result<()> {
+        let Some((first, _, _)) = self.files.first() else {
+            return Ok(());
+        };
+        // Every provider kept until the commit: a key/value file's staged
+        // records live in its handle until its family commits them.
+        let mut providers = Vec::with_capacity(self.files.len());
+        providers.push(schema_io.create_new(first.clone()).await);
+        for (file, _, _) in &self.files[1..] {
+            providers.push(schema_io.create_new(file.clone()).await);
+        }
+        let txn = providers[0].begin_txn();
+        let mut logged = None;
+        for (io, (_, offset, bytes)) in providers.iter().zip(&self.files) {
+            let at = match offset {
+                Some(at) => *at,
+                None => io.get_len().await,
+            };
+            let token = io.write_data_txn(txn, at, bytes).await;
+            if token != 0 {
+                logged = Some((io, token));
+            }
+        }
+        match logged {
+            // Through any one file: the transaction is the directory's, and
+            // its commit reports a write of any of them that failed.
+            Some((io, token)) => io.commit_durable(token).await,
+            // No log: each write landed (and was synced) at once.
+            None => {
+                for io in &providers {
+                    io.commit_durable(0).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The name of the sidecar `suffix` (`"FK.db"`, …) of the table whose schema
+/// file `schema_io` writes: `<schema file less .db>_<suffix>`.
+pub fn sidecar_name<S: crate::core::storage_providers::traits::StorageIO>(schema_io: &S, suffix: &str) -> String {
+    format!("{}_{}", schema_io.get_name().replace(".db", ""), suffix)
 }
 
 /// Whether `record` is a schema sidecar record of zeros: never written by a
 /// declaration (every one names something), so the remains of an append a
 /// power cut kept the length of and dropped the page of, by a build before
-/// [`append_records`]. Its loader skips it rather than reading a constraint
+/// [`SidecarWrites`]. Its loader skips it rather than reading a constraint
 /// with no name, no column and no target.
 pub fn is_unwritten(record: &[u8]) -> bool {
     record.iter().all(|&b| b == 0)

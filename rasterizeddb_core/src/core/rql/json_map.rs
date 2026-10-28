@@ -415,9 +415,21 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
     entry: &JsonColumn,
 ) -> std::io::Result<()> {
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &entry.into_vec()).await
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, entry)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `entry`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: crate::core::storage_providers::traits::StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    entry: &JsonColumn,
+) -> std::io::Result<()> {
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "JSON.db"), &entry.into_vec());
+    Ok(())
 }
 
 /// The table backing `column`, if it is a JSON column.

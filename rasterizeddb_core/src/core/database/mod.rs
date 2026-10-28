@@ -3918,19 +3918,22 @@ async fn write_schema_sidecars(
     // single row does: "the column this table calls its key" and "some
     // column that happens to be unique" are different questions, and only
     // the first has one answer.
+    //
+    // Staged with every sidecar record below, all written and committed as
+    // one transaction at the end (`torn_tail::SidecarWrites`): one log sync,
+    // and after a cut all of them or none.
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
     if let Some(primary_key) = &ct.primary_key {
         schema.set_primary_key(primary_key.clone());
-        if let Err(e) = schema.rewrite_header(io_schema.clone()).await {
-            error!("Failed to record primary key for {}: {}", schema.name, e);
-            return Err(e);
-        }
+        // `TableSchema::rewrite_header`'s write, in the transaction.
+        writes.write_at(io_schema.get_name(), 0, &schema.into_vec());
     }
 
     // Written after the table exists so its sidecar sits beside the schema
     // it belongs to, and kept in the loaded schema so the first statement
     // after `CREATE TABLE` is already constrained.
     for fk in &ct.foreign_keys {
-        if let Err(e) = crate::core::rql::foreign_key::append(io_schema.clone(), fk).await
+        if let Err(e) = crate::core::rql::foreign_key::stage(&*io_schema, &mut writes, fk)
         {
             error!("Failed to persist foreign key {}: {}", fk.name, e);
             return Err(e);
@@ -3940,7 +3943,7 @@ async fn write_schema_sidecars(
 
     for entry in &ct.defaults {
         if let Err(e) =
-            crate::core::rql::column_default::append(io_schema.clone(), entry).await
+            crate::core::rql::column_default::stage(&*io_schema, &mut writes, entry)
         {
             error!("Failed to persist default for {}: {}", entry.column, e);
             return Err(e);
@@ -3971,7 +3974,7 @@ async fn write_schema_sidecars(
                 ));
             }
         }
-        if let Err(e) = crate::core::rql::unique_key::append(io_schema.clone(), key).await
+        if let Err(e) = crate::core::rql::unique_key::stage(&*io_schema, &mut writes, key)
         {
             error!("Failed to persist unique constraint {}: {}", key.name, e);
             return Err(e);
@@ -3981,7 +3984,7 @@ async fn write_schema_sidecars(
 
     for entry in &ct.type_modifiers {
         if let Err(e) =
-            crate::core::rql::type_modifier::append(io_schema.clone(), entry).await
+            crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, entry)
         {
             error!(
                 "Failed to persist type modifier for {}: {}",
@@ -4006,7 +4009,7 @@ async fn write_schema_sidecars(
 
     for entry in &ct.generated {
         if let Err(e) =
-            crate::core::rql::generated::append(io_schema.clone(), entry).await
+            crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
         {
             error!("Failed to persist generated column {}: {}", entry.column, e);
             return Err(e);
@@ -4015,7 +4018,7 @@ async fn write_schema_sidecars(
     }
 
     for entry in &ct.checks {
-        if let Err(e) = crate::core::rql::check::append(io_schema.clone(), entry).await {
+        if let Err(e) = crate::core::rql::check::stage(&*io_schema, &mut writes, entry) {
             error!("Failed to persist check constraint {}: {}", entry.name, e);
             return Err(e);
         }
@@ -4023,12 +4026,18 @@ async fn write_schema_sidecars(
     }
 
     for entry in &ct.json_columns {
-        if let Err(e) = crate::core::rql::json_map::append(io_schema.clone(), entry).await
+        if let Err(e) = crate::core::rql::json_map::stage(&*io_schema, &mut writes, entry)
         {
             error!("Failed to register JSON column {}: {}", entry.column, e);
             return Err(e);
         }
         schema.json_columns.push(entry.clone());
+    }
+    // Every record above as one transaction, one log sync: after a cut all
+    // of them or none (`torn_tail::SidecarWrites`).
+    if let Err(e) = writes.commit(&*io_schema).await {
+        error!("Failed to persist the constraints of {}: {}", schema.name, e);
+        return Err(e);
     }
     Ok(())
 }

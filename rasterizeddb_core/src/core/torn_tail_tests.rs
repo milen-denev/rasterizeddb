@@ -985,6 +985,80 @@ impl Sidecar {
         }
     }
 
+    /// Record `i`, staged into `writes` through the sidecar's own `stage`.
+    fn stage<S: crate::core::storage_providers::traits::StorageIO>(
+        self,
+        io: &S,
+        writes: &mut SidecarWrites,
+        i: usize,
+    ) -> io::Result<()> {
+        use crate::core::rql::*;
+        let name = self.name(i);
+        match self {
+            Sidecar::Fk => foreign_key::stage(
+                io,
+                writes,
+                &foreign_key::ForeignKey {
+                    name,
+                    column: "v".into(),
+                    parent_table: format!("parent_{i}"),
+                    parent_column: "id".into(),
+                    on_delete: foreign_key::ReferentialAction::Cascade,
+                    on_update: foreign_key::ReferentialAction::SetNull,
+                    is_deleted: false,
+                },
+            ),
+            Sidecar::Chk => {
+                check::stage(io, writes, &check::CheckConstraint { name, expression: format!("v > {i}"), is_deleted: false })
+            }
+            Sidecar::Uk => unique_key::stage(
+                io,
+                writes,
+                &unique_key::UniqueKey {
+                    name,
+                    columns: vec!["v".into(), "id".into()],
+                    is_deleted: false,
+                    predicate: None,
+                    compiled: Default::default(),
+                },
+            ),
+            Sidecar::Def => column_default::stage(
+                io,
+                writes,
+                &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false },
+            ),
+            Sidecar::Idx => crate::core::index::decl::stage(
+                io,
+                writes,
+                &crate::core::index::decl::IndexDecl {
+                    name,
+                    method: crate::core::index::decl::Method::BTree,
+                    unique: false,
+                    columns: vec![1],
+                    is_deleted: false,
+                },
+            ),
+            Sidecar::Typ => type_modifier::stage(
+                io,
+                writes,
+                &type_modifier::TypeModifier { column: name, precision: 12, scale: 3, is_deleted: false },
+            ),
+            Sidecar::Gen => generated::stage(
+                io,
+                writes,
+                &generated::GeneratedColumn { column: name, expression: format!("v + {i}"), is_deleted: false },
+            ),
+            Sidecar::Json => json_map::stage(
+                io,
+                writes,
+                &json_map::JsonColumn { column: name, shadow_table: format!("shadow_{i}"), is_deleted: false },
+            ),
+            Sidecar::Pix => {
+                path_index::stage(io, writes, &path_index::PathIndex { name, path: format!("a{i}"), is_deleted: false })
+            }
+        }
+    }
+
     /// What the loader reads, each record as its name and the field that
     /// carries the rest of it (a torn record reads with a name and a cut or
     /// missing remainder).
@@ -1026,7 +1100,7 @@ impl Sidecar {
 }
 
 /// A record of zeros in a schema sidecar (what a build before
-/// `append_records` could leave: a logged append whose length a power cut
+/// `SidecarWrites` could leave: a logged append whose length a power cut
 /// kept and whose page it dropped) is skipped by every loader, and the
 /// records around it still read.
 ///
@@ -1059,7 +1133,7 @@ async fn a_schema_record_of_zeros_reads_as_no_declaration() {
 /// under every seed kind reads exactly the records appended so far, whole.
 /// None lost once its `append` returned, none torn, none of zeros.
 ///
-/// Mutation: `append_records` back to a logged append (`append_data(..,
+/// Mutation: `SidecarWrites::commit` back to a logged append (`append_data(..,
 /// true)`). The bytes reach the file before the log's sync, which the
 /// statement used to take later: an image that drops the log loses records
 /// `append` reported, and one that keeps the length and drops a page reads
@@ -1125,4 +1199,146 @@ async fn a_schema_record_reads_whole_after_a_cut_once_appended() {
         }
     }
     assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+}
+
+/// Not a test: the statements whose syncs `strace -f -e
+/// trace=fsync,fdatasync,openat` counts, each preceded by an `openat` of
+/// `/__rdb_sync_mark_<label>` (which fails, and so marks the trace). Run
+/// alone, single-threaded; see `.claude/reviews/p4-fk-crash/count_syncs.sh`.
+/// tmpfs hides what a sync costs, never how many there are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn sidecar_sync_count_probe() {
+    let mark = |label: &str| {
+        let _ = std::fs::File::open(format!("/__rdb_sync_mark_{label}"));
+    };
+    let settle = || tokio::time::sleep(std::time::Duration::from_millis(400));
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await.unwrap();
+    exec(&db, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)").await.unwrap();
+    exec(&db, "INSERT INTO parent (id) VALUES (1), (2), (3)").await.unwrap();
+    exec(&db, "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, p BIGINT, v BIGINT)").await.unwrap();
+    exec(&db, "INSERT INTO t2 (id, p, v) VALUES (1, 1, 10), (2, 2, 20)").await.unwrap();
+    db.sync_durable().unwrap();
+    settle().await;
+    let statements = [
+        (
+            "create_table",
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT, \
+             c BIGINT CHECK (c > 0), d BIGINT CHECK (d < 100), e BIGINT DEFAULT 1, f TEXT DEFAULT 'x', \
+             g BIGINT DEFAULT 2, n1 NUMERIC(10, 2), n2 NUMERIC(12, 4), p BIGINT REFERENCES parent (id), \
+             CONSTRAINT t_a UNIQUE (a), CONSTRAINT t_b UNIQUE (b))",
+        ),
+        ("add_fk", "ALTER TABLE t2 ADD CONSTRAINT t2_fk FOREIGN KEY (p) REFERENCES parent (id)"),
+        ("create_index", "CREATE INDEX t2_v ON t2 (v)"),
+        ("set_default", "ALTER TABLE t2 ALTER COLUMN v SET DEFAULT 7"),
+        ("add_check", "ALTER TABLE t2 ADD CONSTRAINT t2_c CHECK (v > 0)"),
+    ];
+    for (label, sql) in statements {
+        mark(&format!("{label}_begin"));
+        exec(&db, sql).await.unwrap_or_else(|e| panic!("{label}: {e}"));
+        mark(&format!("{label}_end"));
+        settle().await;
+    }
+    let t = db.table_held("t").unwrap();
+    let s = &t.schema;
+    eprintln!(
+        "t declares uk {:?} chk {} def {} typ {} fk {}",
+        s.unique_keys.iter().map(|k| &k.name).collect::<Vec<_>>(),
+        s.checks.len(),
+        s.defaults.len(),
+        s.type_modifiers.len(),
+        s.foreign_keys.len()
+    );
+    assert!(s.unique_keys.len() >= 2 && s.checks.len() == 2 && s.defaults.len() == 3);
+    assert!(s.type_modifiers.len() == 2 && s.foreign_keys.len() == 1);
+    close(&dir, db);
+}
+
+/// One statement's records in several sidecars, staged into one
+/// `SidecarWrites` and committed once, cut inside each log sync the commit
+/// takes and after it returns: every image under every seed kind holds all
+/// of them, whole, or none (and an image cut after the commit, all). Across
+/// the seeds both happen, or the cut tells nothing apart.
+///
+/// Mutations: each file committed as its own transaction; the first file
+/// committed before the others are written. Either takes a second log sync,
+/// and a cut inside it keeps the first file's records without the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_statements_sidecar_records_read_all_or_none_after_a_cut() {
+    use crate::core::power_loss::failpoint;
+    use crate::core::power_loss::image::Recorder;
+    use parking_lot::Mutex;
+    const KINDS: [Sidecar; 6] = [Sidecar::Fk, Sidecar::Chk, Sidecar::Uk, Sidecar::Def, Sidecar::Typ, Sidecar::Gen];
+    const EACH: usize = 3;
+    let seeds: u64 = std::env::var("RDB_POWER_LOSS_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, 64);
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    {
+        let db = open(&dir).await.unwrap();
+        exec(&db, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await.unwrap();
+        db.sync_durable().unwrap();
+        close(&dir, db);
+    }
+    let db = open(&dir).await.unwrap();
+    let io = db.table_held("t").unwrap().io_schema.clone();
+    let rec = Recorder::start(&dir);
+    let sink = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let guards: Vec<failpoint::Guard> = (1..=4)
+        .map(|nth| failpoint::arm("sync:wal.log", &dir, nth, rec.cut_action(format!("log sync #{nth}"), sink.clone())))
+        .collect();
+    let mut writes = SidecarWrites::default();
+    for kind in KINDS {
+        for i in 0..EACH {
+            kind.stage(&*io, &mut writes, i).unwrap();
+        }
+    }
+    writes.commit(&*io).await.unwrap();
+    let fired: Vec<u64> = guards.iter().map(|g| g.fired()).collect();
+    drop(guards);
+    let after = rec.cut_quiescent("after the commit");
+    drop(io);
+    close(&dir, db);
+    drop(rec);
+    assert!(fired[0] == 1, "the commit took no log sync ({fired:?})");
+    let mut points: Vec<_> = sink.lock().drain(..).filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok()).collect();
+    let after = after.expect("the cut after the commit was disturbed");
+    let after_label = after.label.clone();
+    points.push(after);
+
+    let mut want = Vec::new();
+    for kind in KINDS {
+        want.push(kind.expected(EACH).await);
+    }
+    let img = base.path().join("image");
+    let (mut all, mut none, mut problems) = (0, 0, Vec::new());
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img);
+            match open(&img).await {
+                Err(e) => problems.push(format!("{} seed {seed}: does not open: {e}", point.label)),
+                Ok(db) => {
+                    let io = db.table_held("t").unwrap().io_schema.clone();
+                    let mut got = Vec::new();
+                    for kind in KINDS {
+                        got.push(kind.load(&io).await);
+                    }
+                    if got == want {
+                        all += 1;
+                    } else if got.iter().all(Vec::is_empty) && point.label != after_label {
+                        none += 1;
+                    } else {
+                        problems.push(format!("{} seed {seed}: read {got:?}", point.label));
+                    }
+                    drop(io);
+                    close(&img, db);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    eprintln!("{} cuts (log syncs fired {fired:?}): {all} all, {none} none", points.len());
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    assert!(all > 0 && none > 0, "every image fell on one side ({all} all, {none} none): the cuts tell nothing apart");
 }

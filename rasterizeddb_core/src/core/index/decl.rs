@@ -197,9 +197,21 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
     decl: &IndexDecl,
 ) -> std::io::Result<()> {
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    // Write-ahead, never a logged append (`torn_tail::append_records`).
-    crate::core::torn_tail::append_records(&io, &decl.into_vec()).await
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, decl)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `decl`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: crate::core::storage_providers::traits::StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    decl: &IndexDecl,
+) -> std::io::Result<()> {
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, SIDECAR_SUFFIX), &decl.into_vec());
+    Ok(())
 }
 
 #[cfg(test)]
