@@ -1374,13 +1374,6 @@ fn live_and_dead(ids_handed_out: u64, slots: u64) -> (i64, i64) {
     (live, slots - live)
 }
 
-/// The indexes a table has and whether they are ready, or `None` when it has
-/// none. A plain table's are its live ones. A partitioned table's are built
-/// from its shell's schema (its declarations, and the implicit ones of its
-/// `PRIMARY KEY` and `UNIQUE` constraints), since every partition builds its
-/// own from the same schema and the shell builds none; they are ready once
-/// every materialized partition's are. Errs on a table that cannot serve
-/// data: "no indexes" would make a migration tool re-issue every one.
 /// Every column index a schema declares, as `(name, unique, columns by
 /// write_order, predicate)`, in the order and under the names
 /// [`crate::core::index::for_schema`] builds them: `CREATE INDEX`, then the
@@ -1416,6 +1409,13 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
     out
 }
 
+/// The indexes a table has and whether they are ready, or `None` when it has
+/// none. A plain table's are its live ones. A partitioned table's are built
+/// from its shell's schema (its declarations, and the implicit ones of its
+/// `PRIMARY KEY` and `UNIQUE` constraints), since every partition builds its
+/// own from the same schema and the shell builds none; they are ready once
+/// every materialized partition's are. Errs on a table that cannot serve
+/// data: "no indexes" would make a migration tool re-issue every one.
 fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::index::TableIndexes>, bool)>, String> {
     match relation {
         Relation::Plain(table) => Ok(table

@@ -1836,8 +1836,14 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
             // One index per columns and method, compared by the method built,
             // not the one declared: an implicit key declares B-tree and may
             // build hash, so a primary key also recorded as a unique key was
-            // built, maintained and listed twice.
-            Ok(method) if out.iter().any(|i| i.decl.columns == decl.columns && i.decl.method == method) => {}
+            // built, maintained and listed twice. A key's own index is only
+            // for finding equal values, which any index on its columns does,
+            // so it takes whichever is there — `CREATE INDEX … USING btree
+            // (id)` over a uuid key is one index, not two.
+            Ok(method)
+                if out
+                    .iter()
+                    .any(|i| i.decl.columns == decl.columns && (implicit || i.decl.method == method)) => {}
             Ok(method) => {
                 let decl = IndexDecl { method, ..decl };
                 out.push(Arc::new(LiveIndex::new_in(decl, columns, implicit, placement)));

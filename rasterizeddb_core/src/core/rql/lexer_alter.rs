@@ -212,12 +212,12 @@ pub fn parse_alter_table_actions_tagged(sql: &str) -> Result<Vec<(AlterTable, bo
 /// type, so each was dropped: duplicates went in, and orphans, and values
 /// the check forbids.
 ///
-/// Names are PostgreSQL's: `<t>_<c>_key`, `<t>_pkey`, `<t>_<c>_check`, or
-/// the `CONSTRAINT name` written before one. A foreign key is left unnamed
-/// for its own path to name. If one fails, the executor drops the column the
-/// statement added, so the whole of it fails, as in PostgreSQL. They
-/// belong to the column: under `IF NOT EXISTS` the executor runs them only
-/// when the column is added ([`parse_alter_table_actions_tagged`]).
+/// Unnamed unless `CONSTRAINT name` is written before one, so the
+/// constraint path names it as it names every unnamed one, numbering on a
+/// collision as PostgreSQL does. They belong to the column: under `IF NOT
+/// EXISTS` the executor runs them only when the column is added
+/// ([`parse_alter_table_actions_tagged`]), and if one fails it drops the
+/// columns the statement added.
 fn inline_constraints(action: &AlterTable, segment: &str) -> Result<Vec<AlterTable>, String> {
     let AlterAction::AddColumn { name, .. } = &action.action else {
         return Ok(Vec::new());
@@ -228,21 +228,76 @@ fn inline_constraints(action: &AlterTable, segment: &str) -> Result<Vec<AlterTab
         table_name: table.clone(),
         action: AlterAction::ConstraintClause { drop: false, description },
     };
-    let mut out = Vec::new();
+    let named = |name: Option<String>| name.map(|n| format!("CONSTRAINT {} ", quote(&n))).unwrap_or_default();
+
+    // `CONSTRAINT x` names the constraint whose keyword follows it. Read
+    // from the words as written, before the CHECK clauses come out: taken
+    // after, a check's name was left in front of whatever followed it.
+    let mut names: Vec<(String, String)> = Vec::new();
+    let raw: Vec<&str> = segment.split_whitespace().collect();
+    for i in 0..raw.len().saturating_sub(2) {
+        if raw[i].eq_ignore_ascii_case("CONSTRAINT") {
+            let kind = raw[i + 2].to_ascii_uppercase();
+            let kind = ["CHECK", "UNIQUE", "PRIMARY", "REFERENCES"].into_iter().find(|k| kind.starts_with(k));
+            if let Some(kind) = kind {
+                names.push((kind.to_string(), bare_name(raw[i + 1])));
+            }
+        }
+    }
+    let mut name_for = |kind: &str| {
+        let at = names.iter().position(|(k, _)| k == kind)?;
+        Some(names.remove(at).1)
+    };
 
     // Every clause that carries an expression or a literal comes out first,
     // so a DEFAULT 'UNIQUE' or a CHECK naming the word is not read as a key.
-    let (text, _) = crate::core::rql::generated::split_clause(segment);
-    let (text, check) = crate::core::rql::check::split_clause(&text);
+    let (mut text, _) = crate::core::rql::generated::split_clause(segment);
+    let mut checks = Vec::new();
+    loop {
+        let (rest, check) = crate::core::rql::check::split_clause(&text);
+        text = rest;
+        match check {
+            Some(expression) => checks.push(expression),
+            None => break,
+        }
+    }
     let (text, _) = crate::core::rql::column_default::split_clause(&text);
     let words: Vec<&str> = text.split_whitespace().collect();
     let Some(at) = words.iter().position(|w| bare_name(w).eq_ignore_ascii_case(name)) else {
         return Ok(Vec::new());
     };
-    let after: Vec<&str> = words[at + 1..].to_vec();
-    let references = after.iter().position(|w| w.eq_ignore_ascii_case("REFERENCES"));
-    // The key words are read before `REFERENCES`, and after its target and
-    // actions: `c INT REFERENCES p (id) ON DELETE CASCADE UNIQUE`.
+    // The words after the column's name, without `CONSTRAINT x` (read above)
+    // and without the target a REFERENCES names: `REFERENCES p (unique)` is a
+    // column called unique.
+    let mut after: Vec<&str> = Vec::new();
+    let mut references: Option<usize> = None;
+    let mut i = at + 1;
+    while i < words.len() {
+        let word = words[i];
+        if word.eq_ignore_ascii_case("CONSTRAINT") {
+            i += 2;
+            continue;
+        }
+        if word.eq_ignore_ascii_case("REFERENCES") && references.is_none() {
+            references = Some(i);
+            // The table, then its column list: attached (`p(id)`) or apart.
+            let parens = |w: &str| w.matches('(').count() as i32 - w.matches(')').count() as i32;
+            i += 1;
+            let mut depth = words.get(i).map_or(0, |w| parens(w));
+            i += 1;
+            if depth == 0 && words.get(i).is_some_and(|w| w.starts_with('(')) {
+                depth = parens(words[i]);
+                i += 1;
+            }
+            while i < words.len() && depth > 0 {
+                depth += parens(words[i]);
+                i += 1;
+            }
+            continue;
+        }
+        after.push(word);
+        i += 1;
+    }
     let upper: Vec<String> = after.iter().map(|w| w.to_ascii_uppercase()).collect();
     let has = |seq: &[&str]| upper.windows(seq.len()).any(|w| w.iter().map(String::as_str).eq(seq.iter().copied()));
     // Refused before anything runs: as a constraint after the column, the
@@ -254,43 +309,26 @@ fn inline_constraints(action: &AlterTable, segment: &str) -> Result<Vec<AlterTab
             name
         ));
     }
-    // `CONSTRAINT x` names the constraint the next word starts.
-    let named = |keyword: usize| {
-        (keyword >= 2 && upper[keyword - 2] == "CONSTRAINT").then(|| bare_name(after[keyword - 1]))
-    };
-    let primary = upper.windows(2).position(|w| w[0] == "PRIMARY" && w[1] == "KEY");
-    let unique = upper.iter().position(|w| w == "UNIQUE");
-    if let Some(k) = primary.or(unique) {
-        let constraint = named(k).unwrap_or_else(|| {
-            if primary.is_some() {
-                crate::core::rql::unique_key::pkey_name(table)
-            } else {
-                crate::core::rql::unique_key::implicit_key_name(table, name)
-            }
-        });
-        out.push(clause(format!(
-            "CONSTRAINT {} {} ({})",
-            quote(&constraint),
-            if primary.is_some() { "PRIMARY KEY" } else { "UNIQUE" },
-            quote(name)
-        )));
+
+    let mut out = Vec::new();
+    // A primary key is unique already; written both ways, it is the one key.
+    if has(&["PRIMARY", "KEY"]) {
+        out.push(clause(format!("{}PRIMARY KEY ({})", named(name_for("PRIMARY")), quote(name))));
+    } else if upper.iter().any(|w| w == "UNIQUE") {
+        out.push(clause(format!("{}UNIQUE ({})", named(name_for("UNIQUE")), quote(name))));
     }
     if let Some(k) = references {
         // From `REFERENCES` to the end: the target, its columns, the
-        // actions; the foreign key parser reads what it needs and the key
-        // words after it are already taken.
-        // Unnamed unless written: the foreign key path names it, and numbers
-        // it on a collision, as it names every other one.
-        let target = after[k..].join(" ");
-        let constraint = named(k).map(|n| format!("CONSTRAINT {} ", quote(&n))).unwrap_or_default();
-        out.push(clause(format!("{}FOREIGN KEY ({}) {}", constraint, quote(name), target)));
-    }
-    if let Some(expression) = check {
+        // actions. The foreign key parser reads what it needs.
         out.push(clause(format!(
-            "CONSTRAINT {} CHECK ({})",
-            quote(&crate::core::rql::check::derived_name(table, Some(name), 1)),
-            expression
+            "{}FOREIGN KEY ({}) {}",
+            named(name_for("REFERENCES")),
+            quote(name),
+            words[k..].join(" ")
         )));
+    }
+    for expression in checks {
+        out.push(clause(format!("{}CHECK ({})", named(name_for("CHECK")), expression)));
     }
     Ok(out)
 }
@@ -1402,12 +1440,12 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(keys("ALTER TABLE t ADD COLUMN e INT UNIQUE"), ["CONSTRAINT \"t_e_key\" UNIQUE (\"e\")"]);
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN e INT UNIQUE"), ["UNIQUE (\"e\")"]);
         assert_eq!(
             keys("ALTER TABLE t ADD COLUMN IF NOT EXISTS e INT CONSTRAINT e_u UNIQUE NOT NULL DEFAULT 0"),
             ["CONSTRAINT \"e_u\" UNIQUE (\"e\")"]
         );
-        assert_eq!(keys("ALTER TABLE t ADD f INT PRIMARY KEY"), ["CONSTRAINT \"t_pkey\" PRIMARY KEY (\"f\")"]);
+        assert_eq!(keys("ALTER TABLE t ADD f INT PRIMARY KEY"), ["PRIMARY KEY (\"f\")"]);
         assert!(
             parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b TEXT UNIQUE NULLS NOT DISTINCT")
                 .unwrap_err()
@@ -1416,17 +1454,28 @@ mod tests {
         assert_eq!(
             keys("ALTER TABLE t ADD COLUMN p INT REFERENCES par (id) ON DELETE CASCADE UNIQUE CHECK (p > 0)"),
             [
-                "CONSTRAINT \"t_p_key\" UNIQUE (\"p\")",
+                "UNIQUE (\"p\")",
                 "FOREIGN KEY (\"p\") REFERENCES par (id) ON DELETE CASCADE UNIQUE",
-                "CONSTRAINT \"t_p_check\" CHECK (p > 0)",
+                "CHECK (p > 0)",
             ]
         );
         assert_eq!(
             keys("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'UNIQUE' CHECK (c <> 'PRIMARY KEY')"),
-            ["CONSTRAINT \"t_c_check\" CHECK (c <> 'PRIMARY KEY')"]
+            ["CHECK (c <> 'PRIMARY KEY')"]
         );
-        // The column's own action is never tagged.
-        assert!(!parse_alter_table_actions_tagged("ALTER TABLE t ADD COLUMN e INT UNIQUE").unwrap()[0].1);
+        // A name belongs to the constraint after it, a check's included, and
+        // never leaks onto the next one; every check is taken.
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN c INT CONSTRAINT c_pos CHECK (c > 0) UNIQUE CHECK (c < 9)"),
+            ["UNIQUE (\"c\")", "CONSTRAINT \"c_pos\" CHECK (c > 0)", "CHECK (c < 9)"]
+        );
+        // The target's column list is no key, attached or apart.
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN q INT REFERENCES p(\"unique\")"), ["FOREIGN KEY (\"q\") REFERENCES p(\"unique\")"]);
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN q INT REFERENCES p ( unique ) ON DELETE SET NULL"), [
+            "FOREIGN KEY (\"q\") REFERENCES p ( unique ) ON DELETE SET NULL"
+        ]);
+        // Written both ways, it is the one key.
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN k INT PRIMARY KEY UNIQUE"), ["PRIMARY KEY (\"k\")"]);
         assert!(keys("ALTER TABLE t ADD COLUMN unique_id INT").is_empty());
         // `NULLS NOT DISTINCT` travels to the constraint, which refuses it;
         // dropped here, the index enforced NULLs as distinct.

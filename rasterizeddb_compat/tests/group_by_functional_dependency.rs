@@ -121,6 +121,18 @@ async fn a_number_groups_by_that_select_item() {
     rows.sort();
     assert_eq!(rows, vec![("A".into(), 30), ("B".into(), 5), ("C".into(), 7)]);
 
+    // A HAVING over the column a position names.
+    let mut rows: Vec<(String, i64)> =
+        sqlx::query("SELECT customer, COUNT(*) FROM o GROUP BY 1 HAVING customer <> 'a'")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+    rows.sort();
+    assert_eq!(rows, vec![("b".into(), 1), ("c".into(), 1)]);
+
     for sql in ["SELECT customer, COUNT(*) FROM o GROUP BY 3", "SELECT customer FROM o GROUP BY 0"] {
         let e = sqlx::query(sql).fetch_all(&pool).await.expect_err(sql);
         let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());

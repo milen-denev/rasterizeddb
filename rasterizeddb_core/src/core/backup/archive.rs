@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! "RDBA" u32 | version u8 | pad u8 x3 | entry_count u32
-//! per entry: name_len u16 | name utf-8 | data_len u64 | crc32 u32 | data
+//! per entry: name_len u16 | name utf-8 | data_len u64 | data | crc32 u32
 //! ```
 //!
 //! Written into a zstd stream, so the numbers above are what the *compressor*

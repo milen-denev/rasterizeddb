@@ -1573,10 +1573,22 @@ pub fn row_fetch_from_select_query(
                     split.row_terms[0].text
                 ));
             };
+            // `GROUP BY 2` groups by the second select item, so a plain
+            // column there is a plain key here; its alias is not its name.
+            let selected = split_select_items(columns_part);
+            let positional = |item: &str| -> Option<&SchemaField> {
+                let n: usize = item.trim().parse().ok()?;
+                let text = selected.get(n.checked_sub(1)?)?.trim();
+                let text = match crate::core::rql::join::find_keyword(text, "AS", 0) {
+                    Some(at) => text[..at].trim(),
+                    None => text,
+                };
+                plain_group_column(text, schema)
+            };
             let mut plain: Vec<&SchemaField> =
                 crate::core::rql::join::split_top_level_commas(list)
                     .iter()
-                    .filter_map(|item| plain_group_column(item, schema))
+                    .filter_map(|item| plain_group_column(item, schema).or_else(|| positional(item)))
                     .collect();
             // Grouped by a unique NOT NULL column, every column is constant
             // within a group, so a term over any of them moves into WHERE.

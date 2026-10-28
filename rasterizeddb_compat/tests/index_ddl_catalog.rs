@@ -215,6 +215,27 @@ async fn a_key_declared_on_an_added_column_is_enforced() {
     // A re-run finds the column, and adds none of its constraints again.
     c.simple_ok("ALTER TABLE ac ADD COLUMN IF NOT EXISTS p INT REFERENCES par (id) CHECK (p > 0)").await;
 
+    // A whole statement goes when one column's constraint fails, not only
+    // that column.
+    let r = c.simple("ALTER TABLE ac ADD COLUMN a1 INT UNIQUE, ADD COLUMN a2 INT DEFAULT 0 UNIQUE").await;
+    assert_eq!(wire::error_code(&r).as_deref(), Some("23505"), "{}", wire::render(&r));
+    for column in ["a1", "a2"] {
+        let r = c.simple(&format!("SELECT {column} FROM ac")).await;
+        assert!(wire::error_code(&r).is_some(), "column {column} was left behind: {}", wire::render(&r));
+    }
+
+    // A name before an inline CHECK is the check's: it drops by that name.
+    c.simple_ok("ALTER TABLE ac ADD COLUMN pos INT CONSTRAINT pos_positive CHECK (pos > 0)").await;
+    c.simple_ok("ALTER TABLE ac DROP CONSTRAINT pos_positive").await;
+    c.simple_ok("UPDATE ac SET pos = -1 WHERE id = 1").await;
+
+    // A table whose name holds the word "references" is no foreign key: its
+    // keys were read as one and failed to parse.
+    c.simple_ok("CREATE TABLE user_preferences (k INT)").await;
+    c.simple_ok("ALTER TABLE user_preferences ADD COLUMN x INT UNIQUE").await;
+    c.simple_ok("ALTER TABLE user_preferences ADD COLUMN id INT PRIMARY KEY").await;
+    assert_eq!(names(&mut c, "user_preferences").await, ["user_preferences_pkey", "user_preferences_x_key"]);
+
     // Refused before anything runs: no column is left behind.
     let r = c.simple("ALTER TABLE ac ADD COLUMN n INT UNIQUE NULLS NOT DISTINCT").await;
     assert_eq!(wire::error_code(&r).as_deref(), Some("0A000"), "{}", wire::render(&r));

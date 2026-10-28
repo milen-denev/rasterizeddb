@@ -131,8 +131,9 @@ impl Database {
                 )
             }),
             AlterAction::ConstraintClause { drop: false, description } => {
-                let upper = description.to_ascii_uppercase();
-                if upper.contains("FOREIGN KEY") || upper.contains("REFERENCES") {
+                // Whole words outside quotes, as the ALTER arm reads it.
+                let keyword = |word: &str| crate::core::rql::join::find_keyword(description, word, 0).is_some();
+                if keyword("FOREIGN") || keyword("REFERENCES") {
                     return Some("FOREIGN KEY on a partitioned table is not supported yet".to_string());
                 }
                 // As the ALTER arm reads it: `IF NOT EXISTS` out, in front

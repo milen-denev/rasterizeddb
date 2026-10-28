@@ -9374,15 +9374,14 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     // Set while an `ADD COLUMN IF NOT EXISTS` found its column: the
     // constraints written on it are part of that definition, and go with it.
     let mut skipping = false;
-    // The column the last `ADD COLUMN` added, while its constraints run.
-    let mut added: Option<(String, String)> = None;
+    // Every column this statement has added, for undoing it.
+    let mut added: Vec<(String, String)> = Vec::new();
     for (plan, inline) in plans {
         if inline {
             if skipping {
                 continue;
             }
         } else {
-            added = None;
             skipping = match &plan.action {
                 // Under the ACCESS EXCLUSIVE the statement already holds, so
                 // the column cannot appear between this look and the add.
@@ -9404,28 +9403,30 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
         result = execute_alter_table_action(plan, database, tx).await;
         // `ddl_error` frames lead with status 3.
         if result.first() == Some(&3u8) {
-            // A constraint written on the column failed — a DEFAULT the rows
-            // share breaks UNIQUE, has no parent, fails the CHECK. The column
-            // goes too: in PostgreSQL the statement changes nothing.
-            if inline && let Some((table_name, name)) = added.take() {
-                let undo = lexer_alter::AlterTable {
-                    table_name,
-                    action: lexer_alter::AlterAction::DropColumn { name, if_exists: true },
-                };
-                let undone = execute_alter_table_action(undo, database, tx).await;
-                if undone.first() == Some(&3u8) {
-                    error!(
-                        "ALTER TABLE: a constraint on an added column failed and the column could not be \
-                         dropped again: {}",
-                        String::from_utf8_lossy(&undone[1..])
-                    );
+            // A constraint written on a column failed — a DEFAULT the rows
+            // share breaks UNIQUE, has no parent, fails the CHECK. Every
+            // column this statement added goes, and its constraints with it:
+            // in PostgreSQL the statement changes nothing. Other actions'
+            // failures keep what earlier actions did, as DDL here always has.
+            if inline {
+                for (table_name, name) in added.drain(..).rev() {
+                    let undo = lexer_alter::AlterTable {
+                        table_name,
+                        action: lexer_alter::AlterAction::DropColumn { name, if_exists: true },
+                    };
+                    let undone = execute_alter_table_action(undo, database, tx).await;
+                    if undone.first() == Some(&3u8) {
+                        error!(
+                            "ALTER TABLE: a constraint on an added column failed and the column could not \
+                             be dropped again: {}",
+                            String::from_utf8_lossy(&undone[1..])
+                        );
+                    }
                 }
             }
             return result;
         }
-        if added_now.is_some() {
-            added = added_now;
-        }
+        added.extend(added_now);
     }
     result
 }
@@ -10609,7 +10610,11 @@ async fn execute_alter_table_action(
             }
 
             // A foreign key is enforced, so it is stored rather than noted.
-            if upper.contains("FOREIGN KEY") || upper.contains("REFERENCES") {
+            // By whole words outside quotes: as substrings, a constraint named
+            // `user_preferences_pkey` (pg_dump's spelling) or `"prefs_x_key"`
+            // was read as a foreign key and failed to parse as one.
+            let keyword = |word: &str| crate::core::rql::join::find_keyword(&description, word, 0).is_some();
+            if keyword("FOREIGN") || keyword("REFERENCES") {
                 let name = if upper.starts_with("CONSTRAINT") {
                     description
                         .split_whitespace()
@@ -12949,11 +12954,9 @@ fn dropped_constraint_name(description: &str) -> Option<String> {
 /// The parent an `ADD [CONSTRAINT n] FOREIGN KEY … REFERENCES p` names,
 /// parsed as the constraint arm parses it; `None` for any other clause.
 fn fk_parent_of_clause(description: &str) -> Option<String> {
-    let upper = description.to_ascii_uppercase();
-    if !upper.contains("FOREIGN KEY") && !upper.contains("REFERENCES") {
-        return None;
-    }
-    let clause_at = upper.find("FOREIGN KEY").or_else(|| upper.find("REFERENCES")).unwrap_or(0);
+    // Whole words outside quotes, as the constraint arm reads it.
+    let find = |word: &str| crate::core::rql::join::find_keyword(description, word, 0);
+    let clause_at = find("FOREIGN").or_else(|| find("REFERENCES"))?;
     crate::core::rql::foreign_key::parse_clause(&description[clause_at..], None, None)
         .ok()
         .map(|fk| fk.parent_table)
