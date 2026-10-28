@@ -285,15 +285,22 @@ impl SidecarWrites {
     /// Returns once they are durable, or the write's or the commit's error,
     /// in which case none of them is.
     pub async fn commit<S: crate::core::storage_providers::traits::StorageIO>(self, schema_io: &S) -> io::Result<()> {
-        let Some((first, _, _)) = self.files.first() else {
+        if self.files.is_empty() {
             return Ok(());
-        };
+        }
         // Every provider kept until the commit: a key/value file's staged
-        // records live in its handle until its family commits them.
+        // records live in its handle until its family commits them. The
+        // schema file itself (the header) through the caller's own provider:
+        // a sidecar's provider inherits the table's gate word from it
+        // (`GatedIo::inherit_from`), but one opened anew for the schema file
+        // has none, and its write would reach a live file set unregistered.
         let mut providers = Vec::with_capacity(self.files.len());
-        providers.push(schema_io.create_new(first.clone()).await);
-        for (file, _, _) in &self.files[1..] {
-            providers.push(schema_io.create_new(file.clone()).await);
+        for (file, _, _) in &self.files {
+            providers.push(if *file == schema_io.get_name() {
+                schema_io.clone()
+            } else {
+                schema_io.create_new(file.clone()).await
+            });
         }
         let txn = providers[0].begin_txn();
         let mut logged = None;
