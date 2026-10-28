@@ -8166,8 +8166,7 @@ async fn add_foreign_key(
     // in PostgreSQL. What an import uses for a source key PostgreSQL itself
     // never validated.
     let (rest, not_valid) = strip_not_valid(rest);
-    let upper = rest.to_ascii_uppercase();
-    let clause_at = upper.find("FOREIGN KEY").or_else(|| upper.find("REFERENCES")).unwrap_or(0);
+    let clause_at = crate::core::rql::join::find_keyword(rest, "FOREIGN", 0).or_else(|| crate::core::rql::join::find_keyword(rest, "REFERENCES", 0)).unwrap_or(0);
     let mut fk = match foreign_key::parse_clause(&rest[clause_at..], table_name, named.clone(), None) {
         Ok(fk) => fk,
         Err(e) => return ddl_error(&e),
@@ -11289,8 +11288,6 @@ async fn execute_alter_table_action(
         }
         AlterAction::ConstraintClause { drop, description } => {
             use crate::core::rql::foreign_key;
-
-            let upper = description.to_ascii_uppercase();
 
             // `DROP CONSTRAINT [IF EXISTS] <name>`. Both sidecars are tried,
             // since the name alone does not say which kind it was. A name

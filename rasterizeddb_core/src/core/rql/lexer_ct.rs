@@ -1175,24 +1175,28 @@ pub(crate) fn split_definitions(body: &str) -> Vec<String> {
 
 /// The `FOREIGN KEY …` or `REFERENCES …` part of a definition, if it has one.
 fn foreign_key_clause(def: &str) -> Option<&str> {
-    let upper = def.to_ascii_uppercase();
-    if let Some(at) = upper.find("FOREIGN KEY") {
+    // Whole words outside quotes and parentheses: a constraint or column
+    // named `user_preferences_…` holds "references".
+    if let Some(at) = crate::core::rql::join::find_keyword(def, "FOREIGN", 0) {
         return Some(&def[at..]);
     }
     // An inline `REFERENCES` on a column definition.
-    upper.find("REFERENCES").map(|at| &def[at..])
+    crate::core::rql::join::find_keyword(def, "REFERENCES", 0).map(|at| &def[at..])
 }
 
 /// The name a column definition gives its `REFERENCES` constraint:
 /// `CONSTRAINT <name>` (bare or quoted) directly before `REFERENCES`. A
 /// `CONSTRAINT` naming another of the column's constraints is not its.
 fn inline_constraint_name(def: &str) -> Option<String> {
-    let upper = def.to_ascii_uppercase();
-    let references = upper.find("REFERENCES")?;
-    let at = upper[..references].rfind("CONSTRAINT")?;
-    if at > 0 && !def.as_bytes()[at - 1].is_ascii_whitespace() {
-        return None;
+    let references = crate::core::rql::join::find_keyword(def, "REFERENCES", 0)?;
+    // The last whole-word `CONSTRAINT` before it.
+    let mut at = None;
+    let mut from = 0;
+    while let Some(found) = crate::core::rql::join::find_keyword(def, "CONSTRAINT", from).filter(|f| *f < references) {
+        at = Some(found);
+        from = found + 1;
     }
+    let at = at?;
     match crate::core::rql::unique_key::split_constraint_name(&def[at..]) {
         Ok((Some(name), rest)) if rest.to_ascii_uppercase().starts_with("REFERENCES") => Some(name),
         _ => None,

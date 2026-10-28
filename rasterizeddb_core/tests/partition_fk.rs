@@ -901,3 +901,61 @@ fn adding_a_cross_type_key_validates_as_the_insert_checks() {
         assert_eq!(e.code, "23503", "{e}");
     }
 }
+
+/// Foreign keys are told by the whole words `FOREIGN` and `REFERENCES`,
+/// outside quotes and parentheses (round 3, as on fix/index-ddl aa2d345): a
+/// table `user_preferences`, whose `pg_dump` constraint names hold
+/// "references", with a primary key, a UNIQUE, a CHECK named
+/// `references_check` and a foreign key on a column `references_id`, on a
+/// plain and a partitioned table, each created, enforced, dropped and added
+/// again by `ALTER … ADD CONSTRAINT`. Read as a foreign key, each of the
+/// others failed to parse.
+#[test]
+fn a_name_holding_references_is_no_foreign_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path().to_str().unwrap());
+    let mut c = server.connect();
+    c.ok("CREATE TABLE users_r (id BIGINT NOT NULL PRIMARY KEY)");
+    c.ok("INSERT INTO users_r (id) VALUES (1), (2)");
+    for (t, part) in [("user_preferences", ""), ("user_preferences_p", " PARTITION BY HASH (id) PARTITIONS 4")] {
+        c.ok(&format!(
+            "CREATE TABLE {t} (id BIGINT NOT NULL, references_id BIGINT, theme TEXT, \
+             CONSTRAINT {t}_pkey PRIMARY KEY (id), CONSTRAINT {t}_references_uq UNIQUE (id, theme), \
+             CONSTRAINT references_check CHECK (id > 0), \
+             CONSTRAINT {t}_references_id_fkey FOREIGN KEY (references_id) REFERENCES users_r (id)){part}"
+        ));
+        c.ok(&format!("INSERT INTO {t} (id, references_id, theme) VALUES (1, 1, 'dark'), (2, NULL, 'light')"));
+        let e = |c: &mut Client, sql: &str| c.simple(sql).expect_err(sql).code;
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id, references_id) VALUES (3, 9)")), "23503", "{t}: the key");
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id, references_id) VALUES (-4, 1)")), "23514", "{t}: the check");
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id) VALUES (1)")), "23505", "{t}: the primary key");
+        for name in [format!("{t}_pkey"), format!("{t}_references_uq"), "references_check".to_string()] {
+            c.ok(&format!("ALTER TABLE {t} VALIDATE CONSTRAINT {name}"));
+        }
+        // pg_dump's forms, after the data.
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"));
+        c.ok(&format!("ALTER TABLE ONLY {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (id)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_references_uq"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_references_uq UNIQUE (id, theme)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT references_check"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT references_check CHECK (id > 0)"));
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_references_id_fkey"));
+        c.ok(&format!(
+            "ALTER TABLE ONLY {t} ADD CONSTRAINT {t}_references_id_fkey FOREIGN KEY (references_id) REFERENCES users_r (id)"
+        ));
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id, references_id) VALUES (3, 9)")), "23503", "{t}: the key again");
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id, references_id) VALUES (-4, 1)")), "23514", "{t}: the check again");
+        assert_eq!(e(&mut c, &format!("INSERT INTO {t} (id) VALUES (1)")), "23505", "{t}: the primary key again");
+        c.ok(&format!("ALTER TABLE {t} VALIDATE CONSTRAINT {t}_references_id_fkey"));
+        // A UNIQUE without the partition key is still refused on the
+        // partitioned table, its name notwithstanding (§1b), and added on the
+        // plain one.
+        let uq = c.simple(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_references_theme_uq UNIQUE (theme)"));
+        if part.is_empty() {
+            uq.unwrap_or_else(|e| panic!("{t}: {e}"));
+        } else {
+            assert!(uq.expect_err("§1b").is_unsupported(), "{t}");
+        }
+    }
+}
+

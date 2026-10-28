@@ -425,6 +425,7 @@ the same tests, but the one marked; and these):
 | *(round 3)* a lossy move kept | `coerce_key_literal` | the same |
 | *(round 3)* validation probes the child's values unmoved | `first_value_without_parent` | `…::adding_a_cross_type_key_validates_as_the_insert_checks` (`TIMESTAMP` 10:00 validated against `DATE`; it survived until that case was added, since the scan reads `7` at `NUMERIC` by itself) |
 | *(round 3)* VALIDATE of an unknown name succeeds | the ALTER arm | `partition_fk::validating_an_unknown_constraint_is_42704` |
+| *(round 3)* the ALTER arm, CREATE's `foreign_key_clause`, the partitioned refusal, `parse_clause`: `REFERENCES` read as a substring (each alone) | those four | `partition_fk::a_name_holding_references_is_no_foreign_key` (the partitioned refusal's: a UNIQUE without the key accepted) |
 | the table dropped before its dependent keys | `execute_drop_table` | `pddl_crash_tests::a_cascading_drop_…` (images at the log's syncs hold a key naming a dropped table) |
 
 Not pinned: the child-side chunk of 512 for a child not partitioned by its
@@ -540,6 +541,18 @@ cascade; `fk_reverse` reached only through the slot primitives):
   `…::adding_a_cross_type_key_validates_as_the_insert_checks`.
 - `VALIDATE CONSTRAINT` of a name no constraint has is 42704 (above);
   compat `ddl.rs` expects it.
+- **A foreign key is told by whole words.** The ALTER arm, the lock set's
+  `fk_parent_of_clause`, the partitioned refusal, `lexer_ct`'s
+  `foreign_key_clause` and `inline_constraint_name`, and
+  `foreign_key::parse_clause` tested `contains("REFERENCES")`, so pg_dump's
+  `ADD CONSTRAINT user_preferences_pkey PRIMARY KEY (id)` was read as a
+  foreign key and failed to parse, a CREATE TABLE holding it likewise, and
+  `FOREIGN KEY (references_id) REFERENCES …` found its `REFERENCES` in the
+  column list. Each now uses `join::find_keyword` (whole words, outside
+  quotes and parentheses), as fix/index-ddl does (aa2d345). Pinned by
+  `partition_fk::a_name_holding_references_is_no_foreign_key` (a
+  `user_preferences` table with a primary key, a UNIQUE, a CHECK named
+  `references_check` and a key on `references_id`, plain and partitioned).
 
 **Behaviour changes for plain tables** (the same code serves both kinds):
 
@@ -587,6 +600,9 @@ here).
   lift that.
 - ~~By reading: a column-level `CONSTRAINT n REFERENCES p (k)` gave its key
   no name of its own~~ (fixed in round 2, `lexer_ct::inline_constraint_name`).
+- Seen while pinning round 3, not investigated (CHECK code P4 does not
+  touch): `CHECK (x IS NULL OR x > 0)` refuses a row whose `x` is NULL
+  (23514), on a plain table too; PostgreSQL accepts it.
 - The insert-time check finds its parent by exact name (`has_table`), as
   every lookup here does (identifiers are not case-folded, an open finding):
   a key on `P` never matches `p`.

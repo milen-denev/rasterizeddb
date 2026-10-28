@@ -338,10 +338,9 @@ pub fn parse_clause(
     name: Option<String>,
     inline_column: Option<&str>,
 ) -> Result<ForeignKey, String> {
-    let upper = clause.to_ascii_uppercase();
-
-    let references_at = upper
-        .find("REFERENCES")
+    // A whole word outside parentheses: `FOREIGN KEY (references_id)` holds
+    // the letters in its column list.
+    let references_at = crate::core::rql::join::find_keyword(clause, "REFERENCES", 0)
         .ok_or_else(|| "a foreign key must name what it REFERENCES".to_string())?;
 
     // Referencing column: either from the `FOREIGN KEY (…)` list, or the column
