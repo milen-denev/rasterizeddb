@@ -6897,12 +6897,6 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("operator does not exist") {
         return "42883";
     }
-    // `datatype_mismatch`: a value with no assignment cast to its column's
-    // type ("column \"d\" is of type jsonb but expression is of type
-    // integer").
-    if has(" but expression is of type ") {
-        return "42804";
-    }
     // `invalid_column_reference`: an ON CONFLICT target no unique key
     // matches (a partitioned table's that leaves out a key column, S18).
     // Decided early: the message quotes the column names.
@@ -6926,8 +6920,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return "42703";
     }
     // `datatype_mismatch`: a foreign key between columns of incompatible
-    // types, in the engine's words (never a client's quoted text).
-    if has("foreign key constraint") && has("cannot be implemented") && has("are of incompatible types") {
+    // types, in the engine's words (never a client's quoted text); a value
+    // with no assignment cast to its column's type ("column \"d\" is of
+    // type jsonb but expression is of type integer").
+    if (has("foreign key constraint") && has("cannot be implemented") && has("are of incompatible types"))
+        || has(" but expression is of type ")
+    {
         return "42804";
     }
     // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
