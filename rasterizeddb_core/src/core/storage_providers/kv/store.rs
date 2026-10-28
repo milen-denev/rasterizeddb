@@ -97,6 +97,10 @@ pub trait KvStore: Send + Sync + 'static {
 /// layout should still be the object one.
 pub struct MemoryKvStore {
     objects: dashmap::DashMap<String, Arc<Vec<u8>>>,
+    /// Which store this is. Two in-memory stores hold different objects, and
+    /// a family's identity (`describe`) has to say so, or a backup copying one
+    /// would pause the other.
+    id: u64,
 }
 
 impl Default for MemoryKvStore {
@@ -107,8 +111,10 @@ impl Default for MemoryKvStore {
 
 impl MemoryKvStore {
     pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             objects: dashmap::DashMap::new(),
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -179,7 +185,7 @@ impl KvStore for MemoryKvStore {
     }
 
     fn describe(&self) -> String {
-        "memory".to_string()
+        format!("memory #{}", self.id)
     }
 
     fn kind(&self) -> &'static str {

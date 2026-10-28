@@ -346,21 +346,41 @@ impl KvFamily {
     /// any file is opened — a per-file scan could not see the commit
     /// declarations that live in another file's deltas.
     pub async fn open(store: Arc<dyn KvStore>, config: KvConfig) -> io::Result<Arc<Self>> {
-        Self::open_with(store, config, false).await
+        Self::open_with(store, config, false, None).await
     }
 
     /// The family as a restart would recover it from the objects in the store
     /// now, for reading only: a crash-consistent copy of every file, with no
     /// object written or deleted to get it. A live family on the same prefix
-    /// should be paused around it ([`super::export`]).
-    pub async fn open_snapshot(store: Arc<dyn KvStore>, config: KvConfig) -> io::Result<Arc<Self>> {
-        Self::open_with(store, config, true).await
+    /// should be paused around it ([`super::export`]); `listing` — the hold
+    /// on its commits — is let go as soon as the objects are listed, since a
+    /// listed object never changes while maintenance is paused.
+    pub async fn open_snapshot(
+        store: Arc<dyn KvStore>,
+        config: KvConfig,
+        listing: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    ) -> io::Result<Arc<Self>> {
+        Self::open_with(store, config, true, listing).await
     }
 
-    async fn open_with(store: Arc<dyn KvStore>, config: KvConfig, read_only: bool) -> io::Result<Arc<Self>> {
+    async fn open_with(
+        store: Arc<dyn KvStore>,
+        config: KvConfig,
+        read_only: bool,
+        listing: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    ) -> io::Result<Arc<Self>> {
         config.validate()?;
         let prefix = format!("{}/", config.root);
         let listed = store.list(&prefix).await?;
+        drop(listing);
+        // Shared by every family serving this prefix, so a copy pauses one
+        // opened after it began as surely as one open before. A read-only
+        // copy has nothing to pause and takes its own.
+        let (maintenance, declaring) = if read_only {
+            Default::default()
+        } else {
+            super::export::gates(&identity_of(store.as_ref(), &config.root))
+        };
 
         let mut meta_keys: Vec<(String, String)> = Vec::new();
         let mut delta_keys: Vec<(String, u64, String)> = Vec::new();
@@ -524,8 +544,8 @@ impl KvFamily {
             committed: Arc::new(committed),
             ledger,
             erasing: dashmap::DashMap::new(),
-            maintenance: Arc::new(tokio::sync::RwLock::new(())),
-            declaring: Arc::new(tokio::sync::RwLock::new(())),
+            maintenance,
+            declaring,
         }))
     }
 
@@ -905,10 +925,19 @@ impl KvFile {
         }))
     }
 
-    /// Whether this file is holding unstored records for `txn`.
+    /// Whether this file has written for `txn` and its commit has yet to land:
+    /// records still pending, or taken by a flush whose put is in flight.
+    ///
+    /// Pending alone missed the second: a background flush takes the queue
+    /// before its put, so a commit landing meanwhile skipped this file and
+    /// declared the transaction while its records here were in neither the
+    /// store nor the queue — torn after a crash in that window, or for good if
+    /// the put failed and the records only went back on the queue. A file
+    /// counted here is flushed by the commit, which waits on the flush lock
+    /// for the put in flight and writes the records again if it failed.
     fn holds(&self, txn: u64) -> bool {
         let state = self.state.read();
-        state.pending.iter().any(|r| r.txn == txn)
+        state.open_txns.contains_key(&txn) || state.pending.iter().any(|r| r.txn == txn)
     }
 
     // ---- reads -------------------------------------------------------------

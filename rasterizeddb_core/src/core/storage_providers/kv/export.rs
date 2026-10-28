@@ -15,16 +15,25 @@
 //!    than its listing, or none at all.
 //! 2. **Untransacted writes flushed**: schema headers and the id sequence are
 //!    in the store only once the background service has written them.
-//! 3. **Commits held** only while the reader lists and fetches the deltas. A
-//!    commit is several objects, the declaring one last; a listing that passed
-//!    the first before it was stored and then found the declaration would keep
-//!    a transaction with half its bytes. Writers go on appending meanwhile —
-//!    an undeclared batch is inert, and per file a listing always sees a
-//!    prefix of the sequence, since sequences are allocated in store order.
+//! 3. **Commits held** only while the reader lists the objects. A commit is
+//!    several objects, the declaring one last; a listing that passed the
+//!    first before it was stored and then found the declaration would keep a
+//!    transaction with half its bytes. Writers go on appending meanwhile — an
+//!    undeclared batch is inert, and per file a listing always sees a prefix
+//!    of the sequence, since sequences are allocated in store order. What was
+//!    listed is then fetched with commits running again: a listed object
+//!    never changes while maintenance is paused.
+//!
+//! The two gates live here, one pair per store and prefix ([`gates`]), and
+//! every family serving that prefix takes them: one opened after a copy began
+//! is paused as surely as one open before it.
 //!
 //! Commits wait for the listing alone, not for the copy; a statement that
-//! truncates or a compaction waits for the copy.
+//! truncates or a compaction waits for the copy. Meanwhile writes are held in
+//! the live overlay, which only compaction empties, so a long copy under a
+//! heavy write load costs memory for its length.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
@@ -58,6 +67,16 @@ fn live_families(identity: &str) -> Vec<Arc<KvFamily>> {
         .collect()
 }
 
+type Gate = Arc<tokio::sync::RwLock<()>>;
+
+/// The `(maintenance, declaring)` gates of the families over each prefix.
+static GATES: LazyLock<Mutex<HashMap<String, (Gate, Gate)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The gates every family over `identity` takes: see the module comment.
+pub(super) fn gates(identity: &str) -> (Gate, Gate) {
+    GATES.lock().entry(identity.to_string()).or_default().clone()
+}
+
 /// One file the copy wrote.
 #[derive(Debug, Clone)]
 pub struct ExportedFile {
@@ -72,31 +91,24 @@ const COPY_CACHE_BYTES: u64 = 64 << 20;
 
 /// Copies every file of the family in `store` under `config.root` that `keep`
 /// accepts into `dir`, as one crash-consistent cut. See the module comment.
+/// Refused before a byte is written when `dir`'s disk cannot hold the copy:
+/// it is the database's own disk, and the copy is whole tables.
 pub async fn export(
     store: Arc<dyn KvStore>,
     mut config: KvConfig,
     keep: impl Fn(&str) -> bool,
     dir: &Path,
 ) -> io::Result<Vec<ExportedFile>> {
-    let live = live_families(&identity_of(store.as_ref(), &config.root));
-    let mut paused = Vec::with_capacity(live.len());
-    for family in &live {
-        paused.push(family.pause_maintenance().await);
-    }
-    for family in &live {
+    let identity = identity_of(store.as_ref(), &config.root);
+    let (maintenance, declaring) = gates(&identity);
+    let paused = maintenance.write_owned().await;
+    for family in live_families(&identity) {
         family.flush_all().await?;
     }
     config.cache_bytes = config.cache_bytes.min(COPY_CACHE_BYTES);
-    let reader = {
-        let mut held = Vec::with_capacity(live.len());
-        for family in &live {
-            held.push(family.hold_commits().await);
-        }
-        KvFamily::open_snapshot(store, config).await?
-    };
+    let reader = KvFamily::open_snapshot(store, config, Some(declaring.write_owned().await)).await?;
 
-    std::fs::create_dir_all(dir)?;
-    let mut out = Vec::new();
+    let mut files = Vec::new();
     for name in reader.file_names().into_iter().filter(|name| keep(name)) {
         // A store's names are a table's file names. One that could climb out
         // of `dir` is not, and is not copied.
@@ -105,6 +117,21 @@ pub async fn export(
         }
         let file = KvStorageProvider::open(reader.clone(), &name).await?;
         let len = file.get_len().await;
+        files.push((name, file, len));
+    }
+    tokio::fs::create_dir_all(dir).await?;
+    let needed: u64 = files.iter().map(|(_, _, len)| len).sum();
+    if let Some(free) = crate::core::storage::available_bytes(&dir.to_string_lossy())
+        && needed.saturating_add(needed / 10) > free
+    {
+        return Err(io::Error::other(format!(
+            "copying {needed} bytes needs more room than {} has ({free} bytes free)",
+            dir.display()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(files.len());
+    for (name, file, len) in files {
         let path = dir.join(&name);
         copy_out(&file, len, &path).await?;
         out.push(ExportedFile { name, path, bytes: len });
@@ -114,17 +141,18 @@ pub async fn export(
 }
 
 async fn copy_out(file: &KvStorageProvider, len: u64, path: &Path) -> io::Result<()> {
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
     const CHUNK: usize = 1 << 20;
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut out = tokio::io::BufWriter::new(tokio::fs::File::create(path).await?);
     let mut buffer = vec![0u8; CHUNK.min(len as usize).max(1)];
     let mut position = 0u64;
     while position < len {
         let take = ((len - position) as usize).min(buffer.len());
         let mut cursor = position;
         file.read_data_into_buffer(&mut cursor, &mut buffer[..take]).await?;
-        out.write_all(&buffer[..take])?;
+        out.write_all(&buffer[..take]).await?;
         position += take as u64;
     }
-    out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    out.flush().await?;
+    out.into_inner().sync_all().await
 }

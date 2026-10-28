@@ -87,7 +87,7 @@ fn placements(database: &Path) -> Vec<(String, String)> {
 /// records why it could not. `now` stamps the copy.
 pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCopy {
     let dir = location.join(COLD_DIR);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
     let mut copy = ColdCopy {
         files: Vec::new(),
         tables: Vec::new(),
@@ -112,12 +112,15 @@ pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCop
         }
         for (store, tables) in on_store {
             let target = dir.join(&database);
+            // Stamped as the copy starts: its cut is taken right after, so
+            // the time a restore names is never later than what it holds.
+            let started = now();
             match copy_store(&database_dir, &store, &tables, &target).await {
                 Ok(files) => {
-                    copy.copied_at.get_or_insert_with(&now);
+                    copy.copied_at = Some(copy.copied_at.map_or(started, |at| at.min(started)));
                     for table in &tables {
                         let mine: Vec<&(String, PathBuf, u64)> =
-                            files.iter().filter(|(file, _, _)| crate::core::database::table_owns_file(table, file)).collect();
+                            files.iter().filter(|(file, _, _)| owner(&tables, file) == Some(table)).collect();
                         if mine.is_empty() {
                             copy.uncovered.push(UncoveredTable {
                                 database: database.clone(),
@@ -154,6 +157,15 @@ pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCop
     copy
 }
 
+/// The table of `tables` that owns `file`: the longest one that does, so `a`
+/// never takes `a_b`'s files.
+fn owner<'t>(tables: &'t [String], file: &str) -> Option<&'t String> {
+    tables
+        .iter()
+        .filter(|table| crate::core::database::table_owns_file(table, file))
+        .max_by_key(|table| table.len())
+}
+
 #[cfg(feature = "kv_storage")]
 async fn copy_store(
     database_dir: &Path,
@@ -163,7 +175,7 @@ async fn copy_store(
 ) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
     let stores = crate::core::storage::kv_registry::KvRegistry::open(&database_dir.to_string_lossy());
     let (client, config) = stores.connect(store)?;
-    let owned = |file: &str| tables.iter().any(|table| crate::core::database::table_owns_file(table, file));
+    let owned = |file: &str| owner(tables, file).is_some();
     let files = crate::core::storage_providers::kv::export::export(client, config, owned, target).await?;
     Ok(files.into_iter().map(|f| (f.name, f.path, f.bytes)).collect())
 }
@@ -178,4 +190,21 @@ async fn copy_store(
     Err(std::io::Error::other(format!(
         "this build has no key/value storage, so store '{store}' cannot be read"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owner;
+
+    #[test]
+    fn a_file_belongs_to_the_longest_table_that_owns_it() {
+        let tables = vec!["a".to_string(), "a_b".to_string()];
+        assert_eq!(owner(&tables, "a_b_pointers.db").map(String::as_str), Some("a_b"));
+        assert_eq!(owner(&tables, "a_pointers.db").map(String::as_str), Some("a"));
+        assert_eq!(owner(&tables, "a_schema_FK.db").map(String::as_str), Some("a"));
+        // `a_schema_x` is a table name, not a sidecar of `a`'s.
+        assert_eq!(owner(&["a".to_string()], "a_schema_x.db"), None);
+        assert_eq!(owner(&["a".to_string()], "a_schema_x_pointers.db"), None);
+        assert_eq!(owner(&tables, "ab.db"), None);
+    }
 }

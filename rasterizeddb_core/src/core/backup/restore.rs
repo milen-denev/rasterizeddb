@@ -486,7 +486,9 @@ async fn build(
     }
     if !snapshot.uncovered.is_empty() {
         warn!(
-            "Snapshot {} does not contain {} table(s), which will read as missing: {}",
+            "Snapshot {} does not contain {} table(s), and a restore does not bring them back — \
+             a copy elsewhere lacks them, and in place one on a store keeps its placement and reads \
+             whatever the store holds now: {}",
             snapshot.id,
             snapshot.uncovered.len(),
             snapshot

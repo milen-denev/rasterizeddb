@@ -305,11 +305,17 @@ pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
 ];
 
 /// Whether `file` is one of table `table`'s: a name [`table_file_names`]
-/// gives, or a schema sidecar, which is created when first used and so is not
-/// always on that list.
+/// gives, or a schema sidecar — `_schema_` and an upper-case tag — which is
+/// created when first used and so is not always on that list. Lower case is
+/// left out: `a_schema_x` is a table name of its own, and `a` claiming its
+/// files would copy them as `a`'s.
 pub(crate) fn table_owns_file(table: &str, file: &str) -> bool {
     file.strip_prefix(table).is_some_and(|rest| {
-        RENAMED_SUFFIXES.contains(&rest) || (rest.starts_with("_schema_") && rest.ends_with(".db"))
+        RENAMED_SUFFIXES.contains(&rest)
+            || rest
+                .strip_prefix("_schema_")
+                .and_then(|tag| tag.strip_suffix(".db"))
+                .is_some_and(|tag| !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
     })
 }
 

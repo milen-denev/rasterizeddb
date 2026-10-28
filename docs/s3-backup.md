@@ -699,7 +699,17 @@ restore came back without it. Now each snapshot copies it
   TABLE` puts it back on a store once the copy is verified.
 * **As of the copy.** A point-in-time target does not reach these tables: there
   is no log to replay. The restore says so and names the time. Snapshot more
-  often to narrow the gap.
+  often to narrow the gap. A table that is in a directory is replayed to the
+  target, so a cold table and one that is not can disagree in the restore —
+  rows its foreign keys point at, or, with JSON shredding on, the
+  `__json_*` shadow tables of a cold table's JSON columns, which are in the
+  directory.
+* **What waits.** Compaction, truncation, scratch adoption and a dropped
+  file's sweep on the store wait for the whole copy; commits only for the
+  listing. Writes go on, held in memory until compaction runs again, so a long
+  copy under a heavy write load costs memory for its length. The copy is
+  staged on the database's own disk first and refused, as uncovered, when that
+  disk has not the room.
 * **What still cannot be copied** — an in-memory table, a store this server
   cannot reach — is recorded on the snapshot (`SnapshotEntry.uncovered`). Such a
   snapshot is still published, since it protects every other table, but

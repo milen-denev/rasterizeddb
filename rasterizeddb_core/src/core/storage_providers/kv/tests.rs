@@ -3007,3 +3007,108 @@ async fn an_export_reads_a_store_no_family_has_open() {
     let only = super::export::export(store.clone(), tiny_config(), |name| name != "t.db", dir.path()).await.unwrap();
     assert!(only.is_empty());
 }
+
+/// Holds every delta put to `a.db` once armed, until released.
+struct HeldPutStore {
+    inner: MemoryKvStore,
+    armed: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Semaphore,
+}
+
+impl KvStore for HeldPutStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get(key)
+    }
+    fn get_range<'a>(&'a self, key: &'a str, offset: u64, len: usize) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get_range(key, offset, len)
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            if self.armed.load(Ordering::Acquire) && key.contains("/a.db/d/") {
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.inner.put(key, body).await
+        })
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn concurrency(&self) -> usize {
+        4
+    }
+    fn describe(&self) -> String {
+        "gated".to_string()
+    }
+}
+
+/// A commit landing while another file's flush is putting the transaction's
+/// records waits for that put. It used to see nothing pending there, declare
+/// the transaction on its own file, and return: the declaration was stored
+/// while the other half was in flight — torn after a crash in that window,
+/// and torn in any copy listed then.
+#[tokio::test]
+async fn a_commit_waits_for_a_flush_already_putting_its_records() {
+    let gated = Arc::new(HeldPutStore {
+        inner: MemoryKvStore::new(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let store: Arc<dyn KvStore> = gated.clone();
+    let family = open_family(store.clone()).await;
+    let a = Arc::new(open(&family, "a.db").await);
+    let b = Arc::new(open(&family, "b.db").await);
+
+    let txn = a.begin_txn();
+    a.append_data_txn(txn, b"row").await;
+    b.append_data_txn(txn, b"ptr").await;
+
+    // What the background service does: puts what is pending.
+    gated.armed.store(true, Ordering::Release);
+    let flush = tokio::spawn({
+        let a = a.clone();
+        async move { a.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let commit = tokio::spawn({
+        let b = b.clone();
+        async move { b.commit_durable(txn).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!commit.is_finished(), "the commit declared while the other half was being put");
+
+    gated.armed.store(false, Ordering::Release);
+    gated.release.add_permits(16);
+    flush.await.unwrap().unwrap();
+    commit.await.unwrap().unwrap();
+
+    drop((a, b));
+    let family = open_family(store).await;
+    assert_eq!(read_all(&open(&family, "a.db").await).await, b"row".to_vec());
+    assert_eq!(read_all(&open(&family, "b.db").await).await, b"ptr".to_vec());
+}
+
+/// The gates belong to the prefix, not to a family: one opened after a copy
+/// paused the prefix is paused too, and compacts nothing under the reader.
+#[tokio::test]
+async fn a_family_opened_during_a_pause_is_paused_too() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let first = open_family(store.clone()).await;
+    let paused = first.pause_maintenance().await;
+
+    let late = open_family(store.clone()).await;
+    let io = Arc::new(open(&late, "t.db").await);
+    let txn = io.begin_txn();
+    io.append_data_txn(txn, &vec![b'z'; 20_000]).await;
+    io.commit_durable(txn).await.unwrap();
+    let compaction = tokio::spawn({
+        let io = io.clone();
+        async move { io.compact_now().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!compaction.is_finished(), "a family opened later compacted during the pause");
+    drop(paused);
+    compaction.await.unwrap().unwrap();
+}
