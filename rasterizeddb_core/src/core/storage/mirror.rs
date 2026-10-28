@@ -514,6 +514,24 @@ async fn write_backup(backup: &LocalStorageProvider, position: u64, buffer: &[u8
     }
 }
 
+/// Commits a copy's transaction on `backup`; whether it landed, with every
+/// write under it.
+async fn commit_backup(backup: &LocalStorageProvider, token: u64, ranges: usize) -> bool {
+    match backup.commit_durable(token).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                "could not copy {} committed ranges to the backup copy {} in {}: {}; it is rebuilt at the next open",
+                ranges,
+                backup.get_name(),
+                backup.get_location().unwrap_or_default(),
+                e
+            );
+            false
+        }
+    }
+}
+
 /// [`write_backup`] for a write no mark covers yet: a failure leaves one,
 /// stuck, so the next open rebuilds the copy.
 async fn write_backup_or_mark(backup: &LocalStorageProvider, name: &str, position: u64, buffer: &[u8]) {
@@ -704,7 +722,12 @@ mod pending {
         /// backup; whether every read and write succeeded.
         pub(super) async fn copy(&self) -> bool {
             let _copying = super::copy_lock(&self.primary).await;
-            let mut copied = true;
+            // One transaction per backup for the whole copy, committed once:
+            // a commit per range cost a backup log commit and sync each, up
+            // to `MAX_RANGES` of them for one scattered DELETE.
+            // A provider without a log writes at once under transaction 0,
+            // and its commit then takes any failure recorded under it.
+            let txns: Vec<u64> = self.backups.iter().map(|b| b.begin_txn()).collect();
             let mut buffer = Vec::new();
             for &(start, end) in &self.ranges {
                 let mut at = start;
@@ -719,15 +742,22 @@ mod pending {
                             self.primary.get_name(),
                             e
                         );
+                        for (backup, txn) in self.backups.iter().zip(&txns) {
+                            backup.abort_txn(*txn).await;
+                        }
                         return false;
                     }
                     #[cfg(test)]
                     super::test_hooks::park_after_read(&self.primary).await;
-                    for backup in self.backups.iter() {
-                        copied &= super::write_backup(backup, at, &buffer).await;
+                    for (backup, txn) in self.backups.iter().zip(&txns) {
+                        backup.write_data_txn(*txn, at, &buffer).await;
                     }
                     at += take as u64;
                 }
+            }
+            let mut copied = true;
+            for (backup, txn) in self.backups.iter().zip(&txns) {
+                copied &= super::commit_backup(backup, *txn, self.ranges.len()).await;
             }
             copied
         }

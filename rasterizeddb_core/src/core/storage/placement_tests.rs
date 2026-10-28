@@ -1089,6 +1089,34 @@ async fn a_failed_immediate_backup_write_leaves_a_mark_that_the_next_attach_hono
     assert!(marks_in(backup.path()).is_empty());
 }
 
+/// A scattered DELETE's committed in-place writes reach each backup as one
+/// transaction and one commit, not one per range: each range was its own
+/// backup commit and sync, up to 4,096 of them for one statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_commits_each_backup_once() {
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let db = mirrored(root.path(), backup.path()).await;
+    exec(&db, "CREATE TABLE ms (id BIGINT, label TEXT)").await.unwrap();
+    let values: Vec<String> = (0..2000).map(|i| format!("({i}, 'label-{i:04}')")).collect();
+    exec(&db, &format!("INSERT INTO ms (id, label) VALUES {}", values.join(", "))).await.unwrap();
+    db.sync_durable().unwrap();
+
+    let watch = crate::core::sync_audit::watch(backup.path());
+    exec(&db, "DELETE FROM ms WHERE id % 2 = 0").await.unwrap();
+    let syncs: usize = watch.counts().values().sum();
+    drop(watch);
+    // Measured on tmpfs: 1002 syncs before (one commit per deleted row's
+    // pointer range, plus the statement's own), 3 after.
+    assert!(syncs <= 8, "{syncs} backup syncs for one statement");
+
+    close(db, root.path(), backup.path()).await;
+    let names = table_files(root.path(), "ms");
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_same(root.path(), backup.path(), &names, "after the DELETE");
+    assert!(marks_in(backup.path()).is_empty());
+}
+
 /// `write_data_seek` wrote each backup with the backup's own
 /// `write_data_seek`, whose failure nothing saw: the backup kept older
 /// bytes at the same length and no mark said so. It goes through
