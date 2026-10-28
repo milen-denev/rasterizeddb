@@ -63,6 +63,19 @@ impl Database {
             if let Some(why) = self.parent_refusal(fk, &ct.table_name, &own_side) {
                 return Some(why);
             }
+            // The two columns' types (42804), against the parent as it is
+            // now or as this statement declares it.
+            let child_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.column)).map(|c| &c.data_type);
+            let parent_type = if fk.parent_table.eq_ignore_ascii_case(&ct.table_name) {
+                ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.parent_column)).map(|c| c.data_type.clone())
+            } else {
+                self.column_type(&fk.parent_table, &fk.parent_column)
+            };
+            if let (Some(child), Some(parent)) = (child_type, parent_type)
+                && let Some(why) = crate::core::rql::foreign_key::type_refusal(fk, child, &parent)
+            {
+                return Some(why);
+            }
         }
         // Keys another table declared on this name while no table had it: a
         // partitioned table must be a parent they can be checked against by
@@ -76,6 +89,12 @@ impl Database {
             }
             if let Some(why) = referenced_key_refusal(&fk, &own_side()) {
                 return Some(format!("table \"{child}\" has foreign key \"{}\" naming \"{}\": {why}", fk.name, ct.table_name));
+            }
+            let parent_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.parent_column)).map(|c| &c.data_type);
+            if let (Some(child_type), Some(parent)) = (self.column_type(&child, &fk.column), parent_type)
+                && let Some(why) = crate::core::rql::foreign_key::type_refusal(&fk, &child_type, parent)
+            {
+                return Some(why);
             }
         }
         None
@@ -96,6 +115,16 @@ impl Database {
             return None;
         }
         self.existing_parent_refusal(fk)
+    }
+
+    /// The declared type of `table`'s live column `column`, if both exist.
+    pub(crate) fn column_type(&self, table: &str, column: &str) -> Option<crate::core::db_type::DbType> {
+        let view = self.schema_view(table)?;
+        view.schema()
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+            .map(|f| f.db_type.clone())
     }
 
     /// Why `fk` cannot reference its parent, a table other than the one

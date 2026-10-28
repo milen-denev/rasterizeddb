@@ -415,6 +415,9 @@ the same tests, but the one marked; and these):
 | validation reads a NULL as its zero bytes | the same | the same |
 | the last chunk never probed | the same | the same |
 | an inline `CONSTRAINT n` ignored | `lexer_ct` | `lexer_ct` tests |
+| every pair of key types compatible | `foreign_key::compatible_key_types` | `partition_fk::a_key_between_incompatible_types_is_42804` |
+| ADD skips the type check | `add_foreign_key` | the same |
+| 42804 not mapped | `pgwire::sqlstate_for` | the same |
 | the table dropped before its dependent keys | `execute_drop_table` | `pddl_crash_tests::a_cascading_drop_…` (images at the log's syncs hold a key naming a dropped table) |
 
 Not pinned: the child-side chunk of 512 for a child not partitioned by its
@@ -479,6 +482,15 @@ cascade; `fk_reverse` reached only through the slot primitives):
   this box (load 15 to 33) was 1.5 to 3.6 s before, 1.3 to 2.7 s after,
   noise either way.
 - A column's own `CONSTRAINT n REFERENCES …` is named `n`.
+- **A key between incompatible types is 42804**, PostgreSQL's "foreign key
+  constraint … cannot be implemented: key columns … are of incompatible
+  types", at CREATE TABLE and ADD CONSTRAINT, on both table kinds
+  (`foreign_key::compatible_key_types`): integers of any width with each
+  other, the float widths with each other, `TEXT`/`VARCHAR`/`CHAR` with each
+  other, `NUMERIC` with `NUMERIC`, anything else only with its own type. A
+  `TEXT` column referencing an `INT` key used to be accepted. Pinned by
+  `partition_fk::a_key_between_incompatible_types_is_42804` on the four
+  configurations; no existing test declared a cross-family key.
 - The release note for databases written by older binaries is in
   `docs/postgres-compatibility.md` ("Release note: foreign keys from older
   binaries").
@@ -494,6 +506,8 @@ cascade; `fk_reverse` reached only through the slot primitives):
   name another constraint of the table has is 42710.
 - `CREATE TABLE` refuses a key whose referencing column, or whose existing
   parent's referenced column, is not there (42703).
+- A key between columns of incompatible types is refused with 42804, at
+  CREATE and ADD (round 2).
 - `DROP TABLE` of a referenced table is refused (2BP01) unless `CASCADE`,
   which drops the dependent keys.
 - An unnamed key is `<table>_<column>_fkey` (it was `fk_<column>_<parent>`;

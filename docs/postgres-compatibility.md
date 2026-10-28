@@ -247,6 +247,9 @@ as built") foreign keys also run to and from hash-partitioned tables, and:
   the report, rather than stopping at its last step.
 - `DROP TABLE` of a table another table's key references is refused (2BP01)
   unless `CASCADE`, which drops those keys and keeps their tables.
+- A key between columns of incompatible types is refused with 42804, as in
+  PostgreSQL: integers of any width reference each other, text types each
+  other, `NUMERIC` only `NUMERIC`, any other type only itself.
 - Names are kept as written (UTF-8, spaces, quotes), and an unnamed key is
   PostgreSQL's `<table>_<column>_fkey`, numbered on a collision; a column's own
   `CONSTRAINT n REFERENCES …` is named `n`.

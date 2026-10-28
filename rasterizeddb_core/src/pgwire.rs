@@ -6844,6 +6844,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("referenced in foreign key constraint does not exist") {
         return "42703";
     }
+    // `datatype_mismatch`: a foreign key between columns of incompatible
+    // types, in the engine's words (never a client's quoted text).
+    if has("foreign key constraint") && has("cannot be implemented") && has("are of incompatible types") {
+        return "42804";
+    }
     // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
     // foreign keys reference, without CASCADE; DROP COLUMN of a referenced
     // column. Early: the message quotes table and constraint names.

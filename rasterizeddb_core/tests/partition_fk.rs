@@ -547,8 +547,15 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
             );
             q.on(i, &child).unwrap_or_else(|e| panic!("{child}: {e}"));
         }
+        // A NUMERIC column cannot reference a BIGINT key (42804, as in
+        // PostgreSQL); an INT one can.
         let child = format!(
             "CREATE TABLE {{c}}n (cid BIGINT NOT NULL PRIMARY KEY, k NUMERIC(10, 0) REFERENCES {{p}}i (k)){}",
+            partitioned("cid", *part_child)
+        );
+        assert_eq!(q.on(i, &child).expect_err("NUMERIC onto BIGINT").code, "42804", "{child}");
+        let child = format!(
+            "CREATE TABLE {{c}}n (cid BIGINT NOT NULL PRIMARY KEY, k INT REFERENCES {{p}}i (k)){}",
             partitioned("cid", *part_child)
         );
         q.on(i, &child).unwrap_or_else(|e| panic!("{child}: {e}"));
@@ -588,7 +595,7 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
     {
         q.all(&format!("INSERT INTO {{c}}u (cid, k) VALUES ({n}, {value})"));
     }
-    for (n, value) in ["-7", "-7.0", "-7::numeric", "CAST(-6 AS NUMERIC)", "7.4", "-999"].iter().enumerate() {
+    for (n, value) in ["-7", "-7::int", "CAST(-6 AS INT)", "'-5'", "-999"].iter().enumerate() {
         q.all(&format!("INSERT INTO {{c}}n (cid, k) VALUES ({n}, {value})"));
     }
     // Prepared, as an ORM binds `$n` (text parameters).
@@ -620,4 +627,67 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
     q.all("INSERT INTO {c}i (cid, k) VALUES (200, -6::bigint)");
     q.all("INSERT INTO {c}i (cid, k) VALUES (201, -1::bigint)");
     q.same_rows_of("{c}i");
+}
+
+/// A key between columns of incompatible types is refused with 42804, as
+/// PostgreSQL refuses it ("foreign key constraint … cannot be implemented"),
+/// at CREATE TABLE and at ADD CONSTRAINT, on every configuration: integers
+/// of any width reference each other, text types each other, a UUID a UUID;
+/// across those families nothing. Nothing is written.
+#[test]
+fn a_key_between_incompatible_types_is_42804() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Quad::start(dir.path());
+    for (i, (_, part_parent, _)) in CONFIGS.iter().enumerate() {
+        for (suffix, column) in [("i", "BIGINT"), ("t", "TEXT"), ("u", "UUID")] {
+            let parent = format!(
+                "CREATE TABLE {{p}}{suffix} (k {column} NOT NULL PRIMARY KEY){}",
+                partitioned("k", *part_parent)
+            );
+            q.on(i, &parent).unwrap_or_else(|e| panic!("{parent}: {e}"));
+        }
+    }
+    for (child_type, parent, ok) in [
+        ("TEXT", "i", false),
+        ("UUID", "i", false),
+        ("NUMERIC(12, 0)", "i", false),
+        ("DOUBLE PRECISION", "i", false),
+        ("INT", "t", false),
+        ("UUID", "t", false),
+        ("TEXT", "u", false),
+        ("BIGINT", "u", false),
+        ("SMALLINT", "i", true),
+        ("INT", "i", true),
+        ("VARCHAR(20)", "t", true),
+        ("UUID", "u", true),
+    ] {
+        for (i, (_, _, part_child)) in CONFIGS.iter().enumerate() {
+            let create = format!(
+                "CREATE TABLE {{c}}x (cid BIGINT NOT NULL PRIMARY KEY, k {child_type} REFERENCES {{p}}{parent} (k)){}",
+                partitioned("cid", *part_child)
+            );
+            match (q.on(i, &create), ok) {
+                (Ok(_), true) => {}
+                (Err(e), false) => assert_eq!(e.code, "42804", "{create}: {e}"),
+                (other, _) => panic!("{create}: {other:?}"),
+            }
+            if ok {
+                q.on(i, "DROP TABLE {c}x").unwrap();
+            }
+            let create = format!(
+                "CREATE TABLE {{c}}x (cid BIGINT NOT NULL PRIMARY KEY, k {child_type}){}",
+                partitioned("cid", *part_child)
+            );
+            q.on(i, &create).unwrap_or_else(|e| panic!("{create}: {e}"));
+        }
+        let add = format!("ALTER TABLE {{c}}x ADD FOREIGN KEY (k) REFERENCES {{p}}{parent} (k)");
+        if ok {
+            q.ok(&add);
+        } else {
+            q.err(&add, "42804");
+            // Nothing was added: the column takes any value.
+            q.ok("SELECT count(*) FROM {c}x");
+        }
+        q.ok("DROP TABLE {c}x");
+    }
 }

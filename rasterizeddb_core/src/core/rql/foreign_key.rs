@@ -519,6 +519,45 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
     None
 }
 
+/// Whether a referencing column of type `child` can reference a column of
+/// type `parent`, by PostgreSQL's rule as far as this engine's types carry it
+/// (a key needs an equality between the two in the referenced key's
+/// operator family): integers of any width with each other, the two float
+/// widths with each other, text with text (`TEXT`, `VARCHAR`, `CHAR`),
+/// `NUMERIC` with `NUMERIC`; any other type only with itself. Across those
+/// families PostgreSQL refuses the key (42804), and here a check would
+/// compare a literal of one type with a column of another.
+pub fn compatible_key_types(child: &crate::core::db_type::DbType, parent: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType::*;
+    let family = |t: &crate::core::db_type::DbType| match t {
+        I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 => 1,
+        F32 | F64 => 2,
+        STRING | CHAR => 3,
+        DECIMAL => 4,
+        _ => 0,
+    };
+    match (family(child), family(parent)) {
+        (0, 0) => child == parent,
+        (a, b) => a == b,
+    }
+}
+
+/// PostgreSQL's refusal (42804) of `fk` when its column's type `child` cannot
+/// reference the parent column's type `parent` ([`compatible_key_types`]).
+pub fn type_refusal(
+    fk: &ForeignKey,
+    child: &crate::core::db_type::DbType,
+    parent: &crate::core::db_type::DbType,
+) -> Option<String> {
+    (!compatible_key_types(child, parent)).then(|| {
+        format!(
+            "foreign key constraint \"{}\" cannot be implemented: key columns \"{}\" and \"{}\" are of \
+             incompatible types: {:?} and {:?}",
+            fk.name, fk.column, fk.parent_column, child, parent
+        )
+    })
+}
+
 /// Reads the action after `keyword`, defaulting to `NO ACTION` as SQL does.
 fn parse_action(actions: &str, keyword: &str) -> Result<ReferentialAction, String> {
     let upper = actions.to_ascii_uppercase();

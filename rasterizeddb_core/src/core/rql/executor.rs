@@ -8031,6 +8031,19 @@ async fn add_foreign_key(
     if let Some(why) = refusal {
         return ddl_error(&why);
     }
+    // The two columns' types (42804): the child's as it is, the parent's as
+    // it is (this table's own, for a self-reference).
+    let child_type = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).map(|f| f.db_type.clone());
+    let parent_type = if fk.parent_table.eq_ignore_ascii_case(table_name) {
+        schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.parent_column)).map(|f| f.db_type.clone())
+    } else {
+        database.column_type(&fk.parent_table, &fk.parent_column)
+    };
+    if let (Some(child), Some(parent)) = (child_type, parent_type)
+        && let Some(why) = foreign_key::type_refusal(&fk, &child, &parent)
+    {
+        return ddl_error(&why);
+    }
     if not_valid {
         info!("ALTER TABLE {table_name}: foreign key {} added NOT VALID; its existing rows are not checked", fk.name);
     } else {
