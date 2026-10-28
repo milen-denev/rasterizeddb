@@ -3211,3 +3211,44 @@ async fn dropping_the_declaring_file_keeps_the_other_files_half_committed() {
     let restarted = open_family(store).await;
     assert_eq!(read_all(&open(&restarted, "b.db").await).await, b"kept".to_vec());
 }
+
+/// DROP TABLE drops a table's files one after the other, so the first other
+/// holder of a transaction is often the table's own other file, still being
+/// swept. The declaration goes to a holder that stays — here `y.db` — not to
+/// none.
+#[tokio::test]
+async fn a_table_dropped_file_by_file_still_keeps_another_tables_half() {
+    let held = HeldPutStore::holding("/x.db/d/");
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let x_rows = Arc::new(open(&family, "x.db").await);
+    let x_pointers = open(&family, "x_pointers.db").await;
+    let y = open(&family, "y.db").await;
+    let txn = x_pointers.begin_txn();
+    // Stored first, so the ledger names it first among the holders.
+    x_rows.append_data_txn(txn, b"x row").await;
+    x_rows.flush().await.unwrap();
+    y.append_data_txn(txn, b"kept").await;
+    x_pointers.append_data_txn(txn, b"x pointer").await;
+    x_pointers.commit_durable(txn).await.unwrap();
+
+    // A put of x.db's in flight keeps its sweep going while x_pointers' runs.
+    x_rows.append_data(b"header", false).await;
+    held.armed.store(true, Ordering::Release);
+    let flush = tokio::spawn({
+        let x_rows = x_rows.clone();
+        async move { x_rows.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    x_rows.drop_io();
+    x_pointers.drop_io();
+    drop(open(&family, "x_pointers.db").await);
+    held.armed.store(false, Ordering::Release);
+    held.release.add_permits(16);
+    flush.await.unwrap().unwrap();
+    drop(open(&family, "x.db").await);
+    drop(y);
+
+    let restarted = open_family(store).await;
+    assert_eq!(read_all(&open(&restarted, "y.db").await).await, b"kept".to_vec());
+}

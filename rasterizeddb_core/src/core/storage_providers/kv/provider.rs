@@ -219,10 +219,16 @@ impl Ledger {
         }
     }
 
-    /// A file other than `except` holding records of `txn`, if any.
-    fn holder(&self, txn: u64, except: &str) -> Option<Arc<str>> {
+    /// The files other than `except` holding records of `txn`, each once.
+    fn holders_of(&self, txn: u64, except: &str) -> Vec<Arc<str>> {
         let holders = self.holders.lock();
-        holders.get(&txn)?.iter().find(|(n, _)| &**n != except).map(|(n, _)| n.clone())
+        let mut out: Vec<Arc<str>> = Vec::new();
+        for (name, _) in holders.get(&txn).into_iter().flatten() {
+            if &**name != except && !out.iter().any(|n| n == name) {
+                out.push(name.clone());
+            }
+        }
+        out
     }
 
     /// Of `declared`, the transactions some delta other than the ones
@@ -712,6 +718,11 @@ impl KvFamily {
     /// declaration with the dropped file lost the other half on the next
     /// restart: a transaction that wrote two tables and committed on the one
     /// dropped took the other's rows with it. See [`Ledger`].
+    ///
+    /// A holder being dropped too — a table's other file, dropped beside it —
+    /// is passed over for the next; one batch per holder, written under its
+    /// flush lock as `adopt` writes its own, so no other flush can take the
+    /// declarations and lose them with a failed put.
     async fn carry_declarations(self: &Arc<Self>, file: &KvFile) -> io::Result<()> {
         let declared: Vec<u64> = file
             .state
@@ -721,20 +732,52 @@ impl KvFamily {
             .flat_map(|d| d.declared.iter().copied())
             .collect();
         let name = &*file.ledger_name;
-        for txn in self.ledger.still_needed(declared, |n, _| n == name) {
-            let Some(holder) = self.ledger.holder(txn, name) else {
-                continue;
-            };
-            // A holder being dropped too takes its records with it; opening it
-            // would wait out its sweep and declare into a new file of that name.
-            let dropping = self.erasing.contains_key(&*holder)
-                || self.files.get(&*holder).is_some_and(|f| f.dropped.load(Ordering::Acquire));
-            if dropping {
-                continue;
+        let mut owed: Vec<(u64, Vec<Arc<str>>)> = self
+            .ledger
+            .still_needed(declared, |n, _| n == name)
+            .into_iter()
+            .map(|txn| (txn, self.ledger.holders_of(txn, name)))
+            .collect();
+        while !owed.is_empty() {
+            // Each transaction to the first of its holders still standing.
+            let mut by_holder: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
+            owed.retain_mut(|(txn, holders)| {
+                while let Some(holder) = holders.first() {
+                    let dropping = self.erasing.contains_key(&**holder)
+                        || self.files.get(&**holder).is_some_and(|f| f.dropped.load(Ordering::Acquire));
+                    if !dropping {
+                        by_holder.entry(holder.clone()).or_default().push(*txn);
+                        return true;
+                    }
+                    holders.remove(0);
+                }
+                // Every holder is going too: its records go with them.
+                false
+            });
+            for (holder, txns) in by_holder {
+                let target = self.open_file(&holder).await?;
+                let landed = {
+                    let _serialised = target.flush.lock().await;
+                    if target.dropped.load(Ordering::Acquire) {
+                        false
+                    } else {
+                        target.state.write().committing.extend(txns.iter().copied());
+                        target.flush_locked(None).await?;
+                        true
+                    }
+                };
+                // Landed: done. Dropped meanwhile: on to that holder's next.
+                owed.retain_mut(|(txn, holders)| {
+                    if !txns.contains(txn) {
+                        return true;
+                    }
+                    if landed {
+                        return false;
+                    }
+                    holders.retain(|h| *h != holder);
+                    true
+                });
             }
-            let target = self.open_file(&holder).await?;
-            target.state.write().committing.push(txn);
-            target.flush(None).await?;
         }
         Ok(())
     }
@@ -930,8 +973,14 @@ impl KvFile {
                 continue;
             }
             state.deltas.push(batch.seq);
-            // Already registered in the ledger by `KvFamily::open`.
-            state.delta_txns.insert(batch.seq, DeltaTxns::of(batch));
+            // Already registered in the ledger by `KvFamily::open`. What it
+            // declares counts only if recovery kept it committed: a declaring
+            // put that reported failure, landed late and was overridden by a
+            // rollback still names the transaction, and a compaction, `adopt`
+            // or drop carrying that forward would make it committed again.
+            let mut txns = DeltaTxns::of(batch);
+            txns.declared.retain(|txn| family.committed.contains(txn));
+            state.delta_txns.insert(batch.seq, txns);
             for record in &batch.records {
                 if record.txn != 0 && !family.committed.contains(&record.txn) {
                     continue;
