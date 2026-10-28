@@ -303,13 +303,27 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 crate::core::rql::column_default::split_clause(col_def);
             let col_def = col_def_owned.as_str();
 
-            // Split by whitespace to get name and (potentially multi-token) type
-            let tokens: Vec<&str> = col_def.split_whitespace().collect();
+            // The name (quoted, it may hold spaces), then the (potentially
+            // multi-token) type and constraints, split by whitespace.
+            let (name, name_end) = crate::core::sql_scan::leading_identifier(col_def)?;
+            // Read whole now, but the SELECT list, ORDER BY, the WHERE
+            // rewriter and tokenizer and ALTER still split names on
+            // whitespace, so a column created with a space in its name could
+            // be written and not read back by name. Refused by name until
+            // every one of them uses this reader.
+            if name.chars().any(char::is_whitespace) {
+                rejection.replace(format!(
+                    "a column name containing a space is not supported yet: {}",
+                    crate::core::value_codec::double_quoted(&name)
+                ));
+                return None;
+            }
+            let mut tokens: Vec<&str> = vec![col_def[..name_end].trim()];
+            tokens.extend(col_def[name_end..].split_whitespace());
             if tokens.len() < 2 {
                 return None;
             }
 
-            let name = tokens[0].trim_matches('"').to_string();
             if crate::core::rql::nullable::is_hidden(&name) {
                 rejection.replace(format!(
                     "column names beginning with __null_ are reserved: '{}'",

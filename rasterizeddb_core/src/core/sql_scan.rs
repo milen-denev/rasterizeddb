@@ -182,6 +182,45 @@ pub fn identifier_with_doubled_quote(sql: &str) -> Option<&str> {
     None
 }
 
+/// The identifier `text` starts with (after whitespace), and the offset just
+/// past it: a double-quoted one read whole, its spaces and case kept and
+/// `""` read as `"`; a bare one up to the next whitespace, quotes trimmed, as
+/// the readers that split on whitespace always took it. `None` for an empty
+/// or unterminated name.
+///
+/// The one reader the statement parsers share for a name that may hold a
+/// space: split on whitespace, `"c d" TEXT` was the column `c` of a type
+/// `d" TEXT`, refused as "column type 'D"' is not supported yet".
+pub fn leading_identifier(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    if bytes[start] == b'"' {
+        let mut name = Vec::new();
+        let mut i = start + 1;
+        loop {
+            match bytes.get(i)? {
+                b'"' if bytes.get(i + 1) == Some(&b'"') => {
+                    name.push(b'"');
+                    i += 2;
+                }
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                b => {
+                    name.push(*b);
+                    i += 1;
+                }
+            }
+        }
+        let name = String::from_utf8(name).ok()?;
+        return (!name.is_empty()).then_some((name, i));
+    }
+    let end = bytes[start..].iter().position(|b| b.is_ascii_whitespace()).map_or(bytes.len(), |n| start + n);
+    let name = text[start..end].trim_matches('"').to_string();
+    (!name.is_empty()).then_some((name, end))
+}
+
 /// Whether `needle` occurs anywhere in `text`, ignoring ASCII case, quotes
 /// and comments included: a scanner's cheap precondition, so one that can
 /// only match where these bytes are can skip a statement that has none.

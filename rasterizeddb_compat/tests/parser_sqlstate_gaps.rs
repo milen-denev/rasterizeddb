@@ -134,3 +134,21 @@ async fn excluded_of_an_unwritten_column_is_its_default_or_null() {
         "0A000"
     );
 }
+
+/// A column name with a space in it is refused by name. It failed as
+/// "column type 'D\"' is not supported yet" (the name split on its space),
+/// and the readers that would query it still split names on whitespace, so
+/// creating it would make a column that can be written but not read by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_name_with_a_space_is_refused_by_name() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    let e = pool.execute(r#"CREATE TABLE qs (id INT PRIMARY KEY, "c d" TEXT)"#).await.expect_err("spaced name");
+    assert_eq!(code(&e), "0A000");
+    assert!(e.to_string().contains("a column name containing a space"), "{e}");
+    assert_eq!(refused(&pool, "SELECT * FROM qs").await, "42P01");
+    // A quoted name without a space keeps its case, as before.
+    run(&pool, r#"CREATE TABLE qm (id INT PRIMARY KEY, "Mixed" INT)"#).await;
+    run(&pool, r#"INSERT INTO qm (id, "Mixed") VALUES (1, 5)"#).await;
+    assert_eq!(ids(&pool, r#"SELECT "Mixed" FROM qm"#).await, vec![5]);
+}
