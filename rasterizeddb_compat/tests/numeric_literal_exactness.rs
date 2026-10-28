@@ -123,3 +123,78 @@ async fn numeric_constants_are_exact_or_refused() {
     let b: i64 = sqlx::query_scalar("SELECT b FROM h WHERE id = 1").fetch_one(&pool).await.unwrap();
     assert_eq!(b, 5);
 }
+
+fn close(got: f64, want: f64, what: &str) {
+    assert!((got - want).abs() <= want.abs() * 1e-12, "{what}: got {got}, want {want}");
+}
+
+/// A constant the engine carries as a float, against integers and NUMERICs:
+/// answered from the exact result, never refused row by row. The first
+/// version of the exactness check compared each row's float product with
+/// the exact answer and refused the rows where float rounding differed
+/// (3 · 1e30 but not 5 · 1e30), and the aggregate fold turned that row's
+/// error into "no value": `sum(b * 0.00000000011)` silently lost a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn float_carried_constants_answer_every_row() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql(
+        "CREATE TABLE ag (id BIGINT PRIMARY KEY, b BIGINT, i INT, n NUMERIC(10,4), f DOUBLE PRECISION, g BIGINT);
+         INSERT INTO ag VALUES (1, 100, 3, 1.5, 1.0, 1), (2, 7, 5, 2.5, 2.0, 1), (3, 1, 7, 3.5, 3.0, 2), (4, 2, 3, 4.5, 4.0, 2);",
+    ))
+    .await
+    .unwrap();
+    let r = sqlx::query("SELECT sum(b * 0.00000000011) AS s, count(b * 0.00000000011) AS c, avg(b * 0.00000000011) AS a FROM ag")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    close(r.get::<f64, _>("s"), 110.0 * 1.1e-10, "sum");
+    assert_eq!(r.get::<i64, _>("c"), 4);
+    close(r.get::<f64, _>("a"), 110.0 * 1.1e-10 / 4.0, "avg");
+    let groups: Vec<(i64, f64)> = sqlx::query_as("SELECT g, sum(b * 0.00000000011) FROM ag GROUP BY g ORDER BY g")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(groups.len(), 2);
+    close(groups[0].1, 107.0 * 1.1e-10, "group 1");
+    close(groups[1].1, 3.0 * 1.1e-10, "group 2");
+
+    // i = 3, 5, 7, 3: every row, each the float nearest i · 10^30.
+    let rows: Vec<f64> = sqlx::query_scalar("SELECT i * 1e30 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, [3e30, 5e30, 7e30, 3e30]);
+    let r = sqlx::query("SELECT sum(i * 1e30) AS s, count(i * 1e30) AS c FROM ag").fetch_one(&pool).await.unwrap();
+    close(r.get::<f64, _>("s"), 18e30, "sum(i * 1e30)");
+    assert_eq!(r.get::<i64, _>("c"), 4);
+    let s: f64 = sqlx::query_scalar("SELECT sum(n * 1e30) FROM ag").fetch_one(&pool).await.unwrap();
+    close(s, 12e30, "sum(n * 1e30)");
+    let rows: Vec<f64> = sqlx::query_scalar("SELECT b * 0.00000000011 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, [1.1e-8, 7.7e-10, 1.1e-10, 2.2e-10]);
+
+    // A per-row failure fails the statement; it used to drop the row.
+    for sql in ["SELECT sum(1/(b-7)) FROM ag", "SELECT count(*) FILTER (WHERE 1/(b-7) > 0) FROM ag", "SELECT g, sum(1/(b-7)) FROM ag GROUP BY g"] {
+        refused(&pool, sql, "22012").await;
+    }
+
+    // A literal past a float's digits against a float is float arithmetic.
+    let pi = 3.141592653589793_f64;
+    let rows: Vec<f64> =
+        sqlx::query_scalar("SELECT f * 3.14159265358979323846 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, [pi, 2.0 * pi, 3.0 * pi, 4.0 * pi]);
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM ag WHERE f < 3.14159265358979323846 * 2 ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(ids, [1, 2, 3, 4]);
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM ag WHERE f > 3.14159265358979323846 ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(ids, [4]);
+    sqlx::query("UPDATE ag SET f = f * 3.14159265358979323846 WHERE id = 1").execute(&pool).await.unwrap();
+    let f: f64 = sqlx::query_scalar("SELECT f FROM ag WHERE id = 1").fetch_one(&pool).await.unwrap();
+    assert_eq!(f, pi);
+    sqlx::query("INSERT INTO ag VALUES (9, 0, 0, 0, 0.1 * 3.14159265358979323846, 0)").execute(&pool).await.unwrap();
+    let f: f64 = sqlx::query_scalar("SELECT f FROM ag WHERE id = 9").fetch_one(&pool).await.unwrap();
+    assert_eq!(f, 0.1 * pi);
+
+    // Against a NUMERIC column, rounded at the column's scale as there.
+    sqlx::query("UPDATE ag SET n = n + 0.3333333333333333333333333333 WHERE id = 1").execute(&pool).await.unwrap();
+    let n: String = sqlx::query_scalar("SELECT n::text FROM ag WHERE id = 1").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, "1.8333");
+}
