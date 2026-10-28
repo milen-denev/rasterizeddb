@@ -101,11 +101,12 @@ async fn concatenation(partitioning: &str) {
         assert_eq!(r.get::<serde_json::Value, _>("d"), serde_json::json!({"q": 0, "s": [true], "x": 0}), "{p}");
 
         // Never stored: text that is not a document, a string concatenation
-        // of two literals that is not one, and a number.
+        // of two literals (text, 42804), and a number.
         for (sql, want_code) in [
             ("UPDATE jc SET doc = doc || 'abc' WHERE id = 1", "22P02"),
-            (r#"UPDATE jc SET doc = '{"a":1}' || '{"b":1}' WHERE id = 1"#, "22P02"),
-            (r#"INSERT INTO jc VALUES (9, '{"a":1}' || '{"b":1}', NULL, 9)"#, "22P02"),
+            // Text concatenation, which PostgreSQL does not assign to jsonb.
+            (r#"UPDATE jc SET doc = '{"a":1}' || '{"b":1}' WHERE id = 1"#, "42804"),
+            (r#"INSERT INTO jc VALUES (9, '{"a":1}' || '{"b":1}', NULL, 9)"#, "42804"),
             ("UPDATE jc SET doc = n + 1 WHERE id = 1", "42804"),
             ("UPDATE jc SET doc = jc.doc || 'abc' FROM js WHERE jc.id = 1 AND js.id = 1", "22P02"),
         ] {

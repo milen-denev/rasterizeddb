@@ -1014,12 +1014,38 @@ pub(crate) fn encode_column_value(
         // of keeping its low bytes. A decimal stays at the engine scale:
         // it is rendered as text below and read at the column's scale
         // by the literal reader.
-        let evaluated = crate::core::rql::expr::eval(&expr, &empty, &[])
-            .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type))
-            .map_err(refuse)
-            .ok()?;
+        //
+        // A NUMERIC column takes the value computed for it, exactly and at
+        // its own scale (`expr::eval_into`): at the engine's nine places,
+        // `VALUES (1 / 3.0)` into a NUMERIC(20,12) stored 0.333333333000. A
+        // `jsonb` one is checked as an assignment is (`'a' || 'b'` is text).
+        let scale = declared_scale(&schema_field.name, modifiers);
+        let evaluated = match schema_field.db_type {
+            DbType::DECIMAL | DbType::JSONB => {
+                let mut target = schema_field.clone();
+                target.scale = scale;
+                crate::core::rql::expr::eval_into(&expr, &empty, &[], &target)
+            }
+            _ => crate::core::rql::expr::eval(&expr, &empty, &[])
+                .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type)),
+        }
+        .map_err(refuse)
+        .ok()?;
         value_owned = match evaluated {
             crate::core::rql::expr::Value::Null => "NULL".to_string(),
+            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::DECIMAL }
+                if schema_field.db_type == DbType::DECIMAL =>
+            {
+                // At the column's scale now, which the engine-scale renderer
+                // would read a power of ten wrong.
+                match <[u8; 16]>::try_from(bytes.as_slice()) {
+                    Ok(raw) => crate::core::value_codec::format_decimal_scaled(
+                        i128::from_le_bytes(raw),
+                        scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+                    ),
+                    Err(_) => "NULL".to_string(),
+                }
+            }
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
                     .unwrap_or_else(|| "NULL".to_string())

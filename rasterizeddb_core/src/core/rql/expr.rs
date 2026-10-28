@@ -3049,6 +3049,13 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
 /// refuses what it cannot carry rather than truncating it
 /// ([`to_engine_scale`], [`decimal_arith`]).
 pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: &SchemaField) -> Result<Value, String> {
+    // `'{"a":1}' || '{"b":1}'` is text concatenation, which PostgreSQL
+    // has no assignment cast from to `jsonb`: 42804, not the 22P02 of
+    // reading the joined text as a document. (A document on either side
+    // is `jsonb ||`, and a single literal is read as a document.)
+    if target.db_type == DbType::JSONB && matches!(expr, Expr::Concat(..)) && static_type(expr) == DbType::STRING {
+        return Err(format!("column \"{}\" is of type jsonb but expression is of type text", target.name));
+    }
     if target.db_type == DbType::DECIMAL {
         let scale = target.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
         if let Some(value) = exact_numeric(expr, row, schema, scale)? {
