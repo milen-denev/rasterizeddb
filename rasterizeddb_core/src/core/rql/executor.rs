@@ -7075,6 +7075,8 @@ fn has_top_level_arithmetic(text: &str) -> bool {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
+            // `->` and `->>` reach into a document; they are not a minus.
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {}
             b'+' | b'-' | b'*' | b'/' | b'%' if depth == 0 && i > 0 => return true,
             _ => {}
         }

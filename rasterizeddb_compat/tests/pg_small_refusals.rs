@@ -60,6 +60,11 @@ async fn a_number_left_of_column_arithmetic_compares() {
         let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_all(&pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_eq!(ids, want, "{sql}");
     }
+    // A path into a document is not arithmetic: left as written, so the
+    // refusal names the operands in their own order.
+    pool.execute("CREATE TABLE d (id BIGINT PRIMARY KEY, doc JSONB)").await.unwrap();
+    let e = sqlx::query("SELECT id FROM d WHERE 1 = doc->'a'").fetch_all(&pool).await.expect_err("integer = jsonb");
+    assert!(e.to_string().contains("integer = jsonb"), "{e}");
     let n = sqlx::query("UPDATE t SET v = 0 WHERE 3 = v * 1").execute(&pool).await.unwrap().rows_affected();
     assert_eq!(n, 1);
 }
