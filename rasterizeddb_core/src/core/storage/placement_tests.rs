@@ -1088,3 +1088,38 @@ async fn a_failed_immediate_backup_write_leaves_a_mark_that_the_next_attach_hono
     assert_same(root.path(), backup.path(), &["mi.db"], "after the next attach");
     assert!(marks_in(backup.path()).is_empty());
 }
+
+/// `write_data_seek` wrote each backup with the backup's own
+/// `write_data_seek`, whose failure nothing saw: the backup kept older
+/// bytes at the same length and no mark said so. It goes through
+/// `write_backup_or_mark` now, as every immediate write does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_seek_write_to_a_backup_leaves_a_mark() {
+    use crate::core::storage::mirror::MirrorStorageProvider;
+    use std::io::SeekFrom;
+    let root = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_string_lossy().into_owned();
+    let backup_path = backup.path().to_string_lossy().into_owned();
+    {
+        let io = MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "ms.db").await;
+        io.append_data(&vec![0u8; 4096], true).await;
+        io.commit_durable(io.begin_txn()).await.unwrap();
+        // A seek write that succeeds reaches the backup, with no mark.
+        io.write_data_seek(SeekFrom::Start(10), &[0xAA; 4]).await;
+        io.write_data_seek(SeekFrom::End(-8), &[0xBB; 4]).await;
+        assert!(marks_in(backup.path()).is_empty(), "{:?}", marks_in(backup.path()));
+        let copy = std::fs::read(backup.path().join("ms.db")).unwrap();
+        assert_eq!((&copy[10..14], &copy[4088..4092]), (&[0xAA; 4][..], &[0xBB; 4][..]));
+
+        crate::core::storage_providers::file_sync::failed_appends::FAIL_INPLACE_IN.lock().push(backup_path.clone());
+        io.write_data_seek(SeekFrom::Start(100), &[0xCC; 8]).await;
+    }
+    assert!(marks_in(backup.path()).contains(&"__mirror_behind.ms.db".to_string()), "{:?}", marks_in(backup.path()));
+    let primary = std::fs::read(root.path().join("ms.db")).unwrap();
+    assert_eq!(&primary[100..108], &[0xCC; 8]);
+    assert_ne!(primary, std::fs::read(backup.path().join("ms.db")).unwrap(), "the failed write reached the backup");
+    drop(MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "ms.db").await);
+    assert_same(root.path(), backup.path(), &["ms.db"], "after the next attach");
+    assert!(marks_in(backup.path()).is_empty());
+}

@@ -210,10 +210,31 @@ impl StorageIO for MirrorStorageProvider {
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
+        // Where the write lands, read before it: the backups are written at
+        // that position, through `write_backup_or_mark` as every other
+        // immediate write is, so one that fails leaves a mark. They were
+        // written with their own `write_data_seek`, whose failure nothing
+        // saw.
+        let position = match seek {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(offset) => self.primary.get_len().await.checked_add_signed(offset),
+            // Relative to a handle's cursor, which a backup's handle does not
+            // share.
+            SeekFrom::Current(_) => None,
+        };
         self.primary.write_data_seek(seek, buffer).await;
         let _copying = copy_lock(&self.primary).await;
         for backup in self.backups.iter() {
-            backup.write_data_seek(seek, buffer).await;
+            match position {
+                Some(position) => write_backup_or_mark(backup, &self.primary.get_name(), position, buffer).await,
+                // A write the backup cannot be shown to follow: rebuilt at
+                // the next open.
+                None => {
+                    if let Some(mark) = BehindMark::make(backup, &self.primary.get_name()) {
+                        mark.release(false);
+                    }
+                }
+            }
         }
     }
 
