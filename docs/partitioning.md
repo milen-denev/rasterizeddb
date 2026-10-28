@@ -232,13 +232,16 @@ now on `tx`'s behalf, under ACCESS SHARE on the table's **logical** name
   could get there (`fk_partition_tests::a_check_that_cannot_route_is_refused_never_skipped`).
   Where `route_where` reads no key point in the predicate (a signed number:
   `k = -7` routes everywhere, §4.1's "signed literal" limit), each value is
-  routed by its own key bytes instead (`parent_key_ranges`: an integer at
-  the column's width, a string with its doubled quotes undone, any other
-  type as `encode_literal` reads it, then `keyed_range`), and only those
-  partitions are read (`RowSource::partitioned_in`), the probe's predicate
-  still applied in each; a value that does not encode is refused. The twin
-  found this at 0x5eedf1a1 with 1,500 statements: the first build refused
-  every child of a negative tenant
+  routed by its own key bytes instead (`parent_key_ranges`: the value
+  encoded by `lexer_ir::encode_column_value`, the encoder an `INSERT` of it
+  stores and routes by, so `-7::bigint`, `CAST(-6 AS BIGINT)`, `'x'::text`
+  and a UUID's spellings route as the parent row did; then `keyed_range`),
+  and only those partitions are read (`RowSource::partitioned_in`), the
+  probe's predicate still applied in each. A value that encodes as no key of
+  the column (`7.5` for a BIGINT) is read in every partition, its predicate
+  deciding, as a plain parent's scan does (round 2; the first fallback
+  refused it). The twin found the signed case at 0x5eedf1a1 with 1,500
+  statements: the first build refused every child of a negative tenant
   (`fk_partition_tests::a_key_the_router_cannot_read_still_routes_by_its_bytes`).
 - *The child side* (`KeySide::Child`: a parent `DELETE`'s or `UPDATE`'s
   "does any child reference these keys", before and after its action): the
@@ -395,18 +398,98 @@ its test failed by assertion, the file restored byte-exact and compared;
 | that key probed in every partition | `referenced_values_now` | the same (a negative key read more than its partition) |
 | FK children's schema files held aside by their logical names | `reload_atomic_with` | `fk_partition_tests::a_failed_parent_column_rename_puts_a_partitioned_childs_key_back` |
 
-Not pinned: the statement snapshot handed to every partition's write
-(`write_partitions_as_of`) has no test that fails without it; its plain
-counterpart is pinned by a concurrent-insert test (`foreign_key_concurrency`).
-And `apply_on_update` after a partitioned `UPDATE` cannot run before phase 6:
-a partitioned parent's referenced key is its partition key, which no
-`UPDATE` may change.
+*Round 2* (every mutation above run again over the round-2 code, killed by
+the same tests, but the one marked; and these):
+
+| Mutation | Where | Test that fails |
+|---|---|---|
+| a probe in chunks of 512 (past the route cap) | `referenced_values_now` | **survives, equivalent since round 2**: a 512-value `IN` routes everywhere, so each value is routed by its key bytes, and still only its partition is read |
+| a routed probe reads every partition | `referenced_values_now` | `fk_partition_tests::a_check_of_a_partitioned_parent_reads_one_partition_per_key` |
+| a value the router cannot read gets no key range (read everywhere) | `parent_key_ranges` | `fk_partition_tests::a_key_the_router_cannot_read_still_routes_by_its_bytes` (`-8::bigint` read more than its partition) |
+| a partitioned write takes its own snapshot | `write_partitions_as_of` | `fk_partition_tests::a_partitioned_delete_writes_the_rows_its_keys_were_read_from` (the late parent deleted, its child orphaned) |
+| `NOT VALID` still validates | `add_foreign_key` | `partition_fk::add_and_drop_foreign_key_answer_like_the_twin` |
+| `VALIDATE CONSTRAINT` checks nothing | the ALTER arm | the same |
+| the import aborts on a source orphan | `migrate::run::add_foreign_key` | `load_tests::a_foreign_key_broken_by_the_source_rows_is_added_not_valid_with_a_note` |
+| an unvalidated source key planned as validated | `migrate::plan` | `plan::tests::a_source_key_never_validated_is_added_not_valid` |
+| validation reads deleted and invisible versions | `existing_rows_break_foreign_key` | `partition_fk::add_and_drop_…` (a deleted orphan refuses VALIDATE) |
+| validation reads a NULL as its zero bytes | the same | the same |
+| the last chunk never probed | the same | the same |
+| an inline `CONSTRAINT n` ignored | `lexer_ct` | `lexer_ct` tests |
+| the table dropped before its dependent keys | `execute_drop_table` | `pddl_crash_tests::a_cascading_drop_…` (images at the log's syncs hold a key naming a dropped table) |
+
+Not pinned: the child-side chunk of 512 for a child not partitioned by its
+key column (a cost, measured above, not an answer); `apply_on_update` after
+a partitioned `UPDATE` cannot run before phase 6: a partitioned parent's
+referenced key is its partition key, which no `UPDATE` may change.
+
+**Round 2** (2026-10-28), from two reviews of `b00d905` (no merge blocker;
+no orphan in six configurations, races both ways, a self-referencing
+cascade; `fk_reverse` reached only through the slot primitives):
+
+- **A cast negative key routes.** `-7::bigint` and `CAST(-6 AS BIGINT)`, an
+  ORM's `$n::bigint` with a negative id, were refused with 0A000 on a
+  partitioned parent; the fallback read only a bare integer or a quoted
+  string. It now encodes each value through `lexer_ir::encode_column_value`,
+  extracted from `insert_row_with_defaults` so the two cannot drift (above).
+  Pinned on four configurations by
+  `partition_fk::every_literal_form_of_a_key_answers_like_the_plain_twin`
+  (negative ints alone, cast, quoted and in `CAST`; `'x'::text`,
+  `'x'::varchar`, `CAST('a' AS TEXT)` and a doubled quote on a TEXT key; a
+  UUID in upper case, cast, in `CAST` and without hyphens; a NUMERIC child
+  column on a BIGINT key; prepared negative ids), and by the reads test.
+  Braced UUIDs are refused on both kinds alike (pre-existing, left).
+- **`NOT VALID` and `VALIDATE CONSTRAINT`.** `ADD … FOREIGN KEY … NOT VALID`
+  enforces new writes and leaves the rows already there unchecked;
+  `VALIDATE CONSTRAINT n` checks them then (23503 for the first orphan),
+  on both table kinds. No record says "not valid" (the sidecar has no spare
+  byte), so validating a valid key checks again and passes; a name no key
+  has is accepted as VALIDATE always was here (PostgreSQL: 42704). The
+  import reads `convalidated` and adds a key its source never validated
+  `NOT VALID`, with a note; a validated key whose source rows break it
+  (rows loaded with `pg_restore --disable-triggers`) is retried `NOT VALID`
+  with a note naming the table, so the import no longer ends at its last
+  step (`migrate::run::add_foreign_key`; pinned by
+  `load_tests::a_foreign_key_broken_by_the_source_rows_is_added_not_valid_with_a_note`
+  and `plan::tests::a_source_key_never_validated_is_added_not_valid`).
+- **Validation in bounded memory.** `existing_rows_break_foreign_key` walks
+  each table's pointers as a scan does (a reclamation read ticket,
+  `Visibility::visible`, one reused `Row` holding the column and its NULL
+  companion), probes chunks of 512 distinct values and drops them, with a
+  dedupe set capped at 64 Ki values. Measured on a 200,000-row child with
+  200,000 distinct values (`fk_partition_tests::validation_peak_memory`,
+  debug build, `VmHWM` reset before the ADD): **+133,044 kB** over the
+  starting resident set before, **+18,608 kB** after; 3.2 s and 4.1 s.
+- **The statement snapshot is pinned**: a parent committed between a fan-out
+  DELETE's key reads, and a child of it, survive the DELETE
+  (`fk_partition_tests::a_partitioned_delete_writes_the_rows_its_keys_were_read_from`).
+- **`DROP TABLE … CASCADE` through a power cut**
+  (`pddl_crash_tests::a_cascading_drop_cut_anywhere_leaves_no_key_naming_a_missing_table`,
+  a plain parent with a partitioned child and the reverse, cut between the
+  two steps, `test.rewrite.fkdrop_after_keys`, inside the child's reload and
+  at the log's syncs): every image is nothing dropped, keys gone with the
+  table there (the DROP then runs again), or both gone; all three occur in
+  both cases, and none holds a key naming a missing table.
+- **Child-side probes**: a child not partitioned by its key column (its
+  leading key column) reads every partition whatever the chunk, so it is
+  probed in chunks of 512, not 256, and its predicate is not tokenized for
+  a route at all; a routed probe reads its route once
+  (`RowSource::partitioned_routed`). A 10,000-key parent DELETE over a
+  40,000-row child in 8 partitions: **320 partition scans before, 160
+  after** (`fk_partition_tests::child_probe_chunk_timing`); wall-clock on
+  this box (load 15 to 33) was 1.5 to 3.6 s before, 1.3 to 2.7 s after,
+  noise either way.
+- A column's own `CONSTRAINT n REFERENCES …` is named `n`.
+- The release note for databases written by older binaries is in
+  `docs/postgres-compatibility.md` ("Release note: foreign keys from older
+  binaries").
 
 **Behaviour changes for plain tables** (the same code serves both kinds):
 
 - `ADD CONSTRAINT … FOREIGN KEY` validates the rows already there (23503,
   nothing written), as PostgreSQL does; it used to store the key
-  unvalidated, so a table could hold a constraint its rows broke. It needs
+  unvalidated, so a table could hold a constraint its rows broke. `NOT
+  VALID` (round 2) skips that, and `VALIDATE CONSTRAINT`, an accepted no-op
+  before, now checks a foreign key's rows. It needs
   the parent to exist (42P01) and the column on both sides (42703), and a
   name another constraint of the table has is 42710.
 - `CREATE TABLE` refuses a key whose referencing column, or whose existing
@@ -442,9 +525,8 @@ here).
 - Keys are one column on every table, so a table partitioned by two or
   three columns can be referenced by no key at all; composite keys would
   lift that.
-- By reading, not run: a column-level `CONSTRAINT n REFERENCES p (k)` gives
-  its key no name of its own (`lexer_ct`'s inline path passes none), so it
-  is `<t>_<c>_fkey`.
+- ~~By reading: a column-level `CONSTRAINT n REFERENCES p (k)` gave its key
+  no name of its own~~ (fixed in round 2, `lexer_ct::inline_constraint_name`).
 - The insert-time check finds its parent by exact name (`has_table`), as
   every lookup here does (identifiers are not case-folded, an open finding):
   a key on `P` never matches `p`.
