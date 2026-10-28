@@ -4783,8 +4783,7 @@ async fn carry_index_store(
 /// changed.
 async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
     for suffix in RENAMED_SUFFIXES {
-        let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
-        io.drop_io();
+        io_pointers.drop_file(format!("{}{}", name, suffix)).await;
     }
     if let Some(dir) = io_pointers.index_store_dir() {
         crate::core::index_store::file_gate::remove_files(&dir, name);
@@ -4874,8 +4873,7 @@ pub(super) async fn discard_files_in(
         return false;
     }
     for suffix in suffixes {
-        let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
-        io.drop_io();
+        io_pointers.drop_file(format!("{}{}", name, suffix)).await;
     }
     if logs.is_empty() {
         return true;

@@ -218,27 +218,45 @@ a dropped table comes back:
 - **A reopen never gets the dropped file.** The sweep's gate is registered
   before the file leaves the map, and a dropped file still in the map is
   waited out, not returned.
-- **It never gives up, and it outlives a stop.** The carry and the erase are
-  each retried until the store lets them, backing off to 30 s; only an open of
-  that name waits meanwhile — `DROP` itself returns at once. The name is written
-  to `db_kv_erase.pending` beside `db_kv.cfg` before the sweep starts and taken
-  out when it ends, and a family that opens resumes every sweep listed there,
+- **It never gives up, and it outlives a stop.** The carry, the erase and
+  the removal of the sweep's record are each retried until they succeed,
+  backing off to 30 s; only an open of that name waits meanwhile. `DROP`
+  itself does not: it drops a table's file names with `drop_file`, which
+  leaves a name already being swept, or never stored, as it is instead of
+  opening it — opening waited out the sweep, and made the names the table
+  never had, to drop them.
+- **The record.** The name goes to `db_kv_erase.pending` beside `db_kv.cfg`
+  (`store`, the store's identity, the name) before the sweep starts, and a
+  family that opens resumes every sweep listed for its store at its identity,
   holding the name, before any table can open it. A server stopped mid-sweep
   used to leave the objects for a same-named table to read as its own. The
-  file is left out of backup snapshots: a restored copy resuming a sweep would
-  delete from the store the live server uses.
+  invariant is that **a name is listed only while no table can hold it**: the
+  gate opens only after the record is gone, a record that cannot be read is
+  an error rather than an empty list, and the last removal is synced like any
+  other write. A record left behind while a table took the name again would
+  have the next start's resumed sweep erase that table. A line for the store
+  at an address it no longer has is dropped, not resumed. The file is left
+  out of backup snapshots: a restored copy resuming a sweep would delete from
+  the store the live server uses.
 
 A cancelled compaction (its future dropped) unfreezes and clears its flag on
 the way out, as a failed one does; left set, every later compaction of the
-file declined and a sweep waited for it for ever.
+file declined and a sweep waited for it for ever. `compact_now` runs its
+compaction detached, so a caller going away cannot cancel one part way while
+a put it sent is still landing.
 
 A file that cannot be opened — `KvFile::open` refuses a META whose chunk size
-it cannot use — comes back from `create_new` as a handle that fails rather
-than as the handle asked: an empty file of that name, already dropped and
-never registered, so reads fail, a commit is refused, and nothing reaches the
-name's real objects. `StorageIO::create_new` cannot return an error; the
-handle it used to return instead was the caller's own file, and a table's
-reads and writes went to another table's bytes.
+it cannot use, before it takes the recovered state, so the next open is
+refused too rather than building an empty file over the real one — comes
+back from `create_new` as a stand-in that fails: an empty, dropped,
+unregistered file under a prefix no name has. Reading it fails, anything
+written to it is refused at its flush, and a transaction that wrote to it
+cannot commit on any file (the commit looks for stand-ins apart, since they
+are in no map). `StorageIO::create_new` cannot return an error; the handle it
+used to return instead was the caller's own file, and a table's reads and
+writes went to another table's bytes. What remains: its length reads 0, so a
+lazily read sidecar opened through one looks empty. The full fix is a
+fallible `create_new`.
 
 ## 5. The cache
 

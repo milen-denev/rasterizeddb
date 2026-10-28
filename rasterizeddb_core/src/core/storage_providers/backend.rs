@@ -24,6 +24,18 @@ pub enum DbStorageProvider {
 }
 
 impl DbStorageProvider {
+    /// Drops the file `name` of this provider's family. On a key/value store
+    /// a name being swept, or never stored, is left as it is rather than
+    /// opened: opening waits out the sweep, and a sweep that retries until the
+    /// store answers would hold up the DROP that started it.
+    pub async fn drop_file(&self, name: String) {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(kv) => kv.drop_name(&name).await,
+            _ => self.create_new(name).await.drop_io(),
+        }
+    }
+
     pub async fn new_file(location: &str, table_name: Option<&str>) -> Self {
         Self::File(LocalStorageProvider::new(location, table_name).await)
     }

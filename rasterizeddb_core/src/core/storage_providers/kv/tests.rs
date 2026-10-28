@@ -3365,12 +3365,13 @@ async fn a_cancelled_compaction_does_not_wedge_the_file() {
     held.armed.store(true, Ordering::Release);
     let compaction = tokio::spawn({
         let a = a.clone();
-        async move { a.compact_now().await }
+        async move { a.compact_attached().await }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     compaction.abort();
     let _ = compaction.await;
     held.armed.store(false, Ordering::Release);
+    held.release.add_permits(64);
 
     // Still readable, and compacts again.
     assert_eq!(read_all(&a).await, vec![b'q'; 20_000]);
@@ -3417,7 +3418,8 @@ async fn a_sweep_interrupted_by_a_stop_resumes_at_the_next_open() {
     }
     // What a drop records before its sweep, with the stop landing before the
     // sweep ran.
-    super::pending::PendingErases::new(path.clone()).add("s", "a.db").unwrap();
+    let identity = open_family(store.clone()).await.identity();
+    super::pending::PendingErases::new(path.clone()).add("s", &identity, "a.db").unwrap();
     assert!(!store.list("t/a.db/").await.unwrap().is_empty());
 
     let family = open_family(store.clone()).await;
@@ -3428,13 +3430,13 @@ async fn a_sweep_interrupted_by_a_stop_resumes_at_the_next_open() {
         .expect("the resumed sweep did not finish");
     assert!(read_all(&a).await.is_empty(), "the dropped bytes came back");
     assert!(store.list("t/a.db/").await.unwrap().is_empty());
-    assert!(super::pending::PendingErases::new(path.clone()).names("s").is_empty());
+    assert!(super::pending::PendingErases::new(path.clone()).names("s", &identity).unwrap().is_empty());
 
     // A drop in this process records the name, and its sweep clears it.
     a.append_data(b"new", true).await;
     a.drop_io();
     drop(tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db")).await.unwrap());
-    assert!(super::pending::PendingErases::new(path).names("s").is_empty());
+    assert!(super::pending::PendingErases::new(path).names("s", &identity).unwrap().is_empty());
 }
 
 /// A file that cannot be opened gets a handle that fails, not the handle
@@ -3461,4 +3463,97 @@ async fn a_handle_that_could_not_open_fails_instead_of_aliasing() {
     assert_eq!(read_all(&seed).await, b"seed bytes".to_vec());
     assert_eq!(read_all(&real).await, b"real bytes".to_vec());
     assert!(!store.list("t/b.db/").await.unwrap().is_empty());
+}
+
+/// The name is held until the sweep's record is gone, not only its objects: a
+/// record left behind while a table took the name again had the next start's
+/// resumed sweep erase that table. Here the record cannot be removed for a
+/// while (its directory is read-only); the name stays unopenable until it is.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_name_stays_held_until_its_sweep_record_is_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(super::pending::PENDING_FILE);
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+    let a = open(&family, "a.db").await;
+    a.append_data(b"bytes", true).await;
+
+    a.drop_io(); // records the name, synchronously
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(800), open(&family, "a.db")).await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(blocked.is_err(), "the name opened while its sweep was still recorded");
+    let a = tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db"))
+        .await
+        .expect("the name was never released");
+    assert!(read_all(&a).await.is_empty());
+    assert!(!path.exists(), "the record outlived the sweep");
+}
+
+/// A record that cannot be read is an error, never an empty list — read as
+/// empty, `remove` reported success with the line still there. A line for
+/// the store at another address is not resumed against this one.
+#[test]
+fn the_pending_record_is_strict_about_what_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(super::pending::PENDING_FILE);
+    let pending = super::pending::PendingErases::new(path.clone());
+    pending.add("s", "here", "a.db").unwrap();
+    pending.add("s", "elsewhere", "b.db").unwrap();
+    assert_eq!(pending.take_for("s", "here").unwrap(), vec!["a.db".to_string()]);
+    assert!(pending.names("s", "elsewhere").unwrap().is_empty(), "a line for another address survived");
+    assert!(pending.add("s", "here", "bad\nname").is_err());
+
+    std::fs::write(&path, "not a record\n").unwrap();
+    assert!(pending.names("s", "here").is_err());
+    assert!(pending.remove("s", "here", "a.db").is_err());
+}
+
+/// Dropping a name that is being swept does not wait for the sweep: DROP
+/// TABLE drops every file name a table may have, and opening each waited out
+/// a sweep that may retry for as long as the store is down.
+#[tokio::test]
+async fn dropping_a_name_being_swept_does_not_wait_for_it() {
+    let held = HeldPutStore::holding("/a.db/d/");
+    let store: Arc<dyn KvStore> = held.clone();
+    let family = open_family(store.clone()).await;
+    let seed = open(&family, "seed.db").await;
+    let a = Arc::new(open(&family, "a.db").await);
+    a.append_data(b"bytes", false).await;
+    held.armed.store(true, Ordering::Release);
+    let flush = tokio::spawn({
+        let a = a.clone();
+        async move { a.flush().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    a.drop_io(); // its sweep waits for the held put
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), seed.drop_name("a.db"))
+        .await
+        .expect("dropping a name being swept waited for the sweep");
+    // A name never stored is not made in order to be dropped.
+    seed.drop_name("never.db").await;
+    assert!(store.list("t/never.db/").await.unwrap().is_empty());
+
+    held.armed.store(false, Ordering::Release);
+    held.release.add_permits(16);
+    flush.await.unwrap().unwrap();
+}
+
+/// A transaction that wrote to a stand-in for an unopenable file cannot
+/// commit, even on a healthy file: the stand-in is in no map, and the
+/// commit used to declare it without that half.
+#[tokio::test]
+async fn a_transaction_touching_an_unopenable_file_cannot_commit() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let healthy = open(&family, "t_pointers.db").await;
+    let poisoned = healthy.poisoned("t.db");
+    let txn = healthy.begin_txn();
+    poisoned.append_data_txn(txn, b"row").await;
+    healthy.append_data_txn(txn, b"pointer").await;
+    assert!(healthy.commit_durable(txn).await.is_err(), "a torn transaction was declared");
 }
