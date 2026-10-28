@@ -347,6 +347,11 @@ pub struct KvFamily {
     /// Files standing in for ones that could not be opened. A commit refuses
     /// a transaction that wrote to one: it is in no file's `holds`.
     poisoned: Mutex<Vec<std::sync::Weak<KvFile>>>,
+    /// Transactions that wrote to a stand-in, until they end: refused at
+    /// commit whether or not the stand-in itself is still alive — a stand-in
+    /// dropped before the commit was missed, and its scratch files are in no
+    /// list at all. Shared with every file.
+    tainted: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// Read by everything that rewrites or deletes an object of this family —
     /// compaction, a truncation's deletes, adopting a scratch generation, a
     /// dropped file's sweep. Written by [`KvFamily::pause_maintenance`], so a
@@ -575,6 +580,7 @@ impl KvFamily {
             opening: tokio::sync::Mutex::new(()),
             pending: std::sync::OnceLock::new(),
             poisoned: Mutex::new(Vec::new()),
+            tainted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             maintenance,
             declaring,
         }))
@@ -632,6 +638,12 @@ impl KvFamily {
     /// stored but inert until that declaration lands.
     async fn commit(&self, txn: u64, last: &Arc<KvFile>) -> io::Result<()> {
         let _declaring = self.declaring.read().await;
+        if self.tainted.lock().contains(&txn) {
+            self.abort(txn);
+            return Err(io::Error::other(format!(
+                "transaction {txn} wrote to a file that could not be opened; nothing of it is committed"
+            )));
+        }
         // A stand-in for a file that could not be opened is in no map, so it is
         // looked for apart: one holding this transaction fails its flush, and
         // the commit with it — the other half would be declared without it.
@@ -688,6 +700,7 @@ impl KvFamily {
         for file in self.open_files().into_iter().chain(self.stand_ins()) {
             file.abort_local(txn);
         }
+        self.tainted.lock().remove(&txn);
     }
 
     /// The live stand-ins for files that could not be opened.
@@ -853,6 +866,7 @@ impl KvFamily {
             next_seq: Arc::new(AtomicU64::new(0)),
             is_temp: false,
             poisoned,
+            tainted: self.tainted.clone(),
             state: RwLock::new(State {
                 live: Overlay::new(),
                 frozen: None,
@@ -1142,6 +1156,8 @@ pub(crate) struct KvFile {
     /// (`KvStorageProvider::poisoned`): anything written to it fails to store,
     /// rather than vanishing as a dropped file's writes do.
     poisoned: bool,
+    /// The family's `tainted`: a stand-in adds each transaction it is given.
+    tainted: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// The family's `maintenance` gate, read around every rewrite or delete
     /// of an object.
     maintenance: Arc<tokio::sync::RwLock<()>>,
@@ -1294,6 +1310,7 @@ impl KvFile {
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             is_temp: false,
             poisoned: false,
+            tainted: family.tainted.clone(),
             state: RwLock::new(state),
             flush: tokio::sync::Mutex::new(()),
             compacting: AtomicBool::new(false),
@@ -1856,6 +1873,9 @@ impl KvFile {
         if txn != 0 {
             let low = state.open_txns.entry(txn).or_insert(u64::MAX);
             *low = (*low).min(record.offset);
+            if self.poisoned {
+                self.tainted.lock().insert(txn);
+            }
         }
         state.pending_bytes += record.weight();
         state.pending.push(record);
@@ -3226,6 +3246,7 @@ impl StorageIO for KvStorageProvider {
             next_seq: file.next_seq.clone(),
             is_temp: true,
             poisoned: file.poisoned,
+            tainted: file.tainted.clone(),
             state: RwLock::new(State {
                 live: Overlay::new(),
                 frozen: None,

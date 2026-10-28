@@ -235,8 +235,12 @@ a dropped table comes back:
   an error rather than an empty list (and refuses the store's open, since
   which names are mid-sweep is then unknown), and the last removal is synced
   like any other write. The identity is the store's definition — kind,
-  address, prefix — not its description, which may be reworded; one record
-  object per file serves the whole process. A record left behind while a table took the name again would
+  address (a directory by its canonical path), prefix — not its description,
+  which may be reworded; one record object per canonical file serves the
+  whole process. A store that refuses to open costs its tables, never their
+  writes: an existing one reads as missing, and `CREATE TABLE` placed on it is
+  refused rather than made in the in-memory fallback, whose writes would
+  report done and vanish at the next start. A record left behind while a table took the name again would
   have the next start's resumed sweep erase that table. A line for the store
   at an address it no longer has is dropped, not resumed. The file is left
   out of backup snapshots: a restored copy resuming a sweep would delete from
@@ -254,9 +258,9 @@ refused too rather than building an empty file over the real one — comes
 back from `create_new` as a stand-in that fails: an empty, dropped,
 unregistered file under a prefix no name has. Reading it fails, anything
 written to it is refused at its flush, and a transaction that wrote to it
-cannot commit on any file: a stand-in holds a transaction from its first
-write to its end however its queue is emptied, and the commit and an abort
-look for stand-ins apart, since they are in no map. A name the store holds
+cannot commit on any file: every transaction a stand-in (or its scratch)
+is given is marked on the family until it ends, and the commit refuses a
+marked one — whether or not the stand-in is still alive. A name the store holds
 but whose file cannot be opened is swept through a blank built from its
 recovered deltas, so the declarations other files need are carried first;
 and a name with nothing but chunks left is still known to recovery, so a

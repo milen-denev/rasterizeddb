@@ -1504,3 +1504,27 @@ async fn partition_storage_statements_are_refused_not_misread() {
         .await
         .expect("a plain dry run still works");
 }
+
+/// A table placed on a store that cannot be opened is refused, not created
+/// in memory: the store refuses to open while its record of unfinished sweeps
+/// cannot be read, and the in-memory fallback took the table's writes, said
+/// they were done, and lost them at the next start.
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_a_table_on_a_store_that_cannot_open_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write_kv_config(root.path(), store.path());
+    std::fs::write(
+        root.path().join(crate::core::storage_providers::kv::pending::PENDING_FILE),
+        "not a record\n",
+    )
+    .unwrap();
+
+    let db = open(root.path()).await;
+    db.storage
+        .pin_backend("ledger", &TableBackend::KeyValue("local".to_string()))
+        .unwrap();
+    let refused = db.add_table(create_statement("ledger")).await;
+    assert!(refused.is_err(), "a table was created on a store that could not open");
+    assert!(!db.has_table("ledger"), "the refused table is in the catalogue");
+}

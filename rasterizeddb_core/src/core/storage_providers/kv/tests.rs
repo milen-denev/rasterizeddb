@@ -3617,3 +3617,24 @@ async fn a_name_with_only_chunks_left_is_dropped_all_the_same() {
     drop(open(&family, "a.db").await);
     assert!(store.list("t/a.db/").await.unwrap().is_empty(), "the chunks outlived the drop");
 }
+
+/// A transaction that wrote to a stand-in is refused at commit even after the
+/// stand-in itself is gone: held by a weak reference, a stand-in dropped
+/// before the commit used to be missed.
+#[tokio::test]
+async fn a_stand_in_dropped_before_the_commit_still_refuses_it() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let healthy = open(&family, "t_pointers.db").await;
+    let txn = healthy.begin_txn();
+    {
+        let poisoned = healthy.poisoned("t.db");
+        poisoned.append_data_txn(txn, b"row").await;
+    }
+    healthy.append_data_txn(txn, b"pointer").await;
+    assert!(healthy.commit_durable(txn).await.is_err(), "a torn transaction was declared");
+    // The next one, which never touched it, commits.
+    let next = healthy.begin_txn();
+    healthy.append_data_txn(next, b"fine").await;
+    healthy.commit_durable(next).await.unwrap();
+}

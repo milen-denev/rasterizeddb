@@ -819,15 +819,46 @@ fn backend_is_openable(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -
 
 /// What a table gets when its backend cannot be opened.
 ///
-/// In memory, deliberately. The database refuses to open when a placement names
-/// a store that is not configured, so reaching this means the configuration
-/// changed under a running server. Falling back to the database *directory*
-/// would scatter that table's files where a later, correct run would find them
-/// as orphans; this way the damage cannot outlive the process.
+/// In memory, deliberately: falling back to the database *directory* would
+/// scatter that table's files where a later, correct run would find them as
+/// orphans. Reached when a store is unreachable or refuses to open (its record
+/// of unfinished sweeps unreadable, say). An existing table opened on this
+/// fails to read its schema and is left out, so it reads as missing; a table
+/// being created is refused instead (`refuse_unopenable_store`,
+/// `seed_fell_back`), since created here it would take writes that vanish.
 fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
     Arc::new(DbStorageProvider::new_memory(&format!(
         "{table_name}_pointers.db"
     )))
+}
+
+#[cfg(feature = "storage_pools")]
+async fn refuse_unopenable_store(pool: &StoragePool, kv: &KvStores, table_name: &str) -> io::Result<()> {
+    use crate::core::storage::TableBackend;
+    match pool.backend_of(table_name) {
+        Some(backend @ TableBackend::KeyValue(_)) => {
+            seed_for_backend(pool, kv, &backend, table_name).await.map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "storage_pools"))]
+async fn refuse_unopenable_store(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -> io::Result<()> {
+    Ok(())
+}
+
+/// Whether `seed` is the in-memory stand-in a table placed on a key/value
+/// store got because the store could not be opened.
+#[cfg(feature = "storage_pools")]
+fn seed_fell_back(pool: &StoragePool, seed: &DbStorageProvider, table_name: &str) -> bool {
+    matches!(pool.backend_of(table_name), Some(crate::core::storage::TableBackend::KeyValue(_)))
+        && matches!(seed, DbStorageProvider::Memory(_))
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn seed_fell_back(_pool: &StoragePool, _seed: &DbStorageProvider, _table_name: &str) -> bool {
+    false
 }
 
 /// Memory-backed storage for a relation that cannot outlive its statement.
@@ -3601,6 +3632,12 @@ impl Database {
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
+        // A table placed on a key/value store that cannot be opened now is
+        // refused, before its catalogue row: `seed_in` falls back to memory
+        // there, and the table was created in a buffer — every write to it
+        // reported done and gone at the next start.
+        refuse_unopenable_store(&self.storage, &self.kv, table_name).await?;
+
         self.write_catalogue_row(table_name, 0).await?;
 
         // The directory is decided and recorded before a single file is
@@ -3616,6 +3653,14 @@ impl Database {
             table_name,
         )
         .await;
+
+        // The store failing between that check and here falls back the same
+        // way; refused all the same.
+        if seed_fell_back(&self.storage, &seed, table_name) {
+            return Err(io::Error::other(format!(
+                "table {table_name}: its key/value store could not be opened; not created"
+            )));
+        }
 
         let mut table =
             Table::new_with_constraints(table_name, seed, columns, &create_table.unique_columns).await;

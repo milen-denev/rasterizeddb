@@ -58,8 +58,18 @@ impl PendingErases {
     }
 
     /// The process's one record at `path`.
+    /// Keyed by the canonical path, so a relative and an absolute spelling of
+    /// one directory share it.
     pub fn for_path(path: PathBuf) -> Arc<Self> {
-        BY_PATH.lock().entry(path.clone()).or_insert_with(|| Arc::new(Self::new(path))).clone()
+        let canonical = match (path.parent().and_then(|dir| std::fs::canonicalize(dir).ok()), path.file_name()) {
+            (Some(dir), Some(name)) => dir.join(name),
+            _ => path,
+        };
+        BY_PATH
+            .lock()
+            .entry(canonical.clone())
+            .or_insert_with(|| Arc::new(Self::new(canonical)))
+            .clone()
     }
 
     /// The names of `store` at `identity` still to sweep. Lines of `store` at

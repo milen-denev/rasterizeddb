@@ -621,11 +621,20 @@ impl KvRegistry {
         let entry = self.entries.read().get(name).cloned().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("no key/value store named '{name}' in {KV_FILE}"))
         })?;
+        // Fields joined by a separator no field holds, and a directory by its
+        // canonical path: `./kv` and `/srv/db/kv/` are one store, and a
+        // spelling change must not orphan its sweeps.
+        const SEP: char = '\u{1f}';
         Ok(match &entry.spec {
-            StoreSpec::Directory { path, root } => format!("dir {path} {root}"),
+            StoreSpec::Directory { path, root } => {
+                let path = std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.clone());
+                format!("dir{SEP}{path}{SEP}{root}")
+            }
             #[cfg(feature = "kv_storage_s3")]
-            StoreSpec::S3 { endpoint, bucket, root, .. } => format!("s3 {endpoint} {bucket} {root}"),
-            StoreSpec::Unsupported { kind, fields } => format!("{kind} {}", fields.join(" ")),
+            StoreSpec::S3 { endpoint, bucket, root, .. } => {
+                format!("s3{SEP}{}{SEP}{bucket}{SEP}{root}", endpoint.trim_end_matches('/'))
+            }
+            StoreSpec::Unsupported { kind, fields } => format!("{kind}{SEP}{}", fields.join(&SEP.to_string())),
         })
     }
 
