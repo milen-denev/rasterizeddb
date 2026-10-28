@@ -3412,18 +3412,18 @@ async fn a_sweep_interrupted_by_a_stop_resumes_at_the_next_open() {
     let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
     {
         let family = open_family(store.clone()).await;
-        family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+        family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s", "id").unwrap();
         let a = open(&family, "a.db").await;
         a.append_data(b"left behind", true).await;
     }
     // What a drop records before its sweep, with the stop landing before the
     // sweep ran.
-    let identity = open_family(store.clone()).await.identity();
+    let identity = "id".to_string();
     super::pending::PendingErases::new(path.clone()).add("s", &identity, "a.db").unwrap();
     assert!(!store.list("t/a.db/").await.unwrap().is_empty());
 
     let family = open_family(store.clone()).await;
-    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s", "id").unwrap();
     // Opening the name waits for the resumed sweep, and finds nothing.
     let a = tokio::time::timeout(std::time::Duration::from_secs(10), open(&family, "a.db"))
         .await
@@ -3477,7 +3477,7 @@ async fn a_name_stays_held_until_its_sweep_record_is_gone() {
     let path = dir.path().join(super::pending::PENDING_FILE);
     let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
     let family = open_family(store.clone()).await;
-    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s");
+    family.attach_pending(Arc::new(super::pending::PendingErases::new(path.clone())), "s", "id").unwrap();
     let a = open(&family, "a.db").await;
     a.append_data(b"bytes", true).await;
 
@@ -3556,4 +3556,64 @@ async fn a_transaction_touching_an_unopenable_file_cannot_commit() {
     poisoned.append_data_txn(txn, b"row").await;
     healthy.append_data_txn(txn, b"pointer").await;
     assert!(healthy.commit_durable(txn).await.is_err(), "a torn transaction was declared");
+}
+
+/// A stand-in holds a transaction from its first write to the end, however
+/// its queue was emptied: here another transaction's failed flush emptied it,
+/// and the second transaction's commit on a healthy file still refuses.
+#[tokio::test]
+async fn a_stand_in_holds_a_transaction_after_its_queue_is_emptied() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let healthy = open(&family, "t_pointers.db").await;
+    let poisoned = healthy.poisoned("t.db");
+    let first = healthy.begin_txn();
+    let second = healthy.begin_txn();
+    poisoned.append_data_txn(first, b"row 1").await;
+    poisoned.append_data_txn(second, b"row 2").await;
+    assert!(healthy.commit_durable(first).await.is_err());
+    healthy.append_data_txn(second, b"pointer 2").await;
+    assert!(healthy.commit_durable(second).await.is_err(), "the second transaction committed torn");
+}
+
+/// A record that cannot be read refuses the attach — the registry then opens
+/// nothing of the store — rather than leaving listed names open to a table.
+#[tokio::test]
+async fn an_unreadable_sweep_record_refuses_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(super::pending::PENDING_FILE);
+    std::fs::write(&path, "garbled\n").unwrap();
+    let family = open_family(Arc::new(MemoryKvStore::new())).await;
+    assert!(family.attach_pending(Arc::new(super::pending::PendingErases::new(path)), "s", "id").is_err());
+}
+
+/// A name with chunk objects and nothing else — a sweep cut short after its
+/// META and deltas went — is a name in the store: a drop reaches it.
+#[tokio::test]
+async fn a_name_with_only_chunks_left_is_dropped_all_the_same() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let a = open(&family, "a.db").await;
+        let txn = a.begin_txn();
+        a.append_data_txn(txn, &vec![b'c'; 20_000]).await;
+        a.commit_durable(txn).await.unwrap();
+        a.compact_now().await.unwrap();
+    }
+    let keys: Vec<String> = store
+        .list("t/a.db/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.ends_with("/META") || k.contains("/d/"))
+        .collect();
+    store.delete(keys).await.unwrap();
+    assert!(!store.list("t/a.db/").await.unwrap().is_empty(), "no chunks left: the test proves nothing");
+
+    let family = open_family(store.clone()).await;
+    let seed = open(&family, "seed.db").await;
+    seed.drop_name("a.db").await;
+    drop(open(&family, "a.db").await);
+    assert!(store.list("t/a.db/").await.unwrap().is_empty(), "the chunks outlived the drop");
 }

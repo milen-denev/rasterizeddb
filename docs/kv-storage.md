@@ -232,8 +232,11 @@ a dropped table comes back:
   used to leave the objects for a same-named table to read as its own. The
   invariant is that **a name is listed only while no table can hold it**: the
   gate opens only after the record is gone, a record that cannot be read is
-  an error rather than an empty list, and the last removal is synced like any
-  other write. A record left behind while a table took the name again would
+  an error rather than an empty list (and refuses the store's open, since
+  which names are mid-sweep is then unknown), and the last removal is synced
+  like any other write. The identity is the store's definition — kind,
+  address, prefix — not its description, which may be reworded; one record
+  object per file serves the whole process. A record left behind while a table took the name again would
   have the next start's resumed sweep erase that table. A line for the store
   at an address it no longer has is dropped, not resumed. The file is left
   out of backup snapshots: a restored copy resuming a sweep would delete from
@@ -251,8 +254,13 @@ refused too rather than building an empty file over the real one — comes
 back from `create_new` as a stand-in that fails: an empty, dropped,
 unregistered file under a prefix no name has. Reading it fails, anything
 written to it is refused at its flush, and a transaction that wrote to it
-cannot commit on any file (the commit looks for stand-ins apart, since they
-are in no map). `StorageIO::create_new` cannot return an error; the handle it
+cannot commit on any file: a stand-in holds a transaction from its first
+write to its end however its queue is emptied, and the commit and an abort
+look for stand-ins apart, since they are in no map. A name the store holds
+but whose file cannot be opened is swept through a blank built from its
+recovered deltas, so the declarations other files need are carried first;
+and a name with nothing but chunks left is still known to recovery, so a
+drop reaches it. `StorageIO::create_new` cannot return an error; the handle it
 used to return instead was the caller's own file, and a table's reads and
 writes went to another table's bytes. What remains: its length reads 0, so a
 lazily read sidecar opened through one looks empty. The full fix is a

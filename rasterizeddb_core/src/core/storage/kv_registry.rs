@@ -585,19 +585,48 @@ impl KvRegistry {
         );
         // Before any table can open a file of it: a sweep a stop interrupted
         // resumes here, with its name held.
+        // Refused when the record cannot be read: a table opened on a name
+        // still listed there would be erased by the sweep a later start
+        // resumes. Nothing of this store opens until it can be read.
         if let Some(root) = &self.root {
             use crate::core::storage_providers::kv::pending::{PENDING_FILE, PendingErases};
             let pending = self
                 .pending
-                .get_or_init(|| Arc::new(PendingErases::new(Path::new(root).join(PENDING_FILE))))
+                .get_or_init(|| PendingErases::for_path(Path::new(root).join(PENDING_FILE)))
                 .clone();
-            family.attach_pending(pending, name);
+            let identity = self.record_identity(name)?;
+            family.attach_pending(pending, name, &identity).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "key/value store '{name}' is not opened: {} cannot be read, so which of its \
+                         names are mid-sweep is unknown: {e}",
+                        PENDING_FILE
+                    ),
+                )
+            })?;
         }
         // So a backup copying this store can pause it: see
         // `kv::export`.
         crate::core::storage_providers::kv::export::register_live(&family);
         open.insert(name.to_string(), family.clone());
         Ok(family)
+    }
+
+    /// What store `name` is, for the record of unfinished sweeps: its kind,
+    /// address and prefix as defined, so a store defined again elsewhere under
+    /// the same name has a different one. From the definition, not from a
+    /// store's description, which is prose and may be reworded.
+    fn record_identity(&self, name: &str) -> io::Result<String> {
+        let entry = self.entries.read().get(name).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no key/value store named '{name}' in {KV_FILE}"))
+        })?;
+        Ok(match &entry.spec {
+            StoreSpec::Directory { path, root } => format!("dir {path} {root}"),
+            #[cfg(feature = "kv_storage_s3")]
+            StoreSpec::S3 { endpoint, bucket, root, .. } => format!("s3 {endpoint} {bucket} {root}"),
+            StoreSpec::Unsupported { kind, fields } => format!("{kind} {}", fields.join(" ")),
+        })
     }
 
     /// A client for store `name` and the configuration its family opens

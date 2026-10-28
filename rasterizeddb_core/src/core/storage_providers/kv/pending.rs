@@ -18,15 +18,17 @@
 //! the last line is made durable like any other write.
 //!
 //! One file per database, beside `db_kv.cfg`: `store<TAB>identity<TAB>name` a
-//! line. The identity — the store's address and prefix — is part of the key:
+//! line. The identity — the store's address and prefix, from its definition,
+//! not from a description that may be reworded — is part of the key:
 //! a store redefined at another address under the same name must not have
 //! the old address's sweeps resumed against it. Left out of every backup
 //! snapshot — a restored copy resuming a sweep would delete from the store the
 //! live server still uses.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use log::warn;
 use parking_lot::Mutex;
@@ -44,9 +46,20 @@ pub struct PendingErases {
     writing: Mutex<()>,
 }
 
+/// One per file across the process: two registries over one database (one
+/// reopened while the old one's sweeps still run) share the lock, or their
+/// read-modify-writes could lose each other's lines — a lost removal is a
+/// record outliving its sweep.
+static BY_PATH: LazyLock<Mutex<HashMap<PathBuf, Arc<PendingErases>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl PendingErases {
     pub fn new(path: PathBuf) -> Self {
         Self { path, writing: Mutex::new(()) }
+    }
+
+    /// The process's one record at `path`.
+    pub fn for_path(path: PathBuf) -> Arc<Self> {
+        BY_PATH.lock().entry(path.clone()).or_insert_with(|| Arc::new(Self::new(path))).clone()
     }
 
     /// The names of `store` at `identity` still to sweep. Lines of `store` at
