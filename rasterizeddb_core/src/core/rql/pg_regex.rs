@@ -139,7 +139,10 @@ pub fn compile(pattern: &str, flags: &str) -> Result<PgRegex, PgRegexError> {
         apply_flag(&mut o, c, false)?;
     }
     let mut body: &str = pattern;
-    if let Some(rest) = body.strip_prefix("***=") {
+    // Under the `q` flag the whole pattern is literal, a leading `***=` or
+    // `***:` included (PostgreSQL reads no director then).
+    if o.literal {
+    } else if let Some(rest) = body.strip_prefix("***=") {
         o.literal = true;
         body = rest;
     } else if let Some(rest) = body.strip_prefix("***:") {
@@ -203,8 +206,10 @@ const QUANT_INVALID: &str = "quantifier operand invalid";
 /// class depends on the locale.
 fn class_set(name: &str) -> Option<(&'static str, bool)> {
     Some(match name {
-        "digit" => ("0-9", false),
-        "xdigit" => ("0-9A-Fa-f", false),
+        // Locale-dependent too: under an ICU locale `[[:digit:]]` takes
+        // '١'. Judged for ASCII text only, as every other class.
+        "digit" => ("0-9", true),
+        "xdigit" => ("0-9A-Fa-f", true),
         "alpha" => ("A-Za-z", true),
         "alnum" => ("0-9A-Za-z", true),
         "upper" => ("A-Z", true),
@@ -415,8 +420,15 @@ impl<'a> Parser<'a> {
         };
         self.i += 1;
         Ok(match c {
-            'd' => ("[0-9]".into(), true),
-            'D' => ("[^0-9]".into(), true),
+            // `\d` is `[[:digit:]]`, locale-dependent as it is.
+            'd' => {
+                self.ascii_only = true;
+                ("[0-9]".into(), true)
+            }
+            'D' => {
+                self.ascii_only = true;
+                ("[^0-9]".into(), true)
+            }
             's' => {
                 self.ascii_only = true;
                 ("[ \\t\\n\\x0B\\x0C\\r]".into(), true)
@@ -507,6 +519,11 @@ impl<'a> Parser<'a> {
         };
         let mut items = String::new();
         let mut first = true;
+        // Whether the member just read was a range, a class or an escape
+        // set: a `-` after one starts no range, and anything but `]` after
+        // that `-` is PostgreSQL's "invalid character range" (`[a-c-e]`,
+        // `[\w-.]`, `[[:alpha:]-z]`), where it was read as a range from `-`.
+        let mut completed = false;
         loop {
             let Some(c) = self.peek() else {
                 return Err(PgRegexError::Invalid("brackets [] not balanced".into()));
@@ -515,6 +532,10 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 break;
             }
+            if completed && c == '-' && self.c.get(self.i + 1).is_some_and(|n| *n != ']') {
+                return Err(PgRegexError::Invalid("invalid character range".into()));
+            }
+            completed = false;
             first = false;
             // One member: a class, a collating element, an escape or a char.
             let start: Option<char> = if c == '[' && self.c.get(self.i + 1) == Some(&':') {
@@ -555,6 +576,7 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 match e {
                     'd' => {
+                        self.ascii_only = true;
                         items.push_str("0-9");
                         None
                     }
@@ -577,7 +599,10 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 Some(c)
             };
-            let Some(lo) = start else { continue };
+            let Some(lo) = start else {
+                completed = true;
+                continue;
+            };
             // A range `lo-hi`, unless the `-` ends the bracket.
             if self.peek() == Some('-') && self.c.get(self.i + 1).is_some_and(|n| *n != ']') {
                 self.i += 1;
@@ -606,6 +631,7 @@ impl<'a> Parser<'a> {
                 items.push_str(&class_char(lo));
                 items.push('-');
                 items.push_str(&class_char(hi));
+                completed = true;
             } else {
                 if self.o.ci && !lo.is_ascii() {
                     return Err(PgRegexError::Unsupported("a non-ASCII character in a case-insensitive pattern".into()));
@@ -710,7 +736,11 @@ mod tests {
         assert_eq!(m("\\yfoo\\y", "", "a foo b"), Some(true));
         assert_eq!(m("[[:<:]]foo[[:>:]]", "", "a foo b"), Some(true));
         assert_eq!(m("[[:<:]]foo[[:>:]]", "", "afoo"), Some(false));
-        assert_eq!(m("^\\d+$", "", "١٢٣"), Some(false));
+        // `\d` and `[[:digit:]]` are the locale's (an ICU database takes
+        // '١'): declined for non-ASCII text, answered for ASCII.
+        assert_eq!(m("^\\d+$", "", "١٢٣"), None);
+        assert_eq!(m("^[[:digit:]]+$", "", "١٢٣"), None);
+        assert_eq!(m("^\\d+$", "", "123"), Some(true));
         assert_eq!(m("^\\w+$", "", "héllo"), None);
         assert_eq!(m("^[a-z]+$", "i", "ſ"), None);
         assert_eq!(m("^\\w{1,30}$", "", "abc"), Some(true));
@@ -718,6 +748,13 @@ mod tests {
         assert_eq!(m("***=a.b", "", "a.b"), Some(true));
         assert_eq!(m("***=a.b", "", "axb"), Some(false));
         assert_eq!(m("a.c", "q", "abc"), Some(false));
+        // Under `q` a leading director is literal too.
+        assert_eq!(m("***=a", "q", "***=a"), Some(true));
+        assert_eq!(m("***=a", "q", "a"), Some(false));
+        assert_eq!(m("***:a", "q", "x***:ab"), Some(true));
+        // A `-` closing a bracket after a range is a literal.
+        assert_eq!(m("^[a-c-]+$", "", "a-c"), Some(true));
+        assert_eq!(m("^[%--]+$", "", "%-"), Some(true));
         assert_eq!(m("(?n)^b$", "", "a\nb"), Some(true));
         assert_eq!(m("^[]a]+$", "", "]a"), Some(true));
         assert_eq!(m("^[a\\]]+$", "", "a]"), Some(true));
@@ -732,6 +769,11 @@ mod tests {
         invalid("a(?i)bc");
         invalid("\\p{L}");
         invalid("a{256}");
+        // A `-` after a range, a class or an escape set, not closing the
+        // bracket: "invalid character range".
+        for p in ["[a-c-e]", "[\\d-z]", "[[:alpha:]-z]", "[\\w-.]+@x", "[a-c--]"] {
+            invalid(p);
+        }
         let unsupported = |p: &str| assert!(matches!(compile(p, ""), Err(PgRegexError::Unsupported(_))), "{p}");
         unsupported("^(a)\\1$");
         unsupported("^a(?=b)");
