@@ -4295,6 +4295,19 @@ async fn execute_update_from(
             "UPDATE … FROM without a WHERE would pair every row with every other; refusing",
         );
     }
+    // Every qualifier names the target or a source. One naming neither was
+    // dropped by the join's reader, so `WHERE u.tid = nosuch.id AND u.id =
+    // 2` paired every target row with u's row 2 and rewrote them all; and an
+    // aliased target is known only by its alias (`UPDATE t x … WHERE u.tid =
+    // t.id`). PostgreSQL's 42P01.
+    {
+        let explicit_alias = (target_alias != table).then_some(target_alias.as_str());
+        let allowed = join_write_qualifiers(table_token, explicit_alias, source_text);
+        let texts = [assignments_text, condition, returning.as_deref().unwrap_or("")];
+        if let Some(refusal) = refuse_unknown_qualifier(&texts, &allowed) {
+            return refusal;
+        }
+    }
 
     // A derived table is materialised first, so the join reads a real relation.
     let mut temps: Vec<String> = Vec::new();
@@ -4807,6 +4820,16 @@ async fn execute_delete_using(
         return ddl_error(
             "DELETE … USING without a WHERE would pair every row with every other; refusing",
         );
+    }
+    // As for `UPDATE … FROM`: `DELETE FROM t USING u WHERE u.tid = nosuch.id
+    // AND u.w = 200` deleted the whole table.
+    {
+        let explicit_alias = (target_alias != table).then_some(target_alias.as_str());
+        let allowed = join_write_qualifiers(table_token, explicit_alias, source_text);
+        let texts = [condition, returning.as_deref().unwrap_or("")];
+        if let Some(refusal) = refuse_unknown_qualifier(&texts, &allowed) {
+            return refusal;
+        }
     }
 
     // A derived source is materialised first, exactly as `UPDATE … FROM` does.
@@ -5376,6 +5399,43 @@ async fn update_from_join(
 
 /// The relation names a `USING` / `FROM` list makes visible: each comma-
 /// separated item's alias, or its table name when it has none.
+/// The qualifiers an `UPDATE … FROM` or `DELETE … USING` knows its
+/// relations by: the target's (its alias alone when it has one) and each
+/// source's, a derived one by its alias.
+fn join_write_qualifiers(target: &str, target_alias: Option<&str>, sources: &str) -> Vec<String> {
+    let mut allowed = crate::core::sql_scan::relation_qualifiers(target, target_alias);
+    for item in crate::core::rql::lexer_ct::split_definitions(sources) {
+        let item = item.trim();
+        if item.starts_with('(') {
+            let Some(close) = crate::core::sql_scan::matching_close(item, 0) else { continue };
+            let alias = item[close + 1..].trim();
+            let alias = alias.strip_prefix("AS ").or_else(|| alias.strip_prefix("as ")).unwrap_or(alias).trim();
+            allowed.push(alias.trim_matches('"').to_string());
+            continue;
+        }
+        let words: Vec<&str> = item.split_whitespace().collect();
+        let alias = match words.as_slice() {
+            [_, kw, a] if kw.eq_ignore_ascii_case("AS") => Some(*a),
+            [_, a] => Some(*a),
+            _ => None,
+        };
+        if let Some(name) = words.first() {
+            allowed.extend(crate::core::sql_scan::relation_qualifiers(name, alias));
+        }
+    }
+    allowed
+}
+
+/// The 42P01 refusal for the first qualifier in `texts` naming none of
+/// `allowed`, or `None`.
+fn refuse_unknown_qualifier(texts: &[&str], allowed: &[String]) -> Option<Vec<u8>> {
+    let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    texts
+        .iter()
+        .find_map(|t| crate::core::sql_scan::unknown_qualifier(t, &allowed))
+        .map(|q| ddl_error(&crate::core::sql_scan::missing_from_entry(&q)))
+}
+
 fn source_aliases(source_clause: &str) -> Vec<String> {
     crate::core::rql::lexer_ct::split_definitions(source_clause)
         .iter()
@@ -5934,12 +5994,17 @@ async fn apply_conflict_update(
     // INTO t AS t0 … SET v = t0.v + 1`); the generated UPDATE names it by
     // none, so each is taken off. `EXCLUDED` is read however it is quoted
     // (sea-orm: `"excluded"."v"`).
-    let mut known = crate::core::sql_scan::relation_qualifiers(table_name, None);
-    if let Some(alias) = insert_alias(insert_sql) {
-        known.push(alias);
-    }
+    // Aliased, the table is known by its alias alone (`INSERT INTO t AS x …
+    // SET v = t.v` is 42P01 in PostgreSQL); `excluded` is the proposed row.
+    let alias = insert_alias(insert_sql);
+    let known = crate::core::sql_scan::relation_qualifiers(table_name, alias.as_deref());
     let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let mut allowed = known.clone();
+    allowed.push("excluded");
     let resolve = |text: &str| -> Result<String, String> {
+        if let Some(q) = crate::core::sql_scan::unknown_qualifier(text, &allowed) {
+            return Err(crate::core::sql_scan::missing_from_entry(&q));
+        }
         let text = crate::core::sql_scan::respell_qualifier(text, "excluded", "EXCLUDED");
         let text = substitute_excluded(&text, &inserted)?;
         Ok(fold_constants_in_predicate(&crate::core::sql_scan::strip_qualifiers(&text, &known)))
@@ -5958,8 +6023,11 @@ async fn apply_conflict_update(
 
     // `RETURNING` was moved back onto the INSERT by the parser, so it is read
     // from there and carried onto the UPDATE.
+    // Its qualifiers are the INSERT's (`RETURNING x.id` under `AS x`), which
+    // the UPDATE, naming the table bare, does not have: taken off as the
+    // SET's are.
     let returning = crate::core::rql::join::find_keyword(insert_sql, "RETURNING", 0)
-        .map(|at| insert_sql[at..].trim().to_string());
+        .map(|at| crate::core::sql_scan::strip_qualifiers(insert_sql[at..].trim(), &known));
 
     let statement = format!(
         "UPDATE {} SET {} WHERE {}{}",
@@ -7170,8 +7238,10 @@ fn insert_alias(insert_sql: &str) -> Option<String> {
     if !next.eq_ignore_ascii_case("AS") {
         return None;
     }
-    let alias = words.next()?.split('(').next()?.trim_matches('"');
-    (!alias.is_empty()).then(|| alias.to_string())
+    // Kept quoted when written so: `AS "X"` is `X` exactly, which a bare `x`
+    // (folded) is not.
+    let alias = words.next()?.split('(').next()?;
+    (!alias.trim_matches('"').is_empty()).then(|| alias.to_string())
 }
 
 /// Whether a column default is a constant: a literal, or one under a cast.
@@ -7194,13 +7264,38 @@ const EXCLUDED_UNAVAILABLE: &str = "\u{1}unavailable:";
 
 /// Replaces every `EXCLUDED.<column>` with the value the insert would have
 /// written for it.
+/// Where `EXCLUDED.` starts in `text` as a reference: outside quotes and
+/// comments, not the tail of a longer word.
+fn find_excluded_marker(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i).or_else(|| crate::core::sql_scan::skip_comment(bytes, i)) {
+            // A double-quoted name is an identifier; only literals are text.
+            if bytes[i] != b'"' {
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        if bytes.len() - i >= 9
+            && bytes[i..i + 9].eq_ignore_ascii_case(b"EXCLUDED.")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.'))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<String, String> {
     const MARKER: &str = "EXCLUDED.";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
-        let upper = rest.to_ascii_uppercase();
-        let Some(at) = upper.find(MARKER) else {
+        // Outside string literals and dollar quotes, as a whole word: text
+        // that says `excluded.v` is text (it was replaced inside the string).
+        let Some(at) = find_excluded_marker(rest) else {
             out.push_str(rest);
             return Ok(out);
         };
@@ -16203,6 +16298,20 @@ pub(crate) async fn execute_with_need(
             // parser with the word SELECT in its assignment and came back as
             // "Cannot parse UPDATE query", naming nothing.
             if let QueryPurpose::UpdateRow(sql) = &query {
+                // A subquery reading the row being updated has a value per
+                // row, which nothing here evaluates: left in place, its text
+                // reached the assignment as a value (22P02, naming the
+                // subquery), and a DO UPDATE's, stripped of its qualifier,
+                // read the inner table's own column and stored NULL.
+                if crate::core::rql::join::find_keyword(sql, "FROM", 0).is_none()
+                    && crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some()
+                {
+                    return ddl_error(
+                        "a correlated subquery in UPDATE is not supported: one that reads \
+                         the row being updated has a value per row, which this cannot evaluate; \
+                         write it as UPDATE … FROM",
+                    );
+                }
                 if crate::core::rql::subquery::find_in_subquery(sql).is_some()
                     || crate::core::rql::subquery::find_exists(sql).is_some()
                     || crate::core::rql::subquery::find_scalar_subquery(sql).is_some()

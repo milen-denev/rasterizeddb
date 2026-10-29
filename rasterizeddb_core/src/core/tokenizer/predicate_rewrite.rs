@@ -1596,6 +1596,29 @@ fn resolve_column(raw: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<Str
         .map(|f| f.name.clone())
 }
 
+/// Whether a word that starts with a digit is a number as PostgreSQL reads
+/// one: digits with one point and an exponent (`1.5e-3`), `_` separators,
+/// or a `0x`/`0o`/`0b` integer.
+fn is_numeric_literal_word(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    for (prefix, digit) in [("0x", 16u32), ("0o", 8), ("0b", 2)] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            return !rest.is_empty() && rest.chars().all(|c| c.is_digit(digit) || c == '_');
+        }
+    }
+    let (mantissa, exponent) = match lower.find('e') {
+        Some(at) => (&lower[..at], Some(&lower[at + 1..])),
+        None => (lower.as_str(), None),
+    };
+    let mantissa_ok = mantissa.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+        && mantissa.matches('.').count() <= 1;
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && e.chars().all(|c| c.is_ascii_digit())
+    });
+    mantissa_ok && exponent_ok
+}
+
 /// True when the token could begin a value: a literal, or a qualified name.
 fn is_value_start(tok: &Tok) -> bool {
     matches!(tok, Tok::Str(_) | Tok::Word(_) | Tok::LPar)
@@ -3668,6 +3691,12 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                 continue;
             }
 
+            // A number running into a word (`id=1AND v=10`) is PostgreSQL's
+            // "trailing junk after numeric literal"; read as a literal, the
+            // `AND` and the comparison after it were lost.
+            if raw.bytes().next().is_some_and(|b| b.is_ascii_digit()) && !is_numeric_literal_word(raw) {
+                return Err(format!("trailing junk after numeric literal at or near \"{}\"", raw));
+            }
             // A bare number is a literal.
             if raw.bytes().next().is_some_and(|b| b.is_ascii_digit())
                 || (raw.starts_with('-') && raw.len() > 1)

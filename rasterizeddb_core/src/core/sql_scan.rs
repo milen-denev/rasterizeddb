@@ -235,9 +235,10 @@ fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
     // One name at `i`: (its text unquoted, the offset past it).
     let read = |i: usize| -> Option<(String, usize)> {
         if bytes.get(i) == Some(&b'"') {
+            // Kept quoted: a quoted name is matched by its exact case.
             let end = quoted_end(bytes, i, b'"');
             let inner = text.get(i + 1..end.saturating_sub(1))?;
-            return Some((inner.replace("\"\"", "\""), end));
+            return Some((format!("\"{}\"", inner.replace("\"\"", "\"")), end));
         }
         let mut j = i;
         while j < bytes.len() && ident_byte(bytes[j]) {
@@ -329,7 +330,30 @@ fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
 /// (`t`, `public.t`), compared name by name without regard to ASCII case.
 fn qualifier_is(names: &[String], allowed: &str) -> bool {
     let parts: Vec<&str> = allowed.split('.').collect();
-    parts.len() == names.len() && parts.iter().zip(names).all(|(a, n)| a.trim_matches('"').eq_ignore_ascii_case(n))
+    parts.len() == names.len()
+        && parts.iter().zip(names).all(|(a, n)| {
+            // A quoted name is its exact spelling (`"T"` is not `t`), a bare
+            // one folds (`T` is `t`), as PostgreSQL reads them. An allowed
+            // name written quoted is held to that; one written bare may be a
+            // catalogue name some caller unquoted, so it matches either way.
+            let a: &str = a;
+            let quoted_n = n.strip_prefix('"').and_then(|n| n.strip_suffix('"'));
+            match a.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+                Some(a) => match quoted_n {
+                    Some(quoted) => quoted == a,
+                    None => n.to_ascii_lowercase() == a,
+                },
+                None => match quoted_n {
+                    Some(quoted) => quoted == a,
+                    None => a.eq_ignore_ascii_case(n),
+                },
+            }
+        })
+}
+
+/// A qualifier's names as a message shows them, unquoted.
+fn written(names: &[String]) -> String {
+    names.iter().map(|n| n.trim_matches('"')).collect::<Vec<_>>().join(".")
 }
 
 /// The first qualifier in `text` (`q` in `q.col`, `public.t` in
@@ -346,7 +370,19 @@ pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
     qualified_references(text)
         .into_iter()
         .find(|(_, _, names)| !allowed.iter().any(|a| qualifier_is(names, a)))
-        .map(|(_, _, names)| names.join("."))
+        .map(|(_, _, names)| written(&names))
+}
+
+/// Whether `text` is exactly `q.*` for a `q` in `allowed` (`t.*`,
+/// `public.t.*`, `"x".*`).
+pub fn is_qualified_star(text: &str, allowed: &[&str]) -> bool {
+    let text = text.trim();
+    let Some(head) = text.strip_suffix(".*") else { return false };
+    let refs = qualified_references(text);
+    refs.len() == 1
+        && refs[0].0 == 0
+        && refs[0].1 == head.len() + 1
+        && allowed.iter().any(|a| qualifier_is(&refs[0].2, a))
 }
 
 /// `text` with each qualifier that is one of `strip` removed: `t0.v` as `v`,
@@ -387,7 +423,9 @@ pub fn respell_qualifier(text: &str, from: &str, to: &str) -> String {
 /// written when that is another schema.
 pub fn relation_qualifiers(relation: &str, alias: Option<&str>) -> Vec<String> {
     if let Some(alias) = alias {
-        return vec![alias.trim_matches('"').to_string()];
+        // A quoted alias keeps its quotes: [`qualifier_is`] then holds it to
+        // its exact spelling, as PostgreSQL does (`AS "X"` is not `x`).
+        return vec![alias.to_string()];
     }
     let parts: Vec<String> = relation.split('.').map(|p| p.trim_matches('"').to_string()).collect();
     let name = parts.last().cloned().unwrap_or_default();
@@ -751,6 +789,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_relation_star_is_read_as_its_columns() {
+        let allowed = ["t", "public.t"];
+        assert!(is_qualified_star("t.*", &allowed));
+        assert!(is_qualified_star("public.t.*", &allowed));
+        assert!(is_qualified_star("T.*", &allowed));
+        assert!(!is_qualified_star("u.*", &allowed));
+        assert!(!is_qualified_star("t.*, id", &allowed));
+        assert!(!is_qualified_star("\"T\".*", &allowed));
+    }
+
+    #[test]
+    fn a_quoted_alias_is_its_exact_spelling() {
+        let quoted = relation_qualifiers("t", Some("\"X\""));
+        let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+        assert_eq!(unknown_qualifier("\"X\".v + 1", &quoted), None);
+        assert_eq!(unknown_qualifier("x.v + 1", &quoted).as_deref(), Some("x"));
+        assert_eq!(unknown_qualifier("X.v + 1", &quoted).as_deref(), Some("X"));
+        let lower = relation_qualifiers("t", Some("\"x\""));
+        let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+        assert_eq!(unknown_qualifier("X.v + x.v + \"x\".v", &lower), None);
+        let bare = relation_qualifiers("t", Some("x"));
+        let bare: Vec<&str> = bare.iter().map(String::as_str).collect();
+        assert_eq!(unknown_qualifier("X.v + x.v", &bare), None);
+    }
 
     fn norm(sql: &str) -> String {
         normalize_string_literals(sql).unwrap().into_owned()

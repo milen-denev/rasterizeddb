@@ -284,6 +284,49 @@ pub struct QueryRowsData {
     pub query: String,
 }
 
+/// The statement with its write target written in the default schema
+/// (`public.k`, `"public"."k"`) as the bare name the catalogue holds, as a
+/// read's FROM already is: Prisma writes every UPDATE and DELETE that way,
+/// and each failed with "Table not found". The target is the word after the
+/// first `skip` words; a qualifier `public.k.id` later in the statement still
+/// names it (`sql_scan::relation_qualifiers`).
+fn unqualify_write_target(sql: &str, skip: usize) -> String {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    for _ in 0..skip {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'(' {
+        if bytes[i] == b'"' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            continue;
+        }
+        i += 1;
+    }
+    let target = &sql[start..i];
+    let lower = target.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("\"public\".") {
+        &target[target.len() - r.len()..]
+    } else if let Some(r) = lower.strip_prefix("public.") {
+        &target[target.len() - r.len()..]
+    } else {
+        return sql.to_string();
+    };
+    if rest.is_empty() || rest.contains('.') && !rest.starts_with('"') {
+        return sql.to_string();
+    }
+    format!("{}{}{}", &sql[..start], rest, &sql[i..])
+}
+
 /// Normalises a relation reference into the bare table name.
 ///
 /// ORMs quote every identifier and may schema-qualify it, so the token after
@@ -561,9 +604,9 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
             None
         }
     } else if simd_compare_strings(query_bytes, b"UPDATE", &StartsWith) {
-        Some(UpdateRow(query_trimmed.to_string()))
+        Some(UpdateRow(unqualify_write_target(query_trimmed, 1)))
     } else if simd_compare_strings(query_bytes, b"DELETE FROM", &StartsWith) {
-        Some(DeleteRow(query_trimmed.to_string()))
+        Some(DeleteRow(unqualify_write_target(query_trimmed, 2)))
     } else if simd_compare_strings(query_bytes, b"SELECT", &StartsWith) {
         // Extract table name after the statement's own "FROM".
         //

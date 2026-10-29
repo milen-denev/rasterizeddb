@@ -4860,7 +4860,33 @@ pub fn plan_statement(
     let limit = parse_count(limit_at, "LIMIT")?;
     let offset = parse_count(offset_at, "OFFSET")?;
 
+    // Set operations this does not implement are refused by name (0A000),
+    // as on one table; they reached the select list as a column name.
+    for clause in ["INTERSECT", "EXCEPT"] {
+        if find_keyword(sql, clause, 0).is_some() {
+            return Err(format!("{clause} is not supported"));
+        }
+    }
     let relations = parse_from_clause(after_from[..from_end].trim())?;
+    // Every qualifier names a relation of the FROM clause, an aliased one by
+    // its alias alone (PostgreSQL's 42P01). An unknown one was refused with
+    // the wrong words, or — `FROM t a JOIN u b ON b.tid = t.id` — read as the
+    // table behind the alias and answered.
+    {
+        let mut allowed: Vec<String> = Vec::new();
+        for r in &relations {
+            let alias = (!r.label.eq_ignore_ascii_case(&r.table)).then_some(r.label.as_str());
+            allowed.extend(crate::core::sql_scan::relation_qualifiers(&r.table, alias));
+        }
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        let from_text = &after_from[..from_end];
+        let tail = &after_from[from_end..];
+        let mut texts: Vec<&str> = vec![select_list, tail];
+        texts.extend(on_segments(from_text));
+        if let Some(q) = texts.iter().find_map(|t| crate::core::sql_scan::unknown_qualifier(t, &allowed)) {
+            return Err(crate::core::sql_scan::missing_from_entry(&q));
+        }
+    }
     let mut planned = plan(
         relations,
         select_list,
@@ -4874,6 +4900,23 @@ pub fn plan_statement(
     )?;
     planned.distinct = distinct;
     Ok(planned)
+}
+
+/// The `ON` conditions of a FROM clause, each from its `ON` to the next join.
+fn on_segments(from_text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(on) = find_keyword(from_text, "ON", at) {
+        let start = on + 2;
+        let end = ["JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS"]
+            .iter()
+            .filter_map(|k| find_keyword(from_text, k, start))
+            .min()
+            .unwrap_or(from_text.len());
+        out.push(&from_text[start..end]);
+        at = end;
+    }
+    out
 }
 
 /// Which relations a `WHERE` conjunct refers to.

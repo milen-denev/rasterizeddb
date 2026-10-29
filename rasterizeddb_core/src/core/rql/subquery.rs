@@ -136,6 +136,17 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
 /// It must return exactly one row of one column, which then behaves as a
 /// constant — the same shape a literal select item takes.
 pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
+    scalar_subquery(sql, false)
+}
+
+/// The first scalar subquery that reads the outer row, which
+/// [`find_scalar_subquery`] leaves in place: a statement with no per-row
+/// evaluator for it must refuse it, or its text reaches a value parser.
+pub fn find_correlated_scalar_subquery(sql: &str) -> Option<InSubquery> {
+    scalar_subquery(sql, true)
+}
+
+fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
     if !may_hold(sql, b"SELECT") {
         return None;
     }
@@ -233,7 +244,7 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
                     // between two of the *inner* table's own columns. That
                     // returns a plausible number for the wrong question, and
                     // the statement then reports success.
-                    if !is_correlated(&inner_sql) {
+                    if is_correlated(&inner_sql) == correlated {
                         return Some(InSubquery {
                             start: open,
                             end: m,

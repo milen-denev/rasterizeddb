@@ -6528,7 +6528,7 @@ fn result_description(
                                 .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                                 .collect::<Vec<_>>(),
                         ),
-                        Some(Err(e)) => return Err(("42703", e)),
+                        Some(Err(e)) => return Err((returning_sqlstate(&e), e)),
                         None => None,
                     }
                 }
@@ -6545,7 +6545,7 @@ fn result_description(
                             .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                             .collect::<Vec<_>>(),
                     ),
-                    Some(Err(e)) => return Err(("42703", e)),
+                    Some(Err(e)) => return Err((returning_sqlstate(&e), e)),
                     None => None,
                 }
             }
@@ -6931,6 +6931,17 @@ fn materialize_class(code: &'static str) -> &'static str {
         code
     } else {
         "0A000"
+    }
+}
+
+/// The SQLSTATE of a `RETURNING` list that does not resolve: a column it
+/// names that is not there (42703), or a qualifier naming no relation of the
+/// statement (42P01), which this read as the column's error.
+fn returning_sqlstate(message: &str) -> &'static str {
+    if message.starts_with("missing FROM-clause entry for table") {
+        "42P01"
+    } else {
+        "42703"
     }
 }
 

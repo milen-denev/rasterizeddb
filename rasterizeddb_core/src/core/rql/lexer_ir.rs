@@ -699,66 +699,10 @@ pub fn returning_columns(
     sql: &str,
     schema: &[SchemaField],
 ) -> Option<Result<Vec<SchemaField>, String>> {
-    // Find the keyword outside of any string literal, so a value containing the
-    // word "returning" cannot be mistaken for the clause.
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut kw_at = None;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                const KW: &[u8] = b"RETURNING";
-                if bytes[i] | 0x20 == b'r'
-                    && i + KW.len() <= bytes.len()
-                    && bytes[i..i + KW.len()].eq_ignore_ascii_case(KW)
-                    && (i == 0 || !is_ident_byte(bytes[i - 1]))
-                    && (i + KW.len() == bytes.len() || !is_ident_byte(bytes[i + KW.len()]))
-                {
-                    kw_at = Some(i + KW.len());
-                    break;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    let start = kw_at?;
-    let list = sql[start..].trim().trim_end_matches(';').trim();
-    if list.is_empty() {
-        return Some(Err(
-            "RETURNING is present but no columns were listed".to_string()
-        ));
-    }
-
-    if list == "*" {
-        // The same columns `SELECT *` shows, for the same reasons: a `__null_`
-        // companion is bookkeeping the client has no name for, and a dropped
-        // column keeps its slot rather than being removed, so both would
-        // otherwise come back here after `SELECT *` had stopped returning them.
-        let mut fields: Vec<SchemaField> = schema
-            .iter()
-            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
-            .cloned()
-            .collect();
-        fields.sort_by_key(|f| f.write_order);
-        return Some(Ok(fields));
-    }
-
-    Some(parse_items(list, schema).map(|items| {
+    // Read from the items, so the two views cannot disagree: this one had a
+    // keyword scan and a `*` of its own, and refused `RETURNING t.*` the items
+    // had accepted.
+    Some(returning_items(sql, schema)?.map(|items| {
         // The compatibility view: every item as a `SchemaField`. A computed
         // item gets a synthetic one — its alias, its static type, a
         // write_order above every real field's — which is exactly what the
@@ -806,14 +750,26 @@ pub fn returning_items(
     sql: &str,
     schema: &[SchemaField],
 ) -> Option<Result<Vec<ReturningItem>, String>> {
-    let (_, list) = returning_split(sql)?;
+    let (head, list) = returning_split(sql)?;
     let list = list.trim().trim_end_matches(';').trim();
     if list.is_empty() {
         return Some(Err(
             "RETURNING is present but no columns were listed".to_string()
         ));
     }
-    if list == "*" {
+    // Every qualifier names the statement's relation (its alias alone when
+    // it has one); `RETURNING nosuch.id` committed and answered. A join
+    // write (`UPDATE … FROM`, `DELETE … USING`) checks its own, across its
+    // relations.
+    let mut star = false;
+    if let Some(allowed) = write_target_qualifiers(head) {
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        if let Some(q) = crate::core::sql_scan::unknown_qualifier(list, &allowed) {
+            return Some(Err(crate::core::sql_scan::missing_from_entry(&q)));
+        }
+        star = crate::core::sql_scan::is_qualified_star(list, &allowed);
+    }
+    if list == "*" || star {
         let mut fields: Vec<SchemaField> = schema
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -823,6 +779,36 @@ pub fn returning_items(
         return Some(Ok(fields.into_iter().map(ReturningItem::Column).collect()));
     }
     Some(parse_items(list, schema))
+}
+
+/// The qualifiers the target of a one-relation `INSERT`, `UPDATE` or
+/// `DELETE` is known by; `None` for one that joins other relations or that
+/// this cannot read.
+fn write_target_qualifiers(head: &str) -> Option<Vec<String>> {
+    use crate::core::rql::join::find_keyword;
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let first = words.first()?.to_ascii_uppercase();
+    let (name, rest) = match first.as_str() {
+        "INSERT" if words.get(1)?.eq_ignore_ascii_case("INTO") => (*words.get(2)?, &words[3..]),
+        "UPDATE" if find_keyword(head, "FROM", 0).is_none() => (*words.get(1)?, &words[2..]),
+        "DELETE" if words.get(1)?.eq_ignore_ascii_case("FROM") && find_keyword(head, "USING", 0).is_none() => {
+            (*words.get(2)?, &words[3..])
+        }
+        _ => return None,
+    };
+    let name = name.split('(').next()?;
+    let alias = match rest {
+        [kw, a, ..] if kw.eq_ignore_ascii_case("AS") => Some(a.split('(').next()?),
+        [a, ..] if !["SET", "WHERE", "VALUES", "SELECT", "DEFAULT", "ON", "OVERRIDING"]
+            .iter()
+            .any(|k| a.eq_ignore_ascii_case(k))
+            && !a.starts_with('(') =>
+        {
+            Some(*a)
+        }
+        _ => None,
+    };
+    Some(crate::core::sql_scan::relation_qualifiers(name, alias))
 }
 
 fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>, String> {

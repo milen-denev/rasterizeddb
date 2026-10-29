@@ -1555,6 +1555,7 @@ pub fn row_fetch_from_select_query(
     // And every qualifier names that relation (or its alias): `WHERE
     // nosuch.v > 0` read t's `v`. Up to a UNION, whose branches have their
     // own FROM.
+    let star_list;
     {
         let raw = after_from[..table_end].split_whitespace().next().unwrap_or("");
         // Once aliased, the relation is known only by its alias, as in
@@ -1567,7 +1568,11 @@ pub fn row_fetch_from_select_query(
                 return Err(crate::core::sql_scan::missing_from_entry(&q));
             }
         }
+        star_list = crate::core::sql_scan::is_qualified_star(columns_part, &allowed);
     }
+    // `SELECT t.*`, `x.*`, `public.t.*`: the relation's every column, which
+    // is `*` here (it was "Column 't.*' not found").
+    let columns_part = if star_list { "*" } else { columns_part };
 
     // WHERE clause is everything after WHERE up to ORDER BY / LIMIT / OFFSET.
     let where_raw = if let Some(wp) = where_pos {

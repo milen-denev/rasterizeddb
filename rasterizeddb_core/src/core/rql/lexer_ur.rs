@@ -531,10 +531,17 @@ fn parse_update_row(
     let mut expressions: SmallVec<[(u32, crate::core::rql::expr::Expr); 8]> = SmallVec::new();
     // Split on top-level commas only: a comma inside `COALESCE(a, b)` or inside
     // a quoted string is data, not a separator between assignments.
+    if set_clause.trim_end().ends_with(',') {
+        rejection.replace("syntax error at or near \",\": an assignment is missing".to_string());
+        return None;
+    }
     for assignment in crate::core::rql::lexer_ct::split_definitions(set_clause) {
         let assignment = assignment.trim();
         if assignment.is_empty() {
-            continue;
+            // `SET v = 0, WHERE …`: an empty assignment is a syntax error,
+            // not one fewer.
+            rejection.replace("syntax error at or near \",\": an assignment is missing".to_string());
+            return None;
         }
 
         let mut kv = assignment.splitn(2, '=');

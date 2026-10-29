@@ -95,7 +95,7 @@ async fn unknown_words_and_qualifiers_are_refused() {
 /// the relation in the default schema (`public.t.id` beside a bare `FROM t`),
 /// quoted or not; in `ON CONFLICT DO UPDATE`, the INSERT's alias (Ecto:
 /// `INSERT INTO t AS t0 … SET v = t0.v + 1`), the schema-qualified target
-/// (Prisma's upsert) and `EXCLUDED` however quoted (sea-orm). Each was 42P01
+/// (Prisma's upsert) and `EXCLUDED` bare or quoted as `"excluded"` (sea-orm). Each was 42P01
 /// once qualifiers were checked, where PostgreSQL stores the row. And the
 /// rest of the refusals: a keyword typo after a condition on any column is
 /// 42601, an unknown column under a known qualifier 42703, and the clauses
@@ -131,7 +131,7 @@ async fn every_qualifier_postgres_accepts_is_accepted() {
             "INSERT INTO t AS t0 (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t0.v + 1",
             "INSERT INTO t AS t0 (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t0.v + 1 WHERE t0.v < 1000",
             "INSERT INTO t AS x (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = x.v + EXCLUDED.v WHERE x.v < 1000",
-            r#"INSERT INTO t (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t.v + "EXCLUDED"."v""#,
+            r#"INSERT INTO t (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t.v + "excluded"."v""#,
         ] {
             exec(sql.to_string()).await.unwrap_or_else(|e| panic!("extended={extended}: {sql}: {e}"));
         }
@@ -144,6 +144,9 @@ async fn every_qualifier_postgres_accepts_is_accepted() {
         ("SELECT id FROM t WHERE nosuch.t.id = 1", "42P01"),
         ("SELECT id FROM t AS q WHERE public.t.id = 1", "42P01"),
         ("INSERT INTO t AS t0 (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t9.v + 1", "42P01"),
+        // Quoted, a name is its exact spelling: the proposed row is
+        // `excluded`, which `"EXCLUDED"` is not (PostgreSQL's 42P01 too).
+        (r#"INSERT INTO t (id, v, x) VALUES (2, 5, 0) ON CONFLICT (id) DO UPDATE SET v = t.v + "EXCLUDED"."v""#, "42P01"),
         // `x` is not the key: the non-key path through the predicate tokenizer.
         ("SELECT id FROM t WHERE x = 1 LIMT 1", "42601"),
         ("SELECT id FROM t WHERE x = 1 ODER BY id", "42601"),
@@ -175,4 +178,117 @@ async fn rows3(pool: &sqlx::PgPool) -> Vec<(i32, i32)> {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect()
+}
+
+/// The joins, the join writes, `RETURNING` and an upsert check their
+/// qualifiers too. `UPDATE t SET v = 0 FROM u WHERE nosuch.id = t.id` and
+/// `DELETE FROM t USING u WHERE nosuch.tid = t.id` dropped the unknown
+/// qualifier and its condition with it, and wrote every row of t; an aliased
+/// target named by its table (`UPDATE t x … WHERE u.tid = t.id`) did the
+/// same. A join read `t.id` under `FROM t a` as `a.id`; `RETURNING nosuch.id`
+/// committed and answered; a bare `x` named an upsert's `AS "X"`. Each is
+/// 42P01 in PostgreSQL and leaves the table as it was. A correlated subquery
+/// in SET, which nothing here evaluates per row, is refused (0A000) where its
+/// text reached the value parser (22P02) or, in a DO UPDATE, read the inner
+/// table's own column and stored NULL. And what PostgreSQL accepts runs:
+/// `RETURNING t.*`, `SELECT x.*`, a target in `"public"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn joins_join_writes_returning_and_upserts_check_their_qualifiers() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 10), (2, 20), (3, 30); \
+         CREATE TABLE u (id INT PRIMARY KEY, tid INT, w INT); INSERT INTO u VALUES (1, 2, 100), (2, 1, 200)",
+    )
+    .await
+    .expect("setup");
+    let before = rows(&pool).await;
+    let cases: &[(&str, &str)] = &[
+        ("UPDATE t SET v = 0 FROM u WHERE nosuch.id = t.id", "42P01"),
+        ("UPDATE t SET v = nosuch.w FROM u WHERE u.tid = t.id", "42P01"),
+        ("UPDATE t x SET v = 0 FROM u WHERE u.tid = t.id", "42P01"),
+        ("UPDATE t SET v = 0 FROM u WHERE u.tid = t.id RETURNING nosuch.id", "42P01"),
+        ("DELETE FROM t USING u WHERE nosuch.tid = t.id", "42P01"),
+        ("DELETE FROM t x USING u WHERE u.tid = t.id", "42P01"),
+        ("SELECT a.id FROM t a JOIN u b ON b.tid = t.id", "42P01"),
+        ("SELECT a.id FROM t a JOIN u b ON b.tid = a.id WHERE nosuch.w > 0", "42P01"),
+        ("UPDATE t SET v = 0 WHERE id = 1 RETURNING nosuch.id", "42P01"),
+        ("DELETE FROM t WHERE id = 1 RETURNING nosuch.id", "42P01"),
+        ("INSERT INTO t VALUES (9, 9) RETURNING nosuch.id", "42P01"),
+        (r#"INSERT INTO t AS "X" VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = x.v + 1"#, "42P01"),
+        (r#"SELECT "T".id FROM t"#, "42P01"),
+        ("SELECT id FROM t WHERE id=1AND v=10", "42601"),
+        ("UPDATE t SET v = 0, WHERE id = 1", "42601"),
+        ("UPDATE t SET v = (SELECT w FROM u WHERE u.tid = t.id)", "0A000"),
+        ("INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = (SELECT w FROM u WHERE u.tid = t.id)", "0A000"),
+    ];
+    // Every case is run and every wrong answer listed.
+    let mut wrong: Vec<String> = Vec::new();
+    for (sql, want) in cases {
+        let simple = pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await;
+        let extended = sqlx::query(AssertSqlSafe(sql.to_string())).fetch_all(&pool).await;
+        for (protocol, result) in [("simple", simple), ("extended", extended)] {
+            match result {
+                Ok(rows) => wrong.push(format!("{protocol}: {sql} answered {} rows", rows.len())),
+                Err(e) if code(&e) != *want => wrong.push(format!("{protocol}: {sql}: {e} (want {want})")),
+                Err(_) => {}
+            }
+        }
+        let now = rows(&pool).await;
+        if now != before {
+            wrong.push(format!("{sql}: a refused statement changed t to {now:?}"));
+            pool.execute("DELETE FROM t; INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").await.expect("reset");
+        }
+    }
+
+    for (i, (sql, want)) in [
+        ("INSERT INTO t VALUES (4, 40) RETURNING t.*", vec![(4, 40)]),
+        ("INSERT INTO t VALUES (4, 41) ON CONFLICT DO NOTHING RETURNING t.*", vec![]),
+        ("UPDATE t SET v = 41 WHERE id = 4 RETURNING t.*", vec![(4, 41)]),
+        ("UPDATE t SET v = 42 WHERE public.t.id = 4 RETURNING public.t.*", vec![(4, 42)]),
+        (r#"UPDATE "public"."t" SET v = 43 WHERE "public"."t".id = 4 RETURNING id, v"#, vec![(4, 43)]),
+        (r#"INSERT INTO t AS "X" VALUES (4, 1) ON CONFLICT (id) DO UPDATE SET v = "X".v + 1 RETURNING "X".id, "X".v"#, vec![(4, 44)]),
+        ("SELECT x.* FROM t x WHERE x.id = 4", vec![(4, 44)]),
+        ("SELECT public.t.* FROM t WHERE id = 4", vec![(4, 44)]),
+        (r#"DELETE FROM "public"."t" WHERE id = 4 RETURNING t.*"#, vec![(4, 44)]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A read runs over both protocols; a write once, the protocols
+        // alternating down the list.
+        let protocols: &[bool] = if sql.starts_with("SELECT") { &[false, true] } else if i % 2 == 0 { &[false] } else { &[true] };
+        for &extended in protocols {
+            let got: Result<Vec<(i32, i32)>, sqlx::Error> = if extended {
+                sqlx::query_as(AssertSqlSafe(sql.to_string())).fetch_all(&pool).await
+            } else {
+                pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(sql.to_string())))
+                    .await
+                    .map(|rows| rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+            };
+            match got {
+                Ok(got) if got == want => {}
+                got => wrong.push(format!("extended={extended}: {sql}: {got:?}, want {want:?}")),
+            }
+        }
+    }
+    if rows(&pool).await != before {
+        wrong.push(format!("the accepted statements left t as {:?}", rows(&pool).await));
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+
+    // `EXCLUDED.v` inside a string is text, not the proposed row's value.
+    pool.execute("CREATE TABLE n (id INT PRIMARY KEY, name TEXT); INSERT INTO n VALUES (1, 'a')")
+        .await
+        .expect("n");
+    pool.execute(
+        "INSERT INTO n VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET name = 'was ' || EXCLUDED.name || ' excluded.name'",
+    )
+    .await
+    .expect("upsert");
+    pool.execute("INSERT INTO n VALUES (1, 'c') ON CONFLICT (id) DO UPDATE SET name = n.name || $$ EXCLUDED.name$$")
+        .await
+        .expect("upsert");
+    let name: String = sqlx::query_scalar("SELECT name FROM n WHERE id = 1").fetch_one(&pool).await.expect("n");
+    assert_eq!(name, "was b excluded.name EXCLUDED.name");
 }
