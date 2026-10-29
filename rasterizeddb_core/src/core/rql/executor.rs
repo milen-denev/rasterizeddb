@@ -7569,6 +7569,29 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
     evaluated_numeric_literal(text, field)
 }
 
+/// The bytes `literal` is stored as in `field`, for comparing two rows'
+/// keys: a number as [`stored_numeric_literal`] writes it, any other
+/// constant evaluated into the column (a UUID's sixteen bytes, a
+/// timestamp's microseconds, a boolean's byte). `None` for anything that is
+/// not a constant the column takes.
+fn stored_key_bytes(literal: &str, field: &crate::core::row::schema::SchemaField) -> Option<Vec<u8>> {
+    if let Some(number) = stored_numeric_literal(literal, field) {
+        return Some(number.into_bytes());
+    }
+    let text = literal.trim();
+    if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
+        return None;
+    }
+    let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
+    if !crate::core::rql::expr::columns_of(&expr).is_empty() {
+        return None;
+    }
+    match crate::core::rql::expr::eval_into(&expr, &crate::core::row::row::Row::default(), &[], field).ok()? {
+        crate::core::rql::expr::Value::Data { bytes, db_type } if db_type == field.db_type => Some(bytes),
+        _ => None,
+    }
+}
+
 /// [`stored_numeric_literal`]'s general path: `text` parsed and evaluated
 /// into `field` as an INSERT stores it.
 fn evaluated_numeric_literal(text: &str, field: &crate::core::row::schema::SchemaField) -> Option<String> {
@@ -8660,18 +8683,21 @@ async fn insert_values_tuples(
     // key would update one row twice, the second time the row the first had
     // just written. PostgreSQL refuses the statement (21000) rather than let
     // the order of the VALUES list decide the outcome; checked before any row
-    // is written. Compared as written, so `1` and `'1'` are not caught: a
-    // missed duplicate is today's behaviour, and nothing valid is refused.
+    // is written, each key as its column stores it (`stored_key_bytes`).
     if let Some(spec) = row_data.on_conflict_update.as_ref().filter(|s| !s.arbiter.is_empty()) {
         if statements.len() > 1 {
             // Compared as the column stores each key (`stored_numeric_literal`):
             // as written, `(0.995, …), (1.00, …)` into a NUMERIC(10,2) were two
             // keys, and `(5.0, …), (5.00, …)` applied last-wins.
             let fields = database.schema_view(&row_data.table_name).map(|v| v.schema().fields.clone());
-            let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
             for stmt in &statements {
                 let values = crate::core::rql::lexer_ir::assignments_of_insert(stmt).unwrap_or_default();
-                let key: Option<Vec<String>> = spec
+                // Every type, not only numbers: `'A0EE…'` and `'a0ee…'` are
+                // one UUID, `'2020-01-01'` and `'2020-01-01 00:00:00'` one
+                // timestamp, `true` and `'t'` one boolean, and each pair
+                // applied last-wins.
+                let key: Option<Vec<Vec<u8>>> = spec
                     .arbiter
                     .iter()
                     .map(|column| {
@@ -8682,9 +8708,9 @@ async fn insert_values_tuples(
                                     fields
                                         .iter()
                                         .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
-                                        .and_then(|f| stored_numeric_literal(literal, f))
+                                        .and_then(|f| stored_key_bytes(literal, f))
                                 })
-                                .unwrap_or_else(|| literal.trim().to_string())
+                                .unwrap_or_else(|| literal.trim().as_bytes().to_vec())
                         })
                     })
                     .collect();

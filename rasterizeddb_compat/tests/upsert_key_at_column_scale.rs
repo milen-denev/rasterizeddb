@@ -66,7 +66,9 @@ async fn upserts(partitioning: &str) {
              CREATE TABLE up2 (k NUMERIC(20,12) PRIMARY KEY, v INT){hash_k}; INSERT INTO up2 VALUES (0.123456789123, 1); \
              CREATE TABLE uc (k NUMERIC(10,2), t INT, v INT, PRIMARY KEY (k, t)){hash_ck}; INSERT INTO uc VALUES (1.25, 7, 1); \
              CREATE TABLE ui (id INT PRIMARY KEY, v INT){hash_i}; INSERT INTO ui VALUES (2, 1); \
-             CREATE TABLE s2 (b NUMERIC(38,20)); INSERT INTO s2 VALUES (0.12345678912300000001)"
+             CREATE TABLE s2 (b NUMERIC(38,20)); INSERT INTO s2 VALUES (0.12345678912300000001); \
+             CREATE TABLE uu (k UUID PRIMARY KEY, v INT); CREATE TABLE ut (k TIMESTAMP PRIMARY KEY, v INT); \
+             CREATE TABLE ub (k BOOLEAN PRIMARY KEY, v INT); CREATE TABLE ux (k TEXT PRIMARY KEY, v INT)"
         ))
         .await
         .expect("setup");
@@ -109,6 +111,11 @@ async fn upserts(partitioning: &str) {
         "INSERT INTO up VALUES (7.10, 1), ('7.1', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
         "INSERT INTO uc VALUES (2.004, 7, 3), (2.001, 7, 4) ON CONFLICT (k, t) DO UPDATE SET v = EXCLUDED.v",
         "INSERT INTO ui VALUES (5, 1), ('5', 2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        // Every type, not only numbers.
+        "INSERT INTO uu VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 1), ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 2) \
+         ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO ut VALUES ('2020-01-01', 1), ('2020-01-01 00:00:00', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO ub VALUES (true, 1), ('t', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
     ] {
         let got = text(&client, sql).await;
         if got != Err("21000".to_string()) {
@@ -119,6 +126,12 @@ async fn upserts(partitioning: &str) {
         ("SELECT count(*) FROM up WHERE k IN (1.00, 5.00, 7.10)", &["0"][..]),
         ("SELECT count(*) FROM uc WHERE k = 2.00", &["0"]),
         ("SELECT count(*) FROM ui WHERE id = 5", &["0"]),
+        ("SELECT count(*) FROM uu", &["0"]),
+        ("SELECT count(*) FROM ut", &["0"]),
+        ("SELECT count(*) FROM ub", &["0"]),
+        // Text keys spelled differently are different keys: both stored.
+        ("INSERT INTO ux VALUES ('a', 1), ('A', 2), ('a ', 3) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", &[]),
+        ("SELECT count(*) FROM ux", &["3"]),
     ] {
         let got = text(&client, sql).await;
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
