@@ -7734,8 +7734,12 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
         })
         .collect();
     for check in &create_table.checks {
-        if let Err(reason) = compile_check(&check.expression, &fields) {
-            return Err(format!("check constraint \"{}\" cannot be compiled: {}", check.name, reason));
+        match compile_check(&check.expression, &fields) {
+            Err(reason) => {
+                return Err(format!("check constraint \"{}\" cannot be compiled: {}", check.name, reason));
+            }
+            Ok(CompiledCheck::Unenforced(why)) => warn_unenforced_check(&check.name, &create_table.table_name, &why),
+            Ok(_) => {}
         }
     }
     Ok(())
@@ -9925,6 +9929,11 @@ pub(crate) enum CompiledCheck {
         plan: crate::core::processor::transformer::TransformerPlan,
         width: usize,
     },
+    /// A check whose regular expression is outside what this engine can
+    /// match as PostgreSQL does (`pg_regex`): kept, and not enforced, rather
+    /// than enforced another way or refused (which would lose the table on
+    /// a restore). Said so where it is declared.
+    Unenforced(String),
 }
 
 impl CompiledCheck {
@@ -9935,7 +9944,24 @@ impl CompiledCheck {
         row: &crate::core::row::row::Row,
         fields: &[crate::core::row::schema::SchemaField],
     ) -> Result<bool, String> {
+        // A regular expression that could not be answered for this value as
+        // PostgreSQL would answer it leaves the check unjudged for the row.
+        let _ = crate::core::rql::expr::take_check_uncertainty();
+        let verdict = self.violated_as_written(row, fields)?;
+        if let Some(why) = crate::core::rql::expr::take_check_uncertainty() {
+            log::warn!("a check constraint was not judged for a row: {why}");
+            return Ok(false);
+        }
+        Ok(verdict)
+    }
+
+    fn violated_as_written(
+        &self,
+        row: &crate::core::row::row::Row,
+        fields: &[crate::core::row::schema::SchemaField],
+    ) -> Result<bool, String> {
         match self {
+            CompiledCheck::Unenforced(_) => Ok(false),
             CompiledCheck::Violation(cond) => crate::core::rql::expr::eval_cond(cond, row, fields),
             CompiledCheck::Direct(cond) => {
                 Ok(crate::core::rql::expr::eval_cond_3vl(cond, row, fields)? == Some(false))
@@ -9975,6 +10001,7 @@ impl CompiledCheck {
         fields: &[crate::core::row::schema::SchemaField],
     ) -> Vec<crate::core::row::schema::SchemaField> {
         let cond = match self {
+            CompiledCheck::Unenforced(_) => return Vec::new(),
             CompiledCheck::Violation(cond) | CompiledCheck::Direct(cond) => cond,
             // What the plan reads is not listed here, so every column is
             // taken as read: an UPDATE judges the check against each row.
@@ -10059,12 +10086,82 @@ pub(crate) fn compile_check(
     // `pg_dump`'s canonical spellings, in the shape the rewriter reads.
     let expression = crate::core::rql::check::normalize_expression(expression);
     let expression = expression.as_str();
+    // A written regular expression this engine cannot match as PostgreSQL
+    // does: the check is kept and not enforced.
+    if let Some(why) = unsupported_check_pattern(expression) {
+        return Ok(CompiledCheck::Unenforced(why));
+    }
+    let compiled = compile_check_lowered(expression, &fields_sv, fields);
+    match compiled {
+        // What none of the readers takes, around a regular expression, is
+        // kept unenforced too: refusing the CREATE loses the table and its
+        // rows on a `psql -f` restore.
+        Err(e) if expression.contains(crate::core::rql::check::CHECK_REGEXP_LIKE) => {
+            Ok(CompiledCheck::Unenforced(format!("this form of check around a regular expression ({e})")))
+        }
+        other => other,
+    }
+}
+
+/// Says, where a check is declared, that it is kept and not enforced: in
+/// the server log and as a WARNING notice to the client.
+fn warn_unenforced_check(name: &str, table: &str, why: &str) {
+    let message = format!(
+        "check constraint \"{name}\" of relation \"{table}\" is not enforced: {why}; rows that \
+         violate it are accepted"
+    );
+    log::warn!("{message}");
+    crate::core::notice::push("WARNING", "01000", message);
+}
+
+/// The reason a check's written pattern is outside the verified subset of
+/// PostgreSQL regular expressions (`pg_regex`), for the first such pattern;
+/// `None` when every pattern written as a constant is inside it (or invalid
+/// as PostgreSQL finds it invalid, which is then answered as PostgreSQL
+/// answers it: 2201B for each value).
+fn unsupported_check_pattern(expression: &str) -> Option<String> {
+    let name = crate::core::rql::check::CHECK_REGEXP_LIKE;
+    let mut from = 0;
+    while let Some(at) = expression[from..].find(name).map(|a| a + from) {
+        from = at + name.len();
+        let open = from;
+        if expression.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+        let Some(close) = crate::core::sql_scan::matching_close(expression, open) else { continue };
+        let args = crate::core::sql_scan::split_top_level(&expression[open + 1..close], b',');
+        let constant = |text: Option<&&str>| -> Option<String> {
+            let e = crate::core::rql::expr::parse(text?.trim(), &[]).ok()?;
+            match crate::core::rql::expr::eval(&e, &crate::core::row::row::Row::default(), &[]).ok()? {
+                crate::core::rql::expr::Value::Data { bytes, .. } => String::from_utf8(bytes).ok(),
+                crate::core::rql::expr::Value::Null => None,
+            }
+        };
+        let Some(pattern) = constant(args.get(1)) else { continue };
+        let flags = if args.len() > 2 { constant(args.get(2)).unwrap_or_default() } else { String::new() };
+        if let Err(crate::core::rql::pg_regex::PgRegexError::Unsupported(why)) =
+            crate::core::rql::pg_regex::compile_cached(&pattern, &flags)
+        {
+            return Some(format!(
+                "the regular expression {} uses {why}, which this engine does not match as PostgreSQL does",
+                crate::core::value_codec::quote_sql(&pattern)
+            ));
+        }
+    }
+    None
+}
+
+fn compile_check_lowered(
+    expression: &str,
+    fields_sv: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+    fields: &[crate::core::row::schema::SchemaField],
+) -> Result<CompiledCheck, String> {
     // The question is "is the check FALSE": `NOT (check)` as a WHERE, and
     // where the rewriter cannot negate the expression (a bare `CASE`),
     // `(check) IS FALSE`, which is the same question.
     let mut lowered = Err(String::new());
     for question in [format!("NOT ({})", expression), format!("({}) IS FALSE", expression)] {
-        let attempt = crate::core::tokenizer::predicate_rewrite::rewrite_where(&question, &fields_sv);
+        let attempt = crate::core::tokenizer::predicate_rewrite::rewrite_where(&question, fields_sv);
         if let Ok(text) = &attempt {
             if let Ok(condition) = crate::core::rql::expr::parse_cond(text, fields) {
                 return Ok(CompiledCheck::Violation(condition));
@@ -10094,8 +10191,13 @@ pub(crate) fn compile_check(
     }
     // Names resolve among the columns a client sees; the companions are read
     // only when the row is.
-    let visible = crate::core::rql::nullable::visible_fields(&fields_sv);
+    let visible = crate::core::rql::nullable::visible_fields(fields_sv);
+    // A regular expression's `(f(…) = TRUE)` is what the rewriter reads; the
+    // condition reader takes the call itself, which a comparison or a NOT
+    // around it then reads (`(s ~ 'a') = false`, `NOT (s ~ 'x')`).
+    let bare = crate::core::rql::check::bare_regex_calls(expression);
     crate::core::rql::expr::parse_cond(expression, &visible)
+        .or_else(|e| crate::core::rql::expr::parse_cond(&bare, &visible).map_err(|_| e))
         // A check that is a boolean expression rather than a comparison (a
         // bare `CASE … END`) is compared with TRUE, which keeps its NULL.
         .or_else(|e| crate::core::rql::expr::parse_cond(&format!("({}) = TRUE", expression), &visible).map_err(|_| e))
@@ -10282,6 +10384,7 @@ fn collect_condition_columns(
                 collect_condition_columns(part, out);
             }
         }
+        crate::core::rql::expr::Cond::Not(inner) => collect_condition_columns(inner, out),
     }
 }
 
@@ -11114,17 +11217,25 @@ async fn add_check_constraint(
     }
 
     // It must compile, or it would be stored and then skipped on every write.
-    if let Err(reason) = compile_check(&expression, &schema.fields) {
-        return ddl_error(&format!("check constraint \"{}\" cannot be compiled: {}", name, reason));
-    }
+    let unenforced = match compile_check(&expression, &schema.fields) {
+        Err(reason) => {
+            return ddl_error(&format!("check constraint \"{}\" cannot be compiled: {}", name, reason));
+        }
+        Ok(CompiledCheck::Unenforced(why)) => {
+            warn_unenforced_check(&name, table_name, &why);
+            true
+        }
+        Ok(_) => false,
+    };
 
     // A row for which it is false (NULL is not false) refuses the statement.
+    // A check kept unenforced judges no row, the stored ones included.
     let probe = format!(
         "SELECT 1 FROM {} WHERE NOT ({}) LIMIT 1",
         table_name,
         crate::core::rql::check::normalize_expression(&expression)
     );
-    match run_subquery(&probe, database, tx).await {
+    match if unenforced { Ok(Vec::new()) } else { run_subquery(&probe, database, tx).await } {
         Ok(rows) if rows.is_empty() => {}
         Ok(_) => {
             return ddl_error(&format!(

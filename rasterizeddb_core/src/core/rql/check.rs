@@ -185,22 +185,11 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
         return (definition.to_string(), None);
     }
 
-    let mut depth = 0usize;
-    let mut close = None;
-    for (offset, c) in tail[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(open + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(close) = close else {
+    // Quote- and nesting-aware: a `(` or `)` inside a string literal
+    // (`CHECK (s ~ '[)]')`, `CHECK (s <> '(')`) is text. Counted raw, the
+    // clause ended inside the literal, and the check was stored cut and
+    // never enforced.
+    let Some(close) = crate::core::sql_scan::matching_close(tail, open) else {
         return (definition.to_string(), None);
     };
 
@@ -348,10 +337,242 @@ pub fn normalize_expression(expression: &str) -> String {
     for (from, to) in [(" !~~* ", " NOT ILIKE "), (" !~~ ", " NOT LIKE "), (" ~~* ", " ILIKE "), (" ~~ ", " LIKE ")] {
         text = replace_outside_quotes(&text, from, to);
     }
+    let text = drop_collations(&text);
     let text = drop_text_casts(&text);
     let text = unwrap_bare_names(&text);
+    let text = lower_similar_to(&text);
+    let text = lower_regex_any(&text);
     let text = lower_any_all(&text);
-    lower_regex_operators(&text)
+    let text = lower_regex_operators(&text);
+    let text = fold_regex_truth_tests(&text);
+    replace_word_outside_quotes(&text, "regexp_like", CHECK_REGEXP_LIKE)
+}
+
+/// `((s ~ 'a') = false)`, as Django and hand-written checks put it, lowered
+/// to `((call = TRUE)) = false` and then folded to `(call = FALSE)`: the
+/// comparison of a comparison is a form neither the condition reader nor the
+/// scan's predicate parser reads ("trailing text after …" from the probe of
+/// the stored rows at ADD CONSTRAINT). `= b` and `<> b` against a boolean
+/// literal fold the same way in three values: a NULL call stays NULL.
+fn fold_regex_truth_tests(text: &str) -> String {
+    use crate::core::sql_scan::matching_close;
+    let mut out = text.to_string();
+    let head = format!("({CHECK_REGEXP_LIKE}(");
+    let mut from = 0;
+    // Bounded: each pass folds one test or moves past one call.
+    for _ in 0..64 {
+        let Some(at) = out[from..].find(&head).map(|a| a + from) else { break };
+        let call_open = at + head.len() - 1;
+        let Some(call_close) = matching_close(&out, call_open) else { break };
+        let rest = &out[call_close + 1..];
+        let (inner, used) = if let Some(r) = rest.strip_prefix(" = TRUE)") {
+            (true, rest.len() - r.len())
+        } else if let Some(r) = rest.strip_prefix(" = FALSE)") {
+            (false, rest.len() - r.len())
+        } else {
+            from = call_close;
+            continue;
+        };
+        // Out through any parentheses wrapping just this test.
+        let (mut start, mut end) = (at, call_close + 1 + used);
+        loop {
+            let before = out[..start].trim_end();
+            let after = out[end..].trim_start();
+            if !(before.ends_with('(') && after.starts_with(')')) {
+                break;
+            }
+            let open = before.len() - 1;
+            let close = out.len() - after.len();
+            if matching_close(&out, open) != Some(close) {
+                break;
+            }
+            (start, end) = (open, close + 1);
+        }
+        let after = out[end..].trim_start();
+        let (equal, after_op) = if let Some(r) = after.strip_prefix("<>").or_else(|| after.strip_prefix("!=")) {
+            (false, r)
+        } else if let Some(r) = after.strip_prefix('=') {
+            (true, r)
+        } else {
+            from = call_close;
+            continue;
+        };
+        let operand = after_op.trim_start();
+        let word_len = operand.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+        let wanted = match operand[..word_len].to_ascii_uppercase().as_str() {
+            "TRUE" => true,
+            "FALSE" => false,
+            _ => {
+                from = call_close;
+                continue;
+            }
+        };
+        let truth = inner == (wanted == equal);
+        let call = out[at + 1..=call_close].to_string();
+        let replacement = format!("({call} = {})", if truth { "TRUE" } else { "FALSE" });
+        let word_end = out.len() - operand.len() + word_len;
+        out.replace_range(start..word_end, &replacement);
+        from = start;
+    }
+    out
+}
+
+/// The function a check's regular expression is evaluated by: `regexp_like`,
+/// except that a value it cannot answer for PostgreSQL leaves the check
+/// unjudged for that row (`expr::TextFunc::CheckRegexpLike`).
+pub const CHECK_REGEXP_LIKE: &str = "__check_regexp_like";
+
+/// `COLLATE <name>` dropped: the engine compares text by its bytes whatever
+/// the collation, and a regular expression's locale-dependent classes are
+/// judged for ASCII values only (`pg_regex`), where collations agree.
+fn drop_collations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if word_start && text[i..].len() > 7 && text[i..i + 7].eq_ignore_ascii_case("COLLATE")
+            && bytes[i + 7].is_ascii_whitespace()
+        {
+            let mut j = i + 7;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'"') {
+                j = crate::core::sql_scan::quoted_end(bytes, j, b'"');
+            } else {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'.')) {
+                    j += 1;
+                }
+            }
+            i = j;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `a [NOT] SIMILAR TO b [ESCAPE e]` as `a [!]~ similar_to_escape(b [, e])`,
+/// what it means in PostgreSQL, so one regular-expression reader decides it.
+fn lower_similar_to(text: &str) -> String {
+    let mut out = text.to_string();
+    for _ in 0..64 {
+        let upper = out.to_ascii_uppercase();
+        let Some(at) = find_word_outside_quotes(&upper, "SIMILAR") else { break };
+        let after_similar = upper[at + 7..].trim_start();
+        if !after_similar.starts_with("TO") {
+            break;
+        }
+        let to_end = out.len() - after_similar.len() + 2;
+        // `NOT` directly before.
+        let before = out[..at].trim_end();
+        let (op_start, negated) = match before.len().checked_sub(3) {
+            Some(n) if before[n..].eq_ignore_ascii_case("NOT")
+                && (n == 0 || !before.as_bytes()[n - 1].is_ascii_alphanumeric()) => (n, true),
+            _ => (at, false),
+        };
+        let Some(pattern_end) = super_operand_after(&out, to_end) else { break };
+        let pattern = out[to_end..pattern_end].trim().to_string();
+        let mut end = pattern_end;
+        let mut escape = String::new();
+        let rest_upper = upper[pattern_end..].trim_start();
+        if rest_upper.starts_with("ESCAPE") {
+            let esc_at = out.len() - rest_upper.len() + 6;
+            if let Some(esc_end) = super_operand_after(&out, esc_at) {
+                escape = format!(", {}", out[esc_at..esc_end].trim());
+                end = esc_end;
+            }
+        }
+        let op = if negated { "!~" } else { "~" };
+        out = format!("{} {} similar_to_escape({}{}) {}", &out[..op_start], op, pattern, escape, &out[end..]);
+    }
+    out
+}
+
+fn super_operand_after(text: &str, at: usize) -> Option<usize> {
+    operand_after(text, at)
+}
+
+/// `a ~ ANY (ARRAY[p, q])` as `(a ~ p OR a ~ q)`, and `a !~ ALL (…)` as
+/// `(a !~ p AND a !~ q)`: the same three-valued answer.
+fn lower_regex_any(text: &str) -> String {
+    let mut out = text.to_string();
+    for (op, quant, join) in [("~*", "ANY", " OR "), ("~", "ANY", " OR "), ("!~*", "ALL", " AND "), ("!~", "ALL", " AND ")] {
+        for _ in 0..32 {
+            let upper = out.to_ascii_uppercase();
+            let needle = format!("{op} {quant}");
+            let Some(at) = find_outside_quotes(&upper, &needle) else { break };
+            if op.starts_with('~') && at > 0 && upper.as_bytes()[at - 1] == b'!' {
+                break;
+            }
+            let Some(left) = operand_before(&out, at) else { break };
+            let after = out[at + needle.len()..].trim_start();
+            let open = out.len() - after.len();
+            if !after.starts_with('(') {
+                break;
+            }
+            let Some(close) = crate::core::sql_scan::matching_close(&out, open) else { break };
+            let inner = out[open + 1..close].trim();
+            let inner = inner.strip_prefix('(').and_then(|i| i.strip_suffix(')')).map(str::trim).unwrap_or(inner);
+            let Some(items) = inner
+                .get(..5)
+                .filter(|h| h.eq_ignore_ascii_case("ARRAY"))
+                .map(|_| inner[5..].trim())
+                .filter(|r| r.starts_with('[') && r.ends_with(']'))
+                .map(|r| r[1..r.len() - 1].to_string())
+            else {
+                break;
+            };
+            let subject = out[left..at].trim().to_string();
+            let parts: Vec<String> = crate::core::sql_scan::split_top_level(&items, b',')
+                .iter()
+                .map(|p| format!("{subject} {op} {}", p.trim()))
+                .collect();
+            out = format!("{}({}){}", &out[..left], parts.join(join), &out[close + 1..]);
+        }
+    }
+    out
+}
+
+/// Position of `word` (upper case) in `upper` as a whole word outside quotes.
+fn find_word_outside_quotes(upper: &str, word: &str) -> Option<usize> {
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            continue;
+        }
+        if upper[i..].starts_with(word)
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && !bytes.get(i + word.len()).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `text` with `word` (a whole word, any case, outside quotes) replaced.
+fn replace_word_outside_quotes(text: &str, word: &str, with: &str) -> String {
+    let mut out = text.to_string();
+    let upper_word = word.to_ascii_uppercase();
+    let mut from = 0;
+    while let Some(at) = find_word_outside_quotes(&out[from..].to_ascii_uppercase(), &upper_word).map(|a| a + from) {
+        out.replace_range(at..at + word.len(), with);
+        from = at + with.len();
+    }
+    out
 }
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` as `(regexp_like(a, b) = TRUE)`
@@ -386,7 +607,7 @@ fn lower_regex_operators(text: &str) -> String {
         let flags = if starred { ", 'i'" } else { "" };
         let truth = if negated { "FALSE" } else { "TRUE" };
         out = format!(
-            "{}(regexp_like({}, {}{}) = {}){}",
+            "{}({CHECK_REGEXP_LIKE}({}, {}{}) = {}){}",
             &out[..left],
             out[left..op_start].trim(),
             out[op_end..right].trim(),
@@ -394,6 +615,32 @@ fn lower_regex_operators(text: &str) -> String {
             truth,
             &out[right..]
         );
+    }
+    out
+}
+
+/// `(__check_regexp_like(…) = TRUE)` as the call, and `= FALSE)` as `(NOT
+/// call)`: the form the condition reader takes (see `compile_check`).
+pub fn bare_regex_calls(text: &str) -> String {
+    let mut out = text.to_string();
+    let head = format!("({CHECK_REGEXP_LIKE}(");
+    let mut from = 0;
+    while let Some(at) = out[from..].find(&head).map(|a| a + from) {
+        let call_open = at + head.len() - 1;
+        let Some(call_close) = crate::core::sql_scan::matching_close(&out, call_open) else { break };
+        let rest = &out[call_close + 1..];
+        let (truth, used) = if let Some(r) = rest.strip_prefix(" = TRUE)") {
+            (true, rest.len() - r.len())
+        } else if let Some(r) = rest.strip_prefix(" = FALSE)") {
+            (false, rest.len() - r.len())
+        } else {
+            from = call_close;
+            continue;
+        };
+        let call = out[at + 1..=call_close].to_string();
+        let replacement = if truth { format!("({call})") } else { format!("(NOT {call})") };
+        out.replace_range(at..call_close + 1 + used, &replacement);
+        from = at + replacement.len();
     }
     out
 }
@@ -430,25 +677,44 @@ fn operand_before(text: &str, at: usize) -> Option<usize> {
             while i > 0 && word(bytes[i - 1]) {
                 i -= 1;
             }
-            Some(i)
+            Some(with_concat_before(text, i))
         }
         b'\'' => {
-            i -= 1;
-            while i > 0 {
-                i -= 1;
-                if bytes[i] == b'\'' && !(i > 0 && bytes[i - 1] == b'\'') {
-                    break;
+            // The literal ending here, found by reading literals forward:
+            // backwards, `'it''s'` cannot be told from two literals.
+            let mut j = 0;
+            let mut start = None;
+            while j < i {
+                if bytes[j] == b'\'' {
+                    let end = crate::core::sql_scan::quoted_end(bytes, j, b'\'');
+                    if end == i {
+                        start = Some(j);
+                        break;
+                    }
+                    j = end;
+                    continue;
                 }
+                j += 1;
             }
-            Some(i)
+            start.map(|s| with_concat_before(text, s))
         }
         b if word(b) => {
             while i > 0 && (word(bytes[i - 1]) || bytes[i - 1] == b':') {
                 i -= 1;
             }
-            Some(i)
+            Some(with_concat_before(text, i))
         }
         _ => None,
+    }
+}
+
+/// `start`, moved back over `x || ` chains before it: `||` binds as tightly
+/// as `~` and from the left, so `s || 'x' ~ p` is `(s || 'x') ~ p`.
+fn with_concat_before(text: &str, start: usize) -> usize {
+    let before = text[..start].trim_end();
+    match before.strip_suffix("||") {
+        Some(rest) if !rest.ends_with('|') => operand_before(text, rest.len()).unwrap_or(start),
+        _ => start,
     }
 }
 
@@ -672,6 +938,25 @@ fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_regex_compared_with_a_boolean_folds_into_one_call() {
+        let cases = [
+            ("((x ~ 'a'::text) = false)", "((__check_regexp_like(x, 'a') = FALSE))"),
+            ("((x ~ 'a') = true)", "((__check_regexp_like(x, 'a') = TRUE))"),
+            ("((x !~ 'a') = FALSE)", "((__check_regexp_like(x, 'a') = TRUE))"),
+            ("((x ~ 'a') <> false)", "((__check_regexp_like(x, 'a') = TRUE))"),
+            ("(n > 0 AND (x ~* 'a') = false)", "(n > 0 AND (__check_regexp_like(x, 'a', 'i') = FALSE))"),
+            // Not a boolean literal: left as it was.
+            ("((x ~ 'a') = flag)", "(((__check_regexp_like(x, 'a') = TRUE)) = flag)"),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(from, to)| normalize_expression(from) != *to)
+            .map(|(from, _)| format!("{from} -> {}", normalize_expression(from)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn a_record_round_trips_through_its_bytes() {

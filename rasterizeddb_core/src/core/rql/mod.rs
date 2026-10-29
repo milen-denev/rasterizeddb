@@ -48,6 +48,7 @@ pub mod prepared;
 
 pub mod catalog_views;
 pub mod check;
+pub mod pg_regex;
 pub mod executor;
 pub mod generated;
 pub mod lexer_alter;

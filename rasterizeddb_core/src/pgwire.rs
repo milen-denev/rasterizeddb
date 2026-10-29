@@ -6953,6 +6953,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return if has("(the disk is full)") { "53100" } else { "58030" };
     }
 
+    // A regular-expression flag PostgreSQL refuses: invalid_parameter_value,
+    // also when a CHECK meets it.
+    if has("regexp_like() does not support the") || has("invalid regular expression option") {
+        return "22023";
+    }
     // A CHECK no evaluator here can read: one code, 0A000, whatever words
     // the reader that refused it used (they mapped to 42601, 42703, XX000).
     if has("check constraint") && has("cannot be compiled") {

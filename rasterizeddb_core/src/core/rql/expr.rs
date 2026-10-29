@@ -85,6 +85,10 @@ pub enum Cond {
     And(Vec<Cond>),
     /// Any part suffices.
     Or(Vec<Cond>),
+    /// SQL's three-valued NOT: TRUE for FALSE, FALSE for TRUE, UNKNOWN for
+    /// UNKNOWN. Evaluated through [`eval_cond_3vl`] even by [`eval_cond`],
+    /// so a NULL comparison under it never becomes TRUE.
+    Not(Box<Cond>),
 }
 
 /// A scalar expression.
@@ -198,6 +202,11 @@ pub enum TextFunc {
     /// `regexp_like(text, pattern [, flags])`: whether a POSIX regular
     /// expression matches, the boolean `~` (and, with flag `i`, `~*`) is.
     RegexpLike,
+    /// `regexp_like` inside a CHECK (`__check_regexp_like`): a value the
+    /// answer cannot be vouched for is NULL, and marks the evaluation
+    /// uncertain ([`take_check_uncertainty`]), so the check is not judged
+    /// for that row rather than judged another way.
+    CheckRegexpLike,
     /// `similar_to_escape(pattern [, escape])`: a `SIMILAR TO` pattern as the
     /// anchored regular expression it means, as `pg_dump` writes `SIMILAR
     /// TO` (`x ~ similar_to_escape('a%')`).
@@ -586,7 +595,7 @@ pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
     "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "JSONB_TYPEOF",
-    "REGEXP_LIKE", "SIMILAR_TO_ESCAPE",
+    "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE",
 ];
 
 /// Parses one expression against `schema`.
@@ -1115,11 +1124,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     }
                     Ok(Expr::Call(TextFunc::JsonbTypeof, args))
                 }
-                "REGEXP_LIKE" => {
+                "REGEXP_LIKE" | "__CHECK_REGEXP_LIKE" => {
                     if !(2..=3).contains(&args.len()) {
                         return Err("regexp_like takes a text, a pattern and optionally flags".to_string());
                     }
-                    Ok(Expr::Call(TextFunc::RegexpLike, args))
+                    let func = if upper_name == "REGEXP_LIKE" { TextFunc::RegexpLike } else { TextFunc::CheckRegexpLike };
+                    Ok(Expr::Call(func, args))
                 }
                 "SIMILAR_TO_ESCAPE" => {
                     if !(1..=2).contains(&args.len()) {
@@ -1356,8 +1366,13 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     // with NULL evaluate to false here, and negating that false would take a
     // branch PostgreSQL's three-valued NOT would not. An error is honest; a
     // plausible wrong branch is not.
-    if text.to_ascii_uppercase().starts_with("NOT ") {
-        return Err("NOT in a condition is not supported yet".to_string());
+    // `NOT` is SQL's three-valued one (`Cond::Not`): negating a two-valued
+    // FALSE would take a branch PostgreSQL's NOT does not.
+    if text.len() > 4 && text[..4].eq_ignore_ascii_case("NOT ") {
+        return Ok(Cond::Not(Box::new(parse_cond(&text[4..], schema)?)));
+    }
+    if text.len() > 4 && text[..3].eq_ignore_ascii_case("NOT") && text.as_bytes()[3] == b'(' {
+        return Ok(Cond::Not(Box::new(parse_cond(&text[3..], schema)?)));
     }
     Ok(Cond::Cmp(parse_condition(text, schema)?))
 }
@@ -1390,6 +1405,7 @@ fn split_on_keyword(text: &str, keyword: &str) -> Option<Vec<String>> {
 /// `AND`/`OR` see plain booleans.
 pub fn eval_cond(cond: &Cond, row: &Row, schema: &[SchemaField]) -> Result<bool, String> {
     Ok(match cond {
+        Cond::Not(_) => eval_cond_3vl(cond, row, schema)? == Some(true),
         Cond::Cmp(c) => eval_condition(c, row, schema)?,
         Cond::And(parts) => {
             for part in parts {
@@ -1419,6 +1435,7 @@ pub fn eval_cond(cond: &Cond, row: &Row, schema: &[SchemaField]) -> Result<bool,
 /// where [`eval_cond`]'s two values read the first as FALSE.
 pub fn eval_cond_3vl(cond: &Cond, row: &Row, schema: &[SchemaField]) -> Result<Option<bool>, String> {
     Ok(match cond {
+        Cond::Not(inner) => eval_cond_3vl(inner, row, schema)?.map(|b| !b),
         Cond::Cmp(c) => eval_condition_3vl(c, row, schema)?,
         Cond::And(parts) => {
             let mut unknown = false;
@@ -1505,6 +1522,17 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left,
                 cmp,
                 right: Some(right),
+            });
+        }
+    }
+    // A boolean expression standing alone (`regexp_like(s, 'x')`) is its
+    // comparison with TRUE, which keeps its NULL.
+    if let Ok(expr) = parse(text, schema) {
+        if static_type(&expr) == DbType::BOOL {
+            return Ok(Condition {
+                left: Box::new(expr),
+                cmp: Cmp::Eq,
+                right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),
             });
         }
     }
@@ -1637,6 +1665,7 @@ pub fn cond_columns(cond: &Cond) -> Vec<SchemaField> {
                     walk(part, out);
                 }
             }
+            Cond::Not(inner) => walk(inner, out),
         }
     }
     walk(cond, &mut out);
@@ -1707,6 +1736,7 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                                 walk_cond(part, out);
                             }
                         }
+                        Cond::Not(inner) => walk_cond(inner, out),
                     }
                 }
                 for (condition, result) in whens {
@@ -1800,7 +1830,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
-        Expr::Call(TextFunc::RegexpLike, _) => DbType::BOOL,
+        Expr::Call(TextFunc::RegexpLike | TextFunc::CheckRegexpLike, _) => DbType::BOOL,
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
         // `select_common_type` does — see `common_type`.
@@ -2281,6 +2311,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::Rtrim
             | TextFunc::JsonbTypeof
             | TextFunc::RegexpLike
+            | TextFunc::CheckRegexpLike
             | TextFunc::SimilarToEscape
     ) && args.iter().any(|a| a.is_null())
     {
@@ -2288,17 +2319,42 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
     }
 
     Ok(match func {
-        TextFunc::RegexpLike => {
+        TextFunc::RegexpLike | TextFunc::CheckRegexpLike => {
             let flags = args.get(2).map(as_text).unwrap_or_default();
-            let matched = regex_matches(&as_text(&args[0]), &as_text(&args[1]), &flags)?;
-            Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL }
+            let answer = match crate::core::rql::pg_regex::compile_cached(&as_text(&args[1]), &flags) {
+                Ok(re) => re.matches(&as_text(&args[0])).ok_or_else(|| {
+                    crate::core::rql::pg_regex::PgRegexError::Unsupported(
+                        "a locale-dependent class or case-insensitivity over a non-ASCII value".to_string(),
+                    )
+                }),
+                Err(e) => Err(e),
+            };
+            match (answer, func) {
+                (Ok(matched), _) => Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL },
+                // Inside a CHECK, what cannot be vouched for is not judged.
+                (Err(crate::core::rql::pg_regex::PgRegexError::Unsupported(why)), TextFunc::CheckRegexpLike) => {
+                    CHECK_UNCERTAIN.with(|u| {
+                        u.borrow_mut().get_or_insert(why);
+                    });
+                    Value::Null
+                }
+                (Err(e), _) => return Err(e.message()),
+            }
         }
         TextFunc::SimilarToEscape => {
             let escape = match args.get(1) {
-                Some(e) => as_text(e).chars().next(),
+                Some(e) => {
+                    let e = as_text(e);
+                    let mut chars = e.chars();
+                    match (chars.next(), chars.next()) {
+                        (None, _) => None,
+                        (Some(c), None) => Some(c),
+                        _ => return Err("invalid escape string (it must be empty or one character)".to_string()),
+                    }
+                }
                 None => Some('\\'),
             };
-            string(similar_to_regex(&as_text(&args[0]), escape))
+            string(crate::core::rql::pg_regex::similar_to_escape(&as_text(&args[0]), escape)?)
         }
         TextFunc::Btrim | TextFunc::Ltrim | TextFunc::Rtrim => {
             let text = as_text(&args[0]);
@@ -3319,87 +3375,16 @@ pub(crate) fn eval_output_planned(expr: &Expr, wide: bool, row: &Row, schema: &[
     eval(expr, row, schema)
 }
 
-/// Whether `pattern`, a POSIX regular expression, matches `text`, with
-/// PostgreSQL's flags: `i` case-insensitive, `c` case-sensitive (the
-/// default), `n`/`m` newline-sensitive, `s` (the default), `x` expanded.
-///
-/// PostgreSQL reads an advanced regular expression (ARE); this reads it with
-/// Rust's `regex`, which agrees on the common syntax — classes, `[[:alpha:]]`,
-/// anchors, alternation, bounded repetition, `\d`/`\w`/`\s`, non-greedy
-/// quantifiers — and lacks back-references (`\1`), look-around and ARE's
-/// word-boundary escapes `\m`, `\M`, `\y`. A pattern using one is refused
-/// (2201B, invalid regular expression), never matched another way. Compiled
-/// patterns are kept per thread.
-fn regex_matches(text: &str, pattern: &str, flags: &str) -> Result<bool, String> {
-    thread_local! {
-        static COMPILED: std::cell::RefCell<std::collections::HashMap<(String, String), regex::Regex>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    if let Some(hit) = COMPILED.with(|c| c.borrow().get(&(pattern.to_string(), flags.to_string())).map(|r| r.is_match(text))) {
-        return Ok(hit);
-    }
-    let mut builder = regex::RegexBuilder::new(pattern);
-    for flag in flags.chars() {
-        match flag {
-            'i' => builder.case_insensitive(true),
-            'c' => builder.case_insensitive(false),
-            'n' | 'm' => builder.multi_line(true),
-            's' => builder.multi_line(false),
-            'x' => builder.ignore_whitespace(true),
-            other => return Err(format!("invalid regular expression option: \"{other}\"")),
-        };
-    }
-    let compiled = builder
-        .size_limit(1 << 20)
-        .build()
-        .map_err(|e| format!("invalid regular expression: {}", e.to_string().lines().last().unwrap_or("")))?;
-    let matched = compiled.is_match(text);
-    COMPILED.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() >= 256 {
-            cache.clear();
-        }
-        cache.insert((pattern.to_string(), flags.to_string()), compiled);
-    });
-    Ok(matched)
+thread_local! {
+    /// Why the last CHECK evaluation on this thread met a regular expression
+    /// it could not answer for PostgreSQL (see `TextFunc::CheckRegexpLike`).
+    static CHECK_UNCERTAIN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// A `SIMILAR TO` pattern as the anchored regular expression it means,
-/// PostgreSQL's `similar_to_escape`: `%` is `.*`, `_` is `.`, a character
-/// after the escape is itself, a `.` or anchor is literal, and the regular
-/// expression operators `SIMILAR TO` shares (`|`, `*`, `+`, `?`, `{…}`,
-/// `(…)`, `[…]`) are kept.
-fn similar_to_regex(pattern: &str, escape: Option<char>) -> String {
-    let mut out = String::from("^(?:");
-    let mut chars = pattern.chars().peekable();
-    let mut in_class = false;
-    while let Some(c) = chars.next() {
-        if Some(c) == escape {
-            if let Some(next) = chars.next() {
-                out.push_str(&regex::escape(&next.to_string()));
-            }
-            continue;
-        }
-        if in_class {
-            if c == ']' {
-                in_class = false;
-            }
-            out.push(c);
-            continue;
-        }
-        match c {
-            '%' => out.push_str(".*"),
-            '_' => out.push('.'),
-            '[' => {
-                in_class = true;
-                out.push(c);
-            }
-            '|' | '*' | '+' | '?' | '{' | '}' | '(' | ')' => out.push(c),
-            other => out.push_str(&regex::escape(&other.to_string())),
-        }
-    }
-    out.push_str(")$");
-    out
+/// Takes the reason the CHECK evaluated since the last call could not be
+/// vouched for, if it could not.
+pub(crate) fn take_check_uncertainty() -> Option<String> {
+    CHECK_UNCERTAIN.with(|u| u.borrow_mut().take())
 }
 
 /// Whether `expr` reads a NUMERIC column with more places than the engine's.
@@ -3424,6 +3409,7 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
                     match cond {
                         Cond::Cmp(c) => wide(&c.left) || c.right.as_deref().is_some_and(wide),
                         Cond::And(parts) | Cond::Or(parts) => parts.iter().any(wide_cond),
+                        Cond::Not(inner) => wide_cond(inner),
                     }
                 }
                 whens.iter().any(|(c, r)| wide_cond(c) || wide(r)) || otherwise.as_deref().is_some_and(wide)
