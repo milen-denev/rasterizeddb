@@ -73,20 +73,116 @@ struct Outcomes {
     present: usize,
 }
 
+/// Where `t` goes: the database directory by the policy, or pinned before the
+/// `CREATE` (`STORAGE PLACE TABLE`) to a second directory or a key/value
+/// store. A pin must outlive a `CREATE` cut before its catalogue row: the
+/// retry lands where it says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Placement {
+    Root,
+    #[cfg(feature = "storage_pools")]
+    Disk,
+    #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+    Kv,
+}
+
+/// The spec `t`'s pin must read in a database whose files are under `base`.
+fn pinned_spec(placement: Placement, base: &Path) -> Option<String> {
+    let _ = base;
+    match placement {
+        Placement::Root => None,
+        #[cfg(feature = "storage_pools")]
+        Placement::Disk => Some(path_str(&base.join("disk2"))),
+        #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+        Placement::Kv => Some("kv:local".to_string()),
+    }
+}
+
+#[cfg(feature = "storage_pools")]
+fn spec_of(db: &Arc<Database>) -> Option<String> {
+    db.storage.spec_of("t")
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn spec_of(_db: &Arc<Database>) -> Option<String> {
+    None
+}
+
+/// The key/value store `local`, a directory under `base`, for `root`.
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+fn write_kv_config(root: &Path, base: &Path) {
+    let store = base.join("kvstore");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join(crate::core::storage::kv_registry::KV_FILE),
+        format!("# test stores\nversion\t1\nstore\tlocal\tdir\t{}\trdb\n", path_str(&store)),
+    )
+    .unwrap();
+}
+
+/// An image's store configuration names the store under the image, as the
+/// image writer does for the pool file: otherwise the image would read the
+/// recorded run's own store.
+fn repoint_kv_config(root: &Path, from: &Path, to: &Path) {
+    let path = root.join("db_kv.cfg");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        std::fs::write(&path, text.replace(&path_str(from), &path_str(to))).unwrap();
+    }
+}
+
+/// Closes `db` and forgets the log of every location under `base`, not only
+/// the root's: an image reuses its paths, and a log still registered under
+/// one answers the next image with the last one's offsets.
+fn close_all(base: &Path, root: &Path, db: Arc<Database>) {
+    close(root, db);
+    for location in ["disk2"] {
+        crate::core::wal::remove_for(&path_str(&base.join(location)));
+    }
+}
+
 /// Runs `create` cut at each of its syncs and after it returns, and checks
 /// every image of every cut.
-async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
+async fn run_case(create: &str, partitioned: bool, placement: Placement, seeds: u64) -> Outcomes {
     let base = tempfile::tempdir().unwrap();
-    let dir = base.path().join("db");
+    // The recorded directory holds the root, a second location and a store
+    // side by side (a location may not nest inside the root).
+    let rec_dir = base.path().join("rec");
+    let dir = rec_dir.join("db");
+    #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+    if placement == Placement::Kv {
+        write_kv_config(&dir, &rec_dir);
+    }
     {
         let db = open(&dir, "create_cut").await.unwrap();
         exec(&db, PARENT).await.unwrap();
         exec(&db, "INSERT INTO parent (id) VALUES (1), (2)").await.unwrap();
+        match placement {
+            Placement::Root => {}
+            #[cfg(feature = "storage_pools")]
+            Placement::Disk => {
+                let disk = rec_dir.join("disk2");
+                std::fs::create_dir_all(&disk).unwrap();
+                let added = db
+                    .storage
+                    .add_location(&path_str(&disk), crate::core::storage::LocationRole::Primary, 1, true)
+                    .unwrap();
+                db.storage.pin("t", &added).unwrap();
+            }
+            #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+            Placement::Kv => {
+                db.storage
+                    .pin_backend("t", &crate::core::storage::TableBackend::KeyValue("local".to_string()))
+                    .unwrap();
+            }
+        }
         db.sync_durable().unwrap();
-        close(&dir, db);
+        close_all(&rec_dir, &dir, db);
     }
     let db = open(&dir, "create_cut").await.unwrap();
-    let rec = Recorder::start(&dir);
+    let pin = pinned_spec(placement, &rec_dir);
+    assert_eq!(spec_of(&db), pin, "the pin was not recorded");
+    let rec = Recorder::start(&rec_dir);
     let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
     // Inside each sync the CREATE may take: the intent's, each log sync, a
     // data file's and a directory's. Not every one fires for every table.
@@ -100,7 +196,7 @@ async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
     ] {
         for nth in 1..=n {
             let label = format!("{site} #{nth}");
-            guards.push((label.clone(), failpoint::arm(site, &dir, nth, rec.cut_action(label, sink.clone()))));
+            guards.push((label.clone(), failpoint::arm(site, &rec_dir, nth, rec.cut_action(label, sink.clone()))));
         }
     }
     exec(&db, create).await.unwrap_or_else(|e| panic!("{create}: {e}"));
@@ -108,19 +204,29 @@ async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
     drop(guards);
     sink.lock().push(rec.cut_quiescent("after the CREATE returned"));
     let new = shape(&db).expect("the CREATE left no table");
-    close(&dir, db);
+    close_all(&rec_dir, &dir, db);
     drop(rec);
     assert!(fired.iter().any(|l| l.starts_with("sync:wal.log")), "{create}: no cut fell in a log sync ({fired:?})");
 
     let points: Vec<CrashPoint> = sink.lock().drain(..).filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok()).collect();
     assert!(points.len() >= 2, "{create}: too many cuts were disturbed: {}", points.len());
-    let img = base.path().join("image");
+    let img_dir = base.path().join("image");
+    let img = img_dir.join("db");
+    let pin_in_image = pinned_spec(placement, &img_dir);
     let mut out = Outcomes::default();
     let mut problems = Vec::new();
     for point in &points {
         for seed in 0..seeds {
-            point.write_image(seed, &img);
-            let label = format!("{} seed {seed}", point.label);
+            point.write_image(seed, &img_dir);
+            // An image holds files, not directories: a location or a store
+            // with nothing in it yet still exists on the disk it is.
+            for empty in ["disk2", "kvstore"] {
+                if rec_dir.join(empty).is_dir() {
+                    std::fs::create_dir_all(img_dir.join(empty)).unwrap();
+                }
+            }
+            repoint_kv_config(&img, &rec_dir, &img_dir);
+            let label = format!("{placement:?} {} seed {seed}", point.label);
             match open(&img, "create_cut").await {
                 Err(e) => problems.push(format!("{label}: does not open: {e}")),
                 Ok(db) => {
@@ -128,16 +234,25 @@ async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
                     if !intents.is_empty() {
                         problems.push(format!("{label}: intents left after the open: {intents:?}"));
                     }
+                    // A pin, whatever the image; a placement the CREATE chose
+                    // (the root, recorded too) goes and comes with the table.
+                    if pin_in_image.is_some() && spec_of(&db) != pin_in_image {
+                        problems.push(format!("{label}: the placement reads {:?}, not the pin {pin_in_image:?}", spec_of(&db)));
+                    }
                     match shape(&db) {
                         None => {
                             out.absent += 1;
                             // No stray file in the way: the CREATE runs again
-                            // and leaves the whole table.
+                            // and leaves the whole table, where the pin says.
                             match exec(&db, create).await {
                                 Err(e) => problems.push(format!("{label}: absent, and a CREATE again fails: {e}")),
                                 Ok(_) if shape(&db).as_ref() != Some(&new) => problems.push(format!(
                                     "{label}: absent, and a CREATE again leaves {:?}, not {new}",
                                     shape(&db)
+                                )),
+                                Ok(_) if spec_of(&db) != pin_in_image && pin_in_image.is_some() => problems.push(format!(
+                                    "{label}: absent, and a CREATE again placed it at {:?}, not the pin {pin_in_image:?}",
+                                    spec_of(&db)
                                 )),
                                 Ok(_) => {}
                             }
@@ -153,13 +268,13 @@ async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
                     if point.label.starts_with("after the CREATE") && shape(&db).is_none() {
                         problems.push(format!("{label}: the CREATE had returned and the table is gone"));
                     }
-                    close(&img, db);
+                    close_all(&img_dir, &img, db);
                 }
             }
-            let _ = std::fs::remove_dir_all(&img);
+            let _ = std::fs::remove_dir_all(&img_dir);
         }
     }
-    eprintln!("{create}: cuts {} at {fired:?}: {out:?}", points.len());
+    eprintln!("{create} ({placement:?}): cuts {} at {fired:?}: {out:?}", points.len());
     assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
     out
 }
@@ -168,17 +283,26 @@ async fn run_case(create: &str, partitioned: bool, seeds: u64) -> Outcomes {
 /// a `CHECK` and a `FOREIGN KEY`, cut inside every sync it takes and after it
 /// returns, every image under every seed kind: the table is absent (and a
 /// `CREATE` of it succeeds) or present with all of it, enforced. Both happen.
+/// The plain one also pinned before the `CREATE` to a second directory and to
+/// a key/value store: every image keeps the pin, and an absent table's retry
+/// lands there.
 ///
 /// Mutations: the catalogue row written first again (images keep it with
 /// the columns and no constraint); the intent's recovery skipped (an absent
 /// table's files block the next `CREATE`); the intent removed before the
-/// row is durable.
+/// row is durable; the discard forgetting a pin (the image reads no
+/// placement, and the retry goes to the database directory).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_create_table_cut_anywhere_leaves_no_table_or_the_whole_table() {
     let seeds = env_count("RDB_POWER_LOSS_SEEDS", 16, 1024);
+    let mut cases = vec![(PLAIN, false, Placement::Root), (PARTITIONED, true, Placement::Root)];
+    #[cfg(feature = "storage_pools")]
+    cases.push((PLAIN, false, Placement::Disk));
+    #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+    cases.push((PLAIN, false, Placement::Kv));
     let mut total = Outcomes::default();
-    for (create, partitioned) in [(PLAIN, false), (PARTITIONED, true)] {
-        let o = run_case(create, partitioned, seeds).await;
+    for (create, partitioned, placement) in cases {
+        let o = run_case(create, partitioned, placement, seeds).await;
         total.absent += o.absent;
         total.present += o.present;
     }

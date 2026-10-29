@@ -1020,9 +1020,21 @@ impl<S: StorageIO> Table<S> {
                 // must not replace them with an empty one.
                 TableSchema::new(table_name.to_string(), false)
             } else {
-                Self::create_schema_files(io_schema.clone(), table_name, columns, unique_columns)
-                    .await
-                    .expect("Failed to save initial schema")
+                match Self::create_schema_files(io_schema.clone(), table_name, columns, unique_columns).await {
+                    Ok(schema) => schema,
+                    // A CREATE whose schema or a field record could not be
+                    // written (a full disk, a file-size limit, a refused
+                    // key/value put): unusable, which `add_table` sees and
+                    // discards the table for, before its catalogue row. It
+                    // used to panic here, and before that the write's failure
+                    // was only logged, and the CREATE succeeded with a column
+                    // its files did not hold.
+                    Err(e) => {
+                        error!("table '{}': its schema could not be written: {}", table_name, e);
+                        schema_unreadable = true;
+                        TableSchema::new(table_name.to_string(), false)
+                    }
+                }
             }
         };
 
@@ -1152,8 +1164,8 @@ impl<S: StorageIO> Table<S> {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&column.name));
             schema
-                .add_field(io_schema.clone(), column.name, column.data_type, is_unique)
-                .await;
+                .try_add_field(io_schema.clone(), column.name, column.data_type, is_unique)
+                .await?;
         }
         Ok(schema)
     }

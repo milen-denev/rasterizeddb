@@ -8205,6 +8205,17 @@ async fn execute_create_partitioned(
         }
         Err(e) => {
             error!("Cannot create partitioned table {}: {}", name, e);
+            // Past its catalogue row the table is installed whatever the sync
+            // or the open said, and replication is told so, as for a plain
+            // CREATE. A refusal (the name taken, a key it cannot route) left
+            // nothing.
+            if !matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Unsupported
+            ) && database.is_partitioned(&name)
+            {
+                note_write(database, tx, depth, &query_sql(query), None);
+            }
             ddl_error(&partitioned_ddl_message(&e))
         }
     }
@@ -11230,16 +11241,22 @@ async fn execute_alter_table_action(
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
                             .map_err(|e| e.to_string())?;
                     }
-                    schema.add_field(io_schema.clone(), name.clone(), db_type, false).await;
+                    // A field record that cannot be written fails the change,
+                    // which puts the schema files back (`reload_atomic`).
+                    schema
+                        .try_add_field(io_schema.clone(), name.clone(), db_type, false)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     if is_nullable {
                         schema
-                            .add_field(
+                            .try_add_field(
                                 io_schema.clone(),
                                 nullable::flag_column_name(&name),
                                 nullable::FLAG_TYPE,
                                 false,
                             )
-                            .await;
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
                     // A JSON column is a `UUID` plus a table of its own, and
                     // the sidecar entry is what connects the two. Registered
@@ -11886,7 +11903,10 @@ async fn execute_alter_table_action(
                             .reload_atomic(&plan.table_name, |old| async move {
                                 let mut schema = schema;
                                 retire_tombstoned_name(&mut schema, &flag, old.io_schema.clone()).await?;
-                                schema.add_field(old.io_schema.clone(), flag, nullable::FLAG_TYPE, false).await;
+                                schema
+                                    .try_add_field(old.io_schema.clone(), flag, nullable::FLAG_TYPE, false)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                                 Ok(())
                             })
                             .await
@@ -15497,7 +15517,18 @@ pub(crate) async fn execute_with_need(
                             return ddl_error(&e);
                         }
                     };
+                let created_name = create_table.table_name.clone();
                 let added = database.add_table(create_table).await;
+                // Past its commit point a CREATE whose last sync failed has
+                // installed the table and reports the error: replication is
+                // told all the same, or the replica would lack a table every
+                // later statement names.
+                if added.as_ref().is_err_and(|e| {
+                    !matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists)
+                }) && database.has_table(&created_name)
+                {
+                    note_write(&database, tx, depth, &query_sql(&query), None);
+                }
                 if let Err(e) = &added {
                     // The guards in `add_table` say why a name is refused; a
                     // generic message would leave the client guessing.

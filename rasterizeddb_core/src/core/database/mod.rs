@@ -20,6 +20,8 @@ mod cross_dir_commit_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
 mod create_intent;
+#[cfg(test)]
+mod create_failure_tests;
 mod foreign_keys;
 mod partitioned;
 mod partitioned_ddl;
@@ -1187,6 +1189,19 @@ fn pool_location_of(pool: &StoragePool, table_name: &str) -> Option<String> {
 #[cfg(not(feature = "storage_pools"))]
 fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
     None
+}
+
+/// Whether a placement is recorded for `table_name`: a `STORAGE PLACE TABLE`
+/// pin (applied before the table exists, and the only way onto a key/value
+/// store), or what an earlier `CREATE` of the name chose.
+#[cfg(feature = "storage_pools")]
+fn pool_has_placement(pool: &StoragePool, table_name: &str) -> bool {
+    pool.spec_of(table_name).is_some()
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
+    false
 }
 
 pub struct Database {
@@ -3683,8 +3698,12 @@ impl Database {
         // then every file, durable, then the catalogue row, the commit point.
         // Only for a table a crash can leave files of.
         let durable = self.creates_durably(table_name);
+        // A placement recorded before this CREATE is a pin (`STORAGE PLACE
+        // TABLE`), which outlives a CREATE that fails or is cut: only one this
+        // CREATE chose goes with its files.
+        let pinned = pool_has_placement(&self.storage, table_name);
         let intent = match (durable, self.location.as_deref()) {
-            (true, Some(root)) => Some(create_intent::record(root, table_name)?),
+            (true, Some(root)) => Some(create_intent::record(root, table_name, pinned)?),
             _ => None,
         };
 
@@ -3704,7 +3723,7 @@ impl Database {
         // The store failing between that check and here falls back the same
         // way; refused all the same.
         if seed_fell_back(&self.storage, &seed, table_name) {
-            self.abandon_create(table_name, None, intent).await;
+            self.abandon_create(table_name, None, intent, pinned).await;
             return Err(io::Error::other(format!(
                 "table {table_name}: its key/value store could not be opened; not created"
             )));
@@ -3712,23 +3731,31 @@ impl Database {
 
         let mut table =
             Table::new_with_constraints(table_name, seed, columns, &create_table.unique_columns).await;
+        // Its schema or a field record could not be written: nothing is
+        // catalogued, and the files go.
+        if table.schema_unreadable {
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
+            return Err(io::Error::other(format!(
+                "table {table_name}: its schema could not be written; not created"
+            )));
+        }
         table.scope_cache_to_database(self.id);
 
         // Through `register_unique_key`, which also arms the table's unique
         // checks; the sidecars only record them.
         let keys_before = table.schema.unique_keys.len();
         if let Err(e) = write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await {
-            self.abandon_create(table_name, Some(table), intent).await;
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
         // Every file durable before the catalogue names the table: an image
         // holding any byte of the row then holds them all.
         if durable && let Err(e) = self.sync_durable() {
-            self.abandon_create(table_name, Some(table), intent).await;
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
         if let Err(e) = self.write_catalogue_row(table_name, 0).await {
-            self.abandon_create(table_name, Some(table), intent).await;
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
         // Past the commit point, whatever the sync says: the table goes in,
@@ -3782,14 +3809,15 @@ impl Database {
     }
 
     /// A `CREATE TABLE` that failed before its catalogue row: the instance it
-    /// opened retired, its files discarded and its placement forgotten, then
-    /// its intent removed. A discard that fails keeps the intent, so the next
+    /// opened retired, its files discarded and the placement it chose
+    /// forgotten (a pin it found stays), then its intent removed. A discard that fails keeps the intent, so the next
     /// open finishes it; nothing names the files meanwhile.
     async fn abandon_create(
         &self,
         table_name: &str,
         table: Option<Table<DbStorageProvider>>,
         intent: Option<std::path::PathBuf>,
+        pinned: bool,
     ) {
         if let Some(table) = table {
             table.retire().await;
@@ -3801,7 +3829,9 @@ impl Database {
         if intent.is_none() && !self.creates_durably(table_name) {
             return;
         }
-        if !create_intent::discard(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, root, table_name).await {
+        if !create_intent::discard(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, root, table_name, !pinned)
+            .await
+        {
             error!("CREATE TABLE {table_name} failed and its files could not be discarded yet; the next open does");
             return;
         }
@@ -5047,7 +5077,11 @@ pub(super) async fn discard_files_in(
     for suffix in suffixes {
         io_pointers.drop_file(format!("{}{}", name, suffix)).await;
     }
-    if logs.is_empty() {
+    // No directory to sync for a database with none. One with its log
+    // disabled still has directories, whose unlinks a power cut could
+    // otherwise bring back: this used to return here whenever no log held
+    // the files.
+    if logs.is_empty() && own.is_none() {
         return true;
     }
     for dir in dirs_reached(io_pointers, pool) {

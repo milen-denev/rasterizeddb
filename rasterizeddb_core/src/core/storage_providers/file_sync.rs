@@ -370,6 +370,13 @@ impl LocalStorageProvider {
         // file of the directory's transaction, then kept `pending_count`
         // raised, and every checkpoint declined until a restart. Released
         // here, where it is known the commit was never attempted.
+        //
+        // Never committed later: a caller's `commit_durable` is its last word
+        // on a transaction (one that fails is not retried with the same
+        // token, and `abort_txn` after it is refused by contract), and
+        // nothing else commits a token. A later commit of it would log a
+        // commit marker for payloads already released, and its in-place
+        // writes would replay from the log while never being applied here.
         match self.refuse_commit(token, land_staged).await {
             Ok(()) => {}
             Err(e) => {
@@ -743,6 +750,24 @@ pub(crate) mod failed_appends {
     /// failure, keyed by directory so it reaches a write on any thread.
     #[cfg(test)]
     pub(crate) static FAIL_INPLACE_IN: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    /// File names whose next append fails as a refused write does: nothing
+    /// written, the failure taken by the commit. One entry per failure,
+    /// matched against the end of the file's path.
+    #[cfg(test)]
+    pub(crate) static FAIL_APPEND_TO: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    pub(super) fn injected_append_failure(file: &str) -> bool {
+        let mut armed = FAIL_APPEND_TO.lock();
+        match armed.iter().position(|name| file.ends_with(&format!("/{name}"))) {
+            Some(i) => {
+                armed.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
 
     #[cfg(test)]
     pub(super) fn injected_inplace_failure(location: &str) -> bool {
@@ -1897,6 +1922,11 @@ impl StorageIO for LocalStorageProvider {
             GatedIo::record_failure(&self.location, &self.table_name, Failure::Txn(txn), e);
             return (self.file_len.load(Ordering::Acquire), txn);
         });
+        #[cfg(test)]
+        if failed_appends::injected_append_failure(&self.file_str) {
+            failed_appends::record(&self.location, &self.file_str, txn, io::Error::other("injected append failure"));
+            return (self.file_len.load(Ordering::Acquire), txn);
+        }
         let mut file = self.append_file.write();
         // `file_len` is the append allocator, and this is where these bytes go.
         let at = self.file_len.load(Ordering::Acquire);

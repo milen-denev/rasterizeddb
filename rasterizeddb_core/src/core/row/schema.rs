@@ -226,13 +226,24 @@ impl SchemaField {
     }
 
     pub async fn save_field(&self, io: &mut impl StorageIO) -> io::Result<()> {
-        let data = self.into_vec();
-
-        // True only if appending multiple fields in a batch, no background service is running.
-        io.append_data(&data, true).await;
-
-        Ok(())
+        // A logged append committed here, so a write that fails (a full disk,
+        // a file-size limit, a key/value put) is this call's error: the
+        // immediate `append_data` only logged it, and a CREATE then reported
+        // a column its files did not hold.
+        append_committed(io, &self.into_vec()).await
     }
+}
+
+/// Appends `bytes` to the file `io` writes and commits it, returning the
+/// append's or the commit's error: what the immediate `append_data` does,
+/// except that its failure (a full disk, a file-size limit, a refused
+/// key/value put) was only logged there. The commit is the deferred kind, as
+/// before: durable with the statement's next log sync, or, on a key/value
+/// store, once its family has stored it.
+pub(crate) async fn append_committed<S: StorageIO>(io: &S, bytes: &[u8]) -> io::Result<()> {
+    let txn = io.begin_txn();
+    let (_, token) = io.append_data_txn(txn, bytes).await;
+    io.commit_durable(token).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -725,10 +736,9 @@ impl TableSchema {
         if self.incarnation != 0 {
             data.extend_from_slice(&incarnation_record(self.incarnation));
         }
-        // Schema is small and critical; persist immediately so CREATE TABLE is durable
-        // even if the process crashes before any background flush runs.
-        schema_io.append_data(&data, true).await;
-        Ok(())
+        // Committed here, so a failed write is the caller's error rather than
+        // a log line (`append_committed`).
+        append_committed(&*schema_io, &data).await
     }
 
     /// Overwrites the header record without appending a second one.
@@ -744,6 +754,8 @@ impl TableSchema {
         Ok(())
     }
 
+    /// [`Self::try_add_field`] for a caller with nowhere to send its error,
+    /// which is logged. The field is kept only once its record is written.
     pub async fn add_field<S: StorageIO>(
         &mut self,
         schema_io: Arc<S>,
@@ -751,6 +763,21 @@ impl TableSchema {
         db_type: DbType,
         is_unique: bool,
     ) {
+        if let Err(e) = self.try_add_field(schema_io, field_name.clone(), db_type, is_unique).await {
+            log::error!("column {field_name} of {} could not be recorded: {e}", self.name);
+        }
+    }
+
+    /// Adds a field and writes its record, returning the write's error. The
+    /// field joins `self.fields` only once its record is written: a schema
+    /// holding a column its file does not would lose it at the next open.
+    pub async fn try_add_field<S: StorageIO>(
+        &mut self,
+        schema_io: Arc<S>,
+        field_name: String,
+        db_type: DbType,
+        is_unique: bool,
+    ) -> io::Result<()> {
         let mut field_io = schema_io
             .create_new(format!(
                 "{}_{}",
@@ -769,7 +796,7 @@ impl TableSchema {
         // equal, so a SELECT could be served the WHERE clause's columns instead
         // of the ones it asked for.
         if self.fields.iter().any(|f| f.name == field_name) {
-            return;
+            return Ok(());
         }
 
         let offset: u64 = self.fields.iter().map(|f| f.size as u64).sum();
@@ -790,8 +817,9 @@ impl TableSchema {
             is_unique,
         );
 
-        _ = field.save_field(&mut field_io).await;
+        field.save_field(&mut field_io).await?;
         self.fields.push(field);
+        Ok(())
     }
 
     /// Renames a field in the schema and in its persisted record.

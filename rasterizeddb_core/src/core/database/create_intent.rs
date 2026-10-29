@@ -30,7 +30,9 @@
 //! replay and the catalogue is read ([`recover`]), an intent whose table is
 //! catalogued is a create that reached its commit point and is removed; one
 //! whose table is not has its files voided in the logs and deleted
-//! (`discard_files_in`), its placement forgotten, and then goes.
+//! (`discard_files_in`), the placement it chose forgotten (a pin recorded
+//! before it, `STORAGE PLACE TABLE`, stays, so a retry lands where the pin
+//! says), and then goes.
 //!
 //! So the removal in step 5 need not be synced: an intent left by a cut after
 //! the row is durable names a catalogued table, which recovery keeps. The row
@@ -70,29 +72,42 @@ fn intent_path(root: &str, table: &str) -> PathBuf {
     ))
 }
 
-/// The intent's bytes: a tag, the table's name, then a checksum over both,
-/// so only exactly one intent parses. The name may hold a line break: the
-/// checksum is the last line.
-fn encode(table: &str) -> String {
-    let body = format!("create\n{table}");
+/// The intent's bytes: a tag, whether the table's placement was there before
+/// the `CREATE` (`pinned`) or is the one it chose (`placed`), the table's
+/// name, then a checksum over all of it, so only exactly one intent parses.
+/// The name may hold a line break: the checksum is the last line.
+fn encode(table: &str, pinned: bool) -> String {
+    let body = format!("create\n{}\n{table}", if pinned { PINNED } else { PLACED });
     format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
 }
 
-/// The table an intent names; `None` for anything not exactly one intent.
-fn parse(text: &str) -> Option<String> {
+const PINNED: &str = "pinned";
+const PLACED: &str = "placed";
+
+/// The table an intent names and whether its placement is a pin; `None` for
+/// anything not exactly one intent. An intent with no placement line (this
+/// branch's first form) keeps the placement, the side that loses nothing.
+fn parse(text: &str) -> Option<(String, bool)> {
     let text = text.strip_suffix('\n')?;
     let (body, sum) = text.rsplit_once('\n')?;
     if sum != format!("{:016x}", crate::core::wal::file_id_for_name(body)) {
         return None;
     }
-    let table = body.strip_prefix("create\n")?;
-    (!table.is_empty()).then(|| table.to_string())
+    let rest = body.strip_prefix("create\n")?;
+    let (table, pinned) = match rest.split_once('\n') {
+        Some((PINNED, table)) => (table, true),
+        Some((PLACED, table)) => (table, false),
+        _ => (rest, true),
+    };
+    (!table.is_empty()).then(|| (table.to_string(), pinned))
 }
 
 /// Writes `table`'s intent durably (step 1) and returns where it is.
-pub(super) fn record(root: &str, table: &str) -> io::Result<PathBuf> {
+/// `pinned`: a placement was recorded before the `CREATE` (`STORAGE PLACE
+/// TABLE`), which a discard keeps.
+pub(super) fn record(root: &str, table: &str, pinned: bool) -> io::Result<PathBuf> {
     let path = intent_path(root, table);
-    super::rewrite::write_intent(&path, &encode(table))?;
+    super::rewrite::write_intent(&path, &encode(table, pinned))?;
     Ok(path)
 }
 
@@ -109,8 +124,12 @@ pub(super) fn clear(path: &Path) {
 }
 
 /// Discards the files of `table`, a create that never reached its catalogue
-/// row: their log records voided, the files deleted, the placement
-/// forgotten. False, keeping the files, when that could not be done.
+/// row: their log records voided, the files deleted, and, when
+/// `forget_placement`, the placement the `CREATE` chose forgotten. A pin
+/// recorded before it (`STORAGE PLACE TABLE`, applied before the table
+/// exists, and the only way onto a key/value store) stays: forgotten, a
+/// retried `CREATE` went to the database directory instead. False, keeping
+/// the files, when that could not be done.
 pub(super) async fn discard(
     io_pointers: &Arc<DbStorageProvider>,
     pool: &StoragePool,
@@ -118,12 +137,15 @@ pub(super) async fn discard(
     seeds: &SeedCache,
     root: &str,
     table: &str,
+    forget_placement: bool,
 ) -> bool {
     let seed = seed_in(io_pointers, pool, kv, seeds, table).await;
     if !discard_files_in(&seed, pool, Some(root), table, RENAMED_SUFFIXES).await {
         return false;
     }
-    super::pool_forget(pool, table);
+    if forget_placement {
+        super::pool_forget(pool, table);
+    }
     true
 }
 
@@ -163,7 +185,7 @@ pub(super) async fn recover(
         if path.extension().is_none_or(|x| x != EXTENSION) {
             continue;
         }
-        let Some(table) = std::fs::read_to_string(&path).ok().as_deref().and_then(parse) else {
+        let Some((table, pinned)) = std::fs::read_to_string(&path).ok().as_deref().and_then(parse) else {
             // Written whole by a rename over it, so never torn: one that does
             // not parse was not written by this engine.
             warn!("A create intent {} could not be read; leaving it in place", path.display());
@@ -181,7 +203,7 @@ pub(super) async fn recover(
             continue;
         }
         info!("Discarding the files of {table}: its CREATE TABLE was interrupted before its catalogue row");
-        if !discard(io_pointers, pool, kv, seeds, &root, &table).await {
+        if !discard(io_pointers, pool, kv, seeds, &root, &table, !pinned).await {
             error!(
                 "Could not discard the files of {table}, whose CREATE TABLE was interrupted; \
                  the next open tries again"
@@ -202,15 +224,21 @@ mod tests {
 
     #[test]
     fn an_intent_round_trips_and_a_torn_one_does_not_parse() {
-        for table in ["t", "a b", "line\nbreak", "外键"] {
-            let text = encode(table);
-            assert_eq!(parse(&text).as_deref(), Some(table));
-            for cut in 0..text.len() {
-                if text.is_char_boundary(cut) {
-                    assert_eq!(parse(&text[..cut]), None, "{table:?} cut at {cut} parsed");
+        for table in ["t", "a b", "line\nbreak", "pinned\nx", "外键"] {
+            for pinned in [false, true] {
+                let text = encode(table, pinned);
+                assert_eq!(parse(&text), Some((table.to_string(), pinned)));
+                for cut in 0..text.len() {
+                    if text.is_char_boundary(cut) {
+                        assert_eq!(parse(&text[..cut]), None, "{table:?} cut at {cut} parsed");
+                    }
                 }
             }
         }
-        assert_eq!(parse(&encode("")), None);
+        assert_eq!(parse(&encode("", false)), None);
+        // The first form, no placement line: the placement is kept.
+        let body = "create\nt";
+        let old = format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(body));
+        assert_eq!(parse(&old), Some(("t".to_string(), true)));
     }
 }
