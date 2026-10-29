@@ -141,6 +141,37 @@ pub fn stage<S: StorageIO>(
     Ok(())
 }
 
+/// The prefix of a record that is no modifier but says a column was
+/// declared `character(n)` (or `char`, `bpchar`): PostgreSQL compares such a
+/// column blank-padded, and this engine stores it as text, so a check that
+/// reads it is kept unenforced (`check::cast_columns_to_bpchar`). Recorded in
+/// this sidecar, keyed by a name no column can have, so every reader that
+/// looks a modifier up by its column never meets one, and a later `ALTER
+/// TABLE … ADD CONSTRAINT` still knows the column's type.
+pub const BPCHAR_MARKER: &str = "\u{1}bpchar:";
+
+/// The record marking `column` as `character(n)`.
+pub fn bpchar_marker(column: &str) -> TypeModifier {
+    TypeModifier { column: format!("{BPCHAR_MARKER}{column}"), precision: 0, scale: 0, is_deleted: false }
+}
+
+/// The columns `modifiers` mark as `character(n)`.
+pub fn bpchar_columns(modifiers: &[TypeModifier]) -> Vec<String> {
+    modifiers
+        .iter()
+        .filter(|m| !m.is_deleted)
+        .filter_map(|m| m.column.strip_prefix(BPCHAR_MARKER).map(str::to_string))
+        .collect()
+}
+
+/// Whether a declared type, as written (`CHAR(3)`, `character`, `bpchar`,
+/// `char`), is `character(n)`; `character varying` is not.
+pub fn is_bpchar_type(declared: &str) -> bool {
+    let upper = declared.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or("").trim();
+    (base == "BPCHAR" || base == "CHAR" || base == "CHARACTER" || base == "NCHAR") && !upper.contains("VARYING")
+}
+
 /// The scale a decimal column stores at.
 ///
 /// An unrecorded column keeps the engine's default, which is what its rows were

@@ -34,6 +34,9 @@ pub enum AlterAction {
         /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
         /// the column was added and never given a value.
         generated: Option<String>,
+        /// Declared `character(n)`, which a check compares blank-padded
+        /// (`type_modifier::BPCHAR_MARKER`).
+        bpchar: bool,
     },
     DropColumn {
         name: String,
@@ -448,6 +451,8 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 }
                 joined
             };
+            let bpchar = crate::core::rql::type_modifier::is_bpchar_type(&declared)
+                && !type_tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("VARYING"));
             let modifier = match crate::core::rql::type_modifier::parse_numeric_modifier(&declared) {
                 Some(Ok(pair)) => Some(pair),
                 Some(Err(reason)) => return Err(reason),
@@ -471,6 +476,7 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 json,
                 modifier,
                 generated,
+                bpchar,
             }
         }
         "DROP" => {
@@ -1192,6 +1198,7 @@ mod tests {
                 json: false,
                 modifier: None,
                 generated: None,
+                bpchar: false,
             }
         );
     }

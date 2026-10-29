@@ -417,9 +417,10 @@ fn fold_regex_truth_tests(text: &str) -> String {
     out
 }
 
-/// `expression` with each bare reference to one of `columns` written
-/// `column::bpchar`, outside quotes; a qualified, called or already cast
-/// one is left alone.
+/// `expression` with each reference to one of `columns` written
+/// `column::bpchar`, outside quotes, ahead of any cast it already has
+/// (`tag::text` is `tag::bpchar::text`: PostgreSQL strips the padding
+/// there too); a function of that name is left alone.
 pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
     let bytes = expression.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -432,7 +433,7 @@ pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
             i = end;
             continue;
         }
-        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'"') && (i == 0 || !word(bytes[i - 1]) && bytes[i - 1] != b'.') {
+        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'"') && (i == 0 || !word(bytes[i - 1])) {
             let (end, name) = if bytes[i] == b'"' {
                 let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
                 (end, expression[i + 1..end.saturating_sub(1)].to_string())
@@ -445,7 +446,7 @@ pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
             };
             let rest = expression[end..].trim_start();
             let named = columns.iter().any(|c| c.eq_ignore_ascii_case(&name));
-            if named && !rest.starts_with('(') && !rest.starts_with('.') && !rest.starts_with("::") {
+            if named && !rest.starts_with('(') && !rest.starts_with('.') && !rest.starts_with("::bpchar") {
                 out.push_str(&format!("{}::bpchar", &expression[i..end]));
             } else {
                 out.push_str(&expression[i..end]);
@@ -986,7 +987,8 @@ mod tests {
     fn a_character_n_column_is_cast_where_a_check_reads_it() {
         let c = |e: &str| cast_columns_to_bpchar(e, &["tag".to_string()]);
         assert_eq!(c("tag IN ('AB', 'tag')"), "tag::bpchar IN ('AB', 'tag')");
-        assert_eq!(c("t.tag = 'x' OR length(tag) > 1 OR tag::text = 'y' OR tagx = 1"), "t.tag = 'x' OR length(tag::bpchar) > 1 OR tag::text = 'y' OR tagx = 1");
+        assert_eq!(c("t.tag = 'x' OR length(tag) > 1 OR tag::text = 'y' OR tagx = 1"), "t.tag::bpchar = 'x' OR length(tag::bpchar) > 1 OR tag::bpchar::text = 'y' OR tagx = 1");
+        assert_eq!(c("tag::bpchar = 'x'"), "tag::bpchar = 'x'");
         assert_eq!(c("\"tag\" <> ''"), "\"tag\"::bpchar <> ''");
     }
 

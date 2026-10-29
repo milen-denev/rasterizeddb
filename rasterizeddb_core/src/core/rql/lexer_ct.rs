@@ -390,19 +390,12 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
                 joined
             };
+            if crate::core::rql::type_modifier::is_bpchar_type(&raw_type)
+                && !type_phrase.to_ascii_uppercase().contains("VARYING")
             {
-                let upper = raw_type.to_ascii_uppercase();
-                let base = upper.split('(').next().unwrap_or("").trim();
-                let width = upper
-                    .split_once('(')
-                    .and_then(|(_, r)| r.split(')').next())
-                    .and_then(|w| w.trim().parse::<u32>().ok());
-                let bpchar = base == "BPCHAR"
-                    || (base == "CHARACTER" && !type_phrase.to_ascii_uppercase().contains("VARYING"))
-                    || (base == "CHAR" && width.is_some_and(|n| n > 1));
-                if bpchar {
-                    bpchar_columns.push(name.clone());
-                }
+                bpchar_columns.push(name.clone());
+                // Recorded, so a check added later by ALTER knows it too.
+                type_modifiers.push(crate::core::rql::type_modifier::bpchar_marker(&name));
             }
             match crate::core::rql::type_modifier::parse_numeric_modifier(&raw_type) {
                 Some(Ok((precision, scale))) => {

@@ -11815,6 +11815,16 @@ async fn add_check_constraint(
     if schema.checks.iter().any(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name)) {
         return ddl_error(&format!("constraint \"{}\" for relation \"{}\" already exists", name, table_name));
     }
+    // A `character(n)` column is cast `::bpchar` where the check reads it,
+    // as CREATE TABLE stores it, which keeps the check unenforced: enforced,
+    // `ADD CONSTRAINT CHECK (tag IN ('AB', 'CD'))` on a CHAR(3) refused the
+    // 'AB ' PostgreSQL accepts.
+    let bpchar = crate::core::rql::type_modifier::bpchar_columns(&schema.type_modifiers);
+    let expression = if bpchar.is_empty() {
+        expression
+    } else {
+        crate::core::rql::check::cast_columns_to_bpchar(&expression, &bpchar)
+    };
 
     // It must compile, or it would be stored and then skipped on every write.
     let unenforced = match compile_check(&expression, &schema.fields) {
@@ -11973,6 +11983,7 @@ async fn execute_alter_table_action(
             json,
             modifier,
             generated,
+            bpchar,
         } => {
             if nullable::is_hidden(&name) {
                 return ddl_error("column names beginning with __null_ are reserved");
@@ -12161,7 +12172,12 @@ async fn execute_alter_table_action(
                     added,
                     new_defaults,
                     new_json,
-                    new_modifier.into_iter().collect(),
+                    // With its `character(n)` record, as the in-place add
+                    // stages it (`type_modifier::BPCHAR_MARKER`).
+                    new_modifier
+                        .into_iter()
+                        .chain(bpchar.then(|| crate::core::rql::type_modifier::bpchar_marker(&name)))
+                        .collect(),
                     new_generated.into_iter().collect(),
                     tx,
                 ))
@@ -12237,6 +12253,14 @@ async fn execute_alter_table_action(
                     if let Some(entry) = &new_modifier {
                         crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, entry)
                             .map_err(|e| e.to_string())?;
+                    }
+                    // `character(n)`, for the checks that read it
+                    // (`type_modifier::BPCHAR_MARKER`).
+                    if bpchar {
+                        let marker = crate::core::rql::type_modifier::bpchar_marker(&name);
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &marker)
+                            .map_err(|e| e.to_string())?;
+                        schema.type_modifiers.push(marker);
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
