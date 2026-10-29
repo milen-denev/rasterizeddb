@@ -184,8 +184,8 @@ Statements accepted without acting, each for a stated reason rather than
 silently: index DDL (the engine maintains its own indexes), extensions, schemas,
 `COMMENT ON`, `ANALYZE`/`VACUUM`, and table storage tuning —
 `ALTER TABLE … SET COMPRESSION`, `SET`/`RESET (reloptions)`,
-`VALIDATE CONSTRAINT`, `CLUSTER`, `OWNER TO`. `CHECK` is accepted and logged as
-unenforced.
+`VALIDATE CONSTRAINT`, `CLUSTER`, `OWNER TO`. `CHECK` is enforced; see
+[CHECK constraints](#check-constraints).
 
 **`UNIQUE` and `PRIMARY KEY` are enforced, including composite keys.** Declared
 inline, as a table constraint, or through `ALTER TABLE … ADD CONSTRAINT`;
@@ -286,6 +286,59 @@ What a database written by an older binary holds, read by this one:
   validity is not recorded and `pg_constraint` is not emulated, so nothing
   shows which keys still have unchecked rows; run `VALIDATE CONSTRAINT` on
   each to find their orphans.
+
+### CHECK constraints
+
+A check refuses a row only when it is FALSE, as in PostgreSQL: a NULL result
+passes, so `CHECK (x > 0)` and `CHECK (x IS NULL OR x > 0)` both take a NULL
+`x`. It is judged on `INSERT`, on `UPDATE` (against the row as it will be
+stored) and over the stored rows by `ALTER TABLE … ADD CONSTRAINT … CHECK`,
+all three the same way: a row violates the check when `NOT (check)` holds,
+evaluated as a `WHERE` clause would be.
+
+Accepted forms include what `pg_dump` writes — `((status = ANY
+(ARRAY['a'::text, 'b'::text])))`, a varchar column's `((status)::text = ANY
+((ARRAY[…])::text[]))`, `'…'::timestamp without time zone` — and what ORMs
+generate: comparisons, `BETWEEN`, `IN`/`NOT IN`, `IS [NOT] NULL`,
+`IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE/FALSE`, `LIKE`/`ILIKE`/`NOT LIKE`,
+`SIMILAR TO` (and `pg_dump`'s `~~`, `~~*`, `!~~`), a `CASE` value compared,
+`COALESCE`, `length`/`char_length`/`upper`/`lower`/`btrim`, `jsonb_typeof`,
+`doc ? 'k'`, `doc @> …`, `doc ->> 'k' IS NOT NULL`, and `AND`/`OR`/`NOT` of
+them. A check no evaluator here can read is refused where it is declared,
+always with 0A000, rather than stored unenforced. Not yet supported: POSIX
+regular expressions (`~`, `~*`, `!~`) and a `CASE` whose branches are
+themselves conditions (`CASE WHEN a THEN b > 0 ELSE true END`).
+
+#### Release note: checks stored by older binaries
+
+Older binaries stored some checks without enforcing them, logging "could not
+be compiled" at each write: checks using `COALESCE`, `IS NOT NULL`,
+`char_length`, `upper`, `IS DISTINCT FROM` or `->> … IS NOT NULL`, among
+others. This binary enforces them. Rows written while they were not enforced
+may violate them, and a later `UPDATE` of such a row fails with 23514 even if
+it does not touch the checked columns. Find them before upgrading traffic:
+
+```sql
+SELECT * FROM <table> WHERE NOT (<check expression>);
+```
+
+and fix or delete each row, or drop the check (`ALTER TABLE <table> DROP
+CONSTRAINT <name>`) and add it again once the data holds.
+
+### NUMERIC past nine places
+
+Expressions compute `NUMERIC` at the engine's nine places. A column declared
+with more (`NUMERIC(20,12)`) is still exact where it is stored, compared with
+a literal of any length, compared in an expression (`CASE WHEN a > 1`), cast
+(`a::numeric(10,2)`, `a::float8`, `a::text`), assigned (`UPDATE … SET a = a +
+0.000000000001`, computed exactly and rounded once to the column's scale), and
+in a select list or `ORDER BY` key built from `+`, `-`, `*`, unary minus and
+`COALESCE` (`SELECT a + 1`, `-a`, `a * 2`). Three things are refused with
+0A000 rather than answered without the value's last digits: `WHERE`-clause
+arithmetic on it (`WHERE a + 0 > 1`), a quotient that does not end (`a / 3`),
+and `RETURNING` arithmetic on it. That refusal depends on the data: it fires
+only for rows whose value has nonzero digits past the ninth place, so the same
+statement may run against some rows and be refused against others.
 
 ## JSON
 

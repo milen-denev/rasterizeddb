@@ -187,6 +187,14 @@ pub enum TextFunc {
     OctetLength,
     /// `abs(x)` — the magnitude, in `x`'s own type.
     Abs,
+    /// `btrim` / `ltrim` / `rtrim(text [, characters])`: the characters
+    /// (a space when none are given) taken off both ends, the start or the end.
+    Btrim,
+    Ltrim,
+    Rtrim,
+    /// `jsonb_typeof(doc)`: `object`, `array`, `string`, `number`, `boolean`
+    /// or `null`.
+    JsonbTypeof,
 }
 
 /// How many elements an array's text form `{a,b,"c,d"}` holds.
@@ -570,7 +578,7 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
 pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
-    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "JSONB_TYPEOF",
 ];
 
 /// Parses one expression against `schema`.
@@ -1081,6 +1089,23 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("abs takes exactly one argument".to_string());
                     }
                     Ok(Expr::Call(TextFunc::Abs, args))
+                }
+                "BTRIM" | "LTRIM" | "RTRIM" => {
+                    if !(1..=2).contains(&args.len()) {
+                        return Err(format!("{} takes a text and optionally the characters to trim", upper_name.to_lowercase()));
+                    }
+                    let func = match upper_name.as_str() {
+                        "BTRIM" => TextFunc::Btrim,
+                        "LTRIM" => TextFunc::Ltrim,
+                        _ => TextFunc::Rtrim,
+                    };
+                    Ok(Expr::Call(func, args))
+                }
+                "JSONB_TYPEOF" => {
+                    if args.len() != 1 {
+                        return Err("jsonb_typeof takes exactly one argument".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::JsonbTypeof, args))
                 }
                 "MOD" => {
                     if args.len() != 2 {
@@ -2228,7 +2253,48 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         return Ok(Value::Null);
     }
 
+    if matches!(func, TextFunc::Btrim | TextFunc::Ltrim | TextFunc::Rtrim | TextFunc::JsonbTypeof)
+        && args.iter().any(|a| a.is_null())
+    {
+        return Ok(Value::Null);
+    }
+
     Ok(match func {
+        TextFunc::Btrim | TextFunc::Ltrim | TextFunc::Rtrim => {
+            let text = as_text(&args[0]);
+            let set: Vec<char> = match args.get(1) {
+                Some(chars) => as_text(chars).chars().collect(),
+                None => vec![' '],
+            };
+            let trimmed = match func {
+                TextFunc::Btrim => text.trim_matches(|c| set.contains(&c)),
+                TextFunc::Ltrim => text.trim_start_matches(|c| set.contains(&c)),
+                _ => text.trim_end_matches(|c| set.contains(&c)),
+            };
+            string(trimmed.to_string())
+        }
+        TextFunc::JsonbTypeof => {
+            let Value::Data { bytes, db_type } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let document = if *db_type == DbType::JSONB {
+                crate::core::jsonb::decode(bytes)?
+            } else {
+                serde_json::from_str(&as_text(&args[0]))
+                    .map_err(|e| format!("invalid input syntax for type json: {}", e))?
+            };
+            string(
+                match document {
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Null => "null",
+                }
+                .to_string(),
+            )
+        }
         // Always `public`: this engine has one schema, and reporting anything
         // else would make a qualified name the caller then builds unresolvable.
         TextFunc::CurrentSchema => string("public".to_string()),

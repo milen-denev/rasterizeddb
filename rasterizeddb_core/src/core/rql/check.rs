@@ -314,6 +314,211 @@ fn columns_read(expression: &str, columns: &[String]) -> Vec<String> {
     read
 }
 
+/// A check expression in the shape the predicate rewriter reads, from the
+/// canonical form `pg_dump` writes and the forms ORMs generate.
+///
+/// `pg_dump` renders `status IN ('a', 'b')` as `((status = ANY
+/// (ARRAY['a'::text, 'b'::text])))`, and for a varchar column as
+/// `(((status)::text = ANY ((ARRAY['a'::character varying, …])::text[])))`;
+/// a timestamp literal as `'…'::timestamp without time zone`. None of these
+/// read, so a `psql -f dump.sql` restore refused those tables, and with DDL
+/// outside the transaction lost them and their rows. Each is rewritten to
+/// what it means:
+/// - `x = ANY (ARRAY[…])` is `x IN (…)`, and `x <> ALL (ARRAY[…])` is
+///   `x NOT IN (…)` (the same three-valued answer, NULL included), with an
+///   array cast `(ARRAY[…])::text[]` dropped;
+/// - a string literal's or a bare column's cast to `text`, `character
+///   varying`, `varchar` or `bpchar` is dropped: a no-op on text;
+/// - `timestamp without time zone` is `timestamp`, `timestamp with time
+///   zone` is `timestamptz`, and so for `time`;
+/// - the operators `~~`, `~~*`, `!~~`, `!~~*` are `LIKE`, `ILIKE`,
+///   `NOT LIKE`, `NOT ILIKE`.
+pub fn normalize_expression(expression: &str) -> String {
+    let mut text = expression.to_string();
+    for (from, to) in [
+        ("::timestamp without time zone", "::timestamp"),
+        ("::timestamp with time zone", "::timestamptz"),
+        ("::time without time zone", "::time"),
+        ("::time with time zone", "::timetz"),
+    ] {
+        text = replace_outside_quotes(&text, from, to);
+    }
+    // `pg_dump` writes LIKE as its operator: `~~`, `~~*` (ILIKE), and `!~~`,
+    // `!~~*` for the negations. Longest first.
+    for (from, to) in [(" !~~* ", " NOT ILIKE "), (" !~~ ", " NOT LIKE "), (" ~~* ", " ILIKE "), (" ~~ ", " LIKE ")] {
+        text = replace_outside_quotes(&text, from, to);
+    }
+    let text = drop_text_casts(&text);
+    let text = unwrap_bare_names(&text);
+    lower_any_all(&text)
+}
+
+/// `(status)` as `status` where the parentheses hold one name and are not a
+/// call's: what is left of `pg_dump`'s `(status)::text` once the cast is
+/// dropped, which the rewriter does not read before `IN`.
+fn unwrap_bare_names(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'(' {
+            let called = out.trim_end().ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            if let Some(close) = text[i + 1..].find(')').map(|c| i + 1 + c) {
+                let inner = text[i + 1..close].trim();
+                let name = !inner.is_empty()
+                    && (inner.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        && inner.starts_with(|c: char| c.is_alphabetic() || c == '_')
+                        || inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"') && !inner[1..inner.len() - 1].contains('"'));
+                let keyword = ["NULL", "TRUE", "FALSE"].iter().any(|k| inner.eq_ignore_ascii_case(k));
+                if name && !called && !keyword {
+                    out.push_str(inner);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `haystack` with each occurrence of `from` outside string literals,
+/// matched without regard to ASCII case, replaced by `to`.
+fn replace_outside_quotes(haystack: &str, from: &str, to: &str) -> String {
+    let bytes = haystack.as_bytes();
+    let lower_from = from.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&haystack[i..end]);
+            i = end;
+            continue;
+        }
+        if haystack[i..].len() >= from.len()
+            && haystack.is_char_boundary(i + from.len())
+            && haystack[i..i + from.len()].to_ascii_lowercase() == lower_from
+        {
+            out.push_str(to);
+            i += from.len();
+            continue;
+        }
+        let ch = haystack[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Drops `::text`-like casts (and an array's `::text[]`) after a string
+/// literal, a bare or parenthesised column, or a parenthesised `ARRAY[…]`.
+fn drop_text_casts(text: &str) -> String {
+    const TEXTUAL: [&str; 5] = ["character varying", "varchar", "text", "bpchar", "character"];
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b':' && bytes.get(i + 1) == Some(&b':') {
+            let rest = &text[i + 2..];
+            let lower = rest.to_ascii_lowercase();
+            if let Some(name) = TEXTUAL.iter().find(|name| {
+                lower.starts_with(*name)
+                    && !lower[name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            }) {
+                // What the cast applies to must be text already: a literal,
+                // a name, or a parenthesised one of those or an ARRAY.
+                let before = out.trim_end();
+                let castable = before.ends_with('\'')
+                    || before.ends_with(')')
+                    || before.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '"');
+                if castable {
+                    let mut skip = i + 2 + name.len();
+                    // `[]` of an array cast.
+                    if text[skip..].starts_with("[]") {
+                        skip += 2;
+                    }
+                    i = skip;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `x = ANY (ARRAY[a, b])` as `x IN (a, b)`, and `x <> ALL (ARRAY[a, b])`
+/// as `x NOT IN (a, b)`; an extra pair of parentheses around the array, as
+/// `pg_dump` writes with a cast, is taken too.
+fn lower_any_all(text: &str) -> String {
+    let mut out = text.to_string();
+    for (op_kw, replacement) in [("= ANY", "IN"), ("<> ALL", "NOT IN"), ("!= ALL", "NOT IN")] {
+        loop {
+            let upper = out.to_ascii_uppercase();
+            let Some(at) = find_outside_quotes(&upper, op_kw) else { break };
+            let after = out[at + op_kw.len()..].trim_start();
+            let after_at = out.len() - after.len();
+            // `(ARRAY[...])` or `((ARRAY[...]))`
+            let Some(open) = after.starts_with('(').then_some(after_at) else { break };
+            let Some(close) = crate::core::sql_scan::matching_close(&out, open) else { break };
+            let inner = out[open + 1..close].trim();
+            let inner = inner
+                .strip_prefix('(')
+                .and_then(|i| i.strip_suffix(')'))
+                .map(str::trim)
+                .unwrap_or(inner);
+            let upper_inner = inner.to_ascii_uppercase();
+            let Some(items) = upper_inner
+                .strip_prefix("ARRAY")
+                .map(str::trim_start)
+                .filter(|r| r.starts_with('[') && r.ends_with(']'))
+                .map(|r| {
+                    let start = inner.len() - r.len() + 1;
+                    inner[start..inner.len() - 1].to_string()
+                })
+            else {
+                break;
+            };
+            out = format!("{}{} ({}){}", &out[..at], replacement, items, &out[close + 1..]);
+        }
+    }
+    out
+}
+
+/// Byte position of `needle` (upper case) in `upper` outside string literals.
+fn find_outside_quotes(upper: &str, needle: &str) -> Option<usize> {
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            continue;
+        }
+        if upper[i..].starts_with(needle) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Position of `keyword` as a whole word.
 fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
     fn is_word_byte(b: u8) -> bool {

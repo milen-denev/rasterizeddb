@@ -9790,7 +9790,7 @@ fn check_constraints_hold(
         // A check that cannot be compiled is refused when it is declared
         // (`compile_check`); one stored before that rule is logged and
         // skipped rather than failing every insert into the table.
-        let compiled = match compile_check(&constraint.expression, &schema.fields) {
+        let compiled = match compile_check_cached(&constraint.expression, &schema.fields) {
             Ok(compiled) => compiled,
             Err(reason) => {
                 log::error!(
@@ -9812,18 +9812,18 @@ fn check_constraints_hold(
                     table_name, constraint.name
                 ));
             }
-            Err(reason) => {
-                log::error!(
-                    "check constraint '{}' on '{}' could not be evaluated and is not being \
-                     enforced for this row: {}",
-                    constraint.name,
-                    table_name,
-                    reason
-                );
-            }
+            // A check that cannot be evaluated for this row fails the
+            // statement: it was logged and the row stored unchecked.
+            Err(reason) => return Err(check_evaluation_failed(&constraint.name, table_name, &reason)),
         }
     }
     Ok(())
+}
+
+/// The failure of a check that could not be evaluated for a row, with its
+/// reason (which carries the SQLSTATE: `division by zero` is 22012).
+fn check_evaluation_failed(name: &str, table: &str, reason: &str) -> String {
+    format!("check constraint \"{name}\" of relation \"{table}\" could not be evaluated for the row: {reason}")
 }
 
 /// A `CHECK`, compiled to tell whether a row violates it.
@@ -9846,6 +9846,15 @@ pub(crate) enum CompiledCheck {
     /// evaluator can (`COALESCE(x, 1) > 0`), evaluated with three values: a
     /// row violates it when it is FALSE.
     Direct(crate::core::rql::expr::Cond),
+    /// `NOT (check)` lowered as for `Violation`, but in a shape only the
+    /// scan's predicate engine reads — `LIKE`, `SIMILAR TO`, `doc ? 'k'`,
+    /// `doc @> …`, a lifted `CASE` — run by that engine against the row, as
+    /// a `WHERE` runs it against a stored one. A check is then enforced on
+    /// a write exactly as `ADD CONSTRAINT` judged the stored rows by it.
+    Scan {
+        plan: crate::core::processor::transformer::TransformerPlan,
+        width: usize,
+    },
 }
 
 impl CompiledCheck {
@@ -9861,6 +9870,30 @@ impl CompiledCheck {
             CompiledCheck::Direct(cond) => {
                 Ok(crate::core::rql::expr::eval_cond_3vl(cond, row, fields)? == Some(false))
             }
+            CompiledCheck::Scan { plan, width } => {
+                use crate::core::processor::concurrent_processor::RowView;
+                use crate::core::processor::transformer::TransformerProcessor;
+                // The row's cells by write order, as a scan addresses them.
+                let mut map: smallvec::SmallVec<[u8; 32]> = smallvec::SmallVec::new();
+                map.resize((*width).max(1), u8::MAX);
+                for (pos, column) in row.columns.iter().enumerate() {
+                    let wo = column.schema_id as usize;
+                    if pos >= u8::MAX as usize {
+                        return Err("a check over more than 254 columns cannot be evaluated".to_string());
+                    }
+                    if wo < map.len() {
+                        map[wo] = pos as u8;
+                    }
+                }
+                let mut transformers = smallvec::SmallVec::new();
+                let mut intermediates = smallvec::SmallVec::new();
+                let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediates);
+                processor.load_plan(plan);
+                let mut results = smallvec::SmallVec::new();
+                processor
+                    .execute_row(&RowView::new(row, &map), &mut results)
+                    .map_err(|e| e.as_str().to_string())
+            }
         }
     }
 
@@ -9871,7 +9904,18 @@ impl CompiledCheck {
         &self,
         fields: &[crate::core::row::schema::SchemaField],
     ) -> Vec<crate::core::row::schema::SchemaField> {
-        let (CompiledCheck::Violation(cond) | CompiledCheck::Direct(cond)) = self;
+        let cond = match self {
+            CompiledCheck::Violation(cond) | CompiledCheck::Direct(cond) => cond,
+            // What the plan reads is not listed here, so every column is
+            // taken as read: an UPDATE judges the check against each row.
+            CompiledCheck::Scan { .. } => {
+                return fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .cloned()
+                    .collect();
+            }
+        };
         let mut read = Vec::new();
         collect_condition_columns(cond, &mut read);
         let mut out: Vec<crate::core::row::schema::SchemaField> = Vec::new();
@@ -9892,6 +9936,43 @@ impl CompiledCheck {
     }
 }
 
+/// [`compile_check`], remembered per thread by the expression and the
+/// schema it was compiled against: an INSERT judges every row, and compiling
+/// each check again per row made a bulk load with checks some 40% slower.
+fn compile_check_cached(
+    expression: &str,
+    fields: &[crate::core::row::schema::SchemaField],
+) -> Result<std::sync::Arc<CompiledCheck>, String> {
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<u64, (String, std::sync::Arc<CompiledCheck>)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    // Keyed by everything the compilation reads: the text and each field's
+    // name, type, position, scale and liveness.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    expression.hash(&mut hasher);
+    for f in fields {
+        (&f.name, f.db_type.to_string(), f.write_order, f.scale, f.is_deleted).hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    if let Some(hit) = CACHE.with(|c| {
+        c.borrow().get(&key).filter(|(text, _)| text == expression).map(|(_, compiled)| compiled.clone())
+    }) {
+        return Ok(hit);
+    }
+    let compiled = std::sync::Arc::new(compile_check(expression, fields)?);
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // Bounded: a long-lived worker sees many tables.
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, (expression.to_string(), compiled.clone()));
+    });
+    Ok(compiled)
+}
+
 /// Compiles a `CHECK`'s expression against a table's whole schema, its
 /// nullability companions included (see [`CompiledCheck`]).
 ///
@@ -9905,20 +9986,58 @@ pub(crate) fn compile_check(
 ) -> Result<CompiledCheck, String> {
     let fields_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
         fields.iter().cloned().collect();
-    let lowered =
-        crate::core::tokenizer::predicate_rewrite::rewrite_where(&format!("NOT ({})", expression), &fields_sv)
-            .and_then(|lowered| crate::core::rql::expr::parse_cond(&lowered, fields));
-    match lowered {
-        Ok(condition) => Ok(CompiledCheck::Violation(condition)),
-        Err(first) => {
-            // Names resolve among the columns a client sees; the companions
-            // are read only when the row is.
-            let visible = crate::core::rql::nullable::visible_fields(&fields_sv);
-            crate::core::rql::expr::parse_cond(expression, &visible)
-                .map(CompiledCheck::Direct)
-                .map_err(|_| first)
+    // `pg_dump`'s canonical spellings, in the shape the rewriter reads.
+    let expression = crate::core::rql::check::normalize_expression(expression);
+    let expression = expression.as_str();
+    // The question is "is the check FALSE": `NOT (check)` as a WHERE, and
+    // where the rewriter cannot negate the expression (a bare `CASE`),
+    // `(check) IS FALSE`, which is the same question.
+    let mut lowered = Err(String::new());
+    for question in [format!("NOT ({})", expression), format!("({}) IS FALSE", expression)] {
+        let attempt = crate::core::tokenizer::predicate_rewrite::rewrite_where(&question, &fields_sv);
+        if let Ok(text) = &attempt {
+            if let Ok(condition) = crate::core::rql::expr::parse_cond(text, fields) {
+                return Ok(CompiledCheck::Violation(condition));
+            }
+            // The scan's predicate engine reads more than the condition
+            // evaluator: run it.
+            let schema_arc = rclite::Arc::new(fields_sv.clone());
+            let scanned =
+                crate::core::processor::concurrent_processor::ConcurrentProcessor::prepare_query(text, &schema_arc)
+                    .and_then(|(no_filter, tokens)| {
+                        if no_filter {
+                            return Err("an empty check".to_string());
+                        }
+                        crate::core::processor::concurrent_processor::ConcurrentProcessor::compile_query_plan(
+                            &schema_arc,
+                            &tokens,
+                        )
+                    });
+            if let Ok(plan) = scanned {
+                let width = fields.iter().map(|f| f.write_order as usize + 1).max().unwrap_or(0);
+                return Ok(CompiledCheck::Scan { plan, width });
+            }
+        }
+        if lowered.is_err() {
+            lowered = attempt;
         }
     }
+    // Names resolve among the columns a client sees; the companions are read
+    // only when the row is.
+    let visible = crate::core::rql::nullable::visible_fields(&fields_sv);
+    crate::core::rql::expr::parse_cond(expression, &visible)
+        // A check that is a boolean expression rather than a comparison (a
+        // bare `CASE … END`) is compared with TRUE, which keeps its NULL.
+        .or_else(|e| crate::core::rql::expr::parse_cond(&format!("({}) = TRUE", expression), &visible).map_err(|_| e))
+        .map(CompiledCheck::Direct)
+        .map_err(|direct| {
+        // One code for a check neither path reads (0A000), whatever the
+        // reader's own words would have mapped to.
+        format!(
+            "this check is not supported: {}",
+            lowered.err().filter(|e| !e.is_empty()).unwrap_or(direct)
+        )
+    })
 }
 
 /// Refuses an `UPDATE` whose assignments violate a `CHECK`.
@@ -9975,7 +10094,10 @@ fn check_constraints_hold_for_update(
             continue;
         }
 
-        if let Ok(true) = compiled.violated(&candidate, &schema.fields) {
+        if compiled
+            .violated(&candidate, &schema.fields)
+            .map_err(|reason| check_evaluation_failed(&constraint.name, table_name, &reason))?
+        {
             return Err(format!(
                 "new row for relation \"{}\" violates check constraint \"{}\"",
                 table_name, constraint.name
@@ -10069,15 +10191,7 @@ impl UpdateRowChecks {
                         table_name, name
                     ));
                 }
-                Err(reason) => {
-                    log::error!(
-                        "check constraint '{}' on '{}' could not be evaluated and is not being \
-                         enforced for this row: {}",
-                        name,
-                        table_name,
-                        reason
-                    );
-                }
+                Err(reason) => return Err(check_evaluation_failed(name, table_name, &reason)),
             }
         }
         Ok(())
@@ -10935,7 +11049,11 @@ async fn add_check_constraint(
     }
 
     // A row for which it is false (NULL is not false) refuses the statement.
-    let probe = format!("SELECT 1 FROM {} WHERE NOT ({}) LIMIT 1", table_name, expression);
+    let probe = format!(
+        "SELECT 1 FROM {} WHERE NOT ({}) LIMIT 1",
+        table_name,
+        crate::core::rql::check::normalize_expression(&expression)
+    );
     match run_subquery(&probe, database, tx).await {
         Ok(rows) if rows.is_empty() => {}
         Ok(_) => {
