@@ -2031,6 +2031,17 @@ impl<S: StorageIO> Table<S> {
         crate::core::rql::statement_snapshot::get_or_take(manager, || self.visibility_for(tx))
     }
 
+    /// The snapshot a write's statement already read under, when it read
+    /// before writing (its subqueries, CTE bodies, join sources): the rows
+    /// it writes are scanned under it, so they are the rows those reads
+    /// described ([`crate::core::rql::statement_snapshot::kept`]). `None`
+    /// for an unversioned table and for a statement that read nothing yet,
+    /// whose write takes its own under the write lock.
+    pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
+        let versions = self.versions.load();
+        crate::core::rql::statement_snapshot::kept(versions.as_ref()?, tx)
+    }
+
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned.
     ///
     /// For a rewrite of the table rather than a query of it: every row that is

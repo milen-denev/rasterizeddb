@@ -912,13 +912,6 @@ fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
     names
 }
 
-/// The refusal for a correlated `[NOT] EXISTS` in an UPDATE or a DELETE
-/// outside a pinned snapshot (`substitute_in_subqueries`).
-pub(crate) const CORRELATED_EXISTS_WRITE: &str = "a correlated EXISTS in UPDATE or DELETE is not supported under \
-     READ COMMITTED: its subquery is read under an earlier snapshot than the rows the statement writes, so a \
-     concurrent writer between them makes it touch the wrong rows; run it in a REPEATABLE READ or SERIALIZABLE \
-     transaction, or write it as UPDATE … FROM / DELETE … USING";
-
 /// Whether the `[NOT] EXISTS (…)` at `start..end` of `sql` is a value
 /// rather than a condition: cast (`::`) or an operand of arithmetic.
 fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
@@ -986,30 +979,11 @@ pub async fn substitute_in_subqueries(
     const MAX_SUBQUERIES: usize = 8;
 
     let mut current = sql.to_string();
-    // A correlated EXISTS of an UPDATE or a DELETE is read once, under the
-    // snapshot this takes now, while the rows it then writes are scanned
-    // under a later one: with a writer between them it touched rows
-    // PostgreSQL's does not (27 of 300 statements under a concurrent
-    // writer, PostgreSQL 0 of 2000). Only a pinned snapshot (REPEATABLE
-    // READ, SERIALIZABLE) makes the two one.
     let write_statement = {
         let head = sql.trim_start();
         let word = head.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
         word == "UPDATE" || word == "DELETE"
     };
-    let pinned = write_statement && database.transactions.has_pinned_snapshot(database.row_locks.txn_of(tx));
-    // One nested in another subquery (`id IN (SELECT … WHERE EXISTS (…
-    // t0.id))`, Django's DELETE) is read under that subquery's earlier
-    // snapshot too.
-    if write_statement && !pinned {
-        let mut at = 0;
-        while let Some(clause) = subquery::find_exists(&current[at..]) {
-            if inside_a_subquery(&current, at + clause.start) && subquery::is_correlated(&clause.inner_sql) {
-                return Err(CORRELATED_EXISTS_WRITE.to_string());
-            }
-            at += clause.end.max(1);
-        }
-    }
 
     // `EXISTS` is rewritten into the equivalent `IN` first, so the loop below
     // resolves both forms with one mechanism.
@@ -1068,9 +1042,6 @@ pub async fn substitute_in_subqueries(
             continue;
         }
 
-        if write_statement && !pinned {
-            return Err(CORRELATED_EXISTS_WRITE.to_string());
-        }
         // As a value — under arithmetic or a cast (`x - EXISTS (…)::int`) —
         // its `IN` form, a predicate, came out as text no reader takes (XX000,
         // "is neither a column nor a value").
@@ -5829,6 +5800,74 @@ fn affected_by(response: &[u8]) -> Option<u64> {
 /// a NUMERIC column, "operand size does not match") silently wrote the row
 /// with no recheck, which is the write a concurrently changed row must not
 /// get.
+/// Whether `sql` holds an `IN (SELECT …)`, an `EXISTS` or a scalar
+/// subquery, which [`substitute_in_subqueries`] folds into literals.
+fn has_subquery(sql: &str) -> bool {
+    crate::core::rql::statement_snapshot::mentions_select(sql)
+        && (crate::core::rql::subquery::find_in_subquery(sql).is_some()
+            || crate::core::rql::subquery::find_exists(sql).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(sql).is_some())
+}
+
+/// Folds `sql`'s subqueries into literals and runs the statement that
+/// leaves, under the same transaction and depth.
+async fn execute_flattened(sql: &str, verb: &str, database: Arc<Database>, depth: usize, tx: TxId) -> Vec<u8> {
+    match substitute_in_subqueries(sql, &database, tx).await {
+        Ok(flattened) => {
+            let Some(purpose) = recognize_query_purpose(&flattened) else {
+                return ddl_error(&format!("could not parse the {} after subquery substitution", verb));
+            };
+            Box::pin(execute_with_context(purpose, database, depth, tx)).await
+        }
+        Err(e) => ddl_error(&e),
+    }
+}
+
+/// Whether an `UPDATE` or a `DELETE` reads before it writes, so its attempt
+/// needs one snapshot for both (`statement_snapshot`): a subquery to fold, or
+/// a `FROM`/`USING` source to join (a derived one materialised first). A
+/// plain one reads nothing first and takes its snapshot under its lock.
+fn write_reads_first(query: &QueryPurpose) -> bool {
+    match query {
+        QueryPurpose::UpdateRow(sql) => {
+            has_subquery(sql) || crate::core::rql::join::find_keyword(sql, "FROM", 0).is_some()
+        }
+        QueryPurpose::DeleteRow(sql) => {
+            has_subquery(sql) || crate::core::rql::join::find_keyword(sql, "USING", 0).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// One attempt of a statement in a retry loop: [`execute_with_context`],
+/// inside a write scope of its own when it is a write that reads first
+/// and no enclosing write scope (a CTE-fed write's) already holds the
+/// statement's reads. Each attempt's scope is new, so a conflict retry reads afresh.
+///
+/// Not an `async fn`, and boxed once: the retry loops box every attempt, and
+/// an `async fn` wrapper boxed the statement's future a second time.
+fn execute_attempt(
+    query: QueryPurpose,
+    database: Arc<Database>,
+    tx: TxId,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Vec<u8>>>> {
+    let scoped = write_reads_first(&query) && !crate::core::rql::statement_snapshot::in_write_scope();
+    let attempt = execute_with_context(query, database, 0, tx);
+    Box::pin(if scoped {
+        futures::future::Either::Left(crate::core::rql::statement_snapshot::write_scope(attempt))
+    } else {
+        futures::future::Either::Right(attempt)
+    })
+}
+
+/// The snapshot an `UPDATE`'s or a `DELETE`'s target rows are scanned under
+/// when its statement read first: the one its reads took. Only the
+/// statement's own target (`depth` 0); a foreign-key action it sets off
+/// reads and writes its rows as of now, as before.
+fn statement_snapshot_for(depth: usize, kept: impl FnOnce() -> Option<crate::core::mvcc::Visibility>) -> Option<crate::core::mvcc::Visibility> {
+    if depth == 0 { kept() } else { None }
+}
+
 async fn run_per_row_write(
     with_recheck: String,
     key_only: String,
@@ -5841,8 +5880,20 @@ async fn run_per_row_write(
     // arithmetic (`v < 0.1234 * 100`), which only the fold computes at a
     // width a NUMERIC column compares with.
     let (with_recheck, key_only) = (fold_where_constants(&with_recheck), fold_where_constants(&key_only));
+    // Each write by key reads its row as it is now and rechecks the
+    // condition against it, PostgreSQL's recheck of a row changed since the
+    // join read it: in a scope of its own, so it is not scanned under the
+    // join's snapshot, which the statement's scope holds.
     let response = match recognize_query_purpose(&with_recheck) {
-        Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+        Some(purpose) => {
+            crate::core::rql::statement_snapshot::scope(Box::pin(execute_with_context(
+                purpose,
+                database.clone(),
+                depth,
+                tx,
+            )))
+            .await
+        }
         None => {
             let mut refused = vec![3u8];
             refused.extend_from_slice(format!("could not parse the rewritten {}", sql_literal(&with_recheck)).as_bytes());
@@ -5863,7 +5914,15 @@ async fn run_per_row_write(
     // transaction, which that failure aborts (an `UPDATE … FROM` never
     // overwrites in place, `forbid_in_place`).
     let keyed = match recognize_query_purpose(&key_only) {
-        Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+        Some(purpose) => {
+            crate::core::rql::statement_snapshot::scope(Box::pin(execute_with_context(
+                purpose,
+                database.clone(),
+                depth,
+                tx,
+            )))
+            .await
+        }
         None => return Ok(response),
     };
     if keyed.first() == Some(&3u8) {
@@ -15783,13 +15842,8 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
                 ),
                 purpose => {
                     crate::core::rql::conflict_wait::capture(
-                        std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
-                            purpose,
-                            database.clone(),
-                            0,
-                            tx,
-                        )))
-                        .catch_unwind(),
+                        std::panic::AssertUnwindSafe(execute_attempt(purpose, database.clone(), tx))
+                            .catch_unwind(),
                     )
                     .await
                 }
@@ -16191,13 +16245,7 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
                 .await
             }
             query => {
-                crate::core::rql::conflict_wait::capture(Box::pin(execute_with_context(
-                    query,
-                    database.clone(),
-                    0,
-                    tx,
-                )))
-                .await
+                crate::core::rql::conflict_wait::capture(execute_attempt(query, database.clone(), tx)).await
             }
         };
         if !retryable || !is_retryable_conflict(&response) {
@@ -17148,6 +17196,21 @@ pub(crate) async fn execute_with_need(
             {
                 database.transactions.forbid_in_place(tx);
             }
+            // Subqueries are folded first, exactly as the SELECT arm does,
+            // and then the flattened statement is dispatched. Without this an
+            // `UPDATE … SET c = (SELECT …)` reached the UPDATE parser with the
+            // word SELECT in its assignment and came back as "Cannot parse
+            // UPDATE query", naming nothing. Folded here, inside the attempt,
+            // rather than at the wire: the attempt's reads share one snapshot
+            // and its rows are scanned under it (`statement_snapshot`), and a
+            // conflict retry folds them again under its own.
+            if let QueryPurpose::UpdateRow(sql) = &query
+                && has_subquery(sql)
+                && !(crate::core::rql::join::find_keyword(sql, "FROM", 0).is_none()
+                    && crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some())
+            {
+                return Box::pin(execute_flattened(sql, "UPDATE", database.clone(), depth, tx)).await;
+            }
             // `UPDATE t SET … FROM src WHERE …` reads one relation to write
             // another, which the single-relation write path cannot express.
             // Handled by joining the two, reading the values out, and writing
@@ -17222,35 +17285,6 @@ pub(crate) async fn execute_with_need(
                     {
                         error!("{}", e);
                         return ddl_error(&e);
-                    }
-                }
-            }
-
-            // Subqueries are folded first, exactly as the SELECT arm does.
-            // Without this an `UPDATE … SET c = (SELECT …)` reached the UPDATE
-            // parser with the word SELECT in its assignment and came back as
-            // "Cannot parse UPDATE query", naming nothing.
-            if let QueryPurpose::UpdateRow(sql) = &query {
-                if crate::core::rql::subquery::find_in_subquery(sql).is_some()
-                    || crate::core::rql::subquery::find_exists(sql).is_some()
-                    || crate::core::rql::subquery::find_scalar_subquery(sql).is_some()
-                {
-                    match substitute_in_subqueries(sql, &database, tx).await {
-                        Ok(flattened) => {
-                            let Some(purpose) = recognize_query_purpose(&flattened) else {
-                                return ddl_error(
-                                    "could not parse the UPDATE after subquery substitution",
-                                );
-                            };
-                            return Box::pin(execute_with_context(
-                                purpose,
-                                database.clone(),
-                                depth,
-                                tx,
-                            ))
-                            .await;
-                        }
-                        Err(e) => return ddl_error(&e),
                     }
                 }
             }
@@ -17411,11 +17445,15 @@ pub(crate) async fn execute_with_need(
 
             // One snapshot for the statement when its foreign keys need to know
             // which rows it changes: the rows judged and the rows written must
-            // be the same rows. `None` — every other UPDATE — leaves the write
-            // to take its own, as before.
-            let statement_visibility =
-                update_needs_statement_snapshot(&database, &table.schema, &table_name, &update_plan)
-                    .then(|| table.visibility_for(tx));
+            // be the same rows. The one its reads took when it read first (a
+            // subquery, a FROM source). `None` — every other UPDATE — leaves
+            // the write to take its own, as before.
+            let foreign_keys_read =
+                update_needs_statement_snapshot(&database, &table.schema, &table_name, &update_plan);
+            let statement_visibility = statement_snapshot_for(depth, || table.statement_visibility(tx))
+                .or_else(|| foreign_keys_read.then(|| table.visibility_for(tx)));
+            // What the foreign-key work reads under: only when it has any.
+            let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
             let target = crate::core::database::Relation::Plain(table.clone());
 
             if let Some(assignments) =
@@ -17427,7 +17465,7 @@ pub(crate) async fn execute_with_need(
                     &table_name,
                     &update_plan,
                     &assignments,
-                    statement_visibility.as_ref(),
+                    foreign_key_visibility,
                     tx,
                 )
                 .await
@@ -17440,7 +17478,7 @@ pub(crate) async fn execute_with_need(
             // The parent side: keys this statement moves, locked before the
             // write and acted on after it. `None` — the common case — unless a
             // foreign key references a column the statement assigns.
-            let key_changes = match statement_visibility.as_ref() {
+            let key_changes = match foreign_key_visibility {
                 None => None,
                 Some(visibility) => match keys_about_to_change(
                     &database,
@@ -17733,6 +17771,13 @@ pub(crate) async fn execute_with_need(
             result
         }
         QueryPurpose::DeleteRow(_) => {
+            // Subqueries are folded first and the flattened statement
+            // dispatched, inside the attempt, as the UPDATE arm does.
+            if let QueryPurpose::DeleteRow(sql) = &query
+                && has_subquery(sql)
+            {
+                return Box::pin(execute_flattened(sql, "DELETE", database.clone(), depth, tx)).await;
+            }
             // `DELETE … USING` names a second relation, which the
             // single-relation path cannot express — and must never degrade
             // into `DELETE FROM t` (see the refusal in `lexer_dr` and the
@@ -17841,9 +17886,11 @@ pub(crate) async fn execute_with_need(
             // One snapshot for the statement when foreign keys point here: the
             // keys whose referencing rows are dealt with and the rows the scan
             // deletes must be the same rows. See `keys_about_to_be_deleted`.
-            let statement_visibility = (!referencing_keys(&database, &table_name).is_empty())
-                .then(|| table.visibility_for(tx));
-            match match statement_visibility.as_ref() {
+            // Or the one its reads took, when it read first (a subquery).
+            let referenced = !referencing_keys(&database, &table_name).is_empty();
+            let statement_visibility = statement_snapshot_for(depth, || table.statement_visibility(tx))
+                .or_else(|| referenced.then(|| table.visibility_for(tx)));
+            match match statement_visibility.as_ref().filter(|_| referenced) {
                 Some(visibility) => {
                     keys_about_to_be_deleted(
                         &database,
@@ -18242,7 +18289,7 @@ async fn execute_partitioned_update(
     // locked before the write and acted on after it. Every read routes on
     // the statement's `WHERE` over the partitions, under that snapshot.
     let (statement_visibility, key_changes) =
-        match partitioned_update_foreign_keys(database, &pt, table_name, &update_plan, &sql, tx).await {
+        match partitioned_update_foreign_keys(database, &pt, table_name, &update_plan, &sql, depth, tx).await {
             Ok(found) => found,
             Err(e) => {
                 error!("{}", e);
@@ -18346,11 +18393,14 @@ async fn partitioned_update_foreign_keys(
     table_name: &str,
     plan: &crate::core::rql::lexer_ur::UpdateRow,
     sql: &str,
+    depth: usize,
     tx: TxId,
 ) -> Result<(Option<crate::core::mvcc::Visibility>, Option<KeyChanges>), String> {
     let schema = &pt.shell().schema;
-    let statement_visibility =
-        update_needs_statement_snapshot(database, schema, table_name, plan).then(|| pt.visibility_for(tx));
+    let foreign_keys_read = update_needs_statement_snapshot(database, schema, table_name, plan);
+    let statement_visibility = statement_snapshot_for(depth, || pt.statement_visibility(tx))
+        .or_else(|| foreign_keys_read.then(|| pt.visibility_for(tx)));
+    let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
     let target = crate::core::database::Relation::Partitioned(pt.clone());
     if let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) {
         check_foreign_keys_for_update(
@@ -18359,12 +18409,12 @@ async fn partitioned_update_foreign_keys(
             table_name,
             plan,
             &assignments,
-            statement_visibility.as_ref(),
+            foreign_key_visibility,
             tx,
         )
         .await?;
     }
-    let key_changes = match statement_visibility.as_ref() {
+    let key_changes = match foreign_key_visibility {
         None => None,
         Some(visibility) => keys_about_to_change(database, &target, table_name, plan, visibility, tx).await?,
     };
@@ -18405,8 +18455,10 @@ async fn execute_partitioned_delete(
     // keys the routed partitions are about to lose read under it, their
     // referenced-key locks taken under the logical name and each child's
     // action run, and the same snapshot handed to every partition's write.
-    let statement_visibility = (!referencing_keys(database, table_name).is_empty()).then(|| pt.visibility_for(tx));
-    if let Some(visibility) = statement_visibility.as_ref() {
+    let referenced = !referencing_keys(database, table_name).is_empty();
+    let statement_visibility = statement_snapshot_for(depth, || pt.statement_visibility(tx))
+        .or_else(|| referenced.then(|| pt.visibility_for(tx)));
+    if let Some(visibility) = statement_visibility.as_ref().filter(|_| referenced) {
         let target = crate::core::database::Relation::Partitioned(pt.clone());
         let keys = match keys_about_to_be_deleted(database, &target, table_name, &where_clause, &query_row_fetch, visibility, tx)
             .await

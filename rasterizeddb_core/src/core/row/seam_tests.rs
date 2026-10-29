@@ -40,6 +40,9 @@ const SCHEMA_ONLY: &[&str] = &[
     // The statement snapshot over `visibility_for`, and the cache counters:
     // all on `Table`, none on its data.
     "read_visibility_for",
+    // The snapshot a write's statement read under (`statement_snapshot::
+    // kept`): on `Table`, none on its data.
+    "statement_visibility",
     "cache_generation",
     "write_generation",
     "visibility_now_for",

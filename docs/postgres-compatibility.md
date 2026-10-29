@@ -387,17 +387,21 @@ SELECT * FROM <table> WHERE NOT (<check expression>);
 and fix or delete each row, or drop the check (`ALTER TABLE <table> DROP
 CONSTRAINT <name>`) and add it again once the data holds.
 
-### Correlated EXISTS in UPDATE and DELETE
+### Subqueries in UPDATE and DELETE
 
-A correlated `[NOT] EXISTS` in an `UPDATE` or a `DELETE` (`UPDATE t … WHERE
-EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)`, Django's forms included) runs
-only in a `REPEATABLE READ` or `SERIALIZABLE` transaction, and is refused with
-0A000 under `READ COMMITTED` (autocommit or an explicit block). Its subquery is
-read once, under a snapshot taken before the rows it writes are scanned, so a
-concurrent writer between the two would make it touch rows PostgreSQL's does
-not; a pinned snapshot makes them one. Write it as `UPDATE … FROM` /
-`DELETE … USING` to run it under `READ COMMITTED`. `IN (SELECT …)` and `NOT IN
-(SELECT …)` in a write share the snapshot gap and are not yet refused.
+An `UPDATE` or a `DELETE` reads its subqueries (`[NOT] IN (SELECT …)`,
+correlated or not `[NOT] EXISTS`, a scalar subquery), its `FROM`/`USING`
+source, its CTEs and its derived tables under the snapshot its target rows are
+scanned under, as PostgreSQL reads a statement under `READ COMMITTED`: a
+transaction committing in between cannot make it write a row that no single
+moment had match. There is no EvalPlanQual: a target row changed since that
+snapshot is a write conflict, replayed whole (subqueries read again under a
+new snapshot) in autocommit and in a `READ COMMITTED` block, and reported
+(40001) when it cannot be. A statement fed by a CTE or a derived table, which
+are read before the write starts, replays only when the transaction it met
+aborted; otherwise its conflict is reported. `UPDATE … FROM` and `DELETE …
+USING` still write each joined row back by its key, rechecking the condition
+against the row as it is then.
 
 A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
 either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …

@@ -901,6 +901,12 @@ impl PartitionedTable {
         Visibility::for_snapshot(self.transactions.snapshot(tx), self.transactions.clone())
     }
 
+    /// `Table::statement_visibility` for a partitioned table: the snapshot
+    /// its write's statement already read under, if it read first.
+    pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
+        crate::core::rql::statement_snapshot::kept(&self.transactions, tx)
+    }
+
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned, as
     /// `Table::visibility_now_for` is for a plain table: what a foreign-key
     /// check reads a partitioned parent or child with (phase 3 P4), every

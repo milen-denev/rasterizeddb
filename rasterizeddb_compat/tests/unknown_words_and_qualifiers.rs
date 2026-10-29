@@ -293,21 +293,19 @@ async fn joins_join_writes_returning_and_upserts_check_their_qualifiers() {
     assert_eq!(name, "was b excluded.name EXCLUDED.name");
 }
 
-/// A correlated EXISTS in an UPDATE or a DELETE runs only under a pinned
-/// snapshot (REPEATABLE READ, SERIALIZABLE), and is refused (0A000) under
-/// READ COMMITTED, autocommit or an explicit block.
-///
-/// Its subquery is read once, under a snapshot taken before the scan of the
-/// rows it then writes: with a writer between the two it touched rows
-/// PostgreSQL's does not (27 of 300 statements; PostgreSQL 0 of 2000). Under
-/// a pinned snapshot the two are one, and Django's forms run as in
-/// PostgreSQL 17: the statement's relation (`UPDATE "t" … WHERE EXISTS (… =
-/// ("t"."id") …)`), a parenthesised predicate, `LIMIT 1`, a schema-qualified
-/// target, and an EXISTS inside an `IN` subquery correlating with that
-/// subquery's own alias. One inside an `IN` that reads the target itself is
-/// refused, as is a correlation the rewrite cannot place, both as 0A000.
+/// A correlated EXISTS in an UPDATE or a DELETE runs at every isolation
+/// level: autocommit, an explicit `READ COMMITTED` block, `REPEATABLE READ`
+/// and `SERIALIZABLE` blocks, and autocommit under a session's `REPEATABLE
+/// READ` characteristics. Its subquery is read under the snapshot its rows
+/// are scanned under (`write_subquery_snapshot` holds that under a
+/// concurrent writer). Django's forms run as in PostgreSQL 17: the
+/// statement's relation (`UPDATE "t" … WHERE EXISTS (… = ("t"."id") …)`), a
+/// parenthesised predicate, `LIMIT 1`, a schema-qualified target, and an
+/// EXISTS inside an `IN` subquery correlating with that subquery's own
+/// alias. One inside an `IN` that reads the target itself is refused, as is
+/// a correlation the rewrite cannot place, both as 0A000.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_correlated_exists_in_an_update_or_delete_needs_a_pinned_snapshot() {
+async fn a_correlated_exists_in_an_update_or_delete_runs_at_every_isolation_level() {
     let server = TestServer::start().await.expect("server");
     let pool = server.connect_sqlx().await.expect("connect");
     pool.execute(
@@ -322,49 +320,63 @@ async fn a_correlated_exists_in_an_update_or_delete_needs_a_pinned_snapshot() {
         r#"DELETE FROM "t" WHERE EXISTS(SELECT 1 AS "a" FROM "u" U0 WHERE (U0."tid" = ("t"."id") AND U0."w" > 150) LIMIT 1)"#,
         r#"DELETE FROM "t" WHERE "t"."id" IN (SELECT "t0"."id" FROM "t" AS "t0" WHERE EXISTS (SELECT 1 FROM "u" WHERE "u"."tid" = "t0"."id" AND "u"."w" < 60))"#,
     ];
-    let before = rows(&pool).await;
-    // READ COMMITTED: autocommit, and an explicit block.
-    for begin in [None, Some("BEGIN"), Some("BEGIN ISOLATION LEVEL READ COMMITTED")] {
-        for sql in statements {
-            let mut conn = pool.acquire().await.expect("conn");
-            if let Some(begin) = begin {
-                conn.execute(begin).await.expect("begin");
-            }
-            let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-            assert_eq!(code(&e), "0A000", "{begin:?} {sql}: {e}");
-            if begin.is_some() {
-                conn.execute("ROLLBACK").await.expect("rollback");
-            }
-        }
-    }
-    assert_eq!(rows(&pool).await, before, "a refused statement changed a row");
-    // A pinned snapshot: each runs, as in PostgreSQL 17.
-    for begin in ["BEGIN ISOLATION LEVEL REPEATABLE READ", "BEGIN ISOLATION LEVEL SERIALIZABLE"] {
+    // (session characteristics, BEGIN): each runs, as in PostgreSQL 17.
+    let levels: [(Option<&str>, Option<&str>); 6] = [
+        (None, None),
+        (None, Some("BEGIN")),
+        (None, Some("BEGIN ISOLATION LEVEL READ COMMITTED")),
+        (None, Some("BEGIN ISOLATION LEVEL REPEATABLE READ")),
+        (None, Some("BEGIN ISOLATION LEVEL SERIALIZABLE")),
+        (Some("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"), None),
+    ];
+    for (session, begin) in levels {
         pool.execute("DELETE FROM t; INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)").await.expect("reset");
         let mut conn = pool.acquire().await.expect("conn");
-        conn.execute(begin).await.expect("begin");
-        for sql in statements {
-            conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{begin}: {sql}: {e}"));
+        if let Some(session) = session {
+            conn.execute(session).await.expect("session characteristics");
         }
-        conn.execute("COMMIT").await.expect("commit");
+        if let Some(begin) = begin {
+            conn.execute(begin).await.expect("begin");
+        }
+        for sql in statements {
+            conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string())))
+                .await
+                .unwrap_or_else(|e| panic!("{session:?} {begin:?}: {sql}: {e}"));
+        }
+        if begin.is_some() {
+            conn.execute("COMMIT").await.expect("commit");
+        }
+        if session.is_some() {
+            conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .await
+                .expect("reset session characteristics");
+        }
         drop(conn);
         // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
-        assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)], "{begin}");
+        assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)], "{session:?} {begin:?}");
     }
     // Refused under any snapshot: an IN subquery reading the target, and an
     // inequality the rewrite cannot place.
-    let mut conn = pool.acquire().await.expect("conn");
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in [
+    let refused = [
         "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))",
         "UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)",
-    ] {
+    ];
+    let before = rows(&pool).await;
+    for sql in refused {
+        let e = pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
+        assert_eq!(code(&e), "0A000", "autocommit {sql}: {e}");
+    }
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    for sql in refused {
         let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
         assert_eq!(code(&e), "0A000", "{sql}: {e}");
         conn.execute("ROLLBACK").await.expect("rollback");
         conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
     }
     conn.execute("ROLLBACK").await.expect("rollback");
+    drop(conn);
+    assert_eq!(rows(&pool).await, before, "a refused statement changed a row");
 }
 
 /// Correlations PostgreSQL places that the rewrite placed wrong, and two it

@@ -3,11 +3,6 @@
 //! `SELECT`s, so the `DELETE` context is the variable; two of them alias the
 //! delete target and correlate a `NOT EXISTS` against that alias, and the
 //! third does it four times.
-//!
-//! A correlated `[NOT] EXISTS` in a `DELETE` is refused (0A000) under READ
-//! COMMITTED — its subquery is read under an earlier snapshot than the rows
-//! the statement deletes — so the worker's statements run here inside a
-//! REPEATABLE READ block, and the autocommit form is pinned as the refusal.
 
 use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
@@ -56,39 +51,17 @@ async fn the_three_retention_deletes_run() {
     run(&pool, "INSERT INTO user_table_row_archive_restore_state (object_id, restored_at) VALUES (1, '2026-08-01 00:00:00')").await.unwrap();
     run(&pool, "INSERT INTO user_table_row_archive_restore_state (object_id, restored_at) VALUES (9, '2026-08-01 00:00:00')").await.unwrap();
 
-    const STATEMENT_1: &str = "DELETE FROM user_table_row_archive_restore_state rs \
+    // 1. aliased target, one correlated NOT EXISTS, bound parameter.
+    sqlx::query(
+        "DELETE FROM user_table_row_archive_restore_state rs \
          WHERE rs.restored_at <= $1 \
            AND NOT EXISTS (SELECT 1 FROM data_lake_archive_object_metadata om \
-                            WHERE om.object_id = rs.object_id)";
-
-    // Under autocommit (READ COMMITTED) the statement is refused and
-    // deletes nothing.
-    let refused = sqlx::query(STATEMENT_1)
-        .bind("2026-08-24 00:00:00")
-        .execute(&pool)
-        .await
-        .expect_err("a correlated NOT EXISTS DELETE under READ COMMITTED is refused");
-    assert_eq!(
-        refused.as_database_error().and_then(|e| e.code()).as_deref(),
-        Some("0A000"),
-        "{refused}"
-    );
-    assert_eq!(
-        count(&pool, "SELECT COUNT(*) FROM user_table_row_archive_restore_state").await,
-        2,
-        "the refused statement deleted nothing"
-    );
-
-    let mut conn = pool.acquire().await.expect("connection");
-
-    // 1. aliased target, one correlated NOT EXISTS, bound parameter.
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    sqlx::query(STATEMENT_1)
-        .bind("2026-08-24 00:00:00")
-        .execute(&mut *conn)
-        .await
-        .expect("statement 1 must run");
-    conn.execute("COMMIT").await.expect("commit");
+                            WHERE om.object_id = rs.object_id)",
+    )
+    .bind("2026-08-24 00:00:00")
+    .execute(&pool)
+    .await
+    .expect("statement 1 must run");
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM user_table_row_archive_restore_state").await,
         1,
@@ -100,7 +73,6 @@ async fn the_three_retention_deletes_run() {
     );
 
     // 3. aliased target, FOUR correlated NOT EXISTS clauses.
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
     sqlx::query(
         "DELETE FROM data_lake_archive_object_metadata m \
          WHERE NOT EXISTS (SELECT 1 FROM user_table_row_archive_manifest manifest \
@@ -112,10 +84,9 @@ async fn the_three_retention_deletes_run() {
            AND NOT EXISTS (SELECT 1 FROM data_lake_iceberg_file file \
                             WHERE file.object_key = m.object_key)",
     )
-    .execute(&mut *conn)
+    .execute(&pool)
     .await
     .expect("statement 3 must run");
-    conn.execute("COMMIT").await.expect("commit");
     let left: Vec<i32> = pool
         .fetch_all(sqlx::raw_sql("SELECT object_id FROM data_lake_archive_object_metadata ORDER BY object_id"))
         .await

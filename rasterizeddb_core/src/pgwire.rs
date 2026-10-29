@@ -5515,6 +5515,19 @@ where
             ))
             .await
         }
+        // An UPDATE or DELETE fed by a CTE or a derived table, which are
+        // read here before the write runs: one snapshot for the whole of it.
+        None if crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt) => {
+            crate::core::rql::statement_snapshot::write_scope(execute_single_statement(
+                database,
+                state,
+                stream,
+                stmt,
+                result_formats,
+                omit_description,
+            ))
+            .await
+        }
         None => execute_single_statement(database, state, stream, stmt, result_formats, omit_description).await,
     }
 }
@@ -6204,10 +6217,32 @@ where
     // subquery at all. Flattened here, `GENERATED ALWAYS AS (a + (SELECT
     // max(a) FROM t))` was created with whatever the maximum was that moment
     // baked in as a constant.
+    //
+    // Nor in an UPDATE or a DELETE, which the engine flattens itself, inside
+    // each attempt: there its subqueries are read under the snapshot its rows
+    // are scanned under (`statement_snapshot`). Flattened here, they were read
+    // under one taken before the write's, and a writer committing between
+    // the two made it write rows no single moment had match. The describe
+    // below reads only the target and its `RETURNING`, which a subquery in
+    // the predicate leaves as they are.
     let flattened;
-    let stmt = if (crate::core::rql::subquery::find_in_subquery(stmt).is_some()
-        || crate::core::rql::subquery::find_exists(stmt).is_some()
-        || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some())
+    let write = stmt
+        .trim_start()
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case(b"UPDATE") || w.eq_ignore_ascii_case(b"DELETE"));
+    if write
+        && (crate::core::rql::subquery::find_in_subquery(stmt).is_some()
+            || crate::core::rql::subquery::find_exists(stmt).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some())
+    {
+        // The literals the engine folds in are this execution's answer.
+        crate::core::rql::prepared::note_rewritten();
+    }
+    let stmt = if !write
+        && (crate::core::rql::subquery::find_in_subquery(stmt).is_some()
+            || crate::core::rql::subquery::find_exists(stmt).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some())
         && !crate::core::rql::generated::declares_generated(stmt)
     {
         match crate::core::rql::executor::substitute_in_subqueries(
