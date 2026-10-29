@@ -350,7 +350,137 @@ pub fn normalize_expression(expression: &str) -> String {
     }
     let text = drop_text_casts(&text);
     let text = unwrap_bare_names(&text);
-    lower_any_all(&text)
+    let text = lower_any_all(&text);
+    lower_regex_operators(&text)
+}
+
+/// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` as `(regexp_like(a, b) = TRUE)`
+/// (with flag `'i'` for the starred ones, `= FALSE` for the negations): the
+/// boolean form the rewriter lifts to the evaluator. `pg_dump` writes every
+/// `SIMILAR TO` check as `((x)::text ~ similar_to_escape('a%'::text))`, and
+/// Django's `__regex`/`__iregex` constraints are these operators.
+fn lower_regex_operators(text: &str) -> String {
+    let mut out = text.to_string();
+    // Bounded: each pass removes one operator.
+    for _ in 0..64 {
+        let bytes = out.as_bytes();
+        let mut found = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            if bytes[i] == b'~' && bytes.get(i + 1) != Some(&b'~') && (i == 0 || bytes[i - 1] != b'~') {
+                let negated = i > 0 && bytes[i - 1] == b'!';
+                let start = if negated { i - 1 } else { i };
+                let starred = bytes.get(i + 1) == Some(&b'*');
+                let end = i + 1 + usize::from(starred);
+                found = Some((start, end, negated, starred));
+                break;
+            }
+            i += 1;
+        }
+        let Some((op_start, op_end, negated, starred)) = found else { break };
+        let (Some(left), Some(right)) = (operand_before(&out, op_start), operand_after(&out, op_end)) else { break };
+        let flags = if starred { ", 'i'" } else { "" };
+        let truth = if negated { "FALSE" } else { "TRUE" };
+        out = format!(
+            "{}(regexp_like({}, {}{}) = {}){}",
+            &out[..left],
+            out[left..op_start].trim(),
+            out[op_end..right].trim(),
+            flags,
+            truth,
+            &out[right..]
+        );
+    }
+    out
+}
+
+/// Where the operand ending just before `at` starts: a name, a string
+/// literal, a parenthesised group or a call, with any `::type` cast.
+fn operand_before(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = at;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"';
+    match bytes[i - 1] {
+        b')' => {
+            // Back to the matching parenthesis, then a call's name.
+            let mut depth = 0i32;
+            while i > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            while i > 0 && word(bytes[i - 1]) {
+                i -= 1;
+            }
+            Some(i)
+        }
+        b'\'' => {
+            i -= 1;
+            while i > 0 {
+                i -= 1;
+                if bytes[i] == b'\'' && !(i > 0 && bytes[i - 1] == b'\'') {
+                    break;
+                }
+            }
+            Some(i)
+        }
+        b if word(b) => {
+            while i > 0 && (word(bytes[i - 1]) || bytes[i - 1] == b':') {
+                i -= 1;
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+/// Where the operand starting after `at` ends (see [`operand_before`]).
+fn operand_after(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = at;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"';
+    match bytes.get(i)? {
+        b'\'' => i = crate::core::sql_scan::quoted_end(bytes, i, b'\''),
+        b'(' => i = crate::core::sql_scan::matching_close(text, i)? + 1,
+        b if word(*b) => {
+            while i < bytes.len() && word(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'(') {
+                i = crate::core::sql_scan::matching_close(text, i)? + 1;
+            }
+        }
+        _ => return None,
+    }
+    // A cast on it.
+    if text[i..].starts_with("::") {
+        i += 2;
+        while i < bytes.len() && (word(bytes[i]) || bytes[i] == b'[' || bytes[i] == b']') {
+            i += 1;
+        }
+    }
+    Some(i)
 }
 
 /// `(status)` as `status` where the parentheses hold one name and are not a

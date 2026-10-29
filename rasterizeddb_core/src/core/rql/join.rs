@@ -1190,6 +1190,9 @@ pub struct Projector<'p> {
     /// Each expression item's display scale ([`JoinPlan::output_scales`]),
     /// which its NUMERIC value is rounded to, found once per statement.
     display_scales: Vec<Option<u32>>,
+    /// Each expression item read exactly ([`crate::core::rql::expr::output_is_wide`]),
+    /// decided once per statement.
+    wide: Vec<bool>,
     layout_companions: Option<Companions>,
     /// The first expression failure, reported once by [`Projector::report`].
     expression_failure: Option<String>,
@@ -1227,6 +1230,11 @@ impl<'p> Projector<'p> {
                 .iter()
                 .map(|i| i.expr.as_ref().and_then(crate::core::rql::expr::display_scale))
                 .collect(),
+            wide: plan
+                .items
+                .iter()
+                .map(|i| i.expr.as_ref().is_some_and(crate::core::rql::expr::output_is_wide))
+                .collect(),
             layout_companions: plan
                 .order_layout
                 .as_ref()
@@ -1257,7 +1265,7 @@ impl<'p> Projector<'p> {
             if let Some(expr) = item.expr.as_ref() {
                 let (bytes, column_type) = match (synthetic.as_ref(), plan.order_layout.as_ref()) {
                     (Some(row), Some(layout)) => {
-                        match crate::core::rql::expr::eval_output(expr, row, &layout.schema) {
+                        match crate::core::rql::expr::eval_output_planned(expr, self.wide[i], row, &layout.schema) {
                             // Coerced to the type this item was *described* as.
                             // The row description is sent before any row, and a
                             // payload of a different width than the type it was
@@ -1471,12 +1479,14 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
             let companions = Companions::new(plan, &layout.columns);
             let mut failure: Option<String> = None;
             let mut keys: Vec<Vec<crate::core::rql::expr::Value>> = Vec::with_capacity(order.len());
+            let wide: Vec<bool> =
+                plan.order_exprs.iter().map(|(e, _, _)| crate::core::rql::expr::output_is_wide(e)).collect();
             for index in 0..combined.len() {
                 let synthetic =
                     combined_row_with(plan, &layout.columns, &companions, combined.tuple(index));
                 let mut values = Vec::with_capacity(plan.order_exprs.len());
-                for (expr, _, _) in plan.order_exprs.iter() {
-                    match crate::core::rql::expr::eval_output(expr, &synthetic, &layout.schema) {
+                for ((expr, _, _), wide) in plan.order_exprs.iter().zip(&wide) {
+                    match crate::core::rql::expr::eval_output_planned(expr, *wide, &synthetic, &layout.schema) {
                         Ok(value) => values.push(value),
                         Err(e) => {
                             // A key that cannot be computed fails the

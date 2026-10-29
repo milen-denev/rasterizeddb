@@ -4673,6 +4673,7 @@ dependencies = [
  "rand 0.10.2",
  "rastcp",
  "rclite",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "serde",

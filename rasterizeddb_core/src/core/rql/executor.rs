@@ -581,6 +581,11 @@ fn normalize_decimal_scales(rows: &mut [crate::core::row::row::Row], scales: &[u
             // scale like any other, from *its* scale, and becomes an ordinary
             // sixteen-byte cell: what leaves a query for another is uniform.
             let (from, v) = match crate::core::value_codec::split_decimal_cell(cell.data.into_slice()) {
+                // More places than the engine's, with digits there (`a + 1`
+                // over a NUMERIC(20,12)): kept whole. Rounded to nine here,
+                // `INSERT INTO t2 SELECT id, a + 1 FROM w` stored
+                // 1.123456789000; a reader of the cell writes it at its scale.
+                Some((v, Some(own))) if own > target && v % 10i128.pow(own - target) != 0 => continue,
                 Some((v, Some(own))) => {
                     let lifted = if own <= target {
                         10i128.checked_pow(target - own).and_then(|f| v.checked_mul(f))
@@ -3205,7 +3210,7 @@ enum SlotValue {
     Scalar(crate::core::rql::aggregate::ScalarFunc),
     /// An expression over the row's own columns, and the scale its value is
     /// sent at when it is a `NUMERIC` (see `expr::display_scale`).
-    RowExpression(crate::core::rql::expr::Expr, Option<u32>),
+    RowExpression(crate::core::rql::expr::Expr, Option<u32>, bool),
 }
 
 type DbTypeRef = crate::core::db_type::DbType;
@@ -12851,10 +12856,11 @@ fn sort_rows_by_expressions(
     // error, and re-evaluating inside one would be quadratic anyway. Every
     // row's keys are evaluated even with a cap, so a key that fails on any
     // row still fails the statement.
+    let wide: Vec<bool> = keys.iter().map(|(expr, _, _)| crate::core::rql::expr::output_is_wide(expr)).collect();
     let eval_keys = |row: &Row| -> Result<Vec<crate::core::rql::expr::Value>, String> {
         let mut values = Vec::with_capacity(keys.len());
-        for (expr, _, _) in keys {
-            values.push(crate::core::rql::expr::eval_output(expr, row, schema)?);
+        for ((expr, _, _), wide) in keys.iter().zip(&wide) {
+            values.push(crate::core::rql::expr::eval_output_planned(expr, *wide, row, schema)?);
         }
         Ok(values)
     };
@@ -17703,6 +17709,8 @@ async fn execute_query_rows_body(
                         SlotValue::RowExpression(
                             expr.clone(),
                             crate::core::rql::expr::display_scale(expr),
+                            // Decided here, once: see `expr::output_is_wide`.
+                            crate::core::rql::expr::output_is_wide(expr),
                         ),
                         db_type.clone(),
                     )
@@ -18149,7 +18157,7 @@ async fn execute_query_rows_body(
                                             SlotValue::Constant(bytes) => {
                                                 (bytes.clone(), db_type.clone())
                                             }
-                                            SlotValue::RowExpression(expr, scale) => {
+                                            SlotValue::RowExpression(expr, scale, wide) => {
                                                 // Same rule as
                                                 // `RETURNING`: the
                                                 // value is re-encoded
@@ -18160,8 +18168,9 @@ async fn execute_query_rows_body(
                                                 // at the scale
                                                 // `query_output_scales`
                                                 // announces for it.
-                                                match crate::core::rql::expr::eval_output(
+                                                match crate::core::rql::expr::eval_output_planned(
                                                     expr,
+                                                    *wide,
                                                     &row,
                                                     &slot_schema,
                                                 )

@@ -195,6 +195,13 @@ pub enum TextFunc {
     /// `jsonb_typeof(doc)`: `object`, `array`, `string`, `number`, `boolean`
     /// or `null`.
     JsonbTypeof,
+    /// `regexp_like(text, pattern [, flags])`: whether a POSIX regular
+    /// expression matches, the boolean `~` (and, with flag `i`, `~*`) is.
+    RegexpLike,
+    /// `similar_to_escape(pattern [, escape])`: a `SIMILAR TO` pattern as the
+    /// anchored regular expression it means, as `pg_dump` writes `SIMILAR
+    /// TO` (`x ~ similar_to_escape('a%')`).
+    SimilarToEscape,
 }
 
 /// How many elements an array's text form `{a,b,"c,d"}` holds.
@@ -579,6 +586,7 @@ pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
     "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "JSONB_TYPEOF",
+    "REGEXP_LIKE", "SIMILAR_TO_ESCAPE",
 ];
 
 /// Parses one expression against `schema`.
@@ -1106,6 +1114,18 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("jsonb_typeof takes exactly one argument".to_string());
                     }
                     Ok(Expr::Call(TextFunc::JsonbTypeof, args))
+                }
+                "REGEXP_LIKE" => {
+                    if !(2..=3).contains(&args.len()) {
+                        return Err("regexp_like takes a text, a pattern and optionally flags".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::RegexpLike, args))
+                }
+                "SIMILAR_TO_ESCAPE" => {
+                    if !(1..=2).contains(&args.len()) {
+                        return Err("similar_to_escape takes a pattern and optionally an escape".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::SimilarToEscape, args))
                 }
                 "MOD" => {
                     if args.len() != 2 {
@@ -1780,6 +1800,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
+        Expr::Call(TextFunc::RegexpLike, _) => DbType::BOOL,
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
         // `select_common_type` does — see `common_type`.
@@ -2253,13 +2274,32 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         return Ok(Value::Null);
     }
 
-    if matches!(func, TextFunc::Btrim | TextFunc::Ltrim | TextFunc::Rtrim | TextFunc::JsonbTypeof)
-        && args.iter().any(|a| a.is_null())
+    if matches!(
+        func,
+        TextFunc::Btrim
+            | TextFunc::Ltrim
+            | TextFunc::Rtrim
+            | TextFunc::JsonbTypeof
+            | TextFunc::RegexpLike
+            | TextFunc::SimilarToEscape
+    ) && args.iter().any(|a| a.is_null())
     {
         return Ok(Value::Null);
     }
 
     Ok(match func {
+        TextFunc::RegexpLike => {
+            let flags = args.get(2).map(as_text).unwrap_or_default();
+            let matched = regex_matches(&as_text(&args[0]), &as_text(&args[1]), &flags)?;
+            Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL }
+        }
+        TextFunc::SimilarToEscape => {
+            let escape = match args.get(1) {
+                Some(e) => as_text(e).chars().next(),
+                None => Some('\\'),
+            };
+            string(similar_to_regex(&as_text(&args[0]), escape))
+        }
         TextFunc::Btrim | TextFunc::Ltrim | TextFunc::Rtrim => {
             let text = as_text(&args[0]);
             let set: Vec<char> = match args.get(1) {
@@ -3124,7 +3164,24 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
     }
     if target.db_type == DbType::DECIMAL {
         let scale = target.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
-        if let Some(value) = exact_numeric(expr, row, schema, scale)? {
+        let exact = match exact_numeric(expr, row, schema, scale) {
+            // The exact form is past an i128. Through the engine this is cut
+            // to nine places, which a column keeping more must not take:
+            // `SET a = a / 7` on a NUMERIC(38,20) of 1e13 stored
+            // …714285714000000000000.
+            Err(e) if e == EXACT_RANGE => {
+                if scale > crate::core::value_codec::DECIMAL_SCALE {
+                    return Err(format!(
+                        "the value for column \"{}\" cannot be computed exactly at {} decimal places: its exact \
+                         form has more digits than this engine carries (not supported)",
+                        target.name, scale
+                    ));
+                }
+                None
+            }
+            other => other?,
+        };
+        if let Some(value) = exact {
             return match value {
                 None => Ok(Value::Null),
                 Some(exact) => match exact.settle(scale) {
@@ -3225,7 +3282,21 @@ fn inexact_assignment(column: &str, places: u32) -> String {
 /// [`eval`] it was refused for the places past nine. Anything else is
 /// [`eval`]'s.
 pub(crate) fn eval_output(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
-    if static_type(expr) == DbType::DECIMAL {
+    eval_output_planned(expr, output_is_wide(expr), row, schema)
+}
+
+/// Whether [`eval_output`] reads `expr` exactly: a NUMERIC expression over a
+/// NUMERIC column with more places than the engine's. Decided once per
+/// statement by the callers that evaluate an expression per row, and handed
+/// to [`eval_output_planned`]: decided per row, the walk cost a select list
+/// or a sort key some 2–7% more instructions.
+pub(crate) fn output_is_wide(expr: &Expr) -> bool {
+    reads_wide_decimal(expr, &[]) && static_type(expr) == DbType::DECIMAL
+}
+
+/// [`eval_output`] with [`output_is_wide`] already decided.
+pub(crate) fn eval_output_planned(expr: &Expr, wide: bool, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
+    if wide {
         if let Some(value) = wide_exact(expr, row, schema)? {
             let Some(x) = value else { return Ok(Value::Null) };
             let (m, scale) = if x.e <= 0 {
@@ -3248,12 +3319,118 @@ pub(crate) fn eval_output(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Res
     eval(expr, row, schema)
 }
 
+/// Whether `pattern`, a POSIX regular expression, matches `text`, with
+/// PostgreSQL's flags: `i` case-insensitive, `c` case-sensitive (the
+/// default), `n`/`m` newline-sensitive, `s` (the default), `x` expanded.
+///
+/// PostgreSQL reads an advanced regular expression (ARE); this reads it with
+/// Rust's `regex`, which agrees on the common syntax — classes, `[[:alpha:]]`,
+/// anchors, alternation, bounded repetition, `\d`/`\w`/`\s`, non-greedy
+/// quantifiers — and lacks back-references (`\1`), look-around and ARE's
+/// word-boundary escapes `\m`, `\M`, `\y`. A pattern using one is refused
+/// (2201B, invalid regular expression), never matched another way. Compiled
+/// patterns are kept per thread.
+fn regex_matches(text: &str, pattern: &str, flags: &str) -> Result<bool, String> {
+    thread_local! {
+        static COMPILED: std::cell::RefCell<std::collections::HashMap<(String, String), regex::Regex>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(hit) = COMPILED.with(|c| c.borrow().get(&(pattern.to_string(), flags.to_string())).map(|r| r.is_match(text))) {
+        return Ok(hit);
+    }
+    let mut builder = regex::RegexBuilder::new(pattern);
+    for flag in flags.chars() {
+        match flag {
+            'i' => builder.case_insensitive(true),
+            'c' => builder.case_insensitive(false),
+            'n' | 'm' => builder.multi_line(true),
+            's' => builder.multi_line(false),
+            'x' => builder.ignore_whitespace(true),
+            other => return Err(format!("invalid regular expression option: \"{other}\"")),
+        };
+    }
+    let compiled = builder
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| format!("invalid regular expression: {}", e.to_string().lines().last().unwrap_or("")))?;
+    let matched = compiled.is_match(text);
+    COMPILED.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert((pattern.to_string(), flags.to_string()), compiled);
+    });
+    Ok(matched)
+}
+
+/// A `SIMILAR TO` pattern as the anchored regular expression it means,
+/// PostgreSQL's `similar_to_escape`: `%` is `.*`, `_` is `.`, a character
+/// after the escape is itself, a `.` or anchor is literal, and the regular
+/// expression operators `SIMILAR TO` shares (`|`, `*`, `+`, `?`, `{…}`,
+/// `(…)`, `[…]`) are kept.
+fn similar_to_regex(pattern: &str, escape: Option<char>) -> String {
+    let mut out = String::from("^(?:");
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            if let Some(next) = chars.next() {
+                out.push_str(&regex::escape(&next.to_string()));
+            }
+            continue;
+        }
+        if in_class {
+            if c == ']' {
+                in_class = false;
+            }
+            out.push(c);
+            continue;
+        }
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            '[' => {
+                in_class = true;
+                out.push(c);
+            }
+            '|' | '*' | '+' | '?' | '{' | '}' | '(' | ')' => out.push(c),
+            other => out.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    out.push_str(")$");
+    out
+}
+
 /// Whether `expr` reads a NUMERIC column with more places than the engine's.
+///
+/// Asked per row (a comparison, an output item), so it walks the tree and
+/// allocates nothing: collecting `columns_of` cloned every field it met,
+/// which cost 2–7% of the instructions of `a * 1.1` over 60k rows.
 fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
     let _ = schema;
-    columns_of(expr).iter().any(|f| {
-        f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
-    })
+    fn wide(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(f) => {
+                f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
+            }
+            Expr::Null | Expr::Literal { .. } | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
+            Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
+            Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
+            Expr::Cast(inner, _) => wide(inner),
+            Expr::NumericCast { value, .. } => wide(value),
+            Expr::Case { whens, otherwise } => {
+                fn wide_cond(cond: &Cond) -> bool {
+                    match cond {
+                        Cond::Cmp(c) => wide(&c.left) || c.right.as_deref().is_some_and(wide),
+                        Cond::And(parts) | Cond::Or(parts) => parts.iter().any(wide_cond),
+                    }
+                }
+                whens.iter().any(|(c, r)| wide_cond(c) || wide(r)) || otherwise.as_deref().is_some_and(wide)
+            }
+        }
+    }
+    wide(expr)
 }
 
 /// The exact value of `expr` when it reads a NUMERIC column with more places
@@ -3263,7 +3440,7 @@ fn wide_exact(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Option<O
     if !reads_wide_decimal(expr, schema) {
         return Ok(None);
     }
-    Ok(exact_numeric(expr, row, schema, 30)?.filter(|v| v.is_none_or(|x| x.err == 0.0)))
+    Ok(exact_numeric_or_engine(expr, row, schema, 30)?.filter(|v| v.is_none_or(|x| x.err == 0.0)))
 }
 
 /// [`eval_into`]'s exact reading of `expr`: `Ok(None)` when it has a part
@@ -3354,13 +3531,15 @@ fn exact_numeric(
 /// the cut in the error bound. `None` past `i128`.
 fn exact_arith(a: ExactNumber, op: ArithOp, b: ExactNumber, places: u32) -> Result<Option<ExactNumber>, String> {
     let (fa, fb) = (a.approx().abs(), b.approx().abs());
+    let range = || EXACT_RANGE.to_string();
     Ok(match op {
-        ArithOp::Add | ArithOp::Sub => ExactNumber::aligned(a, b).and_then(|(x, y, e)| {
-            let m = if matches!(op, ArithOp::Add) { x.checked_add(y) } else { x.checked_sub(y) }?;
+        ArithOp::Add | ArithOp::Sub => {
+            let (x, y, e) = ExactNumber::aligned(a, b).ok_or_else(range)?;
+            let m = if matches!(op, ArithOp::Add) { x.checked_add(y) } else { x.checked_sub(y) }.ok_or_else(range)?;
             Some(ExactNumber { m, e, err: a.err + b.err })
-        }),
-        ArithOp::Mul => a.m.checked_mul(b.m).map(|m| ExactNumber {
-            m,
+        }
+        ArithOp::Mul => Some(ExactNumber {
+            m: a.m.checked_mul(b.m).ok_or_else(range)?,
             e: a.e + b.e,
             err: fa * b.err + fb * a.err + a.err * b.err,
         }),
@@ -3369,12 +3548,19 @@ fn exact_arith(a: ExactNumber, op: ArithOp, b: ExactNumber, places: u32) -> Resu
                 return Err("division by zero".to_string());
             }
             // q = a / b at 10^-k: a.m · 10^(a.e - b.e + k) / b.m, with k
-            // large enough that the numerator is lifted, never cut.
-            let k = (places as i32 + 6).max(b.e - a.e);
-            let shift = (a.e - b.e + k) as u32;
-            let Some(numerator) = 10i128.checked_pow(shift).and_then(|p| a.m.checked_mul(p)) else {
-                return Ok(None);
-            };
+            // large enough that the numerator is lifted, never cut: six
+            // places past the target where an i128 holds that, else as few
+            // as one past it (`a / 7` on a NUMERIC(38,20) of 1e13).
+            let lowest = (places as i32 + 1).max(b.e - a.e);
+            let mut found = None;
+            for k in (lowest..=(places as i32 + 6).max(lowest)).rev() {
+                let shift = (a.e - b.e + k) as u32;
+                if let Some(numerator) = 10i128.checked_pow(shift).and_then(|p| a.m.checked_mul(p)) {
+                    found = Some((k, numerator));
+                    break;
+                }
+            }
+            let (k, numerator) = found.ok_or_else(range)?;
             let (q, r) = (numerator / b.m, numerator % b.m);
             // What each operand's own error makes of the quotient.
             let carried = if fb > 0.0 { a.err / fb + fa * b.err / (fb * fb) } else { 0.0 };
@@ -3386,15 +3572,31 @@ fn exact_arith(a: ExactNumber, op: ArithOp, b: ExactNumber, places: u32) -> Resu
                 // between q and the next unit, so a tie at the target is
                 // never mistaken for one, and the cut is in the bound.
                 let sign = numerator.signum() * b.m.signum();
-                q.checked_mul(10).and_then(|m| m.checked_add(5 * sign)).map(|m| ExactNumber {
-                    m,
-                    e: -(k + 1),
-                    err: 0.5 * 10f64.powi(-k) + carried,
-                })
+                let m = q.checked_mul(10).and_then(|m| m.checked_add(5 * sign)).ok_or_else(range)?;
+                Some(ExactNumber { m, e: -(k + 1), err: 0.5 * 10f64.powi(-k) + carried })
             }
         }
         ArithOp::Rem => None,
     })
+}
+
+/// [`exact_arith`]'s word for a value whose exact form an i128 cannot hold:
+/// the engine path may still answer it (at nine places), which is fine for a
+/// NUMERIC that keeps no more and a cut for one that keeps more.
+const EXACT_RANGE: &str = "\u{1}exact form out of range";
+
+/// [`exact_numeric`], with a value past its range taken as one it does not
+/// compute, for the engine path to answer or refuse.
+fn exact_numeric_or_engine(
+    expr: &Expr,
+    row: &Row,
+    schema: &[SchemaField],
+    places: u32,
+) -> Result<Option<Option<ExactNumber>>, String> {
+    match exact_numeric(expr, row, schema, places) {
+        Err(e) if e == EXACT_RANGE => Ok(None),
+        other => other,
+    }
 }
 
 /// Lifts a `NUMERIC(p, s)` column's stored integer to the engine scale, so
@@ -4800,7 +5002,7 @@ pub fn eval_condition_3vl(
     if let (Some(right), true) = (&condition.right, matches!(condition.cmp, Cmp::Eq | Cmp::Ne | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge)) {
         if reads_wide_decimal(&condition.left, schema) || reads_wide_decimal(right, schema) {
             if let (Some(a), Some(b)) =
-                (exact_numeric(&condition.left, row, schema, 30)?, exact_numeric(right, row, schema, 30)?)
+                (exact_numeric_or_engine(&condition.left, row, schema, 30)?, exact_numeric_or_engine(right, row, schema, 30)?)
             {
                 let (Some(a), Some(b)) = (a, b) else { return Ok(None) };
                 if let Some((x, y, e)) = ExactNumber::aligned(a, b) {

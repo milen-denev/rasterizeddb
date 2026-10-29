@@ -192,3 +192,56 @@ async fn wide_scale_numeric_arithmetic_on_a_plain_table() {
 async fn wide_scale_numeric_arithmetic_on_a_hash_partitioned_table() {
     wide_scale(" PARTITION BY HASH (id) PARTITIONS 4").await;
 }
+
+/// Two paths that still cut to nine places: an INSERT … SELECT (its rows
+/// were rounded to the engine scale on the way out of the SELECT, so `a + 1`
+/// over a NUMERIC(20,12) stored 1.123456789000), and a quotient whose exact
+/// form passed an i128 (`a / 7` on a NUMERIC(38,20) of 1e13 fell back to nine
+/// places and stored …714285714000000000000). Exact now, or refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_path_cuts_a_wide_numeric_to_nine_places() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    run(
+        &pool,
+        "CREATE TABLE w (id INT PRIMARY KEY, a NUMERIC(20,12)); CREATE TABLE t2 (id INT PRIMARY KEY, a NUMERIC(20,12)); \
+         CREATE TABLE t3 (id INT PRIMARY KEY, a NUMERIC(10,2)); INSERT INTO w VALUES (1, 0.123456789123), (2, 1.5); \
+         CREATE TABLE z (id INT PRIMARY KEY, a NUMERIC(38,20)); INSERT INTO z VALUES (1, 10000000000000), (2, 1.5)",
+    )
+    .await;
+    run(&pool, "INSERT INTO t2 SELECT id, a + 1 FROM w").await;
+    run(&pool, "INSERT INTO t3 SELECT id, a + 1 FROM w").await;
+    let text = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sql)
+                .fetch_all(&pool)
+                .await
+                .expect(sql)
+                .iter()
+                .map(|r| r.get::<String, _>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(text("SELECT a::text FROM t2 ORDER BY id").await, ["1.123456789123", "2.500000000000"]);
+    assert_eq!(text("SELECT a::text FROM t3 ORDER BY id").await, ["1.12", "2.50"]);
+    assert_eq!(
+        text("WITH c AS (SELECT id, a + 1 AS b FROM w) SELECT b::text FROM c ORDER BY id").await,
+        ["1.123456789123", "2.500000000000"]
+    );
+
+    run(&pool, "UPDATE z SET a = a / 7").await;
+    assert_eq!(
+        text("SELECT a::text FROM z ORDER BY id").await,
+        ["1428571428571.42857142857142857143", "0.21428571428571428571"]
+    );
+    // Past what even the exact reading holds: refused, the row unchanged.
+    assert_eq!(refused(&pool, "UPDATE z SET a = a * 100000000000000000 + a / 3 WHERE id = 1").await, "0A000");
+    assert_eq!(text("SELECT a::text FROM z WHERE id = 1").await, ["1428571428571.42857142857142857143"]);
+    // A value with no digits past nine, whose exact quotient is past an
+    // i128: through the engine it would be computed at nine places and
+    // stored cut; refused instead.
+    run(&pool, "INSERT INTO z VALUES (3, 900000000000000000)").await;
+    assert_eq!(refused(&pool, "UPDATE z SET a = a / 7 WHERE id = 3").await, "0A000");
+    assert_eq!(text("SELECT a::text FROM z WHERE id = 3").await, ["900000000000000000.00000000000000000000"]);
+}

@@ -6,7 +6,9 @@
 //! transactional, so a `psql -f dump.sql` restore lost those tables and their
 //! rows. Every form here must be accepted and enforced, with SQL's NULL
 //! semantics (a NULL result passes), on a plain and on a hash-partitioned
-//! table; a form nothing here can evaluate is refused with 0A000.
+//! table; a form nothing here can evaluate is refused with 0A000. POSIX
+//! regular expressions are read with Rust's `regex` (no back-references or
+//! look-around; such a pattern is refused with 2201B when a row meets it).
 
 use rasterizeddb_compat::TestServer;
 use sqlx::{AssertSqlSafe, Executor};
@@ -166,6 +168,38 @@ const CASES: &[Case] = &[
         ("NULL, NULL, 'a1', NULL, NULL, NULL, NULL, NULL", false),
         (NULLS, true),
     ]),
+    // POSIX regular expressions: pg_dump's SIMILAR TO, Django's __regex and
+    // __iregex, and the email/slug checks written by hand.
+    ("pg_dump SIMILAR TO", "(((x)::text ~ similar_to_escape('a%'::text)))", &[
+        ("NULL, NULL, 'abc', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'bbc', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
+    ("Django __regex", "((\"x\")::text ~ '^[a-z]+$'::text)", &[
+        ("NULL, NULL, 'abc', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'ab1', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
+    ("Django __iregex", "((\"x\")::text ~* '^[a-z]+$'::text)", &[
+        ("NULL, NULL, 'ABC', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'AB1', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
+    ("regex negated", "((x !~ '[0-9]'::text))", &[
+        ("NULL, NULL, 'abc', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'a1', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
+    ("regex negated, any case", "((x !~* 'Z'::text))", &[
+        ("NULL, NULL, 'abc', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'az', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
+    ("email", "(x ~ '^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$')", &[
+        ("NULL, NULL, 'a@b.co', NULL, NULL, NULL, NULL, NULL", true),
+        ("NULL, NULL, 'a@b', NULL, NULL, NULL, NULL, NULL", false),
+        (NULLS, true),
+    ]),
     ("COALESCE", "(COALESCE(n, 0) >= 0)", &[
         ("NULL, NULL, NULL, 1, NULL, NULL, NULL, NULL", true),
         ("NULL, NULL, NULL, -1, NULL, NULL, NULL, NULL", false),
@@ -222,7 +256,6 @@ async fn corpus(partitioning: &str) {
     // What nothing here evaluates is refused where it is declared, with 0A000.
     // A CASE whose branches are themselves conditions is not read yet.
     for check in [
-        "((x ~ '^[a-z]+$'::text))",
         "(no_such_function(n) > 0)",
         "(CASE WHEN (n > 10) THEN (price > (5)::numeric) ELSE true END)",
     ] {

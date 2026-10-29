@@ -17,6 +17,8 @@ ahash = "0.8"
 hashbrown = { version = "0.16", default-features = false }
 # Bulk scanning of SQL text for the next quote/placeholder byte.
 memchr = "2"
+# POSIX regular expressions (`~`, `~*`, `regexp_like`), for CHECKs `pg_dump` writes.
+regex = "1"
 once_cell = "1.21.3"
 orx-concurrent-vec = "3.10"
 stopwatch = "0.0.7"
