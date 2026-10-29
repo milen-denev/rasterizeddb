@@ -127,12 +127,12 @@ fn parse_delete_row(
         // nosuch.id = 1` deleted t's row 1 (PostgreSQL: 42P01).
         if let Some(idx) = where_idx {
             let head: Vec<&str> = sql[..idx].split_whitespace().collect();
-            let mut allowed: Vec<String> = table_name.split('.').map(|p| p.trim_matches('"').to_string()).collect();
+            let mut allowed = crate::core::sql_scan::relation_qualifiers(table_name, None);
             match head.as_slice() {
                 [_, _, _] => {}
                 [_, _, _, alias] | [_, _, _, _, alias] if head.len() == 4 || head[3].eq_ignore_ascii_case("AS") => {
                     // Aliased, the table is known only by the alias.
-                    allowed = vec![alias.trim_matches('"').to_string()];
+                    allowed = crate::core::sql_scan::relation_qualifiers(table_name, Some(alias));
                 }
                 _ => {
                     rejection.replace(format!("syntax error at or near \"{}\"", head.get(4).or(head.get(3)).unwrap_or(&"WHERE")));

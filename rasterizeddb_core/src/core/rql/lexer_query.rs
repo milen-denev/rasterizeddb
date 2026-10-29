@@ -1542,6 +1542,15 @@ pub fn row_fetch_from_select_query(
     // A misspelt clause keyword was read as the alias and everything after
     // it dropped: `FROM t WHER id = 1` returned every row, and so did `FROM t
     // LIMT 5` and `FROM t ODER BY id`. PostgreSQL's 42601.
+    // Clauses this does not implement are refused by name (0A000). Read as
+    // an alias and a dropped tail they answered as if absent (`INTERSECT`
+    // returned the first branch whole), and as a syntax error they named the
+    // wrong problem.
+    for clause in ["INTERSECT", "EXCEPT", "TABLESAMPLE", "WINDOW"] {
+        if find_keyword(after_from, clause, 0).is_some() {
+            return Err(format!("{clause} is not supported"));
+        }
+    }
     let alias = relation_alias(&after_from[..table_end])?;
     // And every qualifier names that relation (or its alias): `WHERE
     // nosuch.v > 0` read t's `v`. Up to a UNION, whose branches have their
@@ -1550,10 +1559,7 @@ pub fn row_fetch_from_select_query(
         let raw = after_from[..table_end].split_whitespace().next().unwrap_or("");
         // Once aliased, the relation is known only by its alias, as in
         // PostgreSQL (`FROM t AS x WHERE t.id = 1` is 42P01).
-        let allowed: Vec<String> = match &alias {
-            Some(alias) => vec![alias.clone()],
-            None => raw.split('.').map(|p| p.trim_matches('"').to_string()).collect(),
-        };
+        let allowed = crate::core::sql_scan::relation_qualifiers(raw, alias.as_deref());
         let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
         let branch_end = union_pos.unwrap_or(after_from.len()).max(table_end);
         for text in [columns_part, &after_from[table_end..branch_end]] {

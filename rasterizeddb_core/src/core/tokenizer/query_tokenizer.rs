@@ -735,6 +735,15 @@ fn tokenize_inner<'a>(
                     // For identifiers not found in schema, this should probably be an error
                     // since all valid fields should be in the schema
                     // But if you want to allow unknown identifiers, you could use a default type
+                    // Right after a value, a word is where an operator or a
+                    // keyword goes: `x = 1 LIMT 1`, `x = 1 ANDD v = 2`, `0x10`.
+                    // A syntax error (42601), not an unknown column.
+                    if matches!(
+                        out.last(),
+                        Some(Token::Number(_) | Token::StringLit(_) | Token::Ident(_) | Token::RPar | Token::JsonPath { .. })
+                    ) {
+                        return Err(format!("syntax error at or near \"{}\"", id));
+                    }
                     return Err(format!(
                         "unknown identifier '{}' is not defined in the schema",
                         id

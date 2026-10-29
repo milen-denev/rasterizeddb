@@ -501,12 +501,12 @@ fn parse_update_row(
     // was dropped, so `SET v = 5 WHERE nosuch.id = 2` updated t's row 2.
     {
         let words: Vec<&str> = before_set.split_whitespace().collect();
-        let mut allowed: Vec<String> = table_name.split('.').map(|p| p.trim_matches('"').to_string()).collect();
+        let mut allowed = crate::core::sql_scan::relation_qualifiers(table_name, None);
         match words.as_slice() {
             [_, _] => {}
             [_, _, alias] | [_, _, _, alias] if words.len() == 3 || words[2].eq_ignore_ascii_case("AS") => {
                 // Aliased, the table is known only by the alias.
-                allowed = vec![alias.trim_matches('"').to_string()];
+                allowed = crate::core::sql_scan::relation_qualifiers(table_name, Some(alias));
             }
             _ => {
                 rejection.replace(format!("syntax error at or near \"{}\"", words.get(3).or(words.get(2)).unwrap_or(&"SET")));

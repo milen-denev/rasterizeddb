@@ -221,19 +221,14 @@ pub fn leading_identifier(text: &str) -> Option<(String, usize)> {
     (!name.is_empty()).then_some((name, end))
 }
 
-/// The first qualifier in `text` (`q` in `q.col`) that is none of `allowed`,
-/// as written; `None` when every one names a relation the statement has.
-///
-/// A single-table statement's readers take the last segment of `q.col` and
-/// drop the qualifier, so a qualifier naming no relation was ignored:
-/// `DELETE FROM t WHERE nosuch.id = 1` deleted t's row 1, and `WHERE
-/// nosuch.v > 0 OR id = 2` read t's `v`. PostgreSQL refuses both ("missing
-/// FROM-clause entry", 42P01).
+/// Every qualified column reference in `text`: the byte span of its
+/// qualifier including the final dot (`public.t.` in `public.t.id`, `t.` in
+/// `t.*`), and the qualifier's names unquoted (`["public", "t"]`).
 ///
 /// Quotes, comments and numbers are skipped, and so is a parenthesised
 /// subquery, which has its own FROM. A schema-qualified call
 /// (`pg_catalog.now()`) and what follows `::` are not column references.
-pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
+fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
     let bytes = text.as_bytes();
     let ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'"' || b >= 0x80;
     let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
@@ -250,6 +245,7 @@ pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
         }
         (j > i).then(|| (text[i..j].to_string(), j))
     };
+    let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if let Some(end) = skip_comment(bytes, i) {
@@ -290,38 +286,116 @@ pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
             continue;
         }
         if ident_start(b) && (i == 0 || !ident_byte(bytes[i - 1])) {
-            let Some((name, end)) = read(i) else {
-                i += 1;
-                continue;
-            };
-            if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|c| ident_start(*c) || *c == b'*') {
-                // `q.name(` is a schema-qualified function, not a column.
-                let call = read(end + 1).is_some_and(|(_, after)| {
-                    text[after..].trim_start().starts_with('(')
-                });
-                if !call && !allowed.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
-                    return Some(name);
-                }
-                // Past the whole dotted reference.
-                let mut j = end;
-                while bytes.get(j) == Some(&b'.') {
-                    match read(j + 1) {
-                        Some((_, after)) => j = after,
-                        None => {
-                            j += 1;
-                            break;
-                        }
+            // The whole dotted chain: names, and where each one ends.
+            let mut names: Vec<(String, usize)> = Vec::new();
+            let mut j = i;
+            let mut star = false;
+            while let Some((name, end)) = read(j) {
+                names.push((name, end));
+                if bytes.get(end) == Some(&b'.') {
+                    if bytes.get(end + 1) == Some(&b'*') {
+                        star = true;
+                        j = end + 2;
+                        break;
+                    }
+                    if bytes.get(end + 1).is_some_and(|c| ident_start(*c)) {
+                        j = end + 1;
+                        continue;
                     }
                 }
-                i = j.max(end + 1);
+                j = end;
+                break;
+            }
+            if names.is_empty() {
+                i += 1;
                 continue;
             }
-            i = end.max(i + 1);
+            // `q.name(` is a schema-qualified function, not a column.
+            let call = text[j..].trim_start().starts_with('(');
+            let qualifiers = if star { names.len() } else { names.len() - 1 };
+            if qualifiers > 0 && !call {
+                let span_end = names[qualifiers - 1].1 + 1;
+                out.push((i, span_end, names[..qualifiers].iter().map(|(n, _)| n.clone()).collect()));
+            }
+            i = j.max(i + 1);
             continue;
         }
         i += 1;
     }
-    None
+    out
+}
+
+/// Whether the qualifier `names` is one of `allowed`, each a dotted path
+/// (`t`, `public.t`), compared name by name without regard to ASCII case.
+fn qualifier_is(names: &[String], allowed: &str) -> bool {
+    let parts: Vec<&str> = allowed.split('.').collect();
+    parts.len() == names.len() && parts.iter().zip(names).all(|(a, n)| a.trim_matches('"').eq_ignore_ascii_case(n))
+}
+
+/// The first qualifier in `text` (`q` in `q.col`, `public.t` in
+/// `public.t.col`) that is none of `allowed`, as written; `None` when every
+/// one names a relation the statement has.
+///
+/// A single-table statement's readers take the last segment of `q.col` and
+/// drop the qualifier, so a qualifier naming no relation was ignored:
+/// `DELETE FROM t WHERE nosuch.id = 1` deleted t's row 1, and `WHERE
+/// nosuch.v > 0 OR id = 2` read t's `v`. PostgreSQL refuses both ("missing
+/// FROM-clause entry", 42P01). `allowed` is what [`relation_qualifiers`]
+/// gives, plus what a statement adds (`EXCLUDED`).
+pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
+    qualified_references(text)
+        .into_iter()
+        .find(|(_, _, names)| !allowed.iter().any(|a| qualifier_is(names, a)))
+        .map(|(_, _, names)| names.join("."))
+}
+
+/// `text` with each qualifier that is one of `strip` removed: `t0.v` as `v`,
+/// `"public"."t"."id"` as `"id"`.
+pub fn strip_qualifiers(text: &str, strip: &[&str]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (start, end, names) in qualified_references(text) {
+        if strip.iter().any(|s| qualifier_is(&names, s)) {
+            out.push_str(&text[from..start]);
+            from = end;
+        }
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// `text` with each qualifier that is `from` written as `to.`: `"excluded"."v"`
+/// as `EXCLUDED."v"`, so one spelling is left for a reader that looks for it.
+pub fn respell_qualifier(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from_at = 0;
+    for (start, end, names) in qualified_references(text) {
+        if qualifier_is(&names, from) {
+            out.push_str(&text[from_at..start]);
+            out.push_str(to);
+            out.push('.');
+            from_at = end;
+        }
+    }
+    out.push_str(&text[from_at..]);
+    out
+}
+
+/// The qualifiers a single relation is known by: its alias alone when it has
+/// one (PostgreSQL hides the name behind it), else its name and its name in
+/// the default schema (`t`, `public.t`), and the schema-qualified name as
+/// written when that is another schema.
+pub fn relation_qualifiers(relation: &str, alias: Option<&str>) -> Vec<String> {
+    if let Some(alias) = alias {
+        return vec![alias.trim_matches('"').to_string()];
+    }
+    let parts: Vec<String> = relation.split('.').map(|p| p.trim_matches('"').to_string()).collect();
+    let name = parts.last().cloned().unwrap_or_default();
+    let mut out = vec![name.clone(), format!("public.{name}")];
+    if parts.len() > 1 {
+        out.push(parts.join("."));
+    }
+    out
 }
 
 /// The refusal for a qualifier [`unknown_qualifier`] found, in PostgreSQL's

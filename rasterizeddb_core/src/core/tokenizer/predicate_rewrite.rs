@@ -3698,7 +3698,10 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                 return Err(format!("syntax error at or near \"{}\"", raw));
             }
             if !matches!(toks.get(i + 1), Some(Tok::LPar))
-                && raw.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && raw.split('.').all(|part| {
+                    let part = part.trim_matches('"');
+                    !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+                })
             {
                 return Err(format!("column \"{}\" does not exist", raw));
             }

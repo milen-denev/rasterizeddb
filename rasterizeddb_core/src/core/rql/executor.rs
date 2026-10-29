@@ -5924,11 +5924,20 @@ async fn apply_conflict_update(
         }
     }
 
+    // The conflicting row is named by the table, by it in the default schema
+    // (Prisma: `"public"."t"."id"`) or by the INSERT's alias (Ecto: `INSERT
+    // INTO t AS t0 … SET v = t0.v + 1`); the generated UPDATE names it by
+    // none, so each is taken off. `EXCLUDED` is read however it is quoted
+    // (sea-orm: `"excluded"."v"`).
+    let mut known = crate::core::sql_scan::relation_qualifiers(table_name, None);
+    if let Some(alias) = insert_alias(insert_sql) {
+        known.push(alias);
+    }
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
     let resolve = |text: &str| -> Result<String, String> {
-        let text = substitute_excluded(text, &inserted)?;
-        Ok(fold_constants_in_predicate(&strip_qualifier(
-            &text, table_name,
-        )))
+        let text = crate::core::sql_scan::respell_qualifier(text, "excluded", "EXCLUDED");
+        let text = substitute_excluded(&text, &inserted)?;
+        Ok(fold_constants_in_predicate(&crate::core::sql_scan::strip_qualifiers(&text, &known)))
     };
 
     let assignments = match resolve(&spec.assignments) {
@@ -7145,6 +7154,19 @@ fn has_top_level_arithmetic(text: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// The alias an `INSERT INTO t AS a …` gives its target, unquoted.
+fn insert_alias(insert_sql: &str) -> Option<String> {
+    let into = crate::core::rql::join::find_keyword(insert_sql, "INTO", 0)?;
+    let mut words = insert_sql[into + "INTO".len()..].split_whitespace();
+    words.next()?;
+    let next = words.next()?;
+    if !next.eq_ignore_ascii_case("AS") {
+        return None;
+    }
+    let alias = words.next()?.split('(').next()?.trim_matches('"');
+    (!alias.is_empty()).then(|| alias.to_string())
 }
 
 /// Whether a column default is a constant: a literal, or one under a cast.
