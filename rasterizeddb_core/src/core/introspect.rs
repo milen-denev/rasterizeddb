@@ -1673,11 +1673,7 @@ fn checks(database: &Arc<Database>) -> Vec<Row> {
         let Some(table) = database.schema_view(&name) else { continue };
         let schema = table.schema();
         for check in schema.checks.iter().filter(|c| !c.is_deleted) {
-            let (status, reason) = match crate::core::rql::executor::check_status(&check.expression, &schema.fields) {
-                Ok(None) => ("enforced", String::new()),
-                Ok(Some(why)) => ("not enforced", why),
-                Err(why) => ("cannot be compiled", why),
-            };
+            let (status, reason) = crate::core::rql::executor::check_listing(&check.expression, &schema.fields);
             out.push(row(&[
                 Cell::Text(schema.name.clone()),
                 Cell::Text(check.name.clone()),

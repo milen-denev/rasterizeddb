@@ -548,7 +548,89 @@ async fn the_not_judged_rule_is_narrow_and_said_once() {
             _ => None,
         })
         .collect();
-    for want in ["ck ck_c enforced", "nm nm_c enforced", "c1 c1_tag_check not enforced"] {
+    for want in ["ck ck_c enforced (ASCII-exact)", "nm nm_c enforced (ASCII-exact)", "c1 c1_tag_check not enforced"] {
+        if !listed.iter().any(|l| l == want) {
+            wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A check reading a `character(n)` column is kept unenforced (said so) on
+/// every DDL path, and listed as such: CREATE TABLE with `tag::text`, a bare
+/// `CHAR`, ALTER TABLE ADD CONSTRAINT on an existing CHAR(3) (alone and in an
+/// OR), and ADD COLUMN … CHAR(3) CHECK over a table with rows. Each refused
+/// the 'AB ' PostgreSQL accepts, and SHOW CHECKS said "enforced". And ADD
+/// CONSTRAINT says when stored rows go unjudged; SHOW CHECKS says a check
+/// over a locale-dependent pattern is enforced for ASCII text exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn character_n_checks_are_declined_on_every_ddl_path() {
+    use std::sync::{Arc, Mutex};
+    let server = TestServer::start().await.expect("server");
+    let (client, mut connection) =
+        tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    let notices: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = notices.clone();
+    tokio::spawn(async move {
+        while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+            if let Ok(tokio_postgres::AsyncMessage::Notice(n)) = message {
+                sink.lock().unwrap().push(n.message().to_string());
+            }
+        }
+    });
+    let taken = || std::mem::take(&mut *notices.lock().unwrap());
+    let mut wrong = Vec::new();
+    client
+        .batch_execute("CREATE TABLE c4 (id INT PRIMARY KEY, tag CHAR(3), q INT, tg2 TEXT); INSERT INTO c4 VALUES (9, 'CD', 1, NULL)")
+        .await
+        .expect("c4");
+    let _ = taken();
+    for (ddl, name) in [
+        ("ALTER TABLE c4 ADD CONSTRAINT c4_t CHECK (tag IN ('AB', 'CD'))", "c4_t"),
+        ("ALTER TABLE c4 ADD CONSTRAINT c4_o CHECK (q > 0 OR tag = 'AB')", "c4_o"),
+        ("ALTER TABLE c4 ADD COLUMN tg3 CHAR(3) CHECK (tg3 IN ('X'))", "c4_tg3_check"),
+        ("CREATE TABLE c5 (id INT PRIMARY KEY, tag CHAR(3) CHECK (tag::text IN ('AB', 'CD')), c1 CHAR CHECK (c1 IN ('a')))", "c5_tag_check"),
+    ] {
+        client.batch_execute(ddl).await.unwrap_or_else(|e| panic!("{ddl}: {e}"));
+        let warned = taken();
+        if !warned.iter().any(|m| m.contains(&format!("\"{name}\"")) && m.contains("character(n)")) {
+            wrong.push(format!("{ddl}: no warning: {warned:?}"));
+        }
+    }
+    for sql in ["INSERT INTO c4 VALUES (1, 'AB ', -1, NULL, 'X  ')", "INSERT INTO c5 VALUES (1, 'AB ', 'a')"] {
+        if let Err(e) = client.batch_execute(sql).await {
+            wrong.push(format!("{sql}: {e}"));
+        }
+    }
+    // Stored rows a check leaves unjudged are said at ADD CONSTRAINT.
+    client
+        .batch_execute("CREATE TABLE w (id INT PRIMARY KEY, s TEXT, n INT); INSERT INTO w VALUES (1, 'é', 1), (2, 'ab', 1), (3, 'ü', 1)")
+        .await
+        .expect("w");
+    let _ = taken();
+    client.batch_execute("ALTER TABLE w ADD CONSTRAINT w_c CHECK (s ~ '^\\w+$' AND n > 0)").await.expect("w_c");
+    let warned = taken();
+    if !warned.iter().any(|m| m.contains("\"w_c\"") && m.contains("not judged for 2 existing rows")) {
+        wrong.push(format!("ADD CONSTRAINT w_c: {warned:?}"));
+    }
+    let listed: Vec<String> = client
+        .simple_query("SHOW CHECKS")
+        .await
+        .expect("SHOW CHECKS")
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(format!("{} {}", r.get(1).unwrap_or(""), r.get(2).unwrap_or(""))),
+            _ => None,
+        })
+        .collect();
+    for want in [
+        "c4_t not enforced",
+        "c4_o not enforced",
+        "c4_tg3_check not enforced",
+        "c5_tag_check not enforced",
+        "c5_c1_check not enforced",
+        "w_c enforced (ASCII-exact)",
+    ] {
         if !listed.iter().any(|l| l == want) {
             wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
         }

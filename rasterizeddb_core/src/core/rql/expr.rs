@@ -216,6 +216,11 @@ pub enum TextFunc {
     /// uncertain ([`take_check_uncertainty`]), so the check is not judged
     /// for that row rather than judged another way.
     CheckRegexpLike,
+    /// `__check_regexp_uncertain(s, p[, f])`: whether a CHECK's regular
+    /// expression has no answer this engine can vouch for on `s` (a locale
+    /// class over non-ASCII text). What ADD CONSTRAINT counts its stored
+    /// rows not judged by.
+    CheckRegexpUncertain,
     /// `similar_to_escape(pattern [, escape])`: a `SIMILAR TO` pattern as the
     /// anchored regular expression it means, as `pg_dump` writes `SIMILAR
     /// TO` (`x ~ similar_to_escape('a%')`).
@@ -604,7 +609,7 @@ pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
     "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "JSONB_TYPEOF",
-    "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE",
+    "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
 ];
 
 /// Parses one expression against `schema`.
@@ -1133,11 +1138,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     }
                     Ok(Expr::Call(TextFunc::JsonbTypeof, args))
                 }
-                "REGEXP_LIKE" | "__CHECK_REGEXP_LIKE" => {
+                "REGEXP_LIKE" | "__CHECK_REGEXP_LIKE" | "__CHECK_REGEXP_UNCERTAIN" => {
                     if !(2..=3).contains(&args.len()) {
                         return Err("regexp_like takes a text, a pattern and optionally flags".to_string());
                     }
-                    let func = if upper_name == "REGEXP_LIKE" { TextFunc::RegexpLike } else { TextFunc::CheckRegexpLike };
+                    let func = match upper_name.as_str() {
+                        "REGEXP_LIKE" => TextFunc::RegexpLike,
+                        "__CHECK_REGEXP_LIKE" => TextFunc::CheckRegexpLike,
+                        _ => TextFunc::CheckRegexpUncertain,
+                    };
                     Ok(Expr::Call(func, args))
                 }
                 "SIMILAR_TO_ESCAPE" => {
@@ -1847,7 +1856,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
-        Expr::Call(TextFunc::RegexpLike | TextFunc::CheckRegexpLike, _) => DbType::BOOL,
+        Expr::Call(TextFunc::RegexpLike | TextFunc::CheckRegexpLike | TextFunc::CheckRegexpUncertain, _) => DbType::BOOL,
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
         // `select_common_type` does — see `common_type`.
@@ -2336,6 +2345,14 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
     }
 
     Ok(match func {
+        // NULL arguments: nothing to vouch for (an answer of NULL is exact).
+        TextFunc::CheckRegexpUncertain => {
+            let flags = args.get(2).map(as_text).unwrap_or_default();
+            let uncertain = !args.iter().any(|a| a.is_null())
+                && crate::core::rql::pg_regex::compile_cached(&as_text(&args[1]), &flags)
+                    .is_ok_and(|re| re.matches(&as_text(&args[0])).is_none());
+            Value::Data { bytes: vec![u8::from(uncertain)], db_type: DbType::BOOL }
+        }
         TextFunc::RegexpLike | TextFunc::CheckRegexpLike => {
             let flags = args.get(2).map(as_text).unwrap_or_default();
             // A pattern or flags outside the translated subset — here only

@@ -76,6 +76,12 @@ impl PgRegex {
     /// Whether the pattern matches `text`, as PostgreSQL answers it; `None`
     /// when that answer cannot be vouched for (non-ASCII text under a
     /// locale-dependent construct).
+    /// Whether an answer depends on the locale for non-ASCII text (`matches`
+    /// declines such a value).
+    pub fn locale_dependent(&self) -> bool {
+        self.ascii_only
+    }
+
     pub fn matches(&self, text: &str) -> Option<bool> {
         if self.ascii_only && !text.is_ascii() {
             return None;

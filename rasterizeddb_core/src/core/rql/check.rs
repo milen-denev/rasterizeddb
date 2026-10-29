@@ -461,6 +461,22 @@ pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
     out
 }
 
+/// A predicate over a table's row that holds where one of `normalized`'s
+/// regular expressions has no answer this engine can vouch for (a locale
+/// class over non-ASCII text): the OR of `__check_regexp_uncertain` over
+/// each call's arguments. `None` when the check has no regular expression.
+pub fn regex_uncertainty_predicate(normalized: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut from = 0;
+    while let Some(at) = normalized[from..].find(CHECK_REGEXP_LIKE).map(|a| a + from) {
+        let open = at + CHECK_REGEXP_LIKE.len();
+        let Some(close) = crate::core::sql_scan::matching_close(normalized, open) else { break };
+        terms.push(format!("(__check_regexp_uncertain({}) = TRUE)", &normalized[open + 1..close]));
+        from = close + 1;
+    }
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
 /// The function a check's regular expression is evaluated by: `regexp_like`,
 /// except that a value it cannot answer for PostgreSQL leaves the check
 /// unjudged for that row (`expr::TextFunc::CheckRegexpLike`).

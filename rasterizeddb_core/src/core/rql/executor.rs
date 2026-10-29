@@ -10682,6 +10682,70 @@ pub(crate) fn check_status(
     }
 }
 
+/// What `SHOW CHECKS` says of the check `expression`: its status and why.
+/// `enforced (ASCII-exact)` is a check with a regular expression whose
+/// answer depends on the locale: answered for ASCII text, and for other text
+/// judged only where that answer cannot change the result (`Monotone`), or
+/// not judged for the row at all.
+pub(crate) fn check_listing(
+    expression: &str,
+    fields: &[crate::core::row::schema::SchemaField],
+) -> (&'static str, String) {
+    match compile_check(expression, fields) {
+        Err(why) => ("cannot be compiled", why),
+        Ok(CompiledCheck::Unenforced(why)) => ("not enforced", why),
+        Ok(compiled) => {
+            let normalized = crate::core::rql::check::normalize_expression(expression);
+            if !regex_locale_dependent(&normalized) {
+                return ("enforced", String::new());
+            }
+            let how = if matches!(compiled, CompiledCheck::Monotone(_)) {
+                "a row with other text is judged only where the regular expression's answer cannot change the result"
+            } else {
+                "a row with other text is not judged"
+            };
+            (
+                "enforced (ASCII-exact)",
+                format!("a locale-dependent regular expression is answered for ASCII text; {how}"),
+            )
+        }
+    }
+}
+
+/// Whether any regular expression in the normalized check depends on the
+/// locale for non-ASCII text: a constant one that does, or one read from the
+/// row, which may.
+fn regex_locale_dependent(normalized: &str) -> bool {
+    let name = crate::core::rql::check::CHECK_REGEXP_LIKE;
+    let mut from = 0;
+    while let Some(at) = normalized[from..].find(name).map(|a| a + from) {
+        from = at + name.len();
+        let open = from;
+        let Some(close) = crate::core::sql_scan::matching_close(normalized, open) else { continue };
+        let args = crate::core::sql_scan::split_top_level(&normalized[open + 1..close], b',');
+        let constant = |text: Option<&&str>| -> Option<String> {
+            let e = crate::core::rql::expr::parse(text?.trim(), &[]).ok()?;
+            match crate::core::rql::expr::eval(&e, &crate::core::row::row::Row::default(), &[]).ok()? {
+                crate::core::rql::expr::Value::Data { bytes, .. } => String::from_utf8(bytes).ok(),
+                crate::core::rql::expr::Value::Null => None,
+            }
+        };
+        let Some(pattern) = constant(args.get(1)) else { return true };
+        let flags = if args.len() > 2 {
+            match constant(args.get(2)) {
+                Some(f) => f,
+                None => return true,
+            }
+        } else {
+            String::new()
+        };
+        if crate::core::rql::pg_regex::compile_cached(&pattern, &flags).is_ok_and(|re| re.locale_dependent()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Logs, once per process for each table's check, one this binary does not
 /// enforce or cannot compile: at the table's first write after a start, so
 /// one declared by another session or stored by an older binary is said in
@@ -11840,12 +11904,41 @@ async fn add_check_constraint(
 
     // A row for which it is false (NULL is not false) refuses the statement.
     // A check kept unenforced judges no row, the stored ones included.
-    let probe = format!(
-        "SELECT 1 FROM {} WHERE NOT ({}) LIMIT 1",
-        table_name,
-        crate::core::rql::check::normalize_expression(&expression)
-    );
-    match if unenforced { Ok(Vec::new()) } else { run_subquery(&probe, database, tx).await } {
+    // A stored row whose regex answer depends on the locale (non-ASCII text
+    // under a locale class) is judged as a write judges it: a check where
+    // that answer cannot change the result (`regex_calls_are_monotone`) is
+    // judged with it UNKNOWN, any other is not judged for the row; either
+    // way the rows not judged are said, once, as a WARNING (they were not).
+    let normalized = crate::core::rql::check::normalize_expression(&expression);
+    let uncertain = crate::core::rql::check::regex_uncertainty_predicate(&normalized);
+    let probe = match (&uncertain, regex_calls_are_monotone(&normalized)) {
+        (Some(u), false) => format!("SELECT 1 FROM {table_name} WHERE NOT ({normalized}) AND NOT ({u}) LIMIT 1"),
+        _ => format!("SELECT 1 FROM {table_name} WHERE NOT ({normalized}) LIMIT 1"),
+    };
+    let result = if unenforced { Ok(Vec::new()) } else { run_subquery(&probe, database, tx).await };
+    if let (Ok(rows), Some(u), false) = (&result, &uncertain, unenforced) {
+        if rows.is_empty() {
+            if let Ok(found) = run_subquery(&format!("SELECT count(*) FROM {table_name} WHERE {u}"), database, tx).await {
+                let n = found
+                    .first()
+                    .and_then(|r| r.columns.first())
+                    .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+                    .map(i64::from_le_bytes)
+                    .unwrap_or(0);
+                if n > 0 {
+                    let message = format!(
+                        "check constraint \"{name}\" of relation \"{table_name}\" was not judged for {n} existing \
+                         {}: a locale-dependent class or case-insensitivity met a non-ASCII value, where PostgreSQL's \
+                         answer depends on the locale",
+                        if n == 1 { "row" } else { "rows" }
+                    );
+                    log::warn!("{message}");
+                    crate::core::notice::push("WARNING", "01000", message);
+                }
+            }
+        }
+    }
+    match result {
         Ok(rows) if rows.is_empty() => {}
         Ok(_) => {
             return ddl_error(&format!(
