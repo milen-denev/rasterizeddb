@@ -1157,7 +1157,9 @@ fn apply_post_join(
         } else {
             processor
                 .execute_row(&RowView::new(&row, &map), &mut bool_buffer)
-                .map_err(|e| format!("{:?}", e))?
+                // In words the wire maps (`InexactNumeric` reached the client
+                // as the XX000 "InexactNumeric").
+                .map_err(|e| e.to_string())?
         };
 
         // Both halves must hold. The synthetic row is addressed by write order,

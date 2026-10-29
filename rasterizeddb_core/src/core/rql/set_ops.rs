@@ -108,18 +108,106 @@ fn push_row_length(out: &mut Vec<u8>, payload: usize) {
     out.extend_from_slice(&(payload as u32).to_le_bytes());
 }
 
+/// For each output column of a `UNION` whose branches are NUMERIC at
+/// different scales, or NUMERIC and integer, the scale each branch's cells are
+/// stored at there: `rescale[branch][column]`. Such a column is described by
+/// the first branch, at its scale, and its cells were all read at that scale:
+/// `numeric(10,2) UNION ALL numeric(12,4)` showed 3.1415 as 314.15, and an
+/// integer under a NUMERIC description went out empty. Each cell is then
+/// carried at its own scale (`value_codec::decimal_cell_with_scale`), as
+/// PostgreSQL shows each value of a `numeric` column at its own.
+///
+/// `Ok(None)` when no column needs it; refused when the first branch is an
+/// integer and a later one NUMERIC, a column PostgreSQL makes `numeric` and
+/// this would describe as the integer; `None` for a branch whose scales are
+/// not known leaves that column as it was.
+pub fn union_decimal_scales(
+    declared: &[Vec<Option<DbType>>],
+    scales: &[Option<Vec<u32>>],
+) -> Result<Option<Vec<Vec<Option<u32>>>>, String> {
+    let integer_type = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 | DbType::U8 | DbType::U16 | DbType::U32
+                | DbType::U64
+        )
+    };
+    let width = declared.iter().map(Vec::len).min().unwrap_or(0);
+    let mut out = vec![vec![None; width]; declared.len()];
+    let mut any = false;
+    for at in 0..width {
+        let types: Option<Vec<&DbType>> = declared.iter().map(|b| b[at].as_ref()).collect();
+        let Some(types) = types else { continue };
+        if !types.iter().any(|t| **t == DbType::DECIMAL) {
+            continue;
+        }
+        if !types.iter().all(|t| **t == DbType::DECIMAL || integer_type(t)) {
+            continue;
+        }
+        if *types[0] != DbType::DECIMAL {
+            return Err(format!(
+                "UNION column {} is an integer in its first branch and NUMERIC in another, which is not supported: \
+                 cast the first branch's column to numeric",
+                at + 1
+            ));
+        }
+        let at_scale: Option<Vec<u32>> = types
+            .iter()
+            .zip(scales)
+            .map(|(t, s)| if **t == DbType::DECIMAL { s.as_ref().and_then(|s| s.get(at).copied()) } else { Some(0) })
+            .collect();
+        let Some(at_scale) = at_scale else { continue };
+        let mixed = types.iter().any(|t| **t != DbType::DECIMAL) || at_scale.windows(2).any(|w| w[0] != w[1]);
+        if !mixed {
+            continue;
+        }
+        any = true;
+        for (branch, scale) in at_scale.into_iter().enumerate() {
+            out[branch][at] = Some(scale);
+        }
+    }
+    Ok(any.then_some(out))
+}
+
+/// A NUMERIC cell's value and scale: one carrying its own (seventeen
+/// bytes), or an ordinary one at `default`.
+fn decimal_at(v: &[u8], default: u32) -> Option<(i128, u32)> {
+    let (m, own) = crate::core::value_codec::split_decimal_cell(v)?;
+    Some((m, own.unwrap_or(default)))
+}
+
 /// Appends `row` to `out` with each integer cell at a widened position
-/// rewritten as the wider type, in the serialized layout: the length header,
-/// then per cell its size, schema id, data and type tag.
-fn push_widened(row: &[u8], widen: &[Option<DbType>], out: &mut Vec<u8>) -> std::io::Result<()> {
+/// rewritten as the wider type, and each cell at a rescaled position as a
+/// NUMERIC carrying its scale ([`union_decimal_scales`]), in the serialized
+/// layout: the length header, then per cell its size, schema id, data and
+/// type tag.
+fn push_widened(
+    row: &[u8],
+    widen: &[Option<DbType>],
+    rescale: Option<&[Option<u32>]>,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let start = out.len();
     push_row_length(out, 0);
     let header = out.len() - start;
     for (position, cell) in serialized_cells(row)?.enumerate() {
         let cell = cell?;
-        let wide = widen.get(position).and_then(|t| t.as_ref()).and_then(|ty| {
-            let bytes = integer_bytes(integer(&cell.column_type, cell.data)?, ty)?;
-            Some((ty.clone(), bytes))
+        let scaled = rescale.and_then(|r| r.get(position).copied().flatten()).and_then(|scale| {
+            let m = match cell.column_type {
+                DbType::DECIMAL => match decimal_at(cell.data, scale)? {
+                    // Already carrying its own scale: kept.
+                    (_, own) if cell.data.len() == 17 => return Some((DbType::DECIMAL, cell.data.to_vec())).filter(|_| own <= 38),
+                    (m, _) => m,
+                },
+                ref t => integer(t, cell.data)?,
+            };
+            Some((DbType::DECIMAL, crate::core::value_codec::decimal_cell_with_scale(m, scale)))
+        });
+        let wide = scaled.or_else(|| {
+            widen.get(position).and_then(|t| t.as_ref()).and_then(|ty| {
+                let bytes = integer_bytes(integer(&cell.column_type, cell.data)?, ty)?;
+                Some((ty.clone(), bytes))
+            })
         });
         let (ty, data) = match &wide {
             Some((ty, bytes)) => (ty, bytes.as_slice()),
@@ -164,6 +252,9 @@ pub struct Combined {
     documents: Vec<bool>,
     /// The integer type each output column is widened to, if any.
     widen: Vec<Option<DbType>>,
+    /// Per branch, the scale each rescaled column's cells are at
+    /// ([`union_decimal_scales`]).
+    rescale: Option<Vec<Vec<Option<u32>>>>,
     sort: Vec<SortKey>,
     limit: Option<u64>,
     offset: u64,
@@ -194,6 +285,7 @@ impl Combined {
             state: ahash::RandomState::new(),
             documents,
             widen,
+            rescale: None,
             sort,
             limit: parts.limit,
             offset: parts.offset,
@@ -210,9 +302,17 @@ impl Combined {
                 .is_some_and(|n| self.starts.len() as u64 >= n.saturating_add(self.offset))
     }
 
+    /// Sets [`union_decimal_scales`]'s answer, which [`Combined::push`] reads
+    /// by branch.
+    pub fn rescale(&mut self, rescale: Option<Vec<Vec<Option<u32>>>>) {
+        self.rescale = rescale;
+    }
+
     /// Adds one branch's serialized rows. `distinct` drops each row equal to
     /// one already kept; the branches for which it is set must come first.
-    pub fn push(&mut self, rows: &[u8], distinct: bool) -> Result<(), String> {
+    /// `branch` is its position among the UNION's branches.
+    pub fn push(&mut self, rows: &[u8], distinct: bool, branch: usize) -> Result<(), String> {
+        let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
         let mut key = Vec::new();
         for row in serialized_rows(rows) {
             if self.is_full() {
@@ -221,7 +321,7 @@ impl Combined {
             let row = row.map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
             if distinct {
                 key.clear();
-                duplicate_key(row, &self.documents, &mut key)
+                duplicate_key(row, &self.documents, rescale, &mut key)
                     .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
                 let hash = self.state.hash_one(&key[..]);
                 let (keys, key_starts) = (&self.keys, &self.key_starts);
@@ -241,8 +341,8 @@ impl Combined {
                 self.keys.extend_from_slice(&key);
             }
             self.starts.push(self.out.len());
-            if self.widen.iter().any(Option::is_some) {
-                push_widened(row, &self.widen, &mut self.out)
+            if self.widen.iter().any(Option::is_some) || rescale.is_some() {
+                push_widened(row, &self.widen, rescale, &mut self.out)
                     .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
             } else {
                 self.out.extend_from_slice(row);
@@ -397,6 +497,24 @@ fn compare_values(a: &(DbType, &[u8]), b: &(DbType, &[u8]), document: bool) -> O
     if document || (*ta == DbType::JSONB && *tb == DbType::JSONB) {
         return crate::core::jsonb::order(va, vb);
     }
+    // NUMERICs carrying their own scales (`union_decimal_scales`): compared
+    // at the larger of the two.
+    if *ta == DbType::DECIMAL && *tb == DbType::DECIMAL && (va.len() == 17 || vb.len() == 17) {
+        let nine = crate::core::value_codec::DECIMAL_SCALE;
+        if let (Some((x, sx)), Some((y, sy))) = (decimal_at(va, nine), decimal_at(vb, nine)) {
+            let up = |m: i128, by: u32| 10i128.checked_pow(by).and_then(|f| m.checked_mul(f));
+            let aligned = if sx >= sy { up(y, sx - sy).map(|y| (x, y)) } else { up(x, sy - sx).map(|x| (x, y)) };
+            return match aligned {
+                Some((x, y)) => x.cmp(&y),
+                // Past an i128 once aligned: apart by more than a float's
+                // error, which is all the order needs.
+                None => crate::core::processor::concurrent_processor::pg_float_cmp(
+                    x as f64 / 10f64.powi(sx as i32),
+                    y as f64 / 10f64.powi(sy as i32),
+                ),
+            };
+        }
+    }
     if ta == tb {
         if va.is_empty() || vb.is_empty() {
             // Only text has an empty value, and it sorts first, as its bytes do.
@@ -473,13 +591,37 @@ fn number(ty: &DbType, v: &[u8]) -> Option<f64> {
 ///   other float is its value as an `f64`, zero and NaN each spelled once.
 /// - Text and a single character are their bytes, so `text` meets `varchar`.
 /// - Anything else keeps its type tag with its bytes, as before.
-fn duplicate_key(row: &[u8], documents: &[bool], out: &mut Vec<u8>) -> std::io::Result<()> {
+fn duplicate_key(
+    row: &[u8],
+    documents: &[bool],
+    rescale: Option<&[Option<u32>]>,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
     for (position, cell) in serialized_cells(row)?.enumerate() {
         let cell = cell?;
         let (ty, data) = (&cell.column_type, cell.data);
         if *ty == DbType::NULL {
             out.push(0);
             continue;
+        }
+        // A rescaled NUMERIC column (`union_decimal_scales`): by value, its
+        // trailing zeros dropped, so 1.25 at two places meets 1.2500 at four
+        // and an integer 7 meets 7.00, as `=` says.
+        if let Some(scale) = rescale.and_then(|r| r.get(position).copied().flatten()) {
+            let value = match ty {
+                DbType::DECIMAL => decimal_at(data, scale),
+                t => integer(t, data).map(|m| (m, 0)),
+            };
+            if let Some((mut m, mut scale)) = value {
+                while scale > 0 && m % 10 == 0 {
+                    m /= 10;
+                    scale -= 1;
+                }
+                out.push(7);
+                out.extend_from_slice(&m.to_le_bytes());
+                out.extend_from_slice(&scale.to_le_bytes());
+                continue;
+            }
         }
         if *ty == DbType::JSONB || documents.get(position).copied().unwrap_or(false) {
             out.push(1);
@@ -550,7 +692,7 @@ mod tests {
 
     fn key(columns: Vec<Column>, documents: &[bool]) -> Vec<u8> {
         let mut out = Vec::new();
-        duplicate_key(&serialized(columns), documents, &mut out).unwrap();
+        duplicate_key(&serialized(columns), documents, None, &mut out).unwrap();
         out
     }
 
@@ -662,7 +804,7 @@ mod tests {
             cell(2, DbType::NULL, b""),
         ]);
         let mut out = vec![2u8];
-        push_widened(&row, &[Some(DbType::I64), None, Some(DbType::I64)], &mut out).unwrap();
+        push_widened(&row, &[Some(DbType::I64), None, Some(DbType::I64)], None, &mut out).unwrap();
         let back = Row::decode(&out[1..]).unwrap();
         assert_eq!(back.columns.len(), 3);
         assert_eq!(back.columns[0].column_type, DbType::I64);

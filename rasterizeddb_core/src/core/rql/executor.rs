@@ -562,8 +562,9 @@ pub(crate) fn query_output_scales(
 /// reads them — literal substitution, a derived table's temp relation —
 /// assumes the engine's. Without this a `sum(bigint)` (a numeric at scale 0)
 /// read through a derived table was a billionth of itself, and so was any
-/// `NUMERIC(p, s)` column with `s` other than nine. Rounded half away from
-/// zero when the stored scale is wider.
+/// `NUMERIC(p, s)` column with `s` other than nine. A value with digits past
+/// the engine's nine places is left whole, as a cell carrying its own scale,
+/// for its reader to write at that scale; one without is brought to nine.
 fn normalize_decimal_scales(rows: &mut [crate::core::row::row::Row], scales: &[u32]) {
     use crate::core::db_type::DbType;
     let target = crate::core::value_codec::DECIMAL_SCALE;
@@ -611,6 +612,20 @@ fn normalize_decimal_scales(rows: &mut [crate::core::row::row::Row], scales: &[u
                 None => continue,
             };
             if from == target {
+                continue;
+            }
+            // A column with more places than the engine's, holding digits
+            // there: kept whole, at its scale, as the cell carrying its own
+            // scale above is. Rounded to nine here, `INSERT INTO t2 SELECT b
+            // FROM t` over a NUMERIC(38,20) stored 1.12345678900000000000
+            // for 1.12345678912345678912 — a plain copy, a join, a derived
+            // table, a CTE, `min(b)`, every source whose cells are the
+            // column's own.
+            if from > target && 10i128.checked_pow(from - target).is_some_and(|f| v % f != 0) {
+                let bytes = crate::core::value_codec::decimal_cell_with_scale(v, from);
+                let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                block.into_slice_mut().copy_from_slice(&bytes);
+                cell.data = block;
                 continue;
             }
             let lifted = if from < target {
@@ -4147,6 +4162,26 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         Ok(combined) => combined,
         Err(e) => return ddl_error(&e),
     };
+    // A NUMERIC column whose branches keep different scales: each cell at
+    // its own (`set_ops::union_decimal_scales`).
+    {
+        let declared: Vec<Vec<Option<crate::core::db_type::DbType>>> = parts
+            .branches
+            .iter()
+            .map(|b| crate::core::rql::cte::declared_item_types_among(b, database, &[]))
+            .collect();
+        if declared.iter().any(|d| d.iter().any(|t| *t == Some(crate::core::db_type::DbType::DECIMAL))) {
+            let scales: Vec<Option<Vec<u32>>> = parts
+                .branches
+                .iter()
+                .map(|b| recognize_query_purpose(b).and_then(|p| query_output_scales(&p, database)))
+                .collect();
+            match crate::core::rql::set_ops::union_decimal_scales(&declared, &scales) {
+                Ok(rescale) => combined.rescale(rescale),
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    }
 
     // Each branch's rows stay serialized from the subquery response to the
     // result: no `Vec<Row>` (1.5 KB a row).
@@ -4164,7 +4199,7 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
                 return ddl_error(&e);
             }
         };
-        if let Err(e) = combined.push(&branch_bytes, at < parts.distinct_prefix) {
+        if let Err(e) = combined.push(&branch_bytes, at < parts.distinct_prefix, at) {
             return ddl_error(&e);
         }
     }

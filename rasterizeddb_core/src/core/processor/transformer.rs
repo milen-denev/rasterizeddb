@@ -62,6 +62,12 @@ pub struct ColumnTransformer {
     pub column_1_scale: Option<u32>,
     /// The same for the right operand.
     pub column_2_scale: Option<u32>,
+    /// For a comparison with an operand keeping more places than the
+    /// engine's nine, the scale both sides are compared at instead of being
+    /// lifted to nine (`set_last_operand_scales`). Decided where the scales
+    /// are set, not per row: asked per row, the question cost a plain `WHERE
+    /// a > 50000.5` some 2% of its instructions.
+    pub compare_at: Option<u32>,
 
     /// Parentheses opening immediately before this comparison, and closing
     /// immediately after it.
@@ -125,6 +131,7 @@ impl Clone for ColumnTransformer {
             column_2_eval: self.column_2_eval.clone(),
             column_1_scale: self.column_1_scale,
             column_2_scale: self.column_2_scale,
+            compare_at: self.compare_at,
             group_opens: self.group_opens,
             group_closes: self.group_closes,
             in_set: self.in_set.clone(),
@@ -291,6 +298,7 @@ impl ColumnTransformer {
             column_2_index: None,
             column_1_scale: None,
             column_2_scale: None,
+            compare_at: None,
             group_opens: 0,
             group_closes: 0,
             in_set: None,
@@ -414,16 +422,31 @@ impl ColumnTransformer {
         };
 
         // A `NUMERIC(p, s)` operand lifted to the engine scale, where the
-        // other side already is. In a stack buffer: this is per row.
+        // other side already is. In a stack buffer: this is per row. A
+        // comparison with a side keeping more places than nine is made at the
+        // larger scale instead, exactly: lifted to nine, `WHERE ja.a > jb.a`
+        // over a NUMERIC(10,2) and a NUMERIC(38,20) was refused for jb's
+        // places (InexactNumeric), and an order needs no arithmetic.
         let mut lifted_1 = [0u8; 16];
-        let input1 = match self.column_1_scale {
-            Some(scale) => lift_to_engine_scale(input1, scale, &mut lifted_1)?,
-            None => input1,
-        };
         let mut lifted_2 = [0u8; 16];
-        let input2 = match self.column_2_scale {
-            Some(scale) => lift_to_engine_scale(input2, scale, &mut lifted_2)?,
-            None => input2,
+        let (input1, input2) = match self.compare_at.filter(|_| self.in_set.is_none()) {
+            Some(common) => {
+                let engine = crate::core::value_codec::DECIMAL_SCALE;
+                (
+                    lift_decimal_to(input1, self.column_1_scale.unwrap_or(engine), common, &mut lifted_1)?,
+                    lift_decimal_to(input2, self.column_2_scale.unwrap_or(engine), common, &mut lifted_2)?,
+                )
+            }
+            None => (
+                match self.column_1_scale {
+                    Some(scale) => lift_to_engine_scale(input1, scale, &mut lifted_1)?,
+                    None => input1,
+                },
+                match self.column_2_scale {
+                    Some(scale) => lift_to_engine_scale(input2, scale, &mut lifted_2)?,
+                    None => input2,
+                },
+            ),
         };
 
         match self.transformer_type {
@@ -983,6 +1006,22 @@ impl ComparisonOperand {
 /// > 1` over a NUMERIC(20,12) holding 0.000000000005 cut it to 0 and dropped
 /// the row. Bytes that are not a decimal are passed through for the
 /// operation to refuse.
+/// A `NUMERIC` stored at `from` places, at `to` places (`to >= from`),
+/// exactly; refused past an i128. Bytes that are not a decimal pass through.
+#[inline]
+fn lift_decimal_to<'a>(input: &'a [u8], from: u32, to: u32, buf: &'a mut [u8; 16]) -> Result<&'a [u8], EvalError> {
+    let Ok(raw) = <[u8; 16]>::try_from(input) else {
+        return Ok(input);
+    };
+    if from == to {
+        return Ok(input);
+    }
+    let lifted = crate::core::rql::expr::rescale_decimal(i128::from_le_bytes(raw), from, to)
+        .ok_or(EvalError::ArithmeticOverflow)?;
+    *buf = lifted.to_le_bytes();
+    Ok(&buf[..])
+}
+
 #[inline]
 fn lift_to_engine_scale<'a>(
     input: &'a [u8],
@@ -1551,6 +1590,10 @@ impl<'a> TransformerProcessor<'a> {
         if let Some(t) = self.transformers.last_mut() {
             t.column_1_scale = left;
             t.column_2_scale = right;
+            let engine = crate::core::value_codec::DECIMAL_SCALE;
+            t.compare_at = (matches!(t.transformer_type, ColumnTransformerType::ComparerOperation(_))
+                && (left.is_some_and(|s| s > engine) || right.is_some_and(|s| s > engine)))
+            .then(|| left.unwrap_or(engine).max(right.unwrap_or(engine)));
         }
     }
 
