@@ -223,12 +223,23 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             }
             None => {
                 let mut result = vec![2u8];
-                crate::core::rql::join::project_serialized(&plan, &combined, &mut result);
-                result
+                match crate::core::rql::join::project_serialized(&plan, &combined, &mut result) {
+                    Ok(()) => result,
+                    Err(e) => {
+                        error!("Join projection failed: {}", e);
+                        error(&e)
+                    }
+                }
             }
         };
     }
-    let mut rows = crate::core::rql::join::project(&plan, combined);
+    let mut rows = match crate::core::rql::join::project(&plan, combined) {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Join projection failed: {}", e);
+            return error(&e);
+        }
+    };
 
     // A shredded JSON column projected through a join is still the stored
     // UUID, and nothing downstream of here would replace it: the join path
@@ -12660,7 +12671,7 @@ fn sort_rows_by_expressions(
     let eval_keys = |row: &Row| -> Result<Vec<crate::core::rql::expr::Value>, String> {
         let mut values = Vec::with_capacity(keys.len());
         for (expr, _, _) in keys {
-            values.push(crate::core::rql::expr::eval(expr, row, schema)?);
+            values.push(crate::core::rql::expr::eval_output(expr, row, schema)?);
         }
         Ok(values)
     };
@@ -17966,7 +17977,7 @@ async fn execute_query_rows_body(
                                                 // at the scale
                                                 // `query_output_scales`
                                                 // announces for it.
-                                                match crate::core::rql::expr::eval(
+                                                match crate::core::rql::expr::eval_output(
                                                     expr,
                                                     &row,
                                                     &slot_schema,

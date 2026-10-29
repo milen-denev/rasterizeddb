@@ -3146,9 +3146,58 @@ impl ExactNumber {
 
 fn inexact_assignment(column: &str, places: u32) -> String {
     format!(
-        "the value for column \"{column}\" cannot be computed exactly at {places} decimal places: a written \
-         number has more digits than this engine carries in an expression (not supported)"
+        "the value for column \"{column}\" cannot be rounded to {places} decimal places with certainty: it \
+         lies too close to a rounding boundary for the precision this expression is carried at (not supported)"
     )
+}
+
+/// An expression's value for output — a select list's item, a sort key —
+/// computed exactly when it reads a NUMERIC column with more places than the
+/// engine's and is exactly computable: `a + 1`, `-a`, `COALESCE(a, 0)`,
+/// `a * 2` over a NUMERIC(20,12). Such a value is a cell carrying its own
+/// scale, as an `AVG` result is, which the wire writes at that scale. Through
+/// [`eval`] it was refused for the places past nine. Anything else is
+/// [`eval`]'s.
+pub(crate) fn eval_output(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
+    if static_type(expr) == DbType::DECIMAL {
+        if let Some(value) = wide_exact(expr, row, schema)? {
+            let Some(x) = value else { return Ok(Value::Null) };
+            let (m, scale) = if x.e <= 0 {
+                (x.m, x.e.unsigned_abs())
+            } else {
+                (
+                    x.m.checked_mul(10i128.checked_pow(x.e as u32).ok_or("value overflows numeric format")?)
+                        .ok_or("value overflows numeric format")?,
+                    0,
+                )
+            };
+            if scale <= 38 {
+                return Ok(Value::Data {
+                    bytes: crate::core::value_codec::decimal_cell_with_scale(m, scale),
+                    db_type: DbType::DECIMAL,
+                });
+            }
+        }
+    }
+    eval(expr, row, schema)
+}
+
+/// Whether `expr` reads a NUMERIC column with more places than the engine's.
+fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
+    let _ = schema;
+    columns_of(expr).iter().any(|f| {
+        f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
+    })
+}
+
+/// The exact value of `expr` when it reads a NUMERIC column with more places
+/// than the engine's and is exactly computable (`Some(None)` for NULL);
+/// `None` when either is not so, for the engine path to take.
+fn wide_exact(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Option<Option<ExactNumber>>, String> {
+    if !reads_wide_decimal(expr, schema) {
+        return Ok(None);
+    }
+    Ok(exact_numeric(expr, row, schema, 30)?.filter(|v| v.is_none_or(|x| x.err == 0.0)))
 }
 
 /// [`eval_into`]'s exact reading of `expr`: `Ok(None)` when it has a part
@@ -3253,21 +3302,30 @@ fn exact_arith(a: ExactNumber, op: ArithOp, b: ExactNumber, places: u32) -> Resu
             if b.m == 0 {
                 return Err("division by zero".to_string());
             }
-            // q = a / b at 10^-k: a.m · 10^(a.e - b.e + k) / b.m.
-            let k = places as i32 + 6;
-            let shift = a.e - b.e + k;
-            let numerator = if shift >= 0 {
-                10i128.checked_pow(shift as u32).and_then(|p| a.m.checked_mul(p))
-            } else {
-                10i128.checked_pow(shift.unsigned_abs()).map(|p| a.m / p)
+            // q = a / b at 10^-k: a.m · 10^(a.e - b.e + k) / b.m, with k
+            // large enough that the numerator is lifted, never cut.
+            let k = (places as i32 + 6).max(b.e - a.e);
+            let shift = (a.e - b.e + k) as u32;
+            let Some(numerator) = 10i128.checked_pow(shift).and_then(|p| a.m.checked_mul(p)) else {
+                return Ok(None);
             };
-            numerator.map(|n| ExactNumber {
-                m: n / b.m,
-                e: -k,
-                // The cut, plus what each operand's error makes of the quotient.
-                err: 10f64.powi(-k) * if shift >= 0 { 1.0 } else { 2.0 }
-                    + if fb > 0.0 { a.err / fb + fa * b.err / (fb * fb) } else { 0.0 },
-            })
+            let (q, r) = (numerator / b.m, numerator % b.m);
+            // What each operand's own error makes of the quotient.
+            let carried = if fb > 0.0 { a.err / fb + fa * b.err / (fb * fb) } else { 0.0 };
+            if r == 0 {
+                // Exact: `19.99 / 2` is 9.995, a tie the rounding settles.
+                Some(ExactNumber { m: q, e: -k, err: carried })
+            } else {
+                // A sticky digit past the cut: the quotient lies strictly
+                // between q and the next unit, so a tie at the target is
+                // never mistaken for one, and the cut is in the bound.
+                let sign = numerator.signum() * b.m.signum();
+                q.checked_mul(10).and_then(|m| m.checked_add(5 * sign)).map(|m| ExactNumber {
+                    m,
+                    e: -(k + 1),
+                    err: 0.5 * 10f64.powi(-k) + carried,
+                })
+            }
         }
         ArithOp::Rem => None,
     })
@@ -4043,6 +4101,14 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             }
         }
     }
+    // Two NUMERICs, one carrying its own scale: compared at their scales.
+    if let Value::Data { db_type: DbType::DECIMAL, .. } = b {
+        if *at == DbType::DECIMAL && (ab.len() == 17 || bb.len() == 17) {
+            if let (Some(x), Some(y)) = (numeric_key(at, ab), numeric_key(&DbType::DECIMAL, bb)) {
+                return Some(x.cmp_exact(&y));
+            }
+        }
+    }
     // Two numeric types: widened to a common one rather than reading `b`'s
     // bytes as `a`'s type, which made `compare(a, b)` and `compare(b, a)`
     // disagree for mixed widths (`COALESCE(bigint, int)`, `LEAST`, `CASE`) —
@@ -4104,10 +4170,12 @@ fn numeric_key(db_type: &DbType, bytes: &[u8]) -> Option<NumKey> {
             mag: u128::from_le_bytes(b.try_into().ok()?),
             scale: 0,
         },
-        DbType::DECIMAL => signed(
-            i128::from_le_bytes(b.try_into().ok()?),
-            crate::core::value_codec::DECIMAL_SCALE,
-        ),
+        // A cell carrying its own scale (a NUMERIC with more places than
+        // the engine's, `eval_output`) at that scale.
+        DbType::DECIMAL => {
+            let (v, own) = crate::core::value_codec::split_decimal_cell(b)?;
+            signed(v, own.unwrap_or(crate::core::value_codec::DECIMAL_SCALE))
+        }
         DbType::F32 => NumKey::Float(f32::from_le_bytes(b.try_into().ok()?) as f64),
         DbType::F64 => NumKey::Float(f64::from_le_bytes(b.try_into().ok()?)),
         _ => return None,
@@ -4387,6 +4455,32 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 other => cast(to_engine_scale(other, field)?, &DbType::STRING)?,
             }
         }
+        // Over a NUMERIC with more places than the engine's: a float is the
+        // nearest to the exact value and text is the exact value (both were
+        // refused for the places past nine).
+        Expr::Cast(inner, target @ (DbType::F64 | DbType::F32 | DbType::STRING))
+            if wide_exact(inner, row, schema)?.is_some() =>
+        {
+            match wide_exact(inner, row, schema)?.flatten() {
+                None => Value::Null,
+                Some(x) if *target == DbType::STRING => {
+                    let text = if x.e <= 0 {
+                        crate::core::value_codec::format_decimal_scaled(x.m, x.e.unsigned_abs())
+                    } else {
+                        format!("{}{}", x.m, "0".repeat(x.e as usize))
+                    };
+                    Value::Data { bytes: text.into_bytes(), db_type: DbType::STRING }
+                }
+                Some(x) => {
+                    let f: f64 = format!("{}e{}", x.m, x.e).parse().map_err(|_| "value out of range".to_string())?;
+                    if *target == DbType::F32 {
+                        Value::Data { bytes: (f as f32).to_le_bytes().to_vec(), db_type: DbType::F32 }
+                    } else {
+                        Value::Data { bytes: f.to_le_bytes().to_vec(), db_type: DbType::F64 }
+                    }
+                }
+            }
+        }
         Expr::Cast(inner, target) => {
             let value = eval(inner, row, schema)?;
             // A NUMERIC rendered as text keeps the places PostgreSQL displays
@@ -4415,6 +4509,20 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             scale,
         } => {
             use crate::core::value_codec::DECIMAL_SCALE;
+            // Over a NUMERIC with more places than the engine's, rounded from
+            // the exact value (it was refused for the places past nine).
+            if *scale <= DECIMAL_SCALE {
+                if let Some(exact) = wide_exact(value, row, schema)? {
+                    let Some(exact) = exact else { return Ok(Value::Null) };
+                    let rounded = exact
+                        .settle(*scale)
+                        .ok_or_else(|| "value overflows numeric format".to_string())?;
+                    crate::core::value_codec::check_numeric_precision(rounded, *precision, *scale)?;
+                    let lifted = rescale_decimal(rounded, *scale, DECIMAL_SCALE)
+                        .ok_or_else(|| "value overflows numeric format".to_string())?;
+                    return Ok(Value::Data { bytes: lifted.to_le_bytes().to_vec(), db_type: DbType::DECIMAL });
+                }
+            }
             let Value::Data { bytes, .. } = eval(value, row, schema)? else {
                 return Ok(Value::Null);
             };
@@ -4620,6 +4728,36 @@ pub fn eval_condition_3vl(
     row: &Row,
     schema: &[SchemaField],
 ) -> Result<Option<bool>, String> {
+    // A NUMERIC with more places than the engine's, compared exactly: read
+    // through the engine it was refused for the places past nine, so `CASE
+    // WHEN a > 1` failed on a NUMERIC(20,12) value with digits there.
+    if let (Some(right), true) = (&condition.right, matches!(condition.cmp, Cmp::Eq | Cmp::Ne | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge)) {
+        if reads_wide_decimal(&condition.left, schema) || reads_wide_decimal(right, schema) {
+            if let (Some(a), Some(b)) =
+                (exact_numeric(&condition.left, row, schema, 30)?, exact_numeric(right, row, schema, 30)?)
+            {
+                let (Some(a), Some(b)) = (a, b) else { return Ok(None) };
+                if let Some((x, y, e)) = ExactNumber::aligned(a, b) {
+                    // A float-carried literal is within its bound of the
+                    // number written; the order is certain when the two are
+                    // further apart than both bounds.
+                    let bound = a.err + b.err;
+                    let apart = x.checked_sub(y).map_or(0.0, |d| (d as f64).abs() * 10f64.powi(e));
+                    if bound == 0.0 || apart > bound * 1.000001 {
+                        let ordering = x.cmp(&y);
+                        return Ok(Some(match condition.cmp {
+                            Cmp::Eq => ordering.is_eq(),
+                            Cmp::Ne => !ordering.is_eq(),
+                            Cmp::Lt => ordering.is_lt(),
+                            Cmp::Le => ordering.is_le(),
+                            Cmp::Gt => ordering.is_gt(),
+                            _ => ordering.is_ge(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
     let left = eval(&condition.left, row, schema)?;
     match condition.cmp {
         Cmp::IsNull => return Ok(Some(left.is_null())),

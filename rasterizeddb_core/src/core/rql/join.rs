@@ -1257,7 +1257,7 @@ impl<'p> Projector<'p> {
             if let Some(expr) = item.expr.as_ref() {
                 let (bytes, column_type) = match (synthetic.as_ref(), plan.order_layout.as_ref()) {
                     (Some(row), Some(layout)) => {
-                        match crate::core::rql::expr::eval(expr, row, &layout.schema) {
+                        match crate::core::rql::expr::eval_output(expr, row, &layout.schema) {
                             // Coerced to the type this item was *described* as.
                             // The row description is sent before any row, and a
                             // payload of a different width than the type it was
@@ -1370,12 +1370,17 @@ impl<'p> Projector<'p> {
         }
     }
 
-    /// Logs the first expression failure, once. The column is NULL in every
-    /// row it failed for, which is visible; saying nothing would leave a NULL
-    /// that looks like data.
-    pub fn report(&self) {
-        if let Some(e) = self.expression_failure.as_ref() {
-            log::error!("join SELECT list expression failed: {}", e);
+    /// The first expression failure, as the statement's error.
+    ///
+    /// It used to be logged while the column went out NULL in every row it
+    /// failed for, and the statement succeeded: `UPDATE … SET s = w.a + 1
+    /// FROM w …` stored that NULL, a join SELECT returned it as data. A
+    /// failing expression fails the statement, as it does on one table and as
+    /// an aggregate's argument does.
+    pub fn finish(&self) -> Result<(), String> {
+        match self.expression_failure.as_ref() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
     }
 }
@@ -1392,10 +1397,10 @@ fn mb_from(bytes: &[u8]) -> crate::memory_pool::MemoryBlock {
 ///
 /// [`project_serialized`], decoded. For the paths that must still edit rows
 /// after projecting — hydrating a shredded JSON column — and for tests.
-pub fn project(plan: &JoinPlan, combined: Joined<'_>) -> Vec<Row> {
+pub fn project(plan: &JoinPlan, combined: Joined<'_>) -> Result<Vec<Row>, String> {
     let mut bytes = Vec::new();
-    project_serialized(plan, &combined, &mut bytes);
-    crate::core::row::row::vec_into_rows(&bytes).expect("rows this function serialized")
+    project_serialized(plan, &combined, &mut bytes)?;
+    Ok(crate::core::row::row::vec_into_rows(&bytes).expect("rows this function serialized"))
 }
 
 /// Projects combined tuples into serialized output rows appended to `out`,
@@ -1406,7 +1411,7 @@ pub fn project(plan: &JoinPlan, combined: Joined<'_>) -> Vec<Row> {
 /// 1.5 KB elements. `ORDER BY` sorts row indices, not rows (an expression sort
 /// used to move a 1584-byte `(keys, Row)` element per swap), and `DISTINCT`
 /// keeps a hash table of row indices rather than a byte copy of every row.
-pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<u8>) {
+pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<u8>) -> Result<(), String> {
     let mut projector = Projector::new(plan);
 
     // A key addresses a projected column by position, so it is resolved once
@@ -1434,8 +1439,7 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
         for tuple in combined.iter().skip(skip).take(take) {
             projector.row(tuple).extend_serialized(out);
         }
-        projector.report();
-        return;
+        return projector.finish();
     }
 
     let mut rows: Vec<u8> = Vec::with_capacity(combined.len() * 32);
@@ -1444,7 +1448,7 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
         starts.push(rows.len());
         projector.row(tuple).extend_serialized(&mut rows);
     }
-    projector.report();
+    projector.finish()?;
     let row_at = |i: u32| -> &[u8] {
         let i = i as usize;
         let end = starts.get(i + 1).copied().unwrap_or(rows.len());
@@ -1472,13 +1476,12 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
                     combined_row_with(plan, &layout.columns, &companions, combined.tuple(index));
                 let mut values = Vec::with_capacity(plan.order_exprs.len());
                 for (expr, _, _) in plan.order_exprs.iter() {
-                    match crate::core::rql::expr::eval(expr, &synthetic, &layout.schema) {
+                    match crate::core::rql::expr::eval_output(expr, &synthetic, &layout.schema) {
                         Ok(value) => values.push(value),
                         Err(e) => {
-                            // Sorts as NULL so the comparator stays total, and
-                            // reported once: an ORDER BY that silently gave up
-                            // would return the rows in scan order and look
-                            // ordered.
+                            // A key that cannot be computed fails the
+                            // statement. It sorted as NULL and was logged, so
+                            // the rows came back in an order nobody asked for.
                             failure.get_or_insert(e);
                             values.push(crate::core::rql::expr::Value::Null);
                         }
@@ -1487,7 +1490,7 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
                 keys.push(values);
             }
             if let Some(e) = failure {
-                log::error!("join ORDER BY expression failed: {}", e);
+                return Err(e);
             }
             sort_or_select(&mut order, plan, |a, b| {
                 crate::core::rql::expr::compare_key_values(
@@ -1569,6 +1572,7 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
     for i in order.into_iter().skip(skip).take(take) {
         out.extend_from_slice(row_at(i));
     }
+    Ok(())
 }
 
 /// Orders `order` by `cmp`, ties left in scan order — or, when a page without
@@ -1609,7 +1613,7 @@ pub fn fold_joined(
     for tuple in combined.iter() {
         folder.push(&projector.row(tuple))?;
     }
-    projector.report();
+    projector.finish()?;
     folder.finish_into(out)
 }
 
@@ -5093,7 +5097,7 @@ mod tests {
     #[test]
     fn inner_join_pairs_rows_on_the_key() {
         let plan = two_relation_plan(JoinKind::Inner);
-        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join")).expect("project");
         assert_eq!(
             rendered(&out),
             vec!["Alice|Acme", "Bob|Acme", "Carol|Globex"]
@@ -5108,7 +5112,8 @@ mod tests {
         let out = project(
             &plan,
             combine(&plan, &sets(vec![users(), only_globex])).expect("join"),
-        );
+        )
+        .expect("project");
         assert_eq!(rendered(&out), vec!["Carol|Globex"]);
     }
 
@@ -5119,7 +5124,8 @@ mod tests {
         let out = project(
             &plan,
             combine(&plan, &sets(vec![users(), only_globex])).expect("join"),
-        );
+        )
+        .expect("project");
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|Globex"]);
     }
 
@@ -5134,7 +5140,7 @@ mod tests {
             (0, DbType::STRING, b"d1"),
             (1, DbType::STRING, b"Acme Two"),
         ]));
-        let out = project(&plan, combine(&plan, &sets(vec![users(), ds])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), ds])).expect("join")).expect("project");
         assert_eq!(out.len(), 5, "Alice and Bob each match two rows");
     }
 
@@ -5143,7 +5149,7 @@ mod tests {
         let mut plan = two_relation_plan(JoinKind::Inner);
         let name = plan.relations[0].fetch_columns[1].clone();
         plan.order_by = vec![(0, name, true)];
-        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join")).expect("project");
         assert_eq!(
             rendered(&out),
             vec!["Carol|Globex", "Bob|Acme", "Alice|Acme"]
@@ -5159,7 +5165,7 @@ mod tests {
         // Domain ascending, and within one domain the name descending. Alice
         // and Bob tie on Acme, so only the second key separates them.
         plan.order_by = vec![(1, domain, false), (0, name, true)];
-        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join")).expect("project");
         assert_eq!(
             rendered(&out),
             vec!["Bob|Acme", "Alice|Acme", "Carol|Globex"]
@@ -5173,7 +5179,7 @@ mod tests {
         plan.order_by = vec![(0, name, false)];
         plan.offset = Some(1);
         plan.limit = Some(1);
-        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join")).expect("project");
         assert_eq!(rendered(&out), vec!["Bob|Acme"]);
     }
 
@@ -5183,7 +5189,8 @@ mod tests {
         let out = project(
             &plan,
             combine(&plan, &sets(vec![Vec::new(), domains()])).expect("join"),
-        );
+        )
+        .expect("project");
         assert!(out.is_empty());
     }
 
@@ -5236,12 +5243,13 @@ mod tests {
         let out = project(
             &plan,
             combine(&plan, &sets(vec![users(), only_globex.clone()])).expect("join"),
-        );
+        )
+        .expect("project");
         assert_eq!(rendered(&out), vec!["Carol|Globex", "Alice|", "Bob|"]);
 
         plan.order_by = vec![(1, domain, true), (0, name, false)];
         plan.limit = Some(2);
-        let out = project(&plan, combine(&plan, &sets(vec![users(), only_globex])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), only_globex])).expect("join")).expect("project");
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|"]);
     }
 
@@ -5249,7 +5257,7 @@ mod tests {
     #[test]
     fn left_join_against_an_empty_relation_keeps_every_left_row() {
         let plan = two_relation_plan(JoinKind::Left);
-        let out = project(&plan, combine(&plan, &sets(vec![users(), Vec::new()])).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), Vec::new()])).expect("join")).expect("project");
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|"]);
     }
 
@@ -5642,7 +5650,7 @@ mod join_bench {
             let mut out_len = 0;
             for _ in 0..5 {
                 let t = std::time::Instant::now();
-                let out = project(&plan, combine(&plan, &scanned).unwrap());
+                let out = project(&plan, combine(&plan, &scanned).unwrap()).unwrap();
                 times.push(t.elapsed().as_secs_f64() * 1000.0);
                 out_len = out.len();
             }
@@ -5861,7 +5869,7 @@ mod outer_join_reference {
             &schema_of,
         )
         .unwrap_or_else(|e| panic!("plan {}: {}", sql_from, e));
-        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")))
+        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")).expect("project"))
     }
 
     fn cell(rows: &[Gen], at: Option<usize>, f: impl Fn(&Gen) -> Option<i64>) -> Option<i64> {
@@ -5945,7 +5953,7 @@ mod outer_join_reference {
             &schema_of,
         )
         .unwrap_or_else(|e| panic!("plan {} WHERE {}: {}", sql_from, where_clause, e));
-        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")))
+        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")).expect("project"))
     }
 
     /// The pre-rewrite `project`'s sort, DISTINCT and paging, over a
@@ -5982,7 +5990,7 @@ mod outer_join_reference {
                         .iter()
                         .map(|(e, _, _)| {
                             crate::core::rql::expr::eval(e, &synthetic, &layout.schema)
-                                .unwrap_or(crate::core::rql::expr::Value::Null)
+                                .expect("a reference sort key")
                         })
                         .collect();
                     keyed.push((values, row));
@@ -6089,7 +6097,7 @@ mod outer_join_reference {
                             let joined = combine(&p, &rels).expect("join");
                             let want = project_reference(&p, &joined);
                             let mut bytes = Vec::new();
-                            project_serialized(&p, &joined, &mut bytes);
+                            project_serialized(&p, &joined, &mut bytes).expect("project");
                             let got = crate::core::row::row::vec_into_rows(&bytes).expect("rows");
                             assert_eq!(exact(&got), exact(&want), "round {}: {}", round, sql);
                             checked += 1;

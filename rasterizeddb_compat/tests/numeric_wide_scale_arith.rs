@@ -11,7 +11,7 @@
 //! refused (0A000), never answered without its digits.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor, Row};
+use sqlx::{AssertSqlSafe, Executor, Row, ValueRef};
 
 struct Root(String);
 
@@ -111,13 +111,14 @@ async fn wide_scale(partitioning: &str) {
             .collect();
         assert_eq!(back, ["0.123456789124"], "{partitioning}");
 
-        // What cannot be carried exactly is refused, not cut: the column's
-        // digits past nine in a SELECT or a WHERE, a literal past nine in
-        // WHERE arithmetic, and an assignment the float a long literal is
-        // carried as cannot settle (PostgreSQL: 0.000000000001).
+        // What cannot be carried exactly is refused, not cut: WHERE-clause
+        // arithmetic over the column's digits past nine, a literal past nine
+        // there, a quotient that does not end, and an assignment the float a
+        // long literal is carried as cannot settle (PostgreSQL:
+        // 0.000000000001).
         for sql in [
-            "SELECT a + 1 FROM w WHERE id = 1",
             "SELECT id FROM w WHERE a + 1 > 1",
+            "SELECT a / 3 FROM w WHERE id = 1",
             "SELECT id FROM w WHERE a + 0.000000000001 > 1",
             "UPDATE w SET a = 0.0000000000004999999999999999999 + a * 0 WHERE id = 5",
         ] {
@@ -133,6 +134,49 @@ async fn wide_scale(partitioning: &str) {
             .expect("select");
         assert_eq!(r.get::<String, _>(0), "1.100000000000", "{partitioning}");
         assert_eq!(r.get::<f64, _>(1), 5.5e-10, "{partitioning}");
+
+        // Reads of the digits past nine that are exact are answered exactly
+        // (they were refused): a comparison, casts, unary minus, COALESCE,
+        // + - * between NUMERICs, an ORDER BY key, a join's projection.
+        let text = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::raw_sql(AssertSqlSafe(sql))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                    .iter()
+                    .map(|r| {
+                        (0..r.len())
+                            .map(|i| r.try_get_raw(i).ok().and_then(|v| v.as_str().ok().map(str::to_string)).unwrap_or("NULL".into()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            text("SELECT a + 1, -a, COALESCE(a, 0), a * 2, a - a FROM w WHERE id = 1").await,
+            ["1.123456789124 -0.123456789124 0.123456789124 0.246913578248 0.000000000000"],
+            "{partitioning}"
+        );
+        assert_eq!(
+            text("SELECT CASE WHEN a > 0.1234567891239 THEN 'big' ELSE 'small' END, a::numeric(10,2), a::float8, a::text FROM w WHERE id = 1").await,
+            ["big 0.12 0.123456789124 0.123456789124"],
+            "{partitioning}"
+        );
+        assert_eq!(
+            text("SELECT id FROM w WHERE a IS NOT NULL ORDER BY a + 1 DESC LIMIT 3").await,
+            ["8", "1", "5"],
+            "{partitioning}"
+        );
+        run(&pool, "CREATE TABLE wj (id INT PRIMARY KEY, b NUMERIC(20,12))").await;
+        run(&pool, "INSERT INTO wj VALUES (1, 0.000000000001)").await;
+        assert_eq!(
+            text("SELECT w.a + wj.b FROM w JOIN wj ON wj.id = w.id").await,
+            ["0.123456789125"],
+            "{partitioning}"
+        );
     }
     let server = TestServer::start_file_backed(&dir.0).await.expect("restart");
     let pool = server.connect_sqlx().await.expect("connect");

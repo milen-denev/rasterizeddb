@@ -185,21 +185,14 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         };
         let text = crate::core::rql::subquery::value_to_literal(lit_type, mb.into_slice())?;
         let text = crate::core::value_codec::unquote_sql(&text);
-        let (m, e) = crate::core::rql::expr::decimal_digits(text.trim())?;
-        // Exact at the column's scale: the ordinary path encodes it there.
-        let shift = e.checked_add(scale as i32)?;
-        if shift >= 0 {
+        // The literal's units at the column's scale, cut toward zero, and
+        // whether anything nonzero was cut. Read off its digits, so a literal
+        // longer than an i128 holds (48 digits) is still exact.
+        let (q, cut, negative) = units_at_scale(text.trim(), scale)?;
+        if !cut {
             return None;
         }
-        // The literal is m·10^e; the column's units below and above it.
-        let (q, r) = match 10i128.checked_pow(shift.unsigned_abs()) {
-            Some(divisor) => (m / divisor, m % divisor),
-            None => (0, m),
-        };
-        if r == 0 {
-            return None;
-        }
-        let below = if m < 0 { q - 1 } else { q };
+        let below = if negative { q - 1 } else { q };
         let above = below + 1;
         let constant = |holds: bool| {
             let one = numeric_to_mb(&NumericValue::I32(1));
@@ -1548,7 +1541,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                         j += 1;
                     }
                     let number = matches!(self.toks.get(j), Some(Token::Number(_)))
-                        || matches!(self.toks.get(j), Some(Token::StringLit(t)) if crate::core::value_codec::parse_decimal(t).is_some());
+                        || matches!(self.toks.get(j), Some(Token::StringLit(t)) if units_at_scale(t, 0).is_some());
                     if number && matches!(self.toks.get(j + 1), Some(Token::RPar)) {
                         start += 1;
                         close = true;
@@ -1565,7 +1558,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 // Only when a number follows the signs: otherwise nothing is
                 // consumed beyond the first sign, as before.
                 let number_next = matches!(self.toks.get(start), Some(Token::Number(_)))
-                    || matches!(self.toks.get(start), Some(Token::StringLit(t)) if crate::core::value_codec::parse_decimal(t).is_some());
+                    || matches!(self.toks.get(start), Some(Token::StringLit(t)) if units_at_scale(t, 0).is_some());
                 if number_next {
                     self.pos = start;
                 } else {
@@ -1586,7 +1579,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 // as its text (see the tokenizer's `number_token`), and takes
                 // its sign the same way.
                 if let Some(Token::StringLit(text)) = self.toks.get(self.pos).cloned() {
-                    if crate::core::value_codec::parse_decimal(&text).is_some() {
+                    if units_at_scale(&text, 0).is_some() {
                         self.pos += 1;
                         let signed = match (negate, text.strip_prefix('-')) {
                             (true, Some(positive)) => positive.to_string(),
@@ -3726,4 +3719,46 @@ mod tests {
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
     }
+}
+
+/// A plain decimal literal (`-0.125`, `1e-12`, any number of digits) at
+/// `scale` places: its units cut toward zero, whether a nonzero digit was
+/// cut, and its sign. `None` for anything that is not such a number, or
+/// whose kept units do not fit an i128.
+fn units_at_scale(text: &str, scale: u32) -> Option<(i128, bool, bool)> {
+    let (negative, body) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], body[at + 1..].parse::<i64>().ok()?),
+        None => (body, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // All digits, and where the point falls among them after the exponent.
+    let digits: Vec<u8> = whole.bytes().chain(fraction.bytes()).map(|b| b - b'0').collect();
+    let point = whole.len() as i64 + exponent;
+    // Units at `scale` places: the digits up to `point + scale`.
+    let keep = point + i64::from(scale);
+    let mut units: i128 = 0;
+    let mut cut = false;
+    for (i, d) in digits.iter().enumerate() {
+        if (i as i64) < keep {
+            units = units.checked_mul(10)?.checked_add(i128::from(*d))?;
+        } else if *d != 0 {
+            cut = true;
+        }
+    }
+    // Zeros the digits do not reach (`5e3` at two places).
+    for _ in digits.len() as i64..keep.max(0) {
+        units = units.checked_mul(10)?;
+    }
+    if keep < 0 {
+        units = 0;
+    }
+    Some((if negative { -units } else { units }, cut, negative && (units != 0 || cut)))
 }

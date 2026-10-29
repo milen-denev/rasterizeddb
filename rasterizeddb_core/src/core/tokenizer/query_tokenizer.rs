@@ -916,7 +916,8 @@ fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token
         if numeric_context && text.contains(['.', 'e', 'E']) {
             let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
             let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
-            if written.is_some() && written != read {
+            // More digits than an i128 holds is never what the float is.
+            if written != read && (written.is_some() || is_plain_decimal(text)) {
                 return Token::StringLit(text.to_string());
             }
         }
@@ -930,7 +931,21 @@ fn numeric_value_is_lossy_fraction(text: &str, value: &NumericValue) -> bool {
         return false;
     };
     let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
-    written.is_some() && written != crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits)
+    if written.is_none() {
+        return is_plain_decimal(text);
+    }
+    written != crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits)
+}
+
+/// Digits with at most one point, an optional sign and exponent: a number
+/// as written, however long.
+fn is_plain_decimal(text: &str) -> bool {
+    let body = text.trim_start_matches(['-', '+']);
+    let mantissa = body.split(['e', 'E']).next().unwrap_or("");
+    !mantissa.is_empty()
+        && mantissa.bytes().any(|b| b.is_ascii_digit())
+        && mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && mantissa.bytes().filter(|b| *b == b'.').count() <= 1
 }
 
 /// `m × 10^e` with the trailing zeros of `m` moved into `e`, so equal
