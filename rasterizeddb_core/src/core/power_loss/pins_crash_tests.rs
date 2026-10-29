@@ -360,3 +360,134 @@ async fn serial_values_never_repeat_after_a_power_cut() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// A forget round's `SWEPT`s across a page boundary of the map log, then a
+/// power cut with nothing else synced (the log writer's round held off this
+/// directory): every image opens the table untorn and unrefused, holds the
+/// round's pins, and still compacts and reaps.
+///
+/// From the rebase review's probe (`probe_unsynced_swept_tail_images`): the
+/// map log padded to a few dozen bytes short of a page so the batch
+/// straddles it. With the records appended data-first and their sync left to
+/// group commit, 6 of 400 images refused the whole table (zeros where the
+/// first page's tail was dropped, then a record whose page survived) and 118
+/// kept torn evidence, which turns compaction and reaping off.
+///
+/// Mutation: `MapLogFile::append_all` taking the logged append
+/// (`append_data_txn`) whatever the provider: images refuse the table or
+/// come back torn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_power_cut_after_a_forget_round_never_tears_the_map() {
+    const IMAGES: u64 = 400;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _held = crate::core::log_writer::test_hooks::hold(base.path());
+    let db = open(&dir, "pins_cut").await.unwrap();
+    exec(&db, "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 8")
+        .await
+        .unwrap();
+    let values: Vec<String> = (1..=64i64).map(|t| format!("({t}, {t}, 'c')")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await.unwrap();
+    let t = pt(&db);
+    let pids = materialized(&t);
+    assert_eq!(pids.len(), 8);
+    let board = t.pin_board().unwrap().clone();
+    let small_advance = |db: &Database| {
+        for _ in 0..20 {
+            let tx = db.transactions.begin();
+            db.transactions.commit(tx);
+        }
+        db.transactions.settle_now();
+    };
+    let map_len = || async { crate::core::storage_providers::traits::StorageIO::get_len(&*board.log.io()).await };
+    // Write to every partition (a durable `DIRTY` each) and sweep them all,
+    // until the log ends where the next round's eight `SWEPT`s (23 bytes
+    // each) straddle a page with a whole record past it.
+    let mut next_id = 1000i64;
+    let mut found = false;
+    for _ in 0..400 {
+        let vals: Vec<String> = (1..=64i64)
+            .map(|t| {
+                next_id += 1;
+                format!("({t}, {next_id}, 'w')")
+            })
+            .collect();
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", vals.join(", "))).await.unwrap();
+        let r = map_len().await % 4096;
+        if (4096 - 150..4096 - 30).contains(&r) {
+            found = true;
+            break;
+        }
+        small_advance(&db);
+        for (pid, r) in board.sweep_all(&pids).await.unwrap() {
+            r.unwrap_or_else(|e| panic!("pid {pid}: {e}"));
+        }
+    }
+    assert!(found, "the map log never ended in the page window");
+    small_advance(&db);
+    db.sync_durable().unwrap();
+    let before = map_len().await;
+
+    let rec = Recorder::start(&dir);
+    for (pid, r) in board.sweep_all(&pids).await.unwrap() {
+        let r = r.unwrap_or_else(|e| panic!("pid {pid}: {e}"));
+        assert!(r.advanced_to.is_some(), "pid {pid} did not advance: {r:?}");
+    }
+    let after = map_len().await;
+    assert!(
+        before % 4096 + (after - before) > 4096 + 23,
+        "the round's records ({before}..{after}) do not cross a page with a whole record past it"
+    );
+    let mut pins = Vec::new();
+    for &pid in &pids {
+        pins.push(t.pin_of(pid).await.unwrap());
+    }
+    let cut = rec.cut_quiescent("after a forget round's SWEPTs").unwrap();
+    let uid = t.uid();
+    drop(t);
+    drop(board);
+    close(&dir, db);
+    drop(rec);
+
+    let img = base.path().join("image");
+    let mut problems = Vec::new();
+    for seed in 0..IMAGES {
+        cut.write_image(seed, &img);
+        let db = match open(&img, "pins_cut").await {
+            Ok(db) => db,
+            Err(e) => {
+                problems.push(format!("seed {seed}: the database does not open: {e}"));
+                let _ = std::fs::remove_dir_all(&img);
+                continue;
+            }
+        };
+        let t = pt(&db);
+        if let Some(why) = t.broken() {
+            problems.push(format!("seed {seed}: the table is refused: {why}"));
+        } else if let Some(why) = t.torn() {
+            problems.push(format!("seed {seed}: the map log is torn: {why}"));
+        } else {
+            for (&pid, pin) in pids.iter().zip(&pins) {
+                let got = t.pin_of(pid).await.unwrap();
+                if got != *pin {
+                    problems.push(format!("seed {seed}: partition {pid} pins at {got:?}, the round left {pin:?}"));
+                }
+            }
+            match t.pin_board().unwrap().compact().await {
+                Ok(true) => {}
+                other => problems.push(format!("seed {seed}: compaction did not run: {other:?}")),
+            }
+            if let Err(why) = crate::core::partition::files::read_live_map(&img, uid) {
+                problems.push(format!("seed {seed}: reaping is off: {why}"));
+            }
+            if let Err(e) = exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (5, 5555, 'after')").await {
+                problems.push(format!("seed {seed}: an insert failed: {e}"));
+            }
+        }
+        drop(t);
+        close(&img, db);
+        let _ = std::fs::remove_dir_all(&img);
+    }
+    assert!(problems.is_empty(), "{} of {IMAGES} images:\n{}", problems.len(), problems.join("\n"));
+}

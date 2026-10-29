@@ -1078,3 +1078,59 @@ async fn an_insert_during_the_clean_shutdown_write_never_repeats_after_a_restart
     assert_distinct(&got, "an insert during the clean-shutdown write, then a restart");
     close(&dir, db);
 }
+
+/// The log syncs one forget round of eight pinned partitions takes, with
+/// nothing to rewrite (`clean`: every stamp committed) and with an aborted
+/// row in every partition (each sweep's rewrites synced first, as
+/// `neutralize_aborted_from` makes them durable). Counted from the WAL's own
+/// sync site, with the scheduler's rounds and the log writer's held off the
+/// directory.
+async fn forget_round_syncs(aborted: bool) -> (usize, usize) {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _held = crate::core::log_writer::test_hooks::hold(base.path());
+    let db = open(&dir).await;
+    // Before any board registers, so the scheduler's first sleep is this.
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(&db, "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 8").await;
+    let values: Vec<String> = (1..=64i64).map(|t| format!("({t}, {t}, 'c')")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let t = pt(&db);
+    assert_eq!(materialized(&t).len(), 8);
+    if aborted {
+        let x = db.transactions.begin();
+        let values: Vec<String> = (1..=64i64).map(|t| format!("({t}, {}, 'aborted')", 1000 + t)).collect();
+        exec_in(&db, x, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+        db.abort_transaction(x);
+    }
+    advance(&db);
+    db.sync_durable().unwrap();
+    let board = t.pin_board().unwrap().clone();
+    board.set_step(1);
+    let watch = crate::core::sync_audit::watch(&dir);
+    let advanced = board.forget_round(8).await;
+    let syncs = watch.take().iter().filter(|(tag, _)| *tag == "wal.log").count();
+    drop(watch);
+    drop((t, board));
+    close(&dir, db);
+    (advanced, syncs)
+}
+
+/// A forget round's `SWEPT`s are one map-log transaction: one log sync for
+/// the round, however many partitions advanced, on top of the syncs each
+/// sweep's own rewrites take. Written ahead of the log, a `SWEPT` cannot be
+/// left to group commit (a transaction holding an in-place write syncs at
+/// its commit), so unbatched a round of eight took eight.
+///
+/// Mutation: `forget_round` sweeping each partition with its own `sweep`
+/// (the unbatched form): eight syncs for a clean round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_round_takes_one_map_log_sync() {
+    let (advanced, clean) = forget_round_syncs(false).await;
+    assert_eq!(advanced, 8, "not every pinned partition advanced");
+    let (advanced, rewriting) = forget_round_syncs(true).await;
+    assert_eq!(advanced, 8, "not every pinned partition advanced");
+    eprintln!("log syncs for one forget round of 8 partitions: {clean} with nothing to rewrite, {rewriting} with an aborted row in each");
+    assert_eq!(clean, 1, "a clean round took {clean} log syncs");
+}

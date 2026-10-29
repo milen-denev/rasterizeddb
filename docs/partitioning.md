@@ -232,8 +232,11 @@ the registry.
   once a pin lags the settle bound by `FORGET_STEP`, or
   `Table::neutralize_aborted_now` / `PartitionedTable::sweep_pin_now`)
   runs `vacuum::neutralize_aborted_from` through the unit, then appends
-  `SWEPT` (group commit; a lost one only pins lower), moves the pin to `h`
-  or clears it, and asks the registry to forget. Clean needs the sweep to
+  `SWEPT`, moves the pin to `h` or clears it, and asks the registry to
+  forget. A forget round's `SWEPT`s are one map-log transaction
+  (`PinBoard::sweep_all`): one log sync per table per round, the pins
+  raised only once it has committed (see "Map-log appends are written
+  ahead" below). Clean needs the sweep to
   have seen **no stamp at or above `h`** (`NeutralizeReport::newer`: a
   running transaction's stamp may still abort) and **no writer inside or
   entering**: the watch counts `active` before `seq` per entry, the sweep
@@ -285,6 +288,28 @@ from its maximum after a restart, differs there). **A sequence a second
 table shares** through a hand-written `nextval` default is reserved only by
 the table whose defaults this file serves; the other table seeds it by its
 own rules.
+
+**Map-log appends are written ahead** (§3.2; rebase review of 2bae3f8).
+`SWEPT` was appended as the logged append writes every record: data file
+first, log record after, sync left to group commit. A power cut before a
+sync could keep the map log's new length and drop its pages, and a forget
+round that rewrote nothing never synced: of 400 crash images of eight
+`SWEPT`s across a page, 118 kept torn evidence (compaction and reaping off
+until an operator looked) and 6 refused the whole table (zeros, then a
+record whose page survived), its `broken_pin` then holding the forgotten
+horizon for good. `MapLogFile::append_all` now writes every record kind
+as `torn_tail::SidecarWrites` writes the schema sidecars: an in-place write
+at the log's end, held by the WAL until its record is durable and applied
+only then, so no crash tears the file and the evidence and refusal logic is
+left for media damage. A transaction holding an in-place write syncs at its
+commit, so appends are batched: a forget round's `SWEPT`s (one sync for
+the round, measured `a_forget_round_takes_one_map_log_sync`: 1 for eight
+partitions with nothing to rewrite, against 0 before and 8 unbatched; 9
+with an aborted row in each, against 8 before and 16 unbatched, eight of
+them the sweeps' own rewrite syncs), `CREATE`'s three records, a compaction's opening records and its
+captured tail. Without a log (`wal_enabled = false`) records are appended
+directly and flushed, as before. Pinned by
+`power_loss::pins_crash_tests::a_power_cut_after_a_forget_round_never_tears_the_map`.
 
 **Map-log generations** (§3.2). `PinBoard::compact`, from the scheduler
 once the log passes twice its generation's opening bytes plus 1 MiB:
@@ -2044,10 +2069,15 @@ sharding's cluster map reuses with records of its own
 | `PLACE` | `[(pid, lo)]`: one record per `CREATE` or reshape. No location: an unwritten partition has none (§6.1). | fsync |
 | `MATERIALIZE` | `(pid, floor, loc_idx)`: the files exist at that location; the forget floor at that moment (§7.2) | WAL record at append; fsync, once per partition |
 | `DIRTY` | `(pid, floor)`: a clean partition is about to take its first stamp (§7.2) | root log durable before the stamp |
-| `SWEPT` | `(pid, swept_to, clean)`, appended after the sweep's writes are durable | group commit |
-| `STATS` | `(pid, rows, bytes)`, after vacuum and on a close that wrote something | group commit |
+| `SWEPT` | `(pid, swept_to, clean)`, appended after the sweep's writes are durable | fsync, one per forget round (batched) |
+| `STATS` | `(pid, rows, bytes)`, after vacuum and on a close that wrote something | fsync (written ahead, as every record) |
 | `RESHAPE_BEGIN` / `_COMMIT` / `_ABORT` | sources and new entries, with targets' locations | fsync |
-| `RETIRED_GONE`, `DROPPED` | pids / none | group commit / fsync |
+| `RETIRED_GONE`, `DROPPED` | pids / none | fsync |
+
+Every record is written ahead of the log since the P5a rebase review
+(`MapLogFile::append_all`): an in-place write the WAL applies only after its
+record is durable, so a crash never tears the map log, and "group commit"
+here is gone; records that may share a sync are appended as one transaction.
 
 **`MATERIALIZE` is fsynced, once per partition.** Order: delete leftover
 `__pt_<uid>_<pid>*` files (§12), create the files exclusively, fsync the
@@ -2529,7 +2559,9 @@ partitions' **pins**:
   `MATERIALIZE` floor until swept again; a clean `SWEPT` pins nothing. Sound:
   stamps below the pin were neutralized, later ones are newer, and nothing
   stamps after a clean `SWEPT` without a durable `DIRTY`. A lost `SWEPT` only
-  pins lower, so it needs no fsync.
+  pins lower, so its correctness needs no fsync; it takes one anyway, shared
+  by its forget round, because a map-log record left unsynced could tear the
+  file in a power cut (§3.2, written ahead since the P5a rebase review).
 - **Restart cost**: forgetting waits until every partition dirty at the crash
   (the recently written set, not all materialized) is swept once, by
   pointer-file-only opens. At 2 bits per transaction the status bitmap grows

@@ -144,9 +144,18 @@ fn flush_once() {
         if own.contains(&dir) {
             continue;
         }
+        #[cfg(test)]
+        if test_hooks::held(&dir) {
+            continue;
+        }
         let _ = log.sync_pending();
     }
     for (location, manager) in entries {
+        // Neither its log nor its staged outcomes, which may only follow it.
+        #[cfg(test)]
+        if test_hooks::held(&location) {
+            continue;
+        }
         if let Some(log) = wal::wal_for(&location) {
             let _ = log.sync_pending();
         }
@@ -162,6 +171,39 @@ fn flush_once() {
 /// backlog it accumulated to be durable before it says so.
 pub fn flush_now() {
     flush_once();
+}
+
+/// Test-only: keeps the writer's round off the logs of one directory tree,
+/// so a crash test can cut an image with group commits still unsynced
+/// whatever the round's timing, without changing the process-wide delay
+/// every other test runs under.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::path::{Path, PathBuf};
+
+    static HELD: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Holds the round off every log under `dir` until the guard drops.
+    pub(crate) fn hold(dir: &Path) -> Hold {
+        HELD.lock().push(dir.to_path_buf());
+        Hold(dir.to_path_buf())
+    }
+
+    pub(crate) struct Hold(PathBuf);
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let mut held = HELD.lock();
+            if let Some(at) = held.iter().position(|d| *d == self.0) {
+                held.remove(at);
+            }
+        }
+    }
+
+    pub(super) fn held(dir: &str) -> bool {
+        let held = HELD.lock();
+        !held.is_empty() && held.iter().any(|d| Path::new(dir).starts_with(d))
+    }
 }
 
 #[cfg(test)]

@@ -2071,6 +2071,11 @@ impl StorageIO for LocalStorageProvider {
             ));
         }
         if len == current {
+            // Nothing to cut, but a claim past it is still false: an in-place
+            // write at the end whose commit failed raised `inplace_end` and
+            // left the file as it was, and the next in-place commit would
+            // otherwise publish that write's end as the length (see below).
+            self.inplace_end.fetch_min(len, Ordering::AcqRel);
             return Ok(());
         }
 

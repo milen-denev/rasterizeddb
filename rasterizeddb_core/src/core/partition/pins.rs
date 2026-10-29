@@ -31,8 +31,12 @@
 //!   the location's log, `vacuum::neutralize_aborted_from`), and every reader
 //!   that predates them drained. The pin rises to `h`, or clears when the
 //!   sweep was clean: it saw no stamp at or above `h` and no write ran or
-//!   began meanwhile (the write watch's proof, `maintenance`). Group commit:
-//!   a lost `SWEPT` only pins lower.
+//!   began meanwhile (the write watch's proof, `maintenance`). A lost
+//!   `SWEPT` would only pin lower, but every map-log record is written ahead
+//!   of the log and synced (`MapLogFile::append_all`), since an unsynced one
+//!   could tear the file in a power cut; a forget round's `SWEPT`s share one
+//!   transaction and one sync ([`PinBoard::sweep_all`]), and the pins move
+//!   only once it has committed.
 //!
 //! After a restart the replayed state is the rule §7.2 gives: a partition
 //! whose last pin record is `MATERIALIZE`, `DIRTY` or an unclean `SWEPT`
@@ -219,59 +223,109 @@ impl PinBoard {
     }
 
     /// A forget sweep of partition `pid` (§7.2), when it is open and pinned:
-    /// its records proven free of non-committed ids below the settle bound,
-    /// then `SWEPT`, the pin raised (or cleared, when clean) and the handle
-    /// moved, and the registry asked to forget. Returns the sweep's report;
+    /// [`Self::sweep_all`] of one partition. Returns the sweep's report;
     /// `advanced_to` is `None` when nothing moved.
     pub(crate) async fn sweep(&self, pid: u32) -> io::Result<NeutralizeReport> {
+        let mut done = self.sweep_all(&[pid]).await?;
+        done.pop().map_or(Ok(NeutralizeReport::default()), |(_, r)| r)
+    }
+
+    /// Forget sweeps of partitions `pids` (§7.2), each when it is open and
+    /// pinned: each one's records proven free of non-committed ids below the
+    /// settle bound, durably (`vacuum::neutralize_aborted_from` syncs its
+    /// rewrites), then every `SWEPT` appended as **one** map-log transaction,
+    /// one log sync for the batch however many partitions advanced
+    /// (`MapLogFile::append_all`, which writes ahead of the log, so a crash
+    /// never tears the map), and only once that has committed the pins raised
+    /// (or cleared, when clean), the handle moved and the registry asked to
+    /// forget. A failed append puts every pin back as it was.
+    ///
+    /// Returns each partition's report, in order, or its own error (its
+    /// sweep failed, or the batch's append did); `Err` only for a partition
+    /// with no write watch.
+    pub(crate) async fn sweep_all(&self, pids: &[u32]) -> io::Result<Vec<(u32, io::Result<NeutralizeReport>)>> {
         let _one = self.sweeping.lock().await;
-        let watch = self.watch(pid)?;
-        let Some(unit) = watch.unit() else {
-            return Ok(NeutralizeReport::default());
-        };
-        let Some(from) = self.state.lock().await.part(pid).and_then(|p| p.pin) else {
-            return Ok(NeutralizeReport::default());
-        };
-        let (seq0, active0) = watch.arm();
-        let report = unit.neutralize_from(&self.transactions, from).await?;
-        let Some(bound) = report.advanced_to else {
-            return Ok(report);
-        };
+        // Each partition's proof, before the state's lock: the scans and
+        // their rewrites take as long as they take, and writers' first-write
+        // edges wait on that lock.
+        let mut swept: Vec<(u32, io::Result<NeutralizeReport>, (u64, u64))> = Vec::with_capacity(pids.len());
+        for &pid in pids {
+            let watch = self.watch(pid)?;
+            let Some(unit) = watch.unit() else {
+                swept.push((pid, Ok(NeutralizeReport::default()), (0, 0)));
+                continue;
+            };
+            let Some(from) = self.state.lock().await.part(pid).and_then(|p| p.pin) else {
+                swept.push((pid, Ok(NeutralizeReport::default()), (0, 0)));
+                continue;
+            };
+            let armed = watch.arm();
+            let report = unit.neutralize_from(&self.transactions, from).await;
+            swept.push((pid, report, armed));
+        }
+
         let mut state = self.state.lock().await;
-        let Some(saved) = state.part(pid).copied() else {
-            return Ok(NeutralizeReport { advanced_to: None, ..report });
-        };
-        // Clean only with no stamp at or above the bound and no writer
-        // inside at the start; `pinned` is cleared before `seq` is read
-        // again, so a writer arriving after the read takes the slow path
-        // and waits for this lock (`maintenance` module docs).
-        let mut clean = false;
-        if report.newer == 0 && active0 == 0 {
-            watch.set_pinned(false);
-            clean = watch.seq() == seq0;
-            if !clean {
-                watch.set_pinned(true);
+        let mut records = Vec::new();
+        // The partitions whose `SWEPT` is in `records`, with their state
+        // before it, to put back if the append fails.
+        let mut applied: Vec<(usize, super::log::PartState)> = Vec::new();
+        for (at, (pid, report, (seq0, active0))) in swept.iter_mut().enumerate() {
+            let pid = *pid;
+            let Ok(r) = report else {
+                continue;
+            };
+            let Some(bound) = r.advanced_to else {
+                continue;
+            };
+            let watch = self.watch(pid)?;
+            let Some(saved) = state.part(pid).copied() else {
+                r.advanced_to = None;
+                continue;
+            };
+            // Clean only with no stamp at or above the bound and no writer
+            // inside at the start; `pinned` is cleared before `seq` is read
+            // again, so a writer arriving after the read takes the slow path
+            // and waits for this lock (`maintenance` module docs), which is
+            // held until the batch has committed or been put back.
+            let mut clean = false;
+            if r.newer == 0 && *active0 == 0 {
+                watch.set_pinned(false);
+                clean = watch.seq() == *seq0;
+                if !clean {
+                    watch.set_pinned(true);
+                }
             }
+            let rec = Record::Swept { pid, swept_to: bound, clean };
+            if let Err(e) = state.apply(&rec) {
+                watch.set_pinned(true);
+                *report = Err(invalid(e));
+                continue;
+            }
+            records.push(rec);
+            applied.push((at, saved));
         }
-        let rec = Record::Swept { pid, swept_to: bound, clean };
-        if let Err(e) = state.apply(&rec) {
-            watch.set_pinned(true);
-            return Err(invalid(e));
+        if records.is_empty() {
+            return Ok(swept.into_iter().map(|(pid, r, _)| (pid, r)).collect());
         }
-        if let Err(e) = self.log.append(&rec).await {
-            state.restore_part(pid, saved);
-            watch.set_pinned(true);
-            return Err(e);
+        if let Err(e) = self.log.append_all(&records).await {
+            for &(at, saved) in &applied {
+                let pid = swept[at].0;
+                state.restore_part(pid, saved);
+                self.watch(pid)?.set_pinned(true);
+                swept[at].1 = Err(io::Error::new(e.kind(), e.to_string()));
+            }
+            return Ok(swept.into_iter().map(|(pid, r, _)| (pid, r)).collect());
         }
         self.follow(&state);
         drop(state);
         self.transactions.try_forget();
-        Ok(report)
+        Ok(swept.into_iter().map(|(pid, r, _)| (pid, r)).collect())
     }
 
     /// The forget round for this table (§7.3): up to `budget` pinned
-    /// partitions whose pin lags the settle bound by the step, round-robin.
-    /// Clean ones are never swept. Returns how many advanced.
+    /// partitions whose pin lags the settle bound by the step, round-robin,
+    /// swept as one batch ([`Self::sweep_all`]: one map-log sync for the
+    /// round). Clean ones are never swept. Returns how many advanced.
     pub(crate) async fn forget_round(&self, budget: usize) -> usize {
         if !self.transactions.status().settles() {
             return 0;
@@ -290,9 +344,17 @@ impl PinBoard {
             return 0;
         }
         let start = self.cursor.fetch_add(budget, Ordering::AcqRel) % due.len();
+        let batch: Vec<u32> = due.iter().cycle().skip(start).take(budget.min(due.len())).copied().collect();
+        let done = match self.sweep_all(&batch).await {
+            Ok(done) => done,
+            Err(e) => {
+                ::log::error!("forget sweep of \"{}\" failed: {e}", self.name);
+                return 0;
+            }
+        };
         let mut advanced = 0;
-        for &pid in due.iter().cycle().skip(start).take(budget.min(due.len())) {
-            match self.sweep(pid).await {
+        for (pid, r) in done {
+            match r {
                 Ok(r) if r.advanced_to.is_some() => advanced += 1,
                 Ok(_) => {}
                 Err(e) => ::log::error!("forget sweep of partition {pid} of \"{}\" failed: {e}", self.name),
@@ -382,9 +444,9 @@ impl PinBoard {
             return Ok(false);
         }
         let sealed = async {
-            for rec in &tail {
-                fresh.append(rec).await?;
-            }
+            // One transaction, one sync, for the records taken since the
+            // clone.
+            fresh.append_all(&tail).await?;
             // The new generation must say exactly what the state does before
             // anything makes it the one an open chooses.
             let replay = fresh.replay().await?;
@@ -431,9 +493,14 @@ impl PinBoard {
         files::create_map_generation(&self.root, self.uid, generation)?;
         let io = StdArc::new(self.seed.create_new(files::map_file(self.uid, generation)).await);
         let log = MapLogFile::create(io).await?;
-        log.append(&Record::Header(clone.header().clone())).await?;
-        log.append(&Record::Locations(clone.locations().to_vec())).await?;
-        log.append(&Record::Snapshot(clone.snapshot())).await?;
+        // One transaction, one sync: nothing chooses the generation until
+        // its `SEALED`, so these need no order of their own.
+        log.append_all(&[
+            Record::Header(clone.header().clone()),
+            Record::Locations(clone.locations().to_vec()),
+            Record::Snapshot(clone.snapshot()),
+        ])
+        .await?;
         Ok(log)
     }
 

@@ -476,14 +476,12 @@ impl PartitionedTable {
 
         files::require_existing(&root, &[files::map_file(uid, 0), files::ids_file(uid)])?;
         let log = MapLogFile::create(StdArc::new(seed.create_new(files::map_file(uid, 0)).await)).await?;
-        // One sync covers all three: the log is synced in order, so the last
-        // record durable means the first two are.
-        log.append(&Record::Header(header)).await?;
-        log.append(&Record::Locations(vec![root_str])).await?;
-        log.append_durable(&Record::Place {
-            hi: SPACE_END,
-            entries: map.entries().to_vec(),
-        })
+        // One transaction, one sync, for all three.
+        log.append_all_durable(&[
+            Record::Header(header),
+            Record::Locations(vec![root_str]),
+            Record::Place { hi: SPACE_END, entries: map.entries().to_vec() },
+        ])
         .await?;
         IdSource::create(Arc::new(seed.create_new(files::ids_file(uid)).await)).await?;
         Ok(())
@@ -1248,9 +1246,10 @@ impl PartitionedTable {
     /// tools: the scheduler sweeps a pin once it lags by `FORGET_STEP`.
     pub async fn sweep_pins_now(&self) -> io::Result<usize> {
         let live = self.live()?;
+        let open: Vec<u32> = live.slots.iter().filter(|s| s.open.get().is_some()).map(|s| s.pid).collect();
         let mut advanced = 0;
-        for slot in live.slots.iter() {
-            if slot.open.get().is_some() && live.board.sweep(slot.pid).await?.advanced_to.is_some() {
+        for (_, r) in live.board.sweep_all(&open).await? {
+            if r?.advanced_to.is_some() {
                 advanced += 1;
             }
         }

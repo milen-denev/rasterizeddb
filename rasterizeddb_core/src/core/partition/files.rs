@@ -683,8 +683,9 @@ pub(crate) fn reap(
 }
 
 /// The map log's file (§3.2). Appends are serialised by its lock, and each
-/// issues its WAL record at append time, so a transaction outcome logged
-/// after it can never replay without it.
+/// is written ahead of the log and durable when it returns
+/// ([`MapLogFile::append_all`]), so a transaction outcome logged after it
+/// can never replay without it, and no crash leaves the file torn.
 pub(crate) struct MapLogFile {
     /// The live generation's provider: swapped by a compaction
     /// ([`Self::adopt`]), under `lock`, so no append straddles two files.
@@ -845,56 +846,110 @@ impl MapLogFile {
         }
     }
 
-    /// Appends `rec` as one WAL transaction, its record issued now and its
-    /// sync left to the statement's group commit: `append_data(buf, true)`'s
-    /// path, with its error returned instead of logged. The deferred
-    /// `append_data(buf, false)` would stage the bytes in `.tmp` with no WAL
-    /// record, so nothing would order them before an outcome (§3.2).
-    ///
-    /// A failure leaves the file as it was. The bytes are in the file before
-    /// the commit can fail (a full disk on the commit marker, a poisoned
-    /// file or directory), and left there they replay although the caller
-    /// heard `Err`: a retried `MATERIALIZE` would then be a second one, which
-    /// replay refuses, and the table would never open again. Every failure in
-    /// `commit_durable` comes before the commit marker is written, so the
-    /// transaction is aborted and the file cut back to where it was. If the
-    /// cut fails the record's fate is unknown, and the log refuses every later
-    /// append in this process.
+    /// Appends `rec`: [`Self::append_all`] of one record.
     pub(crate) async fn append(&self, rec: &log::Record) -> io::Result<()> {
-        let buf = log::encode(rec).map_err(invalid)?;
+        self.append_all(std::slice::from_ref(rec)).await
+    }
+
+    /// Appends `recs`, in order, as one WAL transaction, durable when this
+    /// returns.
+    ///
+    /// **Write-ahead, as `torn_tail::SidecarWrites` writes the schema
+    /// sidecars:** one in-place write at the log's end
+    /// (`StorageIO::write_data_txn`), which the WAL holds back until the
+    /// record describing it is durable and only then applies to the file. So
+    /// the file never holds a byte the log cannot account for, and no crash
+    /// can tear it: a cut before the commit's sync leaves the file as it was,
+    /// one after it leaves whatever of the apply reached the disk, which
+    /// recovery writes over whole. The logged append this replaced wrote the
+    /// file first and the log record after, so a power cut before a sync
+    /// could keep the file's new length and drop its pages: a run of zeros
+    /// at the end (a torn tail, with compaction and reaping off until an
+    /// operator looked), or zeros followed by a record whose page did reach
+    /// the disk, which `log::replay` refuses, refusing the table. Every
+    /// record kind goes this way, whatever §3.2 lists it under, so the
+    /// evidence and refusal logic is left for real media damage.
+    ///
+    /// The price is a log sync per call (a transaction holding an in-place
+    /// write syncs at its commit), so callers batch: a forget round's
+    /// `SWEPT`s are one call (`PinBoard::sweep_all`), a `CREATE`'s three
+    /// records one, a compaction's opening records one.
+    ///
+    /// Without a log (a directory with `wal_enabled = false`) an in-place
+    /// write lands at once and does not move the provider's length, so the
+    /// records are appended directly, flushed, as before: there is no log
+    /// for a record to be written ahead of.
+    ///
+    /// A failure leaves the file as it was, and nothing is aborted here:
+    /// `commit_durable` ends a transaction it refuses before attempting the
+    /// commit itself, and one whose commit was attempted and failed has
+    /// poisoned the log, which refuses every later commit (its record then
+    /// replays or not, either of which the state tolerates for every kind:
+    /// `DROPPED` and `MATERIALIZE` follow their commit points, `DIRTY` and
+    /// `SWEPT` only pin lower or record a proof already made). A retry
+    /// therefore appends at the same offset. The provider's claim on where
+    /// in-place writes reached is cut back to that offset, or the next
+    /// commit would publish the failed record's end as the file's length;
+    /// if that cut fails, the log refuses every later append in this
+    /// process.
+    pub(crate) async fn append_all(&self, recs: &[log::Record]) -> io::Result<()> {
+        let mut buf = Vec::new();
+        for rec in recs {
+            buf.extend_from_slice(&log::encode(rec).map_err(invalid)?);
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
         let _order = self.lock.lock().await;
         self.check()?;
-        let txn = self.io().begin_txn();
-        let (at, token) = self.io().append_data_txn(txn, &buf).await;
-        let Err(e) = self.io().commit_durable(token).await else {
+        let io = self.io();
+        let txn = io.begin_txn();
+        let (at, token) = if io.defers_in_place_writes() {
+            let at = io.get_len().await;
+            (at, io.write_data_txn(txn, at, &buf).await)
+        } else {
+            io.append_data_txn(txn, &buf).await
+        };
+        let Err(e) = io.commit_durable(token).await else {
             if let Some(kept) = self.capture.lock().as_mut() {
-                kept.push(rec.clone());
+                kept.extend(recs.iter().cloned());
             }
             return Ok(());
         };
-        self.io().abort_txn(token).await;
-        if let Err(cut) = self.io().truncate(at).await {
+        if let Err(cut) = io.truncate(at).await {
             let _ = self.broken.set(format!(
-                "an append failed ({e}) and could not be cut back to byte {at} ({cut})"
+                "an append failed ({e}) and the file could not be cut back to byte {at} ({cut})"
             ));
         }
         Err(e)
     }
 
-    /// [`Self::append`], then forces the location's log to disk: for the
-    /// records §3.2 marks fsync (`HEADER`, `LOCATIONS`, `PLACE`, reshape
-    /// steps, `DROPPED`). With no WAL the append already flushed the file.
-    /// A failed sync poisons the log (`Wal::commit_through`), which refuses
-    /// every later commit before its marker, so [`Self::append`] cuts those
-    /// back and nothing lands after this record.
-    pub(crate) async fn append_durable(&self, rec: &log::Record) -> io::Result<()> {
-        self.append(rec).await?;
+    /// [`Self::append_all`], then [`Self::sync_pending`]: for a caller that
+    /// must also see every earlier group commit of the location durable.
+    pub(crate) async fn append_all_durable(&self, recs: &[log::Record]) -> io::Result<()> {
+        self.append_all(recs).await?;
+        self.sync_pending()
+    }
+
+    fn sync_pending(&self) -> io::Result<()> {
         match self.io().get_location() {
             Some(location) => {
                 crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))
             }
             None => Ok(()),
         }
+    }
+
+    /// [`Self::append`], then the location's group commits forced out too:
+    /// for the records §3.2 marks fsync (`HEADER`, `LOCATIONS`, `PLACE`,
+    /// `MATERIALIZE`, `DIRTY`, reshape steps, `DROPPED`). The record itself
+    /// is durable once [`Self::append`] returns; the sync after it covers a
+    /// caller that relies on the log being synced through this point, as
+    /// before. With no WAL the append already flushed the file. A failed sync
+    /// poisons the log (`Wal::commit_through`), which refuses every later
+    /// commit, so nothing lands after this record.
+    pub(crate) async fn append_durable(&self, rec: &log::Record) -> io::Result<()> {
+        self.append_all_durable(std::slice::from_ref(rec)).await
     }
 
     /// Reads the whole log and replays it, without changing the file.
@@ -1396,6 +1451,55 @@ mod tests {
         assert_eq!(replay.state.part(1).unwrap().location, Some(0));
         let one = log::encode(&materialize).unwrap().len() as u64;
         assert_eq!(std::fs::metadata(&path).unwrap().len(), before + one);
+        crate::core::wal::remove_for(d.to_str().unwrap());
+    }
+
+    /// With a log, an append is durable when it returns, and a failed append
+    /// that was longer than the retry leaves no claim on the bytes past the
+    /// retry's end. Without the provider's claim cut back, the next
+    /// commit published the failed record's end as the length, and the next
+    /// append landed past a hole of zeros, which replay refuses.
+    ///
+    /// (That no crash can tear the file is `power_loss::pins_crash_tests`'
+    /// to show: no failure here can tell the two orders apart.)
+    ///
+    /// Mutation: `append_all` not cutting the provider back after a failure
+    /// (the length runs past the file, and the replay is torn).
+    #[tokio::test]
+    async fn an_append_is_written_ahead_and_a_failed_one_leaves_no_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let wal = install_wal(d);
+        let log = MapLogFile::create(map_provider(d).await).await.unwrap();
+        let path = d.join(map_file(UID, 0));
+        log.append(&header()).await.unwrap();
+        let base = std::fs::metadata(&path).unwrap().len();
+
+        // A failed commit marker leaves the file as it was.
+        let long = Record::Locations(vec!["/a/much/longer/location/than/the/retry".to_string()]);
+        crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        let failed = log.append(&long).await;
+        crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(failed.is_err(), "the injected commit failure was swallowed");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), base, "the failed record reached the file");
+        assert_eq!(log.io().get_len().await, base);
+
+        // A shorter retry: the length is its end, not the failed record's.
+        let short = Record::Locations(vec!["/r".to_string()]);
+        assert!(log::encode(&short).unwrap().len() < log::encode(&long).unwrap().len());
+        log.append(&short).await.unwrap();
+        let after_short = base + log::encode(&short).unwrap().len() as u64;
+        assert_eq!(log.io().get_len().await, after_short, "the failed append's claim outlived it");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), after_short);
+        log.append(&place()).await.unwrap();
+        let expect = after_short + log::encode(&place()).unwrap().len() as u64;
+        assert_eq!(log.io().get_len().await, expect);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), expect);
+        assert!(wal.durable_through() >= wal.commit_lsn(), "append_all returned before its log record was durable");
+        let replay = log.replay().await.unwrap();
+        assert!(replay.torn.is_none(), "{:?}", replay.torn);
+        assert_eq!(replay.valid_len as u64, expect);
+        assert_eq!(replay.state.map().entries(), RangeMap::initial(8).unwrap().entries());
         crate::core::wal::remove_for(d.to_str().unwrap());
     }
 
