@@ -152,3 +152,66 @@ async fn a_column_name_with_a_space_is_refused_by_name() {
     run(&pool, r#"INSERT INTO qm (id, "Mixed") VALUES (1, 5)"#).await;
     assert_eq!(ids(&pool, r#"SELECT "Mixed" FROM qm"#).await, vec![5]);
 }
+
+/// The 42703 rule reaches only a name that is no column: a statement the
+/// parser could not read stays a syntax error (42601), and a cast to a type
+/// that does not exist is 42704.
+#[tokio::test(flavor = "multi_thread")]
+async fn syntax_errors_stay_42601() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    run(&pool, "CREATE TABLE t (id INT PRIMARY KEY, x TEXT, v INT)").await;
+    run(&pool, "INSERT INTO t VALUES (1, 'a', 10)").await;
+    for (sql, want) in [
+        ("SELECT id + FROM t", "42601"),
+        ("SELECT id +* 2 FROM t", "42601"),
+        ("SELECT id, x y z FROM t", "42601"),
+        ("SELECT id FROM t WHERE x = 'a' ||", "42601"),
+        ("SELECT id FROM t WHERE v BETWEN 1 AND 30", "42601"),
+        ("SELECT id FROM t WHERE x ILIKEE 'a'", "42601"),
+        ("SELECT id FROM t ODER BY id", "42601"),
+        ("SELECT id FROM t WHERE id = 1 ODER BY id", "42601"),
+        ("SELECT id FROM t GROUPBY id", "42601"),
+        ("SELECT id FROM t GROUP BY id HAVNG id > 1", "42601"),
+        ("SELECT id FROM t WHERE id = 1 ANDD v = 2", "42601"),
+        ("SELECT id FROM t LIMT 5", "42601"),
+        ("SELECT 0x10 FROM t", "42601"),
+        ("SELECT id::nosuchtype FROM t", "42704"),
+        ("SELECT id FROM t WHERE v::nosuchtype = 1", "42704"),
+        // And the names that are no column are still 42703.
+        ("SELECT nosuch FROM t", "42703"),
+        ("SELECT id FROM t WHERE v = 1 AND nosuch = 1", "42703"),
+        ("SELECT id FROM t ORDER BY nosuch", "42703"),
+    ] {
+        assert_eq!(refused(&pool, sql).await, want, "{sql}");
+    }
+}
+
+/// `EXCLUDED` of an unwritten column: a constant default is taken however
+/// it is spelt (`'(none)'` was refused for its parentheses), a computed one
+/// (`CURRENT_TIMESTAMP`) is refused rather than computed again, and `IS
+/// [NOT] NULL` over a substituted value is a constant (it was 0A000 "NULL
+/// literals are not supported").
+#[tokio::test(flavor = "multi_thread")]
+async fn excluded_defaults_and_null_tests() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    run(
+        &pool,
+        "CREATE TABLE ex (id INT PRIMARY KEY, c TEXT DEFAULT '(none)', d TIMESTAMP DEFAULT CURRENT_TIMESTAMP, v TEXT)",
+    )
+    .await;
+    run(&pool, "INSERT INTO ex (id, v) VALUES (1, 'a')").await;
+    run(&pool, "INSERT INTO ex (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.c").await;
+    let v: String = sqlx::query_scalar("SELECT v FROM ex").fetch_one(&pool).await.expect("v");
+    assert_eq!(v, "(none)");
+    assert_eq!(
+        refused(&pool, "INSERT INTO ex (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.d::text").await,
+        "0A000"
+    );
+    run(&pool, "INSERT INTO ex (id, v) VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET v = 'was null' WHERE EXCLUDED.v IS NULL").await;
+    run(&pool, "INSERT INTO ex (id, v) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = 'not reached' WHERE EXCLUDED.v IS NULL").await;
+    run(&pool, "INSERT INTO ex (id, v) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET c = 'reached' WHERE EXCLUDED.v IS NOT NULL").await;
+    let r = sqlx::query("SELECT v, c FROM ex").fetch_one(&pool).await.expect("row");
+    assert_eq!((r.get::<String, _>(0), r.get::<String, _>(1)), ("was null".to_string(), "reached".to_string()));
+}

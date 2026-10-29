@@ -5909,7 +5909,11 @@ async fn apply_conflict_update(
             } else {
                 match crate::core::rql::column_default::expression_for(&field.name, &schema.defaults) {
                     None => Some("NULL".to_string()),
-                    Some(expression) if !expression.contains('(') => Some(format!("({})", expression.trim())),
+                    // A constant — a literal, possibly cast (`'(none)'`,
+                    // `0`, `'x'::text`) — is the value the row took. Anything
+                    // the default computes (`nextval(…)`, `CURRENT_TIMESTAMP`)
+                    // would be another value computed again here.
+                    Some(expression) if default_is_constant(expression) => Some(format!("({})", expression.trim())),
                     Some(_) => None,
                 }
             };
@@ -7143,6 +7147,20 @@ fn has_top_level_arithmetic(text: &str) -> bool {
     false
 }
 
+/// Whether a column default is a constant: a literal, or one under a cast.
+fn default_is_constant(expression: &str) -> bool {
+    fn constant(e: &crate::core::rql::expr::Expr) -> bool {
+        use crate::core::rql::expr::Expr;
+        match e {
+            Expr::Literal { .. } | Expr::Null => true,
+            Expr::Cast(inner, _) => constant(inner),
+            Expr::NumericCast { value, .. } => constant(value),
+            _ => false,
+        }
+    }
+    crate::core::rql::expr::parse(expression.trim(), &[]).is_ok_and(|e| constant(&e))
+}
+
 /// What `apply_conflict_update` puts for an `EXCLUDED` column it cannot
 /// give a value for; never a literal anything writes.
 const EXCLUDED_UNAVAILABLE: &str = "\u{1}unavailable:";
@@ -7173,13 +7191,38 @@ fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<Stri
         };
         if literal.starts_with(EXCLUDED_UNAVAILABLE) {
             return Err(format!(
-                "EXCLUDED.{} of a column this INSERT does not write, whose default is computed or which is \
-                 generated, is not supported",
+                "EXCLUDED.{} is not supported: this INSERT does not write the column, and its default is \
+                 computed when the row is (a sequence, CURRENT_TIMESTAMP), so computing it again here would \
+                 give another value",
                 column
             ));
         }
-        out.push_str(literal);
         rest = &after[end..];
+        // `EXCLUDED.c IS [NOT] NULL` over the value now known is a constant;
+        // left as `NULL IS NULL` the predicate reader refused it ("NULL
+        // literals are not supported").
+        let words: Vec<&str> = rest.split_whitespace().take(3).collect();
+        let test = match words.as_slice() {
+            [is, null, ..] if is.eq_ignore_ascii_case("IS") && null.eq_ignore_ascii_case("NULL") => Some((true, 2)),
+            [is, not, null] if is.eq_ignore_ascii_case("IS")
+                && not.eq_ignore_ascii_case("NOT")
+                && null.eq_ignore_ascii_case("NULL") => Some((false, 3)),
+            _ => None,
+        };
+        if let Some((want_null, n)) = test {
+            let is_null = literal.trim().trim_start_matches('(').trim_end_matches(')').trim().eq_ignore_ascii_case("NULL");
+            out.push_str(if is_null == want_null { "1 = 1" } else { "1 = 0" });
+            // Past the test's words.
+            let mut cut = rest;
+            for _ in 0..n {
+                cut = cut.trim_start();
+                let w = cut.find(char::is_whitespace).unwrap_or(cut.len());
+                cut = &cut[w..];
+            }
+            rest = cut;
+            continue;
+        }
+        out.push_str(literal);
     }
 }
 
