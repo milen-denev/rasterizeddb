@@ -230,21 +230,36 @@ pub fn leading_identifier(text: &str) -> Option<(String, usize)> {
 /// (`pg_catalog.now()`) and what follows `::` are not column references.
 fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
     let bytes = text.as_bytes();
+    // No dot, no qualifier: every statement's texts are asked, most of
+    // them hold none, and the scan below is the per-statement cost.
+    if memchr::memchr(b'.', bytes).is_none() {
+        return Vec::new();
+    }
     let ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'"' || b >= 0x80;
     let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
-    // One name at `i`: (its text unquoted, the offset past it).
-    let read = |i: usize| -> Option<(String, usize)> {
+    // One name at `i`: (where it starts, the offset past it), read without
+    // a copy; only a qualifier's names are made into strings.
+    let read = |i: usize| -> Option<(usize, usize)> {
         if bytes.get(i) == Some(&b'"') {
-            // Kept quoted: a quoted name is matched by its exact case.
             let end = quoted_end(bytes, i, b'"');
-            let inner = text.get(i + 1..end.saturating_sub(1))?;
-            return Some((format!("\"{}\"", inner.replace("\"\"", "\"")), end));
+            text.get(i + 1..end.saturating_sub(1))?;
+            return Some((i, end));
         }
         let mut j = i;
         while j < bytes.len() && ident_byte(bytes[j]) {
             j += 1;
         }
-        (j > i).then(|| (text[i..j].to_string(), j))
+        (j > i).then_some((i, j))
+    };
+    // A name as a qualifier carries it: kept quoted, since a quoted name is
+    // matched by its exact case.
+    let name_of = |(start, end): (usize, usize)| -> String {
+        if bytes[start] == b'"' {
+            let inner = &text[start + 1..end.saturating_sub(1)];
+            format!("\"{}\"", inner.replace("\"\"", "\""))
+        } else {
+            text[start..end].to_string()
+        }
     };
     let mut out = Vec::new();
     let mut i = 0;
@@ -287,12 +302,12 @@ fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
             continue;
         }
         if ident_start(b) && (i == 0 || !ident_byte(bytes[i - 1])) {
-            // The whole dotted chain: names, and where each one ends.
-            let mut names: Vec<(String, usize)> = Vec::new();
+            // The whole dotted chain: each name's span.
+            let mut names: smallvec::SmallVec<[(usize, usize); 4]> = smallvec::SmallVec::new();
             let mut j = i;
             let mut star = false;
-            while let Some((name, end)) = read(j) {
-                names.push((name, end));
+            while let Some((start, end)) = read(j) {
+                names.push((start, end));
                 if bytes.get(end) == Some(&b'.') {
                     if bytes.get(end + 1) == Some(&b'*') {
                         star = true;
@@ -316,7 +331,7 @@ fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
             let qualifiers = if star { names.len() } else { names.len() - 1 };
             if qualifiers > 0 && !call {
                 let span_end = names[qualifiers - 1].1 + 1;
-                out.push((i, span_end, names[..qualifiers].iter().map(|(n, _)| n.clone()).collect()));
+                out.push((i, span_end, names[..qualifiers].iter().map(|n| name_of(*n)).collect()));
             }
             i = j.max(i + 1);
             continue;
@@ -371,6 +386,39 @@ pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
         .into_iter()
         .find(|(_, _, names)| !allowed.iter().any(|a| qualifier_is(names, a)))
         .map(|(_, _, names)| written(&names))
+}
+
+/// [`unknown_qualifier`], [`respell_qualifier`] and [`strip_qualifiers`] in
+/// one scan, for a text an `ON CONFLICT DO UPDATE` rewrites every row:
+/// `Err` with the first qualifier none of `allowed` names (as written);
+/// otherwise the text with `respell_from`'s qualifier written `respell_to.`
+/// and each of `strip`'s removed.
+pub fn resolve_qualifiers(
+    text: &str,
+    allowed: &[&str],
+    respell_from: &str,
+    respell_to: &str,
+    strip: &[&str],
+) -> Result<String, String> {
+    let refs = qualified_references(text);
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (start, end, names) in refs {
+        if !allowed.iter().any(|a| qualifier_is(&names, a)) {
+            return Err(written(&names));
+        }
+        if qualifier_is(&names, respell_from) {
+            out.push_str(&text[from..start]);
+            out.push_str(respell_to);
+            out.push('.');
+            from = end;
+        } else if strip.iter().any(|s| qualifier_is(&names, s)) {
+            out.push_str(&text[from..start]);
+            from = end;
+        }
+    }
+    out.push_str(&text[from..]);
+    Ok(out)
 }
 
 /// Whether `text` is exactly `q.*` for a `q` in `allowed` (`t.*`,

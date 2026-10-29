@@ -922,7 +922,7 @@ fn parse_numeric_value<'a>(
 /// became 0.123456789123 and matched that row of a `NUMERIC(20,12)`.
 fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
     if let NumericValue::F64(f) = value {
-        if numeric_context && text.contains(['.', 'e', 'E']) {
+        if numeric_context && text.contains(['.', 'e', 'E']) && !float_holds_exactly(text) {
             let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
             let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
             // More digits than an i128 holds is never what the float is.
@@ -939,11 +939,34 @@ fn numeric_value_is_lossy_fraction(text: &str, value: &NumericValue) -> bool {
     let NumericValue::F64(f) = value else {
         return false;
     };
+    if float_holds_exactly(text) {
+        return false;
+    }
     let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
     if written.is_none() {
         return is_plain_decimal(text);
     }
     written != crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits)
+}
+
+/// Whether `text` is a plain decimal (`[+-]digits[.digits]`, no exponent)
+/// of at most fifteen digits, which an `f64` reads and prints back as the
+/// same digits (`f64::DIGITS`): the float round-trip in [`number_token`]
+/// and [`numeric_value_is_lossy_fraction`] cannot find a difference, so it
+/// is not made — it formatted a float and read two decimals for every
+/// numeric literal of a statement on a NUMERIC column.
+fn float_holds_exactly(text: &str) -> bool {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let mut digits = 0usize;
+    let mut points = 0usize;
+    for b in body.bytes() {
+        match b {
+            b'0'..=b'9' => digits += 1,
+            b'.' => points += 1,
+            _ => return false,
+        }
+    }
+    digits > 0 && points <= 1 && digits <= f64::DIGITS as usize
 }
 
 /// Digits with at most one point, an optional sign and exponent: a number
@@ -1149,6 +1172,49 @@ pub fn numeric_type_to_db_type(nv: &NumericValue) -> DbType {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every decimal `float_holds_exactly` lets past the round-trip is one
+    /// the round-trip finds equal: the shortcut never hides a lossy literal.
+    ///
+    /// Mutation: the fifteen-digit bound raised to seventeen.
+    #[test]
+    fn a_decimal_a_float_holds_skips_nothing_the_round_trip_would_catch() {
+        let mut texts: Vec<String> = Vec::new();
+        let mut seed: u64 = 0x5eed;
+        for _ in 0..20_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let digits = 1 + (seed >> 59) as usize % 17;
+            let point = (seed >> 40) as usize % (digits + 1);
+            let mut text = String::new();
+            let mut s = seed;
+            for d in 0..digits {
+                if d == point && d > 0 {
+                    text.push('.');
+                }
+                text.push(char::from(b'0' + (s % 10) as u8));
+                s /= 10;
+                if s == 0 {
+                    s = seed ^ 0x9e3779b97f4a7c15;
+                }
+            }
+            texts.push(text);
+        }
+        texts.extend(["0.1", "1234567890.12345", "123456789012345", "0.000000000000001", "9999999999999.99"].map(String::from));
+        let mut held = 0;
+        for text in &texts {
+            if float_holds_exactly(text) {
+                held += 1;
+                let f: f64 = text.parse().expect("a number");
+                let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+                let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
+                assert_eq!(written, read, "{text} read as {f}");
+            }
+        }
+        assert!(held > 10_000, "only {held} held");
+        assert!(!float_holds_exactly("1234567890123456.78"));
+        assert!(!float_holds_exactly("1e5"));
+    }
+
     use super::*;
 
     #[test]

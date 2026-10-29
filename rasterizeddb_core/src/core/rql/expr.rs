@@ -3022,9 +3022,12 @@ pub(crate) fn decimal_digits(text: &str) -> Option<(i128, i32)> {
     if !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let digits = format!("{whole}{fraction}");
-    let digits = digits.trim_start_matches('0');
-    let m: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    // Accumulated in place: more digits than an i128 holds overflow to
+    // `None`, as parsing the joined digits did, without the copy.
+    let mut m: i128 = 0;
+    for b in whole.bytes().chain(fraction.bytes()) {
+        m = m.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+    }
     let e = exponent.checked_sub(i32::try_from(fraction.len()).ok()?)?;
     Some((if negative { -m } else { m }, e))
 }

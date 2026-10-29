@@ -1600,15 +1600,24 @@ fn resolve_column(raw: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<Str
 /// one: digits with one point and an exponent (`1.5e-3`), `_` separators,
 /// or a `0x`/`0o`/`0b` integer.
 fn is_numeric_literal_word(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    for (prefix, digit) in [("0x", 16u32), ("0o", 8), ("0b", 2)] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
+    // Read in place, case-insensitively: a copy per numeric word of every
+    // predicate was a per-statement allocation.
+    let bytes = word.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'0' {
+        let digit = match bytes[1].to_ascii_lowercase() {
+            b'x' => Some(16u32),
+            b'o' => Some(8),
+            b'b' => Some(2),
+            _ => None,
+        };
+        if let Some(digit) = digit {
+            let rest = &word[2..];
             return !rest.is_empty() && rest.chars().all(|c| c.is_digit(digit) || c == '_');
         }
     }
-    let (mantissa, exponent) = match lower.find('e') {
-        Some(at) => (&lower[..at], Some(&lower[at + 1..])),
-        None => (lower.as_str(), None),
+    let (mantissa, exponent) = match bytes.iter().position(|b| b.eq_ignore_ascii_case(&b'e')) {
+        Some(at) => (&word[..at], Some(&word[at + 1..])),
+        None => (word, None),
     };
     let mantissa_ok = mantissa.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
         && mantissa.matches('.').count() <= 1;

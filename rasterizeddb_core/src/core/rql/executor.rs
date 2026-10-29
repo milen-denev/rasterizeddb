@@ -6296,13 +6296,14 @@ async fn apply_conflict_update(
     let known: Vec<&str> = known.iter().map(String::as_str).collect();
     let mut allowed = known.clone();
     allowed.push("excluded");
+    // One scan: refused if unknown, `excluded` respelled, the table's own
+    // qualifiers taken off; then each `EXCLUDED.<column>` becomes its value
+    // (a literal or a constant default, which names no column to strip).
     let resolve = |text: &str| -> Result<String, String> {
-        if let Some(q) = crate::core::sql_scan::unknown_qualifier(text, &allowed) {
-            return Err(crate::core::sql_scan::missing_from_entry(&q));
-        }
-        let text = crate::core::sql_scan::respell_qualifier(text, "excluded", "EXCLUDED");
+        let text = crate::core::sql_scan::resolve_qualifiers(text, &allowed, "excluded", "EXCLUDED", &known)
+            .map_err(|q| crate::core::sql_scan::missing_from_entry(&q))?;
         let text = substitute_excluded(&text, &inserted)?;
-        Ok(fold_constants_in_predicate(&crate::core::sql_scan::strip_qualifiers(&text, &known)))
+        Ok(fold_constants_in_predicate(&text))
     };
 
     let assignments = match resolve(&spec.assignments) {
@@ -7557,6 +7558,21 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
     if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
     }
+    // A plain number the column holds exactly, read without the parse
+    // and evaluation below, which an upsert ran for every column of every
+    // row: an integer into an integer column, or a decimal with no more
+    // places than its column's scale. Anything else (rounding, an
+    // exponent, an expression, a value out of range) takes the general path.
+    if let Some(stored) = stored_plain_number(text, field, integer) {
+        return Some(stored);
+    }
+    evaluated_numeric_literal(text, field)
+}
+
+/// [`stored_numeric_literal`]'s general path: `text` parsed and evaluated
+/// into `field` as an INSERT stores it.
+fn evaluated_numeric_literal(text: &str, field: &crate::core::row::schema::SchemaField) -> Option<String> {
+    use crate::core::db_type::DbType;
     let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
     if !crate::core::rql::expr::columns_of(&expr).is_empty() {
         return None;
@@ -7580,6 +7596,92 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
         DbType::U32 => Some(u32::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
         DbType::U64 => Some(u64::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
         _ => None,
+    }
+}
+
+/// [`stored_numeric_literal`] for a plain number its column holds exactly:
+/// `[+-]digits` for an integer column (in its range), `[+-]digits[.digits]`
+/// with no more places than the scale for a NUMERIC one. `None` otherwise.
+fn stored_plain_number(text: &str, field: &crate::core::row::schema::SchemaField, integer: bool) -> Option<String> {
+    use crate::core::db_type::DbType;
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (whole, fraction) = match body.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (body, None),
+    };
+    if !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.is_none_or(|f| f.bytes().all(|b| b.is_ascii_digit()))
+        || whole.len() + fraction.map_or(0, str::len) == 0
+        || whole.len() > 30
+    {
+        return None;
+    }
+    if integer {
+        if fraction.is_some() {
+            return None;
+        }
+        let value: i128 = text.parse().ok()?;
+        let fits = match field.db_type {
+            DbType::I8 => i8::try_from(value).is_ok(),
+            DbType::I16 => i16::try_from(value).is_ok(),
+            DbType::I32 => i32::try_from(value).is_ok(),
+            DbType::I64 => i64::try_from(value).is_ok(),
+            DbType::U8 => u8::try_from(value).is_ok(),
+            DbType::U16 => u16::try_from(value).is_ok(),
+            DbType::U32 => u32::try_from(value).is_ok(),
+            DbType::U64 => u64::try_from(value).is_ok(),
+            _ => false,
+        };
+        return fits.then(|| value.to_string());
+    }
+    let scale = field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+    if fraction.is_some_and(|f| f.len() > scale as usize) {
+        return None;
+    }
+    let raw = crate::core::value_codec::parse_decimal_scaled(text, scale)?;
+    Some(crate::core::value_codec::format_decimal_scaled(raw, scale))
+}
+
+#[cfg(test)]
+mod stored_plain_number_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    /// The fast path answers exactly what evaluation answers, wherever it
+    /// answers at all.
+    ///
+    /// Mutation: `stored_plain_number` keeping more places than the scale.
+    #[test]
+    fn the_fast_path_agrees_with_evaluation() {
+        let texts = [
+            "0", "-0", "+5", "007", "2023", "-2147483648", "2147483648", "9223372036854775807",
+            "9223372036854775808", "-129", "255", "1.25", "1.254", "-1.255", "0.5", ".5", "5.",
+            "1.2500", "12345678901.99", "1e2", "1.0", "-0.00",
+        ];
+        let types = [
+            (DbType::I8, None),
+            (DbType::I16, None),
+            (DbType::I32, None),
+            (DbType::I64, None),
+            (DbType::U8, None),
+            (DbType::U32, None),
+            (DbType::DECIMAL, Some(2)),
+            (DbType::DECIMAL, Some(0)),
+            (DbType::DECIMAL, None),
+        ];
+        let mut answered = 0;
+        for (db_type, scale) in types {
+            let integer = db_type != DbType::DECIMAL;
+            let mut field = crate::core::row::schema::SchemaField::new("k".to_string(), db_type.clone(), 0, 0, 0, false);
+            field.scale = scale;
+            for text in texts {
+                if let Some(fast) = stored_plain_number(text, &field, integer) {
+                    answered += 1;
+                    assert_eq!(Some(fast), evaluated_numeric_literal(text, &field), "{db_type:?} {scale:?} {text}");
+                }
+            }
+        }
+        assert!(answered > 40, "the fast path answered only {answered}");
     }
 }
 

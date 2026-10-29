@@ -369,8 +369,11 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
         Some((head, _)) => head,
         None => sql,
     };
-    let upper = sql.to_ascii_uppercase();
-    if !upper.trim_start().starts_with("INSERT INTO") {
+    // Searched in place: `find_word` compares case-insensitively, so the
+    // upper-cased copy of the statement each call made was only a cost
+    // (every row of an upsert pays it, twice).
+    let head = sql.trim_start().as_bytes();
+    if head.len() < "INSERT INTO".len() || !head[.."INSERT INTO".len()].eq_ignore_ascii_case(b"INSERT INTO") {
         return None;
     }
 
@@ -382,7 +385,7 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
         .filter(|c| !c.is_empty())
         .collect();
 
-    let values_at = find_word(&upper, "VALUES", columns_close)?;
+    let values_at = find_word(sql, "VALUES", columns_close)?;
     let values_open = sql[values_at..].find('(')? + values_at;
     let values_close = matching_paren(sql, values_open)?;
     let values = split_values(&sql[values_open + 1..values_close]);
