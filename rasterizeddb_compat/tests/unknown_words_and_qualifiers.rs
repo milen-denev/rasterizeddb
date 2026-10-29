@@ -366,3 +366,54 @@ async fn a_correlated_exists_in_an_update_or_delete_needs_a_pinned_snapshot() {
     }
     conn.execute("ROLLBACK").await.expect("rollback");
 }
+
+/// Correlations PostgreSQL places that the rewrite placed wrong, and two it
+/// cannot, each with its proper answer: a schema-qualified outer column
+/// (Prisma's `"public"."t"."id"`) and an EXISTS beside an `UPDATE … FROM`
+/// source correlating with the target run (both were 42P01, "missing
+/// FROM-clause entry"); an outer column under arithmetic (`u.x = t.x + 1`,
+/// was 42601) and an EXISTS used as a value (`x - EXISTS (…)::int`, was
+/// XX000) are refused as 0A000.
+///
+/// Mutations: `qualifier_of` taking the first segment as the qualifier;
+/// the UPDATE target left out of an `UPDATE … FROM`'s outer names;
+/// `exists_used_as_value` always false.
+#[tokio::test(flavor = "multi_thread")]
+async fn correlations_are_placed_or_refused_with_their_code() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(
+        "CREATE TABLE t2 (id INT PRIMARY KEY, x INT, y INT, v INT); INSERT INTO t2 VALUES (1, 1, 1, 0), (2, 5, 2, 0); \
+         CREATE TABLE u2 (id INT PRIMARY KEY, tid INT, x INT); INSERT INTO u2 VALUES (1, 1, 2); \
+         CREATE TABLE w2 (id INT PRIMARY KEY, y INT); INSERT INTO w2 VALUES (1, 1)",
+    )
+    .await
+    .expect("setup");
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    for sql in [
+        "UPDATE t2 SET v = 0 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.x = t2.x + 1)",
+        "UPDATE t2 SET v = x - EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id)::int",
+    ] {
+        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
+        assert_eq!(code(&e), "0A000", "{sql}: {e}");
+        conn.execute("ROLLBACK").await.expect("rollback");
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    }
+    for sql in [
+        r#"UPDATE "public"."t2" SET v = 7 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid = "public"."t2"."id")"#,
+        "UPDATE t2 SET v = 9 FROM u2 WHERE u2.tid = t2.id AND EXISTS (SELECT 1 FROM w2 WHERE w2.y = t2.y)",
+    ] {
+        conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    conn.execute("COMMIT").await.expect("commit");
+    drop(conn);
+    let got: Vec<(i32, i32)> = pool
+        .fetch_all("SELECT id, v FROM t2 ORDER BY id")
+        .await
+        .expect("t2")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(got, vec![(1, 9), (2, 0)]);
+}

@@ -1066,13 +1066,41 @@ fn names_outer_column(term: &str, inner: &[String], outer_relations: &[String]) 
 }
 
 fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -> Side {
-    let cleaned = reference.trim().trim_matches('"');
-    let Some((qualifier, _)) = cleaned.rsplit_once('.') else {
+    let cleaned = reference.trim();
+    // Only a column reference has a side: `t.x + 1` is an expression over
+    // one, which the `IN` rewrite cannot place (it came out as `t.x + 1 IN
+    // (…)`, a syntax error), so it is no correlation.
+    let mut segments: Vec<&str> = Vec::new();
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i] == b'"' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            segments.push(cleaned[start..i].trim_matches('"'));
+        } else {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'$') || bytes[i] >= 0x80) {
+                i += 1;
+            }
+            if i == start {
+                return Side::Unknown;
+            }
+            segments.push(&cleaned[start..i]);
+        }
+        match bytes.get(i) {
+            None => break,
+            Some(b'.') => i += 1,
+            Some(_) => return Side::Unknown,
+        }
+    }
+    let qualifier = match segments.len() {
         // An unqualified name inside the subquery belongs to the subquery's
         // own relation, which is how SQL resolves it.
-        return Side::Inner;
+        0 | 1 => return Side::Inner,
+        // `q.col`, or `schema.q.col` (Prisma's `"public"."t"."id"`): the
+        // relation is the segment before the column.
+        n => segments[n - 2],
     };
-    let qualifier = qualifier.trim_matches('"');
 
     if inner.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
         Side::Inner

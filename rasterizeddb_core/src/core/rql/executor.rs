@@ -862,12 +862,14 @@ fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
     // `UPDATE t [AS] x SET …` names its relation before SET and has no FROM:
     // read as having none, a correlated EXISTS ran with no outer row and was
     // refused 42P01 (Django writes `UPDATE … WHERE EXISTS (…)`).
+    // `UPDATE t … FROM u` names both: the target too, or an EXISTS
+    // correlating with it ran with no outer row and was refused 42P01.
     let trimmed = sql.trim_start();
-    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("UPDATE") && find_keyword(sql, "FROM", 0).is_none() {
+    let mut names = Vec::new();
+    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("UPDATE") {
         let Some(set) = find_keyword(sql, "SET", 0) else { return Vec::new() };
         let head = sql[..set].trim();
         let mut words = head.split_whitespace().skip(1);
-        let mut names = Vec::new();
         if let Some(table) = words.next() {
             names.push(table.trim_matches('"').to_string());
         }
@@ -876,11 +878,13 @@ fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
             Some(a) => names.push(a.trim_matches('"').to_string()),
             None => {}
         }
-        return names;
+        if find_keyword(sql, "FROM", 0).is_none() {
+            return names;
+        }
     }
 
     let Some(from) = find_keyword(sql, "FROM", 0) else {
-        return Vec::new();
+        return names;
     };
     let start = from + "FROM".len();
     let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING"]
@@ -889,7 +893,6 @@ fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
         .min()
         .unwrap_or(sql.len());
 
-    let mut names = Vec::new();
     for segment in sql[start..end].split(|c| c == ',') {
         let mut words = segment.split_whitespace().peekable();
         while let Some(word) = words.next() {
@@ -915,6 +918,16 @@ pub(crate) const CORRELATED_EXISTS_WRITE: &str = "a correlated EXISTS in UPDATE 
      READ COMMITTED: its subquery is read under an earlier snapshot than the rows the statement writes, so a \
      concurrent writer between them makes it touch the wrong rows; run it in a REPEATABLE READ or SERIALIZABLE \
      transaction, or write it as UPDATE … FROM / DELETE … USING";
+
+/// Whether the `[NOT] EXISTS (…)` at `start..end` of `sql` is a value
+/// rather than a condition: cast (`::`) or an operand of arithmetic.
+fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
+    let after = sql[end..].trim_start();
+    let before = sql[..start].trim_end();
+    after.starts_with("::")
+        || matches!(after.as_bytes().first(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'|'))
+        || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'|'))
+}
 
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
 /// parenthesised `SELECT`.
@@ -1057,6 +1070,16 @@ pub async fn substitute_in_subqueries(
 
         if write_statement && !pinned {
             return Err(CORRELATED_EXISTS_WRITE.to_string());
+        }
+        // As a value — under arithmetic or a cast (`x - EXISTS (…)::int`) —
+        // its `IN` form, a predicate, came out as text no reader takes (XX000,
+        // "is neither a column nor a value").
+        if exists_used_as_value(&current, clause.start, clause.end) {
+            return Err(
+                "a correlated EXISTS used as a value (under arithmetic or a cast) is not supported; \
+                 use it as a condition, or write a CASE over it"
+                    .to_string(),
+            );
         }
         if bounds.offset > 0 {
             // "More than k matching rows per outer row" has no `IN` form.
