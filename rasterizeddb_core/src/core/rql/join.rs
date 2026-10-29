@@ -273,6 +273,21 @@ impl JoinPlan {
     /// scale, as `expr::eval` produces it. Without this a join was rendered at
     /// the engine scale throughout, so a `NUMERIC(10,2)` holding 1.25 read
     /// back through any join as 0.000000125.
+    /// The type of each output column, slot for slot: what the row
+    /// description advertises (`JoinSelectItem::field`), or an aggregate's
+    /// result type. A constant is flagged, as its type is the float it is
+    /// carried as (`executor::query_output_types`).
+    pub fn output_types(&self) -> Vec<(DbType, bool)> {
+        if let Some(agg) = &self.aggregate {
+            return agg
+                .items
+                .iter()
+                .map(|item| (item.result_type(), matches!(item, crate::core::rql::aggregate::SelectItem::Literal { .. })))
+                .collect();
+        }
+        self.items.iter().map(|i| (i.field.db_type.clone(), i.literal.is_some())).collect()
+    }
+
     pub fn output_scales(&self) -> Vec<u32> {
         use crate::core::rql::aggregate::SelectItem;
         let engine = crate::core::value_codec::DECIMAL_SCALE;

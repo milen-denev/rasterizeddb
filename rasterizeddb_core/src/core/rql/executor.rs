@@ -568,7 +568,22 @@ pub(crate) fn query_output_types(
 ) -> Option<Vec<crate::core::db_type::DbType>> {
     let QueryPurpose::QueryRows(qr) = purpose else { return None };
     if crate::core::rql::join::statement_has_join(&qr.query) {
-        return None;
+        // A join's, from its plan, as `query_output_scales` takes its scales:
+        // refused unread, `SELECT nn.c FROM nn JOIN mm … UNION SELECT c FROM
+        // mm` was refused where base answered it.
+        let schema_of = |name: &str| database.schema_view(name).map(|v| v.schema().fields.clone());
+        let plan = crate::core::rql::join::plan_statement(&qr.query, &schema_of).ok()?;
+        return Some(
+            plan.output_types()
+                .into_iter()
+                .map(|(t, constant)| match t {
+                    crate::core::db_type::DbType::F64 if constant && constants_as_numeric => {
+                        crate::core::db_type::DbType::DECIMAL
+                    }
+                    other => other,
+                })
+                .collect(),
+        );
     }
     let view = database.schema_view(&qr.table_name)?;
     let parsed = crate::core::rql::lexer_query::row_fetch_from_select_query(purpose, &view.schema().fields).ok()?;

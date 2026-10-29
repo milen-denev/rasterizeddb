@@ -50,9 +50,26 @@ pub fn widened_branch_integers(
     database: &Arc<Database>,
     relations: &[(String, crate::core::rql::cte::ScratchFields)],
 ) -> Vec<Option<DbType>> {
+    // A constant, an expression or an aggregate declares nothing; its type is
+    // the select list's own. Unread, `SELECT i FROM nn UNION SELECT 1 FROM mm`
+    // sent the constant's eight bytes under `i`'s int4 description, which
+    // rendered empty.
     let declared: Vec<Vec<Option<DbType>>> = branches
         .iter()
-        .map(|branch| crate::core::rql::cte::declared_item_types_among(branch, database, relations))
+        .map(|branch| {
+            let mut types = crate::core::rql::cte::declared_item_types_among(branch, database, relations);
+            if let Some(own) = crate::core::rql::lexer_s1::recognize_query_purpose(branch)
+                .and_then(|p| crate::core::rql::executor::query_output_types(&p, database, false))
+            {
+                types.resize(types.len().max(own.len()), None);
+                for (at, t) in own.into_iter().enumerate() {
+                    if types[at].is_none() {
+                        types[at] = Some(t);
+                    }
+                }
+            }
+            types
+        })
         .collect();
     let width = declared.iter().map(Vec::len).min().unwrap_or(0);
     (0..width)

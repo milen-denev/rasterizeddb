@@ -126,6 +126,10 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         ("SELECT sum(c) FROM r UNION ALL SELECT d FROM r ORDER BY 1", &["-0.0001", "3.1415", "44810.10"]),
         ("SELECT c FROM r UNION ALL SELECT 0.0001 FROM r WHERE id = 1 ORDER BY 1", &["-2.55", "0.0001", "44812.65"]),
         ("SELECT c FROM r UNION SELECT 44812.6500 FROM r ORDER BY 1", &["-2.55", "44812.65"]),
+        // A join branch is typed from its plan (it was refused), and a
+        // constant beside an integer column widens it (it rendered empty).
+        ("SELECT c FROM r UNION SELECT r.d FROM r JOIN jb ON jb.id = r.id ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
+        ("SELECT i FROM r UNION SELECT 1 FROM r ORDER BY 1", &["1", "4", "7"]),
         ("SELECT count(*) FROM (SELECT c AS x FROM r UNION ALL SELECT d FROM r) s WHERE x < 0", &["2"]),
         // Compared with a constant or a column of another scale.
         ("INSERT INTO ck VALUES (1, 1.123456789123)", &[]),
