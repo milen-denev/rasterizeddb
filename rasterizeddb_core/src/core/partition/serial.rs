@@ -212,15 +212,20 @@ impl SerialSource {
         let Some(io) = &self.io else {
             return Ok(());
         };
+        let raised: Vec<(String, i64)> = behind.into_iter().map(|(n, c)| (n, c.saturating_add(STEP))).collect();
         let next = {
             let mut entries = self.entries.lock().clone();
-            for (name, current) in behind {
-                entries.insert(name, current.saturating_add(STEP));
-            }
+            entries.extend(raised.iter().cloned());
             entries
         };
         Self::write(io, &next, "raised").await?;
-        *self.entries.lock() = next;
+        // Merged, not replaced: a sequence `track`ed while the write was in
+        // flight keeps its entry (the next raise writes it).
+        let mut entries = self.entries.lock();
+        for (name, value) in raised {
+            let e = entries.entry(name).or_insert(value);
+            *e = (*e).max(value);
+        }
         Ok(())
     }
 
@@ -260,32 +265,84 @@ impl SerialSource {
     /// The clean-shutdown write (§10): every entry whose counter this
     /// process has seeded lowered to the exact last value handed out, then
     /// synced, so a clean restart resumes with no gap, as PostgreSQL's
-    /// sequences do. Sound at any moment, not only after the sessions end:
-    /// a value taken later is above the new entry, and the write path
-    /// raises it again before the row is written.
+    /// sequences do. Sound at any moment, not only after the sessions end
+    /// (a shutdown can start sealing with statements still running): a
+    /// value taken after the counters are read is above the lowered entry,
+    /// and the write path raises it again before the row is written.
     pub(crate) async fn record_exact(&self) -> io::Result<()> {
+        // Under `raising` for the whole of it: a raise that began first has
+        // written its file before this reads, and one a later value needs
+        // waits until this has written, so its higher value lands last.
         let _one = self.raising.lock().await;
         let Some(io) = &self.io else {
             return Ok(());
         };
-        let current = self.entries.lock().clone();
-        let mut next = current.clone();
-        for (name, reserved) in next.iter_mut() {
-            if let Some(last) = crate::core::rql::sequence::current(self.db_id, name)
-                && last < *reserved
-            {
-                *reserved = last;
+        // Read every counter and lower the entries in one critical section
+        // of the lock `behind` reads under: a value taken after the read is
+        // above the lowered entry, so its write raises again (and waits for
+        // `raising`, above). Lowered after the file write instead, a value
+        // taken while the write was in flight would still see the old, high
+        // entry, raise nothing, and commit; a restart from the file would
+        // then hand it out again.
+        let next = {
+            let mut entries = self.entries.lock();
+            let mut changed = false;
+            for (name, reserved) in entries.iter_mut() {
+                if let Some(last) = crate::core::rql::sequence::current(self.db_id, name)
+                    && last < *reserved
+                {
+                    *reserved = last;
+                    changed = true;
+                }
             }
-        }
-        if next == current {
-            return Ok(());
-        }
+            if !changed {
+                return Ok(());
+            }
+            entries.clone()
+        };
+        #[cfg(test)]
+        test_hooks::park_before_write(io.get_location()).await;
         Self::write(io, &next, "recorded").await?;
         if let Some(location) = io.get_location() {
             crate::core::wal::with_wal_for(&location, |w| w.map_or(Ok(()), |w| w.sync_pending()))?;
         }
-        *self.entries.lock() = next;
         Ok(())
+    }
+}
+
+/// Test-only: holds `record_exact` between lowering its entries and writing
+/// them, for tables whose files are under an armed directory.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    type Park = (PathBuf, Arc<Notify>, Arc<Notify>);
+    static PARKS: parking_lot::Mutex<Vec<Park>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The first `Notify` is signalled when a `record_exact` under `dir`
+    /// reaches the park, which goes on once the second is.
+    pub(crate) fn arm(dir: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PARKS.lock().push((dir.to_path_buf(), reached.clone(), resume.clone()));
+        (reached, resume)
+    }
+
+    pub(super) async fn park_before_write(location: Option<String>) {
+        let Some(location) = location else {
+            return;
+        };
+        let found = {
+            let mut parks = PARKS.lock();
+            let at = parks.iter().position(|(d, _, _)| Path::new(&location).starts_with(d));
+            at.map(|i| parks.remove(i))
+        };
+        if let Some((_, reached, resume)) = found {
+            reached.notify_one();
+            resume.notified().await;
+        }
     }
 }
 

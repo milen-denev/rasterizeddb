@@ -1035,3 +1035,46 @@ async fn a_stuck_partition_holds_up_no_forget_round() {
     assert!(boards_after >= boards + 5, "board rounds stopped behind a parked unit ({boards} then {boards_after})");
     close(&dir, db);
 }
+
+/// A clean shutdown's exact write with an insert still running: the insert
+/// takes the next value after the counters were read and before the file
+/// is written. It must raise the reservation above that value (it sees the
+/// lowered entry, and waits for the write), or a restart from the file would
+/// hand the value out again.
+///
+/// Mutation: `record_exact` lowering its in-memory entries only after the
+/// file write (the first ordering): the insert sees the old, high entry,
+/// raises nothing, and the restart repeats its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_during_the_clean_shutdown_write_never_repeats_after_a_restart() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    exec(&db, "CREATE TABLE sx (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+    exec(&db, "INSERT INTO sx (tenant_id, v) VALUES (1, 'a'), (2, 'a'), (3, 'a')").await;
+    let (reached, resume) = super::serial::test_hooks::arm(&dir);
+    let recording = {
+        let db = db.clone();
+        tokio::spawn(async move { db.record_clean_shutdown().await })
+    };
+    reached.notified().await;
+    let inserting = {
+        let db = db.clone();
+        tokio::spawn(async move { exec(&db, "INSERT INTO sx (tenant_id, v) VALUES (4, 'during')").await })
+    };
+    // Long enough for the insert to take its value and reach its cover.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    resume.notify_one();
+    recording.await.unwrap();
+    inserting.await.unwrap();
+    assert_eq!(serial_ids(&db, "sx").await, vec![1, 2, 3, 4]);
+    // No second clean write: the restart reads what the file holds now.
+    db.sync_durable().unwrap();
+    close(&dir, db);
+    let db = open(&dir).await;
+    exec(&db, "INSERT INTO sx (tenant_id, v) VALUES (5, 'after')").await;
+    let got = serial_ids(&db, "sx").await;
+    assert_eq!(got.len(), 5);
+    assert_distinct(&got, "an insert during the clean-shutdown write, then a restart");
+    close(&dir, db);
+}

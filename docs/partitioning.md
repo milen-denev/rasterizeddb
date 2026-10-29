@@ -267,8 +267,14 @@ durable reservation. **A clean shutdown records the exact last value**
 (`Database::record_clean_shutdown`, run by `seal_for_shutdown` after the
 sessions end, synced), so a clean restart resumes with no gap, as
 PostgreSQL does; **a crash leaves a gap of up to one step**. Lowering the
-entry is sound at any moment: a later value is above it and the write path
-raises it again. **An entry the defaults no longer read is forgotten** at
+entry is sound at any moment, statements still running included (a
+shutdown seals after a bounded wait for its sessions): the counters are
+read and the in-memory entries lowered in one critical section of the lock
+the write path's check reads under, before the file write, so a value
+taken afterwards raises again, and that raise waits for the exact write
+and lands above it (review round 3; lowered after the write, a value taken
+during the fsync raised nothing and repeated after a restart:
+`an_insert_during_the_clean_shutdown_write_never_repeats_after_a_restart`). **An entry the defaults no longer read is forgotten** at
 every open and every schema change's reopen (`retain_read`): after `RENAME
 a TO b` the counter runs on as `b_id_seq`, and an `a_id_seq` entry kept
 for a later `RENAME b TO a` would resume below values handed out
