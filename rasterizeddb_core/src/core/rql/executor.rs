@@ -7487,33 +7487,60 @@ fn has_top_level_arithmetic(text: &str) -> bool {
 }
 
 /// The alias an `INSERT INTO t AS a …` gives its target, unquoted.
-/// A numeric literal bound for `field` as the column stores it, written
-/// back as a literal: rounded half away from zero to a NUMERIC's scale, or
-/// to a whole number for an integer column, PostgreSQL's assignment cast.
-/// `None` for anything that is not a plain number (NULL, an expression, a
-/// string the column reads otherwise), which is left as written.
+/// The value `literal` (a constant, or a constant expression: `1.254`,
+/// `'1.254'`, `1.254::numeric`, `CAST(… AS NUMERIC(10,3))`, `1.25 + 0.004`)
+/// becomes when assigned to `field`, written back as a literal: evaluated
+/// into the column as an INSERT stores it (`expr::eval_into`, PostgreSQL's
+/// assignment cast: a NUMERIC rounded half away from zero at its scale, an
+/// integer from text or a fraction). `None` for anything that is not such
+/// a constant of a numeric column, which is left as written.
+///
+/// The one key an `ON CONFLICT` statement looks rows up by, checks its own
+/// rows against and hands `EXCLUDED`: from literal text, `1.254::numeric`
+/// matched no row, and `(0.995, …), (1.00, …)` were two keys that the
+/// column stores as one.
 pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::schema::SchemaField) -> Option<String> {
     use crate::core::db_type::DbType;
+    let integer = matches!(
+        field.db_type,
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+    );
+    if field.db_type != DbType::DECIMAL && !integer {
+        return None;
+    }
     let text = literal.trim();
-    let text = text
+    // A quoted number is an untyped constant the column reads as its own.
+    let unquoted = text
         .strip_prefix('\'')
         .and_then(|t| t.strip_suffix('\''))
         .map(str::trim)
-        .unwrap_or(text);
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E')) {
+        .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E')));
+    let text = unquoted.unwrap_or(text);
+    if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
     }
-    match field.db_type {
+    let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
+    if !crate::core::rql::expr::columns_of(&expr).is_empty() {
+        return None;
+    }
+    let value = crate::core::rql::expr::eval_into(&expr, &crate::core::row::row::Row::default(), &[], field).ok()?;
+    let crate::core::rql::expr::Value::Data { bytes, db_type } = value else { return None };
+    match db_type {
         DbType::DECIMAL => {
-            let scale = field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
-            let v = crate::core::value_codec::parse_decimal_rounded(text, scale)?;
-            Some(crate::core::value_codec::format_decimal_scaled(v, scale))
+            let raw = i128::from_le_bytes(bytes.as_slice().try_into().ok()?);
+            Some(crate::core::value_codec::format_decimal_scaled(
+                raw,
+                field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+            ))
         }
-        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
-            if text.contains(['.', 'e', 'E']) =>
-        {
-            Some(crate::core::value_codec::parse_decimal_rounded(text, 0)?.to_string())
-        }
+        DbType::I8 => Some(i8::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::I16 => Some(i16::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::I32 => Some(i32::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::I64 => Some(i64::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::U8 => Some(u8::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::U16 => Some(u16::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::U32 => Some(u32::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
+        DbType::U64 => Some(u64::from_le_bytes(bytes.as_slice().try_into().ok()?).to_string()),
         _ => None,
     }
 }
@@ -8497,6 +8524,10 @@ async fn insert_values_tuples(
     // missed duplicate is today's behaviour, and nothing valid is refused.
     if let Some(spec) = row_data.on_conflict_update.as_ref().filter(|s| !s.arbiter.is_empty()) {
         if statements.len() > 1 {
+            // Compared as the column stores each key (`stored_numeric_literal`):
+            // as written, `(0.995, …), (1.00, …)` into a NUMERIC(10,2) were two
+            // keys, and `(5.0, …), (5.00, …)` applied last-wins.
+            let fields = database.schema_view(&row_data.table_name).map(|v| v.schema().fields.clone());
             let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
             for stmt in &statements {
                 let values = crate::core::rql::lexer_ir::assignments_of_insert(stmt).unwrap_or_default();
@@ -8504,10 +8535,17 @@ async fn insert_values_tuples(
                     .arbiter
                     .iter()
                     .map(|column| {
-                        values
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                            .map(|(_, literal)| literal.trim().to_string())
+                        values.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, literal)| {
+                            fields
+                                .as_ref()
+                                .and_then(|fields| {
+                                    fields
+                                        .iter()
+                                        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+                                        .and_then(|f| stored_numeric_literal(literal, f))
+                                })
+                                .unwrap_or_else(|| literal.trim().to_string())
+                        })
                     })
                     .collect();
                 if let Some(key) = key {

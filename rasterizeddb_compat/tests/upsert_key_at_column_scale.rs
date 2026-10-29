@@ -7,6 +7,12 @@
 //! proposed row is now taken as the column stores it, for the lookup and for
 //! `EXCLUDED`, on plain and partitioned tables, for composite keys and an
 //! INSERT … SELECT from a wider NUMERIC. The expected text is PostgreSQL 17's.
+//!
+//! The key is the value as evaluated into the column, never the literal's
+//! text: `1.254::numeric`, `CAST('1.254' AS numeric)`, `(1.254)` matched no
+//! row; and two rows of one statement whose keys the column stores as one —
+//! `(0.995, …), (1.00, …)`, `(5.0, …), (5.00, …)` — were stored twice or
+//! applied last-wins, where PostgreSQL raises 21000.
 
 use rasterizeddb_compat::TestServer;
 use tokio_postgres::SimpleQueryMessage;
@@ -79,8 +85,40 @@ async fn upserts(partitioning: &str) {
         ("INSERT INTO up2 SELECT b, 4 FROM s2 ON CONFLICT (k) DO NOTHING RETURNING k", &[]),
         ("SELECT k, v FROM up2", &["0.123456789123|30"]),
         ("INSERT INTO uc VALUES (1.254, 7, 2) ON CONFLICT (k, t) DO UPDATE SET v = 20 RETURNING k, t, v", &["1.25|7|20"]),
+        // The key as an expression: evaluated into the column.
+        ("INSERT INTO up VALUES (1.254::numeric, 2) ON CONFLICT (k) DO UPDATE SET v = 2 RETURNING k, v", &["1.25|2"]),
+        ("INSERT INTO up VALUES ('1.254'::numeric, 3) ON CONFLICT (k) DO UPDATE SET v = 3 RETURNING k, v", &["1.25|3"]),
+        ("INSERT INTO up VALUES (CAST('1.254' AS numeric), 4) ON CONFLICT (k) DO UPDATE SET v = 4 RETURNING k, v", &["1.25|4"]),
+        ("INSERT INTO up VALUES ((1.254), 5) ON CONFLICT (k) DO UPDATE SET v = 5 RETURNING k, v", &["1.25|5"]),
+        ("INSERT INTO up VALUES (1.254::numeric(10,2), 7) ON CONFLICT (k) DO UPDATE SET v = 7 RETURNING k, v", &["1.25|7"]),
+        ("INSERT INTO up (v, k) VALUES (9, 1.25 + 0.004) ON CONFLICT (k) DO UPDATE SET v = 9 RETURNING k, v", &["1.25|9"]),
         ("SELECT count(*) FROM up", &["1"]),
         ("SELECT count(*) FROM uc", &["1"]),
+    ] {
+        let got = text(&client, sql).await;
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!("{sql}\n    got  {got:?}\n    want {want:?}"));
+        }
+    }
+    // Two rows of one statement that the column stores under one key: 21000,
+    // nothing written. As PostgreSQL 17 answers.
+    for sql in [
+        "INSERT INTO up VALUES (0.995, 3), (1.00, 4) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO up VALUES (5.0, 1), (5.00, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO up VALUES (7.10, 1), ('7.1', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO uc VALUES (2.004, 7, 3), (2.001, 7, 4) ON CONFLICT (k, t) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO ui VALUES (5, 1), ('5', 2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+    ] {
+        let got = text(&client, sql).await;
+        if got != Err("21000".to_string()) {
+            wrong.push(format!("{sql}\n    got  {got:?}\n    want Err(21000)"));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT count(*) FROM up WHERE k IN (1.00, 5.00, 7.10)", &["0"][..]),
+        ("SELECT count(*) FROM uc WHERE k = 2.00", &["0"]),
+        ("SELECT count(*) FROM ui WHERE id = 5", &["0"]),
     ] {
         let got = text(&client, sql).await;
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
