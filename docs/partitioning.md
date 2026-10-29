@@ -629,10 +629,40 @@ storage-config sync are the same at all three. A batched run before the
 header joined the transaction took a second log sync on another thread
 while the statement ran; at `e446df4` all three took one. Before, a
 single-record statement could return before its log sync; now it returns
-after it. The `FIELDS` sidecar and the schema file's first
-write (`TableSchema::save`) keep the logged append: they are written by `CREATE
-TABLE`, before the catalogue names the table, or under `reload_atomic` and
-`rewrite_table`, whose backup and intent put the files back after a cut.
+after it.
+
+**A `CREATE TABLE` cut inside its sync** (found by the review of
+`982f578`, at `c29e3d9` too): the catalogue row went first, a logged
+append, then the schema and field files, then the sidecars and the
+primary-key header in their one write-ahead commit. A cut inside that sync
+kept the row and the fields and lost the sidecars: the table reopened with
+every column and no `PRIMARY KEY`, `UNIQUE`, `CHECK` or `FOREIGN KEY`, none
+enforced, and `CREATE TABLE IF NOT EXISTS` then succeeded on it. A plain
+`CREATE` now writes an intent (`database::create_intent`), then every file,
+syncs the log, writes the catalogue row, the commit point, syncs again, and
+removes the intent. An image holding any byte of the row holds every file
+whole, since they were durable before it was written; one without it has its
+files voided and deleted at open by the intent naming them, so a `CREATE` of
+the name succeeds again. A failure before the row discards the files the
+same way. A partitioned `CREATE` already wrote and synced its uid's files
+before its row, and the startup reaper deletes a uid no row names. The
+intent costs two syncs (the file and the directory), and the row's own sync
+moves from the statement's end into the `CREATE`; a statement-scoped
+relation and a directory being bulk-loaded take neither. The schema file and
+its field records keep the logged append: an image can keep a field file's
+new length and drop its page only where no catalogue row names the table,
+and the field loader skips a record of zeros all the same
+(`SchemaFieldIterator`). `CREATE TABLE … AS` is not a table definition here
+and never reaches `add_table`. A commit `commit_durable` refuses before it
+is attempted (one of a batch's writes failed) now aborts its transaction:
+nothing else ended it, and its other files' held writes kept every
+checkpoint declining (`SidecarWrites` and `column_declarations` alike).
+Pinned by `create_crash_tests::a_create_table_cut_anywhere_leaves_no_table_or_the_whole_table`
+(a plain and a partitioned table with all four constraints, cut in every
+sync and after it returns, every seed kind: absent and re-creatable, or
+whole and enforced; both happen), `torn_tail::tests::a_field_record_of_zeros_reads_as_no_column`
+and `…::a_refused_batch_releases_its_transaction`.
+
 Pinned by `torn_tail::tests::a_schema_record_reads_whole_after_a_cut_once_appended`
 (each sidecar cut after each of its last three records, past a page
 boundary, every seed kind: exactly the records appended, whole),
