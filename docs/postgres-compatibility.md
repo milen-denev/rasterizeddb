@@ -176,9 +176,13 @@ what makes a seed migration re-runnable against a database that already holds
 the rows. The arbiter is not consulted — any uniqueness violation is swallowed,
 where PostgreSQL would error if the named columns matched no constraint. That is
 more permissive, and the difference only shows for a statement PostgreSQL would
-have rejected. **`DO UPDATE` is refused** rather than treated as `DO NOTHING`:
-silently dropping the update half is a lost write the caller cannot detect,
-which is worse than an unsupported statement.
+have rejected. `DO UPDATE` finds the conflicting row by its arbiter key as the
+column stores it (`1.254` into a `NUMERIC(10,2)` key is `1.25`).
+
+Two rows of one `INSERT … ON CONFLICT DO UPDATE` with the same arbiter key
+refuse the statement with 21000, as in PostgreSQL, the keys compared as each
+column stores them: `5.0` and `5.00`, `'A0EE…'` and `'a0ee…'`, `'2020-01-01'`
+and `'2020-01-01 00:00:00'`, `true` and `'t'` are one key each.
 
 Statements accepted without acting, each for a stated reason rather than
 silently: index DDL (the engine maintains its own indexes), extensions, schemas,
@@ -348,7 +352,11 @@ kept unenforced, with a WARNING, on every DDL path (CREATE TABLE, ALTER TABLE
 ADD CONSTRAINT, ADD COLUMN … CHECK): PostgreSQL compares `character(n)`
 blank-padded (`'AB '` is `'AB'`), and this engine stores it as text, so
 enforcing it would refuse rows PostgreSQL accepts. The column's declared type
-is recorded with the table for a later ALTER; the stored check reads the
+is recorded with the table for a later ALTER, and follows the column: `RENAME
+COLUMN` carries it, `DROP COLUMN` retires it, and `ALTER COLUMN … TYPE` between
+`character(n)` and text sets or retires it, declining the column's stored
+checks when it becomes `character(n)` (a check stored while it was
+`character(n)` stays declined after `TYPE text`). The stored check reads the
 column `::bpchar`, as `pg_dump` writes it.
 
 `SHOW CHECKS` lists every check, with `enforced`, `enforced (ASCII-exact)` (a
@@ -388,6 +396,11 @@ concurrent writer between the two would make it touch rows PostgreSQL's does
 not; a pinned snapshot makes them one. Write it as `UPDATE … FROM` /
 `DELETE … USING` to run it under `READ COMMITTED`. `IN (SELECT …)` and `NOT IN
 (SELECT …)` in a write share the snapshot gap and are not yet refused.
+
+A correlation may name the target schema-qualified (`"public"."t"."id"`), or,
+in `UPDATE … FROM`, the target beside its source. One that compares an outer
+column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
+(`x - EXISTS (…)::int`), is refused with 0A000.
 
 ### NUMERIC past nine places
 
