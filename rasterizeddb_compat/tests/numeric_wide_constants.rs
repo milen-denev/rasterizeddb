@@ -60,7 +60,8 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
              INSERT INTO jb VALUES (1, 1.12345678912345678912), (2, -0.00000000000000000005); \
              CREATE TABLE u2 (id BIGINT PRIMARY KEY, c NUMERIC(10,2), d NUMERIC(12,4)); \
              INSERT INTO u2 VALUES (1, 1.25, 1.2500); \
-             CREATE TABLE un (id BIGINT PRIMARY KEY, n NUMERIC)",
+             CREATE TABLE un (id BIGINT PRIMARY KEY, n NUMERIC); \
+             CREATE TABLE ni (id BIGINT PRIMARY KEY, i INT); INSERT INTO ni VALUES (1, 7)",
         )
         .await
         .expect("setup");
@@ -130,6 +131,7 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         // constant beside an integer column widens it (it rendered empty).
         ("SELECT c FROM r UNION SELECT r.d FROM r JOIN jb ON jb.id = r.id ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT i FROM r UNION SELECT 1 FROM r ORDER BY 1", &["1", "4", "7"]),
+        ("SELECT i FROM ni UNION SELECT 1 FROM ni ORDER BY 1", &["1", "7"]),
         ("SELECT count(*) FROM (SELECT c AS x FROM r UNION ALL SELECT d FROM r) s WHERE x < 0", &["2"]),
         // Compared with a constant or a column of another scale.
         ("INSERT INTO ck VALUES (1, 1.123456789123)", &[]),
