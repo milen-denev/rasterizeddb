@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::database::Database;
 use crate::core::mvcc::TxId;
-use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxOutcome};
+use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
 
 /// How long a statement's conflict waits may last together, from its first
 /// conflict: the blind back-off's old total (twelve doublings capped at
@@ -138,7 +138,11 @@ impl Pacing {
     ) -> Pause {
         let since = *self.since.get_or_insert_with(Instant::now);
         let transactions = &database.transactions;
-        let live = |tx: TxId| transactions.outcome(tx) == TxOutcome::InProgress;
+        // Until the blocker is retired (`TransactionManager::unfinished`):
+        // a replay inside its commit's window reads at a snapshot that still
+        // cannot see the commit, meets the same version, and the replays ran
+        // out at once with 40001 (`row_lock_handover_tests`).
+        let live = |tx: TxId| transactions.unfinished(tx);
         // A blocker of the waiter's own family (a savepoint's key in flight,
         // met by a later savepoint of the same block) never ends while the
         // waiter waits.
@@ -175,7 +179,9 @@ fn blind_backoff(n: usize) -> Duration {
 async fn wait_for(database: &Database, site: Site, waiter: TxId, blocker: TxId, since: Instant) -> Pause {
     let transactions = &database.transactions;
     let row_locks = &database.row_locks;
-    let live = |tx: TxId| transactions.outcome(tx) == TxOutcome::InProgress;
+    // As in `Pacing::pause`. `watch_ends` is signalled after retirement
+    // (`TransactionManager::commit`), so the wait wakes when this changes.
+    let live = |tx: TxId| transactions.unfinished(tx);
     row_locks.conflict_waits.waits[site as usize].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let started = Instant::now();
     let lock_timeout = crate::core::cancel::lock_timeout();

@@ -1697,12 +1697,14 @@ async fn acquire_referenced_waiting(
 ) -> Result<(), String> {
     use crate::core::mvcc::row_locks::Acquired;
 
-    let live = |candidate: TxId| {
-        matches!(
-            database.transactions.status().outcome(candidate),
-            crate::core::mvcc::transaction::TxOutcome::InProgress
-        )
-    };
+    // Until its holder is retired, not only while its outcome is
+    // `InProgress` (`TransactionManager::unfinished`): what the caller reads
+    // under the key next is read at a snapshot taken after it, and one taken
+    // in a commit's window between record and retirement does not show the
+    // holder's writes. A child insert then saw a deleted parent, and a
+    // parent's DELETE missed an inserted child: an orphan either way
+    // (`row_lock_handover_tests`).
+    let live = |candidate: TxId| database.transactions.unfinished(candidate);
     let started = std::time::Instant::now();
     let deadline = started + LOCK_WAIT_TIMEOUT;
     let _waiting = database.row_locks.waiting_guard(tx);
@@ -6154,12 +6156,14 @@ async fn acquire_row_lock(
 ) -> Result<crate::core::mvcc::row_locks::Acquired, String> {
     use crate::core::mvcc::row_locks::Acquired;
 
-    let live = |candidate: TxId| {
-        matches!(
-            database.transactions.status().outcome(candidate),
-            crate::core::mvcc::transaction::TxOutcome::InProgress
-        )
-    };
+    // A holder counts as live until it is retired, as a writer's mark does
+    // below (`TransactionManager::unfinished`). Taking a dead holder's row
+    // frees everything the holder holds, in every lock space
+    // (`RowLocks::acquire`): a holder taken for dead in its commit's window
+    // lost its referenced-key locks with it, and a child insert that came
+    // next found its parent's key free and the parent still showing
+    // (`row_lock_handover_tests`).
+    let live = |candidate: TxId| database.transactions.unfinished(candidate);
     // A writer that marked the row counts as live until it is retired from
     // the running set, not only while its owner is: a commit records its
     // outcome first and retires after (`TransactionManager::commit`), and a
@@ -13543,6 +13547,13 @@ impl RowMarker {
         let Ok(key) = self.key.row_key(&cells) else {
             return Ok(());
         };
+        // By outcome alone, unlike a locker's checks (`acquire_row_lock`): a
+        // holder whose commit is recorded and not yet retired may be passed
+        // here. If it wrote this row, the version this writer is stamping
+        // carries its `xmax`, and `Table::check_write_conflict`, which runs
+        // first, has refused it; if it wrote nothing here, its lock guarded
+        // nothing that changed. Nothing is freed on the way: `mark_row_writes`
+        // only reads the holders.
         let live = |candidate: TxId| {
             matches!(
                 self.transactions.status().outcome(candidate),

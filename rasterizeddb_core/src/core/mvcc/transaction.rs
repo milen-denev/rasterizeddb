@@ -1625,6 +1625,25 @@ impl TransactionManager {
         self.inner.read().running.contains(&tx)
     }
 
+    /// Whether `tx` has yet to end for a reader: in progress, or committed
+    /// but not yet retired, so a snapshot taken now still cannot see its
+    /// writes ([`Self::is_running`]). An abort is final at once: an aborted
+    /// write is invisible to every snapshot, retired or not.
+    ///
+    /// What a wait or a lock handover must ask before acting on a read it
+    /// takes next. Asking whether the outcome is `InProgress` handed on a
+    /// row lock, a referenced key and a conflict wait in the window between
+    /// a commit's record and its retirement, and the reader that followed
+    /// read the rows as they were before the commit
+    /// (`rql::row_lock_handover_tests`).
+    pub fn unfinished(&self, tx: TxId) -> bool {
+        match self.outcome(tx) {
+            TxOutcome::InProgress => true,
+            TxOutcome::Committed => tx != FROZEN_TX && self.is_running(tx),
+            TxOutcome::Aborted => false,
+        }
+    }
+
     /// One past the highest id assigned so far.
     pub fn next_id(&self) -> TxId {
         self.next_id.load(Ordering::Acquire)

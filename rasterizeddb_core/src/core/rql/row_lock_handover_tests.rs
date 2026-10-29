@@ -1,18 +1,23 @@
-//! A writer's row mark holds its row while the writer's commit is recorded
-//! but not yet visible.
+//! Nothing is handed on, waited out or counted free while a transaction's
+//! commit is recorded but not yet visible.
 //!
 //! `TransactionManager::commit` records the outcome, then retires the
 //! transaction from the running set, and only a snapshot taken after the
-//! retirement sees the commit. A locker that counted the writer as gone at
-//! the recorded outcome kept the row's lock in between; its locking read then
-//! scanned again at a snapshot that still could not see the commit, and,
-//! finding the row locked by itself already, returned it as scanned. The
-//! `SKIP LOCKED` job queue handed a finished job to a second worker, which
-//! marked it again by key (compat `composite_row_locks.rs`, "job (4,25)
-//! claimed by workers 4 and 5").
+//! retirement sees the commit. Whatever judged the transaction gone by its
+//! recorded outcome, and then read at a snapshot, read the rows as they were
+//! before the commit. First seen as the `SKIP LOCKED` job queue handing a
+//! finished job to a second worker (compat `composite_row_locks.rs`, "job
+//! (4,25) claimed by workers 4 and 5"): a locker kept a row whose writer was
+//! in that window, scanned again at a snapshot that could not see the
+//! commit, found the row locked by itself already, and returned it as
+//! scanned. The same judgment, elsewhere, stored orphans (a referenced-key
+//! lock), lost an upsert and showed a key twice (the uniqueness check's
+//! in-flight rule), and failed a replay with 40001 (the conflict wait).
+//! `TransactionManager::unfinished` is the rule they ask now.
 //!
-//! Each test parks a claimer's `COMMIT` in that window
-//! (`commit_test_hooks::after_record`) and runs the second claim inside it.
+//! Each test parks a `COMMIT` in that window
+//! (`commit_test_hooks::after_record`) and runs the second transaction's
+//! statement inside it.
 
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
@@ -179,5 +184,296 @@ async fn a_writers_mark_holds_its_row_until_its_commit_is_visible() {
     assert_eq!(
         stored(&db).await,
         vec![((1, 1), "done".to_string(), 1), ((1, 2), "done".to_string(), 2)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the family: every other place that judged a transaction gone by
+// its recorded outcome and then acted on a read taken next.
+// ---------------------------------------------------------------------------
+
+/// How long a statement started inside the window is given to finish there
+/// before the parked commit is let go, unless it begins a conflict wait
+/// first. One that would act on the stale read does so at once; one that
+/// waits for the commit's retirement is still waiting when this runs out.
+/// A conflict wait gives up past `CONFLICT_WAIT_BUDGET`, shorter than this,
+/// so [`start_in_window`] lets the commit go the moment one begins.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Conflict waits begun on a live blocker, at every retry site.
+fn conflict_waits(db: &Arc<Database>) -> usize {
+    db.row_locks.conflict_waits.waits.iter().map(|w| w.load(std::sync::atomic::Ordering::Acquire)).sum()
+}
+
+/// Starts `sql` in autocommit inside a parked commit's window and returns
+/// once it has finished there (with its response), begun a conflict wait,
+/// or had [`GRACE`].
+async fn start_in_window(db: &Arc<Database>, sql: &str) -> (tokio::task::JoinHandle<Vec<u8>>, Option<Vec<u8>>) {
+    let waits = conflict_waits(db);
+    let statement = tokio::spawn({
+        let (db, sql) = (db.clone(), sql.to_string());
+        async move { autocommit(&db, &sql).await }
+    });
+    let started = std::time::Instant::now();
+    while !statement.is_finished() && conflict_waits(db) == waits && started.elapsed() < GRACE {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    if statement.is_finished() {
+        return (tokio::spawn(async { Vec::new() }), Some(statement.await.unwrap()));
+    }
+    (statement, None)
+}
+
+/// Lets the parked commit go on, then the statement finish.
+async fn release(
+    (committer, go): (std::thread::JoinHandle<()>, mpsc::Sender<()>),
+    (statement, early): (tokio::task::JoinHandle<Vec<u8>>, Option<Vec<u8>>),
+) -> Vec<u8> {
+    go.send(()).unwrap();
+    tokio::task::spawn_blocking(move || committer.join().expect("the parked commit"))
+        .await
+        .unwrap();
+    match early {
+        Some(response) => response,
+        None => tokio::time::timeout(BOUND, statement).await.expect("the statement never finished").unwrap(),
+    }
+}
+
+async fn db_with(statements: &[&str]) -> Arc<Database> {
+    let db = crate::replication::test_support::in_memory_database().await;
+    for sql in statements {
+        let response = execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+        assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response));
+    }
+    db
+}
+
+async fn autocommit(db: &Arc<Database>, sql: &str) -> Vec<u8> {
+    execute(recognize_query_purpose(sql).unwrap_or_else(|| panic!("{sql}: not recognised")), db.clone()).await
+}
+
+/// One BIGINT (or INT) value per row of `sql`'s result.
+async fn ints(db: &Arc<Database>, sql: &str) -> Vec<i64> {
+    let response = autocommit(db, sql).await;
+    assert_eq!(response.first(), Some(&2), "{sql}: {}", String::from_utf8_lossy(&response));
+    crate::core::row::row::vec_into_rows(&response[1..])
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let bytes = row.columns[0].data.into_slice();
+            match bytes.len() {
+                4 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
+                _ => int(&row.columns[0]),
+            }
+        })
+        .collect()
+}
+
+fn text(response: &[u8]) -> String {
+    String::from_utf8_lossy(response).to_string()
+}
+
+fn row_count(response: &[u8]) -> u64 {
+    match response.first() {
+        Some(0) | Some(1) if response.len() >= 9 => u64::from_le_bytes(response[1..9].try_into().unwrap()),
+        _ => panic!("not a row count: {}", text(response)),
+    }
+}
+
+/// Runs `sql` in autocommit while a commit is parked in the window
+/// ([`start_in_window`]), then lets the commit go on. Returns its response.
+async fn in_window(
+    db: &Arc<Database>,
+    sql: &str,
+    parked: (std::thread::JoinHandle<()>, mpsc::Sender<()>),
+) -> Vec<u8> {
+    let started = start_in_window(db, sql).await;
+    release(parked, started).await
+}
+
+const PARENT_CHILD: [&str; 3] = [
+    "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY)",
+    "CREATE TABLE c (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES p (id))",
+    "INSERT INTO p (id) VALUES (1), (2)",
+];
+
+/// A parent's DELETE has committed, recorded but not retired; a child
+/// insert of that parent comes in the window. The DELETE held the parent
+/// key's exclusive referenced-key lock: the insert waits for it to be
+/// handed on, and its look under the lock then sees the parent gone.
+///
+/// Mutation: `acquire_referenced_waiting`'s `live` is the outcome alone (as
+/// it was): the insert takes the lock as the DELETE's, looks at a snapshot
+/// that still shows the parent, and stores an orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_insert_in_a_parent_deletes_commit_window_leaves_no_orphan() {
+    let db = db_with(&PARENT_CHILD).await;
+    let d = db.transactions.begin();
+    in_block(&db, d, "DELETE FROM p WHERE id = 1").await;
+    let parked = park_commit(&db, d);
+    let response = in_window(&db, "INSERT INTO c (cid, pid) VALUES (10, 1)", parked).await;
+
+    assert_eq!(ints(&db, "SELECT id FROM p").await, vec![2]);
+    assert_eq!(
+        ints(&db, "SELECT cid FROM c").await,
+        Vec::<i64>::new(),
+        "an orphan was stored; the insert said {}",
+        text(&response)
+    );
+    assert_eq!(response.first(), Some(&3), "the insert of an orphan succeeded: {}", text(&response));
+}
+
+/// A child insert has committed, recorded but not retired; its parent's
+/// DELETE comes in the window. The insert held the parent key's shared
+/// referenced-key lock: the DELETE waits for it, and its look at the
+/// referencing rows then finds the child, and refuses.
+///
+/// Mutation: as above: the DELETE takes the key as the insert's, finds no
+/// child at a snapshot that cannot see the insert, and deletes the parent
+/// under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parent_delete_in_a_child_inserts_commit_window_leaves_no_orphan() {
+    let db = db_with(&PARENT_CHILD).await;
+    let i = db.transactions.begin();
+    in_block(&db, i, "INSERT INTO c (cid, pid) VALUES (10, 1)").await;
+    let parked = park_commit(&db, i);
+    let response = in_window(&db, "DELETE FROM p WHERE id = 1", parked).await;
+
+    assert_eq!(ints(&db, "SELECT cid FROM c").await, vec![10]);
+    assert_eq!(
+        ints(&db, "SELECT id FROM p ORDER BY id").await,
+        vec![1, 2],
+        "the referenced parent was deleted; the DELETE said {}",
+        text(&response)
+    );
+}
+
+/// A writer's UPDATE has committed, recorded but not retired; another
+/// UPDATE of the same row comes in the window, meets the first one's
+/// version and conflicts. The conflict waits for the first writer to be
+/// retired and replays then, over its value, as `READ COMMITTED` does.
+///
+/// Mutation: `Pacing::pause` counts a blocker live by its outcome alone
+/// (as it did): the replays run at once, inside the window, meet the same
+/// version every time, and the statement gives up with 40001 although the
+/// row was free a moment later. `wait_for` the same: the wait it begins
+/// ends at once, inside the window (the replays then spin on the version
+/// until the commit is retired).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_met_in_a_commit_window_waits_and_applies_over_the_commit() {
+    let db = db_with(&[
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        "INSERT INTO n (id, v) VALUES (1, 1)",
+    ])
+    .await;
+    let a = db.transactions.begin();
+    in_block(&db, a, "UPDATE n SET v = v + 1 WHERE id = 1").await;
+    let parked = park_commit(&db, a);
+    let woken = |db: &Arc<Database>| {
+        db.row_locks.conflict_waits.woken.iter().map(|w| w.load(std::sync::atomic::Ordering::Acquire)).sum::<usize>()
+    };
+    let before = woken(&db);
+    let started = start_in_window(&db, "UPDATE n SET v = v + 10 WHERE id = 1").await;
+    if started.1.is_none() {
+        // The wait has begun; it must not end while A is still committing.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(woken(&db), before, "the conflict wait ended while its blocker's commit was not yet visible");
+    }
+    let response = release(parked, started).await;
+
+    assert_ne!(response.first(), Some(&3), "the UPDATE failed: {}", text(&response));
+    assert_eq!(row_count(&response), 1);
+    assert_eq!(ints(&db, "SELECT v FROM n WHERE id = 1").await, vec![12]);
+}
+
+/// An insert of key 1 has committed, recorded but not retired; an upsert of
+/// key 1 comes in the window. The key's row is there but no snapshot shows
+/// it yet: the upsert waits for the insert to be retired, then updates the
+/// row it conflicts with.
+///
+/// Mutation: the uniqueness check's in-flight rule is the creator's
+/// outcome alone (as it was): the key reads as taken, the `DO UPDATE` reads
+/// at a snapshot that cannot see the row, updates nothing, and the
+/// statement reports `INSERT 0 0` with neither row written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upsert_in_an_inserts_commit_window_updates_the_row() {
+    let db = db_with(&["CREATE TABLE u (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"]).await;
+    let a = db.transactions.begin();
+    in_block(&db, a, "INSERT INTO u (k, v) VALUES (1, 1)").await;
+    let parked = park_commit(&db, a);
+    let response = in_window(
+        &db,
+        "INSERT INTO u (k, v) VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        parked,
+    )
+    .await;
+
+    assert_ne!(response.first(), Some(&3), "the upsert failed: {}", text(&response));
+    assert_eq!(ints(&db, "SELECT v FROM u WHERE k = 1").await, vec![2], "the upsert said {}", text(&response));
+    assert_eq!(row_count(&response), 1);
+}
+
+/// A DELETE of key 1 has committed, recorded but not retired; an insert of
+/// key 1 comes in the window. The old row still shows to every snapshot
+/// taken in the window, so the key is not free yet: the insert waits for the
+/// DELETE to be retired, and no reader ever sees two rows of key 1.
+///
+/// Mutation: the uniqueness check counts a row whose deleter's outcome is
+/// recorded as gone (as it did): the insert lands and commits inside the
+/// window, and a reader there sees key 1 twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_in_a_deletes_commit_window_never_shows_the_key_twice() {
+    let db = db_with(&[
+        "CREATE TABLE u (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        "INSERT INTO u (k, v) VALUES (1, 1)",
+    ])
+    .await;
+    let a = db.transactions.begin();
+    in_block(&db, a, "DELETE FROM u WHERE k = 1").await;
+    let parked = park_commit(&db, a);
+    let started = start_in_window(&db, "INSERT INTO u (k, v) VALUES (1, 2)").await;
+    // Still inside the window, whichever way the insert went.
+    let seen_in_window = ints(&db, "SELECT v FROM u WHERE k = 1").await;
+    let response = release(parked, started).await;
+
+    assert!(seen_in_window.len() <= 1, "key 1 was visible twice: {seen_in_window:?}");
+    assert_ne!(response.first(), Some(&3), "the insert failed: {}", text(&response));
+    assert_eq!(ints(&db, "SELECT v FROM u WHERE k = 1").await, vec![2]);
+}
+
+/// The holder's lock handover, across lock spaces. D deletes parent 1
+/// (holding the key's exclusive referenced-key lock) and locks row 1 of `r`
+/// `FOR UPDATE`; its commit is parked in the window. A `FOR UPDATE` of
+/// `r`'s row 1 there must not count D as gone either: taking a dead
+/// holder's row frees everything the holder holds, its referenced-key lock
+/// included, and a child insert of parent 1 that came next found the key
+/// free and the parent still showing.
+///
+/// Mutation: `acquire_row_lock`'s `live` is the outcome alone (as it was):
+/// the `FOR UPDATE` takes D's row and with it D's referenced key, and the
+/// child insert stores an orphan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn taking_a_committing_holders_row_frees_none_of_its_other_locks() {
+    let mut statements = PARENT_CHILD.to_vec();
+    statements.extend(["CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY)", "INSERT INTO r (id) VALUES (1)"]);
+    let db = db_with(&statements).await;
+    let d = db.transactions.begin();
+    in_block(&db, d, "SELECT id FROM r WHERE id = 1 FOR UPDATE").await;
+    in_block(&db, d, "DELETE FROM p WHERE id = 1").await;
+    let parked = park_commit(&db, d);
+
+    // Inside the window: a SKIP LOCKED claim of `r`, which never waits.
+    let b = db.transactions.begin();
+    let claimed = in_block(&db, b, "SELECT id FROM r FOR UPDATE SKIP LOCKED").await;
+    let started = start_in_window(&db, "INSERT INTO c (cid, pid) VALUES (10, 1)").await;
+    let response = release(parked, started).await;
+    end(&db, b);
+
+    assert_eq!(
+        ints(&db, "SELECT cid FROM c").await,
+        Vec::<i64>::new(),
+        "an orphan was stored; the insert said {}; the claim got {}",
+        text(&response),
+        text(&claimed)
     );
 }

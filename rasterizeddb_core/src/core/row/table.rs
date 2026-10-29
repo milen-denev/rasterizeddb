@@ -1784,6 +1784,75 @@ impl<S: StorageIO> Table<S> {
     /// that transaction to end, with a wait-for edge (slice B6, finding L1),
     /// and replays, which under `READ COMMITTED` is PostgreSQL's block and
     /// re-evaluate, and under `REPEATABLE READ` conflicts again and reports.
+    /// How a version stands for a uniqueness check by `writer`, judged by
+    /// outcome rather than by a snapshot (see `find_row_with_value`), or
+    /// `None` when it holds no key: the decision that is cheap. What needs
+    /// the running set waits for [`Self::settle_occupancy`], once the
+    /// version's value has matched.
+    fn occupancy(
+        manager: &crate::core::mvcc::transaction::TransactionManager,
+        pointer: &RowPointer,
+        writer: TxId,
+        visibility: &crate::core::mvcc::Visibility,
+    ) -> Option<Occupancy> {
+        use crate::core::mvcc::transaction::TxOutcome;
+        let creator = manager.outcome(pointer.xmin);
+        if pointer.deleted || creator == TxOutcome::Aborted {
+            return None;
+        }
+        if pointer.xmax != NO_TX && !visibility.deleted_by_reader(pointer.xmax) {
+            if manager.outcome(pointer.xmax) == TxOutcome::Committed {
+                // Deleted, unless the delete's commit is recorded and not yet
+                // retired: until then a snapshot still shows the version.
+                return Some(Occupancy::DeletedBy(pointer.xmax));
+            }
+        } else if pointer.xmax != NO_TX {
+            return None;
+        }
+        // Our own uncommitted row is a real duplicate, not a race: retrying
+        // would find it again. Only another transaction's unfinished write is
+        // worth waiting out.
+        Some(match creator {
+            TxOutcome::InProgress if pointer.xmin != writer => Occupancy::InFlight(pointer.xmin),
+            TxOutcome::Committed if pointer.xmin != writer => Occupancy::Committed(pointer.xmin),
+            _ => Occupancy::Held,
+        })
+    }
+
+    /// Whether a matched version's key is in flight (`Some(true)`: the
+    /// statement replays, waiting on the transaction named to
+    /// `conflict_wait`), held (`Some(false)`), or free after all (`None`).
+    ///
+    /// A commit recorded but not yet retired (`TransactionManager::
+    /// unfinished`) is still in flight here, in both directions. An insert of
+    /// a key whose own insert was in that window read the key as taken, and
+    /// its `ON CONFLICT DO UPDATE` then read at a snapshot that could not see
+    /// the row, updated nothing and reported `INSERT 0 0`; an insert of a key
+    /// whose delete was in that window wrote it and committed while a
+    /// snapshot still showed the deleted row: the key twice
+    /// (`rql::row_lock_handover_tests`).
+    fn settle_occupancy(
+        manager: Option<&crate::core::mvcc::transaction::TransactionManager>,
+        occupancy: Option<Occupancy>,
+    ) -> Option<bool> {
+        let (manager, occupancy) = match (manager, occupancy) {
+            (Some(manager), Some(occupancy)) => (manager, occupancy),
+            _ => return Some(false),
+        };
+        let blocker = match occupancy {
+            Occupancy::Held => return Some(false),
+            Occupancy::InFlight(creator) => creator,
+            Occupancy::Committed(creator) if manager.is_running(creator) => creator,
+            Occupancy::Committed(_) => return Some(false),
+            Occupancy::DeletedBy(deleter) if manager.is_running(deleter) => deleter,
+            Occupancy::DeletedBy(_) => return None,
+        };
+        // The writer of a key in flight is the transaction the replay waits
+        // for (slice B6, finding L1).
+        crate::core::rql::conflict_wait::note_blocker(blocker);
+        Some(true)
+    }
+
     fn check_write_conflict(&self, pointer: &RowPointer, writer: TxId) -> Result<()> {
         if pointer.xmax == NO_TX || pointer.xmax == writer {
             return Ok(());
@@ -3012,28 +3081,19 @@ impl<S: StorageIO> Table<S> {
             // each find nothing and each write — 950 rows for 300 pairs from
             // four connections, with no error.
             let manager = self.versions.load_full();
-            let in_flight = match (&manager, written_by) {
+            let occupancy = match (&manager, written_by) {
                 (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
-                    use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
-                    let creator = manager.outcome(pointer.xmin);
                     // A delete this transaction made has happened, for it.
-                    let occupied = !pointer.deleted
-                        && creator != TxOutcome::Aborted
-                        && (pointer.xmax == NO_TX
-                            || (manager.outcome(pointer.xmax) != TxOutcome::Committed
-                                && !visibility.deleted_by_reader(pointer.xmax)));
-                    if !occupied {
-                        continue;
+                    match Self::occupancy(manager, &pointer, writer, &visibility) {
+                        Some(occupancy) => Some(occupancy),
+                        None => continue,
                     }
-                    // Our own uncommitted row is a real duplicate; only another
-                    // transaction's unfinished write is worth waiting out.
-                    creator == TxOutcome::InProgress && pointer.xmin != writer
                 }
                 _ => {
                     if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
                         continue;
                     }
-                    false
+                    None
                 }
             };
             if pointer
@@ -3072,11 +3132,9 @@ impl<S: StorageIO> Table<S> {
                     continue;
                 }
             }
-            // The writer of a key in flight is the transaction the
-            // replay waits for (slice B6, finding L1).
-            if in_flight {
-                crate::core::rql::conflict_wait::note_blocker(pointer.xmin);
-            }
+            let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                continue;
+            };
             return Ok(Some((pointer.row_id(), in_flight)));
         }
 
@@ -3465,31 +3523,21 @@ impl<S: StorageIO> Table<S> {
             // may adopt it, because seeing uncommitted rows is exactly wrong for
             // a scan, the query cache and reclamation.
             let manager = self.versions.load_full();
-            let in_flight = match (&manager, written_by) {
+            let occupancy = match (&manager, written_by) {
                 (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
-                    use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
-                    let creator = manager.outcome(pointer.xmin);
                     // A delete this transaction made has happened, for it:
                     // deleting a row and writing its key again in one
                     // transaction was refused, where PostgreSQL allows it.
-                    let occupied = !pointer.deleted
-                        && creator != TxOutcome::Aborted
-                        && (pointer.xmax == NO_TX
-                            || (manager.outcome(pointer.xmax) != TxOutcome::Committed
-                                && !visibility.deleted_by_reader(pointer.xmax)));
-                    if !occupied {
-                        continue;
+                    match Self::occupancy(manager, &pointer, writer, &visibility) {
+                        Some(occupancy) => Some(occupancy),
+                        None => continue,
                     }
-                    // Our own uncommitted row is a real duplicate, not a race:
-                    // retrying would find it again. Only another transaction's
-                    // unfinished write is worth waiting out.
-                    creator == TxOutcome::InProgress && pointer.xmin != writer
                 }
                 _ => {
                     if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
                         continue;
                     }
-                    false
+                    None
                 }
             };
             if pointer
@@ -3514,11 +3562,9 @@ impl<S: StorageIO> Table<S> {
                         same_unique_value(&field.db_type, column.data.into_slice(), value)
                     })
             {
-                // The writer of a key in flight is the transaction the
-                // replay waits for (slice B6, finding L1).
-                if in_flight {
-                    crate::core::rql::conflict_wait::note_blocker(pointer.xmin);
-                }
+                let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                    continue;
+                };
                 return Ok(Some((pointer.row_id(), in_flight)));
             }
         }
@@ -6053,3 +6099,17 @@ pub(crate) mod table_seal;
 
 #[path = "table_audit.rs"]
 pub(crate) mod table_audit;
+
+/// A version's standing in a uniqueness check, before the running set is
+/// asked about it ([`Table::occupancy`], [`Table::settle_occupancy`]).
+#[derive(Debug, Clone, Copy)]
+enum Occupancy {
+    /// Holds the key, written by the checking transaction itself.
+    Held,
+    /// Holds the key; its creator is still in progress.
+    InFlight(TxId),
+    /// Holds the key; its creator's commit is recorded.
+    Committed(TxId),
+    /// Its deleter's commit is recorded: free, once that is retired.
+    DeletedBy(TxId),
+}
