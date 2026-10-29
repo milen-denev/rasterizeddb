@@ -1538,9 +1538,12 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
             });
         }
     }
-    // A boolean expression standing alone (`regexp_like(s, 'x')`) is its
-    // comparison with TRUE, which keeps its NULL.
-    if let Ok(expr) = parse(text, schema) {
+    // A boolean function call standing alone (`regexp_like(s, 'x')`) is its
+    // comparison with TRUE, which keeps its NULL. Only a call: a bare boolean
+    // column read as `flag = TRUE` became a computed select item wherever a
+    // comparison is taken for a value (`join::comparison_value`), and
+    // `SELECT id, is_active FROM t` lost the column from its rows.
+    if let Ok(expr @ Expr::Call(..)) = parse(text, schema) {
         if static_type(&expr) == DbType::BOOL {
             return Ok(Condition {
                 left: Box::new(expr),
@@ -6113,8 +6116,12 @@ mod tests {
             Some(1)
         );
 
-        // NOT is refused, not folded to two-valued logic.
-        assert!(parse("CASE WHEN NOT v = 1 THEN 1 ELSE 0 END", &s).is_err());
+        // NOT is SQL's three-valued one, never two-valued logic: NOT of a
+        // NULL comparison is NULL, which a WHEN does not take.
+        let e = parse("CASE WHEN NOT v = 1 THEN 1 ELSE 0 END", &s).unwrap();
+        for (v, want) in [(Some(1), 0), (Some(2), 1), (None, 0)] {
+            assert_eq!(as_i64(&eval(&e, &row_with(v, ""), &s).unwrap()), Some(want), "{v:?}");
+        }
     }
 
     #[test]
