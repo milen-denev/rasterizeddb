@@ -11527,6 +11527,45 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
+/// What `ALTER COLUMN column TYPE declared` changes about `character(n)`,
+/// which shares text's storage: the column's marker record, set or retired,
+/// and every live check reading the column rewritten as `ADD CONSTRAINT`
+/// would have stored it (`check::cast_columns_to_bpchar`), so it is declined
+/// as a check declared on a `character(n)` column is. Nothing when the
+/// column keeps its kind. A check stored while the column was
+/// `character(n)` keeps its casts when the column becomes text, and stays
+/// declined: the casts cannot be told from ones the statement wrote.
+fn bpchar_type_change(
+    schema: &crate::core::row::schema::TableSchema,
+    column: &str,
+    declared: &str,
+) -> (Option<crate::core::rql::type_modifier::TypeModifier>, Vec<crate::core::rql::check::CheckConstraint>) {
+    use crate::core::rql::type_modifier;
+    let was = type_modifier::is_marked_bpchar(column, &schema.type_modifiers);
+    let now = type_modifier::is_bpchar_type(declared);
+    if was == now {
+        return (None, Vec::new());
+    }
+    if !now {
+        return (Some(type_modifier::bpchar_marker_retired(column)), Vec::new());
+    }
+    let columns = [column.to_string()];
+    let checks = schema
+        .checks
+        .iter()
+        .filter(|c| !c.is_deleted)
+        .filter_map(|c| {
+            let expression = crate::core::rql::check::cast_columns_to_bpchar(&c.expression, &columns);
+            (expression != c.expression).then(|| crate::core::rql::check::CheckConstraint {
+                name: c.name.clone(),
+                expression,
+                is_deleted: false,
+            })
+        })
+        .collect();
+    (Some(type_modifier::bpchar_marker(column)), checks)
+}
+
 /// `ALTER COLUMN … TYPE` naming the type a column already has, with what it
 /// says about a NUMERIC column's `(precision, scale)`.
 ///
@@ -12282,9 +12321,14 @@ async fn execute_alter_table_action(
                     new_json,
                     // With its `character(n)` record, as the in-place add
                     // stages it (`type_modifier::BPCHAR_MARKER`).
+                    // A former column's record under the name is retired.
                     new_modifier
                         .into_iter()
                         .chain(bpchar.then(|| crate::core::rql::type_modifier::bpchar_marker(&name)))
+                        .chain(
+                            (!bpchar && crate::core::rql::type_modifier::is_marked_bpchar(&name, &schema.type_modifiers))
+                                .then(|| crate::core::rql::type_modifier::bpchar_marker_retired(&name)),
+                        )
                         .collect(),
                     new_generated.into_iter().collect(),
                     tx,
@@ -12369,6 +12413,12 @@ async fn execute_alter_table_action(
                         crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &marker)
                             .map_err(|e| e.to_string())?;
                         schema.type_modifiers.push(marker);
+                    } else if crate::core::rql::type_modifier::is_marked_bpchar(&name, &schema.type_modifiers) {
+                        // A former column's, left by a binary that kept it.
+                        let retired = crate::core::rql::type_modifier::bpchar_marker_retired(&name);
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &retired)
+                            .map_err(|e| e.to_string())?;
+                        schema.type_modifiers.retain(|m| !m.column.eq_ignore_ascii_case(&retired.column));
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
@@ -12994,21 +13044,48 @@ async fn execute_alter_table_action(
                 let type_tokens: Vec<&str> = words[1..].to_vec();
                 return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
                     Ok((db_type, _)) if db_type == field.db_type => {
-                        match numeric_modifier_change(&schema, &name, &type_tokens.join(" "), row_count) {
-                            Ok(None) => ddl_ok(0),
-                            // The reload's work, all or nothing (B5).
-                            Ok(Some(entry)) => match database
-                                .reload_atomic(&plan.table_name, |old| async move {
-                                    crate::core::rql::type_modifier::append(old.io_schema.clone(), &entry)
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                })
-                                .await
-                            {
-                                Ok(()) => ddl_ok(0),
-                                Err(failure) => reload_failed(failure, ""),
-                            },
-                            Err(e) => ddl_error(&e),
+                        let numeric = match numeric_modifier_change(&schema, &name, &type_tokens.join(" "), row_count) {
+                            Ok(entry) => entry,
+                            Err(e) => return ddl_error(&e),
+                        };
+                        // `character(n)` and text are one storage type here, so a
+                        // change between them rewrites no row; what moves is the
+                        // column's `character(n)` record and the checks that read
+                        // it (`type_modifier::BPCHAR_MARKER`).
+                        let (marker, checks) = bpchar_type_change(&schema, &field.name, &type_tokens.join(" "));
+                        if numeric.is_none() && marker.is_none() {
+                            return ddl_ok(0);
+                        }
+                        let declined: Vec<String> = checks.iter().map(|c| c.name.clone()).collect();
+                        // The reload's work, all or nothing (B5): one sidecar
+                        // transaction.
+                        match database
+                            .reload_atomic(&plan.table_name, |old| async move {
+                                let io = old.io_schema.clone();
+                                let mut writes = crate::core::torn_tail::SidecarWrites::default();
+                                for entry in numeric.iter().chain(marker.iter()) {
+                                    crate::core::rql::type_modifier::stage(&*io, &mut writes, entry)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                for check in &checks {
+                                    crate::core::rql::check::stage(&*io, &mut writes, check).map_err(|e| e.to_string())?;
+                                }
+                                writes.commit(&*io).await.map_err(|e| e.to_string())
+                            })
+                            .await
+                        {
+                            Ok(()) => {
+                                for check in &declined {
+                                    crate::core::notice::push("WARNING", "01000", format!(
+                                        "check constraint \"{}\" reads column \"{}\", now character(n), and is \
+                                         not enforced: character(n) compares blank-padded, which this engine \
+                                         does not evaluate",
+                                        check, field.name
+                                    ));
+                                }
+                                ddl_ok(0)
+                            }
+                            Err(failure) => reload_failed(failure, ""),
                         }
                     }
                     // A real change still needs every row rewritten under the

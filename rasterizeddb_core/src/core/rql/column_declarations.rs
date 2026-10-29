@@ -481,6 +481,11 @@ async fn other_foreign_keys(
     out
 }
 
+/// The key of `column`'s `character(n)` record in the type-modifier sidecar.
+fn bpchar_key(column: &str) -> String {
+    format!("{}{}", type_modifier::BPCHAR_MARKER, column)
+}
+
 /// The last-wins sidecars of one table.
 struct Declarations {
     defaults: Keyed<column_default::ColumnDefault>,
@@ -527,6 +532,10 @@ impl Declarations {
         self.defaults.retire(name);
         self.generated.retire(name);
         self.modifiers.retire(name);
+        // Its `character(n)` record too (`type_modifier::BPCHAR_MARKER`):
+        // left behind, a TEXT column later added or renamed onto the name
+        // had its checks declined as if it were `character(n)`.
+        self.modifiers.retire(&bpchar_key(name));
         self.json.retire(name);
         self.retire_constraints(table, name, fields);
     }
@@ -782,6 +791,9 @@ pub(crate) async fn rename_column(
     decl.defaults.move_key(from, to);
     decl.generated.move_key(from, to);
     decl.modifiers.move_key(from, to);
+    // The `character(n)` record follows it as well: left under `from`, a
+    // check added after the rename was enforced on a `character(n)` column.
+    decl.modifiers.move_key(&bpchar_key(from), &bpchar_key(to));
     decl.json.move_key(from, to);
 
     // Everything else that mentions it is rewritten. A partial index's

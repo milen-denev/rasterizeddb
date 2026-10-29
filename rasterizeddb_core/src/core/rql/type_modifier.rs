@@ -155,6 +155,19 @@ pub fn bpchar_marker(column: &str) -> TypeModifier {
     TypeModifier { column: format!("{BPCHAR_MARKER}{column}"), precision: 0, scale: 0, is_deleted: false }
 }
 
+/// The record retiring `column`'s `character(n)` marker: what `DROP COLUMN`,
+/// `ALTER COLUMN … TYPE` to another type and a re-`ADD` under another type
+/// leave, so a later check on a column of that name is judged by the
+/// column's own type, not by the one a former column of the name had.
+pub fn bpchar_marker_retired(column: &str) -> TypeModifier {
+    TypeModifier { is_deleted: true, ..bpchar_marker(column) }
+}
+
+/// Whether `modifiers` mark `column` as `character(n)`.
+pub fn is_marked_bpchar(column: &str, modifiers: &[TypeModifier]) -> bool {
+    bpchar_columns(modifiers).iter().any(|c| c.eq_ignore_ascii_case(column))
+}
+
 /// The columns `modifiers` mark as `character(n)`.
 pub fn bpchar_columns(modifiers: &[TypeModifier]) -> Vec<String> {
     modifiers

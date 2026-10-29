@@ -637,3 +637,103 @@ async fn character_n_checks_are_declined_on_every_ddl_path() {
     }
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// A column's `character(n)` record follows it through later DDL: `RENAME
+/// COLUMN` moves it, `DROP COLUMN` retires it, and `ALTER COLUMN … TYPE`
+/// sets or retires it, declining the checks already stored on the column
+/// when it becomes `character(n)`. Kept per column name and left alone, a
+/// check added after `RENAME code TO tag` was enforced on a `character(n)`
+/// column (refusing `'AB '`), one on a TEXT column that took a former
+/// `character(n)` column's name was declined (accepting `'ZZ'`), and a
+/// TEXT column's check stayed enforced after `TYPE CHAR(3)`.
+///
+/// Mutations: the marker's `move_key` in `rename_column`; its `retire` in
+/// `retire_leftovers`; `bpchar_type_change` returning nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_character_n_record_follows_rename_drop_and_type_changes() {
+    let root = format!("/var/tmp/check_corpus_bpchar_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&root);
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let server = TestServer::start_file_backed(&root).await.expect("server");
+    let (client, connection) =
+        tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE m (id INT PRIMARY KEY, tag CHAR(3), q INT);
+             INSERT INTO m VALUES (9, 'AB', 1);
+             ALTER TABLE m DROP COLUMN tag;
+             ALTER TABLE m ADD COLUMN tag TEXT;
+             ALTER TABLE m ADD CONSTRAINT m_c CHECK (tag IN ('AB'));
+             CREATE TABLE n (id INT PRIMARY KEY, tag CHAR(3), q INT);
+             ALTER TABLE n ALTER COLUMN tag TYPE TEXT;
+             ALTER TABLE n ADD CONSTRAINT n_c CHECK (tag IN ('AB'));
+             CREATE TABLE o (id INT PRIMARY KEY, code CHAR(3), q INT);
+             ALTER TABLE o RENAME COLUMN code TO tag;
+             ALTER TABLE o ADD CONSTRAINT o_c CHECK (tag IN ('AB'));
+             CREATE TABLE p (id INT PRIMARY KEY, tag CHAR(3), code TEXT);
+             ALTER TABLE p RENAME COLUMN tag TO t2;
+             ALTER TABLE p RENAME COLUMN code TO tag;
+             ALTER TABLE p ADD CONSTRAINT p_c CHECK (tag IN ('AB'));
+             CREATE TABLE l (id INT PRIMARY KEY, tag TEXT, CONSTRAINT l_c CHECK (tag IN ('AB', 'CD')));
+             ALTER TABLE l ALTER COLUMN tag TYPE CHAR(3);",
+        )
+        .await
+        .expect("ddl");
+    let mut wrong = Vec::new();
+    // TEXT columns: the check is enforced, as in PostgreSQL.
+    for sql in [
+        "INSERT INTO m (id, q, tag) VALUES (1, 1, 'ZZ')",
+        "INSERT INTO n VALUES (1, 'ZZ', 1)",
+        "INSERT INTO p VALUES (1, 'x', 'ZZ')",
+    ] {
+        match client.batch_execute(sql).await {
+            Ok(()) => wrong.push(format!("{sql}: accepted")),
+            Err(e) if e.code().map(|c| c.code()) == Some("23514") => {}
+            Err(e) => wrong.push(format!("{sql}: {e}")),
+        }
+    }
+    // character(n) columns: declined, so a blank-padded value PostgreSQL
+    // accepts is not refused.
+    for sql in ["INSERT INTO o VALUES (1, 'AB ', 1)", "INSERT INTO l VALUES (1, 'AB ')"] {
+        if let Err(e) = client.batch_execute(sql).await {
+            wrong.push(format!("{sql}: {e}"));
+        }
+    }
+    let listed: Vec<String> = client
+        .simple_query("SHOW CHECKS")
+        .await
+        .expect("SHOW CHECKS")
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(format!("{} {}", r.get(1).unwrap_or(""), r.get(2).unwrap_or(""))),
+            _ => None,
+        })
+        .collect();
+    for want in ["m_c enforced", "n_c enforced", "p_c enforced", "o_c not enforced", "l_c not enforced"] {
+        if !listed.iter().any(|l| l == want) {
+            wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
+        }
+    }
+    // And after a restart, from the records alone.
+    drop(client);
+    drop(server);
+    let server = TestServer::start_file_backed(&root).await.expect("restart");
+    let (client, connection) =
+        tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("reconnect");
+    tokio::spawn(connection);
+    match client.batch_execute("INSERT INTO p VALUES (2, 'x', 'YY')").await {
+        Err(e) if e.code().map(|c| c.code()) == Some("23514") => {}
+        other => wrong.push(format!("after restart, p accepted 'YY': {other:?}")),
+    }
+    if let Err(e) = client.batch_execute("INSERT INTO o VALUES (2, 'AB ', 1)").await {
+        wrong.push(format!("after restart, o: {e}"));
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
