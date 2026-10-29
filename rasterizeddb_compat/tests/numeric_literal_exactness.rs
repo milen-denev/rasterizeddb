@@ -132,12 +132,16 @@ fn close(got: f64, want: f64, what: &str) {
     assert!((got - want).abs() <= want.abs() * 1e-12, "{what}: got {got}, want {want}");
 }
 
-/// A constant the engine carries as a float, against integers and NUMERICs:
-/// answered from the exact result, never refused row by row. The first
-/// version of the exactness check compared each row's float product with
-/// the exact answer and refused the rows where float rounding differed
+/// A constant with more places than nine is `numeric`, as in PostgreSQL,
+/// and answered exactly every row; one too large for an i128 at nine places
+/// (`1e30`) is still carried as a float, and answered every row too. The
+/// first version of the exactness check compared each row's float product
+/// with the exact answer and refused the rows where float rounding differed
 /// (3 · 1e30 but not 5 · 1e30), and the aggregate fold turned that row's
-/// error into "no value": `sum(b * 0.00000000011)` silently lost a row.
+/// error into "no value": `sum(b * 0.00000000011)` silently lost a row. Such
+/// a wide constant inside an aggregate's argument is refused now (0A000), as
+/// the aggregate folds at nine places; it was summed as a float, described
+/// `float8` where PostgreSQL says `numeric`.
 #[tokio::test(flavor = "multi_thread")]
 async fn float_carried_constants_answer_every_row() {
     let server = TestServer::start().await.expect("server");
@@ -148,20 +152,17 @@ async fn float_carried_constants_answer_every_row() {
     ))
     .await
     .unwrap();
-    let r = sqlx::query("SELECT sum(b * 0.00000000011) AS s, count(b * 0.00000000011) AS c, avg(b * 0.00000000011) AS a FROM ag")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    close(r.get::<f64, _>("s"), 110.0 * 1.1e-10, "sum");
-    assert_eq!(r.get::<i64, _>("c"), 4);
-    close(r.get::<f64, _>("a"), 110.0 * 1.1e-10 / 4.0, "avg");
-    let groups: Vec<(i64, f64)> = sqlx::query_as("SELECT g, sum(b * 0.00000000011) FROM ag GROUP BY g ORDER BY g")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert_eq!(groups.len(), 2);
-    close(groups[0].1, 107.0 * 1.1e-10, "group 1");
-    close(groups[1].1, 3.0 * 1.1e-10, "group 2");
+    // PostgreSQL 17's answers.
+    assert_eq!(
+        texts(&pool, "SELECT (b * 0.00000000011)::text FROM ag ORDER BY id").await,
+        ["0.00000001100", "0.00000000077", "0.00000000011", "0.00000000022"]
+    );
+    for sql in [
+        "SELECT sum(b * 0.00000000011) AS s, count(b * 0.00000000011) AS c, avg(b * 0.00000000011) AS a FROM ag",
+        "SELECT g, sum(b * 0.00000000011) FROM ag GROUP BY g ORDER BY g",
+    ] {
+        refused(&pool, sql, "0A000").await;
+    }
 
     // i = 3, 5, 7, 3: every row, each the float nearest i · 10^30.
     let rows: Vec<f64> = sqlx::query_scalar("SELECT i * 1e30 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
@@ -171,8 +172,6 @@ async fn float_carried_constants_answer_every_row() {
     assert_eq!(r.get::<i64, _>("c"), 4);
     let s: f64 = sqlx::query_scalar("SELECT sum(n * 1e30) FROM ag").fetch_one(&pool).await.unwrap();
     close(s, 12e30, "sum(n * 1e30)");
-    let rows: Vec<f64> = sqlx::query_scalar("SELECT b * 0.00000000011 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
-    assert_eq!(rows, [1.1e-8, 7.7e-10, 1.1e-10, 2.2e-10]);
 
     // A per-row failure fails the statement; it used to drop the row.
     for sql in ["SELECT sum(1/(b-7)) FROM ag", "SELECT count(*) FILTER (WHERE 1/(b-7) > 0) FROM ag", "SELECT g, sum(1/(b-7)) FROM ag GROUP BY g"] {
