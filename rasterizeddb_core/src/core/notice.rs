@@ -26,8 +26,16 @@ pub struct Notice {
     pub message: String,
 }
 
+/// What one statement has collected: its notices, and the counted ones
+/// ([`count`]), each said once with how many times it happened.
+#[derive(Default)]
+struct Collected {
+    notices: Vec<Notice>,
+    counted: Vec<(String, String, u64)>,
+}
+
 tokio::task_local! {
-    static NOTICES: RefCell<Vec<Notice>>;
+    static NOTICES: RefCell<Collected>;
 }
 
 /// Runs `fut` with a fresh notice collector.
@@ -36,7 +44,7 @@ tokio::task_local! {
 /// argument and again where it is awaited: this wraps every statement, and
 /// its future is copied whole each time it moves.
 pub fn collect<F: Future>(fut: F) -> impl Future<Output = F::Output> {
-    NOTICES.scope(RefCell::new(Vec::new()), fut)
+    NOTICES.scope(RefCell::new(Collected::default()), fut)
 }
 
 /// Raises a notice for the current statement's client. Returns whether a
@@ -46,7 +54,7 @@ pub fn push(severity: &'static str, sqlstate: &'static str, message: impl Into<S
     let mut message = Some(message);
     let collected = NOTICES
         .try_with(|n| {
-            n.borrow_mut().push(Notice {
+            n.borrow_mut().notices.push(Notice {
                 severity,
                 sqlstate,
                 message: message.take().expect("taken once"),
@@ -59,11 +67,53 @@ pub fn push(severity: &'static str, sqlstate: &'static str, message: impl Into<S
     collected
 }
 
-/// Takes every notice collected so far in this task.
+/// Records one occurrence of something said once per statement: a WARNING
+/// (01000) `message`, followed by how many times `key` was counted, sent
+/// with the statement's other notices and logged once, at warn. A check that
+/// left rows unjudged said so per row in the log, naming nothing.
+///
+/// Outside a statement's scope it is logged at most once a minute per key.
+pub fn count(key: &str, message: impl FnOnce() -> String) {
+    let mut message = Some(message);
+    let counted = NOTICES
+        .try_with(|n| {
+            let mut n = n.borrow_mut();
+            match n.counted.iter_mut().find(|(k, _, _)| k == key) {
+                Some(entry) => entry.2 += 1,
+                None => n.counted.push((key.to_string(), (message.take().expect("taken once"))(), 1)),
+            }
+        })
+        .is_ok();
+    if !counted {
+        static LAST: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match last.iter_mut().find(|(k, _)| k == key) {
+            Some((_, at)) if now.duration_since(*at) < std::time::Duration::from_secs(60) => return,
+            Some((_, at)) => *at = now,
+            None => {
+                if last.len() >= 1024 {
+                    last.clear();
+                }
+                last.push((key.to_string(), now));
+            }
+        }
+        log::warn!("{} (further occurrences within a minute are not logged)", (message.take().expect("taken once"))());
+    }
+}
+
+/// Takes every notice collected so far in this task, the counted ones last.
 pub fn drain() -> Vec<Notice> {
-    NOTICES
+    let collected = NOTICES
         .try_with(|n| std::mem::take(&mut *n.borrow_mut()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mut out = collected.notices;
+    for (_, message, n) in collected.counted {
+        let message = format!("{message} ({n} {})", if n == 1 { "row" } else { "rows" });
+        log::warn!("{message}");
+        out.push(Notice { severity: "WARNING", sqlstate: "01000", message });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -83,5 +133,19 @@ mod tests {
         assert_eq!(drained[0].message, "first");
         assert_eq!(drained[1].severity, "NOTICE");
         assert!(drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_counted_notice_is_said_once_with_its_count() {
+        let drained = collect(async {
+            for _ in 0..3 {
+                count("t/c", || "check c was not judged".to_string());
+            }
+            count("t/d", || "check d was not judged".to_string());
+            drain()
+        })
+        .await;
+        let messages: Vec<&str> = drained.iter().map(|n| n.message.as_str()).collect();
+        assert_eq!(messages, ["check c was not judged (3 rows)", "check d was not judged (1 row)"]);
     }
 }

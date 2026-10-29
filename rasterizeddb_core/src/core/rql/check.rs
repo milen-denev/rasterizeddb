@@ -417,6 +417,49 @@ fn fold_regex_truth_tests(text: &str) -> String {
     out
 }
 
+/// `expression` with each bare reference to one of `columns` written
+/// `column::bpchar`, outside quotes; a qualified, called or already cast
+/// one is left alone.
+pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
+    let bytes = expression.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(expression.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&expression[i..end]);
+            i = end;
+            continue;
+        }
+        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'"') && (i == 0 || !word(bytes[i - 1]) && bytes[i - 1] != b'.') {
+            let (end, name) = if bytes[i] == b'"' {
+                let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                (end, expression[i + 1..end.saturating_sub(1)].to_string())
+            } else {
+                let mut j = i;
+                while j < bytes.len() && word(bytes[j]) {
+                    j += 1;
+                }
+                (j, expression[i..j].to_string())
+            };
+            let rest = expression[end..].trim_start();
+            let named = columns.iter().any(|c| c.eq_ignore_ascii_case(&name));
+            if named && !rest.starts_with('(') && !rest.starts_with('.') && !rest.starts_with("::") {
+                out.push_str(&format!("{}::bpchar", &expression[i..end]));
+            } else {
+                out.push_str(&expression[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        let ch = expression[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// The function a check's regular expression is evaluated by: `regexp_like`,
 /// except that a value it cannot answer for PostgreSQL leaves the check
 /// unjudged for that row (`expr::TextFunc::CheckRegexpLike`).
@@ -938,6 +981,14 @@ fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_character_n_column_is_cast_where_a_check_reads_it() {
+        let c = |e: &str| cast_columns_to_bpchar(e, &["tag".to_string()]);
+        assert_eq!(c("tag IN ('AB', 'tag')"), "tag::bpchar IN ('AB', 'tag')");
+        assert_eq!(c("t.tag = 'x' OR length(tag) > 1 OR tag::text = 'y' OR tagx = 1"), "t.tag = 'x' OR length(tag::bpchar) > 1 OR tag::text = 'y' OR tagx = 1");
+        assert_eq!(c("\"tag\" <> ''"), "\"tag\"::bpchar <> ''");
+    }
 
     #[test]
     fn a_regex_compared_with_a_boolean_folds_into_one_call() {

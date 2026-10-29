@@ -639,6 +639,16 @@ impl TableSchema {
         }
         table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
+        // A check this binary keeps unenforced, or cannot compile (stored by
+        // an older one), is said in the log when the table opens: it was said
+        // only to the session that declared it.
+        for check in table_schema.checks.iter().filter(|c| !c.is_deleted) {
+            match crate::core::rql::executor::check_status(&check.expression, &table_schema.fields) {
+                Ok(None) => {}
+                Ok(Some(why)) => crate::core::rql::executor::report_unenforced_once(&table_schema.name, &check.name, &why, true),
+                Err(why) => crate::core::rql::executor::report_unenforced_once(&table_schema.name, &check.name, &why, false),
+            }
+        }
 
         Ok(table_schema)
     }

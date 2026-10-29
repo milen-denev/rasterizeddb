@@ -201,6 +201,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         // Whether each check's name was written (`CONSTRAINT c CHECK …`)
         // rather than derived, for the duplicate rule below.
         let mut named_checks: Vec<bool> = Vec::new();
+        // Columns declared `character(n)`, which PostgreSQL compares
+        // blank-padded and this engine stores as text (see below).
+        let mut bpchar_columns: Vec<String> = Vec::new();
         for col_def in split_definitions(columns_str) {
             let col_def = col_def.trim();
             if col_def.is_empty() {
@@ -387,6 +390,20 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
                 joined
             };
+            {
+                let upper = raw_type.to_ascii_uppercase();
+                let base = upper.split('(').next().unwrap_or("").trim();
+                let width = upper
+                    .split_once('(')
+                    .and_then(|(_, r)| r.split(')').next())
+                    .and_then(|w| w.trim().parse::<u32>().ok());
+                let bpchar = base == "BPCHAR"
+                    || (base == "CHARACTER" && !type_phrase.to_ascii_uppercase().contains("VARYING"))
+                    || (base == "CHAR" && width.is_some_and(|n| n > 1));
+                if bpchar {
+                    bpchar_columns.push(name.clone());
+                }
+            }
             match crate::core::rql::type_modifier::parse_numeric_modifier(&raw_type) {
                 Some(Ok((precision, scale))) => {
                     type_modifiers.push(crate::core::rql::type_modifier::TypeModifier {
@@ -585,6 +602,18 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 name: crate::core::rql::nullable::flag_column_name(&column),
                 data_type: crate::core::rql::nullable::FLAG_TYPE,
             });
+        }
+
+        // A check reading a `character(n)` column compares it blank-padded in
+        // PostgreSQL (`'AB '` is `'AB'`), which this engine, storing it as
+        // text, does not: `tag char(3) CHECK (tag IN ('AB', 'CD'))` refused
+        // the 'AB ' PostgreSQL accepts. The column is written `::bpchar` in
+        // the stored check, as `pg_dump` writes such checks, which keeps it
+        // unenforced, said so (`executor::compile_check`).
+        if !bpchar_columns.is_empty() {
+            for check in checks.iter_mut() {
+                check.expression = crate::core::rql::check::cast_columns_to_bpchar(&check.expression, &bpchar_columns);
+            }
         }
 
         // Two checks written with one name are PostgreSQL's 42710; the

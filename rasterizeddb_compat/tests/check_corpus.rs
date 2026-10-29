@@ -432,3 +432,126 @@ async fn a_pattern_outside_the_translated_subset_is_unenforced_and_said_so() {
         assert_eq!(stored, want, "{table}");
     }
 }
+
+/// The "not judged" rule is narrow and said once.
+///
+/// A check whose regular expressions stand under AND, OR and NOT alone is
+/// judged with a locale-dependent answer UNKNOWN, which is exact:
+/// `s ~ '^\w+$' AND n > 0` with ('héllo', -1) is FALSE whatever `\w` says of
+/// 'é', and PostgreSQL refuses it; it was accepted. Only a check that reads
+/// such an answer as a value (`… IS TRUE`) is not judged for the row, and
+/// that is said once per statement as a WARNING naming the constraint, with
+/// how many rows. A pattern or flags read from the row outside the
+/// translated subset refuse the row (0A000; an invalid one 2201B), where
+/// plain ASCII data was not judged. `character(n)` checks are kept
+/// unenforced (said so), as this engine does not compare blank-padded: they
+/// refused the 'AB ' PostgreSQL accepts. `SHOW CHECKS` lists every check
+/// and whether it is enforced.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_not_judged_rule_is_narrow_and_said_once() {
+    use std::sync::{Arc, Mutex};
+    let server = TestServer::start().await.expect("server");
+    let (client, mut connection) =
+        tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    let notices: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let sink = notices.clone();
+    tokio::spawn(async move {
+        while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+            if let Ok(tokio_postgres::AsyncMessage::Notice(n)) = message {
+                sink.lock().unwrap().push((n.code().code().to_string(), n.message().to_string()));
+            }
+        }
+    });
+    let taken = || std::mem::take(&mut *notices.lock().unwrap());
+    let outcome = |r: Result<(), tokio_postgres::Error>| match r {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.code().map(|c| c.code().to_string()).unwrap_or_else(|| e.to_string()),
+    };
+    client
+        .batch_execute(
+            "CREATE TABLE ck (id INT PRIMARY KEY, s TEXT, n INT, CONSTRAINT ck_c CHECK (s ~ '^\\w+$' AND n > 0)); \
+             CREATE TABLE nm (id INT PRIMARY KEY, s TEXT, n INT, CONSTRAINT nm_c CHECK ((s ~ '^\\w+$') IS TRUE OR n > 0)); \
+             CREATE TABLE cp (id INT PRIMARY KEY, s TEXT, p TEXT, CHECK (s ~ p)); \
+             CREATE TABLE cf (id INT PRIMARY KEY, s TEXT, f TEXT, CHECK (regexp_like(s, 'a', f))); \
+             CREATE TABLE em (id INT PRIMARY KEY, s TEXT, CHECK (s ~ '[\\w-.]+@x'))",
+        )
+        .await
+        .expect("setup");
+    let _ = taken();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        // FALSE whatever the regex answers: judged. (PostgreSQL 17's answers.)
+        ("INSERT INTO ck VALUES (1, 'héllo', -1)", "23514"),
+        ("INSERT INTO ck VALUES (2, 'h llo', 1)", "23514"),
+        ("INSERT INTO ck VALUES (3, 'hello', 1)", "ok"),
+        // Read as a value: not judged (PostgreSQL accepts it: 'é' is \w).
+        ("INSERT INTO nm VALUES (1, 'héllo', -1)", "ok"),
+        ("INSERT INTO nm VALUES (2, 'h llo', -1)", "23514"),
+        // From the row: outside the subset 0A000, invalid 2201B, else judged.
+        ("INSERT INTO cp VALUES (1, 'aa', '^(a)\\1$')", "0A000"),
+        ("INSERT INTO cp VALUES (2, 'aa', '^(a')", "2201B"),
+        ("INSERT INTO cp VALUES (3, 'aa', '^a+$')", "ok"),
+        ("INSERT INTO cp VALUES (4, 'ab', '^a+$')", "23514"),
+        ("INSERT INTO cf VALUES (1, 'a', 'x')", "0A000"),
+        ("INSERT INTO cf VALUES (2, 'A', 'i')", "ok"),
+        // `-` after a class: PostgreSQL's invalid character range.
+        ("INSERT INTO em VALUES (1, 'a@x')", "2201B"),
+    ] {
+        let got = outcome(client.batch_execute(sql).await);
+        if got != want {
+            wrong.push(format!("{sql}: {got}, want {want}"));
+        }
+    }
+    let _ = taken();
+    // Three rows not judged by one statement: one WARNING, with the count.
+    client
+        .batch_execute("INSERT INTO nm VALUES (10, 'é', -1), (11, 'ü', -1), (12, 'ß', -1)")
+        .await
+        .expect("not judged");
+    let warned: Vec<(String, String)> =
+        taken().into_iter().filter(|(_, m)| m.contains("was not judged")).collect();
+    if !(warned.len() == 1
+        && warned[0].0 == "01000"
+        && warned[0].1.contains("\"nm_c\"")
+        && warned[0].1.contains("\"nm\"")
+        && warned[0].1.ends_with("(3 rows)"))
+    {
+        wrong.push(format!("not-judged warning: {warned:?}"));
+    }
+
+    // character(n): kept unenforced, said so, and the padded value stored.
+    for (create, table) in [
+        ("CREATE TABLE c1 (id INT PRIMARY KEY, tag character(3), CONSTRAINT c1_tag_check CHECK ((tag = ANY (ARRAY['AB'::bpchar, 'CD'::bpchar]))))", "c1"),
+        ("CREATE TABLE c3 (id INT PRIMARY KEY, tag char(3) CHECK (tag IN ('AB', 'CD')))", "c3"),
+    ] {
+        client.batch_execute(create).await.expect(table);
+        let warned = taken();
+        if !warned.iter().any(|(c, m)| c == "01000" && m.contains("not enforced") && m.contains("character(n)")) {
+            wrong.push(format!("{table}: no warning: {warned:?}"));
+        }
+        let got = outcome(client.batch_execute(&format!("INSERT INTO {table} VALUES (1, 'AB ')")).await);
+        if got != "ok" {
+            wrong.push(format!("{table}: 'AB ' refused {got}"));
+        }
+    }
+
+    // Listed, with whether each is enforced.
+    let listed: Vec<String> = client
+        .simple_query("SHOW CHECKS")
+        .await
+        .expect("SHOW CHECKS")
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some(format!("{} {} {}", r.get(0).unwrap_or(""), r.get(1).unwrap_or(""), r.get(2).unwrap_or("")))
+            }
+            _ => None,
+        })
+        .collect();
+    for want in ["ck ck_c enforced", "nm nm_c enforced", "c1 c1_tag_check not enforced"] {
+        if !listed.iter().any(|l| l == want) {
+            wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

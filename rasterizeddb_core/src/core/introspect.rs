@@ -11,6 +11,7 @@
 //! SHOW QUERY STATS             -- one row per statement shape, with its totals
 //! RESET QUERY STATS            -- forget both
 //! SHOW SCHEMA MAP              -- a row per relationship, for drawing a graph
+//! SHOW CHECKS                  -- a row per CHECK constraint, and whether it is enforced
 //! SHOW CONFIG                  -- every runtime knob, its value and how to change it
 //! SHOW CONFIG KEYS             -- what SET CONFIG accepts
 //! SET CONFIG <key> = <value>   -- change one, where the engine can do it live
@@ -63,6 +64,8 @@ pub enum Introspect {
     Partitions(String),
     Columns(String),
     SchemaMap,
+    /// Every CHECK constraint and whether this binary enforces it.
+    Checks,
     BackupStatus,
     /// The last `n` statements this server answered, newest first. `None`
     /// takes whatever the ring holds.
@@ -240,6 +243,12 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             }
             Some(Ok(Introspect::QueryStats))
         }
+        Some("CHECKS") => {
+            if words.len() > 2 {
+                return Some(Err(format!("SHOW CHECKS takes no arguments; unexpected {:?}", original[2])));
+            }
+            Some(Ok(Introspect::Checks))
+        }
         Some("SCHEMA") if words.get(2).copied() == Some("MAP") => {
             if words.len() > 3 {
                 return Some(Err(format!(
@@ -379,6 +388,7 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
             text("statement"),
         ],
         Introspect::ResetQueryStats => vec![text("result")],
+        Introspect::Checks => vec![text("table_name"), text("constraint_name"), text("status"), text("reason"), text("expression")],
         Introspect::SchemaMap => vec![
             text("kind"),
             text("from_table"),
@@ -439,6 +449,7 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Ok(r) => rows(r),
             Err(e) => failure(&e),
         },
+        Introspect::Checks => rows(checks(database)),
         Introspect::RecentQueries(limit) => match recent_queries(*limit) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1648,6 +1659,37 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
 ///
 /// Errs on a partitioned table whose schema could not be read: its edges are
 /// unknown, and leaving them out would draw a map with them missing.
+/// A row per CHECK constraint of every table: `enforced`, `not enforced`
+/// (kept, as a pattern outside what is matched as PostgreSQL matches it, or
+/// `character(n)` compared blank-padded) or `cannot be compiled` (stored by
+/// an older binary in a form this one does not read), with why. An
+/// unenforced check was said only to the session that declared it; this is
+/// how an operator finds them afterwards.
+fn checks(database: &Arc<Database>) -> Vec<Row> {
+    let mut names: Vec<String> = table_names(database);
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Some(table) = database.schema_view(&name) else { continue };
+        let schema = table.schema();
+        for check in schema.checks.iter().filter(|c| !c.is_deleted) {
+            let (status, reason) = match crate::core::rql::executor::check_status(&check.expression, &schema.fields) {
+                Ok(None) => ("enforced", String::new()),
+                Ok(Some(why)) => ("not enforced", why),
+                Err(why) => ("cannot be compiled", why),
+            };
+            out.push(row(&[
+                Cell::Text(schema.name.clone()),
+                Cell::Text(check.name.clone()),
+                Cell::Text(status.to_string()),
+                Cell::Text(reason),
+                Cell::Text(check.expression.clone()),
+            ]));
+        }
+    }
+    out
+}
+
 fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut names: Vec<String> = table_names(database);
     names.sort();
@@ -2890,6 +2932,7 @@ mod tests {
         assert_eq!(ok("SHOW STATS"), Introspect::DatabaseStats);
         assert_eq!(ok("SHOW DATABASE STATS"), Introspect::DatabaseStats);
         assert_eq!(ok("SHOW SCHEMA MAP"), Introspect::SchemaMap);
+        assert_eq!(ok("SHOW CHECKS"), Introspect::Checks);
         assert_eq!(ok("SHOW CONFIG"), Introspect::Config);
         assert_eq!(ok("SHOW CONFIG KEYS"), Introspect::ConfigKeys);
         assert_eq!(ok("SHOW BACKUP STATUS"), Introspect::BackupStatus);
@@ -3448,6 +3491,7 @@ mod tests {
             Introspect::TableStats("t".into()),
             Introspect::Columns("t".into()),
             Introspect::SchemaMap,
+            Introspect::Checks,
             Introspect::BackupStatus,
             Introspect::Config,
             Introspect::ConfigKeys,

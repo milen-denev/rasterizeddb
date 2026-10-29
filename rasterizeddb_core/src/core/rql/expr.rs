@@ -2338,24 +2338,31 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
     Ok(match func {
         TextFunc::RegexpLike | TextFunc::CheckRegexpLike => {
             let flags = args.get(2).map(as_text).unwrap_or_default();
-            let answer = match crate::core::rql::pg_regex::compile_cached(&as_text(&args[1]), &flags) {
-                Ok(re) => re.matches(&as_text(&args[0])).ok_or_else(|| {
-                    crate::core::rql::pg_regex::PgRegexError::Unsupported(
-                        "a locale-dependent class or case-insensitivity over a non-ASCII value".to_string(),
-                    )
-                }),
-                Err(e) => Err(e),
-            };
-            match (answer, func) {
-                (Ok(matched), _) => Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL },
-                // Inside a CHECK, what cannot be vouched for is not judged.
-                (Err(crate::core::rql::pg_regex::PgRegexError::Unsupported(why)), TextFunc::CheckRegexpLike) => {
+            // A pattern or flags outside the translated subset — here only
+            // ones read from the row, as a constant one leaves the check
+            // unenforced where it is declared — refuse the row (0A000), and
+            // an invalid one is PostgreSQL's 2201B: neither is "not judged",
+            // which plain ASCII data reached that way. Only a value whose
+            // answer depends on the locale's classes is not judged.
+            let re = crate::core::rql::pg_regex::compile_cached(&as_text(&args[1]), &flags).map_err(|e| e.message())?;
+            match (re.matches(&as_text(&args[0])), func) {
+                (Some(matched), _) => Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL },
+                // Inside a CHECK it is UNKNOWN, which a monotone check
+                // still judges (`compile_check`).
+                (None, TextFunc::CheckRegexpLike) => {
                     CHECK_UNCERTAIN.with(|u| {
-                        u.borrow_mut().get_or_insert(why);
+                        u.borrow_mut().get_or_insert_with(|| {
+                            "a locale-dependent class or case-insensitivity met a non-ASCII value".to_string()
+                        });
                     });
                     Value::Null
                 }
-                (Err(e), _) => return Err(e.message()),
+                (None, _) => {
+                    return Err(crate::core::rql::pg_regex::PgRegexError::Unsupported(
+                        "a locale-dependent class or case-insensitivity over a non-ASCII value".to_string(),
+                    )
+                    .message())
+                }
             }
         }
         TextFunc::SimilarToEscape => {

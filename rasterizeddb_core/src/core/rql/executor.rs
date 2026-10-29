@@ -10048,18 +10048,16 @@ fn check_constraints_hold(
         let compiled = match compile_check_cached(&constraint.expression, &schema.fields) {
             Ok(compiled) => compiled,
             Err(reason) => {
-                log::error!(
-                    "check constraint '{}' on '{}' could not be compiled and is not being \
-                     enforced: {}",
-                    constraint.name,
-                    table_name,
-                    reason
-                );
+                report_unenforced_once(table_name, &constraint.name, &reason, false);
                 continue;
             }
         };
+        if let CompiledCheck::Unenforced(why) = compiled.as_ref() {
+            report_unenforced_once(table_name, &constraint.name, why, true);
+            continue;
+        }
 
-        match compiled.violated(row, &schema.fields) {
+        match compiled.violated(row, &schema.fields, table_name, &constraint.name) {
             Ok(false) => {}
             Ok(true) => {
                 return Err(format!(
@@ -10115,22 +10113,45 @@ pub(crate) enum CompiledCheck {
     /// than enforced another way or refused (which would lose the table on
     /// a restore). Said so where it is declared.
     Unenforced(String),
+    /// A check over regular expressions each of which stands as a boolean
+    /// under AND, OR and NOT alone, so one left UNKNOWN for a value still
+    /// gives the check's exact three-valued answer (`violated`).
+    Monotone(Box<CompiledCheck>),
 }
 
 impl CompiledCheck {
     /// Whether `row` violates the check. `fields` is the table's whole
     /// schema, so a column whose companion is set reads as NULL.
+    ///
+    /// A regular expression that could not be answered for this value as
+    /// PostgreSQL would (a locale class over non-ASCII text) is UNKNOWN. A
+    /// check whose every such call sits under AND, OR and NOT ([`Monotone`])
+    /// is judged with it UNKNOWN, which is exact: FALSE whatever the call
+    /// answers is FALSE (`s ~ '^\w+$' AND n > 0` with n = -1 is refused,
+    /// as in PostgreSQL; it was accepted). Any other check is not judged for
+    /// the row, which is counted against `table`'s `name` and said once per
+    /// statement (`notice::count`).
+    ///
+    /// [`Monotone`]: CompiledCheck::Monotone
     pub(crate) fn violated(
         &self,
         row: &crate::core::row::row::Row,
         fields: &[crate::core::row::schema::SchemaField],
+        table: &str,
+        name: &str,
     ) -> Result<bool, String> {
-        // A regular expression that could not be answered for this value as
-        // PostgreSQL would answer it leaves the check unjudged for the row.
         let _ = crate::core::rql::expr::take_check_uncertainty();
         let verdict = self.violated_as_written(row, fields)?;
         if let Some(why) = crate::core::rql::expr::take_check_uncertainty() {
-            log::warn!("a check constraint was not judged for a row: {why}");
+            if verdict && matches!(self, CompiledCheck::Monotone(_)) {
+                return Ok(true);
+            }
+            crate::core::notice::count(&format!("unjudged\u{1}{table}\u{1}{name}"), || {
+                format!(
+                    "check constraint \"{name}\" of relation \"{table}\" was not judged for some rows: {why}, \
+                     where PostgreSQL's answer depends on the locale; those rows were accepted"
+                )
+            });
             return Ok(false);
         }
         Ok(verdict)
@@ -10143,6 +10164,7 @@ impl CompiledCheck {
     ) -> Result<bool, String> {
         match self {
             CompiledCheck::Unenforced(_) => Ok(false),
+            CompiledCheck::Monotone(inner) => inner.violated_as_written(row, fields),
             CompiledCheck::Violation(cond) => crate::core::rql::expr::eval_cond(cond, row, fields),
             CompiledCheck::Direct(cond) => {
                 Ok(crate::core::rql::expr::eval_cond_3vl(cond, row, fields)? == Some(false))
@@ -10183,6 +10205,7 @@ impl CompiledCheck {
     ) -> Vec<crate::core::row::schema::SchemaField> {
         let cond = match self {
             CompiledCheck::Unenforced(_) => return Vec::new(),
+            CompiledCheck::Monotone(inner) => return inner.columns(fields),
             CompiledCheck::Violation(cond) | CompiledCheck::Direct(cond) => cond,
             // What the plan reads is not listed here, so every column is
             // taken as read: an UPDATE judges the check against each row.
@@ -10265,12 +10288,23 @@ pub(crate) fn compile_check(
     let fields_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
         fields.iter().cloned().collect();
     // `pg_dump`'s canonical spellings, in the shape the rewriter reads.
+    let original = expression;
     let expression = crate::core::rql::check::normalize_expression(expression);
     let expression = expression.as_str();
     // A written regular expression this engine cannot match as PostgreSQL
     // does: the check is kept and not enforced.
     if let Some(why) = unsupported_check_pattern(expression) {
         return Ok(CompiledCheck::Unenforced(why));
+    }
+    // `character(n)` compares blank-padded in PostgreSQL ('AB ' = 'AB'),
+    // and this engine stores it as text: `tag = ANY (ARRAY['AB'::bpchar,
+    // …])`, which `pg_dump` writes for every such check, refused the 'AB '
+    // its `--inserts` writes, and the restore lost the row.
+    if compares_bpchar(original) {
+        return Ok(CompiledCheck::Unenforced(
+            "it compares character(n) values, which this engine does not compare blank-padded as PostgreSQL does"
+                .to_string(),
+        ));
     }
     let compiled = compile_check_lowered(expression, &fields_sv, fields);
     match compiled {
@@ -10280,7 +10314,152 @@ pub(crate) fn compile_check(
         Err(e) if expression.contains(crate::core::rql::check::CHECK_REGEXP_LIKE) => {
             Ok(CompiledCheck::Unenforced(format!("this form of check around a regular expression ({e})")))
         }
+        Ok(compiled) if regex_calls_are_monotone(expression) => Ok(CompiledCheck::Monotone(Box::new(compiled))),
         other => other,
+    }
+}
+
+/// Whether `text` (as written) casts to `bpchar` or `character` — not
+/// `character varying`.
+fn compares_bpchar(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            continue;
+        }
+        if lower[i..].starts_with("::") {
+            let rest = lower[i + 2..].trim_start().trim_start_matches('"');
+            if rest.starts_with("bpchar") {
+                return true;
+            }
+            if let Some(after) = rest.strip_prefix("character") {
+                if !after.trim_start().starts_with("varying") && !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether every regular expression in the normalized `expression` stands
+/// as a boolean term under AND, OR and NOT alone, at every level of
+/// parentheses around it — `(call = TRUE)`, `(call = FALSE)`, `NOT call`,
+/// `call` — so an UNKNOWN call leaves the check UNKNOWN exactly when
+/// PostgreSQL's answer could go either way. One read by anything that sees
+/// a NULL as a value (`IS`, `COALESCE`, `CASE`, a comparison, a function)
+/// is not. `false` when there is no call.
+fn regex_calls_are_monotone(expression: &str) -> bool {
+    use crate::core::sql_scan::matching_close;
+    let name = crate::core::rql::check::CHECK_REGEXP_LIKE;
+    if !expression.contains(name) {
+        return false;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let ends_with_word = |text: &str, w: &str| {
+        let t = text.to_ascii_uppercase();
+        t.ends_with(w) && t.len().checked_sub(w.len() + 1).is_none_or(|i| !word(t.as_bytes()[i]))
+    };
+    let starts_with_word = |text: &str, w: &str| {
+        let t = text.to_ascii_uppercase();
+        t.starts_with(w) && t.as_bytes().get(w.len()).is_none_or(|b| !word(*b))
+    };
+    // The innermost `(` open at `pos`, outside quotes.
+    let enclosing_open = |pos: usize| -> Option<usize> {
+        let bytes = expression.as_bytes();
+        let mut stack = Vec::new();
+        let mut i = 0;
+        while i < pos {
+            match bytes[i] {
+                b'\'' => {
+                    i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                    continue;
+                }
+                b'(' => stack.push(i),
+                b')' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        stack.pop()
+    };
+    let mut from = 0;
+    while let Some(at) = expression[from..].find(name).map(|a| a + from) {
+        let open = at + name.len();
+        let Some(close) = matching_close(expression, open) else { return false };
+        let mut span = (at, close + 1);
+        loop {
+            let before = expression[..span.0].trim_end();
+            let after = expression[span.1..].trim_start();
+            let prev_ok = before.is_empty()
+                || before.ends_with('(')
+                || ["AND", "OR", "NOT"].iter().any(|w| ends_with_word(before, w));
+            let truth_test = ["= TRUE", "= FALSE"].iter().any(|t| {
+                after.to_ascii_uppercase().starts_with(t) && {
+                    let rest = after[t.len()..].trim_start();
+                    rest.is_empty() || rest.starts_with(')') || starts_with_word(rest, "AND") || starts_with_word(rest, "OR")
+                }
+            });
+            let next_ok = after.is_empty()
+                || after.starts_with(')')
+                || starts_with_word(after, "AND")
+                || starts_with_word(after, "OR")
+                || truth_test;
+            if !(prev_ok && next_ok) {
+                return false;
+            }
+            match enclosing_open(span.0) {
+                None => break,
+                Some(o) => match matching_close(expression, o) {
+                    Some(c) => span = (o, c + 1),
+                    None => return false,
+                },
+            }
+        }
+        from = close + 1;
+    }
+    true
+}
+
+/// Whether this binary enforces the check `expression`: `Ok(None)` when it
+/// does, `Ok(Some(why))` when it keeps it unenforced, `Err(why)` when it
+/// cannot compile it (one stored by an older binary). `SHOW CHECKS` reads it.
+pub(crate) fn check_status(
+    expression: &str,
+    fields: &[crate::core::row::schema::SchemaField],
+) -> Result<Option<String>, String> {
+    match compile_check(expression, fields)? {
+        CompiledCheck::Unenforced(why) => Ok(Some(why)),
+        _ => Ok(None),
+    }
+}
+
+/// Logs, once per process for each table's check, one this binary does not
+/// enforce or cannot compile: at the table's first write after a start, so
+/// one declared by another session or stored by an older binary is said in
+/// the log too (`SHOW CHECKS` lists them).
+pub(crate) fn report_unenforced_once(table: &str, name: &str, why: &str, compiled: bool) {
+    static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|(t, n)| t == table && n == name) {
+        return;
+    }
+    if seen.len() >= 4096 {
+        seen.clear();
+    }
+    seen.push((table.to_string(), name.to_string()));
+    if compiled {
+        log::warn!("check constraint \"{name}\" of relation \"{table}\" is not enforced: {why}");
+    } else {
+        log::error!("check constraint \"{name}\" of relation \"{table}\" could not be compiled and is not enforced: {why}");
     }
 }
 
@@ -10448,7 +10627,7 @@ fn check_constraints_hold_for_update(
         }
 
         if compiled
-            .violated(&candidate, &schema.fields)
+            .violated(&candidate, &schema.fields, table_name, &constraint.name)
             .map_err(|reason| check_evaluation_failed(&constraint.name, table_name, &reason))?
         {
             return Err(format!(
@@ -10536,7 +10715,7 @@ impl UpdateRowChecks {
             });
         }
         for (name, compiled) in &self.checks {
-            match compiled.violated(&row, fields) {
+            match compiled.violated(&row, fields, table_name, name) {
                 Ok(false) => {}
                 Ok(true) => {
                     return Err(format!(
