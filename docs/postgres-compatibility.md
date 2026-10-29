@@ -330,10 +330,28 @@ classes, non-ASCII range endpoints, non-ASCII characters under
 case-insensitivity, the flags `x p w b e`, braces that are not a repetition
 count, a quantifier on a quantifier or an anchor, and unknown classes. A few
 constructs depend on the locale's character classes: `\w`, `\W`, `\s`, `\S`,
-word boundaries, classes other than `[:digit:]`/`[:xdigit:]`, and
-case-insensitive matching. They are judged for ASCII text, where every
-locale agrees; a row whose text is not ASCII is not judged by that
-constraint (stored, with a log line), rather than judged by a guess.
+`\d`, every bracket class (`[:digit:]` included: under an ICU locale it takes
+'١'), word boundaries, and case-insensitive matching. They are answered for
+ASCII text, where every locale agrees; for other text the answer is UNKNOWN.
+A check whose regular expressions stand under AND, OR and NOT alone is then
+still judged, exactly: `s ~ '^\w+$' AND n > 0` refuses `n = -1` whatever `\w`
+says. A check that reads that answer as a value (`(s ~ '…') IS TRUE`,
+`COALESCE`, `CASE`) is not judged for the row; the statement says so once, as
+a WARNING (01000) naming the table and the constraint with how many rows, and
+the log says it once per statement.
+
+A pattern or flags read from the row (`CHECK (s ~ t)`) outside the subset
+refuse that row with 0A000, and an invalid one with 2201B, as PostgreSQL's.
+
+A check on a `character(n)` column is kept unenforced, with a WARNING:
+PostgreSQL compares `character(n)` blank-padded (`'AB '` is `'AB'`), and this
+engine stores it as text, so enforcing it would refuse rows PostgreSQL
+accepts. `pg_dump` writes such checks with `::bpchar`, and a `CREATE TABLE`
+that declares one on a `char(n)` column stores it so.
+
+`SHOW CHECKS` lists every check, with `enforced`, `not enforced` or `cannot be
+compiled` (one stored by an older binary) and why; each that is not enforced
+is also logged once when its table is opened.
 
 A pattern PostgreSQL itself rejects (`'('`, `'[a'`, `'*a'`) is accepted at
 CREATE TABLE, as there, and every row it meets is refused with 2201B; an
@@ -367,7 +385,10 @@ SELECT` from any source (a join, a derived table, a CTE, `min`), and in a
 select list, `ORDER BY` key or `RETURNING` item built from `+`, `-`, `*`,
 unary minus, `COALESCE`, `CASE`, `LEAST` and `GREATEST` (`SELECT a + 1`,
 `-a`, `a * 2`). A `UNION` of NUMERIC columns at different scales, or of a
-NUMERIC and an integer, gives each value at its own scale.
+NUMERIC and an integer, an expression, an aggregate or a numeric constant,
+gives each value at its own scale; one whose branch types cannot be resolved
+to NUMERIC (a float, a join or `SELECT` with no `FROM`) is refused with
+0A000 rather than mixed.
 
 A constant with more than nine places, written either way (`0.000000000001`,
 `43e-17`), is `numeric` as in PostgreSQL, carried with its digits (up to 38
@@ -375,6 +396,8 @@ places) and computed exactly in the same places: `SELECT c + 43e-17` is
 44812.65000000000000043, and a `CASE` with such a branch stays `numeric`.
 
 Refused with 0A000 rather than answered without the value's last digits:
+a value with more than nine places stored into an unconstrained `NUMERIC`
+column, which keeps nine here (declare it `NUMERIC(p, s)`),
 `WHERE`-clause arithmetic on such a value or constant (`WHERE a + 0 > 1`), a
 quotient that does not end (`a / 3`), such a constant inside an aggregate's
 argument (`sum(c + 43e-17)`), and a `UNION` whose first branch is an integer
