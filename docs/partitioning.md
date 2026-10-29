@@ -645,10 +645,13 @@ whole, since they were durable before it was written; one without it has its
 files voided and deleted at open by the intent naming them, so a `CREATE` of
 the name succeeds again. A failure before the row discards the files the
 same way. A partitioned `CREATE` already wrote and synced its uid's files
-before its row, and the startup reaper deletes a uid no row names. The
-intent costs two syncs (the file and the directory), and the row's own sync
-moves from the statement's end into the `CREATE`; a statement-scoped
-relation and a directory being bulk-loaded take neither. The schema file and
+before its row, and the startup reaper deletes a uid no row names. Cost,
+counted as above: the probe's `CREATE TABLE` takes 34 syncs where `e446df4`
+took 31, the intent's two (its file and the directory) and a log sync of
+the catalogue row's own, which the sidecars' commit covered while the row
+was logged before them; the single-record statements still take one. A
+statement-scoped relation and a directory being bulk-loaded take none of
+it. The schema file and
 its field records keep the logged append: an image can keep a field file's
 new length and drop its page only where no catalogue row names the table,
 and the field loader skips a record of zeros all the same
