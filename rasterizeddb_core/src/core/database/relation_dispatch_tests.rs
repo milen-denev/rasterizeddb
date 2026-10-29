@@ -184,6 +184,8 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("table_files_conflict_beside", "the name guard: a pass over every relation, plain and partitioned, by design"),
     ("remember_in_catalogue", "a row write; rename dispatches before it"),
     ("write_catalogue_row", "a row write with the cluster value its caller chose"),
+    ("creates_durably", "a CREATE's own target, which add_table's guards found no relation under"),
+    ("abandon_create", "a failed CREATE's own files, before its catalogue row and before any relation holds the name"),
     ("catalogue_contains", "test-only catalogue read"),
     ("claim_name", "an in-memory claim on the name, whatever it names"),
     ("drop_partitioned", "the partitioned branch of drop_table_to_depth's dispatch"),
