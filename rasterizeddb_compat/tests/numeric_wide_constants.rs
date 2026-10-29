@@ -95,6 +95,9 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
             "-613300910.00000000000000006700|-613300910.00000000000000013400",
         ]),
         ("INSERT INTO r2 SELECT id, c + 43e-17 FROM r WHERE id = 1 RETURNING z", &["44812.65000000000000043000"]),
+        // Into an integer column: PostgreSQL's assignment cast, rounded.
+        ("UPDATE r SET i = 3 + 0.00000000001 WHERE id = 1 RETURNING i", &["3"]),
+        ("UPDATE r SET i = 3.4999999999999 + 0.5 WHERE id = 1 RETURNING i", &["4"]),
         // A wide column copied by INSERT … SELECT, from each kind of source.
         ("INSERT INTO r2 SELECT id + 10, b FROM r WHERE id = 2", &[]),
         ("INSERT INTO r2 SELECT x.id + 20, y.a FROM r x JOIN jb y ON y.id = x.id WHERE x.id = 2", &[]),
@@ -113,7 +116,7 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         // integer: each value at its own scale.
         ("SELECT c FROM r UNION ALL SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT d FROM r UNION ALL SELECT c FROM r ORDER BY 1 DESC", &["44812.65", "3.1415", "-0.0001", "-2.55"]),
-        ("SELECT c FROM r UNION ALL SELECT i FROM r ORDER BY 1", &["-2.55", "3", "7", "44812.65"]),
+        ("SELECT c FROM r UNION ALL SELECT i FROM r ORDER BY 1", &["-2.55", "4", "7", "44812.65"]),
         ("SELECT c FROM r UNION SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT c FROM u2 UNION SELECT d FROM u2", &["1.25"]),
         ("SELECT count(*) FROM (SELECT c AS x FROM r UNION ALL SELECT d FROM r) s WHERE x < 0", &["2"]),
