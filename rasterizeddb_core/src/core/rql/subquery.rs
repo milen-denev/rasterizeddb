@@ -197,7 +197,10 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
                 // is a value. Without that distinction the second subquery of
                 // `… SET c = (SELECT …) WHERE x IS DISTINCT FROM (SELECT …)`
                 // was skipped and reached the parser as the word SELECT.
-                let derived_table = matches!(previous_word.as_str(), "FROM" | "JOIN")
+                // `DELETE … USING (SELECT …) s` names a derived source the
+                // same way; read as a value, a source of two rows was refused
+                // as "returned 2 rows".
+                let derived_table = matches!(previous_word.as_str(), "FROM" | "JOIN" | "USING")
                     && word_before_previous != "DISTINCT";
                 // A parenthesised branch of a `UNION` is a query of its own,
                 // not a value: `(SELECT … LIMIT 2) UNION (SELECT …)`. Taken for
@@ -1399,6 +1402,22 @@ mod correlation_tests {
             find_scalar_subquery(sql).is_none(),
             "a correlated subquery must be left in place for per-row evaluation"
         );
+    }
+
+    /// `DELETE … USING (SELECT …) s` names a derived source, as `FROM (…)`
+    /// does: read as a value, a source of two rows failed the statement
+    /// with "returned 2 rows". A scalar subquery in its condition is still
+    /// one.
+    ///
+    /// Mutation: `"USING"` dropped from the derived-table words.
+    #[test]
+    fn a_using_source_is_not_a_scalar_subquery() {
+        assert!(find_scalar_subquery("DELETE FROM t USING (SELECT other FROM u) p WHERE p.other = t.id").is_none());
+        let found = find_scalar_subquery(
+            "DELETE FROM t USING (SELECT other FROM u) p WHERE p.other = t.id AND t.v = (SELECT max(w) FROM u)",
+        )
+        .expect("the value subquery is still found");
+        assert!(found.inner_sql.contains("max(w)"), "{}", found.inner_sql);
     }
 
     #[test]
