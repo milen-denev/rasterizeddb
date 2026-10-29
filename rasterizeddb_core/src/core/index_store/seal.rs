@@ -232,8 +232,9 @@ pub trait SealTarget: Send + Sync {
     fn land_staged(&self) -> impl Future<Output = io::Result<()>> + Send;
     /// §3 step 3: `Some(why)` when the snapshot must not be taken.
     fn ineligible(&self) -> Option<String>;
-    /// `outcome_revocations` when the instance opened.
-    fn revocations_at_open(&self) -> u64;
+    /// Whether the instance's database revoked a commit after it opened
+    /// (N26; `mvcc::status::outcome_revocations`).
+    fn revoked_since_open(&self) -> bool;
     /// §3 step 4.
     fn barrier(&self) -> io::Result<()>;
     /// The database's root directory, where `incompat::check` reads.
@@ -404,7 +405,7 @@ async fn sealed<T: SealTarget>(t: &T, gate: &Arc<FileGate>, kind: SealKind) -> R
     if let Some(why) = t.ineligible() {
         return Err(Ended::Skip(Skip::Ineligible(why)));
     }
-    if crate::core::mvcc::status::outcome_revocations() != t.revocations_at_open() {
+    if t.revoked_since_open() {
         return Err(Ended::Skip(Skip::Revoked));
     }
     // Step 4.
@@ -433,7 +434,7 @@ async fn sealed<T: SealTarget>(t: &T, gate: &Arc<FileGate>, kind: SealKind) -> R
     let root = t.root_dir();
     let dir = gate.dir().expect("a file set with files").to_path_buf();
     let scan = blocking(|| prepare_marker(gate, &ixm, &dir, root.as_deref()))?;
-    if crate::core::mvcc::status::outcome_revocations() != t.revocations_at_open() {
+    if t.revoked_since_open() {
         return Err(Ended::Skip(Skip::Revoked));
     }
     publishing(gate, kind).await?;

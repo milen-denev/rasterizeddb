@@ -721,3 +721,44 @@ async fn move_carries_the_pair_and_the_word_to_the_destination() {
     close(&root, db);
     crate::core::wal::remove_for(&disk.to_string_lossy());
 }
+
+/// N26 is a database's own: a commit revoked in another database's status
+/// log (in a test run, another test's) leaves this database's seals alone,
+/// and one revoked in this database's own log after the table opened still
+/// refuses its seal (`Skip::Revoked`).
+///
+/// Mutations: the seal comparing the process-wide count again (the first
+/// checkpoint skips); `StatusLog::record` not recording its latest
+/// revocation (the second publishes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revocation_refuses_only_its_own_databases_seals() {
+    use crate::core::mvcc::TxOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "seal_revoked").await;
+    let t = seeded(&db, "r", 30).await;
+
+    // Another database's log revokes a commit of its own.
+    let other = crate::core::mvcc::status::StatusLog::in_memory();
+    other.record(5, TxOutcome::Committed);
+    other.record(5, TxOutcome::Aborted);
+    for s in checkpoint(&db, "r").await {
+        assert!(s.outcome.is_clean(), "another database's revocation refused {}: {}", s.name, s.outcome.describe());
+    }
+
+    // Dirty again, then this database revokes one of its own commits. A
+    // transaction held open keeps the log from settling past it.
+    exec(&db, "INSERT INTO r (id, v, s) VALUES (1000, 1, 'late')").await;
+    ready(&t).await;
+    let held = db.transactions.begin();
+    let tx = db.transactions.begin();
+    db.transactions.commit(tx);
+    db.transactions.status().record(tx, TxOutcome::Aborted);
+    let sealed = checkpoint(&db, "r").await;
+    assert!(
+        sealed.iter().any(|s| matches!(s.outcome, SealOutcome::Skipped(Skip::Revoked))),
+        "a revocation in the table's own database did not refuse its seal: {:?}",
+        sealed.iter().map(|s| s.outcome.describe()).collect::<Vec<_>>()
+    );
+    db.transactions.abort(held);
+    close(dir.path(), db);
+}

@@ -189,6 +189,12 @@ async fn run_case(case: &Case, seeds: u64) -> Outcomes {
         }
         let report = db.seal_for_shutdown(std::time::Duration::from_secs(60)).await;
         assert!(report.skipped.is_empty(), "{}: the shutdown seal skipped {:?}", case.ddl, report.skipped);
+        // Every file set sealed, not only none past the deadline: a seal
+        // that skipped (a revocation, say) is filed under `sealed`, and the
+        // images then hold no snapshot to load.
+        for s in &report.sealed {
+            assert!(s.outcome.is_clean(), "{}: the shutdown seal of {} ended {}", case.ddl, s.name, s.outcome.describe());
+        }
         close(&dir, db);
     }
     let db = open(&dir, "pddl_cut").await.unwrap();

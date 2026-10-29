@@ -162,8 +162,15 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
         None
     }
 
-    fn revocations_at_open(&self) -> u64 {
-        self.revocations_at_open
+    fn revoked_since_open(&self) -> bool {
+        match self.versions.load_full() {
+            // Its own database's log: a revocation in another database's
+            // cannot make a version of this one visible again.
+            Some(tm) => tm.status().revoked_since(self.revocations_at_open),
+            // Unversioned, nothing decided on an outcome here; the
+            // process-wide count, conservatively, as before.
+            None => crate::core::mvcc::status::outcome_revocations() != self.revocations_at_open,
+        }
     }
 
     fn barrier(&self) -> io::Result<()> {

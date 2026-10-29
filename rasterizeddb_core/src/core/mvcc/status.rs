@@ -256,6 +256,11 @@ pub struct StatusLog {
     /// neighbour is the `Mutex` guarding the log itself, so the counter update
     /// and the lock word were contending for one line from different threads.
     dirty_bytes: CacheGuard<AtomicUsize>,
+    /// The process-wide sequence number ([`outcome_revocations`]) of this
+    /// log's latest revocation, 0 for none: what a seal of one of this
+    /// database's tables compares against the sequence at its open
+    /// ([`StatusLog::revoked_since`]).
+    last_revocation: std::sync::atomic::AtomicU64,
 }
 
 /// See [`outcome_revocations`].
@@ -271,6 +276,14 @@ static OUTCOME_REVOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// index and the filter are rebuilt from rows; a persisted snapshot taken in
 /// the window would not be. So a snapshot is refused if this moved since the
 /// partition opened and again just before it is published.
+///
+/// Process-wide, so it is a sequence: every revocation in every log takes the
+/// next number. A seal asks its own database's log whether it revoked anything
+/// numbered after its open ([`StatusLog::revoked_since`]), never whether the
+/// count moved: a transaction's outcome is its database's, so a revocation in
+/// another database's log cannot make a version of this one visible again. The
+/// count alone let one database (one test, in a test run) refuse every other
+/// one's seals.
 pub fn outcome_revocations() -> u64 {
     OUTCOME_REVOCATIONS.load(Ordering::Acquire)
 }
@@ -446,7 +459,14 @@ impl StatusLog {
                 persist_step: SIDECAR_PERSIST_STEP,
             }),
             dirty_bytes: AtomicUsize::new(0).into(),
+            last_revocation: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Whether this log revoked a commit ([`outcome_revocations`]) numbered
+    /// after `sequence`, a reading of [`outcome_revocations`] taken earlier.
+    pub fn revoked_since(&self, sequence: u64) -> bool {
+        self.last_revocation.load(Ordering::Acquire) > sequence
     }
 
     /// A log that is never written anywhere.
@@ -477,6 +497,7 @@ impl StatusLog {
                 persist_step: SIDECAR_PERSIST_STEP,
             }),
             dirty_bytes: AtomicUsize::new(0).into(),
+            last_revocation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -517,7 +538,8 @@ impl StatusLog {
         let shift = (tx % ENTRIES_PER_BYTE) * 2;
         let byte = view.bits.load_for_update(index);
         if revokes_a_commit((byte >> shift) & 0b11, bits) {
-            OUTCOME_REVOCATIONS.fetch_add(1, Ordering::AcqRel);
+            let sequence = OUTCOME_REVOCATIONS.fetch_add(1, Ordering::AcqRel) + 1;
+            self.last_revocation.fetch_max(sequence, Ordering::AcqRel);
             log::warn!(
                 "transaction {} was recorded committed and is now recorded aborted; \
                  work decided on the committed outcome in between is healed by a restart",
@@ -1823,6 +1845,7 @@ impl StatusLog {
                 persist_step: SIDECAR_PERSIST_STEP,
             }),
             dirty_bytes: AtomicUsize::new(0).into(),
+            last_revocation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2042,6 +2065,9 @@ mod tests {
             outcome_revocations() > before,
             "a Committed outcome was revoked and nothing counted it"
         );
+        // And the log that revoked it says so; another log does not.
+        assert!(log.revoked_since(before), "the revoking log did not record its revocation");
+        assert!(!StatusLog::in_memory().revoked_since(before), "a log that revoked nothing says it did");
 
         for (old, new, revokes) in [
             (BITS_COMMITTED, BITS_ABORTED, true),
