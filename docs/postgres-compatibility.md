@@ -303,11 +303,41 @@ generate: comparisons, `BETWEEN`, `IN`/`NOT IN`, `IS [NOT] NULL`,
 `IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE/FALSE`, `LIKE`/`ILIKE`/`NOT LIKE`,
 `SIMILAR TO` (and `pg_dump`'s `~~`, `~~*`, `!~~`), a `CASE` value compared,
 `COALESCE`, `length`/`char_length`/`upper`/`lower`/`btrim`, `jsonb_typeof`,
-`doc ? 'k'`, `doc @> …`, `doc ->> 'k' IS NOT NULL`, and `AND`/`OR`/`NOT` of
-them. A check no evaluator here can read is refused where it is declared,
-always with 0A000, rather than stored unenforced. Not yet supported: POSIX
-regular expressions (`~`, `~*`, `!~`) and a `CASE` whose branches are
-themselves conditions (`CASE WHEN a THEN b > 0 ELSE true END`).
+`doc ? 'k'`, `doc @> …`, `doc ->> 'k' IS NOT NULL`, POSIX regular
+expressions (`~`, `~*`, `!~`, `!~*`, `regexp_like`, `pg_dump`'s `x ~
+similar_to_escape('…')`), and `AND`/`OR`/`NOT` of them. A check no evaluator
+here can read is refused where it is declared, always with 0A000, rather than
+stored unenforced. Not yet supported: a `CASE` whose branches are themselves
+conditions (`CASE WHEN a THEN b > 0 ELSE true END`).
+
+#### Regular expressions in a CHECK
+
+A pattern is translated from PostgreSQL's dialect (its ARE) into one this
+engine matches exactly as PostgreSQL does, checked against 16674 answers
+recorded from PostgreSQL 17 (`core/rql/pg_regex_pg17.tsv`): `.` takes a
+newline unless the `n` flag is given, `\d` and `[0-9]` are ASCII,
+`[[:<:]]`, `[[:>:]]`, `\m`, `\M`, `\y`, `\Y` are word boundaries, `\b` is a
+backspace and `\B` a backslash, and the flags `i c n m s t q` apply. The
+shapes regex checks are written in are read: `NOT (s ~ 'x')`, `(s ~ 'a') =
+false`, a literal on the left, `COLLATE "C"`, `s ~ ANY (ARRAY[…])`.
+
+A pattern outside that subset neither refuses the table nor its rows: the
+table is created (or the constraint added), the constraint is **not
+enforced**, and a WARNING (01000) naming it is sent to the client and logged.
+Outside the subset: back-references, look-around, `\x`, `\c` and octal
+escapes, collating elements other than one ASCII character, equivalence
+classes, non-ASCII range endpoints, non-ASCII characters under
+case-insensitivity, the flags `x p w b e`, braces that are not a repetition
+count, a quantifier on a quantifier or an anchor, and unknown classes. A few
+constructs depend on the locale's character classes: `\w`, `\W`, `\s`, `\S`,
+word boundaries, classes other than `[:digit:]`/`[:xdigit:]`, and
+case-insensitive matching. They are judged for ASCII text, where every
+locale agrees; a row whose text is not ASCII is not judged by that
+constraint (stored, with a log line), rather than judged by a guess.
+
+A pattern PostgreSQL itself rejects (`'('`, `'[a'`, `'*a'`) is accepted at
+CREATE TABLE, as there, and every row it meets is refused with 2201B; an
+unknown flag, or `g`, is 22023.
 
 #### Release note: checks stored by older binaries
 
@@ -329,16 +359,29 @@ CONSTRAINT <name>`) and add it again once the data holds.
 
 Expressions compute `NUMERIC` at the engine's nine places. A column declared
 with more (`NUMERIC(20,12)`) is still exact where it is stored, compared with
-a literal of any length, compared in an expression (`CASE WHEN a > 1`), cast
-(`a::numeric(10,2)`, `a::float8`, `a::text`), assigned (`UPDATE … SET a = a +
-0.000000000001`, computed exactly and rounded once to the column's scale), and
-in a select list or `ORDER BY` key built from `+`, `-`, `*`, unary minus and
-`COALESCE` (`SELECT a + 1`, `-a`, `a * 2`). Three things are refused with
-0A000 rather than answered without the value's last digits: `WHERE`-clause
-arithmetic on it (`WHERE a + 0 > 1`), a quotient that does not end (`a / 3`),
-and `RETURNING` arithmetic on it. That refusal depends on the data: it fires
-only for rows whose value has nonzero digits past the ninth place, so the same
-statement may run against some rows and be refused against others.
+a literal of any length or a column of another scale (`WHERE ja.a > jb.a`),
+compared in an expression (`CASE WHEN a > 1`), cast (`a::numeric(10,2)`,
+`a::float8`, `a::text`), assigned (`UPDATE … SET a = a + 0.000000000001`,
+computed exactly and rounded once to the column's scale), copied by `INSERT …
+SELECT` from any source (a join, a derived table, a CTE, `min`), and in a
+select list, `ORDER BY` key or `RETURNING` item built from `+`, `-`, `*`,
+unary minus, `COALESCE`, `CASE`, `LEAST` and `GREATEST` (`SELECT a + 1`,
+`-a`, `a * 2`). A `UNION` of NUMERIC columns at different scales, or of a
+NUMERIC and an integer, gives each value at its own scale.
+
+A constant with more than nine places, written either way (`0.000000000001`,
+`43e-17`), is `numeric` as in PostgreSQL, carried with its digits (up to 38
+places) and computed exactly in the same places: `SELECT c + 43e-17` is
+44812.65000000000000043, and a `CASE` with such a branch stays `numeric`.
+
+Refused with 0A000 rather than answered without the value's last digits:
+`WHERE`-clause arithmetic on such a value or constant (`WHERE a + 0 > 1`), a
+quotient that does not end (`a / 3`), such a constant inside an aggregate's
+argument (`sum(c + 43e-17)`), and a `UNION` whose first branch is an integer
+and a later one NUMERIC (cast the first branch's column to `numeric`). The
+refusal for a column's value depends on the data: it fires only for rows whose
+value has nonzero digits past the ninth place, so the same statement may run
+against some rows and be refused against others.
 
 ## JSON
 
