@@ -660,11 +660,49 @@ and never reaches `add_table`. A commit `commit_durable` refuses before it
 is attempted (one of a batch's writes failed) now aborts its transaction:
 nothing else ended it, and its other files' held writes kept every
 checkpoint declining (`SidecarWrites` and `column_declarations` alike).
+**Review of `a5ad4d3`.** The intent's discard forgot the table's placement
+whatever it was, so a `STORAGE PLACE TABLE` pin (applied before the table
+exists, and the only way onto a key/value store) went with a failed or cut
+`CREATE`, and the retry landed in the database directory. The intent now
+records whether a placement was there before the `CREATE`, and only one it
+chose goes. The schema header and field records were appended with their
+failure only logged (`append_data(.., true)` on files, a key/value put
+dropped by `persist_untransacted`), so "every file durable before the row"
+held only when nothing failed: a full disk, a file-size limit or a refused
+put gave a `CREATE` that succeeded and a table that lost a column, or its
+schema, at the next open. `TableSchema::save` and `SchemaField::save_field`
+now commit their append and return its error (`append_committed`; on a
+store, its family's commit is the put), `create_schema_files` passes it
+on, and `add_table` discards the table before its row; ADD COLUMN's field
+records fail their change, which puts the schema files back. A `CREATE`
+whose post-row sync fails after the table is installed now tells
+replication, plain and partitioned. With its log disabled,
+`discard_files_in` syncs the directories it deleted from too.
+
 Pinned by `create_crash_tests::a_create_table_cut_anywhere_leaves_no_table_or_the_whole_table`
 (a plain and a partitioned table with all four constraints, cut in every
 sync and after it returns, every seed kind: absent and re-creatable, or
-whole and enforced; both happen), `torn_tail::tests::a_field_record_of_zeros_reads_as_no_column`
-and `…::a_refused_batch_releases_its_transaction`.
+whole and enforced; both happen; the plain one also pinned to a second
+directory and to a store: every image keeps the pin, and an absent table's
+retry lands there), `create_failure_tests` (a pin kept and a chosen
+placement forgotten by a failed `CREATE`; a header or field record that
+cannot be written, and a store refusing its puts, failing it),
+`torn_tail::tests::a_field_record_of_zeros_reads_as_no_column` and
+`…::a_refused_batch_releases_its_transaction`.
+
+The intermittent `RENAME TO pt2` "no image loaded a persisted index" was
+not this branch (the reviewer traced it at base): a revocation (N26,
+`Committed` recorded over by `Aborted`) was counted process-wide, so any
+test's `StatusLog` (the status tests do it on purpose) refused every other
+database's seals, and `seal_for_shutdown` files a `Skipped(Revoked)` under
+`sealed`, so the pddl setup's `report.skipped.is_empty()` passed with
+nothing published. The count is a sequence now, and each log records its
+own latest revocation: a seal refuses only when its own database revoked a
+commit after the table opened (`StatusLog::revoked_since`). A transaction's
+outcome is its database's, so another database's revocation cannot make a
+version of this one visible again. The pddl setup requires every seal to be
+`Published` or `AlreadyClean`, as the other seal-reading tests did. Pinned
+by `seal::tests::a_revocation_refuses_only_its_own_databases_seals`.
 
 Pinned by `torn_tail::tests::a_schema_record_reads_whole_after_a_cut_once_appended`
 (each sidecar cut after each of its last three records, past a page
