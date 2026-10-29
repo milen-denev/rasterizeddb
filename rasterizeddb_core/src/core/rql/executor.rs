@@ -825,6 +825,26 @@ pub(crate) async fn run_statement(
 fn outer_relation_names(sql: &str) -> Vec<String> {
     use crate::core::rql::join::find_keyword;
 
+    // `UPDATE t [AS] x SET …` names its relation before SET and has no FROM:
+    // read as having none, a correlated EXISTS ran with no outer row and was
+    // refused 42P01 (Django writes `UPDATE … WHERE EXISTS (…)`).
+    let trimmed = sql.trim_start();
+    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("UPDATE") && find_keyword(sql, "FROM", 0).is_none() {
+        let Some(set) = find_keyword(sql, "SET", 0) else { return Vec::new() };
+        let head = sql[..set].trim();
+        let mut words = head.split_whitespace().skip(1);
+        let mut names = Vec::new();
+        if let Some(table) = words.next() {
+            names.push(table.trim_matches('"').to_string());
+        }
+        match words.next() {
+            Some(w) if w.eq_ignore_ascii_case("AS") => names.extend(words.next().map(|a| a.trim_matches('"').to_string())),
+            Some(a) => names.push(a.trim_matches('"').to_string()),
+            None => {}
+        }
+        return names;
+    }
+
     let Some(from) = find_keyword(sql, "FROM", 0) else {
         return Vec::new();
     };
@@ -855,6 +875,47 @@ fn outer_relation_names(sql: &str) -> Vec<String> {
     names
 }
 
+/// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
+/// parenthesised `SELECT`.
+fn top_level_exists(sql: &str) -> Option<crate::core::rql::subquery::ExistsClause> {
+    let mut from = 0;
+    loop {
+        let mut clause = crate::core::rql::subquery::find_exists(&sql[from..])?;
+        clause.start += from;
+        clause.end += from;
+        if !inside_a_subquery(sql, clause.start) {
+            return Some(clause);
+        }
+        from = clause.end.max(from + 1);
+    }
+}
+
+/// Whether `pos` lies inside a parenthesised `SELECT` or `WITH` of `sql`.
+fn inside_a_subquery(sql: &str, pos: usize) -> bool {
+    let bytes = sql.as_bytes();
+    let mut stack: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < pos.min(bytes.len()) {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            b'(' => {
+                let rest = sql[i + 1..].trim_start();
+                let head = rest.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
+                stack.push(head.starts_with("SELECT") || head.starts_with("WITH"));
+            }
+            b')' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    stack.iter().any(|s| *s)
+}
+
 /// Replaces every `IN (SELECT …)` with the literal list the inner query
 /// produces, so the outer statement can then be planned as an ordinary one.
 ///
@@ -875,7 +936,11 @@ pub async fn substitute_in_subqueries(
     // `EXISTS` is rewritten into the equivalent `IN` first, so the loop below
     // resolves both forms with one mechanism.
     for _ in 0..MAX_SUBQUERIES {
-        let Some(clause) = subquery::find_exists(&current) else {
+        // Only an EXISTS of this statement's own: one inside another
+        // subquery (`id IN (SELECT t0.id FROM t AS t0 WHERE EXISTS (… t0.id))`,
+        // Django's DELETE) correlates with that subquery's relation, and is
+        // resolved when that subquery is run, below.
+        let Some(clause) = top_level_exists(&current) else {
             break;
         };
         let outer = outer_relation_names(&current);
@@ -16572,6 +16637,19 @@ pub(crate) async fn execute_with_need(
                 if crate::core::rql::join::find_keyword(sql, "FROM", 0).is_some() {
                     return Box::pin(execute_update_from(sql, &database, depth, tx)).await;
                 }
+                // A subquery reading the row being updated has a value per
+                // row, which nothing here evaluates: left in place, its text
+                // reached the assignment as a value (22P02, naming the
+                // subquery), and a DO UPDATE's, stripped of its qualifier,
+                // read the inner table's own column and stored NULL.
+                if crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some()
+                {
+                    return ddl_error(
+                        "a correlated subquery in UPDATE is not supported: one that reads \
+                         the row being updated has a value per row, which this cannot evaluate; \
+                         write it as UPDATE … FROM",
+                    );
+                }
                 // A row another transaction holds `FOR UPDATE` may not be
                 // written underneath it.
                 let mut words = sql.split_whitespace().skip(1);
@@ -16634,20 +16712,6 @@ pub(crate) async fn execute_with_need(
             // parser with the word SELECT in its assignment and came back as
             // "Cannot parse UPDATE query", naming nothing.
             if let QueryPurpose::UpdateRow(sql) = &query {
-                // A subquery reading the row being updated has a value per
-                // row, which nothing here evaluates: left in place, its text
-                // reached the assignment as a value (22P02, naming the
-                // subquery), and a DO UPDATE's, stripped of its qualifier,
-                // read the inner table's own column and stored NULL.
-                if crate::core::rql::join::find_keyword(sql, "FROM", 0).is_none()
-                    && crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some()
-                {
-                    return ddl_error(
-                        "a correlated subquery in UPDATE is not supported: one that reads \
-                         the row being updated has a value per row, which this cannot evaluate; \
-                         write it as UPDATE … FROM",
-                    );
-                }
                 if crate::core::rql::subquery::find_in_subquery(sql).is_some()
                     || crate::core::rql::subquery::find_exists(sql).is_some()
                     || crate::core::rql::subquery::find_scalar_subquery(sql).is_some()

@@ -574,6 +574,16 @@ fn take_count_suffix<'a>(text: &'a str, keyword: &str) -> Option<(&'a str, u64)>
 /// outer row, and the filter index sees the resulting equalities.
 ///
 /// Returns the replacement text, or an error naming what could not be handled.
+/// `text` without the parentheses that wrap all of it: `((a = b))` is
+/// `a = b`, `(a) = (b)` is left as it is.
+fn unwrap_parens(text: &str) -> &str {
+    let mut t = text.trim();
+    while t.starts_with('(') && crate::core::sql_scan::matching_close(t, 0) == Some(t.len() - 1) {
+        t = t[1..t.len() - 1].trim();
+    }
+    t
+}
+
 pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result<String, String> {
     const SELECT_LEN: usize = "SELECT".len();
     let inner = clause.inner_sql.trim();
@@ -617,6 +627,9 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     // outer reference. Split off here, and refused below once the subquery is
     // known to correlate — the `IN` rewrite has nowhere to put them.
     let (where_clause, grouping) = split_grouping(where_clause);
+    // Django parenthesises the whole predicate and each outer reference:
+    // `WHERE (U0."tid" = ("t"."id") AND U0."w" < 150)`.
+    let where_clause = unwrap_parens(where_clause);
 
     // Split the inner predicate into the one term that correlates with the
     // outer query and everything else, which stays inside the subquery.
@@ -624,13 +637,13 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     let mut rest: Vec<String> = Vec::new();
 
     for conjunct in crate::core::rql::join::split_conjuncts(where_clause) {
-        let term = conjunct.trim();
+        let term = unwrap_parens(conjunct.trim());
         let Some(eq) = find_bare_equals(term) else {
             rest.push(term.to_string());
             continue;
         };
-        let lhs = term[..eq].trim();
-        let rhs = term[eq + 1..].trim();
+        let lhs = unwrap_parens(term[..eq].trim());
+        let rhs = unwrap_parens(term[eq + 1..].trim());
 
         let lhs_side = qualifier_of(lhs, &inner, outer_relations);
         let rhs_side = qualifier_of(rhs, &inner, outer_relations);
@@ -650,6 +663,16 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     }
 
     if correlations.is_empty() {
+        // An outer column the rewrite cannot place is no proof of an
+        // uncorrelated EXISTS: run once with no outer row, it was refused as
+        // 42P01 ("missing FROM-clause entry"), naming a fault the statement
+        // does not have.
+        if let Some(term) = rest.iter().find(|t| names_outer_column(t, &inner, outer_relations)) {
+            return Err(format!(
+                "a correlated EXISTS can compare an outer column only with `=`; '{}' is not supported",
+                term
+            ));
+        }
         return Err(UNCORRELATED.to_string());
     }
 
@@ -831,7 +854,7 @@ fn exists_parts(
     let names = inner_names(relation_text);
     let where_clause = match where_at {
         None => return Err("an EXISTS with no WHERE clause correlates nothing".to_string()),
-        Some(w) => after_from[w + "WHERE".len()..].trim(),
+        Some(w) => unwrap_parens(after_from[w + "WHERE".len()..].trim()),
     };
 
     let mut outer_refs: Vec<String> = Vec::new();
@@ -839,13 +862,13 @@ fn exists_parts(
     let mut rest: Vec<String> = Vec::new();
 
     for conjunct in crate::core::rql::join::split_conjuncts(where_clause) {
-        let term = conjunct.trim();
+        let term = unwrap_parens(conjunct.trim());
         let Some(eq) = find_bare_equals(term) else {
             rest.push(term.to_string());
             continue;
         };
-        let lhs = term[..eq].trim();
-        let rhs = term[eq + 1..].trim();
+        let lhs = unwrap_parens(term[..eq].trim());
+        let rhs = unwrap_parens(term[eq + 1..].trim());
         match (
             qualifier_of(lhs, &names, outer_relations),
             qualifier_of(rhs, &names, outer_relations),

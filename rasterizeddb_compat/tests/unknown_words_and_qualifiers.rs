@@ -292,3 +292,37 @@ async fn joins_join_writes_returning_and_upserts_check_their_qualifiers() {
     let name: String = sqlx::query_scalar("SELECT name FROM n WHERE id = 1").fetch_one(&pool).await.expect("n");
     assert_eq!(name, "was b excluded.name EXCLUDED.name");
 }
+
+/// A correlated EXISTS in an UPDATE or a DELETE, as Django writes it: the
+/// statement's relation (`UPDATE "t" … WHERE EXISTS (… = ("t"."id") …)`),
+/// a parenthesised predicate, `LIMIT 1`, and one inside an `IN` subquery
+/// correlating with that subquery's own alias. The UPDATE ran the EXISTS
+/// with no outer row and was refused 42P01, "missing FROM-clause entry", as
+/// was every parenthesised correlation; each now runs as in PostgreSQL 17.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_exists_in_an_update_or_delete_runs() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40); \
+         CREATE TABLE u (id INT PRIMARY KEY, tid INT, w INT); INSERT INTO u VALUES (1, 1, 100), (2, 2, 200), (3, 4, 50)",
+    )
+    .await
+    .expect("setup");
+    for sql in [
+        r#"UPDATE "t" SET "v" = 2 WHERE EXISTS(SELECT 1 AS "a" FROM "u" U0 WHERE (U0."tid" = ("t"."id") AND U0."w" < 150) LIMIT 1)"#,
+        "UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+        r#"DELETE FROM "t" WHERE EXISTS(SELECT 1 AS "a" FROM "u" U0 WHERE (U0."tid" = ("t"."id") AND U0."w" > 150) LIMIT 1)"#,
+        r#"DELETE FROM "t" WHERE "t"."id" IN (SELECT "t0"."id" FROM "t" AS "t0" WHERE EXISTS (SELECT 1 FROM "u" WHERE "u"."tid" = "t0"."id" AND "u"."w" < 60))"#,
+    ] {
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
+    assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)]);
+    // An outer column the rewrite cannot place is refused as such, not 42P01.
+    let e = pool
+        .execute("UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)")
+        .await
+        .expect_err("inequality correlation");
+    assert_eq!(code(&e), "0A000", "{e}");
+}
