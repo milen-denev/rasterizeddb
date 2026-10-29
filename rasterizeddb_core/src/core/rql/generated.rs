@@ -534,6 +534,7 @@ impl Predicate {
                 left: Box::new(e.clone()),
                 cmp: Cmp::IsTrue,
                 right: None,
+                wide: Default::default(),
             }),
             Predicate::And(parts) => Cond::And(parts.iter().map(Predicate::holds).collect()),
             Predicate::Or(parts) => Cond::Or(parts.iter().map(Predicate::holds).collect()),
@@ -567,12 +568,14 @@ impl Predicate {
                     left: c.left.clone(),
                     cmp,
                     right: c.right.clone(),
+                    wide: Default::default(),
                 })
             }
             Predicate::Term(e) => Cond::Cmp(Condition {
                 left: Box::new(e.clone()),
                 cmp: Cmp::IsFalse,
                 right: None,
+                wide: Default::default(),
             }),
             Predicate::And(parts) => Cond::Or(parts.iter().map(Predicate::fails).collect()),
             Predicate::Or(parts) => Cond::And(parts.iter().map(Predicate::fails).collect()),
@@ -668,6 +671,7 @@ fn test_of_predicate(
         left: Box::new(operand.into_expr()),
         cmp,
         right: None,
+        wide: Default::default(),
     }))
 }
 

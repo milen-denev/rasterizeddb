@@ -71,7 +71,16 @@ pub struct Condition {
     pub left: Box<Expr>,
     pub cmp: Cmp,
     pub right: Option<Box<Expr>>,
+    /// Whether a side reads a NUMERIC with more places than the engine's,
+    /// decided on the first row and kept: [`eval_condition_3vl`] asked it of
+    /// both sides on every row, a walk of the tree that cost a `CASE` over
+    /// 60k rows some 2.6% of its instructions.
+    pub wide: WideOnce,
 }
+
+/// [`Condition::wide`]: computed once, on first use.
+#[derive(Debug, Clone, Default)]
+pub struct WideOnce(std::sync::OnceLock<bool>);
 
 /// A boolean condition tree: comparisons joined by `AND`/`OR`, possibly
 /// parenthesised. `CASE WHEN` arms are the consumer — a real application
@@ -1474,6 +1483,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left,
                 cmp: Cmp::IsNull,
                 right: None,
+                wide: Default::default(),
             });
         }
         if tail == "NOT NULL" {
@@ -1481,6 +1491,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left,
                 cmp: Cmp::IsNotNull,
                 right: None,
+                wide: Default::default(),
             });
         }
         // Whitespace between the words is free, as anywhere else.
@@ -1500,6 +1511,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left,
                 cmp,
                 right: None,
+                wide: Default::default(),
             });
         }
         return Err(format!("condition '{}' is not supported yet", text));
@@ -1522,6 +1534,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left,
                 cmp,
                 right: Some(right),
+                wide: Default::default(),
             });
         }
     }
@@ -1533,6 +1546,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 left: Box::new(expr),
                 cmp: Cmp::Eq,
                 right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),
+                wide: Default::default(),
             });
         }
     }
@@ -4986,7 +5000,7 @@ pub fn eval_condition_3vl(
     // through the engine it was refused for the places past nine, so `CASE
     // WHEN a > 1` failed on a NUMERIC(20,12) value with digits there.
     if let (Some(right), true) = (&condition.right, matches!(condition.cmp, Cmp::Eq | Cmp::Ne | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge)) {
-        if reads_wide_decimal(&condition.left, schema) || reads_wide_decimal(right, schema) {
+        if *condition.wide.0.get_or_init(|| reads_wide_decimal(&condition.left, schema) || reads_wide_decimal(right, schema)) {
             if let (Some(a), Some(b)) =
                 (exact_numeric_or_engine(&condition.left, row, schema, 30)?, exact_numeric_or_engine(right, row, schema, 30)?)
             {

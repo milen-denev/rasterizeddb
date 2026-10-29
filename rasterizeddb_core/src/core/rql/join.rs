@@ -4537,6 +4537,7 @@ pub(crate) fn comparison_value(
             left: Box::new(operand.clone()),
             cmp: Cmp::IsNull,
             right: None,
+            wide: Default::default(),
         })
     };
     let mut whens = Vec::new();
