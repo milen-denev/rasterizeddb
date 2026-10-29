@@ -10113,8 +10113,8 @@ async fn seed_sequences(
             let last =
                 crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
                     .unwrap_or(0);
-            crate::core::rql::sequence::seed(database.id, &name, last);
-            pt.track_serial(&name, last)
+            let seeded = crate::core::rql::sequence::seed(database.id, &name, last);
+            pt.track_serial(&name, last, seeded)
                 .map_err(|e| format!("could not reserve '{}''s sequence {}: {}", table_name, name, e))?;
         }
         return Ok(());

@@ -1209,8 +1209,9 @@ impl PartitionedTable {
     }
 
     /// Reserves `SERIAL` sequence `name` from here on, seeded at `last`.
-    pub(crate) fn track_serial(&self, name: &str, last: i64) -> io::Result<()> {
-        self.live()?.board.serials.track(name, last);
+    /// `seeded`: whether the caller's seed was the counter's.
+    pub(crate) fn track_serial(&self, name: &str, last: i64, seeded: bool) -> io::Result<()> {
+        self.live()?.board.serials.track(name, last, seeded);
         Ok(())
     }
 

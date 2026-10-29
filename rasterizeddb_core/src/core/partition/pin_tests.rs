@@ -1079,6 +1079,121 @@ async fn an_insert_during_the_clean_shutdown_write_never_repeats_after_a_restart
     close(&dir, db);
 }
 
+/// Who takes from a shared sequence first in a process.
+#[derive(Debug, Clone, Copy)]
+enum SharedOrder {
+    /// The plain table, seeding the counter from its own rows, then the
+    /// partitioned one.
+    PlainFirst,
+    /// The partitioned table, from its reservation, then the plain one.
+    PartitionedFirst,
+    /// Only the plain table.
+    PlainOnly,
+}
+
+/// A `SERIAL` sequence a plain table shares through a hand-written
+/// `nextval` default: whichever table seeds the counter in a process, the
+/// partitioned table's reservation stays above every value it holds, across
+/// clean and crash-like restarts, so its first insert after a restart never
+/// repeats one.
+///
+/// From the rebase review's probes (`probe_shared_sequence_stale_reservation`
+/// and `probe_shared_sequence_clean_shutdown_lowers`). The plain table
+/// seeding first meant `seed_sequences` never resumed the partitioned one,
+/// so nothing set its `tracked` and its reservation was never raised for the
+/// rest of the process (repeats `[2, 3]` after clean restarts, `[1026,
+/// 1027]` after crash-like ones); and a clean shutdown lowered the
+/// reservation to a counter the plain table had seeded below the
+/// partitioned table's values (3 lowered to 1, and 2 handed out again).
+///
+/// The plain table's own values can still collide with the partitioned
+/// table's, and a plain table that seeds the counter below values the
+/// partitioned one holds makes both draw them again (it seeds from its own
+/// maximum: `sequence::follow_rename` documents that sharing). That predates
+/// P5a and is kept out of the way here (the plain table's maximum is raised
+/// to the partitioned table's, except in the plain-only case, which needs
+/// the low seed and has the partitioned table take nothing meanwhile); only
+/// the partitioned table's values are asserted.
+///
+/// Mutations: `SerialSource::open` starting `tracked` false (plain-first
+/// repeats, clean and crash-like); `record_exact` lowering entries not
+/// seeded here (plain-only, clean: the reservation falls below the stored
+/// values, and they repeat).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_sequence_never_repeats_a_partitioned_tables_values() {
+    use SharedOrder::*;
+    for order in [PlainFirst, PartitionedFirst, PlainOnly] {
+        for clean in [true, false] {
+            let what = format!("{order:?}, {} restarts", if clean { "clean" } else { "crash-like" });
+            let base = tempfile::tempdir().unwrap();
+            let dir = base.path().join("db");
+            let db = open(&dir).await;
+            exec(&db, "CREATE TABLE sa (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+            exec(&db, "CREATE TABLE sb (id BIGINT DEFAULT nextval('sa_id_seq'), v TEXT)").await;
+            exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (1, 'start1'), (2, 'start1'), (3, 'start1')").await;
+            if !matches!(order, PlainOnly) {
+                // The plain table's maximum at the partitioned one's, so its
+                // seed next start is not below values the partitioned table
+                // already holds: that older defect (both tables then draw
+                // from a counter below them) is not what this pins, and
+                // would repeat values within start 2 already.
+                exec(&db, "INSERT INTO sb (id, v) VALUES (3, 'explicit')").await;
+            }
+            let at: &Path = &dir;
+            let restart = |db: Arc<Database>| async move {
+                if clean {
+                    db.record_clean_shutdown().await;
+                }
+                db.sync_durable().unwrap();
+                close(at, db);
+                open(at).await
+            };
+            let reserved = |db: &Database| match db.relation("sa") {
+                Some(Relation::Partitioned(t)) => t.serial_reserved("sa_id_seq"),
+                _ => None,
+            };
+            let db = restart(db).await;
+
+            // Enough partitioned rows to pass a whole reservation step.
+            let many: Vec<String> = (0..1100).map(|i| format!("({}, 'start2')", i % 7)).collect();
+            let many = format!("INSERT INTO sa (tenant_id, v) VALUES {}", many.join(", "));
+            let mut expected = 3;
+            match order {
+                PlainFirst => {
+                    exec(&db, "INSERT INTO sb (v) VALUES ('b')").await;
+                    exec(&db, &many).await;
+                    expected += 1100;
+                }
+                PartitionedFirst => {
+                    exec(&db, &many).await;
+                    exec(&db, "INSERT INTO sb (v) VALUES ('b')").await;
+                    expected += 1100;
+                }
+                PlainOnly => {
+                    exec(&db, "INSERT INTO sb (v) VALUES ('b')").await;
+                }
+            }
+            let held = serial_ids(&db, "sa").await;
+            let max = *held.last().unwrap();
+            if clean {
+                db.record_clean_shutdown().await;
+            }
+            let on_disk = reserved(&db);
+            assert!(
+                on_disk.is_some_and(|r| r >= max),
+                "{what}: the reservation {on_disk:?} is below the partitioned table's {max}"
+            );
+            let db = restart(db).await;
+
+            exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (5, 'start3'), (6, 'start3')").await;
+            let got = serial_ids(&db, "sa").await;
+            assert_eq!(got.len(), expected + 2, "{what}");
+            assert_distinct(&got, &what);
+            close(&dir, db);
+        }
+    }
+}
+
 /// The log syncs one forget round of eight pinned partitions takes, with
 /// nothing to rewrite (`clean`: every stamp committed) and with an aborted
 /// row in every partition (each sweep's rewrites synced first, as

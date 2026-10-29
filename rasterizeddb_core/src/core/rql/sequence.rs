@@ -106,10 +106,17 @@ pub fn is_seeded(database: u64, name: &str) -> bool {
 ///
 /// `last` is the largest value already stored, so the next value handed out is
 /// `last + 1`. A fresh table seeds with `0`.
-pub fn seed(database: u64, name: &str, last: i64) {
-    SEQUENCES
-        .entry(key(database, name))
-        .or_insert_with(|| AtomicI64::new(last));
+///
+/// Returns whether this call seeded it: `false` when the sequence already had
+/// a counter (another table sharing it seeded it first), which is left as it
+/// was.
+pub fn seed(database: u64, name: &str, last: i64) -> bool {
+    let mut seeded = false;
+    SEQUENCES.entry(key(database, name)).or_insert_with(|| {
+        seeded = true;
+        AtomicI64::new(last)
+    });
+    seeded
 }
 
 /// The next value of `database`'s sequence `name`.

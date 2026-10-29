@@ -287,7 +287,19 @@ counter**, so a later default can repeat it (a plain table, which reseeds
 from its maximum after a restart, differs there). **A sequence a second
 table shares** through a hand-written `nextval` default is reserved only by
 the table whose defaults this file serves; the other table seeds it by its
-own rules.
+own rules. Whichever table seeds the shared counter in a process, the
+partitioned table's reservation still covers it (rebase review of
+2bae3f8): the file's entries are tracked from the open, so a counter the
+other table seeded first still raises the reservation once it passes it,
+and a clean shutdown lowers only an entry this table seeded
+(`seeded_here`), never one the other table seeded below this table's
+values. Before, the plain table seeding first left the reservation unraised
+for the process (values repeated after a restart), and a clean shutdown
+lowered it to the plain table's lower counter (pinned:
+`a_shared_sequence_never_repeats_a_partitioned_tables_values`). Still open,
+and older than P5a: the other table seeds from its own maximum, which can be
+below values the partitioned table holds, and both then draw them again
+(`sequence::follow_rename` documents that sharing).
 
 **Map-log appends are written ahead** (§3.2; rebase review of 2bae3f8).
 `SWEPT` was appended as the logged append writes every record: data file

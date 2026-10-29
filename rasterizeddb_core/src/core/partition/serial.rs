@@ -30,7 +30,15 @@
 //!
 //! Only a sequence this table's own defaults resume is reserved: one a
 //! second table shares through a hand-written `nextval` default is that
-//! table's to seed, by its own rules (a plain one from its maximum).
+//! table's to seed, by its own rules (a plain one from its maximum). The
+//! reservation still covers the counter whoever seeds it: entries are
+//! tracked from the open, so [`SerialSource::cover`] raises one the counter
+//! has passed even when the other table seeded the counter first, and a
+//! clean shutdown lowers only an entry this table seeded (`Entry::
+//! seeded_here`), since a counter the other table seeded from its own rows
+//! can be below this table's values. (That low seed is itself an older
+//! defect, documented at `rql::sequence::follow_rename`: both tables then
+//! draw values this one already holds.)
 //!
 //! An explicit value written into a `SERIAL` column does not move the
 //! counter, as in PostgreSQL: a later default can repeat it.
@@ -57,13 +65,32 @@ pub const STEP: i64 = 1024;
 
 const MAGIC: &[u8; 4] = b"RSQ1";
 
+/// One sequence's reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    /// The value reserved on disk.
+    reserved: i64,
+    /// Whether this process seeded the sequence's counter from this table
+    /// (from `reserved`, [`SerialSource::resume`], or from the partitions'
+    /// maximum, [`SerialSource::track`]): only then is the counter known to
+    /// be at or above every value the table holds, so only then may a clean
+    /// shutdown lower `reserved` to it ([`SerialSource::record_exact`]). A
+    /// counter another table seeded (one sharing the sequence through a
+    /// hand-written `nextval` default, seeded from its own rows) can sit below
+    /// this table's values.
+    seeded_here: bool,
+}
+
 /// The durable `SERIAL` reservations of one partitioned table.
 pub struct SerialSource {
     db_id: u64,
     io: Option<StdArc<DbStorageProvider>>,
-    /// By sequence name: the value reserved on disk.
-    entries: parking_lot::Mutex<BTreeMap<String, i64>>,
-    /// Any entry at all: the fast path's one load.
+    /// By sequence name.
+    entries: parking_lot::Mutex<BTreeMap<String, Entry>>,
+    /// Any entry at all: the fast path's one load. Set at open for a file
+    /// that has entries, whoever seeds the counters: a counter another table
+    /// seeded first still hands this table values, and one past its
+    /// reservation must raise it before the row is written ([`Self::cover`]).
     tracked: AtomicBool,
     raising: tokio::sync::Mutex<()>,
     /// Sequences seeded from the partitions' maximum, ever, by this
@@ -128,19 +155,24 @@ impl SerialSource {
             let mut at = 0u64;
             io.read_data_into_buffer(&mut at, &mut buf).await?;
         }
-        let entries = decode(&buf).unwrap_or_else(|why| {
+        let entries: BTreeMap<String, Entry> = decode(&buf)
+            .unwrap_or_else(|why| {
             ::log::warn!(
                 "the SERIAL reservations in {} cannot be read ({why}); every sequence of the table reseeds from \
                  its column's maximum",
                 io.get_name()
             );
             BTreeMap::new()
-        });
+            })
+            .into_iter()
+            .map(|(name, reserved)| (name, Entry { reserved, seeded_here: false }))
+            .collect();
+        let tracked = !entries.is_empty();
         Ok(SerialSource {
             db_id,
             io: Some(io),
             entries: parking_lot::Mutex::new(entries),
-            tracked: AtomicBool::new(false),
+            tracked: AtomicBool::new(tracked),
             raising: tokio::sync::Mutex::new(()),
             max_scans: AtomicU64::new(0),
         })
@@ -148,7 +180,7 @@ impl SerialSource {
 
     /// The reservation of `name`, if the file has one.
     pub fn reserved(&self, name: &str) -> Option<i64> {
-        self.entries.lock().get(name).copied()
+        self.entries.lock().get(name).map(|e| e.reserved)
     }
 
     pub fn max_scans(&self) -> u64 {
@@ -158,23 +190,33 @@ impl SerialSource {
     /// Seeds `name`'s counter from its reservation, if the file has one:
     /// the next value is one past it. `false` when it has none, and the
     /// caller seeds from the maximum and then [`Self::track`]s it.
+    ///
+    /// The entry is seeded here only if this seed is the counter's: another
+    /// table may have seeded it between the caller's check and this.
     pub(crate) fn resume(&self, name: &str) -> bool {
-        let Some(reserved) = self.reserved(name) else {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(name) else {
             return false;
         };
-        crate::core::rql::sequence::seed(self.db_id, name, reserved);
+        if crate::core::rql::sequence::seed(self.db_id, name, entry.reserved) {
+            entry.seeded_here = true;
+        }
         self.tracked.store(true, Ordering::Release);
         true
     }
 
-    /// Tracks `name`, seeded from the maximum `last`: reserved at `last`, so
-    /// the first value taken raises it. Before any value is taken.
-    pub(crate) fn track(&self, name: &str, last: i64) {
+    /// Tracks `name`, whose counter the caller seeded from the maximum `last`
+    /// (`seeded`: whether that seed was the counter's, as
+    /// `rql::sequence::seed` reports): reserved at `last`, so the first value
+    /// taken raises it. Before any value is taken.
+    pub(crate) fn track(&self, name: &str, last: i64, seeded: bool) {
         self.max_scans.fetch_add(1, Ordering::AcqRel);
         if self.io.is_none() {
             return;
         }
-        self.entries.lock().entry(name.to_string()).or_insert(last);
+        let mut entries = self.entries.lock();
+        let entry = entries.entry(name.to_string()).or_insert(Entry { reserved: last, seeded_here: false });
+        entry.seeded_here |= seeded;
         self.tracked.store(true, Ordering::Release);
     }
 
@@ -183,9 +225,9 @@ impl SerialSource {
         self.entries
             .lock()
             .iter()
-            .filter_map(|(name, &reserved)| {
+            .filter_map(|(name, e)| {
                 let current = crate::core::rql::sequence::current(self.db_id, name)?;
-                (current > reserved).then(|| (name.clone(), current))
+                (current > e.reserved).then(|| (name.clone(), current))
             })
             .collect()
     }
@@ -215,7 +257,11 @@ impl SerialSource {
         let raised: Vec<(String, i64)> = behind.into_iter().map(|(n, c)| (n, c.saturating_add(STEP))).collect();
         let next = {
             let mut entries = self.entries.lock().clone();
-            entries.extend(raised.iter().cloned());
+            for (name, value) in &raised {
+                if let Some(e) = entries.get_mut(name) {
+                    e.reserved = e.reserved.max(*value);
+                }
+            }
             entries
         };
         Self::write(io, &next, "raised").await?;
@@ -223,15 +269,16 @@ impl SerialSource {
         // flight keeps its entry (the next raise writes it).
         let mut entries = self.entries.lock();
         for (name, value) in raised {
-            let e = entries.entry(name).or_insert(value);
-            *e = (*e).max(value);
+            if let Some(e) = entries.get_mut(&name) {
+                e.reserved = e.reserved.max(value);
+            }
         }
         Ok(())
     }
 
     /// Rewrites the file as `entries`, as one logged write from byte 0.
-    async fn write(io: &StdArc<DbStorageProvider>, entries: &BTreeMap<String, i64>, what: &str) -> io::Result<()> {
-        let buf = encode(entries);
+    async fn write(io: &StdArc<DbStorageProvider>, entries: &BTreeMap<String, Entry>, what: &str) -> io::Result<()> {
+        let buf = encode(&entries.iter().map(|(n, e)| (n.clone(), e.reserved)).collect());
         let txn = io.begin_txn();
         let token = io.write_data_txn(txn, 0, &buf).await;
         io.commit_durable(token).await.map_err(|e| {
@@ -252,7 +299,7 @@ impl SerialSource {
         let Some(io) = &self.io else {
             return Ok(());
         };
-        let next: BTreeMap<String, i64> =
+        let next: BTreeMap<String, Entry> =
             self.entries.lock().iter().filter(|(n, _)| read.contains(*n)).map(|(n, v)| (n.clone(), *v)).collect();
         if next.len() == self.entries.lock().len() {
             return Ok(());
@@ -263,7 +310,8 @@ impl SerialSource {
     }
 
     /// The clean-shutdown write (§10): every entry whose counter this
-    /// process has seeded lowered to the exact last value handed out, then
+    /// table seeded in this process (`Entry::seeded_here`) lowered to the
+    /// exact last value handed out, then
     /// synced, so a clean restart resumes with no gap, as PostgreSQL's
     /// sequences do. Sound at any moment, not only after the sessions end
     /// (a shutdown can start sealing with statements still running): a
@@ -287,11 +335,16 @@ impl SerialSource {
         let next = {
             let mut entries = self.entries.lock();
             let mut changed = false;
-            for (name, reserved) in entries.iter_mut() {
+            for (name, entry) in entries.iter_mut() {
+                // Seeded elsewhere, the counter may be below values this table
+                // holds: lowered to it, a restart would hand them out again.
+                if !entry.seeded_here {
+                    continue;
+                }
                 if let Some(last) = crate::core::rql::sequence::current(self.db_id, name)
-                    && last < *reserved
+                    && last < entry.reserved
                 {
-                    *reserved = last;
+                    entry.reserved = last;
                     changed = true;
                 }
             }
