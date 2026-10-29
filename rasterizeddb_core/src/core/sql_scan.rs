@@ -221,6 +221,115 @@ pub fn leading_identifier(text: &str) -> Option<(String, usize)> {
     (!name.is_empty()).then_some((name, end))
 }
 
+/// The first qualifier in `text` (`q` in `q.col`) that is none of `allowed`,
+/// as written; `None` when every one names a relation the statement has.
+///
+/// A single-table statement's readers take the last segment of `q.col` and
+/// drop the qualifier, so a qualifier naming no relation was ignored:
+/// `DELETE FROM t WHERE nosuch.id = 1` deleted t's row 1, and `WHERE
+/// nosuch.v > 0 OR id = 2` read t's `v`. PostgreSQL refuses both ("missing
+/// FROM-clause entry", 42P01).
+///
+/// Quotes, comments and numbers are skipped, and so is a parenthesised
+/// subquery, which has its own FROM. A schema-qualified call
+/// (`pg_catalog.now()`) and what follows `::` are not column references.
+pub fn unknown_qualifier(text: &str, allowed: &[&str]) -> Option<String> {
+    let bytes = text.as_bytes();
+    let ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'"' || b >= 0x80;
+    let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    // One name at `i`: (its text unquoted, the offset past it).
+    let read = |i: usize| -> Option<(String, usize)> {
+        if bytes.get(i) == Some(&b'"') {
+            let end = quoted_end(bytes, i, b'"');
+            let inner = text.get(i + 1..end.saturating_sub(1))?;
+            return Some((inner.replace("\"\"", "\""), end));
+        }
+        let mut j = i;
+        while j < bytes.len() && ident_byte(bytes[j]) {
+            j += 1;
+        }
+        (j > i).then(|| (text[i..j].to_string(), j))
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let b = bytes[i];
+        if b == b'\'' || b == b'$' && dollar_tag_len(bytes, i).is_some() {
+            i = skip_quoted(bytes, i).unwrap_or(i + 1).max(i + 1);
+            continue;
+        }
+        if b == b'(' {
+            // A subquery's names are its own.
+            let inner = text[i + 1..].trim_start();
+            let upper = inner.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
+            if upper.starts_with("SELECT") || upper.starts_with("WITH") || upper.starts_with("VALUES") {
+                i = matching_close(text, i).map_or(bytes.len(), |c| c + 1);
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_') {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b':' && bytes.get(i + 1) == Some(&b':') {
+            // A cast's type name, which may be schema-qualified.
+            i += 2;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while i < bytes.len() && (ident_byte(bytes[i]) || matches!(bytes[i], b'.' | b'"')) {
+                i += 1;
+            }
+            continue;
+        }
+        if ident_start(b) && (i == 0 || !ident_byte(bytes[i - 1])) {
+            let Some((name, end)) = read(i) else {
+                i += 1;
+                continue;
+            };
+            if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|c| ident_start(*c) || *c == b'*') {
+                // `q.name(` is a schema-qualified function, not a column.
+                let call = read(end + 1).is_some_and(|(_, after)| {
+                    text[after..].trim_start().starts_with('(')
+                });
+                if !call && !allowed.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+                    return Some(name);
+                }
+                // Past the whole dotted reference.
+                let mut j = end;
+                while bytes.get(j) == Some(&b'.') {
+                    match read(j + 1) {
+                        Some((_, after)) => j = after,
+                        None => {
+                            j += 1;
+                            break;
+                        }
+                    }
+                }
+                i = j.max(end + 1);
+                continue;
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The refusal for a qualifier [`unknown_qualifier`] found, in PostgreSQL's
+/// words (42P01).
+pub fn missing_from_entry(qualifier: &str) -> String {
+    format!("missing FROM-clause entry for table \"{qualifier}\"")
+}
+
 /// Whether `needle` occurs anywhere in `text`, ignoring ASCII case, quotes
 /// and comments included: a scanner's cheap precondition, so one that can
 /// only match where these bytes are can skip a statement that has none.

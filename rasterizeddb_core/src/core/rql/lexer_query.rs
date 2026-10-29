@@ -1376,6 +1376,32 @@ pub(crate) fn extract_where_columns(
 ///
 /// # Returns
 /// QueryRows - Contains query_row_fetch (WHERE columns), requested_row_fetch (SELECT columns), and WHERE clause
+/// The alias in a single relation's FROM text (`t`, `t x`, `t AS x`),
+/// or a syntax error naming the first word that cannot be there.
+fn relation_alias(from_text: &str) -> Result<Option<String>, String> {
+    let words: Vec<&str> = from_text.split_whitespace().collect();
+    let name_ok = |w: &str| {
+        let w = w.trim_matches('"');
+        !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    let at = |w: &str| format!("syntax error at or near \"{}\"", w);
+    match words.as_slice() {
+        [] | [_] => Ok(None),
+        [_, kw, alias] if kw.eq_ignore_ascii_case("AS") => {
+            if name_ok(alias) { Ok(Some(alias.trim_matches('"').to_string())) } else { Err(at(alias)) }
+        }
+        [_, alias] => {
+            if name_ok(alias) && !alias.eq_ignore_ascii_case("AS") {
+                Ok(Some(alias.trim_matches('"').to_string()))
+            } else {
+                Err(at(alias))
+            }
+        }
+        [_, kw, ..] if kw.eq_ignore_ascii_case("AS") => Err(at(words[3])),
+        [_, _, next, ..] => Err(at(next)),
+    }
+}
+
 pub fn row_fetch_from_select_query(
     query_purpose: &QueryPurpose,
     schema: &SmallVec<[SchemaField; 20]>,
@@ -1511,6 +1537,31 @@ pub fn row_fetch_from_select_query(
         .next()
         .unwrap_or("")
         .trim_matches('"');
+
+    // Only `[AS] alias` may follow the relation before the first clause.
+    // A misspelt clause keyword was read as the alias and everything after
+    // it dropped: `FROM t WHER id = 1` returned every row, and so did `FROM t
+    // LIMT 5` and `FROM t ODER BY id`. PostgreSQL's 42601.
+    let alias = relation_alias(&after_from[..table_end])?;
+    // And every qualifier names that relation (or its alias): `WHERE
+    // nosuch.v > 0` read t's `v`. Up to a UNION, whose branches have their
+    // own FROM.
+    {
+        let raw = after_from[..table_end].split_whitespace().next().unwrap_or("");
+        // Once aliased, the relation is known only by its alias, as in
+        // PostgreSQL (`FROM t AS x WHERE t.id = 1` is 42P01).
+        let allowed: Vec<String> = match &alias {
+            Some(alias) => vec![alias.clone()],
+            None => raw.split('.').map(|p| p.trim_matches('"').to_string()).collect(),
+        };
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        let branch_end = union_pos.unwrap_or(after_from.len()).max(table_end);
+        for text in [columns_part, &after_from[table_end..branch_end]] {
+            if let Some(q) = crate::core::sql_scan::unknown_qualifier(text, &allowed) {
+                return Err(crate::core::sql_scan::missing_from_entry(&q));
+            }
+        }
+    }
 
     // WHERE clause is everything after WHERE up to ORDER BY / LIMIT / OFFSET.
     let where_raw = if let Some(wp) = where_pos {

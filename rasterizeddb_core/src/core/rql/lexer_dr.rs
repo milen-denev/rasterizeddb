@@ -122,6 +122,29 @@ fn parse_delete_row(
         // clause nobody wrote.
         let where_idx = crate::core::rql::join::find_keyword(sql, "WHERE", 0);
         let _ = &sql_upper;
+        // Every qualifier in the condition names the target or its alias.
+        // One naming no relation was dropped, so `DELETE FROM t WHERE
+        // nosuch.id = 1` deleted t's row 1 (PostgreSQL: 42P01).
+        if let Some(idx) = where_idx {
+            let head: Vec<&str> = sql[..idx].split_whitespace().collect();
+            let mut allowed: Vec<String> = table_name.split('.').map(|p| p.trim_matches('"').to_string()).collect();
+            match head.as_slice() {
+                [_, _, _] => {}
+                [_, _, _, alias] | [_, _, _, _, alias] if head.len() == 4 || head[3].eq_ignore_ascii_case("AS") => {
+                    // Aliased, the table is known only by the alias.
+                    allowed = vec![alias.trim_matches('"').to_string()];
+                }
+                _ => {
+                    rejection.replace(format!("syntax error at or near \"{}\"", head.get(4).or(head.get(3)).unwrap_or(&"WHERE")));
+                    return None;
+                }
+            }
+            let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            if let Some(q) = crate::core::sql_scan::unknown_qualifier(&sql[idx + "WHERE".len()..], &allowed) {
+                rejection.replace(crate::core::sql_scan::missing_from_entry(&q));
+                return None;
+            }
+        }
         let where_clause = if let Some(idx) = where_idx {
             let clause = sql[idx + 5..].trim();
             // Remove leading "WHERE" if present (case-insensitive)
@@ -151,6 +174,11 @@ fn parse_delete_row(
                 _ => false,
             };
             if !alias_only || table_name.is_empty() {
+                // `DELETE FROM t WHER id = 1`: a clause this does not know is
+                // a syntax error, never "no condition".
+                if let Some(word) = rest.get(if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("AS")) { 2 } else { 1 }) {
+                    rejection.replace(format!("syntax error at or near \"{}\"", word));
+                }
                 return None;
             }
             return Some(DeleteRow {

@@ -3683,6 +3683,20 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
             // statement. A word that is not called is a column, in
             // PostgreSQL's words (42703); a called one is a function this
             // does not read.
+            // Right after a value (`id = 1 ODER BY id`, `x ANDD y`), a word
+            // is where an operator or keyword goes: a syntax error (42601).
+            const LEADS_AN_OPERAND: [&str; 16] = [
+                "AND", "OR", "NOT", "IS", "IN", "BETWEEN", "LIKE", "ILIKE", "ESCAPE", "CASE", "WHEN", "THEN",
+                "ELSE", "DISTINCT", "FROM", "SIMILAR",
+            ];
+            let after_value = match toks.get(i.wrapping_sub(1)) {
+                Some(Tok::Str(_) | Tok::RPar) => true,
+                Some(Tok::Word(w)) => !LEADS_AN_OPERAND.iter().any(|k| w.eq_ignore_ascii_case(k)),
+                _ => false,
+            };
+            if i > 0 && after_value {
+                return Err(format!("syntax error at or near \"{}\"", raw));
+            }
             if !matches!(toks.get(i + 1), Some(Tok::LPar))
                 && raw.chars().all(|c| c.is_alphanumeric() || c == '_')
             {

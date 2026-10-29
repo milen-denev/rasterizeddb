@@ -497,6 +497,31 @@ fn parse_update_row(
         (after_set.trim(), "")
     };
 
+    // Every qualifier names the target or its alias; one naming no relation
+    // was dropped, so `SET v = 5 WHERE nosuch.id = 2` updated t's row 2.
+    {
+        let words: Vec<&str> = before_set.split_whitespace().collect();
+        let mut allowed: Vec<String> = table_name.split('.').map(|p| p.trim_matches('"').to_string()).collect();
+        match words.as_slice() {
+            [_, _] => {}
+            [_, _, alias] | [_, _, _, alias] if words.len() == 3 || words[2].eq_ignore_ascii_case("AS") => {
+                // Aliased, the table is known only by the alias.
+                allowed = vec![alias.trim_matches('"').to_string()];
+            }
+            _ => {
+                rejection.replace(format!("syntax error at or near \"{}\"", words.get(3).or(words.get(2)).unwrap_or(&"SET")));
+                return None;
+            }
+        }
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        for text in [set_clause, where_clause] {
+            if let Some(q) = crate::core::sql_scan::unknown_qualifier(text, &allowed) {
+                rejection.replace(crate::core::sql_scan::missing_from_entry(&q));
+                return None;
+            }
+        }
+    }
+
     if set_clause.is_empty() {
         return None;
     }

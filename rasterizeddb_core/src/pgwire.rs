@@ -4747,9 +4747,15 @@ where
         // `CASE types integer and text cannot be matched` — PostgreSQL's
         // datatype_mismatch.
         "42804"
-    } else if message.ends_with(" not found in schema")
+    } else if message.starts_with("missing FROM-clause entry for table") {
+        // A qualifier naming no relation of the statement.
+        "42P01"
+    } else if (message.contains("unknown type '") && message.contains("in a cast")) || casts_to_unknown_type(message) {
+        "42704"
+    } else if (message.ends_with(" not found in schema")
         || message.contains("is neither a column nor a value")
-        || (message.starts_with("column \"") && message.ends_with("\" does not exist"))
+        || (message.starts_with("column \"") && message.ends_with("\" does not exist")))
+        && names_one_identifier(message)
     {
         // A name in the select list, ORDER BY or GROUP BY that is no column
         // ("Column 'nosuch' not found in schema"): undefined_column, not a
@@ -4759,6 +4765,44 @@ where
         sqlstate
     };
     send_error_response(stream, sqlstate, message).await
+}
+
+/// Whether a select item the reader could not resolve (`Column
+/// 'id::nosuchtype' not found`) casts to a type no reader knows: that is
+/// PostgreSQL's "type … does not exist" (42704), not a syntax error.
+fn casts_to_unknown_type(message: &str) -> bool {
+    if !message.ends_with(" not found in schema") {
+        return false;
+    }
+    let Some(start) = message.find('\'') else { return false };
+    let Some(end) = message.rfind('\'') else { return false };
+    let item = message.get(start + 1..end).unwrap_or("");
+    let Some((_, ty)) = item.rsplit_once("::") else { return false };
+    let ty = ty.trim();
+    !ty.is_empty()
+        && ty.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ' ' || c == '(' || c == ')' || c == ',')
+        && crate::core::rql::expr::db_type_of_cast(ty).is_none()
+}
+
+/// Whether the name an unknown-column message quotes (between its first
+/// pair of quotes) is one identifier, `x` or `t.x`, so the message reports a
+/// name that is not a column (42703). Anything else it quotes — `id HAVNG
+/// id > 1`, `1 WHER id = 1`, `+` — is text the parser could not read: a
+/// syntax error, and stays 42601.
+fn names_one_identifier(message: &str) -> bool {
+    let quoted = ['\'', '"'].iter().find_map(|q| {
+        let start = message.find(*q)? + 1;
+        let end = start + message[start..].find(*q)?;
+        Some(&message[start..end])
+    });
+    quoted.is_some_and(|name| {
+        !name.is_empty()
+            && name.split('.').all(|part| {
+                let part = part.trim_matches('"');
+                part.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            })
+    })
 }
 
 /// Answers `IMPORT DATABASE FROM POSTGRES … INTO …`.
@@ -6788,6 +6832,11 @@ fn engine_integrity_phrase(message: &str, statement: &str) -> Option<&'static st
 
 /// [`materialize_sqlstate`] with [`sqlstate_in`]'s blanking.
 pub(crate) fn materialize_sqlstate_in(message: &str, statement: &str) -> &'static str {
+    // A body with a syntax error is one (`WITH c AS (SELECT … FROM t WHER
+    // id = 1)`), not a feature this lacks.
+    if message.contains("syntax error at or near") {
+        return "42601";
+    }
     materialize_class(sqlstate_in(message, statement))
 }
 
@@ -6876,7 +6925,9 @@ pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
 /// The code a failed CTE body or derived table is reported under, given the
 /// code of its own failure: see [`materialize_sqlstate`].
 fn materialize_class(code: &'static str) -> &'static str {
-    if ["23", "22", "40", "57", "55", "53", "58"].iter().any(|class| code.starts_with(class)) {
+    // A body naming a relation or column that is not there is the client's
+    // mistake, as it is outside a CTE (42P01, 42703), not a missing feature.
+    if ["23", "22", "40", "57", "55", "53", "58", "42P01", "42703"].iter().any(|class| code.starts_with(class)) {
         code
     } else {
         "0A000"
@@ -7031,6 +7082,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "23514"
     } else if has("permission denied") || has("is not a superuser") {
         "42501"
+    } else if has("missing from-clause entry for table") {
+        "42P01"
+    } else if has("unknown type") && has("in a cast") {
+        // `x::nosuchtype`: undefined_object, as PostgreSQL's "type … does
+        // not exist".
+        "42704"
     } else if has("relation") && has("does not exist")
         || has("table not found")
         || (has("table ") && has(" not found"))
@@ -7038,9 +7095,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "42P01"
     } else if has("column") && has("does not exist")
         // The WHERE tokenizer's and the expression reader's words for a
-        // name that is no column.
-        || (has("unknown identifier") && has("is not defined in the schema"))
-        || has("is neither a column nor a value")
+        // name that is no column, when the name is one.
+        || ((has("unknown identifier") && has("is not defined in the schema"))
+            || has("is neither a column nor a value"))
+            && names_one_identifier(message)
     {
         "42703"
     } else if has("constraint") && has("already exists") {
