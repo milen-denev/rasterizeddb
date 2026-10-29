@@ -5903,6 +5903,26 @@ async fn apply_conflict_update(
         Err(e) => return ddl_error(&e),
     };
 
+    // The proposed row as the column stores it: a key written `1.254` for a
+    // NUMERIC(10,2) conflicted as 1.25, and the DO UPDATE then looked the
+    // row up by `k = 1.254`, matched nothing and reported success — a lost
+    // write. `EXCLUDED.k` is the stored value too, as in PostgreSQL.
+    let inserted: Vec<(String, String)> = match target.clone() {
+        Some(entry) => inserted
+            .into_iter()
+            .map(|(name, literal)| {
+                let canonical = entry
+                    .schema
+                    .fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&name))
+                    .and_then(|f| stored_numeric_literal(&literal, f));
+                (name, canonical.unwrap_or(literal))
+            })
+            .collect(),
+        None => inserted,
+    };
+
     let value_of = |column: &str| -> Option<String> {
         inserted
             .iter()
@@ -7265,6 +7285,37 @@ fn has_top_level_arithmetic(text: &str) -> bool {
 }
 
 /// The alias an `INSERT INTO t AS a …` gives its target, unquoted.
+/// A numeric literal bound for `field` as the column stores it, written
+/// back as a literal: rounded half away from zero to a NUMERIC's scale, or
+/// to a whole number for an integer column, PostgreSQL's assignment cast.
+/// `None` for anything that is not a plain number (NULL, an expression, a
+/// string the column reads otherwise), which is left as written.
+pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::schema::SchemaField) -> Option<String> {
+    use crate::core::db_type::DbType;
+    let text = literal.trim();
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .map(str::trim)
+        .unwrap_or(text);
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E')) {
+        return None;
+    }
+    match field.db_type {
+        DbType::DECIMAL => {
+            let scale = field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+            let v = crate::core::value_codec::parse_decimal_rounded(text, scale)?;
+            Some(crate::core::value_codec::format_decimal_scaled(v, scale))
+        }
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+            if text.contains(['.', 'e', 'E']) =>
+        {
+            Some(crate::core::value_codec::parse_decimal_rounded(text, 0)?.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn insert_alias(insert_sql: &str) -> Option<String> {
     let into = crate::core::rql::join::find_keyword(insert_sql, "INTO", 0)?;
     let mut words = insert_sql[into + "INTO".len()..].split_whitespace();
