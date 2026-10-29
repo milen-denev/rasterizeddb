@@ -181,10 +181,19 @@ async fn run_case(case: &Case, seeds: u64) -> Outcomes {
     let _sealing = storage_override::set(&dir, IndexStorage::Snapshot);
     {
         let db = populated(&dir, case).await;
-        if let Some(pt) = db.partitioned_table("pt") {
-            let epoch = pt.epoch().unwrap();
-            for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap() {
-                settled(&part).await.unwrap();
+        // Every file set the seal below covers settled first: each partition,
+        // and each plain table a case's prep made (the FK cases' parent
+        // `pp`), whose index builds in the background after its CREATE. A
+        // seal refuses a table whose index is still building (Ineligible),
+        // as it should; the setup must not race it.
+        for name in db.relation_names() {
+            if let Some(pt) = db.partitioned_table(&name) {
+                let epoch = pt.epoch().unwrap();
+                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap() {
+                    settled(&part).await.unwrap();
+                }
+            } else if let Some(t) = db.table_held(&name) {
+                settled(&t).await.unwrap_or_else(|e| panic!("{}: {name}: {e}", case.ddl));
             }
         }
         let report = db.seal_for_shutdown(std::time::Duration::from_secs(60)).await;
