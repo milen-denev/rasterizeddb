@@ -1308,6 +1308,8 @@ impl TransactionManager {
     /// aborted.
     pub fn commit(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Committed);
+        #[cfg(test)]
+        commit_test_hooks::recorded(self, tx);
         self.retire_family(tx);
         self.signal_ended();
         self.maybe_settle();
@@ -1611,6 +1613,18 @@ impl TransactionManager {
             .unwrap_or(inner.next_id)
     }
 
+    /// Whether `tx` is still in the running set: begun and not yet retired.
+    ///
+    /// Not the same as an outcome of `InProgress`. [`Self::commit`] records
+    /// the outcome first and retires the transaction after it, and a snapshot
+    /// taken in between still lists `tx` as running, so it does not see the
+    /// commit. A locker that let a writer's row mark go in that window kept
+    /// a row whose latest version no snapshot it could take yet would show
+    /// (`acquire_row_lock` in the executor).
+    pub fn is_running(&self, tx: TxId) -> bool {
+        self.inner.read().running.contains(&tx)
+    }
+
     /// One past the highest id assigned so far.
     pub fn next_id(&self) -> TxId {
         self.next_id.load(Ordering::Acquire)
@@ -1689,6 +1703,42 @@ impl TransactionManager {
 
     pub fn status(&self) -> &StatusLog {
         &self.status
+    }
+}
+
+/// A test's hold on a commit between its two halves: the outcome recorded,
+/// the transaction not yet retired from the running set
+/// ([`TransactionManager::commit`]).
+#[cfg(test)]
+pub(crate) mod commit_test_hooks {
+    use super::{TransactionManager, TxId};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Keyed by the manager's address as well as the id: tests run in
+    /// parallel, each database counting its ids from the same start.
+    static HOOKS: Mutex<Vec<(usize, TxId, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once, on the thread committing `tx` under `manager`, after
+    /// its outcome is recorded and before it is retired.
+    pub(crate) fn after_record(manager: &TransactionManager, tx: TxId, hook: impl Fn() + Send + Sync + 'static) {
+        let key = manager as *const TransactionManager as usize;
+        HOOKS.lock().unwrap().push((key, tx, Arc::new(hook)));
+    }
+
+    pub(super) fn recorded(manager: &TransactionManager, tx: TxId) {
+        let key = manager as *const TransactionManager as usize;
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(m, t, _)| *m == key && *t == tx)
+                .map(|at| hooks.swap_remove(at).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 

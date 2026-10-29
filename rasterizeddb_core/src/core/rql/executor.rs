@@ -6160,7 +6160,19 @@ async fn acquire_row_lock(
             crate::core::mvcc::transaction::TxOutcome::InProgress
         )
     };
-    let owner_live = |o: TxId| database.transactions.owner_live(o);
+    // A writer that marked the row counts as live until it is retired from
+    // the running set, not only while its owner is: a commit records its
+    // outcome first and retires after (`TransactionManager::commit`), and a
+    // snapshot taken in between still lists it as running, so it does not
+    // see the writer's version. A locker that ignored the mark in that
+    // window kept the row, and a later round of `execute_query_rows` scanned
+    // at such a snapshot, found the row locked by this transaction already,
+    // did not ask `committed_since` about it, and returned the version the
+    // writer had just replaced: the `SKIP LOCKED` queue handed a finished
+    // job to a second worker (`row_lock_handover_tests`). Every write of a
+    // row marks it, a lock holder's included, so the mark is what is asked;
+    // a holder that wrote nothing changed nothing a locker could read stale.
+    let owner_live = |o: TxId| database.transactions.owner_live(o) || database.transactions.is_running(o);
     let already = locker && database.row_locks.holds(table_name, key, tx);
     // Taken first, then the fast-path writers asked about: the order
     // `mark_row_writes` relies on. Held by the writer's owner until it ends.
@@ -18497,3 +18509,7 @@ mod future_size_tests {
 #[cfg(test)]
 #[path = "shadow_latch_tests.rs"]
 mod shadow_latch_tests;
+
+#[cfg(test)]
+#[path = "row_lock_handover_tests.rs"]
+mod row_lock_handover_tests;
