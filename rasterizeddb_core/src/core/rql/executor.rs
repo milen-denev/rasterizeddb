@@ -13811,8 +13811,12 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     // arithmetic is done in i64/f64, so `counter - 1` on an
                     // `int4` column produced eight bytes under an `int4` OID
                     // and the client refused to decode it.
+                    // Exactly when it reads a NUMERIC with more places than
+                    // the engine's, as a select list's item is: through the
+                    // engine `RETURNING b - 67e-18` over a NUMERIC(38,20) was
+                    // refused for the places past nine.
                     let value = crate::core::rql::expr::coerce_to(
-                        crate::core::rql::expr::eval(expr, row, schema)?,
+                        crate::core::rql::expr::eval_output(expr, row, schema)?,
                         db_type,
                     );
                     // A NUMERIC is shown at the scale PostgreSQL gives the

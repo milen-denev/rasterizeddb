@@ -774,12 +774,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     }
     // A constant with a point or an exponent is `numeric`, not `float8`, so
     // arithmetic on it is exact: `14 * 1.37 + 0.99` is 20.17, where the float
-    // it used to be gave 20.169999999999998. Only a constant the engine scale
-    // holds exactly is one, though; past nine places, or too large, it stays a
-    // float. Rounding it to nine places lost what a float would have kept —
-    // `1e-10` became 0 in a float column, and `f * 0.0000000001` was 0 — and
-    // rounded it a second time when it was then stored at a column's scale,
-    // so 20.1649999999 became 20.165 and then 20.17.
+    // it used to be gave 20.169999999999998. Past nine places it is carried
+    // with its digits at its own scale (`numeric_constant`); too large for
+    // that, it stays a float. Rounding it to nine places lost digits — `1e-10`
+    // became 0 in a float column, and `f * 0.0000000001` was 0 — and rounded
+    // it a second time when it was then stored at a column's scale, so
+    // 20.1649999999 became 20.165 and then 20.17.
     if let Ok(v) = text.parse::<f64>() {
         if text.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+')) {
             if let Some(units) = exact_engine_decimal(text) {
@@ -2766,6 +2766,15 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     };
 
     let (Some(x), Some(y)) = (scaled(a), scaled(b)) else {
+        // A constant with more places than these nine (`numeric_constant`),
+        // which `scaled` does not read: cut to them here, it would be
+        // answered wrong. It is computed exactly where a result is output or
+        // stored; anywhere else it is refused. Asked only on this failure,
+        // so the common path pays nothing for it.
+        let wide = |v: &Value| matches!(v, Value::Data { bytes, db_type: DbType::DECIMAL } if bytes.len() == 17);
+        if wide(a) || wide(b) {
+            return Err(WIDE_CONSTANT_HERE.to_string());
+        }
         return Err(format!("'{}' needs numeric operands", op.symbol()));
     };
 
@@ -2793,6 +2802,12 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         db_type: DbType::DECIMAL,
     })
 }
+
+/// The refusal for a constant with more places than the engine's met where
+/// only the engine's nine-place arithmetic runs.
+pub(crate) const WIDE_CONSTANT_HERE: &str = "a NUMERIC constant with more than 9 decimal places is computed \
+     exactly in a select list, a sort key, a comparison or a stored value; in this expression it is not \
+     supported";
 
 /// Whether a float's shortest digits need no more places than the engine
 /// keeps, so taking it into `NUMERIC` loses nothing.
@@ -2878,7 +2893,7 @@ fn float_holds_literal(text: &str, v: f64) -> bool {
 /// (`0.00000000001 * 2`), and refused otherwise (`1e30 + 1`, which the float
 /// answered as 1e30). `None` for anything else, which the evaluator computes.
 fn exact_literal_arith(l: &Expr, op: ArithOp, r: &Expr, text: &str) -> Option<Result<Expr, String>> {
-    let float = |e: &Expr| matches!(e, Expr::Literal { db_type: DbType::F64, .. });
+    let float = |e: &Expr| matches!(e, Expr::Literal { db_type: DbType::F64, .. }) || is_wide_literal(e);
     if !(float(l) || float(r)) || !matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) {
         return None;
     }
@@ -2913,6 +2928,19 @@ fn numeric_constant(m: i128, e: i32, text: &str) -> Result<Expr, String> {
             return Ok(Expr::Literal { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL });
         }
     }
+    // More places than the engine keeps: the digits as written, at their own
+    // scale, in the cell an `AVG` result is carried in. PostgreSQL types the
+    // constant `numeric`; carried as a float it made `c + 43e-17` the float
+    // 44812.65 (described float8), and `CASE … ELSE n2 - 1.0000000001 END`
+    // stored 67268942325258700 for 67268942325258704.12. Read exactly where a
+    // result is output or stored (`eval_output`, `eval_into`) and refused by
+    // the engine's nine-place arithmetic (`decimal_arith`), never cut.
+    if e < -scale && e >= -(WIDE_LITERAL_PLACES as i32) {
+        return Ok(Expr::Literal {
+            bytes: crate::core::value_codec::decimal_cell_with_scale(m, e.unsigned_abs()),
+            db_type: DbType::DECIMAL,
+        });
+    }
     let written = format!("{m}e{e}");
     if let Ok(v) = written.parse::<f64>() {
         if v.is_finite() && (float_holds_literal(&written, v) || v.abs() < FLOAT_KEEPS_BELOW) {
@@ -2923,6 +2951,16 @@ fn numeric_constant(m: i128, e: i32, text: &str) -> Result<Expr, String> {
         Some(units) => Ok(Expr::Literal { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL }),
         None => Err(inexact_literal(text)),
     }
+}
+
+/// The most places a written constant is carried exactly at (an i128 holds
+/// 38 digits); one with more is the float or rounded constant it was.
+const WIDE_LITERAL_PLACES: u32 = 38;
+
+/// Whether `expr` is a written constant with more places than the engine
+/// keeps, carried at its own scale ([`numeric_constant`]).
+fn is_wide_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal { bytes, db_type: DbType::DECIMAL } if bytes.len() == 17)
 }
 
 /// `m × 10^e` at the engine scale, rounded half away from zero; `None` when
@@ -2982,6 +3020,12 @@ fn exact_decimal(value: &Value) -> Option<(i128, i32)> {
         }
         Some((m, if m == 0 { 0 } else { e }))
     };
+    // A cell carrying its own scale is at that scale, its written places
+    // kept: they are the display scale PostgreSQL gives the result.
+    if *db_type == DbType::DECIMAL && bytes.len() == 17 {
+        let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
+        return Some((m, -(own? as i32)));
+    }
     normal(match db_type {
         DbType::DECIMAL => Some((
             i128::from_le_bytes(bytes.as_slice().try_into().ok()?),
@@ -3110,10 +3154,9 @@ fn fold_float_literal_into_decimal(expr: Expr) -> Expr {
             };
             // Only a float the engine scale holds. One with more places is
             // left a float: rounded to nine here, `d * 0.00000000011` was 0
-            // and `a + 0.000000000001` was `a`. As a float it is the
-            // float-carried constant `numeric_literal_arith` answers from the
-            // exact result (described as float8), and a value stored in a
-            // NUMERIC column is computed exactly by `eval_into`.
+            // and `a + 0.000000000001` was `a`. A *written* constant with
+            // more places is no float (`numeric_constant` carries its digits);
+            // this is a float the statement asked for or computed.
             if let Some(units) = as_f64(&value).filter(|f| float_is_engine_exact(*f)).and_then(float_to_engine_decimal) {
                 **side = Expr::Literal {
                     bytes: units.to_le_bytes().to_vec(),
@@ -3416,7 +3459,8 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
             Expr::Column(f) => {
                 f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
             }
-            Expr::Null | Expr::Literal { .. } | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
+            Expr::Literal { .. } => is_wide_literal(expr),
+            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
             Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
             Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
             Expr::Cast(inner, _) => wide(inner),
@@ -3510,6 +3554,39 @@ fn exact_numeric(
             found
         }
         Expr::Cast(inner, DbType::DECIMAL) => exact_numeric(inner, row, schema, places)?,
+        // The branch taken, exactly: through the engine a branch with more
+        // places than nine made the whole CASE a float.
+        Expr::Case { whens, otherwise } => {
+            for (cond, result) in whens {
+                if eval_cond_3vl(cond, row, schema)? == Some(true) {
+                    return exact_numeric(result, row, schema, places);
+                }
+            }
+            match otherwise {
+                Some(result) => return exact_numeric(result, row, schema, places),
+                None => Some(None),
+            }
+        }
+        // NULLs ignored, NULL only when every one is, as PostgreSQL has it.
+        Expr::Least(args) | Expr::Greatest(args) => {
+            let greatest = matches!(expr, Expr::Greatest(_));
+            let mut best: Option<ExactNumber> = None;
+            for arg in args {
+                let Some(value) = exact_numeric(arg, row, schema, places)? else { return Ok(None) };
+                let Some(x) = value else { continue };
+                if x.err != 0.0 {
+                    return Ok(None);
+                }
+                best = Some(match best {
+                    None => x,
+                    Some(b) => {
+                        let Some((p, q, _)) = ExactNumber::aligned(x, b) else { return Ok(None) };
+                        if (p > q) == greatest && p != q { x } else { b }
+                    }
+                });
+            }
+            Some(best)
+        }
         // Integer arithmetic is the engine's own, exact already and with
         // PostgreSQL's integer division and range: `1 / 3` is 0.
         Expr::Arith(..) if integer(&static_type(expr)) => match eval(expr, row, schema)? {
@@ -3664,6 +3741,30 @@ pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value
 /// from zero, as its `numeric → int` cast does.
 pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
+    // A NUMERIC carrying its own scale (a constant past nine places, folded
+    // or not) bound for another type: PostgreSQL's assignment cast from
+    // `numeric`, rounded half away from zero for an integer. Its seventeen
+    // bytes read as an engine-scale NUMERIC failed `SET n = 3 + 0.00000000001`
+    // with "a numeric could not be read".
+    if let Value::Data { bytes, db_type: DbType::DECIMAL } = &value {
+        if bytes.len() == 17 && field.db_type != DbType::DECIMAL {
+            let (m, own) = crate::core::value_codec::split_decimal_cell(bytes).ok_or("a numeric could not be read")?;
+            let own = own.unwrap_or(DECIMAL_SCALE);
+            value = match field.db_type {
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                | DbType::U64 => {
+                    let whole = round_decimal(m, own, 0).ok_or_else(|| integer_out_of_range(&field.db_type))?;
+                    let whole = i64::try_from(whole).map_err(|_| integer_out_of_range(&field.db_type))?;
+                    Value::Data { bytes: whole.to_le_bytes().to_vec(), db_type: DbType::I64 }
+                }
+                DbType::F32 | DbType::F64 => match as_f64(&value) {
+                    Some(f) => Value::Data { bytes: f.to_le_bytes().to_vec(), db_type: DbType::F64 },
+                    None => return Err("a numeric could not be read".to_string()),
+                },
+                _ => value,
+            };
+        }
+    }
     let number = |v: &Value| {
         matches!(
             v.db_type(),
@@ -4137,6 +4238,11 @@ fn as_f64(value: &Value) -> Option<f64> {
         DbType::F64 => Some(f64::from_le_bytes(bytes.as_slice().try_into().ok()?)),
         // Through its text, which `str::parse` reads to the nearest float: a
         // division by the scale would round twice.
+        // A cell at its own scale (a wide constant), through `m e-s`.
+        DbType::DECIMAL if bytes.len() == 17 => {
+            let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
+            format!("{m}e-{}", own?).parse().ok()
+        }
         DbType::DECIMAL => crate::core::value_codec::format_decimal(i128::from_le_bytes(
             bytes.as_slice().try_into().ok()?,
         ))
@@ -6417,12 +6523,11 @@ mod float_literal_fold_tests {
             ("f * 1.5", vec![DbType::DECIMAL]),
             ("i * 1.5", vec![DbType::DECIMAL]),
             ("1.5 * 2.5", vec![DbType::DECIMAL, DbType::DECIMAL]),
-            // Only while the engine scale holds it exactly; trailing zeros
-            // past it are not places. Past it, a float keeps what rounding to
-            // nine places threw away.
+            // Past the engine scale too, as PostgreSQL types it: carried
+            // with its digits at its own scale, not as a float.
             ("f * 1.5000000000", vec![DbType::DECIMAL]),
-            ("f * 0.0000000001", vec![DbType::F64]),
-            ("i * (1e-10)", vec![DbType::F64]),
+            ("f * 0.0000000001", vec![DbType::DECIMAL]),
+            ("i * (1e-10)", vec![DbType::DECIMAL]),
         ] {
             let mut got = Vec::new();
             literal_types(&parse(text, &s).unwrap(), &mut got);
@@ -6434,12 +6539,20 @@ mod float_literal_fold_tests {
             });
             assert_eq!(got, want, "{text}");
         }
-        // `float_col * 1.5` is still float arithmetic.
+        // `float_col * 1.5` is still float arithmetic, a long constant too.
         let r = row(100, 2.0, 1, 0);
         assert!(matches!(
             eval(&parse("f * 1.5", &s).unwrap(), &r, &s).unwrap(),
             Value::Data { db_type: DbType::F64, .. }
         ));
+        assert_eq!(as_f64(&eval(&parse("f * 0.0000000001", &s).unwrap(), &r, &s).unwrap()), Some(2.0e-10));
+        // Against an integer, exact where a result is output, at the
+        // constant's places.
+        let out = eval_output(&parse("i * (1e-10)", &s).unwrap(), &r, &s).unwrap();
+        assert_eq!(
+            out,
+            Value::Data { bytes: crate::core::value_codec::decimal_cell_with_scale(1, 10), db_type: DbType::DECIMAL }
+        );
     }
 
     /// `cargo test --release -p rasterizeddb_core --lib -- --ignored float_literal_fold_bench --nocapture`

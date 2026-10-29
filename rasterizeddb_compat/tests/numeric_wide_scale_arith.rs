@@ -113,27 +113,19 @@ async fn wide_scale(partitioning: &str) {
 
         // What cannot be carried exactly is refused, not cut: WHERE-clause
         // arithmetic over the column's digits past nine, a literal past nine
-        // there, a quotient that does not end, and an assignment the float a
-        // long literal is carried as cannot settle (PostgreSQL:
-        // 0.000000000001).
+        // there, and a quotient that does not end.
         for sql in [
             "SELECT id FROM w WHERE a + 1 > 1",
             "SELECT a / 3 FROM w WHERE id = 1",
             "SELECT id FROM w WHERE a + 0.000000000001 > 1",
-            "UPDATE w SET a = 0.0000000000004999999999999999999 + a * 0 WHERE id = 5",
         ] {
             assert_eq!(refused(&pool, sql).await, "0A000", "{partitioning}: {sql}");
         }
         assert_eq!(rows(&pool).await, want, "{partitioning}: a refused statement changed a row");
 
-        // A value the engine scale holds still computes in a SELECT, and a
-        // long literal against NUMERIC is the float nearest the exact answer.
-        let r = sqlx::query("SELECT (a + 1)::text, n * 0.00000000011 FROM w WHERE id = 5")
-            .fetch_one(&pool)
-            .await
-            .expect("select");
+        // A value the engine scale holds still computes in a SELECT.
+        let r = sqlx::query("SELECT (a + 1)::text FROM w WHERE id = 5").fetch_one(&pool).await.expect("select");
         assert_eq!(r.get::<String, _>(0), "1.100000000000", "{partitioning}");
-        assert_eq!(r.get::<f64, _>(1), 5.5e-10, "{partitioning}");
 
         // Reads of the digits past nine that are exact are answered exactly
         // (they were refused): a comparison, casts, unary minus, COALESCE,
@@ -170,6 +162,16 @@ async fn wide_scale(partitioning: &str) {
             ["8", "1", "5"],
             "{partitioning}"
         );
+        // A long constant against NUMERIC is NUMERIC, exact, at its own
+        // places (it was the float 5.5e-10, described float8), and one past a
+        // float's digits is stored as PostgreSQL rounds it (it was refused:
+        // the float it was carried as could not settle the rounding).
+        assert_eq!(text("SELECT n * 0.00000000011 FROM w WHERE id = 5").await, ["0.000000000550000"], "{partitioning}");
+        run(&pool, "CREATE TABLE w5 (id INT PRIMARY KEY, a NUMERIC(20,12))").await;
+        run(&pool, "INSERT INTO w5 VALUES (5, 1)").await;
+        run(&pool, "UPDATE w5 SET a = 0.0000000000004999999999999999999 + a * 0 WHERE id = 5").await;
+        run(&pool, "UPDATE w5 SET a = a + 0.0000000000005000000000000000001 WHERE id = 5").await;
+        assert_eq!(text("SELECT a FROM w5").await, ["0.000000000001"], "{partitioning}");
         run(&pool, "CREATE TABLE wj (id INT PRIMARY KEY, b NUMERIC(20,12))").await;
         run(&pool, "INSERT INTO wj VALUES (1, 0.000000000001)").await;
         assert_eq!(
