@@ -124,8 +124,12 @@ vacuum's forget sweeps), and `forgetting_held_by` names the hash-partitioned
 tables that cannot be opened and therefore hold it where it was when they were
 refused: until such a table opens or is dropped the transaction status log
 grows (2 bits per transaction), and the server also logs a warning naming it
-every ten minutes. `partition_maintenance_panics` counts panics the shared
-partition maintenance caught and survived.
+every ten minutes. `partition_compaction_held_by` names the hash-partitioned
+tables whose map log is not compacted because torn-tail evidence
+(`<map log>.torn`) is still beside it: their map log grows until an operator
+examines and removes that file (the server logs it once per open, at the first
+compaction it holds off). `partition_maintenance_panics` counts panics the
+shared partition maintenance caught and survived.
 
 ## What `SHOW DATABASE STATS` does not report
 

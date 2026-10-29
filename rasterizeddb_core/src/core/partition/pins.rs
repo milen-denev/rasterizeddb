@@ -97,6 +97,8 @@ pub struct PinBoard {
     /// The log had a torn tail, or still has its evidence: no compaction
     /// moves the records away from the generation the evidence names.
     torn: bool,
+    /// Whether a refused compaction has named `torn` in the log yet.
+    torn_warned: std::sync::atomic::AtomicBool,
     /// Bytes of the live generation's opening records (its `SNAPSHOT`'s
     /// generation; 0 for generation 0), and the slack past twice that.
     snapshot_len: AtomicU64,
@@ -152,6 +154,7 @@ impl PinBoard {
                 uid: files.uid,
                 seed: files.seed,
                 torn: files.torn,
+                torn_warned: std::sync::atomic::AtomicBool::new(false),
                 snapshot_len: AtomicU64::new(0),
                 slack: AtomicU64::new(COMPACT_SLACK),
                 compacting: tokio::sync::Mutex::new(0),
@@ -373,6 +376,11 @@ impl PinBoard {
         self.snapshot_len.store(bytes, Ordering::Release);
     }
 
+    /// Whether compaction is held off by torn-tail evidence (`torn`).
+    pub fn compaction_held(&self) -> bool {
+        self.torn
+    }
+
     /// The map log's live generation.
     pub fn generation(&self) -> u64 {
         self.log.generation()
@@ -402,6 +410,18 @@ impl PinBoard {
     /// generation, which the reaper deletes. Returns whether it compacted.
     pub async fn compact(&self) -> io::Result<bool> {
         if self.torn {
+            // Not silently: the log grows for as long as the evidence stays,
+            // so it is named once here and for as long as it lasts in `SHOW
+            // DATABASE STATS` (`partition_compaction_held_by`).
+            if !self.torn_warned.swap(true, Ordering::AcqRel) {
+                ::log::warn!(
+                    "the partition map log of \"{}\" is not compacted while its torn-tail evidence ({}{}) exists; \
+                     the log grows until an operator examines and removes that file",
+                    self.name,
+                    files::map_file(self.uid, self.log.generation()),
+                    files::TORN,
+                );
+            }
             return Ok(false);
         }
         let mut tried = self.compacting.lock().await;

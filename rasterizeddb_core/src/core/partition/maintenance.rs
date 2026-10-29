@@ -354,6 +354,22 @@ impl Scheduler {
         q.broken.iter().map(|(n, _)| n.clone()).collect()
     }
 
+    /// The partitioned tables whose map log is not compacted because its
+    /// torn-tail evidence is still there (`PinBoard::compact`): their logs
+    /// grow until an operator examines and removes the evidence.
+    pub fn compaction_held_by(&self) -> Vec<String> {
+        let boards: Vec<Weak<PinBoard>> = {
+            let mut q = self.queue.lock();
+            q.boards.retain(|b| b.strong_count() > 0);
+            q.boards.clone()
+        };
+        let mut names: Vec<String> =
+            boards.iter().filter_map(|b| b.upgrade()).filter(|b| b.compaction_held()).map(|b| b.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn start(self: &StdArc<Self>, q: &mut Queue) {
         if q.running {
             return;

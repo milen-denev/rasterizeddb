@@ -1249,3 +1249,46 @@ async fn a_forget_round_takes_one_map_log_sync() {
     eprintln!("log syncs for one forget round of 8 partitions: {clean} with nothing to rewrite, {rewriting} with an aborted row in each");
     assert_eq!(clean, 1, "a clean round took {clean} log syncs");
 }
+
+/// A map log whose torn-tail evidence is still there is not compacted, and
+/// says so: the table is named in `SHOW DATABASE STATS`
+/// (`partition_compaction_held_by`) for as long as the evidence lasts, so a
+/// log growing behind media-damage evidence is not invisible. Removed, the
+/// next open compacts again.
+///
+/// Mutation: `PinBoard::compaction_held` answering false (nothing named).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torn_evidence_holding_compaction_is_reported() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    exec(&db, CREATE).await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a')").await;
+    let uid = pt(&db).uid();
+    assert!(db.partition_maintenance().compaction_held_by().is_empty());
+    db.sync_durable().unwrap();
+    close(&dir, db);
+    let evidence = dir.join(format!(
+        "{}{}",
+        crate::core::partition::files::map_file(uid, 0),
+        crate::core::partition::files::TORN
+    ));
+    std::fs::write(&evidence, [0u8; 7]).unwrap();
+
+    let db = open(&dir).await;
+    let t = pt(&db);
+    assert!(t.torn().is_some());
+    assert!(!t.pin_board().unwrap().compact().await.unwrap(), "compacted past torn evidence");
+    assert_eq!(db.partition_maintenance().compaction_held_by(), vec!["pt".to_string()]);
+    let parsed = crate::core::introspect::parse("SHOW DATABASE STATS").unwrap().unwrap();
+    let stats = String::from_utf8_lossy(&crate::core::introspect::execute(&parsed, &db).await).into_owned();
+    assert!(stats.contains("partition_compaction_held_by"), "the stat is missing: {stats}");
+    drop(t);
+    close(&dir, db);
+
+    std::fs::remove_file(&evidence).unwrap();
+    let db = open(&dir).await;
+    assert!(db.partition_maintenance().compaction_held_by().is_empty());
+    assert!(pt(&db).pin_board().unwrap().compact().await.unwrap());
+    close(&dir, db);
+}

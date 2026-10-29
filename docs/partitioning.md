@@ -322,6 +322,8 @@ them the sweeps' own rewrite syncs), `CREATE`'s three records, a compaction's op
 captured tail. Without a log (`wal_enabled = false`) records are appended
 directly and flushed, as before. Pinned by
 `power_loss::pins_crash_tests::a_power_cut_after_a_forget_round_never_tears_the_map`.
+A torn log's held-off compaction is no longer silent: logged once per open
+and named in `SHOW DATABASE STATS` (`partition_compaction_held_by`).
 
 **Map-log generations** (§3.2). `PinBoard::compact`, from the scheduler
 once the log passes twice its generation's opening bytes plus 1 MiB:

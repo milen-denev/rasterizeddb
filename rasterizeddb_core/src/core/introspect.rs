@@ -938,6 +938,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "partitioned tables that cannot open and hold the forgotten horizon where they were refused",
     );
     push(
+        "partition_compaction_held_by",
+        database.partition_maintenance().compaction_held_by().join(", "),
+        "partitioned tables whose map log is not compacted while its torn-tail evidence (<map log>.torn) exists",
+    );
+    push(
         "partition_maintenance_panics",
         database.partition_maintenance().panics().to_string(),
         "partition maintenance rounds or units that panicked and were caught",
