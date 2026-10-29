@@ -363,6 +363,28 @@ impl LocalStorageProvider {
     }
 
     async fn commit_durable_with(&self, token: u64, land_staged: bool) -> io::Result<()> {
+        // A refusal before the commit is attempted leaves `token` neither
+        // committed nor aborted, and nothing else ends it: a failed
+        // `commit_durable` must not be followed by `abort_txn` (it may have
+        // committed), so callers never do. Its in-place payloads, in every
+        // file of the directory's transaction, then kept `pending_count`
+        // raised, and every checkpoint declined until a restart. Released
+        // here, where it is known the commit was never attempted.
+        match self.refuse_commit(token, land_staged).await {
+            Ok(()) => {}
+            Err(e) => {
+                // Its held payloads and recorded failures with it.
+                StorageIO::abort_txn(self, token).await;
+                return Err(e);
+            }
+        }
+        self.commit_attempted(token).await
+    }
+
+    /// The checks [`Self::commit_durable_with`] makes before committing
+    /// `token`, and the landing of staged bytes: an `Err` means the commit was
+    /// never attempted.
+    async fn refuse_commit(&self, token: u64, land_staged: bool) -> io::Result<()> {
         // Checked for every token, including the no-log path's `0`: a flush
         // that failed after an append is this file's failure to report, and
         // this is the one call every writer makes before reporting success.
@@ -426,6 +448,12 @@ impl LocalStorageProvider {
                 self.land_staged_durably().await?;
             }
         }
+        Ok(())
+    }
+
+    /// [`Self::commit_durable_with`] past its refusals: the log's commit of
+    /// `token`, which settles it whatever it returns.
+    async fn commit_attempted(&self, token: u64) -> io::Result<()> {
         if token == 0 {
             return Ok(());
         }

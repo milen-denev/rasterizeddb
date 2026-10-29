@@ -360,48 +360,59 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
 
     /// Get the next SchemaField from the buffer, loading a new chunk if necessary
     pub async fn next_schema_field(&mut self) -> io::Result<Option<SchemaField>> {
-        // If we've reached the end of the data, return None
-        if self.end_of_data {
-            return Ok(None);
-        }
-
-        // If we've reached the end of the current buffer, load the next chunk
-        if self.buffer_index >= self.buffer_valid_length {
-            self.load_next_chunk().await?;
-
-            // If loading the next chunk reached the end of data, return None
+        loop {
+            // If we've reached the end of the data, return None
             if self.end_of_data {
                 return Ok(None);
             }
-        }
 
-        // If the remaining buffer is smaller than a single field, load the next chunk
-        if self.buffer_index + SCHEMA_FIELD_SIZE as usize > self.buffer_valid_length {
-            self.load_next_chunk().await?;
-            if self.end_of_data {
-                return Ok(None);
+            // If we've reached the end of the current buffer, load the next chunk
+            if self.buffer_index >= self.buffer_valid_length {
+                self.load_next_chunk().await?;
+
+                // If loading the next chunk reached the end of data, return None
+                if self.end_of_data {
+                    return Ok(None);
+                }
             }
-        }
 
-        // Extract the schema field data from the buffer
-        let field_data = &self.buffer.into_slice()
-            [self.buffer_index..self.buffer_index + SCHEMA_FIELD_SIZE as usize];
-
-        // Parse the SchemaField from the buffer
-        let schema_field = match SchemaField::from_vec(field_data) {
-            Ok(field) => field,
-            Err(_e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Failed to parse SchemaField.",
-                ));
+            // If the remaining buffer is smaller than a single field, load the next chunk
+            if self.buffer_index + SCHEMA_FIELD_SIZE as usize > self.buffer_valid_length {
+                self.load_next_chunk().await?;
+                if self.end_of_data {
+                    return Ok(None);
+                }
             }
-        };
 
-        // Advance the buffer index
-        self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+            // Extract the schema field data from the buffer
+            let field_data = &self.buffer.into_slice()
+                [self.buffer_index..self.buffer_index + SCHEMA_FIELD_SIZE as usize];
 
-        Ok(Some(schema_field))
+            // A record of zeros is no column (every one has a name): the
+            // remains of an append a power cut kept the length of and dropped
+            // the page of (`torn_tail::is_unwritten`). Read, it was a column
+            // named "" at write order 0.
+            if crate::core::torn_tail::is_unwritten(field_data) {
+                self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+                continue;
+            }
+
+            // Parse the SchemaField from the buffer
+            let schema_field = match SchemaField::from_vec(field_data) {
+                Ok(field) => field,
+                Err(_e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to parse SchemaField.",
+                    ));
+                }
+            };
+
+            // Advance the buffer index
+            self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+
+            return Ok(Some(schema_field));
+        }
     }
 
     /// Get multiple SchemaFields at once, up to BATCH_SIZE

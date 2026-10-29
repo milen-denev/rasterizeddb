@@ -1342,3 +1342,67 @@ async fn a_statements_sidecar_records_read_all_or_none_after_a_cut() {
     assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
     assert!(all > 0 && none > 0, "every image fell on one side ({all} all, {none} none): the cuts tell nothing apart");
 }
+
+/// A field record of zeros in `<t>_schema_FIELDS.db` (an append a power cut
+/// kept the length of and dropped the page of) is no column: the schema
+/// loads the columns around it, and none named "".
+///
+/// Mutation: `SchemaFieldIterator::next_schema_field`'s `is_unwritten` check
+/// removed.
+#[tokio::test]
+async fn a_field_record_of_zeros_reads_as_no_column() {
+    use crate::core::db_type::DbType;
+    use crate::core::row::schema::{SCHEMA_FIELD_SIZE, TableSchema};
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new(path_str(dir.path()).as_str(), Some("f_schema.db")).await);
+    let mut schema = TableSchema::new("f".into(), false);
+    schema.save(io.clone()).await.unwrap();
+    schema.add_field(io.clone(), "a".into(), DbType::I64, false).await;
+    let fields = crate::core::storage_providers::traits::StorageIO::create_new(&*io, "f_schema_FIELDS.db".to_string()).await;
+    crate::core::storage_providers::traits::StorageIO::append_data(&fields, &vec![0u8; SCHEMA_FIELD_SIZE as usize], true).await;
+    schema.add_field(io.clone(), "b".into(), DbType::STRING, false).await;
+    let on_disk = std::fs::metadata(dir.path().join("f_schema_FIELDS.db")).unwrap().len();
+    assert_eq!(on_disk, 3 * SCHEMA_FIELD_SIZE, "the zero record is not between the two fields");
+    let loaded = TableSchema::load(io.clone()).await.expect("a schema with a record of zeros must load");
+    let names: Vec<&str> = loaded.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"], "a record of zeros read as a column");
+}
+
+/// A batch one of whose writes failed is refused at its commit, and the
+/// transaction is released with it: the other files' held writes no longer
+/// count as an open transaction, so the next checkpoint is not declined for
+/// it, and the next batch commits.
+///
+/// Mutation: `commit_durable_with` no longer aborting a transaction it
+/// refuses before committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_batch_releases_its_transaction() {
+    use crate::core::storage_providers::file_sync::failed_appends::FAIL_INPLACE_IN;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await.unwrap();
+    db.sync_durable().unwrap();
+    let io = db.table_held("t").unwrap().io_schema.clone();
+    let location = crate::core::storage_providers::traits::StorageIO::get_location(&*io).unwrap();
+    let wal = crate::core::wal::wal_for(&location).expect("the table's directory has a log");
+    assert_eq!(wal.pending_transactions(), 0);
+
+    // The first file's write is refused; the second's is held.
+    FAIL_INPLACE_IN.lock().push(location.clone());
+    let mut writes = SidecarWrites::default();
+    Sidecar::Fk.stage(&*io, &mut writes, 0).unwrap();
+    Sidecar::Chk.stage(&*io, &mut writes, 0).unwrap();
+    let refused = writes.commit(&*io).await;
+    FAIL_INPLACE_IN.lock().retain(|l| *l != location);
+    assert!(refused.is_err(), "a batch with a refused write committed");
+    assert_eq!(wal.pending_transactions(), 0, "the refused batch's transaction is still held");
+    assert_eq!(Sidecar::Chk.load(&io).await, Vec::new(), "the refused batch's other file was written");
+
+    let mut writes = SidecarWrites::default();
+    Sidecar::Fk.stage(&*io, &mut writes, 1).unwrap();
+    writes.commit(&*io).await.expect("the next batch commits");
+    assert_eq!(Sidecar::Fk.load(&io).await, Sidecar::Fk.expected(2).await[1..].to_vec());
+    drop(io);
+    close(&dir, db);
+}

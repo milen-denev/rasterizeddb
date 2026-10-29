@@ -44,9 +44,9 @@
 //! under disk index residency, whose extra files moved the image's draws onto
 //! the one length that keeps the record whole).
 //!
-//! So the `_schema_*` sidecars below are never appended that way.
-//! [`SidecarWrites`] is their one writer, one transaction and one log sync
-//! per statement: the bytes go to the log first and
+//! So the nine constraint sidecars below (every `_schema_*` one but
+//! `FIELDS`) are never appended that way. [`SidecarWrites`] is their one
+//! writer, one transaction and one log sync per statement: the bytes go to the log first and
 //! reach the file only once the record describing them is durable (an
 //! in-place write at the file's end, which the log holds back until its
 //! commit has synced). A cut before that sync leaves the file as it was; a
@@ -54,7 +54,11 @@
 //! replay writes over whole (a fragment past the last whole record cut here
 //! first, as above). And because files written before that may still hold such a
 //! record, each sidecar's loader skips a record of zeros ([`is_unwritten`]),
-//! which no declaration ever encodes to.
+//! which no declaration ever encodes to. The field records keep the logged
+//! append: a plain `CREATE TABLE` makes them durable before its catalogue
+//! row names the table (`database::create_intent`), and every later writer
+//! of them runs under a rewrite's backup and intent; their loader skips a
+//! record of zeros all the same.
 //!
 //! # The durable floor
 //!
