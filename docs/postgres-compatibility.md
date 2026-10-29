@@ -343,15 +343,19 @@ the log says it once per statement.
 A pattern or flags read from the row (`CHECK (s ~ t)`) outside the subset
 refuse that row with 0A000, and an invalid one with 2201B, as PostgreSQL's.
 
-A check on a `character(n)` column is kept unenforced, with a WARNING:
-PostgreSQL compares `character(n)` blank-padded (`'AB '` is `'AB'`), and this
-engine stores it as text, so enforcing it would refuse rows PostgreSQL
-accepts. `pg_dump` writes such checks with `::bpchar`, and a `CREATE TABLE`
-that declares one on a `char(n)` column stores it so.
+A check that reads a `character(n)` column (`char`, `char(n)`, `bpchar`) is
+kept unenforced, with a WARNING, on every DDL path (CREATE TABLE, ALTER TABLE
+ADD CONSTRAINT, ADD COLUMN … CHECK): PostgreSQL compares `character(n)`
+blank-padded (`'AB '` is `'AB'`), and this engine stores it as text, so
+enforcing it would refuse rows PostgreSQL accepts. The column's declared type
+is recorded with the table for a later ALTER; the stored check reads the
+column `::bpchar`, as `pg_dump` writes it.
 
-`SHOW CHECKS` lists every check, with `enforced`, `not enforced` or `cannot be
-compiled` (one stored by an older binary) and why; each that is not enforced
-is also logged once when its table is opened.
+`SHOW CHECKS` lists every check, with `enforced`, `enforced (ASCII-exact)` (a
+locale-dependent pattern, answered exactly for ASCII text), `not enforced` or
+`cannot be compiled` (one stored by an older binary) and why; each that is
+not enforced is also logged once when its table is opened. `ALTER TABLE …
+ADD CONSTRAINT` says, as a WARNING, how many stored rows went unjudged.
 
 A pattern PostgreSQL itself rejects (`'('`, `'[a'`, `'*a'`) is accepted at
 CREATE TABLE, as there, and every row it meets is refused with 2201B; an
@@ -372,6 +376,18 @@ SELECT * FROM <table> WHERE NOT (<check expression>);
 
 and fix or delete each row, or drop the check (`ALTER TABLE <table> DROP
 CONSTRAINT <name>`) and add it again once the data holds.
+
+### Correlated EXISTS in UPDATE and DELETE
+
+A correlated `[NOT] EXISTS` in an `UPDATE` or a `DELETE` (`UPDATE t … WHERE
+EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)`, Django's forms included) runs
+only in a `REPEATABLE READ` or `SERIALIZABLE` transaction, and is refused with
+0A000 under `READ COMMITTED` (autocommit or an explicit block). Its subquery is
+read once, under a snapshot taken before the rows it writes are scanned, so a
+concurrent writer between the two would make it touch rows PostgreSQL's does
+not; a pinned snapshot makes them one. Write it as `UPDATE … FROM` /
+`DELETE … USING` to run it under `READ COMMITTED`. `IN (SELECT …)` and `NOT IN
+(SELECT …)` in a write share the snapshot gap and are not yet refused.
 
 ### NUMERIC past nine places
 
