@@ -610,24 +610,26 @@ theirs. Each loader also skips a record of zeros
 (`torn_tail::is_unwritten`, which no declaration encodes to), for files a
 build before this wrote.
 
-Syncs, counted with `strace -f` around each statement
-(`torn_tail::tests::sidecar_sync_count_probe`; tmpfs hides what a sync
-costs, never how many there are), log `fdatasync`s:
+Syncs, counted with `strace -f` around each statement, three runs at each
+revision (`torn_tail::tests::sidecar_sync_count_probe`, added alone to each
+revision; tmpfs hides what a sync costs, never how many there are), log
+`fdatasync`s; "+1 after" is one the log took after the statement had
+returned:
 
-| statement | before (`c29e3d9`) | one commit per record | batched |
+| statement | `c29e3d9` (before) | `45963d5` (a commit per record) | `e446df4` (batched) |
 |---|---|---|---|
-| `CREATE TABLE` with a PK, 2 UNIQUE, 2 CHECK, 3 DEFAULT, 2 `NUMERIC(p,s)`, 1 FK | 2 | 12 | 2 |
-| `ADD CONSTRAINT … FOREIGN KEY` | 1 (after the statement returned, 3 runs of 3) | 1 | 1 |
-| `CREATE INDEX` | 1 | 1 | 1 |
-| `ALTER COLUMN … SET DEFAULT`, `ADD CONSTRAINT … CHECK` | 1 (after it returned, 1 run of 3) | 1 | 1 |
+| `CREATE TABLE` with a PK, 2 UNIQUE, 2 CHECK, 3 DEFAULT, 2 `NUMERIC(p,s)`, 1 FK | 2, +1 after | 12 | 1 |
+| `ADD CONSTRAINT … FOREIGN KEY` | 1 (after, 1 run of 3) | 1 | 1 |
+| `CREATE INDEX` | 1 (after, 3 of 3) | 1 | 1 |
+| `ALTER COLUMN … SET DEFAULT` | 1 (after, 3 of 3) | 1 | 1 |
+| `ADD CONSTRAINT … CHECK` | 1 (after, 2 of 3) | 1 | 1 |
 
-Batched, `CREATE TABLE`'s sidecar records and header take one log sync
-on the statement's thread; the other is taken on another thread while
-the statement runs, before the batch (the schema and field records go in
-as logged appends left to a later sync). Its 29 directory syncs (two per
-file created) and the storage-config sync are the same in all three
-columns. Before, a single-record `ALTER` could return before its log sync;
-now it returns after. The `FIELDS` sidecar and the schema file's first
+`CREATE TABLE`'s 29 directory syncs (two per file created) and its
+storage-config sync are the same at all three. A batched run before the
+header joined the transaction took a second log sync on another thread
+while the statement ran; at `e446df4` all three took one. Before, a
+single-record statement could return before its log sync; now it returns
+after it. The `FIELDS` sidecar and the schema file's first
 write (`TableSchema::save`) keep the logged append: they are written by `CREATE
 TABLE`, before the catalogue names the table, or under `reload_atomic` and
 `rewrite_table`, whose backup and intent put the files back after a cut.
