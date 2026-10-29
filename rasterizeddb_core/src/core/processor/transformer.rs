@@ -429,14 +429,8 @@ impl ColumnTransformer {
         // places (InexactNumeric), and an order needs no arithmetic.
         let mut lifted_1 = [0u8; 16];
         let mut lifted_2 = [0u8; 16];
-        let (input1, input2) = match self.compare_at.filter(|_| self.in_set.is_none()) {
-            Some(common) => {
-                let engine = crate::core::value_codec::DECIMAL_SCALE;
-                (
-                    lift_decimal_to(input1, self.column_1_scale.unwrap_or(engine), common, &mut lifted_1)?,
-                    lift_decimal_to(input2, self.column_2_scale.unwrap_or(engine), common, &mut lifted_2)?,
-                )
-            }
+        let (input1, input2) = match self.compare_at {
+            Some(common) => self.lift_for_wide_compare(input1, input2, common, &mut lifted_1, &mut lifted_2)?,
             None => (
                 match self.column_1_scale {
                     Some(scale) => lift_to_engine_scale(input1, scale, &mut lifted_1)?,
@@ -1006,6 +1000,42 @@ impl ComparisonOperand {
 /// > 1` over a NUMERIC(20,12) holding 0.000000000005 cut it to 0 and dropped
 /// the row. Bytes that are not a decimal are passed through for the
 /// operation to refuse.
+impl ColumnTransformer {
+    /// The operands of a comparison with a side keeping more places than
+    /// nine, at `common` places (`compare_at`); an `IN` set's at nine, as
+    /// it was built. Out of line and cold, so the common path through
+    /// `transform_on_row` is the code it was: inlined there, it cost a
+    /// plain `WHERE a > 50000.5` some 2% of its instructions.
+    #[cold]
+    #[inline(never)]
+    fn lift_for_wide_compare<'a>(
+        &self,
+        input1: &'a [u8],
+        input2: &'a [u8],
+        common: u32,
+        lifted_1: &'a mut [u8; 16],
+        lifted_2: &'a mut [u8; 16],
+    ) -> Result<(&'a [u8], &'a [u8]), EvalError> {
+        let engine = crate::core::value_codec::DECIMAL_SCALE;
+        if self.in_set.is_some() {
+            return Ok((
+                match self.column_1_scale {
+                    Some(scale) => lift_to_engine_scale(input1, scale, lifted_1)?,
+                    None => input1,
+                },
+                match self.column_2_scale {
+                    Some(scale) => lift_to_engine_scale(input2, scale, lifted_2)?,
+                    None => input2,
+                },
+            ));
+        }
+        Ok((
+            lift_decimal_to(input1, self.column_1_scale.unwrap_or(engine), common, lifted_1)?,
+            lift_decimal_to(input2, self.column_2_scale.unwrap_or(engine), common, lifted_2)?,
+        ))
+    }
+}
+
 /// A `NUMERIC` stored at `from` places, at `to` places (`to >= from`),
 /// exactly; refused past an i128. Bytes that are not a decimal pass through.
 #[inline]
