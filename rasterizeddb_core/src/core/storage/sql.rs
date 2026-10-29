@@ -528,6 +528,12 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
     database
         .refuse_partitioned(&table, "STORAGE PLACE TABLE")
         .map_err(|e| e.to_string())?;
+    // Held to the pin, against a CREATE (or RENAME, or DROP) of the name in
+    // flight: `has_table` below is false until a CREATE installs its table,
+    // so a pin set meanwhile changed the placement after the files had gone
+    // where the old one said, and a CREATE that then failed forgot the new
+    // pin as its own. Refused instead; the operator runs it again.
+    let _claim = database.claim_name(&table).map_err(|e| e.to_string())?;
     if database.has_table(&table) {
         // Reported from the backend rather than the directory: `location_of`
         // is `None` for a table that is not in one, and falling back to the

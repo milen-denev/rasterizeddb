@@ -533,7 +533,10 @@ pub(super) async fn recover_interrupted_rename(
         set_aside_malformed(&path, &text);
         return;
     };
-    let schema = super::load_db_data_schema(io_schema.clone()).await;
+    let Ok(schema) = super::load_db_data_schema(io_schema.clone()).await else {
+        warn!("The catalogue's schema could not be read to finish a partitioned rename; leaving its intent in place");
+        return;
+    };
     let Ok(mut iterator) = crate::core::row::row_pointer::RowPointerIterator::new(io_pointers.clone()).await else {
         warn!("The catalogue could not be read to finish a partitioned rename; leaving its intent in place");
         return;

@@ -233,3 +233,105 @@ async fn a_create_on_a_store_that_refuses_its_puts_creates_nothing() {
     assert!(db.has_table("warm"));
     close(&root, db);
 }
+
+/// `STORAGE PLACE TABLE` is refused while a statement holds the name (a
+/// CREATE between its name check and its install), and runs once it is
+/// released: a pin set meanwhile landed after the CREATE's files had gone
+/// where the old placement said.
+///
+/// Mutation: `place_table` no longer taking the name's claim.
+#[cfg(feature = "storage_pools")]
+#[tokio::test]
+async fn a_placement_waits_for_no_statement_holding_the_name() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("db");
+    let disk = base.path().join("disk2");
+    let db = open(&root).await;
+    let pin = add_disk(&db, &disk);
+    let sql = format!("STORAGE PLACE TABLE racing AT '{pin}'");
+    let held = db.claim_name("racing").unwrap();
+    let refused = crate::core::storage::sql::execute(&sql, &db).await;
+    assert!(refused.is_err(), "a placement went in while a statement held the name: {refused:?}");
+    assert_eq!(db.storage.spec_of("racing"), None);
+    drop(held);
+    crate::core::storage::sql::execute(&sql, &db).await.unwrap();
+    assert_eq!(db.storage.spec_of("racing").as_deref(), Some(pin.as_str()));
+    close(&root, db);
+}
+
+/// An ALTER that rewrites the table and cannot write its new schema (a field
+/// record refused) fails and puts the old files back: the columns and rows
+/// are as they were, across a restart, and the ALTER runs again. It reported
+/// success over an empty schema, every row with no column.
+///
+/// Mutation: `Database::create_files` no longer refusing a table whose
+/// schema could not be written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rewrite_whose_schema_cannot_be_written_puts_the_table_back() {
+    use crate::core::storage_providers::file_sync::failed_appends::FAIL_APPEND_TO;
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("db");
+    let db = open(&root).await;
+    let name = "rwfail_t";
+    exec(&db, &format!("CREATE TABLE {name} (id BIGINT NOT NULL, v BIGINT)")).await.unwrap();
+    exec(&db, &format!("INSERT INTO {name} (id, v) VALUES (1, 10), (2, 20), (3, 30)")).await.unwrap();
+    let columns = |db: &Arc<Database>| -> Vec<String> {
+        db.table_held(name).unwrap().schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect()
+    };
+    let before = columns(&db);
+    let target = format!("{name}_schema_FIELDS.db");
+    FAIL_APPEND_TO.lock().push(target.clone());
+    let failed = exec(&db, &format!("ALTER TABLE {name} ADD COLUMN extra BIGINT DEFAULT 5")).await;
+    let armed = FAIL_APPEND_TO.lock().iter().any(|t| *t == target);
+    FAIL_APPEND_TO.lock().retain(|t| *t != target);
+    assert!(!armed, "the rewrite never appended a field record");
+    assert!(failed.is_err(), "a rewrite whose field record could not be written succeeded");
+    assert_eq!(columns(&db), before, "the failed rewrite changed the columns");
+    assert_eq!(count(&db, name).await, 3);
+    close(&root, db);
+    let db = open(&root).await;
+    assert_eq!(columns(&db), before, "the failed rewrite's columns came back after a restart");
+    let out = exec(&db, &format!("SELECT v FROM {name} WHERE id = 2")).await.unwrap();
+    let rows = crate::core::row::row::vec_into_rows(&out[1..]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns[0].data.into_slice(), 20i64.to_le_bytes().as_slice(), "the row's value changed");
+    exec(&db, &format!("ALTER TABLE {name} ADD COLUMN extra BIGINT DEFAULT 5")).await.unwrap();
+    assert!(columns(&db).iter().any(|c| c == "extra"), "the retried ALTER added nothing");
+    assert_eq!(count(&db, name).await, 3);
+    close(&root, db);
+}
+
+/// A first open whose catalogue schema cannot be written (a full disk)
+/// returns an error, as `try_new_named` promises, rather than panicking in
+/// the catalogue's `save` after `add_field` dropped the field that failed;
+/// the next open, the disk recovered, makes the catalogue and works.
+///
+/// Mutation: `load_db_data_schema` back to `add_field`, the failure logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_open_that_cannot_write_its_catalogue_is_an_error() {
+    use crate::core::storage_providers::file_sync::failed_appends::FAIL_APPEND_TO;
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("db");
+    // This directory's own catalogue only: the hook is process-wide.
+    let target = format!(
+        "{}/db/db_data_schema_FIELDS.db",
+        base.path().file_name().unwrap().to_string_lossy()
+    );
+    FAIL_APPEND_TO.lock().push(target.clone());
+    let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
+    let opened = Database::try_new_named(&path_str(&root), false, "create_failure").await;
+    let armed = FAIL_APPEND_TO.lock().iter().any(|t| *t == target);
+    FAIL_APPEND_TO.lock().retain(|t| *t != target);
+    crate::core::wal::remove_for(&path_str(&root));
+    assert!(!armed, "the first open never wrote the catalogue's fields");
+    assert!(opened.is_err(), "a first open whose catalogue could not be written opened");
+    drop(opened);
+
+    let db = open(&root).await;
+    exec(&db, "CREATE TABLE after_bootstrap (id BIGINT NOT NULL)").await.unwrap();
+    exec(&db, "INSERT INTO after_bootstrap (id) VALUES (1)").await.unwrap();
+    close(&root, db);
+    let db = open(&root).await;
+    assert_eq!(count(&db, "after_bootstrap").await, 1);
+    close(&root, db);
+}

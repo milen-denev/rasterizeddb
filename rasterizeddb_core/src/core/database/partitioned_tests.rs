@@ -100,7 +100,7 @@ fn partitioned(db: &Database, name: &str) -> Arc<PartitionedTable> {
 
 /// The live catalogue rows, read as startup reads them.
 async fn catalogue(db: &Database) -> Vec<(String, u64)> {
-    let schema = load_db_data_schema(db.db_io_schema.clone()).await;
+    let schema = load_db_data_schema(db.db_io_schema.clone()).await.unwrap();
     let mut iterator = RowPointerIterator::new(db.db_io_pointers.clone()).await.unwrap();
     let mut rows = load_db_tables(&schema, &mut iterator, db.db_io_rows.clone()).await;
     rows.sort();

@@ -1458,7 +1458,15 @@ impl Database {
             );
         });
 
-        let schema = load_db_data_schema(io_schema.clone()).await;
+        let schema = match load_db_data_schema(io_schema.clone()).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                if installed_root_log {
+                    let _ = crate::core::wal::remove_for(location);
+                }
+                return Err(format!("refusing to open the database at {location}: its catalogue's schema could not be written: {e}"));
+            }
+        };
 
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
@@ -4152,41 +4160,25 @@ async fn write_schema_sidecars(
     Ok(())
 }
 
-async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
-    let schema = {
-        if let Ok(schema) = TableSchema::load(schema_io.clone()).await {
-            info!("Loaded schema: {:?}", schema);
-            schema
-        } else {
-            info!("Schema not found, creating new schema");
-            let mut table = TableSchema::new("db_data".to_string(), false);
-
-            table
-                .add_field(
-                    schema_io.clone(),
-                    "table_name".to_string(),
-                    DbType::STRING,
-                    true,
-                )
-                .await;
-            table
-                .add_field(
-                    schema_io.clone(),
-                    "clusters".to_string(),
-                    DbType::U64,
-                    false,
-                )
-                .await;
-
-            table.save(schema_io).await.unwrap();
-
-            info!("Created new schema and saved it");
-
-            table
-        }
-    };
-
-    schema
+/// The catalogue's schema, written first when there is none. An error when
+/// that write fails (a full disk at the first open): `add_field` used to drop
+/// a field whose write failed and `save` then panicked on the rest.
+async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> io::Result<TableSchema> {
+    if let Ok(schema) = TableSchema::load(schema_io.clone()).await {
+        info!("Loaded schema: {:?}", schema);
+        return Ok(schema);
+    }
+    info!("Schema not found, creating new schema");
+    let mut table = TableSchema::new("db_data".to_string(), false);
+    table
+        .try_add_field(schema_io.clone(), "table_name".to_string(), DbType::STRING, true)
+        .await?;
+    table
+        .try_add_field(schema_io.clone(), "clusters".to_string(), DbType::U64, false)
+        .await?;
+    table.save(schema_io).await?;
+    info!("Created new schema and saved it");
+    Ok(table)
 }
 
 /// Whether the catalogue still names a table.
@@ -4495,7 +4487,7 @@ async fn tombstone_catalogue_row(
     io_schema: &Arc<DbStorageProvider>,
     table_name: &str,
 ) -> io::Result<bool> {
-    let schema = load_db_data_schema(io_schema.clone()).await;
+    let schema = load_db_data_schema(io_schema.clone()).await?;
     let fetch = create_db_data_row_fetch(&schema.fields);
 
     let mut iterator = RowPointerIterator::new(io_pointers.clone())
@@ -4548,7 +4540,15 @@ async fn catalogue_rows(
     io_schema: &Arc<DbStorageProvider>,
     table_name: &str,
 ) -> Vec<u64> {
-    let schema = load_db_data_schema(io_schema.clone()).await;
+    // The open read (or wrote) this schema before anything asks here, so it
+    // only fails on one that stopped reading since; said loudly.
+    let schema = match load_db_data_schema(io_schema.clone()).await {
+        Ok(schema) => schema,
+        Err(e) => {
+            error!("The catalogue's schema could not be read: {e}; {table_name} reads as uncatalogued");
+            return Vec::new();
+        }
+    };
     let fetch = create_db_data_row_fetch(&schema.fields);
 
     let Ok(mut iterator) = RowPointerIterator::new(io_pointers.clone()).await else {

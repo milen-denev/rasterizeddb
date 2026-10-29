@@ -679,6 +679,19 @@ whose post-row sync fails after the table is installed now tells
 replication, plain and partitioned. With its log disabled,
 `discard_files_in` syncs the directories it deleted from too.
 
+**Re-review of `410f5e7`.** A rewriting ALTER whose new field record
+failed reported success over an empty schema: `new_with_constraints` marks
+such a table `schema_unreadable`, which `add_table` checked and the
+rewrite's `create_files` did not, so every row went in under no column. It
+refuses that table now, and the rewrite puts its backup back. Every caller
+of the writers was audited (`new_with_constraints`, `create_schema_files`,
+`try_add_field`, `append_committed`, and the open-only `Table::new`): the
+catalogue's own bootstrap (`load_db_data_schema`) dropped a failed field
+and panicked in `save`, and returns the error now, so a first open on a
+full disk is an error. `STORAGE PLACE TABLE` takes the name's claim, so a
+pin can no longer land while a `CREATE` of the name is in flight (after its
+files went where the old placement said, or forgotten by its failure).
+
 Pinned by `create_crash_tests::a_create_table_cut_anywhere_leaves_no_table_or_the_whole_table`
 (a plain and a partitioned table with all four constraints, cut in every
 sync and after it returns, every seed kind: absent and re-creatable, or

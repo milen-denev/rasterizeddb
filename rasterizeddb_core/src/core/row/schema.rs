@@ -239,7 +239,10 @@ impl SchemaField {
 /// except that its failure (a full disk, a file-size limit, a refused
 /// key/value put) was only logged there. The commit is the deferred kind, as
 /// before: durable with the statement's next log sync, or, on a key/value
-/// store, once its family has stored it.
+/// store, once its family has stored it. It also lands any staged bytes of
+/// the file (`commit_durable`), which the immediate append did not: harmless,
+/// since schema and field files are only ever appended immediately and never
+/// stage.
 pub(crate) async fn append_committed<S: StorageIO>(io: &S, bytes: &[u8]) -> io::Result<()> {
     let txn = io.begin_txn();
     let (_, token) = io.append_data_txn(txn, bytes).await;

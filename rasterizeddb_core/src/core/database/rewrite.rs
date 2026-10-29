@@ -358,6 +358,16 @@ impl Database {
         let columns = std::mem::take(&mut create.columns);
         let seed = self.seed_of(&create.table_name).await;
         let mut table = Table::new_with_constraints(&create.table_name, seed, columns, &create.unique_columns).await;
+        // Its schema or a field record could not be written: the table holds
+        // an empty schema, and going on wrote the rows under none of their
+        // columns. An error, so the rewrite puts its backup back.
+        if table.schema_unreadable {
+            table.retire().await;
+            return Err(io::Error::other(format!(
+                "the rewritten table {}'s schema could not be written",
+                create.table_name
+            )));
+        }
         table.scope_cache_to_database(self.id);
         super::write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create).await?;
         Ok(Arc::new(table))
