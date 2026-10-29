@@ -59,7 +59,8 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
              CREATE TABLE jb (id BIGINT PRIMARY KEY, a NUMERIC(38,20)); \
              INSERT INTO jb VALUES (1, 1.12345678912345678912), (2, -0.00000000000000000005); \
              CREATE TABLE u2 (id BIGINT PRIMARY KEY, c NUMERIC(10,2), d NUMERIC(12,4)); \
-             INSERT INTO u2 VALUES (1, 1.25, 1.2500)",
+             INSERT INTO u2 VALUES (1, 1.25, 1.2500); \
+             CREATE TABLE un (id BIGINT PRIMARY KEY, n NUMERIC)",
         )
         .await
         .expect("setup");
@@ -119,6 +120,12 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         ("SELECT c FROM r UNION ALL SELECT i FROM r ORDER BY 1", &["-2.55", "4", "7", "44812.65"]),
         ("SELECT c FROM r UNION SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT c FROM u2 UNION SELECT d FROM u2", &["1.25"]),
+        // A branch that is an expression, an aggregate or a constant has no
+        // declared type; read as the first branch's layout it showed 314.15.
+        ("SELECT c + 0 FROM r UNION ALL SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
+        ("SELECT sum(c) FROM r UNION ALL SELECT d FROM r ORDER BY 1", &["-0.0001", "3.1415", "44810.10"]),
+        ("SELECT c FROM r UNION ALL SELECT 0.0001 FROM r WHERE id = 1 ORDER BY 1", &["-2.55", "0.0001", "44812.65"]),
+        ("SELECT c FROM r UNION SELECT 44812.6500 FROM r ORDER BY 1", &["-2.55", "44812.65"]),
         ("SELECT count(*) FROM (SELECT c AS x FROM r UNION ALL SELECT d FROM r) s WHERE x < 0", &["2"]),
         // Compared with a constant or a column of another scale.
         ("INSERT INTO ck VALUES (1, 1.123456789123)", &[]),
@@ -140,6 +147,11 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
     for (sql, code) in [
         ("INSERT INTO ck VALUES (2, 1.123456789124)", "23514"),
         ("SELECT i FROM r UNION ALL SELECT c FROM r", "0A000"),
+        // Never mixed with a float, which read as NUMERIC rendered blanks.
+        ("SELECT c FROM r UNION ALL SELECT c::float8 FROM r", "0A000"),
+        // More places than an unconstrained NUMERIC keeps here: a limit, not
+        // the overflow (22003) it was reported as.
+        ("INSERT INTO un SELECT id, b FROM r WHERE id = 2", "0A000"),
         ("SELECT sum(c + 43e-17) FROM r", "0A000"),
     ] {
         let got = text(&client, sql).await;

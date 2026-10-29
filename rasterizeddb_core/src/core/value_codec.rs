@@ -2066,6 +2066,15 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             Err(_) => syntax(),
         },
         DbType::DECIMAL => match text.trim().parse::<f64>() {
+            // More places than the nine an unconstrained `NUMERIC` keeps here
+            // (`INSERT INTO un SELECT a + 0.0000000000001` from a
+            // NUMERIC(20,12)): no overflow, which 22003 said; a limit.
+            Ok(_) if digits_past_scale(text, DECIMAL_SCALE) && !text.contains(['e', 'E']) => format!(
+                "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
+                 (not supported); declare the column NUMERIC(p, s)",
+                double_quoted(text.trim()),
+                DECIMAL_SCALE
+            ),
             Ok(_) => format!("numeric field overflow: {} does not fit the column's precision", double_quoted(text.trim())),
             Err(_) => syntax(),
         },

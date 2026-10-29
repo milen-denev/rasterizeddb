@@ -132,41 +132,70 @@ pub fn union_decimal_scales(
                 | DbType::U64
         )
     };
-    let width = declared.iter().map(Vec::len).min().unwrap_or(0);
+    let width = declared.iter().map(Vec::len).max().unwrap_or(0);
     let mut out = vec![vec![None; width]; declared.len()];
     let mut any = false;
     for at in 0..width {
-        let types: Option<Vec<&DbType>> = declared.iter().map(|b| b[at].as_ref()).collect();
-        let Some(types) = types else { continue };
-        if !types.iter().any(|t| **t == DbType::DECIMAL) {
+        let types: Vec<Option<&DbType>> = declared.iter().map(|b| b.get(at).and_then(Option::as_ref)).collect();
+        if !types.iter().any(|t| *t == Some(&DbType::DECIMAL)) {
             continue;
         }
-        if !types.iter().all(|t| **t == DbType::DECIMAL || integer_type(t)) {
-            continue;
-        }
-        if *types[0] != DbType::DECIMAL {
-            return Err(format!(
-                "UNION column {} is an integer in its first branch and NUMERIC in another, which is not supported: \
-                 cast the first branch's column to numeric",
+        let refuse = |why: &str| {
+            Err(format!(
+                "UNION column {} is NUMERIC in one branch and {why}, which is not supported: cast each branch's \
+                 column to numeric",
                 at + 1
-            ));
+            ))
+        };
+        // Never mixed: a branch whose type is not known, or one that is
+        // neither NUMERIC nor an integer (a float, text), is refused rather
+        // than read at another branch's layout (`numeric UNION float8`
+        // rendered blanks or "}").
+        if types.iter().any(Option::is_none) {
+            return refuse("of a type this cannot tell in another (a constant with no FROM, a join)");
         }
+        if let Some(other) =
+            types.iter().flatten().find(|t| ***t != DbType::DECIMAL && ***t != DbType::NULL && !integer_type(t))
+        {
+            return refuse(&format!("{other} in another"));
+        }
+        if *types[0].expect("known") != DbType::DECIMAL {
+            return refuse("an integer in the first, which this would describe as the integer");
+        }
+        // The scale each branch's cells are at: a column's declared one, an
+        // expression's display scale or the engine's (`query_output_scales`).
         let at_scale: Option<Vec<u32>> = types
             .iter()
             .zip(scales)
-            .map(|(t, s)| if **t == DbType::DECIMAL { s.as_ref().and_then(|s| s.get(at).copied()) } else { Some(0) })
+            .map(|(t, s)| {
+                // A NULL branch's cells are NULL, left as they are.
+                if *t == Some(&DbType::DECIMAL) { s.as_ref().and_then(|s| s.get(at).copied()) } else { Some(0) }
+            })
             .collect();
-        let Some(at_scale) = at_scale else { continue };
-        let mixed = types.iter().any(|t| **t != DbType::DECIMAL) || at_scale.windows(2).any(|w| w[0] != w[1]);
-        if !mixed {
-            continue;
-        }
+        let Some(at_scale) = at_scale else {
+            return refuse("at a scale this cannot tell in another");
+        };
         any = true;
         for (branch, scale) in at_scale.into_iter().enumerate() {
             out[branch][at] = Some(scale);
         }
     }
     Ok(any.then_some(out))
+}
+
+/// A float cell's value as the decimal it was written as, through its
+/// shortest digits: a select list's numeric constant (`SELECT 1.25`) is
+/// carried as a float, and in a NUMERIC column of a `UNION` it is that
+/// number.
+fn float_decimal(v: &[u8]) -> Option<(i128, u32)> {
+    let f = f64::from_le_bytes(le::<8>(v)?);
+    if !f.is_finite() {
+        return None;
+    }
+    let text = format!("{f}");
+    let (whole, frac) = text.split_once('.').unwrap_or((&text, ""));
+    let scale = u32::try_from(frac.len()).ok().filter(|s| *s <= 38)?;
+    Some((format!("{whole}{frac}").parse().ok()?, scale))
 }
 
 /// A NUMERIC cell's value and scale: one carrying its own (seventeen
@@ -193,13 +222,14 @@ fn push_widened(
     for (position, cell) in serialized_cells(row)?.enumerate() {
         let cell = cell?;
         let scaled = rescale.and_then(|r| r.get(position).copied().flatten()).and_then(|scale| {
-            let m = match cell.column_type {
+            let (m, scale) = match cell.column_type {
                 DbType::DECIMAL => match decimal_at(cell.data, scale)? {
                     // Already carrying its own scale: kept.
                     (_, own) if cell.data.len() == 17 => return Some((DbType::DECIMAL, cell.data.to_vec())).filter(|_| own <= 38),
-                    (m, _) => m,
+                    (m, _) => (m, scale),
                 },
-                ref t => integer(t, cell.data)?,
+                DbType::F64 => float_decimal(cell.data)?,
+                ref t => (integer(t, cell.data)?, scale),
             };
             Some((DbType::DECIMAL, crate::core::value_codec::decimal_cell_with_scale(m, scale)))
         });
@@ -610,6 +640,7 @@ fn duplicate_key(
         if let Some(scale) = rescale.and_then(|r| r.get(position).copied().flatten()) {
             let value = match ty {
                 DbType::DECIMAL => decimal_at(data, scale),
+                DbType::F64 => float_decimal(data),
                 t => integer(t, data).map(|m| (m, 0)),
             };
             if let Some((mut m, mut scale)) = value {

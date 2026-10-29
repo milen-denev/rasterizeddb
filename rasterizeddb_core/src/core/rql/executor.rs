@@ -555,6 +555,53 @@ pub(crate) fn query_output_scales(
     }
 }
 
+/// The type of each output column of a single-table `SELECT`, slot for slot,
+/// as its select list says — an expression's, an aggregate's or a constant's
+/// as well as a column's. `None` where the statement is not one this reads
+/// (a join, a `SELECT` with no `FROM`). [`query_output_scales`]'s companion:
+/// a `UNION` resolves each column's type from both (`set_ops::
+/// union_decimal_scales`).
+pub(crate) fn query_output_types(
+    purpose: &QueryPurpose,
+    database: &Database,
+    constants_as_numeric: bool,
+) -> Option<Vec<crate::core::db_type::DbType>> {
+    let QueryPurpose::QueryRows(qr) = purpose else { return None };
+    if crate::core::rql::join::statement_has_join(&qr.query) {
+        return None;
+    }
+    let view = database.schema_view(&qr.table_name)?;
+    let parsed = crate::core::rql::lexer_query::row_fetch_from_select_query(purpose, &view.schema().fields).ok()?;
+    if let Some(plan) = &parsed.aggregate {
+        return Some(plan.items.iter().map(|i| i.result_type()).collect());
+    }
+    if !parsed.select_items.is_empty() {
+        // A `NULL` constant is reported as NULL, not as the text it is
+        // described as: it fits a column of any type.
+        return Some(
+            parsed
+                .select_items
+                .iter()
+                .map(|i| match i {
+                    crate::core::rql::aggregate::SelectItem::Literal {
+                        db_type: crate::core::db_type::DbType::NULL,
+                        ..
+                    } => crate::core::db_type::DbType::NULL,
+                    // A written numeric constant (`SELECT 1.25`) is carried
+                    // as a float but is PostgreSQL's `numeric`: a UNION
+                    // column takes it as one (`set_ops::float_decimal`).
+                    crate::core::rql::aggregate::SelectItem::Literal {
+                        db_type: crate::core::db_type::DbType::F64,
+                        ..
+                    } if constants_as_numeric => crate::core::db_type::DbType::DECIMAL,
+                    other => other.result_type(),
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
 /// Brings every `DECIMAL` cell of a subquery's rows to the engine scale, from
 /// the scale [`query_output_scales`] says it is stored at.
 ///
@@ -4165,12 +4212,32 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     // A NUMERIC column whose branches keep different scales: each cell at
     // its own (`set_ops::union_decimal_scales`).
     {
+        // Each item's type: a column's as declared, and where that says
+        // nothing (an expression, an aggregate, a constant) the select
+        // list's own. A branch typed by neither is unknown, which a NUMERIC
+        // column cannot be resolved with (refused below, never mixed).
         let declared: Vec<Vec<Option<crate::core::db_type::DbType>>> = parts
             .branches
             .iter()
-            .map(|b| crate::core::rql::cte::declared_item_types_among(b, database, &[]))
+            .enumerate()
+            .map(|(at, b)| {
+                let mut types = crate::core::rql::cte::declared_item_types_among(b, database, &[]);
+                // Not in the first branch, which describes the column: a
+                // constant there is described as the float it is carried as.
+                if let Some(own) = recognize_query_purpose(b).and_then(|p| query_output_types(&p, database, at > 0)) {
+                    types.resize(types.len().max(own.len()), None);
+                    for (at, t) in own.into_iter().enumerate() {
+                        if types[at].is_none() {
+                            types[at] = Some(t);
+                        }
+                    }
+                }
+                types
+            })
             .collect();
-        if declared.iter().any(|d| d.iter().any(|t| *t == Some(crate::core::db_type::DbType::DECIMAL))) {
+        if declared.iter().any(|d| d.iter().any(|t| *t == Some(crate::core::db_type::DbType::DECIMAL)))
+            || parts.branches.len() > declared.iter().filter(|d| !d.is_empty()).count()
+        {
             let scales: Vec<Option<Vec<u32>>> = parts
                 .branches
                 .iter()
