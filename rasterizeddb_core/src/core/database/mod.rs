@@ -19,6 +19,7 @@ mod drop_recreate_replay_tests;
 mod cross_dir_commit_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
+mod create_intent;
 mod foreign_keys;
 mod partitioned;
 mod partitioned_ddl;
@@ -1483,6 +1484,14 @@ impl Database {
                 let _ = crate::core::wal::remove_for(location);
             }
             return Err(format!("refusing to open the database at {location}: {e}"));
+        }
+
+        // A plain CREATE TABLE a cut interrupted before its catalogue row:
+        // its files discarded by the intent naming them (`create_intent`),
+        // before any table opens and before a CREATE of the name could find
+        // them in its way.
+        if !in_memory {
+            create_intent::recover(&io_pointers, &storage, &kv_stores, &seeds, &tables_names, &held).await;
         }
 
         // After WAL recovery and the catalogue read, before any table opens
@@ -3670,12 +3679,18 @@ impl Database {
         // reported done and gone at the next start.
         refuse_unopenable_store(&self.storage, &self.kv, table_name).await?;
 
-        self.write_catalogue_row(table_name, 0).await?;
+        // All or nothing across a power cut (`create_intent`): the intent,
+        // then every file, durable, then the catalogue row, the commit point.
+        // Only for a table a crash can leave files of.
+        let durable = self.creates_durably(table_name);
+        let intent = match (durable, self.location.as_deref()) {
+            (true, Some(root)) => Some(create_intent::record(root, table_name)?),
+            _ => None,
+        };
 
         // The directory is decided and recorded before a single file is
-        // created there. A crash between the two leaves a placement pointing at
-        // a half-written table, which the next `CREATE TABLE` of that name
-        // reuses; the other order leaves the files somewhere nothing looks.
+        // created there, so the files are where the intent's discard (or the
+        // next `CREATE TABLE` of the name) looks for them.
         pool_place(&self.storage, table_name);
         let seed = seed_in(
             &self.db_io_pointers,
@@ -3689,6 +3704,7 @@ impl Database {
         // The store failing between that check and here falls back the same
         // way; refused all the same.
         if seed_fell_back(&self.storage, &seed, table_name) {
+            self.abandon_create(table_name, None, intent).await;
             return Err(io::Error::other(format!(
                 "table {table_name}: its key/value store could not be opened; not created"
             )));
@@ -3701,7 +3717,30 @@ impl Database {
         // Through `register_unique_key`, which also arms the table's unique
         // checks; the sidecars only record them.
         let keys_before = table.schema.unique_keys.len();
-        write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await?;
+        if let Err(e) = write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await {
+            self.abandon_create(table_name, Some(table), intent).await;
+            return Err(e);
+        }
+        // Every file durable before the catalogue names the table: an image
+        // holding any byte of the row then holds them all.
+        if durable && let Err(e) = self.sync_durable() {
+            self.abandon_create(table_name, Some(table), intent).await;
+            return Err(e);
+        }
+        if let Err(e) = self.write_catalogue_row(table_name, 0).await {
+            self.abandon_create(table_name, Some(table), intent).await;
+            return Err(e);
+        }
+        // Past the commit point, whatever the sync says: the table goes in,
+        // and an error from here is reported after it. The intent goes only
+        // once the row is durable, so a cut can never leave the files with
+        // neither a row nor an intent naming them.
+        let synced = if durable { self.sync_durable() } else { Ok(()) };
+        if let Some(path) = &intent
+            && synced.is_ok()
+        {
+            create_intent::clear(path);
+        }
         let keys: Vec<_> = table.schema.unique_keys.drain(keys_before..).collect();
         for key in keys {
             table.register_unique_key(key);
@@ -3727,7 +3766,48 @@ impl Database {
             self.reload_table(&name).await?;
         }
 
-        Ok(())
+        synced
+    }
+
+    /// Whether a `CREATE TABLE` of `table_name` must be all or nothing across
+    /// a power cut (`create_intent`): its files survive one (the database
+    /// has a directory and the table is not on `memory:`), and it is neither
+    /// a statement-scoped relation (in memory, created by every CTE, and kept
+    /// off the sync path) nor in a directory being bulk-loaded (an import that
+    /// dies is discarded whole).
+    fn creates_durably(&self, table_name: &str) -> bool {
+        temp_seed(table_name).is_none()
+            && self.survives_a_crash(table_name)
+            && !self.location.as_deref().is_some_and(crate::core::bulk_load::is_active)
+    }
+
+    /// A `CREATE TABLE` that failed before its catalogue row: the instance it
+    /// opened retired, its files discarded and its placement forgotten, then
+    /// its intent removed. A discard that fails keeps the intent, so the next
+    /// open finishes it; nothing names the files meanwhile.
+    async fn abandon_create(
+        &self,
+        table_name: &str,
+        table: Option<Table<DbStorageProvider>>,
+        intent: Option<std::path::PathBuf>,
+    ) {
+        if let Some(table) = table {
+            table.retire().await;
+            drop(table);
+        }
+        let Some(root) = self.location.as_deref() else {
+            return;
+        };
+        if intent.is_none() && !self.creates_durably(table_name) {
+            return;
+        }
+        if !create_intent::discard(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, root, table_name).await {
+            error!("CREATE TABLE {table_name} failed and its files could not be discarded yet; the next open does");
+            return;
+        }
+        if let Some(path) = &intent {
+            create_intent::clear(path);
+        }
     }
 
     /// Reclaims dead space across every open table, now rather than at the

@@ -220,7 +220,7 @@ impl Database {
 
     /// Whether `table` lives somewhere a crash leaves: the database has a
     /// directory, and the table is not on `memory:`.
-    fn survives_a_crash(&self, table: &str) -> bool {
+    pub(super) fn survives_a_crash(&self, table: &str) -> bool {
         if self.location.is_none() {
             return false;
         }
