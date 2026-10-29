@@ -6229,9 +6229,14 @@ where
                 // A subquery that ran and failed reports its own failure's code,
                 // as it would have alone: a refusal inside `IN (…)` is still
                 // 0A000. Only a subquery that could not be read is 42601.
+                // A rewrite's own refusal ("a correlated EXISTS … is not
+                // supported") is what its words say, 0A000; it was 42601.
                 let code = match e.strip_prefix("subquery failed: ") {
                     Some(inner) => sqlstate_in(inner, stmt),
-                    None => "42601",
+                    None => match sqlstate_in(&e, stmt) {
+                        "XX000" => "42601",
+                        code => code,
+                    },
                 };
                 fail_statement(state, stream, code, &e).await?;
                 return Ok(());

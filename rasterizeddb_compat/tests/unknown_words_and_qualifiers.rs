@@ -293,14 +293,21 @@ async fn joins_join_writes_returning_and_upserts_check_their_qualifiers() {
     assert_eq!(name, "was b excluded.name EXCLUDED.name");
 }
 
-/// A correlated EXISTS in an UPDATE or a DELETE, as Django writes it: the
-/// statement's relation (`UPDATE "t" … WHERE EXISTS (… = ("t"."id") …)`),
-/// a parenthesised predicate, `LIMIT 1`, and one inside an `IN` subquery
-/// correlating with that subquery's own alias. The UPDATE ran the EXISTS
-/// with no outer row and was refused 42P01, "missing FROM-clause entry", as
-/// was every parenthesised correlation; each now runs as in PostgreSQL 17.
+/// A correlated EXISTS in an UPDATE or a DELETE runs only under a pinned
+/// snapshot (REPEATABLE READ, SERIALIZABLE), and is refused (0A000) under
+/// READ COMMITTED, autocommit or an explicit block.
+///
+/// Its subquery is read once, under a snapshot taken before the scan of the
+/// rows it then writes: with a writer between the two it touched rows
+/// PostgreSQL's does not (27 of 300 statements; PostgreSQL 0 of 2000). Under
+/// a pinned snapshot the two are one, and Django's forms run as in
+/// PostgreSQL 17: the statement's relation (`UPDATE "t" … WHERE EXISTS (… =
+/// ("t"."id") …)`), a parenthesised predicate, `LIMIT 1`, a schema-qualified
+/// target, and an EXISTS inside an `IN` subquery correlating with that
+/// subquery's own alias. One inside an `IN` that reads the target itself is
+/// refused, as is a correlation the rewrite cannot place, both as 0A000.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_correlated_exists_in_an_update_or_delete_runs() {
+async fn a_correlated_exists_in_an_update_or_delete_needs_a_pinned_snapshot() {
     let server = TestServer::start().await.expect("server");
     let pool = server.connect_sqlx().await.expect("connect");
     pool.execute(
@@ -309,20 +316,53 @@ async fn a_correlated_exists_in_an_update_or_delete_runs() {
     )
     .await
     .expect("setup");
-    for sql in [
+    let statements = [
         r#"UPDATE "t" SET "v" = 2 WHERE EXISTS(SELECT 1 AS "a" FROM "u" U0 WHERE (U0."tid" = ("t"."id") AND U0."w" < 150) LIMIT 1)"#,
-        "UPDATE t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+        "UPDATE public.t SET v = v + 1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
         r#"DELETE FROM "t" WHERE EXISTS(SELECT 1 AS "a" FROM "u" U0 WHERE (U0."tid" = ("t"."id") AND U0."w" > 150) LIMIT 1)"#,
         r#"DELETE FROM "t" WHERE "t"."id" IN (SELECT "t0"."id" FROM "t" AS "t0" WHERE EXISTS (SELECT 1 FROM "u" WHERE "u"."tid" = "t0"."id" AND "u"."w" < 60))"#,
-    ] {
-        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    ];
+    let before = rows(&pool).await;
+    // READ COMMITTED: autocommit, and an explicit block.
+    for begin in [None, Some("BEGIN"), Some("BEGIN ISOLATION LEVEL READ COMMITTED")] {
+        for sql in statements {
+            let mut conn = pool.acquire().await.expect("conn");
+            if let Some(begin) = begin {
+                conn.execute(begin).await.expect("begin");
+            }
+            let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
+            assert_eq!(code(&e), "0A000", "{begin:?} {sql}: {e}");
+            if begin.is_some() {
+                conn.execute("ROLLBACK").await.expect("rollback");
+            }
+        }
     }
-    // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
-    assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)]);
-    // An outer column the rewrite cannot place is refused as such, not 42P01.
-    let e = pool
-        .execute("UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)")
-        .await
-        .expect_err("inequality correlation");
-    assert_eq!(code(&e), "0A000", "{e}");
+    assert_eq!(rows(&pool).await, before, "a refused statement changed a row");
+    // A pinned snapshot: each runs, as in PostgreSQL 17.
+    for begin in ["BEGIN ISOLATION LEVEL REPEATABLE READ", "BEGIN ISOLATION LEVEL SERIALIZABLE"] {
+        pool.execute("DELETE FROM t; INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)").await.expect("reset");
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.execute(begin).await.expect("begin");
+        for sql in statements {
+            conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{begin}: {sql}: {e}"));
+        }
+        conn.execute("COMMIT").await.expect("commit");
+        drop(conn);
+        // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
+        assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)], "{begin}");
+    }
+    // Refused under any snapshot: an IN subquery reading the target, and an
+    // inequality the rewrite cannot place.
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    for sql in [
+        "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))",
+        "UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)",
+    ] {
+        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
+        assert_eq!(code(&e), "0A000", "{sql}: {e}");
+        conn.execute("ROLLBACK").await.expect("rollback");
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    }
+    conn.execute("ROLLBACK").await.expect("rollback");
 }

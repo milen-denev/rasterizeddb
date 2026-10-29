@@ -823,6 +823,25 @@ pub(crate) async fn run_statement(
 /// The relation names and aliases the outer `FROM` clause introduces, used to
 /// tell an outer column reference from an inner one inside an `EXISTS`.
 fn outer_relation_names(sql: &str) -> Vec<String> {
+    // A schema-qualified relation (`public.t`, `"public"."t"`) is named by
+    // its last part too, which is how its columns are qualified (`t.id`).
+    let mut names = outer_relation_names_as_written(sql);
+    let mut parts: Vec<String> = Vec::new();
+    for name in &names {
+        if name.contains('.') {
+            if let Some(last) = name.rsplit('.').next() {
+                parts.push(last.trim_matches('"').to_string());
+            }
+        }
+    }
+    for n in names.iter_mut() {
+        *n = n.split('.').map(|p| p.trim_matches('"')).collect::<Vec<_>>().join(".");
+    }
+    names.extend(parts);
+    names
+}
+
+fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
     use crate::core::rql::join::find_keyword;
 
     // `UPDATE t [AS] x SET …` names its relation before SET and has no FROM:
@@ -874,6 +893,13 @@ fn outer_relation_names(sql: &str) -> Vec<String> {
     }
     names
 }
+
+/// The refusal for a correlated `[NOT] EXISTS` in an UPDATE or a DELETE
+/// outside a pinned snapshot (`substitute_in_subqueries`).
+pub(crate) const CORRELATED_EXISTS_WRITE: &str = "a correlated EXISTS in UPDATE or DELETE is not supported under \
+     READ COMMITTED: its subquery is read under an earlier snapshot than the rows the statement writes, so a \
+     concurrent writer between them makes it touch the wrong rows; run it in a REPEATABLE READ or SERIALIZABLE \
+     transaction, or write it as UPDATE … FROM / DELETE … USING";
 
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
 /// parenthesised `SELECT`.
@@ -932,6 +958,30 @@ pub async fn substitute_in_subqueries(
     const MAX_SUBQUERIES: usize = 8;
 
     let mut current = sql.to_string();
+    // A correlated EXISTS of an UPDATE or a DELETE is read once, under the
+    // snapshot this takes now, while the rows it then writes are scanned
+    // under a later one: with a writer between them it touched rows
+    // PostgreSQL's does not (27 of 300 statements under a concurrent
+    // writer, PostgreSQL 0 of 2000). Only a pinned snapshot (REPEATABLE
+    // READ, SERIALIZABLE) makes the two one.
+    let write_statement = {
+        let head = sql.trim_start();
+        let word = head.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
+        word == "UPDATE" || word == "DELETE"
+    };
+    let pinned = write_statement && database.transactions.has_pinned_snapshot(database.row_locks.txn_of(tx));
+    // One nested in another subquery (`id IN (SELECT … WHERE EXISTS (…
+    // t0.id))`, Django's DELETE) is read under that subquery's earlier
+    // snapshot too.
+    if write_statement && !pinned {
+        let mut at = 0;
+        while let Some(clause) = subquery::find_exists(&current[at..]) {
+            if inside_a_subquery(&current, at + clause.start) && subquery::is_correlated(&clause.inner_sql) {
+                return Err(CORRELATED_EXISTS_WRITE.to_string());
+            }
+            at += clause.end.max(1);
+        }
+    }
 
     // `EXISTS` is rewritten into the equivalent `IN` first, so the loop below
     // resolves both forms with one mechanism.
@@ -990,6 +1040,9 @@ pub async fn substitute_in_subqueries(
             continue;
         }
 
+        if write_statement && !pinned {
+            return Err(CORRELATED_EXISTS_WRITE.to_string());
+        }
         if bounds.offset > 0 {
             // "More than k matching rows per outer row" has no `IN` form.
             return Err(
@@ -1050,8 +1103,25 @@ pub async fn substitute_in_subqueries(
         // inner table's schema does not have, so it fails here by name rather
         // than being silently evaluated against the wrong relation.
         // Membership ignores order, so an unbounded ORDER BY is not run.
-        let rows =
-            run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Membership).await?;
+        let rows = match run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Membership).await {
+            Ok(rows) => rows,
+            // One that reads the UPDATE's or DELETE's own row, from inside
+            // (`id IN (SELECT … WHERE EXISTS (… t.id))`): run with no outer
+            // row it named a "missing FROM-clause entry", a fault the
+            // statement does not have.
+            Err(e) if write_statement
+                && outer_relation_names(sql)
+                    .iter()
+                    .any(|n| e.contains(&crate::core::sql_scan::missing_from_entry(n))) =>
+            {
+                return Err(
+                    "a subquery inside IN that reads the row the UPDATE or DELETE writes (a correlated \
+                     subquery) is not supported; write it as UPDATE … FROM / DELETE … USING"
+                        .to_string(),
+                );
+            }
+            Err(e) => return Err(e),
+        };
         let document = crate::core::rql::cte::document_columns(&found.inner_sql, database)
             .first()
             .copied()
