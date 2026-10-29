@@ -1771,29 +1771,21 @@ impl<S: StorageIO> Table<S> {
     /// reaches a client.
     pub(crate) const CONFLICT_RETRYABLE: &'static str = " [retryable]";
 
-    /// Refuses a write to a version another transaction has already retired.
-    ///
-    /// Without this, two transactions can update the same row and both succeed:
-    /// the second one's snapshot still shows the *old* version, so it relocates
-    /// from the same base and appends a second replacement. Once both commit,
-    /// two versions of one row are visible and the row is duplicated — and the
-    /// update that was overwritten is silently lost.
-    ///
-    /// First updater wins. The second is told to retry, naming the transaction
-    /// it met (`conflict_wait::note_blocker`); the executor's retry waits for
-    /// that transaction to end, with a wait-for edge (slice B6, finding L1),
-    /// and replays, which under `READ COMMITTED` is PostgreSQL's block and
-    /// re-evaluate, and under `REPEATABLE READ` conflicts again and reports.
     /// How a version stands for a uniqueness check by `writer`, judged by
     /// outcome rather than by a snapshot (see `find_row_with_value`), or
-    /// `None` when it holds no key: the decision that is cheap. What needs
-    /// the running set waits for [`Self::settle_occupancy`], once the
-    /// version's value has matched.
+    /// `None` when it holds no key: decided before the version's row is
+    /// fetched. Only a creator or deleter at or above `floor` (the running
+    /// set's minimum, [`RunningFloor`]) can be a commit not yet retired;
+    /// that question waits for [`Self::settle_occupancy`], once the
+    /// version's value has matched. Below the floor a recorded commit is
+    /// retired for good, so a version deleted that long ago is skipped here,
+    /// unfetched, as it was before the running set was asked at all.
     fn occupancy(
         manager: &crate::core::mvcc::transaction::TransactionManager,
         pointer: &RowPointer,
         writer: TxId,
         visibility: &crate::core::mvcc::Visibility,
+        floor: &mut RunningFloor,
     ) -> Option<Occupancy> {
         use crate::core::mvcc::transaction::TxOutcome;
         let creator = manager.outcome(pointer.xmin);
@@ -1804,6 +1796,9 @@ impl<S: StorageIO> Table<S> {
             if manager.outcome(pointer.xmax) == TxOutcome::Committed {
                 // Deleted, unless the delete's commit is recorded and not yet
                 // retired: until then a snapshot still shows the version.
+                if floor.retired(manager, pointer.xmax) {
+                    return None;
+                }
                 return Some(Occupancy::DeletedBy(pointer.xmax));
             }
         } else if pointer.xmax != NO_TX {
@@ -1814,7 +1809,9 @@ impl<S: StorageIO> Table<S> {
         // worth waiting out.
         Some(match creator {
             TxOutcome::InProgress if pointer.xmin != writer => Occupancy::InFlight(pointer.xmin),
-            TxOutcome::Committed if pointer.xmin != writer => Occupancy::Committed(pointer.xmin),
+            TxOutcome::Committed if pointer.xmin != writer && !floor.retired(manager, pointer.xmin) => {
+                Occupancy::Committed(pointer.xmin)
+            }
             _ => Occupancy::Held,
         })
     }
@@ -1831,6 +1828,11 @@ impl<S: StorageIO> Table<S> {
     /// whose delete was in that window wrote it and committed while a
     /// snapshot still showed the deleted row: the key twice
     /// (`rql::row_lock_handover_tests`).
+    ///
+    /// An insert of a key whose DELETE is still in progress is refused with
+    /// 23505 at once, as before (`occupancy` counts the version as held):
+    /// PostgreSQL waits for that DELETE instead. Only a delete whose commit
+    /// is recorded waits here.
     fn settle_occupancy(
         manager: Option<&crate::core::mvcc::transaction::TransactionManager>,
         occupancy: Option<Occupancy>,
@@ -1853,6 +1855,19 @@ impl<S: StorageIO> Table<S> {
         Some(true)
     }
 
+    /// Refuses a write to a version another transaction has already retired.
+    ///
+    /// Without this, two transactions can update the same row and both succeed:
+    /// the second one's snapshot still shows the *old* version, so it relocates
+    /// from the same base and appends a second replacement. Once both commit,
+    /// two versions of one row are visible and the row is duplicated — and the
+    /// update that was overwritten is silently lost.
+    ///
+    /// First updater wins. The second is told to retry, naming the transaction
+    /// it met (`conflict_wait::note_blocker`); the executor's retry waits for
+    /// that transaction to end, with a wait-for edge (slice B6, finding L1),
+    /// and replays, which under `READ COMMITTED` is PostgreSQL's block and
+    /// re-evaluate, and under `REPEATABLE READ` conflicts again and reports.
     fn check_write_conflict(&self, pointer: &RowPointer, writer: TxId) -> Result<()> {
         if pointer.xmax == NO_TX || pointer.xmax == writer {
             return Ok(());
@@ -3070,6 +3085,7 @@ impl<S: StorageIO> Table<S> {
         };
 
         let mut row = Row::default();
+        let mut floor = RunningFloor::default();
         while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
             if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
@@ -3084,7 +3100,7 @@ impl<S: StorageIO> Table<S> {
             let occupancy = match (&manager, written_by) {
                 (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
                     // A delete this transaction made has happened, for it.
-                    match Self::occupancy(manager, &pointer, writer, &visibility) {
+                    match Self::occupancy(manager, &pointer, writer, &visibility, &mut floor) {
                         Some(occupancy) => Some(occupancy),
                         None => continue,
                     }
@@ -3479,6 +3495,7 @@ impl<S: StorageIO> Table<S> {
 
         let mut row = Row::default();
         let mut record = [0u8; ROW_POINTER_RECORD_LEN];
+        let mut floor = RunningFloor::default();
         loop {
             // A read that fails is an error, never the end of the table: ending
             // early answers "no duplicate" for a value that may be there.
@@ -3528,7 +3545,7 @@ impl<S: StorageIO> Table<S> {
                     // A delete this transaction made has happened, for it:
                     // deleting a row and writing its key again in one
                     // transaction was refused, where PostgreSQL allows it.
-                    match Self::occupancy(manager, &pointer, writer, &visibility) {
+                    match Self::occupancy(manager, &pointer, writer, &visibility, &mut floor) {
                         Some(occupancy) => Some(occupancy),
                         None => continue,
                     }
@@ -6102,7 +6119,7 @@ pub(crate) mod table_audit;
 
 /// A version's standing in a uniqueness check, before the running set is
 /// asked about it ([`Table::occupancy`], [`Table::settle_occupancy`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Occupancy {
     /// Holds the key, written by the checking transaction itself.
     Held,
@@ -6112,4 +6129,85 @@ enum Occupancy {
     Committed(TxId),
     /// Its deleter's commit is recorded: free, once that is retired.
     DeletedBy(TxId),
+}
+
+/// The running set's minimum, read once per uniqueness check, the first time
+/// a version needs it ([`Table::occupancy`]): every id below it has left the
+/// running set for good. `TransactionManager::oldest_active` is that minimum
+/// (or the next id when nothing runs), never an oldest snapshot or any other
+/// horizon; ids enter the running set only as they are handed out, at the
+/// next id, so the minimum never falls below a value once read.
+#[derive(Default)]
+struct RunningFloor(Option<TxId>);
+
+impl RunningFloor {
+    /// Whether `id`'s recorded commit is retired for good: below the floor.
+    /// At or above it the running set itself must be asked.
+    fn retired(&mut self, manager: &crate::core::mvcc::transaction::TransactionManager, id: TxId) -> bool {
+        id < *self.0.get_or_insert_with(|| manager.oldest_active())
+    }
+}
+
+#[cfg(test)]
+mod occupancy_floor_tests {
+    use super::*;
+    use crate::core::mvcc::transaction::TransactionManager;
+
+    type T = Table<crate::core::storage_providers::file_sync::LocalStorageProvider>;
+
+    fn version(xmin: TxId, xmax: TxId) -> RowPointer {
+        let mut pointer = RowPointer::from_slice(&[0u8; ROW_POINTER_RECORD_LEN]);
+        pointer.deleted = false;
+        pointer.xmin = xmin;
+        pointer.xmax = xmax;
+        pointer
+    }
+
+    /// A version whose creator or deleter is below the running set's minimum
+    /// is decided before its row is fetched: a delete retired long ago frees
+    /// the key at once, and an old committed insert holds it, with no
+    /// question to the running set left for after the fetch. A deleter at or
+    /// above the minimum is left to `settle_occupancy`, even one already
+    /// retired: the floor is the running set's minimum, not the next id or
+    /// any later horizon, which would wave a committing delete through.
+    ///
+    /// Mutations: `RunningFloor::retired` answers false (the old delete comes
+    /// back as `DeletedBy`, to be fetched and asked about, and the old insert
+    /// as `Committed`); the floor read is `next_id` (the delete above the
+    /// running minimum comes back free, unasked).
+    #[test]
+    fn versions_below_the_running_floor_are_decided_before_the_fetch() {
+        let m = std::sync::Arc::new(TransactionManager::in_memory());
+        let inserted = m.begin();
+        m.commit(inserted);
+        let deleted = m.begin();
+        m.commit(deleted);
+        // Holds the running set's minimum here, above both.
+        let running = m.begin();
+        let later = m.begin();
+        m.commit(later);
+        let writer = m.begin();
+        let visibility = crate::core::mvcc::Visibility::for_snapshot(m.snapshot(writer), m.clone());
+        assert_eq!(m.oldest_active(), running);
+
+        let mut floor = RunningFloor::default();
+        assert_eq!(T::occupancy(&m, &version(inserted, deleted), writer, &visibility, &mut floor), None);
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, NO_TX), writer, &visibility, &mut floor),
+            Some(Occupancy::Held)
+        );
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, later), writer, &visibility, &mut floor),
+            Some(Occupancy::DeletedBy(later)),
+            "a delete above the running minimum was decided without asking the running set"
+        );
+        assert_eq!(
+            T::occupancy(&m, &version(later, NO_TX), writer, &visibility, &mut floor),
+            Some(Occupancy::Committed(later))
+        );
+        // And settled: both retired, so free and held.
+        assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::DeletedBy(later))), None);
+        assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::Committed(later))), Some(false));
+        let _ = running;
+    }
 }

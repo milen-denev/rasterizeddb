@@ -1731,6 +1731,7 @@ impl TransactionManager {
 #[cfg(test)]
 pub(crate) mod commit_test_hooks {
     use super::{TransactionManager, TxId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -1738,22 +1739,34 @@ pub(crate) mod commit_test_hooks {
     /// Keyed by the manager's address as well as the id: tests run in
     /// parallel, each database counting its ids from the same start.
     static HOOKS: Mutex<Vec<(usize, TxId, Hook)>> = Mutex::new(Vec::new());
+    /// `HOOKS.len()`, so a commit with no hook armed anywhere (every commit
+    /// of every other test) skips the process-wide mutex.
+    static ARMED: AtomicUsize = AtomicUsize::new(0);
 
     /// Runs `hook` once, on the thread committing `tx` under `manager`, after
     /// its outcome is recorded and before it is retired.
     pub(crate) fn after_record(manager: &TransactionManager, tx: TxId, hook: impl Fn() + Send + Sync + 'static) {
         let key = manager as *const TransactionManager as usize;
-        HOOKS.lock().unwrap().push((key, tx, Arc::new(hook)));
+        let mut hooks = HOOKS.lock().unwrap();
+        hooks.push((key, tx, Arc::new(hook)));
+        ARMED.store(hooks.len(), Ordering::Release);
     }
 
     pub(super) fn recorded(manager: &TransactionManager, tx: TxId) {
+        // Armed before the commit it is for begins, by the thread that then
+        // starts that commit, so this load sees it.
+        if ARMED.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let key = manager as *const TransactionManager as usize;
         let hook = {
             let mut hooks = HOOKS.lock().unwrap();
-            hooks
+            let hook = hooks
                 .iter()
                 .position(|(m, t, _)| *m == key && *t == tx)
-                .map(|at| hooks.swap_remove(at).2)
+                .map(|at| hooks.swap_remove(at).2);
+            ARMED.store(hooks.len(), Ordering::Release);
+            hook
         };
         if let Some(hook) = hook {
             hook();

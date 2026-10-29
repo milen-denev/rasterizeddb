@@ -784,7 +784,9 @@ impl RowLocks {
         inner
             .table_marks
             .iter()
-            .filter(|(o, tables)| other(o) && tables.iter().any(|t| &**t == table))
+            // The name first: `other` asks the transaction manager, under
+            // this mutex every lock operation takes.
+            .filter(|(o, tables)| tables.iter().any(|t| &**t == table) && other(o))
             .map(|(o, _)| *o)
             .next()
     }
