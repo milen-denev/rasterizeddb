@@ -882,6 +882,11 @@ fn tokenize_inner<'a>(
 /// (`predicate_rewrite::lift_evaluated_operands`).
 fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
     use crate::core::rql::type_modifier::TextTypmod;
+    // Only a string literal is rewritten; most statements have none beside
+    // a column, and this runs on every one.
+    if !out.iter().any(|t| matches!(t, Token::StringLit(_))) {
+        return;
+    }
     // A cast to `character(n)` yields one too (`s::char(5) = 'ab '`), over
     // a table that has no such column.
     if !schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))))

@@ -2616,11 +2616,7 @@ pub fn lift_evaluated_operands(
     if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
-    if !needs_evaluator(clause)
-        && !pattern_may_read_bpchar(clause, schema)
-        && !contains_spaced_text_literal(clause)
-        && !padded_beside_varying(clause, schema)
-    {
+    if !needs_evaluator(clause) && !char_lift_needed(clause, schema) {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
@@ -2644,6 +2640,36 @@ fn spaced_text_literal(side: &str) -> bool {
         && literal.starts_with('\'')
         && crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') == literal.len()
         && literal[..literal.len() - 1].ends_with(' ')
+}
+
+/// Whether `text` needs lifting for what `character(n)` and `character
+/// varying` read differently from text: a pattern over a `character(n)`
+/// value ([`pattern_may_read_bpchar`]), a typed text literal compared with
+/// one ([`contains_spaced_text_literal`]), or the two column kinds compared
+/// ([`padded_beside_varying`]). Every one of them needs a `character(n)`
+/// column in `schema` or a cast (`::`) in `text`; one pass over the fields
+/// and one byte search answer most clauses, which have neither, before any
+/// of the scans. It runs on every term of every statement.
+fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let (mut padded, mut varying) = (false, false);
+    for f in schema.iter() {
+        if f.is_deleted || f.db_type != crate::core::db_type::DbType::STRING {
+            continue;
+        }
+        match f.text_typmod() {
+            Some(TextTypmod::Bpchar(_)) => padded = true,
+            Some(TextTypmod::Varchar(_)) => varying = true,
+            _ => {}
+        }
+    }
+    let cast = memchr::memchr(b':', text.as_bytes()).is_some();
+    if !padded && !cast {
+        return false;
+    }
+    pattern_may_read_bpchar(text, schema)
+        || (cast && contains_spaced_text_literal(text))
+        || (padded && varying && padded_beside_varying(text, schema))
 }
 
 /// Whether `text` may hold a [`spaced_text_literal`]. Cheap and generous.
@@ -2833,11 +2859,7 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !needs_evaluator(term)
-        && !pattern_may_read_bpchar(term, schema)
-        && !contains_spaced_text_literal(term)
-        && !padded_beside_varying(term, schema)
-    {
+    if !needs_evaluator(term) && !char_lift_needed(term, schema) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
