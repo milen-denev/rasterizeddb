@@ -273,24 +273,19 @@ fn evaluate_in(
     // Time of the insert, not of the declaration, which is why the expression
     // is stored as text and evaluated here.
     //
-    // `clock_timestamp()`, `statement_timestamp()` and `transaction_timestamp()`
-    // differ in PostgreSQL by *when in the transaction* they are taken.
-    // Evaluated here they are all the time of the insert, which is what
-    // `clock_timestamp()` means and is within a statement of the other two.
-    // They are accepted rather than refused because a schema that asks for a
-    // wall clock should not fail to create over the distinction.
-    if matches!(
-        upper.as_str(),
-        "CURRENT_TIMESTAMP"
-            | "NOW()"
-            | "CURRENT_TIMESTAMP()"
-            | "LOCALTIMESTAMP"
-            | "LOCALTIMESTAMP()"
-            | "CLOCK_TIMESTAMP()"
-            | "STATEMENT_TIMESTAMP()"
-            | "TRANSACTION_TIMESTAMP()"
-    ) {
-        let micros = now_micros();
+    // Each read as PostgreSQL reads it (`crate::core::statement_clock`): the
+    // transaction's start for `now()` and its spellings, so every row of a
+    // statement and every statement of a block take one value; the
+    // statement's start for `statement_timestamp()`; the wall clock, per row,
+    // for `clock_timestamp()`.
+    let clock = match upper.as_str() {
+        "CURRENT_TIMESTAMP" | "NOW()" | "CURRENT_TIMESTAMP()" | "LOCALTIMESTAMP" | "LOCALTIMESTAMP()"
+        | "TRANSACTION_TIMESTAMP()" => Some(crate::core::statement_clock::transaction_us()),
+        "STATEMENT_TIMESTAMP()" => Some(crate::core::statement_clock::statement_us()),
+        "CLOCK_TIMESTAMP()" => Some(crate::core::statement_clock::wall_us()),
+        _ => None,
+    };
+    if let Some(micros) = clock {
         // A wall clock defaulting a `DATE` or a `TIME` column is that instant's
         // date or time of day, not the whole timestamp: the column's encoder
         // would refuse the full text, and `DEFAULT now()` on a date column is
@@ -385,12 +380,10 @@ fn evaluate_in(
     ))
 }
 
-/// Microseconds since the Unix epoch, now.
+/// The transaction's start, in microseconds since the Unix epoch: what
+/// `CURRENT_DATE` and `CURRENT_TIME` are taken from, as `now()` is.
 fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+    crate::core::statement_clock::transaction_us()
 }
 
 /// The `YYYY-MM-DD` of an instant.

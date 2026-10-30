@@ -1508,10 +1508,8 @@ fn keyword_constant(text: &str) -> Option<Expr> {
     }
     let now = crate::core::rql::aggregate::ScalarFunc::Now;
     match trimmed.to_ascii_uppercase().as_str() {
-        // PostgreSQL separates these three by *when in the transaction* the
-        // clock is read, which this engine does not model yet; they are all the
-        // wall clock here, on the same terms `column_default` already accepts
-        // them for.
+        // The transaction's start (`crate::core::statement_clock`), as
+        // `now()` is.
         "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "TRANSACTION_TIMESTAMP" => Some(Expr::Scalar(now)),
         "CURRENT_DATE" => Some(Expr::Scalar(
             crate::core::rql::aggregate::ScalarFunc::CurrentDate,
@@ -2117,7 +2115,9 @@ pub fn static_type(expr: &Expr) -> DbType {
             }
         }
         Expr::Scalar(func) => match func {
-            crate::core::rql::aggregate::ScalarFunc::Now => DbType::DATETIME,
+            crate::core::rql::aggregate::ScalarFunc::Now
+            | crate::core::rql::aggregate::ScalarFunc::StatementTimestamp
+            | crate::core::rql::aggregate::ScalarFunc::ClockTimestamp => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::CurrentDate => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => DbType::STRING,
             crate::core::rql::aggregate::ScalarFunc::UuidV7 => DbType::UUID,
@@ -5095,6 +5095,8 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         Expr::Scalar(func) => {
             let (_, db_type) = crate::core::rql::aggregate::ScalarFunc::parse(match func {
                 crate::core::rql::aggregate::ScalarFunc::Now => "now",
+                crate::core::rql::aggregate::ScalarFunc::StatementTimestamp => "statement_timestamp",
+                crate::core::rql::aggregate::ScalarFunc::ClockTimestamp => "clock_timestamp",
                 crate::core::rql::aggregate::ScalarFunc::CurrentDate => "current_date",
                 crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => "gen_random_uuid",
                 crate::core::rql::aggregate::ScalarFunc::UuidV7 => "uuidv7",

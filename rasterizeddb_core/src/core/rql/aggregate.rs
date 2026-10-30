@@ -255,9 +255,14 @@ pub struct ComputedInput {
 /// error honest rather than returning a plausible wrong answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunc {
-    /// Current timestamp. Evaluated per row rather than per statement, so it
-    /// does not yet carry PostgreSQL's transaction-timestamp semantics.
+    /// `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()`: when the
+    /// transaction began, one value for all of it
+    /// ([`crate::core::statement_clock`]).
     Now,
+    /// `statement_timestamp()`: when the current statement began.
+    StatementTimestamp,
+    /// `clock_timestamp()`: the wall clock, read at each call.
+    ClockTimestamp,
     /// Today's date, as that day's midnight UTC.
     ///
     /// A `DATETIME` rather than a type of its own: a `DATE` column is stored as
@@ -355,7 +360,9 @@ pub fn uuid_extract_timestamp_us(u: &[u8; 16]) -> Option<i64> {
 impl ScalarFunc {
     pub fn parse(name: &str) -> Option<(ScalarFunc, DbType)> {
         match name.trim().to_ascii_uppercase().as_str() {
-            "NOW" | "CURRENT_TIMESTAMP" => Some((ScalarFunc::Now, DbType::DATETIME)),
+            "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => Some((ScalarFunc::Now, DbType::DATETIME)),
+            "STATEMENT_TIMESTAMP" => Some((ScalarFunc::StatementTimestamp, DbType::DATETIME)),
+            "CLOCK_TIMESTAMP" => Some((ScalarFunc::ClockTimestamp, DbType::DATETIME)),
             "CURRENT_DATE" => Some((ScalarFunc::CurrentDate, DbType::DATETIME)),
             "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUIDV4" => {
                 Some((ScalarFunc::GenRandomUuid, DbType::UUID))
@@ -368,18 +375,12 @@ impl ScalarFunc {
     /// The value for one row, encoded the way the column type stores it.
     pub fn evaluate(&self) -> Vec<u8> {
         match self {
-            ScalarFunc::Now => {
-                let micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
-                micros.to_le_bytes().to_vec()
-            }
+            ScalarFunc::Now => crate::core::statement_clock::transaction_us().to_le_bytes().to_vec(),
+            ScalarFunc::StatementTimestamp => crate::core::statement_clock::statement_us().to_le_bytes().to_vec(),
+            ScalarFunc::ClockTimestamp => crate::core::statement_clock::wall_us().to_le_bytes().to_vec(),
+            // The transaction's date, as `now()` is the transaction's instant.
             ScalarFunc::CurrentDate => {
-                let micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
+                let micros = crate::core::statement_clock::transaction_us();
                 const DAY: i64 = 86_400_000_000;
                 // `rem_euclid` rather than `%`: a pre-epoch instant has a
                 // negative remainder, which would round the day *up* and put

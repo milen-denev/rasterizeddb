@@ -970,7 +970,7 @@ impl ConcurrentProcessor {
             // scan stays consistent with itself either way.
             let horizon_ref = crate::core::vacuum::VersionHorizon::for_visibility(&visibility);
 
-            let h = task::spawn(async move {
+            let h = task::spawn(crate::core::statement_clock::inherit(async move {
                 let io_rows_ref: &S = &*io_rows_batch;
 
                 // Worker-local Buffer; allocated ONCE and reused across every
@@ -1462,7 +1462,7 @@ impl ConcurrentProcessor {
                         let _ = tx_rp.send(acc_ptrs).await;
                     }
                 }
-            });
+            }));
 
             worker_handles.push(h);
         }
@@ -2662,7 +2662,7 @@ impl ConcurrentProcessor {
             // batch needs its own so the task can own it.
             let visibility_ref = visibility.clone();
 
-            let batch_handle = task::spawn(async move {
+            let batch_handle = task::spawn(crate::core::statement_clock::inherit(async move {
                 // Owned permit acquired in the outer loop; held until task completion.
                 let _batch_permit = batch_permit;
 
@@ -2909,7 +2909,7 @@ impl ConcurrentProcessor {
                 let elapsed_ns = batch_read_start.elapsed().as_nanos() as u64;
                 reading_time_total_clone
                     .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
-            });
+            }));
 
             batch_handles.push(batch_handle);
         }

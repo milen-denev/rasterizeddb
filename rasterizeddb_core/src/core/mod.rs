@@ -41,6 +41,9 @@ pub mod redact;
 pub mod row;
 pub mod rql;
 pub mod similar_to;
+/// The transaction's and the statement's start, which `now()` and
+/// `statement_timestamp()` read.
+pub mod statement_clock;
 /// The shared quote-aware scanner, and escape/dollar-string normalisation.
 pub mod sql_scan;
 pub mod index;

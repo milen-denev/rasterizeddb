@@ -2449,6 +2449,9 @@ struct SessionTransaction {
     /// first two, where PostgreSQL keeps neither. A `BEGIN` inside one makes
     /// it explicit (`implicit` false), as PostgreSQL does.
     implicit: bool,
+    /// When the block began, microseconds since the Unix epoch: what `now()`
+    /// reads in every statement of it (`statement_clock`).
+    started_us: i64,
     /// The block's transaction was aborted at its error (R3, slice B6): with
     /// no savepoint open, an error ends the block at once, as PostgreSQL's
     /// TBLOCK_ABORT does, releasing its locks, its keys in flight and its
@@ -5191,7 +5194,19 @@ where
     let block_root = state.transaction.as_ref().map(|t| t.id);
     let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
     let signal = cancel.clone();
-    let result = crate::core::cancel::STATEMENT_CANCEL
+    // `now()` is the open block's start, or this statement's under
+    // autocommit; `statement_timestamp()` is this statement's
+    // (`statement_clock`), except in an implicit block, whose statements
+    // arrived in one message: PostgreSQL stamps the message, so they share
+    // it, and it is when the block began.
+    let clock = match &state.transaction {
+        Some(t) if t.implicit => crate::core::statement_clock::StatementClock {
+            transaction_us: t.started_us,
+            statement_us: t.started_us,
+        },
+        t => crate::core::statement_clock::StatementClock::starting(t.as_ref().map(|t| t.started_us)),
+    };
+    let result = crate::core::statement_clock::scope(clock, crate::core::cancel::STATEMENT_CANCEL
         .scope(cancel, async {
             match block_root {
                 Some(root) => {
@@ -5257,7 +5272,7 @@ where
                     .await
                 }
             }
-        })
+        }))
         .await;
     // O's scope has ended, so its locks are released: now the reply's end.
     if let Some(hold) = signal.held_reply() {
@@ -7666,6 +7681,7 @@ fn open_block(
         savepoints: Vec::new(),
         failed: false,
         implicit: false,
+        started_us: crate::core::statement_clock::wall_us(),
         aborted: false,
         database: database.clone(),
         owner: crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, id),
