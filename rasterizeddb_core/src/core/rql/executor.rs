@@ -4206,6 +4206,142 @@ async fn retype_column(
     .await
 }
 
+/// `ALTER COLUMN c TYPE character(n) | character varying(n) | text` on a
+/// legacy `CHAR` column: every row rewritten under the new type, each value
+/// as the text it holds (`value_codec::legacy_char_text`), without trailing
+/// spaces as a `character(1)` value is cast to any text type, assigned to
+/// the new type as PostgreSQL's rewrite assigns it: held to the length
+/// (22001). The column's NULL
+/// companion, its keys, checks, defaults and indexes are carried as by any
+/// rewrite (`rewrite_rows`). This is how such a column becomes the
+/// `character(1)` a bare `CHAR` means now; it was refused.
+///
+/// Refused, leaving the table as it was, when a value does not fit, when
+/// two keys of a unique constraint over the column become one (23505:
+/// `'x '` and `'x'`, `''` and `' '`, which an older build stored apart), and
+/// when a check reading the column is false for a row (23514), since a
+/// `character(n)` column's checks are enforced.
+async fn retype_legacy_char(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    declared: &str,
+    tx: TxId,
+) -> Result<(), String> {
+    use crate::core::rql::{nullable, type_modifier};
+    let wanted = match type_modifier::parse_text_typmod(declared) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    // The checks reading the column judge the rows first, read as the text
+    // they hold: the rewrite cannot be asked afterwards.
+    let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    for check in schema.checks.iter().filter(|c| !c.is_deleted) {
+        let reads = crate::core::rql::check::columns_read(&check.expression, &names);
+        if !reads.iter().any(|c| c.eq_ignore_ascii_case(&field.name)) {
+            continue;
+        }
+        let normalized = crate::core::rql::check::normalize_expression(&check.expression);
+        let probe = format!("SELECT 1 FROM {table_name} WHERE NOT ({normalized}) LIMIT 1");
+        if !run_subquery(&probe, database, tx).await?.is_empty() {
+            return Err(format!(
+                "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                check.name, table_name
+            ));
+        }
+    }
+    let column = field.name.clone();
+    let table = table_name.to_string();
+    rewrite_rows(database, table_name, tx, move |definition, mut versions| {
+        let Some(declared) = definition.columns.iter_mut().find(|c| c.name == column) else {
+            return Err(format!("column \"{}\" of relation \"{}\" does not exist", column, table));
+        };
+        declared.data_type = crate::core::db_type::DbType::STRING;
+        let records = type_modifier::text_typmod_records(&column, wanted, &definition.type_modifiers);
+        definition.type_modifiers.extend(records);
+        let companion = nullable::flag_column_name(&column);
+        let is_null = |values: &[(String, crate::memory_pool::MemoryBlock, DbTypeRef)], name: &str| {
+            let flag = nullable::flag_column_name(name);
+            values
+                .iter()
+                .find(|(n, _, _)| *n == flag)
+                .is_some_and(|(_, block, _)| nullable::flag_is_set(block.into_slice()))
+        };
+        for version in &mut versions {
+            let Some(at) = version.values.iter().position(|(name, _, _)| *name == column) else {
+                continue;
+            };
+            let null = version
+                .values
+                .iter()
+                .find(|(name, _, _)| *name == companion)
+                .is_some_and(|(_, block, _)| nullable::flag_is_set(block.into_slice()));
+            // `character(1)`'s value without its padding, as PostgreSQL casts
+            // it to any text type: a `' '` becomes `''` in text too.
+            let text = crate::core::value_codec::legacy_char_text(version.values[at].1.into_slice())
+                .trim_end_matches(' ')
+                .to_string();
+            let held = match (null, wanted) {
+                (true, _) => String::new(),
+                (false, Some(t)) => t.assign(&text)?.to_string(),
+                (false, None) => text,
+            };
+            let mut block = crate::memory_pool::MEMORY_POOL.acquire(held.len());
+            block.into_slice_mut().copy_from_slice(held.as_bytes());
+            version.values[at] = (column.clone(), block, crate::core::db_type::DbType::STRING);
+        }
+        // Each unique constraint over the column, over the rows no one has
+        // deleted: a key the new type makes one with another is 23505, as
+        // PostgreSQL's rebuilt index refuses it. A partial one is judged over
+        // every row, which can refuse what PostgreSQL would take, never the
+        // other way round.
+        let mut keys: Vec<Vec<String>> = definition
+            .unique_columns
+            .iter()
+            .filter(|c| **c == column)
+            .map(|c| vec![c.clone()])
+            .collect();
+        keys.extend(
+            definition
+                .unique_keys
+                .iter()
+                .filter(|k| !k.is_deleted && k.columns.iter().any(|c| c.eq_ignore_ascii_case(&column)))
+                .map(|k| k.columns.clone()),
+        );
+        for key in keys {
+            let mut seen = std::collections::HashSet::new();
+            for version in versions.iter().filter(|v| v.xmax == crate::core::mvcc::transaction::NO_TX) {
+                if key.iter().any(|c| is_null(&version.values, c)) {
+                    continue;
+                }
+                let tuple: Option<Vec<Vec<u8>>> = key
+                    .iter()
+                    .map(|c| {
+                        version
+                            .values
+                            .iter()
+                            .find(|(n, _, _)| n.eq_ignore_ascii_case(c))
+                            .map(|(_, block, _)| block.into_slice().to_vec())
+                    })
+                    .collect();
+                if let Some(tuple) = tuple {
+                    if !seen.insert(tuple) {
+                        return Err(format!(
+                            "could not create unique index on \"{}\" ({}): duplicate key value, two rows hold one key under the new type",
+                            table,
+                            key.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(versions)
+    })
+    .await
+}
+
 /// Renders a JSON value as the literal a column of `db_type` takes.
 fn literal_of_json(
     value: &serde_json::Value,
@@ -13996,6 +14132,17 @@ async fn execute_alter_table_action(
                         {
                             Ok(()) => ddl_ok(0),
                             Err(failure) => reload_failed(failure, ""),
+                        }
+                    }
+                    // A legacy `CHAR` column to `character(n)`, `character
+                    // varying(n)` or text: every row rewritten as the text it
+                    // holds (`retype_legacy_char`).
+                    Ok((crate::core::db_type::DbType::STRING, _))
+                        if field.db_type == crate::core::db_type::DbType::CHAR =>
+                    {
+                        match retype_legacy_char(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), tx).await {
+                            Ok(()) => ddl_ok(0),
+                            Err(e) => ddl_error(&e),
                         }
                     }
                     // A real change still needs every row rewritten under the

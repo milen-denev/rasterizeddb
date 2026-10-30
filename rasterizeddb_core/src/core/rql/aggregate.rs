@@ -1284,7 +1284,7 @@ fn decode_exact(bytes: &[u8], ty: &DbType) -> Option<i128> {
         DbType::I128 | DbType::DECIMAL => i128::from_le_bytes(le::<16>(bytes)?),
         DbType::U8 | DbType::BOOL => u8::from_le_bytes(le::<1>(bytes)?) as i128,
         DbType::U16 => u16::from_le_bytes(le::<2>(bytes)?) as i128,
-        DbType::U32 | DbType::CHAR => u32::from_le_bytes(le::<4>(bytes)?) as i128,
+        DbType::U32 => u32::from_le_bytes(le::<4>(bytes)?) as i128,
         DbType::U64 => u64::from_le_bytes(le::<8>(bytes)?) as i128,
         DbType::U128 => i128::try_from(u128::from_le_bytes(le::<16>(bytes)?)).ok()?,
         _ => return None,

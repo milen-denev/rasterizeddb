@@ -2069,7 +2069,7 @@ semantics would sit in the wrong partition.
 | NUMERIC | bytes depend on scale; `parse_decimal_scaled` (`value_codec.rs:500`) truncates |
 | JSONB | its `=` is not PostgreSQL's, and is not property-tested |
 | CITEXT, NAME | map to STRING without their semantics (case folding, NAME's 63-byte truncation). |
-| a bare `CHAR` an older binary created (`DbType::CHAR`) | the engine's one-codepoint type, not PostgreSQL's `character(1)` |
+| a bare `CHAR` an older binary created (`DbType::CHAR`) | the engine's legacy four-byte type, not PostgreSQL's `character(1)` |
 | INTERVAL, TIMETZ, geometric and range types | equality is not byte equality |
 | BOOL | too few distinct values |
 | a non-default `COLLATE` | the rule above |

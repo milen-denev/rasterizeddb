@@ -294,7 +294,24 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                 None => return None,
             }
         }
-        DbType::STRING | DbType::CHAR => {
+        // A legacy `CHAR`: held to one character and stored in its four
+        // bytes (`value_codec::legacy_char_assign`). Copied in as text, the
+        // value was cut at four bytes by `fit_to_width` and reported stored.
+        DbType::CHAR => {
+            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            match crate::core::value_codec::legacy_char_assign(&stripped) {
+                Ok(bytes) => {
+                    let mut mb = MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                    mb
+                }
+                Err(reason) => {
+                    REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+                    return None;
+                }
+            }
+        }
+        DbType::STRING => {
             // `unquote_sql` rather than `strip_surrounding_quotes`: the outer
             // pair is not the whole story, since a quote inside the literal is
             // written doubled and has to be collapsed back to one.

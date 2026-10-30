@@ -3450,13 +3450,20 @@ impl<S: StorageIO> Table<S> {
     /// (`type_modifier::assign_bytes`): a `character(n)` value in its stored
     /// form, without trailing spaces; past the length the reason (22001).
     /// Free for a table that declares none.
+    ///
+    /// `legacy_char` holds a legacy `CHAR` column's value too, to one
+    /// character in its four bytes, for a value being written. Not for a row
+    /// a rewrite carries across, whose value an older build stored: it may
+    /// hold two characters, and refusing it would refuse the whole rewrite.
     fn hold_text_lengths(
         &self,
         row_write: &mut RowWrite,
         columns: impl Fn(u32) -> bool,
+        legacy_char: bool,
     ) -> std::result::Result<(), String> {
         for field in self.schema.fields.iter() {
-            if field.text_typmod().is_none() || field.is_deleted || !columns(field.write_order as u32) {
+            let held = field.text_typmod().is_some() || (legacy_char && field.db_type == DbType::CHAR);
+            if !held || field.is_deleted || !columns(field.write_order as u32) {
                 continue;
             }
             let Some(column) = row_write
@@ -4307,7 +4314,7 @@ impl<S: StorageIO> Table<S> {
         // encoders do this already; this is the one place every insert
         // passes, so a path that reached here without them still stores
         // `'b '` in a `character(3)` key as the `'b'` it is.
-        self.hold_text_lengths(&mut row_write, |_| true)
+        self.hold_text_lengths(&mut row_write, |_| true, true)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         // Before the gate below and before anything is written (§2 lock order,
         // T1).
@@ -4423,7 +4430,7 @@ impl<S: StorageIO> Table<S> {
         let d = self.data()?;
         // A rewrite's added column (its DEFAULT) is held to its declared
         // text length as any insert is; the copied columns already hold.
-        self.hold_text_lengths(&mut row_write, |_| true)
+        self.hold_text_lengths(&mut row_write, |_| true, false)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
@@ -5738,7 +5745,7 @@ impl<S: StorageIO> Table<S> {
             // A declared text length holds for the merged row too, whichever
             // encoder produced the assigned value: the assigned columns only,
             // since the rest already hold.
-            if let Err(e) = self.hold_text_lengths(&mut row_write, |wo| updates.iter().any(|u| u.write_order == wo)) {
+            if let Err(e) = self.hold_text_lengths(&mut row_write, |wo| updates.iter().any(|u| u.write_order == wo), true) {
                 d.io_pointers.abort_txn(txn).await;
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
             }

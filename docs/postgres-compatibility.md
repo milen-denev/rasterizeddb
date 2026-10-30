@@ -247,9 +247,25 @@ reading old values one way and new writes another would answer from neither.
 `ALTER TABLE … ALTER COLUMN c TYPE character(n)` converts it: the values lose
 their trailing spaces (23505 while two would become one key), the length is
 recorded, and its checks are enforced from then on — refused (23514) while a
-stored row is false for one. A bare `CHAR` / `CHAR(1)` from an older binary
-was the engine's one-codepoint type and keeps it; new ones are
-`character(1)`.
+stored row is false for one. A bare `CHAR` / `CHAR(1)` an older binary created
+(up to f89ed7ad) is the engine's legacy four-byte type, and new ones are
+`character(1)`. Every build stored such a value's UTF-8, cut at four
+bytes and zero-padded (`'é'` is `c3 a9 00 00`), while every reader decoded
+the four bytes as a code point, so `'é'` read back as `'꧃'`, `'€'` as a
+number, and `c = 'é'` found nothing. The bytes are read as what they are
+now, so any value of one character (at most four bytes) reads back as
+written; a longer one was cut by the write that stored it (`'abcde'` is
+`'abcd'`) and reads as what survived. New writes are held to
+`character(1)`: one character, the rest spaces, `''` stored as `' '`, and
+anything longer 22001 where it was cut and reported stored. The column is
+still described as `text` and compared by its stored bytes, a literal
+read as a write would store it; `<`/`>` over non-ASCII
+values still follow the four bytes read as an integer (`docs/indexes.md`).
+`ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
+`varchar(n)`) rewrites it into the new type, refused while a value does
+not fit (22001) or two keys of a unique constraint would become one
+(23505). Nothing converts it on open: a conversion is a rewrite of every
+row, and DDL here is not transactional.
 
 Storing UUIDs natively rather than as `U128` matters for pruning. Canonical UUID
 octets are big-endian while `U128` is read little-endian, so copying the bytes

@@ -271,7 +271,26 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             mb.into_slice_mut().copy_from_slice(&encoded);
             mb
         }
-        DbType::STRING | DbType::CHAR | DbType::UNKNOWN | DbType::START | DbType::END => {
+        // A legacy `CHAR`, as the `INSERT` path stores one
+        // (`value_codec::legacy_char_assign`); too long is refused by
+        // `type_modifier::assign_bytes` after this, where the reason is kept.
+        DbType::CHAR => {
+            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            match crate::core::value_codec::legacy_char_assign(&stripped) {
+                Ok(bytes) => {
+                    let mut mb = MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                    mb
+                }
+                Err(_) => {
+                    let bytes = stripped.as_bytes();
+                    let mut mb = MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(bytes);
+                    mb
+                }
+            }
+        }
+        DbType::STRING | DbType::UNKNOWN | DbType::START | DbType::END => {
             // Doubled quotes are collapsed here too, or an UPDATE would
             // corrupt what an INSERT stored correctly; and an unquoted number
             // is its value's text, as the INSERT path reads one.

@@ -1540,6 +1540,66 @@ fn format_bytea_legacy(raw: &[u8]) -> String {
     out
 }
 
+// ------------------------------------------------------- legacy CHAR
+
+/// The width of a legacy `CHAR` cell ([`DbType::CHAR`]).
+///
+/// [`DbType::CHAR`]: crate::core::db_type::DbType::CHAR
+pub const LEGACY_CHAR_WIDTH: usize = 4;
+
+/// The text a legacy `CHAR` cell holds.
+///
+/// Builds before `character(n)` was a type made bare `CHAR` and `CHAR(1)`
+/// this four-byte type, and every write path stored the value's **UTF-8
+/// bytes**, cut at four and padded with zeros: `'é'` is `c3 a9 00 00`. Every
+/// reader decoded those four bytes as a little-endian code point instead,
+/// so `'é'` came back as U+A9C3 `'꧃'`, `'€'` as the number 11305698 and
+/// `'ab'` as `'扡'`. Nothing was lost on the way in for a value of at most
+/// four bytes — any one character — so reading the bytes as what they are
+/// gives every such value back. A longer one was cut by the write
+/// (`'abcde'` is `'abcd'`); what survives is read up to the last whole
+/// character.
+pub fn legacy_char_text(bytes: &[u8]) -> &str {
+    let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
+    let bytes = &bytes[..end];
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+    }
+}
+
+/// `text` assigned to a legacy `CHAR` column, as PostgreSQL assigns to a
+/// `CHAR`, which is `character(1)`: one character, the rest only spaces
+/// (`'x  '` is `'x'`), and `''` padded to `' '`. Anything longer is 22001,
+/// where the cell kept its first four bytes and reported success. One
+/// character always fits the four bytes.
+pub fn legacy_char_assign(text: &str) -> Result<[u8; LEGACY_CHAR_WIDTH], String> {
+    let mut chars = text.chars();
+    let first = chars.next().unwrap_or(' ');
+    if chars.any(|c| c != ' ') {
+        return Err("value too long for type character(1)".to_string());
+    }
+    let mut out = [0u8; LEGACY_CHAR_WIDTH];
+    first.encode_utf8(&mut out);
+    Ok(out)
+}
+
+/// A literal compared with a legacy `CHAR` column, in the form the column
+/// stores: as [`legacy_char_assign`] stores it, or for text no assignment
+/// takes, its bytes as an older build stored them (`'ab'` finds the `'ab'`
+/// it kept). `None` past four bytes, which no cell holds. It was the
+/// literal's code point, which no stored value of a non-ASCII character
+/// ever equalled: `c = 'é'` found nothing.
+pub fn legacy_char_literal(text: &str) -> Option<[u8; LEGACY_CHAR_WIDTH]> {
+    legacy_char_assign(text).ok().or_else(|| {
+        (text.len() <= LEGACY_CHAR_WIDTH).then(|| {
+            let mut out = [0u8; LEGACY_CHAR_WIDTH];
+            out[..text.len()].copy_from_slice(text.as_bytes());
+            out
+        })
+    })
+}
+
 // ------------------------------------------------------- literal coercion
 
 /// Re-encodes a literal so it has the width and representation of the column it
@@ -1565,6 +1625,18 @@ pub fn coerce_literal(
         return Some(bytes.to_vec());
     }
 
+    // A legacy `CHAR` is text in four bytes (`legacy_char_text`), and goes on
+    // as its text. Read as a `u32` it became a number: `'A'` was `65`.
+    if *from == DbType::CHAR {
+        return coerce_literal(legacy_char_text(bytes).as_bytes(), &DbType::STRING, to);
+    }
+    // A number becoming one is its digits, as PostgreSQL's assignment to a
+    // `CHAR` writes them; it was the code point the number spelled.
+    if *to == DbType::CHAR && *from != DbType::STRING {
+        let v = decode_integer(bytes, from)?;
+        return legacy_char_literal(&v.to_string()).map(|b| b.to_vec());
+    }
+
     // Text literals carry their own syntax, so they are re-parsed at the target
     // type rather than reinterpreted bit-for-bit.
     if matches!(from, DbType::STRING) {
@@ -1583,13 +1655,7 @@ pub fn coerce_literal(
                 "false" | "f" | "no" | "n" | "off" | "0" => Some(vec![0]),
                 _ => None,
             },
-            DbType::CHAR => {
-                let c = text.chars().next()?;
-                if text.chars().count() != 1 {
-                    return None;
-                }
-                Some((c as u32).to_le_bytes().to_vec())
-            }
+            DbType::CHAR => legacy_char_literal(text).map(|b| b.to_vec()),
             // Not `parse::<i128>().ok()?`: that `?` returned from the whole
             // function for any text that is not an integer, so the float
             // fallback never ran and `f = '1.5'`, `f = 'NaN'` and
@@ -1665,7 +1731,7 @@ fn decode_integer(bytes: &[u8], ty: &crate::core::db_type::DbType) -> Option<i12
         DbType::I128 | DbType::DECIMAL => i128::from_le_bytes(le::<16>(bytes)?),
         DbType::U8 | DbType::BOOL => u8::from_le_bytes(le::<1>(bytes)?) as i128,
         DbType::U16 => u16::from_le_bytes(le::<2>(bytes)?) as i128,
-        DbType::U32 | DbType::CHAR => u32::from_le_bytes(le::<4>(bytes)?) as i128,
+        DbType::U32 => u32::from_le_bytes(le::<4>(bytes)?) as i128,
         DbType::U64 => u64::from_le_bytes(le::<8>(bytes)?) as i128,
         DbType::U128 => u128::from_le_bytes(le::<16>(bytes)?) as i128,
         _ => return None,
@@ -1704,7 +1770,7 @@ fn encode_integer(v: i128, to: &crate::core::db_type::DbType) -> Option<Vec<u8>>
             _ => return None,
         },
         DbType::U16 => u16::try_from(v).ok()?.to_le_bytes().to_vec(),
-        DbType::U32 | DbType::CHAR => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::U32 => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::U64 => u64::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::U128 => u128::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::DECIMAL => v.checked_mul(DECIMAL_SCALE_FACTOR)?.to_le_bytes().to_vec(),
@@ -2905,6 +2971,43 @@ mod tests {
             coerce_literal(&lit, &DbType::I64, &DbType::I64).unwrap(),
             lit.to_vec()
         );
+    }
+
+    /// The cells an older build wrote for a legacy `CHAR` — the value's
+    /// UTF-8, cut at four bytes and zero-padded (f89ed7ad's files, byte for
+    /// byte) — read back as the text; new writes are `character(1)`; a
+    /// literal meets the cell in the form the cell has.
+    #[test]
+    fn a_legacy_char_cell_is_text_in_four_bytes() {
+        use crate::core::db_type::DbType;
+        for (cell, text) in [
+            ([0x41, 0, 0, 0], "A"),
+            ([0xc3, 0xa9, 0, 0], "é"),
+            ([0xe2, 0x82, 0xac, 0], "€"),
+            ([0xf0, 0x9f, 0x98, 0x80], "😀"),
+            ([0x61, 0x62, 0, 0], "ab"),
+            ([0x61, 0x62, 0x63, 0x64], "abcd"),
+            ([0x20, 0, 0, 0], " "),
+            ([0, 0, 0, 0], ""),
+            // 'aé€' cut inside the euro sign: what survives whole.
+            ([0x61, 0xc3, 0xa9, 0xe2], "aé"),
+        ] {
+            assert_eq!(legacy_char_text(&cell), text, "{cell:02x?}");
+        }
+        assert_eq!(legacy_char_assign("é"), Ok([0xc3, 0xa9, 0, 0]));
+        assert_eq!(legacy_char_assign("x  "), Ok([0x78, 0, 0, 0]));
+        assert_eq!(legacy_char_assign(""), Ok([0x20, 0, 0, 0]));
+        assert_eq!(legacy_char_assign("😀"), Ok([0xf0, 0x9f, 0x98, 0x80]));
+        assert!(legacy_char_assign("ab").is_err());
+        assert!(legacy_char_assign("abcde").is_err());
+        assert!(legacy_char_assign("a b").is_err());
+        assert_eq!(legacy_char_literal("é"), Some([0xc3, 0xa9, 0, 0]));
+        assert_eq!(legacy_char_literal("ab"), Some([0x61, 0x62, 0, 0]));
+        assert_eq!(legacy_char_literal("abcde"), None);
+        // Through the comparison coercion, and out of it as text.
+        assert_eq!(coerce_literal("é".as_bytes(), &DbType::STRING, &DbType::CHAR), Some(vec![0xc3, 0xa9, 0, 0]));
+        assert_eq!(coerce_literal(&[0x41, 0, 0, 0], &DbType::CHAR, &DbType::STRING), Some(b"A".to_vec()));
+        assert_eq!(coerce_literal(&5i32.to_le_bytes(), &DbType::I32, &DbType::CHAR), Some(vec![b'5', 0, 0, 0]));
     }
 
     #[test]

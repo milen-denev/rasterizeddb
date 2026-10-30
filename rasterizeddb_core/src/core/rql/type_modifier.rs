@@ -319,6 +319,23 @@ impl TextTypmod {
 /// it is too long. Anything but a text column with a declared length, and
 /// bytes that are not UTF-8, are left alone.
 pub fn assign_bytes(field: &crate::core::row::schema::SchemaField, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    // A legacy `CHAR` column (`value_codec::legacy_char_assign`): the text,
+    // or a cell already in its stored form, as the four bytes it is stored
+    // as. The text was copied into the cell and cut at four bytes, so
+    // `'abcde'` stored `'abcd'` and reported success. No bytes, or a slot of
+    // zeros, is a NULL here, its companion saying so, and is left as it is:
+    // an encoder that can tell `''` from NULL stores `''` as `' '` itself
+    // (`lexer_ir`, `lexer_ur`, `expr`).
+    if field.db_type == crate::core::db_type::DbType::CHAR {
+        if bytes.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
+        let text = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| "value too long for type character(1)".to_string())?;
+        let held = crate::core::value_codec::legacy_char_assign(text)?;
+        return Ok((held.as_slice() != bytes).then(|| held.to_vec()));
+    }
     let Some(typmod) = field.text_typmod() else { return Ok(None) };
     if let TextTypmod::Precision(p) = typmod {
         // A time value assigned to a column of declared precision is rounded

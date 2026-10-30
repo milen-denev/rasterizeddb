@@ -408,7 +408,10 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::DATETIME => "TIMESTAMPTZ",
         DbType::TIMESTAMP => "TIMESTAMP",
         DbType::STRING => "TEXT",
-        DbType::CHAR => "CHAR",
+        // A legacy `CHAR` goes into the temporary relation as the text it
+        // holds. `CHAR` is `character(1)` now, which an older value of two
+        // characters does not fit.
+        DbType::CHAR => "TEXT",
         // The types stored in PostgreSQL's own layout. Without them a CTE
         // over a date, a time, an interval, a MAC address or any geometry was
         // refused as "a type that cannot be materialised".

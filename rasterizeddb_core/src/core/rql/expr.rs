@@ -2681,7 +2681,8 @@ fn as_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Data { bytes, db_type } => match db_type {
-            DbType::STRING | DbType::CHAR => String::from_utf8_lossy(bytes).to_string(),
+            DbType::STRING => String::from_utf8_lossy(bytes).to_string(),
+            DbType::CHAR => crate::core::value_codec::legacy_char_text(bytes).to_string(),
             // A document's text is its JSON, not its encoding.
             DbType::JSONB => {
                 let mut out = Vec::with_capacity(bytes.len());
@@ -3048,7 +3049,8 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                 // Characters, not bytes, for text; bytes for bytea and for
                 // octet_length. A text value that is not valid UTF-8 counts
                 // its bytes rather than inventing characters.
-                (TextFunc::Length, DbType::STRING | DbType::CHAR) => match std::str::from_utf8(bytes) {
+                (TextFunc::Length, DbType::CHAR) => crate::core::value_codec::legacy_char_text(bytes).chars().count(),
+                (TextFunc::Length, DbType::STRING) => match std::str::from_utf8(bytes) {
                     Ok(text) => text.chars().count(),
                     Err(_) => bytes.len(),
                 },
@@ -4420,6 +4422,22 @@ pub(crate) fn check_declared_precision(
 /// trailing spaces, past the length an error (22001).
 pub(crate) fn held_to_text_length(value: Value, field: &SchemaField) -> Result<Value, String> {
     match &value {
+        // A legacy `CHAR` column takes the value's text as `character(1)`
+        // does (`value_codec::legacy_char_assign`): `SET c = c || 'zz'` is
+        // 22001 and `SET c = 5` is `'5'`. The bytes were copied into the
+        // cell, cut at four: the first four of a longer text, a number's
+        // little-endian bytes.
+        Value::Data { bytes, db_type } if field.db_type == DbType::CHAR => {
+            let text = match db_type {
+                DbType::CHAR => crate::core::value_codec::legacy_char_text(bytes).to_string(),
+                DbType::STRING => std::str::from_utf8(bytes)
+                    .map_err(|_| "invalid byte sequence for encoding \"UTF8\"".to_string())?
+                    .to_string(),
+                _ => as_text(&value),
+            };
+            let held = crate::core::value_codec::legacy_char_assign(&text)?;
+            Ok(Value::Data { bytes: held.to_vec(), db_type: DbType::CHAR })
+        }
         // A text value to a declared length, a time value to a declared
         // precision (`type_modifier::assign_bytes` checks the column's type).
         Value::Data { bytes, db_type } if *db_type == field.db_type || *db_type == DbType::STRING => {
@@ -4924,6 +4942,13 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
                 },
             }
         }
+        // A legacy `CHAR` cell is text in four bytes
+        // (`value_codec::legacy_char_text`), and an expression reads it as the
+        // text: `c || '|'` of `'é'` is `'é|'`, not its four bytes.
+        Some(column) if field.db_type == DbType::CHAR => Value::Data {
+            bytes: crate::core::value_codec::legacy_char_text(column.data.into_slice()).as_bytes().to_vec(),
+            db_type: DbType::STRING,
+        },
         Some(column) => Value::Data {
             bytes: column.data.into_slice().to_vec(),
             db_type: field.db_type.clone(),

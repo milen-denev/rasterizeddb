@@ -1242,10 +1242,7 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::U128 => u128::from_le_bytes(le::<16>(bytes)?).to_string(),
         DbType::F32 => f32::from_le_bytes(le::<4>(bytes)?).to_string(),
         DbType::F64 => f64::from_le_bytes(le::<8>(bytes)?).to_string(),
-        DbType::CHAR => {
-            let code = u32::from_le_bytes(le::<4>(bytes)?);
-            value_codec::quote_sql(&char::from_u32(code)?.to_string())
-        }
+        DbType::CHAR => value_codec::quote_sql(value_codec::legacy_char_text(bytes)),
         // A document that has already been rebuilt — the bytes ARE the JSON
         // text, so it needs quoting and nothing else. Without this arm a
         // shredded JSON column had no literal form and materialising any

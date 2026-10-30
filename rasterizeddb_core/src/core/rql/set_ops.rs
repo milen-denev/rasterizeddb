@@ -786,9 +786,9 @@ fn duplicate_key(
                 Some(std::borrow::Cow::Borrowed(&data[..end]))
             }
             DbType::STRING => Some(std::borrow::Cow::Borrowed(data)),
-            DbType::CHAR => le::<4>(data)
-                .and_then(|c| char::from_u32(u32::from_le_bytes(c)))
-                .map(|c| std::borrow::Cow::Owned(c.to_string().into_bytes())),
+            DbType::CHAR => Some(std::borrow::Cow::Borrowed(
+                crate::core::value_codec::legacy_char_text(data).as_bytes(),
+            )),
             _ => None,
         };
         match text {
