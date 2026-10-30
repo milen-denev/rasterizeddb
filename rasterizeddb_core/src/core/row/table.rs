@@ -79,6 +79,11 @@ pub struct Table<S: StorageIO> {
     /// reclamation service, which is spawned before versioning can be wired, so
     /// it has to be able to pick it up afterwards.
     versions: StdArc<ArcSwapOption<TransactionManager>>,
+    /// The highest transaction id that has written this table (`note_write`,
+    /// before any of its rows): what a statement that read the table asks
+    /// to know whether a commit since its snapshot could have changed what
+    /// it read (`statement_snapshot::target_visibility`).
+    max_writer: StdArc<AtomicU64>,
     /// Transaction bound at the last sweep that cleared filter fingerprints.
     /// Shared with the service so both agree on what is already cleared.
     cleared_below: StdArc<CacheGuard<AtomicU64>>,
@@ -922,6 +927,7 @@ impl<S: StorageIO> Table<S> {
             data: None,
             in_place_column_updates: AtomicU64::new(0).into(),
             versions: StdArc::new(ArcSwapOption::empty()),
+            max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
             has_unique,
             hard_locked: AtomicBool::new(false).into(),
@@ -1631,6 +1637,7 @@ impl<S: StorageIO> Table<S> {
                 vacuum_stats,
             }),
             versions,
+            max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below,
             has_unique,
             in_place_column_updates: AtomicU64::new(0).into(),
@@ -1850,6 +1857,9 @@ impl<S: StorageIO> Table<S> {
     /// rather than decided from the shape of the statement, because a `SELECT`
     /// with a data-modifying CTE writes rows through exactly these paths.
     fn note_write(&self, written_by: TxId) {
+        // Before any row is written, so before the writer can commit: a
+        // snapshot that sees the commit is taken after this is visible.
+        self.max_writer.fetch_max(written_by, std::sync::atomic::Ordering::SeqCst);
         if let Some(manager) = self.versions.load().as_ref() {
             manager.mark_wrote(written_by);
         }
@@ -2028,7 +2038,12 @@ impl<S: StorageIO> Table<S> {
         let Some(manager) = versions.as_ref() else {
             return Visibility::All;
         };
-        crate::core::rql::statement_snapshot::get_or_take(manager, || self.visibility_for(tx))
+        let noting = if self.schema.name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            crate::core::rql::statement_snapshot::Noting::Derived
+        } else {
+            crate::core::rql::statement_snapshot::Noting::Table(&self.max_writer)
+        };
+        crate::core::rql::statement_snapshot::get_or_take_noting(manager, noting, || self.visibility_for(tx))
     }
 
     /// The snapshot a write's statement already read under, when it read
@@ -2039,7 +2054,8 @@ impl<S: StorageIO> Table<S> {
     /// whose write takes its own under the write lock.
     pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
         let versions = self.versions.load();
-        crate::core::rql::statement_snapshot::kept(versions.as_ref()?, tx)
+        let manager = versions.as_ref()?;
+        crate::core::rql::statement_snapshot::target_visibility(manager, tx, || self.visibility_for(tx))
     }
 
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned.

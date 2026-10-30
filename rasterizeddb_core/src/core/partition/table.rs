@@ -904,7 +904,7 @@ impl PartitionedTable {
     /// `Table::statement_visibility` for a partitioned table: the snapshot
     /// its write's statement already read under, if it read first.
     pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
-        crate::core::rql::statement_snapshot::kept(&self.transactions, tx)
+        crate::core::rql::statement_snapshot::target_visibility(&self.transactions, tx, || self.visibility_for(tx))
     }
 
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned, as

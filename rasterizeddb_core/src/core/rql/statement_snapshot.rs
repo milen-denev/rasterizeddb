@@ -37,11 +37,30 @@ use std::sync::Arc;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::TransactionManager;
 
+/// What one statement's reads hold: a snapshot per database (every
+/// versioned table of one database shares its manager, so one serves them
+/// all), and, inside a [`write_scope`], which tables were read under it.
+#[derive(Default)]
+struct Reads {
+    snapshots: smallvec::SmallVec<[Visibility; 1]>,
+    /// The `max_writer` of each plain table read, or `None` once a read
+    /// could not name its table's (a partitioned table): then nothing is
+    /// known about what changed since, and the target keeps the reads'
+    /// snapshot ([`target_visibility`]).
+    tables: Option<Vec<Arc<AtomicU64>>>,
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
 tokio::task_local! {
-    static READ: parking_lot::Mutex<Option<Visibility>>;
+    static READ: parking_lot::Mutex<Reads>;
     /// Present inside [`write_scope`]: only there is a write handed the
-    /// snapshot its statement's reads took ([`kept`]).
+    /// snapshot its statement's reads took ([`target_visibility`]).
     static WRITE: ();
+}
+
+fn fresh_reads() -> parking_lot::Mutex<Reads> {
+    parking_lot::Mutex::new(Reads { snapshots: smallvec::SmallVec::new(), tables: Some(Vec::new()) })
 }
 
 /// Runs `f` with one snapshot for all its reads.
@@ -50,17 +69,18 @@ tokio::task_local! {
 /// argument and again where it is awaited: this wraps every statement, and
 /// its future is copied whole each time it moves.
 pub fn scope<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
-    READ.scope(parking_lot::Mutex::new(None), f)
+    READ.scope(fresh_reads(), f)
 }
 
 /// [`scope`] for an `UPDATE` or `DELETE` that reads before it writes: its
-/// reads share one snapshot, and its target is scanned under it ([`kept`]).
-/// A write running inside a read-only statement's [`scope`] (a test's hook
-/// between two partition reads, say) is not this statement, and is never
-/// handed that statement's snapshot: scanned under it, its rows conflicted
-/// with every version committed since.
+/// reads share one snapshot, and its target is scanned under it, or under a
+/// later one when nothing it read can have changed since
+/// ([`target_visibility`]). A write running inside a read-only statement's
+/// [`scope`] (a test's hook between two partition reads, say) is not this
+/// statement, and is never handed that statement's snapshot: scanned under
+/// it, its rows conflicted with every version committed since.
 pub fn write_scope<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
-    READ.scope(parking_lot::Mutex::new(None), WRITE.scope((), f))
+    READ.scope(fresh_reads(), WRITE.scope((), f))
 }
 
 /// Whether the caller runs inside [`write_scope`].
@@ -73,22 +93,55 @@ pub(crate) fn in_write_scope() -> bool {
 /// time.
 ///
 /// Only a snapshot is kept: `Visibility::All` is a table with no versions,
-/// and whether the next table has them is its own question. Every versioned
-/// table of one database shares its transaction manager, so that database's
-/// snapshot serves all of them; a read of another database's table (a role
-/// lookup, a catalogue copy) is that database's ids, which the kept snapshot
-/// says nothing about, so it takes its own and the kept one stays.
+/// and whether the next table has them is its own question. A read of
+/// another database's table (a role lookup, a catalogue copy) keeps that
+/// database's snapshot beside this one's: kept one at a time, a first read
+/// of another database left this one's reads unshared.
 pub fn get_or_take(manager: &Arc<TransactionManager>, take: impl FnOnce() -> Visibility) -> Visibility {
-    let kept = READ.try_with(|read| read.lock().clone());
-    match kept {
-        Ok(Some(Visibility::AsOf { snapshot, manager: kept })) if Arc::ptr_eq(&kept, manager) => {
-            Visibility::AsOf { snapshot, manager: kept }
+    get_or_take_noting(manager, Noting::Unknown, take)
+}
+
+/// What a read tells a [`write_scope`] about its table.
+pub enum Noting<'a> {
+    /// A plain table, and its `max_writer`.
+    Table(&'a Arc<AtomicU64>),
+    /// A relation the statement materialised itself (a CTE or derived
+    /// table's `__cte_` relation): its rows come from reads already noted.
+    Derived,
+    /// A table that cannot name its writers (a partitioned one).
+    Unknown,
+}
+
+/// [`get_or_take`] saying what the read's table is ([`Noting`]): a
+/// [`write_scope`] records a plain table's `max_writer` so its target can
+/// tell whether anything it read was written since.
+pub fn get_or_take_noting(
+    manager: &Arc<TransactionManager>,
+    noting: Noting<'_>,
+    take: impl FnOnce() -> Visibility,
+) -> Visibility {
+    let writes = in_write_scope();
+    let kept = READ.try_with(|read| {
+        let mut read = read.lock();
+        if writes {
+            match (noting, read.tables.as_mut()) {
+                (Noting::Table(writer), Some(tables)) => {
+                    if !tables.iter().any(|t| Arc::ptr_eq(t, writer)) {
+                        tables.push(writer.clone());
+                    }
+                }
+                (Noting::Unknown, _) => read.tables = None,
+                _ => {}
+            }
         }
-        Ok(Some(_)) => take(),
+        read.snapshots.iter().find(|v| matches!(v, Visibility::AsOf { manager: m, .. } if Arc::ptr_eq(m, manager))).cloned()
+    });
+    match kept {
+        Ok(Some(visibility)) => visibility,
         Ok(None) => {
             let visibility = take();
             if matches!(visibility, Visibility::AsOf { .. }) {
-                let _ = READ.try_with(|read| *read.lock() = Some(visibility.clone()));
+                let _ = READ.try_with(|read| read.lock().snapshots.push(visibility.clone()));
             }
             visibility
         }
@@ -97,23 +150,56 @@ pub fn get_or_take(manager: &Arc<TransactionManager>, take: impl FnOnce() -> Vis
 }
 
 /// The snapshot the enclosing [`write_scope`] holds for the database
-/// `manager` keeps, if a read of the statement has taken one: what a write
-/// whose statement read first scans its target under, so the rows it writes
-/// are the rows its reads described. `None` outside a write scope (a
-/// read-only statement's [`scope`] included), before any read, for another
-/// database's manager, and for a write under a transaction the snapshot
-/// was not taken for: another transaction run in the same task (a test's
-/// hook inside a statement) scanned under it conflicted with every version
-/// committed since.
-pub fn kept(manager: &Arc<TransactionManager>, tx: crate::core::mvcc::TxId) -> Option<Visibility> {
+/// `manager` keeps, if a read of the statement has taken one: what its
+/// reads described. `None` outside a write scope (a read-only statement's
+/// [`scope`] included), before any read, for another database's manager,
+/// and for a write under a transaction the snapshot was not taken for:
+/// another transaction run in the same task (a test's hook inside a
+/// statement) scanned under it conflicted with every version committed
+/// since.
+pub(crate) fn kept(manager: &Arc<TransactionManager>, tx: crate::core::mvcc::TxId) -> Option<Visibility> {
     if !in_write_scope() {
         return None;
     }
-    match READ.try_with(|read| read.lock().clone()) {
-        Ok(Some(Visibility::AsOf { snapshot, manager: kept })) if Arc::ptr_eq(&kept, manager) && snapshot.is_mine(tx) => {
-            Some(Visibility::AsOf { snapshot, manager: kept })
-        }
-        _ => None,
+    READ.try_with(|read| {
+        read.lock()
+            .snapshots
+            .iter()
+            .find(|v| matches!(v, Visibility::AsOf { manager: m, snapshot } if Arc::ptr_eq(m, manager) && snapshot.is_mine(tx)))
+            .cloned()
+    })
+    .ok()
+    .flatten()
+}
+
+/// The snapshot a write's target is scanned under when its statement read
+/// first (`None`: it read nothing, or is not this scope's statement, and
+/// takes its own under its lock).
+///
+/// `fresh`'s snapshot when nothing the statement read can have changed
+/// since its reads' snapshot: every table it read was last written by a
+/// transaction older than that snapshot's oldest running one, so no commit
+/// since can show there, and the reads hold at the fresh snapshot as they
+/// held at theirs. The fresh one is taken first and the writers are checked
+/// after it: a commit it sees was preceded by its writer's `note_write`. So
+/// a conflict on the target alone, an incrementer of the same row, replays
+/// as it does for a plain write, without reading the subqueries again
+/// (they were at 91-100% 40001 under a tight-loop incrementer). Otherwise
+/// the reads' snapshot, which keeps the two halves one moment.
+pub fn target_visibility(
+    manager: &Arc<TransactionManager>,
+    tx: crate::core::mvcc::TxId,
+    fresh: impl FnOnce() -> Visibility,
+) -> Option<Visibility> {
+    let read = kept(manager, tx)?;
+    let Visibility::AsOf { snapshot, .. } = &read else { return Some(read) };
+    let tables = READ.try_with(|r| r.lock().tables.clone()).ok().flatten();
+    let Some(tables) = tables else { return Some(read) };
+    let now = fresh();
+    if tables.iter().all(|writer| writer.load(Ordering::SeqCst) < snapshot.xmin) {
+        Some(now)
+    } else {
+        Some(read)
     }
 }
 
@@ -315,6 +401,48 @@ mod tests {
                 _ => panic!("a versioned read"),
             }
             assert!(kept(&there, tx).is_none(), "another database's write was handed this one's snapshot");
+        })
+        .await;
+    }
+
+    /// The target is scanned at a fresh snapshot only when no table the
+    /// statement read was written by a transaction its reads' snapshot could
+    /// not see; otherwise, and when a read could not name its table, under
+    /// the reads' own.
+    ///
+    /// Mutations: the writer check always passing (`all` -> true); a
+    /// `Noting::Unknown` read not clearing the table list.
+    #[tokio::test]
+    async fn the_target_moves_on_only_when_nothing_read_was_written_since() {
+        let m = Arc::new(TransactionManager::in_memory());
+        let tx = m.begin();
+        let take = |m: &Arc<TransactionManager>| {
+            let m = m.clone();
+            move || Visibility::for_snapshot(m.snapshot(tx), m)
+        };
+        let xmax = |v: &Visibility| match v {
+            Visibility::AsOf { snapshot, .. } => snapshot.xmax,
+            Visibility::All => 0,
+        };
+        let u = Arc::new(AtomicU64::new(1));
+        write_scope(async {
+            let read = get_or_take_noting(&m, Noting::Table(&u), take(&m));
+            let later = m.begin();
+            let moved = target_visibility(&m, tx, take(&m)).expect("a target snapshot");
+            assert!(xmax(&moved) > xmax(&read), "nothing read changed, yet the target kept the reads' snapshot");
+            // A writer of the table read that the reads' snapshot could not see.
+            u.store(later, Ordering::SeqCst);
+            let kept = target_visibility(&m, tx, take(&m)).expect("a target snapshot");
+            assert_eq!(xmax(&kept), xmax(&read), "a table read was written since, yet the target moved on");
+        })
+        .await;
+        let u = Arc::new(AtomicU64::new(1));
+        write_scope(async {
+            let read = get_or_take_noting(&m, Noting::Table(&u), take(&m));
+            let _ = get_or_take_noting(&m, Noting::Unknown, take(&m));
+            let _later = m.begin();
+            let kept = target_visibility(&m, tx, take(&m)).expect("a target snapshot");
+            assert_eq!(xmax(&kept), xmax(&read), "a read that named no table, yet the target moved on");
         })
         .await;
     }
