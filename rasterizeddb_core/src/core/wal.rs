@@ -1092,7 +1092,21 @@ impl Wal {
             return Err(self.poisoned_error());
         }
 
-        let seq = self.log_commit_marker(txn)?;
+        let seq = match self.log_commit_marker(txn) {
+            Ok(seq) => seq,
+            Err(e) => {
+                // No marker reached the log (cut back cleanly, or the log is
+                // poisoned and replay stops at the torn bytes), so `txn` is
+                // uncommitted and none of its held overwrites were applied.
+                // The caller may not abort after a failed commit, so nobody
+                // else will ever take its entry out of `pending`: left there,
+                // `pending_count` stayed raised, every later checkpoint
+                // declined and the log grew until restart, long after the
+                // condition that failed the write had cleared.
+                self.abort_txn(txn);
+                return Err(e);
+            }
+        };
 
         // The common case, and worth not taking a lock for: nothing anywhere is
         // holding payloads, so this commit is certainly append-only. Hinted
@@ -2022,7 +2036,8 @@ impl Wal {
     /// replay already discards its records; what it also left behind was its
     /// entry here, which kept `pending_count` raised and every later
     /// `checkpoint` declined — the log then grew for the life of the process.
-    /// Only for a transaction whose commit was never attempted.
+    /// Only for a transaction whose commit was never attempted; `finish_txn`
+    /// calls it itself when the commit marker could not be written.
     pub fn abort_txn(&self, txn: u64) {
         let held = self.pending.lock().remove(&txn);
         if let Some(held) = held {

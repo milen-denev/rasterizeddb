@@ -1503,6 +1503,41 @@ mod tests {
         crate::core::wal::remove_for(d.to_str().unwrap());
     }
 
+    /// A map-log append whose commit marker failed holds no claim on the log
+    /// afterwards. The append's record is held as an in-place overwrite, and
+    /// the commit contract forbids an abort after a failed commit, so only
+    /// `finish_txn` can release it: before it did, `pending_transactions`
+    /// stayed raised and every later checkpoint declined, so the log grew
+    /// until restart although the next append succeeded.
+    ///
+    /// Mutation: `finish_txn` returning the marker's error without
+    /// `abort_txn` (pending stays 1, both checkpoints return `Ok(false)`).
+    #[tokio::test]
+    async fn a_failed_commit_marker_leaves_checkpoints_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let wal = install_wal(d);
+        let log = MapLogFile::create(map_provider(d).await).await.unwrap();
+        log.append(&header()).await.unwrap();
+        log.append(&place()).await.unwrap();
+        assert_eq!(wal.pending_transactions(), 0);
+        assert!(wal.checkpoint().unwrap(), "a checkpoint with nothing in flight declined");
+
+        crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        let failed = log.append(&Record::Locations(vec!["/x".to_string()])).await;
+        crate::core::wal::test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(failed.is_err(), "the injected commit failure was swallowed");
+        assert!(!wal.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+        assert_eq!(wal.pending_transactions(), 0, "the failed commit kept its claim on the log");
+
+        log.append(&Record::Locations(vec!["/r".to_string()])).await.unwrap();
+        assert!(wal.checkpoint().unwrap(), "every checkpoint after a failed marker declines");
+        assert!(wal.checkpoint().unwrap());
+        let replay = log.replay().await.unwrap();
+        assert!(replay.torn.is_none(), "{:?}", replay.torn);
+        crate::core::wal::remove_for(d.to_str().unwrap());
+    }
+
     /// A failure that stays (a data file in the directory failed its flush)
     /// refuses every retry, and none of them leaves bytes behind.
     #[tokio::test]

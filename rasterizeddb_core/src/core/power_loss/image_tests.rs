@@ -538,3 +538,76 @@ fn a_keep_tail_checkpoint_loses_no_acknowledged_record_at_a_power_cut() {
         assert!(reverted > 0, "fail={fail}: no image reverted the rename, so that case went untested");
     }
 }
+
+/// A transaction whose commit marker could not be written is uncommitted:
+/// its held in-place overwrite is never applied, it holds no claim on the log
+/// (so checkpoints keep working), and a power cut right after the failure, or
+/// after a later commit has synced its records into the log, replays none of
+/// it while keeping every acknowledged write.
+///
+/// Mutation: `finish_txn` returning the marker's error without `abort_txn`
+/// (the claim stays, the checkpoint declines).
+#[test]
+fn a_failed_commit_marker_is_uncommitted_and_releases_its_claim() {
+    use crate::core::wal::{self, Wal, test_hooks};
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join(wal::DEFAULT_WAL_NAME);
+    let data = dir.path().join("data.db");
+    std::fs::write(&data, vec![b'.'; 64]).unwrap();
+    let log = Wal::open(&wal_path).unwrap();
+    let id = wal::file_id_for_name("data.db");
+    log.register_file(id, &data).unwrap();
+    let rec = Recorder::start(dir.path());
+
+    let commit_in_place = |at: u64, bytes: &[u8]| {
+        let t = log.begin();
+        log.log_in_place(t, id, at, bytes).unwrap();
+        log.commit_txn(t).unwrap();
+    };
+    commit_in_place(0, b"EARLY");
+
+    let failed = log.begin();
+    log.log_in_place(failed, id, 16, b"LOST").unwrap();
+    test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+    let outcome = log.commit_txn(failed);
+    test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+    assert!(outcome.is_err(), "the injected marker failure never fired");
+    assert!(!log.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+    assert_eq!(log.pending_transactions(), 0, "the failed commit kept its claim on the log");
+    assert_eq!(&std::fs::read(&data).unwrap()[16..20], b"....", "an uncommitted overwrite was applied");
+    let mut points = vec![rec.cut_quiescent("right after the failed marker")];
+
+    // A later commit syncs the failed transaction's record into the log too.
+    commit_in_place(32, b"LATE");
+    points.push(rec.cut_quiescent("after a later commit"));
+    assert!(log.checkpoint().unwrap(), "the checkpoint declined after a failed marker");
+    commit_in_place(48, b"AFTER");
+    points.push(rec.cut_quiescent("after the checkpoint and another commit"));
+    drop(rec);
+    drop(log);
+
+    let img = dir.path().join("image");
+    for (n, point) in points.into_iter().enumerate() {
+        let point = point.unwrap_or_else(|why| panic!("{why}"));
+        for seed in 0..10 {
+            point.write_image(seed, &img);
+            let replayed = img.join("data.db");
+            let image_log = img.join(wal::DEFAULT_WAL_NAME);
+            if image_log.exists() {
+                Wal::recover(&image_log, |f| (f == id).then(|| replayed.clone()))
+                    .unwrap_or_else(|e| panic!("{} seed {seed}: replay failed: {e}", point.label));
+            }
+            let bytes = std::fs::read(&replayed).unwrap();
+            let what = format!("{}, seed {seed}", point.label);
+            assert_eq!(&bytes[0..5], b"EARLY", "{what}: an acknowledged write was lost");
+            assert_eq!(&bytes[16..20], b"....", "{what}: the uncommitted overwrite was replayed");
+            if n >= 1 {
+                assert_eq!(&bytes[32..36], b"LATE", "{what}: an acknowledged write was lost");
+            }
+            if n >= 2 {
+                assert_eq!(&bytes[48..53], b"AFTER", "{what}: an acknowledged write was lost");
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+}
