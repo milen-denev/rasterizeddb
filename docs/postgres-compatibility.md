@@ -394,14 +394,20 @@ correlated or not `[NOT] EXISTS`, a scalar subquery), its `FROM`/`USING`
 source, its CTEs and its derived tables under the snapshot its target rows are
 scanned under, as PostgreSQL reads a statement under `READ COMMITTED`: a
 transaction committing in between cannot make it write a row that no single
-moment had match. There is no EvalPlanQual: a target row changed since that
-snapshot is a write conflict, replayed whole (subqueries read again under a
-new snapshot) in autocommit and in a `READ COMMITTED` block, and reported
-(40001) when it cannot be. A statement fed by a CTE or a derived table, which
-are read before the write starts, replays only when the transaction it met
-aborted; otherwise its conflict is reported. `UPDATE … FROM` and `DELETE …
-USING` still write each joined row back by its key, rechecking the condition
-against the row as it is then.
+moment had match. When nothing the statement read has been written since
+(every table read was last written by a transaction older than that
+snapshot's oldest running one), the target is scanned at a fresh snapshot
+instead, which holds the same answer for the reads: contention on the target
+alone then behaves as it does for a plain write. There is no EvalPlanQual: a
+target row changed since its snapshot is a write conflict, replayed whole
+(subqueries read again) in autocommit and in a `READ COMMITTED` block, and
+reported (40001) when it cannot be. A statement fed by a CTE or a derived
+table, which are read before the write starts, is replayed whole outside a
+block, its CTEs and derived tables read anew, up to four times. A locking
+read in a write's subquery (`… = (SELECT id FROM jobs … FOR UPDATE SKIP
+LOCKED)`) reads the latest rows at a snapshot of its own. `UPDATE … FROM` and
+`DELETE … USING` still write each joined row back by its key, rechecking the
+condition against the row as it is then.
 
 A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
 either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
