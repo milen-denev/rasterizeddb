@@ -136,8 +136,16 @@ async fn a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row() {
     let dir = base.path().join("db");
     let db = open(&dir, "lazy_cut").await.unwrap();
     exec(&db, CREATE).await.unwrap();
+    // Every partition materialized and its files synced before the
+    // recorder starts, so the rows below follow the page model: a file the
+    // scenario created, no recorded sync touching it, is imaged whole.
+    let first: Vec<String> = (1..=8i64).map(|t| format!("({t}, {}, 'base')", 10_000 + t)).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", first.join(", "))).await.unwrap();
+    let mut want: Vec<(i64, i64)> = (1..=8i64).map(|t| (t, 10_000 + t)).collect();
     db.sync_durable().unwrap();
-    let mut want = Vec::new();
+    let dir_s = dir.to_string_lossy().into_owned();
+    let base_checkpoint = crate::core::wal::with_wal_for(&dir_s, |w| w.map(|w| w.checkpoint()));
+    assert!(matches!(base_checkpoint, Some(Ok(true))), "the baseline checkpoint: {base_checkpoint:?}");
     let rec = Recorder::start(&dir);
     for round in 0..3i64 {
         let values: Vec<String> = (1..=8i64).map(|t| format!("({t}, {}, 'r{round}')", round * 100 + t)).collect();
@@ -162,7 +170,6 @@ async fn a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row() {
     assert_eq!(t.close_idle().await.unwrap() as u64, n);
     assert_eq!(guards.iter().map(|g| g.fired()).sum::<u64>(), 4, "the close's cut points were never reached");
     drop(guards);
-    let dir_s = dir.to_string_lossy().into_owned();
     let checkpointed = crate::core::wal::with_wal_for(&dir_s, |w| w.map(|w| w.checkpoint()));
     assert!(matches!(checkpointed, Some(Ok(true))), "the checkpoint after the close: {checkpointed:?}");
     sink.lock().push(rec.cut_quiescent("after every close and a checkpoint"));

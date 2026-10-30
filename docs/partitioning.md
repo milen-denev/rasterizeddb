@@ -343,6 +343,14 @@ statement, `twin_hash_tenant_1024_few_open` (1,024 partitions) and
 every kind runs through reopened partitions. The test harness's stored-row
 reader closes again what it opened.
 
+**Measured** (`database::lazy_resident_tests`, ignored, run by hand;
+one-row partitions, tmpfs, so no fsync here is a disk's; on a shared box at
+load 18 to 27, so times and wakeups carry noise of their own; fds and tasks
+are exact). Before: `f89ed7ad`, P5a's `partition_resident_tests` at N = 1024,
+every partition opened at the start. After: this branch.
+
+BASE_TABLE_PLACEHOLDER
+
 **Left for P5b-2 and after.** The open budget and the sharded CLOCK
 (scan-resistant fan-out opens), idle close with the persistent-index
 snapshot written at close and loaded on reopen, scan-only fan-out opens
