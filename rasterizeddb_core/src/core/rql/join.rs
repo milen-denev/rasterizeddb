@@ -3381,7 +3381,7 @@ pub fn plan(
         // A relation with nothing to fetch still has to produce rows for the
         // join to see.
         if fetch.is_empty() {
-            if let Some(f) = schemas[i].iter().min_by_key(|f| f.write_order) {
+            if let Some(f) = crate::core::rql::lexer_query::placeholder_column(&schemas[i], |f| f.write_order) {
                 fetch.push(f.clone());
             }
         }

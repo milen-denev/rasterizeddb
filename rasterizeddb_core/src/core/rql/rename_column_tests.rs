@@ -822,3 +822,75 @@ fn expression_rewrite_renames_references_and_nothing_else() {
     // A new name that is not a plain identifier is quoted.
     assert_eq!(rewrite("a > 0", "t", "a", "my col"), "\"my col\" > 0");
 }
+
+
+/// A scan that reads no column (`COUNT(*)`, a select list of constants)
+/// still fetches one, as a placeholder. On an empty table `DROP COLUMN`
+/// rewrites nothing, so the dropped column's tombstone stays in the schema:
+/// first in write order when it was the first column, and, once `ADD COLUMN`
+/// took its name back, its companion retired as `__dropped___null_<c>_<n>`,
+/// which no longer reads as hidden and as a BOOL is the narrowest field. The
+/// placeholder picked that tombstone, which no lookup finds: `SELECT 1 FROM
+/// m WHERE …`, `COUNT(*)` and every `ADD CONSTRAINT … CHECK` (it validates
+/// existing rows with `SELECT 1 … WHERE NOT (…)`) failed with XX000 "Column
+/// '__dropped___null_tag_3' not found in schema", for INT columns too.
+/// Checked again after a reopen, and with rows.
+///
+/// Mutation: `placeholder_column` without the `!f.is_deleted` filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_column_is_never_a_scans_placeholder() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    for (table, ty) in [("mt", "TEXT"), ("mi", "INT")] {
+        ok(&db, &format!("CREATE TABLE {table} (id INT PRIMARY KEY, tag {ty}, q INT)")).await;
+        ok(&db, &format!("ALTER TABLE {table} DROP COLUMN tag")).await;
+        ok(&db, &format!("ALTER TABLE {table} ADD COLUMN tag TEXT")).await;
+    }
+    // A dropped first column, and a dropped narrowest one, with no re-add.
+    ok(&db, "CREATE TABLE y (a INT, b INT)").await;
+    ok(&db, "ALTER TABLE y DROP COLUMN a").await;
+    ok(&db, "CREATE TABLE z (id INT, flag BOOLEAN, v INT)").await;
+    ok(&db, "ALTER TABLE z DROP COLUMN flag").await;
+
+    async fn queries(db: &Arc<Database>, n: usize) {
+        for table in ["mt", "mi"] {
+            for sql in [
+                format!("SELECT 1 FROM {table} WHERE NOT (tag IN ('AB')) LIMIT 1"),
+                format!("SELECT 1 FROM {table} WHERE tag = 'AB'"),
+                format!("SELECT 1 FROM {table} WHERE NOT (q = 1)"),
+                format!("SELECT 1 FROM {table}"),
+            ] {
+                let _ = rows(db, &sql).await;
+            }
+            assert_eq!(ints(db, &format!("SELECT count(*) FROM {table}")).await, vec![Some(n as i64)]);
+        }
+        assert_eq!(rows_of(db, "SELECT 1 FROM z").await, n);
+        assert_eq!(rows_of(db, "SELECT 1 FROM z WHERE v = 1").await, n);
+        assert_eq!(ints(db, "SELECT count(*) FROM y").await, vec![Some(n as i64)]);
+        assert_eq!(ints(db, "SELECT count(*) FROM y WHERE b = 2").await, vec![Some(n as i64)]);
+    }
+    async fn rows_of(db: &Arc<Database>, sql: &str) -> usize {
+        rows(db, sql).await.len()
+    }
+
+    queries(&db, 0).await;
+    // The reported failure: a CHECK's validation of the existing rows.
+    ok(&db, "ALTER TABLE mt ADD CONSTRAINT mt_c CHECK (tag IN ('AB'))").await;
+    ok(&db, "ALTER TABLE mi ADD CONSTRAINT mi_c CHECK (tag IN ('AB'))").await;
+
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    let db = open(dir.path()).await;
+    queries(&db, 0).await;
+    for table in ["mt", "mi"] {
+        ok(&db, &format!("INSERT INTO {table} (id, tag, q) VALUES (1, 'AB', 1)")).await;
+        assert!(is_error(&run(&db, &format!("INSERT INTO {table} (id, tag, q) VALUES (2, 'ZZ', 1)")).await), "{table}: the CHECK was not enforced");
+    }
+    ok(&db, "INSERT INTO y (b) VALUES (2)").await;
+    ok(&db, "INSERT INTO z (id, v) VALUES (1, 1)").await;
+    queries(&db, 1).await;
+    assert_eq!(ints(&db, "SELECT q FROM mi WHERE tag = 'AB'").await, vec![Some(1)]);
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+}

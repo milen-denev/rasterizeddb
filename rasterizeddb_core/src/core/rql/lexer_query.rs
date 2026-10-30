@@ -2172,9 +2172,12 @@ pub fn row_fetch_from_select_query(
             }
         }
         // `SELECT COUNT(*)` reads no column at all, but the scan still has to
-        // fetch something per row for the fold to have rows to count.
+        // fetch something per row for the fold to have rows to count. A live
+        // column (`placeholder_column`): a dropped one is not found by name,
+        // and on an empty table, where DROP COLUMN rewrites nothing, its
+        // tombstone is still the first field.
         if cols.is_empty() {
-            if let Some(f) = schema.iter().min_by_key(|f| f.write_order) {
+            if let Some(f) = placeholder_column(schema, |f| f.write_order) {
                 cols.push(f.name.clone());
             }
         }
@@ -2230,11 +2233,7 @@ pub fn row_fetch_from_select_query(
             }
         }
         if all_literals {
-            if let Some(f) = schema
-                .iter()
-                .filter(|f| !crate::core::rql::nullable::is_hidden(&f.name))
-                .min_by_key(|f| f.size)
-            {
+            if let Some(f) = placeholder_column(schema, |f| f.size) {
                 cols.push(f.name.clone());
             }
         }
@@ -2534,6 +2533,28 @@ pub fn row_fetch_from_select_query(
     debug!("Parsed QueryRows: {:?}", query_rows);
 
     Ok(query_rows)
+}
+
+/// The column a scan fetches when the statement reads none (`COUNT(*)`, a
+/// select list of constants): only so it has something per row. The live,
+/// visible field `key` ranks lowest.
+///
+/// Live is the part that matters. A dropped column keeps its field as a
+/// tombstone, and on an empty table `DROP COLUMN` rewrites nothing, so the
+/// tombstone stays first in write order; and its companion, retired as
+/// `__dropped___null_<c>_<n>` when the name is taken again, no longer reads
+/// as hidden and is a one-byte BOOL, so it was the narrowest. Either way the
+/// pick named a field no lookup finds, and `SELECT 1 FROM t`, `COUNT(*)` and
+/// every CHECK's validation of existing rows failed with "Column … not found
+/// in schema".
+pub(crate) fn placeholder_column<K: Ord>(
+    schema: &[SchemaField],
+    key: impl Fn(&SchemaField) -> K,
+) -> Option<&SchemaField> {
+    schema
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .min_by_key(|f| key(f))
 }
 
 #[cfg(test)]
