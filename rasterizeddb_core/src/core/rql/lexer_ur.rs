@@ -193,7 +193,9 @@ fn encode_assignment(
 }
 
 fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
-    let value_str = value_str.trim();
+    // `text 'x'` is the literal `'x'`, as an INSERT reads it: taken whole,
+    // `SET s = text 'zz '` stored those ten characters.
+    let value_str = crate::core::rql::column_default::typed_text_literal_or(value_str.trim());
 
     // "NULL" becomes empty.
     if value_str.eq_ignore_ascii_case("NULL") {

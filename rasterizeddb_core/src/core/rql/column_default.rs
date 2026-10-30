@@ -175,6 +175,9 @@ pub fn expression_for<'a>(column: &str, defaults: &'a [ColumnDefault]) -> Option
 /// expression, or one over a function call, is not redundant in the same way and
 /// is left to fail rather than quietly reinterpreted.
 pub fn strip_redundant_cast(text: &str) -> &str {
+    if let Some(literal) = typed_text_literal(text) {
+        return literal;
+    }
     let Some(at) = text.rfind("::") else {
         return text;
     };
@@ -201,6 +204,35 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     } else {
         text
     }
+}
+
+/// The quoted literal of `text 'x'`, `varchar 'x'`, `char 'x'` (and
+/// `character`, `bpchar`, `character varying`): the typed-literal spelling of
+/// `'x'::text`, whose type the column says too. Taken as anything else, the
+/// whole spelling was the value — `text 'zz '` stored as those ten
+/// characters, or refused by a `character(3)` as too long (22001).
+/// `text` with a `text '…'`-style prefix taken off ([`typed_text_literal`]),
+/// or as it is.
+pub fn typed_text_literal_or(text: &str) -> &str {
+    typed_text_literal(text).unwrap_or(text)
+}
+
+fn typed_text_literal(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let quote = text.find('\'')?;
+    let (head, literal) = (text[..quote].trim_end(), &text[quote..]);
+    if head.len() == quote {
+        // No space before the quote: `E'…'`, `B'…'` and `X'…'` are other forms.
+        return None;
+    }
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let text_type = match words.as_slice() {
+        [w] => ["text", "varchar", "char", "character", "bpchar"].iter().any(|t| w.eq_ignore_ascii_case(t)),
+        [a, b] => a.eq_ignore_ascii_case("character") && b.eq_ignore_ascii_case("varying"),
+        _ => false,
+    };
+    let whole = crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') == literal.len();
+    (text_type && whole && literal.len() >= 2).then_some(literal)
 }
 
 /// The literal a default expression produces for one row about to be written

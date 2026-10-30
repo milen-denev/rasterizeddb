@@ -488,6 +488,19 @@ async fn relation_columns(
     };
     let sampled_wide = declared_wide_types(query, labels, database);
     let engine = crate::core::value_codec::DECIMAL_SCALE;
+    // A bare `character varying` column keeps that type in the relation, so
+    // it compares blank-padded with a `character(n)` one there as it does in
+    // its table; declared TEXT, `WHERE a = b` over a CTE compared exactly.
+    let varying: Vec<Option<u32>> = {
+        use crate::core::rql::type_modifier::TextTypmod;
+        declared_fields_among(query, labels, database, &[])
+            .into_iter()
+            .map(|f| match f.as_ref().and_then(|f| (f.db_type == DbType::STRING).then(|| f.text_typmod()).flatten()) {
+                Some(TextTypmod::Varchar(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    };
 
     let mut columns = Vec::with_capacity(labels.len());
     for index in 0..labels.len() {
@@ -523,6 +536,12 @@ async fn relation_columns(
                 _ => "NUMERIC".to_string(),
             },
             Some(DbType::BPCHAR(n)) if *n > 0 => format!("CHAR({n})"),
+            Some(DbType::STRING) if varying.get(index).copied().flatten().is_some() => {
+                match varying[index] {
+                    Some(0) | None => "VARCHAR".to_string(),
+                    Some(n) => format!("VARCHAR({n})"),
+                }
+            }
             Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
             None => "TEXT".to_string(),
         };

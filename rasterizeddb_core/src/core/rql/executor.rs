@@ -7897,11 +7897,17 @@ fn stored_text_literal(literal: &str, field: &crate::core::row::schema::SchemaFi
         return None;
     }
     let text = literal.trim();
-    let plain = text.len() >= 2
-        && text.starts_with('\'')
-        && crate::core::sql_scan::quoted_end(text.as_bytes(), 0, b'\'') == text.len();
-    if plain || text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
+    let plain = |t: &str| {
+        t.len() >= 2 && t.starts_with('\'') && crate::core::sql_scan::quoted_end(t.as_bytes(), 0, b'\'') == t.len()
+    };
+    if plain(text) || text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
+    }
+    // `text 'a  '` and `'a  '::text`: the literal, which the comparison reads
+    // as the column does.
+    let bare = crate::core::rql::column_default::strip_redundant_cast(text);
+    if bare.len() != text.len() && plain(bare) {
+        return Some(bare.to_string());
     }
     let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
     if !crate::core::rql::expr::columns_of(&expr).is_empty() {
@@ -7930,7 +7936,8 @@ fn stored_key_bytes(literal: &str, field: &crate::core::row::schema::SchemaField
     if let Some(number) = stored_numeric_literal(literal, field) {
         return Some(number.into_bytes());
     }
-    let text = literal.trim();
+    // `text 'y'` is the literal `'y'` (`column_default::strip_redundant_cast`).
+    let text = crate::core::rql::column_default::typed_text_literal_or(literal.trim());
     if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
     }

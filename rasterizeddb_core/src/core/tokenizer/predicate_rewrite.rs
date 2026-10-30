@@ -2667,7 +2667,9 @@ fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
         }
     }
     if !padded && !cast {
-        return false;
+        // Only a pattern over `CAST(… AS CHAR(n))`, which its own word
+        // check answers cheaply.
+        return pattern_may_read_bpchar(text, schema);
     }
     pattern_may_read_bpchar(text, schema)
         || (cast && contains_spaced_text_literal(text))
@@ -2701,10 +2703,8 @@ fn pattern_may_read_bpchar(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> 
     }
     let column = || schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(n)) if n > 0) && !f.is_deleted);
     let cast = || {
-        text.contains("::") && {
-            let lower = text.to_ascii_lowercase();
-            ["::char", "::bpchar", "::nchar"].iter().any(|c| lower.contains(c))
-        }
+        let lower = text.to_ascii_lowercase();
+        ["::char", "::bpchar", "::nchar", " as char", " as bpchar", " as nchar"].iter().any(|c| lower.contains(c))
     };
     (column() || cast())
         && top_level_words(text).iter().any(|&(s, e)| {
@@ -2723,8 +2723,9 @@ fn pattern_may_read_bpchar(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> 
 fn padded_for_pattern(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<String> {
     use crate::core::rql::type_modifier::TextTypmod;
     let name = operand.trim();
-    // A cast to `character(n)` (`s::char(3) LIKE 'ab '`) reads padded too.
-    if name.contains("::") {
+    // A cast to `character(n)` (`s::char(3) LIKE 'ab '`, `CAST(s AS
+    // CHAR(3))`) reads padded too.
+    if name.contains("::") || name.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("CAST(")) {
         let n = crate::core::rql::expr::parse(name, schema)
             .ok()
             .and_then(|e| crate::core::rql::expr::bpchar_width(&e))
@@ -2817,6 +2818,38 @@ fn is_pattern_operator(rest: &str) -> bool {
         first = words.next().unwrap_or("");
     }
     ["LIKE", "ILIKE", "SIMILAR"].iter().any(|k| first.eq_ignore_ascii_case(k))
+}
+
+/// `[NOT] LIKE|ILIKE '<pattern>' ESCAPE '<c>'` with the escape folded into
+/// the pattern (`canonical_like_pattern`), as a column's match is rewritten;
+/// `None` when `rest` names no `ESCAPE`.
+fn like_without_escape(rest: &str) -> Result<Option<String>, String> {
+    let toks = lex(rest)?;
+    let mut at = 0;
+    let negated = toks.first().is_some_and(|t| t.is_keyword("not"));
+    if negated {
+        at += 1;
+    }
+    let Some(op) = toks.get(at).filter(|t| t.is_keyword("like") || t.is_keyword("ilike")) else {
+        return Ok(None);
+    };
+    let Some(pattern @ Tok::Str(_)) = toks.get(at + 1) else { return Ok(None) };
+    if !toks.get(at + 2).is_some_and(|t| t.is_keyword("escape")) {
+        return Ok(None);
+    }
+    let (escape, after) = like_escape(&toks, at + 2)?;
+    let canonical = canonical_like_pattern(&like_pieces(&pattern_text(pattern), escape)?);
+    let mut out = format!(
+        " {}{} {}",
+        if negated { "NOT " } else { "" },
+        op.render().to_ascii_uppercase(),
+        quote_standard(&canonical)
+    );
+    for tok in &toks[after..] {
+        out.push(' ');
+        out.push_str(&tok.render());
+    }
+    Ok(Some(out))
 }
 
 /// Lifts within a boolean group: each `AND`/`OR` term on its own. The `AND`
@@ -2977,6 +3010,14 @@ fn lift_comparison(
     // A `character(n)` column under a pattern match reads padded, which only
     // the evaluator gives it (`padded_for_pattern`).
     let padded = if is_pattern_operator(rest) { padded_for_pattern(&body[..at], schema) } else { None };
+    // Its `ESCAPE`, which nothing after a lifted operand reads, is folded
+    // into the pattern here, in the backslash form the matcher reads: left
+    // as written, `a LIKE 'a!%b%' ESCAPE '!'` was refused (42601).
+    let escaped = match &padded {
+        Some(_) => like_without_escape(rest)?,
+        None => None,
+    };
+    let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
     if !needs_evaluator(left_text) {
         // The operand is the tokenizer's own. A list item or a bound that
@@ -3114,13 +3155,27 @@ fn spell_out_list_or_range(
                 && !items.iter().any(|item| item.to_ascii_uppercase().starts_with("SELECT"))
             {
                 let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
+                // Over a `character(n)` column the whole list is `bpchar`,
+                // a computed item too (`a IN ('ab' || '  ', 'x')`): read
+                // without its trailing spaces. Lifted as it is, the item was
+                // text and compared with the column exactly.
+                let padded = column_text_kind(left, schema) == Some(TextSide::Padded);
                 let mut parts = Vec::with_capacity(items.len());
                 for item in items {
                     // Not forced: an IN list's items take the column's type
                     // with it (`a IN ('ab  '::text, 'x')` reads both
                     // blank-padded against `character(n)`, as PostgreSQL's
                     // common type of the list does), where `=` compares text.
-                    parts.push(format!("{} {} {}", left, each, lift_list_item(item, schema)?));
+                    // Except a subquery's text value, which compares exactly
+                    // as `= ANY` over text does: substituted as `('…' || '')`
+                    // (`subquery::subquery_literal`).
+                    let substituted = item.trim().starts_with("('") && item.trim().ends_with(" || '')");
+                    let item: std::borrow::Cow<str> = if padded && !substituted && needs_evaluator(item) {
+                        format!("rtrim({})", item.trim()).into()
+                    } else {
+                        item.into()
+                    };
+                    parts.push(format!("{} {} {}", left, each, lift_list_item(&item, schema)?));
                 }
                 return Ok(Some(format!("({})", parts.join(join))));
             }

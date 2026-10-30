@@ -1090,3 +1090,144 @@ async fn interval_fields_restrict_what_a_column_keeps() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// `LIKE … ESCAPE` over a `character(n)` column, which matches its padded
+/// value: the escape character is read as PostgreSQL reads it, for `NOT
+/// LIKE` and `ILIKE` too. The padded match left the `ESCAPE` clause where
+/// nothing read it, and every such statement was refused (42601).
+///
+/// Mutation: `like_without_escape` answering `None` (each case is 42601).
+#[tokio::test(flavor = "multi_thread")]
+async fn like_escape_reads_a_character_column_padded() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), b VARCHAR(6)); \
+         INSERT INTO c VALUES (1, 'a%b', 'a%b'), (2, 'ab', 'ab  '), (3, 'a_b', 'a_b'), (4, NULL, NULL), (5, 'x', 'x ')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            ("SELECT id FROM c WHERE a LIKE 'a!%b%' ESCAPE '!' ORDER BY id", "[1]"),
+            // Padded to four, 'a%b' is 'a%b ', which the pattern does not end.
+            ("SELECT id FROM c WHERE a LIKE 'a!%b' ESCAPE '!' ORDER BY id", ""),
+            ("SELECT id FROM c WHERE a NOT LIKE 'a!%b%' ESCAPE '!' ORDER BY id", "[2];[3];[5]"),
+            ("SELECT id FROM c WHERE a ILIKE 'A!%B%' ESCAPE '!' ORDER BY id", "[1]"),
+            ("SELECT id FROM c WHERE a LIKE 'a#_b ' ESCAPE '#' ORDER BY id", "[3]"),
+            ("SELECT id FROM c WHERE a LIKE 'a%b%' ESCAPE '' ORDER BY id", "[1];[2];[3]"),
+            ("SELECT id FROM c WHERE a LIKE 'a\\%b%' ORDER BY id", "[1]"),
+            ("SELECT id FROM c WHERE b LIKE 'a!%b%' ESCAPE '!' ORDER BY id", "[1]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// An `IN` list over a `character(n)` column is `bpchar` as a whole, an item
+/// computed from strings included (`'ab' || '  '`, `lower('AB  ')`): it is
+/// read without its trailing spaces, as the plain literals beside it are.
+/// Such an item was text and compared with the column exactly, so `IN`
+/// missed the row, `NOT IN` kept it and a `DELETE` left it.
+///
+/// Mutation: the list's computed items not trimmed (`spell_out_list_or_range`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_list_over_character_reads_computed_items_padded() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), b VARCHAR(6), t TEXT); \
+         INSERT INTO c VALUES (1, 'a%b', 'a%b', 'a%b'), (2, 'ab', 'ab  ', 'ab  '), (3, 'a_b', 'a_b', 'a_b'), (4, NULL, NULL, NULL), (5, 'x', 'x ', 'x')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check_each_rolled_back(
+        &c,
+        &[
+            ("SELECT id FROM c WHERE a IN ('ab' || '  ', 'x')", "[2];[5]"),
+            ("SELECT id FROM c WHERE a NOT IN ('ab' || '  ', 'x')", "[1];[3]"),
+            ("SELECT id FROM c WHERE a IN ('ab  ', 'x' || ' ')", "[2];[5]"),
+            ("SELECT id FROM c WHERE a IN (lower('AB  '), 'q')", "[2]"),
+            ("DELETE FROM c WHERE a IN ('x' || ' ', 'a%b' || '') RETURNING id", "[1];[5]"),
+            // Over text and varchar the items stay text.
+            ("SELECT id FROM c WHERE b IN ('ab' || '  ', 'x')", "[2]"),
+            ("SELECT id FROM c WHERE t IN ('ab' || '  ', 'x')", "[2];[5]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `text 'x'` (and `varchar 'x'`, `char 'x'`, `character varying 'x'`) is
+/// the value `x`, as `'x'::text` is: written by an INSERT, an UPDATE and an
+/// upsert's key. Taken whole, `text 'ab  '` was too long for a
+/// `character(4)` (22001), an upsert keyed by it failed, and `SET s = text
+/// 'zz '` stored the ten characters `text 'zz '`.
+///
+/// Mutation: `typed_text_literal` answering `None` (each write fails or
+/// stores the spelling).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_text_literal_is_its_value_on_every_write() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE tt (id INT PRIMARY KEY, s TEXT, c CHAR(4), v VARCHAR(3)); \
+         CREATE TABLE cc (k CHAR(3), n INT, v INT, CONSTRAINT cc_pk PRIMARY KEY (k, n)); \
+         INSERT INTO cc VALUES ('a', 1, 1)",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            ("INSERT INTO tt VALUES (1, text 'ab  ', text 'ab  ', varchar 'x ')", ""),
+            ("INSERT INTO tt VALUES (2, 'q', char 'cd', character varying 'yz   ')", ""),
+            ("UPDATE tt SET s = text 'zz ' WHERE id = 2 RETURNING s", "[zz ]"),
+            ("SELECT id, s, c, v FROM tt ORDER BY id", "[1]|[ab  ]|[ab  ]|[x ];[2]|[zz ]|[cd  ]|[yz ]"),
+            (
+                "INSERT INTO cc VALUES (text 'a  ', 1, 25) ON CONFLICT (k, n) DO UPDATE SET v = EXCLUDED.v RETURNING k, n, v",
+                "[a  ]|[1]|[25]",
+            ),
+            (
+                "INSERT INTO cc VALUES (text 'b  ', 2, 26), (text 'b', 2, 27) ON CONFLICT (k, n) DO UPDATE SET v = EXCLUDED.v",
+                "ERR 21000",
+            ),
+            ("SELECT k, n, v FROM cc ORDER BY k", "[a  ]|[1]|[25]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A pattern over `CAST(t AS CHAR(n))` reads the padded value, as one over
+/// `t::char(n)` does; and a `character varying` column keeps its type in a
+/// CTE or a derived table, so it compares blank-padded with a `character(n)`
+/// one there as in its table. Both read text before.
+///
+/// Mutations: `padded_for_pattern` not reading `CAST(` (the LIKE misses
+/// row 2); the relation's varying column declared TEXT (`a = b` misses
+/// rows 2 and 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_pattern_and_a_relations_varying_column_read_as_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), b VARCHAR(6), t TEXT); \
+         INSERT INTO c VALUES (1, 'a%b', 'a%b', 'a%b'), (2, 'ab', 'ab  ', 'ab  '), (3, 'a_b', 'a_b', 'a_b'), (4, NULL, NULL, NULL), (5, 'x', 'x ', 'x')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            ("SELECT id FROM c WHERE CAST(t AS CHAR(4)) LIKE 'ab  ' ORDER BY id", "[2]"),
+            ("SELECT id FROM c WHERE t::char(4) LIKE 'ab  ' ORDER BY id", "[2]"),
+            ("WITH w AS (SELECT id, a, b FROM c) SELECT id FROM w WHERE a = b ORDER BY id", "[1];[2];[3];[5]"),
+            ("WITH w AS (SELECT id, a, b FROM c) SELECT id FROM w WHERE b = a ORDER BY id", "[1];[2];[3];[5]"),
+            ("SELECT id FROM (SELECT id, a, b FROM c) s WHERE s.a = s.b ORDER BY id", "[1];[2];[3];[5]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

@@ -1333,7 +1333,10 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// list's typed literals as the column's type, as a written list is. One
 /// from a `character(n)` or `character varying` column compares
 /// blank-padded and is written untyped. Without trailing spaces the two
-/// readings agree.
+/// readings agree. The exact `('…' || '')` shape is what the rewrite knows
+/// a substituted value by, and keeps exact inside an `IN` list over
+/// `character(n)` (`predicate_rewrite::spell_out_list_or_range`), where a
+/// computed item written in the statement is read blank-padded.
 pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
     let literal = value_to_literal(db_type, bytes)?;
     Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {
