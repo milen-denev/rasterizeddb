@@ -343,3 +343,25 @@ async fn an_updates_expression_reads_its_text_as_the_column_does() {
     run(&c, "UPDATE tu SET a = coalesce(a, '2024-06-06 10:00:00+02') WHERE k = 2").await.expect("coalesce");
     assert_eq!(walls(column(&c, "SELECT a FROM tu ORDER BY k").await), ["2024-05-05 10:00:00", "2024-06-06 10:00:00"]);
 }
+
+/// Flipping between `timestamp` and `timestamptz` re-reads the column's
+/// DEFAULT and CHECK text under the new type, which would change a value a
+/// zone was written into; PostgreSQL keeps the value. Refused until it is
+/// restated without the zone; a column without one still flips.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flip_that_would_change_a_zoned_default_or_check_is_refused() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tf (k INT, a TIMESTAMPTZ DEFAULT '2024-01-01 09:00:00+05')").await.expect("create");
+    let e = run(&c, "ALTER TABLE tf ALTER COLUMN a TYPE timestamp").await.expect_err("refused");
+    assert_eq!(e.code().map(|c| c.code()), Some("0A000"), "{e}");
+    run(&c, "INSERT INTO tf (k) VALUES (1)").await.expect("insert");
+    assert_eq!(column(&c, "SELECT a FROM tf").await, ["2024-01-01 04:00:00+00"], "the default kept its value");
+
+    run(&c, "CREATE TABLE tg (k INT, a TIMESTAMP CHECK (a > '2024-01-01 09:00:00+05'))").await.expect("create");
+    let e = run(&c, "ALTER TABLE tg ALTER COLUMN a TYPE timestamptz").await.expect_err("refused");
+    assert_eq!(e.code().map(|c| c.code()), Some("0A000"), "{e}");
+
+    run(&c, "CREATE TABLE th (k INT, a TIMESTAMPTZ DEFAULT '2024-01-01 09:00:00')").await.expect("create");
+    run(&c, "ALTER TABLE th ALTER COLUMN a TYPE timestamp").await.expect("no zone: flips");
+}

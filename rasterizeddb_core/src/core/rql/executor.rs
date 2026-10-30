@@ -13848,6 +13848,28 @@ async fn execute_alter_table_action(
                             )
                             && db_type != field.literal_type() =>
                     {
+                        // A DEFAULT or CHECK of the column holding a zoned
+                        // literal (`'… 09:00+05'`) is re-read under the new
+                        // type and would mean another value; PostgreSQL keeps
+                        // the value it stored. Refused, rather than silently
+                        // changed, until it is restated without a zone.
+                        let mentions = |text: &str| {
+                            crate::core::sql_scan::contains_ignore_ascii_case(text, field.name.as_bytes())
+                        };
+                        let zoned_default = crate::core::rql::column_default::expression_for(&field.name, &schema.defaults)
+                            .filter(|e| crate::core::sql_scan::has_zoned_timestamp_literal(e));
+                        let zoned_check = schema
+                            .checks
+                            .iter()
+                            .find(|c| !c.is_deleted && mentions(&c.expression) && crate::core::sql_scan::has_zoned_timestamp_literal(&c.expression));
+                        if let Some(text) = zoned_default.map(str::to_string).or_else(|| zoned_check.map(|c| c.expression.clone())) {
+                            return ddl_error(&format!(
+                                "ALTER COLUMN {} TYPE cannot change between timestamp and timestamptz while its \
+                                 DEFAULT or a CHECK ({}) holds a literal with a time zone, which the new type \
+                                 would read as another value; restate it without the zone first (not supported)",
+                                field.name, text
+                            ));
+                        }
                         let without_time_zone = db_type == crate::core::db_type::DbType::TIMESTAMP;
                         let table_name = plan.table_name.clone();
                         let column = field.name.clone();
