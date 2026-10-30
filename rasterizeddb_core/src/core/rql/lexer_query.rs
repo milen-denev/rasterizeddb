@@ -2817,6 +2817,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -2828,6 +2829,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 8,
                 write_order: 1,
@@ -2839,6 +2841,7 @@ mod tests {
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
                 size: 1,
                 offset: 40,
                 write_order: 2,
@@ -2850,6 +2853,7 @@ mod tests {
             SchemaField {
                 name: "email".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 64,
                 offset: 41,
                 write_order: 3,

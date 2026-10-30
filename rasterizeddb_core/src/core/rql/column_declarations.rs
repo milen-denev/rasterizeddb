@@ -743,6 +743,41 @@ pub(crate) async fn drop_column(
     .await
 }
 
+/// `ALTER COLUMN name TYPE timestamp` or `TYPE timestamptz` on a column of
+/// the other: the field record's `without_time_zone` flag rewritten, in one
+/// log transaction. No row changes. The two are the same eight bytes, and the
+/// session time zone is UTC, so PostgreSQL's conversion between them keeps
+/// every value's microseconds as they are.
+pub(crate) async fn set_time_zone(
+    table: &str,
+    io_schema: &Arc<DbStorageProvider>,
+    name: &str,
+    without_time_zone: bool,
+) -> Result<Vec<String>, String> {
+    let mut fields = Fields::read(io_schema).await;
+    let live = fields.find(name, false);
+    if live.is_empty() {
+        return Err(format!("column '{}' does not exist", name));
+    }
+    for i in live {
+        let mut field = fields.records[i].clone().expect("found");
+        if field.db_type != crate::core::db_type::DbType::DATETIME {
+            return Err(format!("column '{}' is not a timestamp", name));
+        }
+        field.without_time_zone = without_time_zone;
+        fields.put(i, field);
+    }
+    Batch {
+        table: table.to_string(),
+        io_schema: io_schema.clone(),
+        header: None,
+        own: vec![fields.file],
+        others: Vec::new(),
+    }
+    .commit()
+    .await
+}
+
 /// `RENAME COLUMN from TO to` whole, as one transaction: the field and its
 /// companion, the column's own declarations, and every constraint, CHECK,
 /// generation expression and path index that mentions it, on this table and

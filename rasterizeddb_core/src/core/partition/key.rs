@@ -95,6 +95,7 @@ pub fn family_of(t: &DbType) -> Result<KeyFamily, String> {
         DbType::DATE
         | DbType::TIME
         | DbType::DATETIME
+        | DbType::TIMESTAMP
         | DbType::INET
         | DbType::MACADDR
         | DbType::MACADDR8 => "it is not supported as a partition key yet",

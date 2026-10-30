@@ -27,6 +27,36 @@ use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 /// left in [`REFUSAL`] for the caller to report. Both are what PostgreSQL's
 /// assignment does; this truncated, so `20.169` and `20.165` both stored 20.16,
 /// and took any number of integer digits.
+/// The type `value`, a literal written for `field`, is read at.
+///
+/// A `timestamp` column reads its literals with their zone discarded
+/// ([`SchemaField::literal_type`]), and a `timestamptz` one converts it. A
+/// cast written on the literal says which of the two it is, whatever the
+/// column: `'… 10:00+02'::timestamptz` is the 08:00 UTC instant, which a
+/// `timestamp` column holds as 08:00 (the session is UTC), and
+/// `'… 10:00+02'::timestamp` is 10:00 in either. The cast is otherwise
+/// dropped before the literal is read (`strip_redundant_cast`), which is why
+/// it is looked at here.
+pub(crate) fn literal_type_for(value: &str, field: &SchemaField) -> DbType {
+    let own = field.literal_type();
+    if !matches!(own, DbType::DATETIME | DbType::TIMESTAMP) {
+        return own;
+    }
+    let value = value.trim();
+    let stripped = crate::core::rql::column_default::strip_redundant_cast(value);
+    if stripped.len() == value.len() {
+        return own;
+    }
+    let cast = value[stripped.len()..].trim_start().trim_start_matches("::").trim();
+    if cast.eq_ignore_ascii_case("timestamptz") {
+        DbType::DATETIME
+    } else if cast.eq_ignore_ascii_case("timestamp") {
+        DbType::TIMESTAMP
+    } else {
+        own
+    }
+}
+
 fn value_to_mb_scaled(
     value_str: &str,
     db_type: &DbType,
@@ -250,7 +280,8 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // one encoder with the `UPDATE` path, so the two cannot drift apart on
         // what they accept. An unparsable literal yields an empty block rather
         // than a plausible-looking zero value.
-        DbType::DATETIME | DbType::UUID | DbType::INET | DbType::DECIMAL => {
+        // `TIMESTAMP` is a `timestamp` column's literal: its zone is discarded.
+        DbType::DATETIME | DbType::TIMESTAMP | DbType::UUID | DbType::INET | DbType::DECIMAL => {
             match crate::core::value_codec::encode_literal(db_type, value_str) {
                 Some(bytes) => {
                     let mut mb = MEMORY_POOL.acquire(bytes.len());
@@ -1047,7 +1078,8 @@ pub(crate) fn encode_column_value(
 
     let encoded = value_to_mb_scaled(
         value,
-        &schema_field.db_type,
+        // A `timestamp` column's literal keeps its wall-clock time.
+        &literal_type_for(value, schema_field),
         declared_scale(&schema_field.name, modifiers),
         crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
     )
@@ -1367,7 +1399,7 @@ pub fn insert_row_with_defaults(
                     .and_then(|literal| {
                         value_to_mb_scaled(
                             &literal,
-                            &field.db_type,
+                            &literal_type_for(&literal, field),
                             declared_scale(&field.name, modifiers),
                             crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
                         )
@@ -1496,6 +1528,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
@@ -1507,6 +1540,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 4 + 8,
                 offset: 4,
                 write_order: 1,
@@ -1541,6 +1575,7 @@ mod tests {
         let schema = vec![SchemaField {
             name: "id".to_string(),
             db_type: DbType::I32,
+            without_time_zone: false,
             size: 4,
             offset: 0,
             write_order: 0,
@@ -1566,6 +1601,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
@@ -1577,6 +1613,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
@@ -1588,6 +1625,7 @@ mod tests {
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I16,
+                without_time_zone: false,
                 size: 2,
                 offset: 20,
                 write_order: 2,
@@ -1599,6 +1637,7 @@ mod tests {
             SchemaField {
                 name: "email".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 22,
                 write_order: 3,
@@ -1610,6 +1649,7 @@ mod tests {
             SchemaField {
                 name: "active".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
                 size: 1,
                 offset: 54,
                 write_order: 4,
@@ -1621,6 +1661,7 @@ mod tests {
             SchemaField {
                 name: "score".to_string(),
                 db_type: DbType::F64,
+                without_time_zone: false,
                 size: 8,
                 offset: 55,
                 write_order: 5,
@@ -1632,6 +1673,7 @@ mod tests {
             SchemaField {
                 name: "created_at".to_string(),
                 db_type: DbType::I64,
+                without_time_zone: false,
                 size: 8,
                 offset: 63,
                 write_order: 6,
@@ -1643,6 +1685,7 @@ mod tests {
             SchemaField {
                 name: "notes".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 64,
                 offset: 71,
                 write_order: 7,
@@ -1720,6 +1763,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
@@ -1731,6 +1775,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
@@ -1742,6 +1787,7 @@ mod tests {
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I16,
+                without_time_zone: false,
                 size: 2,
                 offset: 20,
                 write_order: 2,
@@ -1795,6 +1841,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
@@ -1806,6 +1853,7 @@ mod tests {
             SchemaField {
                 name: "flag".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
                 size: 1,
                 offset: 4,
                 write_order: 1,
@@ -1817,6 +1865,7 @@ mod tests {
             SchemaField {
                 name: "desc".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 5,
                 write_order: 2,
@@ -1850,6 +1899,7 @@ mod tests {
             SchemaField {
                 name: "score".to_string(),
                 db_type: DbType::F64,
+                without_time_zone: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -1861,6 +1911,7 @@ mod tests {
             SchemaField {
                 name: "grade".to_string(),
                 db_type: DbType::CHAR,
+                without_time_zone: false,
                 size: 1,
                 offset: 8,
                 write_order: 1,
@@ -1893,6 +1944,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
@@ -1904,6 +1956,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
@@ -1950,6 +2003,7 @@ mod tests {
             SchemaField {
                 name: "ok".to_string(),
                 db_type: DbType::BOOL,
+                without_time_zone: false,
                 size: 1,
                 offset: 0,
                 write_order: 0,
@@ -1961,6 +2015,7 @@ mod tests {
             SchemaField {
                 name: "flag".to_string(),
                 db_type: DbType::BOOL,
+                without_time_zone: false,
                 size: 1,
                 offset: 1,
                 write_order: 1,
@@ -2010,6 +2065,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -2021,6 +2077,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 8,
                 write_order: 1,
@@ -2032,6 +2089,7 @@ mod tests {
             SchemaField {
                 name: "job_title".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 40,
                 write_order: 2,
@@ -2043,6 +2101,7 @@ mod tests {
             SchemaField {
                 name: "salary".to_string(),
                 db_type: DbType::F32,
+                without_time_zone: false,
                 size: 4,
                 offset: 72,
                 write_order: 3,
@@ -2054,6 +2113,7 @@ mod tests {
             SchemaField {
                 name: "department".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 76,
                 write_order: 4,
@@ -2065,6 +2125,7 @@ mod tests {
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
                 size: 4,
                 offset: 108,
                 write_order: 5,
@@ -2076,6 +2137,7 @@ mod tests {
             SchemaField {
                 name: "manager".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 112,
                 write_order: 6,
@@ -2087,6 +2149,7 @@ mod tests {
             SchemaField {
                 name: "location".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 144,
                 write_order: 7,
@@ -2098,6 +2161,7 @@ mod tests {
             SchemaField {
                 name: "hire_date".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 176,
                 write_order: 8,
@@ -2109,6 +2173,7 @@ mod tests {
             SchemaField {
                 name: "degree".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 184,
                 write_order: 9,
@@ -2120,6 +2185,7 @@ mod tests {
             SchemaField {
                 name: "skills".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 64,
                 offset: 216,
                 write_order: 10,
@@ -2131,6 +2197,7 @@ mod tests {
             SchemaField {
                 name: "current_project".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 32,
                 offset: 280,
                 write_order: 11,
@@ -2142,6 +2209,7 @@ mod tests {
             SchemaField {
                 name: "performance_score".to_string(),
                 db_type: DbType::F32,
+                without_time_zone: false,
                 size: 4,
                 offset: 312,
                 write_order: 12,
@@ -2153,6 +2221,7 @@ mod tests {
             SchemaField {
                 name: "is_active".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
                 size: 1,
                 offset: 316,
                 write_order: 13,
@@ -2164,6 +2233,7 @@ mod tests {
             SchemaField {
                 name: "created_at".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 317,
                 write_order: 14,
@@ -2175,6 +2245,7 @@ mod tests {
             SchemaField {
                 name: "updated_at".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 325,
                 write_order: 15,
@@ -2186,6 +2257,7 @@ mod tests {
             SchemaField {
                 name: "is_fired".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
                 size: 1,
                 offset: 333,
                 write_order: 16,
@@ -2664,6 +2736,7 @@ mod insert_parse_bench {
         SchemaField {
             name: name.to_string(),
             db_type,
+            without_time_zone: false,
             size,
             offset: 0,
             write_order: order,

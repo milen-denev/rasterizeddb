@@ -853,6 +853,7 @@ fn tokenize_inner<'a>(
             _ => return Err(format!("unexpected character '{}'", c as char)),
         }
     }
+    local_timestamp_literals(&mut out, schema);
 
     // `0.12345678912300000001 > a`: read before the column, so with no
     // NUMERIC beside it, the literal became a float that is another number.
@@ -914,6 +915,54 @@ fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallV
             if let Token::StringLit(text) = &mut out[j] {
                 let kept = text.trim_end_matches(' ').len();
                 text.truncate(kept);
+            }
+        }
+    }
+}
+
+/// A string compared with a `timestamp` (without time zone) column, read as
+/// that type reads it: its zone, if it has one, discarded.
+///
+/// Such a column is a `DATETIME` that keeps a literal's wall-clock time
+/// (`SchemaField::without_time_zone`), so `ts = '2024-01-01 10:00:00+02'`
+/// has to look for 10:00, as PostgreSQL's `timestamp` comparison does, and
+/// not for the 08:00 UTC instant the text names: read that way, a value the
+/// column holds was not found. Done on the tokens, the form every reader of a
+/// predicate shares (the scan's comparisons, the filter index, the secondary
+/// indexes, the prefilter, partition routing); `IN` and `BETWEEN` reach here
+/// as the comparisons they mean. The literal is rewritten in the form every
+/// one of them reads as the same microseconds. A literal under a cast is left
+/// alone: `::timestamptz` names an instant.
+fn local_timestamp_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
+    if !schema.iter().any(|f| f.without_time_zone && !f.is_deleted) {
+        return;
+    }
+    let local = |t: &Token| match t {
+        Token::Ident((name, DbType::DATETIME, wo)) => schema
+            .iter()
+            .any(|f| f.write_order == *wo && !f.is_deleted && f.name == *name && f.without_time_zone),
+        _ => false,
+    };
+    let comparison = |t: &Token| {
+        matches!(t, Token::Op(op) if matches!(op.as_str(), "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="))
+    };
+    for j in 0..out.len() {
+        if !matches!(out[j], Token::StringLit(_)) || matches!(out.get(j + 1), Some(Token::Cast(_))) {
+            continue;
+        }
+        let after_column = j >= 2 && comparison(&out[j - 1]) && local(&out[j - 2]);
+        let before_column = j + 2 < out.len() && comparison(&out[j + 1]) && local(&out[j + 2]);
+        if !(after_column || before_column) {
+            continue;
+        }
+        if let Token::StringLit(text) = &mut out[j] {
+            if let Some(us) = crate::core::value_codec::parse_timestamp_local_us(text) {
+                // Only a form that reads back as the same instant; anything
+                // else (a year past 9999) is left as written.
+                let local = crate::core::value_codec::format_timestamp_us(us);
+                if crate::core::value_codec::parse_timestamp_us(&local) == Some(us) {
+                    *text = local;
+                }
             }
         }
     }
@@ -1438,6 +1487,7 @@ mod tests {
         schema.push(SchemaField {
             name: "field1".to_string(),
             db_type: DbType::F64,
+            without_time_zone: false,
             is_deleted: false,
             size: 0,
             offset: 0,
@@ -1449,6 +1499,7 @@ mod tests {
         schema.push(SchemaField {
             name: "field2".to_string(),
             db_type: DbType::F64,
+            without_time_zone: false,
             is_deleted: false,
             size: 0,
             offset: 0,

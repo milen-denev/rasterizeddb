@@ -245,6 +245,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -256,6 +257,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 12,
                 offset: 8,
                 write_order: 1,

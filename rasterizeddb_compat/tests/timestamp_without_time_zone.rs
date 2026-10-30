@@ -1,0 +1,276 @@
+//! `timestamp` (without time zone) against `timestamptz`, as PostgreSQL 17
+//! answers each statement here (`docker run --rm postgres:17`, session
+//! `TimeZone` UTC).
+//!
+//! The two were one type, so a zone written in a literal was applied to a
+//! column that has none: `'2024-01-01 10:00:00+02'` into a `TIMESTAMP` column
+//! stored 08:00, reported success, and a later `WHERE ts = '… 10:00:00'` found
+//! nothing. PostgreSQL's `timestamp_in` discards the zone and stores 10:00; a
+//! `timestamptz` keeps converting by it.
+
+use rasterizeddb_compat::TestServer;
+use tokio_postgres::{Client, SimpleQueryMessage};
+
+async fn client(server: &TestServer) -> Client {
+    let (client, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    client
+}
+
+async fn run(c: &Client, sql: &str) -> Result<u64, tokio_postgres::Error> {
+    let mut count = 0;
+    for m in c.simple_query(sql).await? {
+        if let SimpleQueryMessage::CommandComplete(n) = m {
+            count = n;
+        }
+    }
+    Ok(count)
+}
+
+/// Every row's cells as text, NULL as `None`.
+async fn rows(c: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    c.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some((0..r.len()).map(|i| r.get(i).map(str::to_string)).collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first column of every row.
+async fn column(c: &Client, sql: &str) -> Vec<String> {
+    rows(c, sql).await.into_iter().map(|r| r[0].clone().unwrap_or_else(|| "NULL".into())).collect()
+}
+
+/// A `timestamp` cell's wall-clock time, whatever suffix it is shown with:
+/// what these tests check is the value stored, not how it is rendered.
+fn wall(cell: &str) -> &str {
+    cell.strip_suffix("+00").unwrap_or(cell)
+}
+
+fn walls(cells: Vec<String>) -> Vec<String> {
+    cells.iter().map(|c| wall(c).to_string()).collect()
+}
+
+const TABLE: &str = "CREATE TABLE ts (k INT NOT NULL, a TIMESTAMP, b TIMESTAMPTZ, \
+     c TIMESTAMP WITHOUT TIME ZONE, d TIMESTAMP WITH TIME ZONE, e TIMESTAMP(3))";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_literals_zone_is_discarded_by_timestamp_and_applied_by_timestamptz() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, TABLE).await.expect("create");
+    run(
+        &c,
+        "INSERT INTO ts VALUES (1, '2024-01-01 10:00:00+02', '2024-01-01 10:00:00+02', \
+         '2024-01-01 10:00:00-05:30', '2024-01-01 10:00:00-05:30', '2024-01-01T10:00:00Z')",
+    )
+    .await
+    .expect("insert");
+    // A multi-row VALUES, which is executed row by row.
+    run(&c, "INSERT INTO ts (k, a, b) VALUES (2, '2021-01-01 00:00:00+0530', '2021-01-01 00:00:00+0530'), (3, '2024-03-03 03:03:03+03', '2024-03-03 03:03:03+03')")
+        .await
+        .expect("multi-row insert");
+    let got = rows(&c, "SELECT k, a, b, c, d, e FROM ts ORDER BY k").await;
+    let cell = |r: usize, i: usize| got[r][i].clone().unwrap_or_default();
+    // PostgreSQL 17: 10:00 | 08:00+00 | 10:00 | 15:30+00 | 10:00.
+    assert_eq!(wall(&cell(0, 1)), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(cell(0, 2), "2024-01-01 08:00:00+00", "{got:?}");
+    assert_eq!(wall(&cell(0, 3)), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(cell(0, 4), "2024-01-01 15:30:00+00", "{got:?}");
+    assert_eq!(wall(&cell(0, 5)), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(wall(&cell(1, 1)), "2021-01-01 00:00:00", "{got:?}");
+    assert_eq!(cell(1, 2), "2020-12-31 18:30:00+00", "{got:?}");
+    assert_eq!(wall(&cell(2, 1)), "2024-03-03 03:03:03", "{got:?}");
+    assert_eq!(cell(2, 2), "2024-03-03 00:03:03+00", "{got:?}");
+
+    run(&c, "UPDATE ts SET a = '2024-06-01 12:00:00+03', b = '2024-06-01 12:00:00+03' WHERE k = 2")
+        .await
+        .expect("update");
+    let got = rows(&c, "SELECT a, b FROM ts WHERE k = 2").await;
+    assert_eq!(wall(got[0][0].as_deref().unwrap()), "2024-06-01 12:00:00", "{got:?}");
+    assert_eq!(got[0][1].as_deref(), Some("2024-06-01 09:00:00+00"), "{got:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn defaults_and_upserts_keep_the_wall_clock_time() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(
+        &c,
+        "CREATE TABLE tsd (k INT, a TIMESTAMP DEFAULT '2024-01-01 10:00:00+02', \
+         b TIMESTAMPTZ DEFAULT '2024-01-01 10:00:00+02')",
+    )
+    .await
+    .expect("create");
+    run(&c, "INSERT INTO tsd (k) VALUES (1)").await.expect("omitted");
+    run(&c, "INSERT INTO tsd VALUES (2, DEFAULT, DEFAULT)").await.expect("DEFAULT");
+    let got = rows(&c, "SELECT a, b FROM tsd ORDER BY k").await;
+    for row in &got {
+        assert_eq!(wall(row[0].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+        assert_eq!(row[1].as_deref(), Some("2024-01-01 08:00:00+00"), "{got:?}");
+    }
+
+    run(&c, "CREATE TABLE tsu (k INT PRIMARY KEY, a TIMESTAMP)").await.expect("create");
+    let upsert = "INSERT INTO tsu VALUES (1, '2024-01-01 10:00:00+02') \
+                  ON CONFLICT (k) DO UPDATE SET a = '2025-01-01 10:00:00+02'";
+    run(&c, upsert).await.expect("insert");
+    run(&c, upsert).await.expect("update");
+    let many = |year: u32| {
+        format!(
+            "INSERT INTO tsu VALUES (2, '{year}-01-01 10:00:00+02'), (3, '{year}-01-01 11:00:00-02') \
+             ON CONFLICT (k) DO UPDATE SET a = EXCLUDED.a"
+        )
+    };
+    run(&c, &many(2024)).await.expect("insert");
+    run(&c, &many(2026)).await.expect("update");
+    assert_eq!(
+        walls(column(&c, "SELECT a FROM tsu ORDER BY k").await),
+        ["2025-01-01 10:00:00", "2026-01-01 10:00:00", "2026-01-01 11:00:00"]
+    );
+
+    // A key compares the wall-clock times: these are one value of a
+    // `timestamp` key, and PostgreSQL refuses the second.
+    run(&c, "CREATE TABLE tsk (a TIMESTAMP PRIMARY KEY, n INT)").await.expect("create");
+    run(&c, "INSERT INTO tsk VALUES ('2024-01-01 10:00:00+02', 1)").await.expect("first");
+    let dup = run(&c, "INSERT INTO tsk VALUES ('2024-01-01 10:00:00-07', 2)").await.expect_err("same key");
+    assert_eq!(dup.code().map(|c| c.code()), Some("23505"), "{dup}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn predicates_read_a_literal_against_a_timestamp_column_without_its_zone() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE ts (k INT NOT NULL, a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
+    run(
+        &c,
+        "INSERT INTO ts VALUES (1, '2024-01-01 10:00:00', '2024-01-01 10:00:00+02'), \
+         (2, '2024-06-01 12:00:00', '2024-06-01 12:00:00'), (3, '2024-01-01 08:00:00', '2024-01-01 08:00:00')",
+    )
+    .await
+    .expect("insert");
+    // Each against PostgreSQL 17.
+    for (sql, want) in [
+        ("SELECT k FROM ts WHERE a = '2024-01-01 10:00:00+07'", vec!["1"]),
+        ("SELECT k FROM ts WHERE '2024-01-01 10:00:00-09' = a", vec!["1"]),
+        ("SELECT k FROM ts WHERE a <> '2024-01-01 10:00:00+07' ORDER BY k", vec!["2", "3"]),
+        (
+            "SELECT k FROM ts WHERE a BETWEEN '2024-01-01 09:59:00+05' AND '2024-01-01 10:01:00+05' ORDER BY k",
+            vec!["1"],
+        ),
+        ("SELECT k FROM ts WHERE a IN ('2024-01-01 10:00:00+01', '2024-06-01 12:00:00Z') ORDER BY k", vec!["1", "2"]),
+        ("SELECT k FROM ts WHERE a > '2024-01-01 09:00:00+09' ORDER BY k", vec!["1", "2"]),
+        // A `timestamptz` column still converts: both name 08:00 UTC.
+        ("SELECT k FROM ts WHERE b = '2024-01-01 10:00:00+02' ORDER BY k", vec!["1", "3"]),
+        ("SELECT CASE WHEN a = '2024-01-01 10:00:00+02' THEN 'hit' ELSE 'miss' END FROM ts WHERE k = 1", vec!["hit"]),
+    ] {
+        assert_eq!(column(&c, sql).await, want, "{sql}");
+    }
+    assert_eq!(run(&c, "UPDATE ts SET k = 10 WHERE a = '2024-01-01 10:00:00+05'").await.expect("update"), 1);
+    assert_eq!(run(&c, "DELETE FROM ts WHERE a = '2024-06-01 12:00:00-11'").await.expect("delete"), 1);
+    assert_eq!(column(&c, "SELECT k FROM ts ORDER BY k").await, ["3", "10"]);
+}
+
+/// The flag is a field record's: a table rewrite (ADD COLUMN on a populated
+/// table rebuilds it), ALTER COLUMN TYPE in either direction and a restart
+/// each keep or change it as asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_column_stays_a_timestamp_across_a_rewrite_an_alter_and_a_restart() {
+    let root = format!("/var/tmp/timestamp_without_time_zone_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&root);
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    {
+        let server = TestServer::start_file_backed(&root).await.expect("server");
+        let c = client(&server).await;
+        run(&c, "CREATE TABLE ts (k INT NOT NULL, a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
+        run(&c, "INSERT INTO ts VALUES (1, '2024-01-01 10:00:00+02', '2024-01-01 10:00:00+02')").await.expect("insert");
+        // Rebuilds the populated table; the new column's default fills the
+        // row already there.
+        run(&c, "ALTER TABLE ts ADD COLUMN f TIMESTAMP DEFAULT '2024-01-01 10:00:00+02'").await.expect("add");
+        run(&c, "INSERT INTO ts (k, a, b) VALUES (2, '2024-01-01 10:00:00+02', '2024-01-01 10:00:00+02')")
+            .await
+            .expect("insert after the rewrite");
+        let got = rows(&c, "SELECT a, b, f FROM ts ORDER BY k").await;
+        for row in &got {
+            assert_eq!(wall(row[0].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+            assert_eq!(row[1].as_deref(), Some("2024-01-01 08:00:00+00"), "{got:?}");
+            assert_eq!(wall(row[2].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+        }
+
+        // `timestamptz` and back: no value moves (the session is UTC), and
+        // each statement after reads its literal as the column now is.
+        run(&c, "ALTER TABLE ts ALTER COLUMN a TYPE timestamptz").await.expect("to timestamptz");
+        run(&c, "INSERT INTO ts (k, a) VALUES (3, '2024-01-01 10:00:00+02')").await.expect("insert");
+        run(&c, "ALTER TABLE ts ALTER COLUMN a TYPE timestamp without time zone").await.expect("to timestamp");
+        run(&c, "INSERT INTO ts (k, a) VALUES (4, '2024-01-01 10:00:00+02')").await.expect("insert");
+        // Restated as it is: no change.
+        run(&c, "ALTER TABLE ts ALTER COLUMN a TYPE timestamp").await.expect("same type");
+        assert_eq!(
+            walls(column(&c, "SELECT a FROM ts ORDER BY k").await),
+            ["2024-01-01 10:00:00", "2024-01-01 10:00:00", "2024-01-01 08:00:00", "2024-01-01 10:00:00"]
+        );
+    }
+    let server = TestServer::start_file_backed(&root).await.expect("restart");
+    let c = client(&server).await;
+    run(&c, "INSERT INTO ts (k, a, b, f) VALUES (5, '2024-01-01 10:00:00-03', '2024-01-01 10:00:00-03', '2024-01-01 10:00:00-03')")
+        .await
+        .expect("insert after the restart");
+    let got = rows(&c, "SELECT a, b, f FROM ts WHERE k = 5").await;
+    assert_eq!(wall(got[0][0].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(got[0][1].as_deref(), Some("2024-01-01 13:00:00+00"), "{got:?}");
+    assert_eq!(wall(got[0][2].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(column(&c, "SELECT k FROM ts WHERE a = '2024-01-01 10:00:00+09' ORDER BY k").await, ["1", "2", "4", "5"]);
+}
+
+/// A prepared statement bound with text: the parse is learned on the second
+/// execution and reused from the third (`rql::prepared`), and every one of
+/// them reads the bound literal as the column does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_lookup_reads_each_bound_literal_without_its_zone() {
+    use sqlx::Row;
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    sqlx::query("CREATE TABLE ts (k INT NOT NULL, a TIMESTAMP)").execute(&pool).await.expect("create");
+    for k in 0..6 {
+        sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO ts VALUES ({k}, '2024-01-0{} 10:00:00')", k + 1)))
+            .execute(&pool)
+            .await
+            .expect("insert");
+    }
+    for k in 0..6i32 {
+        // A different zone each time; each names the row's wall-clock time.
+        let literal = format!("2024-01-0{} 10:00:00+0{}", k + 1, k + 1);
+        let found: Vec<i32> = sqlx::query("SELECT k FROM ts WHERE a = $1")
+            .bind(&literal)
+            .fetch_all(&pool)
+            .await
+            .expect("select")
+            .iter()
+            .map(|r| r.get::<i32, _>(0))
+            .collect();
+        assert_eq!(found, vec![k], "{literal}");
+        sqlx::query("INSERT INTO ts (k, a) VALUES ($1, $2)")
+            .bind(100 + k)
+            .bind(&literal)
+            .execute(&pool)
+            .await
+            .expect("insert");
+    }
+    let n: i64 = sqlx::query("SELECT count(*) FROM ts WHERE k >= 100 AND a = '2024-01-03 10:00:00'")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(n, 1);
+}

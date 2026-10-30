@@ -24,6 +24,10 @@ const SCHEMA_FIELD_CHUNK_SIZE: usize = SCHEMA_FIELD_SIZE as usize * 100;
 /// Number of schema fields to retrieve in a batch
 const BATCH_SIZE: usize = 100;
 
+/// Bit 0 of a field record's spare type byte (130): the column is a
+/// `timestamp` (without time zone). See [`SchemaField::without_time_zone`].
+const TIMESTAMP_WITHOUT_TIME_ZONE: u8 = 0x01;
+
 const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator and primary key + null terminator
 
 /// Opens the incarnation record that follows the header in `_schema.db`.
@@ -84,6 +88,20 @@ pub fn mint_incarnation() -> u128 {
 pub struct SchemaField {
     pub name: String,
     pub db_type: DbType,
+    /// A `DATETIME` column declared `timestamp` (without time zone) rather
+    /// than `timestamptz`; always `false` for any other type.
+    ///
+    /// The two are stored alike, eight bytes of microseconds, so this is
+    /// metadata: a literal's zone offset is discarded for such a column rather
+    /// than applied (`'… 10:00+02'` stores 10:00, as PostgreSQL stores it), and
+    /// the column is described as `timestamp` and shown with no `+00`
+    /// ([`DbType::TIMESTAMP`], [`SchemaField::literal_type`]).
+    ///
+    /// Persisted in the field record's spare type byte (130), which every
+    /// earlier build wrote as zero and reads past: a table created before this
+    /// existed reads as `timestamptz`, which is what it always behaved as, and
+    /// an earlier build opening a newer table does the same.
+    pub without_time_zone: bool,
     pub size: u32,
     pub offset: u64,
     pub write_order: u64,
@@ -140,9 +158,14 @@ impl SchemaField {
         write_order: u64,
         is_unique: bool,
     ) -> Self {
+        // `DbType::TIMESTAMP` names a `timestamp` column; it is stored as a
+        // `DATETIME` that carries the flag.
+        let without_time_zone = db_type == DbType::TIMESTAMP;
+        let db_type = if without_time_zone { DbType::DATETIME } else { db_type };
         SchemaField {
             name,
             db_type,
+            without_time_zone,
             size,
             offset,
             write_order,
@@ -150,6 +173,17 @@ impl SchemaField {
             scale: None,
             typmod_packed: None,
             is_deleted: false,
+        }
+    }
+
+    /// The type a literal written for this column is read as: its own, except
+    /// that a `timestamp` column reads one as [`DbType::TIMESTAMP`], so a
+    /// zone offset in it is discarded rather than applied.
+    pub fn literal_type(&self) -> DbType {
+        if self.without_time_zone && self.db_type == DbType::DATETIME {
+            DbType::TIMESTAMP
+        } else {
+            self.db_type.clone()
         }
     }
 
@@ -178,6 +212,12 @@ impl SchemaField {
         // Add type at position 129
         let type_bytes = (self.db_type.to_byte() as u16).to_le_bytes();
         vec[129..129 + 2].copy_from_slice(&type_bytes);
+        // The type's high byte is spare (every type fits the low one, and the
+        // reader has always taken only that): bit 0 marks a `timestamp`
+        // column ([`SchemaField::without_time_zone`]).
+        if self.without_time_zone && self.db_type == DbType::DATETIME {
+            vec[130] |= TIMESTAMP_WITHOUT_TIME_ZONE;
+        }
 
         // Add size at position 131
         let size_bytes = self.size.to_le_bytes();
@@ -218,8 +258,9 @@ impl SchemaField {
         };
 
         // Extract type from position 129
-        let db_type_value = u16::from_le_bytes([vec[129], vec[130]]);
-        let db_type = DbType::from_byte(db_type_value as u8);
+        let db_type = DbType::from_byte(vec[129]);
+        let without_time_zone =
+            db_type == DbType::DATETIME && vec[130] & TIMESTAMP_WITHOUT_TIME_ZONE != 0;
 
         // Extract size from position 131
         let size = u32::from_le_bytes([vec[131], vec[132], vec[133], vec[134]]);
@@ -241,6 +282,7 @@ impl SchemaField {
         Ok(SchemaField {
             name,
             db_type,
+            without_time_zone,
             size,
             offset,
             write_order,
@@ -1781,6 +1823,34 @@ mod tests {
                 assert_eq!(back, "é".repeat(64));
             }
         }
+    }
+
+    /// A `timestamp` column's flag rides in the record's spare type byte: it
+    /// reads back, a `timestamptz` and every other type read back without it,
+    /// and the low byte an earlier build reads the type from is unchanged
+    /// (`DATETIME`, 15), so such a build opens the table as the `timestamptz`
+    /// it always took the column for.
+    #[test]
+    fn a_timestamp_column_keeps_its_flag_in_the_record() {
+        let ts = SchemaField::new("at".into(), DbType::TIMESTAMP, 8, 0, 0, false);
+        assert_eq!((ts.db_type.clone(), ts.without_time_zone), (DbType::DATETIME, true));
+        let bytes = ts.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (15, 1));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert_eq!((back.db_type.clone(), back.without_time_zone), (DbType::DATETIME, true));
+        assert_eq!(back.literal_type(), DbType::TIMESTAMP);
+
+        let tz = SchemaField::new("at".into(), DbType::DATETIME, 8, 0, 0, false);
+        let bytes = tz.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (15, 0));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert!(!back.without_time_zone);
+        assert_eq!(back.literal_type(), DbType::DATETIME);
+
+        // The bit means nothing on another type.
+        let mut other = SchemaField::new("n".into(), DbType::I64, 8, 0, 0, false).into_vec();
+        other[130] = 1;
+        assert!(!SchemaField::from_vec(&other).unwrap().without_time_zone);
     }
 
     #[test]

@@ -155,7 +155,9 @@ impl Database {
                         return None;
                     }
                     let (db_type, _) = crate::core::rql::lexer_alter::parse_column_type(&words[1..]).ok()?;
-                    if db_type == field.db_type {
+                    // `literal_type`: a `timestamp` column restated as
+                    // `timestamp` is no change.
+                    if db_type == field.literal_type() {
                         return None;
                     }
                     if is_key(name) {

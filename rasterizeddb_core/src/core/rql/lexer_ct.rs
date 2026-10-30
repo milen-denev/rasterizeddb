@@ -1509,7 +1509,8 @@ mod tests {
             DbType::STRING,
             DbType::STRING,
             DbType::DATETIME,
-            DbType::DATETIME,
+            // `timestamp_col TIMESTAMP`: without time zone.
+            DbType::TIMESTAMP,
             DbType::BOOL,
             DbType::BOOL,
         ];
@@ -1586,7 +1587,8 @@ mod tests {
         assert_eq!(declared(&result)[2].name, "score");
         assert_eq!(declared(&result)[2].data_type, DbType::F64);
         assert_eq!(declared(&result)[3].name, "created_at");
-        assert_eq!(declared(&result)[3].data_type, DbType::DATETIME);
+        // `TIMESTAMP` alone is `timestamp without time zone`.
+        assert_eq!(declared(&result)[3].data_type, DbType::TIMESTAMP);
         assert_eq!(declared(&result)[4].name, "is_active");
         assert_eq!(declared(&result)[4].data_type, DbType::I8);
         assert_eq!(declared(&result)[5].name, "desc");

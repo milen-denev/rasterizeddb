@@ -10402,7 +10402,7 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             }
         }
 
-        DbType::DATETIME => {
+        DbType::DATETIME | DbType::TIMESTAMP => {
             // 8-byte LE microseconds since the Unix epoch. The server reports
             // TimeZone=UTC at startup, so the offset is always +00.
             let Some(us) = le_i64(bytes) else { return None };

@@ -641,10 +641,16 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         String::new()
     };
 
+    // `timestamp without time zone` is `timestamp`, `DbType::TIMESTAMP`: a
+    // `DATETIME` whose literals keep their wall-clock time (see
+    // `SchemaField::without_time_zone`). Both were `DATETIME`, so a zone in a
+    // literal was applied to a column that has none: `'10:00+02'` stored 08:00.
     if four == "TIMESTAMP WITH TIME ZONE" || four == "TIMESTAMP WITHOUT TIME ZONE" {
         return Ok((
             if is_array(4) {
                 DbType::ARRAY
+            } else if four == "TIMESTAMP WITHOUT TIME ZONE" {
+                DbType::TIMESTAMP
             } else {
                 DbType::DATETIME
             },
@@ -744,7 +750,11 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         // `timestamptz` on the wire and a client asking to decode a date or a
         // time of day refused the column. They are their own types now, stored
         // in the layout Postgres sends them in.
-        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => DbType::DATETIME,
+        // `TIMESTAMP` alone is PostgreSQL's `timestamp without time zone`.
+        // `DATETIME` is this engine's own word and keeps meaning what it
+        // always did, `timestamptz`.
+        "TIMESTAMP" => DbType::TIMESTAMP,
+        "TIMESTAMPTZ" | "DATETIME" => DbType::DATETIME,
         "DATE" => DbType::DATE,
         "TIME" => DbType::TIME,
         "TIMETZ" => DbType::TIMETZ,
@@ -1268,6 +1278,12 @@ mod tests {
                 "ALTER TABLE t ADD COLUMN c TIMESTAMP WITH TIME ZONE",
                 DbType::DATETIME,
             ),
+            (
+                "ALTER TABLE t ADD COLUMN c TIMESTAMP WITHOUT TIME ZONE",
+                DbType::TIMESTAMP,
+            ),
+            ("ALTER TABLE t ADD COLUMN c TIMESTAMP(3)", DbType::TIMESTAMP),
+            ("ALTER TABLE t ADD COLUMN c TIMESTAMPTZ", DbType::DATETIME),
             ("ALTER TABLE t ADD COLUMN c DOUBLE PRECISION", DbType::F64),
             (
                 "ALTER TABLE t ADD COLUMN c CHARACTER VARYING",

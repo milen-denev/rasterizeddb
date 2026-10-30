@@ -1797,6 +1797,8 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
                 strip_trailing_spaces(&mut left);
                 blank_pad_varying(&mut left);
             }
+            local_timestamp_literal(&left, &mut right);
+            local_timestamp_literal(&right, &mut left);
             return Ok(Condition {
                 left,
                 cmp,
@@ -1821,6 +1823,28 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         }
     }
     Err(format!("condition '{}' is not a comparison", text))
+}
+
+/// A quoted literal compared with a `timestamp` (without time zone) column,
+/// read as that column reads one: its zone discarded
+/// (`SchemaField::without_time_zone`). Left as text it was converted to UTC
+/// when compared, so `ts = '… 10:00+02'` looked for 08:00 in a column that
+/// holds 10:00. The tokenizer does the same for the scan's predicates
+/// (`query_tokenizer::local_timestamp_literals`).
+fn local_timestamp_literal(column: &Expr, literal: &mut Expr) {
+    let Expr::Column(field) = column else { return };
+    if !(field.without_time_zone && field.db_type == DbType::DATETIME) {
+        return;
+    }
+    let Expr::Literal { bytes, db_type } = literal else { return };
+    if *db_type != DbType::STRING {
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes).to_string();
+    if let Some(us) = crate::core::value_codec::parse_timestamp_local_us(text.trim_matches('\'')) {
+        *bytes = us.to_le_bytes().to_vec();
+        *db_type = DbType::DATETIME;
+    }
 }
 
 /// Position of a top-level operator, outside quotes and parentheses.

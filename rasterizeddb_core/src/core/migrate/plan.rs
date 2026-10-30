@@ -971,7 +971,7 @@ mod tests {
         );
         assert!(
             plan.create
-                .contains("at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+                .contains("at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP"),
             "{}",
             plan.create
         );

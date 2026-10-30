@@ -3193,7 +3193,10 @@ where
                         .iter()
                         .map(|f| CreateColumnData {
                             name: f.name.clone(),
-                            data_type: f.db_type.clone(),
+                            // `literal_type`: a `timestamp` column is
+                            // recreated as one, not as the `timestamptz`
+                            // its storage type alone would declare.
+                            data_type: f.literal_type(),
                         })
                         .collect(),
                     is_immutable: false,
@@ -3392,8 +3395,10 @@ fn rewrite_payload(
                             .map(|v| v.to_le_bytes().to_vec());
                         }
                     }
+                    // `literal_type`: a `timestamp` column's default keeps
+                    // its wall-clock time, as an INSERT's would.
                     crate::core::value_codec::encode_literal(
-                        &field.db_type,
+                        &field.literal_type(),
                         literal.trim_matches('\''),
                     )
                     .or_else(|| {
@@ -13729,7 +13734,39 @@ async fn execute_alter_table_action(
                 }
                 let type_tokens: Vec<&str> = words[1..].to_vec();
                 return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
-                    Ok((db_type, _)) if db_type == field.db_type => {
+                    // `timestamp` to `timestamptz` or back: the same bytes,
+                    // so only the field's flag changes (no row is rewritten).
+                    Ok((db_type, _))
+                        if field.db_type == crate::core::db_type::DbType::DATETIME
+                            && matches!(
+                                db_type,
+                                crate::core::db_type::DbType::DATETIME | crate::core::db_type::DbType::TIMESTAMP
+                            )
+                            && db_type != field.literal_type() =>
+                    {
+                        let without_time_zone = db_type == crate::core::db_type::DbType::TIMESTAMP;
+                        let table_name = plan.table_name.clone();
+                        let column = field.name.clone();
+                        match database
+                            .reload_atomic(&plan.table_name, |old| async move {
+                                crate::core::rql::column_declarations::set_time_zone(
+                                    &table_name,
+                                    &old.io_schema,
+                                    &column,
+                                    without_time_zone,
+                                )
+                                .await
+                                .map(|_| ())
+                            })
+                            .await
+                        {
+                            Ok(()) => ddl_ok(0),
+                            Err(failure) => reload_failed(failure, ""),
+                        }
+                    }
+                    // `literal_type`: a `timestamp` column restated as
+                    // `timestamp` asks for no change.
+                    Ok((db_type, _)) if db_type == field.literal_type() => {
                         let numeric = match numeric_modifier_change(&schema, &name, &type_tokens.join(" "), row_count) {
                             Ok(entry) => entry,
                             Err(e) => return ddl_error(&e),

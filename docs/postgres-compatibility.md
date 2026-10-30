@@ -91,8 +91,40 @@ the filter index entirely.
 | `INET` / `CIDR` | 18 bytes: `[family][addr(16, BE)][prefix]` | sorts by family, then address, then netmask |
 | `NUMERIC` / `DECIMAL` | `i128` at a fixed scale of 9 | one scale keeps it comparable as an integer |
 | `TIMESTAMPTZ` | `i64` microseconds from the Unix epoch | little-endian, so it compares as a signed integer |
+| `TIMESTAMP` | the same eight bytes, flagged in the field record | a literal's zone is discarded, not applied (below) |
 | `BYTEA` | variable width, same mechanism as `TEXT` | distinguished only so the wire reports `bytea` |
 | `TEXT[]` | Postgres' binary array form, variable width | the element OID lives in the value, so one type serves arrays of anything |
+
+### `timestamp` and `timestamptz`
+
+`TIMESTAMP` (and `TIMESTAMP WITHOUT TIME ZONE`, `TIMESTAMP(p)`) is
+PostgreSQL's `timestamp`: a wall-clock time. A zone written in a literal is read
+and **discarded**, as `timestamp_in` discards it, so
+`'2024-01-01 10:00:00+02'` stores 10:00. `TIMESTAMPTZ` (and `TIMESTAMP WITH TIME
+ZONE`, and this engine's own `DATETIME`) is an instant: the same literal stores
+08:00 UTC. The session time zone is always UTC, so both hold the same
+microseconds for a literal with no zone, and `ALTER COLUMN … TYPE timestamp` /
+`TYPE timestamptz` rewrites no row. Every path a literal reaches a column by
+reads it this way: `INSERT` (single- and multi-row, `DEFAULT`, `ON CONFLICT DO
+UPDATE`), `UPDATE`, a backfilled `ADD COLUMN … DEFAULT`, and every predicate
+compared with the column (the scan, `IN`, `BETWEEN`, the filter and secondary
+indexes, a prepared statement's bound text, a `CASE` condition).
+
+The column is a `DATETIME` whose field record carries a flag in its spare type
+byte (`SchemaField::without_time_zone`). A build from before the flag reads the
+record as `timestamptz`, which is what it always took the column for.
+
+**Data written before this change.** Until then both spellings were one type,
+so a literal with a zone written into a `TIMESTAMP` column was converted to UTC:
+`'… 10:00:00+02'` was stored as 08:00. Such values cannot be told apart from
+ones written without a zone, and nothing rewrites them. A table created before
+the change also has no flag, so its `TIMESTAMP` columns keep behaving as
+`timestamptz` until `ALTER TABLE … ALTER COLUMN c TYPE timestamp` sets it (which
+moves no value). If an application wrote zoned literals into such a column, the
+affected rows are off by the zone they were written with; correct them with an
+`UPDATE` once the column is flagged (for a `+02` source:
+`SET c = c + interval '2 hours'`), or reload them from their source. Literals
+without a zone, and values bound in the binary format, were stored right.
 
 `BYTEA` and `ARRAY` report `STRING` as their *physical* type, so the row writer,
 the fetch path and the in-place-update path need no knowledge of them; only the

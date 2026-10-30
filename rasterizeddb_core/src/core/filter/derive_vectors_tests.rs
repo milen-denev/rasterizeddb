@@ -81,6 +81,9 @@ fn class(t: &DbType) -> Class {
         | DbType::ARRAY
         | DbType::JSON
         | DbType::BPCHAR(_)
+        // Reporting-only, as `JSON` is: a `timestamp` column is stored and
+        // indexed as the `DATETIME` it is.
+        | DbType::TIMESTAMP
         | DbType::JSONB
         | DbType::INTERVAL
         | DbType::MACADDR
@@ -110,7 +113,7 @@ fn class(t: &DbType) -> Class {
     }
 }
 
-const ALL: [DbType; 49] = [
+const ALL: [DbType; 50] = [
     DbType::I8,
     DbType::I16,
     DbType::I32,
@@ -127,6 +130,7 @@ const ALL: [DbType; 49] = [
     DbType::CHAR,
     DbType::STRING,
     DbType::DATETIME,
+    DbType::TIMESTAMP,
     DbType::UUID,
     DbType::INET,
     DbType::BYTEA,
@@ -1520,4 +1524,5 @@ numeric s2 `amt = 0.001` -> none
 numeric default `amt = 0.001` -> eq 40420f00000000000000000000000000 zone=0
 numeric s2 `amt > 49.99` -> gt 87130000000000000000000000000000 zone=1
 numeric default `amt > 49.99` -> gt 80dda2a30b0000000000000000000000 zone=0
+excluded TIMESTAMP zonemap=false
 "#;

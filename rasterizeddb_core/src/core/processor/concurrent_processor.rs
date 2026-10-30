@@ -3012,7 +3012,7 @@ pub(crate) fn compare_bytes_as_type(
         // Microseconds since the Unix epoch, stored little-endian. Comparing the
         // raw bytes would order by the low byte first, and would sort negative
         // (pre-1970) instants above positive ones.
-        DbType::DATETIME => read_num::<8, i64>(a, b, i64::from_le_bytes),
+        DbType::DATETIME | DbType::TIMESTAMP => read_num::<8, i64>(a, b, i64::from_le_bytes),
         // Fixed-scale unscaled units, so the integer order is the numeric order.
         DbType::DECIMAL => read_num::<16, i128>(a, b, i128::from_le_bytes),
         DbType::I8 => read_num::<1, i8>(a, b, i8::from_le_bytes),

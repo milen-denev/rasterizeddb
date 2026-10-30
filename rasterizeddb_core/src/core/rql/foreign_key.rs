@@ -569,7 +569,7 @@ pub fn compatible_key_types(child: &crate::core::db_type::DbType, parent: &crate
         F32 | F64 => F::Float,
         DECIMAL => F::Numeric,
         STRING | CHAR => F::Text,
-        DATE | DATETIME => F::Time,
+        DATE | DATETIME | TIMESTAMP => F::Time,
         _ => F::Other,
     };
     match (family(child), family(parent)) {

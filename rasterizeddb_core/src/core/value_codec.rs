@@ -293,6 +293,20 @@ pub fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 pub fn parse_timestamp_us(text: &str) -> Option<i64> {
+    parse_timestamp(text, true)
+}
+
+/// [`parse_timestamp_us`] for a `timestamp` (without time zone): a trailing
+/// zone (`Z`, `+02`, `-05:30`) is accepted and *discarded*, as PostgreSQL's
+/// `timestamp_in` discards it, so `'2024-01-01 10:00:00+02'` is 10:00 and not
+/// the 08:00 UTC instant it names.
+pub fn parse_timestamp_local_us(text: &str) -> Option<i64> {
+    parse_timestamp(text, false)
+}
+
+/// The text as a timestamp, a trailing zone converted to UTC when
+/// `apply_zone`, read and dropped otherwise.
+fn parse_timestamp(text: &str, apply_zone: bool) -> Option<i64> {
     let s = text.trim();
     if s.is_empty() {
         return None;
@@ -402,6 +416,9 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
         }
     }
 
+    if !apply_zone {
+        offset_minutes = 0;
+    }
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
     Some((secs - offset_minutes * 60) * 1_000_000 + micros)
@@ -1554,9 +1571,12 @@ pub fn coerce_literal(
         let text = std::str::from_utf8(bytes).ok()?;
         return match to {
             DbType::STRING => Some(bytes.to_vec()),
-            DbType::UUID | DbType::INET | DbType::DATETIME | DbType::DECIMAL | DbType::JSONB => {
-                encode_literal(to, text)
-            }
+            DbType::UUID
+            | DbType::INET
+            | DbType::DATETIME
+            | DbType::TIMESTAMP
+            | DbType::DECIMAL
+            | DbType::JSONB => encode_literal(to, text),
             _ if has_text_literal(to) => encode_literal(to, text),
             DbType::BOOL => match text.trim().to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "on" | "1" => Some(vec![1]),
@@ -2000,7 +2020,7 @@ pub fn pg_input_type_name(db_type: &crate::core::db_type::DbType) -> &'static st
         DbType::BOOL => "boolean",
         DbType::UUID => "uuid",
         DbType::INET => "inet",
-        DbType::DATETIME => "timestamp",
+        DbType::DATETIME | DbType::TIMESTAMP => "timestamp",
         DbType::DATE => "date",
         DbType::TIME => "time",
         DbType::TIMETZ => "time with time zone",
@@ -2096,7 +2116,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             Ok(_) => syntax(),
         },
         DbType::ARRAY => format!("malformed array literal: {}", double_quoted(text)),
-        DbType::DATETIME | DbType::DATE | DbType::TIME | DbType::TIMETZ => {
+        DbType::DATETIME | DbType::TIMESTAMP | DbType::DATE | DbType::TIME | DbType::TIMETZ => {
             // Shaped like a date/time but not one (`2026-13-45`): a field is
             // out of range. Anything else is not a date/time at all.
             let shaped = text.bytes().any(|b| b.is_ascii_digit())
@@ -2141,6 +2161,8 @@ pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> 
         DbType::UUID => parse_uuid(text).map(|b| b.to_vec()),
         DbType::INET => parse_inet(text).map(|b| b.to_vec()),
         DbType::DATETIME => parse_timestamp_us(text).map(|us| us.to_le_bytes().to_vec()),
+        // A `timestamp` column's: the same eight bytes, its zone discarded.
+        DbType::TIMESTAMP => parse_timestamp_local_us(text).map(|us| us.to_le_bytes().to_vec()),
         DbType::DECIMAL => parse_decimal(text).map(|v| v.to_le_bytes().to_vec()),
         DbType::ARRAY => parse_array_literal(text),
         // Answered above, from the literal as written rather than from `text`:
@@ -2320,6 +2342,22 @@ mod tests {
         );
         assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+0200").unwrap(), utc);
         assert_eq!(parse_timestamp_us("2026-08-20 10:00:00-02").unwrap(), utc);
+    }
+
+    /// `timestamp_in`: the zone is read and discarded, and the encoder a
+    /// `timestamp` column's literal goes through (`DbType::TIMESTAMP`) is
+    /// this one.
+    #[test]
+    fn a_local_timestamp_discards_the_zone() {
+        let wall = parse_timestamp_us("2026-08-20 14:00:00").unwrap();
+        for text in ["2026-08-20 14:00:00+02:00", "2026-08-20 14:00:00+0200", "2026-08-20 14:00:00-05:30", "2026-08-20T14:00:00Z"] {
+            assert_eq!(parse_timestamp_local_us(text), Some(wall), "{text}");
+        }
+        assert_eq!(
+            encode_literal(&crate::core::db_type::DbType::TIMESTAMP, "'2026-08-20 14:00:00+02'"),
+            Some(wall.to_le_bytes().to_vec())
+        );
+        assert_eq!(parse_timestamp_local_us("2026-02-30 00:00:00+02"), None);
     }
 
     #[test]

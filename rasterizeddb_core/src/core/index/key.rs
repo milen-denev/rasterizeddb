@@ -452,7 +452,7 @@ mod tests {
     fn every_supported_type_has_vectors_and_a_property_test() {
         use crate::core::index::vectors;
         let all = every_type!(
-            I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, F32, F64, BOOL, CHAR, STRING, DATETIME, UUID, INET,
+            I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, F32, F64, BOOL, CHAR, STRING, DATETIME, TIMESTAMP, UUID, INET,
             BYTEA, ARRAY, DECIMAL, JSON, JSONB, INTERVAL, MACADDR, MACADDR8, BIT, VARBIT, DATE, TIME, TIMETZ, POINT,
             LINE, LSEG, BOX, PATH, POLYGON, CIRCLE, INT4RANGE, INT8RANGE, NUMRANGE, TSRANGE, TSTZRANGE, DATERANGE,
             UNKNOWN, NULL, START, END,

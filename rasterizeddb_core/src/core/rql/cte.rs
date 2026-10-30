@@ -402,7 +402,11 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::DECIMAL => "NUMERIC",
         DbType::BOOL => "BOOLEAN",
         DbType::UUID => "UUID",
-        DbType::DATETIME => "TIMESTAMP",
+        // `TIMESTAMP` alone declares a `timestamp` (without time zone),
+        // whose literals drop their zone; a `DATETIME` cell is a
+        // `timestamptz`.
+        DbType::DATETIME => "TIMESTAMPTZ",
+        DbType::TIMESTAMP => "TIMESTAMP",
         DbType::STRING => "TEXT",
         DbType::CHAR => "CHAR",
         // The types stored in PostgreSQL's own layout. Without them a CTE

@@ -19,6 +19,19 @@ pub enum DbType {
     CHAR,
     STRING,
     DATETIME,
+    /// `timestamp` (without time zone), for *reporting* and literal reading
+    /// only, as [`DbType::JSON`] is: nothing stores it. A `timestamp` column
+    /// is a `DATETIME` whose field carries `without_time_zone`
+    /// (`SchemaField::without_time_zone`); its eight bytes are the same
+    /// microseconds, read as a wall-clock time rather than an instant.
+    ///
+    /// Two things differ, and both come from this one type so they cannot
+    /// disagree: a literal's zone (`'… 10:00+02'`) is discarded, as
+    /// PostgreSQL's `timestamp_in` discards it, rather than converted to UTC;
+    /// and the column is described as `timestamp` (OID 1114) and shown with
+    /// no `+00`. The session time zone is always UTC here, so the binary form
+    /// is the same microseconds as `timestamptz`'s.
+    TIMESTAMP,
     /// RFC 4122 UUID, stored as its 16 octets in network order. Equality is
     /// byte equality and `memcmp` reproduces canonical-text ordering, so it
     /// needs no comparator of its own.
@@ -171,6 +184,8 @@ impl DbType {
             | DbType::TSTZRANGE
             | DbType::DATERANGE
             | DbType::BPCHAR(_) => DbType::STRING,
+            // The same eight bytes as a `timestamptz`.
+            DbType::TIMESTAMP => DbType::DATETIME,
             other => other.clone(),
         }
     }
@@ -216,6 +231,10 @@ impl DbType {
             DbType::CHAR => 13,
             DbType::STRING => 14,
             DbType::DATETIME => 15,
+            // Never written to disk: a `timestamp` field is written as
+            // `DATETIME` with its flag in the record's spare type byte
+            // (`SchemaField::into_vec`).
+            DbType::TIMESTAMP => 46,
             DbType::BOOL => 16,
             DbType::UUID => 17,
             DbType::INET => 18,
@@ -284,6 +303,7 @@ impl DbType {
             13 => DbType::CHAR,
             14 => DbType::STRING,
             15 => DbType::DATETIME,
+            46 => DbType::TIMESTAMP,
             16 => DbType::BOOL,
             17 => DbType::UUID,
             18 => DbType::INET,
@@ -374,7 +394,7 @@ impl DbType {
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,
-            DbType::DATETIME => 8,
+            DbType::DATETIME | DbType::TIMESTAMP => 8,
         }
     }
 
@@ -401,6 +421,7 @@ impl DbType {
             DbType::STRING => 25,     // TEXT
             DbType::BPCHAR(_) => 1042, // bpchar
             DbType::DATETIME => 1184, // timestamptz
+            DbType::TIMESTAMP => 1114,
             DbType::UUID => 2950,
             DbType::INET => 869,
             DbType::DECIMAL => 1700, // numeric
@@ -465,7 +486,7 @@ impl DbType {
             DbType::F32 => 4,
             DbType::F64 => 8,
             DbType::STRING => -1,
-            DbType::DATETIME => 8,
+            DbType::DATETIME | DbType::TIMESTAMP => 8,
             DbType::UUID => 16,
             // Postgres models `inet` as a varlena, so its advertised length is
             // variable even though we store it fixed-width.

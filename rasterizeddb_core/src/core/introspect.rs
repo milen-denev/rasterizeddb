@@ -1625,7 +1625,8 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
         // back, so reporting the storage type here would name something no
         // statement can use: `WHERE body = <uuid>` is not what anyone means.
         let declared = if json_table.is_empty() {
-            sql_type_name(&field.db_type).to_string()
+            // `literal_type`: a `timestamp` column is named as one.
+            sql_type_name(&field.literal_type()).to_string()
         } else {
             "JSONB".to_string()
         };
@@ -2715,6 +2716,7 @@ pub fn sql_type_name(db_type: &DbType) -> &'static str {
         DbType::CHAR => "CHAR",
         DbType::STRING => "TEXT",
         DbType::DATETIME => "TIMESTAMPTZ",
+        DbType::TIMESTAMP => "TIMESTAMP",
         DbType::UUID => "UUID",
         DbType::INET => "INET",
         DbType::BYTEA => "BYTEA",

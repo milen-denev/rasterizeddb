@@ -171,7 +171,9 @@ fn encode_assignment(
     }
 
     // PostgreSQL's reason, from which the wire layer derives its SQLSTATE.
-    let encoded = value_to_mb(trimmed, &field.db_type).ok_or_else(|| {
+    // A `timestamp` column's literal keeps its wall-clock time.
+    let literal_type = crate::core::rql::lexer_ir::literal_type_for(trimmed, field);
+    let encoded = value_to_mb(trimmed, &literal_type).ok_or_else(|| {
         format!(
             "{} for column \"{}\"",
             crate::core::value_codec::refusal_message(&field.db_type, trimmed),
@@ -376,7 +378,8 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // one encoder, so `UPDATE` and `INSERT` cannot drift apart on what they
         // accept. An unparsable literal yields an empty block rather than a
         // plausible-looking zero value.
-        DbType::DATETIME | DbType::UUID | DbType::INET | DbType::DECIMAL => {
+        // `TIMESTAMP` is a `timestamp` column's literal: its zone is discarded.
+        DbType::DATETIME | DbType::TIMESTAMP | DbType::UUID | DbType::INET | DbType::DECIMAL => {
             match crate::core::value_codec::encode_literal(db_type, value_str) {
                 Some(bytes) => {
                     let mut mb = MEMORY_POOL.acquire(bytes.len());
@@ -775,6 +778,7 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -786,6 +790,7 @@ mod tests {
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
                 size: 12,
                 offset: 8,
                 write_order: 1,

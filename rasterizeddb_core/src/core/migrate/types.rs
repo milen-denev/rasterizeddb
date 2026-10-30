@@ -264,9 +264,10 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
 
         "bytea" => Mapping::plain(DbType::BYTEA, "BYTEA", Conversion::Bytea),
 
-        "timestamp" | "timestamptz" => {
-            Mapping::plain(DbType::DATETIME, "TIMESTAMP", Conversion::Timestamp)
-        }
+        // Declared as each is: `TIMESTAMP` alone is a `timestamp` (without
+        // time zone) here as there, so `timestamptz` has to say so.
+        "timestamp" => Mapping::plain(DbType::DATETIME, "TIMESTAMP", Conversion::Timestamp),
+        "timestamptz" => Mapping::plain(DbType::DATETIME, "TIMESTAMPTZ", Conversion::Timestamp),
         "date" => Mapping::noted(
             DbType::DATETIME,
             "TIMESTAMP",
@@ -634,7 +635,8 @@ mod tests {
             ("uuid", "UUID", DbType::UUID),
             ("inet", "INET", DbType::INET),
             ("bytea", "BYTEA", DbType::BYTEA),
-            ("timestamptz", "TIMESTAMP", DbType::DATETIME),
+            ("timestamp", "TIMESTAMP", DbType::DATETIME),
+            ("timestamptz", "TIMESTAMPTZ", DbType::DATETIME),
         ] {
             let m = mapping_of(pg);
             assert_eq!(m.declared, declared, "{}", pg);
