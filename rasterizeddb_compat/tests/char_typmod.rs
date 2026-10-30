@@ -796,8 +796,10 @@ async fn a_time_column_rounds_to_its_declared_precision() {
             ("UPDATE tp SET t = '1999-12-31 23:59:59.5' WHERE id = 2", ""),
             (
                 "SELECT id, t, tz, tm, iv, raw FROM tp ORDER BY id",
-                "[1]|[2024-01-01 10:00:01+00]|[2024-01-01 10:00:00.13+00]|[10:00:00.6]|[00:00:02]|[2024-01-01 10:00:00.5+00];\
-                 [2]|[1999-12-31 23:59:59+00]|[2024-01-01 10:00:00.5+00]|[24:00:00]|[-00:00:02]|[2024-01-01 10:00:00.5+00]",
+                // `t` and `raw` are TIMESTAMP (without time zone), shown with
+                // no offset as PostgreSQL shows them; `tz` is a timestamptz.
+                "[1]|[2024-01-01 10:00:01]|[2024-01-01 10:00:00.13+00]|[10:00:00.6]|[00:00:02]|[2024-01-01 10:00:00.5];\
+                 [2]|[1999-12-31 23:59:59]|[2024-01-01 10:00:00.5+00]|[24:00:00]|[-00:00:02]|[2024-01-01 10:00:00.5]",
             ),
             ("SELECT id FROM tp WHERE t = t::timestamp(0) AND raw::timestamp(0) = '2024-01-01 10:00:01' ORDER BY id", "[1];[2]"),
             ("UPDATE tp SET tm = '10:00:00.64' WHERE id = 1 RETURNING tm", "[10:00:00.6]"),
