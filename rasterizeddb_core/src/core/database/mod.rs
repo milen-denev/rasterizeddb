@@ -4143,6 +4143,11 @@ async fn write_schema_sidecars(
             field.scale = Some(entry.scale as u32);
         }
     }
+    // A column's declared text length, onto its field for the same reason
+    // (`SchemaField::text_typmod`).
+    for field in schema.fields.iter_mut().filter(|f| !f.is_deleted) {
+        field.text_typmod = crate::core::rql::type_modifier::text_typmod_of(&field.name, &schema.type_modifiers);
+    }
 
     for entry in &ct.generated {
         if let Err(e) =

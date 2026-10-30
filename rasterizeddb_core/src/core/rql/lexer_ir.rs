@@ -350,7 +350,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // of an unhandled type a way to kill the worker doing the insert.
         // Reporting-only: a JSON column is written as the UUID reference it
         // holds, never through this.
-        DbType::JSON | DbType::UNKNOWN | DbType::NULL | DbType::START | DbType::END => {
+        DbType::JSON | DbType::BPCHAR(_) | DbType::UNKNOWN | DbType::NULL | DbType::START | DbType::END => {
             MemoryBlock::default()
         }
     })
@@ -1045,24 +1045,47 @@ pub(crate) fn encode_column_value(
         value
     };
 
+    let encoded = value_to_mb_scaled(
+        value,
+        &schema_field.db_type,
+        declared_scale(&schema_field.name, modifiers),
+        crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
+    )
+    .or_else(|| {
+        // A reason already given — an overflow — is the real one.
+        if REFUSAL.with(|r| r.borrow().is_none()) {
+            note_refusal(&schema_field.name, &schema_field.db_type, value);
+        }
+        None
+    })?;
     Some(fit_to_width(
-        value_to_mb_scaled(
-            value,
-            &schema_field.db_type,
-            declared_scale(&schema_field.name, modifiers),
-            crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
-        )
-        .or_else(|| {
-            // A reason already given — an overflow — is the real one.
-            if REFUSAL.with(|r| r.borrow().is_none()) {
-                note_refusal(&schema_field.name, &schema_field.db_type, value);
-            }
-            None
-        })?,
+        held_to_text_length(encoded, schema_field)?,
         &schema_field.db_type,
         schema_field.size as usize,
         &schema_field.name,
     ))
+}
+
+/// `data`, a text value for `field`, held to the field's declared length
+/// (`type_modifier::TextTypmod::assign`): a `character(n)` value without its
+/// trailing spaces, a `character varying(n)` one cut of excess spaces.
+/// `None`, the reason left for [`take_refusal`], when it is too long (22001).
+/// Before any key is computed from the row, so `'b '` and `'b'` in a
+/// `character(3)` key are one key to the uniqueness check, the conflict
+/// arbiter and the multi-row check alike.
+fn held_to_text_length(data: MemoryBlock, field: &SchemaField) -> Option<MemoryBlock> {
+    match crate::core::rql::type_modifier::assign_bytes(field, data.into_slice()) {
+        Ok(None) => Some(data),
+        Ok(Some(bytes)) => {
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            Some(mb)
+        }
+        Err(reason) => {
+            REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+            None
+        }
+    }
 }
 
 pub fn insert_row_with_defaults(
@@ -1352,8 +1375,9 @@ pub fn insert_row_with_defaults(
             {
                 // The column was omitted but has a default, evaluated now — so
                 // `DEFAULT CURRENT_TIMESTAMP` is the time of this insert rather
-                // than of the declaration.
-                fit_to_width(data, &field.db_type, field.size as usize, &field.name)
+                // than of the declaration. Held to the column's length as a
+                // written value is.
+                fit_to_width(held_to_text_length(data, field)?, &field.db_type, field.size as usize, &field.name)
             } else if field.db_type.is_variable_width() {
                 // Variable-width: an unsupplied string is simply empty.
                 MemoryBlock::default()
@@ -1478,6 +1502,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1488,6 +1513,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
@@ -1521,6 +1547,7 @@ mod tests {
             is_unique: false,
             is_deleted: false,
             scale: None,
+            text_typmod: None,
         }];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
@@ -1545,6 +1572,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1555,6 +1583,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -1565,6 +1594,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "email".to_string(),
@@ -1575,6 +1605,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "active".to_string(),
@@ -1585,6 +1616,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "score".to_string(),
@@ -1595,6 +1627,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
@@ -1605,6 +1638,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "notes".to_string(),
@@ -1615,6 +1649,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
 
@@ -1691,6 +1726,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1701,6 +1737,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -1711,6 +1748,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
         let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, "Charlie")"#;
@@ -1763,6 +1801,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "flag".to_string(),
@@ -1773,6 +1812,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "desc".to_string(),
@@ -1783,6 +1823,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
         let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, "Edge")"#;
@@ -1815,6 +1856,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "grade".to_string(),
@@ -1825,6 +1867,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
         let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, "A")"#;
@@ -1856,6 +1899,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1866,6 +1910,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
         // Leading/trailing whitespace, tabs, newlines, and semicolon termination
@@ -1911,6 +1956,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "flag".to_string(),
@@ -1921,6 +1967,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
 
@@ -1969,6 +2016,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1979,6 +2027,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "job_title".to_string(),
@@ -1989,6 +2038,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "salary".to_string(),
@@ -1999,6 +2049,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "department".to_string(),
@@ -2009,6 +2060,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -2019,6 +2071,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "manager".to_string(),
@@ -2029,6 +2082,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "location".to_string(),
@@ -2039,6 +2093,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "hire_date".to_string(),
@@ -2049,6 +2104,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "degree".to_string(),
@@ -2059,6 +2115,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "skills".to_string(),
@@ -2069,6 +2126,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "current_project".to_string(),
@@ -2079,6 +2137,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "performance_score".to_string(),
@@ -2089,6 +2148,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "is_active".to_string(),
@@ -2099,6 +2159,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
@@ -2109,6 +2170,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "updated_at".to_string(),
@@ -2119,6 +2181,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "is_fired".to_string(),
@@ -2129,6 +2192,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ];
 
@@ -2606,6 +2670,7 @@ mod insert_parse_bench {
             is_unique: false,
             is_deleted: false,
             scale: None,
+            text_typmod: None,
         }
     }
 

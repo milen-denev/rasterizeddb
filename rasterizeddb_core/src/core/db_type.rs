@@ -114,6 +114,19 @@ pub enum DbType {
     TSTZRANGE,
     /// `daterange`.
     DATERANGE,
+    /// A `character(n)` value, for *reporting* only, as [`DbType::JSON`] is:
+    /// nothing stores it. A `character(n)` column is a `STRING` held to its
+    /// length and stored without its trailing spaces
+    /// (`type_modifier::TextTypmod`); the wire layer substitutes this when
+    /// describing one (`bpchar`, OID 1042, `atttypmod` n + 4), and formats
+    /// the cell blank-padded to `n`, so the description and the value come
+    /// from the one place. `0` is a `bpchar` with no length, shown as stored.
+    ///
+    /// Sixteen bits, so the type stays four bytes and a row's `Column` its
+    /// 32 (`row::Column`); a length past 65535, which PostgreSQL allows up to
+    /// 10485760, is reported as `bpchar` with none ([`DbType::bpchar`]) and
+    /// shown as stored, unpadded.
+    BPCHAR(u16),
     /// Sentinel / UNKNOWN type. Used for forward-compat and internal meta records.
     UNKNOWN,
     NULL,
@@ -156,7 +169,8 @@ impl DbType {
             | DbType::NUMRANGE
             | DbType::TSRANGE
             | DbType::TSTZRANGE
-            | DbType::DATERANGE => DbType::STRING,
+            | DbType::DATERANGE
+            | DbType::BPCHAR(_) => DbType::STRING,
             other => other.clone(),
         }
     }
@@ -167,6 +181,7 @@ impl DbType {
         matches!(
             self,
             DbType::STRING
+                | DbType::BPCHAR(_)
                 | DbType::BYTEA
                 | DbType::ARRAY
                 | DbType::JSONB
@@ -241,6 +256,9 @@ impl DbType {
             // no type, so the value had no literal form and the statement
             // failed. 23 is free and nothing on disk can hold it.
             DbType::JSON => 23,
+            // Never written to disk either; its length does not survive the
+            // byte (45 reads back as a `bpchar` with none, shown as stored).
+            DbType::BPCHAR(_) => 45,
             DbType::NULL => 253,
             DbType::START => 254,
             DbType::END => 255,
@@ -295,6 +313,7 @@ impl DbType {
             43 => DbType::TSTZRANGE,
             44 => DbType::DATERANGE,
             23 => DbType::JSON,
+            45 => DbType::BPCHAR(0),
             252 => DbType::UNKNOWN,
             253 => DbType::NULL,
             254 => DbType::START,
@@ -321,7 +340,7 @@ impl DbType {
             DbType::F64 => 8,
             DbType::BOOL => 1,
             DbType::CHAR => 4,
-            DbType::STRING => 4 + 8,
+            DbType::STRING | DbType::BPCHAR(_) => 4 + 8,
             DbType::UUID => crate::core::value_codec::UUID_LEN as u32,
             DbType::INET => crate::core::value_codec::INET_LEN as u32,
             DbType::DECIMAL => 16,
@@ -380,6 +399,7 @@ impl DbType {
             DbType::F32 => 700,
             DbType::F64 => 701,
             DbType::STRING => 25,     // TEXT
+            DbType::BPCHAR(_) => 1042, // bpchar
             DbType::DATETIME => 1184, // timestamptz
             DbType::UUID => 2950,
             DbType::INET => 869,
@@ -412,6 +432,21 @@ impl DbType {
             DbType::DATERANGE => 3912,
             DbType::INT8RANGE => 3926,
             _ => 25, // fallback TEXT
+        }
+    }
+
+    /// How a `character(n)` value of declared length `n` is reported (`0`, a
+    /// bare `bpchar`, has none): see [`DbType::BPCHAR`].
+    pub fn bpchar(n: u32) -> DbType {
+        DbType::BPCHAR(u16::try_from(n).unwrap_or(0))
+    }
+
+    /// `atttypmod` as a `RowDescription` carries it: a `character(n)`'s
+    /// length plus four, -1 for everything else (no modifier recorded).
+    pub fn pg_typmod(&self) -> i32 {
+        match self {
+            DbType::BPCHAR(n) if *n > 0 => i32::from(*n) + 4,
+            _ => -1,
         }
     }
 

@@ -136,6 +136,15 @@ pub enum Expr {
         precision: u32,
         scale: u32,
     },
+    /// `expr::varchar(n)`, `::char(n)`, `::timestamp(p)`, `::time(p)`,
+    /// `::interval(p)`: the value — a `Cast` to the type — held to the
+    /// type's modifier, as PostgreSQL's explicit cast holds it ([`CastTypmod`]).
+    /// A `Cast` carries no modifier, and these were plain casts: `'abcd'::
+    /// varchar(2)` was `abcd`, so `WHERE s::varchar(2) = 'ab'` matched nothing.
+    TypmodCast {
+        value: Box<Expr>,
+        typmod: CastTypmod,
+    },
     /// Binary arithmetic: `a + b`, `a * b`, and so on.
     Arith(Box<Expr>, ArithOp, Box<Expr>),
     /// `a || b` — string concatenation. Not arithmetic: its operands are text
@@ -154,6 +163,167 @@ pub enum Expr {
         /// yields its own contents instead of a quoted JSON string.
         as_text: bool,
     },
+}
+
+/// The modifier of a cast the evaluator applies ([`Expr::TypmodCast`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastTypmod {
+    /// `character(n)` (padded on output, compared without trailing spaces)
+    /// or `character varying(n)`: cut to the length.
+    Text(crate::core::rql::type_modifier::TextTypmod),
+    /// `timestamp(p)` / `timestamptz(p)`: rounded to `p` fractional digits.
+    Timestamp(u32),
+    /// `time(p)`.
+    Time(u32),
+    /// `timetz(p)`.
+    TimeTz(u32),
+    /// `interval(p)`: its time part rounded to `p` fractional digits.
+    Interval(u32),
+}
+
+/// Rounds a count of microseconds to `precision` fractional digits of a
+/// second, half away from zero — PostgreSQL's `AdjustTimestampForTypmod`,
+/// `AdjustTimeForTypmod` and `AdjustIntervalForTypmod`.
+fn round_micros(micros: i64, precision: u32) -> i64 {
+    if precision >= 6 {
+        return micros;
+    }
+    let scale = 10i64.pow(6 - precision);
+    let offset = scale / 2;
+    if micros >= 0 {
+        micros.saturating_add(offset) / scale * scale
+    } else {
+        -((micros.saturating_neg().saturating_add(offset)) / scale * scale)
+    }
+}
+
+/// The modifier of the cast `target` names, when it has one this evaluator
+/// applies: `varchar(n)`, `char(n)` (and a bare `character`, `char(1)`),
+/// `timestamp(p)`, `timestamptz(p)`, `time(p)`, `timetz(p)`, `interval(p)`.
+fn cast_typmod(target: &str, db_type: &DbType) -> Result<Option<CastTypmod>, String> {
+    if *db_type == DbType::STRING {
+        return Ok(match crate::core::rql::type_modifier::parse_text_typmod(target) {
+            Some(Ok(t)) => Some(CastTypmod::Text(t)),
+            Some(Err(e)) => return Err(e),
+            None => None,
+        });
+    }
+    if !matches!(db_type, DbType::DATETIME | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL) {
+        return Ok(None);
+    }
+    let text = target.trim();
+    let Some(open) = text.find('(') else { return Ok(None) };
+    let Some(close) = text[open..].find(')').map(|c| c + open) else { return Ok(None) };
+    let digits = text[open + 1..close].trim();
+    let precision: i64 = digits
+        .parse()
+        .map_err(|_| format!("invalid type modifier '{}'", digits))?;
+    if precision < 0 {
+        return Err(format!("{} precision must not be negative", crate::core::value_codec::pg_input_type_name(db_type)));
+    }
+    // Past six PostgreSQL warns and keeps six, which changes nothing.
+    let precision = precision.min(6) as u32;
+    let base = text[..open].trim().to_ascii_uppercase();
+    let with_zone = text[close + 1..].trim().to_ascii_uppercase().starts_with("WITH TIME ZONE");
+    Ok(match db_type {
+        DbType::DATETIME => Some(CastTypmod::Timestamp(precision)),
+        DbType::TIME if base == "TIMETZ" || with_zone => Some(CastTypmod::TimeTz(precision)),
+        DbType::TIME => Some(CastTypmod::Time(precision)),
+        DbType::TIMETZ => Some(CastTypmod::TimeTz(precision)),
+        DbType::INTERVAL => Some(CastTypmod::Interval(precision)),
+        _ => None,
+    })
+}
+
+/// `value`, the result of a cast, held to the cast's modifier.
+fn apply_cast_typmod(value: Value, typmod: CastTypmod) -> Result<Value, String> {
+    let Value::Data { bytes, db_type } = value else { return Ok(Value::Null) };
+    let bytes = match typmod {
+        CastTypmod::Text(t) => match std::str::from_utf8(&bytes) {
+            Ok(text) => t.cast(text).as_bytes().to_vec(),
+            Err(_) => bytes,
+        },
+        CastTypmod::Timestamp(p) => match <[u8; 8]>::try_from(bytes.as_slice()) {
+            // Rounded on PostgreSQL's own epoch, 2000-01-01, which is where
+            // its half-away-from-zero meets the sign: `1999-12-31
+            // 23:59:59.5::timestamp(0)` is 23:59:59, as it is there.
+            Ok(raw) => {
+                let offset = crate::core::value_codec::PG_EPOCH_OFFSET_US;
+                let pg = i64::from_le_bytes(raw).wrapping_sub(offset);
+                round_micros(pg, p).wrapping_add(offset).to_le_bytes().to_vec()
+            }
+            Err(_) => bytes,
+        },
+        CastTypmod::Time(p) => match <[u8; 8]>::try_from(bytes.as_slice()) {
+            Ok(raw) => round_micros(i64::from_be_bytes(raw), p).to_be_bytes().to_vec(),
+            Err(_) => bytes,
+        },
+        CastTypmod::TimeTz(p) if bytes.len() == 12 => {
+            let micros = i64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
+            let mut out = round_micros(micros, p).to_be_bytes().to_vec();
+            out.extend_from_slice(&bytes[8..]);
+            out
+        }
+        CastTypmod::Interval(p) if bytes.len() == 16 => {
+            let micros = i64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
+            let mut out = round_micros(micros, p).to_be_bytes().to_vec();
+            out.extend_from_slice(&bytes[8..]);
+            out
+        }
+        CastTypmod::TimeTz(_) | CastTypmod::Interval(_) => bytes,
+    };
+    Ok(Value::Data { bytes, db_type })
+}
+
+/// An integer function argument as a number: an integer of any width, or
+/// its text.
+fn integer_argument(bytes: &[u8], db_type: &DbType) -> Option<i64> {
+    Some(match db_type {
+        DbType::I8 => i64::from(*bytes.first()? as i8),
+        DbType::I16 => i64::from(i16::from_le_bytes(bytes.try_into().ok()?)),
+        DbType::I32 => i64::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+        DbType::I64 => i64::from_le_bytes(bytes.try_into().ok()?),
+        DbType::STRING => std::str::from_utf8(bytes).ok()?.trim().parse().ok()?,
+        _ => return None,
+    })
+}
+
+/// A string literal without its trailing spaces: how one compared with a
+/// `character(n)` value is read.
+fn strip_trailing_spaces(expr: &mut Expr) {
+    if let Expr::Literal { bytes, db_type: DbType::STRING } = expr {
+        while bytes.last() == Some(&b' ') {
+            bytes.pop();
+        }
+    }
+}
+
+/// Whether `expr` yields a `character(n)` value: a column declared so, or a
+/// cast to the type. Such a value is held without its trailing spaces
+/// (`type_modifier::TextTypmod`), and a string compared with it is read the
+/// same way, as PostgreSQL's `bpchar` comparison reads both sides.
+pub fn yields_bpchar(expr: &Expr) -> bool {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match expr {
+        Expr::Column(f) => matches!(f.text_typmod, Some(TextTypmod::Bpchar(_))) && f.db_type == DbType::STRING,
+        Expr::TypmodCast { typmod: CastTypmod::Text(TextTypmod::Bpchar(_)), .. } => true,
+        _ => false,
+    }
+}
+
+/// The declared length a select-list item that yields `character(n)` is
+/// shown at (`DbType::BPCHAR`), when it has one: a column declared so, or a
+/// cast to the type.
+pub fn bpchar_width(expr: &Expr) -> Option<u32> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match expr {
+        Expr::Column(f) if f.db_type == DbType::STRING => match f.text_typmod {
+            Some(TextTypmod::Bpchar(n)) => Some(n),
+            _ => None,
+        },
+        Expr::TypmodCast { typmod: CastTypmod::Text(TextTypmod::Bpchar(n)), .. } => Some(*n),
+        _ => None,
+    }
 }
 
 /// A function taking arguments, as opposed to the nullary [`ScalarFunc`].
@@ -205,6 +375,11 @@ pub enum TextFunc {
     Btrim,
     Ltrim,
     Rtrim,
+    /// `rpad` / `lpad(text, length [, fill])`: filled to `length`
+    /// characters (a space when no fill is given) on the right or the left,
+    /// or cut to it. What a pattern match reads a `character(n)` column as.
+    Rpad,
+    Lpad,
     /// `jsonb_typeof(doc)`: `object`, `array`, `string`, `number`, `boolean`
     /// or `null`.
     JsonbTypeof,
@@ -416,6 +591,9 @@ fn cast_target(name: &str) -> Option<DbType> {
             "INT" | "INTEGER" | "INT4" => DbType::I32,
             "SMALLINT" | "INT2" => DbType::I16,
             "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
+            // `character(n)`: text, held to its length by the cast's
+            // modifier (`Expr::TypmodCast`).
+            "CHAR" | "CHARACTER" | "BPCHAR" | "NCHAR" => DbType::STRING,
             "BOOL" | "BOOLEAN" => DbType::BOOL,
             "UUID" => DbType::UUID,
             "TIMESTAMP" | "TIMESTAMPTZ" => DbType::DATETIME,
@@ -462,6 +640,9 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     let db_type = cast_target(target)
         .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
     let cast = Expr::Cast(Box::new(inner), db_type.clone());
+    if let Some(typmod) = cast_typmod(target, &db_type)? {
+        return Ok(Expr::TypmodCast { value: Box::new(cast), typmod });
+    }
     if db_type == DbType::DECIMAL {
         if let Some(modifier) = crate::core::rql::type_modifier::parse_numeric_modifier(target) {
             let (precision, scale) = modifier?;
@@ -608,7 +789,7 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
 pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
-    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "JSONB_TYPEOF",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
 ];
 
@@ -1132,6 +1313,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     };
                     Ok(Expr::Call(func, args))
                 }
+                "RPAD" | "LPAD" => {
+                    if !(2..=3).contains(&args.len()) {
+                        return Err(format!("{} takes a text, a length and optionally a fill", upper_name.to_lowercase()));
+                    }
+                    Ok(Expr::Call(if upper_name == "RPAD" { TextFunc::Rpad } else { TextFunc::Lpad }, args))
+                }
                 "JSONB_TYPEOF" => {
                     if args.len() != 1 {
                         return Err("jsonb_typeof takes exactly one argument".to_string());
@@ -1537,8 +1724,15 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         (">", Cmp::Gt),
     ] {
         if let Some(at) = find_operator(text, token) {
-            let left = Box::new(parse(&text[..at], schema)?);
-            let right = Box::new(parse(&text[at + token.len()..], schema)?);
+            let mut left = Box::new(parse(&text[..at], schema)?);
+            let mut right = Box::new(parse(&text[at + token.len()..], schema)?);
+            // A string compared with a `character(n)` value is read without
+            // its trailing spaces, as the value is held (`yields_bpchar`).
+            if yields_bpchar(&left) {
+                strip_trailing_spaces(&mut right);
+            } else if yields_bpchar(&right) {
+                strip_trailing_spaces(&mut left);
+            }
             return Ok(Condition {
                 left,
                 cmp,
@@ -1747,7 +1941,7 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                 walk(b, out);
             }
             Expr::Cast(inner, _) => walk(inner, out),
-            Expr::NumericCast { value, .. } => walk(value, out),
+            Expr::NumericCast { value, .. } | Expr::TypmodCast { value, .. } => walk(value, out),
             Expr::Case { whens, otherwise } => {
                 fn walk_cond(cond: &Cond, out: &mut Vec<SchemaField>) {
                     match cond {
@@ -1842,6 +2036,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         },
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::NumericCast { .. } => DbType::DECIMAL,
+        Expr::TypmodCast { value, .. } => static_type(value),
         Expr::Concat(lhs, rhs) if concat_is_jsonb(lhs, rhs) => DbType::JSONB,
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
@@ -2335,6 +2530,8 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         TextFunc::Btrim
             | TextFunc::Ltrim
             | TextFunc::Rtrim
+            | TextFunc::Rpad
+            | TextFunc::Lpad
             | TextFunc::JsonbTypeof
             | TextFunc::RegexpLike
             | TextFunc::CheckRegexpLike
@@ -2409,6 +2606,26 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                 _ => text.trim_end_matches(|c| set.contains(&c)),
             };
             string(trimmed.to_string())
+        }
+        TextFunc::Rpad | TextFunc::Lpad => {
+            let text = as_text(&args[0]);
+            let length = match &args[1] {
+                Value::Data { bytes, db_type } => integer_argument(bytes, db_type)
+                    .ok_or_else(|| format!("{} needs an integer length", if func == TextFunc::Rpad { "rpad" } else { "lpad" }))?,
+                Value::Null => return Ok(Value::Null),
+            };
+            let fill: Vec<char> = match args.get(2) {
+                Some(f) => as_text(f).chars().collect(),
+                None => vec![' '],
+            };
+            let length = length.clamp(0, i64::from(crate::core::rql::type_modifier::MAX_TEXT_LENGTH)) as usize;
+            let chars: Vec<char> = text.chars().collect();
+            if chars.len() >= length || fill.is_empty() {
+                string(chars.iter().take(length).collect())
+            } else {
+                let padding: String = fill.iter().cycle().take(length - chars.len()).collect();
+                string(if func == TextFunc::Rpad { format!("{text}{padding}") } else { format!("{padding}{text}") })
+            }
         }
         TextFunc::JsonbTypeof => {
             let Value::Data { bytes, db_type } = &args[0] else {
@@ -3491,7 +3708,7 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
             Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
             Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
             Expr::Cast(inner, _) => wide(inner),
-            Expr::NumericCast { value, .. } => wide(value),
+            Expr::NumericCast { value, .. } | Expr::TypmodCast { value, .. } => wide(value),
             Expr::Case { whens, otherwise } => {
                 fn wide_cond(cond: &Cond) -> bool {
                     match cond {
@@ -3961,6 +4178,19 @@ pub(crate) fn check_declared_precision(
         precision,
         field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
     )
+}
+
+/// `value`, assigned to `field`, held to the field's declared text length
+/// (`type_modifier::TextTypmod::assign`): a `character(n)` value without its
+/// trailing spaces, past the length an error (22001).
+pub(crate) fn held_to_text_length(value: Value, field: &SchemaField) -> Result<Value, String> {
+    match &value {
+        Value::Data { bytes, db_type: DbType::STRING } => match crate::core::rql::type_modifier::assign_bytes(field, bytes)? {
+            Some(held) => Ok(Value::Data { bytes: held, db_type: DbType::STRING }),
+            None => Ok(value),
+        },
+        _ => Ok(value),
+    }
 }
 
 /// A number assigned to an integer column, at that column's width or refused.
@@ -4742,6 +4972,18 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             for arg in args {
                 values.push(eval(arg, row, schema)?);
             }
+            // `octet_length` counts a `character(n)` value's padding, as
+            // PostgreSQL's does; every other function reads it as text,
+            // without (`length` included).
+            if *func == TextFunc::OctetLength {
+                if let (Some(n), Some(Value::Data { bytes, .. })) =
+                    (args.first().and_then(bpchar_width), values.first_mut())
+                {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        *bytes = crate::core::rql::type_modifier::pad_to(text, n).into_owned().into_bytes();
+                    }
+                }
+            }
             call(*func, &values, row)?
         }
         Expr::Arith(lhs, op, rhs) => {
@@ -4907,6 +5149,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 _ => cast(value, target)?,
             }
         }
+        Expr::TypmodCast { value, typmod } => apply_cast_typmod(eval(value, row, schema)?, *typmod)?,
         Expr::NumericCast {
             value,
             precision,
@@ -6163,6 +6406,58 @@ mod tests {
         assert_eq!(i16::from_le_bytes(bytes[..].try_into().unwrap()), 300);
 
         assert!(parse("v::nosuchtype", &s).is_err());
+    }
+
+    /// A cast keeps its type modifier, as PostgreSQL 17's explicit cast
+    /// does: text cut (and `character(n)` held without trailing spaces),
+    /// times rounded half away from zero, a timestamp on PostgreSQL's epoch.
+    #[test]
+    fn a_cast_keeps_its_type_modifier() {
+        let value = |text: &str| eval(&parse(text, &[]).unwrap(), &Row::default(), &[]).unwrap();
+        let bytes = |text: &str| match value(text) {
+            Value::Data { bytes, .. } => bytes,
+            Value::Null => panic!("{text}: NULL"),
+        };
+        assert_eq!(bytes("'abcd'::varchar(2)"), b"ab");
+        assert_eq!(bytes("CAST('abcd' AS character varying(3))"), b"abc");
+        assert_eq!(bytes("'ab'::varchar(5)"), b"ab");
+        assert_eq!(bytes("'abcd'::char(2)"), b"ab");
+        assert_eq!(bytes("'ab   '::char(4)"), b"ab");
+        assert_eq!(bytes("'abc'::character"), b"a");
+        let ts = |t: &str| crate::core::value_codec::parse_timestamp_us(t).unwrap().to_le_bytes().to_vec();
+        assert_eq!(bytes("'2024-01-01 10:00:00.6'::timestamp(0)"), ts("2024-01-01 10:00:01"));
+        assert_eq!(bytes("'2024-01-01 10:00:00.5'::timestamp(0)"), ts("2024-01-01 10:00:01"));
+        assert_eq!(bytes("'2024-01-01 10:00:00.123456'::timestamp(2)"), ts("2024-01-01 10:00:00.12"));
+        assert_eq!(bytes("'1999-12-31 23:59:59.5'::timestamp(0)"), ts("1999-12-31 23:59:59"));
+        assert_eq!(bytes("'2024-01-01 10:00:00.4'::timestamptz(0)"), ts("2024-01-01 10:00:00"));
+        assert_eq!(bytes("'10:00:00.56'::time(1)"), 36_000_600_000i64.to_be_bytes());
+        assert_eq!(bytes("'23:59:59.5'::time(0)"), 86_400_000_000i64.to_be_bytes());
+        let interval = |t: &str| bytes(t)[..8].to_vec();
+        assert_eq!(interval("'1.5 seconds'::interval(0)"), 2_000_000i64.to_be_bytes());
+        assert_eq!(interval("'-1.5 seconds'::interval(0)"), (-2_000_000i64).to_be_bytes());
+        assert_eq!(interval("'1 day 00:00:00.567'::interval(1)"), 600_000i64.to_be_bytes());
+        // Past six digits is six: nothing to round.
+        assert_eq!(bytes("'2024-01-01 10:00:00.123456'::timestamp(9)"), ts("2024-01-01 10:00:00.123456"));
+        assert!(parse("'x'::char(0)", &[]).is_err());
+        assert!(parse("'x'::varchar(-1)", &[]).is_err());
+        // A `character(n)` comparison reads the literal without trailing spaces.
+        let c = parse_cond("'ab'::char(4) = 'ab  '", &[]).unwrap();
+        assert!(eval_cond(&c, &Row::default(), &[]).unwrap());
+        let c = parse_cond("'ab'::varchar(4) = 'ab  '", &[]).unwrap();
+        assert!(!eval_cond(&c, &Row::default(), &[]).unwrap());
+    }
+
+    #[test]
+    fn rpad_and_lpad_fill_or_cut() {
+        let text = |t: &str| match eval(&parse(t, &[]).unwrap(), &Row::default(), &[]).unwrap() {
+            Value::Data { bytes, .. } => String::from_utf8(bytes).unwrap(),
+            Value::Null => "NULL".to_string(),
+        };
+        assert_eq!(text("rpad('ab', 4)"), "ab  ");
+        assert_eq!(text("rpad('abcdef', 3)"), "abc");
+        assert_eq!(text("lpad('ab', 4)"), "  ab");
+        assert_eq!(text("rpad('ab', 5, 'xy')"), "abxyx");
+        assert_eq!(text("rpad(NULL, 3)"), "NULL");
     }
 
     #[test]

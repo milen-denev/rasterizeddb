@@ -203,7 +203,6 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         let mut named_checks: Vec<bool> = Vec::new();
         // Columns declared `character(n)`, which PostgreSQL compares
         // blank-padded and this engine stores as text (see below).
-        let mut bpchar_columns: Vec<String> = Vec::new();
         for col_def in split_definitions(columns_str) {
             let col_def = col_def.trim();
             if col_def.is_empty() {
@@ -390,12 +389,28 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
                 joined
             };
-            if crate::core::rql::type_modifier::is_bpchar_type(&raw_type)
-                && !type_phrase.to_ascii_uppercase().contains("VARYING")
-            {
-                bpchar_columns.push(name.clone());
-                // Recorded, so a check added later by ALTER knows it too.
-                type_modifiers.push(crate::core::rql::type_modifier::bpchar_marker(&name));
+            // `character(n)` and `character varying(n)`: the length is
+            // recorded (`type_modifier::TextTypmod`), so every write is held
+            // to it and a `character(n)` value is stored, compared and keyed
+            // without its trailing spaces. The whole written type, a
+            // multi-word one included (`character varying(3)`).
+            let full_type = {
+                let mut joined = tokens[1..1 + tokens_used].join(" ");
+                let mut next = 1 + tokens_used;
+                while joined.matches('(').count() > joined.matches(')').count() && next < tokens.len() {
+                    joined.push(' ');
+                    joined.push_str(tokens[next]);
+                    next += 1;
+                }
+                joined
+            };
+            match crate::core::rql::type_modifier::parse_text_typmod(&full_type) {
+                Some(Ok(typmod)) => type_modifiers.push(typmod.marker(&name)),
+                Some(Err(reason)) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+                None => {}
             }
             match crate::core::rql::type_modifier::parse_numeric_modifier(&raw_type) {
                 Some(Ok((precision, scale))) => {
@@ -597,17 +612,11 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             });
         }
 
-        // A check reading a `character(n)` column compares it blank-padded in
-        // PostgreSQL (`'AB '` is `'AB'`), which this engine, storing it as
-        // text, does not: `tag char(3) CHECK (tag IN ('AB', 'CD'))` refused
-        // the 'AB ' PostgreSQL accepts. The column is written `::bpchar` in
-        // the stored check, as `pg_dump` writes such checks, which keeps it
-        // unenforced, said so (`executor::compile_check`).
-        if !bpchar_columns.is_empty() {
-            for check in checks.iter_mut() {
-                check.expression = crate::core::rql::check::cast_columns_to_bpchar(&check.expression, &bpchar_columns);
-            }
-        }
+        // A check reading a `character(n)` column is stored as written and
+        // enforced: the column's values are stored, and its literals read,
+        // without trailing spaces (`type_modifier::TextTypmod`), which is how
+        // PostgreSQL compares the type. (An older binary wrote such a column
+        // `::bpchar` into the check and kept it unenforced.)
 
         // Two checks written with one name are PostgreSQL's 42710; the
         // second used to supersede the first when the table was loaded, so
@@ -1475,7 +1484,8 @@ mod tests {
             DbType::F64,
             DbType::F32,
             DbType::F64,
-            DbType::CHAR,
+            // `CHAR` is `character(1)`: text held to one character.
+            DbType::STRING,
             DbType::STRING,
             DbType::STRING,
             DbType::STRING,

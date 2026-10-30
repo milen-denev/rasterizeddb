@@ -162,7 +162,10 @@ pub fn key_value_bytes(literal: &str, ty: &DbType) -> Option<smallvec::SmallVec<
     let b = literal.as_bytes();
     if *ty == STRING {
         let inner = b.strip_prefix(b"'")?.strip_suffix(b"'")?;
-        if inner.iter().any(|c| *c == b'\'' || *c == b'\\') {
+        // A trailing space is not certain: a `character(n)` key is stored,
+        // and routed, without it (`type_modifier::TextTypmod`), which the
+        // declared type alone does not say.
+        if inner.iter().any(|c| *c == b'\'' || *c == b'\\') || inner.last() == Some(&b' ') {
             return None;
         }
         return Some(smallvec::SmallVec::from_slice(inner));

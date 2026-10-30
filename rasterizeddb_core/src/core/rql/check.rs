@@ -240,7 +240,7 @@ pub fn unnamed_name(
 /// The distinct `columns` an expression names, in the order first read:
 /// identifiers outside string literals, a bare one matched without case, a
 /// double-quoted one exactly.
-fn columns_read(expression: &str, columns: &[String]) -> Vec<String> {
+pub(crate) fn columns_read(expression: &str, columns: &[String]) -> Vec<String> {
     let mut read: Vec<String> = Vec::new();
     let mut note = |found: Option<&String>| {
         if let Some(c) = found
@@ -902,7 +902,11 @@ fn drop_text_casts(text: &str) -> String {
                 let castable = before.ends_with('\'')
                     || before.ends_with(')')
                     || before.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '"');
-                if castable {
+                // A length is no no-op: `::varchar(2)` cuts, `::char(3)`
+                // pads. Kept whole for the evaluator, which applies it;
+                // dropping the name alone left `tag(2)`, a call.
+                let with_length = text[i + 2 + name.len()..].trim_start().starts_with('(');
+                if castable && !with_length {
                     let mut skip = i + 2 + name.len();
                     // `[]` of an array cast.
                     if text[skip..].starts_with("[]") {

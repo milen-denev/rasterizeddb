@@ -2996,7 +2996,8 @@ pub(crate) fn compare_bytes_as_type(
         | DbType::UNKNOWN
         | DbType::START
         | DbType::END
-        | DbType::JSON => a.cmp(b),
+        | DbType::JSON
+        | DbType::BPCHAR(_) => a.cmp(b),
         // PostgreSQL's `jsonb` order, by value. The encoded bytes used to be
         // compared instead: stable, but `{"a":1}` and `{"a":1.0}` were two
         // values to every sort, window and comparison, `ORDER BY doc` was not

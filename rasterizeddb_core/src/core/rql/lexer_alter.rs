@@ -34,9 +34,9 @@ pub enum AlterAction {
         /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
         /// the column was added and never given a value.
         generated: Option<String>,
-        /// Declared `character(n)`, which a check compares blank-padded
-        /// (`type_modifier::BPCHAR_MARKER`).
-        bpchar: bool,
+        /// A declared `character(n)` / `character varying(n)` length
+        /// (`type_modifier::TextTypmod`).
+        text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
     },
     DropColumn {
         name: String,
@@ -439,20 +439,23 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
             // The declared type as written, across the tokens `NUMERIC(12, 3)`
             // was split into.
+            // A multi-word name is all of its words (`character varying(3)`).
             let declared = {
-                let mut joined = String::new();
-                for token in &type_tokens {
-                    joined.push_str(token);
-                    let opens = joined.matches('(').count();
-                    if opens == 0 || opens == joined.matches(')').count() {
-                        break;
-                    }
+                let used = used.clamp(1, type_tokens.len().max(1));
+                let mut joined = type_tokens[..used.min(type_tokens.len())].join(" ");
+                let mut next = used;
+                while joined.matches('(').count() > joined.matches(')').count() && next < type_tokens.len() {
                     joined.push(' ');
+                    joined.push_str(type_tokens[next]);
+                    next += 1;
                 }
                 joined
             };
-            let bpchar = crate::core::rql::type_modifier::is_bpchar_type(&declared)
-                && !type_tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("VARYING"));
+            let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared) {
+                Some(Ok(t)) if !json => Some(t),
+                Some(Err(reason)) => return Err(reason),
+                _ => None,
+            };
             let modifier = match crate::core::rql::type_modifier::parse_numeric_modifier(&declared) {
                 Some(Ok(pair)) => Some(pair),
                 Some(Err(reason)) => return Err(reason),
@@ -476,7 +479,7 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 json,
                 modifier,
                 generated,
-                bpchar,
+                text_typmod,
             }
         }
         "DROP" => {
@@ -701,12 +704,6 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
     }
 
     let one = norm(tokens[0]);
-    // `CHAR(n)` for n above one is `bpchar`, a *string* of that width. Mapping
-    // it to the engine's `CHAR` — a single codepoint — stored only the first
-    // character and reported success: `'ABCDE'` in a `CHAR(5)` column came back
-    // as `'ABCD'`. Only a bare `CHAR`, which Postgres reads as `CHAR(1)`, is
-    // the one-character type.
-    let char_width = declared_width(tokens[0]);
 
     let db_type = match one.as_str() {
         // Postgres spellings first, then the engine's own aliases. Unsigned
@@ -730,11 +727,13 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         // Postgres treats a bare FLOAT as double precision.
         "FLOAT8" | "FLOAT" | "DOUBLE" => DbType::F64,
         "TEXT" | "VARCHAR" | "STRING" | "NAME" | "CITEXT" => DbType::STRING,
-        "CHARACTER" | "BPCHAR" => DbType::STRING,
-        "CHAR" => match char_width {
-            Some(n) if n > 1 => DbType::STRING,
-            _ => DbType::CHAR,
-        },
+        // `character(n)` — `char`, `char(1)` and `nchar` included — is text
+        // held to its length (`type_modifier::TextTypmod`), stored without
+        // its trailing spaces. `CHAR(n)` once mapped to the engine's `CHAR`,
+        // a single codepoint: `'ABCDE'` in a `CHAR(5)` came back as
+        // `'ABCD'`, and `'x '` in a bare `CHAR` was stored as the codepoint
+        // its two bytes spell (`⁸`). Columns created that way keep it.
+        "CHARACTER" | "BPCHAR" | "CHAR" | "NCHAR" => DbType::STRING,
         "NUMERIC" | "DECIMAL" | "MONEY" => DbType::DECIMAL,
         "BOOL" | "BOOLEAN" => DbType::BOOL,
         "UUID" => DbType::UUID,
@@ -1198,7 +1197,7 @@ mod tests {
                 json: false,
                 modifier: None,
                 generated: None,
-                bpchar: false,
+                text_typmod: None,
             }
         );
     }

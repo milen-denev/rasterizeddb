@@ -704,6 +704,12 @@ impl PartialEq for EvaluatedOperand {
 }
 
 impl EvaluatedOperand {
+    /// Whether it yields `character(n)`: a string compared with it is read
+    /// without trailing spaces, as it is (`expr::yields_bpchar`).
+    pub fn is_bpchar(&self) -> bool {
+        crate::core::rql::expr::yields_bpchar(&self.expr)
+    }
+
     /// Reads `text` as an expression over `schema`.
     ///
     /// Only the types whose comparison here is what PostgreSQL's is are

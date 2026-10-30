@@ -287,6 +287,11 @@ pub(super) fn encode_cell_text(
             }
             true
         }
+        // Stored without its trailing spaces, shown padded to its length.
+        DbType::BPCHAR(n) => {
+            push_bpchar(bytes, *n, out);
+            true
+        }
         DbType::DECIMAL => {
             // A value carrying its own display scale (an `AVG` result) wins
             // over the column's, exactly as `format_column_text_scaled` does.
@@ -376,6 +381,13 @@ pub(super) fn encode_cell_text(
     }
 }
 
+/// A `character(n)` value as it is shown, text and binary alike: its stored
+/// form (no trailing spaces) blank-padded to `n` characters.
+fn push_bpchar(bytes: &[u8], n: u16, out: &mut Vec<u8>) {
+    let text = String::from_utf8_lossy(bytes);
+    out.extend_from_slice(crate::core::rql::type_modifier::pad_to(&text, u32::from(n)).as_bytes());
+}
+
 /// Appends the binary form of one cell to `out`; `false` means NULL, and then
 /// nothing was appended. Byte-for-byte [`super::format_column_binary`].
 pub(super) fn encode_cell_binary(
@@ -388,6 +400,11 @@ pub(super) fn encode_cell_binary(
         DbType::NULL | DbType::START | DbType::END => false,
         DbType::STRING | DbType::UNKNOWN | DbType::BYTEA | DbType::ARRAY => {
             out.extend_from_slice(bytes);
+            true
+        }
+        // `bpcharsend` is the padded text, as the text form is.
+        DbType::BPCHAR(n) => {
+            push_bpchar(bytes, *n, out);
             true
         }
         // The unsigned widths are advertised as `int8` (`DbType::pg_oid`),

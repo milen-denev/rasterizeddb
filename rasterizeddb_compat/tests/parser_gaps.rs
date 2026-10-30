@@ -544,18 +544,8 @@ async fn a_computed_operand_and_a_column_of_another_type() {
         ),
         ("SELECT k FROM pd WHERE t = k % 3", "operator does not exist: text = integer"),
         ("SELECT k FROM pe WHERE bt = k % 2", "operator does not exist: bit = integer"),
-        // Pairs PostgreSQL does compare and the engine cannot yet. Its
-        // answers, in order: 1, '' and 1,2. The `<` over a `character`
-        // column answered 1 before, and the rest failed per row with an
-        // operand-size error.
-        (
-            "SELECT k FROM pe WHERE c1 = CASE WHEN k = 1 THEN 'a' ELSE 'z' END ORDER BY k",
-            "is not supported yet",
-        ),
-        (
-            "SELECT k FROM pe WHERE CASE WHEN k = 1 THEN 'a' ELSE 'z' END < c1 ORDER BY k",
-            "is not supported yet",
-        ),
+        // A pair PostgreSQL does compare and the engine cannot yet. Its
+        // answer is 1,2.
         (
             "SELECT k FROM pe WHERE (j->>'a')::bigint = k % 3 ORDER BY k",
             "comparing a bigint value with a computed integer value is not supported yet",
@@ -585,6 +575,12 @@ async fn a_computed_operand_and_a_column_of_another_type() {
         ("SELECT k FROM pe WHERE bt = CASE WHEN k = 1 THEN B'1010' ELSE B'1111' END ORDER BY k", "1"),
         ("SELECT k FROM pe WHERE vb = CASE WHEN k = 1 THEN B'101' ELSE B'1' END ORDER BY k", "1"),
         ("SELECT k FROM pe WHERE j->>'a' = k || '' ORDER BY k", "1,2"),
+        // A bare `CHAR` is `character(1)`, text held to one character
+        // (`type_modifier::TextTypmod`). It was the engine's one-codepoint
+        // type, which refused these (and the `<` answered 1 before that).
+        // PostgreSQL's answers: 1 and none.
+        ("SELECT k FROM pe WHERE c1 = CASE WHEN k = 1 THEN 'a' ELSE 'z' END ORDER BY k", "1"),
+        ("SELECT k FROM pe WHERE CASE WHEN k = 1 THEN 'a' ELSE 'z' END < c1 ORDER BY k", ""),
     ];
     wrong.extend(wrong_answers(&pool, cases).await);
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));

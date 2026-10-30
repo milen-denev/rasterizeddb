@@ -864,7 +864,54 @@ fn tokenize_inner<'a>(
             out[at] = Token::StringLit(text);
         }
     }
+    canonicalize_bpchar_literals(&mut out, schema);
     Ok(out)
+}
+
+/// A string compared with a `character(n)` column, read as the type reads
+/// it: without its trailing spaces.
+///
+/// Such a column is stored that way (`type_modifier::TextTypmod`), so
+/// `k = 'b  '` has to look for `'b'` — which is what PostgreSQL's `bpchareq`
+/// compares — or it answers from a value the column cannot hold. Done on the
+/// tokens, the one form every reader of a predicate shares: the scan's
+/// comparisons, the filter index (`sarg`), the secondary indexes, the
+/// prefilter, a partition's routing and a point update's key stripe all plan
+/// from them. `IN` and `BETWEEN` reach here as the comparisons they mean.
+/// The pattern operators read the padded value and are lifted before this
+/// (`predicate_rewrite::lift_evaluated_operands`).
+fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
+    use crate::core::rql::type_modifier::TextTypmod;
+    // A cast to `character(n)` yields one too (`s::char(5) = 'ab '`), over
+    // a table that has no such column.
+    if !schema.iter().any(|f| matches!(f.text_typmod, Some(TextTypmod::Bpchar(_))))
+        && !out.iter().any(|t| matches!(t, Token::Evaluated(operand) if operand.is_bpchar()))
+    {
+        return;
+    }
+    let bpchar = |t: &Token| match t {
+        Token::Ident((name, DbType::STRING, wo)) => schema.iter().any(|f| {
+            f.write_order == *wo && !f.is_deleted && f.name == *name && matches!(f.text_typmod, Some(TextTypmod::Bpchar(_)))
+        }),
+        Token::Evaluated(operand) => operand.is_bpchar(),
+        _ => false,
+    };
+    let comparison = |t: &Token| {
+        matches!(t, Token::Op(op) if matches!(op.as_str(), "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="))
+    };
+    for j in 0..out.len() {
+        if !matches!(out[j], Token::StringLit(_)) {
+            continue;
+        }
+        let after_column = j >= 2 && comparison(&out[j - 1]) && bpchar(&out[j - 2]);
+        let before_column = j + 2 < out.len() && comparison(&out[j + 1]) && bpchar(&out[j + 2]);
+        if after_column || before_column {
+            if let Token::StringLit(text) = &mut out[j] {
+                let kept = text.trim_end_matches(' ').len();
+                text.truncate(kept);
+            }
+        }
+    }
 }
 
 /// The type of a `TYPE 'literal'` at this position, or `None` when the
@@ -1392,6 +1439,7 @@ mod tests {
             write_order: 5,
             is_unique: false,
             scale: None,
+            text_typmod: None,
         });
         schema.push(SchemaField {
             name: "field2".to_string(),
@@ -1402,6 +1450,7 @@ mod tests {
             write_order: 10,
             is_unique: false,
             scale: None,
+            text_typmod: None,
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);

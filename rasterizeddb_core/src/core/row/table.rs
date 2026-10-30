@@ -3390,6 +3390,36 @@ impl<S: StorageIO> Table<S> {
 
     /// The `unique_lock` stripes a row's keys fall on: one per constraint it
     /// holds a key for. A NULL key conflicts with nothing, so it needs none.
+    /// Holds each column of `row_write` that `columns` selects (by write
+    /// order) and that declares a text length to it, as an assignment does
+    /// (`type_modifier::assign_bytes`): a `character(n)` value in its stored
+    /// form, without trailing spaces; past the length the reason (22001).
+    /// Free for a table that declares none.
+    fn hold_text_lengths(
+        &self,
+        row_write: &mut RowWrite,
+        columns: impl Fn(u32) -> bool,
+    ) -> std::result::Result<(), String> {
+        for field in self.schema.fields.iter() {
+            if field.text_typmod.is_none() || field.is_deleted || !columns(field.write_order as u32) {
+                continue;
+            }
+            let Some(column) = row_write
+                .columns_writing_data
+                .iter_mut()
+                .find(|c| c.write_order as u64 == field.write_order)
+            else {
+                continue;
+            };
+            if let Some(held) = crate::core::rql::type_modifier::assign_bytes(field, column.data.into_slice())? {
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(held.len());
+                mb.into_slice_mut().copy_from_slice(&held);
+                column.data = mb;
+            }
+        }
+        Ok(())
+    }
+
     fn unique_stripes(&self, row_write: &RowWrite) -> SmallVec<[usize; 4]> {
         let value_of = |wo: u32| {
             row_write
@@ -4213,8 +4243,15 @@ impl<S: StorageIO> Table<S> {
 
     /// Inserts a row belonging to `written_by`, visible to nobody else until it
     /// commits.
-    pub async fn insert_row_in_txn(&self, row_write: RowWrite, written_by: TxId) -> Result<()> {
+    pub async fn insert_row_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
         let d = self.data()?;
+        // Before a key is taken from the row: every value of a declared text
+        // length in its stored form, or the insert refused (22001). The
+        // encoders do this already; this is the one place every insert
+        // passes, so a path that reached here without them still stores
+        // `'b '` in a `character(3)` key as the `'b'` it is.
+        self.hold_text_lengths(&mut row_write, |_| true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         // Before the gate below and before anything is written (§2 lock order,
         // T1).
         let _watch = self.enter_write().await?;
@@ -4325,8 +4362,12 @@ impl<S: StorageIO> Table<S> {
     /// retired) must both go in. The caller holds ACCESS EXCLUSIVE, so
     /// nothing else writes the table meanwhile. Indexed and filtered like any
     /// insert.
-    pub(crate) async fn insert_version(&self, row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
+    pub(crate) async fn insert_version(&self, mut row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        // A rewrite's added column (its DEFAULT) is held to its declared
+        // text length as any insert is; the copied columns already hold.
+        self.hold_text_lengths(&mut row_write, |_| true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let _watch = self.enter_write().await?;
         let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
@@ -5547,8 +5588,11 @@ impl<S: StorageIO> Table<S> {
                 let fields = self.schema.fields.as_slice();
                 let value = match fields.iter().find(|f| f.write_order as u32 == *write_order as u32) {
                     Some(target) => crate::core::rql::expr::eval_into(expression, &row, fields, target).and_then(|value| {
-                        crate::core::rql::expr::check_declared_precision(&value, target, &self.schema.type_modifiers)
-                            .map(|()| value)
+                        crate::core::rql::expr::check_declared_precision(&value, target, &self.schema.type_modifiers)?;
+                        // A declared text length, as an assignment holds it
+                        // (`type_modifier::assign_bytes`): `SET c = c || 'zz'`
+                        // past it is 22001.
+                        crate::core::rql::expr::held_to_text_length(value, target)
                     }),
                     None => crate::core::rql::expr::eval(expression, &row, fields),
                 };
@@ -5632,6 +5676,14 @@ impl<S: StorageIO> Table<S> {
                 let n = bytes.len().min(slot.len());
                 slot[..n].copy_from_slice(&bytes[..n]);
                 row_write.columns_writing_data[slot_index].data = mb;
+            }
+
+            // A declared text length holds for the merged row too, whichever
+            // encoder produced the assigned value: the assigned columns only,
+            // since the rest already hold.
+            if let Err(e) = self.hold_text_lengths(&mut row_write, |wo| updates.iter().any(|u| u.write_order == wo)) {
+                d.io_pointers.abort_txn(txn).await;
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
             }
 
             // Refused as an expression that fails to evaluate is refused: the

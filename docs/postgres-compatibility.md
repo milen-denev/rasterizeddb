@@ -72,6 +72,62 @@ wire layer, which reports the declared type, tells them apart. Neither is
 indexed: they share `STRING`'s storage but have no comparator, so indexing them
 would store values no query could match.
 
+### `character(n)`, `character varying(n)` and cast modifiers
+
+`character(n)` (`char`, `char(n)`, `nchar`, `bpchar`) is text held to its
+declared length `n`, which is recorded with the table (a marker in the
+type-modifier sidecar, copied onto the column's `SchemaField::text_typmod`).
+PostgreSQL stores the value blank-padded and strips the padding in every
+comparison it makes on the type; this engine stores it **without its trailing
+spaces**, which is that comparison form, and puts the padding back where the
+value leaves as itself. So:
+
+- `'b'`, `'b '` and `'b  '` are one value, and one key: the primary key, a
+  UNIQUE column or composite, the ON CONFLICT arbiter, the multi-row 21000
+  check, a B-tree, hash or filter index and a row lock all see equal bytes.
+- A string compared with the column (`=`, `<>`, `<`, `IN`, `BETWEEN`, in a
+  `WHERE`, a `CASE` or a `CHECK`) is read without its trailing spaces too.
+- `LIKE`, `ILIKE` and `SIMILAR TO` match the padded value (`k LIKE 'b'` is
+  false for a `char(3)` 'b'), as in PostgreSQL.
+- Read as text (`||`, `length`, `upper`, `::text`, `::varchar`, a join with a
+  text column) it has no trailing spaces; `octet_length` counts the padding.
+- On the wire it is `bpchar` (OID 1042, `atttypmod` n + 4) and padded to `n`,
+  in text and in binary. A length past 65535 is reported as `bpchar` with
+  none and shown unpadded.
+- A value past `n` is an error (22001) unless every character past it is a
+  space; this holds for every write path (literals, expressions, DEFAULT,
+  parameters, `INSERT … SELECT`, `UPDATE`, `ON CONFLICT DO UPDATE`), with
+  the table's own write as the backstop.
+- Checks reading it are enforced, `pg_dump`'s `= ANY (ARRAY['AB'::bpchar,
+  …])` included.
+
+`character varying(n)` is held to `n` the same way (22001, excess spaces cut)
+and otherwise is text. A cast applies its modifier as PostgreSQL's explicit
+cast does: `'abcd'::varchar(2)` is `ab`, `::char(n)` pads (and cuts),
+`::timestamp(p)`, `::timestamptz(p)`, `::time(p)`, `::timetz(p)` and
+`::interval(p)` round half away from zero (a timestamp on PostgreSQL's epoch,
+so `1999-12-31 23:59:59.5::timestamp(0)` is `23:59:59`). `WHERE tm::time(0) =
+…` and `WHERE iv::interval(0) = …` are refused (42601): a time or interval
+value an expression computes cannot be compared in a `WHERE` yet.
+
+`ALTER COLUMN … TYPE` between text, `character(n)` and `character varying(n)`
+rewrites the stored values as PostgreSQL's rewrite does: past the length is
+22001, two keys that become one are 23505, and a `character(n)` value loses
+its trailing spaces (to text, nothing changes: they are already gone).
+
+**Columns from older binaries.** A `character(n)` column created before this
+was stored as plain text, values as written (trailing spaces kept, so `'b'`
+and `'b '` may both be keys), with a marker that recorded no length. It opens
+as it was: text semantics, described as `text`, its checks unenforced (they
+were stored reading the column `::bpchar`). Nothing is reinterpreted, because
+reading old values one way and new writes another would answer from neither.
+`ALTER TABLE … ALTER COLUMN c TYPE character(n)` converts it: the values lose
+their trailing spaces (23505 while two would become one key), the length is
+recorded, and its checks are enforced from then on — refused (23514) while a
+stored row is false for one. A bare `CHAR` / `CHAR(1)` from an older binary
+was the engine's one-codepoint type and keeps it; new ones are
+`character(1)`.
+
 Storing UUIDs natively rather than as `U128` matters for pruning. Canonical UUID
 octets are big-endian while `U128` is read little-endian, so copying the bytes
 straight in destroys the ordering. Measured on 1M v7 keys: byte-reversed storage
@@ -350,16 +406,12 @@ A pattern or flags read from the row (`CHECK (s ~ t)`) outside the subset
 refuse that row with 0A000, and an invalid one with 2201B, as PostgreSQL's.
 
 A check that reads a `character(n)` column (`char`, `char(n)`, `bpchar`) is
-kept unenforced, with a WARNING, on every DDL path (CREATE TABLE, ALTER TABLE
-ADD CONSTRAINT, ADD COLUMN … CHECK): PostgreSQL compares `character(n)`
-blank-padded (`'AB '` is `'AB'`), and this engine stores it as text, so
-enforcing it would refuse rows PostgreSQL accepts. The column's declared type
-is recorded with the table for a later ALTER, and follows the column: `RENAME
-COLUMN` carries it, `DROP COLUMN` retires it, and `ALTER COLUMN … TYPE` between
-`character(n)` and text sets or retires it, declining the column's stored
-checks when it becomes `character(n)` (a check stored while it was
-`character(n)` stays declined after `TYPE text`). The stored check reads the
-column `::bpchar`, as `pg_dump` writes it.
+enforced, compared blank-padded as PostgreSQL compares it (`'AB '` is
+`'AB'`; see *`character(n)`* under Type system). One on a `character(n)`
+column an older binary created stays unenforced, with a WARNING, until
+`ALTER COLUMN … TYPE character(n)` gives the column a length. The column's
+declared type follows it: `RENAME COLUMN` carries it, `DROP COLUMN` retires
+it, and `ALTER COLUMN … TYPE` sets or retires it.
 
 `SHOW CHECKS` lists every check, with `enforced`, `enforced (ASCII-exact)` (a
 locale-dependent pattern, answered exactly for ASCII text), `not enforced` or
@@ -411,9 +463,9 @@ condition against the row as it is then.
 
 A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
 either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
-FROM`, name the target beside its source. A cast this engine does not compute
-as PostgreSQL does — a type modifier other than NUMERIC's (`::varchar(1)`,
-`::timestamp(0)`), or `character` — is refused with 0A000 there. One that compares an outer
+FROM`, name the target beside its source; a cast keeps its type modifier
+there (`::varchar(1)`, `::char(2)`, `::timestamp(0)`, `::interval(3)`), as it
+does everywhere. One that compares an outer
 column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
 (`x - EXISTS (…)::int`), is refused with 0A000.
 

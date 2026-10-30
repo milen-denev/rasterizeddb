@@ -1780,7 +1780,7 @@ An allowlist, not `hash_supported` (`core/index/key.rs:83`):
 |---|---|---|
 | `0x01` integer | I8–I128, U8–U64 | the value as i128, 16 bytes LE, so `INT 42` and `BIGINT 42` hash alike |
 | `0x02` uuid | UUID | the 16 stored bytes |
-| `0x03` text | TEXT, VARCHAR(n) | the UTF-8 bytes, in the evaluator's binary order |
+| `0x03` text | TEXT, VARCHAR(n), CHARACTER(n) | the UTF-8 bytes, in the evaluator's binary order; a `character(n)` value is stored without its trailing spaces (`type_modifier::TextTypmod`), which is its comparison form, so `'b'` and `'b '` route alike |
 
 All else is refused at DDL time with its reason, by one rule: if the engine's
 `=` for a type may yet change to match PostgreSQL, rows placed under the old
@@ -1792,7 +1792,8 @@ semantics would sit in the wrong partition.
 | F32, F64 | NaN, −0, lossy coercion |
 | NUMERIC | bytes depend on scale; `parse_decimal_scaled` (`value_codec.rs:500`) truncates |
 | JSONB | its `=` is not PostgreSQL's, and is not property-tested |
-| CITEXT, BPCHAR, CHARACTER, CHAR(n > 1), NAME | map to STRING without their semantics (case folding, blank padding, NAME's 63-byte truncation; `core/rql/lexer_alter.rs:527-532`). Bare `CHAR` and `CHAR(1)` map to `DbType::CHAR`, not on the allowlist. |
+| CITEXT, NAME | map to STRING without their semantics (case folding, NAME's 63-byte truncation). |
+| a bare `CHAR` an older binary created (`DbType::CHAR`) | the engine's one-codepoint type, not PostgreSQL's `character(1)` |
 | INTERVAL, TIMETZ, geometric and range types | equality is not byte equality |
 | BOOL | too few distinct values |
 | a non-default `COLLATE` | the rule above |

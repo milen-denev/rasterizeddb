@@ -1069,9 +1069,9 @@ fn names_outer_column(term: &str, inner: &[String], outer_relations: &[String]) 
 }
 
 /// Whether a cast to `target` (one `::type`) is one the evaluator applies
-/// exactly as PostgreSQL does: a type with no modifier other than
-/// `character`'s family, or NUMERIC / DECIMAL with `(p, s)`, whose rounding
-/// and precision are applied (22003 past the precision).
+/// exactly as PostgreSQL does: a type with no modifier, NUMERIC / DECIMAL
+/// with `(p, s)` (rounded, 22003 past the precision), or a text or time type
+/// with the modifier `expr::CastTypmod` applies.
 fn placeable_cast(target: &str) -> bool {
     let t = target.trim().to_ascii_lowercase();
     if t.is_empty()
@@ -1080,10 +1080,28 @@ fn placeable_cast(target: &str) -> bool {
         return false;
     }
     let base = t.split('(').next().unwrap_or("").trim().trim_matches('"');
-    if matches!(base, "char" | "character" | "bpchar" | "nchar") {
-        return false;
-    }
-    !t.contains('(') || matches!(base, "numeric" | "decimal")
+    // Every modifier the evaluator applies exactly (`expr::CastTypmod`):
+    // `varchar(n)` and `character(n)` cut (and `character(n)` compares
+    // without trailing spaces, as its literals are read), and `timestamp(p)`,
+    // `time(p)`, `timetz(p)` and `interval(p)` round half away from zero.
+    !t.contains('(')
+        || matches!(
+            base,
+            "numeric"
+                | "decimal"
+                | "varchar"
+                | "character varying"
+                | "char varying"
+                | "char"
+                | "character"
+                | "bpchar"
+                | "nchar"
+                | "timestamp"
+                | "timestamptz"
+                | "time"
+                | "timetz"
+                | "interval"
+        )
 }
 
 fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -> Side {
@@ -1091,12 +1109,11 @@ fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -
     // 2)`) keeps its side: ORMs write them, and the `IN` rewrite carries the
     // cast with the column. Only a type may follow `::`.
     //
-    // Not a cast whose value this engine does not compute as PostgreSQL does:
-    // a type modifier other than NUMERIC's (`varchar(1)`, `timestamp(0)`,
-    // `interval(3)`) is ignored by the evaluator, so `u.y::varchar(1) = t.y`
-    // matched rows 1 and 2 where PostgreSQL matched row 2; and `character`
-    // (`char`, `bpchar`) truncates and blank-pads. Those keep no side, and the
-    // EXISTS is refused (0A000) rather than answered wrong.
+    // Not a cast whose value this engine does not compute as PostgreSQL does
+    // (`placeable_cast`): those keep no side, and the EXISTS is refused
+    // (0A000) rather than answered wrong. The modifiers of `varchar(n)`,
+    // `character(n)`, `timestamp(p)`, `time(p)`, `timetz(p)` and
+    // `interval(p)` are applied (`expr::CastTypmod`), so they place.
     let cleaned = match reference.trim().split_once("::") {
         Some((column, cast)) if cast.split("::").all(placeable_cast) => column.trim(),
         _ => reference.trim(),

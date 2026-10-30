@@ -443,10 +443,10 @@ async fn a_pattern_outside_the_translated_subset_is_unenforced_and_said_so() {
 /// that is said once per statement as a WARNING naming the constraint, with
 /// how many rows. A pattern or flags read from the row outside the
 /// translated subset refuse the row (0A000; an invalid one 2201B), where
-/// plain ASCII data was not judged. `character(n)` checks are kept
-/// unenforced (said so), as this engine does not compare blank-padded: they
-/// refused the 'AB ' PostgreSQL accepts. `SHOW CHECKS` lists every check
-/// and whether it is enforced.
+/// plain ASCII data was not judged. `character(n)` checks are enforced as
+/// PostgreSQL enforces them, blank-padded: 'AB ' is 'AB' and 'ZZ' is
+/// refused (they were kept unenforced, and accepted 'ZZ'). `SHOW CHECKS`
+/// lists every check and whether it is enforced.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_not_judged_rule_is_narrow_and_said_once() {
     use std::sync::{Arc, Mutex};
@@ -519,19 +519,23 @@ async fn the_not_judged_rule_is_narrow_and_said_once() {
         wrong.push(format!("not-judged warning: {warned:?}"));
     }
 
-    // character(n): kept unenforced, said so, and the padded value stored.
+    // character(n): enforced, blank-padded, with no warning. PostgreSQL 17
+    // takes 'AB ' and 'AB  ' and refuses 'ZZ'; `pg_dump`'s `= ANY
+    // (ARRAY['AB'::bpchar, …])` form is the first.
     for (create, table) in [
         ("CREATE TABLE c1 (id INT PRIMARY KEY, tag character(3), CONSTRAINT c1_tag_check CHECK ((tag = ANY (ARRAY['AB'::bpchar, 'CD'::bpchar]))))", "c1"),
         ("CREATE TABLE c3 (id INT PRIMARY KEY, tag char(3) CHECK (tag IN ('AB', 'CD')))", "c3"),
     ] {
         client.batch_execute(create).await.expect(table);
         let warned = taken();
-        if !warned.iter().any(|(c, m)| c == "01000" && m.contains("not enforced") && m.contains("character(n)")) {
-            wrong.push(format!("{table}: no warning: {warned:?}"));
+        if !warned.is_empty() {
+            wrong.push(format!("{table}: warned: {warned:?}"));
         }
-        let got = outcome(client.batch_execute(&format!("INSERT INTO {table} VALUES (1, 'AB ')")).await);
-        if got != "ok" {
-            wrong.push(format!("{table}: 'AB ' refused {got}"));
+        for (id, value, want) in [(1, "AB ", "ok"), (2, "AB  ", "ok"), (3, "ZZ", "23514"), (4, "CD", "ok")] {
+            let got = outcome(client.batch_execute(&format!("INSERT INTO {table} VALUES ({id}, '{value}')")).await);
+            if got != want {
+                wrong.push(format!("{table}: {value:?} {got}, want {want}"));
+            }
         }
     }
 
@@ -548,7 +552,7 @@ async fn the_not_judged_rule_is_narrow_and_said_once() {
             _ => None,
         })
         .collect();
-    for want in ["ck ck_c enforced (ASCII-exact)", "nm nm_c enforced (ASCII-exact)", "c1 c1_tag_check not enforced"] {
+    for want in ["ck ck_c enforced (ASCII-exact)", "nm nm_c enforced (ASCII-exact)", "c1 c1_tag_check enforced", "c3 c3_tag_check enforced"] {
         if !listed.iter().any(|l| l == want) {
             wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
         }
@@ -556,15 +560,15 @@ async fn the_not_judged_rule_is_narrow_and_said_once() {
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
 
-/// A check reading a `character(n)` column is kept unenforced (said so) on
+/// A check reading a `character(n)` column is enforced, blank-padded, on
 /// every DDL path, and listed as such: CREATE TABLE with `tag::text`, a bare
 /// `CHAR`, ALTER TABLE ADD CONSTRAINT on an existing CHAR(3) (alone and in an
-/// OR), and ADD COLUMN … CHAR(3) CHECK over a table with rows. Each refused
-/// the 'AB ' PostgreSQL accepts, and SHOW CHECKS said "enforced". And ADD
-/// CONSTRAINT says when stored rows go unjudged; SHOW CHECKS says a check
-/// over a locale-dependent pattern is enforced for ASCII text exactly.
+/// OR), and ADD COLUMN … CHAR(3) CHECK over a table with rows. They were
+/// kept unenforced, said so, and took 'ZZ'; PostgreSQL 17's answers below.
+/// And ADD CONSTRAINT says when stored rows go unjudged; SHOW CHECKS says a
+/// check over a locale-dependent pattern is enforced for ASCII text exactly.
 #[tokio::test(flavor = "multi_thread")]
-async fn character_n_checks_are_declined_on_every_ddl_path() {
+async fn character_n_checks_are_enforced_on_every_ddl_path() {
     use std::sync::{Arc, Mutex};
     let server = TestServer::start().await.expect("server");
     let (client, mut connection) =
@@ -585,21 +589,34 @@ async fn character_n_checks_are_declined_on_every_ddl_path() {
         .await
         .expect("c4");
     let _ = taken();
-    for (ddl, name) in [
-        ("ALTER TABLE c4 ADD CONSTRAINT c4_t CHECK (tag IN ('AB', 'CD'))", "c4_t"),
-        ("ALTER TABLE c4 ADD CONSTRAINT c4_o CHECK (q > 0 OR tag = 'AB')", "c4_o"),
-        ("ALTER TABLE c4 ADD COLUMN tg3 CHAR(3) CHECK (tg3 IN ('X'))", "c4_tg3_check"),
-        ("CREATE TABLE c5 (id INT PRIMARY KEY, tag CHAR(3) CHECK (tag::text IN ('AB', 'CD')), c1 CHAR CHECK (c1 IN ('a')))", "c5_tag_check"),
+    for ddl in [
+        "ALTER TABLE c4 ADD CONSTRAINT c4_t CHECK (tag IN ('AB', 'CD'))",
+        "ALTER TABLE c4 ADD CONSTRAINT c4_o CHECK (q > 0 OR tag = 'AB')",
+        "ALTER TABLE c4 ADD COLUMN tg3 CHAR(3) CHECK (tg3 IN ('X'))",
+        "CREATE TABLE c5 (id INT PRIMARY KEY, tag CHAR(3) CHECK (tag::text IN ('AB', 'CD')), c1 CHAR CHECK (c1 IN ('a')))",
     ] {
         client.batch_execute(ddl).await.unwrap_or_else(|e| panic!("{ddl}: {e}"));
         let warned = taken();
-        if !warned.iter().any(|m| m.contains(&format!("\"{name}\"")) && m.contains("character(n)")) {
-            wrong.push(format!("{ddl}: no warning: {warned:?}"));
+        if !warned.is_empty() {
+            wrong.push(format!("{ddl}: warned: {warned:?}"));
         }
     }
-    for sql in ["INSERT INTO c4 VALUES (1, 'AB ', -1, NULL, 'X  ')", "INSERT INTO c5 VALUES (1, 'AB ', 'a')"] {
-        if let Err(e) = client.batch_execute(sql).await {
-            wrong.push(format!("{sql}: {e}"));
+    for (sql, want) in [
+        ("INSERT INTO c4 VALUES (1, 'AB ', -1, NULL, 'X  ')", "ok"),
+        ("INSERT INTO c5 VALUES (1, 'AB ', 'a')", "ok"),
+        ("INSERT INTO c4 VALUES (2, 'ZZ', 1, NULL, NULL)", "23514"),
+        ("INSERT INTO c4 VALUES (3, 'AB', -1, NULL, 'Y')", "23514"),
+        ("INSERT INTO c4 VALUES (4, 'CD', -1, NULL, NULL)", "23514"),
+        ("INSERT INTO c5 VALUES (2, 'ZZ', 'a')", "23514"),
+        ("INSERT INTO c5 VALUES (3, 'AB', 'b')", "23514"),
+        ("INSERT INTO c5 VALUES (4, 'CD ', 'a ')", "ok"),
+    ] {
+        let got = match client.batch_execute(sql).await {
+            Ok(()) => "ok".to_string(),
+            Err(e) => e.code().map(|c| c.code().to_string()).unwrap_or_else(|| e.to_string()),
+        };
+        if got != want {
+            wrong.push(format!("{sql}: {got}, want {want}"));
         }
     }
     // Stored rows a check leaves unjudged are said at ADD CONSTRAINT.
@@ -624,11 +641,11 @@ async fn character_n_checks_are_declined_on_every_ddl_path() {
         })
         .collect();
     for want in [
-        "c4_t not enforced",
-        "c4_o not enforced",
-        "c4_tg3_check not enforced",
-        "c5_tag_check not enforced",
-        "c5_c1_check not enforced",
+        "c4_t enforced",
+        "c4_o enforced",
+        "c4_tg3_check enforced",
+        "c5_tag_check enforced",
+        "c5_c1_check enforced",
         "w_c enforced (ASCII-exact)",
     ] {
         if !listed.iter().any(|l| l == want) {
@@ -640,15 +657,15 @@ async fn character_n_checks_are_declined_on_every_ddl_path() {
 
 /// A column's `character(n)` record follows it through later DDL: `RENAME
 /// COLUMN` moves it, `DROP COLUMN` retires it, and `ALTER COLUMN … TYPE`
-/// sets or retires it, declining the checks already stored on the column
-/// when it becomes `character(n)`. Kept per column name and left alone, a
-/// check added after `RENAME code TO tag` was enforced on a `character(n)`
-/// column (refusing `'AB '`), one on a TEXT column that took a former
-/// `character(n)` column's name was declined (accepting `'ZZ'`), and a
-/// TEXT column's check stayed enforced after `TYPE CHAR(3)`.
+/// sets or retires it. Kept per column name and left alone, a check added
+/// after `RENAME code TO tag` compared a `character(n)` column as text
+/// (refusing `'AB '`), and one on a TEXT column that took a former
+/// `character(n)` column's name compared it blank-padded (taking `'AB '`
+/// where PostgreSQL refuses it). Every check is enforced, as PostgreSQL 17
+/// enforces it.
 ///
 /// Mutations: the marker's `move_key` in `rename_column`; its `retire` in
-/// `retire_leftovers`; `bpchar_type_change` returning nothing.
+/// `retire_leftovers`; `text_type_change` returning nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_character_n_record_follows_rename_drop_and_type_changes() {
     let root = format!("/var/tmp/check_corpus_bpchar_{}", std::process::id());
@@ -699,11 +716,25 @@ async fn a_character_n_record_follows_rename_drop_and_type_changes() {
             Err(e) => wrong.push(format!("{sql}: {e}")),
         }
     }
-    // character(n) columns: declined, so a blank-padded value PostgreSQL
-    // accepts is not refused.
+    // A TEXT column that took a `character(n)` column's name compares as
+    // text: 'AB ' is not 'AB'.
+    match client.batch_execute("INSERT INTO p VALUES (3, 'x', 'AB ')").await {
+        Ok(()) => wrong.push("p accepted 'AB ' (compared blank-padded)".to_string()),
+        Err(e) if e.code().map(|c| c.code()) == Some("23514") => {}
+        Err(e) => wrong.push(format!("p 'AB ': {e}")),
+    }
+    // character(n) columns: blank-padded, so 'AB ' is 'AB', and 'ZZ' is
+    // refused.
     for sql in ["INSERT INTO o VALUES (1, 'AB ', 1)", "INSERT INTO l VALUES (1, 'AB ')"] {
         if let Err(e) = client.batch_execute(sql).await {
             wrong.push(format!("{sql}: {e}"));
+        }
+    }
+    for sql in ["INSERT INTO o VALUES (3, 'ZZ', 1)", "INSERT INTO l VALUES (3, 'ZZ')"] {
+        match client.batch_execute(sql).await {
+            Ok(()) => wrong.push(format!("{sql}: accepted")),
+            Err(e) if e.code().map(|c| c.code()) == Some("23514") => {}
+            Err(e) => wrong.push(format!("{sql}: {e}")),
         }
     }
     let listed: Vec<String> = client
@@ -716,7 +747,7 @@ async fn a_character_n_record_follows_rename_drop_and_type_changes() {
             _ => None,
         })
         .collect();
-    for want in ["m_c enforced", "n_c enforced", "p_c enforced", "o_c not enforced", "l_c not enforced"] {
+    for want in ["m_c enforced", "n_c enforced", "p_c enforced", "o_c enforced", "l_c enforced"] {
         if !listed.iter().any(|l| l == want) {
             wrong.push(format!("SHOW CHECKS lacks {want:?}: {listed:?}"));
         }

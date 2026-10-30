@@ -7700,7 +7700,15 @@ fn stored_key_bytes(literal: &str, field: &crate::core::row::schema::SchemaField
         return None;
     }
     match crate::core::rql::expr::eval_into(&expr, &crate::core::row::row::Row::default(), &[], field).ok()? {
-        crate::core::rql::expr::Value::Data { bytes, db_type } if db_type == field.db_type => Some(bytes),
+        // In a column of declared text length, as the column holds it
+        // (`type_modifier::assign_bytes`): `'y'` and `'y '` are one
+        // `character(3)` key, and applied last-wins without this.
+        crate::core::rql::expr::Value::Data { bytes, db_type } if db_type == field.db_type => {
+            match crate::core::rql::type_modifier::assign_bytes(field, &bytes) {
+                Ok(Some(held)) => Some(held),
+                _ => Some(bytes),
+            }
+        }
         _ => None,
     }
 }
@@ -7842,7 +7850,7 @@ fn default_is_constant(expression: &str) -> bool {
         match e {
             Expr::Literal { .. } | Expr::Null => true,
             Expr::Cast(inner, _) => constant(inner),
-            Expr::NumericCast { value, .. } => constant(value),
+            Expr::NumericCast { value, .. } | Expr::TypmodCast { value, .. } => constant(value),
             _ => false,
         }
     }
@@ -8416,6 +8424,7 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
                 .iter()
                 .find(|m| m.column.eq_ignore_ascii_case(&c.name))
                 .map(|m| m.scale as u32);
+            field.text_typmod = crate::core::rql::type_modifier::text_typmod_of(&c.name, &create_table.type_modifiers);
             field
         })
         .collect();
@@ -10766,11 +10775,15 @@ fn compile_check_cached(
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
     // Keyed by everything the compilation reads: the text and each field's
-    // name, type, position, scale and liveness.
+    // name, type, position, scale, declared text length and liveness. The
+    // length decides whether a check on a `character(n)` column is enforced
+    // (`compile_check`) and how its literals read: left out, a check compiled
+    // while the column was an older binary's (unenforced) kept being
+    // answered from the cache after `ALTER COLUMN … TYPE character(n)`.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     expression.hash(&mut hasher);
     for f in fields {
-        (&f.name, f.db_type.to_string(), f.write_order, f.scale, f.is_deleted).hash(&mut hasher);
+        (&f.name, f.db_type.to_string(), f.write_order, f.scale, f.text_typmod, f.is_deleted).hash(&mut hasher);
     }
     let key = hasher.finish();
     if let Some(hit) = CACHE.with(|c| {
@@ -10812,11 +10825,26 @@ pub(crate) fn compile_check(
     if let Some(why) = unsupported_check_pattern(expression) {
         return Ok(CompiledCheck::Unenforced(why));
     }
-    // `character(n)` compares blank-padded in PostgreSQL ('AB ' = 'AB'),
-    // and this engine stores it as text: `tag = ANY (ARRAY['AB'::bpchar,
-    // …])`, which `pg_dump` writes for every such check, refused the 'AB '
-    // its `--inserts` writes, and the restore lost the row.
-    if compares_bpchar(original) {
+    // `character(n)` compares blank-padded in PostgreSQL ('AB ' = 'AB'). A
+    // column with a recorded length is stored and compared that way here
+    // (`type_modifier::TextTypmod`), so `tag = ANY (ARRAY['AB'::bpchar,
+    // …])`, which `pg_dump` writes for every such check, is enforced. One an
+    // older binary created holds its values as written (and that binary cast
+    // it `::bpchar` in every check reading it): a check casting to `bpchar`
+    // that reads a text column without a recorded `character(n)` length is
+    // kept unenforced, as it was.
+    let reads_unpadded_text = || {
+        let names: Vec<String> = fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+        crate::core::rql::check::columns_read(original, &names).iter().any(|name| {
+            fields.iter().any(|f| {
+                !f.is_deleted
+                    && f.name == *name
+                    && f.db_type == crate::core::db_type::DbType::STRING
+                    && !matches!(f.text_typmod, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_)))
+            })
+        })
+    };
+    if compares_bpchar(original) && reads_unpadded_text() {
         return Ok(CompiledCheck::Unenforced(
             "it compares character(n) values, which this engine does not compare blank-padded as PostgreSQL does"
                 .to_string(),
@@ -11809,43 +11837,126 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
-/// What `ALTER COLUMN column TYPE declared` changes about `character(n)`,
-/// which shares text's storage: the column's marker record, set or retired,
-/// and every live check reading the column rewritten as `ADD CONSTRAINT`
-/// would have stored it (`check::cast_columns_to_bpchar`), so it is declined
-/// as a check declared on a `character(n)` column is. Nothing when the
-/// column keeps its kind. A check stored while the column was
-/// `character(n)` keeps its casts when the column becomes text, and stays
-/// declined: the casts cannot be told from ones the statement wrote.
-fn bpchar_type_change(
+/// What `ALTER COLUMN column TYPE declared` changes about a text column's
+/// declared length (`type_modifier::TextTypmod`), which shares text's
+/// storage: the marker records to write, after the stored values have been
+/// brought to the new type, as PostgreSQL's rewrite brings them.
+///
+/// - To `character(n)`: every value held to `n` (22001 past it) and stored
+///   without its trailing spaces, so `'p'` and `'p '` under a UNIQUE are one
+///   key (23505), as they are in PostgreSQL.
+/// - To `character varying(n)`: every value held to `n`, excess spaces cut.
+/// - From `character(n)` to text: nothing; the values are already stored
+///   without their trailing spaces, which is what the conversion gives.
+/// - A `character(n)` column an older binary created (no length,
+///   [`type_modifier::is_legacy_bpchar`]) holds its values as written, so it
+///   is converted as text is. Restating its type is how it gets one.
+///
+/// Nothing when the column keeps its type and length.
+async fn text_type_change(
+    database: &Arc<Database>,
+    table_name: &str,
     schema: &crate::core::row::schema::TableSchema,
-    column: &str,
+    field: &crate::core::row::schema::SchemaField,
     declared: &str,
-) -> (Option<crate::core::rql::type_modifier::TypeModifier>, Vec<crate::core::rql::check::CheckConstraint>) {
-    use crate::core::rql::type_modifier;
-    let was = type_modifier::is_marked_bpchar(column, &schema.type_modifiers);
-    let now = type_modifier::is_bpchar_type(declared);
-    if was == now {
-        return (None, Vec::new());
+    row_count: u64,
+    tx: TxId,
+) -> Result<Vec<crate::core::rql::type_modifier::TypeModifier>, String> {
+    use crate::core::rql::type_modifier::{self, TextTypmod};
+    if field.db_type != crate::core::db_type::DbType::STRING {
+        return Ok(Vec::new());
     }
-    if !now {
-        return (Some(type_modifier::bpchar_marker_retired(column)), Vec::new());
+    let wanted = match type_modifier::parse_text_typmod(declared) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    let had = field.text_typmod;
+    let legacy = type_modifier::is_legacy_bpchar(&field.name, &schema.type_modifiers);
+    if wanted == had && !legacy {
+        return Ok(Vec::new());
     }
-    let columns = [column.to_string()];
-    let checks = schema
-        .checks
-        .iter()
-        .filter(|c| !c.is_deleted)
-        .filter_map(|c| {
-            let expression = crate::core::rql::check::cast_columns_to_bpchar(&c.expression, &columns);
-            (expression != c.expression).then(|| crate::core::rql::check::CheckConstraint {
-                name: c.name.clone(),
-                expression,
-                is_deleted: false,
-            })
-        })
-        .collect();
-    (Some(type_modifier::bpchar_marker(column)), checks)
+    if row_count > 0 {
+        // Its values already in `character(n)`'s stored form, or not.
+        let stripped = matches!(had, Some(TextTypmod::Bpchar(_))) && !legacy;
+        let simple = |name: &str| {
+            name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        let column = if simple(&field.name) { field.name.clone() } else { format!("\"{}\"", field.name.replace('"', "\"\"")) };
+        // Past the length is an error unless the excess is spaces.
+        if let Some(n) = wanted.and_then(|t| t.length()) {
+            let shrinks = !matches!(had, Some(TextTypmod::Bpchar(m) | TextTypmod::Varchar(m)) if !legacy && m != 0 && m <= n);
+            if shrinks {
+                let probe = format!("SELECT 1 FROM {table_name} WHERE length(rtrim({column})) > {n} LIMIT 1");
+                if !run_subquery(&probe, database, tx).await?.is_empty() {
+                    return Err(format!("value too long for type {}", wanted.expect("has a length").type_name()));
+                }
+            }
+        }
+        let rewrite = match wanted {
+            // Stored without trailing spaces; a key two values now share is
+            // the UPDATE's 23505.
+            Some(TextTypmod::Bpchar(_)) if !stripped => {
+                Some(format!("UPDATE {table_name} SET {column} = rtrim({column}) WHERE {column} LIKE '% '"))
+            }
+            // Excess spaces cut (anything else was refused above).
+            Some(TextTypmod::Varchar(n)) => {
+                Some(format!("UPDATE {table_name} SET {column} = rpad({column}, {n}) WHERE length({column}) > {n}"))
+            }
+            // `character(n)` to text loses the padding, which an older
+            // binary's column still stores.
+            None if legacy => Some(format!("UPDATE {table_name} SET {column} = rtrim({column}) WHERE {column} LIKE '% '")),
+            _ => None,
+        };
+        if let Some(sql) = rewrite {
+            let purpose = recognize_query_purpose(&sql)
+                .ok_or_else(|| format!("could not convert column \"{}\" to {}", field.name, declared.trim()))?;
+            let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
+            if response.first() == Some(&3) {
+                return Err(String::from_utf8_lossy(&response[1..]).to_string());
+            }
+        }
+        // An older binary's `character(n)` column kept every check reading it
+        // unenforced, so its rows were never judged by them. Given a length
+        // the column's checks are enforced from now on (`compile_check`), and
+        // as `ADD CONSTRAINT` does, a stored row one of them is false for
+        // refuses the change rather than sit under a check it breaks.
+        if legacy && matches!(wanted, Some(TextTypmod::Bpchar(_))) {
+            let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+            for check in schema.checks.iter().filter(|c| !c.is_deleted) {
+                let reads = crate::core::rql::check::columns_read(&check.expression, &names);
+                if !reads.iter().any(|c| c.eq_ignore_ascii_case(&field.name)) {
+                    continue;
+                }
+                // Still reading another column held as written: it stays
+                // unenforced (`compile_check`), and judges nothing.
+                let still_declined = reads.iter().any(|c| {
+                    !c.eq_ignore_ascii_case(&field.name)
+                        && schema.fields.iter().any(|f| {
+                            !f.is_deleted
+                                && f.name == *c
+                                && f.db_type == crate::core::db_type::DbType::STRING
+                                && !matches!(f.text_typmod, Some(TextTypmod::Bpchar(_)))
+                        })
+                });
+                if still_declined && compares_bpchar(&check.expression) {
+                    continue;
+                }
+                let normalized = crate::core::rql::check::normalize_expression(&check.expression);
+                let probe = format!("SELECT 1 FROM {table_name} WHERE NOT ({normalized}) LIMIT 1");
+                if !run_subquery(&probe, database, tx).await?.is_empty() {
+                    return Err(format!(
+                        "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                        check.name, table_name
+                    ));
+                }
+            }
+        }
+    }
+    // An older binary's marker is retired when the column leaves
+    // `character(n)`, and superseded by one carrying the length when not.
+    Ok(type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers))
 }
 
 /// `ALTER COLUMN … TYPE` naming the type a column already has, with what it
@@ -12215,11 +12326,12 @@ async fn add_check_constraint(
     if schema.checks.iter().any(|c| !c.is_deleted && c.name.eq_ignore_ascii_case(&name)) {
         return ddl_error(&format!("constraint \"{}\" for relation \"{}\" already exists", name, table_name));
     }
-    // A `character(n)` column is cast `::bpchar` where the check reads it,
-    // as CREATE TABLE stores it, which keeps the check unenforced: enforced,
-    // `ADD CONSTRAINT CHECK (tag IN ('AB', 'CD'))` on a CHAR(3) refused the
-    // 'AB ' PostgreSQL accepts.
-    let bpchar = crate::core::rql::type_modifier::bpchar_columns(&schema.type_modifiers);
+    // A `character(n)` column an older binary created holds its values as
+    // written, so a check on it cannot compare them blank-padded: it is cast
+    // `::bpchar` where the check reads it, as that binary stored such
+    // checks, and kept unenforced. A column with a recorded length
+    // (`type_modifier::TextTypmod`) needs none of this.
+    let bpchar = crate::core::rql::type_modifier::legacy_bpchar_columns(&schema.type_modifiers);
     let expression = if bpchar.is_empty() {
         expression
     } else {
@@ -12412,7 +12524,7 @@ async fn execute_alter_table_action(
             json,
             modifier,
             generated,
-            bpchar,
+            text_typmod,
         } => {
             if nullable::is_hidden(&name) {
                 return ddl_error("column names beginning with __null_ are reserved");
@@ -12606,11 +12718,11 @@ async fn execute_alter_table_action(
                     // A former column's record under the name is retired.
                     new_modifier
                         .into_iter()
-                        .chain(bpchar.then(|| crate::core::rql::type_modifier::bpchar_marker(&name)))
-                        .chain(
-                            (!bpchar && crate::core::rql::type_modifier::is_marked_bpchar(&name, &schema.type_modifiers))
-                                .then(|| crate::core::rql::type_modifier::bpchar_marker_retired(&name)),
-                        )
+                        .chain(crate::core::rql::type_modifier::text_typmod_records(
+                            &name,
+                            text_typmod,
+                            &schema.type_modifiers,
+                        ))
                         .collect(),
                     new_generated.into_iter().collect(),
                     tx,
@@ -12688,19 +12800,19 @@ async fn execute_alter_table_action(
                         crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, entry)
                             .map_err(|e| e.to_string())?;
                     }
-                    // `character(n)`, for the checks that read it
-                    // (`type_modifier::BPCHAR_MARKER`).
-                    if bpchar {
-                        let marker = crate::core::rql::type_modifier::bpchar_marker(&name);
-                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &marker)
+                    // Its declared text length (`type_modifier::TextTypmod`),
+                    // and a former column's marker under the name retired.
+                    for record in crate::core::rql::type_modifier::text_typmod_records(
+                        &name,
+                        text_typmod,
+                        &schema.type_modifiers,
+                    ) {
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &record)
                             .map_err(|e| e.to_string())?;
-                        schema.type_modifiers.push(marker);
-                    } else if crate::core::rql::type_modifier::is_marked_bpchar(&name, &schema.type_modifiers) {
-                        // A former column's, left by a binary that kept it.
-                        let retired = crate::core::rql::type_modifier::bpchar_marker_retired(&name);
-                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, &retired)
-                            .map_err(|e| e.to_string())?;
-                        schema.type_modifiers.retain(|m| !m.column.eq_ignore_ascii_case(&retired.column));
+                        schema.type_modifiers.retain(|m| !m.column.eq_ignore_ascii_case(&record.column));
+                        if !record.is_deleted {
+                            schema.type_modifiers.push(record);
+                        }
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
@@ -13335,43 +13447,37 @@ async fn execute_alter_table_action(
                             Ok(entry) => entry,
                             Err(e) => return ddl_error(&e),
                         };
-                        // `character(n)` and text are one storage type here, so a
-                        // change between them rewrites no row; what moves is the
-                        // column's `character(n)` record and the checks that read
-                        // it (`type_modifier::BPCHAR_MARKER`).
-                        let (marker, checks) = bpchar_type_change(&schema, &field.name, &type_tokens.join(" "));
-                        if numeric.is_none() && marker.is_none() {
+                        // `character(n)`, `character varying(n)` and text are one
+                        // storage type here. What moves is the column's declared
+                        // length (`type_modifier::TextTypmod`), and the stored
+                        // values where the new type holds them otherwise: held
+                        // to the length (22001), and a `character(n)` value
+                        // without its trailing spaces (23505 when two keys
+                        // become one), as PostgreSQL's rewrite does.
+                        let markers = match text_type_change(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), row_count, tx).await {
+                            Ok(markers) => markers,
+                            Err(e) => return ddl_error(&e),
+                        };
+                        if numeric.is_none() && markers.is_empty() {
                             return ddl_ok(0);
                         }
-                        let declined: Vec<String> = checks.iter().map(|c| c.name.clone()).collect();
                         // The reload's work, all or nothing (B5): one sidecar
-                        // transaction.
+                        // transaction. The checks reading the column are left
+                        // as they are: a `character(n)` column is compared as
+                        // PostgreSQL compares it, so they stay enforced.
                         match database
                             .reload_atomic(&plan.table_name, |old| async move {
                                 let io = old.io_schema.clone();
                                 let mut writes = crate::core::torn_tail::SidecarWrites::default();
-                                for entry in numeric.iter().chain(marker.iter()) {
+                                for entry in numeric.iter().chain(markers.iter()) {
                                     crate::core::rql::type_modifier::stage(&*io, &mut writes, entry)
                                         .map_err(|e| e.to_string())?;
-                                }
-                                for check in &checks {
-                                    crate::core::rql::check::stage(&*io, &mut writes, check).map_err(|e| e.to_string())?;
                                 }
                                 writes.commit(&*io).await.map_err(|e| e.to_string())
                             })
                             .await
                         {
-                            Ok(()) => {
-                                for check in &declined {
-                                    crate::core::notice::push("WARNING", "01000", format!(
-                                        "check constraint \"{}\" reads column \"{}\", now character(n), and is \
-                                         not enforced: character(n) compares blank-padded, which this engine \
-                                         does not evaluate",
-                                        check, field.name
-                                    ));
-                                }
-                                ddl_ok(0)
-                            }
+                            Ok(()) => ddl_ok(0),
                             Err(failure) => reload_failed(failure, ""),
                         }
                     }

@@ -486,6 +486,11 @@ fn bpchar_key(column: &str) -> String {
     format!("{}{}", type_modifier::BPCHAR_MARKER, column)
 }
 
+/// The key of `column`'s `character varying(n)` record.
+fn varchar_key(column: &str) -> String {
+    format!("{}{}", type_modifier::VARCHAR_MARKER, column)
+}
+
 /// The last-wins sidecars of one table.
 struct Declarations {
     defaults: Keyed<column_default::ColumnDefault>,
@@ -536,6 +541,9 @@ impl Declarations {
         // left behind, a TEXT column later added or renamed onto the name
         // had its checks declined as if it were `character(n)`.
         self.modifiers.retire(&bpchar_key(name));
+        // And its `character varying(n)` length: left behind, a column added
+        // under the name was held to it.
+        self.modifiers.retire(&varchar_key(name));
         self.json.retire(name);
         self.retire_constraints(table, name, fields);
     }
@@ -794,6 +802,8 @@ pub(crate) async fn rename_column(
     // The `character(n)` record follows it as well: left under `from`, a
     // check added after the rename was enforced on a `character(n)` column.
     decl.modifiers.move_key(&bpchar_key(from), &bpchar_key(to));
+    // And its declared `character varying(n)` length.
+    decl.modifiers.move_key(&varchar_key(from), &varchar_key(to));
     decl.json.move_key(from, to);
 
     // Everything else that mentions it is rewritten. A partial index's

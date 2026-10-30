@@ -80,6 +80,7 @@ fn class(t: &DbType) -> Class {
         DbType::BYTEA
         | DbType::ARRAY
         | DbType::JSON
+        | DbType::BPCHAR(_)
         | DbType::JSONB
         | DbType::INTERVAL
         | DbType::MACADDR
@@ -109,7 +110,7 @@ fn class(t: &DbType) -> Class {
     }
 }
 
-const ALL: [DbType; 48] = [
+const ALL: [DbType; 49] = [
     DbType::I8,
     DbType::I16,
     DbType::I32,
@@ -132,6 +133,8 @@ const ALL: [DbType; 48] = [
     DbType::ARRAY,
     DbType::DECIMAL,
     DbType::JSON,
+    // Reporting-only, as JSON is; the byte decodes to a `bpchar` with no length.
+    DbType::BPCHAR(0),
     DbType::JSONB,
     DbType::INTERVAL,
     DbType::MACADDR,
@@ -776,7 +779,7 @@ fn every_type_is_classified_and_covered() {
     let count = |c| ALL.iter().filter(|t| class(t) == c).count();
     assert_eq!(
         (count(Class::Fingerprinted), count(Class::BoundsOnly), count(Class::Excluded)),
-        (18, 1, 29)
+        (18, 1, 30)
     );
 
     let rendered = render();
@@ -1501,7 +1504,8 @@ probe f16 gffff -> 0:0000000000000004,1:0000000000000004,2:0000000000000004,3:00
 
 /// Lines `render` added since [`GOLDEN_V1`] was frozen. Only appended to; a
 /// change to one is a derivation change like any other.
-const GOLDEN_ADDED: &str = r#"numeric s2 z0 [125, 5000, -1] -> ffffffffffffffffffffffffffffffff88130000000000000000000000000000
+const GOLDEN_ADDED: &str = r#"excluded BPCHAR(0) zonemap=false
+numeric s2 z0 [125, 5000, -1] -> ffffffffffffffffffffffffffffffff88130000000000000000000000000000
 numeric s2 `amt = 1.25` -> eq 7d000000000000000000000000000000 zone=1
 numeric default `amt = 1.25` -> eq 807c814a000000000000000000000000 zone=0
 numeric s2 `amt > 50` -> gt 88130000000000000000000000000000 zone=0

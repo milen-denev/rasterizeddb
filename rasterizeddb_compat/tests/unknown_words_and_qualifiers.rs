@@ -439,16 +439,18 @@ async fn correlations_are_placed_or_refused_with_their_code() {
 }
 
 /// A correlated cast is placed only when the evaluator computes it as
-/// PostgreSQL does. A type modifier other than NUMERIC's is ignored by the
-/// evaluator (`'abcd'::varchar(2)` stays 'abcd', `ts::timestamp(0)` keeps
-/// its fraction), and `character` pads and truncates: placed, `u.y::
-/// varchar(1) = t.y` matched rows 1 and 2 where PostgreSQL matched row 2.
-/// Those are refused (0A000), never answered wrong; `::int` (rounding a
-/// NUMERIC) and `::numeric(10,1)` run and match PostgreSQL 17.
+/// PostgreSQL does. The modifiers of `varchar(n)`, `character(n)` and
+/// `timestamp(p)` are applied now (`expr::CastTypmod`), so those run, and
+/// answer as PostgreSQL 17 does; they were refused (0A000) while the
+/// evaluator ignored them, since placed then, `u.y::varchar(1) = t.y` matched
+/// rows 1 and 2 where PostgreSQL matched row 2. `::int` (rounding a NUMERIC)
+/// and `::numeric(10,1)` run and match PostgreSQL 17 too.
 ///
-/// Mutation: `placeable_cast` accepting every modifier.
+/// Mutations: `placeable_cast` refusing the text and time modifiers again
+/// (0A000 here); `apply_cast_typmod` leaving the value as it is (rows 1 and
+/// 2 for the first).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_correlated_cast_the_evaluator_cannot_apply_is_refused() {
+async fn a_correlated_cast_with_a_type_modifier_answers_as_postgresql() {
     let server = TestServer::start().await.expect("server");
     let pool = server.connect_sqlx().await.expect("connect");
     pool.execute(
@@ -460,20 +462,30 @@ async fn a_correlated_cast_the_evaluator_cannot_apply_is_refused() {
     .await
     .expect("setup");
     let mut conn = pool.acquire().await.expect("conn");
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in [
-        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y)",
-        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y = et.y::varchar(1))",
-        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::character varying(1) = et.y)",
-        "DELETE FROM et WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y)",
-        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::char(1) = et.y)",
-        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.ts::timestamp(0) = et.ts)",
+    // Each as PostgreSQL 17 answers it: the ids it writes.
+    for (sql, want) in [
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y) RETURNING id", vec![2]),
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y = et.y::varchar(1)) RETURNING id", vec![1, 2, 3]),
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::character varying(1) = et.y) RETURNING id", vec![2]),
+        ("DELETE FROM et WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y) RETURNING id", vec![2]),
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::char(1) = et.y) RETURNING id", vec![2]),
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.ts::timestamp(0) = et.ts) RETURNING id", vec![1]),
+        ("UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.ts = et.ts::timestamp(0)) RETURNING id", vec![]),
+        ("UPDATE et SET v = 1 WHERE NOT EXISTS (SELECT 1 FROM eu WHERE eu.y::char(2) = et.y::char(2)) RETURNING id", vec![3]),
     ] {
-        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "{sql}: {e}");
-        conn.execute("ROLLBACK").await.expect("rollback");
         conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+        let mut got: Vec<i32> = conn
+            .fetch_all(sqlx::raw_sql(AssertSqlSafe(sql.to_string())))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, want, "{sql}");
+        conn.execute("ROLLBACK").await.expect("rollback");
     }
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
     // Placed, and as PostgreSQL 17 answers: 2.6, 2.4, 3.5 round to 3, 2, 4,
     // each some eu.x; no eu.x is 2.6, 2.4 or 3.5 at one place.
     for (sql, want) in [
@@ -492,5 +504,5 @@ async fn a_correlated_cast_the_evaluator_cannot_apply_is_refused() {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    assert_eq!(got, vec![(1, 1), (2, 1), (3, 1)], "a refused statement changed a row, or a placed one the wrong rows");
+    assert_eq!(got, vec![(1, 1), (2, 1), (3, 1)], "a rolled-back statement changed a row, or a placed one the wrong rows");
 }

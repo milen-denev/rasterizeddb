@@ -2538,6 +2538,18 @@ fn evaluated_cast_after(after: &str) -> bool {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(target.len());
     use crate::core::db_type::DbType;
+    // A type modifier only the evaluator applies (`expr::CastTypmod`):
+    // `tm::time(0)`, `iv::interval(0)`, `t::timetz(2)` round, which the
+    // comparison's own per-row conversion does not.
+    let modified = target[name_end..].trim_start().starts_with('(');
+    if modified
+        && matches!(
+            crate::core::rql::expr::db_type_of_cast(&target[..name_end]),
+            Some(DbType::TIME | DbType::TIMETZ | DbType::INTERVAL)
+        )
+    {
+        return true;
+    }
     matches!(
         crate::core::rql::expr::db_type_of_cast(&target[..name_end]),
         Some(
@@ -2601,10 +2613,70 @@ pub fn lift_evaluated_operands(
     clause: &str,
     schema: &SmallVec<[SchemaField; 20]>,
 ) -> Result<String, String> {
-    if !needs_evaluator(clause) {
+    if !needs_evaluator(clause) && !pattern_may_read_bpchar(clause, schema) {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
+}
+
+/// Whether `text` may hold a pattern match (`LIKE`, `ILIKE`, `SIMILAR TO`)
+/// over a `character(n)` column of `schema`, which is lifted padded
+/// ([`padded_for_pattern`]). Cheap and generous: the lift decides exactly.
+fn pattern_may_read_bpchar(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let column = || schema.iter().any(|f| matches!(f.text_typmod, Some(TextTypmod::Bpchar(n)) if n > 0) && !f.is_deleted);
+    let cast = || {
+        text.contains("::") && {
+            let lower = text.to_ascii_lowercase();
+            ["::char", "::bpchar", "::nchar"].iter().any(|c| lower.contains(c))
+        }
+    };
+    (column() || cast())
+        && top_level_words(text).iter().any(|&(s, e)| {
+            let w = &text[s..e];
+            w.eq_ignore_ascii_case("LIKE") || w.eq_ignore_ascii_case("ILIKE") || w.eq_ignore_ascii_case("SIMILAR")
+        })
+}
+
+/// A bare `character(n)` column as a pattern operator reads it: padded to
+/// its length, `rpad(k, n)`.
+///
+/// Such a column is stored without its trailing spaces
+/// (`type_modifier::TextTypmod`), and PostgreSQL matches `LIKE`, `ILIKE`
+/// and `SIMILAR TO` against the padded value: `k LIKE 'b'` is false for a
+/// `character(3)` 'b' and `k LIKE 'b  '` true. `None` for anything else.
+fn padded_for_pattern(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<String> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let name = operand.trim();
+    // A cast to `character(n)` (`s::char(3) LIKE 'ab '`) reads padded too.
+    if name.contains("::") {
+        let n = crate::core::rql::expr::parse(name, schema)
+            .ok()
+            .and_then(|e| crate::core::rql::expr::bpchar_width(&e))
+            .filter(|n| *n > 0)?;
+        return Some(format!("rpad({}, {})", name, n));
+    }
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '\'' | ':')) {
+        return None;
+    }
+    let column = resolve_column(name, schema)?;
+    let field = schema.iter().find(|f| f.name == column && !f.is_deleted)?;
+    match field.text_typmod {
+        Some(TextTypmod::Bpchar(n)) if n > 0 && field.db_type == crate::core::db_type::DbType::STRING => {
+            Some(format!("rpad({}, {})", name, n))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `rest`, a comparison from its operator on, is a pattern match.
+fn is_pattern_operator(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    let mut first = words.next().unwrap_or("");
+    if first.eq_ignore_ascii_case("NOT") {
+        first = words.next().unwrap_or("");
+    }
+    ["LIKE", "ILIKE", "SIMILAR"].iter().any(|k| first.eq_ignore_ascii_case(k))
 }
 
 /// Lifts within a boolean group: each `AND`/`OR` term on its own. The `AND`
@@ -2649,7 +2721,7 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !needs_evaluator(term) {
+    if !needs_evaluator(term) && !pattern_may_read_bpchar(term, schema) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -2752,8 +2824,11 @@ fn lift_comparison(
         ));
     }
 
-    let left_text = &body[..at];
     let rest = &body[at..];
+    // A `character(n)` column under a pattern match reads padded, which only
+    // the evaluator gives it (`padded_for_pattern`).
+    let padded = if is_pattern_operator(rest) { padded_for_pattern(&body[..at], schema) } else { None };
+    let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
     if !needs_evaluator(left_text) {
         // The operand is the tokenizer's own. A list item or a bound that
         // needs the evaluator is lifted on its own: `price BETWEEN qty % 7

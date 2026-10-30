@@ -4572,7 +4572,7 @@ async fn describe_resolved(
                             None => field.db_type.clone(),
                         }
                     }
-                    other => other.result_type(),
+                    other => other.reported_type(),
                 }
             };
 
@@ -6592,7 +6592,7 @@ fn result_description(
                     crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
                         reported_type(field, table.schema())
                     }
-                    other => other.result_type(),
+                    other => other.reported_type(),
                 }
             };
             // A `UNION` is described by its first branch, planned on its own:
@@ -7302,6 +7302,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "42701"
     } else if has("already exists") {
         "42710"
+    } else if has("value too long for type character") || has("value too long for type bpchar") {
+        // A value past a declared `character(n)` / `character varying(n)`
+        // length (`type_modifier::TextTypmod::assign`).
+        "22001"
     } else if has("date/time field value out of range") {
         // Before the generic "out of range": a date/time field is 22008.
         "22008"
@@ -9354,6 +9358,13 @@ fn reported_type_of(
         // with SQL type TEXT". The value on the wire is the document in both
         // cases; only the name was wrong.
         DbType::JSON
+    } else if let (DbType::STRING, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(n))) =
+        (&field.db_type, field.text_typmod)
+    {
+        // `character(n)`: stored without its trailing spaces, described as
+        // `bpchar` with its length and formatted padded to it — the one type
+        // here both the description and the value are taken from.
+        DbType::bpchar(n)
     } else {
         field.db_type.clone()
     }
@@ -9381,7 +9392,12 @@ fn join_output_columns(
             return fallback;
         };
         // An expression's type is the expression's own, worked out when it was
-        // parsed; there is no source column to advertise it as.
+        // parsed; there is no source column to advertise it as — but a
+        // `character(n)` value it yields is described as one, as the
+        // single-relation path describes it (`expr::bpchar_width`).
+        if let Some(n) = item.expr.as_ref().and_then(crate::core::rql::expr::bpchar_width) {
+            return DbType::bpchar(n);
+        }
         if item.scalar.is_some() || item.literal.is_some() || item.expr.is_some() {
             return fallback;
         }
@@ -9410,6 +9426,16 @@ fn join_output_columns(
                 crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
                     (name, advertised_at(field.write_order as usize, ty))
                 }
+                // `MIN`/`MAX` of a `character(n)` column of the projection.
+                crate::core::rql::aggregate::SelectItem::Aggregate {
+                    func: crate::core::rql::aggregate::AggFunc::Min | crate::core::rql::aggregate::AggFunc::Max,
+                    arg: Some(field),
+                    arg_expr: None,
+                    ..
+                } => match advertised_at(field.write_order as usize, ty.clone()) {
+                    bpchar @ DbType::BPCHAR(_) => (name, bpchar),
+                    _ => (name, ty),
+                },
                 _ => (name, ty),
             })
             .collect(),
@@ -9855,6 +9881,12 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
     }
 
     match db_type {
+        // `bpcharsend`: the padded text, as the text form shows it.
+        DbType::BPCHAR(n) => Some(
+            crate::core::rql::type_modifier::pad_to(&String::from_utf8_lossy(bytes), u32::from(n))
+                .into_owned()
+                .into_bytes(),
+        ),
         // `jsonb`'s binary form is a one-byte format version followed by the
         // document text. Sent as bare text it reached the client as
         // "unsupported JSONB format version 0" — the first character of the
@@ -10308,6 +10340,9 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             // path and its replacement characters.
             text_from_bytes(bytes)
         }
+        // A `character(n)` value is stored without its trailing spaces and
+        // shown blank-padded to its length, as PostgreSQL shows it.
+        DbType::BPCHAR(n) => crate::core::rql::type_modifier::pad_to(&text_from_bytes(bytes), u32::from(n)).into_owned(),
 
         // A stored document, rendered back to the JSON text a client expects.
         // An empty slot is a NULL that reached here as bytes rather than
@@ -11071,8 +11106,9 @@ where
         let size = db_type.pg_type_size();
         payload.extend_from_slice(&(size as i16).to_be_bytes());
 
-        // type_modifier
-        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        // type_modifier: a `character(n)`'s length plus four, as
+        // PostgreSQL reports it; -1 for every other type.
+        payload.extend_from_slice(&db_type.pg_typmod().to_be_bytes());
 
         // format_code
         let format_code = if result_formats.is_empty() {

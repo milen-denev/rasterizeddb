@@ -436,10 +436,12 @@ mod tests {
             fn exhaustive(t: &DbType) {
                 match t {
                     $(DbType::$v)|* => {}
+                    // The one variant with a payload: reporting-only.
+                    DbType::BPCHAR(_) => {}
                 }
             }
             let _ = exhaustive;
-            [$(DbType::$v),*]
+            [$(DbType::$v,)* DbType::BPCHAR(0)]
         }};
     }
 

@@ -103,6 +103,16 @@ pub struct SchemaField {
     /// `None` means the engine default,
     /// [`crate::core::value_codec::DECIMAL_SCALE`].
     pub scale: Option<u32>,
+    /// The declared length of a `character(n)` or `character varying(n)`
+    /// column, from its marker in the type-modifier sidecar
+    /// (`type_modifier::TextTypmod`).
+    ///
+    /// On the field for the reason `scale` is: the planner, the tokenizer and
+    /// the evaluator are handed fields, not the sidecar, and a `character(n)`
+    /// column is stored without its trailing spaces, so a literal compared
+    /// with one has to be read the same way (`'b  '` is `'b'`) or the
+    /// comparison answers from a value the column cannot hold.
+    pub text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
 }
 
 impl SchemaField {
@@ -122,6 +132,7 @@ impl SchemaField {
             write_order,
             is_unique,
             scale: None,
+            text_typmod: None,
             is_deleted: false,
         }
     }
@@ -222,6 +233,7 @@ impl SchemaField {
             // Not part of the persisted record. `TableSchema::load` fills it in
             // from the type-modifier sidecar once every field has been read.
             scale: None,
+            text_typmod: None,
         })
     }
 
@@ -636,6 +648,10 @@ impl TableSchema {
                 .iter()
                 .find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted)
                 .map(|m| m.scale as u32);
+            // And the declared text length, for the same reason.
+            field.text_typmod = (!field.is_deleted)
+                .then(|| crate::core::rql::type_modifier::text_typmod_of(&field.name, &table_schema.type_modifiers))
+                .flatten();
         }
         table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
@@ -1219,11 +1235,14 @@ mod tests {
     /// One `TableSchema` per open table, and one more in every clone. With
     /// nine inline `SmallVec`s of declarations it was 3720 bytes, about 2.4 KB
     /// of that empty slots, since almost no table declares any of them. 1408
-    /// before the 16-byte incarnation.
+    /// before the 16-byte incarnation; 1744 since each of the twenty inline
+    /// fields carries its declared text length (`SchemaField::text_typmod`, 8
+    /// bytes) and `DbType` grew to 4 bytes for `BPCHAR`'s length.
     #[test]
     fn table_schema_stays_small() {
         let size = std::mem::size_of::<TableSchema>();
-        assert!(size <= 1424, "TableSchema grew to {size} bytes");
+        assert!(size <= 1744, "TableSchema grew to {size} bytes");
+        assert!(std::mem::size_of::<SchemaField>() <= 72, "SchemaField grew");
     }
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
     use std::{fs, io, path::Path};

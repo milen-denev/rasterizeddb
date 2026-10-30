@@ -409,6 +409,34 @@ impl SelectItem {
         }
     }
 
+    /// The type an item that is not a plain column is *described* as:
+    /// [`SelectItem::result_type`], except where a `character(n)` value
+    /// comes out (`DbType::BPCHAR`) — a cast to the type, or `MIN`/`MAX` of
+    /// a column of it, which keep its stored form and are shown padded.
+    pub fn reported_type(&self) -> DbType {
+        use crate::core::rql::type_modifier::TextTypmod;
+        match self {
+            SelectItem::RowExpr { expr, .. } | SelectItem::Computed { expr, .. } => {
+                match crate::core::rql::expr::bpchar_width(expr) {
+                    Some(n) => DbType::bpchar(n),
+                    None => self.result_type(),
+                }
+            }
+            SelectItem::Aggregate {
+                func: AggFunc::Min | AggFunc::Max,
+                arg: Some(field),
+                arg_expr: None,
+                ..
+            } if field.db_type == DbType::STRING && matches!(field.text_typmod, Some(TextTypmod::Bpchar(_))) => {
+                match field.text_typmod {
+                    Some(TextTypmod::Bpchar(n)) => DbType::bpchar(n),
+                    _ => self.result_type(),
+                }
+            }
+            _ => self.result_type(),
+        }
+    }
+
     pub fn result_type(&self) -> DbType {
         match self {
             SelectItem::Column { field, .. } => field.db_type.clone(),
@@ -882,7 +910,13 @@ impl Acc {
                 want_max,
             } => {
                 let Some(b) = bytes else { return };
-                if b.is_empty() {
+                // A NULL arrives as `None` (its cell retyped from the
+                // companion, `retype_nulls_from_flags`). Empty bytes of a
+                // fixed-width type are no value; of text they are `''`, which
+                // is one — the least there is — and a `character(n)` of
+                // spaces is stored as it. Skipped, `min(s)` over `''` and `'b'`
+                // answered `'b'`.
+                if b.is_empty() && !acc_ty.is_variable_width() {
                     return;
                 }
                 match best {

@@ -387,7 +387,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         // Reporting-only: a JSON column's value is written as the UUID it
         // stores, through the arm above, never as this.
-        DbType::JSON | DbType::NULL => MemoryBlock::default(),
+        DbType::JSON | DbType::BPCHAR(_) | DbType::NULL => MemoryBlock::default(),
     })
 }
 
@@ -657,7 +657,21 @@ fn parse_update_row(
                 declared_scale(&field.name, modifiers),
                 crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
             ) {
-                Ok(mb) => mb,
+                // Held to a declared text length as an INSERT holds it
+                // (`type_modifier::assign_bytes`): 22001 past it, and a
+                // `character(n)` value without its trailing spaces.
+                Ok(mb) => match crate::core::rql::type_modifier::assign_bytes(field, mb.into_slice()) {
+                    Ok(None) => mb,
+                    Ok(Some(bytes)) => {
+                        let mut held = MEMORY_POOL.acquire(bytes.len());
+                        held.into_slice_mut().copy_from_slice(&bytes);
+                        held
+                    }
+                    Err(reason) => {
+                        rejection.replace(reason);
+                        return None;
+                    }
+                },
                 Err(reason) => {
                     rejection.replace(reason);
                     return None;
@@ -765,6 +779,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -775,6 +790,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
+                text_typmod: None,
             },
         ]
     }
