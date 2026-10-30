@@ -293,10 +293,14 @@ sketches.
 PARTITIONS`, `pg_class`, `pg_stat_user_tables`) report a closed partition's
 sizes from its files' metadata (each data file plus its `.tmp`, and the
 index-store files), equal to what the open instance reported
-(`a_closed_partition_answers_like_an_open_one`). The per-instance figures
+(`a_closed_partition_answers_like_an_open_one`); that is six `stat`s per
+closed partition per catalog read (about 60k at 10⁴ closed partitions),
+which P5b-2's `STATS` records replace with running totals. The per-instance figures
 (`SHOW TABLE`'s reclaimable bytes, vacuum stats, in-place counts, index
-readiness in `pg_indexes`, a checkpoint's seals) cover the open partitions
-only: a closed one has no in-memory state, and its next open builds it.
+readiness in `pg_indexes`) and a shutdown's seals cover the open
+partitions only: a closed one has no in-memory state, and its next open
+builds it. An operator's `rdb_index_checkpoint(t)` and `rdb_index_check(t)`
+still reach every materialized partition, opening the closed ones.
 `SET CONFIG vacuum.enabled` is kept on the table and applied to every
 partition as it opens, so a closed and reopened partition keeps it.
 

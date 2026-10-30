@@ -712,3 +712,29 @@ async fn a_replaced_instance_opens_and_closes_nothing() {
     drop((old, new));
     close(dir.path(), db);
 }
+
+/// An operator's `rdb_index_checkpoint` reaches every materialized
+/// partition, opening the closed ones; a shutdown's seal only the open ones.
+///
+/// Mutation: `seal_targets` naming the open partitions for the checkpoint
+/// too: it seals none of a table whose partitions are closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_index_checkpoint_reaches_closed_partitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    let materialized = t.materialized_pids().unwrap().len();
+    t.close_idle().await.unwrap();
+    let report = db.index_checkpoint("pt", None).await.unwrap();
+    assert_eq!(report.sealed.len(), materialized, "the checkpoint left closed partitions out: {:?}", report.sealed.len());
+    t.close_idle().await.unwrap();
+    let shutdown = db.seal_for_shutdown(Duration::from_secs(30)).await;
+    assert!(
+        shutdown.sealed.iter().all(|s| !s.name.contains("partition")) && shutdown.skipped.iter().all(|n| !n.contains("partition")),
+        "a shutdown opened a closed partition to seal it"
+    );
+    assert_eq!(t.open_count(), 0);
+    drop(t);
+    close(dir.path(), db);
+}

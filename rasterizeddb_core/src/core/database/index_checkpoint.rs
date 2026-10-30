@@ -136,7 +136,7 @@ impl Database {
                 .ok_or_else(|| format!("relation \"{name}\" does not exist"))?;
             let family = owner::family_for(&self.transactions);
             let mut report = CheckpointReport::default();
-            for (label, table) in seal_targets(name, &relation)? {
+            for (label, table) in seal_targets(name, &relation, Partitions::Every).await? {
                 if let Some(f) = family
                     && self.transactions.family_tickets().keeps_on(f, table.gate())
                 {
@@ -173,7 +173,7 @@ impl Database {
             };
             let family = owner::family_for(&self.transactions);
             let mut report = CheckReport::default();
-            for (label, table) in seal_targets(name, &relation).map_err(CheckRefusal::Other)? {
+            for (label, table) in seal_targets(name, &relation, Partitions::Every).await.map_err(CheckRefusal::Other)? {
                 let outcome = match family {
                     Some(f) if self.transactions.family_tickets().keeps_on(f, table.gate()) => {
                         Outcome::Abandoned("this transaction has written it; run rdb_index_check after it ends".into())
@@ -240,7 +240,7 @@ impl Database {
             self.row_locks.release_owner(own);
             self.transactions.end_owner(own.id());
             match relation {
-                Ok(Some(relation)) => match seal_targets(&name, &relation) {
+                Ok(Some(relation)) => match seal_targets(&name, &relation, Partitions::Open).await {
                     Ok(found) => targets.extend(found),
                     Err(e) => log::warn!("shutdown: {name} is not sealed: {e}"),
                 },
@@ -283,11 +283,23 @@ impl Database {
     }
 }
 
+/// Which of a partitioned table's partitions [`seal_targets`] names.
+enum Partitions {
+    /// Every materialized one, each opened if it is closed: what an
+    /// operator's `rdb_index_checkpoint` or `rdb_index_check` asks for.
+    Every,
+    /// The open ones (phase 3 P5b): a shutdown's seal. A closed partition
+    /// holds no structures to seal, and its next open builds or loads them.
+    Open,
+}
+
 /// The file sets `relation` stands for: a plain table's own, or each
-/// materialized partition's, by pid. A partitioned table's shell has none.
-fn seal_targets(
+/// materialized partition's (by `which`), by pid. A partitioned table's
+/// shell has none.
+async fn seal_targets(
     name: &str,
     relation: &Relation,
+    which: Partitions,
 ) -> Result<Vec<(String, Arc<Table<DbStorageProvider>>)>, String> {
     match relation {
         Relation::Plain(table) => Ok(if table.is_shell() {
@@ -295,12 +307,13 @@ fn seal_targets(
         } else {
             vec![(name.to_string(), table.clone())]
         }),
-        // The open partitions: a closed one holds no structures to seal, and
-        // its next open builds or loads them (phase 3 P5b).
         Relation::Partitioned(pt) => {
             pt.check().map_err(|e| e.to_string())?;
-            Ok(pt
-                .open_partitions_now()
+            let parts = match which {
+                Partitions::Every => pt.all_partitions().await.map_err(|e| e.to_string())?,
+                Partitions::Open => pt.open_partitions_now(),
+            };
+            Ok(parts
                 .into_iter()
                 .map(|(pid, table)| (format!("{name} (partition {pid})"), table))
                 .collect())
