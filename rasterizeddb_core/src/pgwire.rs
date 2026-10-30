@@ -2107,11 +2107,13 @@ struct SessionState {
     ///
     /// `None` means autocommit: each statement gets a transaction of its own.
     transaction: Option<SessionTransaction>,
-    /// What `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL` set, and
-    /// what a `BEGIN` with no level of its own inherits.
+    /// What `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL` or
+    /// `SET default_transaction_isolation` set, and what a `BEGIN` with no
+    /// level of its own inherits.
     default_isolation: IsolationLevel,
-    /// What `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` set, and
-    /// what a `BEGIN` with no access mode of its own inherits.
+    /// What `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` or `SET
+    /// default_transaction_read_only` set, and what a `BEGIN` with no access
+    /// mode of its own inherits.
     default_read_only: bool,
     /// `SET statement_timeout` for this session, in milliseconds.
     ///
@@ -2404,6 +2406,11 @@ struct SessionTransaction {
     local_idle_in_transaction: Option<Duration>,
     /// The same for `idle_session_timeout`.
     local_idle_session: Option<Duration>,
+    /// `default_transaction_isolation` from before the first `SET LOCAL` of
+    /// it in this block, put back when the block ends.
+    local_default_isolation: Option<IsolationLevel>,
+    /// The same for `default_transaction_read_only`.
+    local_default_read_only: Option<bool>,
     /// The level this block runs at.
     level: IsolationLevel,
     /// `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY`: writes in this block
@@ -2538,6 +2545,12 @@ impl SessionState {
         }
         if let Some(previous) = t.local_idle_session {
             self.idle_session_timeout = previous;
+        }
+        if let Some(previous) = t.local_default_isolation {
+            self.default_isolation = previous;
+        }
+        if let Some(previous) = t.local_default_read_only {
+            self.default_read_only = previous;
         }
     }
 
@@ -7547,6 +7560,8 @@ fn open_block(
         local_synchronous_commit: None,
         local_idle_in_transaction: None,
         local_idle_session: None,
+        local_default_isolation: None,
+        local_default_read_only: None,
         level,
         read_only,
         savepoints: Vec::new(),
@@ -7967,15 +7982,15 @@ where
                         t.read_only = read_only;
                     }
                 }
-                // Outside a block it sets the next one, which is what
-                // PostgreSQL does for `SET TRANSACTION` with no transaction.
+                // Outside a block it has no transaction to apply to, and
+                // PostgreSQL warns and changes nothing. It used to set the
+                // session's default instead, so every later `BEGIN` ran at a
+                // level the session never asked for (`SET SESSION
+                // CHARACTERISTICS` and `default_transaction_isolation` are
+                // what set that).
                 None => {
-                    if let Some(level) = modes.level {
-                        state.default_isolation = level;
-                    }
-                    if let Some(read_only) = modes.read_only {
-                        state.default_read_only = read_only;
-                    }
+                    send_notice(stream, "25P01", "SET TRANSACTION can only be used in transaction blocks")
+                        .await?;
                 }
             }
         }
@@ -8240,6 +8255,167 @@ fn strip_setting(lower: &str, key: &str) -> Option<Option<String>> {
         return Some(None);
     }
     Some(Some(value.to_string()))
+}
+
+/// An isolation level as `default_transaction_isolation` and
+/// `transaction_isolation` take it, quoted or not: PostgreSQL's four names.
+/// `SERIALIZABLE` runs as `REPEATABLE READ` and `READ UNCOMMITTED` as
+/// `READ COMMITTED`, as they do on `BEGIN` (see [`IsolationLevel`]).
+fn parse_isolation_setting(value: &str) -> Option<IsolationLevel> {
+    let v = value.trim().trim_matches('\'').trim_matches('"');
+    match v.to_ascii_lowercase().as_str() {
+        "serializable" | "repeatable read" => Some(IsolationLevel::RepeatableRead),
+        "read committed" | "read uncommitted" => Some(IsolationLevel::ReadCommitted),
+        _ => None,
+    }
+}
+
+/// A boolean run-time parameter's value, as PostgreSQL reads one: `on`,
+/// `off`, `true`, `false`, `yes`, `no`, `1`, `0`, or a unique prefix of one.
+fn parse_bool_setting(value: &str) -> Option<bool> {
+    let v = value.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    match v.as_str() {
+        "1" | "on" => return Some(true),
+        "0" | "of" | "off" => return Some(false),
+        "o" => return None,
+        _ => {}
+    }
+    if "true".starts_with(&v) || "yes".starts_with(&v) {
+        Some(true)
+    } else if "false".starts_with(&v) || "no".starts_with(&v) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The error a value an isolation parameter does not take reports, as
+/// PostgreSQL words it.
+fn invalid_isolation_value(key: &str, value: &str) -> String {
+    format!(
+        "invalid value for parameter \"{}\": \"{}\" (available values: serializable, repeatable read, \
+         read committed, read uncommitted)",
+        key,
+        value.trim().trim_matches('\'').trim_matches('"')
+    )
+}
+
+/// Applies `SET`/`RESET` of `default_transaction_isolation` or
+/// `default_transaction_read_only`: what a `BEGIN` naming no mode of its own
+/// inherits, as `SET SESSION CHARACTERISTICS AS TRANSACTION` sets it.
+///
+/// `value` is what [`strip_setting`] returned: `None` for `RESET` or
+/// `DEFAULT` (READ COMMITTED, read-write). A value the parameter does not
+/// take is refused, never dropped. `SET LOCAL` outside a block warns and
+/// changes nothing, as in PostgreSQL; inside one it lasts until the block
+/// ends.
+async fn set_transaction_default<S>(
+    state: &mut SessionState,
+    stream: &mut S,
+    lower: &str,
+    key: &str,
+    value: Option<String>,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let isolation = key == "default_transaction_isolation";
+    // Parsed first: a refused value changes nothing, `SET LOCAL` included.
+    let (level, read_only) = match &value {
+        None => (Some(IsolationLevel::default()), Some(false)),
+        Some(v) if isolation => match parse_isolation_setting(v) {
+            Some(level) => (Some(level), None),
+            None => return fail_statement(state, stream, "22023", &invalid_isolation_value(key, v)).await,
+        },
+        Some(v) => match parse_bool_setting(v) {
+            Some(b) => (None, Some(b)),
+            None => {
+                let message = format!("parameter \"{}\" requires a Boolean value", key);
+                return fail_statement(state, stream, "22023", &message).await;
+            }
+        },
+    };
+    let (level, read_only) = if isolation { (level, None) } else { (None, read_only) };
+    if is_set_local(lower) {
+        let (default_isolation, default_read_only) = (state.default_isolation, state.default_read_only);
+        match state.transaction.as_mut() {
+            None => {
+                send_notice(stream, "25P01", "SET LOCAL can only be used in transaction blocks").await?;
+                return send_command_complete(stream, "SET").await;
+            }
+            Some(t) => {
+                if level.is_some() {
+                    t.local_default_isolation.get_or_insert(default_isolation);
+                }
+                if read_only.is_some() {
+                    t.local_default_read_only.get_or_insert(default_read_only);
+                }
+            }
+        }
+    }
+    if let Some(level) = level {
+        state.default_isolation = level;
+    }
+    if let Some(read_only) = read_only {
+        state.default_read_only = read_only;
+    }
+    send_command_complete(stream, "SET").await
+}
+
+/// Applies `SET transaction_isolation` / `SET transaction_read_only`: the
+/// open block's, as `SET TRANSACTION` sets them. Outside a block there is no
+/// transaction for them to outlive the statement in, so PostgreSQL changes
+/// nothing, and neither does this; a value they do not take is refused
+/// either way. `RESET` changes nothing (the block keeps the level it began
+/// with).
+async fn set_current_transaction_mode<S>(
+    state: &mut SessionState,
+    stream: &mut S,
+    key: &str,
+    value: Option<String>,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(value) = value else {
+        return send_command_complete(stream, "SET").await;
+    };
+    if key == "transaction_isolation" {
+        let Some(level) = parse_isolation_setting(&value) else {
+            return fail_statement(state, stream, "22023", &invalid_isolation_value(key, &value)).await;
+        };
+        let Some(t) = state.transaction.as_mut() else {
+            return send_command_complete(stream, "SET").await;
+        };
+        if t.aborted {
+            let message = "current transaction is aborted, commands ignored until end of transaction block";
+            return fail_statement(state, stream, "25P02", message).await;
+        }
+        // As `SET TRANSACTION ISOLATION LEVEL`: a fixed snapshot cannot be
+        // given up.
+        if t.level == IsolationLevel::RepeatableRead && level == IsolationLevel::ReadCommitted {
+            let message = "cannot change the isolation level of a transaction that has already fixed its snapshot";
+            return fail_statement(state, stream, "25001", message).await;
+        }
+        if t.level != level {
+            t.level = level;
+            if level == IsolationLevel::RepeatableRead {
+                t.database.transactions.pin_snapshot(t.id);
+            }
+        }
+    } else {
+        let Some(read_only) = parse_bool_setting(&value) else {
+            let message = format!("parameter \"{}\" requires a Boolean value", key);
+            return fail_statement(state, stream, "22023", &message).await;
+        };
+        if let Some(t) = state.transaction.as_mut() {
+            t.read_only = read_only;
+        }
+    }
+    send_command_complete(stream, "SET").await
 }
 
 /// Applies `SET`/`RESET` of one of the idle timeouts.
@@ -8577,6 +8753,26 @@ where
             set_idle_timeout(state, stream, &s_lower, key, kind, value).await?;
             return Ok(true);
         }
+    }
+
+    // The transaction characteristics as run-time parameters. Each used to
+    // fall through to the blanket `SET` below, acknowledged and dropped: a
+    // session that set `default_transaction_isolation = 'repeatable read'`
+    // got READ COMMITTED blocks, which saw other sessions' commits, and
+    // `SHOW` said read committed.
+    if let Some((key, value)) = ["default_transaction_isolation", "default_transaction_read_only"]
+        .into_iter()
+        .find_map(|key| strip_setting(&s_lower, key).map(|value| (key, value)))
+    {
+        set_transaction_default(state, stream, &s_lower, key, value).await?;
+        return Ok(true);
+    }
+    if let Some((key, value)) = ["transaction_isolation", "transaction_read_only"]
+        .into_iter()
+        .find_map(|key| strip_setting(&s_lower, key).map(|value| (key, value)))
+    {
+        set_current_transaction_mode(state, stream, key, value).await?;
+        return Ok(true);
     }
 
     // Server-wide, fixed at start-up. `SHOW` reports them, so a `SET` that

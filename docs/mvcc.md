@@ -416,7 +416,17 @@ depends on true serializability should not rely on this level.
 
 `SET TRANSACTION ISOLATION LEVEL` and `SET SESSION CHARACTERISTICS AS
 TRANSACTION ...` both take effect; they used to fall through to the blanket
-`SET` no-op, so asking for a stricter level silently got the default.
+`SET` no-op, so asking for a stricter level silently got the default. So do
+the run-time parameters: `default_transaction_isolation` and
+`default_transaction_read_only` (`SET`, `SET LOCAL` inside a block, `RESET`,
+`DEFAULT`; `SHOW` reads them back) set what a `BEGIN` naming no mode
+inherits, and `transaction_isolation` / `transaction_read_only` inside a block
+act as `SET TRANSACTION`. A value they do not take is refused with 22023.
+`SERIALIZABLE` runs as `REPEATABLE READ` and `READ UNCOMMITTED` as
+`READ COMMITTED`, and `SHOW` reports the level that runs. As in PostgreSQL,
+`SET TRANSACTION` outside a block warns (25P01) and changes nothing; it used
+to set the session default. Not yet as in PostgreSQL: a `SET` inside a block
+that then rolls back is not undone, for these as for every other setting.
 
 ## 10. Savepoints
 

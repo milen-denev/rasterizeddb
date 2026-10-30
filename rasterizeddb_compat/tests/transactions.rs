@@ -1211,3 +1211,102 @@ async fn rollback_to_savepoint_restores_the_setting() {
     exec(&mut c, "COMMIT").await.expect("commit");
     assert_eq!(show(&mut c, "synchronous_commit").await, "on");
 }
+
+/// `SET default_transaction_isolation` used to be acknowledged and dropped:
+/// the next `BEGIN` ran READ COMMITTED, saw another session's commit, and
+/// `SHOW transaction_isolation` said read committed. Now it is what a
+/// `BEGIN` naming no level inherits, as in PostgreSQL 17, with `RESET`,
+/// `DEFAULT`, `SET LOCAL` and the other spellings, and a value it does not
+/// take is refused (22023) rather than dropped.
+///
+/// Mutation: the `default_transaction_isolation` arm in
+/// `handle_builtin_query` removed (the blanket `SET` takes it: the block sees
+/// the concurrent insert, `SHOW` says read committed).
+#[tokio::test(flavor = "multi_thread")]
+async fn default_transaction_isolation_sets_the_next_blocks_level() {
+    let (server, pool) = server().await;
+    table(&pool).await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'a')").await.expect("insert");
+
+    let mut c = conn(&server).await;
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "SET default_transaction_isolation = 'repeatable read'").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "repeatable read");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, 1);
+    run(&pool, "INSERT INTO t (id, name) VALUES (2, 'b')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, 1, "a concurrent insert became visible in a REPEATABLE READ block");
+    exec(&mut c, "COMMIT").await.expect("commit");
+
+    // The other spellings PostgreSQL takes, over the simple protocol too.
+    for (sql, want) in [
+        ("SET default_transaction_isolation TO serializable", "repeatable read"),
+        ("SET SESSION default_transaction_isolation = 'READ COMMITTED'", "read committed"),
+        ("SET default_transaction_isolation = \"repeatable read\"", "repeatable read"),
+        ("SET default_transaction_isolation = 'read uncommitted'", "read committed"),
+        ("SET default_transaction_isolation = 'repeatable read'", "repeatable read"),
+    ] {
+        sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut c).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(show(&mut c, "default_transaction_isolation").await, want, "{sql}");
+    }
+
+    // A value it does not take is refused and changes nothing.
+    for bad in ["SET default_transaction_isolation = 'bogus'", "SET default_transaction_isolation = repeatable"] {
+        assert_eq!(sqlstate(&mut c, bad).await.as_deref(), Some("22023"), "{bad}");
+        assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read", "{bad}");
+    }
+
+    // SET LOCAL outside a block changes nothing; inside one it lasts until
+    // the block ends.
+    exec(&mut c, "SET LOCAL default_transaction_isolation = 'read committed'").await.expect("set local");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    exec(&mut c, "SET LOCAL default_transaction_isolation = 'read committed'").await.expect("set local");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+
+    // RESET and DEFAULT go back to READ COMMITTED, and a block sees commits again.
+    exec(&mut c, "RESET default_transaction_isolation").await.expect("reset");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "read committed");
+    let before = rows(&mut c, "SELECT id FROM t").await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (3, 'c')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, before + 1, "a READ COMMITTED block missed a commit");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    exec(&mut c, "SET default_transaction_isolation = 'repeatable read'").await.expect("set");
+    exec(&mut c, "SET default_transaction_isolation = DEFAULT").await.expect("default");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+
+    // SET SESSION CHARACTERISTICS sets the same thing SHOW reads back.
+    exec(&mut c, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "RESET default_transaction_isolation").await.expect("reset");
+
+    // SET TRANSACTION outside a block has no transaction to apply to: it
+    // changes nothing (it used to set the session default).
+    exec(&mut c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.expect("set transaction");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "read committed");
+    // `SET transaction_isolation` inside a block is `SET TRANSACTION`.
+    exec(&mut c, "SET transaction_isolation = 'repeatable read'").await.expect("set");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "repeatable read");
+    let before = rows(&mut c, "SELECT id FROM t").await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (4, 'd')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, before, "SET transaction_isolation was dropped");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    assert_eq!(sqlstate(&mut c, "SET transaction_isolation = 'bogus'").await.as_deref(), Some("22023"));
+
+    // default_transaction_read_only likewise.
+    exec(&mut c, "SET default_transaction_read_only = on").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "on");
+    assert_eq!(sqlstate(&mut c, "DELETE FROM t WHERE id = 1").await.as_deref(), Some("25006"));
+    assert_eq!(sqlstate(&mut c, "SET default_transaction_read_only = 'maybe'").await.as_deref(), Some("22023"));
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "on");
+    exec(&mut c, "RESET default_transaction_read_only").await.expect("reset");
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "off");
+    exec(&mut c, "DELETE FROM t WHERE id = 1").await.expect("a write after the reset");
+}
