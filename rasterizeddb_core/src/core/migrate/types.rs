@@ -275,14 +275,33 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
             "date became TIMESTAMP at midnight; this engine has no date-only type".to_string(),
         ),
 
-        "text" | "varchar" | "bpchar" | "name" | "citext" | "xml" => {
-            Mapping::plain(DbType::STRING, "TEXT", Conversion::Text)
-        }
-        // `"char"` is PostgreSQL's internal one-byte type, and `bpchar` is
-        // `character(n)`. Neither is this engine's `CHAR`, which holds one
-        // Unicode scalar in four bytes, so both go to `TEXT` — a `character(3)`
-        // stored as `CHAR` would keep three bytes of a four-byte cell and read
-        // back with the tail of whatever the encoder left.
+        // `character(n)` and `character varying(n)` are types here with their
+        // declared length (`type_modifier::TextTypmod`), so they keep it: a
+        // `char(5)` value is held to five characters, stored without its
+        // trailing spaces, compared blank-padded and shown padded, as in
+        // PostgreSQL. `COPY` sends a `char(5)` 'ab' as 'ab   ', which the
+        // column stores as 'ab'. Both were TEXT, so 'ab' no longer matched
+        // a key copied across padded, and nothing held the length.
+        "bpchar" => match text_length(column.type_modifier) {
+            Some(n) => Mapping::plain(DbType::STRING, &format!("CHARACTER({n})"), Conversion::Text),
+            // A bare `bpchar` has no length to hold or pad to.
+            None => Mapping::noted(
+                DbType::STRING,
+                "BPCHAR",
+                Conversion::Text,
+                "bpchar without a length became BPCHAR, which compares as PostgreSQL's does but \
+                 does not keep a value's trailing spaces"
+                    .to_string(),
+            ),
+        },
+        "varchar" => match text_length(column.type_modifier) {
+            Some(n) => Mapping::plain(DbType::STRING, &format!("VARCHAR({n})"), Conversion::Text),
+            None => Mapping::plain(DbType::STRING, "VARCHAR", Conversion::Text),
+        },
+        "text" | "name" | "citext" | "xml" => Mapping::plain(DbType::STRING, "TEXT", Conversion::Text),
+        // `"char"` is PostgreSQL's internal one-byte type, which has no
+        // counterpart here: it is not `character(1)`, which holds a
+        // character rather than a byte.
         "char" => Mapping::noted(
             DbType::STRING,
             "TEXT",
@@ -588,6 +607,15 @@ pub fn numeric_scale(type_modifier: i32) -> Option<i32> {
     Some((type_modifier - 4) & 0xffff)
 }
 
+/// The declared length of a `character(n)` or `character varying(n)`:
+/// `atttypmod` is `n + 4`, and -1 when no length was declared. `None` for
+/// one past what a column here can declare, which PostgreSQL's own limit
+/// keeps from happening.
+pub fn text_length(type_modifier: i32) -> Option<u32> {
+    let n = u32::try_from(type_modifier.checked_sub(4)?).ok()?;
+    (n >= 1 && n <= crate::core::rql::type_modifier::MAX_TEXT_LENGTH).then_some(n)
+}
+
 /// The declared precision of a `numeric(p, s)`.
 pub fn numeric_precision(type_modifier: i32) -> Option<i32> {
     if type_modifier < 4 {
@@ -631,7 +659,7 @@ mod tests {
             ("float8", "DOUBLE PRECISION", DbType::F64),
             ("numeric", "NUMERIC", DbType::DECIMAL),
             ("text", "TEXT", DbType::STRING),
-            ("varchar", "TEXT", DbType::STRING),
+            ("varchar", "VARCHAR", DbType::STRING),
             ("uuid", "UUID", DbType::UUID),
             ("inet", "INET", DbType::INET),
             ("bytea", "BYTEA", DbType::BYTEA),
@@ -642,6 +670,39 @@ mod tests {
             assert_eq!(m.declared, declared, "{}", pg);
             assert_eq!(m.db_type, db_type, "{}", pg);
         }
+    }
+
+    /// `character(n)` and `character varying(n)` keep their length, read
+    /// from `atttypmod` (`n + 4`; -1 for none). They were TEXT, so nothing
+    /// held the length and a `char(n)` key lost its blank-padded equality.
+    #[test]
+    fn character_types_keep_their_declared_length() {
+        for (pg, typmod, declared) in [
+            ("bpchar", 9, "CHARACTER(5)"),
+            ("bpchar", 5, "CHARACTER(1)"),
+            ("bpchar", -1, "BPCHAR"),
+            ("varchar", 259, "VARCHAR(255)"),
+            ("varchar", -1, "VARCHAR"),
+            ("text", -1, "TEXT"),
+        ] {
+            let mut c = column(pg);
+            c.type_modifier = typmod;
+            let m = map_column(&c, JsonMapping::Text);
+            assert_eq!((m.declared.as_str(), m.db_type.clone(), m.conversion), (declared, DbType::STRING, Conversion::Text), "{pg}({typmod})");
+            // The declaration is one this engine reads back as that type.
+            let tokens: Vec<&str> = m.declared.split_whitespace().collect();
+            assert_eq!(
+                crate::core::rql::lexer_alter::parse_column_type(&tokens).map(|(t, _)| t),
+                Ok(DbType::STRING),
+                "{}",
+                m.declared
+            );
+        }
+        // `"char"`, the one-byte type, is not `character(1)`.
+        assert_eq!(mapping_of("char").declared, "TEXT");
+        assert_eq!(text_length(4), None);
+        assert_eq!(text_length(-1), None);
+        assert_eq!(text_length(14), Some(10));
     }
 
     #[test]

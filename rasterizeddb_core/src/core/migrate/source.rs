@@ -234,6 +234,12 @@ async fn read_columns(
     schema: &str,
     tables: &mut [SourceTable],
 ) -> Result<(), String> {
+    // A column of a domain carries no `atttypmod` of its own (-1): the
+    // domain's `typtypmod` holds the length or scale, `varchar(10)` or
+    // `numeric(12,2)`, so the nearest domain in the chain that has one gives
+    // it. Read from `atttypmod` alone, a domain over `char(5)` lost its length
+    // and one over `numeric(12,2)` its scale.
+    //
     // The recursive term walks a domain down to whatever it is ultimately built
     // on, however many domains deep that is. Without it a column of a domain
     // over `numeric` would be reported as the domain's own name and fall
@@ -242,11 +248,11 @@ async fn read_columns(
     let sql = format!(
         "WITH RECURSIVE resolved AS ( \
              SELECT t.oid AS start_oid, t.oid, t.typname, t.typtype, t.typcategory, \
-                    t.typelem, t.typbasetype, 0 AS depth \
+                    t.typelem, t.typbasetype, t.typtypmod, 0 AS depth \
              FROM pg_type t \
              UNION ALL \
              SELECT r.start_oid, b.oid, b.typname, b.typtype, b.typcategory, \
-                    b.typelem, b.typbasetype, r.depth + 1 \
+                    b.typelem, b.typbasetype, b.typtypmod, r.depth + 1 \
              FROM resolved r \
              JOIN pg_type b ON b.oid = r.typbasetype \
              WHERE r.typtype = 'd' AND r.depth < 16 \
@@ -257,7 +263,11 @@ async fn read_columns(
                 a.attname AS name, \
                 a.attnum::text AS attnum, \
                 a.attnotnull::text AS notnull, \
-                a.atttypmod::text AS typmod, \
+                COALESCE(NULLIF(a.atttypmod, -1), \
+                         (SELECT r.typtypmod FROM resolved r \
+                          WHERE r.start_oid = a.atttypid AND r.typtypmod <> -1 \
+                          ORDER BY r.depth LIMIT 1), \
+                         -1)::text AS typmod, \
                 base.typname AS typname, \
                 base.typtype::text AS typtype, \
                 base.typcategory::text AS typcategory, \

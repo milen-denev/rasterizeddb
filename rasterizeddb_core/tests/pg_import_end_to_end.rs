@@ -642,3 +642,70 @@ async fn the_report_names_what_did_not_come_across_unchanged() {
         );
     }
 }
+
+/// `character(n)` and `character varying(n)` columns, and a domain over
+/// `char(n)`, whose length lives on the domain rather than the column.
+const CHARACTER_FIXTURE: &str = r#"
+DROP SCHEMA IF EXISTS rdb_import_test CASCADE;
+CREATE SCHEMA rdb_import_test;
+SET search_path TO rdb_import_test;
+
+CREATE DOMAIN rdb_import_test.code AS char(4);
+
+CREATE TABLE codes (
+    k     char(5) PRIMARY KEY,
+    flag  char,
+    name  varchar(6) NOT NULL,
+    note  varchar,
+    tag   rdb_import_test.code
+);
+
+INSERT INTO codes VALUES
+ ('ab', 'y', 'abc  ', 'n  ', 'x'),
+ ('é', ' ', 'ü😀', NULL, 'wxyz');
+"#;
+
+/// A `char(5)` arrives over `COPY` padded — `'ab   '` — and was imported as
+/// TEXT, so it was stored padded: `k = 'ab'` found nothing, the key took
+/// `'ab'` beside `'ab   '`, and no length was held. Each type now keeps
+/// its declared length, a domain's included, so the value is stored as
+/// PostgreSQL holds it and compares, keys and refuses as it does there.
+/// Every expectation is PostgreSQL 17's answer on the source.
+#[tokio::test]
+async fn character_columns_keep_their_length_and_their_equality() {
+    const SCHEMA: &str = "rdb_import_character";
+    let params = skip_without_postgres!();
+    let mut connection = PgConnection::connect(&params).await.expect("connect");
+    connection
+        .simple_query(&CHARACTER_FIXTURE.replace(TEMPLATE_SCHEMA, SCHEMA))
+        .await
+        .expect("the fixture");
+    connection.close().await;
+    let (_dir, database, _notes) = imported(&params, options(SCHEMA)).await;
+
+    let one = |sql: &'static str| {
+        let database = database.clone();
+        async move {
+            let found = rows(&database, sql).await;
+            found.iter().map(|r| (0..r.columns.len()).map(|c| if is_null(r, c) { "∅".to_string() } else { text(r, c) }).collect::<Vec<_>>().join("|")).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(one("SELECT k || '|', flag || '|', name || '|', note || '|', tag || '|' FROM codes WHERE k = 'ab'").await, vec!["ab||y||abc  ||n  ||x|"]);
+    assert_eq!(one("SELECT name FROM codes WHERE k = 'ab   '").await, vec!["abc  "]);
+    assert_eq!(one("SELECT name FROM codes WHERE tag = 'x'").await, vec!["abc  "]);
+    assert_eq!(one("SELECT name FROM codes WHERE flag = ''").await, vec!["ü😀"]);
+    assert_eq!(one("SELECT k || '|' FROM codes WHERE length(k) = 1").await, vec!["é|"]);
+
+    // The key, and each length, hold as they did in PostgreSQL.
+    for refused in [
+        "INSERT INTO codes (k, name) VALUES ('ab ', 'q')",
+        "INSERT INTO codes (k, name) VALUES ('abcdef', 'q')",
+        "INSERT INTO codes (k, flag, name) VALUES ('zz', 'yy', 'q')",
+        "INSERT INTO codes (k, name) VALUES ('zz', 'abcdefg')",
+        "INSERT INTO codes (k, name, tag) VALUES ('zz', 'q', 'abcde')",
+    ] {
+        assert_eq!(run(&database, refused).await.first(), Some(&3), "accepted: {refused}");
+    }
+    let count = rows(&database, "SELECT count(*) FROM codes").await;
+    assert_eq!(i64_of(&count[0], 0), 2, "every refused row stayed out");
+}
