@@ -75,6 +75,7 @@ fn partitioned(db: &Database, name: &str) -> rclite::Arc<PartitionedTable> {
 }
 
 async fn exec(db: &rclite::Arc<Database>, sql: &str) -> Vec<u8> {
+    // Box::pin: the executor's future is large.
     let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).unwrap();
     let out = Box::pin(crate::core::rql::executor::execute_with_sync(purpose, db.clone(), true)).await;
     assert!(!out.is_empty() && out[0] != 3, "{sql}: {}", String::from_utf8_lossy(&out));
@@ -99,13 +100,14 @@ async fn lazy_resident_cost_and_startup() {
     let mut tenant_of: Vec<Option<i64>> = vec![None; n as usize];
     {
         let db = rclite::Arc::new(Database::new_named(&root_s, false, "lazy_resident").await);
-        exec(
-            &db,
-            &format!(
-                "CREATE TABLE acct (tenant_id BIGINT NOT NULL, n INT NOT NULL, label TEXT) PARTITION BY HASH (tenant_id) PARTITIONS {n}"
-            ),
+        // Past the parser's 2,048 too: the statement's table, created with
+        // `n` partitions directly.
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(
+            "CREATE TABLE acct (tenant_id BIGINT NOT NULL, n INT NOT NULL, label TEXT)",
         )
-        .await;
+        .unwrap();
+        let ct = crate::core::rql::lexer_ct::create_table_from_query_purpose(&purpose).unwrap();
+        db.create_partitioned_table(ct, &["tenant_id"], n).await.unwrap();
         let t = partitioned(&db, "acct");
         let epoch = t.epoch().unwrap();
         let mut tenant = 0i64;

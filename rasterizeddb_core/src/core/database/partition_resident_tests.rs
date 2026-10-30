@@ -5,6 +5,11 @@
 //! run by hand with `--ignored --nocapture`, and its numbers recorded in
 //! "Phase 3 P5a as built".
 //!
+//! Since phase 3 P5b-1 no partition opens at a start, so "open" here is a
+//! start with N materialized partitions and none open, and the per-partition
+//! figures are a closed partition's; `lazy_resident_tests` measures an open
+//! one (each touched by a routed read).
+//!
 //! Wakeups are counted as the process's context switches (voluntary and
 //! not, every thread, `/proc/self/task/*/status`) over an idle window, with
 //! the database open and, as the baseline, after it closed.

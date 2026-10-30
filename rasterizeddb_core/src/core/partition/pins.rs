@@ -294,7 +294,10 @@ impl PinBoard {
     ) -> (Vec<Arc<crate::core::row::table::Table<DbStorageProvider>>>, Vec<u32>) {
         let mut held = Vec::new();
         let mut opened = Vec::new();
-        let Some(parts) = self.parts.lock().upgrade() else {
+        // A replaced instance (a schema change between its retirement and
+        // its successor's `set_parts`) opens nothing: those partitions wait
+        // for the next round, swept through the new instance.
+        let Some(parts) = self.parts.lock().upgrade().filter(|p| !p.is_retired()) else {
             return (held, opened);
         };
         for &pid in pids {

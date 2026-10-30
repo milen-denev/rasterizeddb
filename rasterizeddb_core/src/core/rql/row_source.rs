@@ -539,7 +539,7 @@ impl FanOut {
                 // own, and the profile showed those copies (S16b).
                 let part = match part {
                     Some(part) => part.clone(),
-                    None => Box::pin(self.table.open_part(*pid)).await?,
+                    None => self.table.open_part(*pid).await?,
                 };
                 out.push(read(part, self.visibility.clone(), self.cache).await?);
             } else {
@@ -549,7 +549,7 @@ impl FanOut {
                 for (pid, part) in chunk {
                     group_parts.push(match part {
                         Some(part) => part.clone(),
-                        None => Box::pin(self.table.open_part(*pid)).await?,
+                        None => self.table.open_part(*pid).await?,
                     });
                 }
                 let reads = group_parts.into_iter().map(|part| read(part, self.visibility.clone(), self.cache));

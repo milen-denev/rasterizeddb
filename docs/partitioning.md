@@ -4,9 +4,11 @@ Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **not
 advertised**, and **phases 3 to 7 designed, not built**, except phase 3's P3
 (composite identifying keys, [as built](#phase-3-p3-as-built)), P1
 (metadata DDL, [as built](#phase-3-p1-as-built)), P4 (foreign keys both
-ways, [as built](#phase-3-p4-as-built)) and P5a (the lazy-open plumbing:
+ways, [as built](#phase-3-p4-as-built)), P5a (the lazy-open plumbing:
 shared maintenance, forget pins, `SWEPT`/`DIRTY`, the persisted `SERIAL`
-high-water and map-log generations, [as built](#phase-3-p5a-as-built)). Phases 0 and 1 are
+high-water and map-log generations, [as built](#phase-3-p5a-as-built)) and
+P5b-1 (partitions opened on demand and closed only exclusively, pins kept
+across a close, [as built](#phase-3-p5b-1-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -163,7 +165,8 @@ idle-box wall-clock A/B is still to run.
 - **A signed numeric literal is never learned** (`k = -1`): such a prepared
   read runs from its text and fans out (§4.1).
 - **Phase 2a's resource limits stand**: every materialized partition opens at
-  startup (lazy open is phase 3), every partition sits in the root location
+  startup (lazy open is phase 3; since P5b-1 none opens at startup and each
+  opens on first touch, [as built](#phase-3-p5b-1-as-built)), every partition sits in the root location
   (placement is phase 4), and the default stays 64 partitions (§1.2, §7).
 
 **Final twin pass (S20, at 97e187f):** `tests/partition_twin.rs` green in all
@@ -574,7 +577,9 @@ sweep, `vacuum::neutralize_test_hooks`),
 `partition_shell_sites` and `partition_returning` again assert exact
 `SERIAL` values across the harness's clean restarts.
 
-**Left for P5b and after.** The open set and idle close themselves; the
+**Left for P5b and after.** The open set and idle close themselves (P5b-1
+built the on-demand open and the exclusive close, [as built](#phase-3-p5b-1-as-built));
+the
 forget round reads every partition's pin each round (O(P) in memory per
 table per second; a pinned set would make it O(pinned)); the per-sweep and
 per-`DIRTY` state edits apply in place, but `MATERIALIZE` and `DROPPED`
@@ -2675,7 +2680,9 @@ holding the old `Arc` can write past the copy into files about to be deleted.
 | Open | 15 (3 providers × 5); 10 with persistent-index v1, which drops `_flt.db` | 3 | ~8 KB, plus filters and indexes in proportion to rows | 0 from phase 3 |
 | A `Table` today | ~25 | 5 | 15–30 KB, plus filters and indexes | 3–4, ~5.6 wakeups/s idle |
 
-**Startup** from phase 3 opens the shell and replays the map, nothing more; WAL
+**Startup** from phase 3 opens the shell and replays the map, nothing more
+(as built in P5b-1, plus a stat of each materialized partition's two data
+files, so I9 still refuses a missing one at startup); WAL
 recovery still replays closed partitions, since `register_directory`
 registers every file it finds (`core/wal.rs:1938`).
 
@@ -3288,10 +3295,10 @@ section specifying the mechanism.
 | I10 | Uniqueness holds | §1b | concurrent duplicate inserts and upserts across tenants and through reshapes; DDL refusals. **As built (S18):** `rasterizeddb_compat/tests/partition_upsert_matrix.rs`: `concurrent_upserts_on_a_partitioned_table_keep_every_key_unique_and_count_every_update` (sixteen clients over the primary key and a composite UNIQUE, `DO NOTHING` single- and multi-row and `INSERT … SELECT`, `DO UPDATE SET n = n + 1`, plain `INSERT`, in autocommit and committing and rolled-back blocks: no duplicate, every reported update applied once) and `three_hundred_keys_across_partitions_are_stored_once_under_concurrent_upserts` *(mutation: the in-flight rule off in `find_row_with_tuple`, 848 rows for 300 keys)*; `tests/partition_insert.rs`'s `duplicates_are_refused_and_racing_duplicates_store_one_row`; `tests/partition_ddl.rs`'s `a_unique_key_must_contain_every_key_column`. Reshapes wait for phase 5. |
 | I11 | A prepared statement never pins a partition | §4.1 | prepared SELECT, UPDATE, DELETE, 10 runs alternating tenants, past the learned third. *(Mutation: route before `note_plain`.)* **As built (S15):** `pgwire::prepared_partition_tests::each_execution_routes_its_own_values` (point SELECT and COUNT, two tenants in two partitions, 10 runs each: own rows, own partition's reads only, 2 parses per statement; mutations: the first execution's route kept, failed at run 3; `note_rewritten` restored, 20 parses), `a_tenant_first_written_after_learning_is_counted` (mutation: each `WHERE`'s first materialized list kept), `text_and_binary_keys_route_alike_from_the_cached_parse`, `a_learned_parse_is_not_parsed_again`; `tests/partition_prepared.rs` (writes, DROP and re-CREATE under the name, columns reordered, a type change, the name changing kind, a restart; mutation: no schema-generation reset, failed on the reordered columns); the twin's `PreparedSelect`, `PreparedCount`, `PreparedDescribeAlias` and `PreparedSelectAcrossDdl`, which fail a run past the second that the cache did not answer. |
 | I12 | Row ids are unique across the logical table | §3.5 | merge two partitions: no repeated id; ids file missing: table refused |
-| I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* **As built (P5a, partitions all open):** `partition::pin_tests` (an unswept partition pins in one process and across a restart, the first-write edge, sweeps with a writer inside or a running writer's stamp, a broken table) and `power_loss::pins_crash_tests` (a crash image, not a kill, of an aborted first write after a clean sweep with its pages forced out); the twin's `ForgetSweep`. *(Mutations, each failing its test: `MATERIALIZE` not lowering the handle; the handle ignoring replayed pins; no `DIRTY` edge; `DIRTY` group-commit only (four of ten images read the aborted row); clean despite a writer inside; clean despite a newer stamp; no `broken_pin`; `follow` pinning nothing (the twin).)* Close and reshape wait for P5b and phase 5. |
-| I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers |
+| I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* **As built (P5a, partitions all open):** `partition::pin_tests` (an unswept partition pins in one process and across a restart, the first-write edge, sweeps with a writer inside or a running writer's stamp, a broken table) and `power_loss::pins_crash_tests` (a crash image, not a kill, of an aborted first write after a clean sweep with its pages forced out); the twin's `ForgetSweep`. *(Mutations, each failing its test: `MATERIALIZE` not lowering the handle; the handle ignoring replayed pins; no `DIRTY` edge; `DIRTY` group-commit only (four of ten images read the aborted row); clean despite a writer inside; clean despite a newer stamp; no `broken_pin`; `follow` pinning nothing (the twin).)* **Close (P5b-1):** `partition::lazy_tests::an_aborted_row_stays_hidden_across_a_close_a_forget_and_a_reopen` (closed, every other table swept and forgotten past, in one process and after a restart; the partition's own sweep opens it) and `a_forget_round_sweeps_closed_partitions_and_closes_them_again`; `power_loss::lazy_crash_tests::a_closed_partition_keeps_its_pin_in_every_image`; the twin's `ClosePartitions` beside `ForgetSweep`. *(Mutations: a close clearing its pin in memory; a close recording a clean `SWEPT`; a sweep skipping closed partitions.)* Reshape waits for phase 5. |
+| I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers. **As built (P5b-1, no budget yet):** `partition::lazy_tests::an_open_waits_for_a_close_in_flight` (a read of a partition whose close is parked waits; mutation: the open without the lifecycle lock), `a_close_leaves_an_instance_in_use_open` (mutation: no strong-count check), `a_replaced_instance_opens_and_closes_nothing` (mutation: a retired instance still opens), `closes_racing_writers_readers_and_sweeps_lose_nothing`, `schema_changes_racing_closes_keep_one_schema_and_every_row`; `tests/partition_lazy.rs` (a block's kept ticket keeps its partition open; mutation: the ticket check off). The budget-1 storm waits for P5b-2's budget. |
 | I15 | The reaper never deletes live data | §12 | corrupt one map, restart: every other table's files intact |
-| I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin |
+| I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin. **Close (P5b-1):** `power_loss::lazy_crash_tests::a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row` (rows with unsynced pages, every partition closed, the log checkpointed, cut: every image holds every acknowledged row). *(Mutation: a close taking its files out of the log's map, `Wal::forget_files`.)* |
 | I17 | No retry after a partial apply | §9 | a conflict in the second partition of a fan-out UPDATE, in autocommit and in BEGIN. **As built:** `row_source::write_tests::a_conflict_after_a_partition_applied_rows_is_not_replayed` and, with `RETURNING` (S17), `row_source::returning_tests::a_returning_conflict_after_a_partition_applied_rows_is_not_replayed`; a multi-row upsert keeps it by `insert_values_batch`, where a tuple's empty `RETURNING` reply no longer strips the marker (S18, §9). |
 | I18 | Downgrade fails loudly, leaving no shadowing duplicate | §3.1 | the previous release opens a phase-2 database: table absent, not empty; `CREATE TABLE t` there, insert, re-upgrade: the new binary refuses to start, naming both rows |
 | I19 | Every crash window leaks rather than loses | §12, §3.2 | failpoints at each step of create, materialize, rename, reshape, conversion and drop, under SIGKILL and the page-cache-drop harness, including a page-cache drop after the outcome is durable: rows equal before or after, never neither. *(Mutation: append `MATERIALIZE` with `append_data(_, false)`.)* |

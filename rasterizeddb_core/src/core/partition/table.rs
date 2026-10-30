@@ -824,6 +824,10 @@ impl PartitionedTable {
                     // handed out, and `pg_stat_user_tables` counts as a plain
                     // table's would after the same change.
                     let old = &live.parts;
+                    // Replaced from here on, whether or not the caller
+                    // retired its partitions first: nothing opens a second
+                    // instance of a file set through it beside the new one.
+                    old.retired.store(true, Ordering::SeqCst);
                     let ids_io = Arc::new(old.seed.create_new(files::ids_file(self.uid)).await);
                     let ids = StdArc::new(IdSource::open_strict(ids_io).await.map_err(|e| e.to_string())?);
                     let slots: Box<[Slot]> = old
@@ -1269,7 +1273,7 @@ impl PartitionedTable {
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
-        Box::pin(live.parts.open_slow(slot, true)).await
+        live.parts.open_slow_erased(slot, true).await
     }
 
     /// Inserts `row` under `tx` into the partition its key routes to,
@@ -1520,6 +1524,12 @@ impl Parts {
         }
     }
 
+    /// Whether a schema change replaced this instance, or a DROP removed the
+    /// table: it opens and closes nothing any more.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
     /// Whether partition `pid` is materialized.
     pub(crate) fn is_materialized(&self, pid: u32) -> bool {
         self.slot(pid).is_ok_and(|s| s.materialized.load(Ordering::SeqCst))
@@ -1537,7 +1547,21 @@ impl Parts {
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
-        Box::pin(self.open_slow(slot, false)).await
+        self.open_slow_erased(slot, false).await
+    }
+
+    /// [`Self::open_slow`] behind a type-erased box: an open runs once per
+    /// closed partition reached, and every statement that may reach one
+    /// awaits this, so the open's state machine (a whole table open) stays
+    /// out of those statements' future types and out of the `Send` proof the
+    /// deepest of them already strains (`index_store::gate::ticket` erases
+    /// its slow path for the same reason).
+    fn open_slow_erased<'a>(
+        &'a self,
+        slot: &'a Slot,
+        materialize: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Arc<Table<DbStorageProvider>>>> + Send + 'a>> {
+        Box::pin(self.open_slow(slot, materialize))
     }
 
     fn refuse_retired(&self) -> io::Result<()> {
@@ -1657,9 +1681,14 @@ impl Parts {
         Ok(Arc::new(table))
     }
 
-    /// [`Self::close`], for a forget round that opened `pid` for its sweep.
-    pub(crate) async fn close_after_sweep(&self, pid: u32) -> io::Result<Close> {
-        self.close(pid).await
+    /// [`Self::close`], for a forget round that opened `pid` for its sweep,
+    /// type-erased as [`Self::open_slow_erased`] is: a sweep is reached from
+    /// statement futures too (`Table::neutralize_aborted_now`).
+    pub(crate) fn close_after_sweep(
+        &self,
+        pid: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Close>> + Send + '_>> {
+        Box::pin(self.close(pid))
     }
 
     fn apply_vacuum(&self, table: &Table<DbStorageProvider>) -> io::Result<()> {
