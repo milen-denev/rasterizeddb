@@ -46,7 +46,9 @@ async fn server() -> (TestServer, sqlx::PgPool) {
     (server, pool)
 }
 
-/// One expression, rendered as text, for the row with this id.
+/// One expression, rendered as text, for the row with this id. `started` is a
+/// `timestamptz`, so a timestamp computed from it is shown with its `+00`, as
+/// PostgreSQL 17 shows it (the session is UTC).
 async fn value(pool: &sqlx::PgPool, expression: &str, id: i32) -> Option<String> {
     sqlx::query(AssertSqlSafe(format!(
         "SELECT ({})::text FROM spans WHERE id = {}",
@@ -82,16 +84,16 @@ async fn a_timestamp_offset_by_an_interval_is_a_timestamp() {
     let (_s, pool) = server().await;
     assert_eq!(
         value(&pool, "started + INTERVAL '1 day'", 1).await.as_deref(),
-        Some("2026-02-01 10:00:00")
+        Some("2026-02-01 10:00:00+00")
     );
     assert_eq!(
         value(&pool, "started - INTERVAL '2 hours'", 1).await.as_deref(),
-        Some("2026-01-31 08:00:00")
+        Some("2026-01-31 08:00:00+00")
     );
     // The interval may come from a column as well as a literal.
     assert_eq!(
         value(&pool, "started + target", 1).await.as_deref(),
-        Some("2026-01-31 11:00:00")
+        Some("2026-01-31 11:00:00+00")
     );
 }
 
@@ -103,12 +105,12 @@ async fn a_month_moves_the_calendar_rather_than_thirty_days() {
     // 2 March, and a naive 31 would give an impossible date.
     assert_eq!(
         value(&pool, "started + INTERVAL '1 month'", 1).await.as_deref(),
-        Some("2026-02-28 10:00:00")
+        Some("2026-02-28 10:00:00+00")
     );
     // A year, likewise, is a calendar step.
     assert_eq!(
         value(&pool, "started + INTERVAL '1 year'", 1).await.as_deref(),
-        Some("2027-01-31 10:00:00")
+        Some("2027-01-31 10:00:00+00")
     );
 }
 
