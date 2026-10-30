@@ -1775,11 +1775,15 @@ pub fn with_untyped_params<F: std::future::Future>(texts: Vec<String>, f: F) -> 
 /// `INSERT INTO t AS q (v) VALUES ($1)` or `INSERT … SELECT 6, $1` stored 7.
 /// A constant written in the statement with exactly a bound parameter's text
 /// is then left as written too, which is how every such value used to be
-/// stored: `VALUES (1, $1, 007)` bound with '007' stores '007' for both,
-/// where PostgreSQL stores '7' for the written one. Telling them apart needs
-/// the parameter's position carried past the inlining, which this does not
-/// do. (`SET c = DEFAULT` is not affected: a constant default is spliced in
-/// as its evaluated, quoted text.)
+/// stored. That happens only where the parameter is inlined unquoted, which
+/// a text slot it is the whole value of never is (Bind types it `text`):
+/// `INSERT INTO dx SELECT 1, $1, 007` into two text columns bound with '007'
+/// stores '007' for both, where PostgreSQL stores '007' and '7'; and
+/// `INSERT INTO dn VALUES (1, $1, 007)` with `$1` in an INT column stores
+/// n = 7 and '007' for the written constant, where PostgreSQL stores '7'.
+/// Telling them apart needs the parameter's position carried past the
+/// inlining, which this does not do. (`SET c = DEFAULT` is not affected: a
+/// constant default is spliced in as its evaluated, quoted text.)
 pub fn written_constant_text(raw: &str) -> Option<String> {
     let rendered = numeric_constant_text(raw)?;
     let raw = raw.trim();
