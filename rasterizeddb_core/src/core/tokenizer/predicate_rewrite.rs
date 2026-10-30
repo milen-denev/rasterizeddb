@@ -2669,11 +2669,35 @@ fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     if !padded && !cast {
         // Only a pattern over `CAST(… AS CHAR(n))`, which its own word
         // check answers cheaply.
-        return pattern_may_read_bpchar(text, schema);
+        return pattern_may_read_bpchar(text, schema) || contains_typed_text_spelling(text);
     }
-    pattern_may_read_bpchar(text, schema)
+    contains_typed_text_spelling(text)
+        || pattern_may_read_bpchar(text, schema)
         || (cast && contains_spaced_text_literal(text))
         || (padded && varying && padded_beside_varying(text, schema))
+}
+
+/// `item` respelled when it is a typed-literal spelling of a text value:
+/// `text 'x'` as `'x'::text`, `varchar 'x'`, `char 'x'` and the rest as the
+/// untyped `'x'` (`column_default::typed_text_literal_or`). The rewrite
+/// reads neither spelling, and took `text` for a column.
+fn typed_text_item(item: &str) -> Option<String> {
+    let trimmed = item.trim();
+    let literal = crate::core::rql::column_default::typed_text_literal_or(trimmed);
+    if literal.len() == trimmed.len() {
+        return None;
+    }
+    let head = trimmed[..trimmed.len() - literal.len()].trim();
+    Some(if head.eq_ignore_ascii_case("text") { format!("{literal}::text") } else { literal.to_string() })
+}
+
+/// Whether `text` may hold a [`typed_text_item`]. Cheap and generous.
+fn contains_typed_text_spelling(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    memchr::memchr(b'\'', bytes).is_some()
+        && [&b"text '"[..], b"char '", b"character varying '"]
+            .iter()
+            .any(|w| bytes.windows(w.len()).any(|x| x.eq_ignore_ascii_case(w)))
 }
 
 /// Whether `text` may hold a [`spaced_text_literal`]. Cheap and generous.
@@ -3025,7 +3049,7 @@ fn lift_comparison(
         // AND 10` was refused as "BETWEEN bounds must be separated by AND",
         // the `%` unreadable to the rewrite. Whatever else follows is left
         // for the ordinary rewrite to read or refuse.
-        if needs_evaluator(rest) || contains_spaced_text_literal(rest) {
+        if needs_evaluator(rest) || contains_spaced_text_literal(rest) || contains_typed_text_spelling(rest) {
             if let Some(spelled) = spell_out_list_or_range(left_text.trim(), rest, schema)? {
                 return Ok(spelled);
             }
@@ -3155,17 +3179,22 @@ fn spell_out_list_or_range(
                 && !items.iter().any(|item| item.to_ascii_uppercase().starts_with("SELECT"))
             {
                 let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
-                // Over a `character(n)` column the whole list is `bpchar`,
-                // a computed item too (`a IN ('ab' || '  ', 'x')`): read
-                // without its trailing spaces. Lifted as it is, the item was
-                // text and compared with the column exactly.
-                let padded = column_text_kind(left, schema) == Some(TextSide::Padded);
+                // PostgreSQL types the list as one array only when two or
+                // more items are not column references (`transformAExprIn`);
+                // then over a `character(n)` column the array is `bpchar`,
+                // a computed or typed item too (`a IN ('ab' || '  ', 'x')`),
+                // read without its trailing spaces. With fewer the list is
+                // `a = item OR …`, each item at its own type, as `=` reads it:
+                // a lone `'ab' || '  '` or `'ab  '::text` is text, exact.
+                let column = |item: &str| resolve_column(item.trim(), schema).is_some();
+                let array = items.iter().filter(|item| !column(item)).count() >= 2;
+                let padded = array && column_text_kind(left, schema) == Some(TextSide::Padded);
                 let mut parts = Vec::with_capacity(items.len());
                 for item in items {
-                    // Not forced: an IN list's items take the column's type
-                    // with it (`a IN ('ab  '::text, 'x')` reads both
-                    // blank-padded against `character(n)`, as PostgreSQL's
-                    // common type of the list does), where `=` compares text.
+                    // `text 'x'` is `'x'::text`; `varchar 'x'` and `char 'x'`
+                    // compare with `character(n)` as an untyped `'x'` does.
+                    let respelled = typed_text_item(item);
+                    let item: &str = respelled.as_deref().unwrap_or(item);
                     // Except a subquery's text value, which compares exactly
                     // as `= ANY` over text does: substituted as `('…' || '')`
                     // (`subquery::subquery_literal`).
@@ -3175,7 +3204,15 @@ fn spell_out_list_or_range(
                     } else {
                         item.into()
                     };
-                    parts.push(format!("{} {} {}", left, each, lift_list_item(&item, schema)?));
+                    // In an array an item takes the column's type, typed or not
+                    // (`a IN ('ab  '::text, 'x')` is blank-padded); alone it is
+                    // a comparison's operand, and a typed one is lifted as one.
+                    let lifted = if array || column(&item) {
+                        lift_list_item(&item, schema)?
+                    } else {
+                        lift_side(&item, schema)?
+                    };
+                    parts.push(format!("{} {} {}", left, each, lifted));
                 }
                 return Ok(Some(format!("({})", parts.join(join))));
             }

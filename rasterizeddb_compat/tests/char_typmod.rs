@@ -1231,3 +1231,47 @@ async fn a_cast_pattern_and_a_relations_varying_column_read_as_postgresql() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// PostgreSQL types an `IN` list as one array only when two or more of its
+/// items are not column references; then the list is `bpchar` over a
+/// `character(n)` column and a computed item is read blank-padded. With
+/// fewer, `a IN (x, …)` is `a = x OR …`, each item at its own type, so a
+/// single computed or typed text item compares exactly, as `=` does. Every
+/// list over a `character(n)` column was read blank-padded, and a one-item
+/// `IN`, `NOT IN`, `UPDATE` and `DELETE` matched rows PostgreSQL does not.
+///
+/// Mutation: the array rule ignoring the item count (`spell_out_list_or_range`
+/// pads a lone computed item).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_item_in_list_compares_as_equals_does() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE d (id INT PRIMARY KEY, a CHAR(5), t TEXT, n INT); \
+         INSERT INTO d VALUES (1, 'ab', 'ab  ', 1), (2, 'x', 'x', 2), (3, 'abc', 'zz', 3)",
+    )
+    .await
+    .expect("setup");
+    let wrong = check_each_rolled_back(
+        &c,
+        &[
+            ("SELECT id FROM d WHERE a IN ('ab' || '  ')", ""),
+            ("SELECT id FROM d WHERE a NOT IN ('ab' || '  ')", "[1];[2];[3]"),
+            ("SELECT id FROM d WHERE a IN ('ab  '::text)", ""),
+            ("SELECT id FROM d WHERE a IN (CAST('ab  ' AS TEXT))", ""),
+            ("SELECT id FROM d WHERE a IN (text 'ab  ')", ""),
+            ("SELECT id FROM d WHERE a IN ('ab' || '  ', t)", "[2]"),
+            ("SELECT id FROM d WHERE a IN (t, 'x' || ' ')", "[2]"),
+            ("SELECT id FROM d WHERE (a IN ('ab' || '  ')) OR id = 3", "[3]"),
+            ("UPDATE d SET n = 100 WHERE a IN ('ab' || '  ') RETURNING id", ""),
+            ("DELETE FROM d WHERE a IN ('x' || ' ') RETURNING id", ""),
+            ("DELETE FROM d WHERE a NOT IN ('abc' || ' ') RETURNING id", "[1];[2];[3]"),
+            // Two items or more that are not columns: one bpchar array.
+            ("SELECT id FROM d WHERE a IN ('ab' || '  ', 'x' || ' ')", "[1];[2]"),
+            ("SELECT id FROM d WHERE a IN ('ab  ', 'x ')", "[1];[2]"),
+            ("SELECT id FROM d WHERE a IN ('ab  ')", "[1]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
