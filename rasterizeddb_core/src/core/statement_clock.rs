@@ -73,6 +73,15 @@ pub fn scope<F: Future>(clock: StatementClock, f: F) -> impl Future<Output = F::
     CLOCK.scope(Some(clock), f)
 }
 
+/// `f`, run on a thread of its own (a `std::thread::scope` worker), under
+/// `clock`, the statement's as [`current`] read it on the thread that spawned
+/// the worker. A task-local is not there otherwise: a parallel aggregate's
+/// fold workers read `now()` off the wall clock, so `count(*) FILTER (WHERE t
+/// = now())` counted only the rows its own thread folded.
+pub fn on_thread<R>(clock: Option<StatementClock>, f: impl FnOnce() -> R) -> R {
+    CLOCK.sync_scope(clock, f)
+}
+
 /// `f`, to be spawned, under the clock of the statement spawning it (if any):
 /// a worker evaluating `now()` for its rows reads the statement's instant.
 pub fn inherit<F: Future>(f: F) -> impl Future<Output = F::Output> {

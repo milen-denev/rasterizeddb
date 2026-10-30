@@ -1928,6 +1928,7 @@ where
             b'Q' => {
                 // A simple query is a unit of its own, not part of a batch.
                 state.error_in_batch = false;
+                state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
                 handle_simple_query(database, state, stream, query).await?;
                 // And it closes its own window: it has already answered with
@@ -1948,6 +1949,7 @@ where
                 handle_describe(database, state, stream, &payload).await?;
             }
             b'E' => {
+                state.message_us = crate::core::statement_clock::wall_us();
                 // Several `Execute`s before one `Sync` are one implicit
                 // transaction in PostgreSQL: they commit together at the
                 // Sync, or an error rolls back every one. Whether this
@@ -2173,6 +2175,12 @@ struct SessionState {
     /// Cleared by `Sync`, which ends the batch, and by a simple `Query`, which
     /// is a unit of its own.
     error_in_batch: bool,
+    /// When the message running now arrived, microseconds since the Unix
+    /// epoch: a simple Query's, or an Execute's. PostgreSQL stamps the
+    /// message, so every statement of one Query reads it as
+    /// `statement_timestamp()`, and a block begun in it as `now()`
+    /// (`statement_clock`).
+    message_us: i64,
     /// The message of the failure `statement_failed` records, for the
     /// boundary log line. The client received it; without it here, a runner
     /// that swallows statement errors (a migration tool reporting only its
@@ -2529,6 +2537,7 @@ impl SessionState {
             defer_conflict: false,
             deferred_conflict: false,
             error_in_batch: false,
+            message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
@@ -5222,16 +5231,13 @@ where
     let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
     let signal = cancel.clone();
     // `now()` is the open block's start, or this statement's under
-    // autocommit; `statement_timestamp()` is this statement's
-    // (`statement_clock`), except in an implicit block, whose statements
-    // arrived in one message: PostgreSQL stamps the message, so they share
-    // it, and it is when the block began.
-    let clock = match &state.transaction {
-        Some(t) if t.implicit => crate::core::statement_clock::StatementClock {
-            transaction_us: t.started_us,
-            statement_us: t.started_us,
-        },
-        t => crate::core::statement_clock::StatementClock::starting(t.as_ref().map(|t| t.started_us)),
+    // autocommit; `statement_timestamp()` is the message's: PostgreSQL
+    // stamps the Query or Execute that carried the statement, so the
+    // statements of one multi-statement Query share it, and a block begun in
+    // one began then (`statement_clock`).
+    let clock = crate::core::statement_clock::StatementClock {
+        transaction_us: state.transaction.as_ref().map_or(state.message_us, |t| t.started_us),
+        statement_us: state.message_us,
     };
     let result = crate::core::statement_clock::scope(clock, crate::core::cancel::STATEMENT_CANCEL
         .scope(cancel, async {
@@ -7708,7 +7714,8 @@ fn open_block(
         savepoints: Vec::new(),
         failed: false,
         implicit: false,
-        started_us: crate::core::statement_clock::wall_us(),
+        // The message that opened the block, as PostgreSQL stamps it.
+        started_us: state.message_us,
         aborted: false,
         database: database.clone(),
         owner: crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, id),

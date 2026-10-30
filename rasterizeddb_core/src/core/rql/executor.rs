@@ -10159,10 +10159,14 @@ fn fold_serialized(
     }
     let folded: Vec<Result<crate::core::rql::aggregate::Folder<'_>, String>> =
         std::thread::scope(|scope| {
+            // The statement's clock goes with each worker: an aggregate's
+            // FILTER or argument may read `now()`.
+            let clock = crate::core::statement_clock::current();
+            let fold_part = &fold_part;
             let handles: Vec<_> = parts
                 .iter()
                 .skip(1)
-                .map(|part| scope.spawn(|| fold_part(part)))
+                .map(|part| scope.spawn(move || crate::core::statement_clock::on_thread(clock, || fold_part(part))))
                 .collect();
             handles
                 .into_iter()

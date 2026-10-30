@@ -27,7 +27,7 @@
 //! replication having to know anything about sessions or connections.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use cacheguard::CacheGuard;
@@ -193,6 +193,11 @@ const NONDETERMINISTIC: &[&str] = &[
     "CURRENT_DATE",
     "CURRENT_TIME",
     "NEXTVAL(",
+    // The other spellings of the clock (`core::statement_clock`).
+    "STATEMENT_TIMESTAMP(",
+    "CLOCK_TIMESTAMP(",
+    "TRANSACTION_TIMESTAMP(",
+    "LOCALTIMESTAMP",
 ];
 
 /// Which of [`NONDETERMINISTIC`] appear in `sql`, as a bitmask.
@@ -207,9 +212,9 @@ const NONDETERMINISTIC: &[&str] = &[
 /// That is exact for these markers, none of which begins with a sequence that
 /// recurs inside itself, and the consequence of being wrong would be a missed
 /// warning rather than a wrong answer.
-fn scan_nondeterministic(sql: &str) -> u8 {
+fn scan_nondeterministic(sql: &str) -> u16 {
     let mut progress = [0usize; NONDETERMINISTIC.len()];
-    let mut found = 0u8;
+    let mut found = 0u16;
 
     for byte in sql.as_bytes() {
         let upper = byte.to_ascii_uppercase();
@@ -272,7 +277,7 @@ pub struct Replication {
     /// +31%. Only `active` keeps its own line, because on a database with
     /// replication *off* — the common case — it is the only one of the four
     /// that is touched at all.
-    warned: AtomicU8,
+    warned: AtomicU16,
     /// Hands out the execution order stamped on each captured statement.
     capture_order: AtomicU64,
     /// Whether the inbound listener has been started. A port binds once per
@@ -316,7 +321,7 @@ impl Replication {
             peers: DashMap::with_hasher(ahash::RandomState::new()),
             stats: Stats::default(),
             table_stamps: DashMap::with_hasher(ahash::RandomState::new()),
-            warned: AtomicU8::new(0),
+            warned: AtomicU16::new(0),
             capture_order: AtomicU64::new(0),
             listener: AtomicBool::new(false),
             bound_listener: parking_lot::Mutex::new(None),
@@ -618,7 +623,7 @@ impl Replication {
         }
 
         for (bit, marker) in NONDETERMINISTIC.iter().enumerate() {
-            let mask = 1u8 << bit;
+            let mask = 1u16 << bit;
             if found & mask == 0 {
                 continue;
             }
@@ -1009,7 +1014,7 @@ mod tests {
     }
 
     /// The marker's index in `NONDETERMINISTIC`, for readable assertions.
-    fn bit_of(marker: &str) -> u8 {
+    fn bit_of(marker: &str) -> u16 {
         1 << NONDETERMINISTIC
             .iter()
             .position(|m| *m == marker)

@@ -143,3 +143,42 @@ async fn the_statements_of_one_message_share_their_instants() {
     run(&c, &batch).await;
     assert_eq!(one(&c, "SELECT count(DISTINCT t), count(DISTINCT u), count(DISTINCT s), count(*) FROM nw").await, ["1", "1", "1", "20"]);
 }
+
+/// A block opened inside a multi-statement Query begins at the message's
+/// stamp, so now() and statement_timestamp() agree in every statement of it
+/// (PostgreSQL 17: equal).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_block_in_one_message_reads_the_messages_stamp() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, TABLE).await;
+    run(
+        &c,
+        "BEGIN; INSERT INTO nw (k, u, s) VALUES (1, now(), statement_timestamp()); \
+         INSERT INTO nw (k, u, s) VALUES (2, now(), statement_timestamp()); COMMIT",
+    )
+    .await;
+    assert_eq!(one(&c, "SELECT count(DISTINCT u), count(DISTINCT s), count(*) FROM nw WHERE u = s").await, ["1", "1", "2"]);
+}
+
+/// An aggregate over enough rows is folded on several threads; each reads
+/// the statement's now(), as the scan does. PostgreSQL 17: every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_aggregate_reads_the_statements_now() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE big (k INT NOT NULL, t TIMESTAMPTZ)").await;
+    // Past the parallel fold's threshold (100,000 rows), in one block, so
+    // every row holds the block's now().
+    const ROWS: i32 = 120_000;
+    run(&c, "BEGIN").await;
+    for start in (0..ROWS).step_by(4_000) {
+        run(&c, &format!("INSERT INTO big (k, t) VALUES {}", values(start..start + 4_000, "now()"))).await;
+    }
+    pause().await;
+    assert_eq!(
+        one(&c, "SELECT count(*), count(*) FILTER (WHERE t = now()) FROM big").await,
+        [ROWS.to_string(), ROWS.to_string()]
+    );
+    run(&c, "COMMIT").await;
+}
