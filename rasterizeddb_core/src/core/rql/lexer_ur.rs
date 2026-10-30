@@ -275,7 +275,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             // Doubled quotes are collapsed here too, or an UPDATE would
             // corrupt what an INSERT stored correctly; and an unquoted number
             // is its value's text, as the INSERT path reads one.
-            let stripped = match crate::core::value_codec::numeric_constant_text(value_str) {
+            let stripped = match crate::core::value_codec::written_constant_text(value_str) {
                 Some(text) => std::borrow::Cow::Owned(text),
                 None => crate::core::value_codec::unquote_sql(value_str),
             };
@@ -585,7 +585,7 @@ fn parse_update_row(
         // and `1E+2` look like arithmetic to it, and an expression's result
         // was written into the text column as the number's raw bytes.
         let rendered_constant;
-        let value: &str = match (&field.db_type, crate::core::value_codec::numeric_constant_text(value)) {
+        let value: &str = match (&field.db_type, crate::core::value_codec::written_constant_text(value)) {
             (DbType::STRING | DbType::CHAR, Some(text)) => {
                 rendered_constant = crate::core::value_codec::quote_sql(&text);
                 &rendered_constant

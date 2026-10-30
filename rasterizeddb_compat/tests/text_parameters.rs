@@ -208,3 +208,42 @@ async fn a_typed_timestamp_value_is_read_as_its_declared_type() {
     let found = c.run("", Some("SELECT k FROM ts WHERE b = $1 ORDER BY k"), &[1114], &[Some(zoned)]).await.expect("select");
     assert_eq!(texts(found), [["1"], ["2"]]);
 }
+
+/// Wherever an untyped value lands in a text column, it is stored as sent:
+/// the shapes below place the parameter where its position does not name
+/// the column (an alias, a CTE ahead of the INSERT, `INSERT … SELECT`), and
+/// each stored `'007'` as `7` (PostgreSQL 17 and base: `007`). The value is
+/// recognised as a bound parameter, not by where it stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untyped_value_is_stored_as_sent_whatever_the_statements_shape() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    c.simple("CREATE TABLE pq (id INT NOT NULL, v TEXT)").await;
+    c.simple("CREATE TABLE \"Qt\" (id INT NOT NULL, \"Val\" TEXT)").await;
+    for (id, sql) in [
+        (1, "INSERT INTO pq AS q (id, v) VALUES ($1, $2)"),
+        (2, "WITH c AS (SELECT 1 AS k) INSERT INTO pq (id, v) VALUES ($1, $2)"),
+        (3, "INSERT INTO pq (id, v) SELECT $1, $2"),
+        (4, "INSERT INTO pq (id, v) SELECT $1, $2 WHERE true"),
+    ] {
+        let id = id.to_string();
+        c.run("", Some(sql), &[], &[Some(&id), Some("007")]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    c.run("", Some("INSERT INTO pq (id, v) SELECT 5, $1"), &[], &[Some("007")]).await.expect("SELECT 5, $1");
+    c.run("", Some("INSERT INTO \"Qt\" AS q (id, \"Val\") VALUES ($1, $2)"), &[], &[Some("1"), Some("007")])
+        .await
+        .expect("quoted names");
+    // Not PostgreSQL syntax (it wants AS); accepted here, it must still be exact.
+    let _ = c.run("", Some("INSERT INTO pq q (id, v) VALUES ($1, $2)"), &[], &[Some("6"), Some("007")]).await;
+    let stored = texts(c.simple("SELECT id, v FROM pq ORDER BY id").await);
+    assert!(stored.iter().all(|r| r[1] == "007"), "{stored:?}");
+    assert!(stored.len() >= 5, "{stored:?}");
+    assert_eq!(texts(c.simple("SELECT \"Val\" FROM \"Qt\"").await), [["007"]]);
+
+    // A constant written in the statement is still its value's text, beside
+    // a bound parameter, and an integer column still reads the text as 7.
+    c.run("", Some("INSERT INTO pq (id, v) VALUES ($1, 1e1)"), &[], &[Some("20")]).await.expect("constant");
+    assert_eq!(texts(c.simple("SELECT v FROM pq WHERE id = 20").await), [["10"]]);
+    c.run("", Some("INSERT INTO pq AS q (id, v) VALUES ($1, 'x')"), &[], &[Some("007")]).await.expect("int");
+    assert_eq!(texts(c.simple("SELECT id FROM pq WHERE v = 'x'").await), [["7"]]);
+}

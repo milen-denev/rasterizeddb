@@ -3504,13 +3504,16 @@ where
         // A prepared `SELECT` may run from its cached parse, a fresh
         // description included: a client that never describes again gets one
         // on every execute, and would otherwise never run from it again.
-        let run = async {
+        // The statement's untyped number-looking parameters, which its text
+        // encoders store as sent (`value_codec::written_constant_text`).
+        let untyped = crate::pg_params::untyped_number_texts(&params);
+        let run = crate::core::value_codec::with_untyped_params(untyped, async {
             if !is_copy {
                 execute_watched(database, state, stream, &stmt_name, &query, &params, &result_formats, true).await
             } else {
                 execute_recorded(database, state, stream, &query, &result_formats, true, None).await
             }
-        };
+        });
         let result = with_shape_check(check.clone(), run).await;
         finish_shape_check(state, &stmt_name, check.as_deref());
         return result;
@@ -3526,7 +3529,10 @@ where
     };
     let ran = with_shape_check(
         check.clone(),
-        execute_recorded(database, state, &mut capture, &query, &result_formats, true, None),
+        crate::core::value_codec::with_untyped_params(
+            crate::pg_params::untyped_number_texts(&params),
+            execute_recorded(database, state, &mut capture, &query, &result_formats, true, None),
+        ),
     )
     .await;
     finish_shape_check(state, &stmt_name, check.as_deref());

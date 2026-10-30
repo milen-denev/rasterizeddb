@@ -251,6 +251,20 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
     Ok(out)
 }
 
+/// The text of each parameter `inline_params` writes unquoted because it is
+/// untyped text that looks like a number: what the statement's text encoders
+/// must store as sent rather than read as a constant written in the
+/// statement (`value_codec::written_constant_text`).
+pub fn untyped_number_texts(params: &[BoundParam]) -> Vec<String> {
+    params
+        .iter()
+        .filter(|p| p.oid == 0 && p.format == 0)
+        .filter_map(|p| std::str::from_utf8(p.value.as_deref()?).ok())
+        .filter(|text| is_numeric_literal(text))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The bare type name of a `::type` cast directly after a placeholder ending
 /// at `at`, as `inline_params` reads one before consuming it.
 fn placeholder_cast(bytes: &[u8], at: usize) -> Option<&str> {

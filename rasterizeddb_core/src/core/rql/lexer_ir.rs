@@ -301,7 +301,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             //
             // An unquoted number is its value's text, as PostgreSQL's
             // assignment renders it: `1e1` is '10', `+9` is '9'.
-            let stripped = match crate::core::value_codec::numeric_constant_text(value_str) {
+            let stripped = match crate::core::value_codec::written_constant_text(value_str) {
                 Some(text) => std::borrow::Cow::Owned(text),
                 None => crate::core::value_codec::unquote_sql(value_str),
             };
@@ -1090,7 +1090,7 @@ pub(crate) fn encode_column_value(
     // taken before the expression test: `100e-2` looks like arithmetic to it,
     // and evaluated it lost the scale its digits give it ('1', not '1.00').
     let rendered_constant;
-    let value: &str = match (&schema_field.db_type, crate::core::value_codec::numeric_constant_text(value)) {
+    let value: &str = match (&schema_field.db_type, crate::core::value_codec::written_constant_text(value)) {
         (DbType::STRING | DbType::CHAR, Some(text)) => {
             rendered_constant = crate::core::value_codec::quote_sql(&text);
             &rendered_constant

@@ -1751,6 +1751,40 @@ fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {
     })
 }
 
+tokio::task_local! {
+    /// The text of every untyped parameter the running statement had inlined
+    /// unquoted because it looks like a number
+    /// (`pg_params::untyped_number_texts`).
+    static UNTYPED_PARAMS: Vec<String>;
+}
+
+/// Runs `f` as a statement whose untyped number-looking parameters were
+/// inlined as `texts`: [`written_constant_text`] leaves them as sent.
+pub fn with_untyped_params<F: std::future::Future>(texts: Vec<String>, f: F) -> impl std::future::Future<Output = F::Output> {
+    UNTYPED_PARAMS.scope(texts, f)
+}
+
+/// [`numeric_constant_text`] for a constant *written in the statement*:
+/// `None` for the text of an untyped parameter the statement was bound with.
+///
+/// A parameter's text is stored in a text column as it was sent, as
+/// PostgreSQL stores an unknown-typed value there; only a constant the
+/// statement spells (`VALUES (1e1)`) is its value's text. The two meet as the
+/// same unquoted text once a number-looking parameter is inlined, so the
+/// parameter's is recognised by what it was: `'007'` bound to
+/// `INSERT INTO t AS q (v) VALUES ($1)` or `INSERT … SELECT 6, $1` stored 7.
+/// A constant written in the statement with exactly a bound parameter's text
+/// is then left as written too, which is how every such value used to be
+/// stored.
+pub fn written_constant_text(raw: &str) -> Option<String> {
+    let rendered = numeric_constant_text(raw)?;
+    let raw = raw.trim();
+    let bound = UNTYPED_PARAMS
+        .try_with(|texts| texts.iter().any(|t| t.trim() == raw))
+        .unwrap_or(false);
+    (!bound).then_some(rendered)
+}
+
 /// An unquoted numeric constant (`1e1`, `+9`, `007`, `1.50`, `0x1F`,
 /// `1_000`), as PostgreSQL renders it when the constant is assigned to a text
 /// column: the value's text, not its spelling. `None` for anything that is
