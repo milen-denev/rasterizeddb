@@ -22,7 +22,6 @@ use parking_lot::Mutex;
 use std::sync::Arc as StdArc;
 
 use crate::core::database::Relation;
-use crate::core::partition::route::Route;
 use crate::core::partition::table::PartitionedTable;
 
 const CREATE: &str =

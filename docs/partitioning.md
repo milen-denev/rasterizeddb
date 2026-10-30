@@ -172,6 +172,181 @@ statements), at 0x5eed2b20 and at 0x5eedf1a1 with 1,500 statements each;
 `KNOWN_DIVERGENCES` is empty, and `REFUSED` holds only the phase 3 and 6
 kinds above. Every `partition_*` suite, core and compat, passes.
 
+## Phase 3 P5b-1 as built
+
+Built on `feat/p5b-lazy-open` (from `f89ed7ad`, 2026-10-30), the first
+part of wave 3's P5b: **partitions open on demand and close only
+exclusively**, with every pin kept in the slot (P5a's). Split from P5b as
+the plan allowed: P5b-2 adds the policy that closes (the sharded CLOCK and
+open budget, idle close with a persistent-index snapshot at close,
+scan-only fan-out opens and `STATS`), and P5b-3 raises the cap to 65,536
+per node and re-measures the default N. Until P5b-2, **nothing closes a
+partition by itself except a forget round's own sweep-open** (below); a
+partition opened by a statement stays open, as every partition did before,
+so the resident cost is bounded by what has been touched since the start,
+not by what is materialized. Not advertised.
+
+**A start opens nothing** (§7.1). `PartitionedTable::open` replays the map
+log and builds the slots; for every materialized partition it only checks
+that its two data files exist (a stat each, never a provider, which would
+create them), so a missing file still refuses the table at startup (I9)
+rather than at the first statement that reaches it. Nothing else is read:
+a pointer file that cannot be read now fails the first statement that
+opens its partition, not the start.
+
+**What opens a partition** (`table::Parts::open`, under the partition's
+lifecycle lock): a routed read or write (`partition_for_point`,
+`materialized_in`), a fan-out read **when it reaches the partition**
+(`FanOut` plans `(pid, Option<instance>)` after its snapshot and epoch, as
+§4.4 orders, and opens a closed one in `each`, so an unordered `LIMIT`
+that stops early opens none of the rest), an `UPDATE`/`DELETE`
+(`write_partitions` opens every routed one), `VACUUM`, `SERIAL` seeding
+from the maximum, a schema change's validation, and a forget sweep of a
+closed, pinned partition. Full opens, as a start used to make: the index
+is rebuilt from rows (or loaded under `index_snapshot.index_storage =
+snapshot` when the snapshot proves current), the filter backfilled;
+queries scan until the index is ready, which is correct. Scan-only fan-out
+opens are P5b-2's.
+
+**A failed open fails the statement.** `materialized()` and the fan-out
+return the open's error; a partition is never skipped (that would answer as
+if its rows were not there) and no provider is built over a missing file
+(`open_instance` checks `require_existing` first: a provider creates what
+it opens, and an empty file would read as an empty partition). The slot
+stays closed, so the next statement tries again.
+
+**The slot** (`table::Slot`): `materialized: AtomicBool`, set from the map
+at open or by `materialize` once `MATERIALIZE` is durable and before the
+first row, never cleared, so §4.3's skip proof is unchanged (read after the
+snapshot); and `open: Mutex<Option<Arc<Table>>>`, cloned under that lock by
+every access. The hot path is one uncontended mutex round trip where the
+`OnceCell` was one load.
+
+**Exclusive close** (§7.2 point 2; `PartitionedTable::close_partition`,
+`close_idle`). Under the partition's lifecycle lock, the instance leaves
+its slot only when the slot's is the **one strong reference**
+(`rclite::Arc::strong_count`; statements, fan-outs and jobs hold clones,
+and nobody can take a new one without the slot's mutex) **and no ticket is
+counted on its write gate**. Then, owned alone, `Table::close_exclusive`
+retires it (maintenance flag cleared, vacuum tick joined, seal cancelled
+and waited for), waits out its unit's scheduler round in flight
+(`ExternalUnit::quiesce`, a lock each round now holds from before it looks
+at `alive`), lands any staged appends (`land_background`; partition writes
+go through the log, so in practice there are none, and a landing that does
+not happen leaves the bytes in `.tmp` for the next open, which lands them
+when its provider is built), and drops it. A close writes nothing else:
+the map log, the pins and the WAL's file map are untouched (§7.2: a close
+never unregisters, so a checkpoint after it still syncs the partition's
+files by path).
+
+**Decision: a transaction's kept ticket blocks the close.** The design
+named only the strong count. A block that wrote a partition keeps a ticket
+on that file set's gate until its outcome is final (persistent indexes §2,
+"Ticket ownership"), while its statements hold no instance between them.
+Closing there would drop the `FileGate` and its word; the next open derives
+a new word from `.ixm` that does not count the kept ticket, so a seal of the
+new instance could run as if no outcome were pending. Rather than reason
+about which seals that would mislead, a close leaves such a partition open
+(`Close::InUse`) until the block ends. Cost: a long transaction keeps the
+partitions it wrote open, which is also what the strong-count rule does for
+a statement.
+
+**One live instance per file set** (I14). The lifecycle lock is per pid
+and lives in the `PinBoard`, which a schema change's new table instance
+shares, so every open, materialize and close of a file set is serialized
+across instances, and an open waits for a close in flight until the old
+instance's providers are idle. A schema change marks the instance it
+replaces retired before retiring its partitions (`retire_partitions`), and
+a retired instance neither opens (an error: no statement reaches one, since
+statements take the logical name's lock first; only a background job could)
+nor closes (`Close::Retired`). `DROP` marks it too and then takes every
+lifecycle lock once, so no open in flight creates files after the drop's
+deletions.
+
+**Decision: a schema change reopens the open set, not every partition.**
+`reopened` opens anew exactly the partitions open in the old instance,
+under the new schema (so a partition that no longer opens fails the change
+as before, and P1's `test.pddl.partition_reopened` cut points stand); a
+closed one stays closed and opens under the new schema on demand. Its
+validation (`row_tables_held`, now async) opens every materialized
+partition: a closed partition's rows never escape a new `UNIQUE`, foreign
+key or `NOT NULL` check. The metadata-only test (`rows_len`) counts a closed
+partition's rows file and its `.tmp` from their metadata, so a table whose
+partitions are all closed is never taken for empty.
+
+**Pins across a close** (§7.2 point 1, I13). A close touches no pin: the
+pin is the map log's, so a closed partition keeps pinning, in memory and
+after a restart. A forget sweep of a closed, pinned partition opens it for
+the sweep (`PinBoard::sweep_all`: through a weak handle on the live
+instance's slots), holds it through the sweep, and closes it again
+afterwards if nothing else took it. Without that, a partition pinned at a
+crash, or closed dirty, would hold forgetting back until a statement opened
+it; with it, §7.2's restart rule ("forgetting waits until every partition
+dirty at the crash is swept once") holds with every partition closed after
+the start. These are full opens, not the pointer-file-only opens §7.2
+sketches.
+
+**Introspection over closed partitions.** `totals`, `partitions` (`SHOW
+PARTITIONS`, `pg_class`, `pg_stat_user_tables`) report a closed partition's
+sizes from its files' metadata (each data file plus its `.tmp`, and the
+index-store files), equal to what the open instance reported
+(`a_closed_partition_answers_like_an_open_one`). The per-instance figures
+(`SHOW TABLE`'s reclaimable bytes, vacuum stats, in-place counts, index
+readiness in `pg_indexes`, a checkpoint's seals) cover the open partitions
+only: a closed one has no in-memory state, and its next open builds it.
+`SET CONFIG vacuum.enabled` is kept on the table and applied to every
+partition as it opens, so a closed and reopened partition keeps it.
+
+**Concurrency, as tested** (`partition::lazy_tests`, `tests/partition_lazy.rs`):
+a close against a routed open (the open waits), a fan-out whose partitions
+close between its partition reads (every one read), writers and readers
+and a forget sweeper under a closer closing every idle partition in a loop
+(every acknowledged row stored once, in one process and after a restart),
+schema changes under the same closer (one schema in every partition,
+every row kept, the replaced instance closing nothing), an open block's
+written partition (kept open). Backup was not raced: snapshots read files
+by path and a close writes none (no landing in practice), so it is the
+background landing's case, already covered.
+
+**Tests.** Lib `partition::lazy_tests`:
+`a_start_opens_nothing_and_an_access_opens_only_what_it_reaches`,
+`a_closed_partition_answers_like_an_open_one`,
+`an_aborted_row_stays_hidden_across_a_close_a_forget_and_a_reopen`,
+`a_forget_round_sweeps_closed_partitions_and_closes_them_again`,
+`a_close_leaves_an_instance_in_use_open`,
+`an_open_waits_for_a_close_in_flight`,
+`a_partition_that_cannot_reopen_fails_the_statement`,
+`a_schema_change_reaches_closed_partitions`,
+`the_vacuum_setting_reaches_partitions_opened_later`,
+`a_fan_out_reads_every_partition_while_they_close_under_it`,
+`closes_racing_writers_readers_and_sweeps_lose_nothing`,
+`schema_changes_racing_closes_keep_one_schema_and_every_row`,
+`a_replaced_instance_opens_and_closes_nothing`. Integration
+`tests/partition_lazy.rs`:
+`a_partition_an_open_block_wrote_stays_open_until_the_block_ends`. Power
+loss, `power_loss::lazy_crash_tests` (crash images):
+`a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row`,
+`a_reopen_cut_anywhere_keeps_every_acknowledged_row`,
+`a_closed_partition_keeps_its_pin_in_every_image`. The twin
+(`tests/partition_twin.rs`) gains `ClosePartitions` (a seeded subset of
+the idle partitions closed, between statements and inside blocks) and two
+configurations that keep at most three partitions open after every
+statement, `twin_hash_tenant_1024_few_open` (1,024 partitions) and
+`twin_hash_tenant_grp_64_few_open`; with the restart midway opening none,
+every kind runs through reopened partitions. The test harness's stored-row
+reader closes again what it opened.
+
+**Left for P5b-2 and after.** The open budget and the sharded CLOCK
+(scan-resistant fan-out opens), idle close with the persistent-index
+snapshot written at close and loaded on reopen, scan-only fan-out opens
+(the FILTER section), `STATS` at close for O(1) catalog totals, `53000` on
+EMFILE (provider opens still `unwrap`), the cap raised to 65,536 per node
+and the default N re-measured (P5b-3). A forget round still reads every
+pin each round (P5a's note). The open's one-shot tasks (index build,
+filter backfill, load audit) are not cancelled by a close: they read
+through the old instance's providers until they end, and write nothing to
+the file set but their own per-instance paged runs.
+
 ## Phase 3 P5a as built
 
 Built on `feat/p5a-lazy-plumbing` (from `f795e2a`, rebased onto

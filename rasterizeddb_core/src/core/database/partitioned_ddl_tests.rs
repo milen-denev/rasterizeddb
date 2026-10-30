@@ -15,7 +15,6 @@ use super::Database;
 use crate::core::index_store::load::Origin;
 use crate::core::index_store::load::settings::IndexStorage;
 use crate::core::index_store::load::storage_override;
-use crate::core::partition::route::Route;
 use crate::core::row::table::Table;
 use crate::core::storage_providers::backend::DbStorageProvider;
 

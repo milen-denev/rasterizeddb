@@ -684,3 +684,31 @@ async fn schema_changes_racing_closes_keep_one_schema_and_every_row() {
     assert_eq!(rows(&db, "").await, want, "after a restart");
     close(dir.path(), db);
 }
+
+/// A table instance a schema change replaced opens and closes nothing: a
+/// background job still holding it (a forget round, a closer) neither opens
+/// a second instance of a file set beside the new table's (I14), with the
+/// old schema, nor closes one.
+///
+/// Mutation: `Parts::refuse_retired` doing nothing: the old instance opens
+/// a closed partition with the old schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_instance_opens_and_closes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let old = pt(&db);
+    let (p_open, p_closed) = (pid_of_tenant(&old, 1), pid_of_tenant(&old, 2));
+    assert_ne!(p_open, p_closed);
+    old.close_idle().await.unwrap();
+    let _ = old.open_part(p_open).await.unwrap();
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let new = pt(&db);
+    assert!(!Arc::ptr_eq(&old, &new));
+    assert!(old.open_part(p_closed).await.is_err(), "a replaced instance opened a partition");
+    assert_eq!(old.close_partition(p_open).await.unwrap(), Close::Retired);
+    assert!(new.open_partitions_now().iter().any(|(pid, _)| *pid == p_open), "the new instance lost its open partition");
+    assert_eq!(rows(&db, "").await, expected());
+    drop((old, new));
+    close(dir.path(), db);
+}

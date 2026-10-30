@@ -379,10 +379,11 @@ impl Database {
                 "partitioned tables in a storage pool with backup mirrors are not supported yet",
             ));
         }
-        if partitions == 0 || partitions > MAX_DECLARED_PER_DATABASE {
+        let cap = self.declared_cap();
+        if partitions == 0 || partitions > cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("PARTITIONS must be between 1 and {MAX_DECLARED_PER_DATABASE}, not {partitions}"),
+                format!("PARTITIONS must be between 1 and {cap}, not {partitions}"),
             ));
         }
         if key.is_empty() || key.len() > 3 {
@@ -429,7 +430,23 @@ impl Database {
             }
         }
         let open: Vec<Arc<PartitionedTable>> = self.partitioned_tables_all();
-        check_declared_cap(declared_in(open.iter().map(|t| &**t))?, partitions)
+        let declared = declared_in(open.iter().map(|t| &**t))?;
+        if cap != MAX_DECLARED_PER_DATABASE {
+            return crate::core::partition::table::check_declared_cap_at(declared, partitions, cap);
+        }
+        check_declared_cap(declared, partitions)
+    }
+
+    /// The declared-partitions cap (§7.1): [`MAX_DECLARED_PER_DATABASE`],
+    /// or in a test a measurement's raised one for its directory
+    /// (`cap_hooks`), so phase 3's scale can be measured before the cap is
+    /// raised for everyone.
+    fn declared_cap(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(cap) = self.location.as_deref().and_then(|l| cap_hooks::cap_for(Path::new(l))) {
+            return cap;
+        }
+        MAX_DECLARED_PER_DATABASE
     }
 
     /// Creates a hash-partitioned table (§12's CREATE order): `ct`'s schema
@@ -747,6 +764,23 @@ impl Database {
             }
             Err(why) => (None, self.refused_partitioned(name, old.uid(), &why)),
         }
+    }
+}
+
+/// Test-only: a raised declared-partitions cap for databases under a
+/// directory, for the scale measurements (`lazy_resident_tests`).
+#[cfg(test)]
+pub(crate) mod cap_hooks {
+    use std::path::{Path, PathBuf};
+
+    static CAPS: parking_lot::Mutex<Vec<(PathBuf, u32)>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(crate) fn raise(dir: &Path, cap: u32) {
+        CAPS.lock().push((dir.to_path_buf(), cap));
+    }
+
+    pub(super) fn cap_for(location: &Path) -> Option<u32> {
+        CAPS.lock().iter().find(|(d, _)| location.starts_with(d)).map(|(_, c)| *c)
     }
 }
 

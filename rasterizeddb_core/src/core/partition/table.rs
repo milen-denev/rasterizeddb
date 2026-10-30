@@ -97,13 +97,18 @@ const ROOT_LOC: u32 = 0;
 /// Refuses declaring `adding` more partitions in a database that already
 /// declares `declared`. "not supported" makes it 0A000.
 pub fn check_declared_cap(declared: u64, adding: u32) -> io::Result<()> {
+    check_declared_cap_at(declared, adding, MAX_DECLARED_PER_DATABASE)
+}
+
+/// [`check_declared_cap`] against `cap`.
+pub(crate) fn check_declared_cap_at(declared: u64, adding: u32, cap: u32) -> io::Result<()> {
     let total = declared.saturating_add(adding as u64);
-    if total > MAX_DECLARED_PER_DATABASE as u64 {
+    if total > cap as u64 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
                 "declaring {adding} more partitions would make {total} in this database; more than \
-                 {MAX_DECLARED_PER_DATABASE} partitions per database is not supported yet"
+                 {cap} partitions per database is not supported yet"
             ),
         ));
     }
@@ -1572,6 +1577,8 @@ impl Parts {
         // this one was there (both sides store, then read the other's).
         self.apply_vacuum(&table)?;
         self.opens.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        crate::core::power_loss::failpoint::hit("test.p5b.reopened", &self.root)?;
         Ok(table)
     }
 
@@ -1695,7 +1702,11 @@ impl Parts {
         };
         #[cfg(test)]
         lifecycle_hooks::closing(&self.root, pid).await;
+        #[cfg(test)]
+        crate::core::power_loss::failpoint::hit("test.p5b.close_taken", &self.root)?;
         table.close_exclusive().await;
+        #[cfg(test)]
+        crate::core::power_loss::failpoint::hit("test.p5b.close_landed", &self.root)?;
         // Owned alone since the check above; dropping it drops the providers
         // (the scheduler holds the unit weakly).
         if let Err(still) = Arc::try_unwrap(table) {

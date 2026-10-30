@@ -479,7 +479,6 @@ async fn a_key_change_is_refused_before_any_partition_is_written() {
     let (low, high) = two_partitions(&pt);
     let original = ledger_rows(&db, "acct").await;
     let slots = slots_by_partition(&pt).await;
-    let epoch = pt.epoch().unwrap();
     let in_place = |pt: &PartitionedTable| -> Vec<u64> {
         pt.open_partitions_now()
             .iter()
