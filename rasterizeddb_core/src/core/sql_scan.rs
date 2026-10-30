@@ -808,6 +808,18 @@ fn timestamp_text(body: &str, with_zone: bool) -> Option<String> {
     Some(text)
 }
 
+/// The number inside `text` when `text` is only a number in parentheses,
+/// `(0098)` or `((1e1))`: the constant as written, without them.
+pub fn parenthesised_number(text: &str) -> Option<&str> {
+    let mut inner = text.trim();
+    let mut stripped = false;
+    while let Some(rest) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        inner = rest.trim();
+        stripped = true;
+    }
+    (stripped && !inner.contains(['(', ')']) && crate::pg_params::is_numeric_literal(inner)).then_some(inner)
+}
+
 /// Whether the timestamps an expression's text makes are all `timestamp`
 /// (without time zone): it names that type (`::timestamp`, `AS timestamp`)
 /// or `LOCALTIMESTAMP`, and nothing that makes a `timestamptz` (that type, or

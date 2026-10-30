@@ -559,6 +559,10 @@ fn parse_update_row(
         if key.is_empty() {
             return None;
         }
+        // A number in parentheses is that number, spelled as written: `SET v
+        // = (0098)` on a text column is '98' as `SET v = 0098` is, and
+        // `(1.50)` keeps its scale, which evaluating it as an expression lost.
+        let value = crate::core::sql_scan::parenthesised_number(value).unwrap_or(value);
 
         // A companion column belongs to the engine; a statement cannot assign
         // to it directly, and doing so would desynchronise it from its column.

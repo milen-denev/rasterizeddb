@@ -282,3 +282,72 @@ async fn a_parameter_inside_an_expression_is_typed_by_the_expression() {
         [["10", "8"], ["11", "-5"], ["12", "-5"], ["13", "007"], ["14", "007x"]]
     );
 }
+
+// A value assigned to a text column in an UPDATE is its text, as
+// PostgreSQL's assignment cast renders it, whatever expression made it. A
+// number in parentheses, an arithmetic result or another column's integer
+// had its raw bytes written into the slot: `(0098)` read back as "b\0\0\0",
+// `(7)` as "\x07", `(1e1)` as sixteen binary bytes, and `(($1))` bound with
+// '65' as "A". A parameter alone in parentheses is the slot's whole value,
+// so it is stored as sent, as it is without them.
+#[tokio::test]
+async fn a_value_assigned_to_a_text_column_is_its_text() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    c.simple("CREATE TABLE pu (id INT PRIMARY KEY, v TEXT, n INT)").await;
+    c.simple(
+        "INSERT INTO pu VALUES (1, 'a', 5), (2, 'a', 5), (3, 'a', 5), (4, 'a', 5), (5, 'a', 5), (6, 'a', 5), \
+         (7, 'a', 5), (8, 'a', 5), (9, 'a', 5), (10, 'a', 5), (11, 'a', 5), (12, 'a', 5), (13, 'a', 5), (14, 'a', 5)",
+    )
+    .await;
+    for sql in [
+        "UPDATE pu SET v = (0098) WHERE id = 1",
+        "UPDATE pu SET v = (1e1) WHERE id = 2",
+        "UPDATE pu SET v = (7) WHERE id = 3",
+        "UPDATE pu SET v = 1 + 1 WHERE id = 4",
+        "UPDATE pu SET v = n WHERE id = 5",
+        "UPDATE pu SET v = n + 1 WHERE id = 6",
+        "UPDATE pu SET v = (1.50) WHERE id = 7",
+        "UPDATE pu SET v = -(7) WHERE id = 8",
+        "UPDATE pu SET v = abs(-7) WHERE id = 9",
+        "INSERT INTO pu VALUES (10, 'z', 1) ON CONFLICT (id) DO UPDATE SET v = (0098)",
+        "UPDATE pu SET v = ((-1.50)) WHERE id = 11",
+        "INSERT INTO pu VALUES (12, 'z', 1) ON CONFLICT (id) DO UPDATE SET v = excluded.n + 1",
+    ] {
+        c.run("", Some(sql), &[], &[]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, value) in [
+        ("UPDATE pu SET v = ($1) WHERE id = 13", "0098"),
+        ("UPDATE pu SET v = (($1)) WHERE id = 14", "65"),
+    ] {
+        c.run("", Some(sql), &[], &[Some(value)]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    c.run("", Some("INSERT INTO pu VALUES (15, 'z', 1) ON CONFLICT (id) DO UPDATE SET v = ($1)"), &[], &[Some("0098")])
+        .await
+        .expect("insert");
+    c.run("", Some("INSERT INTO pu VALUES (15, 'z', 1) ON CONFLICT (id) DO UPDATE SET v = ($1)"), &[], &[Some("0098")])
+        .await
+        .expect("upsert");
+    assert_eq!(
+        texts(c.simple("SELECT id, v FROM pu ORDER BY id").await),
+        [
+            ["1", "98"],
+            ["2", "10"],
+            ["3", "7"],
+            ["4", "2"],
+            ["5", "5"],
+            ["6", "6"],
+            ["7", "1.50"],
+            ["8", "-7"],
+            ["9", "7"],
+            ["10", "98"],
+            ["11", "-1.50"],
+            ["12", "2"],
+            ["13", "0098"],
+            ["14", "65"],
+            ["15", "0098"]
+        ]
+    );
+    let found = c.run("", Some("SELECT id FROM pu WHERE v = ($1) ORDER BY id"), &[], &[Some("0098")]).await.expect("select");
+    assert_eq!(texts(found), [["13"], ["15"]]);
+}

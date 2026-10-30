@@ -4197,6 +4197,20 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
             db_type: DbType::STRING,
         });
     }
+    // Any other value bound for a text column is its text, PostgreSQL's
+    // assignment cast to a string type. Its bytes were copied into the slot:
+    // `SET v = n + 1` stored the integer's four bytes, `SET v = (1e1)` a
+    // decimal's sixteen, and `SET v = (65)` read back as 'A'.
+    if matches!(field.db_type, DbType::STRING | DbType::CHAR) {
+        match &value {
+            Value::Data { db_type: DbType::STRING | DbType::CHAR, .. } | Value::Null => {}
+            Value::Data { db_type: DbType::BOOL, bytes } => {
+                let text = if bytes.first().copied().unwrap_or(0) != 0 { "true" } else { "false" };
+                return Ok(Value::Data { bytes: text.as_bytes().to_vec(), db_type: DbType::STRING });
+            }
+            Value::Data { .. } => return cast(value, &DbType::STRING),
+        }
+    }
     // Text bound for a number, a boolean or a UUID is read as one, or refused
     // as that type's input refuses it. Its bytes were copied into the slot:
     // `SET b = '5' || ''` stored 53, the code of the character `5`, and a

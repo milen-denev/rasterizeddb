@@ -442,17 +442,29 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
             set(n, Some(INT8), &mut oids);
             continue;
         }
+        // A parameter alone in parentheses stands where they do:
+        // `SET v = ($1)`, `WHERE v = (($1))` (not a call's argument, `f($1)`).
+        let (mut lo, mut hi) = (i, i);
+        while lo > 0
+            && toks.get(lo - 1) == Some(&Tok::Open)
+            && toks.get(hi + 1) == Some(&Tok::Close)
+            && !(lo >= 2 && matches!(toks[lo - 2], Tok::Ident(..)) && !is_comparison(&toks[lo - 2]))
+        {
+            lo -= 1;
+            hi += 1;
+        }
+        let before = |k: usize| lo.checked_sub(k).and_then(|j| toks.get(j));
         // `col <op> $n`, `col NOT LIKE $n`.
-        if prev(1).is_some_and(is_comparison) {
-            let col = if prev(2).is_some_and(|p| p.keyword("NOT")) { prev(3) } else { prev(2) };
+        if before(1).is_some_and(is_comparison) {
+            let col = if before(2).is_some_and(|p| p.keyword("NOT")) { before(3) } else { before(2) };
             if let Some(oid) = column_at(database, &rel, col) {
                 set(n, Some(oid), &mut oids);
                 continue;
             }
         }
         // `$n <op> col`.
-        if toks.get(i + 1).is_some_and(is_comparison) {
-            if let Some(oid) = column_at(database, &rel, toks.get(i + 2)) {
+        if toks.get(hi + 1).is_some_and(is_comparison) {
+            if let Some(oid) = column_at(database, &rel, toks.get(hi + 2)) {
                 set(n, Some(oid), &mut oids);
                 continue;
             }
