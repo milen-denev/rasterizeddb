@@ -1488,19 +1488,32 @@ pub fn insert_row_with_defaults(
                 mb.into_slice_mut().copy_from_slice(&bytes);
                 mb
             } else if let Some(data) =
-                crate::core::rql::column_default::expression_for(&field.name, defaults)
+                match crate::core::rql::column_default::expression_for(&field.name, defaults)
                     .and_then(|e| {
                         crate::core::rql::column_default::evaluate(e, &field.db_type, database).ok()
                     })
                     .filter(|literal| literal != "NULL")
-                    .and_then(|literal| {
-                        value_to_mb_scaled(
-                            &literal,
-                            &literal_type_for(&literal, field),
-                            declared_scale(&field.name, modifiers),
-                            crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
-                        )
-                    })
+                {
+                    None => None,
+                    // A default the column cannot hold refuses the row, as the
+                    // same value written in VALUES does. It fell through to the
+                    // filler below: `INT DEFAULT 1.5` stored 0, reported as an
+                    // insert.
+                    Some(literal) => match value_to_mb_scaled(
+                        &literal,
+                        &literal_type_for(&literal, field),
+                        declared_scale(&field.name, modifiers),
+                        crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
+                    ) {
+                        Some(data) => Some(data),
+                        None => {
+                            if REFUSAL.with(|r| r.borrow().is_none()) {
+                                note_refusal(&field.name, &field.db_type, &literal);
+                            }
+                            return None;
+                        }
+                    },
+                }
             {
                 // The column was omitted but has a default, evaluated now — so
                 // `DEFAULT CURRENT_TIMESTAMP` is the time of this insert rather

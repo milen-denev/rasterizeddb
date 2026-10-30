@@ -102,13 +102,47 @@ async fn update_upsert_and_default_render_it_too() {
     );
 
     // PostgreSQL 17: `DEFAULT 1e1` and `DEFAULT +9` on text columns store
-    // '10' and '9', omitted or written as DEFAULT.
-    run(&c, "CREATE TABLE d (k INT, a TEXT DEFAULT 1e1, b TEXT DEFAULT +9, n INT DEFAULT 1e1)").await;
+    // '10' and '9', omitted or written as DEFAULT. (A number column's
+    // default keeps the plain spellings only: see the test below.)
+    run(&c, "CREATE TABLE d (k INT, a TEXT DEFAULT 1e1, b TEXT DEFAULT +9)").await;
     run(&c, "INSERT INTO d (k) VALUES (1)").await;
-    run(&c, "INSERT INTO d VALUES (2, DEFAULT, DEFAULT, DEFAULT)").await;
+    run(&c, "INSERT INTO d VALUES (2, DEFAULT, DEFAULT)").await;
     assert_eq!(
         pairs(&c, "SELECT a, b FROM d ORDER BY k").await,
         [("10", "9"), ("10", "9")].map(|(a, b)| (a.to_string(), b.to_string()))
     );
-    assert_eq!(pairs(&c, "SELECT k, n FROM d ORDER BY k").await, [("1", "10"), ("2", "10")].map(|(a, b)| (a.to_string(), b.to_string())));
+}
+
+/// A number default a column cannot hold is refused, when the table is
+/// created or when a row needs it, never stored as zero. These spellings
+/// stored 0 on every insert that left the column out (PostgreSQL 17 stores 2
+/// for `INT DEFAULT 1.5`, refuses the others with 22003; refusing the first
+/// too is loud where storing 0 was not).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_number_default_the_column_cannot_hold_is_never_a_zero() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    for (i, decl) in [
+        "INT DEFAULT 1.5e0",
+        "INT DEFAULT 1e10",
+        "SMALLINT DEFAULT 1e5",
+        "SMALLINT DEFAULT 100000",
+        "DOUBLE PRECISION DEFAULT 1e400",
+        "NUMERIC(5,2) DEFAULT 1e10",
+        "NUMERIC(5,2) DEFAULT 10000000000",
+        "INT DEFAULT 1.5",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let t = format!("dz{i}");
+        if c.simple_query(&format!("CREATE TABLE {t} (k INT, a {decl})")).await.is_err() {
+            continue;
+        }
+        let stored = c.simple_query(&format!("INSERT INTO {t} (k) VALUES (1)")).await;
+        if stored.is_ok() {
+            let got = pairs(&c, &format!("SELECT k, a FROM {t}")).await;
+            panic!("{decl}: the insert stored {got:?}");
+        }
+    }
 }

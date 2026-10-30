@@ -254,7 +254,43 @@ pub fn evaluate(expression: &str, db_type: &DbType, database: u64) -> Result<Str
 /// row got 2 — and the declaration has no database whose sequence it could
 /// rightly take one from anyway.
 pub fn validate(expression: &str, db_type: &DbType) -> Result<(), String> {
-    evaluate_in(expression, db_type, None).map(|_| ())
+    let literal = evaluate_in(expression, db_type, None)?;
+    // A number column's constant default has to be one the column can hold:
+    // `SMALLINT DEFAULT 100000` or `INT DEFAULT 1.5` was accepted here, and
+    // every insert leaving the column out then stored zero. PostgreSQL rounds
+    // a fraction into an integer column; this refuses it, loudly, until it
+    // does too.
+    let number = matches!(
+        db_type,
+        DbType::I8
+            | DbType::I16
+            | DbType::I32
+            | DbType::I64
+            | DbType::I128
+            | DbType::U8
+            | DbType::U16
+            | DbType::U32
+            | DbType::U64
+            | DbType::U128
+            | DbType::F32
+            | DbType::F64
+            | DbType::DECIMAL
+    );
+    if number && !literal.is_empty() && !literal.eq_ignore_ascii_case("NULL") {
+        let field = crate::core::row::schema::SchemaField::new(String::new(), db_type.clone(), db_type.get_size(), 0, 0, false);
+        let encoded = crate::core::rql::lexer_ir::encode_column_value(&literal, &field, &[]);
+        let refusal = crate::core::rql::lexer_ir::take_refusal();
+        if encoded.is_none_or(|block| block.into_slice().is_empty()) {
+            return Err(format!(
+                "invalid DEFAULT {}: {}",
+                expression.trim(),
+                refusal
+                    .map(|r| r.trim_end_matches(" for column \"\"").to_string())
+                    .unwrap_or_else(|| crate::core::value_codec::refusal_message(db_type, &literal))
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`evaluate`], or with `database` absent [`validate`].
@@ -366,16 +402,19 @@ fn evaluate_in(
     // column (`numeric_constant_text`): `DEFAULT +9` is '9', `DEFAULT 1e1`
     // '10'. Written as spelled, `+9` was stored as '+9', and an exponent was
     // refused here outright.
-    let rendered = crate::core::value_codec::numeric_constant_text(text);
+    //
+    // Only a text column takes a spelling past the plain one (an exponent,
+    // hex, `_`): a number column read `DEFAULT 1.5e0` or `1e10` with an
+    // encoder that refused it, and the row was filled with zero.
+    let rendered = crate::core::value_codec::numeric_constant_text(text)
+        .filter(|_| matches!(db_type, DbType::STRING | DbType::CHAR));
     if plain || rendered.is_some() {
         // A number defaulting a text column is written as text.
         return Ok(
-            if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB) {
+            if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB | DbType::CHAR) {
                 format!("'{}'", rendered.as_deref().unwrap_or(text))
-            } else if plain {
-                text.to_string()
             } else {
-                rendered.unwrap_or_else(|| text.to_string())
+                text.to_string()
             },
         );
     }
