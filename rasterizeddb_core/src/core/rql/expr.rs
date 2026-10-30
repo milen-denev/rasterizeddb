@@ -2078,7 +2078,9 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
 /// already typed.
 fn unify_literal_types(args: &mut [Expr]) {
     let target = args.iter().find_map(|a| match a {
-        Expr::Column(field) if field.db_type != DbType::STRING => Some(field.db_type.clone()),
+        // `literal_type`: beside a `timestamp` column a literal's zone is
+        // discarded, as the column reads one (`coalesce(a, '… 10:00+02')`).
+        Expr::Column(field) if field.db_type != DbType::STRING => Some(field.literal_type()),
         Expr::Cast(_, db_type) if *db_type != DbType::STRING => Some(db_type.clone()),
         _ => None,
     });
@@ -2096,7 +2098,8 @@ fn unify_literal_types(args: &mut [Expr]) {
             crate::core::value_codec::encode_literal(&target, text.trim_matches('\''))
         {
             *bytes = encoded;
-            *db_type = target.clone();
+            // A `timestamp` value is stored as the `DATETIME` it is.
+            *db_type = if target == DbType::TIMESTAMP { DbType::DATETIME } else { target.clone() };
         }
     }
 }
@@ -4129,6 +4132,16 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
                 || field.db_type == DbType::STRING;
             if !convertible {
                 return Err(mismatch());
+            }
+            // Text bound for a `timestamp` (without time zone) column is read
+            // as that column reads a literal, its zone discarded: `SET a =
+            // CASE … THEN '… 10:00+02' END` stored 08:00 where the same
+            // literal written directly, and PostgreSQL, store 10:00.
+            if *from == DbType::STRING && field.literal_type() == DbType::TIMESTAMP {
+                let text = as_text(&value);
+                return crate::core::value_codec::encode_literal(&DbType::TIMESTAMP, text.trim())
+                    .map(|bytes| Value::Data { bytes, db_type: DbType::DATETIME })
+                    .ok_or_else(mismatch);
             }
             return cast(value.clone(), &field.db_type).map_err(|_| mismatch());
         }

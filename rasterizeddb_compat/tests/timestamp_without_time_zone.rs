@@ -330,3 +330,16 @@ async fn a_cast_or_type_name_on_a_literal_decides_how_its_zone_is_read() {
     assert_eq!(e.code().map(|c| c.code()), Some("23514"), "{e}");
     run(&c, "INSERT INTO td (k, c) VALUES (3, '2024-01-01 03:00:00')").await.expect("within the check");
 }
+
+/// An expression's text assigned by UPDATE is read as the column reads a
+/// literal: PostgreSQL 17 stores 10:00 for each.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_updates_expression_reads_its_text_as_the_column_does() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tu (k INT NOT NULL, a TIMESTAMP)").await.expect("create");
+    run(&c, "INSERT INTO tu VALUES (1, '2020-01-01 00:00:00'), (2, NULL)").await.expect("insert");
+    run(&c, "UPDATE tu SET a = CASE WHEN k = 1 THEN '2024-05-05 10:00:00+02' ELSE a END").await.expect("case");
+    run(&c, "UPDATE tu SET a = coalesce(a, '2024-06-06 10:00:00+02') WHERE k = 2").await.expect("coalesce");
+    assert_eq!(walls(column(&c, "SELECT a FROM tu ORDER BY k").await), ["2024-05-05 10:00:00", "2024-06-06 10:00:00"]);
+}
