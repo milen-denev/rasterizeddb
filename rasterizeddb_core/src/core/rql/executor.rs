@@ -17450,8 +17450,12 @@ pub(crate) async fn execute_with_need(
             // the write to take its own, as before.
             let foreign_keys_read =
                 update_needs_statement_snapshot(&database, &table.schema, &table_name, &update_plan);
-            let statement_visibility = statement_snapshot_for(depth, || table.statement_visibility(tx))
-                .or_else(|| foreign_keys_read.then(|| table.visibility_for(tx)));
+            // With no foreign-key work, the target's snapshot is settled under
+            // its write lock (`statement_visibility_deferred`).
+            let statement_visibility = statement_snapshot_for(depth, || {
+                if foreign_keys_read { table.statement_visibility(tx) } else { table.statement_visibility_deferred(tx) }
+            })
+            .or_else(|| foreign_keys_read.then(|| table.visibility_for(tx)));
             // What the foreign-key work reads under: only when it has any.
             let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
             let target = crate::core::database::Relation::Plain(table.clone());
@@ -17888,8 +17892,10 @@ pub(crate) async fn execute_with_need(
             // deletes must be the same rows. See `keys_about_to_be_deleted`.
             // Or the one its reads took, when it read first (a subquery).
             let referenced = !referencing_keys(&database, &table_name).is_empty();
-            let statement_visibility = statement_snapshot_for(depth, || table.statement_visibility(tx))
-                .or_else(|| referenced.then(|| table.visibility_for(tx)));
+            let statement_visibility = statement_snapshot_for(depth, || {
+                if referenced { table.statement_visibility(tx) } else { table.statement_visibility_deferred(tx) }
+            })
+            .or_else(|| referenced.then(|| table.visibility_for(tx)));
             match match statement_visibility.as_ref().filter(|_| referenced) {
                 Some(visibility) => {
                     keys_about_to_be_deleted(

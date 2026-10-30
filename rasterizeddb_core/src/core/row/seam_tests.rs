@@ -43,6 +43,7 @@ const SCHEMA_ONLY: &[&str] = &[
     // The snapshot a write's statement read under (`statement_snapshot::
     // kept`): on `Table`, none on its data.
     "statement_visibility",
+    "statement_visibility_deferred",
     "cache_generation",
     "write_generation",
     "visibility_now_for",

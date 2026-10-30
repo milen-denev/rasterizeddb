@@ -48,6 +48,18 @@ struct Reads {
     /// known about what changed since, and the target keeps the reads'
     /// snapshot ([`target_visibility`]).
     tables: Option<Vec<Arc<AtomicU64>>>,
+    /// A target whose snapshot is settled under its table's write lock
+    /// ([`defer_target`], [`settle_target`]).
+    pending: Option<Pending>,
+}
+
+/// What [`settle_target`] needs: the target (by its `max_writer`), the
+/// transaction writing it, and the reads' snapshot and tables.
+struct Pending {
+    target: Arc<AtomicU64>,
+    tx: crate::core::mvcc::TxId,
+    read: Visibility,
+    tables: Vec<Arc<AtomicU64>>,
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +72,7 @@ tokio::task_local! {
 }
 
 fn fresh_reads() -> parking_lot::Mutex<Reads> {
-    parking_lot::Mutex::new(Reads { snapshots: smallvec::SmallVec::new(), tables: Some(Vec::new()) })
+    parking_lot::Mutex::new(Reads { snapshots: smallvec::SmallVec::new(), tables: Some(Vec::new()), pending: None })
 }
 
 /// Runs `f` with one snapshot for all its reads.
@@ -200,6 +212,54 @@ pub fn target_visibility(
         Some(now)
     } else {
         Some(read)
+    }
+}
+
+/// [`target_visibility`] for a target that takes its snapshot under its
+/// own write lock, as a plain write does: when the statement read first and
+/// its tables are known, the choice is left to [`settle_target`], made once
+/// the table has taken its snapshot under the lock, and this answers `true`
+/// (the caller passes no snapshot). Taken before the lock, a fresh snapshot
+/// still let a writer of the same row commit between it and the scan (19%
+/// of a CTE-fed `UPDATE` in a block failed against a tight-loop
+/// incrementer). `false`: nothing deferred, and the caller asks
+/// [`target_visibility`].
+pub fn defer_target(manager: &Arc<TransactionManager>, tx: crate::core::mvcc::TxId, target: &Arc<AtomicU64>) -> bool {
+    let Some(read) = kept(manager, tx) else { return false };
+    READ.try_with(|r| {
+        let mut r = r.lock();
+        let Some(tables) = r.tables.clone() else { return false };
+        r.pending = Some(Pending { target: target.clone(), tx, read, tables });
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// The snapshot a target deferred by [`defer_target`] scans under, given
+/// `fresh`, the one its table just took under its write lock: `fresh` when
+/// nothing the statement read was written since the reads' snapshot (as in
+/// [`target_visibility`]), else the reads'. `fresh` itself for any other
+/// write (another table, another transaction, nothing deferred). Taken once.
+pub fn settle_target(target: &Arc<AtomicU64>, tx: crate::core::mvcc::TxId, fresh: Visibility) -> Visibility {
+    if !in_write_scope() {
+        return fresh;
+    }
+    let pending = READ
+        .try_with(|r| {
+            let mut r = r.lock();
+            match &r.pending {
+                Some(p) if Arc::ptr_eq(&p.target, target) && p.tx == tx => r.pending.take(),
+                _ => None,
+            }
+        })
+        .ok()
+        .flatten();
+    let Some(pending) = pending else { return fresh };
+    let Visibility::AsOf { snapshot, .. } = &pending.read else { return pending.read };
+    if pending.tables.iter().all(|writer| writer.load(Ordering::SeqCst) < snapshot.xmin) {
+        fresh
+    } else {
+        pending.read
     }
 }
 

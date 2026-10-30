@@ -2052,6 +2052,26 @@ impl<S: StorageIO> Table<S> {
     /// described ([`crate::core::rql::statement_snapshot::kept`]). `None`
     /// for an unversioned table and for a statement that read nothing yet,
     /// whose write takes its own under the write lock.
+    /// [`Self::statement_visibility`] for a write that takes its snapshot
+    /// under the write lock and needs none before it (no foreign-key work):
+    /// the choice is deferred to the lock ([`Self::target_visibility_under_lock`]),
+    /// and `None` comes back, unless the reads' tables are unknown.
+    pub fn statement_visibility_deferred(&self, tx: TxId) -> Option<Visibility> {
+        let versions = self.versions.load();
+        let manager = versions.as_ref()?;
+        if crate::core::rql::statement_snapshot::defer_target(manager, tx, &self.max_writer) {
+            return None;
+        }
+        crate::core::rql::statement_snapshot::target_visibility(manager, tx, || self.visibility_for(tx))
+    }
+
+    /// The snapshot a write scans under when its caller passed none: taken
+    /// now, under the write lock, and settled against a deferred target
+    /// (`statement_snapshot::settle_target`).
+    fn target_visibility_under_lock(&self, tx: TxId) -> Visibility {
+        crate::core::rql::statement_snapshot::settle_target(&self.max_writer, tx, self.visibility_for(tx))
+    }
+
     pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
         let versions = self.versions.load();
         let manager = versions.as_ref()?;
@@ -4948,7 +4968,7 @@ impl<S: StorageIO> Table<S> {
         // row: a visible matching row silently not deleted. Taken first, the
         // snapshot either predates the commit, so the row is invisible and
         // leaving it out is right, or follows it, so its entry landed first.
-        let visibility = visibility.unwrap_or_else(|| self.visibility_for(deleted_by));
+        let visibility = visibility.unwrap_or_else(|| self.target_visibility_under_lock(deleted_by));
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
@@ -5344,7 +5364,7 @@ impl<S: StorageIO> Table<S> {
         // row: a visible matching row silently not updated. Taken first, the
         // snapshot either predates the commit, so the row is invisible and
         // leaving it out is right, or follows it, so its entry landed first.
-        let visibility = visibility.unwrap_or_else(|| self.visibility_for(written_by));
+        let visibility = visibility.unwrap_or_else(|| self.target_visibility_under_lock(written_by));
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
