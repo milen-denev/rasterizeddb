@@ -584,10 +584,19 @@ pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Ve
     let db = db.clone();
     let table = table.to_string();
     block_on_big(async move {
+        // Partitions this read opens (phase 3 P5b: a closed one opens on
+        // demand) are closed again once read, so the reader leaves the open
+        // set as it found it, and no instance keeps a task of this short
+        // runtime's.
+        let mut reopened: Vec<(rclite::Arc<rasterizeddb_core::core::partition::table::PartitionedTable>, Vec<u32>)> =
+            Vec::new();
         let (schema, parts) = match db.partitioned_table(&table) {
             Some(pt) => {
+                let was_open: Vec<u32> = pt.open_partitions_now().into_iter().map(|(pid, _)| pid).collect();
                 let epoch = pt.epoch().expect("the partitioned table opens");
                 let parts = pt.materialized(&epoch, &Route::All).await.expect("its partitions");
+                let opened = parts.iter().map(|(pid, _)| *pid).filter(|pid| !was_open.contains(pid)).collect();
+                reopened.push((pt.clone(), opened));
                 (pt.shell().schema.clone(), parts)
             }
             None => {
@@ -625,6 +634,11 @@ pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Ve
                 .collect();
             stored.sort();
             out.push((pid, stored));
+        }
+        for (pt, opened) in reopened {
+            for pid in opened {
+                pt.close_partition(pid).await.expect("closing a partition the read opened");
+            }
         }
         out
     })

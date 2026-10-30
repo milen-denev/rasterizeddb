@@ -53,16 +53,11 @@ fn count(out: &[u8]) -> usize {
     crate::core::row::row::vec_into_rows(&out[1..]).unwrap_or_default().len()
 }
 
-/// Every materialized partition's open instance. Nothing in these tests
-/// closes one, so every materialized partition is open (a schema change
-/// reopens the open set); asserted, so a closed one never drops out of a
-/// check unnoticed.
-fn partitions(db: &Database, name: &str) -> Vec<(u32, Arc<DbTable>)> {
+/// Every materialized partition's instance, each opened if it is closed
+/// (after a restart none is open).
+async fn partitions(db: &Database, name: &str) -> Vec<(u32, Arc<DbTable>)> {
     let pt = db.partitioned_table(name).expect("a partitioned table");
-    let open = pt.open_partitions_now();
-    let pids: Vec<u32> = open.iter().map(|(pid, _)| *pid).collect();
-    assert_eq!(pids, pt.materialized_pids().expect("it opens"), "a materialized partition of {name} is closed");
-    open
+    pt.all_partitions().await.expect("its partitions")
 }
 
 /// The schema a client can tell apart: names, types, write orders,
@@ -85,11 +80,11 @@ fn schema_text(schema: &crate::core::row::schema::TableSchema) -> String {
 
 /// Every open partition holds the shell's schema, and none of `old` is
 /// still open: each was retired and replaced.
-fn assert_one_schema(db: &Database, name: &str, old: &[(u32, Arc<DbTable>)], at: &str) -> Vec<(u32, Arc<DbTable>)> {
+async fn assert_one_schema(db: &Database, name: &str, old: &[(u32, Arc<DbTable>)], at: &str) -> Vec<(u32, Arc<DbTable>)> {
     let pt = db.partitioned_table(name).expect("a partitioned table");
     assert!(pt.broken().is_none(), "{at}: {:?}", pt.broken());
     let shell = schema_text(&pt.shell().schema);
-    let now = partitions(db, name);
+    let now = partitions(db, name).await;
     assert_eq!(
         now.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
         old.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
@@ -148,12 +143,12 @@ async fn a_schema_change_reopens_every_open_partition_under_one_schema() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let db = populated(d).await;
-    let before = partitions(&db, "pt");
+    let before = partitions(&db, "pt").await;
     assert!(before.len() >= 3 && before.len() < 8, "{} partitions open", before.len());
 
     let (generation0, shape, slot) = (generation(&db), db.shape_epoch(), db.slot_shape_epoch("pt"));
     exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
-    let after = assert_one_schema(&db, "pt", &before, "CREATE INDEX");
+    let after = assert_one_schema(&db, "pt", &before, "CREATE INDEX").await;
     assert_eq!(generation(&db), generation0 + 2, "schema_generation moves once per DDL, never per partition");
     assert_eq!((db.shape_epoch(), db.slot_shape_epoch("pt")), (shape, slot), "an index keeps the shape");
     for (pid, part) in &after {
@@ -161,7 +156,7 @@ async fn a_schema_change_reopens_every_open_partition_under_one_schema() {
     }
 
     exec(&db, "ALTER TABLE pt ADD CONSTRAINT pt_c CHECK (v >= 0)").await;
-    let after = assert_one_schema(&db, "pt", &after, "ADD CHECK");
+    let after = assert_one_schema(&db, "pt", &after, "ADD CHECK").await;
     for tenant in 1..=5 {
         let refused = try_exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, 1000, -1)")).await;
         assert!(refused.is_err(), "tenant {tenant}: a row breaking the new CHECK was stored");
@@ -169,7 +164,7 @@ async fn a_schema_change_reopens_every_open_partition_under_one_schema() {
 
     let (generation0, shape, slot) = (generation(&db), db.shape_epoch(), db.slot_shape_epoch("pt"));
     exec(&db, "ALTER TABLE pt RENAME COLUMN v TO w").await;
-    let after = assert_one_schema(&db, "pt", &after, "RENAME COLUMN");
+    let after = assert_one_schema(&db, "pt", &after, "RENAME COLUMN").await;
     assert_eq!(generation(&db), generation0 + 2);
     assert!(db.shape_epoch() > shape, "a renamed column must move the shape epoch");
     assert_ne!(db.slot_shape_epoch("pt"), slot, "a renamed column must move the table's shape epoch");
@@ -180,13 +175,13 @@ async fn a_schema_change_reopens_every_open_partition_under_one_schema() {
 
     // A partition materialized after the change takes the new schema.
     let mut tenant = 6;
-    while partitions(&db, "pt").len() == after.len() {
+    while partitions(&db, "pt").await.len() == after.len() {
         exec(&db, &format!("INSERT INTO pt (tenant_id, id, w) VALUES ({tenant}, 1, 5)")).await;
         tenant += 1;
         assert!(tenant < 200, "no new partition materialized");
     }
     let shell = schema_text(&db.partitioned_table("pt").unwrap().shell().schema);
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         assert_eq!(schema_text(&part.schema), shell, "partition {pid}");
         assert!(index_names(&part).await.iter().any(|n| n == "pt_v"), "partition {pid} has no pt_v");
     }
@@ -205,7 +200,7 @@ async fn validation_reads_every_partition() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let db = populated(d).await;
-    let parts = partitions(&db, "pt");
+    let parts = partitions(&db, "pt").await;
     // One tenant per open partition.
     let mut tenants: Vec<(u32, i64)> = Vec::new();
     for tenant in 1..=5i64 {
@@ -292,7 +287,7 @@ async fn a_partition_snapshot_from_before_a_schema_change_is_never_loaded_after_
     let _snap = storage_override::set(d, IndexStorage::Snapshot);
     {
         let db = populated(d).await;
-        for (_, part) in partitions(&db, "pt") {
+        for (_, part) in partitions(&db, "pt").await {
             settled(&part).await;
         }
         let report = db.seal_for_shutdown(Duration::from_secs(60)).await;
@@ -300,20 +295,20 @@ async fn a_partition_snapshot_from_before_a_schema_change_is_never_loaded_after_
         close(d, db);
     }
     let db = open(d).await;
-    let parts = partitions(&db, "pt");
+    let parts = partitions(&db, "pt").await;
     for (pid, part) in &parts {
         settled(part).await;
         assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid} did not load before the change");
     }
     exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         settled(&part).await;
         assert_ne!(part.index_origin(), Origin::Loaded, "partition {pid} loaded a snapshot from before CREATE INDEX");
     }
     // A crash: no shutdown seal. The snapshots on disk are the old ones.
     close(d, db);
     let db = open(d).await;
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         settled(&part).await;
         assert_ne!(part.index_origin(), Origin::Loaded, "partition {pid} loaded a stale snapshot after a crash");
         assert!(index_names(&part).await.iter().any(|n| n == "pt_v"), "partition {pid} has no pt_v");
@@ -328,7 +323,7 @@ async fn a_partition_snapshot_from_before_a_schema_change_is_never_loaded_after_
     assert!(report.skipped.is_empty() && report.sealed.iter().all(|s| s.outcome.is_clean()));
     close(d, db);
     let db = open(d).await;
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         settled(&part).await;
         assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid} did not load under the new shape");
     }
@@ -351,7 +346,7 @@ async fn a_swapped_index_never_loads_the_old_index_sections() {
     {
         let db = populated(d).await;
         exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
-        for (_, part) in partitions(&db, "pt") {
+        for (_, part) in partitions(&db, "pt").await {
             settled(&part).await;
         }
         let report = db.seal_for_shutdown(Duration::from_secs(60)).await;
@@ -359,18 +354,18 @@ async fn a_swapped_index_never_loads_the_old_index_sections() {
         close(d, db);
     }
     let db = open(d).await;
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         settled(&part).await;
         assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid} did not load before the change");
     }
     exec(&db, "DROP INDEX pt_v").await;
     exec(&db, "CREATE INDEX pt_s ON pt (s)").await;
-    for (_, part) in partitions(&db, "pt") {
+    for (_, part) in partitions(&db, "pt").await {
         settled(&part).await;
     }
     close(d, db);
     let db = open(d).await;
-    for (pid, part) in partitions(&db, "pt") {
+    for (pid, part) in partitions(&db, "pt").await {
         settled(&part).await;
         assert_ne!(part.index_origin(), Origin::Loaded, "partition {pid} loaded the sections of a dropped index");
     }

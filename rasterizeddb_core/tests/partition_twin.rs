@@ -30,7 +30,11 @@
 //! that stops diverging fails the test, so it is removed with the fix.
 //!
 //! Midway through each run the server restarts (the database is closed and
-//! reopened from its directory). At the end the partitioned table must be the
+//! reopened from its directory; since phase 3 P5b no partition opens until a
+//! statement reaches it). `ClosePartitions` closes a seeded subset of the
+//! idle partitions between statements and inside blocks, and the `few_open`
+//! configurations keep at most [`FEW_OPEN`] open after every statement, so
+//! reads, writes, sweeps and schema changes run through reopened partitions. At the end the partitioned table must be the
 //! same one, its shell still in `Database.tables`, and no file named after it
 //! in the directory (I8).
 //!
@@ -240,6 +244,11 @@ enum Kind {
     // A partition left unswept must keep its aborted rows hidden, so any
     // resurrection shows as rows the twin does not have.
     ForgetSweep,
+    // Phase 3 P5b (§7.2): close a seeded subset of the partitioned table's
+    // idle partitions (and every idle one of the other partitioned tables),
+    // exclusively; the next statement reaching one reopens it. Also inside
+    // blocks, where a partition the block wrote stays open (its ticket).
+    ClosePartitions,
 }
 
 use Kind::*;
@@ -267,7 +276,7 @@ const ALL_KINDS: &[Kind] = &[
     DropDefault, SetNotNull, DropNotNull, DropNotNullKey, RenameColumnRoundTrip, RenameKeyRoundTrip,
     RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, ForeignKeyFromT,
     ForeignKeyOntoPartitioned, ForeignKeyFromSink, PreparedSelectAcrossAlter,
-    TxCommit, TxRollback, Restart, ForgetSweep,
+    TxCommit, TxRollback, Restart, ForgetSweep, ClosePartitions,
 ];
 
 /// A kind the partitioned table refuses today: the SQLSTATE the refusal
@@ -390,7 +399,14 @@ const IDS: i64 = 30;
 struct Config {
     key: &'static [&'static str],
     partitions: u32,
+    /// Phase 3 P5b: after every statement, close every idle partition of
+    /// each partitioned table once more than [`FEW_OPEN`] are open, so the
+    /// run reads and writes through reopened partitions throughout.
+    few_open: bool,
 }
+
+/// What a [`Config::few_open`] run keeps open between statements, at most.
+const FEW_OPEN: usize = 3;
 
 /// Each side's names: `{t}` the table under test, `{d}` a dimension table
 /// (keyed by tenant, so `UPDATE {d} … FROM {t}` can write each row back),
@@ -466,6 +482,9 @@ enum Step {
     Restart,
     /// [`ForgetSweep`]: the bits of the value pick which partitions sweep.
     ForgetSweep(u64),
+    /// [`ClosePartitions`]: the bits of the value pick which of the table's
+    /// idle partitions close (bit `pid % 64`).
+    ClosePartitions(u64),
 }
 
 struct Op {
@@ -1656,6 +1675,7 @@ impl Gen {
             }
             Restart => Op { kind, step: Step::Restart, ordered: false },
             ForgetSweep => Op { kind, step: Step::ForgetSweep(self.rng.u64(..)), ordered: false },
+            ClosePartitions => Op { kind, step: Step::ClosePartitions(self.rng.u64(..)), ordered: false },
         }
     }
 
@@ -1748,7 +1768,7 @@ const BLOCK_KINDS: &[Kind] = &[
     SelectFunctionWhere, CountAll,
     Aggregates, ForUpdate, SkipLocked, ForUpdateNoWait, PreparedInsert, PreparedSelect, PreparedUpdate,
     InsertIntoSinkFromT, ReadSinkAndDim, Join, LeftJoin, JoinRouted, JoinPartitionedBoth, UpdateDimFromT, UpdateFrom,
-    DeleteUsing,
+    DeleteUsing, ClosePartitions,
 ];
 
 /// How often each kind is drawn after the first pass (which draws each once).
@@ -1758,6 +1778,7 @@ fn weight(kind: Kind) -> u32 {
         TxCommit | TxRollback => 4,
         Restart => 0,
         ForgetSweep => 1,
+        ClosePartitions => 2,
         CatalogColumns | CatalogTables | CatalogClass | CatalogStat | CatalogIndexes | Describe => 1,
         Vacuum | VacuumFull | Analyze => 1,
         CreateIndex | DropIndex | CreateUniqueIndex | DropUniqueIndex | UniqueWithoutKey | AddCheck | DropCheck
@@ -1877,6 +1898,7 @@ fn writes_t(kind: Kind) -> bool {
             | TxRollback
             | Restart
             | ForgetSweep
+            | ClosePartitions
             | CreateIndex
             | DropIndex
             | CreateUniqueIndex
@@ -2245,6 +2267,13 @@ impl Twin {
                 self.note(op.kind, &Verdict::Agreed { failed: false });
                 false
             }
+            Step::ClosePartitions(pick) => {
+                let db = self.server.as_ref().unwrap().db.clone();
+                let (closed, in_use) = close_partitions(&db, *pick);
+                self.log.push(format!("-- close partitions: closed {closed:?}, in use {in_use:?}"));
+                self.note(op.kind, &Verdict::Agreed { failed: false });
+                false
+            }
             Step::Restart => {
                 self.log.push("-- restart".into());
                 self.cp = None;
@@ -2263,12 +2292,58 @@ impl Twin {
     }
 }
 
+/// [`ClosePartitions`]: closes the partitioned table's idle partitions that
+/// `pick`'s bits choose (bit `pid % 64`), and every idle partition of the
+/// other partitioned tables. Returns the table's closed pids and those left
+/// open in use (held, or written by an open block).
+fn close_partitions(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, pick: u64) -> (Vec<u32>, Vec<u32>) {
+    use rasterizeddb_core::core::partition::table::Close;
+    let db = db.clone();
+    block_on_big(async move {
+        for name in db.table_names() {
+            if name != PART
+                && let Some(other) = db.partitioned_table(&name)
+            {
+                other.close_idle().await.expect("closing another partitioned table's partitions");
+            }
+        }
+        let (mut closed, mut in_use) = (Vec::new(), Vec::new());
+        if let Some(pt) = db.partitioned_table(PART) {
+            for (pid, _) in pt.open_partitions_now() {
+                if (pick >> (pid % 64)) & 1 == 0 {
+                    continue;
+                }
+                match pt.close_partition(pid).await.expect("a close") {
+                    Close::Closed => closed.push(pid),
+                    Close::InUse => in_use.push(pid),
+                    other => panic!("closing open partition {pid} answered {other:?}"),
+                }
+            }
+        }
+        (closed, in_use)
+    })
+}
+
+/// [`Config::few_open`]: closes every idle partition of each partitioned
+/// table that has more than [`FEW_OPEN`] open.
+fn keep_few_open(db: &rclite::Arc<rasterizeddb_core::core::database::Database>) {
+    let db = db.clone();
+    block_on_big(async move {
+        for name in db.table_names() {
+            if let Some(pt) = db.partitioned_table(&name)
+                && pt.open_count() > FEW_OPEN
+            {
+                pt.close_idle().await.expect("closing idle partitions");
+            }
+        }
+    })
+}
+
 /// [`ForgetSweep`]: ends enough transactions for the settle bound to pass
 /// every id so far, settles, sweeps every plain table and the partitions
 /// `pick`'s bits choose (bit `pid % 64`), and forgets. Returns the swept and
 /// the unswept pids, and the forgotten horizon.
 fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, pick: u64) -> (Vec<u32>, Vec<u32>, u64) {
-    use rasterizeddb_core::core::partition::Route;
     let db = db.clone();
     block_on_big(async move {
         for _ in 0..5_000 {
@@ -2294,8 +2369,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
         }
         let (mut swept, mut left) = (Vec::new(), Vec::new());
         if let Some(pt) = db.partitioned_table(PART) {
-            let epoch = pt.epoch().expect("the partitioned table opens");
-            for (pid, _) in pt.materialized(&epoch, &Route::All).await.expect("its partitions") {
+            // Closed ones too: a sweep opens a closed, pinned partition and
+            // closes it again after.
+            for pid in pt.materialized_pids().expect("its partitions") {
                 if (pick >> (pid % 64)) & 1 == 1 {
                     pt.sweep_pin_now(pid).await.expect("a partition's forget sweep");
                     swept.push(pid);
@@ -2484,6 +2560,9 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         };
         let op = generator.op(kind);
         twin.run(at, &op);
+        if cfg.few_open {
+            keep_few_open(&twin.server.as_ref().unwrap().db);
+        }
 
         if writes_t(kind) {
             twin.compare_storage(at, kind);
@@ -2576,22 +2655,37 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
 
 #[test]
 fn twin_hash_tenant_7() {
-    run_twin(Config { key: &["tenant_id"], partitions: 7 });
+    run_twin(Config { key: &["tenant_id"], partitions: 7, few_open: false });
 }
 
 #[test]
 fn twin_hash_tenant_64() {
-    run_twin(Config { key: &["tenant_id"], partitions: 64 });
+    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false });
 }
 
 #[test]
 fn twin_hash_tenant_grp_64() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64 });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false });
 }
 
 #[test]
 fn twin_hash_full_key_7() {
-    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7 });
+    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7, few_open: false });
+}
+
+/// Phase 3 P5b: many partitions, few open. 1024 declared, the tenants'
+/// partitions materialized, at most [`FEW_OPEN`] left open between
+/// statements, and the restart midway opening none: every statement reads
+/// and writes through partitions closed and reopened.
+#[test]
+fn twin_hash_tenant_1024_few_open() {
+    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: true });
+}
+
+/// The same over a two-level key, 64 partitions.
+#[test]
+fn twin_hash_tenant_grp_64_few_open() {
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true });
 }
 
 /// The two lists name each kind at most once, and only real kinds.

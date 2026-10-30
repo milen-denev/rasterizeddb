@@ -70,6 +70,8 @@ pub mod guard;
 #[cfg(test)]
 mod hash_source_tests;
 pub mod key;
+#[cfg(test)]
+mod lazy_tests;
 pub mod log;
 pub mod maintenance;
 pub mod map;
