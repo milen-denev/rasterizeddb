@@ -6982,6 +6982,7 @@ fn check_not_null(
     schema: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
     supplied: &[(String, String)],
     defaults: &[crate::core::rql::column_default::ColumnDefault],
+    generated: &[crate::core::rql::generated::GeneratedColumn],
     omitted_counts: bool,
 ) -> Result<(), String> {
     use crate::core::rql::nullable;
@@ -7002,12 +7003,31 @@ fn check_not_null(
             continue;
         }
 
+        // What a column with no value written takes: its default, which is
+        // NULL when it has none.
+        let defaulted = || {
+            crate::core::rql::column_default::expression_for(&field.name, defaults)
+                .is_some_and(|e| !e.trim().eq_ignore_ascii_case("NULL"))
+        };
         match supplied
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(&field.name))
         {
             Some((_, value)) => {
-                if value.trim().eq_ignore_ascii_case("NULL") {
+                // The keyword, or a constant that evaluates to NULL
+                // (`NULLIF(1, 1)`), which was stored as the type's zero.
+                if crate::core::rql::lexer_ir::written_null(value) {
+                    return Err(violation(&field.name));
+                }
+                // `DEFAULT` written for the column, in an INSERT or an
+                // UPDATE, is its default: NULL when it has none, which a
+                // NOT NULL column refuses (23502). Taken as a value, it
+                // stored `''` in a text key and `0` in an integer. A
+                // generated column's DEFAULT is its expression.
+                if value.trim().eq_ignore_ascii_case("DEFAULT")
+                    && crate::core::rql::generated::expression_for(&field.name, generated).is_none()
+                    && !defaulted()
+                {
                     return Err(violation(&field.name));
                 }
             }
@@ -8537,6 +8557,11 @@ fn supply_generated_values(
         }
         assignments.remove(position);
     }
+    // A column written as `DEFAULT` holds what it would hold left out: its
+    // default, which an expression reading it reads. Kept as the word, it
+    // reached the expression as text ("'DEFAULT' is neither a column nor a
+    // value").
+    assignments.retain(|(_, value)| !value.trim().eq_ignore_ascii_case("DEFAULT"));
 
     // What each column holds for this row: the literal written, or its default.
     //
@@ -8629,7 +8654,27 @@ fn supply_generated_values(
     }
 
     supplied_defaults.extend(computed);
-    let rewritten = match append_insert_values(&row_data.query, &supplied_defaults) {
+    // A column the statement wrote as `DEFAULT` and that is supplied here (a
+    // generated column, or a default an expression read) is taken out of the
+    // statement first. Appended beside the written `DEFAULT`, the column was
+    // named twice and the row builder kept the first: a generated column
+    // given `DEFAULT` stored 0 or NULL instead of its expression's value.
+    let written_default: Vec<String> = supplied_defaults
+        .iter()
+        .filter(|(name, _)| {
+            crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query)
+                .unwrap_or_default()
+                .iter()
+                .any(|(c, v)| c.eq_ignore_ascii_case(name) && v.trim().eq_ignore_ascii_case("DEFAULT"))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let base = if written_default.is_empty() {
+        Some(row_data.query.clone())
+    } else {
+        crate::core::rql::lexer_ir::without_insert_assignments(&row_data.query, &written_default)
+    };
+    let rewritten = match base.and_then(|base| append_insert_values(&base, &supplied_defaults)) {
         Some(sql) => sql,
         None => {
             return Some(Err(format!(
@@ -8696,6 +8741,65 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
         }
     }
     Ok(())
+}
+
+/// `UPDATE … SET c = DEFAULT`, with each such assignment of a column that is
+/// not generated replaced by what PostgreSQL replaces it with: the column's
+/// default expression, or NULL when it has none. `None` when the statement
+/// has no such assignment.
+///
+/// The update parser read the word as a value: a text column stored the
+/// seven characters `DEFAULT` and reported success, and an integer one was
+/// refused as 22P02. A NOT NULL column with no default is refused (23502)
+/// before this, by `check_not_null`, as NULL is. A generated column's
+/// `DEFAULT` is left for [`generated_update_statement`].
+fn default_update_statement(query: &QueryPurpose, schema: &crate::core::row::schema::TableSchema) -> Option<QueryPurpose> {
+    let QueryPurpose::UpdateRow(sql) = query else {
+        return None;
+    };
+    let defaulted = |column: &str, value: &str| {
+        value.trim().eq_ignore_ascii_case("DEFAULT")
+            && crate::core::rql::generated::expression_for(column, &schema.generated).is_none()
+    };
+    let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)?;
+    if !assignments.iter().any(|(column, value)| defaulted(column, value)) {
+        return None;
+    }
+    // Rebuilt as `generated_update_statement` rebuilds it, from the clause
+    // `assignments_of_update` reads.
+    let (head, returning) = match crate::core::rql::lexer_ir::returning_split(sql) {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (sql.as_str(), None),
+    };
+    let set_at = crate::core::rql::join::find_keyword(head, "SET", 0)?;
+    let body_at = set_at + "SET".len();
+    let end = crate::core::rql::join::find_keyword(head, "WHERE", body_at).unwrap_or(head.len());
+    let sets: Vec<String> = crate::core::rql::lexer_ct::split_definitions(&head[body_at..end])
+        .into_iter()
+        .map(|assignment| {
+            let mut parts = assignment.splitn(2, '=');
+            let written = parts.next().unwrap_or("").trim();
+            let column = written.trim_matches('"');
+            let value = parts.next().unwrap_or("").trim();
+            if defaulted(column, value) {
+                let default = crate::core::rql::column_default::expression_for(column, &schema.defaults)
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or("NULL");
+                format!("{} = {}", written, default)
+            } else {
+                assignment.trim().to_string()
+            }
+        })
+        .collect();
+    let rewritten = format!(
+        "{} SET {} {}{}",
+        head[..set_at].trim_end(),
+        sets.join(", "),
+        head[end..].trim_start(),
+        returning.map(|tail| format!(" RETURNING {}", tail)).unwrap_or_default()
+    );
+    recognize_query_purpose(rewritten.trim_end())
 }
 
 /// An `UPDATE` on a table with generated columns, checked and put in the shape
@@ -16557,6 +16661,7 @@ pub(crate) async fn insert_loaded_row(
         &schema.fields,
         assignments.as_deref().unwrap_or_default(),
         &schema.defaults,
+        &schema.generated,
         true,
     )
     .ok()?;
@@ -17006,6 +17111,7 @@ async fn insert_row_resolved(
         &schema.fields,
         &insert_assignments,
         &schema.defaults,
+        &schema.generated,
         true,
     ) {
         error!("{}", e);
@@ -17737,6 +17843,7 @@ pub(crate) async fn execute_with_need(
                             &table.schema.fields,
                             &assignments,
                             &table.schema.defaults,
+                            &table.schema.generated,
                             false,
                         ) {
                             error!("{}", e);
@@ -17812,14 +17919,17 @@ pub(crate) async fn execute_with_need(
             // shape the parser reads. The rewrite replaces `query` in place
             // rather than being re-dispatched, as the INSERT arm's does, so
             // the check sees only what the client wrote.
-            let generated_rewrite = match generated_update_statement(&query, &table.schema) {
+            // `SET c = DEFAULT` is the column's default, or NULL.
+            let default_rewrite = default_update_statement(&query, &table.schema);
+            let query = default_rewrite.as_ref().unwrap_or(&query);
+            let generated_rewrite = match generated_update_statement(query, &table.schema) {
                 Ok(rewrite) => rewrite,
                 Err(reason) => {
                     error!("{}", reason);
                     return ddl_error(&reason);
                 }
             };
-            let query = generated_rewrite.as_ref().unwrap_or(&query);
+            let query = generated_rewrite.as_ref().unwrap_or(query);
 
             // A JSON document assigned by an UPDATE is stored in the table
             // backing its column and the statement rewritten to carry the

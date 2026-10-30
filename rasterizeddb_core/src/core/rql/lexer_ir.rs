@@ -393,6 +393,32 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     })
 }
 
+/// Whether a value written in `VALUES` is NULL: the keyword, or a constant
+/// expression that evaluates to NULL (`NULLIF(1, 1)`, `NULL::text`).
+///
+/// The companion flag was set only for the keyword, so an expression that
+/// came out NULL was stored as the type's filler (`''`, `0`) and read back
+/// as that, not as NULL.
+pub(crate) fn written_null(value: &str) -> bool {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("NULL") {
+        return true;
+    }
+    if !(crate::core::rql::expr::needs_evaluation(value)
+        || crate::core::rql::lexer_query::looks_like_row_expression(value))
+    {
+        return false;
+    }
+    let empty = crate::core::row::row::Row {
+        position: 0,
+        length: 0,
+        columns: smallvec::SmallVec::new(),
+    };
+    crate::core::rql::expr::parse(value, &[])
+        .and_then(|expr| crate::core::rql::expr::eval(&expr, &empty, &[]))
+        .is_ok_and(|v| v.is_null())
+}
+
 /// Attempts to parse a QueryPurpose::InsertRow variant into a RowWrite object, using the provided schema.
 /// Returns None if the QueryPurpose is not InsertRow or parsing fails.
 /// Handles multi-line, whitespace, and trailing comma issues robustly.
@@ -431,6 +457,51 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
         return None;
     }
     Some(columns.into_iter().zip(values).collect())
+}
+
+/// The `INSERT` with the assignments of the columns in `names` taken out of
+/// its column list and its `VALUES` tuple, the rest of the statement as
+/// written; `None` when it does not have the shape
+/// [`assignments_of_insert`] reads, or that would leave no column.
+///
+/// For a value about to be supplied by the engine in place of the one
+/// written (a `DEFAULT` the engine computed), which appended beside it would
+/// name the column twice: the row builder kept the first, so the computed
+/// value was dropped and the written `DEFAULT` stored an empty value.
+pub fn without_insert_assignments(sql: &str, names: &[String]) -> Option<String> {
+    let (head, returning) = match returning_split(sql) {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (sql, None),
+    };
+    let columns_open = head.find('(')?;
+    let columns_close = matching_paren(head, columns_open)?;
+    let values_at = find_word(head, "VALUES", columns_close)?;
+    let values_open = head[values_at..].find('(')? + values_at;
+    let values_close = matching_paren(head, values_open)?;
+    let columns: Vec<&str> = head[columns_open + 1..columns_close].split(',').map(str::trim).collect();
+    let values = split_values(&head[values_open + 1..values_close]);
+    if columns.len() != values.len() {
+        return None;
+    }
+    let kept: Vec<(&str, String)> = columns
+        .into_iter()
+        .zip(values)
+        .filter(|(c, _)| !names.iter().any(|n| n.eq_ignore_ascii_case(c.trim_matches('"'))))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&head[..=columns_open]);
+    out.push_str(&kept.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", "));
+    out.push_str(&head[columns_close..=values_open]);
+    out.push_str(&kept.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(", "));
+    out.push_str(&head[values_close..]);
+    if let Some(returning) = returning {
+        out.push_str(" RETURNING ");
+        out.push_str(returning);
+    }
+    Some(out)
 }
 
 /// Index of the parenthesis closing the one at `open`, ignoring quoted text
@@ -1398,11 +1469,19 @@ pub fn insert_row_with_defaults(
                 // Set when the column it tracks was not supplied and has no
                 // default, or was supplied as NULL.
                 let tracked = &field.name[nullable::NULL_FLAG_PREFIX.len()..];
-                let is_null = match columns.iter().position(|c| c.eq_ignore_ascii_case(tracked)) {
-                    None => crate::core::rql::column_default::expression_for(tracked, defaults)
+                let defaulted_to_null = || {
+                    crate::core::rql::column_default::expression_for(tracked, defaults)
                         .map(|e| e.trim().eq_ignore_ascii_case("NULL"))
-                        .unwrap_or(true),
-                    Some(i) => values[i].trim().eq_ignore_ascii_case("NULL"),
+                        .unwrap_or(true)
+                };
+                let is_null = match columns.iter().position(|c| c.eq_ignore_ascii_case(tracked)) {
+                    None => defaulted_to_null(),
+                    // `DEFAULT` is what leaving the column out is: NULL when
+                    // the column has no default. Read as a value, the flag
+                    // said not-NULL and the slot held its empty or zero
+                    // filler: `''`, `0`, the epoch, reported as stored.
+                    Some(i) if values[i].trim().eq_ignore_ascii_case("DEFAULT") => defaulted_to_null(),
+                    Some(i) => written_null(&values[i]),
                 };
                 let bytes = nullable::flag_bytes(is_null);
                 let mut mb = MEMORY_POOL.acquire(bytes.len());
