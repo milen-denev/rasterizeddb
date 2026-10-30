@@ -3068,6 +3068,33 @@ where
         });
     }
 
+    // An untyped text value that looks like a number is inlined unquoted
+    // (`pg_params::push_text_param_literal`), and an unquoted number written
+    // into a text column is rendered as its value (`'007'` stored as `7`,
+    // `'+15551234'` as `15551234`). A parameter's text is stored as sent, as
+    // PostgreSQL stores an unknown-typed value in a text column, so one bound
+    // where a text column takes it is typed `text` and quoted. Only a client
+    // that declared no type and did not describe the statement (libpq's
+    // `PQexecParams`, psql's `\bind`) reaches here with OID 0; the position
+    // is read only then.
+    let untyped_number = |p: &BoundParam| {
+        p.oid == 0
+            && p.format == 0
+            && p.value
+                .as_deref()
+                .is_some_and(|v| std::str::from_utf8(v).is_ok_and(crate::pg_params::is_numeric_literal))
+    };
+    if params.iter().any(untyped_number) {
+        if let Some(sql) = state.statements.get(&stmt).map(|s| s.sql.clone()) {
+            let placed = param_infer::infer_where_placed(database, &sql, &[]);
+            for (idx, p) in params.iter_mut().enumerate() {
+                if p.oid == 0 && matches!(placed.get(idx).copied().flatten(), Some(25 | 1042 | 1043 | 19)) {
+                    p.oid = 25;
+                }
+            }
+        }
+    }
+
     let (res_fmt_count, mut i) = read_i16_be_from(payload, i)?;
     let mut result_formats = Vec::with_capacity(res_fmt_count as usize);
     for _ in 0..res_fmt_count {

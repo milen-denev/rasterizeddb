@@ -772,7 +772,7 @@ fn unquote_sql_literal(text: &str) -> String {
     trimmed.to_string()
 }
 
-fn is_numeric_literal(text: &str) -> bool {
+pub(crate) fn is_numeric_literal(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;

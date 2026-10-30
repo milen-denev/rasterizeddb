@@ -302,6 +302,16 @@ fn column_at(database: &Database, rel: &Relations, t: Option<&Tok>) -> Option<i3
 /// One OID per parameter `$1 … $N`, `N` being the larger of the highest
 /// placeholder and the number declared. See the module documentation.
 pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32> {
+    infer_where_placed(database, sql, declared)
+        .into_iter()
+        .map(|o| o.unwrap_or(TEXT))
+        .collect()
+}
+
+/// [`infer`] without its fallback: `None` for a parameter whose position
+/// says nothing (an operand of arithmetic, a function argument), where
+/// [`infer`] answers `text`.
+pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32]) -> Vec<Option<i32>> {
     let toks = tokenize(sql);
     let highest = toks
         .iter()
@@ -316,7 +326,7 @@ pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32
         .map(|i| declared.get(i).copied().filter(|o| *o != 0))
         .collect();
     if oids.iter().all(Option::is_some) {
-        return oids.into_iter().map(|o| o.unwrap_or(TEXT)).collect();
+        return oids;
     }
 
     let rel = relations(&toks);
@@ -415,7 +425,7 @@ pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32
         }
     }
 
-    oids.into_iter().map(|o| o.unwrap_or(TEXT)).collect()
+    oids
 }
 
 /// For `INSERT INTO t (a, b) VALUES …`: the column names, and the index of the
