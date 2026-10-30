@@ -357,18 +357,25 @@ fn evaluate_in(
 
     // A bare number, which the column's own encoder will read.
     let numeric_body = text.strip_prefix(['-', '+']).unwrap_or(text);
-    if !numeric_body.is_empty()
+    let plain = !numeric_body.is_empty()
         && numeric_body
             .bytes()
             .all(|b| b.is_ascii_digit() || b == b'.')
-        && numeric_body.bytes().filter(|b| *b == b'.').count() <= 1
-    {
+        && numeric_body.bytes().filter(|b| *b == b'.').count() <= 1;
+    // Its value's text, as PostgreSQL renders a constant assigned to a text
+    // column (`numeric_constant_text`): `DEFAULT +9` is '9', `DEFAULT 1e1`
+    // '10'. Written as spelled, `+9` was stored as '+9', and an exponent was
+    // refused here outright.
+    let rendered = crate::core::value_codec::numeric_constant_text(text);
+    if plain || rendered.is_some() {
         // A number defaulting a text column is written as text.
         return Ok(
             if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB) {
-                format!("'{}'", text)
-            } else {
+                format!("'{}'", rendered.as_deref().unwrap_or(text))
+            } else if plain {
                 text.to_string()
+            } else {
+                rendered.unwrap_or_else(|| text.to_string())
             },
         );
     }

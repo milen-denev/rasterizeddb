@@ -1764,6 +1764,164 @@ fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {
 ///
 /// Unquoted input is returned unchanged: only a quoted literal carries the
 /// escape, and an unquoted `NULL` has to stay distinguishable from `'NULL'`.
+/// An unquoted numeric constant (`1e1`, `+9`, `007`, `1.50`, `0x1F`,
+/// `1_000`), as PostgreSQL renders it when the constant is assigned to a text
+/// column: the value's text, not its spelling. `None` for anything that is
+/// not one (a quoted string, an identifier, an expression), which is then
+/// stored as it always was.
+///
+/// The constant is an `integer` (or `bigint`, or a `numeric` past that)
+/// without a point or an exponent, shown without its leading zeros or `+`;
+/// otherwise a `numeric`, shown at the scale its digits give it (`numeric_in`:
+/// the digits after the point less the exponent, never below zero), so
+/// `1.50` keeps its zero, `1e1` is `10`, `1.50e1` is `15.0` and `100e-2` is
+/// `1.00`. Unary signs apply as operators, so `- 5` is `-5` and `- - 3` is
+/// `3`; a zero has no sign (`-0.0` is `0.0`). A hexadecimal, octal or binary
+/// integer (`0x1F`, `0o17`, `0b101`) is its decimal value, and `_` may
+/// separate digits, as PostgreSQL 16 allows.
+///
+/// Stored as written, `1e1` read back as `'1e1'` and `+9` as `'+9'`: text
+/// that is not what PostgreSQL stores, reported as success.
+///
+/// A constant whose exponent puts it past `numeric`'s range (which PostgreSQL
+/// refuses as an overflow) is `None` too.
+pub fn numeric_constant_text(raw: &str) -> Option<String> {
+    let mut rest = raw.trim();
+    let mut negative = false;
+    // Unary signs, each an operator of its own, whitespace allowed between.
+    while let Some(c @ ('+' | '-')) = rest.chars().next() {
+        if rest.starts_with("--") {
+            // A comment, not two signs.
+            return None;
+        }
+        if c == '-' {
+            negative = !negative;
+        }
+        rest = rest[1..].trim_start();
+    }
+    let body = rest;
+    if body.is_empty() {
+        return None;
+    }
+
+    // Digits with single `_` separators between them; `leading` allows one
+    // `_` before the first digit (after a base prefix).
+    fn digits_of(text: &str, radix: u32, leading: bool) -> Option<String> {
+        let text = if leading { text.strip_prefix('_').unwrap_or(text) } else { text };
+        if text.is_empty() || text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+            return None;
+        }
+        let out: String = text.chars().filter(|c| *c != '_').collect();
+        out.chars().all(|c| c.is_digit(radix)).then_some(out)
+    }
+    // `digits` (most significant first) in `radix`, as decimal digits.
+    fn to_decimal(digits: &str, radix: u32) -> String {
+        let mut out: Vec<u8> = vec![0]; // little-endian decimal digits
+        for c in digits.chars() {
+            let mut carry = c.to_digit(radix).unwrap_or(0);
+            for d in out.iter_mut() {
+                let v = u32::from(*d) * radix + carry;
+                *d = (v % 10) as u8;
+                carry = v / 10;
+            }
+            while carry > 0 {
+                out.push((carry % 10) as u8);
+                carry /= 10;
+            }
+        }
+        out.iter().rev().map(|d| char::from(b'0' + d)).collect()
+    }
+    let signed = |magnitude: String| -> String {
+        let magnitude = match magnitude.trim_start_matches('0') {
+            "" => "0".to_string(),
+            m => m.to_string(),
+        };
+        if negative && magnitude != "0" { format!("-{magnitude}") } else { magnitude }
+    };
+
+    let lower = body.to_ascii_lowercase();
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = lower.strip_prefix(prefix) {
+            let digits = digits_of(digits, radix, true)?;
+            return Some(signed(to_decimal(&digits, radix)));
+        }
+    }
+
+    // `int[.frac][e[+-]exp]`, either side of the point possibly empty, not
+    // both.
+    let (mantissa, exponent) = match lower.find('e') {
+        Some(at) => (&lower[..at], Some(&lower[at + 1..])),
+        None => (lower.as_str(), None),
+    };
+    let (int_text, frac_text) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let int_digits = if int_text.is_empty() { String::new() } else { digits_of(int_text, 10, false)? };
+    let frac_digits = match frac_text {
+        Some("") | None => String::new(),
+        Some(f) => digits_of(f, 10, false)?,
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    let exponent: i64 = match exponent {
+        None => 0,
+        Some(e) => {
+            let (sign, e) = match e.strip_prefix('-') {
+                Some(e) => (-1, e),
+                None => (1, e.strip_prefix('+').unwrap_or(e)),
+            };
+            let e = digits_of(e, 10, false)?;
+            if e.len() > 9 {
+                return None;
+            }
+            sign * e.parse::<i64>().ok()?
+        }
+    };
+    if frac_text.is_none() && exponent == 0 && !lower.contains('e') {
+        // No point and no exponent: an integer.
+        return Some(signed(int_digits));
+    }
+
+    // `numeric_in`: the display scale is the written fraction less the
+    // exponent; the value moves the point by the exponent.
+    let scale = frac_digits.len() as i64 - exponent;
+    let scale = scale.max(0);
+    let digits = format!("{int_digits}{frac_digits}");
+    let point = int_digits.len() as i64 + exponent;
+    // `numeric`'s limits: 131072 digits before the point, 16383 after.
+    if point > 131_072 || scale > 16_383 {
+        return None;
+    }
+    let len = digits.len() as i64;
+    let whole: String = if point <= 0 {
+        "0".to_string()
+    } else if point >= len {
+        format!("{digits}{}", "0".repeat((point - len) as usize))
+    } else {
+        digits[..point as usize].to_string()
+    };
+    let mut fraction: String = if point < 0 {
+        format!("{}{digits}", "0".repeat((-point) as usize))
+    } else if point < len {
+        digits[point as usize..].to_string()
+    } else {
+        String::new()
+    };
+    while (fraction.len() as i64) < scale {
+        fraction.push('0');
+    }
+    fraction.truncate(scale as usize);
+    let zero = digits.bytes().all(|b| b == b'0');
+    let whole = match whole.trim_start_matches('0') {
+        "" => "0".to_string(),
+        w => w.to_string(),
+    };
+    let sign = if negative && !zero { "-" } else { "" };
+    Some(if fraction.is_empty() { format!("{sign}{whole}") } else { format!("{sign}{whole}.{fraction}") })
+}
+
 pub fn unquote_sql(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
@@ -2342,6 +2500,64 @@ mod tests {
         );
         assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+0200").unwrap(), utc);
         assert_eq!(parse_timestamp_us("2026-08-20 10:00:00-02").unwrap(), utc);
+    }
+
+    /// Each against PostgreSQL 17: `INSERT INTO t (v text) VALUES (<raw>)`
+    /// then `SELECT v`.
+    #[test]
+    fn a_numeric_constant_renders_as_postgresql_assigns_it_to_text() {
+        for (raw, pg) in [
+            ("1e1", "10"),
+            ("+9", "9"),
+            ("1.50", "1.50"),
+            ("007", "7"),
+            ("-0", "0"),
+            ("-0.0", "0.0"),
+            ("1.5e-3", "0.0015"),
+            ("1.50e1", "15.0"),
+            (".5", "0.5"),
+            ("5.", "5"),
+            ("00.10", "0.10"),
+            ("-007", "-7"),
+            ("1E+2", "100"),
+            ("99999999999999999999", "99999999999999999999"),
+            ("0x1F", "31"),
+            ("0X1f", "31"),
+            ("0x_1F", "31"),
+            ("1_000", "1000"),
+            ("1_000.000_1", "1000.0001"),
+            ("1e1_0", "10000000000"),
+            ("0o17", "15"),
+            ("0b101", "5"),
+            ("-0x10", "-16"),
+            ("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", "87112285931760246646623899502532662132735"),
+            ("- 5", "-5"),
+            ("+-5", "-5"),
+            ("- - 3", "3"),
+            ("+ -.5", "-0.5"),
+            ("1e0", "1"),
+            ("0e5", "0"),
+            ("0.0e3", "0"),
+            ("100e-2", "1.00"),
+            ("2147483648", "2147483648"),
+            ("1.0e-0", "1.0"),
+            ("-1e1", "-10"),
+            ("12.340e-1", "1.2340"),
+            ("+1.5", "1.5"),
+            ("1.5e+0", "1.5"),
+            ("9223372036854775808", "9223372036854775808"),
+            ("0.000", "0.000"),
+            ("00", "0"),
+            ("123.456e-20", "0.00000000000000000123456"),
+        ] {
+            assert_eq!(numeric_constant_text(raw).as_deref(), Some(pg), "{raw}");
+        }
+        assert_eq!(numeric_constant_text("1e400").map(|t| t.len()), Some(401));
+        // Not numeric constants (PostgreSQL refuses the malformed ones; here
+        // they are left to the paths that read them as before).
+        for raw in ["'1e1'", "1_", "1__0", "1e", ".e1", "1e+", "abc", "--5", "1.2.3", "0x", "0x1G", "", "-", "1e5000000000"] {
+            assert_eq!(numeric_constant_text(raw), None, "{raw}");
+        }
     }
 
     /// `timestamp_in`: the zone is read and discarded, and the encoder a

@@ -273,8 +273,12 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         DbType::STRING | DbType::CHAR | DbType::UNKNOWN | DbType::START | DbType::END => {
             // Doubled quotes are collapsed here too, or an UPDATE would
-            // corrupt what an INSERT stored correctly.
-            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            // corrupt what an INSERT stored correctly; and an unquoted number
+            // is its value's text, as the INSERT path reads one.
+            let stripped = match crate::core::value_codec::numeric_constant_text(value_str) {
+                Some(text) => std::borrow::Cow::Owned(text),
+                None => crate::core::value_codec::unquote_sql(value_str),
+            };
             let bytes = stripped.as_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(bytes);
@@ -574,6 +578,20 @@ fn parse_update_row(
             return None;
         };
         let assigns_null = value.eq_ignore_ascii_case("NULL");
+
+        // An unquoted number assigned to a text column is its value's text
+        // (`value_codec::numeric_constant_text`), as PostgreSQL's assignment
+        // renders it. Taken here, before the expression test below: `1.5e-3`
+        // and `1E+2` look like arithmetic to it, and an expression's result
+        // was written into the text column as the number's raw bytes.
+        let rendered_constant;
+        let value: &str = match (&field.db_type, crate::core::value_codec::numeric_constant_text(value)) {
+            (DbType::STRING | DbType::CHAR, Some(text)) => {
+                rendered_constant = crate::core::value_codec::quote_sql(&text);
+                &rendered_constant
+            }
+            _ => value,
+        };
 
         // An expression whose value depends on the row is carried to the write
         // path rather than folded here. It must never fall through to

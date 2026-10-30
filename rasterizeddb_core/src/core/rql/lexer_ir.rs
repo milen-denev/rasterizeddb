@@ -298,7 +298,13 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             // `unquote_sql` rather than `strip_surrounding_quotes`: the outer
             // pair is not the whole story, since a quote inside the literal is
             // written doubled and has to be collapsed back to one.
-            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            //
+            // An unquoted number is its value's text, as PostgreSQL's
+            // assignment renders it: `1e1` is '10', `+9` is '9'.
+            let stripped = match crate::core::value_codec::numeric_constant_text(value_str) {
+                Some(text) => std::borrow::Cow::Owned(text),
+                None => crate::core::value_codec::unquote_sql(value_str),
+            };
             let b = stripped.as_bytes();
             let mut mb = MEMORY_POOL.acquire(b.len());
             mb.into_slice_mut().copy_from_slice(b);
@@ -1008,6 +1014,18 @@ pub(crate) fn encode_column_value(
     // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
     // and reported success.
     let value_owned;
+    // An unquoted number for a text column is its value's text, as
+    // PostgreSQL's assignment renders it (`numeric_constant_text`), and is
+    // taken before the expression test: `100e-2` looks like arithmetic to it,
+    // and evaluated it lost the scale its digits give it ('1', not '1.00').
+    let rendered_constant;
+    let value: &str = match (&schema_field.db_type, crate::core::value_codec::numeric_constant_text(value)) {
+        (DbType::STRING | DbType::CHAR, Some(text)) => {
+            rendered_constant = crate::core::value_codec::quote_sql(&text);
+            &rendered_constant
+        }
+        _ => value,
+    };
     // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
     // neither parentheses nor a cast, and was handed to the column's
     // literal reader whole, which refused it as unreadable text.
