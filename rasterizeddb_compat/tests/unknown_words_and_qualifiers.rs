@@ -425,3 +425,60 @@ async fn correlations_are_placed_or_refused_with_their_code() {
         .collect();
     assert_eq!(got, vec![(1, 14), (2, 0)]);
 }
+
+/// A correlated cast is placed only when the evaluator computes it as
+/// PostgreSQL does. A type modifier other than NUMERIC's is ignored by the
+/// evaluator (`'abcd'::varchar(2)` stays 'abcd', `ts::timestamp(0)` keeps
+/// its fraction), and `character` pads and truncates: placed, `u.y::
+/// varchar(1) = t.y` matched rows 1 and 2 where PostgreSQL matched row 2.
+/// Those are refused (0A000), never answered wrong; `::int` (rounding a
+/// NUMERIC) and `::numeric(10,1)` run and match PostgreSQL 17.
+///
+/// Mutation: `placeable_cast` accepting every modifier.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_cast_the_evaluator_cannot_apply_is_refused() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(
+        "CREATE TABLE et (id INT PRIMARY KEY, y TEXT, n NUMERIC(10,2), ts TIMESTAMP, v INT); \
+         INSERT INTO et VALUES (1, 'ab', 2.6, '2024-01-01 10:20:31', 0), (2, 'a', 2.4, '2024-01-01 10:20:30.6', 0), (3, 'bc', 3.5, NULL, 0); \
+         CREATE TABLE eu (id INT PRIMARY KEY, y TEXT, x INT, ts TIMESTAMP); \
+         INSERT INTO eu VALUES (1, 'a', 3, '2024-01-01 10:20:30.6'), (2, 'ab', 2, NULL), (3, 'b', 4, NULL)",
+    )
+    .await
+    .expect("setup");
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    for sql in [
+        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y)",
+        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y = et.y::varchar(1))",
+        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::character varying(1) = et.y)",
+        "DELETE FROM et WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::varchar(1) = et.y)",
+        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.y::char(1) = et.y)",
+        "UPDATE et SET v = 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.ts::timestamp(0) = et.ts)",
+    ] {
+        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
+        assert_eq!(code(&e), "0A000", "{sql}: {e}");
+        conn.execute("ROLLBACK").await.expect("rollback");
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    }
+    // Placed, and as PostgreSQL 17 answers: 2.6, 2.4, 3.5 round to 3, 2, 4,
+    // each some eu.x; no eu.x is 2.6, 2.4 or 3.5 at one place.
+    for (sql, want) in [
+        ("UPDATE et SET v = v + 1 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.x = et.n::int)", 3u64),
+        ("UPDATE et SET v = v + 10 WHERE EXISTS (SELECT 1 FROM eu WHERE eu.x::numeric(10,1) = et.n)", 0),
+    ] {
+        let done = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(done.rows_affected(), want, "{sql}");
+    }
+    conn.execute("COMMIT").await.expect("commit");
+    drop(conn);
+    let got: Vec<(i32, i32)> = pool
+        .fetch_all("SELECT id, v FROM et ORDER BY id")
+        .await
+        .expect("et")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(got, vec![(1, 1), (2, 1), (3, 1)], "a refused statement changed a row, or a placed one the wrong rows");
+}

@@ -400,8 +400,10 @@ not; a pinned snapshot makes them one. Write it as `UPDATE … FROM` /
 (SELECT …)` in a write share the snapshot gap and are not yet refused.
 
 A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
-either side (`u.tid = t.id::bigint`), or, in `UPDATE … FROM`, name the target
-beside its source. One that compares an outer
+either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
+FROM`, name the target beside its source. A cast this engine does not compute
+as PostgreSQL does — a type modifier other than NUMERIC's (`::varchar(1)`,
+`::timestamp(0)`), or `character` — is refused with 0A000 there. One that compares an outer
 column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
 (`x - EXISTS (…)::int`), is refused with 0A000.
 
