@@ -112,10 +112,26 @@ pub struct SchemaField {
     /// column is stored without its trailing spaces, so a literal compared
     /// with one has to be read the same way (`'b  '` is `'b'`) or the
     /// comparison answers from a value the column cannot hold.
-    pub text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
+    ///
+    /// Packed into four bytes ([`crate::core::rql::type_modifier::PackedTypmod`]);
+    /// read through [`SchemaField::text_typmod`]. A `timestamp(p)`-style
+    /// precision is carried here too.
+    pub typmod_packed: Option<crate::core::rql::type_modifier::PackedTypmod>,
 }
 
 impl SchemaField {
+    /// The column's declared length or precision, when it has one.
+    #[inline]
+    pub fn text_typmod(&self) -> Option<crate::core::rql::type_modifier::TextTypmod> {
+        self.typmod_packed.map(crate::core::rql::type_modifier::PackedTypmod::unpack)
+    }
+
+    /// Sets [`SchemaField::text_typmod`].
+    #[inline]
+    pub fn set_text_typmod(&mut self, typmod: Option<crate::core::rql::type_modifier::TextTypmod>) {
+        self.typmod_packed = typmod.and_then(crate::core::rql::type_modifier::PackedTypmod::pack);
+    }
+
     pub fn new(
         name: String,
         db_type: DbType,
@@ -132,7 +148,7 @@ impl SchemaField {
             write_order,
             is_unique,
             scale: None,
-            text_typmod: None,
+            typmod_packed: None,
             is_deleted: false,
         }
     }
@@ -233,7 +249,7 @@ impl SchemaField {
             // Not part of the persisted record. `TableSchema::load` fills it in
             // from the type-modifier sidecar once every field has been read.
             scale: None,
-            text_typmod: None,
+            typmod_packed: None,
         })
     }
 
@@ -649,9 +665,10 @@ impl TableSchema {
                 .find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted)
                 .map(|m| m.scale as u32);
             // And the declared text length, for the same reason.
-            field.text_typmod = (!field.is_deleted)
+            let typmod = (!field.is_deleted)
                 .then(|| crate::core::rql::type_modifier::text_typmod_of(&field.name, &table_schema.type_modifiers))
                 .flatten();
+            field.set_text_typmod(typmod);
         }
         table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
@@ -1242,7 +1259,7 @@ mod tests {
     fn table_schema_stays_small() {
         let size = std::mem::size_of::<TableSchema>();
         assert!(size <= 1744, "TableSchema grew to {size} bytes");
-        assert!(std::mem::size_of::<SchemaField>() <= 72, "SchemaField grew");
+        assert!(std::mem::size_of::<SchemaField>() <= 64, "SchemaField grew");
     }
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
     use std::{fs, io, path::Path};

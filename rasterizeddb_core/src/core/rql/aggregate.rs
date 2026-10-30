@@ -427,8 +427,8 @@ impl SelectItem {
                 arg: Some(field),
                 arg_expr: None,
                 ..
-            } if field.db_type == DbType::STRING && matches!(field.text_typmod, Some(TextTypmod::Bpchar(_))) => {
-                match field.text_typmod {
+            } if field.db_type == DbType::STRING && matches!(field.text_typmod(), Some(TextTypmod::Bpchar(_))) => {
+                match field.text_typmod() {
                     Some(TextTypmod::Bpchar(n)) => DbType::bpchar(n),
                     _ => self.result_type(),
                 }

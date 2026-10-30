@@ -439,6 +439,10 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::INET => "INET",
         DbType::BYTEA => "BYTEA",
         DbType::ARRAY => "ARRAY",
+        // `character(n)` keeps its type through the relation: compared
+        // without trailing spaces, and shown padded (`relation_columns`
+        // declares it with its length).
+        DbType::BPCHAR(_) => "BPCHAR",
         // NULL is not a type, it is the absence of a value in the row that was
         // sampled. The caller resolves it by looking at further rows.
         DbType::NULL => return None,
@@ -518,6 +522,7 @@ async fn relation_columns(
                 Some(scale) if scale != engine => format!("NUMERIC(38,{})", scale),
                 _ => "NUMERIC".to_string(),
             },
+            Some(DbType::BPCHAR(n)) if *n > 0 => format!("CHAR({n})"),
             Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
             None => "TEXT".to_string(),
         };
@@ -1280,6 +1285,52 @@ fn declared_types_among(
     database: &Arc<Database>,
     relations: &[(String, ScratchFields)],
 ) -> Vec<Option<DbType>> {
+    declared_fields_among(query, labels, database, relations)
+        .into_iter()
+        .map(|f| f.map(|f| f.db_type))
+        .collect()
+}
+
+/// Whether each output column of `query`, by position, compares blank-padded
+/// with a `character(n)` value: a bare `character(n)` or `character
+/// varying` column, which PostgreSQL resolves to `bpchar` against one. Any
+/// other item — a text column, an expression, a column this cannot read —
+/// is text, which compares with `character(n)` exactly, trailing spaces
+/// kept (`a IN (SELECT t …)` does not take a `t` of `'ab  '` for `'ab'`).
+pub(crate) fn blank_padded_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
+        .iter()
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| bare_column(split_alias(item).0).unwrap_or_default())
+        .collect();
+    declared_fields_among(query, &labels, database, &[])
+        .into_iter()
+        .map(|f| {
+            f.is_some_and(|f| {
+                f.db_type == DbType::STRING
+                    && matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_) | TextTypmod::Varchar(_)))
+            })
+        })
+        .collect()
+}
+
+/// [`declared_types_among`]'s fields.
+fn declared_fields_among(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<SchemaField>> {
     let none = vec![None; labels.len()];
     // A join has more than one relation behind its columns; this resolves only
     // the single-relation case rather than guessing which one a label meant.
@@ -1299,14 +1350,14 @@ fn declared_types_among(
     if name.is_empty() || name.contains('(') {
         return none;
     }
-    let types_in = |fields: &[SchemaField]| -> Vec<Option<DbType>> {
+    let types_in = |fields: &[SchemaField]| -> Vec<Option<SchemaField>> {
         labels
             .iter()
             .map(|label| {
                 fields
                     .iter()
                     .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
-                    .map(|field| field.db_type.clone())
+                    .cloned()
             })
             .collect()
     };

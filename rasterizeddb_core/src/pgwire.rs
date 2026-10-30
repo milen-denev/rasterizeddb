@@ -4183,47 +4183,7 @@ fn union_bpchar_fields(
     // Each branch's `character(n)` length per output position, where it has one.
     let widths: Vec<Vec<Option<u32>>> = branches
         .iter()
-        .map(|branch| {
-            let Some(purpose) = recognize_query_purpose(branch) else { return Vec::new() };
-            let QueryPurpose::QueryRows(qr) = &purpose else { return Vec::new() };
-            if crate::core::rql::join::statement_has_join(&qr.query) {
-                return Vec::new();
-            }
-            let Some(view) = database.schema_view(&qr.table_name) else { return Vec::new() };
-            let schema = view.schema();
-            let Ok(parsed) = row_fetch_from_select_query(&purpose, &schema.fields) else { return Vec::new() };
-            let width = |t: DbType| match t {
-                DbType::BPCHAR(n) => Some(u32::from(n)),
-                _ => None,
-            };
-            if let Some(plan) = &parsed.aggregate {
-                return plan
-                    .items
-                    .iter()
-                    .map(|i| match i {
-                        crate::core::rql::aggregate::SelectItem::Column { field, .. } => width(reported_type(field, schema)),
-                        other => width(other.reported_type()),
-                    })
-                    .collect();
-            }
-            if !parsed.select_items.is_empty() {
-                return parsed
-                    .select_items
-                    .iter()
-                    .map(|i| match i {
-                        crate::core::rql::aggregate::SelectItem::Column { field, .. } => width(reported_type(field, schema)),
-                        other => width(other.reported_type()),
-                    })
-                    .collect();
-            }
-            parsed
-                .requested_row_fetch
-                .columns_fetching_data
-                .iter()
-                .take(parsed.visible_columns)
-                .map(|c| field_of(&schema.fields, c.schema_id).and_then(|f| width(reported_type(f, schema))))
-                .collect()
-        })
+        .map(|branch| crate::core::rql::set_ops::branch_bpchar_widths(branch, database))
         .collect();
     for (at, (_, ty)) in fields.iter_mut().enumerate() {
         let DbType::BPCHAR(n) = *ty else { continue };
@@ -9437,7 +9397,7 @@ fn reported_type_of(
         // cases; only the name was wrong.
         DbType::JSON
     } else if let (DbType::STRING, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(n))) =
-        (&field.db_type, field.text_typmod)
+        (&field.db_type, field.text_typmod())
     {
         // `character(n)`: stored without its trailing spaces, described as
         // `bpchar` with its length and formatted padded to it — the one type

@@ -49,6 +49,22 @@ faithfully restore old-layout bytes that the new schema then reads at new
 offsets. If a directory does have to cross this change, shut down cleanly first
 so the log is empty, then upgrade.
 
+## No downgrade past `character(n)`
+
+**A database this binary has written must not be opened by an older one.**
+The declared lengths of `character(n)` and `character varying(n)` columns,
+and the precision of `timestamp(p)`-style columns, are recorded as marker
+records an older binary does not read. It opens the table and treats those
+columns as plain text and full-precision times: it stores `'ab  '` beside a
+stored `'ab'` in a `character(4)` primary key, takes `'toolong'` into a
+`character(3)`, and keeps sub-second digits a `timestamp(0)` would round.
+Back on this binary the extra rows are there — two rows with key `'ab  '`,
+one of them unreachable by key — and nothing reports it. No version stamp
+exists that an older binary refuses (the partitioned-table guard works only
+because those tables have no file under their own name), so this is not
+guarded: back up before upgrading, and restore that backup rather than
+downgrading.
+
 ## Type system
 
 Types are stored fixed-width and ordered by `memcmp` wherever an ordering is
@@ -102,7 +118,30 @@ value leaves as itself. So:
   …])` included.
 
 `character varying(n)` is held to `n` the same way (22001, excess spaces cut)
-and otherwise is text. A cast applies its modifier as PostgreSQL's explicit
+and otherwise is text. Compared with `character(n)` it is read without its
+trailing spaces, as PostgreSQL resolves `bpchar` = `varchar` to `bpchar`: in a
+join, `UPDATE … FROM`, `DELETE … USING` and between two columns of a row. A
+`varchar` column created by an older binary recorded no type of its own and
+is text here.
+
+A value typed **text** — a text column read through `IN (SELECT …)`, `=
+(SELECT …)` or a correlated `EXISTS`, a parameter declared text (as sqlx and
+tokio-postgres bind strings), `'…'::text`, `t || ''` — compares with a
+`character(n)` column as text, exactly: `'ab  '` is not `'ab'`. Only an
+untyped literal, a `character varying` value and an `IN (…)` list's items
+(which take the column's type, as PostgreSQL's common type of the list does)
+read blank-padded. A `character(n)` value keeps its type through a CTE, a
+derived table, `CASE`, `COALESCE`, `NULLIF`, `GREATEST`/`LEAST`, and a
+`UNION` whose first branch is `character(n)` and another text (PostgreSQL
+resolves that column to `bpchar`, so `'ab'` and `'ab  '` are one row).
+
+A `timestamp(p)`, `timestamptz(p)`, `time(p)`, `timetz(p)` or `interval(p)`
+column rounds what is written to it to `p` fractional digits, on every write
+path, and `ALTER COLUMN … TYPE` to a narrower precision rounds the stored
+values. A timestamp written with more than six fractional digits is rounded
+to the microsecond, ties to even, as PostgreSQL rounds it (it was cut).
+
+A cast applies its modifier as PostgreSQL's explicit
 cast does: `'abcd'::varchar(2)` is `ab`, `::char(n)` pads (and cuts),
 `::timestamp(p)`, `::timestamptz(p)`, `::time(p)`, `::timetz(p)` and
 `::interval(p)` round half away from zero (a timestamp on PostgreSQL's epoch,

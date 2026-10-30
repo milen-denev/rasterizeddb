@@ -610,3 +610,199 @@ async fn a_character_column_an_older_binary_created_keeps_text_semantics() {
     }
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// A value typed text — a text column's value substituted from a subquery,
+/// a parameter declared text, a `::text` cast — compares with a
+/// `character(n)` column as text, exactly: `'ab  '` is not `'ab'`. Only an
+/// untyped literal, and a `character varying` value, compare blank-padded.
+/// Reading every string blank-padded updated rows PostgreSQL leaves alone.
+///
+/// Mutations: `subquery_literal` never typing the value (`IN (SELECT t …)`
+/// takes 'ab  ' for 'ab'); `spaced_text_literal` false (`'ab  '::text`
+/// matches).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_typed_value_compares_with_character_exactly() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), v INT); \
+         CREATE TABLE d (id INT PRIMARY KEY, t TEXT, b VARCHAR(6), k CHAR(6)); \
+         INSERT INTO c VALUES (1, 'ab', 0), (2, 'abc', 0), (3, 'x', 0); \
+         INSERT INTO d VALUES (1, 'ab  ', 'ab  ', 'ab'), (2, 'abc', 'abc ', 'abc'), (3, 'x ', 'x', 'x')",
+    )
+    .await
+    .expect("setup");
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("UPDATE c SET v = 1 WHERE EXISTS (SELECT 1 FROM d WHERE d.t = c.a) RETURNING id", "[2]"),
+        ("UPDATE c SET v = 2 WHERE a IN (SELECT t FROM d) RETURNING id", "[2]"),
+        ("UPDATE c SET v = 3 WHERE a = (SELECT t FROM d WHERE id = 1) RETURNING id", ""),
+        ("UPDATE c SET v = 3 WHERE a = (SELECT t FROM d WHERE id = 2) RETURNING id", "[2]"),
+        ("UPDATE c SET v = 4 WHERE EXISTS (SELECT 1 FROM d WHERE d.b = c.a) RETURNING id", "[1];[2];[3]"),
+        ("UPDATE c SET v = 5 WHERE a IN (SELECT b FROM d) RETURNING id", "[1];[2];[3]"),
+        ("UPDATE c SET v = 6 WHERE EXISTS (SELECT 1 FROM d WHERE d.k = c.a) RETURNING id", "[1];[2];[3]"),
+        ("UPDATE c SET v = 7 WHERE a IN (SELECT t || '' FROM d) RETURNING id", "[2]"),
+        ("UPDATE c SET v = 9 WHERE a = 'ab  '::text RETURNING id", ""),
+        ("UPDATE c SET v = 9 WHERE a = 'ab  '::varchar RETURNING id", "[1]"),
+        ("UPDATE c SET v = 9 WHERE a = 'ab  ' RETURNING id", "[1]"),
+        // An IN list's items take the column's type, typed or not.
+        ("UPDATE c SET v = 10 WHERE a IN ('ab  '::text, 'x') RETURNING id", "[1];[3]"),
+        ("DELETE FROM c WHERE a NOT IN (SELECT t FROM d WHERE t IS NOT NULL) RETURNING id", "[1];[3]"),
+    ] {
+        c.batch_execute("BEGIN").await.expect("begin");
+        let got = match rows(&c, sql).await {
+            Ok(mut r) => {
+                r.sort();
+                r.join(";")
+            }
+            Err(code) => format!("ERR {code}"),
+        };
+        c.batch_execute("ROLLBACK").await.expect("rollback");
+        if got != want {
+            wrong.push(format!("{sql}\n    got  {got}\n    want {want}"));
+        }
+    }
+    // Parameters: declared text (as sqlx and tokio-postgres bind a string)
+    // compares exactly; `$1::bpchar`, and a parameter whose type is left to
+    // the column, blank-padded.
+    use tokio_postgres::types::Type;
+    for (sql, types, want) in [
+        ("SELECT id FROM c WHERE a = $1", vec![Type::TEXT], 0usize),
+        ("SELECT id FROM c WHERE a = $1::text", vec![], 0),
+        ("SELECT id FROM c WHERE a = $1::bpchar", vec![], 1),
+        ("SELECT id FROM c WHERE a = $1", vec![], 1),
+    ] {
+        let statement = c.prepare_typed(sql, &types).await.expect("prepare");
+        let found = c.query(&statement, &[&"ab  "]).await.map(|r| r.len());
+        if found.as_ref().ok() != Some(&want) {
+            wrong.push(format!("{sql} {types:?} with 'ab  ': {found:?}, want {want} rows"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `character(n)` against `character varying` compares blank-padded, as
+/// PostgreSQL resolves `bpchar = varchar` to `bpchar`: a join, `UPDATE …
+/// FROM`, `DELETE … USING` and a comparison of two columns of one row. The
+/// varying side's trailing spaces were part of the key.
+///
+/// Mutations: `KeyColumn::blank_padded` never set (the join misses 'ab  ');
+/// `column_text_kind` answering `None` (the in-row comparison misses).
+#[tokio::test(flavor = "multi_thread")]
+async fn character_against_varchar_compares_blank_padded() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), b VARCHAR(6), v INT); \
+         CREATE TABLE d (id INT PRIMARY KEY, t TEXT, b VARCHAR(6), u VARCHAR); \
+         INSERT INTO c VALUES (1, 'ab', 'ab  ', 0), (2, 'abc', 'abc', 0), (3, 'x', 'y', 0); \
+         INSERT INTO d VALUES (1, 'ab  ', 'ab  ', 'ab '), (2, 'abc', 'abc ', 'abc'), (3, 'x ', 'x', 'x  ')",
+    )
+    .await
+    .expect("setup");
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT c.id FROM c JOIN d ON c.a = d.b", "[1];[2];[3]"),
+        ("SELECT c.id FROM c JOIN d ON c.a = d.u", "[1];[2];[3]"),
+        ("SELECT c.id FROM c JOIN d ON c.a = d.t", "[2]"),
+        ("SELECT c.id FROM c JOIN d ON d.b = c.a WHERE d.id < 3", "[1];[2]"),
+        ("UPDATE c SET v = 1 FROM d WHERE d.b = c.a RETURNING c.id", "[1];[2];[3]"),
+        ("UPDATE c SET v = 1 FROM d WHERE d.t = c.a RETURNING c.id", "[2]"),
+        ("DELETE FROM c USING d WHERE d.b = c.a AND d.id = 1 RETURNING c.id", "[1]"),
+        ("DELETE FROM c USING d WHERE d.t = c.a AND d.id = 1 RETURNING c.id", ""),
+        ("SELECT id FROM c WHERE a = b", "[1];[2]"),
+        ("SELECT id FROM c WHERE b = a AND id > 1", "[2]"),
+        ("SELECT id FROM c WHERE a <> b", "[3]"),
+    ] {
+        c.batch_execute("BEGIN").await.expect("begin");
+        let got = match rows(&c, sql).await {
+            Ok(mut r) => {
+                r.sort();
+                r.join(";")
+            }
+            Err(code) => format!("ERR {code}"),
+        };
+        c.batch_execute("ROLLBACK").await.expect("rollback");
+        if got != want {
+            wrong.push(format!("{sql}\n    got  {got}\n    want {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A `character(n)` value keeps its type through a CTE, a derived table, a
+/// `CASE`, a `COALESCE` and a `UNION` with text (PostgreSQL resolves the
+/// column to `bpchar`): compared without trailing spaces, and a UNION's
+/// 'ab' and 'ab  ' are one row. Through a relation it was read as text.
+///
+/// Mutations: `sql_type_of` without `BPCHAR` (the CTE reads text: 0 rows);
+/// `common_bpchar` answering `None` (the `COALESCE` comparison misses);
+/// `widened_branch_integers` without the `BPCHAR` mark (the UNION keeps 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn character_keeps_its_type_through_relations_and_expressions() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4)); \
+         CREATE TABLE d (id INT PRIMARY KEY, t TEXT); \
+         INSERT INTO c VALUES (1, 'ab'), (2, 'abc'), (3, 'x'), (4, NULL); \
+         INSERT INTO d VALUES (1, 'ab  '), (2, 'abc'), (3, 'x ')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            ("WITH w AS (SELECT a FROM c) SELECT count(*) FROM w WHERE a = 'ab  '", "[1]"),
+            ("WITH w AS (SELECT a FROM c) SELECT a FROM w WHERE id IS NULL OR a = 'x'", "ERR 42703"),
+            ("SELECT count(*) FROM (SELECT a FROM c) s WHERE a = 'abc '", "[1]"),
+            ("SELECT s.a FROM (SELECT a FROM c WHERE id = 1) s", "[ab  ]"),
+            ("SELECT id FROM c WHERE CASE WHEN id > 0 THEN a END = 'ab  ' ORDER BY id", "[1]"),
+            ("SELECT id FROM c WHERE COALESCE(a, 'zz') = 'zz  ' ORDER BY id", "[4]"),
+            ("SELECT id, CASE WHEN id < 3 THEN a ELSE 'q' END = 'q ' FROM c ORDER BY id", "[1]|[f];[2]|[f];[3]|[t];[4]|[t]"),
+            ("SELECT count(*) FROM (SELECT z FROM (SELECT COALESCE(a, 'q') AS z FROM c) s1 WHERE z = 'ab  ') s2", "[1]"),
+            ("SELECT count(*) FROM (SELECT a FROM c UNION SELECT t FROM d) s", "[4]"),
+            ("SELECT count(*) FROM (SELECT t FROM d UNION SELECT a FROM c) s", "[6]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A `timestamp(p)`, `timestamptz(p)`, `time(p)` or `interval(p)` column
+/// rounds what it is given to `p` fractional digits, on every write path, as
+/// PostgreSQL's assignment does; and a timestamp written with more than six
+/// fractional digits rounds to the microsecond (ties to even), not cuts. It
+/// stored the value whole, so the column disagreed with its own cast.
+///
+/// Mutation: `assign_bytes` leaving a time value as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_time_column_rounds_to_its_declared_precision() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE tp (id INT PRIMARY KEY, t TIMESTAMP(0), tz TIMESTAMPTZ(2), tm TIME(1), iv INTERVAL(0), raw TIMESTAMP)",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            (
+                "INSERT INTO tp VALUES (1, '2024-01-01 10:00:00.5', '2024-01-01 10:00:00.125+00', '10:00:00.56', '1.5 seconds', '2024-01-01 10:00:00.4999995')",
+                "",
+            ),
+            ("INSERT INTO tp SELECT 2, raw, raw, '23:59:59.96', '-1.5 seconds', raw FROM tp WHERE id = 1", ""),
+            ("UPDATE tp SET t = '1999-12-31 23:59:59.5' WHERE id = 2", ""),
+            (
+                "SELECT id, t, tz, tm, iv, raw FROM tp ORDER BY id",
+                "[1]|[2024-01-01 10:00:01+00]|[2024-01-01 10:00:00.13+00]|[10:00:00.6]|[00:00:02]|[2024-01-01 10:00:00.5+00];\
+                 [2]|[1999-12-31 23:59:59+00]|[2024-01-01 10:00:00.5+00]|[24:00:00]|[-00:00:02]|[2024-01-01 10:00:00.5+00]",
+            ),
+            ("SELECT id FROM tp WHERE t = t::timestamp(0) AND raw::timestamp(0) = '2024-01-01 10:00:01' ORDER BY id", "[1];[2]"),
+            ("UPDATE tp SET tm = '10:00:00.64' WHERE id = 1 RETURNING tm", "[10:00:00.6]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

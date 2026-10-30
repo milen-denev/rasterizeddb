@@ -1062,7 +1062,11 @@ pub async fn substitute_in_subqueries(
         if let Some(spec) = subquery::multi_correlated_exists(&clause, &outer) {
             let spec = spec?;
             let rows = run_subquery(&spec.inner_sql, database, tx).await?;
-            let predicate = subquery::multi_exists_predicate(&spec, &rows)?;
+            let exact: Vec<bool> = crate::core::rql::cte::blank_padded_columns(&spec.inner_sql, database)
+                .into_iter()
+                .map(|padded| !padded)
+                .collect();
+            let predicate = subquery::multi_exists_predicate(&spec, &rows, &exact)?;
             current = format!(
                 "{}{}{}",
                 &current[..clause.start],
@@ -1093,7 +1097,11 @@ pub async fn substitute_in_subqueries(
             .first()
             .copied()
             .unwrap_or(false);
-        let literal = subquery::rows_to_scalar(&rows, document)?;
+        let exact = !crate::core::rql::cte::blank_padded_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let literal = subquery::rows_to_scalar(&rows, document, exact)?;
         current = format!(
             "{}{}{}",
             &current[..found.start],
@@ -1135,7 +1143,11 @@ pub async fn substitute_in_subqueries(
             .first()
             .copied()
             .unwrap_or(false);
-        let (list, had_null) = subquery::rows_to_value_list(&rows, document)?;
+        let exact = !crate::core::rql::cte::blank_padded_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let (list, had_null) = subquery::rows_to_value_list(&rows, document, exact)?;
 
         // `x NOT IN (…, NULL)` is never true: x either equals a value (false)
         // or is compared against NULL (unknown). `x IN ()` expresses exactly
@@ -5520,8 +5532,10 @@ async fn update_from_join(
                                     )
                                 },
                             );
+                        // Compared here as text against the term's literal
+                        // (`scalar_comparison_holds`), never substituted.
                         let value =
-                            crate::core::rql::subquery::rows_to_scalar(&produced, document)?;
+                            crate::core::rql::subquery::rows_to_scalar(&produced, document, false)?;
                         answers.insert(resolved, (value.clone(), document));
                         (value, document)
                     }
@@ -8424,7 +8438,7 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
                 .iter()
                 .find(|m| m.column.eq_ignore_ascii_case(&c.name))
                 .map(|m| m.scale as u32);
-            field.text_typmod = crate::core::rql::type_modifier::text_typmod_of(&c.name, &create_table.type_modifiers);
+            field.set_text_typmod(crate::core::rql::type_modifier::text_typmod_of(&c.name, &create_table.type_modifiers));
             field
         })
         .collect();
@@ -10783,7 +10797,7 @@ fn compile_check_cached(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     expression.hash(&mut hasher);
     for f in fields {
-        (&f.name, f.db_type.to_string(), f.write_order, f.scale, f.text_typmod, f.is_deleted).hash(&mut hasher);
+        (&f.name, f.db_type.to_string(), f.write_order, f.scale, f.text_typmod(), f.is_deleted).hash(&mut hasher);
     }
     let key = hasher.finish();
     if let Some(hit) = CACHE.with(|c| {
@@ -10840,7 +10854,7 @@ pub(crate) fn compile_check(
                 !f.is_deleted
                     && f.name == *name
                     && f.db_type == crate::core::db_type::DbType::STRING
-                    && !matches!(f.text_typmod, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_)))
+                    && !matches!(f.text_typmod(), Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_)))
             })
         })
     };
@@ -11863,7 +11877,37 @@ async fn text_type_change(
     tx: TxId,
 ) -> Result<Vec<crate::core::rql::type_modifier::TypeModifier>, String> {
     use crate::core::rql::type_modifier::{self, TextTypmod};
-    if field.db_type != crate::core::db_type::DbType::STRING {
+    use crate::core::db_type::DbType;
+    // A time column's declared precision: the values rounded to it, as
+    // PostgreSQL's rewrite rounds them.
+    if matches!(field.db_type, DbType::DATETIME | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL) {
+        let wanted = match type_modifier::parse_time_precision(declared) {
+            Some(Ok(t)) => Some(t),
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
+        let had = field.text_typmod();
+        if wanted == had {
+            return Ok(Vec::new());
+        }
+        let narrower = match (had, wanted) {
+            (_, None) => false,
+            (Some(TextTypmod::Precision(h)), Some(TextTypmod::Precision(w))) => w < h,
+            _ => true,
+        };
+        if row_count > 0 && narrower {
+            let column = format!("\"{}\"", field.name.replace('"', "\"\""));
+            let sql = format!("UPDATE {table_name} SET {column} = CAST({column} AS {})", declared.trim());
+            let purpose = recognize_query_purpose(&sql)
+                .ok_or_else(|| format!("could not convert column \"{}\" to {}", field.name, declared.trim()))?;
+            let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
+            if response.first() == Some(&3) {
+                return Err(String::from_utf8_lossy(&response[1..]).to_string());
+            }
+        }
+        return Ok(type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers));
+    }
+    if field.db_type != DbType::STRING {
         return Ok(Vec::new());
     }
     let wanted = match type_modifier::parse_text_typmod(declared) {
@@ -11871,7 +11915,7 @@ async fn text_type_change(
         Some(Err(e)) => return Err(e),
         None => None,
     };
-    let had = field.text_typmod;
+    let had = field.text_typmod();
     let legacy = type_modifier::is_legacy_bpchar(&field.name, &schema.type_modifiers);
     if wanted == had && !legacy {
         return Ok(Vec::new());
@@ -11901,12 +11945,12 @@ async fn text_type_change(
                 Some(format!("UPDATE {table_name} SET {column} = rtrim({column}) WHERE {column} LIKE '% '"))
             }
             // Excess spaces cut (anything else was refused above).
-            Some(TextTypmod::Varchar(n)) => {
+            Some(TextTypmod::Varchar(n)) if n > 0 => {
                 Some(format!("UPDATE {table_name} SET {column} = rpad({column}, {n}) WHERE length({column}) > {n}"))
             }
             // `character(n)` to text loses the padding, which an older
             // binary's column still stores.
-            None if legacy => Some(format!("UPDATE {table_name} SET {column} = rtrim({column}) WHERE {column} LIKE '% '")),
+            None | Some(TextTypmod::Varchar(0)) if legacy => Some(format!("UPDATE {table_name} SET {column} = rtrim({column}) WHERE {column} LIKE '% '")),
             _ => None,
         };
         if let Some(sql) = rewrite {
@@ -11937,7 +11981,7 @@ async fn text_type_change(
                             !f.is_deleted
                                 && f.name == *c
                                 && f.db_type == crate::core::db_type::DbType::STRING
-                                && !matches!(f.text_typmod, Some(TextTypmod::Bpchar(_)))
+                                && !matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_)))
                         })
                 });
                 if still_declined && compares_bpchar(&check.expression) {

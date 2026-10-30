@@ -3399,7 +3399,7 @@ impl<S: StorageIO> Table<S> {
         columns: impl Fn(u32) -> bool,
     ) -> std::result::Result<(), String> {
         for field in self.schema.fields.iter() {
-            if field.text_typmod.is_none() || field.is_deleted || !columns(field.write_order as u32) {
+            if field.text_typmod().is_none() || field.is_deleted || !columns(field.write_order as u32) {
                 continue;
             }
             let Some(column) = row_write

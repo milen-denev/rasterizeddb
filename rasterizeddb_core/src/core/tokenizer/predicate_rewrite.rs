@@ -2613,10 +2613,51 @@ pub fn lift_evaluated_operands(
     clause: &str,
     schema: &SmallVec<[SchemaField; 20]>,
 ) -> Result<String, String> {
-    if !needs_evaluator(clause) && !pattern_may_read_bpchar(clause, schema) {
+    if clause.trim().is_empty() {
+        return Ok(clause.to_string());
+    }
+    if !needs_evaluator(clause)
+        && !pattern_may_read_bpchar(clause, schema)
+        && !contains_spaced_text_literal(clause)
+        && !padded_beside_varying(clause, schema)
+    {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
+}
+
+/// Whether `side` is a string literal that ends in a space, cast to `text`
+/// (`'ab  '::text`): a value typed text, which a `character(n)` column
+/// compares with exactly, trailing spaces kept. Every other literal compared
+/// with one is read blank-padded (`query_tokenizer`'s
+/// `canonicalize_bpchar_literals`, which cannot see a cast the rewrite has
+/// dropped), so this one is lifted to the evaluator whole, where it keeps its
+/// spaces. A parameter declared text is written so
+/// (`pg_params::inline_params`). Not in an `IN` list, whose items take the
+/// column's type (`lift_list_item`).
+fn spaced_text_literal(side: &str) -> bool {
+    let t = side.trim();
+    let Some(at) = t.rfind("::") else { return false };
+    let (literal, cast) = (t[..at].trim_end(), t[at + 2..].trim());
+    cast.eq_ignore_ascii_case("text")
+        && literal.len() >= 3
+        && literal.starts_with('\'')
+        && crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') == literal.len()
+        && literal[..literal.len() - 1].ends_with(' ')
+}
+
+/// Whether `text` may hold a [`spaced_text_literal`]. Cheap and generous.
+fn contains_spaced_text_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("::").map(|p| p + from) {
+        let cast = text[at + 2..].trim_start();
+        if cast.len() >= 4 && cast[..4].eq_ignore_ascii_case("text") && bytes[..at].ends_with(b" '") {
+            return true;
+        }
+        from = at + 2;
+    }
+    false
 }
 
 /// Whether `text` may hold a pattern match (`LIKE`, `ILIKE`, `SIMILAR TO`)
@@ -2624,7 +2665,7 @@ pub fn lift_evaluated_operands(
 /// ([`padded_for_pattern`]). Cheap and generous: the lift decides exactly.
 fn pattern_may_read_bpchar(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
-    let column = || schema.iter().any(|f| matches!(f.text_typmod, Some(TextTypmod::Bpchar(n)) if n > 0) && !f.is_deleted);
+    let column = || schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(n)) if n > 0) && !f.is_deleted);
     let cast = || {
         text.contains("::") && {
             let lower = text.to_ascii_lowercase();
@@ -2661,12 +2702,66 @@ fn padded_for_pattern(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Op
     }
     let column = resolve_column(name, schema)?;
     let field = schema.iter().find(|f| f.name == column && !f.is_deleted)?;
-    match field.text_typmod {
+    match field.text_typmod() {
         Some(TextTypmod::Bpchar(n)) if n > 0 && field.db_type == crate::core::db_type::DbType::STRING => {
             Some(format!("rpad({}, {})", name, n))
         }
         _ => None,
     }
+}
+
+/// How a bare text column compares with `character(n)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextSide {
+    Padded,
+    Varying,
+}
+
+/// The [`TextSide`] of `operand`, when it is a bare `character(n)` or
+/// `character varying` column of `schema`.
+fn column_text_kind(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<TextSide> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let name = operand.trim();
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '\'' | ':')) {
+        return None;
+    }
+    let column = resolve_column(name, schema)?;
+    let field = schema.iter().find(|f| f.name == column && !f.is_deleted)?;
+    if field.db_type != crate::core::db_type::DbType::STRING {
+        return None;
+    }
+    match field.text_typmod() {
+        Some(TextTypmod::Bpchar(_)) => Some(TextSide::Padded),
+        Some(TextTypmod::Varchar(_)) => Some(TextSide::Varying),
+        _ => None,
+    }
+}
+
+/// Whether `schema` holds both a `character(n)` and a `character varying`
+/// column, which a comparison between them reads blank-padded.
+fn padded_beside_varying(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    if !padded_and_varying_columns(schema) {
+        return false;
+    }
+    // Both kinds named in the text, which only then can compare them.
+    let mut padded = false;
+    let mut varying = false;
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"')) {
+        match column_text_kind(word, schema) {
+            Some(TextSide::Padded) => padded = true,
+            Some(TextSide::Varying) => varying = true,
+            None => {}
+        }
+    }
+    padded && varying
+}
+
+fn padded_and_varying_columns(schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let has = |want: fn(TextTypmod) -> bool| {
+        schema.iter().any(|f| !f.is_deleted && f.db_type == crate::core::db_type::DbType::STRING && f.text_typmod().is_some_and(want))
+    };
+    has(|t| matches!(t, TextTypmod::Bpchar(_))) && has(|t| matches!(t, TextTypmod::Varchar(_)))
 }
 
 /// Whether `rest`, a comparison from its operator on, is a pattern match.
@@ -2721,7 +2816,11 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !needs_evaluator(term) && !pattern_may_read_bpchar(term, schema) {
+    if !needs_evaluator(term)
+        && !pattern_may_read_bpchar(term, schema)
+        && !contains_spaced_text_literal(term)
+        && !padded_beside_varying(term, schema)
+    {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -2816,11 +2915,20 @@ fn lift_comparison(
         return Ok(format!("{} = true", lift_operand(body, schema, true)?));
     };
     if !keyword {
+        // `character(n)` against a `character varying` column compares
+        // blank-padded: the varying side is read without trailing spaces.
+        let (left, right) = (&body[..at], &body[op_end..]);
+        let (left, right): (std::borrow::Cow<str>, std::borrow::Cow<str>) =
+            match (column_text_kind(left, schema), column_text_kind(right, schema)) {
+                (Some(TextSide::Padded), Some(TextSide::Varying)) => (left.into(), format!(" rtrim({})", right.trim()).into()),
+                (Some(TextSide::Varying), Some(TextSide::Padded)) => (format!("rtrim({}) ", left.trim()).into(), right.into()),
+                _ => (left.into(), right.into()),
+            };
         return Ok(format!(
             "{}{}{}",
-            lift_side(&body[..at], schema)?,
+            lift_side(&left, schema)?,
             &body[at..op_end],
-            lift_side(&body[op_end..], schema)?
+            lift_side(&right, schema)?
         ));
     }
 
@@ -2835,7 +2943,7 @@ fn lift_comparison(
         // AND 10` was refused as "BETWEEN bounds must be separated by AND",
         // the `%` unreadable to the rewrite. Whatever else follows is left
         // for the ordinary rewrite to read or refuse.
-        if needs_evaluator(rest) {
+        if needs_evaluator(rest) || contains_spaced_text_literal(rest) {
             if let Some(spelled) = spell_out_list_or_range(left_text.trim(), rest, schema)? {
                 return Ok(spelled);
             }
@@ -2967,7 +3075,11 @@ fn spell_out_list_or_range(
                 let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
                 let mut parts = Vec::with_capacity(items.len());
                 for item in items {
-                    parts.push(format!("{} {} {}", left, each, lift_side(item, schema)?));
+                    // Not forced: an IN list's items take the column's type
+                    // with it (`a IN ('ab  '::text, 'x')` reads both
+                    // blank-padded against `character(n)`, as PostgreSQL's
+                    // common type of the list does), where `=` compares text.
+                    parts.push(format!("{} {} {}", left, each, lift_list_item(item, schema)?));
                 }
                 return Ok(Some(format!("({})", parts.join(join))));
             }
@@ -2993,8 +3105,15 @@ fn spell_out_list_or_range(
 
 /// One side of a comparison: lifted when it needs the evaluator, and a bare
 /// bit-string literal rewritten as the quoted bits the tokenizer reads.
-fn lift_side(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+fn lift_list_item(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
     if !needs_evaluator(side) {
+        return Ok(side.to_string());
+    }
+    lift_side(side, schema)
+}
+
+fn lift_side(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+    if !needs_evaluator(side) && !spaced_text_literal(side) {
         return Ok(side.to_string());
     }
     let lead = &side[..side.len() - side.trim_start().len()];

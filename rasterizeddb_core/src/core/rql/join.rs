@@ -574,6 +574,26 @@ fn sets(rels: Vec<Vec<Row>>) -> Vec<RowSet> {
         .collect()
 }
 
+/// How a text join-key column compares with `character(n)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    /// `character(n)`, stored without trailing spaces.
+    Padded,
+    /// `character varying`, compared blank-padded against `character(n)`.
+    Varying,
+    /// Anything else, text included, compared exactly.
+    Other,
+}
+
+fn text_kind(f: &SchemaField) -> TextKind {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match (f.db_type == DbType::STRING, f.text_typmod()) {
+        (true, Some(TextTypmod::Bpchar(_))) => TextKind::Padded,
+        (true, Some(TextTypmod::Varchar(_))) => TextKind::Varying,
+        _ => TextKind::Other,
+    }
+}
+
 /// One column of a join key, and the companion that says whether it is NULL.
 #[derive(Clone, Copy)]
 struct KeyColumn {
@@ -581,6 +601,11 @@ struct KeyColumn {
     flag: Option<u64>,
     /// Both sides are documents, so the key matches by value.
     document: bool,
+    /// This side is `character varying` and the other `character(n)`, which
+    /// PostgreSQL compares blank-padded (`bpchar` = `varchar` resolves to
+    /// `bpchar`): this side's trailing spaces are not part of the key, as the
+    /// other's are not stored (`type_modifier::TextTypmod`).
+    blank_padded: bool,
 }
 
 /// One key column's value as the join matches it: by bytes, or for two
@@ -641,6 +666,12 @@ fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<KeyValue<'r>> {
             return None;
         }
     }
+    let bytes = if key.blank_padded {
+        let end = bytes.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
+        &bytes[..end]
+    } else {
+        bytes
+    };
     Some(KeyValue {
         bytes,
         document: key.document,
@@ -934,8 +965,9 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         write_order: f.write_order,
                         flag: companion(left_relation, left_name),
                         document: false,
+                        blank_padded: false,
                     };
-                    (key, f.db_type == DbType::JSONB)
+                    (key, f.db_type == DbType::JSONB, text_kind(f))
                 });
             let r = relation
                 .fetch_columns
@@ -946,15 +978,20 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         write_order: f.write_order,
                         flag: companion(relation, right_name),
                         document: false,
+                        blank_padded: false,
                     };
-                    (key, f.db_type == DbType::JSONB)
+                    (key, f.db_type == DbType::JSONB, text_kind(f))
                 });
             match (l, r) {
-                (Some((mut l, l_doc)), Some((mut r, r_doc))) => {
+                (Some((mut l, l_doc, l_kind)), Some((mut r, r_doc, r_kind))) => {
                     // Matched by value only when both sides are documents;
                     // anything else keeps matching by bytes.
                     l.document = l_doc && r_doc;
                     r.document = l_doc && r_doc;
+                    // `character(n)` against `character varying`: the
+                    // varying side is read without its trailing spaces.
+                    l.blank_padded = l_kind == TextKind::Varying && r_kind == TextKind::Padded;
+                    r.blank_padded = r_kind == TextKind::Varying && l_kind == TextKind::Padded;
                     left_keys.push(l);
                     right_keys.push(r);
                 }

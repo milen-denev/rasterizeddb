@@ -181,22 +181,6 @@ pub enum CastTypmod {
     Interval(u32),
 }
 
-/// Rounds a count of microseconds to `precision` fractional digits of a
-/// second, half away from zero — PostgreSQL's `AdjustTimestampForTypmod`,
-/// `AdjustTimeForTypmod` and `AdjustIntervalForTypmod`.
-fn round_micros(micros: i64, precision: u32) -> i64 {
-    if precision >= 6 {
-        return micros;
-    }
-    let scale = 10i64.pow(6 - precision);
-    let offset = scale / 2;
-    if micros >= 0 {
-        micros.saturating_add(offset) / scale * scale
-    } else {
-        -((micros.saturating_neg().saturating_add(offset)) / scale * scale)
-    }
-}
-
 /// The modifier of the cast `target` names, when it has one this evaluator
 /// applies: `varchar(n)`, `char(n)` (and a bare `character`, `char(1)`),
 /// `timestamp(p)`, `timestamptz(p)`, `time(p)`, `timetz(p)`, `interval(p)`.
@@ -241,34 +225,12 @@ fn apply_cast_typmod(value: Value, typmod: CastTypmod) -> Result<Value, String> 
             Ok(text) => t.cast(text).as_bytes().to_vec(),
             Err(_) => bytes,
         },
-        CastTypmod::Timestamp(p) => match <[u8; 8]>::try_from(bytes.as_slice()) {
-            // Rounded on PostgreSQL's own epoch, 2000-01-01, which is where
-            // its half-away-from-zero meets the sign: `1999-12-31
-            // 23:59:59.5::timestamp(0)` is 23:59:59, as it is there.
-            Ok(raw) => {
-                let offset = crate::core::value_codec::PG_EPOCH_OFFSET_US;
-                let pg = i64::from_le_bytes(raw).wrapping_sub(offset);
-                round_micros(pg, p).wrapping_add(offset).to_le_bytes().to_vec()
-            }
-            Err(_) => bytes,
-        },
-        CastTypmod::Time(p) => match <[u8; 8]>::try_from(bytes.as_slice()) {
-            Ok(raw) => round_micros(i64::from_be_bytes(raw), p).to_be_bytes().to_vec(),
-            Err(_) => bytes,
-        },
-        CastTypmod::TimeTz(p) if bytes.len() == 12 => {
-            let micros = i64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
-            let mut out = round_micros(micros, p).to_be_bytes().to_vec();
-            out.extend_from_slice(&bytes[8..]);
-            out
+        // Rounded as an assignment to a column of the precision rounds
+        // (`type_modifier::round_time_bytes`), a timestamp on PostgreSQL's
+        // epoch: `1999-12-31 23:59:59.5::timestamp(0)` is 23:59:59.
+        CastTypmod::Timestamp(p) | CastTypmod::Time(p) | CastTypmod::TimeTz(p) | CastTypmod::Interval(p) => {
+            crate::core::rql::type_modifier::round_time_bytes(&db_type, &bytes, p).unwrap_or(bytes)
         }
-        CastTypmod::Interval(p) if bytes.len() == 16 => {
-            let micros = i64::from_be_bytes(bytes[..8].try_into().expect("eight bytes"));
-            let mut out = round_micros(micros, p).to_be_bytes().to_vec();
-            out.extend_from_slice(&bytes[8..]);
-            out
-        }
-        CastTypmod::TimeTz(_) | CastTypmod::Interval(_) => bytes,
     };
     Ok(Value::Data { bytes, db_type })
 }
@@ -284,6 +246,20 @@ fn integer_argument(bytes: &[u8], db_type: &DbType) -> Option<i64> {
         DbType::STRING => std::str::from_utf8(bytes).ok()?.trim().parse().ok()?,
         _ => return None,
     })
+}
+
+/// A `character varying` column compared with a `character(n)` value, read
+/// as PostgreSQL resolves `bpchar = varchar`: blank-padded, its trailing
+/// spaces not part of it (`rtrim`). A join's condition, evaluated over the
+/// joined row, compares two columns this way.
+fn blank_pad_varying(expr: &mut Expr) {
+    use crate::core::rql::type_modifier::TextTypmod;
+    if let Expr::Column(f) = expr {
+        if f.db_type == DbType::STRING && matches!(f.text_typmod(), Some(TextTypmod::Varchar(_))) {
+            let column = std::mem::replace(expr, Expr::Null);
+            *expr = Expr::Call(TextFunc::Rtrim, vec![column]);
+        }
+    }
 }
 
 /// A string literal without its trailing spaces: how one compared with a
@@ -303,10 +279,37 @@ fn strip_trailing_spaces(expr: &mut Expr) {
 pub fn yields_bpchar(expr: &Expr) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
     match expr {
-        Expr::Column(f) => matches!(f.text_typmod, Some(TextTypmod::Bpchar(_))) && f.db_type == DbType::STRING,
+        Expr::Column(f) => matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))) && f.db_type == DbType::STRING,
         Expr::TypmodCast { typmod: CastTypmod::Text(TextTypmod::Bpchar(_)), .. } => true,
-        _ => false,
+        // `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` over
+        // `character(n)` values and untyped strings are `bpchar`, as
+        // PostgreSQL's common type of them is.
+        _ => common_bpchar(expr).is_some(),
     }
+}
+
+/// The branches of `expr` when it is a `CASE`, `COALESCE`, `NULLIF`,
+/// `GREATEST` or `LEAST` whose common type is `bpchar`: at least one branch
+/// yields `character(n)` and every other is one too, an untyped string
+/// literal or `NULL`. With them, whether any branch is such a literal.
+fn common_bpchar(expr: &Expr) -> Option<(Vec<&Expr>, bool)> {
+    let branches: Vec<&Expr> = match expr {
+        Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().collect(),
+        Expr::NullIf(a, _) => vec![a.as_ref()],
+        Expr::Case { whens, otherwise } => whens.iter().map(|(_, e)| e).chain(otherwise.as_deref()).collect(),
+        _ => return None,
+    };
+    let mut any = false;
+    let mut literal = false;
+    for b in &branches {
+        match b {
+            Expr::Null => {}
+            Expr::Literal { db_type: DbType::STRING, .. } => literal = true,
+            other if yields_bpchar(other) => any = true,
+            _ => return None,
+        }
+    }
+    any.then_some((branches, literal))
 }
 
 /// The declared length a select-list item that yields `character(n)` is
@@ -315,12 +318,20 @@ pub fn yields_bpchar(expr: &Expr) -> bool {
 pub fn bpchar_width(expr: &Expr) -> Option<u32> {
     use crate::core::rql::type_modifier::TextTypmod;
     match expr {
-        Expr::Column(f) if f.db_type == DbType::STRING => match f.text_typmod {
+        Expr::Column(f) if f.db_type == DbType::STRING => match f.text_typmod() {
             Some(TextTypmod::Bpchar(n)) => Some(n),
             _ => None,
         },
         Expr::TypmodCast { typmod: CastTypmod::Text(TextTypmod::Bpchar(n)), .. } => Some(*n),
-        _ => None,
+        // A common `bpchar` of branches of one length keeps it; with another
+        // length or an untyped string among them it has none, as in
+        // PostgreSQL, and is shown as stored.
+        other => {
+            let (branches, literal) = common_bpchar(other)?;
+            let mut widths = branches.iter().filter(|b| !matches!(b, Expr::Null | Expr::Literal { .. })).map(|b| bpchar_width(b));
+            let first = widths.next().flatten()?;
+            Some(if !literal && widths.all(|w| w == Some(first)) { first } else { 0 })
+        }
     }
 }
 
@@ -1728,8 +1739,10 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
             // its trailing spaces, as the value is held (`yields_bpchar`).
             if yields_bpchar(&left) {
                 strip_trailing_spaces(&mut right);
+                blank_pad_varying(&mut right);
             } else if yields_bpchar(&right) {
                 strip_trailing_spaces(&mut left);
+                blank_pad_varying(&mut left);
             }
             return Ok(Condition {
                 left,
@@ -4183,10 +4196,14 @@ pub(crate) fn check_declared_precision(
 /// trailing spaces, past the length an error (22001).
 pub(crate) fn held_to_text_length(value: Value, field: &SchemaField) -> Result<Value, String> {
     match &value {
-        Value::Data { bytes, db_type: DbType::STRING } => match crate::core::rql::type_modifier::assign_bytes(field, bytes)? {
-            Some(held) => Ok(Value::Data { bytes: held, db_type: DbType::STRING }),
-            None => Ok(value),
-        },
+        // A text value to a declared length, a time value to a declared
+        // precision (`type_modifier::assign_bytes` checks the column's type).
+        Value::Data { bytes, db_type } if *db_type == field.db_type || *db_type == DbType::STRING => {
+            match crate::core::rql::type_modifier::assign_bytes(field, bytes)? {
+                Some(held) => Ok(Value::Data { bytes: held, db_type: db_type.clone() }),
+                None => Ok(value),
+            }
+        }
         _ => Ok(value),
     }
 }

@@ -840,7 +840,7 @@ async fn build(
                         // `character`, as PostgreSQL names `character(n)`
                         // (`type_modifier::TextTypmod`); the wire says
                         // `bpchar` for it too.
-                        if matches!(field.text_typmod, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_))) {
+                        if matches!(field.text_typmod(), Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_))) {
                             "character"
                         } else {
                             sql_type_name(&field.db_type)

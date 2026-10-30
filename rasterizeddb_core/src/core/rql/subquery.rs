@@ -357,7 +357,7 @@ pub fn is_correlated(inner_sql: &str) -> bool {
 /// [`rows_to_value_list`]: a scan reports one as text, and rendered as text
 /// its encoded bytes were refused as a constant, or compared against `doc` as
 /// a literal no document parses from.
-pub fn rows_to_scalar(rows: &[Row], document: bool) -> Result<String, String> {
+pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool) -> Result<String, String> {
     match rows.len() {
         // No rows makes the expression NULL, and NULL is what it becomes.
         // It used to be an empty string, which is a *value*: `WHERE id = ''`
@@ -376,7 +376,7 @@ pub fn rows_to_scalar(rows: &[Row], document: bool) -> Result<String, String> {
             } else {
                 column.column_type.clone()
             };
-            value_to_literal(&db_type, column.data.into_slice()).ok_or_else(|| {
+            subquery_literal(&db_type, column.data.into_slice(), exact_text).ok_or_else(|| {
                 format!(
                     "subquery returned a {} value that cannot be used as a constant",
                     db_type
@@ -924,6 +924,7 @@ fn exists_parts(
 pub fn multi_exists_predicate(
     spec: &MultiCorrelatedExists,
     rows: &[Row],
+    exact_text: &[bool],
 ) -> Result<String, String> {
     let mut groups: Vec<String> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -945,8 +946,9 @@ pub fn multi_exists_predicate(
             continue;
         }
         let mut terms: Vec<String> = Vec::with_capacity(row.columns.len());
-        for (outer, column) in spec.outer_refs.iter().zip(row.columns.iter()) {
-            let literal = value_to_literal(&column.column_type, column.data.into_slice())
+        for (at, (outer, column)) in spec.outer_refs.iter().zip(row.columns.iter()).enumerate() {
+            let exact = exact_text.get(at).copied().unwrap_or(true);
+            let literal = subquery_literal(&column.column_type, column.data.into_slice(), exact)
                 .ok_or_else(|| {
                     format!(
                         "the EXISTS subquery returned a {} value that cannot be compared",
@@ -1198,7 +1200,7 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
     }
 
     Some(match db_type {
-        DbType::STRING => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
+        DbType::STRING | DbType::BPCHAR(_) => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
         DbType::UUID => value_codec::quote_sql(&value_codec::format_uuid(bytes)),
         DbType::INET => value_codec::quote_sql(&value_codec::format_inet(bytes)?),
         DbType::DATETIME => {
@@ -1322,7 +1324,26 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// text, and rendered as text its encoded bytes made a literal no document
 /// parses from, so `doc IN (SELECT doc FROM t)` was refused outright. It is
 /// rendered as the document it is, and duplicates are found by value.
-pub fn rows_to_value_list(rows: &[Row], document: bool) -> Result<(String, bool), String> {
+/// A subquery's value as the literal it is substituted as. A text value
+/// with trailing spaces from a text column (`exact_text`) is written as the
+/// text expression `('…' || '')`: compared with a `character(n)` column
+/// PostgreSQL compares a subquery's text value as text, exactly — in `IN
+/// (SELECT …)` and `= (SELECT …)` alike — where an untyped `'ab  '` is
+/// `'ab'`. An expression keeps that through the rewrite, which reads an `IN`
+/// list's typed literals as the column's type, as a written list is. One
+/// from a `character(n)` or `character varying` column compares
+/// blank-padded and is written untyped. Without trailing spaces the two
+/// readings agree.
+pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
+    let literal = value_to_literal(db_type, bytes)?;
+    Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {
+        format!("({literal} || '')")
+    } else {
+        literal
+    })
+}
+
+pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Result<(String, bool), String> {
     let mut out = String::with_capacity(2 + rows.len() * 8);
     out.push('(');
     let mut had_null = false;
@@ -1360,7 +1381,7 @@ pub fn rows_to_value_list(rows: &[Row], document: bool) -> Result<(String, bool)
         if !seen.insert((db_type.to_byte(), key)) {
             continue;
         }
-        let literal = value_to_literal(&db_type, bytes).ok_or_else(|| {
+        let literal = subquery_literal(&db_type, bytes, exact_text).ok_or_else(|| {
             format!(
                 "subquery returned a {} value that cannot be compared",
                 db_type
@@ -1521,7 +1542,7 @@ mod tests {
             outer_refs: vec!["a.x".to_string(), "a.y".to_string()],
             negated: true,
         };
-        let predicate = multi_exists_predicate(&spec, &[row(1, 1)]).unwrap();
+        let predicate = multi_exists_predicate(&spec, &[row(1, 1)], &[]).unwrap();
         // De Morgan: "differs in at least one column", per inner row.
         assert_eq!(
             predicate,
@@ -1530,7 +1551,7 @@ mod tests {
 
         // The pair (1,1) must be excluded as a *pair*. A per-column rewrite
         // would also exclude (1,2) and (2,1), which is the bug this replaces.
-        let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)]).unwrap();
+        let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)], &[]).unwrap();
         assert_eq!(
             two,
             "(a.x IS NULL OR a.y IS NULL OR ((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2)))"
@@ -1541,12 +1562,12 @@ mod tests {
             ..spec
         };
         assert_eq!(
-            multi_exists_predicate(&positive, &[row(1, 1)]).unwrap(),
+            multi_exists_predicate(&positive, &[row(1, 1)], &[]).unwrap(),
             "((a.x = 1 AND a.y = 1))"
         );
 
         // No inner rows: NOT EXISTS holds for everything, EXISTS for nothing.
-        assert_eq!(multi_exists_predicate(&positive, &[]).unwrap(), "1 = 0");
+        assert_eq!(multi_exists_predicate(&positive, &[], &[]).unwrap(), "1 = 0");
     }
 
     #[test]
@@ -1654,7 +1675,7 @@ mod tests {
 
     #[test]
     fn empty_results_render_as_an_empty_list() {
-        assert_eq!(rows_to_value_list(&[], false).unwrap(), ("()".to_string(), false));
+        assert_eq!(rows_to_value_list(&[], false, true).unwrap(), ("()".to_string(), false));
     }
 
     /// The cheap guard must never turn a finding into `None`: lower case,

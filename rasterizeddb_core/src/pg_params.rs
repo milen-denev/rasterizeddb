@@ -162,6 +162,7 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                 out.push_str(&sql[copied..i]);
                 push_param_literal(&mut out, &params[n - 1])?;
                 i = j;
+                let mut consumed_cast: Option<&str> = None;
 
                 // A cast written on the placeholder goes with it.
                 //
@@ -200,8 +201,23 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                     // `numeric(10,2)`, `text[]` — is left in place rather than
                     // half-consumed, which would strand punctuation.
                     if k > name_start && !matches!(bytes.get(k), Some(b'(') | Some(b'[')) {
+                        consumed_cast = Some(&sql[name_start..k]);
                         i = k;
                     }
+                }
+                // A value typed text that ends in a space keeps its type: a
+                // `character(n)` column compares with text exactly, trailing
+                // spaces kept, and with an untyped literal blank-padded
+                // (`'ab  '` is `'ab'`). Typed by a `::text` cast, or by the
+                // client declaring the parameter text (sqlx and
+                // tokio-postgres bind strings so) with no cast to say
+                // otherwise. Without the space the two readings agree.
+                let typed_text = match consumed_cast {
+                    Some(cast) => cast.eq_ignore_ascii_case("text"),
+                    None => params[n - 1].oid == OID_TEXT,
+                };
+                if typed_text && params[n - 1].value.as_deref().is_some_and(|v| v.last() == Some(&b' ')) {
+                    out.push_str("::text");
                 }
                 copied = i;
             }

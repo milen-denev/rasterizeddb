@@ -159,6 +159,11 @@ pub const BPCHAR_MARKER: &str = "\u{1}bpchar:";
 /// column was unbounded text there, as it always was.
 pub const VARCHAR_MARKER: &str = "\u{1}varchar:";
 
+/// The prefix of a record saying a `timestamp(p)`, `timestamptz(p)`,
+/// `time(p)`, `timetz(p)` or `interval(p)` column rounds what it is given to
+/// `p` fractional digits, stored as `p + 1` as the lengths are.
+pub const PRECISION_MARKER: &str = "\u{1}precision:";
+
 /// The stored length of a bare `bpchar` column, which has none.
 pub const BPCHAR_UNBOUNDED: u32 = u32::MAX;
 
@@ -179,8 +184,44 @@ pub const MAX_TEXT_LENGTH: u32 = 10_485_760;
 pub enum TextTypmod {
     /// `character(n)`; `n` is 0 for a bare `bpchar`, which has no length.
     Bpchar(u32),
-    /// `character varying(n)`.
+    /// `character varying(n)`; `n` is 0 for a `varchar` with none, which
+    /// is otherwise text but compares blank-padded with `character(n)`.
     Varchar(u32),
+    /// The fractional-second digits of `timestamp(p)`, `timestamptz(p)`,
+    /// `time(p)`, `timetz(p)` or `interval(p)` (0 to 5; six is the type's
+    /// own and needs no record): a value assigned is rounded to them.
+    Precision(u32),
+}
+
+/// A [`TextTypmod`] in four bytes, as a `SchemaField` carries it: the kind in
+/// the top two bits, the length plus one below. An enum of three `u32`
+/// variants is eight, and every field of every inline schema copy paid for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedTypmod(std::num::NonZeroU32);
+
+impl PackedTypmod {
+    const VALUE: u32 = (1 << 30) - 1;
+
+    pub fn pack(t: TextTypmod) -> Option<PackedTypmod> {
+        let (kind, n) = match t {
+            TextTypmod::Bpchar(n) => (0u32, n),
+            TextTypmod::Varchar(n) => (1, n),
+            TextTypmod::Precision(p) => (2, p),
+        };
+        // Lengths are at most `MAX_TEXT_LENGTH`, far below the 30 bits.
+        let value = n.checked_add(1).filter(|v| *v <= Self::VALUE)?;
+        std::num::NonZeroU32::new((kind << 30) | value).map(PackedTypmod)
+    }
+
+    pub fn unpack(self) -> TextTypmod {
+        let raw = self.0.get();
+        let n = (raw & Self::VALUE) - 1;
+        match raw >> 30 {
+            0 => TextTypmod::Bpchar(n),
+            1 => TextTypmod::Varchar(n),
+            _ => TextTypmod::Precision(n),
+        }
+    }
 }
 
 impl TextTypmod {
@@ -189,14 +230,16 @@ impl TextTypmod {
         match self {
             TextTypmod::Bpchar(0) => "bpchar".to_string(),
             TextTypmod::Bpchar(n) => format!("character({n})"),
+            TextTypmod::Varchar(0) => "character varying".to_string(),
             TextTypmod::Varchar(n) => format!("character varying({n})"),
+            TextTypmod::Precision(p) => format!("precision({p})"),
         }
     }
 
     /// The declared length, when there is one.
     pub fn length(&self) -> Option<u32> {
         match self {
-            TextTypmod::Bpchar(0) => None,
+            TextTypmod::Bpchar(0) | TextTypmod::Varchar(0) | TextTypmod::Precision(_) => None,
             TextTypmod::Bpchar(n) | TextTypmod::Varchar(n) => Some(*n),
         }
     }
@@ -219,6 +262,7 @@ impl TextTypmod {
                 }
                 Ok(stripped)
             }
+            TextTypmod::Varchar(0) | TextTypmod::Precision(_) => Ok(text),
             TextTypmod::Varchar(n) => match char_boundary(text, n) {
                 None => Ok(text),
                 Some(at) if text[at..].bytes().all(|b| b == b' ') => Ok(&text[..at]),
@@ -237,7 +281,7 @@ impl TextTypmod {
         };
         match self {
             TextTypmod::Bpchar(_) => cut.trim_end_matches(' '),
-            TextTypmod::Varchar(_) => cut,
+            TextTypmod::Varchar(_) | TextTypmod::Precision(_) => cut,
         }
     }
 
@@ -255,7 +299,10 @@ impl TextTypmod {
         let (prefix, stored) = match *self {
             TextTypmod::Bpchar(0) => (BPCHAR_MARKER, BPCHAR_UNBOUNDED),
             TextTypmod::Bpchar(n) => (BPCHAR_MARKER, n),
+            TextTypmod::Varchar(0) => (VARCHAR_MARKER, BPCHAR_UNBOUNDED),
             TextTypmod::Varchar(n) => (VARCHAR_MARKER, n),
+            // Plus one, so `(0)` is a record and not the zeros of none.
+            TextTypmod::Precision(p) => (PRECISION_MARKER, p + 1),
         };
         TypeModifier {
             column: format!("{prefix}{column}"),
@@ -272,13 +319,84 @@ impl TextTypmod {
 /// it is too long. Anything but a text column with a declared length, and
 /// bytes that are not UTF-8, are left alone.
 pub fn assign_bytes(field: &crate::core::row::schema::SchemaField, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let Some(typmod) = field.text_typmod else { return Ok(None) };
+    let Some(typmod) = field.text_typmod() else { return Ok(None) };
+    if let TextTypmod::Precision(p) = typmod {
+        // A time value assigned to a column of declared precision is rounded
+        // to it, as PostgreSQL's assignment does.
+        let rounded = round_time_bytes(&field.db_type, bytes, p);
+        return Ok(rounded.filter(|r| r.as_slice() != bytes));
+    }
     if field.db_type != crate::core::db_type::DbType::STRING {
         return Ok(None);
     }
     let Ok(text) = std::str::from_utf8(bytes) else { return Ok(None) };
     let held = typmod.assign(text)?;
     Ok((held.len() != text.len()).then(|| held.as_bytes().to_vec()))
+}
+
+/// Rounds a count of microseconds to `precision` fractional digits of a
+/// second, half away from zero — PostgreSQL's `AdjustTimestampForTypmod`,
+/// `AdjustTimeForTypmod` and `AdjustIntervalForTypmod`.
+pub fn round_micros(micros: i64, precision: u32) -> i64 {
+    if precision >= 6 {
+        return micros;
+    }
+    let scale = 10i64.pow(6 - precision);
+    let offset = scale / 2;
+    if micros >= 0 {
+        micros.saturating_add(offset) / scale * scale
+    } else {
+        -((micros.saturating_neg().saturating_add(offset)) / scale * scale)
+    }
+}
+
+/// The stored bytes of a time value of `db_type` rounded to `precision`
+/// fractional digits, or `None` when `db_type` is no time type or the bytes
+/// are not one. A timestamp is rounded on PostgreSQL's epoch, 2000-01-01,
+/// where its half-away-from-zero meets the sign: `1999-12-31 23:59:59.5` to
+/// no digits is `23:59:59`.
+pub fn round_time_bytes(db_type: &crate::core::db_type::DbType, bytes: &[u8], precision: u32) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType;
+    match db_type {
+        DbType::DATETIME => {
+            let raw = <[u8; 8]>::try_from(bytes).ok()?;
+            let offset = crate::core::value_codec::PG_EPOCH_OFFSET_US;
+            let pg = i64::from_le_bytes(raw).wrapping_sub(offset);
+            Some(round_micros(pg, precision).wrapping_add(offset).to_le_bytes().to_vec())
+        }
+        DbType::TIME => {
+            let raw = <[u8; 8]>::try_from(bytes).ok()?;
+            Some(round_micros(i64::from_be_bytes(raw), precision).to_be_bytes().to_vec())
+        }
+        DbType::TIMETZ | DbType::INTERVAL if bytes.len() == if *db_type == DbType::TIMETZ { 12 } else { 16 } => {
+            let micros = i64::from_be_bytes(bytes[..8].try_into().ok()?);
+            let mut out = round_micros(micros, precision).to_be_bytes().to_vec();
+            out.extend_from_slice(&bytes[8..]);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The fractional-second precision a declared time type, as written, gives
+/// its column: `timestamp(0)`, `timestamp(3) with time zone`, `timestamptz(2)`,
+/// `time(1)`, `timetz(2)`, `interval(0)`. `None` without a modifier and for
+/// six or more (the type's own precision, nothing to round).
+pub fn parse_time_precision(declared: &str) -> Option<Result<TextTypmod, String>> {
+    let text = declared.trim();
+    let open = text.find('(')?;
+    let close = text[open..].find(')')? + open;
+    let base = text[..open].trim().to_ascii_lowercase();
+    if !matches!(base.as_str(), "timestamp" | "timestamptz" | "time" | "timetz" | "interval") {
+        return None;
+    }
+    let digits = text[open + 1..close].trim();
+    match digits.parse::<i64>() {
+        Ok(p) if p < 0 => Some(Err(format!("{base}({p}) precision must not be negative"))),
+        Ok(p) if p >= 6 => None,
+        Ok(p) => Some(Ok(TextTypmod::Precision(p as u32))),
+        Err(_) => Some(Err(format!("invalid type modifier '{digits}'"))),
+    }
 }
 
 /// `text` blank-padded to `n` characters (PostgreSQL counts characters, not
@@ -354,6 +472,10 @@ pub fn text_typmod_of(column: &str, modifiers: &[TypeModifier]) -> Option<TextTy
     if let Some(m) = live_marker(BPCHAR_MARKER, column, modifiers) {
         return marker_length(m).map(TextTypmod::Bpchar);
     }
+    if let Some(m) = live_marker(PRECISION_MARKER, column, modifiers) {
+        let stored = u32::from(m.precision) | (u32::from(m.scale) << 16);
+        return stored.checked_sub(1).map(TextTypmod::Precision);
+    }
     live_marker(VARCHAR_MARKER, column, modifiers)
         .and_then(marker_length)
         .map(TextTypmod::Varchar)
@@ -389,11 +511,15 @@ pub fn text_typmod_records(column: &str, typmod: Option<TextTypmod>, modifiers: 
     let mut out = Vec::new();
     let bpchar_now = matches!(typmod, Some(TextTypmod::Bpchar(_)));
     let varchar_now = matches!(typmod, Some(TextTypmod::Varchar(_)));
+    let precision_now = matches!(typmod, Some(TextTypmod::Precision(_)));
     if !bpchar_now && live_marker(BPCHAR_MARKER, column, modifiers).is_some() {
         out.push(bpchar_marker_retired(column));
     }
     if !varchar_now && live_marker(VARCHAR_MARKER, column, modifiers).is_some() {
         out.push(varchar_marker_retired(column));
+    }
+    if !precision_now && live_marker(PRECISION_MARKER, column, modifiers).is_some() {
+        out.push(TypeModifier { column: format!("{PRECISION_MARKER}{column}"), precision: 0, scale: 0, is_deleted: true });
     }
     if let Some(t) = typmod {
         out.push(t.marker(column));
@@ -409,8 +535,8 @@ pub fn is_bpchar_type(declared: &str) -> bool {
 
 /// The length a declared type, as written, gives a text column:
 /// `character(3)`, `char`, `nchar(2)`, `bpchar` (no length), `varchar(10)`,
-/// `character varying(3)`. `None` for any other type, an unbounded
-/// `varchar`, and an array of either.
+/// `character varying(3)`, `varchar` (no length). `None` for any other type
+/// and an array of either.
 pub fn parse_text_typmod(declared: &str) -> Option<Result<TextTypmod, String>> {
     let text = declared.trim();
     if text.contains('[') {
@@ -459,7 +585,9 @@ pub fn parse_text_typmod(declared: &str) -> Option<Result<TextTypmod, String>> {
     };
     Some(Ok(match (varying, length) {
         (true, Some(n)) => TextTypmod::Varchar(n),
-        (true, None) => return None,
+        // Recorded with no length: text that compares blank-padded with
+        // `character(n)`, where text compares exactly.
+        (true, None) => TextTypmod::Varchar(0),
         (false, Some(n)) => TextTypmod::Bpchar(n),
         // `character` alone is `character(1)`; `bpchar` alone has no length.
         (false, None) if words == ["bpchar"] => TextTypmod::Bpchar(0),
@@ -617,7 +745,7 @@ mod tests {
         assert_eq!(read("varchar(5)"), Some(Ok(TextTypmod::Varchar(5))));
         assert_eq!(read("character varying(3)"), Some(Ok(TextTypmod::Varchar(3))));
         assert_eq!(read("CHARACTER  VARYING ( 3 )"), Some(Ok(TextTypmod::Varchar(3))));
-        assert_eq!(read("varchar"), None);
+        assert_eq!(read("varchar"), Some(Ok(TextTypmod::Varchar(0))));
         assert_eq!(read("text"), None);
         assert_eq!(read("char(3)[]"), None);
         assert_eq!(read("char(0)"), Some(Err(())));

@@ -404,7 +404,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
                 joined
             };
-            match crate::core::rql::type_modifier::parse_text_typmod(&full_type) {
+            match crate::core::rql::type_modifier::parse_text_typmod(&full_type)
+                .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&full_type))
+            {
                 Some(Ok(typmod)) => type_modifiers.push(typmod.marker(&name)),
                 Some(Err(reason)) => {
                     rejection.replace(reason);

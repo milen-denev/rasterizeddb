@@ -884,14 +884,14 @@ fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallV
     use crate::core::rql::type_modifier::TextTypmod;
     // A cast to `character(n)` yields one too (`s::char(5) = 'ab '`), over
     // a table that has no such column.
-    if !schema.iter().any(|f| matches!(f.text_typmod, Some(TextTypmod::Bpchar(_))))
+    if !schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))))
         && !out.iter().any(|t| matches!(t, Token::Evaluated(operand) if operand.is_bpchar()))
     {
         return;
     }
     let bpchar = |t: &Token| match t {
         Token::Ident((name, DbType::STRING, wo)) => schema.iter().any(|f| {
-            f.write_order == *wo && !f.is_deleted && f.name == *name && matches!(f.text_typmod, Some(TextTypmod::Bpchar(_)))
+            f.write_order == *wo && !f.is_deleted && f.name == *name && matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_)))
         }),
         Token::Evaluated(operand) => operand.is_bpchar(),
         _ => false,
@@ -1439,7 +1439,7 @@ mod tests {
             write_order: 5,
             is_unique: false,
             scale: None,
-            text_typmod: None,
+            typmod_packed: None,
         });
         schema.push(SchemaField {
             name: "field2".to_string(),
@@ -1450,7 +1450,7 @@ mod tests {
             write_order: 10,
             is_unique: false,
             scale: None,
-            text_typmod: None,
+            typmod_packed: None,
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);

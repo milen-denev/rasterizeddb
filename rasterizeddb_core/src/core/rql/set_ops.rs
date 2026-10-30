@@ -72,8 +72,30 @@ pub fn widened_branch_integers(
         })
         .collect();
     let width = declared.iter().map(Vec::len).min().unwrap_or(0);
+    // `character(n)` in the first branch and text in another: PostgreSQL
+    // resolves the column to `bpchar` (the first branch's type wins where each
+    // casts to the other), so the text values are read without trailing
+    // spaces, and `'ab'` and `'ab  '` are one row. Marked `BPCHAR` here, which
+    // `push_widened` applies to the cells.
+    let padded: Vec<Vec<Option<u32>>> = if branches.len() > 1 {
+        branches.iter().map(|b| branch_bpchar_widths(b, database)).collect()
+    } else {
+        Vec::new()
+    };
     (0..width)
         .map(|at| {
+            if let Some(first) = padded.first().and_then(|w| w.get(at).copied().flatten()) {
+                let others: Vec<Option<u32>> = padded[1..].iter().map(|w| w.get(at).copied().flatten()).collect();
+                let text_beside = declared[1..].iter().zip(&others).any(|(b, w)| {
+                    w.is_none() && matches!(b.get(at), Some(Some(DbType::STRING)) | Some(None))
+                });
+                if text_beside {
+                    return Some(DbType::bpchar(0));
+                }
+                if others.iter().any(|w| *w != Some(first)) {
+                    return None;
+                }
+            }
             let types: Vec<&DbType> =
                 declared.iter().map(|b| b[at].as_ref()).collect::<Option<Vec<_>>>()?;
             if types.windows(2).all(|w| w[0] == w[1]) {
@@ -100,6 +122,55 @@ pub fn widened_branch_integers(
                 8 => DbType::I64,
                 _ => DbType::I128,
             })
+        })
+        .collect()
+}
+
+/// The `character(n)` length of each output column of `branch`, a `SELECT`
+/// of one relation, where the column yields `character(n)` (`0` for a bare
+/// `bpchar`): a column declared so, a cast to it, `MIN`/`MAX` of one. Empty
+/// for a branch this cannot read (a join).
+pub fn branch_bpchar_widths(branch: &str, database: &Arc<Database>) -> Vec<Option<u32>> {
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+    use crate::core::rql::type_modifier::TextTypmod;
+    let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(branch) else { return Vec::new() };
+    let crate::core::rql::lexer_s1::QueryPurpose::QueryRows(qr) = &purpose else { return Vec::new() };
+    if crate::core::rql::join::statement_has_join(&qr.query) {
+        return Vec::new();
+    }
+    let Some(view) = database.schema_view(&qr.table_name) else { return Vec::new() };
+    let schema = view.schema();
+    let Ok(parsed) = crate::core::rql::lexer_query::row_fetch_from_select_query(&purpose, &schema.fields) else {
+        return Vec::new();
+    };
+    let of_field = |f: &crate::core::row::schema::SchemaField| match (f.db_type == DbType::STRING, f.text_typmod()) {
+        (true, Some(TextTypmod::Bpchar(n))) => Some(n),
+        _ => None,
+    };
+    let of_item = |item: &SelectItem| match item {
+        SelectItem::Column { field, .. } => of_field(field),
+        SelectItem::RowExpr { expr, .. } => crate::core::rql::expr::bpchar_width(expr),
+        SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, arg: Some(field), arg_expr: None, .. } => of_field(field),
+        _ => None,
+    };
+    if let Some(plan) = &parsed.aggregate {
+        return plan.items.iter().map(of_item).collect();
+    }
+    if !parsed.select_items.is_empty() {
+        return parsed.select_items.iter().map(of_item).collect();
+    }
+    parsed
+        .requested_row_fetch
+        .columns_fetching_data
+        .iter()
+        .take(parsed.visible_columns)
+        .map(|c| {
+            schema
+                .fields
+                .iter()
+                .find(|f| f.write_order == c.schema_id)
+                .or_else(|| schema.fields.get(c.schema_id as usize))
+                .and_then(of_field)
         })
         .collect()
 }
@@ -250,6 +321,17 @@ fn push_widened(
             };
             Some((DbType::DECIMAL, crate::core::value_codec::decimal_cell_with_scale(m, scale)))
         });
+        // A text cell of a column resolved to `bpchar` (`widened_branch_integers`)
+        // is read as one: without its trailing spaces.
+        if matches!(widen.get(position), Some(Some(DbType::BPCHAR(_)))) && cell.column_type == DbType::STRING {
+            let end = cell.data.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
+            let data = &cell.data[..end];
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&u64::from(cell.schema_id).to_le_bytes());
+            out.extend_from_slice(data);
+            out.push(cell.column_type.to_byte());
+            continue;
+        }
         let wide = scaled.or_else(|| {
             widen.get(position).and_then(|t| t.as_ref()).and_then(|ty| {
                 let bytes = integer_bytes(integer(&cell.column_type, cell.data)?, ty)?;
@@ -368,7 +450,7 @@ impl Combined {
             let row = row.map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
             if distinct {
                 key.clear();
-                duplicate_key(row, &self.documents, rescale, &mut key)
+                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key)
                     .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
                 let hash = self.state.hash_one(&key[..]);
                 let (keys, key_starts) = (&self.keys, &self.key_starts);
@@ -642,6 +724,7 @@ fn duplicate_key(
     row: &[u8],
     documents: &[bool],
     rescale: Option<&[Option<u32>]>,
+    widen: &[Option<DbType>],
     out: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     for (position, cell) in serialized_cells(row)?.enumerate() {
@@ -695,6 +778,13 @@ fn duplicate_key(
             continue;
         }
         let text = match ty {
+            // A column resolved to `bpchar` (`widened_branch_integers`): its
+            // values compare without trailing spaces, so 'ab' and a text
+            // branch's 'ab  ' are one row.
+            DbType::STRING if matches!(widen.get(position), Some(Some(DbType::BPCHAR(_)))) => {
+                let end = data.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
+                Some(std::borrow::Cow::Borrowed(&data[..end]))
+            }
             DbType::STRING => Some(std::borrow::Cow::Borrowed(data)),
             DbType::CHAR => le::<4>(data)
                 .and_then(|c| char::from_u32(u32::from_le_bytes(c)))
@@ -740,7 +830,7 @@ mod tests {
 
     fn key(columns: Vec<Column>, documents: &[bool]) -> Vec<u8> {
         let mut out = Vec::new();
-        duplicate_key(&serialized(columns), documents, None, &mut out).unwrap();
+        duplicate_key(&serialized(columns), documents, None, &[], &mut out).unwrap();
         out
     }
 

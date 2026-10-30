@@ -373,18 +373,23 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
             match sec_field.split_once('.') {
                 Some((whole, frac)) => {
                     second = whole.parse().ok()?;
-                    // Pad or truncate the fraction to exactly 6 digits.
-                    let mut f = String::with_capacity(6);
-                    for c in frac.chars().take(6) {
-                        if !c.is_ascii_digit() {
-                            return None;
+                    if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    // Rounded to the microsecond as PostgreSQL rounds it
+                    // (`rint(strtod(".ffff") * 1e6)`, ties to even), not cut:
+                    // `.4999995` is `.500000`, which `::timestamp(0)` then
+                    // rounds up to the next second.
+                    micros = if frac.len() <= 6 {
+                        let mut f = frac.to_string();
+                        while f.len() < 6 {
+                            f.push('0');
                         }
-                        f.push(c);
-                    }
-                    while f.len() < 6 {
-                        f.push('0');
-                    }
-                    micros = f.parse().ok()?;
+                        f.parse().ok()?
+                    } else {
+                        let fraction: f64 = format!("0.{frac}").parse().ok()?;
+                        (fraction * 1_000_000.0).round_ties_even() as i64
+                    };
                 }
                 None => second = sec_field.parse().ok()?,
             }
@@ -2328,10 +2333,19 @@ mod tests {
             parse_timestamp_us("2026-08-20 00:00:00.000001").unwrap(),
             base + 1
         );
-        // More than microsecond precision is truncated, not rejected.
+        // More than microsecond precision is rounded as PostgreSQL rounds
+        // it, not truncated and not rejected.
         assert_eq!(
             parse_timestamp_us("2026-08-20 00:00:00.1234567").unwrap(),
-            base + 123_456
+            base + 123_457
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.4999995").unwrap(),
+            base + 500_000
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.9999996").unwrap(),
+            base + 1_000_000
         );
     }
 

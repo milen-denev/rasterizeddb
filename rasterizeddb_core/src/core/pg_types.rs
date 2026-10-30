@@ -259,7 +259,9 @@ fn parse_clock(token: &str) -> Option<(i64, bool)> {
     }
     let micros = hours.checked_mul(3_600_000_000)?
         + minutes.checked_mul(60_000_000)?
-        + (seconds * 1_000_000.0).round() as i64;
+        // Ties to even, as PostgreSQL's `rint` rounds a fraction of a
+        // microsecond.
+        + (seconds * 1_000_000.0).round_ties_even() as i64;
     Some((if negative { -micros } else { micros }, negative))
 }
 

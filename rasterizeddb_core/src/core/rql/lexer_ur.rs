@@ -779,7 +779,7 @@ mod tests {
                 is_unique: true,
                 is_deleted: false,
                 scale: None,
-                text_typmod: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -790,7 +790,7 @@ mod tests {
                 is_unique: false,
                 is_deleted: false,
                 scale: None,
-                text_typmod: None,
+                typmod_packed: None,
             },
         ]
     }
