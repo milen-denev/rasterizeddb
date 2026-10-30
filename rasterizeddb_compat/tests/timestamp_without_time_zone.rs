@@ -476,6 +476,10 @@ async fn every_spelling_of_a_timestamptz_into_text_gets_the_same_rendering() {
     );
     run(&c, "CREATE TABLE tc (a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
     run(&c, "INSERT INTO tc VALUES ('2024-01-01 10:00:00', '2024-01-01 10:00:00+02')").await.expect("insert");
+    // However deep the parentheses, `::timestamp` discards the literal's zone.
+    run(&c, "CREATE TABLE tn (b TIMESTAMPTZ)").await.expect("create");
+    run(&c, "INSERT INTO tn VALUES ((('2024-01-01 10:00:00+02'))::timestamp)").await.expect("insert nested");
+    assert_eq!(column(&c, "SELECT b FROM tn").await, ["2024-01-01 10:00:00+00"]);
     let got = rows(&c, "SELECT a::text, b::text, a || '', b || '' FROM tc").await;
     assert_eq!(got[0][0].as_deref(), Some("2024-01-01 10:00:00"), "{got:?}");
     assert_eq!(got[0][1].as_deref(), Some("2024-01-01 08:00:00+00"), "{got:?}");
