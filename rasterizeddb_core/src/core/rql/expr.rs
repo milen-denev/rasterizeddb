@@ -1845,6 +1845,26 @@ fn local_timestamp_literal(column: &Expr, literal: &mut Expr) {
     }
 }
 
+/// Whether `expr` is a `timestamp` (without time zone) column, whose text has
+/// no offset.
+fn local_timestamp_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(f) if f.literal_type() == DbType::TIMESTAMP)
+}
+
+/// A `timestamp` value as text: its wall-clock time, no offset.
+fn local_timestamp_text(value: Value) -> Result<Value, String> {
+    match value {
+        Value::Data { bytes, db_type: DbType::DATETIME } => {
+            let us = i64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| "a timestamp could not be read".to_string())?);
+            Ok(Value::Data {
+                bytes: crate::core::value_codec::format_timestamp_us(us).into_bytes(),
+                db_type: DbType::STRING,
+            })
+        }
+        other => cast(other, &DbType::STRING),
+    }
+}
+
 /// Position of a top-level operator, outside quotes and parentheses.
 fn find_operator(text: &str, op: &str) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -3606,6 +3626,11 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
 /// refuses what it cannot carry rather than truncating it
 /// ([`to_engine_scale`], [`decimal_arith`]).
 pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: &SchemaField) -> Result<Value, String> {
+    // A `timestamp` column's value written into a text column: its text with
+    // no offset (`from_engine_scale` would render it as `timestamptz`'s).
+    if matches!(target.db_type, DbType::STRING | DbType::CHAR) && local_timestamp_column(expr) {
+        return local_timestamp_text(eval(expr, row, schema)?);
+    }
     // `'{"a":1}' || '{"b":1}'` is text concatenation, which PostgreSQL
     // has no assignment cast from to `jsonb`: 42804, not the 22P02 of
     // reading the joined text as a document. (A document on either side
@@ -5064,8 +5089,17 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                     db_type: DbType::JSONB,
                 }
             } else {
-                let mut text = as_text(&a);
-                text.push_str(&as_text(&b));
+                // A timestamp's text has the `+00` its `cast` to text has,
+                // except a `timestamp` column's (`local_timestamp_column`).
+                let text_of = |e: &Expr, v: &Value| {
+                    let mut text = as_text(v);
+                    if matches!(v, Value::Data { db_type: DbType::DATETIME, .. }) && !local_timestamp_column(e) {
+                        text.push_str("+00");
+                    }
+                    text
+                };
+                let mut text = text_of(lhs, &a);
+                text.push_str(&text_of(rhs, &b));
                 Value::Data {
                     bytes: text.into_bytes(),
                     db_type: DbType::STRING,
@@ -5185,6 +5219,11 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 Some(e) => return to_common_type(expr, eval(e, row, schema)?),
                 None => Value::Null,
             }
+        }
+        // A `timestamp` (without time zone) column cast to text is its
+        // wall-clock time with no offset; a `timestamptz` value's has `+00`.
+        Expr::Cast(inner, DbType::STRING) if local_timestamp_column(inner) => {
+            local_timestamp_text(eval(inner, row, schema)?)?
         }
         // A NUMERIC(p, s) column cast to text is rendered from its stored
         // integer at its own scale. Through the engine scale it lost every
@@ -5719,7 +5758,14 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     if *target == DbType::STRING {
         let rendered = crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
             .ok_or_else(|| format!("{:?} cannot be rendered as text", db_type))?;
-        let unquoted = crate::core::value_codec::unquote_sql(&rendered).to_string();
+        let mut unquoted = crate::core::value_codec::unquote_sql(&rendered).to_string();
+        // A `DATETIME` is a `timestamptz`, whose text carries its offset, as
+        // PostgreSQL shows it (`… 08:00:00+00`; the session is UTC). A
+        // `timestamp` column's value is shown bare by the caller that knows
+        // it is one ([`local_timestamp_text`]).
+        if db_type == DbType::DATETIME {
+            unquoted.push_str("+00");
+        }
         return Ok(Value::Data {
             bytes: unquoted.into_bytes(),
             db_type: DbType::STRING,

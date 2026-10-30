@@ -1165,6 +1165,24 @@ pub(crate) fn encode_column_value(
                     Err(_) => "NULL".to_string(),
                 }
             }
+            // A timestamp written into a text column is shown as its type
+            // is: `+00` for a `timestamptz` (`CASE … THEN now() END`), bare
+            // for a `timestamp` (`sql_scan::names_only_local_timestamps`).
+            // As a literal it was always bare.
+            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::DATETIME }
+                if matches!(schema_field.db_type, DbType::STRING | DbType::CHAR) =>
+            {
+                match <[u8; 8]>::try_from(bytes.as_slice()) {
+                    Ok(raw) => {
+                        let mut text = crate::core::value_codec::format_timestamp_us(i64::from_le_bytes(raw));
+                        if !crate::core::sql_scan::names_only_local_timestamps(value) {
+                            text.push_str("+00");
+                        }
+                        crate::core::value_codec::quote_sql(&text)
+                    }
+                    Err(_) => "NULL".to_string(),
+                }
+            }
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
                     .unwrap_or_else(|| "NULL".to_string())

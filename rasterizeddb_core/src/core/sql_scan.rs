@@ -716,6 +716,19 @@ pub fn zone_free_timestamp_literals(sql: &str) -> Cow<'_, str> {
             break;
         }
         let body = &sql[i + 1..end - 1];
+        // `'…'::timestamptz::text`: the literal read at its type and shown
+        // as that type's text, folded into one text literal here, as
+        // PostgreSQL computes it. Through the evaluator both types are one
+        // storage type, and `timestamp`'s text came out with `+00`.
+        if let Some((text, span)) = (!body.contains('\'')).then(|| timestamp_text_cast(sql, end, body)).flatten() {
+            let o = out.get_or_insert_with(|| String::with_capacity(sql.len()));
+            o.push_str(&sql[copied..i + 1]);
+            o.push_str(&text);
+            o.push('\'');
+            copied = end + span;
+            i = end + span;
+            continue;
+        }
         let zoned = (!body.contains('\''))
             .then(|| timestamp_type_of_literal(sql, i, end))
             .flatten()
@@ -737,43 +750,168 @@ pub fn zone_free_timestamp_literals(sql: &str) -> Cow<'_, str> {
     }
 }
 
-/// A lone literal cast to `timestamp` or `timestamptz` (`'…'::timestamptz`),
-/// as PostgreSQL shows the value as text: with `+00` for `timestamptz` (the
-/// session is UTC), with no zone for `timestamp`. `None` for anything else.
-///
-/// The value written into a text column. Evaluated as a cast it became the
-/// one storage type both are, and was shown without its `+00`.
-pub fn timestamp_cast_as_text(value: &str) -> Option<String> {
+/// After a literal ending at `end`: `::timestamp[tz][(p)][ with[out] time
+/// zone]::text` (or `::varchar`), as the literal's text in that type and the
+/// length of the casts after the literal; `None` for anything else.
+fn timestamp_text_cast(sql: &str, end: usize, body: &str) -> Option<(String, usize)> {
+    let rest = &sql[end..];
+    let after = rest.trim_start();
+    let cast = after.strip_prefix("::")?;
+    let cast_trimmed = cast.trim_start();
+    let (with_zone, n) = timestamp_type_full(cast_trimmed)?;
+    let tail = cast_trimmed[n..].trim_start();
+    let second = tail.strip_prefix("::")?.trim_start();
+    let word_len = second.bytes().take_while(|b| is_identifier_byte(*b)).count();
+    let word = &second[..word_len];
+    if !(word.eq_ignore_ascii_case("text") || word.eq_ignore_ascii_case("varchar")) {
+        return None;
+    }
+    // A typmod or an array on the text type is not this fold's.
+    if matches!(second[word_len..].trim_start().as_bytes().first(), Some(b'(' | b'[')) {
+        return None;
+    }
+    let text = timestamp_text(body, with_zone)?;
+    let consumed = rest.len() - second[word_len..].len();
+    Some((text, consumed))
+}
+
+/// A timestamp type name at the start of `text`, as [`timestamp_type_at`]
+/// reads it, with the `with[out] time zone` words counted in its length.
+fn timestamp_type_full(text: &str) -> Option<(bool, usize)> {
+    let (with_zone, n) = timestamp_type_at(text)?;
+    let rest = &text[n..];
+    let mut at = n;
+    let mut words = rest.split_whitespace();
+    let zone = matches!(
+        (words.next(), words.next(), words.next()),
+        (Some(a), Some(b), Some(c)) if (a.eq_ignore_ascii_case("with") || a.eq_ignore_ascii_case("without"))
+            && b.eq_ignore_ascii_case("time")
+            && c.len() >= 4 && c[..4].eq_ignore_ascii_case("zone")
+    );
+    if zone {
+        let lower = rest.to_ascii_lowercase();
+        let z = lower.find("zone").expect("seen");
+        at += z + 4;
+    }
+    Some((with_zone, at))
+}
+
+/// `body` as a `timestamp` (`with_zone` false) or `timestamptz` value's
+/// text: no zone for the first, `+00` for the second (the session is UTC).
+fn timestamp_text(body: &str, with_zone: bool) -> Option<String> {
     use crate::core::value_codec::{format_timestamp_us, parse_timestamp_local_us, parse_timestamp_us};
-    let value = value.trim();
-    let bytes = value.as_bytes();
-    if bytes.first() != Some(&b'\'') {
-        return None;
-    }
-    let end = string_literal_end(bytes, 0, false);
-    if end < 2 || bytes[end - 1] != b'\'' {
-        return None;
-    }
-    let body = &value[1..end - 1];
-    let cast = value[end..].trim_start().strip_prefix("::")?.trim_start();
-    let (with_zone, len) = timestamp_type_at(cast)?;
-    let rest = cast[len..].trim();
-    let zone_words = |kind: &str| {
-        let words: Vec<&str> = rest.split_whitespace().collect();
-        words.len() == 3
-            && words[0].eq_ignore_ascii_case(kind)
-            && words[1].eq_ignore_ascii_case("time")
-            && words[2].eq_ignore_ascii_case("zone")
-    };
-    if !(rest.is_empty() || zone_words("with") || zone_words("without")) || body.contains('\'') {
-        return None;
-    }
     let us = if with_zone { parse_timestamp_us(body)? } else { parse_timestamp_local_us(body)? };
     let mut text = format_timestamp_us(us);
     if with_zone {
         text.push_str("+00");
     }
     Some(text)
+}
+
+/// Whether the timestamps an expression's text makes are all `timestamp`
+/// (without time zone): it names that type (`::timestamp`, `AS timestamp`)
+/// or `LOCALTIMESTAMP`, and nothing that makes a `timestamptz` (that type, or
+/// `now()` and its spellings). The value it computes is one storage type
+/// either way, so this is what tells a text column whether it is shown with
+/// `+00`: `CASE … THEN '…'::timestamp END` is bare in PostgreSQL, `CASE …
+/// THEN now() END` is not. A text-level reading: a value cast back and forth
+/// (`'…'::timestamptz::timestamp`) is counted as zoned.
+pub fn names_only_local_timestamps(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let (mut local, mut zoned) = (false, false);
+    let word_at = |i: usize, w: &str| {
+        text.get(i..i + w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w))
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + w.len()).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = string_literal_end(bytes, i, false).max(i + 1);
+                continue;
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                if let Some((with_zone, _)) = timestamp_type_full(text[i + 2..].trim_start()) {
+                    if with_zone { zoned = true } else { local = true }
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        if word_at(i, "AS") {
+            if let Some((with_zone, _)) = timestamp_type_full(text[i + 2..].trim_start()) {
+                if with_zone { zoned = true } else { local = true }
+            }
+        } else if word_at(i, "LOCALTIMESTAMP") {
+            local = true;
+        } else if ["NOW", "CURRENT_TIMESTAMP", "CLOCK_TIMESTAMP", "STATEMENT_TIMESTAMP", "TRANSACTION_TIMESTAMP"]
+            .iter()
+            .any(|w| word_at(i, w))
+        {
+            zoned = true;
+        }
+        i += 1;
+    }
+    local && !zoned
+}
+
+/// A lone literal cast to `timestamp` or `timestamptz` (`'…'::timestamptz`,
+/// `('…')::timestamp`, `CAST('…' AS timestamptz)`), as PostgreSQL shows the
+/// value as text: with `+00` for `timestamptz` (the session is UTC), with no
+/// zone for `timestamp`. `None` for anything else.
+///
+/// The value written into a text column. Evaluated as a cast it becomes the
+/// one storage type both are, which is shown as `timestamptz`'s text, so a
+/// `timestamp` cast needs reading here to stay bare.
+pub fn timestamp_cast_as_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    // A lone quoted literal at the start of `text`: its body and its length.
+    let literal = |text: &str| -> Option<(String, usize)> {
+        let bytes = text.as_bytes();
+        if bytes.first() != Some(&b'\'') {
+            return None;
+        }
+        let end = string_literal_end(bytes, 0, false);
+        if end < 2 || bytes[end - 1] != b'\'' || text[1..end - 1].contains('\'') {
+            return None;
+        }
+        Some((text[1..end - 1].to_string(), end))
+    };
+    // The whole of `text` is one timestamp type name.
+    let whole_type = |text: &str| -> Option<bool> {
+        let text = text.trim();
+        let (with_zone, n) = timestamp_type_full(text)?;
+        text[n..].trim().is_empty().then_some(with_zone)
+    };
+    // `CAST('…' AS type)`.
+    let cast_word = value.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("CAST"));
+    if cast_word {
+        let inner = value[4..].trim_start().strip_prefix('(')?.strip_suffix(')')?.trim();
+        let (body, len) = literal(inner)?;
+        let rest = inner[len..].trim_start();
+        let as_word = rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+            && rest.as_bytes().get(2).is_some_and(|b| b.is_ascii_whitespace());
+        if !as_word {
+            return None;
+        }
+        return timestamp_text(&body, whole_type(&rest[2..])?);
+    }
+    // `'…'::type`, `('…')::type`, `(('…'))::type`.
+    let mut inner = value;
+    let mut depth = 0usize;
+    while let Some(open) = inner.strip_prefix('(') {
+        inner = open.trim_start();
+        depth += 1;
+    }
+    let (body, len) = literal(inner)?;
+    let mut after = inner[len..].trim_start();
+    for _ in 0..depth {
+        after = after.strip_prefix(')')?.trim_start();
+    }
+    let cast = after.strip_prefix("::")?;
+    timestamp_text(&body, whole_type(cast)?)
 }
 
 /// Whether `text` holds a string literal that reads as a timestamp with a
@@ -822,15 +960,17 @@ fn zone_free(body: &str, with_zone: bool) -> Option<String> {
 /// or `CAST(… AS …)` around it; `None` when it is not typed either way.
 fn timestamp_type_of_literal(sql: &str, start: usize, end: usize) -> Option<bool> {
     let after = sql[end..].trim_start();
-    // `('…')::timestamp`: a literal alone in parentheses (not a call's
-    // argument, `f('…')::timestamp`), cast as one.
-    if let Some(rest) = after.strip_prefix(')') {
-        let before = sql[..start].trim_end();
-        if let Some(open) = before.strip_suffix('(') {
-            let call = open.trim_end().as_bytes().last().is_some_and(|b| is_identifier_byte(*b));
-            if let (false, Some(cast)) = (call, rest.trim_start().strip_prefix("::")) {
-                return timestamp_type_at(cast.trim_start()).map(|(tz, _)| tz);
-            }
+    // `('…')::timestamp`, `(('…'))::timestamp`: a literal alone in
+    // parentheses (not a call's argument, `f('…')::timestamp`), cast as one.
+    let (mut inner_after, mut inner_before) = (after, sql[..start].trim_end());
+    while let (Some(rest), Some(open)) = (inner_after.strip_prefix(')'), inner_before.strip_suffix('(')) {
+        let open = open.trim_end();
+        if open.as_bytes().last().is_some_and(|b| is_identifier_byte(*b)) {
+            break;
+        }
+        (inner_after, inner_before) = (rest.trim_start(), open);
+        if let Some(cast) = inner_after.strip_prefix("::") {
+            return timestamp_type_at(cast.trim_start()).map(|(tz, _)| tz);
         }
     }
     if let Some(cast) = after.strip_prefix("::") {

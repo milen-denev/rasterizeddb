@@ -433,3 +433,71 @@ async fn a_timestamp_typed_literal_into_text_reads_as_postgresql_shows_it() {
     assert_eq!(wall(got[0][0].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
     assert_eq!(got[0][1].as_deref(), Some("2024-01-01 10:00:00+00"), "{got:?}");
 }
+
+// PostgreSQL renders a timestamptz as text one way, whatever spelled the
+// value: `CAST`, a parenthesised literal, an explicit `::text`, a column.
+// Only the first spelling used to get the `+00`; the rest stored the bare
+// wall-clock time, and a lookup by `'…'::timestamptz::text` found nothing.
+#[tokio::test]
+async fn every_spelling_of_a_timestamptz_into_text_gets_the_same_rendering() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tx (k INT, v TEXT)").await.expect("create");
+    run(
+        &c,
+        "INSERT INTO tx (k, v) VALUES (1, CAST('2024-01-01 10:00:00+02' AS timestamptz)), \
+         (2, ('2024-01-01 10:00:00+02')::timestamptz), (3, '2024-01-01 10:00:00+02'::timestamptz::text), \
+         (4, '2024-01-01 10:00:00+02'::timestamp with time zone), (5, CAST('2024-01-01 10:00:00+02' AS timestamp)), \
+         (6, ('2024-01-01 10:00:00+02')::timestamp), (7, '2024-01-01 10:00:00+02'::timestamp::text), \
+         (8, (('2024-01-01 10:00:00+02'))::timestamp)",
+    )
+    .await
+    .expect("insert");
+    assert_eq!(
+        column(&c, "SELECT v FROM tx ORDER BY k").await,
+        [
+            "2024-01-01 08:00:00+00",
+            "2024-01-01 08:00:00+00",
+            "2024-01-01 08:00:00+00",
+            "2024-01-01 08:00:00+00",
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00"
+        ]
+    );
+    assert_eq!(
+        column(&c, "SELECT k FROM tx WHERE v = '2024-01-01 10:00:00+02'::timestamptz::text ORDER BY k").await,
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        column(&c, "SELECT k FROM tx WHERE v = '2024-01-01 10:00:00+02'::timestamp::text ORDER BY k").await,
+        ["5", "6", "7", "8"]
+    );
+    run(&c, "CREATE TABLE tc (a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
+    run(&c, "INSERT INTO tc VALUES ('2024-01-01 10:00:00', '2024-01-01 10:00:00+02')").await.expect("insert");
+    let got = rows(&c, "SELECT a::text, b::text, a || '', b || '' FROM tc").await;
+    assert_eq!(got[0][0].as_deref(), Some("2024-01-01 10:00:00"), "{got:?}");
+    assert_eq!(got[0][1].as_deref(), Some("2024-01-01 08:00:00+00"), "{got:?}");
+    assert_eq!(got[0][2].as_deref(), Some("2024-01-01 10:00:00"), "{got:?}");
+    assert_eq!(got[0][3].as_deref(), Some("2024-01-01 08:00:00+00"), "{got:?}");
+
+    // An expression's timestamp, folded in an INSERT or computed in an UPDATE.
+    run(
+        &c,
+        "INSERT INTO tx (k, v) VALUES (9, CASE WHEN 1 = 1 THEN '2024-01-01 10:00:00+02'::timestamptz END), \
+         (10, CASE WHEN 1 = 1 THEN '2024-01-01 10:00:00+02'::timestamp END), (11, 'x'), (12, 'x')",
+    )
+    .await
+    .expect("insert case");
+    run(&c, "UPDATE tx SET v = CASE WHEN k = 11 THEN '2024-01-01 10:00:00+02'::timestamptz END WHERE k = 11")
+        .await
+        .expect("update case");
+    run(&c, "UPDATE tx SET v = CASE WHEN 1 = 1 THEN '2024-01-01 10:00:00+02'::timestamp END WHERE k = 12")
+        .await
+        .expect("update local case");
+    assert_eq!(
+        column(&c, "SELECT v FROM tx WHERE k >= 9 ORDER BY k").await,
+        ["2024-01-01 08:00:00+00", "2024-01-01 10:00:00", "2024-01-01 08:00:00+00", "2024-01-01 10:00:00"]
+    );
+}
