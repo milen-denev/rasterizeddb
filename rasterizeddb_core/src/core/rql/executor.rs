@@ -18537,27 +18537,43 @@ pub(crate) async fn execute_query_rows(
         return execute_query_rows_once(query_row, source, database, tx, None).await;
     }
     let relation = source.rescan_relation();
-    let mut source = Some(source);
+    // Inside a write that reads first (`UPDATE … SET job = (SELECT … FOR
+    // UPDATE SKIP LOCKED)`), a locking read is not one of the reads that
+    // share the statement's snapshot: it locks the latest versions, and a
+    // round scanned under the statement's older snapshot, then re-scanned
+    // under the same one, handed a job its holder had finished (79 of 300
+    // claimed twice). Each round reads in a scope of its own, planned there
+    // too, so its scan, and the `since` its staleness is judged against,
+    // are taken fresh.
+    let own_rounds = crate::core::rql::statement_snapshot::in_write_scope();
+    let mut source = (!own_rounds).then_some(source);
     for _ in 0..MAX_LOCKING_ROUNDS {
-        let source = match source.take() {
-            Some(source) => source,
-            None => match crate::core::rql::row_source::RowSource::for_select(
-                relation.clone(),
-                &query_row.where_clause,
-                None,
-                tx,
-            ) {
-                Ok(source) => source,
-                Err(e) => return ddl_error(&e.to_string()),
-            },
+        let round = async {
+            let source = match source.take() {
+                Some(source) => source,
+                None => match crate::core::rql::row_source::RowSource::for_select(
+                    relation.clone(),
+                    &query_row.where_clause,
+                    None,
+                    tx,
+                ) {
+                    Ok(source) => source,
+                    Err(e) => return ddl_error(&e.to_string()),
+                },
+            };
+            // What the scan can see, taken no later than its own snapshot: a
+            // partitioned source's planned one, else one taken now (a plain
+            // table's scan takes its own after this, so this one is no newer).
+            let since = source.planned_visibility().unwrap_or_else(|| {
+                crate::core::mvcc::Visibility::for_snapshot(database.transactions.snapshot(tx), database.transactions.clone())
+            });
+            execute_query_rows_once(query_row.clone(), source, database, tx, Some(&since)).await
         };
-        // What the scan can see, taken no later than its own snapshot: a
-        // partitioned source's planned one, else one taken now (a plain
-        // table's scan takes its own after this, so this one is no newer).
-        let since = source.planned_visibility().unwrap_or_else(|| {
-            crate::core::mvcc::Visibility::for_snapshot(database.transactions.snapshot(tx), database.transactions.clone())
-        });
-        let out = execute_query_rows_once(query_row.clone(), source, database, tx, Some(&since)).await;
+        let out = if own_rounds {
+            crate::core::rql::statement_snapshot::scope(round).await
+        } else {
+            round.await
+        };
         if out.first() != Some(&3u8) || &out[1..] != LOCKED_ROWS_STALE.as_bytes() {
             return out;
         }
