@@ -1275,3 +1275,62 @@ async fn a_one_item_in_list_compares_as_equals_does() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// An `IN` item that reads a column anywhere (`t || ''`, `lower(t)`,
+/// `d.b`) is outside PostgreSQL's common-typed array: it is compared on its
+/// own, as `a = item`, and only the column-free items count toward the
+/// array. Counted as constants, two such items made the whole list
+/// `bpchar` and every `t || ''` matched blank-padded. A `character varying`
+/// item beside a `character(n)` operand, or the other way round, compares
+/// blank-padded, as `a = b` does; it compared exactly.
+///
+/// Mutations: `reads_a_column` seeing only a bare column (the `t || ''`
+/// lists match rows 1 and 3); the column item compared without the
+/// varying side trimmed (`a IN (b)` misses rows 1, 3 and 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_item_reading_a_column_compares_on_its_own() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE d (id INT PRIMARY KEY, a CHAR(5), t TEXT, n INT); \
+         INSERT INTO d VALUES (1, 'ab', 'ab  ', 1), (2, 'x', 'x', 2), (3, 'q', 'q ', 3); \
+         CREATE TABLE e (id INT PRIMARY KEY, a CHAR(5), t TEXT, b VARCHAR(6), n INT); \
+         INSERT INTO e VALUES (1, 'ab', 'ab  ', 'ab ', 1), (2, 'x', 'x', 'x', 2), (3, 'abc', 'zz', 'abc  ', 3), \
+             (4, NULL, NULL, NULL, 4), (5, 'it''s', 'it''s ', 'it''s', 5)",
+    )
+    .await
+    .expect("setup");
+    let wrong = check_each_rolled_back(
+        &c,
+        &[
+            ("SELECT id FROM d WHERE a IN (t || '', 'x')", "[2]"),
+            ("SELECT id FROM d WHERE a IN (lower(t), 'x')", "[2]"),
+            ("SELECT id FROM d WHERE a IN (t || '', 'x' || '')", "[2]"),
+            ("SELECT id FROM d WHERE a IN (d.t || '', 'x')", "[2]"),
+            ("SELECT id FROM d WHERE a IN (CAST(t AS TEXT), 'x')", "[2]"),
+            // A column's name in a string is a string: two constants, one array.
+            ("SELECT id FROM d WHERE a IN ('t' || ' ', 'q' || '  ')", "[3]"),
+            ("SELECT id FROM d WHERE a NOT IN (t || '', 'zz')", "[1];[3]"),
+            ("UPDATE d SET n = 0 WHERE a IN (t || '', 'zz') RETURNING id", "[2]"),
+            ("DELETE FROM d WHERE a IN (lower(t), 'zz') RETURNING id", "[2]"),
+            ("SELECT id FROM e WHERE a IN (t, b)", "[1];[2];[3];[5]"),
+            ("SELECT id FROM e WHERE a IN (b)", "[1];[2];[3];[5]"),
+            ("SELECT id FROM e WHERE a IN (t, b, 'x')", "[1];[2];[3];[5]"),
+            ("SELECT id FROM e WHERE a IN (e.t, e.b)", "[1];[2];[3];[5]"),
+            ("SELECT id FROM e WHERE a NOT IN (t, b)", ""),
+            ("SELECT id FROM e WHERE b IN (a, 'zz')", "[1];[2];[3];[5]"),
+            ("SELECT id FROM e WHERE t IN (a, 'zz')", "[2];[3]"),
+            ("SELECT id FROM e WHERE a IN (t)", "[2]"),
+            ("SELECT id FROM e WHERE a IN ('ab  '::text, 'x', t)", "[1];[2]"),
+            ("SELECT id FROM e WHERE a IN (t, 'ab' || '  ', 'x' || ' ')", "[1];[2]"),
+            ("SELECT id FROM e WHERE a IN ('it''s' || ' ', NULL)", "[5]"),
+            ("SELECT id FROM e WHERE a IN (text 'ab  ', 'x')", "[1];[2]"),
+            ("SELECT id FROM e WHERE a IN (varchar 'ab ')", "[1]"),
+            ("UPDATE e SET n = 100 WHERE a IN (t, b) RETURNING id", "[1];[2];[3];[5]"),
+            ("DELETE FROM e WHERE a IN ('ab  '::text, t) RETURNING id", "[2]"),
+            ("DELETE FROM e WHERE a NOT IN (b, 'zz') RETURNING id", ""),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

@@ -2677,6 +2677,35 @@ fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
         || (padded && varying && padded_beside_varying(text, schema))
 }
 
+/// Whether `item`, an `IN` list's item, reads a column anywhere: bare,
+/// qualified or quoted, or inside a call, an operator or a cast. PostgreSQL
+/// (`transformAExprIn`) compares each such item on its own, as `a = item`,
+/// and types only the column-free items together. A word counts when it
+/// names a column of `schema` and is neither a function's name nor a type
+/// after `::` or `AS`; a column's name inside a string literal is a string.
+fn reads_a_column(item: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    let item = item.trim();
+    if resolve_column(item, schema).is_some() {
+        return true;
+    }
+    // The evaluator's own reading first: it knows `||`, calls and casts,
+    // which the rewrite's lexer refuses.
+    if let Ok(expr) = crate::core::rql::expr::parse(item, schema) {
+        return !crate::core::rql::expr::columns_of(&expr).is_empty();
+    }
+    let Ok(toks) = lex(item) else { return false };
+    toks.iter().enumerate().any(|(i, tok)| {
+        let name = match tok {
+            Tok::Word(w) => w.as_str(),
+            Tok::Str(s) if s.starts_with('"') => s.as_str(),
+            _ => return false,
+        };
+        let call = matches!(toks.get(i + 1), Some(Tok::LPar));
+        let type_name = i > 0 && (matches!(&toks[i - 1], Tok::Sym(s) if s == "::") || toks[i - 1].is_keyword("as"));
+        !call && !type_name && resolve_column(name, schema).is_some()
+    })
+}
+
 /// `item` respelled when it is a typed-literal spelling of a text value:
 /// `text 'x'` as `'x'::text`, `varchar 'x'`, `char 'x'` and the rest as the
 /// untyped `'x'` (`column_default::typed_text_literal_or`). The rewrite
@@ -3049,7 +3078,13 @@ fn lift_comparison(
         // AND 10` was refused as "BETWEEN bounds must be separated by AND",
         // the `%` unreadable to the rewrite. Whatever else follows is left
         // for the ordinary rewrite to read or refuse.
-        if needs_evaluator(rest) || contains_spaced_text_literal(rest) || contains_typed_text_spelling(rest) {
+        // Also a list naming a `character varying` column beside a
+        // `character(n)` one, which compares blank-padded.
+        if needs_evaluator(rest)
+            || contains_spaced_text_literal(rest)
+            || contains_typed_text_spelling(rest)
+            || padded_beside_varying(body, schema)
+        {
             if let Some(spelled) = spell_out_list_or_range(left_text.trim(), rest, schema)? {
                 return Ok(spelled);
             }
@@ -3186,7 +3221,7 @@ fn spell_out_list_or_range(
                 // read without its trailing spaces. With fewer the list is
                 // `a = item OR …`, each item at its own type, as `=` reads it:
                 // a lone `'ab' || '  '` or `'ab  '::text` is text, exact.
-                let column = |item: &str| resolve_column(item.trim(), schema).is_some();
+                let column = |item: &str| reads_a_column(item, schema);
                 let array = items.iter().filter(|item| !column(item)).count() >= 2;
                 let padded = array && column_text_kind(left, schema) == Some(TextSide::Padded);
                 let mut parts = Vec::with_capacity(items.len());
@@ -3195,6 +3230,24 @@ fn spell_out_list_or_range(
                     // compare with `character(n)` as an untyped `'x'` does.
                     let respelled = typed_text_item(item);
                     let item: &str = respelled.as_deref().unwrap_or(item);
+                    // An item reading a column is outside the array: `a = item`,
+                    // compared as that comparison is, a `character varying`
+                    // beside a `character(n)` blank-padded (`lift_comparison`).
+                    if column(item) {
+                        let (l, r): (std::borrow::Cow<str>, std::borrow::Cow<str>) =
+                            match (column_text_kind(left, schema), column_text_kind(item, schema)) {
+                                (Some(TextSide::Padded), Some(TextSide::Varying)) => {
+                                    (left.into(), format!("rtrim({})", item.trim()).into())
+                                }
+                                (Some(TextSide::Varying), Some(TextSide::Padded)) => {
+                                    (format!("rtrim({})", left.trim()).into(), item.into())
+                                }
+                                _ => (left.into(), item.into()),
+                            };
+                        let l = if l.as_ref() == left { l.into_owned() } else { lift_side(&l, schema)? };
+                        parts.push(format!("{} {} {}", l.trim(), each, lift_side(&r, schema)?.trim()));
+                        continue;
+                    }
                     // Except a subquery's text value, which compares exactly
                     // as `= ANY` over text does: substituted as `('…' || '')`
                     // (`subquery::subquery_literal`).
@@ -3207,11 +3260,7 @@ fn spell_out_list_or_range(
                     // In an array an item takes the column's type, typed or not
                     // (`a IN ('ab  '::text, 'x')` is blank-padded); alone it is
                     // a comparison's operand, and a typed one is lifted as one.
-                    let lifted = if array || column(&item) {
-                        lift_list_item(&item, schema)?
-                    } else {
-                        lift_side(&item, schema)?
-                    };
+                    let lifted = if array { lift_list_item(&item, schema)? } else { lift_side(&item, schema)? };
                     parts.push(format!("{} {} {}", left, each, lifted));
                 }
                 return Ok(Some(format!("({})", parts.join(join))));
@@ -5435,3 +5484,4 @@ mod lifted_operand_tests {
         assert!(e.contains("nested more than"), "{e}");
     }
 }
+
