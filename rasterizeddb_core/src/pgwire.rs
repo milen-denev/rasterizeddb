@@ -3096,8 +3096,16 @@ where
     if params.iter().any(untyped_number) {
         if let Some(sql) = state.statements.get(&stmt).map(|s| s.sql.clone()) {
             let placed = param_infer::infer_where_placed(database, &sql, &[]);
+            // Only where the parameter is the slot's whole value: an operand
+            // of an expression there (`$1 + 1`, `-$1`) is the expression's to
+            // type, and typed text it made `'007' + 1` refuse where base and
+            // PostgreSQL store 8.
+            let whole = param_infer::whole_value_params(&sql, params.len());
             for (idx, p) in params.iter_mut().enumerate() {
-                if p.oid == 0 && matches!(placed.get(idx).copied().flatten(), Some(25 | 1042 | 1043 | 19)) {
+                if p.oid == 0
+                    && whole.get(idx).copied().unwrap_or(false)
+                    && matches!(placed.get(idx).copied().flatten(), Some(25 | 1042 | 1043 | 19))
+                {
                     p.oid = 25;
                 }
             }

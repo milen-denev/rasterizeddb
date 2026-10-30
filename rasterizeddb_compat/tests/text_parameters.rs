@@ -257,3 +257,28 @@ async fn an_untyped_value_is_stored_as_sent_whatever_the_statements_shape() {
     c.run("", Some("INSERT INTO pq AS q (id, v) VALUES ($1, 'x')"), &[], &[Some("007")]).await.expect("int");
     assert_eq!(texts(c.simple("SELECT id FROM pq WHERE v = 'x'").await), [["7"]]);
 }
+
+// A parameter that is an operand inside a text column's value is typed by
+// its expression, not by the column: `$1 + 1` with '007' is 8, as
+// PostgreSQL stores it. Only the whole of the slot, parenthesised or a side
+// of `||`, is the column's text. Typing every parameter in the slot as text
+// refused `$1 + 1` and `-$1`, which the base stored.
+#[tokio::test]
+async fn a_parameter_inside_an_expression_is_typed_by_the_expression() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    c.simple("CREATE TABLE pe (id INT NOT NULL, a TEXT)").await;
+    for (sql, value) in [
+        ("INSERT INTO pe (id, a) VALUES (10, $1 + 1)", "007"),
+        ("INSERT INTO pe (id, a) VALUES (11, -$1)", "5"),
+        ("INSERT INTO pe (id, a) VALUES (12, - $1)", "5"),
+        ("INSERT INTO pe (id, a) VALUES (13, ($1))", "007"),
+        ("INSERT INTO pe (id, a) VALUES (14, $1 || 'x')", "007"),
+    ] {
+        c.run("", Some(sql), &[], &[Some(value)]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        texts(c.simple("SELECT id, a FROM pe ORDER BY id").await),
+        [["10", "8"], ["11", "-5"], ["12", "-5"], ["13", "007"], ["14", "007x"]]
+    );
+}

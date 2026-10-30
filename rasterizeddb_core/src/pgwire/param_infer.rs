@@ -156,6 +156,31 @@ fn tokenize(sql: &str) -> Vec<Tok> {
     out
 }
 
+/// For each parameter `$1 … $count`, whether every place it stands in is
+/// the whole of a value: a slot of a list or tuple, one side of a
+/// comparison or of a `SET` assignment, or a side of `||` (whose operands
+/// PostgreSQL resolves as text). A parameter that is an operand of any other
+/// expression there (`$1 + 1`, `-$1`) is not: its type is the expression's
+/// to decide, so it is not typed by the column it lands in.
+pub(super) fn whole_value_params(sql: &str, count: usize) -> Vec<bool> {
+    let toks = tokenize(sql);
+    let mut whole = vec![true; count];
+    let comparison = |t: &Tok| matches!(t, Tok::Op(op) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "||"));
+    for (i, t) in toks.iter().enumerate() {
+        let Tok::Param(n) = t else { continue };
+        let before = i.checked_sub(1).and_then(|j| toks.get(j));
+        let after = toks.get(i + 1);
+        let opens = matches!(before, None | Some(Tok::Open | Tok::Comma | Tok::Ident(..))) || before.is_some_and(comparison);
+        let closes = matches!(after, None | Some(Tok::Close | Tok::Comma | Tok::Ident(..) | Tok::Cast)) || after.is_some_and(comparison);
+        if !(opens && closes) {
+            if let Some(w) = n.checked_sub(1).and_then(|k| whole.get_mut(k)) {
+                *w = false;
+            }
+        }
+    }
+    whole
+}
+
 /// The OID a cast's type name stands for, `None` when it is not one of these.
 fn cast_oid(name: &str, array: bool) -> Option<i32> {
     let base = match name.to_ascii_lowercase().as_str() {
@@ -341,28 +366,60 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
         }
     };
 
-    // INSERT … (cols) VALUES (…), (…): by position at the top of each tuple.
+    // INSERT … (cols) VALUES (…), (…): by position at the top of each tuple,
+    // or alone in parentheses there (`(($1))`).
     if let Some((columns, values_at)) = &insert_columns {
         let mut depth = 0usize;
         let mut position = 0usize;
+        // The slot's one parameter, while it holds nothing but it and
+        // parentheses; `Err` once it holds anything else.
+        let mut alone: Result<Option<usize>, ()> = Ok(None);
+        let place = |alone: Result<Option<usize>, ()>, position: usize, oids: &mut Vec<Option<i32>>| {
+            if let Ok(Some(n)) = alone {
+                let oid = columns.get(position).and_then(|c| column_oid(database, &rel, None, c));
+                set(n, oid, oids);
+            }
+        };
         for t in &toks[*values_at..] {
             match t {
                 Tok::Open => {
                     depth += 1;
                     if depth == 1 {
                         position = 0;
+                        alone = Ok(None);
                     }
                 }
-                Tok::Close => depth = depth.saturating_sub(1),
-                Tok::Comma if depth == 1 => position += 1,
+                Tok::Close => {
+                    if depth == 1 {
+                        place(alone, position, &mut oids);
+                        alone = Err(());
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                Tok::Comma if depth == 1 => {
+                    place(alone, position, &mut oids);
+                    alone = Ok(None);
+                    position += 1;
+                }
                 Tok::Param(n) if depth == 1 => {
                     let oid = columns
                         .get(position)
                         .and_then(|c| column_oid(database, &rel, None, c));
                     set(*n, oid, &mut oids);
+                    alone = Err(());
+                }
+                Tok::Param(n) if depth > 1 => {
+                    alone = match alone {
+                        Ok(None) => Ok(Some(*n)),
+                        _ => Err(()),
+                    };
                 }
                 t if depth == 0 && (t.keyword("RETURNING") || t.keyword("ON")) => break,
-                _ => {}
+                _ => {
+                    if depth >= 1 {
+                        alone = Err(());
+                    }
+                }
             }
         }
     }
