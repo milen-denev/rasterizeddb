@@ -783,7 +783,7 @@ fn every_type_is_classified_and_covered() {
     let count = |c| ALL.iter().filter(|t| class(t) == c).count();
     assert_eq!(
         (count(Class::Fingerprinted), count(Class::BoundsOnly), count(Class::Excluded)),
-        (18, 1, 30)
+        (18, 1, 31)
     );
 
     let rendered = render();
