@@ -244,6 +244,10 @@ async fn a_character_value_compares_and_shows_as_postgresql() {
             ("SELECT v FROM cv WHERE EXISTS (SELECT 1 FROM cj WHERE cj.k = cv.k) ORDER BY v", "[1];[5];[6]"),
             ("SELECT v, CASE WHEN k = 'a ' THEN 'y' ELSE 'n' END FROM cv ORDER BY v", "[1]|[n];[5]|[n];[6]|[y];[7]|[n];[8]|[n]"),
             ("SELECT v, COALESCE(k, 'zz') || '|' FROM cv WHERE v > 5 ORDER BY v", "[6]|[a|];[7]|[zz|];[8]|[|]"),
+            ("SELECT k FROM cv WHERE v = 1 UNION ALL SELECT k FROM cv WHERE v = 6", "[b  ];[a  ]"),
+            // `character` UNION `text` is `bpchar` with no length: a text
+            // branch's value is shown as it is.
+            ("SELECT k FROM cv WHERE v = 99 UNION ALL SELECT t FROM cj WHERE w = 1", "[b]"),
             ("UPDATE cv SET v = v + 100 WHERE k = 'b  ' RETURNING k, k || '|'", "[b  ]|[b|]"),
             ("DELETE FROM cv WHERE k = 'abc   ' RETURNING k", "[abc]"),
         ],
@@ -256,6 +260,8 @@ async fn a_character_value_compares_and_shows_as_postgresql() {
         ("SELECT k || '' AS t, k FROM cv", vec![(25, -1), (1042, 7)]),
         ("SELECT cv.k, cj.k FROM cv JOIN cj ON cv.k = cj.k", vec![(1042, 7), (1042, 9)]),
         ("UPDATE cv SET v = v WHERE v = 6 RETURNING k", vec![(1042, 7)]),
+        ("SELECT k FROM cv UNION ALL SELECT k FROM cv", vec![(1042, 7)]),
+        ("SELECT k FROM cv UNION ALL SELECT t FROM cj", vec![(1042, -1)]),
     ] {
         let got = described(&server, sql).await;
         if got != want {

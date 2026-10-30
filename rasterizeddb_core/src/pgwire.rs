@@ -4157,10 +4157,84 @@ async fn widen_union_fields(
     let Some(branches) = crate::core::rql::join::union_branches(&text) else {
         return Ok(fields);
     };
-    Ok(widen_fields_by(
-        crate::core::rql::set_ops::widened_branch_integers(&branches, database, &relations),
-        fields,
+    Ok(union_bpchar_fields(
+        &branches,
+        database,
+        widen_fields_by(crate::core::rql::set_ops::widened_branch_integers(&branches, database, &relations), fields),
     ))
+}
+
+/// A `UNION` column described from its first branch as `character(n)`
+/// (`DbType::BPCHAR`) is padded to `n` only when every branch yields
+/// `character(n)` of that length there. Otherwise it is PostgreSQL's
+/// `bpchar` with no length (the first branch's type wins where each casts
+/// to the other, as `character` and `text` do): shown as stored, which is
+/// right for a text branch's value and leaves a `character(n)` branch's
+/// unpadded. A branch this cannot read (a join, a derived table) counts as
+/// another length.
+fn union_bpchar_fields(
+    branches: &[String],
+    database: &Arc<Database>,
+    mut fields: Vec<(String, DbType)>,
+) -> Vec<(String, DbType)> {
+    if !fields.iter().any(|(_, t)| matches!(t, DbType::BPCHAR(_))) {
+        return fields;
+    }
+    // Each branch's `character(n)` length per output position, where it has one.
+    let widths: Vec<Vec<Option<u32>>> = branches
+        .iter()
+        .map(|branch| {
+            let Some(purpose) = recognize_query_purpose(branch) else { return Vec::new() };
+            let QueryPurpose::QueryRows(qr) = &purpose else { return Vec::new() };
+            if crate::core::rql::join::statement_has_join(&qr.query) {
+                return Vec::new();
+            }
+            let Some(view) = database.schema_view(&qr.table_name) else { return Vec::new() };
+            let schema = view.schema();
+            let Ok(parsed) = row_fetch_from_select_query(&purpose, &schema.fields) else { return Vec::new() };
+            let width = |t: DbType| match t {
+                DbType::BPCHAR(n) => Some(u32::from(n)),
+                _ => None,
+            };
+            if let Some(plan) = &parsed.aggregate {
+                return plan
+                    .items
+                    .iter()
+                    .map(|i| match i {
+                        crate::core::rql::aggregate::SelectItem::Column { field, .. } => width(reported_type(field, schema)),
+                        other => width(other.reported_type()),
+                    })
+                    .collect();
+            }
+            if !parsed.select_items.is_empty() {
+                return parsed
+                    .select_items
+                    .iter()
+                    .map(|i| match i {
+                        crate::core::rql::aggregate::SelectItem::Column { field, .. } => width(reported_type(field, schema)),
+                        other => width(other.reported_type()),
+                    })
+                    .collect();
+            }
+            parsed
+                .requested_row_fetch
+                .columns_fetching_data
+                .iter()
+                .take(parsed.visible_columns)
+                .map(|c| field_of(&schema.fields, c.schema_id).and_then(|f| width(reported_type(f, schema))))
+                .collect()
+        })
+        .collect();
+    for (at, (_, ty)) in fields.iter_mut().enumerate() {
+        let DbType::BPCHAR(n) = *ty else { continue };
+        let each: Vec<Option<u32>> = widths.iter().map(|w| w.get(at).copied().flatten()).collect();
+        *ty = if each.iter().all(|w| *w == Some(u32::from(n))) {
+            DbType::BPCHAR(n)
+        } else {
+            DbType::BPCHAR(0)
+        };
+    }
+    fields
 }
 
 /// Sets each field that [`crate::core::rql::set_ops::widened_integers`]
@@ -6716,9 +6790,13 @@ fn result_description(
             select_fields.map(|fields| match crate::core::rql::join::union_branches(&qr.query) {
                 // The statement runs as it is here, its CTEs and derived
                 // tables already materialised into real relations.
-                Some(branches) => widen_fields_by(
-                    crate::core::rql::set_ops::widened_branch_integers(&branches, database, &[]),
-                    fields,
+                Some(branches) => union_bpchar_fields(
+                    &branches,
+                    database,
+                    widen_fields_by(
+                        crate::core::rql::set_ops::widened_branch_integers(&branches, database, &[]),
+                        fields,
+                    ),
                 ),
                 None => fields,
             })

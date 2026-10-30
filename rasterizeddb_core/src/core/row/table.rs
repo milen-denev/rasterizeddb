@@ -3388,8 +3388,6 @@ impl<S: StorageIO> Table<S> {
             .collect()
     }
 
-    /// The `unique_lock` stripes a row's keys fall on: one per constraint it
-    /// holds a key for. A NULL key conflicts with nothing, so it needs none.
     /// Holds each column of `row_write` that `columns` selects (by write
     /// order) and that declares a text length to it, as an assignment does
     /// (`type_modifier::assign_bytes`): a `character(n)` value in its stored
@@ -3420,6 +3418,8 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// The `unique_lock` stripes a row's keys fall on: one per constraint it
+    /// holds a key for. A NULL key conflicts with nothing, so it needs none.
     fn unique_stripes(&self, row_write: &RowWrite) -> SmallVec<[usize; 4]> {
         let value_of = |wo: u32| {
             row_write

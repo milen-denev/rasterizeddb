@@ -223,11 +223,9 @@ fn cast_typmod(target: &str, db_type: &DbType) -> Result<Option<CastTypmod>, Str
     }
     // Past six PostgreSQL warns and keeps six, which changes nothing.
     let precision = precision.min(6) as u32;
-    let base = text[..open].trim().to_ascii_uppercase();
-    let with_zone = text[close + 1..].trim().to_ascii_uppercase().starts_with("WITH TIME ZONE");
+    // By the type the value is cast to, whose layout the rounding reads.
     Ok(match db_type {
         DbType::DATETIME => Some(CastTypmod::Timestamp(precision)),
-        DbType::TIME if base == "TIMETZ" || with_zone => Some(CastTypmod::TimeTz(precision)),
         DbType::TIME => Some(CastTypmod::Time(precision)),
         DbType::TIMETZ => Some(CastTypmod::TimeTz(precision)),
         DbType::INTERVAL => Some(CastTypmod::Interval(precision)),
