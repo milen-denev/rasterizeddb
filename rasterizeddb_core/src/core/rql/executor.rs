@@ -8753,7 +8753,11 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
 /// refused as 22P02. A NOT NULL column with no default is refused (23502)
 /// before this, by `check_not_null`, as NULL is. A generated column's
 /// `DEFAULT` is left for [`generated_update_statement`].
-fn default_update_statement(query: &QueryPurpose, schema: &crate::core::row::schema::TableSchema) -> Option<QueryPurpose> {
+fn default_update_statement(
+    query: &QueryPurpose,
+    schema: &crate::core::row::schema::TableSchema,
+    database: u64,
+) -> Option<QueryPurpose> {
     let QueryPurpose::UpdateRow(sql) = query else {
         return None;
     };
@@ -8782,10 +8786,33 @@ fn default_update_statement(query: &QueryPurpose, schema: &crate::core::row::sch
             let column = written.trim_matches('"');
             let value = parts.next().unwrap_or("").trim();
             if defaulted(column, value) {
-                let default = crate::core::rql::column_default::expression_for(column, &schema.defaults)
+                let expression = crate::core::rql::column_default::expression_for(column, &schema.defaults)
                     .map(str::trim)
-                    .filter(|e| !e.is_empty())
-                    .unwrap_or("NULL");
+                    .filter(|e| !e.is_empty());
+                // The value an INSERT leaving the column out takes: the
+                // default evaluated as `column_default` evaluates it (a
+                // fraction rounded into an integer column, `now()` the
+                // transaction's). Spliced in as written, `INT DEFAULT 1.5`
+                // was refused as 22P02 here where the INSERT stored 2. A
+                // default drawn per row (a sequence, a random UUID, the wall
+                // clock) is left as its expression, so each row draws its own,
+                // and so is a boolean, which `evaluate` renders as the 1 or 0
+                // only an INSERT's encoder reads.
+                let per_row = |e: &str| {
+                    let upper = e.to_ascii_uppercase();
+                    ["NEXTVAL(", "GEN_RANDOM_UUID(", "UUID_GENERATE_V4(", "UUIDV4(", "UUIDV7(", "CLOCK_TIMESTAMP("]
+                        .iter()
+                        .any(|f| upper.contains(f))
+                        || matches!(upper.as_str(), "TRUE" | "FALSE")
+                };
+                let field = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column));
+                let default = match (expression, field) {
+                    (None, _) => "NULL".to_string(),
+                    (Some(e), Some(field)) if !per_row(e) => {
+                        crate::core::rql::column_default::evaluate(e, &field.db_type, database).unwrap_or_else(|_| e.to_string())
+                    }
+                    (Some(e), _) => e.to_string(),
+                };
                 format!("{} = {}", written, default)
             } else {
                 assignment.trim().to_string()
@@ -17968,7 +17995,7 @@ pub(crate) async fn execute_with_need(
             // rather than being re-dispatched, as the INSERT arm's does, so
             // the check sees only what the client wrote.
             // `SET c = DEFAULT` is the column's default, or NULL.
-            let default_rewrite = default_update_statement(&query, &table.schema);
+            let default_rewrite = default_update_statement(&query, &table.schema, database.id);
             let query = default_rewrite.as_ref().unwrap_or(&query);
             let generated_rewrite = match generated_update_statement(query, &table.schema) {
                 Ok(rewrite) => rewrite,

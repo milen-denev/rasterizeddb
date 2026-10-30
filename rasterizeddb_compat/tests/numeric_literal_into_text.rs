@@ -172,3 +172,23 @@ async fn a_fractional_default_on_an_integer_column_is_rounded() {
     let want: Vec<String> = ["2", "3", "-2", "5", "3", "-3"].map(String::from).to_vec();
     assert_eq!(got, vec![want.clone(), want]);
 }
+
+// `SET v = DEFAULT` in an UPDATE or an upsert stores what an INSERT's
+// default stores: the rounded integer, and the constant's own text in a
+// TEXT column. Both used to refuse the fractional default with 22P02.
+#[tokio::test]
+async fn set_to_default_stores_what_an_insert_would() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE r (k INT PRIMARY KEY, v INT DEFAULT 1.5, s TEXT DEFAULT 007, b BOOLEAN DEFAULT true)").await;
+    run(&c, "INSERT INTO r VALUES (1, 9, 'x', false), (2, 9, 'x', false)").await;
+    c.simple_query("UPDATE r SET v = DEFAULT, s = DEFAULT, b = DEFAULT WHERE k = 1").await.expect("update set default");
+    assert_eq!(pairs(&c, "SELECT k, b FROM r ORDER BY k").await, [("1".to_string(), "t".to_string()), ("2".to_string(), "f".to_string())]);
+    c.simple_query("INSERT INTO r VALUES (2, 9, 'x', false) ON CONFLICT (k) DO UPDATE SET v = DEFAULT")
+        .await
+        .expect("upsert set default");
+    assert_eq!(
+        pairs(&c, "SELECT v, s FROM r ORDER BY k").await,
+        [("2".to_string(), "7".to_string()), ("2".to_string(), "x".to_string())]
+    );
+}
