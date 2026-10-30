@@ -349,7 +349,26 @@ load 18 to 27, so times and wakeups carry noise of their own; fds and tasks
 are exact). Before: `f89ed7ad`, P5a's `partition_resident_tests` at N = 1024,
 every partition opened at the start. After: this branch.
 
-BASE_TABLE_PLACEHOLDER
+| | before (`f89ed7ad`), N = 1024 | after, N = 1024 | after, N = 10,000 |
+|---|---|---|---|
+| start (open the database) | 0.948 s, every partition opened (926 µs each) | 0.069 s (68 µs per partition) | 1.216 s (122 µs per partition: a stat of each one's two files, the map replay) |
+| fds after the start | +10,278 (10.04 per partition) | +38 (the parent files; none per closed partition) | +38 |
+| RSS after the start | +15.8 KiB per partition | +0.8 MiB in all | +3.1 MiB in all (≈ 0.3 KiB per closed partition: its slot, watch, lifecycle lock and map state) |
+| idle wakeups after the start | 69.4/s vs 26.1/s with nothing open (0.042/s per partition) | 29.1/s vs 25.8/s | 29.6/s vs 26.2/s |
+| 100 partitions touched by routed reads | — (all open already) | +1,000 fds (10.00 per open partition), +35.5 KiB RSS each, 0 tasks each, +0.021 wakeups/s each | +1,000 fds (10.00 each), +60.8 KiB each, 0 tasks, +0.030/s each |
+| first touch (the read that opens) vs warm, median | — | 2.28 ms vs 1.25 ms | 1.72 ms vs 1.25 ms |
+| closing the 100 | — | 5 ms; fds back to +38 | 11 ms; fds back to +38 |
+
+The per-open-partition RSS after is measured after statements ran (the read
+paths' allocations included, which the allocator keeps after the close);
+before, it is the open alone, so the two rows are not like for like. At
+10,000 partitions the base cannot be measured: phase 2 caps a database at
+2,048 declared partitions (the measurement raises the cap for its own
+directory only, `cap_hooks`), and opening all of them would take about
+100,000 fds, past `deploy.sh`'s `LimitNOFILE=65535`. Start at 10⁴ is
+dominated by the per-partition stats; populating 10⁴ one-row partitions
+took 44 s here (a durable `MATERIALIZE` each, on tmpfs). Debug builds
+throughout.
 
 **Left for P5b-2 and after.** The open budget and the sharded CLOCK
 (scan-resistant fan-out opens), idle close with the persistent-index

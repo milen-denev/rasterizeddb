@@ -58,6 +58,10 @@ const SCHEMA_ONLY: &[&str] = &[
     // vacuum join, on `Table` itself (a shell has both, and runs nothing).
     "retire",
     "is_retired",
+    // A partition's exclusive close (phase 3 P5b): `retire`, then its
+    // unit's round and its staged appends, reached through `self.data()`
+    // only after the retirement; a shell has neither, and nothing to land.
+    "close_exclusive",
     // Test-only: the cache scope string and generation counter.
     "cache_key",
 ];

@@ -1255,7 +1255,7 @@ impl PartitionedTable {
     }
 
     fn slot(live: &Live, pid: u32) -> io::Result<&Slot> {
-        live.parts.slot(pid)
+        live.parts.slot_at(pid)
     }
 
     /// The partition owning `point`, materialized first if it never was and
@@ -1517,7 +1517,7 @@ fn closed_lens(root: &Path, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
 }
 
 impl Parts {
-    fn slot(&self, pid: u32) -> io::Result<&Slot> {
+    fn slot_at(&self, pid: u32) -> io::Result<&Slot> {
         match self.slots.get(pid as usize) {
             Some(slot) if slot.pid == pid => Ok(slot),
             _ => Err(io::Error::other(format!("internal routing error: no slot for partition {pid}"))),
@@ -1532,18 +1532,18 @@ impl Parts {
 
     /// Whether partition `pid` is materialized.
     pub(crate) fn is_materialized(&self, pid: u32) -> bool {
-        self.slot(pid).is_ok_and(|s| s.materialized.load(Ordering::SeqCst))
+        self.slot_at(pid).is_ok_and(|s| s.materialized.load(Ordering::SeqCst))
     }
 
     /// Partition `pid`'s open instance, if it is open now.
     pub(crate) fn open_now(&self, pid: u32) -> Option<Arc<Table<DbStorageProvider>>> {
-        self.slot(pid).ok()?.open_now()
+        self.slot_at(pid).ok()?.open_now()
     }
 
     /// Materialized partition `pid`'s open instance, opened now if it is
     /// closed.
     pub(crate) async fn open(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
-        let slot = self.slot(pid)?;
+        let slot = self.slot_at(pid)?;
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
@@ -1711,7 +1711,7 @@ impl Parts {
     /// instance a schema change already retired is only dropped: what it had
     /// staged is the new instance's to land.
     async fn close(&self, pid: u32) -> io::Result<Close> {
-        let slot = self.slot(pid)?;
+        let slot = self.slot_at(pid)?;
         let lock = self.board.lifecycle(pid)?;
         let _life = lock.lock().await;
         if self.retired.load(Ordering::SeqCst) {
