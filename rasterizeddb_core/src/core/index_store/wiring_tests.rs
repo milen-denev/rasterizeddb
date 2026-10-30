@@ -518,7 +518,7 @@ async fn a_reload_keeps_the_word_and_each_partition_has_its_own() {
     exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
     let pt = db.partitioned_table("pt").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap();
     assert!(parts.len() >= 2, "too few partitions materialized: {}", parts.len());
     let mut paths = Vec::new();
     for (pid, part) in &parts {

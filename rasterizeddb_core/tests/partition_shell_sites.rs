@@ -682,7 +682,7 @@ fn check_invariant(rt: &tokio::runtime::Runtime, db: &Database, dir: &Path, inv:
     let shell_text = schema_text(&shell.schema);
     assert_eq!(rt.block_on(on_disk_text(db, T)), shell_text, "after `{after}`: the shell's file and memory disagree");
     let epoch = table.epoch().expect("it opens");
-    for (pid, part) in table.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).expect("partitions") {
+    for (pid, part) in rt.block_on(table.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All)).expect("partitions") {
         assert_eq!(schema_text(&part.schema), shell_text, "after `{after}`: partition {pid} holds another schema");
     }
     assert_eq!(files_of_table(dir, T), Vec::<String>::new(), "after `{after}`: files under the logical name");

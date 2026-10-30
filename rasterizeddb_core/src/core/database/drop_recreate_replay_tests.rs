@@ -2475,7 +2475,7 @@ mod partitioned {
         let empty = crate::core::rql::join::fetch_for(&[], &schema.fields);
         let epoch = pt.epoch().expect("the table opens");
         let mut seen = Vec::new();
-        for (pid, p) in pt.materialized(&epoch, &Route::All).expect("its partitions") {
+        for (pid, p) in pt.materialized(&epoch, &Route::All).await.expect("its partitions") {
             let rows = p
                 .query_row("", &schema.fields.to_vec(), empty.clone(), fetch.clone(), None, None)
                 .await
@@ -2683,7 +2683,7 @@ mod partitioned {
         let held = {
             let pt = db.partitioned_table(TABLE).unwrap();
             let epoch = pt.epoch().unwrap();
-            let (_, p) = pt.materialized(&epoch, &Route::All).unwrap().into_iter().next().expect("a partition");
+            let (_, p) = pt.materialized(&epoch, &Route::All).await.unwrap().into_iter().next().expect("a partition");
             p
         };
         assert!(db.drop_table(TABLE).await.unwrap());

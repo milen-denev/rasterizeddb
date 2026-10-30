@@ -2295,7 +2295,7 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
         let (mut swept, mut left) = (Vec::new(), Vec::new());
         if let Some(pt) = db.partitioned_table(PART) {
             let epoch = pt.epoch().expect("the partitioned table opens");
-            for (pid, _) in pt.materialized(&epoch, &Route::All).expect("its partitions") {
+            for (pid, _) in pt.materialized(&epoch, &Route::All).await.expect("its partitions") {
                 if (pick >> (pid % 64)) & 1 == 1 {
                     pt.sweep_pin_now(pid).await.expect("a partition's forget sweep");
                     swept.push(pid);

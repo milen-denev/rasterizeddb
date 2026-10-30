@@ -9790,7 +9790,7 @@ async fn existing_rows_break_foreign_key(
     let mut wanted = vec![field.clone()];
     wanted.extend(flag.clone());
     let fetch = crate::core::rql::join::fetch_for(&wanted, schema);
-    let holders = database.row_tables_held(table_name).map_err(|e| e.to_string())?;
+    let holders = database.row_tables_held(table_name).await.map_err(|e| e.to_string())?;
     use crate::core::storage_providers::traits::StorageIO as _;
 
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -11865,10 +11865,11 @@ async fn seed_sequences(
             wanted.iter().map(|(_, f)| f.clone()).collect();
         let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
         let mut rows = Vec::new();
-        let partitions = pt
-            .epoch()
-            .and_then(|epoch| pt.materialized(&epoch, &crate::core::partition::Route::All))
-            .map_err(|e| format!("could not read '{}' to seed its sequences: {}", table_name, e))?;
+        let partitions = match pt.epoch() {
+            Ok(epoch) => pt.materialized(&epoch, &crate::core::partition::Route::All).await,
+            Err(e) => Err(e),
+        }
+        .map_err(|e| format!("could not read '{}' to seed its sequences: {}", table_name, e))?;
         for (pid, partition) in partitions {
             let found = partition
                 .query_row("", &schema.to_vec(), empty.clone(), fetch.clone(), None, None)
@@ -11953,7 +11954,7 @@ async fn existing_rows_break_unique(
     // The rows: the table's, or each open partition's. Exact per partition,
     // since a partitioned table's unique key holds every partition key
     // column (docs/partitioning.md §1b), so equal tuples share a partition.
-    let holders = database.row_tables_held(table_name).map_err(|e| e.to_string())?;
+    let holders = database.row_tables_held(table_name).await.map_err(|e| e.to_string())?;
 
     let schema = &table.schema.fields;
     let mut fields = Vec::with_capacity(key.columns.len());
@@ -18349,7 +18350,7 @@ pub(crate) async fn execute_with_need(
                         None => continue,
                         Some(crate::core::database::Relation::Plain(table)) => vec![table],
                         Some(crate::core::database::Relation::Partitioned(pt)) => {
-                            match vacuum_targets(&pt) {
+                            match vacuum_targets(&pt).await {
                                 Ok(parts) => parts,
                                 // A bare VACUUM goes on past a table that
                                 // cannot be opened, and says so; naming it
@@ -18838,8 +18839,9 @@ fn partitioned_source(
 }
 
 /// The tables a `VACUUM` of partitioned table `pt` visits: its materialized
-/// partitions, by pid. An unmaterialized one has no files to vacuum.
-fn vacuum_targets(
+/// partitions, by pid, each opened if it is closed (its dead versions are
+/// still there). An unmaterialized one has no files to vacuum.
+async fn vacuum_targets(
     pt: &crate::core::partition::table::PartitionedTable,
 ) -> std::io::Result<
     Vec<rclite::Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>>>,
@@ -18847,7 +18849,8 @@ fn vacuum_targets(
     pt.check()?;
     let epoch = pt.epoch()?;
     Ok(pt
-        .materialized(&epoch, &crate::core::partition::Route::All)?
+        .materialized(&epoch, &crate::core::partition::Route::All)
+        .await?
         .into_iter()
         .map(|(_, part)| part)
         .collect())

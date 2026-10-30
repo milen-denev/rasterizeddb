@@ -392,7 +392,7 @@ fn a_genuine_key_change_is_refused_before_any_partition_write() {
     let (refused, overwrites, after_pinned) = block_on_big(async move {
         let epoch = pt.epoch().unwrap();
         let part = pt
-            .materialized(&epoch, &Route::All)
+            .materialized(&epoch, &Route::All).await
             .unwrap()
             .into_iter()
             .find(|(p, _)| *p == pid)

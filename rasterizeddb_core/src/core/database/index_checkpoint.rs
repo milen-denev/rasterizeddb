@@ -295,11 +295,12 @@ fn seal_targets(
         } else {
             vec![(name.to_string(), table.clone())]
         }),
+        // The open partitions: a closed one holds no structures to seal, and
+        // its next open builds or loads them (phase 3 P5b).
         Relation::Partitioned(pt) => {
-            let epoch = pt.epoch().map_err(|e| e.to_string())?;
+            pt.check().map_err(|e| e.to_string())?;
             Ok(pt
-                .materialized(&epoch, &crate::core::partition::route::Route::All)
-                .map_err(|e| e.to_string())?
+                .open_partitions_now()
                 .into_iter()
                 .map(|(pid, table)| (format!("{name} (partition {pid})"), table))
                 .collect())

@@ -608,10 +608,10 @@ async fn figures(relation: &Relation) -> Result<RowFigures, String> {
         }
         Relation::Partitioned(table) => {
             let totals = table.totals().await.map_err(e)?;
+            // The open partitions' in-memory figures; a closed one has none
+            // (its sizes are in `totals`, from its files).
             let epoch = table.epoch().map_err(e)?;
-            let parts = table
-                .materialized(&epoch, &crate::core::partition::Route::All)
-                .map_err(e)?;
+            let parts = table.open_partitions_now();
             let mut reclaimable = 0;
             let mut filters_ready = true;
             let mut vacuum_enabled = true;
@@ -627,8 +627,8 @@ async fn figures(relation: &Relation) -> Result<RowFigures, String> {
                 vacuum.add(part.vacuum_stats().map_err(e)?);
             }
             if parts.is_empty() {
-                // What a partition materialized now would get.
-                vacuum_enabled = crate::vacuum_enabled();
+                // What a partition opened or materialized now would get.
+                vacuum_enabled = table.vacuum_setting().unwrap_or_else(crate::vacuum_enabled);
             }
             let schema = &table.shell().schema;
             let key = table
@@ -2632,10 +2632,12 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             // Every target is found before any is changed: a table that cannot
             // serve data refuses the whole statement rather than leave it
             // reported applied to rows it never reached. A partitioned table's
-            // targets are its materialized partitions; one materialized later
-            // takes the server default, as a table created later does.
+            // targets are its materialized partitions, open or closed (it
+            // keeps the value for every partition it opens later); one
+            // materialized later takes it too.
             let names = table_names(database);
             let mut targets: Vec<Arc<DbTable>> = Vec::new();
+            let mut partitioned: Vec<Arc<crate::core::partition::table::PartitionedTable>> = Vec::new();
             let mut touched = 0usize;
             let mut partitions = 0usize;
             for name in names {
@@ -2646,20 +2648,17 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                         targets.push(table);
                     }
                     Some(Relation::Partitioned(table)) => {
-                        let epoch = table.epoch().map_err(|e| e.to_string())?;
-                        for (_, part) in table
-                            .materialized(&epoch, &crate::core::partition::Route::All)
-                            .map_err(|e| e.to_string())?
-                        {
-                            targets.push(part);
-                            partitions += 1;
-                        }
+                        table.check().map_err(|e| e.to_string())?;
+                        partitioned.push(table);
                     }
                 }
                 touched += 1;
             }
             for table in &targets {
                 table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
+            for table in &partitioned {
+                partitions += table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
             }
             Ok(format!(
                 "background reclamation {} for {} table{}{}",

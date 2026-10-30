@@ -1756,6 +1756,36 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
+    /// The exclusive close of a partition opened `External`
+    /// (docs/partitioning.md §7.2, phase 3 P5b), by its partitioned table
+    /// once it owns this instance alone: retired as a schema change retires
+    /// one, its unit's round in flight waited out, then its staged appends
+    /// landed, so the closed file set keeps every byte in its main files and
+    /// nothing of this instance writes once its successor opens. An instance
+    /// a schema change retired first is left as it was: the successor that
+    /// change opened over the same files lands what it staged.
+    pub(crate) async fn close_exclusive(&self) {
+        let already = self.is_retired();
+        self.retire().await;
+        if let Some(unit) = &self.external {
+            unit.quiesce().await;
+        }
+        if already {
+            return;
+        }
+        if let Ok(d) = self.data() {
+            // A landing the gate refuses, or one that fails, leaves the bytes
+            // in `.tmp`, which the next open of the file set lands.
+            for io in [&d.io_rows, &d.io_pointers] {
+                for _ in 0..3 {
+                    if !io.land_background().await {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether [`Table::retire`] has run (or the table was dropped, or is a
     /// shell, which runs no maintenance).
     pub fn is_retired(&self) -> bool {

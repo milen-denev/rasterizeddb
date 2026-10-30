@@ -80,8 +80,7 @@ pub(super) fn pid_of(pt: &PartitionedTable, tenant: i64) -> u32 {
 }
 
 pub(super) fn materialized(pt: &PartitionedTable) -> Vec<u32> {
-    let epoch = pt.epoch().unwrap();
-    pt.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(pid, _)| pid).collect()
+    pt.materialized_pids().unwrap()
 }
 
 /// `name`, partitioned by tenant into `partitions`, with one opening row of

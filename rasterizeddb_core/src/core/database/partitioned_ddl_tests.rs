@@ -53,10 +53,16 @@ fn count(out: &[u8]) -> usize {
     crate::core::row::row::vec_into_rows(&out[1..]).unwrap_or_default().len()
 }
 
+/// Every materialized partition's open instance. Nothing in these tests
+/// closes one, so every materialized partition is open (a schema change
+/// reopens the open set); asserted, so a closed one never drops out of a
+/// check unnoticed.
 fn partitions(db: &Database, name: &str) -> Vec<(u32, Arc<DbTable>)> {
     let pt = db.partitioned_table(name).expect("a partitioned table");
-    let epoch = pt.epoch().expect("it opens");
-    pt.materialized(&epoch, &Route::All).expect("its partitions")
+    let open = pt.open_partitions_now();
+    let pids: Vec<u32> = open.iter().map(|(pid, _)| *pid).collect();
+    assert_eq!(pids, pt.materialized_pids().expect("it opens"), "a materialized partition of {name} is closed");
+    open
 }
 
 /// The schema a client can tell apart: names, types, write orders,
@@ -206,7 +212,7 @@ async fn validation_reads_every_partition() {
         let pt = db.partitioned_table("pt").unwrap();
         let route = pt.route_where(&format!("tenant_id = {tenant}")).unwrap();
         let epoch = pt.epoch().unwrap();
-        let pid = pt.materialized(&epoch, &route).unwrap()[0].0;
+        let pid = pt.materialized(&epoch, &route).await.unwrap()[0].0;
         if !tenants.iter().any(|(p, _)| *p == pid) {
             tenants.push((pid, tenant));
         }

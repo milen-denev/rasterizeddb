@@ -1001,7 +1001,7 @@ async fn every_partition_loads_after_a_clean_shutdown() {
         }
         let pt = db.partitioned_table("pt").unwrap();
         let epoch = pt.epoch().unwrap();
-        for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap() {
+        for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap() {
             settled(&part).await;
         }
         let report = db.seal_for_shutdown(Duration::from_secs(60)).await;
@@ -1013,7 +1013,7 @@ async fn every_partition_loads_after_a_clean_shutdown() {
     let db = open(d).await;
     let pt = db.partitioned_table("pt").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap();
     assert!(parts.len() >= 6);
     for (pid, part) in &parts {
         settled(part).await;

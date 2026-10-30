@@ -29,7 +29,7 @@ fn a_narrow_route_uses_the_cache_and_a_wide_one_stores_nothing() {
     }
     let pt = server.db.partitioned_table("qc").unwrap();
     let epoch = pt.epoch().unwrap();
-    let materialized = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).unwrap().len();
+    let materialized = pt.materialized_pids().unwrap().len();
     assert!(materialized > 4, "the wide query must reach more than 4 partitions, not {materialized}");
 
     // The cache works here at all: a plain table's repeated query hits.

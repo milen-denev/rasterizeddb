@@ -93,7 +93,7 @@ async fn twins(db: &Arc<Database>) -> Arc<PartitionedTable> {
 /// disagree with a view read a moment later.
 async fn settle(db: &Database, pt: &PartitionedTable) {
     let epoch = pt.epoch().unwrap();
-    for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap() {
+    for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap() {
         part.wait_filters_ready().await.unwrap();
     }
     let twin = db.table_for_tests("twin").unwrap().clone();
@@ -404,7 +404,7 @@ async fn set_config_vacuum_reaches_every_partition() {
     let db = open(root).await;
     let pt = twins(&db).await;
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap();
     assert!(parts.len() > 1);
     let twin = db.table_for_tests("twin").unwrap().clone();
 

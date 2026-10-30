@@ -63,8 +63,7 @@ fn pid_of(pt: &PartitionedTable, key: &[u8]) -> u32 {
 }
 
 fn materialized(pt: &PartitionedTable) -> Vec<u32> {
-    let epoch = pt.epoch().unwrap();
-    pt.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(pid, _)| pid).collect()
+    pt.materialized_pids().unwrap()
 }
 
 fn session(db: &Arc<Database>) -> SessionState {

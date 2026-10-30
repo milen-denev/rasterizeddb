@@ -434,7 +434,7 @@ async fn pt_load(args: &Args) {
     make_durable(&db);
     let pt = db.partitioned_table("p").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).await.unwrap();
     for (_, part) in &parts {
         ready(part).await;
     }
@@ -455,7 +455,7 @@ async fn pt_open(args: &Args) {
     let t_new = t0.elapsed();
     let pt = db.partitioned_table("p").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &rasterizeddb_core::core::partition::Route::All).await.unwrap();
     for (_, part) in &parts {
         ready(part).await;
     }

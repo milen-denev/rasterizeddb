@@ -461,7 +461,7 @@ async fn rdb_index_checkpoint_fans_out_over_partitions_and_skips_its_own_writes(
     exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
     let pt = db.partitioned_table("pt").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap();
     assert!(parts.len() >= 2, "too few partitions materialized: {}", parts.len());
     for (_, p) in &parts {
         ready(p).await;
@@ -516,7 +516,7 @@ async fn shutdown_seals_every_table_and_partition() {
     exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
     let pt = db.partitioned_table("pt").unwrap();
     let epoch = pt.epoch().unwrap();
-    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap();
+    let parts = pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap();
     for (_, p) in &parts {
         ready(p).await;
     }

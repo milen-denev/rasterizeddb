@@ -44,8 +44,7 @@ fn pid_of_tenant(t: &PartitionedTable, tenant: i64) -> u32 {
 }
 
 fn materialized(t: &PartitionedTable) -> Vec<u32> {
-    let epoch = t.epoch().unwrap();
-    t.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(pid, _)| pid).collect()
+    t.materialized_pids().unwrap()
 }
 
 async fn pt_ids(db: &Arc<Database>, clause: &str) -> Result<Vec<i64>, String> {

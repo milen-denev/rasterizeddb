@@ -115,7 +115,7 @@ async fn rows_of(table: &Table<DbStorageProvider>) -> usize {
 pub(super) async fn count(t: &PartitionedTable) -> usize {
     let epoch = t.epoch().unwrap();
     let mut total = 0;
-    for (_, p) in t.materialized(&epoch, &Route::All).unwrap() {
+    for (_, p) in t.materialized(&epoch, &Route::All).await.unwrap() {
         total += rows_of(&p).await;
     }
     total

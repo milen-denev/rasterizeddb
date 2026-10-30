@@ -587,7 +587,7 @@ pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Ve
         let (schema, parts) = match db.partitioned_table(&table) {
             Some(pt) => {
                 let epoch = pt.epoch().expect("the partitioned table opens");
-                let parts = pt.materialized(&epoch, &Route::All).expect("its partitions");
+                let parts = pt.materialized(&epoch, &Route::All).await.expect("its partitions");
                 (pt.shell().schema.clone(), parts)
             }
             None => {

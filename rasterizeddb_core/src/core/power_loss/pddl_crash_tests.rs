@@ -55,7 +55,7 @@ async fn settled(t: &Table<DbStorageProvider>) -> Result<(), String> {
 /// dropped or renamed fails both, alike.
 async fn index_contents(db: &Arc<Database>, name: &str, table: &crate::core::partition::table::PartitionedTable) -> Result<(), String> {
     let epoch = table.epoch().map_err(|e| e.to_string())?;
-    for (_, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).map_err(|e| e.to_string())? {
+    for (_, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).await.map_err(|e| e.to_string())? {
         settled(&part).await?;
     }
     let probes = [0i64, 3, 30, 93, 141].map(|v| (format!("v = {v}"), format!("v + 0 = {v}")));
@@ -121,7 +121,7 @@ async fn fingerprint(db: &Arc<Database>) -> Result<String, String> {
         schema.foreign_keys.iter().filter(|f| !f.is_deleted).map(|f| (&f.name, &f.parent_table)).collect::<Vec<_>>(),
     );
     let epoch = table.epoch().map_err(|e| e.to_string())?;
-    for (pid, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).map_err(|e| e.to_string())? {
+    for (pid, part) in table.materialized(&epoch, &crate::core::partition::route::Route::All).await.map_err(|e| e.to_string())? {
         if part.schema.fields.len() != schema.fields.len()
             || part.schema.fields.iter().zip(&schema.fields).any(|(a, b)| a.name != b.name || a.is_deleted != b.is_deleted)
             || part.schema.secondary_indexes.len() != schema.secondary_indexes.len()
@@ -189,7 +189,7 @@ async fn run_case(case: &Case, seeds: u64) -> Outcomes {
         for name in db.relation_names() {
             if let Some(pt) = db.partitioned_table(&name) {
                 let epoch = pt.epoch().unwrap();
-                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap() {
+                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).await.unwrap() {
                     settled(&part).await.unwrap();
                 }
             } else if let Some(t) = db.table_held(&name) {
@@ -283,7 +283,7 @@ async fn run_case(case: &Case, seeds: u64) -> Outcomes {
                         }
                         if snapshot && let Some(pt) = ["pt", "pt2"].iter().find_map(|n| db.partitioned_table(n)) {
                             if let Ok(epoch) = pt.epoch() {
-                                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).unwrap_or_default() {
+                                for (_, part) in pt.materialized(&epoch, &crate::core::partition::route::Route::All).await.unwrap_or_default() {
                                     out.loaded += (part.index_origin() == Origin::Loaded) as usize;
                                 }
                             }

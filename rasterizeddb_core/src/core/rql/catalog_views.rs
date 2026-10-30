@@ -1442,12 +1442,10 @@ fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::
             if indexes.is_empty() {
                 return Ok(None);
             }
-            let epoch = table.epoch().map_err(|e| e.to_string())?;
+            // Over the open partitions: a closed one serves no index until it
+            // opens, and its open builds or loads one before queries use it.
             let mut ready = true;
-            for (_, partition) in table
-                .materialized(&epoch, &crate::core::partition::Route::All)
-                .map_err(|e| e.to_string())?
-            {
+            for (_, partition) in table.open_partitions_now() {
                 ready &= partition
                     .indexes()
                     .map_err(|e| e.to_string())?

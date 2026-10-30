@@ -41,6 +41,11 @@ pub(crate) struct ExternalUnit<S: StorageIO> {
     /// `None` with reclamation off: nothing is swept, and nothing forgotten.
     vacuum: Option<tokio::sync::Mutex<VacuumSlot<S>>>,
     sealer: Option<tokio::sync::Mutex<IdleSealer<S>>>,
+    /// Held by each round of [`Unit::service`], from before it looks at
+    /// `alive`: what an exclusive close waits on after clearing `alive`, so
+    /// no landing of this instance is still writing when the next instance
+    /// of the file set opens (phase 3 P5b, [`ExternalUnit::quiesce`]).
+    round: tokio::sync::Mutex<()>,
 }
 
 impl<S: StorageIO> ExternalUnit<S> {
@@ -66,10 +71,18 @@ impl<S: StorageIO> ExternalUnit<S> {
                 })
             }),
             sealer: sealer.map(tokio::sync::Mutex::new),
+            round: tokio::sync::Mutex::new(()),
         }
     }
 
+    /// Waits out a round of this unit in flight. Called once `alive` is
+    /// clear, so every later round returns `Gone` without touching a file.
+    pub(super) async fn quiesce(&self) {
+        let _round = self.round.lock().await;
+    }
+
     async fn service_once(&self) -> Service {
+        let _round = self.round.lock().await;
         // First, so a write during this round pushes the unit again.
         self.watch.serviced();
         #[cfg(test)]

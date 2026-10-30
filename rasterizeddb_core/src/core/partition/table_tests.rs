@@ -160,7 +160,7 @@ async fn try_select(t: &PartitionedTable, clause: &str) -> std::io::Result<Vec<R
     let epoch = t.epoch().unwrap();
     let route = t.route_where(&clause).unwrap();
     let mut out = Vec::new();
-    for (_, p) in t.materialized(&epoch, &route).unwrap() {
+    for (_, p) in t.materialized(&epoch, &route).await.unwrap() {
         let fetch = Table::<P>::build_full_row_fetch(&p.schema.fields);
         out.extend(
             p.query_row(&clause, &p.schema.fields.to_vec(), fetch.clone(), fetch, None, None)
@@ -389,7 +389,7 @@ async fn materializing_creates_three_files_and_one_record() {
     assert!(data_files_in(d, UID).is_empty(), "CREATE made partition files");
     assert!(materializes(d, UID).is_empty());
     let epoch = t.epoch().unwrap();
-    assert!(t.materialized(&epoch, &Route::All).unwrap().is_empty());
+    assert!(t.materialized(&epoch, &Route::All).await.unwrap().is_empty());
 
     let pid = pid_of(&t, 42);
     insert(&t, 42, 1).await;
@@ -408,11 +408,11 @@ async fn materializing_creates_three_files_and_one_record() {
     assert_eq!(data_files_in(d, UID), want);
     assert_eq!(materializes(d, UID), vec![pid]);
 
-    let all: Vec<u32> = t.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(p, _)| p).collect();
+    let all: Vec<u32> = t.materialized(&epoch, &Route::All).await.unwrap().into_iter().map(|(p, _)| p).collect();
     assert_eq!(all, vec![pid]);
     let elsewhere = (1..10_000i64).find(|v| pid_of(&t, *v) != pid).unwrap();
     let route = t.route_where(&format!("tenant_id = {elsewhere}")).unwrap();
-    assert!(t.materialized(&epoch, &route).unwrap().is_empty());
+    assert!(t.materialized(&epoch, &route).await.unwrap().is_empty());
     assert!(select(&t, &format!("tenant_id = {elsewhere}")).await.is_empty());
     assert_eq!(select(&t, "tenant_id = 42").await.len(), 2);
 
@@ -557,7 +557,7 @@ async fn a_broken_table_refuses_every_data_call() {
     same(t.route_where("tenant_id = 42").unwrap_err());
     same(t.epoch().unwrap_err());
     same(t.spec().unwrap_err());
-    same(t.materialized(&epoch, &Route::All).err().unwrap());
+    same(t.materialized(&epoch, &Route::All).await.err().unwrap());
     same(t.partition_for_point(0).await.err().unwrap());
     same(t.totals().await.unwrap_err());
     same(t.partitions().await.unwrap_err());
@@ -926,7 +926,7 @@ async fn count_as(t: &PartitionedTable, clause: &str, reader: TxId) -> usize {
     let epoch = t.epoch().unwrap();
     let route = t.route_where(clause).unwrap();
     let mut n = 0;
-    for (_, p) in t.materialized(&epoch, &route).unwrap() {
+    for (_, p) in t.materialized(&epoch, &route).await.unwrap() {
         let fetch = Table::<P>::build_full_row_fetch(&p.schema.fields);
         n += p
             .query_row_in_txn(clause, &p.schema.fields.to_vec(), fetch.clone(), fetch, None, None, reader)
@@ -941,7 +941,7 @@ async fn count_as(t: &PartitionedTable, clause: &str, reader: TxId) -> usize {
 /// itself: its slot pins (§7.2), and the table's one handle sits at or below
 /// every pin.
 async fn assert_registered(t: &PartitionedTable) {
-    let all = t.materialized(&t.epoch().unwrap(), &Route::All).unwrap();
+    let all = t.materialized(&t.epoch().unwrap(), &Route::All).await.unwrap();
     assert!(!all.is_empty());
     let handle = t.pin_board().unwrap().handle_horizon();
     for (pid, p) in all {

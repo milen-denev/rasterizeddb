@@ -65,7 +65,8 @@ impl Database {
     }
 
     /// The bytes in `name`'s rows files: a plain table's `len`, a partitioned
-    /// table's summed over its open partitions. What an ALTER decides
+    /// table's summed over its materialized partitions, closed ones from
+    /// their files' metadata. What an ALTER decides
     /// "metadata-only" by. The caller holds ACCESS EXCLUSIVE on `name`.
     pub(crate) fn rows_len_held(&self, name: &str) -> io::Result<u64> {
         match self.relation(name) {
@@ -76,13 +77,15 @@ impl Database {
     }
 
     /// The tables holding `name`'s rows, for a DDL that validates them: a
-    /// plain table itself, or each open partition of a partitioned one (an
-    /// unmaterialized partition holds none, §4.3). The caller holds ACCESS
-    /// EXCLUSIVE on `name`, so the set cannot change while it reads.
-    pub(crate) fn row_tables_held(&self, name: &str) -> io::Result<Vec<Arc<DbTable>>> {
+    /// plain table itself, or every materialized partition of a partitioned
+    /// one, each opened if it is closed (an unmaterialized partition holds
+    /// none, §4.3; a closed one's rows must not escape the check). The caller
+    /// holds ACCESS EXCLUSIVE on `name`, so the set cannot change while it
+    /// reads.
+    pub(crate) async fn row_tables_held(&self, name: &str) -> io::Result<Vec<Arc<DbTable>>> {
         match self.relation(name) {
             Some(Relation::Partitioned(table)) => {
-                Ok(table.open_partitions()?.into_iter().map(|(_, partition)| partition).collect())
+                Ok(table.all_partitions().await?.into_iter().map(|(_, partition)| partition).collect())
             }
             Some(Relation::Plain(table)) => {
                 table.data()?;

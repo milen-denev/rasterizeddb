@@ -82,6 +82,16 @@ pub struct PinBoard {
     pub(crate) transactions: StdArc<TransactionManager>,
     /// By pid (pids are `0..n` until reshapes, phase 5).
     watches: Box<[StdArc<WriteWatch>]>,
+    /// By pid: held by every open, materialize and close of the partition
+    /// (phase 3 P5b, `table::Parts`), so at most one instance of a file set
+    /// is live and no open builds providers over files a close still lands
+    /// into (I14). Here rather than in a table instance's slots, so a schema
+    /// change's new instance shares it.
+    lifecycle: Box<[tokio::sync::Mutex<()>]>,
+    /// The table's live instance's slots, through which a forget round opens
+    /// a closed, pinned partition to sweep it (§7.2); replaced by a schema
+    /// change's reopen. Weak: the instance owns this board.
+    parts: parking_lot::Mutex<std::sync::Weak<super::table::Parts>>,
     /// One sweep at a time per table, so a sweep's `SWEPT` is applied over
     /// the pin it started from.
     sweeping: tokio::sync::Mutex<()>,
@@ -145,6 +155,8 @@ impl PinBoard {
                 state: StdArc::new(tokio::sync::Mutex::new(state)),
                 handle,
                 transactions: transactions.clone(),
+                lifecycle: (0..pins.len()).map(|_| tokio::sync::Mutex::new(())).collect(),
+                parts: parking_lot::Mutex::new(std::sync::Weak::new()),
                 watches: watches.into_boxed_slice(),
                 sweeping: tokio::sync::Mutex::new(()),
                 cursor: AtomicUsize::new(0),
@@ -169,6 +181,18 @@ impl PinBoard {
             .get(pid as usize)
             .filter(|w| w.pid() == pid)
             .ok_or_else(|| io::Error::other(format!("internal error: no write watch for partition {pid}")))
+    }
+
+    /// Partition `pid`'s lifecycle lock (see the field).
+    pub(crate) fn lifecycle(&self, pid: u32) -> io::Result<&tokio::sync::Mutex<()>> {
+        self.lifecycle
+            .get(pid as usize)
+            .ok_or_else(|| io::Error::other(format!("internal error: no lifecycle lock for partition {pid}")))
+    }
+
+    /// The live instance's slots, for the forget rounds.
+    pub(crate) fn set_parts(&self, parts: std::sync::Weak<super::table::Parts>) {
+        *self.parts.lock() = parts;
     }
 
     /// This table's place in the forget registry, as `try_forget` reads it:
@@ -248,6 +272,68 @@ impl PinBoard {
     /// with no write watch.
     pub(crate) async fn sweep_all(&self, pids: &[u32]) -> io::Result<Vec<(u32, io::Result<NeutralizeReport>)>> {
         let _one = self.sweeping.lock().await;
+        // A closed partition keeps pinning (§7.2, phase 3 P5b): one that is
+        // pinned is opened for its sweep, held open through it, and closed
+        // again afterwards if nothing else took it meanwhile. Otherwise a
+        // partition pinned at a crash, or closed dirty, would hold
+        // forgetting back until a statement happened to open it.
+        let (held, opened_here) = self.open_closed_for_sweep(pids).await;
+        let done = self.sweep_open(pids).await;
+        drop(held);
+        self.close_after_sweep(opened_here).await;
+        done
+    }
+
+    /// Opens each partition of `pids` that is materialized, closed and
+    /// pinned, through the live instance's slots: the instances, held by
+    /// the caller through the sweep, and the pids opened. One that does not
+    /// open is left unswept (its pin stays) and logged.
+    async fn open_closed_for_sweep(
+        &self,
+        pids: &[u32],
+    ) -> (Vec<Arc<crate::core::row::table::Table<DbStorageProvider>>>, Vec<u32>) {
+        let mut held = Vec::new();
+        let mut opened = Vec::new();
+        let Some(parts) = self.parts.lock().upgrade() else {
+            return (held, opened);
+        };
+        for &pid in pids {
+            if !parts.is_materialized(pid) || parts.open_now(pid).is_some() {
+                continue;
+            }
+            if self.state.lock().await.part(pid).and_then(|p| p.pin).is_none() {
+                continue;
+            }
+            match parts.open(pid).await {
+                Ok(table) => {
+                    held.push(table);
+                    opened.push(pid);
+                }
+                Err(e) => ::log::error!("partition {pid} of \"{}\" did not open for its forget sweep: {e}", self.name),
+            }
+        }
+        (held, opened)
+    }
+
+    /// Closes again each partition of `pids` a sweep opened, if nothing else
+    /// holds it now.
+    async fn close_after_sweep(&self, pids: Vec<u32>) {
+        if pids.is_empty() {
+            return;
+        }
+        let Some(parts) = self.parts.lock().upgrade() else {
+            return;
+        };
+        for pid in pids {
+            if let Err(e) = parts.close_after_sweep(pid).await {
+                ::log::error!("partition {pid} of \"{}\" did not close after its forget sweep: {e}", self.name);
+            }
+        }
+    }
+
+    /// [`Self::sweep_all`] over the partitions open now; a closed one is
+    /// skipped, its pin unmoved.
+    async fn sweep_open(&self, pids: &[u32]) -> io::Result<Vec<(u32, io::Result<NeutralizeReport>)>> {
         // Each partition's proof, before the state's lock: the scans and
         // their rewrites take as long as they take, and writers' first-write
         // edges wait on that lock.

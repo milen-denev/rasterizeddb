@@ -69,8 +69,10 @@ pub(crate) const FANOUT_IN_FLIGHT: usize = 8;
 /// the query cache (§8).
 pub(crate) const CACHE_MAX_PARTITIONS: usize = 4;
 
-/// A fan-out's partitions, by ascending pid.
-pub(crate) type Parts = smallvec::SmallVec<[(u32, Arc<PartTable>); 1]>;
+/// A fan-out's partitions, by ascending pid: each open instance, or `None`
+/// for a closed one, opened when the fan-out reaches it (phase 3 P5b), so a
+/// `LIMIT` that stops early opens none of the rest.
+pub(crate) type Parts = crate::core::partition::table::Planned;
 
 /// What a `SELECT` reads.
 pub(crate) enum RowSource {
@@ -90,8 +92,9 @@ pub(crate) struct FanOut {
     /// The map epoch the route was computed under, counted (`load_full`) and
     /// held for the statement, so a reshape's reclamation waits for it.
     _epoch: StdArc<MapEpoch>,
-    /// The routed partitions that are materialized, by ascending pid. Inline
-    /// for the one a routed point read reaches.
+    /// The routed partitions that are materialized, by ascending pid, open
+    /// or closed (see [`Parts`]). Inline for the one a routed point read
+    /// reaches.
     parts: Parts,
     cache: bool,
 }
@@ -139,7 +142,7 @@ impl RowSource {
     ) -> io::Result<Self> {
         table.check()?;
         let epoch = table.epoch()?;
-        let parts = Parts::from_vec(table.materialized(&epoch, route)?);
+        let parts = table.planned(&epoch, route)?;
         let cache = parts.len() <= CACHE_MAX_PARTITIONS;
         Ok(RowSource::Partitioned(Box::new(FanOut { table, visibility, _epoch: epoch, parts, cache })))
     }
@@ -160,7 +163,7 @@ impl RowSource {
     ) -> io::Result<Self> {
         table.check()?;
         let epoch = table.epoch()?;
-        let mut by_pid: std::collections::BTreeMap<u32, Arc<PartTable>> = std::collections::BTreeMap::new();
+        let mut by_pid: std::collections::BTreeMap<u32, Option<Arc<PartTable>>> = std::collections::BTreeMap::new();
         for range in ranges {
             for (pid, part) in table.materialized_in(&epoch, *range)? {
                 by_pid.insert(pid, part);
@@ -504,7 +507,7 @@ impl FanOut {
                 test_hooks::note_keyed(table.uid());
                 table.materialized_in(&epoch, range)?
             }
-            None => Parts::from_vec(table.materialized(&epoch, &table.route_where(where_clause)?)?),
+            None => table.planned(&epoch, &table.route_where(where_clause)?)?,
         };
         Ok((visibility, epoch, parts))
     }
@@ -530,13 +533,26 @@ impl FanOut {
             }
             #[cfg(test)]
             test_hooks::note_reads(self.table.uid(), chunk.iter().map(|(pid, _)| *pid));
-            if let [(_, part)] = chunk {
+            if let [(pid, part)] = chunk {
                 // One partition, as a routed point read is: awaited in place.
                 // `join_all` would move the scan's future into a `Vec` of its
                 // own, and the profile showed those copies (S16b).
-                out.push(read(part.clone(), self.visibility.clone(), self.cache).await?);
+                let part = match part {
+                    Some(part) => part.clone(),
+                    None => Box::pin(self.table.open_part(*pid)).await?,
+                };
+                out.push(read(part, self.visibility.clone(), self.cache).await?);
             } else {
-                let reads = chunk.iter().map(|(_, part)| read(part.clone(), self.visibility.clone(), self.cache));
+                // The group's closed partitions opened first, in pid order:
+                // one that does not open fails the read, never skipped.
+                let mut group_parts: smallvec::SmallVec<[Arc<PartTable>; FANOUT_IN_FLIGHT]> = smallvec::SmallVec::new();
+                for (pid, part) in chunk {
+                    group_parts.push(match part {
+                        Some(part) => part.clone(),
+                        None => Box::pin(self.table.open_part(*pid)).await?,
+                    });
+                }
+                let reads = group_parts.into_iter().map(|part| read(part, self.visibility.clone(), self.cache));
                 for answer in futures::future::join_all(reads).await {
                     out.push(answer?);
                 }
@@ -619,7 +635,7 @@ where
     let visibility = statement.unwrap_or_else(|| table.visibility_for(tx));
     let epoch = table.epoch()?;
     let route = table.route_where(where_clause)?;
-    let parts = table.materialized(&epoch, &route)?;
+    let parts = table.materialized(&epoch, &route).await?;
     #[cfg(test)]
     test_hooks::note_writes(table.uid(), parts.iter().map(|(pid, _)| *pid));
     let collecting = collect.is_some();

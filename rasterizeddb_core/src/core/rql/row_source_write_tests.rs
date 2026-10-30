@@ -93,7 +93,7 @@ async fn slots_by_partition(pt: &PartitionedTable) -> Vec<(u32, u64)> {
 async fn pointer_bytes(pt: &PartitionedTable) -> u64 {
     let epoch = pt.epoch().unwrap();
     let mut total = 0;
-    for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).unwrap() {
+    for (_, part) in pt.materialized(&epoch, &crate::core::partition::Route::All).await.unwrap() {
         total += part.io_pointers().unwrap().get_len().await;
     }
     total
@@ -481,8 +481,7 @@ async fn a_key_change_is_refused_before_any_partition_is_written() {
     let slots = slots_by_partition(&pt).await;
     let epoch = pt.epoch().unwrap();
     let in_place = |pt: &PartitionedTable| -> Vec<u64> {
-        pt.materialized(&epoch, &crate::core::partition::Route::All)
-            .unwrap()
+        pt.open_partitions_now()
             .iter()
             .map(|(_, t)| t.in_place_column_updates())
             .collect()

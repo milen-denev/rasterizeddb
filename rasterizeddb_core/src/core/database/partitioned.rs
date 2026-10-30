@@ -171,7 +171,7 @@ pub(super) async fn vacuum_partitions(table: &PartitionedTable) -> io::Result<Va
         held_min_xmax: NO_TX,
         ..VacuumReport::default()
     };
-    for (pid, partition) in table.materialized(&epoch, &Route::All)? {
+    for (pid, partition) in table.materialized(&epoch, &Route::All).await? {
         let r = partition
             .vacuum_now()
             .await

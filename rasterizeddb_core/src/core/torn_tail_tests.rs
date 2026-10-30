@@ -842,7 +842,7 @@ async fn a_partitions_shrink_in_place_lowers_its_floor() {
     let pt = db.partitioned_table("t").unwrap();
     let epoch = pt.epoch().unwrap();
     let (pid, part) = pt
-        .materialized(&epoch, &crate::core::partition::Route::All)
+        .materialized(&epoch, &crate::core::partition::Route::All).await
         .unwrap()
         .into_iter()
         .max_by_key(|(_, p)| p.data().unwrap().len.load(std::sync::atomic::Ordering::Relaxed))

@@ -171,7 +171,7 @@ async fn insert(t: &PartitionedTable, tenant: i64, n: i32, tx: TxId) {
 async fn count(t: &PartitionedTable) -> usize {
     let epoch = t.epoch().unwrap();
     let mut total = 0;
-    for (_, p) in t.materialized(&epoch, &Route::All).unwrap() {
+    for (_, p) in t.materialized(&epoch, &Route::All).await.unwrap() {
         let fetch = Table::<DbStorageProvider>::build_full_row_fetch(&p.schema.fields);
         total += p
             .query_row("n >= 0", &p.schema.fields.to_vec(), fetch.clone(), fetch, None, None)
@@ -670,7 +670,7 @@ async fn forgetting_advances_with_a_partitioned_table_open() {
         }
     }
     let epoch = t.epoch().unwrap();
-    for (_, p) in t.materialized(&epoch, &Route::All).unwrap() {
+    for (_, p) in t.materialized(&epoch, &Route::All).await.unwrap() {
         if p.neutralize_aborted_now().await.unwrap().advanced_to.is_some() {
             swept += 1;
         }

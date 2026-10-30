@@ -82,8 +82,7 @@ fn pid_of_tenant(t: &PartitionedTable, tenant: i64) -> u32 {
 }
 
 fn materialized(t: &PartitionedTable) -> Vec<u32> {
-    let epoch = t.epoch().unwrap();
-    t.materialized(&epoch, &Route::All).unwrap().into_iter().map(|(pid, _)| pid).collect()
+    t.materialized_pids().unwrap()
 }
 
 /// Ends enough transactions for the settle bound to move well past every
@@ -347,7 +346,7 @@ async fn the_scheduler_runs_the_idle_checkpoint_and_then_rests() {
     exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')").await;
     let t = pt(&db);
     let epoch = t.epoch().unwrap();
-    let parts = t.materialized(&epoch, &Route::All).unwrap();
+    let parts = t.materialized(&epoch, &Route::All).await.unwrap();
     assert!(!parts.is_empty());
     let sched = db.partition_maintenance().clone();
     assert!(sched.queued_units().await > 0, "the writes pushed nothing");
@@ -687,8 +686,7 @@ async fn a_broken_table_pins_until_it_opens() {
 /// The materialized partition holding `tenant`, as its `Table`.
 fn part_of(t: &PartitionedTable, tenant: i64) -> rclite::Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>> {
     let pid = pid_of_tenant(t, tenant);
-    let epoch = t.epoch().unwrap();
-    t.materialized(&epoch, &Route::All).unwrap().into_iter().find(|(p, _)| *p == pid).expect("materialized").1
+    t.open_partitions_now().into_iter().find(|(p, _)| *p == pid).expect("materialized and open").1
 }
 
 /// Two tenants in two different partitions.
