@@ -2147,6 +2147,13 @@ struct SessionState {
     /// to put it — and the CTE wrapper needs the answer to decide whether to
     /// commit the transaction it opened.
     statement_failed: bool,
+    /// Set while a statement the wire can replay whole runs: a write
+    /// conflict it ends in is not reported but noted in
+    /// `deferred_conflict`, and the statement replayed (`run_statement`).
+    defer_conflict: bool,
+    /// The statement just run ended in a write conflict `defer_conflict`
+    /// held back.
+    deferred_conflict: bool,
     /// Whether an error has been reported in the extended-query batch now in
     /// flight, so the rest of it can be discarded.
     ///
@@ -2497,6 +2504,8 @@ impl SessionState {
             synchronous_commit: None,
             statement_tx: None,
             statement_failed: false,
+            defer_conflict: false,
+            deferred_conflict: false,
             error_in_batch: false,
             statement_error: None,
             shape_change: ShapeChangeMode::default(),
@@ -5517,20 +5526,48 @@ where
         }
         // An UPDATE or DELETE fed by a CTE or a derived table, which are
         // read here before the write runs: one snapshot for the whole of it.
+        //
+        // Outside a block it is replayed whole when it ends in a write
+        // conflict: its CTEs and derived tables are read again, in a scope of
+        // their own, as a plain write's retry reads afresh. Replaying only
+        // the write left it under the bodies' snapshot, where every replay
+        // met the same superseded version (100% 40001 against an incrementer
+        // of the same row). Inside a block the statement cannot be undone
+        // alone, and its conflict is reported.
         None if crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt) => {
-            crate::core::rql::statement_snapshot::write_scope(execute_single_statement(
-                database,
-                state,
-                stream,
-                stmt,
-                result_formats,
-                omit_description,
-            ))
-            .await
+            let replays = if state.current_tx().is_none() { WIRE_REPLAYS } else { 1 };
+            for attempt in 1..=replays {
+                state.defer_conflict = attempt < replays;
+                state.deferred_conflict = false;
+                state.statement_failed = false;
+                state.statement_error = None;
+                let ran = crate::core::rql::statement_snapshot::write_scope(execute_single_statement(
+                    database,
+                    state,
+                    stream,
+                    stmt,
+                    result_formats,
+                    omit_description,
+                ))
+                .await;
+                state.defer_conflict = false;
+                ran?;
+                if !state.deferred_conflict {
+                    break;
+                }
+                state.deferred_conflict = false;
+                tokio::task::yield_now().await;
+            }
+            Ok(())
         }
         None => execute_single_statement(database, state, stream, stmt, result_formats, omit_description).await,
     }
 }
+
+/// How many times the wire runs a CTE- or derived-table-fed write that
+/// ends in a write conflict (`run_statement`), its reads taken afresh each
+/// time; the last attempt's conflict is reported.
+const WIRE_REPLAYS: usize = 4;
 
 /// Runs a prepared `SELECT` from its cached parse. What it skips is the
 /// statement text's parsing; what it keeps is everything the text path does
@@ -5762,7 +5799,11 @@ where
     let mut _cte_alias: Option<crate::core::mvcc::row_locks::AliasGuard<'_>> = None;
     let cte_tx = match state.current_tx() {
         Some(tx) => Some((tx, false)),
-        None if crate::core::rql::cte::has_with_clause(stmt) => {
+        // A derived table read at the wire too: its rows and the write are
+        // one transaction's, so the write is handed their snapshot.
+        None if crate::core::rql::cte::has_with_clause(stmt)
+            || crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt) =>
+        {
             let tx = match crate::core::mvcc::owner::adopt_transaction() {
                 Some(o) => o,
                 None => {
@@ -5961,7 +6002,7 @@ where
     // reconstruct, and without it a client-side failure gives no way to tell
     // *which* statement the engine refused. Logged once, at the boundary where
     // the outcome is known.
-    if state.statement_failed {
+    if state.statement_failed && !state.deferred_conflict {
         // Read rather than taken: `execute_recorded` needs the same message to
         // put in the statement log, and clears it before the next statement.
         match state.statement_error.as_deref() {
@@ -6739,10 +6780,20 @@ where
         }
         3 => {
             let msg = String::from_utf8_lossy(&resp[1..]).to_string();
+            let code = sqlstate_in(&msg, stmt);
+            // A conflict the caller will replay the whole statement for:
+            // reported by nothing, but failed, so the transaction it opened
+            // is aborted (`run_statement`).
+            if state.defer_conflict && code == "40001" && state.transaction.is_none() {
+                state.deferred_conflict = true;
+                state.statement_failed = true;
+                state.statement_error = Some(msg);
+                return Ok(());
+            }
             // A failure inside a block poisons it: every later statement is
             // refused until COMMIT or ROLLBACK closes it. Carrying on would
             // let the block commit with a hole in it.
-            fail_statement(state, stream, sqlstate_in(&msg, stmt), &msg).await?;
+            fail_statement(state, stream, code, &msg).await?;
         }
         _ => {
             fail_statement(state, stream, "XX000", "unknown engine response tag").await?;
