@@ -1310,7 +1310,8 @@ fn declared_types_among(
 ) -> Vec<Option<DbType>> {
     declared_fields_among(query, labels, database, relations)
         .into_iter()
-        .map(|f| f.map(|f| f.db_type))
+        // `literal_type`: a `timestamp` column is one.
+        .map(|f| f.map(|f| f.literal_type()))
         .collect()
 }
 

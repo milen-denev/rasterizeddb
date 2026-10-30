@@ -345,12 +345,15 @@ pub(super) fn encode_cell_text(
             out.push(if bytes.first().copied().unwrap_or(0) != 0 { b't' } else { b'f' });
             true
         }
-        DbType::DATETIME => {
+        DbType::DATETIME | DbType::TIMESTAMP => {
             let Ok(raw) = <[u8; 8]>::try_from(bytes) else {
                 return false;
             };
             vc::format_timestamp_us_into(i64::from_le_bytes(raw), out);
-            out.extend_from_slice(b"+00");
+            // A `timestamp` (without time zone) has no offset to show.
+            if *db_type == DbType::DATETIME {
+                out.extend_from_slice(b"+00");
+            }
             true
         }
         DbType::BYTEA => {
@@ -475,7 +478,7 @@ pub(super) fn encode_cell_binary(
             );
             true
         }
-        DbType::DATETIME => {
+        DbType::DATETIME | DbType::TIMESTAMP => {
             let Ok(raw) = <[u8; 8]>::try_from(bytes) else {
                 return false;
             };
@@ -706,7 +709,7 @@ mod cell_tests {
 
     fn all_types() -> Vec<DbType> {
         let mut types: Vec<DbType> = (1..=44u8).chain(252..=255).map(DbType::from_byte).collect();
-        types.extend([DbType::NULL, DbType::START, DbType::END, DbType::UNKNOWN]);
+        types.extend([DbType::NULL, DbType::START, DbType::END, DbType::UNKNOWN, DbType::TIMESTAMP]);
         types.sort();
         types.dedup();
         types

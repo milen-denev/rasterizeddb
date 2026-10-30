@@ -4394,7 +4394,7 @@ async fn describe_resolved(
                             .iter()
                             .map(|item| {
                                 let label: String = item.label().to_string();
-                                (label, item.result_type())
+                                (label, item.reported_type())
                             })
                             .collect();
                         if !fields.is_empty() {
@@ -4410,7 +4410,7 @@ async fn describe_resolved(
                         .filter_map(|c| {
                             field_of(&schema, c.schema_id).map(|f| {
                                 let label: String = f.name.clone();
-                                (label, f.db_type.clone())
+                                (label, f.literal_type())
                             })
                         })
                         .collect();
@@ -4603,7 +4603,7 @@ async fn describe_resolved(
                     crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
                         match &real_table {
                             Some(t) => reported_type(field, t.schema()),
-                            None => field.db_type.clone(),
+                            None => field.literal_type(),
                         }
                     }
                     other => other.reported_type(),
@@ -4679,7 +4679,7 @@ async fn describe_resolved(
                 // the field's own type is what it reports.
                 let ty = match &real_table {
                     Some(t) => reported_type(field, t.schema()),
-                    None => field.db_type.clone(),
+                    None => field.literal_type(),
                 };
                 fields.push((label, ty));
             }
@@ -9404,7 +9404,10 @@ fn reported_type_of(
         // here both the description and the value are taken from.
         DbType::bpchar(n)
     } else {
-        field.db_type.clone()
+        // `literal_type`: a `timestamp` (without time zone) column is
+        // described as `timestamp` and its values formatted with no `+00`,
+        // from this one type, as `DbType::TIMESTAMP` says.
+        field.literal_type()
     }
 }
 
@@ -10065,8 +10068,9 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 None
             }
         }
-        // Binary `timestamptz` counts microseconds from 2000-01-01, big-endian.
-        DbType::DATETIME => {
+        // Binary `timestamptz` counts microseconds from 2000-01-01, big-endian;
+        // a `timestamp`'s are the same, the session being UTC.
+        DbType::DATETIME | DbType::TIMESTAMP => {
             if bytes.len() == 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(bytes);
@@ -10404,11 +10408,14 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
 
         DbType::DATETIME | DbType::TIMESTAMP => {
             // 8-byte LE microseconds since the Unix epoch. The server reports
-            // TimeZone=UTC at startup, so the offset is always +00.
+            // TimeZone=UTC at startup, so a `timestamptz`'s offset is always
+            // +00; a `timestamp` has none, and PostgreSQL shows it bare.
             let Some(us) = le_i64(bytes) else { return None };
             let mut out = Vec::with_capacity(29);
             crate::core::value_codec::format_timestamp_us_into(us, &mut out);
-            out.extend_from_slice(b"+00");
+            if db_type == DbType::DATETIME {
+                out.extend_from_slice(b"+00");
+            }
             String::from_utf8(out).ok()?
         }
 

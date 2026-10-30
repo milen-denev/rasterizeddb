@@ -433,6 +433,15 @@ impl SelectItem {
                     _ => self.result_type(),
                 }
             }
+            // `MIN`/`MAX` of a `timestamp` (without time zone) column is a
+            // `timestamp`, as the column is. Its result type is the column's
+            // storage type, `timestamptz`'s; described from that, the value
+            // was shown with a `+00` it does not have.
+            SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, arg: Some(field), arg_expr: None, .. }
+                if field.literal_type() == DbType::TIMESTAMP =>
+            {
+                DbType::TIMESTAMP
+            }
             _ => self.result_type(),
         }
     }

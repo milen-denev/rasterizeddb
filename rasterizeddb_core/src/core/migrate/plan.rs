@@ -180,18 +180,8 @@ pub fn plan(schema: &SourceSchema, options: &ImportOptions) -> Result<Plan, Stri
         );
     }
 
-    let has_timestamp = plan.tables.iter().any(|t| {
-        t.columns
-            .iter()
-            .any(|c| c.mapping.conversion == types::Conversion::Timestamp)
-    });
-    if has_timestamp {
-        plan.notes.push(
-            "TIMESTAMP is reported to clients as `timestamptz` in UTC, so a `timestamp without \
-             time zone` reads back with a +00 offset on the end. The instant is the same one."
-                .to_string(),
-        );
-    }
+    // No note for timestamps: `timestamp` and `timestamptz` are created as
+    // each, and read back as PostgreSQL shows them.
 
     Ok(plan)
 }

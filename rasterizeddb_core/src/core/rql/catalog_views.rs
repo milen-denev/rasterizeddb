@@ -719,6 +719,7 @@ fn sql_type_name(db_type: &crate::core::db_type::DbType) -> &'static str {
         DbType::F32 => "real",
         DbType::F64 => "double precision",
         DbType::DATETIME => "timestamp with time zone",
+        DbType::TIMESTAMP => "timestamp without time zone",
         DbType::UUID => "uuid",
         DbType::INET => "inet",
         DbType::DECIMAL => "numeric",
@@ -843,7 +844,8 @@ async fn build(
                         if matches!(field.text_typmod(), Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_))) {
                             "character"
                         } else {
-                            sql_type_name(&field.db_type)
+                            // `literal_type`: a `timestamp` column is one.
+                            sql_type_name(&field.literal_type())
                         },
                         if nullable { "YES" } else { "NO" }
                     ));

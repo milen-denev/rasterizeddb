@@ -110,6 +110,18 @@ UPDATE`), `UPDATE`, a backfilled `ADD COLUMN … DEFAULT`, and every predicate
 compared with the column (the scan, `IN`, `BETWEEN`, the filter and secondary
 indexes, a prepared statement's bound text, a `CASE` condition).
 
+On the wire a `timestamp` column is described as `timestamp` (OID 1114) and
+shown with no offset, `2021-01-01 00:00:00`; a `timestamptz` keeps OID 1184 and
+its `+00`. The description and the value are formatted from one type
+(`DbType::TIMESTAMP`), on every path that describes a column: a plain select, a
+join, `MIN`/`MAX`, a CTE or derived table, `RETURNING`, a window,
+`information_schema.columns` (`timestamp without time zone`), and a parameter
+compared with or written into the column. A typed driver therefore decodes it as
+a naive date-time (sqlx `NaiveDateTime`, tokio-postgres `Type::TIMESTAMP`) and
+refuses to read it as an instant, as against PostgreSQL. Not yet: an expression
+yielding the column's value (`CASE … THEN ts`) is still described as
+`timestamptz`.
+
 The column is a `DATETIME` whose field record carries a flag in its spare type
 byte (`SchemaField::without_time_zone`). A build from before the flag reads the
 record as `timestamptz`, which is what it always took the column for.
