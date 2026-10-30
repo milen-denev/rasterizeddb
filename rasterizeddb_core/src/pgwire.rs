@@ -7077,6 +7077,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return if has("(the disk is full)") { "53100" } else { "58030" };
     }
 
+    // `reserved_name`: a table created under, or renamed to, the statement
+    // temporaries' prefix (`cte::reserved_name_refusal`). Early: the message
+    // quotes the name, and the name is the client's.
+    if has("is reserved for the temporary tables a statement materialises") {
+        return "42939";
+    }
     // A regular-expression flag PostgreSQL refuses: invalid_parameter_value,
     // also when a CHECK meets it.
     if has("regexp_like() does not support the") || has("invalid regular expression option") {

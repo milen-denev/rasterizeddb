@@ -2480,6 +2480,11 @@ impl Database {
                 "that prefix is reserved for tables backing JSON columns",
             ));
         }
+        // Only as a destination, as the other reserved prefixes: renaming a
+        // table off it is how one created before the refusal is kept.
+        if let Some(reason) = crate::core::rql::cte::reserved_name_refusal(new_name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
         // The old name only as far as the copy below needs: a name that is not
         // a plain stem has files it cannot find by suffix. A reserved prefix is
         // refused only as a destination — renaming a legacy table off it is

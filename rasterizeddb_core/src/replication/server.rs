@@ -440,12 +440,14 @@ async fn apply_record(
                 break;
             };
 
-            let response = crate::core::mvcc::owner::under(
+            // The peer's statement temporaries arrive as its `CREATE TABLE
+            // __cte_…`, which only the peer's own CTE could have issued.
+            let response = crate::core::rql::cte::allowing_temporaries(crate::core::mvcc::owner::under(
                 &database.transactions,
                 tx,
                 crate::core::mvcc::owner::OwnerKind::Replication,
                 execute_in_txn(purpose, database.clone(), tx),
-            )
+            ))
             .await;
             if response.first() == Some(&3) {
                 let message = String::from_utf8_lossy(&response[1..]).to_string();
@@ -722,6 +724,38 @@ mod tests {
         assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
         assert_eq!(row_count(&database).await, 1);
         assert_eq!(replication.applied().high_water(2), 1);
+    }
+
+    /// A peer's write fed by a CTE carries its statement temporaries: their
+    /// `CREATE TABLE __cte_…` was captured with the transaction. The prefix is
+    /// refused to every user create (`cte::reserved_name_refusal`), so the
+    /// apply loop opens it: refused here, the record failed and the write
+    /// never landed on this node.
+    ///
+    /// Mutation: the apply loop without `cte::allowing_temporaries`.
+    #[tokio::test]
+    async fn a_peers_statement_temporaries_apply() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        let temp = format!("{}k_0_ab12", crate::core::rql::cte::TEMP_TABLE_PREFIX);
+        let create = format!("CREATE TABLE {temp} (id INTEGER)");
+        let fill = format!("INSERT INTO {temp} (id) VALUES (1)");
+        let drop = format!("DROP TABLE {temp}");
+        let outcome = apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                1,
+                vec![&create, &fill, "INSERT INTO repl_t (id, name) VALUES (1, 'ada')", &drop],
+            ),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        assert_eq!(row_count(&database).await, 1);
+        assert!(!database.has_table(&temp), "the temporary outlived the applied transaction");
     }
 
     /// Replication apply runs under a named owner, its transaction's root,

@@ -675,7 +675,7 @@ async fn build_relation(
         .zip(columns.iter())
         .map(|(name, column)| format!("{} {}", name, column.sql_type))
         .collect();
-    crate::core::rql::executor::run_statement(
+    create_temporary(
         &format!("CREATE TABLE {} ({})", temp, definitions.join(", ")),
         database,
         tx,
@@ -728,6 +728,55 @@ async fn build_relation(
 /// single statement can never be read after that statement ends, so nothing it
 /// writes has to reach a disk.
 pub const TEMP_TABLE_PREFIX: &str = "__cte_";
+
+tokio::task_local! {
+    /// Set while this module creates one of its own temporaries, and while a
+    /// replica applies a peer's statements (the peer's temporaries arrive as
+    /// its `CREATE TABLE __cte_…`): the only creates [`reserved_name_refusal`]
+    /// lets take the prefix.
+    static CREATING_TEMPORARY: ();
+}
+
+/// Runs `create`, a `CREATE TABLE` of a temporary this module named.
+async fn create_temporary(create: &str, database: &Arc<Database>, tx: crate::core::mvcc::transaction::TxId) -> Result<(), String> {
+    CREATING_TEMPORARY
+        .scope((), crate::core::rql::executor::run_statement(create, database, tx))
+        .await
+}
+
+/// Runs `work` with the prefix open, for the replication apply loop: a
+/// statement a peer accepted, its temporaries included, must apply here.
+pub(crate) async fn allowing_temporaries<F: std::future::Future>(work: F) -> F::Output {
+    CREATING_TEMPORARY.scope((), work).await
+}
+
+/// Why a table may not be created under, or renamed to, `name`: the
+/// [`TEMP_TABLE_PREFIX`] is the statement temporaries', and a user table
+/// taking it was treated as one. Memory-backed storage (its rows lost at
+/// every restart), no table locks, and reaped at startup: a plain `CREATE
+/// TABLE __cte_orders` lost everything it held. Matched ignoring ASCII case,
+/// so a later case folding of identifiers cannot let one through. `None`
+/// for every other name, and inside [`create_temporary`] or
+/// [`allowing_temporaries`].
+///
+/// The message is the one `pgwire::sqlstate_for` maps to 42939
+/// (`reserved_name`), PostgreSQL's code for a name a reserved prefix keeps
+/// out (`pg_` for schemas and roles), rather than 42602 (`invalid_name`),
+/// which says the name itself is malformed.
+pub fn reserved_name_refusal(name: &str) -> Option<String> {
+    let reserved = name
+        .get(..TEMP_TABLE_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(TEMP_TABLE_PREFIX));
+    if !reserved || CREATING_TEMPORARY.try_with(|_| ()).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "table name {} is reserved: the prefix {} is reserved for the temporary tables a statement \
+         materialises",
+        crate::core::value_codec::double_quoted(name),
+        crate::core::value_codec::double_quoted(TEMP_TABLE_PREFIX)
+    ))
+}
 
 /// A temporary table name that cannot collide with a user's table or with
 /// another execution — including another session running the *same* statement.
@@ -982,7 +1031,7 @@ async fn materialize_inner(
                 let temp = temp_name(&def.name, sql, index);
                 let columns: Vec<String> =
                     labels.iter().map(|name| format!("{} TEXT", name)).collect();
-                crate::core::rql::executor::run_statement(
+                create_temporary(
                     &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
                     database,
                     tx,
@@ -1032,7 +1081,7 @@ async fn materialize_inner(
                 let labels: Vec<&str> = constants.iter().map(|c| c.label.as_str()).collect();
                 refuse_repeated_labels(&labels, &format!("the WITH clause '{}'", def.name))?;
                 let values: Vec<&str> = constants.iter().map(|c| c.value.as_str()).collect();
-                crate::core::rql::executor::run_statement(
+                create_temporary(
                     &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
                     database,
                     tx,
@@ -1609,6 +1658,28 @@ mod tests {
         );
         assert!(out.contains("users.domain_id"), "{}", out);
         assert!(out.contains("FROM __cte_d"), "{}", out);
+    }
+
+    /// The statement temporaries' prefix is refused for any other table,
+    /// whatever its case, and open only inside this module's own creates
+    /// and a replica's apply.
+    ///
+    /// Mutation: `reserved_name_refusal` ignoring `CREATING_TEMPORARY` (the
+    /// scoped calls are refused too).
+    #[tokio::test]
+    async fn the_temporary_prefix_is_reserved_outside_this_module() {
+        for name in ["__cte_orders", "__CTE_x", "__Cte_", &temp_name("c", "WITH c AS (SELECT 1) SELECT 1", 0)] {
+            let refused = reserved_name_refusal(name).unwrap_or_else(|| panic!("{name} was accepted"));
+            assert_eq!(crate::pgwire::sqlstate_for(&refused), "42939", "{refused}");
+            assert_eq!(
+                crate::pgwire::sqlstate_for(&format!("could not rename t to {name}: {refused}")),
+                "42939"
+            );
+            assert_eq!(allowing_temporaries(async { reserved_name_refusal(name) }).await, None, "{name}");
+        }
+        for name in ["orders", "_cte_x", "__ct", "my__cte_x", "__cat_tables_1f"] {
+            assert_eq!(reserved_name_refusal(name), None, "{name}");
+        }
     }
 
     #[test]

@@ -16964,6 +16964,12 @@ pub(crate) async fn execute_with_need(
                 return ddl_error(&reason);
             }
             if let Some(create_table) = parsed {
+                // The statement temporaries' prefix, before the name is
+                // locked: a table under it would be taken for one (no table
+                // locks, memory-backed, reaped at startup).
+                if let Some(reason) = crate::core::rql::cte::reserved_name_refusal(&create_table.table_name) {
+                    return ddl_error(&reason);
+                }
                 // ACCESS EXCLUSIVE on the new name and SHARE on each parent it
                 // references, before anything is checked or written (§7; see
                 // `lock_create_target`).
