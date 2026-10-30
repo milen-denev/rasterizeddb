@@ -246,6 +246,23 @@ pub fn evaluate(expression: &str, db_type: &DbType, database: u64) -> Result<Str
     evaluate_in(expression, db_type, Some(database))
 }
 
+/// The integer column types, whose default a fraction is rounded into.
+fn is_integer_type(db_type: &DbType) -> bool {
+    matches!(
+        db_type,
+        DbType::I8
+            | DbType::I16
+            | DbType::I32
+            | DbType::I64
+            | DbType::I128
+            | DbType::U8
+            | DbType::U16
+            | DbType::U32
+            | DbType::U64
+            | DbType::U128
+    )
+}
+
 /// Whether a default expression is one [`evaluate`] understands, without
 /// evaluating it for a row.
 ///
@@ -413,6 +430,16 @@ fn evaluate_in(
         return Ok(
             if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB | DbType::CHAR) {
                 format!("'{}'", rendered.as_deref().unwrap_or(text))
+            } else if plain && text.contains('.') && is_integer_type(db_type) {
+                // A fraction defaulting an integer column is rounded, half
+                // away from zero, as PostgreSQL's numeric to integer
+                // assignment rounds it: `INT DEFAULT 2.5` is 3, `-1.5` is -2.
+                // A value past the column's range is still refused, by
+                // [`validate`] at CREATE and by the insert.
+                match crate::core::value_codec::parse_decimal_rounded(text, 0) {
+                    Some(whole) => whole.to_string(),
+                    None => text.to_string(),
+                }
             } else {
                 text.to_string()
             },

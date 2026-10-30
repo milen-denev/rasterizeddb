@@ -115,9 +115,8 @@ async fn update_upsert_and_default_render_it_too() {
 
 /// A number default a column cannot hold is refused, when the table is
 /// created or when a row needs it, never stored as zero. These spellings
-/// stored 0 on every insert that left the column out (PostgreSQL 17 stores 2
-/// for `INT DEFAULT 1.5`, refuses the others with 22003; refusing the first
-/// too is loud where storing 0 was not).
+/// stored 0 on every insert that left the column out (PostgreSQL 17 refuses
+/// them with 22003).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_number_default_the_column_cannot_hold_is_never_a_zero() {
     let server = TestServer::start().await.expect("server");
@@ -130,7 +129,7 @@ async fn a_number_default_the_column_cannot_hold_is_never_a_zero() {
         "DOUBLE PRECISION DEFAULT 1e400",
         "NUMERIC(5,2) DEFAULT 1e10",
         "NUMERIC(5,2) DEFAULT 10000000000",
-        "INT DEFAULT 1.5",
+        "SMALLINT DEFAULT 40000.5",
     ]
     .iter()
     .enumerate()
@@ -145,4 +144,31 @@ async fn a_number_default_the_column_cannot_hold_is_never_a_zero() {
             panic!("{decl}: the insert stored {got:?}");
         }
     }
+}
+
+/// A fraction defaulting an integer column is rounded, half away from zero,
+/// as PostgreSQL's numeric to integer assignment rounds it. PostgreSQL 17:
+/// 2, 3, -2, 5, 3, -3.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fractional_default_on_an_integer_column_is_rounded() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(
+        &c,
+        "CREATE TABLE di (k INT, a INT DEFAULT 1.5, b INT DEFAULT 2.5, c INT DEFAULT -1.5, \
+         d INT DEFAULT 5.0, e SMALLINT DEFAULT 2.5, f BIGINT DEFAULT -2.5)",
+    )
+    .await;
+    run(&c, "INSERT INTO di (k) VALUES (1)").await;
+    run(&c, "INSERT INTO di VALUES (2, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT)").await;
+    let rows = c.simple_query("SELECT a, b, c, d, e, f FROM di ORDER BY k").await.expect("select");
+    let got: Vec<Vec<String>> = rows
+        .into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_string()).collect()),
+            _ => None,
+        })
+        .collect();
+    let want: Vec<String> = ["2", "3", "-2", "5", "3", "-3"].map(String::from).to_vec();
+    assert_eq!(got, vec![want.clone(), want]);
 }
