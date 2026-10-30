@@ -160,7 +160,28 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                     ));
                 }
                 out.push_str(&sql[copied..i]);
-                push_param_literal(&mut out, &params[n - 1])?;
+                // `$n::timestamptz` / `$n::timestamp` on a value sent as untyped
+                // text says how to read it, and the cast is consumed below:
+                // read at that type now (`push_text_param_literal`), or a
+                // `timestamp` column would drop the zone a `::timestamptz`
+                // value asked to be converted by.
+                let param = &params[n - 1];
+                let cast_type = (param.oid == 0 && param.format == 0)
+                    .then(|| placeholder_cast(bytes, j))
+                    .flatten()
+                    .and_then(|name| {
+                        if name.eq_ignore_ascii_case("timestamptz") {
+                            Some(OID_TIMESTAMPTZ)
+                        } else if name.eq_ignore_ascii_case("timestamp") {
+                            Some(OID_TIMESTAMP)
+                        } else {
+                            None
+                        }
+                    });
+                match cast_type {
+                    Some(oid) => push_param_literal(&mut out, &BoundParam { oid, ..param.clone() })?,
+                    None => push_param_literal(&mut out, param)?,
+                }
                 i = j;
                 let mut consumed_cast: Option<&str> = None;
 
@@ -228,6 +249,23 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
 
     out.push_str(&sql[copied..]);
     Ok(out)
+}
+
+/// The bare type name of a `::type` cast directly after a placeholder ending
+/// at `at`, as `inline_params` reads one before consuming it.
+fn placeholder_cast(bytes: &[u8], at: usize) -> Option<&str> {
+    if bytes.get(at) != Some(&b':') || bytes.get(at + 1) != Some(&b':') {
+        return None;
+    }
+    let mut k = at + 2;
+    while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+        k += 1;
+    }
+    let start = k;
+    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+        k += 1;
+    }
+    (k > start).then(|| std::str::from_utf8(&bytes[start..k]).ok()).flatten()
 }
 
 /// The bytes that can begin a construct `inline_params` must look inside or
@@ -436,6 +474,25 @@ fn push_text_param_literal(out: &mut String, oid: i32, text: &str) {
                 out.push_str(text);
             } else {
                 push_quoted_literal(out, text);
+            }
+        }
+        // A `timestamptz` or `timestamp` sent as text is read as that type
+        // here, where the type is known, and inlined with no zone: what is
+        // left means the same instant to whichever column or comparison
+        // reads it. Inlined as written, the column decided: a `timestamp`
+        // column dropped the `+02` of a `timestamptz` value (PostgreSQL
+        // converts it, 08:00 for 10:00+02), and a `timestamptz` column
+        // applied the zone of a `timestamp` value (PostgreSQL drops it).
+        // Text that is not a timestamp (`infinity`) is left to the reader.
+        OID_TIMESTAMPTZ | OID_TIMESTAMP => {
+            let us = if oid == OID_TIMESTAMPTZ {
+                crate::core::value_codec::parse_timestamp_us(text)
+            } else {
+                crate::core::value_codec::parse_timestamp_local_us(text)
+            };
+            match us.map(crate::core::value_codec::format_timestamp_us) {
+                Some(utc) if crate::core::value_codec::parse_timestamp_us(&utc) == us => push_quoted_literal(out, &utc),
+                _ => push_quoted_literal(out, text),
             }
         }
         // An unspecified OID (0) is whatever the text looks like: sqlx sends
@@ -1016,6 +1073,23 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `timestamptz` value sent as text goes in as its UTC time and a
+    /// `timestamp` one as its wall-clock time, neither with a zone left for
+    /// the column to read its own way; `$n::timestamptz` on an untyped value
+    /// says the same.
+    #[test]
+    fn a_timestamp_text_parameter_is_read_at_its_declared_type() {
+        let zoned = "2024-01-01 10:00:00+02";
+        assert_eq!(param_to_literal(&text(OID_TIMESTAMPTZ, zoned)).unwrap(), "'2024-01-01 08:00:00'");
+        assert_eq!(param_to_literal(&text(OID_TIMESTAMP, zoned)).unwrap(), "'2024-01-01 10:00:00'");
+        assert_eq!(param_to_literal(&text(OID_TIMESTAMPTZ, "infinity")).unwrap(), "'infinity'");
+        assert_eq!(
+            inline_params("SELECT $1::timestamptz, $2::timestamp, $3::text", &[text(0, zoned), text(0, zoned), text(0, zoned)])
+                .unwrap(),
+            "SELECT '2024-01-01 08:00:00', '2024-01-01 10:00:00', '2024-01-01 10:00:00+02'"
+        );
+    }
 
     fn text(oid: i32, s: &str) -> BoundParam {
         BoundParam {

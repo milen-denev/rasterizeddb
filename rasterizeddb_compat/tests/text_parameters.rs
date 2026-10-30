@@ -181,3 +181,30 @@ async fn an_untyped_value_for_a_text_column_is_stored_as_sent() {
     c.run("", Some("UPDATE pp SET n = $1 WHERE id = $2"), &[], &[Some("007"), Some("0")]).await.expect("int");
     assert_eq!(texts(c.simple("SELECT n FROM pp WHERE id = 0").await), [["7"]]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_timestamp_value_is_read_as_its_declared_type() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    c.simple("CREATE TABLE ts (k INT NOT NULL, a TIMESTAMP, b TIMESTAMPTZ)").await;
+    let zoned = "2024-01-01 10:00:00+02";
+    // a TIMESTAMP gets a timestamptz value, b TIMESTAMPTZ a timestamp one.
+    c.run("", Some("INSERT INTO ts VALUES ($1, $2, $3)"), &[23, 1184, 1114], &[Some("1"), Some(zoned), Some(zoned)])
+        .await
+        .expect("insert");
+    // An untyped value with a cast on its placeholder.
+    c.run("", Some("INSERT INTO ts VALUES ($1, $2::timestamptz, $3::timestamp)"), &[], &[Some("2"), Some(zoned), Some(zoned)])
+        .await
+        .expect("insert with casts");
+    // PostgreSQL 17: 08:00 | 10:00+00 for both.
+    assert_eq!(
+        texts(c.simple("SELECT k, a, b FROM ts ORDER BY k").await),
+        [["1", "2024-01-01 08:00:00", "2024-01-01 10:00:00+00"], ["2", "2024-01-01 08:00:00", "2024-01-01 10:00:00+00"]]
+            .map(|r| r.map(String::from).to_vec())
+    );
+    // A comparison reads it the same way: 08:00 rows, both.
+    let found = c.run("", Some("SELECT k FROM ts WHERE a = $1 ORDER BY k"), &[1184], &[Some(zoned)]).await.expect("select");
+    assert_eq!(texts(found), [["1"], ["2"]]);
+    let found = c.run("", Some("SELECT k FROM ts WHERE b = $1 ORDER BY k"), &[1114], &[Some(zoned)]).await.expect("select");
+    assert_eq!(texts(found), [["1"], ["2"]]);
+}
