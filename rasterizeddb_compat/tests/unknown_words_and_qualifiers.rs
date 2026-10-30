@@ -375,7 +375,11 @@ async fn a_correlated_exists_in_an_update_or_delete_needs_a_pinned_snapshot() {
 /// was 42601) and an EXISTS used as a value (`x - EXISTS (…)::int`, was
 /// XX000) are refused as 0A000.
 ///
+/// A cast on either side of the correlated column (`u.tid = t.id::bigint`,
+/// `u.tid::int = t.id`) is a correlation too.
+///
 /// Mutations: `qualifier_of` taking the first segment as the qualifier;
+/// `qualifier_of` refusing a cast;
 /// the UPDATE target left out of an `UPDATE … FROM`'s outer names;
 /// `exists_used_as_value` always false.
 #[tokio::test(flavor = "multi_thread")]
@@ -403,6 +407,10 @@ async fn correlations_are_placed_or_refused_with_their_code() {
     for sql in [
         r#"UPDATE "public"."t2" SET v = 7 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid = "public"."t2"."id")"#,
         "UPDATE t2 SET v = 9 FROM u2 WHERE u2.tid = t2.id AND EXISTS (SELECT 1 FROM w2 WHERE w2.y = t2.y)",
+        // A cast on either side of the correlated column, as ORMs write it.
+        "UPDATE t2 SET v = 3 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id::bigint)",
+        "UPDATE t2 SET v = v + 1 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid::int = t2.id)",
+        "UPDATE t2 SET v = v + 10 WHERE EXISTS (SELECT 1 FROM w2 WHERE w2.y::text = t2.y::text AND w2.id = 1)",
     ] {
         conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -415,5 +423,5 @@ async fn correlations_are_placed_or_refused_with_their_code() {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    assert_eq!(got, vec![(1, 9), (2, 0)]);
+    assert_eq!(got, vec![(1, 14), (2, 0)]);
 }

@@ -1066,7 +1066,21 @@ fn names_outer_column(term: &str, inner: &[String], outer_relations: &[String]) 
 }
 
 fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -> Side {
-    let cleaned = reference.trim();
+    // A cast of the reference (`t.id::bigint`, `u.y::text`, `x::numeric(10,
+    // 2)`) keeps its side: ORMs write them, and the `IN` rewrite carries the
+    // cast with the column. Only a type may follow `::`.
+    let cleaned = match reference.trim().split_once("::") {
+        Some((column, cast))
+            if cast.split("::").all(|t| {
+                let t = t.trim();
+                !t.is_empty()
+                    && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'(' | b')' | b',' | b'[' | b']' | b'"'))
+            }) =>
+        {
+            column.trim()
+        }
+        _ => reference.trim(),
+    };
     // Only a column reference has a side: `t.x + 1` is an expression over
     // one, which the `IN` rewrite cannot place (it came out as `t.x + 1 IN
     // (…)`, a syntax error), so it is no correlation.
