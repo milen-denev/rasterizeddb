@@ -213,6 +213,25 @@ pub fn as_stored(literal: &str, field: &crate::core::row::schema::SchemaField) -
             | DbType::DECIMAL
     );
     let text = literal.trim();
+    // A `timestamptz` is the value its column stores, typed as the column is:
+    // substituted as bare text, `a > '… 09:00+05'` compared two strings, and
+    // a row at 06:00Z was not later than 04:00Z. (A `timestamp` column's is
+    // left as text: typed, the literal beside it would be read with its zone
+    // applied, where the column reads it without. Its comparison stays a
+    // text one, as it always was.)
+    if field.literal_type() == DbType::DATETIME && !text.eq_ignore_ascii_case("NULL") {
+        let bare = crate::core::rql::column_default::strip_redundant_cast(text);
+        let unquoted = bare.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).unwrap_or(bare);
+        let ty = field.literal_type();
+        if let Some(us) = crate::core::value_codec::encode_literal(&ty, unquoted)
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(i64::from_le_bytes)
+        {
+            let name = if ty == DbType::TIMESTAMP { "timestamp" } else { "timestamptz" };
+            return format!("'{}'::{}", crate::core::value_codec::format_timestamp_us(us), name);
+        }
+        return literal.to_string();
+    }
     if !numeric || text.eq_ignore_ascii_case("NULL") {
         return literal.to_string();
     }

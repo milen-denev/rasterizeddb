@@ -8903,10 +8903,22 @@ fn recompute_generated_in_update(
         return Ok(());
     };
     // A generated column's own `g = g` placeholder is not an input of anything.
+    // A timestamp assigned as a literal goes in typed as its column, as the
+    // INSERT path substitutes it (`generated::as_stored`).
     let inputs: Vec<(String, String)> = assignments
         .into_iter()
         .filter(|(name, _)| {
             crate::core::rql::generated::expression_for(name, &schema.generated).is_none()
+        })
+        .map(|(name, value)| {
+            let quoted = value.trim().starts_with('\'');
+            match schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&name)) {
+                Some(f) if quoted && f.db_type == crate::core::db_type::DbType::DATETIME => {
+                    let typed = crate::core::rql::generated::as_stored(&value, f);
+                    (name, typed)
+                }
+                _ => (name, value),
+            }
         })
         .collect();
     let fields: Vec<crate::core::row::schema::SchemaField> = schema.fields.to_vec();
@@ -13858,7 +13870,7 @@ async fn execute_alter_table_action(
                         // the value it stored. Refused, rather than silently
                         // changed, until it is restated without a zone.
                         let mentions = |text: &str| {
-                            crate::core::sql_scan::contains_ignore_ascii_case(text, field.name.as_bytes())
+                            expression_columns(text, &schema.fields).iter().any(|c| c.eq_ignore_ascii_case(&field.name))
                         };
                         let zoned_default = crate::core::rql::column_default::expression_for(&field.name, &schema.defaults)
                             .filter(|e| crate::core::sql_scan::has_zoned_timestamp_literal(e));
@@ -13872,6 +13884,16 @@ async fn execute_alter_table_action(
                                  DEFAULT or a CHECK ({}) holds a literal with a time zone, which the new type \
                                  would read as another value; restate it without the zone first (not supported)",
                                 field.name, text
+                            ));
+                        }
+                        // A generated column reading this one: PostgreSQL
+                        // refuses to alter the type of a column a generated
+                        // column uses, whatever the expression holds.
+                        if let Some(g) = schema.generated.iter().find(|g| !g.is_deleted && mentions(&g.expression)) {
+                            return ddl_error(&format!(
+                                "cannot alter type of a column used by a generated column: column \"{}\" is used \
+                                 by generated column \"{}\" (not supported)",
+                                field.name, g.column
                             ));
                         }
                         let without_time_zone = db_type == crate::core::db_type::DbType::TIMESTAMP;

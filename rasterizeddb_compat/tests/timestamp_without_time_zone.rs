@@ -365,3 +365,34 @@ async fn a_flip_that_would_change_a_zoned_default_or_check_is_refused() {
     run(&c, "CREATE TABLE th (k INT, a TIMESTAMPTZ DEFAULT '2024-01-01 09:00:00')").await.expect("create");
     run(&c, "ALTER TABLE th ALTER COLUMN a TYPE timestamp").await.expect("no zone: flips");
 }
+
+/// A generated column reading the column blocks the flip, as PostgreSQL
+/// refuses to alter the type of a column a generated column uses; and the
+/// generated value compares a `timestamptz` as an instant, not as text.
+/// PostgreSQL 17: `late` is t, f, then t, t; for the `timestamp` table f, t.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generated_column_reads_the_timestamp_as_its_type_and_blocks_the_flip() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(
+        &c,
+        "CREATE TABLE fl3 (k INT, a TIMESTAMPTZ, late BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01 09:00:00+05') STORED)",
+    )
+    .await
+    .expect("create");
+    run(&c, "INSERT INTO fl3 (k, a) VALUES (1, '2024-01-01 06:00:00+00'), (2, '2024-01-01 03:00:00+00')").await.expect("insert");
+    assert_eq!(column(&c, "SELECT late FROM fl3 ORDER BY k").await, ["t", "f"]);
+    run(&c, "UPDATE fl3 SET a = '2024-01-01 07:00:00+00' WHERE k = 2").await.expect("update");
+    assert_eq!(column(&c, "SELECT late FROM fl3 ORDER BY k").await, ["t", "t"]);
+    let e = run(&c, "ALTER TABLE fl3 ALTER COLUMN a TYPE timestamp").await.expect_err("refused");
+    assert_eq!(e.code().map(|c| c.code()), Some("0A000"), "{e}");
+
+    run(
+        &c,
+        "CREATE TABLE fl4 (k INT, a TIMESTAMP, late BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01 09:00:00+05') STORED)",
+    )
+    .await
+    .expect("create");
+    run(&c, "INSERT INTO fl4 (k, a) VALUES (1, '2024-01-01 06:00:00'), (2, '2024-01-01 10:00:00')").await.expect("insert");
+    assert_eq!(column(&c, "SELECT late FROM fl4 ORDER BY k").await, ["f", "t"]);
+}
