@@ -54,16 +54,28 @@ so the log is empty, then upgrade.
 **A database this binary has written must not be opened by an older one.**
 The declared lengths of `character(n)` and `character varying(n)` columns,
 and the precision of `timestamp(p)`-style columns, are recorded as marker
-records an older binary does not read. It opens the table and treats those
-columns as plain text and full-precision times: it stores `'ab  '` beside a
-stored `'ab'` in a `character(4)` primary key, takes `'toolong'` into a
-`character(3)`, and keeps sub-second digits a `timestamp(0)` would round.
-Back on this binary the extra rows are there — two rows with key `'ab  '`,
-one of them unreachable by key — and nothing reports it. No version stamp
-exists that an older binary refuses (the partitioned-table guard works only
-because those tables have no file under their own name), so this is not
-guarded: back up before upgrading, and restore that backup rather than
-downgrading.
+records whose length an older binary ignores. It does read the
+`character(n)` marker itself — by its name, which is why it treats a CHECK
+on such a column as unenforced when the table is created — but not the
+length in it, and not the `character varying(n)` and precision markers at
+all. So it opens the table and treats those columns as plain text and
+full-precision times:
+
+- it stores `'ab  '` beside a stored `'ab'` in a `character(4)` primary
+  key;
+- it takes `'toolong'` into a `character(3)`;
+- it keeps sub-second digits a `timestamp(0)` would round;
+- it lets a row past a CHECK through padding: under `CHECK (c3 <> 'zz')`
+  it refuses `'zz'` but accepts `'zz '`, which it compares as text.
+
+Back on this binary every such row is still there and nothing reports it:
+two rows with key `'ab  '`, one of them unreachable by key, a `'toolong'` in
+a `character(3)`, and a `'zz '` that violates the CHECK it was written
+under, which survives reopening because a CHECK is enforced on writes, not
+re-validated on open. No version stamp exists that an older binary refuses
+(the partitioned-table guard works only because those tables have no file
+under their own name), so this is not guarded: back up before upgrading, and
+restore that backup rather than downgrading.
 
 ## Type system
 

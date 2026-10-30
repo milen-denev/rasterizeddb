@@ -195,6 +195,16 @@ fn cast_typmod(target: &str, db_type: &DbType) -> Result<Option<CastTypmod>, Str
     if !matches!(db_type, DbType::DATETIME | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL) {
         return Ok(None);
     }
+    // `interval hour to minute`, `interval day to second(0)`: the fields
+    // with the precision (`type_modifier::parse_time_precision`).
+    if *db_type == DbType::INTERVAL {
+        if let Some(t) = crate::core::rql::type_modifier::parse_time_precision(target) {
+            return match t? {
+                crate::core::rql::type_modifier::TextTypmod::Precision(p) => Ok(Some(CastTypmod::Interval(p))),
+                _ => Ok(None),
+            };
+        }
+    }
     let text = target.trim();
     let Some(open) = text.find('(') else { return Ok(None) };
     let Some(close) = text[open..].find(')').map(|c| c + open) else { return Ok(None) };
@@ -296,7 +306,9 @@ fn common_bpchar(expr: &Expr) -> Option<(Vec<&Expr>, bool)> {
     let branches: Vec<&Expr> = match expr {
         Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().collect(),
         Expr::NullIf(a, _) => vec![a.as_ref()],
-        Expr::Case { whens, otherwise } => whens.iter().map(|(_, e)| e).chain(otherwise.as_deref()).collect(),
+        // The `ELSE` first, as PostgreSQL resolves the type
+        // (`blank_pad_text_branches`).
+        Expr::Case { whens, otherwise } => otherwise.as_deref().into_iter().chain(whens.iter().map(|(_, e)| e)).collect(),
         _ => return None,
     };
     let mut any = false;
@@ -306,10 +318,39 @@ fn common_bpchar(expr: &Expr) -> Option<(Vec<&Expr>, bool)> {
             Expr::Null => {}
             Expr::Literal { db_type: DbType::STRING, .. } => literal = true,
             other if yields_bpchar(other) => any = true,
+            // A text value after a `character(n)` one, coerced to it
+            // (`blank_pad_text_branches`).
+            Expr::Call(TextFunc::Rtrim, _) if any => {}
             _ => return None,
         }
     }
     any.then_some((branches, literal))
+}
+
+/// The branches of a `CASE`, `COALESCE`, `GREATEST` or `LEAST` whose first
+/// typed branch yields `character(n)`: PostgreSQL resolves their common type
+/// to `bpchar` (the first of two types each casts to implicitly), so a text
+/// branch after it is read blank-padded, without its trailing spaces.
+/// Wrapped in `rtrim` here, it compares, groups and keys as that type does;
+/// the [`common_bpchar`] that follows then reads the whole as `bpchar`.
+/// A text branch first makes the common type text, and nothing changes.
+fn blank_pad_text_branches<'a>(branches: impl Iterator<Item = &'a mut Expr>) {
+    let mut padded: Option<bool> = None;
+    for branch in branches {
+        match branch {
+            Expr::Null | Expr::Literal { db_type: DbType::STRING, .. } => {}
+            other => match padded {
+                None => padded = Some(yields_bpchar(other)),
+                Some(false) => return,
+                Some(true) => {
+                    if !yields_bpchar(other) && static_type(other) == DbType::STRING {
+                        let text = std::mem::replace(other, Expr::Null);
+                        *other = Expr::Call(TextFunc::Rtrim, vec![text]);
+                    }
+                }
+            },
+        }
+    }
 }
 
 /// The declared length a select-list item that yields `character(n)` is
@@ -587,6 +628,12 @@ pub fn db_type_of_cast(name: &str) -> Option<DbType> {
 
 /// The SQL type a `::` cast names.
 fn cast_target(name: &str) -> Option<DbType> {
+    // `interval <fields>`, which `cast_typmod` restricts.
+    if let Some(Ok(_)) = crate::core::rql::type_modifier::parse_time_precision(name)
+        .filter(|_| name.trim().get(..9).is_some_and(|h| h.eq_ignore_ascii_case("interval ")))
+    {
+        return Some(DbType::INTERVAL);
+    }
     Some(
         match name
             .trim()
@@ -1184,6 +1231,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("COALESCE needs at least one argument".to_string());
                     }
                     check_branch_types("COALESCE", args.iter())?;
+                    blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Coalesce(args))
                 }
                 "NULLIF" => {
@@ -1201,6 +1249,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("LEAST needs at least one argument".to_string());
                     }
                     check_branch_types("LEAST", args.iter())?;
+                    blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Least(args))
                 }
                 "GREATEST" => {
@@ -1208,6 +1257,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("GREATEST needs at least one argument".to_string());
                     }
                     check_branch_types("GREATEST", args.iter())?;
+                    blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Greatest(args))
                 }
                 "QUOTE_IDENT" | "LOWER" | "UPPER" => {
@@ -1542,6 +1592,9 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             .map(|(_, e)| e)
             .chain(otherwise.iter().map(|b| b.as_ref())),
     )?;
+    // The `ELSE` first: PostgreSQL resolves a `CASE`'s type with its default
+    // result ahead of the `THEN`s, so `CASE … THEN a ELSE t END` is text.
+    blank_pad_text_branches(otherwise.iter_mut().map(|b| b.as_mut()).chain(whens.iter_mut().map(|(_, e)| e)));
     Ok(Expr::Case { whens, otherwise })
 }
 

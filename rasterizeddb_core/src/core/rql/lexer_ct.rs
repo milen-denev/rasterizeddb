@@ -402,6 +402,23 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                     joined.push_str(tokens[next]);
                     next += 1;
                 }
+                // `interval hour to minute`, `interval day to second(0)`: the
+                // fields are part of the type (`parse_time_precision`).
+                if joined.eq_ignore_ascii_case("interval") {
+                    while let Some(token) = tokens.get(next) {
+                        let word = token.split('(').next().unwrap_or("");
+                        let field = ["year", "month", "day", "hour", "minute", "second", "to"]
+                            .iter()
+                            .any(|f| word.eq_ignore_ascii_case(f));
+                        let digits = word.is_empty() && token.starts_with('(') && joined.to_ascii_lowercase().ends_with("second");
+                        if !field && !digits {
+                            break;
+                        }
+                        joined.push(' ');
+                        joined.push_str(token);
+                        next += 1;
+                    }
+                }
                 joined
             };
             match crate::core::rql::type_modifier::parse_text_typmod(&full_type)

@@ -384,8 +384,15 @@ pub(super) fn encode_cell_text(
 /// A `character(n)` value as it is shown, text and binary alike: its stored
 /// form (no trailing spaces) blank-padded to `n` characters.
 fn push_bpchar(bytes: &[u8], n: u16, out: &mut Vec<u8>) {
-    let text = String::from_utf8_lossy(bytes);
-    out.extend_from_slice(crate::core::rql::type_modifier::pad_to(&text, u32::from(n)).as_bytes());
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        let text = String::from_utf8_lossy(bytes);
+        out.extend_from_slice(crate::core::rql::type_modifier::pad_to(&text, u32::from(n)).as_bytes());
+        return;
+    };
+    // Written in place, the padding after the value: no copy of it per cell.
+    out.extend_from_slice(text.as_bytes());
+    let have = if text.is_ascii() { text.len() } else { text.chars().count() };
+    out.resize(out.len() + usize::from(n).saturating_sub(have), b' ');
 }
 
 /// Appends the binary form of one cell to `out`; `false` means NULL, and then

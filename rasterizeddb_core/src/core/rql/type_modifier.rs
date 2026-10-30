@@ -362,19 +362,104 @@ pub fn round_time_bytes(db_type: &crate::core::db_type::DbType, bytes: &[u8], pr
             let raw = <[u8; 8]>::try_from(bytes).ok()?;
             let offset = crate::core::value_codec::PG_EPOCH_OFFSET_US;
             let pg = i64::from_le_bytes(raw).wrapping_sub(offset);
-            Some(round_micros(pg, precision).wrapping_add(offset).to_le_bytes().to_vec())
+            Some(round_micros(pg, precision & PRECISION_DIGITS).wrapping_add(offset).to_le_bytes().to_vec())
         }
         DbType::TIME => {
             let raw = <[u8; 8]>::try_from(bytes).ok()?;
-            Some(round_micros(i64::from_be_bytes(raw), precision).to_be_bytes().to_vec())
+            Some(round_micros(i64::from_be_bytes(raw), precision & PRECISION_DIGITS).to_be_bytes().to_vec())
         }
-        DbType::TIMETZ | DbType::INTERVAL if bytes.len() == if *db_type == DbType::TIMETZ { 12 } else { 16 } => {
+        DbType::INTERVAL if bytes.len() == 16 => {
+            let mut iv = crate::core::pg_types::decode_interval(bytes)?;
+            restrict_interval_fields(&mut iv, precision >> INTERVAL_FIELDS_SHIFT);
+            iv.micros = round_micros(iv.micros, precision & PRECISION_DIGITS);
+            Some(crate::core::pg_types::encode_interval(iv))
+        }
+        DbType::TIMETZ if bytes.len() == 12 => {
             let micros = i64::from_be_bytes(bytes[..8].try_into().ok()?);
-            let mut out = round_micros(micros, precision).to_be_bytes().to_vec();
+            let mut out = round_micros(micros, precision & PRECISION_DIGITS).to_be_bytes().to_vec();
             out.extend_from_slice(&bytes[8..]);
             Some(out)
         }
         _ => None,
+    }
+}
+
+/// The low bits of a [`TextTypmod::Precision`]: the fractional-second
+/// digits, six for the type's own.
+pub const PRECISION_DIGITS: u32 = 0xFF;
+/// Where an interval's field restriction sits in a [`TextTypmod::Precision`]
+/// (`interval hour to minute`): one of PostgreSQL's ranges, numbered as
+/// [`parse_interval_fields`] numbers them, 0 for none.
+pub const INTERVAL_FIELDS_SHIFT: u32 = 8;
+
+/// `interval <fields> [(p)]` and `interval <fields> second(p)`: the column's
+/// precision with its field restriction above it. `None` for anything else,
+/// an `interval(p)` without fields among it (read as every other type's
+/// precision is), and fields this does not know (left unrestricted, as
+/// before).
+fn parse_interval_fields(text: &str) -> Option<Result<TextTypmod, String>> {
+    let lower = text.to_ascii_lowercase();
+    let rest = lower.strip_prefix("interval")?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let (words, digits) = match (rest.find('('), rest.find(')')) {
+        (Some(open), Some(close)) if close > open => {
+            (format!("{} {}", &rest[..open], &rest[close + 1..]), Some(rest[open + 1..close].trim().to_string()))
+        }
+        _ => (rest.to_string(), None),
+    };
+    let words: Vec<&str> = words.split_whitespace().collect();
+    let range = match words.as_slice() {
+        ["year"] => 1,
+        ["month"] => 2,
+        ["day"] => 3,
+        ["hour"] => 4,
+        ["minute"] => 5,
+        ["second"] => 6,
+        ["year", "to", "month"] => 7,
+        ["day", "to", "hour"] => 8,
+        ["day", "to", "minute"] => 9,
+        ["day", "to", "second"] => 10,
+        ["hour", "to", "minute"] => 11,
+        ["hour", "to", "second"] => 12,
+        ["minute", "to", "second"] => 13,
+        _ => return None,
+    };
+    let precision = match digits.as_deref().map(str::parse::<i64>) {
+        None => 6,
+        Some(Ok(p)) if p < 0 => return Some(Err(format!("interval({p}) precision must not be negative"))),
+        Some(Ok(p)) => p.min(6) as u32,
+        Some(Err(_)) => return Some(Err(format!("invalid type modifier '{}'", digits.unwrap_or_default()))),
+    };
+    Some(Ok(TextTypmod::Precision(precision | (range << INTERVAL_FIELDS_SHIFT))))
+}
+
+/// `iv` cut to the fields `range` keeps, as PostgreSQL's assignment to
+/// `interval <fields>` cuts it (`AdjustIntervalForTypmod`): the parts below
+/// the last field dropped, toward zero. Seconds are left to the precision.
+fn restrict_interval_fields(iv: &mut crate::core::pg_types::Interval, range: u32) {
+    const HOUR: i64 = 3_600_000_000;
+    const MINUTE: i64 = 60_000_000;
+    match range {
+        // YEAR
+        1 => {
+            iv.months = iv.months / 12 * 12;
+            iv.days = 0;
+            iv.micros = 0;
+        }
+        // MONTH, YEAR TO MONTH
+        2 | 7 => {
+            iv.days = 0;
+            iv.micros = 0;
+        }
+        // DAY
+        3 => iv.micros = 0,
+        // HOUR, DAY TO HOUR
+        4 | 8 => iv.micros = iv.micros / HOUR * HOUR,
+        // MINUTE, DAY TO MINUTE, HOUR TO MINUTE
+        5 | 9 | 11 => iv.micros = iv.micros / MINUTE * MINUTE,
+        _ => {}
     }
 }
 
@@ -384,6 +469,9 @@ pub fn round_time_bytes(db_type: &crate::core::db_type::DbType, bytes: &[u8], pr
 /// six or more (the type's own precision, nothing to round).
 pub fn parse_time_precision(declared: &str) -> Option<Result<TextTypmod, String>> {
     let text = declared.trim();
+    if let Some(fields) = parse_interval_fields(text) {
+        return Some(fields);
+    }
     let open = text.find('(')?;
     let close = text[open..].find(')')? + open;
     let base = text[..open].trim().to_ascii_lowercase();

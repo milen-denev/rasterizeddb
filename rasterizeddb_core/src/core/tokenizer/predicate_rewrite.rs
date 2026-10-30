@@ -2665,6 +2665,12 @@ fn contains_spaced_text_literal(text: &str) -> bool {
 /// ([`padded_for_pattern`]). Cheap and generous: the lift decides exactly.
 fn pattern_may_read_bpchar(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
+    // The words it looks for first, anywhere and in any case: most clauses
+    // have none, and the word scan below runs on every term.
+    let mentions = |word: &[u8]| text.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    if !mentions(b"like") && !mentions(b"similar") {
+        return false;
+    }
     let column = || schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(n)) if n > 0) && !f.is_deleted);
     let cast = || {
         text.contains("::") && {
@@ -2758,10 +2764,21 @@ fn padded_beside_varying(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bo
 
 fn padded_and_varying_columns(schema: &SmallVec<[SchemaField; 20]>) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
-    let has = |want: fn(TextTypmod) -> bool| {
-        schema.iter().any(|f| !f.is_deleted && f.db_type == crate::core::db_type::DbType::STRING && f.text_typmod().is_some_and(want))
-    };
-    has(|t| matches!(t, TextTypmod::Bpchar(_))) && has(|t| matches!(t, TextTypmod::Varchar(_)))
+    let (mut padded, mut varying) = (false, false);
+    for f in schema.iter() {
+        if f.is_deleted || f.db_type != crate::core::db_type::DbType::STRING {
+            continue;
+        }
+        match f.text_typmod() {
+            Some(TextTypmod::Bpchar(_)) => padded = true,
+            Some(TextTypmod::Varchar(_)) => varying = true,
+            _ => {}
+        }
+        if padded && varying {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `rest`, a comparison from its operator on, is a pattern match.

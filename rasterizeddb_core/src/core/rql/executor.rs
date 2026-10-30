@@ -1156,18 +1156,73 @@ pub async fn substitute_in_subqueries(
             (true, Some(not_at)) => (not_at, "IN ()".to_string()),
             _ => (found.start, list),
         };
+        // A `character(n)` subquery's values meet a `character varying`
+        // operand blank-padded, as PostgreSQL's `varchar = bpchar` resolves:
+        // its trailing spaces are not part of it. As untyped literals they
+        // were compared with it exactly, and `b IN (SELECT k …)` missed 'ab  '.
+        let operand = if exact { None } else { varying_in_operand(&current, &found, database) };
         current = format!(
             "{}{}{}",
             &current[..start],
             replacement,
             &current[found.end..]
         );
+        if let Some((from, to)) = operand {
+            current = format!("{}rtrim({}){}", &current[..from], &current[from..to], &current[to..]);
+        }
     }
 
     Err(format!(
         "more than {} subqueries in one statement is not supported",
         MAX_SUBQUERIES
     ))
+}
+
+/// The byte range of the operand of `found`'s `IN` when it is a bare
+/// `character varying` column of one of the statement's relations; `None`
+/// for anything else (another type, an expression, a column not found).
+fn varying_in_operand(
+    sql: &str,
+    found: &crate::core::rql::subquery::InSubquery,
+    database: &Arc<Database>,
+) -> Option<(usize, usize)> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let mut head = sql[..found.negated_start.unwrap_or(found.start)].trim_end();
+    if found.negated_start.is_none() {
+        let cut = head.len().checked_sub(2)?;
+        if !head.get(cut..)?.eq_ignore_ascii_case("IN") {
+            return None;
+        }
+        head = head[..cut].trim_end();
+    }
+    let to = head.len();
+    let from = head
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || matches!(c, '_' | '.' | '"'))
+        .last()
+        .map(|(i, _)| i)?;
+    let reference = &head[from..to];
+    let (qualifier, column) = match reference.rsplit_once('.') {
+        Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
+        None => (None, reference.trim_matches('"')),
+    };
+    let names = outer_relation_names(sql);
+    let mut tables: Vec<&String> = names.iter().filter(|n| qualifier.is_none_or(|q| q == n.as_str())).collect();
+    if tables.is_empty() {
+        tables = names.iter().collect();
+    }
+    let varying = tables.iter().any(|name| {
+        database.schema_view(name).is_some_and(|view| {
+            view.schema().fields.iter().any(|f| {
+                !f.is_deleted
+                    && f.name == column
+                    && f.db_type == crate::core::db_type::DbType::STRING
+                    && matches!(f.text_typmod(), Some(TextTypmod::Varchar(_)))
+            })
+        })
+    });
+    varying.then_some((from, to))
 }
 
 /// Depth limit for cascading writes.
@@ -1299,6 +1354,22 @@ fn parent_literals_for_child(
     }
 }
 
+/// A key literal as a violation message shows it: the value, unquoted,
+/// without the cast a typed value carries (`'zz '::text`, a parameter bound
+/// as text, shows `zz `).
+fn key_display(literal: &str) -> String {
+    let text = literal.trim();
+    let quoted = |t: &str| t.starts_with('\'') && crate::core::sql_scan::quoted_end(t.as_bytes(), 0, b'\'') == t.len();
+    let body = match text.rfind("::") {
+        Some(at) if quoted(text[..at].trim_end()) => text[..at].trim_end(),
+        _ => text,
+    };
+    match body.strip_prefix('\'').and_then(|b| b.strip_suffix('\'')) {
+        Some(inner) if quoted(body) => inner.replace("''", "'"),
+        _ => body.trim_matches('\'').to_string(),
+    }
+}
+
 /// Checks that every foreign key on `table_name` is satisfied by `assignments`.
 ///
 /// `assignments` maps a column name to the literal being written. A `NULL` is
@@ -1356,7 +1427,7 @@ async fn check_foreign_keys_of(
                 table_name,
                 fk.name,
                 fk.column,
-                literal.trim_matches('\''),
+                key_display(literal),
                 fk.parent_table
             )
         };
@@ -5178,7 +5249,9 @@ async fn delete_using_join(
             .map(|h| h.schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect())
             .unwrap_or_default()
     };
-    let recheck = recheck_terms(condition, target_alias, &target_columns).filter(|t| !t.is_empty());
+    let recheck = recheck_terms(condition, target_alias, &target_columns)
+        .filter(|t| !t.is_empty())
+        .map(|terms| pad_varying_beside_padded(terms, table, target_alias, source_clause, database));
     let recheck_text = recheck.as_ref().map(|terms| terms.join(" AND "));
     let recheck_refs = recheck_text
         .as_deref()
@@ -5433,7 +5506,7 @@ async fn update_from_join(
     let target_columns: Vec<String> = target_schema.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
     let recheck_text = recheck_terms(&join_condition, target_alias, &target_columns)
         .filter(|t| !t.is_empty())
-        .map(|terms| terms.join(" AND "));
+        .map(|terms| pad_varying_beside_padded(terms, table, target_alias, source_clause, database).join(" AND "));
     let recheck_refs = recheck_text
         .as_deref()
         .map(|t| qualified_refs(t, &source_aliases(source_clause)))
@@ -5721,6 +5794,79 @@ fn qualified_refs(text: &str, aliases: &[String]) -> Vec<String> {
         }
     }
     found
+}
+
+/// `terms` with each comparison of a `character varying` column and a
+/// `character(n)` one reading the varying side blank-padded (`rtrim`), as
+/// PostgreSQL resolves `varchar = bpchar` and as the join itself compares
+/// them (`join::KeyColumn`). Each source reference is substituted with its
+/// joined value per row, and a value from a `character(n)` column is an
+/// untyped literal by then, which a varying column compares with exactly:
+/// `c.b = d.k` matched in the join and failed its recheck, writing nothing.
+/// The target is `table` under `target_alias`; the source the first relation
+/// of `source_clause` under its last word. Unchanged when neither table has
+/// both kinds of column, which is the common case and costs a schema look.
+fn pad_varying_beside_padded(
+    terms: Vec<String>,
+    table: &str,
+    target_alias: &str,
+    source_clause: &str,
+    database: &Arc<Database>,
+) -> Vec<String> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let fields_of = |name: &str| -> Vec<crate::core::row::schema::SchemaField> {
+        database.schema_view(name).map(|v| v.schema().fields.to_vec()).unwrap_or_default()
+    };
+    let kinded = |fields: &[crate::core::row::schema::SchemaField]| {
+        fields.iter().any(|f| {
+            !f.is_deleted
+                && f.db_type == crate::core::db_type::DbType::STRING
+                && matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_) | TextTypmod::Varchar(_)))
+        })
+    };
+    let target = fields_of(table);
+    let mut words = source_clause.split_whitespace();
+    let source_table = words.next().unwrap_or("").trim_matches('"').to_string();
+    let source_alias = source_clause.split_whitespace().next_back().unwrap_or("").trim_matches('"').to_string();
+    let source = if source_table.is_empty() { Vec::new() } else { fields_of(&source_table) };
+    if !kinded(&target) || !kinded(&source) {
+        return terms;
+    }
+    // `Some(true)` for a `character(n)` column, `Some(false)` for a varying one.
+    let kind = |reference: &str| -> Option<bool> {
+        let reference = reference.trim();
+        let (qualifier, column) = match reference.rsplit_once('.') {
+            Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
+            None => (None, reference.trim_matches('"')),
+        };
+        let fields = match qualifier {
+            None => &target,
+            Some(q) if q == target_alias || q == table => &target,
+            Some(q) if q == source_alias || q == source_table => &source,
+            Some(_) => return None,
+        };
+        let field = fields.iter().find(|f| !f.is_deleted && f.name == column)?;
+        if field.db_type != crate::core::db_type::DbType::STRING {
+            return None;
+        }
+        match field.text_typmod() {
+            Some(TextTypmod::Bpchar(_)) => Some(true),
+            Some(TextTypmod::Varchar(_)) => Some(false),
+            _ => None,
+        }
+    };
+    terms
+        .into_iter()
+        .map(|term| {
+            let Some((at, width)) = find_comparison(&term) else { return term };
+            let (left, op, right) = (&term[..at], &term[at..at + width], &term[at + width..]);
+            match (kind(left), kind(right)) {
+                (Some(false), Some(true)) => format!("rtrim({}) {} {}", left.trim(), op, right.trim()),
+                (Some(true), Some(false)) => format!("{} {} rtrim({})", left.trim(), op, right.trim()),
+                _ => term,
+            }
+        })
+        .collect()
 }
 
 /// The conjuncts of a join condition a per-row write must recheck against
@@ -6229,7 +6375,7 @@ async fn apply_conflict_update(
                     .fields
                     .iter()
                     .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&name))
-                    .and_then(|f| stored_numeric_literal(&literal, f));
+                    .and_then(|f| stored_numeric_literal(&literal, f).or_else(|| stored_text_literal(&literal, f)));
                 (name, canonical.unwrap_or(literal))
             })
             .collect(),
@@ -7130,6 +7276,9 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         let lead = &operand[..operand.len() - operand.trim_start().len()];
         let tail = &operand[lead.len() + trimmed.len()..];
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
+        if let Some(typed) = typed_text_literal(trimmed) {
+            return wrap(typed);
+        }
         match integer_arithmetic(trimmed) {
             IntegerFold::Folded(value) => return wrap(value),
             IntegerFold::Overflow(message) => {
@@ -7170,11 +7319,54 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
             crate::core::rql::expr::Value::Null => wrap("NULL".to_string()),
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 match crate::core::rql::subquery::value_to_literal(&db_type, &bytes) {
+                    // A computed string is typed text (`CAST(… AS TEXT)`,
+                    // `lower(…)`, `'a' || ' '`, `NULLIF`, `COALESCE`), which
+                    // a `character(n)` value compares with exactly. Folded to
+                    // a bare literal it would be read blank-padded, its
+                    // trailing spaces dropped, so one ending in a space keeps
+                    // its type. A cast to `varchar` or `character(n)` compares
+                    // blank-padded and is folded bare.
+                    Some(literal)
+                        if db_type == crate::core::db_type::DbType::STRING
+                            && bytes.last() == Some(&b' ')
+                            && !yields_padded_text(&expr) =>
+                    {
+                        wrap(format!("{literal}::text"))
+                    }
                     Some(literal) => wrap(literal),
                     None => operand.to_string(),
                 }
             }
         }
+    }
+
+    /// Whether `expr` is a cast to `character varying` or `character(n)`,
+    /// whose value a `character(n)` one compares with blank-padded.
+    fn yields_padded_text(expr: &crate::core::rql::expr::Expr) -> bool {
+        use crate::core::rql::type_modifier::TextTypmod;
+        matches!(
+            expr,
+            crate::core::rql::expr::Expr::TypmodCast {
+                typmod: crate::core::rql::expr::CastTypmod::Text(TextTypmod::Varchar(_) | TextTypmod::Bpchar(_)),
+                ..
+            }
+        )
+    }
+
+    /// `text '…'`, the typed-literal spelling of `'…'::text`, respelled so,
+    /// when the string ends in a space: read as an untyped literal its
+    /// trailing spaces were dropped against a `character(n)` value.
+    fn typed_text_literal(text: &str) -> Option<String> {
+        let head = text.get(..4)?;
+        if !head.eq_ignore_ascii_case("text") {
+            return None;
+        }
+        let literal = text[4..].trim_start();
+        if !literal.starts_with('\'') {
+            return None;
+        }
+        let whole = crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') == literal.len();
+        (whole && literal[..literal.len() - 1].ends_with(' ')).then(|| format!("{literal}::text"))
     }
 
     let mut out = String::with_capacity(text.len());
@@ -7687,6 +7879,46 @@ fn batch_key_part(
             _ => Some(std::iter::once(0u8).chain(literal.bytes()).collect()),
         },
     }
+}
+
+/// `literal` as a column of declared text length stores it, as an untyped
+/// literal, when that differs from what is written: a typed text value
+/// (`'a  '::text`, a parameter bound as text, `'b '::varchar(5)`) into a
+/// `character(3)` key is `'a'`. The conflict was found on the stored key; a
+/// look-up by the value as written compares exactly (text against
+/// `character(n)` is text), matched nothing and lost the write. `None` for
+/// a plain untyped literal, which the comparison reads as the column does,
+/// and for anything that is not a constant.
+fn stored_text_literal(literal: &str, field: &crate::core::row::schema::SchemaField) -> Option<String> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    if field.db_type != crate::core::db_type::DbType::STRING
+        || !matches!(field.text_typmod(), Some(TextTypmod::Bpchar(_)) | Some(TextTypmod::Varchar(1..)))
+    {
+        return None;
+    }
+    let text = literal.trim();
+    let plain = text.len() >= 2
+        && text.starts_with('\'')
+        && crate::core::sql_scan::quoted_end(text.as_bytes(), 0, b'\'') == text.len();
+    if plain || text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
+        return None;
+    }
+    let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
+    if !crate::core::rql::expr::columns_of(&expr).is_empty() {
+        return None;
+    }
+    let value = crate::core::rql::expr::eval_into(&expr, &crate::core::row::row::Row::default(), &[], field).ok()?;
+    let crate::core::rql::expr::Value::Data { bytes, db_type } = value else { return None };
+    if db_type != crate::core::db_type::DbType::STRING {
+        return None;
+    }
+    let held = match crate::core::rql::type_modifier::assign_bytes(field, &bytes) {
+        Ok(Some(held)) => held,
+        Ok(None) => bytes,
+        // Too long for the column: the INSERT itself reports it.
+        Err(_) => return None,
+    };
+    crate::core::rql::subquery::value_to_literal(&crate::core::db_type::DbType::STRING, &held)
 }
 
 /// The bytes `literal` is stored as in `field`, for comparing two rows'
@@ -11892,7 +12124,11 @@ async fn text_type_change(
         }
         let narrower = match (had, wanted) {
             (_, None) => false,
-            (Some(TextTypmod::Precision(h)), Some(TextTypmod::Precision(w))) => w < h,
+            // Fewer digits, or other interval fields, change stored values.
+            (Some(TextTypmod::Precision(h)), Some(TextTypmod::Precision(w))) => {
+                use type_modifier::{INTERVAL_FIELDS_SHIFT, PRECISION_DIGITS};
+                w & PRECISION_DIGITS < h & PRECISION_DIGITS || w >> INTERVAL_FIELDS_SHIFT != h >> INTERVAL_FIELDS_SHIFT
+            }
             _ => true,
         };
         if row_count > 0 && narrower {
@@ -14832,7 +15068,13 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     .iter()
                     .find(|f| f.write_order as u32 == *write_order as u32)
                 {
-                    Some(target) => crate::core::rql::expr::eval_into(expression, row, schema, target)?,
+                    // Held to the column's declared length or precision, as
+                    // the write path stores it: a text-typed `'qq   '` into
+                    // `character(4)` is reported `qq  `, not as assigned.
+                    Some(target) => crate::core::rql::expr::held_to_text_length(
+                        crate::core::rql::expr::eval_into(expression, row, schema, target)?,
+                        target,
+                    )?,
                     None => crate::core::rql::expr::eval(expression, row, schema)?,
                 };
                 // NULL is a value here, not an absence: without an entry the

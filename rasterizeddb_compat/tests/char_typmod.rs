@@ -806,3 +806,287 @@ async fn a_time_column_rounds_to_its_declared_precision() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// Runs each `(sql, want)` inside a transaction it rolls back, so each
+/// starts from the same rows, and reports every answer that differs. `want`
+/// is the rows sorted and joined by `;`, or `ERR <sqlstate>`.
+async fn check_each_rolled_back(client: &tokio_postgres::Client, cases: &[(&str, &str)]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        client.batch_execute("BEGIN").await.expect("begin");
+        let got = match rows(client, sql).await {
+            Ok(mut r) => {
+                r.sort();
+                r.join(";")
+            }
+            Err(code) => format!("ERR {code}"),
+        };
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+        if got != *want {
+            wrong.push(format!("{sql}\n    got  {got}\n    want {want}"));
+        }
+    }
+    wrong
+}
+
+/// A value typed text compares with `character(n)` exactly however it is
+/// spelled: a `CAST`, a parenthesised `::text`, the `text '…'` typed literal,
+/// and a string any function or operator computes (`lower`, `||`, `NULLIF`,
+/// `COALESCE`). Each was folded to a bare literal and read blank-padded,
+/// so `'ab  '` matched the stored `'ab'`; a cast to `varchar` or to
+/// `character(n)` compares blank-padded and still does.
+///
+/// Mutation: the constant fold writing every string bare again (each typed
+/// case matches row 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_text_value_spelled_any_way_compares_exactly() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute("CREATE TABLE c (id INT PRIMARY KEY, a CHAR(4), v INT); INSERT INTO c VALUES (1, 'ab', 0), (2, 'abc', 0), (3, 'x', 0)")
+        .await
+        .expect("setup");
+    let wrong = check_each_rolled_back(
+        &c,
+        &[
+            ("SELECT id FROM c WHERE a = CAST('ab  ' AS TEXT)", ""),
+            ("SELECT id FROM c WHERE CAST('ab  ' AS text) = a", ""),
+            ("SELECT id FROM c WHERE a = ('ab  ')::text", ""),
+            ("SELECT id FROM c WHERE a = text 'ab  '", ""),
+            ("SELECT id FROM c WHERE text 'ab  ' = a", ""),
+            ("SELECT id FROM c WHERE a = lower('AB  ')", ""),
+            ("SELECT id FROM c WHERE a = ('ab' || '  ')", ""),
+            ("SELECT id FROM c WHERE a = NULLIF('ab  ', 'z')", ""),
+            ("SELECT id FROM c WHERE COALESCE('ab  '::text, 'z') = a", ""),
+            ("UPDATE c SET v = 1 WHERE a = CAST('ab  ' AS TEXT) RETURNING id", ""),
+            ("DELETE FROM c WHERE a = CAST('ab  ' AS TEXT) RETURNING id", ""),
+            // Blank-padded: a cast to `varchar` or through `character(n)`,
+            // a computed value with no trailing space, an untyped literal.
+            ("SELECT id FROM c WHERE a = CAST('ab  ' AS VARCHAR)", "[1]"),
+            ("SELECT id FROM c WHERE a = 'ab  '::char(4)::text", "[1]"),
+            ("SELECT id FROM c WHERE a = lower('AB')", "[1]"),
+            ("SELECT id FROM c WHERE a = 'ab  '", "[1]"),
+            ("UPDATE c SET v = 1 WHERE a = 'ab  ' RETURNING id", "[1]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// An upsert whose key arrives typed text finds and updates the row it
+/// conflicted with: a parameter bound as text (what sqlx and Npgsql send for
+/// a string), a `::text` literal and a `::varchar(5)` one, on the primary key
+/// and on a UNIQUE column. The conflict was found on the stored key and the
+/// DO UPDATE then looked the row up by the value as written, which text
+/// compares with exactly: no row, no error, the write lost. A foreign key's
+/// violation shows such a key without its cast.
+///
+/// Mutation: `stored_text_literal` answering `None` (every DO UPDATE here
+/// returns no row and the final rows keep their old values).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_keyed_by_typed_text_updates_the_row() {
+    use tokio_postgres::types::Type;
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE k2 (k CHAR(3) PRIMARY KEY, u CHAR(4) UNIQUE, v INT); \
+         CREATE TABLE ch (id INT PRIMARY KEY, pk CHAR(3) REFERENCES k2 (k)); \
+         INSERT INTO k2 VALUES ('a', 'x', 1), ('b', 'y', 2)",
+    )
+    .await
+    .expect("setup");
+    let mut wrong = Vec::new();
+    let text = [Type::TEXT, Type::TEXT];
+    for (sql, params, want) in [
+        (
+            "INSERT INTO k2 VALUES ($1, $2, 4) ON CONFLICT (k) DO UPDATE SET v = 40 RETURNING k, v",
+            ["a  ", "zz"],
+            "a  |40",
+        ),
+        (
+            "INSERT INTO k2 VALUES ($1, $2, 6) ON CONFLICT (u) DO UPDATE SET v = 60 RETURNING k, v",
+            ["q", "x   "],
+            "a  |60",
+        ),
+    ] {
+        let statement = c.prepare_typed(sql, &text).await.expect("prepare");
+        let got = match c.query(&statement, &[&params[0], &params[1]]).await {
+            Ok(rows) => rows
+                .iter()
+                .map(|r| format!("{}|{}", r.get::<_, String>(0), r.get::<_, i32>(1)))
+                .collect::<Vec<_>>()
+                .join(";"),
+            Err(e) => format!("ERR {e}"),
+        };
+        if got != want {
+            wrong.push(format!("{sql} {params:?}\n    got  {got}\n    want {want}"));
+        }
+    }
+    wrong.extend(
+        check(
+            &c,
+            &[
+                ("INSERT INTO k2 VALUES ('b  '::text, 'm', 11) ON CONFLICT (k) DO UPDATE SET v = 110 RETURNING k, v", "[b  ]|[110]"),
+                (
+                    "INSERT INTO k2 VALUES ('a '::varchar(5), 'm2', 12) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v RETURNING k, v",
+                    "[a  ]|[12]",
+                ),
+                ("SELECT k, u, v FROM k2 ORDER BY k", "[a  ]|[x   ]|[12];[b  ]|[y   ]|[110]"),
+            ],
+        )
+        .await,
+    );
+    let statement = c.prepare_typed("INSERT INTO ch VALUES (3, $1)", &[Type::TEXT]).await.expect("prepare");
+    match c.execute(&statement, &[&"zz "]).await {
+        Ok(n) => wrong.push(format!("a key no parent holds was written ({n} rows)")),
+        Err(e) => {
+            let message = e.as_db_error().map(|d| d.message().to_string()).unwrap_or_else(|| e.to_string());
+            if !message.contains("(zz )") || message.contains("::") {
+                wrong.push(format!("23503 shows the key as written: {message}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `COALESCE`, `CASE`, `LEAST` and `GREATEST` over a `character(n)` column
+/// and a text one take the type of the first that has one, as PostgreSQL's
+/// common type does, a `CASE`'s `ELSE` ahead of its `THEN`s: `bpchar` when
+/// that is the `character(n)` value, compared blank-padded, its text values
+/// without their trailing spaces; text when it is the text one. Mixed
+/// branches were read as text whichever came first.
+///
+/// Mutation: `blank_pad_text_branches` doing nothing (`COALESCE(a, t)`
+/// misses row 2); reading a `CASE`'s `THEN`s first (the `CASE … ELSE t`
+/// case matches as `bpchar`).
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_character_and_text_branches_take_the_first_branchs_type() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE s1 (id INT PRIMARY KEY, a CHAR(4), t TEXT); \
+         INSERT INTO s1 VALUES (1, 'ab', 'ab  '), (2, NULL, 'ab  '), (3, 'ab', NULL)",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            ("SELECT id FROM s1 WHERE COALESCE(a, t) = 'ab' ORDER BY id", "[1];[2];[3]"),
+            ("SELECT id FROM s1 WHERE COALESCE(a, t, 'zz') = 'ab  ' ORDER BY id", "[1];[2];[3]"),
+            ("SELECT id FROM s1 WHERE COALESCE(t, a) = 'ab' ORDER BY id", "[3]"),
+            ("SELECT id FROM s1 WHERE CASE WHEN id > 0 THEN a ELSE t END = 'ab  ' ORDER BY id", ""),
+            ("SELECT id FROM s1 WHERE CASE WHEN id > 0 THEN t ELSE a END = 'ab' ORDER BY id", "[1];[2]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A `character varying` column on the left of a `character(n)` one
+/// compares blank-padded too: `b IN (SELECT k …)`, and the recheck an
+/// `UPDATE … FROM` and a `DELETE … USING` run on each row they write. The
+/// subquery's values and the joined key became untyped literals, which a
+/// varying column compares with exactly, so 'ab  ' missed 'ab' (the mirrored
+/// forms, with the `character(n)` column on the left, were right).
+///
+/// Mutations: `varying_in_operand` answering `None` (the IN misses row 1);
+/// `pad_varying_beside_padded` returning its terms (the UPDATE and DELETE
+/// write nothing for row 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_varying_column_beside_character_reads_blank_padded() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE v1 (id INT PRIMARY KEY, b VARCHAR(6), v INT); \
+         CREATE TABLE v2 (id INT PRIMARY KEY, k CHAR(6)); \
+         INSERT INTO v1 VALUES (1, 'ab  ', 0), (2, 'abc', 0), (3, 'zz', 0); \
+         INSERT INTO v2 VALUES (1, 'ab'), (2, 'abc')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check_each_rolled_back(
+        &c,
+        &[
+            ("SELECT id FROM v1 WHERE b IN (SELECT k FROM v2)", "[1];[2]"),
+            ("SELECT id FROM v1 WHERE v1.b NOT IN (SELECT k FROM v2)", "[3]"),
+            ("UPDATE v1 SET v = 1 FROM v2 WHERE v1.b = v2.k RETURNING v1.id", "[1];[2]"),
+            ("DELETE FROM v1 USING v2 WHERE v1.b = v2.k RETURNING v1.id", "[1];[2]"),
+            // The mirrored forms, which were right.
+            ("SELECT id FROM v2 WHERE k IN (SELECT b FROM v1)", "[1];[2]"),
+            ("UPDATE v1 SET v = 1 FROM v2 WHERE v2.k = v1.b RETURNING v1.id", "[1];[2]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `RETURNING` shows a value assigned from a text-typed parameter as the
+/// column holds it: a `character(4)` padded to four, a `varchar(4)` with
+/// the spaces past four cut. It showed the parameter as sent.
+///
+/// Mutation: the RETURNING overlay skipping `held_to_text_length`.
+#[tokio::test(flavor = "multi_thread")]
+async fn returning_shows_a_text_typed_value_as_the_column_holds_it() {
+    use tokio_postgres::types::Type;
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute("CREATE TABLE r1 (id INT PRIMARY KEY, a CHAR(4), b VARCHAR(4)); INSERT INTO r1 VALUES (1, 'a', 'a')")
+        .await
+        .expect("setup");
+    let mut wrong = Vec::new();
+    for (sql, value, want) in [
+        ("UPDATE r1 SET a = $1 WHERE id = 1 RETURNING a", "qq   ", "qq  "),
+        ("UPDATE r1 SET b = $1 WHERE id = 1 RETURNING b", "xy    ", "xy  "),
+    ] {
+        let statement = c.prepare_typed(sql, &[Type::TEXT]).await.expect("prepare");
+        let got = c.query_one(&statement, &[&value]).await.map(|r| r.get::<_, String>(0));
+        if got.as_deref().ok() != Some(want) {
+            wrong.push(format!("{sql} with {value:?}: {got:?}, want {want:?}"));
+        }
+    }
+    let stored = rows(&c, "SELECT a, b FROM r1").await;
+    if stored != Ok(vec!["[qq  ]|[xy  ]".to_string()]) {
+        wrong.push(format!("stored {stored:?}"));
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// An interval column declared with fields keeps only them, as PostgreSQL's
+/// assignment cuts it: `interval hour to minute` drops the seconds, `day`
+/// the time, `year` the months past whole years, and `day to second(0)` and
+/// `minute to second(1)` round the seconds to their precision. The fields
+/// were ignored, so every value was kept whole; `ALTER … TYPE` to such a
+/// type rewrites the stored values.
+///
+/// Mutation: `restrict_interval_fields` doing nothing (every cut value is
+/// kept whole).
+#[tokio::test(flavor = "multi_thread")]
+async fn interval_fields_restrict_what_a_column_keeps() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE w4 (id INT PRIMARY KEY, a INTERVAL HOUR TO MINUTE, b INTERVAL DAY TO SECOND(0), \
+             y INTERVAL YEAR, d INTERVAL DAY, m INTERVAL MINUTE TO SECOND(1)); \
+         INSERT INTO w4 VALUES (1, '1 day 02:03:04.5', '1 day 02:03:04.5', '1 year 5 mons 3 days', '3 days 04:05:06', '02:03:04.56'); \
+         INSERT INTO w4 (id, a) VALUES (2, '-02:03:59'); \
+         CREATE TABLE w5 (id INT PRIMARY KEY, iv INTERVAL); \
+         INSERT INTO w5 VALUES (1, '1 day 02:03:04.5')",
+    )
+    .await
+    .expect("setup");
+    let wrong = check(
+        &c,
+        &[
+            (
+                "SELECT id, a, b, y, d, m FROM w4 ORDER BY id",
+                "[1]|[1 day 02:03:00]|[1 day 02:03:05]|[1 year]|[3 days]|[02:03:04.6];[2]|[-02:03:00]|∅|∅|∅|∅",
+            ),
+            ("UPDATE w4 SET a = '05:06:07.8' WHERE id = 1", ""),
+            ("SELECT a FROM w4 WHERE id = 1", "[05:06:00]"),
+            ("ALTER TABLE w5 ALTER COLUMN iv TYPE INTERVAL HOUR TO MINUTE", ""),
+            ("SELECT iv FROM w5", "[1 day 02:03:00]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
