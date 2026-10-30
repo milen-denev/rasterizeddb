@@ -1394,6 +1394,53 @@ fn declared_fields_among(
     types_in(&table.schema().fields)
 }
 
+/// For each output column of `query`, by position, whether a timestamp it
+/// yields is a `timestamptz` (`Some(true)`), a `timestamp` without time zone
+/// (`Some(false)`), or not known (`None`: not a timestamp, a `*`, a join, an
+/// item this cannot parse).
+///
+/// A scanned row carries a timestamp as the one storage type both are, so
+/// the row cannot say how its text is shown; the item's expression does
+/// (`expr::yields_timestamp`), read against the one relation the query
+/// selects from. What a scalar subquery's or an `INSERT … SELECT`'s value
+/// is rendered as for a text column: `(SELECT b …)` of a `timestamptz` into
+/// TEXT is '… +00', as PostgreSQL stores it, and was stored bare.
+pub(crate) fn zoned_timestamp_items(query: &str, database: &Arc<Database>) -> Vec<Option<bool>> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let fields: Vec<SchemaField> = if crate::core::rql::join::statement_has_join(query) {
+        Vec::new()
+    } else {
+        crate::core::rql::join::find_keyword(query, "FROM", 0)
+            .and_then(|at| {
+                let name = query[at + "FROM".len()..]
+                    .split_whitespace()
+                    .next()?
+                    .trim_end_matches(|c: char| c == ';' || c == ',')
+                    .trim_matches('"')
+                    .to_string();
+                database.schema_view(&name).map(|t| t.schema().fields.iter().filter(|f| !f.is_deleted).cloned().collect())
+            })
+            .unwrap_or_default()
+    };
+    crate::core::rql::lexer_ct::split_definitions(list)
+        .iter()
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| {
+            let expr = crate::core::rql::expr::parse(split_alias(item).0, &fields).ok()?;
+            (crate::core::rql::expr::static_type(&expr) == DbType::DATETIME)
+                .then(|| !crate::core::rql::expr::yields_timestamp(&expr))
+        })
+        .collect()
+}
+
 /// Which output columns of `query`, by position, are stored documents, for
 /// the callers that compare its rows by value: `UNION`'s duplicate check and
 /// `IN (subquery)`. A scan reports a stored document as text, so without this

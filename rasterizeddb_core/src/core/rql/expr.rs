@@ -192,7 +192,7 @@ fn cast_typmod(target: &str, db_type: &DbType) -> Result<Option<CastTypmod>, Str
             None => None,
         });
     }
-    if !matches!(db_type, DbType::DATETIME | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL) {
+    if !matches!(db_type, DbType::DATETIME | DbType::TIMESTAMP | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL) {
         return Ok(None);
     }
     // `interval hour to minute`, `interval day to second(0)`: the fields
@@ -219,7 +219,7 @@ fn cast_typmod(target: &str, db_type: &DbType) -> Result<Option<CastTypmod>, Str
     let precision = precision.min(6) as u32;
     // By the type the value is cast to, whose layout the rounding reads.
     Ok(match db_type {
-        DbType::DATETIME => Some(CastTypmod::Timestamp(precision)),
+        DbType::DATETIME | DbType::TIMESTAMP => Some(CastTypmod::Timestamp(precision)),
         DbType::TIME => Some(CastTypmod::Time(precision)),
         DbType::TIMETZ => Some(CastTypmod::TimeTz(precision)),
         DbType::INTERVAL => Some(CastTypmod::Interval(precision)),
@@ -620,14 +620,22 @@ pub fn db_type_of_cast(name: &str) -> Option<DbType> {
     // The predicate tokenizer still reads `::date` and `DATE '…'` as a
     // timestamp at midnight, which is what its comparisons are built on; only
     // the expression evaluator has date arithmetic.
+    // Nor does it tell the two timestamp types apart: a literal it reads is
+    // already zone-free for `timestamp` (`sql_scan::zone_free_timestamp_literals`).
     match cast_target(name)? {
-        DbType::DATE => Some(DbType::DATETIME),
+        DbType::DATE | DbType::TIMESTAMP => Some(DbType::DATETIME),
         other => Some(other),
     }
 }
 
 /// The SQL type a `::` cast names.
 fn cast_target(name: &str) -> Option<DbType> {
+    // `timestamp` (without time zone) and `timestamptz` are one storage type
+    // and two types: a value cast to the first is read without a zone and
+    // shown without one (`yields_timestamp`).
+    if let Some(with_zone) = timestamp_cast_zone(name) {
+        return Some(if with_zone { DbType::DATETIME } else { DbType::TIMESTAMP });
+    }
     // `interval <fields>`, which `cast_typmod` restricts.
     if let Some(Ok(_)) = crate::core::rql::type_modifier::parse_time_precision(name)
         .filter(|_| name.trim().get(..9).is_some_and(|h| h.eq_ignore_ascii_case("interval ")))
@@ -652,7 +660,6 @@ fn cast_target(name: &str) -> Option<DbType> {
             "CHAR" | "CHARACTER" | "BPCHAR" | "NCHAR" => DbType::STRING,
             "BOOL" | "BOOLEAN" => DbType::BOOL,
             "UUID" => DbType::UUID,
-            "TIMESTAMP" | "TIMESTAMPTZ" => DbType::DATETIME,
             // A real date, not a timestamp at midnight: `date + 3` is three
             // days, and a timestamp plus 3 was three microseconds — the
             // engine's interval unit — rendered as `00:00:00.000003+00`.
@@ -692,6 +699,27 @@ fn cast_target(name: &str) -> Option<DbType> {
 
 /// A cast of `inner` to the type `target` names, keeping a `NUMERIC(p, s)`
 /// modifier as a [`Expr::NumericCast`].
+/// For a timestamp type name, whether it carries a zone: `timestamptz` and
+/// `timestamp with time zone` do, `timestamp` and `timestamp without time
+/// zone` do not, with or without a `(p)`. `None` for any other name.
+fn timestamp_cast_zone(name: &str) -> Option<bool> {
+    let mut words = String::with_capacity(name.len());
+    let mut depth = 0usize;
+    for c in name.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            c => words.push(c.to_ascii_uppercase()),
+        }
+    }
+    match words.split_whitespace().collect::<Vec<_>>().join(" ").as_str() {
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Some(true),
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Some(false),
+        _ => None,
+    }
+}
+
 fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     let db_type = cast_target(target)
         .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
@@ -1510,7 +1538,10 @@ fn keyword_constant(text: &str) -> Option<Expr> {
     match trimmed.to_ascii_uppercase().as_str() {
         // The transaction's start (`crate::core::statement_clock`), as
         // `now()` is.
-        "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "TRANSACTION_TIMESTAMP" => Some(Expr::Scalar(now)),
+        "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => Some(Expr::Scalar(now)),
+        // The same instant as a `timestamp` (without time zone): shown with
+        // no offset (`yields_timestamp`).
+        "LOCALTIMESTAMP" => Some(Expr::Cast(Box::new(Expr::Scalar(now)), DbType::TIMESTAMP)),
         "CURRENT_DATE" => Some(Expr::Scalar(
             crate::core::rql::aggregate::ScalarFunc::CurrentDate,
         )),
@@ -1823,15 +1854,15 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
     Err(format!("condition '{}' is not a comparison", text))
 }
 
-/// A quoted literal compared with a `timestamp` (without time zone) column,
-/// read as that column reads one: its zone discarded
-/// (`SchemaField::without_time_zone`). Left as text it was converted to UTC
+/// A quoted literal compared with a `timestamp` (without time zone) value,
+/// read as that type reads one: its zone discarded. The value is anything
+/// [`yields_timestamp`] says is one: a column, `(a)`, `coalesce(a, …)`, `a +
+/// interval '1 hour'`, a cast. Left as text the literal was converted to UTC
 /// when compared, so `ts = '… 10:00+02'` looked for 08:00 in a column that
-/// holds 10:00. The tokenizer does the same for the scan's predicates
-/// (`query_tokenizer::local_timestamp_literals`).
+/// holds 10:00, and `'… 09:00+05' < a` read 04:00. The tokenizer does the
+/// same for the scan's predicates (`query_tokenizer::local_timestamp_literals`).
 fn local_timestamp_literal(column: &Expr, literal: &mut Expr) {
-    let Expr::Column(field) = column else { return };
-    if !(field.without_time_zone && field.db_type == DbType::DATETIME) {
+    if !yields_timestamp(column) {
         return;
     }
     let Expr::Literal { bytes, db_type } = literal else { return };
@@ -1845,10 +1876,65 @@ fn local_timestamp_literal(column: &Expr, literal: &mut Expr) {
     }
 }
 
-/// Whether `expr` is a `timestamp` (without time zone) column, whose text has
-/// no offset.
-fn local_timestamp_column(expr: &Expr) -> bool {
-    matches!(expr, Expr::Column(f) if f.literal_type() == DbType::TIMESTAMP)
+/// Whether `expr` yields a `timestamp` (without time zone) rather than a
+/// `timestamptz`. The two are one storage type (`DATETIME`, microseconds),
+/// so the value cannot say; its expression does, as PostgreSQL types it:
+///
+/// - a column declared `timestamp` (`SchemaField::literal_type`), and a cast
+///   to the type, `::timestamp[(p)]` or `LOCALTIMESTAMP`;
+/// - a `timestamp` plus or minus an interval, a `date` plus an interval or a
+///   time of day, and `date_trunc` of a `timestamp`;
+/// - `CASE`, `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` whose timestamp
+///   branches all are (a `timestamptz` one makes the common type
+///   `timestamptz`, which PostgreSQL prefers in the category).
+///
+/// It decides how the value is shown as text (bare, or with `+00`) and how a
+/// quoted literal compared with it is read (its zone discarded, or applied):
+/// the two questions the storage type cannot answer. F1's `yields_bpchar`
+/// answers the same kind of question for `character(n)`.
+pub fn yields_timestamp(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(f) => f.literal_type() == DbType::TIMESTAMP,
+        Expr::Cast(_, db_type) => *db_type == DbType::TIMESTAMP,
+        Expr::TypmodCast { value, .. } => yields_timestamp(value),
+        Expr::Arith(lhs, op, rhs) => {
+            let (l, r) = (static_type(lhs), static_type(rhs));
+            match (l, r) {
+                (DbType::DATETIME, DbType::INTERVAL) => yields_timestamp(lhs),
+                (DbType::INTERVAL, DbType::DATETIME) if matches!(op, ArithOp::Add) => yields_timestamp(rhs),
+                // `date + interval`, `date + time`: a `timestamp`.
+                (DbType::DATE, DbType::INTERVAL | DbType::TIME) | (DbType::INTERVAL | DbType::TIME, DbType::DATE) => true,
+                _ => false,
+            }
+        }
+        Expr::Call(TextFunc::DateTrunc, args) => args.get(1).is_some_and(yields_timestamp),
+        Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => common_timestamp(args.iter()),
+        Expr::NullIf(lhs, _) => yields_timestamp(lhs),
+        Expr::Case { whens, otherwise } => {
+            common_timestamp(whens.iter().map(|(_, e)| e).chain(otherwise.iter().map(|b| b.as_ref())))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the common type of `branches` is `timestamp` (without time zone):
+/// at least one branch is a timestamp, and every timestamp branch is one. A
+/// literal or a NULL takes the type of the others and does not count.
+fn common_timestamp<'a>(branches: impl Iterator<Item = &'a Expr>) -> bool {
+    let mut any = false;
+    for b in branches {
+        match b {
+            Expr::Null | Expr::Literal { .. } => {}
+            other if static_type(other) == DbType::DATETIME => {
+                if !yields_timestamp(other) {
+                    return false;
+                }
+                any = true;
+            }
+            _ => {}
+        }
+    }
+    any
 }
 
 /// A `timestamp` value as text: its wall-clock time, no offset.
@@ -2097,13 +2183,19 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
 /// Only quoted literals move. A column's type is a fact, and a number is
 /// already typed.
 fn unify_literal_types(args: &mut [Expr]) {
-    let target = args.iter().find_map(|a| match a {
-        // `literal_type`: beside a `timestamp` column a literal's zone is
-        // discarded, as the column reads one (`coalesce(a, '… 10:00+02')`).
-        Expr::Column(field) if field.db_type != DbType::STRING => Some(field.literal_type()),
-        Expr::Cast(_, db_type) if *db_type != DbType::STRING => Some(db_type.clone()),
-        _ => None,
-    });
+    // Beside timestamps a literal is read as their common type is: its zone
+    // discarded for a `timestamp` (`coalesce(a, '… 10:00+02')`), applied for
+    // a `timestamptz` (`common_timestamp`).
+    let timestamps = args.iter().any(|a| !matches!(a, Expr::Null | Expr::Literal { .. }) && static_type(a) == DbType::DATETIME);
+    let target = if timestamps {
+        Some(if common_timestamp(args.iter()) { DbType::TIMESTAMP } else { DbType::DATETIME })
+    } else {
+        args.iter().find_map(|a| match a {
+            Expr::Column(field) if field.db_type != DbType::STRING => Some(field.literal_type()),
+            Expr::Cast(_, db_type) if *db_type != DbType::STRING => Some(db_type.clone()),
+            _ => None,
+        })
+    };
     let Some(target) = target else { return };
 
     for arg in args.iter_mut() {
@@ -2145,6 +2237,9 @@ pub fn static_type(expr: &Expr) -> DbType {
             crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => DbType::STRING,
             crate::core::rql::aggregate::ScalarFunc::UuidV7 => DbType::UUID,
         },
+        // A `timestamp` is stored as the `DATETIME` it is; `yields_timestamp`
+        // says which of the two it is.
+        Expr::Cast(_, DbType::TIMESTAMP) => DbType::DATETIME,
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::NumericCast { .. } => DbType::DECIMAL,
         Expr::TypmodCast { value, .. } => static_type(value),
@@ -3626,9 +3721,9 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
 /// refuses what it cannot carry rather than truncating it
 /// ([`to_engine_scale`], [`decimal_arith`]).
 pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: &SchemaField) -> Result<Value, String> {
-    // A `timestamp` column's value written into a text column: its text with
-    // no offset (`from_engine_scale` would render it as `timestamptz`'s).
-    if matches!(target.db_type, DbType::STRING | DbType::CHAR) && local_timestamp_column(expr) {
+    // A `timestamp` (without time zone) value written into a text column: its
+    // text with no offset (`from_engine_scale` renders a `timestamptz`'s).
+    if matches!(target.db_type, DbType::STRING | DbType::CHAR) && yields_timestamp(expr) {
         return local_timestamp_text(eval(expr, row, schema)?);
     }
     // `'{"a":1}' || '{"b":1}'` is text concatenation, which PostgreSQL
@@ -5104,10 +5199,11 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 }
             } else {
                 // A timestamp's text has the `+00` its `cast` to text has,
-                // except a `timestamp` column's (`local_timestamp_column`).
+                // except a `timestamp` (without time zone) one's
+                // (`yields_timestamp`).
                 let text_of = |e: &Expr, v: &Value| {
                     let mut text = as_text(v);
-                    if matches!(v, Value::Data { db_type: DbType::DATETIME, .. }) && !local_timestamp_column(e) {
+                    if matches!(v, Value::Data { db_type: DbType::DATETIME, .. }) && !yields_timestamp(e) {
                         text.push_str("+00");
                     }
                     text
@@ -5234,9 +5330,10 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 None => Value::Null,
             }
         }
-        // A `timestamp` (without time zone) column cast to text is its
-        // wall-clock time with no offset; a `timestamptz` value's has `+00`.
-        Expr::Cast(inner, DbType::STRING) if local_timestamp_column(inner) => {
+        // A `timestamp` (without time zone) value cast to text is its
+        // wall-clock time with no offset (`yields_timestamp`); a
+        // `timestamptz` value's has `+00` (`cast`).
+        Expr::Cast(inner, DbType::STRING) if yields_timestamp(inner) => {
             local_timestamp_text(eval(inner, row, schema)?)?
         }
         // A NUMERIC(p, s) column cast to text is rendered from its stored
@@ -5677,6 +5774,20 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     };
     if db_type == *target {
         return Ok(Value::Data { bytes, db_type });
+    }
+    // To a `timestamp` (without time zone): text is read with its zone
+    // discarded; any other value is the `timestamptz` cast, the same
+    // microseconds (the session is UTC). Either way the value is the
+    // `DATETIME` it is stored as; the expression says which type it is
+    // (`yields_timestamp`).
+    if *target == DbType::TIMESTAMP {
+        if matches!(db_type, DbType::STRING | DbType::CHAR) {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            return crate::core::value_codec::encode_literal(&DbType::TIMESTAMP, text.trim())
+                .map(|bytes| Value::Data { bytes, db_type: DbType::DATETIME })
+                .ok_or_else(|| format!("invalid input syntax for type timestamp: \"{}\"", text.trim()));
+        }
+        return cast(Value::Data { bytes, db_type }, &DbType::DATETIME);
     }
 
     // Text in, typed out: the literal is re-read as the target type. The

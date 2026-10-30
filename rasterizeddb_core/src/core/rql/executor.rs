@@ -1101,7 +1101,12 @@ pub async fn substitute_in_subqueries(
             .first()
             .copied()
             .unwrap_or(false);
-        let literal = subquery::rows_to_scalar(&rows, document, exact)?;
+        let zoned = crate::core::rql::cte::zoned_timestamp_items(&found.inner_sql, database)
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or(false);
+        let literal = subquery::rows_to_scalar(&rows, document, exact, zoned)?;
         current = format!(
             "{}{}{}",
             &current[..found.start],
@@ -5613,7 +5618,7 @@ async fn update_from_join(
                         // Compared here as text against the term's literal
                         // (`scalar_comparison_holds`), never substituted.
                         let value =
-                            crate::core::rql::subquery::rows_to_scalar(&produced, document, false)?;
+                            crate::core::rql::subquery::rows_to_scalar(&produced, document, false, false)?;
                         answers.insert(resolved, (value.clone(), document));
                         (value, document)
                     }
@@ -8406,6 +8411,10 @@ async fn insert_from_select(
             crate::core::db_type::DbType::JSONB | crate::core::db_type::DbType::BYTEA | crate::core::db_type::DbType::ARRAY
         )
     };
+    // A `timestamptz` item's literal carries its `+00`, so a text column
+    // takes PostgreSQL's text; a `timestamp` column reading it discards the
+    // zone and keeps the value (`cte::zoned_timestamp_items`).
+    let zoned = crate::core::rql::cte::zoned_timestamp_items(select_sql, database);
     let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut parts: Vec<String> = Vec::with_capacity(row.columns.len());
@@ -8416,10 +8425,14 @@ async fn insert_from_select(
             };
             // `value_to_literal` quotes and escapes, so a value holding a quote
             // or a parenthesis rebuilds as data rather than as syntax.
-            let Some(literal) = crate::core::rql::subquery::value_to_literal(
-                &column_type,
-                column.data.into_slice(),
-            ) else {
+            let literal = if column_type == crate::core::db_type::DbType::DATETIME
+                && zoned.get(at).copied().flatten() == Some(true)
+            {
+                crate::core::rql::subquery::zoned_timestamp_literal(column.data.into_slice())
+            } else {
+                crate::core::rql::subquery::value_to_literal(&column_type, column.data.into_slice())
+            };
+            let Some(literal) = literal else {
                 return Some(ddl_error(&format!(
                     "INSERT … SELECT returned a {} value that cannot be written",
                     column.column_type

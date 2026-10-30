@@ -934,13 +934,18 @@ fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallV
 /// one of them reads as the same microseconds. A literal under a cast is left
 /// alone: `::timestamptz` names an instant.
 fn local_timestamp_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
-    if !schema.iter().any(|f| f.without_time_zone && !f.is_deleted) {
+    if !schema.iter().any(|f| f.without_time_zone && !f.is_deleted)
+        && !out.iter().any(|t| matches!(t, Token::Evaluated(operand) if operand.is_local_timestamp()))
+    {
         return;
     }
     let local = |t: &Token| match t {
         Token::Ident((name, DbType::DATETIME, wo)) => schema
             .iter()
             .any(|f| f.write_order == *wo && !f.is_deleted && f.name == *name && f.without_time_zone),
+        // An expression that is a `timestamp` too: `coalesce(a, …) > '…'`,
+        // `a + interval '1 hour' > '…'` (`expr::yields_timestamp`).
+        Token::Evaluated(operand) => operand.is_local_timestamp(),
         _ => false,
     };
     let comparison = |t: &Token| {

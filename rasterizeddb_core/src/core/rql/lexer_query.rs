@@ -151,6 +151,15 @@ fn parse_computed_item(
         if matches!(ty, crate::core::db_type::DbType::DECIMAL) {
             synth_field.scale = Some(func.decimal_output_scale(arg.as_ref()));
         }
+        // MIN and MAX of a `timestamp` (without time zone) column are one
+        // too, so `max(a)::text` has no offset (`expr::yields_timestamp`).
+        if matches!(
+            func,
+            crate::core::rql::aggregate::AggFunc::Min | crate::core::rql::aggregate::AggFunc::Max
+        ) && ty == crate::core::db_type::DbType::DATETIME
+        {
+            synth_field.without_time_zone = arg.as_ref().is_some_and(|f| f.without_time_zone);
+        }
         synth_schema.push(synth_field);
         inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg });
         rewritten.push_str(&name);

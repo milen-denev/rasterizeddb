@@ -441,9 +441,8 @@ async fn character_indexes_answer_like_an_unindexed_twin() {
 /// `varchar(n)` and `character(n)` cut (and `character(n)` pads and compares
 /// without trailing spaces), `timestamp(p)`, `time(p)` and `interval(p)`
 /// round half away from zero, on PostgreSQL's epoch. They were plain casts:
-/// `WHERE s::varchar(2) = 'ab'` matched only 'ab' itself. (A `timestamp` is
-/// shown with `+00` here, as this engine shows every timestamp; the instants
-/// are PostgreSQL's.)
+/// `WHERE s::varchar(2) = 'ab'` matched only 'ab' itself. (A `timestamp(p)`
+/// is shown without an offset, as PostgreSQL shows it.)
 ///
 /// Mutation: `apply_cast_typmod` returning the value unchanged.
 #[tokio::test(flavor = "multi_thread")]
@@ -468,12 +467,12 @@ async fn casts_keep_their_type_modifiers() {
             ),
             (
                 "SELECT id, t::timestamp(0), tm::time(1), iv::interval(0) FROM tc ORDER BY id",
-                "[1]|[2024-01-01 10:00:01+00]|[10:00:00.6]|[00:00:02];\
-                 [2]|[2024-01-01 10:00:00+00]|[10:00:00.4]|[00:00:00];\
-                 [3]|[2024-01-01 10:00:01+00]|[23:59:59.5]|[-00:00:02];\
-                 [4]|[1999-12-31 23:59:59+00]|[10:00:00]|[1 day 00:00:01]",
+                "[1]|[2024-01-01 10:00:01]|[10:00:00.6]|[00:00:02];\
+                 [2]|[2024-01-01 10:00:00]|[10:00:00.4]|[00:00:00];\
+                 [3]|[2024-01-01 10:00:01]|[23:59:59.5]|[-00:00:02];\
+                 [4]|[1999-12-31 23:59:59]|[10:00:00]|[1 day 00:00:01]",
             ),
-            ("SELECT id, tm::time(0), t::timestamp(2) FROM tc WHERE id = 3", "[3]|[24:00:00]|[2024-01-01 10:00:01+00]"),
+            ("SELECT id, tm::time(0), t::timestamp(2) FROM tc WHERE id = 3", "[3]|[24:00:00]|[2024-01-01 10:00:01]"),
             ("SELECT id FROM tc WHERE s::varchar(2) = 'ab' ORDER BY id", "[1];[2]"),
             ("SELECT id FROM tc WHERE CAST(s AS varchar(1)) = 'a' ORDER BY id", "[1];[2];[3];[4]"),
             ("SELECT id FROM tc WHERE s::char(3) = 'ab' ORDER BY id", "[2]"),

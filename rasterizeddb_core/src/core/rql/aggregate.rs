@@ -420,6 +420,9 @@ impl SelectItem {
             SelectItem::RowExpr { expr, .. } | SelectItem::Computed { expr, .. } => {
                 match crate::core::rql::expr::bpchar_width(expr) {
                     Some(n) => DbType::bpchar(n),
+                    // A `timestamp` (without time zone) expression is
+                    // described as one, and its values shown bare from that.
+                    None if crate::core::rql::expr::yields_timestamp(expr) => DbType::TIMESTAMP,
                     None => self.result_type(),
                 }
             }

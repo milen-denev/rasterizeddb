@@ -710,6 +710,12 @@ impl EvaluatedOperand {
         crate::core::rql::expr::yields_bpchar(&self.expr)
     }
 
+    /// Whether it yields a `timestamp` (without time zone): a literal compared
+    /// with it is read without its zone (`expr::yields_timestamp`).
+    pub fn is_local_timestamp(&self) -> bool {
+        crate::core::rql::expr::yields_timestamp(&self.expr)
+    }
+
     /// Reads `text` as an expression over `schema`.
     ///
     /// Only the types whose comparison here is what PostgreSQL's is are

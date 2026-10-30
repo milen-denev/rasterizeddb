@@ -357,7 +357,10 @@ pub fn is_correlated(inner_sql: &str) -> bool {
 /// [`rows_to_value_list`]: a scan reports one as text, and rendered as text
 /// its encoded bytes were refused as a constant, or compared against `doc` as
 /// a literal no document parses from.
-pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool) -> Result<String, String> {
+/// `zoned`: the value, when it is a timestamp, is a `timestamptz`
+/// (`cte::zoned_timestamp_items`), whose literal carries its `+00`, so a text
+/// column it is assigned to or compared with sees PostgreSQL's text.
+pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool, zoned: bool) -> Result<String, String> {
     match rows.len() {
         // No rows makes the expression NULL, and NULL is what it becomes.
         // It used to be an empty string, which is a *value*: `WHERE id = ''`
@@ -376,7 +379,12 @@ pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool) -> Result<
             } else {
                 column.column_type.clone()
             };
-            subquery_literal(&db_type, column.data.into_slice(), exact_text).ok_or_else(|| {
+            let literal = if zoned && db_type == DbType::DATETIME {
+                zoned_timestamp_literal(column.data.into_slice())
+            } else {
+                subquery_literal(&db_type, column.data.into_slice(), exact_text)
+            };
+            literal.ok_or_else(|| {
                 format!(
                     "subquery returned a {} value that cannot be used as a constant",
                     db_type
@@ -1337,6 +1345,14 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// a substituted value by, and keeps exact inside an `IN` list over
 /// `character(n)` (`predicate_rewrite::spell_out_list_or_range`), where a
 /// computed item written in the statement is read blank-padded.
+/// A `timestamptz` value's literal, with the `+00` its text has (the session
+/// is UTC). Read back into a `timestamp` column the zone is discarded and
+/// the value is the same; into a `timestamptz` one it is the same instant.
+pub fn zoned_timestamp_literal(bytes: &[u8]) -> Option<String> {
+    let us = i64::from_le_bytes(bytes.try_into().ok()?);
+    Some(value_codec::quote_sql(&format!("{}+00", value_codec::format_timestamp_us(us))))
+}
+
 pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
     let literal = value_to_literal(db_type, bytes)?;
     Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {

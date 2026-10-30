@@ -1139,8 +1139,12 @@ pub(crate) fn encode_column_value(
         // `VALUES (1 / 3.0)` into a NUMERIC(20,12) stored 0.333333333000. A
         // `jsonb` one is checked as an assignment is (`'a' || 'b'` is text).
         let scale = declared_scale(&schema_field.name, modifiers);
+        // A text column takes the value's text, as an assignment renders it
+        // (`expr::from_engine_scale`): a `timestamptz` with `+00`, a
+        // `timestamp` without (`expr::yields_timestamp`), a number as its
+        // digits.
         let evaluated = match schema_field.db_type {
-            DbType::DECIMAL | DbType::JSONB => {
+            DbType::DECIMAL | DbType::JSONB | DbType::STRING | DbType::CHAR => {
                 let mut target = schema_field.clone();
                 target.scale = scale;
                 crate::core::rql::expr::eval_into(&expr, &empty, &[], &target)
@@ -1162,24 +1166,6 @@ pub(crate) fn encode_column_value(
                         i128::from_le_bytes(raw),
                         scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
                     ),
-                    Err(_) => "NULL".to_string(),
-                }
-            }
-            // A timestamp written into a text column is shown as its type
-            // is: `+00` for a `timestamptz` (`CASE … THEN now() END`), bare
-            // for a `timestamp` (`sql_scan::names_only_local_timestamps`).
-            // As a literal it was always bare.
-            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::DATETIME }
-                if matches!(schema_field.db_type, DbType::STRING | DbType::CHAR) =>
-            {
-                match <[u8; 8]>::try_from(bytes.as_slice()) {
-                    Ok(raw) => {
-                        let mut text = crate::core::value_codec::format_timestamp_us(i64::from_le_bytes(raw));
-                        if !crate::core::sql_scan::names_only_local_timestamps(value) {
-                            text.push_str("+00");
-                        }
-                        crate::core::value_codec::quote_sql(&text)
-                    }
                     Err(_) => "NULL".to_string(),
                 }
             }
