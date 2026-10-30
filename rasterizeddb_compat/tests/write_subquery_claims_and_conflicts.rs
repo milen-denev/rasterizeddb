@@ -237,3 +237,76 @@ async fn target_contention_replays_like_a_plain_write_read_committed() {
         replays_like_a_plain_write(stmt, true).await;
     }
 }
+
+/// A CTE-fed write replayed at the wire keeps its table locks across the
+/// replay: a session holding ACCESS EXCLUSIVE on `t` never sees `t` change.
+/// The replay aborted the statement's owner O, which was its adopted `WITH`
+/// transaction, without registering O as outliving it; O's locks then read
+/// as a dead owner's and were pruned, and the replay wrote under the other
+/// session's lock (10 changes in 1,146 windows; base 0 in 294). A writer
+/// incrementing the same row keeps the CTE write conflicting and replaying.
+///
+/// Mutation: `outlive_adopted` not called before the replay's abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replayed_write_keeps_its_table_locks() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("pool");
+    pool.execute(sqlx::raw_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL); INSERT INTO t VALUES (1, 0);"))
+        .await
+        .expect("schema");
+    let stop = Arc::new(AtomicBool::new(false));
+    let incrementer = {
+        let (pool, stop) = (pool.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut c = pool.acquire().await.expect("connection");
+            while !stop.load(Ordering::Relaxed) {
+                let _ = run(&mut c, "UPDATE t SET v = v + 1 WHERE id = 1").await;
+            }
+        })
+    };
+    let (windows, changed) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let locker = {
+        let (pool, stop, windows, changed) = (pool.clone(), stop.clone(), windows.clone(), changed.clone());
+        tokio::spawn(async move {
+            let mut c = pool.acquire().await.expect("connection");
+            let mut first = None;
+            while !stop.load(Ordering::Relaxed) {
+                if run(&mut c, "BEGIN").await.is_err() {
+                    continue;
+                }
+                if run(&mut c, "LOCK TABLE t IN ACCESS EXCLUSIVE MODE").await.is_err() {
+                    let _ = run(&mut c, "ROLLBACK").await;
+                    continue;
+                }
+                windows.fetch_add(1, Ordering::Relaxed);
+                let a: i32 = c.fetch_one("SELECT v FROM t WHERE id = 1").await.map(|r| r.get(0)).unwrap_or(-1);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let b: i32 = c.fetch_one("SELECT v FROM t WHERE id = 1").await.map(|r| r.get(0)).unwrap_or(-1);
+                if a != b {
+                    changed.fetch_add(1, Ordering::Relaxed);
+                    first.get_or_insert((a, b));
+                }
+                let _ = run(&mut c, "COMMIT").await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            first
+        })
+    };
+    let mut c = pool.acquire().await.expect("connection");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut writes = 0;
+    while writes < 400 && Instant::now() < deadline {
+        let _ = run(
+            &mut c,
+            "WITH c AS (SELECT id FROM t WHERE id = 1) UPDATE t SET v = v + 1 WHERE id IN (SELECT id FROM c)",
+        )
+        .await;
+        writes += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    incrementer.await.expect("incrementer");
+    let first = locker.await.expect("locker");
+    let (windows, changed) = (windows.load(Ordering::Relaxed), changed.load(Ordering::Relaxed));
+    assert!(windows > 0, "the locker never held its lock");
+    assert_eq!(changed, 0, "t changed under ACCESS EXCLUSIVE {changed} times in {windows} windows, first {first:?}");
+}

@@ -6048,6 +6048,15 @@ where
             // the question is asked of the write paths and not of the SQL.
             let wrote = database.transactions.wrote_family(tx);
             if failed {
+                // Replayed whole (`run_statement`): the statement's owner O
+                // goes on past this transaction, which may be O's own (an
+                // adopted `WITH` transaction), so O is registered as
+                // outliving it first. Left dead, O's table locks were pruned
+                // under the replay, which then wrote under another session's
+                // ACCESS EXCLUSIVE, and the wait-for graph lost its node.
+                if state.deferred_conflict {
+                    crate::core::mvcc::owner::outlive_adopted(tx);
+                }
                 database.abort_transaction(tx);
                 if wrote {
                     flush_outcomes(database);

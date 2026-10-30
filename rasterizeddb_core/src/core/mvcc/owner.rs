@@ -327,6 +327,25 @@ pub fn outlive(tx: TxId) {
     });
 }
 
+/// [`outlive`] for a statement the wire replays whole after aborting its
+/// transaction (a CTE- or derived-fed write's 40001): `tx` may be the scope's
+/// O adopted as that transaction ([`adopt_transaction`]), which [`outlive`]
+/// leaves alone because an adopted O normally ends with its statement. The
+/// replay then acts for O through an alias of its own transaction, as a
+/// later attempt of the autocommit loop does, so O must stay live. A no-op
+/// for any other id.
+pub fn outlive_adopted(tx: TxId) {
+    let _ = SCOPE.try_with(|scope| {
+        if scope.fixed.is_none()
+            && let Some(owner) = scope.minted.get().copied()
+            && owner.id() == tx
+        {
+            scope.ended.store(true, Ordering::Release);
+            scope.register_outliving(owner);
+        }
+    });
+}
+
 /// Called once the attempt loop has decided `tx`'s end, with no await
 /// between this and the commit or abort: when `tx` is the scope's O, a later
 /// ask for the owner registers O then ([`ensure`]), and the scope's end
