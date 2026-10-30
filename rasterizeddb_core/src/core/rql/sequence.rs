@@ -161,6 +161,15 @@ pub fn is_floored(database: u64, name: &str, table: &str) -> bool {
     FLOORED.contains_key(&floor_key(database, name, table))
 }
 
+/// Forgets every floor mark `table` holds in `database`, on any sequence:
+/// for a table dropped or renamed. The marks are by name, so a table that
+/// later takes the name (created, or renamed onto it) would otherwise find
+/// the old table's marks and skip raising the counters to its own rows.
+pub fn forget_table_floors(database: u64, table: &str) {
+    let (prefix, suffix) = (key(database, ""), format!("\u{0}{}", table));
+    FLOORED.retain(|k, _| !(k.starts_with(&prefix) && k.ends_with(&suffix)));
+}
+
 /// Records that `table`'s floor is in `database`'s counter `name`. After the
 /// [`seed`] that put it there, never before: a concurrent insert that sees
 /// the mark takes values straight away.
@@ -490,6 +499,25 @@ mod tests {
         mark_floored(DB, "floor_test_renamed_seq", "sa");
         forget(DB, &["floor_test_renamed_seq".to_string()]);
         assert!(!is_floored(DB, "floor_test_renamed_seq", "sa"), "a forgotten counter kept its floor marks");
+    }
+
+    /// A dropped or renamed table's floor marks go, on every sequence, and
+    /// only its own: not another table's, not one in another database, not
+    /// a table whose name ends in its name.
+    ///
+    /// Mutation: `forget_table_floors` a no-op.
+    #[test]
+    fn a_tables_floor_marks_go_with_its_name() {
+        let (one, two) = ("ftf_one_seq", "ftf_two_seq");
+        for (db, seq, table) in [(DB, one, "a"), (DB, two, "a"), (DB, one, "xa"), (DB, one, "b"), (OTHER_DB, one, "a")] {
+            seed(db, seq, 0);
+            mark_floored(db, seq, table);
+        }
+        forget_table_floors(DB, "a");
+        assert!(!is_floored(DB, one, "a") && !is_floored(DB, two, "a"), "a mark outlived its table's name");
+        assert!(is_floored(DB, one, "xa"), "a table whose name ends in the name lost its mark");
+        assert!(is_floored(DB, one, "b"));
+        assert!(is_floored(OTHER_DB, one, "a"), "another database's table lost its mark");
     }
 
     #[test]

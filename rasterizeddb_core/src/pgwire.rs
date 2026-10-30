@@ -1753,6 +1753,7 @@ where
     if let Some(mode) = startup_timeouts.2 {
         state.shape_change = mode;
     }
+    state.startup_settings = startup_timeouts;
     // A connection that drops mid-transaction must not leave it running: it
     // would hold back reclamation forever and its versions would never resolve.
     // The loop returns from several places, so the cleanup is a guard rather
@@ -2194,6 +2195,10 @@ struct SessionState {
     /// after its lock (`prepared::STALE_PLAN`): the statement ran from its
     /// text instead, and the parse is learned again.
     stale_plan: bool,
+    /// What the StartupMessage set (`statement_timeout`, `lock_timeout`,
+    /// `rdb.shape_change`): the values `RESET ALL` returns them to, as in
+    /// PostgreSQL, where a connection option is the session's default.
+    startup_settings: (Option<u64>, Option<u64>, Option<ShapeChangeMode>),
 }
 
 /// `rdb.shape_change`: what an `Execute` sends when the statement's result
@@ -2411,6 +2416,13 @@ struct SessionTransaction {
     local_default_isolation: Option<IsolationLevel>,
     /// The same for `default_transaction_read_only`.
     local_default_read_only: Option<bool>,
+    /// Whether a statement has run in this block (anything past the SET,
+    /// SHOW and transaction-control statements answered above the engine).
+    /// After it the level is fixed: PostgreSQL refuses a change with 25001
+    /// ("must be called before any query"), and a `SET` that pinned a
+    /// snapshot mid-block made the block READ COMMITTED for its first part
+    /// and REPEATABLE READ after, which neither level promises.
+    queried: bool,
     /// The level this block runs at.
     level: IsolationLevel,
     /// `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY`: writes in this block
@@ -2517,6 +2529,35 @@ impl SessionState {
             statement_error: None,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
+            startup_settings: (None, None, None),
+        }
+    }
+
+    /// `RESET ALL`: every setting a `SET` stores back to its session
+    /// default, the transaction characteristics included. A pool clears a
+    /// connection this way (`DISCARD ALL` runs it) before the next borrower
+    /// gets it: refused, as it was, a `SET default_transaction_isolation`
+    /// one borrower made decided every later borrower's blocks.
+    ///
+    /// Inside a block it is a session-level `SET` of each, so a `SET LOCAL`
+    /// made earlier in the block no longer puts its old value back at the
+    /// block's end, as in PostgreSQL.
+    fn reset_all(&mut self) {
+        let (statement_timeout, lock_timeout, shape_change) = self.startup_settings;
+        self.default_isolation = IsolationLevel::default();
+        self.default_read_only = false;
+        self.statement_timeout_ms = statement_timeout;
+        self.lock_timeout_ms = lock_timeout;
+        self.synchronous_commit = None;
+        self.idle_in_transaction_timeout = self.limits.idle_in_transaction_session_timeout;
+        self.idle_session_timeout = self.limits.idle_session_timeout;
+        self.shape_change = shape_change.unwrap_or_default();
+        if let Some(t) = self.transaction.as_mut() {
+            t.local_synchronous_commit = None;
+            t.local_idle_in_transaction = None;
+            t.local_idle_session = None;
+            t.local_default_isolation = None;
+            t.local_default_read_only = None;
         }
     }
 
@@ -5598,6 +5639,10 @@ async fn execute_prepared<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A statement ran in the block (`SessionTransaction::queried`).
+    if let Some(t) = state.transaction.as_mut() {
+        t.queried = true;
+    }
     if state.transaction.as_ref().is_some_and(|t| t.failed) {
         send_error_response(
             stream,
@@ -6199,6 +6244,11 @@ where
 
     if handle_builtin_query(state, stream, stmt, omit_description).await? {
         return Ok(());
+    }
+    // Past the statements answered above the engine: the block's level is
+    // fixed from here (`SessionTransaction::queried`).
+    if let Some(t) = state.transaction.as_mut() {
+        t.queried = true;
     }
 
     // A read-only block refuses what would write, as PostgreSQL does with
@@ -7568,6 +7618,7 @@ fn open_block(
         local_idle_session: None,
         local_default_isolation: None,
         local_default_read_only: None,
+        queried: false,
         level,
         read_only,
         savepoints: Vec::new(),
@@ -7837,6 +7888,13 @@ where
             // in PostgreSQL: what the batch ran so far is the block's, and it
             // ends at COMMIT or ROLLBACK, not at the Sync. The characteristics
             // named here apply to it.
+            // A level the batch's statements already ran under is fixed, as
+            // for `SET TRANSACTION` (PostgreSQL refuses `SELECT 1; BEGIN
+            // ISOLATION LEVEL REPEATABLE READ` the same way).
+            if let Some(why) = modes.level.and_then(|level| isolation_change_refusal(t, level)) {
+                fail_statement(state, stream, "25001", why).await?;
+                return Ok(true);
+            }
             t.implicit = false;
             if let Some(read_only) = modes.read_only {
                 t.read_only = read_only;
@@ -7967,16 +8025,9 @@ where
                         // PostgreSQL refuses this once the transaction has done
                         // any work, because its snapshot may already be fixed.
                         // Here the same applies for the same reason.
-                        if t.level == IsolationLevel::RepeatableRead
-                            && level == IsolationLevel::ReadCommitted
-                        {
-                            send_error_response(
-                                stream,
-                                "25001",
-                                "cannot change the isolation level of a transaction that has \
-                                 already fixed its snapshot",
-                            )
-                            .await?;
+                        // An error, as PostgreSQL's is: the block fails with it.
+                        if let Some(why) = isolation_change_refusal(t, level) {
+                            fail_statement(state, stream, "25001", why).await?;
                             return Ok(true);
                         }
                         t.level = level;
@@ -8263,6 +8314,27 @@ fn strip_setting(lower: &str, key: &str) -> Option<Option<String>> {
     Some(Some(value.to_string()))
 }
 
+/// Why the open block `t` may not change its level to `level` now, or
+/// `None` when it may.
+///
+/// After a statement has run, never, as in PostgreSQL (25001, "must be
+/// called before any query"): moving to REPEATABLE READ then pinned a
+/// snapshot mid-block, so the block saw other sessions' commits until the
+/// `SET` and none after. Before one, only REPEATABLE READ to READ COMMITTED
+/// is refused, which PostgreSQL allows: the snapshot is pinned when the level
+/// is set and nothing here unpins it.
+fn isolation_change_refusal(t: &SessionTransaction, level: IsolationLevel) -> Option<&'static str> {
+    if level == t.level {
+        None
+    } else if t.queried {
+        Some("SET TRANSACTION ISOLATION LEVEL must be called before any query")
+    } else if t.level == IsolationLevel::RepeatableRead {
+        Some("cannot change the isolation level of a transaction that has already fixed its snapshot")
+    } else {
+        None
+    }
+}
+
 /// An isolation level as `default_transaction_isolation` and
 /// `transaction_isolation` take it, quoted or not: PostgreSQL's four names.
 /// `SERIALIZABLE` runs as `REPEATABLE READ` and `READ UNCOMMITTED` as
@@ -8400,11 +8472,9 @@ where
             let message = "current transaction is aborted, commands ignored until end of transaction block";
             return fail_statement(state, stream, "25P02", message).await;
         }
-        // As `SET TRANSACTION ISOLATION LEVEL`: a fixed snapshot cannot be
-        // given up.
-        if t.level == IsolationLevel::RepeatableRead && level == IsolationLevel::ReadCommitted {
-            let message = "cannot change the isolation level of a transaction that has already fixed its snapshot";
-            return fail_statement(state, stream, "25001", message).await;
+        // As `SET TRANSACTION ISOLATION LEVEL`.
+        if let Some(why) = isolation_change_refusal(t, level) {
+            return fail_statement(state, stream, "25001", why).await;
         }
         if t.level != level {
             t.level = level;
@@ -8422,6 +8492,53 @@ where
         }
     }
     send_command_complete(stream, "SET").await
+}
+
+/// `RESET ALL`, and `DISCARD ALL | PLANS | TEMP | TEMPORARY | SEQUENCES`, as
+/// PostgreSQL 17 answers them; `None` for any other statement.
+///
+/// - `RESET ALL`: [`SessionState::reset_all`].
+/// - `DISCARD ALL`: refused inside a block (25001), as in PostgreSQL;
+///   otherwise `RESET ALL`, every prepared statement deallocated and every
+///   portal closed. The rest of what PostgreSQL's does (session
+///   authorization, LISTEN, advisory locks, temporary tables, sequence
+///   state) has nothing here to reset.
+/// - `DISCARD PLANS`: every prepared statement's learned parse dropped, so
+///   its next executions take the text path and learn it again.
+/// - `DISCARD TEMP` and `DISCARD SEQUENCES`: nothing to discard (no
+///   temporary tables, no per-session sequence state), so only answered.
+async fn reset_or_discard<S>(state: &mut SessionState, stream: &mut S, lower: &str) -> io::Result<Option<bool>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let words: Vec<&str> = lower.trim().trim_end_matches(';').split_whitespace().collect();
+    let tag = match words.as_slice() {
+        ["reset", "all"] => {
+            state.reset_all();
+            "RESET"
+        }
+        ["discard", "all"] => {
+            if state.transaction.is_some() {
+                fail_statement(state, stream, "25001", "DISCARD ALL cannot run inside a transaction block").await?;
+                return Ok(Some(true));
+            }
+            state.reset_all();
+            state.statements.clear();
+            state.portals.clear();
+            "DISCARD ALL"
+        }
+        ["discard", "plans"] => {
+            for info in state.statements.values_mut() {
+                info.prepared = PreparedSelect::default();
+            }
+            "DISCARD PLANS"
+        }
+        ["discard", "temp" | "temporary"] => "DISCARD TEMP",
+        ["discard", "sequences"] => "DISCARD SEQUENCES",
+        _ => return Ok(None),
+    };
+    send_command_complete(stream, tag).await?;
+    Ok(Some(true))
 }
 
 /// Applies `SET`/`RESET` of one of the idle timeouts.
@@ -8595,6 +8712,15 @@ where
 {
     let s = stmt.trim();
     let s_lower = s.to_ascii_lowercase();
+
+    // `RESET ALL` and `DISCARD`: how a pool clears a connection between
+    // borrowers (Npgsql sends `DISCARD ALL`). Both used to fail as a syntax
+    // error, which was harmless while every `SET` was dropped; with the
+    // transaction characteristics real, one borrower's `SET
+    // default_transaction_isolation` decided the next borrower's blocks.
+    if let Some(answered) = reset_or_discard(state, stream, &s_lower).await? {
+        return Ok(answered);
+    }
 
     // `synchronous_commit` is a real setting here, not a runtime parameter to be
     // acknowledged and dropped: it decides whether this session's commits wait

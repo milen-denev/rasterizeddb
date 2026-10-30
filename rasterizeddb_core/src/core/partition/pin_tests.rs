@@ -1278,6 +1278,66 @@ async fn a_shared_sequence_is_raised_to_each_tables_floor() {
     }
 }
 
+/// SERIAL floor marks are kept by table name, so a table that takes a name
+/// over (renamed onto a dropped table's) must not inherit the dropped
+/// table's marks. After a restart `sa` floors the shared counter at its own
+/// maximum (3) and is dropped; `sb`, holding 4..8, is renamed to `sa`. With
+/// the old marks left, the renamed table skipped its own floor and drew 5, 6
+/// and 7 again; and so for a table created under the name, and under the
+/// renamed table's old name. Plain and partitioned `sb`.
+///
+/// From the f3 review's `f2_phase2b_drop_and_rename`.
+///
+/// Mutation: `forget_table_floors` a no-op (the renamed table repeats).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_renamed_onto_a_dropped_name_raises_the_counter_to_its_own_rows() {
+    for partitioned in [false, true] {
+        let what = if partitioned { "partitioned sb" } else { "plain sb" };
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("db");
+        let db = open(&dir).await;
+        exec(&db, "CREATE TABLE sa (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT)").await;
+        if partitioned {
+            exec(&db, "CREATE TABLE sb (tenant_id BIGINT NOT NULL, id BIGINT DEFAULT nextval('sa_id_seq'), v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+        } else {
+            exec(&db, "CREATE TABLE sb (tenant_id BIGINT NOT NULL, id BIGINT DEFAULT nextval('sa_id_seq'), v TEXT)").await;
+        }
+        exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (1, 'a'), (2, 'a'), (3, 'a')").await;
+        exec(&db, "INSERT INTO sb (tenant_id, v) VALUES (1, 'b'), (2, 'b'), (3, 'b'), (4, 'b'), (5, 'b')").await;
+        assert_eq!(serial_ids(&db, "sb").await, vec![4, 5, 6, 7, 8], "{what}");
+        db.record_clean_shutdown().await;
+        db.sync_durable().unwrap();
+        close(&dir, db);
+
+        let db = open(&dir).await;
+        exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (9, 'a2')").await;
+        exec(&db, "DROP TABLE sa").await;
+        exec(&db, "ALTER TABLE sb RENAME TO sa").await;
+        exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (6, 'c'), (7, 'c'), (8, 'c')").await;
+        let got = serial_ids(&db, "sa").await;
+        assert_eq!(got.len(), 8, "{what}");
+        assert_distinct(&got, &format!("{what}, renamed onto the dropped name"));
+        assert!(got[5] > 8, "{what}: the renamed table drew below its own rows: {got:?}");
+
+        // A table created under the renamed table's old name starts from
+        // its own (empty) rows, and the counter goes on above everything.
+        exec(&db, "CREATE TABLE sb (tenant_id BIGINT NOT NULL, id BIGINT DEFAULT nextval('sa_id_seq'), v TEXT)").await;
+        exec(&db, "INSERT INTO sb (tenant_id, v) VALUES (1, 'd')").await;
+        let fresh = serial_ids(&db, "sb").await;
+        assert!(fresh[0] > *got.last().unwrap(), "{what}: {fresh:?} after {got:?}");
+        db.record_clean_shutdown().await;
+        db.sync_durable().unwrap();
+        close(&dir, db);
+
+        let db = open(&dir).await;
+        exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (10, 'e')").await;
+        let got = serial_ids(&db, "sa").await;
+        assert_eq!(got.len(), 9, "{what}");
+        assert_distinct(&got, &format!("{what}, after the next restart"));
+        close(&dir, db);
+    }
+}
+
 /// The log syncs one forget round of eight pinned partitions takes, with
 /// nothing to rewrite (`clean`: every stamp committed) and with an aborted
 /// row in every partition (each sweep's rewrites synced first, as

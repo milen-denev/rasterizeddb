@@ -425,8 +425,14 @@ act as `SET TRANSACTION`. A value they do not take is refused with 22023.
 `SERIALIZABLE` runs as `REPEATABLE READ` and `READ UNCOMMITTED` as
 `READ COMMITTED`, and `SHOW` reports the level that runs. As in PostgreSQL,
 `SET TRANSACTION` outside a block warns (25P01) and changes nothing; it used
-to set the session default. Not yet as in PostgreSQL: a `SET` inside a block
-that then rolls back is not undone, for these as for every other setting.
+to set the session default. Once a statement has run in a block its level is
+fixed: changing it is refused with 25001 and fails the block, as in
+PostgreSQL (it used to pin a snapshot mid-block). `RESET ALL` returns every
+setting to its session default, and `DISCARD ALL` (refused inside a block)
+also deallocates prepared statements and closes portals, which is how a pool
+clears a connection between borrowers. Not yet as in PostgreSQL: a `SET`
+inside a block that then rolls back is not undone, for these as for every
+other setting.
 
 ## 10. Savepoints
 

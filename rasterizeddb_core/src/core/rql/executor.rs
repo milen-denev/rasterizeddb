@@ -12911,6 +12911,11 @@ async fn execute_alter_table_action(
                     plan.table_name, to, e
                 ));
             }
+            // SERIAL floor marks are by table name: the new name's are a
+            // dropped table's, whose rows are not this table's, and the old
+            // name's would let a table created under it skip its seed.
+            crate::core::rql::sequence::forget_table_floors(database.id, &plan.table_name);
+            crate::core::rql::sequence::forget_table_floors(database.id, &to);
             // Every foreign key naming the table as its parent — the
             // children's, and its own self-references, which moved with its
             // files — names the new one. Left naming the old name, a delete
@@ -17083,6 +17088,12 @@ pub(crate) async fn execute_with_need(
                 // This database's only: another database's table of the same
                 // name is a different table.
                 crate::core::rql::sequence::forget(database.id, &owned);
+                // And the name's floor marks on the sequences it shared: a
+                // table later created or renamed under the name has not
+                // raised them to its own rows.
+                if let Ok((name, _)) = crate::core::rql::lexer_alter::parse_drop_table(sql) {
+                    crate::core::rql::sequence::forget_table_floors(database.id, &name);
+                }
                 note_write(&database, tx, depth, sql, None);
             }
             response
