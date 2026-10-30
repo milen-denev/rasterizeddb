@@ -594,48 +594,7 @@ fn parse_update_row(
                 rendered_constant = crate::core::value_codec::quote_sql(&text);
                 &rendered_constant
             }
-            // A literal cast to a timestamp type is shown as PostgreSQL shows
-            // that type as text (`sql_scan::timestamp_cast_as_text`): evaluated
-            // as a cast, a `timestamptz` lost its `+00`.
-            (DbType::STRING | DbType::CHAR, None) => match crate::core::sql_scan::timestamp_cast_as_text(value) {
-                Some(text) => {
-                    rendered_constant = crate::core::value_codec::quote_sql(&text);
-                    &rendered_constant
-                }
-                None => value,
-            },
             _ => value,
-        };
-        // A constant `timestamp` (without time zone) assigned to a text column
-        // is its bare text (`sql_scan::names_only_local_timestamps`): carried
-        // to the write path, it is a value of the one storage type, which a
-        // text column shows as `timestamptz`, with `+00`.
-        let local_timestamp;
-        let value: &str = match matches!(field.db_type, DbType::STRING | DbType::CHAR)
-            && crate::core::sql_scan::names_only_local_timestamps(value)
-        {
-            true => {
-                let empty = crate::core::row::row::Row { position: 0, length: 0, columns: smallvec::SmallVec::new() };
-                let folded = crate::core::rql::expr::parse(value, &[])
-                    .ok()
-                    .filter(|e| crate::core::rql::expr::columns_of(e).is_empty())
-                    .and_then(|e| crate::core::rql::expr::eval(&e, &empty, &[]).ok());
-                match folded {
-                    Some(crate::core::rql::expr::Value::Data { bytes, db_type: DbType::DATETIME }) => {
-                        match <[u8; 8]>::try_from(bytes.as_slice()) {
-                            Ok(raw) => {
-                                local_timestamp = crate::core::value_codec::quote_sql(
-                                    &crate::core::value_codec::format_timestamp_us(i64::from_le_bytes(raw)),
-                                );
-                                &local_timestamp
-                            }
-                            Err(_) => value,
-                        }
-                    }
-                    _ => value,
-                }
-            }
-            false => value,
         };
 
         // An expression whose value depends on the row is carried to the write
