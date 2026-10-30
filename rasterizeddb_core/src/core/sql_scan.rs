@@ -598,8 +598,17 @@ pub fn matching_close(text: &str, open: usize) -> Option<usize> {
 pub fn normalize_string_literals(sql: &str) -> Result<Cow<'_, str>, String> {
     let bytes = sql.as_bytes();
     if !needs_normalizing(bytes) {
-        return Ok(Cow::Borrowed(sql));
+        return Ok(zone_free_timestamp_literals(sql));
     }
+    escapes_resolved(sql).map(|out| match zone_free_timestamp_literals(&out) {
+        Cow::Borrowed(_) => Cow::Owned(out),
+        Cow::Owned(rewritten) => Cow::Owned(rewritten),
+    })
+}
+
+/// [`normalize_string_literals`]'s escape and dollar-quote rewrite.
+fn escapes_resolved(sql: &str) -> Result<String, String> {
+    let bytes = sql.as_bytes();
 
     let mut out = String::with_capacity(sql.len() + 8);
     let mut copied = 0usize;
@@ -660,7 +669,264 @@ pub fn normalize_string_literals(sql: &str) -> Result<Cow<'_, str>, String> {
         }
     }
     out.push_str(&sql[copied..]);
-    Ok(Cow::Owned(out))
+    Ok(out)
+}
+
+/// Every string literal the statement types as `timestamp` or `timestamptz`
+/// (`'…'::timestamptz`, `TIMESTAMP '…'`, `CAST('…' AS timestamp with time
+/// zone)`, a precision allowed) whose text carries a zone, rewritten with no
+/// zone and the same meaning: the wall-clock time for `timestamp`, which
+/// discards the zone, and the UTC time for `timestamptz`, which converts by
+/// it (the session time zone is UTC).
+///
+/// The two types read the same text differently, and the cast or type name
+/// that says which does not reach every reader of the literal: the write path
+/// drops a cast on a literal, the predicate rewrite drops one before the
+/// tokenizer sees it, the typed-literal prefix is stripped before a value is
+/// encoded, and the evaluator's casts name one storage type for both. So a
+/// row written with `'… 10:00+02'::timestamptz` into a `timestamp` column was
+/// stored as 10:00 (PostgreSQL: 08:00) and a predicate spelled the same way
+/// looked for something else. With no zone left, every reader agrees.
+///
+/// Borrowed when the statement has no such literal: the cheap test is that
+/// it never mentions `timestamp`.
+pub fn zone_free_timestamp_literals(sql: &str) -> Cow<'_, str> {
+    let bytes = sql.as_bytes();
+    if !contains_ignore_ascii_case(sql, b"timestamp") {
+        return Cow::Borrowed(sql);
+    }
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(p) = memchr::memchr3(b'\'', b'"', b'$', &bytes[i..]).map(|p| i + p) else {
+            break;
+        };
+        if let Some(c) = first_comment_start(bytes, i, p) {
+            i = skip_comment(bytes, c).expect("a comment opens here");
+            continue;
+        }
+        i = p;
+        if bytes[i] != b'\'' || is_escape_string_quote(bytes, i) {
+            i = skip_quoted(bytes, i).unwrap_or(i + 1);
+            continue;
+        }
+        let end = string_literal_end(bytes, i, false);
+        if end > bytes.len() || end < i + 2 || bytes[end - 1] != b'\'' {
+            break;
+        }
+        let body = &sql[i + 1..end - 1];
+        let zoned = (!body.contains('\''))
+            .then(|| timestamp_type_of_literal(sql, i, end))
+            .flatten()
+            .and_then(|with_zone| zone_free(body, with_zone));
+        if let Some(text) = zoned {
+            let o = out.get_or_insert_with(|| String::with_capacity(sql.len()));
+            o.push_str(&sql[copied..i + 1]);
+            o.push_str(&text);
+            copied = end - 1;
+        }
+        i = end;
+    }
+    match out {
+        None => Cow::Borrowed(sql),
+        Some(mut o) => {
+            o.push_str(&sql[copied..]);
+            Cow::Owned(o)
+        }
+    }
+}
+
+/// Whether `text` holds a string literal that reads as a timestamp with a
+/// zone in it (`'… 09:00+05'`): one that `timestamp` and `timestamptz` read as
+/// two different values.
+pub fn has_zoned_timestamp_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(p) = memchr::memchr(b'\'', &bytes[i..]).map(|p| i + p) {
+        let end = string_literal_end(bytes, p, is_escape_string_quote(bytes, p));
+        if end >= p + 2 {
+            let body = &text[p + 1..end - 1];
+            if zone_free(body, true).is_some() {
+                return true;
+            }
+        }
+        i = end.max(p + 1);
+        if i >= bytes.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// `body` with its zone resolved away, or `None` when it has none to resolve
+/// (or is not a timestamp, or would not read back as the same instant).
+fn zone_free(body: &str, with_zone: bool) -> Option<String> {
+    use crate::core::value_codec::{format_timestamp_us, parse_timestamp_local_us, parse_timestamp_us};
+    let (utc, wall) = (parse_timestamp_us(body)?, parse_timestamp_local_us(body)?);
+    if utc == wall {
+        return None;
+    }
+    let us = if with_zone { utc } else { wall };
+    let text = format_timestamp_us(us);
+    (parse_timestamp_us(&text) == Some(us)).then_some(text)
+}
+
+/// Whether the literal at `start..end` is typed `timestamptz` (`Some(true)`)
+/// or `timestamp` (`Some(false)`) by a cast after it, a type name before it,
+/// or `CAST(… AS …)` around it; `None` when it is not typed either way.
+fn timestamp_type_of_literal(sql: &str, start: usize, end: usize) -> Option<bool> {
+    let after = sql[end..].trim_start();
+    if let Some(cast) = after.strip_prefix("::") {
+        return timestamp_type_at(cast.trim_start()).map(|(tz, _)| tz);
+    }
+    let before = sql[..start].trim_end();
+    if let Some(open) = before.strip_suffix('(') {
+        let head = open.trim_end();
+        let cast_word = head.len() >= 4 && head[head.len() - 4..].eq_ignore_ascii_case("CAST");
+        let word_start = head.len().saturating_sub(4);
+        let bounded = word_start == 0 || !is_identifier_byte(head.as_bytes()[word_start - 1]);
+        if cast_word && bounded {
+            let rest = after;
+            let as_word = rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+                && rest.as_bytes().get(2).is_some_and(|b| !is_identifier_byte(*b));
+            if as_word {
+                return timestamp_type_at(rest[2..].trim_start()).map(|(tz, _)| tz);
+            }
+        }
+        return None;
+    }
+    timestamp_type_before(before)
+}
+
+/// A timestamp type name at the start of `text`: whether it carries a zone,
+/// and its length. `timestamptz`, `timestamp`, either with a `(p)`, and
+/// `timestamp[(p)] with[out] time zone`.
+fn timestamp_type_at(text: &str) -> Option<(bool, usize)> {
+    let word = |t: &str, w: &str| {
+        t.get(..w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w))
+            && t.as_bytes().get(w.len()).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    let precision = |t: &str| -> usize {
+        let rest = t.trim_start();
+        let lead = t.len() - rest.len();
+        match rest.strip_prefix('(') {
+            Some(inner) => match inner.find(')') {
+                Some(close) if inner[..close].trim().bytes().all(|b| b.is_ascii_digit()) => lead + 1 + close + 1,
+                _ => 0,
+            },
+            None => 0,
+        }
+    };
+    if word(text, "timestamptz") {
+        let n = "timestamptz".len();
+        return Some((true, n + precision(&text[n..])));
+    }
+    if !word(text, "timestamp") {
+        return None;
+    }
+    let mut n = "timestamp".len();
+    n += precision(&text[n..]);
+    let rest = &text[n..];
+    let words: Vec<&str> = rest.split_whitespace().take(3).collect();
+    let zone = |kind: &str| {
+        words.len() == 3
+            && words[0].eq_ignore_ascii_case(kind)
+            && words[1].eq_ignore_ascii_case("time")
+            && words[2].len() >= 4
+            && words[2][..4].eq_ignore_ascii_case("zone")
+            && words[2].as_bytes().get(4).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    if zone("with") {
+        return Some((true, n));
+    }
+    Some((false, n))
+}
+
+/// A timestamp type name ending `before` (whitespace-trimmed), the type of a
+/// typed literal `TIMESTAMP '…'`: whether it carries a zone.
+fn timestamp_type_before(before: &str) -> Option<bool> {
+    // The last few words, read backwards: identifier runs, with a `(p)`
+    // precision folded into the word before it.
+    let b = before.as_bytes();
+    let mut words: Vec<String> = Vec::new();
+    let mut k = b.len();
+    let mut first_at = k;
+    while words.len() < 4 && k > 0 {
+        while k > 0 && b[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        let mut stop = k;
+        if k > 0 && b[k - 1] == b')' {
+            let mut j = k - 1;
+            while j > 0 && (b[j - 1].is_ascii_digit() || b[j - 1] == b' ') {
+                j -= 1;
+            }
+            if j == 0 || b[j - 1] != b'(' {
+                break;
+            }
+            stop = j - 1;
+            while stop > 0 && b[stop - 1].is_ascii_whitespace() {
+                stop -= 1;
+            }
+        }
+        let mut j = stop;
+        while j > 0 && is_identifier_byte(b[j - 1]) {
+            j -= 1;
+        }
+        if j == stop {
+            break;
+        }
+        words.push(before[j..stop].to_ascii_lowercase());
+        first_at = j;
+        k = j;
+    }
+    words.reverse();
+    // The type must be a word of its own: not a qualified name (`t.timestamp`),
+    // a quoted identifier, or the tail of a cast (`x::timestamp '…'`).
+    let lead = |at: usize| at == 0 || !matches!(b[at - 1], b'.' | b'"' | b':');
+    let ty = |w: &str| match w {
+        "timestamptz" => Some(true),
+        "timestamp" => Some(false),
+        _ => None,
+    };
+    let n = words.len();
+    if n >= 4 && words[n - 2] == "time" && words[n - 1] == "zone" && ty(&words[n - 4]) == Some(false) {
+        // `first_at` is where the earliest word read starts; with four words
+        // read that is the type's.
+        if n == 4 && !lead(first_at) {
+            return None;
+        }
+        return match words[n - 3].as_str() {
+            "with" => Some(true),
+            "without" => Some(false),
+            _ => None,
+        };
+    }
+    let last = words.last()?;
+    // The last word's start: the text before it must let it stand alone.
+    let last_start = {
+        let trimmed = before.trim_end();
+        let tb = trimmed.as_bytes();
+        let mut j = tb.len();
+        if j > 0 && tb[j - 1] == b')' {
+            while j > 0 && tb[j - 1] != b'(' {
+                j -= 1;
+            }
+            j = j.saturating_sub(1);
+            while j > 0 && tb[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+        }
+        while j > 0 && is_identifier_byte(tb[j - 1]) {
+            j -= 1;
+        }
+        j
+    };
+    if !lead(last_start) {
+        return None;
+    }
+    ty(last)
 }
 
 /// [`string_literal_end`] for an escape string, `None` when it never closes.
@@ -824,6 +1090,51 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// Each spelling PostgreSQL types a literal with, rewritten to the value
+    /// that type reads; everything else left byte for byte.
+    #[test]
+    fn a_typed_timestamp_literal_loses_its_zone_and_keeps_its_meaning() {
+        use super::zone_free_timestamp_literals as z;
+        let t = "'2024-01-01 10:00:00+02'";
+        for (sql, want) in [
+            (format!("SELECT {t}::timestamptz"), "SELECT '2024-01-01 08:00:00'::timestamptz"),
+            (format!("SELECT {t} :: TIMESTAMPTZ(3)"), "SELECT '2024-01-01 08:00:00' :: TIMESTAMPTZ(3)"),
+            (format!("SELECT {t}::timestamp"), "SELECT '2024-01-01 10:00:00'::timestamp"),
+            (format!("SELECT {t}::timestamp with time zone"), "SELECT '2024-01-01 08:00:00'::timestamp with time zone"),
+            (format!("SELECT {t}::timestamp(0) without time zone"), "SELECT '2024-01-01 10:00:00'::timestamp(0) without time zone"),
+            (format!("VALUES (TIMESTAMPTZ {t})"), "VALUES (TIMESTAMPTZ '2024-01-01 08:00:00')"),
+            (format!("VALUES (timestamp {t})"), "VALUES (timestamp '2024-01-01 10:00:00')"),
+            (format!("VALUES(TIMESTAMP(3) {t})"), "VALUES(TIMESTAMP(3) '2024-01-01 10:00:00')"),
+            (format!("VALUES (TIMESTAMP WITH TIME ZONE {t})"), "VALUES (TIMESTAMP WITH TIME ZONE '2024-01-01 08:00:00')"),
+            (format!("VALUES (CAST({t} AS timestamptz))"), "VALUES (CAST('2024-01-01 08:00:00' AS timestamptz))"),
+            (format!("VALUES (cast ( {t} as timestamp))"), "VALUES (cast ( '2024-01-01 10:00:00' as timestamp))"),
+        ] {
+            assert_eq!(z(&sql), want, "{sql}");
+        }
+        // Not typed, not a timestamp, no zone, or not a literal at all.
+        for sql in [
+            format!("SELECT * FROM t WHERE timestamp_col = {t}"),
+            format!("SELECT {t}::text FROM timestamps"),
+            format!("SELECT x AT TIME ZONE {t}"),
+            "SELECT 'now'::timestamptz".to_string(),
+            "SELECT '2024-01-01 10:00:00'::timestamptz".to_string(),
+            "SELECT '2024-01-01 10:00:00Z'::timestamp".to_string(),
+            format!("SELECT \"{t}\"::timestamptz"),
+            format!("SELECT t.timestamp {t}"),
+            format!("SELECT 1 -- {t}::timestamptz\n"),
+            format!("SELECT E{t}::text, $$x$$::timestamp"),
+        ] {
+            assert_eq!(z(&sql), sql.as_str(), "{sql}");
+        }
+        // Through the entry point every statement takes.
+        assert_eq!(
+            super::normalize_string_literals(&format!("SELECT E'a', {t}::timestamptz")).unwrap(),
+            "SELECT 'a', '2024-01-01 08:00:00'::timestamptz"
+        );
+        assert!(super::has_zoned_timestamp_literal("a > '2024-01-01 09:00:00+05'"));
+        assert!(!super::has_zoned_timestamp_literal("a > '2024-01-01 09:00:00'"));
+    }
+
     #[test]
     fn a_doubled_quote_in_an_identifier_is_found_and_nowhere_else() {
         use super::identifier_with_doubled_quote as found;

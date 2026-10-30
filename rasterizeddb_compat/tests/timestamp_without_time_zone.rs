@@ -274,3 +274,59 @@ async fn a_prepared_lookup_reads_each_bound_literal_without_its_zone() {
         .get(0);
     assert_eq!(n, 1);
 }
+
+/// A cast or a type name on a literal says which type reads it, and every
+/// reader agrees: the write, a predicate (with and without an index), a
+/// stored DEFAULT and a CHECK. `::timestamptz` and `TIMESTAMPTZ '…'` convert
+/// by the zone; `::timestamp` and `TIMESTAMP '…'` drop it. A row written with
+/// one spelling is found by the same spelling, as PostgreSQL 17 finds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_or_type_name_on_a_literal_decides_how_its_zone_is_read() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tc (k INT NOT NULL, a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
+    run(
+        &c,
+        "INSERT INTO tc VALUES \
+         (1, '2024-01-01 10:00:00+02'::timestamptz, '2024-01-01 10:00:00+02'::timestamp), \
+         (2, TIMESTAMPTZ '2024-01-01 10:00:00+02', TIMESTAMP '2024-01-01 10:00:00+02'), \
+         (3, CAST('2024-01-01 10:00:00+02' AS timestamptz), CAST('2024-01-01 10:00:00+02' AS timestamp)), \
+         (4, '2024-01-01 07:30:00', NULL), (5, '2024-01-01 10:00:00', NULL), (6, NULL, NULL)",
+    )
+    .await
+    .expect("insert");
+    let got = rows(&c, "SELECT a, b FROM tc WHERE k <= 3 ORDER BY k").await;
+    for row in &got {
+        assert_eq!(wall(row[0].as_deref().unwrap()), "2024-01-01 08:00:00", "{got:?}");
+        assert_eq!(row[1].as_deref(), Some("2024-01-01 10:00:00+00"), "{got:?}");
+    }
+    let queries = [
+        ("SELECT k FROM tc WHERE a = '2024-01-01 10:00:00+02'::timestamptz ORDER BY k", vec!["1", "2", "3"]),
+        ("SELECT k FROM tc WHERE a > '2024-01-01 09:45:00+02'::timestamptz ORDER BY k", vec!["1", "2", "3", "5"]),
+        ("SELECT k FROM tc WHERE a = TIMESTAMP '2024-01-01 10:00:00+02' ORDER BY k", vec!["5"]),
+        ("SELECT k FROM tc WHERE a = '2024-01-01 10:00:00+02'::timestamp ORDER BY k", vec!["5"]),
+        ("SELECT k FROM tc WHERE b = '2024-01-01 10:00:00+02'::timestamp ORDER BY k", vec!["1", "2", "3"]),
+    ];
+    for (sql, want) in &queries {
+        assert_eq!(&column(&c, sql).await, want, "{sql}");
+    }
+    // And through an index on the column.
+    run(&c, "CREATE INDEX tc_a ON tc (a)").await.expect("index");
+    for (sql, want) in &queries {
+        assert_eq!(&column(&c, sql).await, want, "indexed: {sql}");
+    }
+
+    // A DEFAULT and a CHECK keep the type their literal was given.
+    run(
+        &c,
+        "CREATE TABLE td (k INT, a TIMESTAMP DEFAULT '2024-01-01 10:00:00+02'::timestamptz, \
+         c TIMESTAMP CHECK (c < '2024-01-01 09:00:00+05'::timestamptz))",
+    )
+    .await
+    .expect("create");
+    run(&c, "INSERT INTO td (k) VALUES (1)").await.expect("default");
+    assert_eq!(walls(column(&c, "SELECT a FROM td").await), ["2024-01-01 08:00:00"]);
+    let e = run(&c, "INSERT INTO td (k, c) VALUES (2, '2024-01-01 05:00:00')").await.expect_err("PostgreSQL: 23514");
+    assert_eq!(e.code().map(|c| c.code()), Some("23514"), "{e}");
+    run(&c, "INSERT INTO td (k, c) VALUES (3, '2024-01-01 03:00:00')").await.expect("within the check");
+}
