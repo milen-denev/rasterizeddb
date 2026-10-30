@@ -1107,13 +1107,13 @@ enum SharedOrder {
 /// partitioned table's values (3 lowered to 1, and 2 handed out again).
 ///
 /// The plain table's own values can still collide with the partitioned
-/// table's, and a plain table that seeds the counter below values the
-/// partitioned one holds makes both draw them again (it seeds from its own
-/// maximum: `sequence::follow_rename` documents that sharing). That predates
-/// P5a and is kept out of the way here (the plain table's maximum is raised
-/// to the partitioned table's, except in the plain-only case, which needs
-/// the low seed and has the partitioned table take nothing meanwhile); only
-/// the partitioned table's values are asserted.
+/// table's: seeding the counter first, it draws from its own maximum. (That
+/// the partitioned table then draws its own values again is fixed, and
+/// pinned by `a_shared_sequence_is_raised_to_each_tables_floor`; the plain
+/// table's maximum is still raised to the partitioned table's here, except
+/// in the plain-only case, which needs the low seed and has the partitioned
+/// table take nothing meanwhile.) Only the partitioned table's values are
+/// asserted.
 ///
 /// Mutations: `SerialSource::open` starting `tracked` false (plain-first
 /// repeats, clean and crash-like); `record_exact` lowering entries not
@@ -1190,6 +1190,90 @@ async fn a_shared_sequence_never_repeats_a_partitioned_tables_values() {
             assert_eq!(got.len(), expected + 2, "{what}");
             assert_distinct(&got, &what);
             close(&dir, db);
+        }
+    }
+}
+
+/// A sequence two tables read, the second through a hand-written
+/// `DEFAULT nextval('…')`: whichever inserts first after a restart seeds the
+/// counter, and the other raises it to its own floor before its first insert
+/// in the process (a partitioned table to its reservation, with no scan; a
+/// plain one to its column's maximum). The table that holds `1..5` never draws
+/// one of them again, in either order, after clean and crash-like restarts,
+/// partitioned or plain; nor after a further restart.
+///
+/// From the rebase review's `probe_shared_sequence_low_foreign_seed_in_process`:
+/// the plain `sb`, inserting first, seeded the counter from its own maximum
+/// (0), and `seed_sequences` then skipped `sa` because the sequence was
+/// seeded. `sa` drew 2 and 3 again: `[1, 2, 2, 3, 3, 4, 5]`.
+///
+/// Mutations: `seed_sequences` asking `is_seeded` instead of `is_floored`
+/// (the skip: repeats in every `sb`-first case); `sequence::seed` without the
+/// `fetch_max` (the floor never reaches a seeded counter: the same repeats).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_sequence_is_raised_to_each_tables_floor() {
+    for partitioned in [true, false] {
+        for sb_first in [true, false] {
+            for clean in [true, false] {
+                let what = format!(
+                    "{} sa, {} first, {} restarts",
+                    if partitioned { "partitioned" } else { "plain" },
+                    if sb_first { "sb" } else { "sa" },
+                    if clean { "clean" } else { "crash-like" }
+                );
+                let base = tempfile::tempdir().unwrap();
+                let dir = base.path().join("db");
+                let db = open(&dir).await;
+                if partitioned {
+                    exec(&db, "CREATE TABLE sa (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT) PARTITION BY HASH (tenant_id) PARTITIONS 4").await;
+                } else {
+                    exec(&db, "CREATE TABLE sa (tenant_id BIGINT NOT NULL, id BIGSERIAL, v TEXT)").await;
+                }
+                exec(&db, "CREATE TABLE sb (id BIGINT DEFAULT nextval('sa_id_seq'), v TEXT)").await;
+                exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (1, 'a'), (2, 'a'), (3, 'a'), (4, 'a'), (5, 'a')").await;
+                assert_eq!(serial_ids(&db, "sa").await, vec![1, 2, 3, 4, 5], "{what}");
+                let at: &Path = &dir;
+                let restart = |db: Arc<Database>| async move {
+                    if clean {
+                        db.record_clean_shutdown().await;
+                    }
+                    db.sync_durable().unwrap();
+                    close(at, db);
+                    open(at).await
+                };
+                let db = restart(db).await;
+
+                if sb_first {
+                    exec(&db, "INSERT INTO sb (v) VALUES ('b')").await;
+                }
+                exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (6, 'c'), (7, 'c')").await;
+                if !sb_first {
+                    exec(&db, "INSERT INTO sb (v) VALUES ('b')").await;
+                    let sb = serial_ids(&db, "sb").await;
+                    assert!(sb[0] > 7, "{what}: sb drew {sb:?}, below values sa's first insert took");
+                }
+                let got = serial_ids(&db, "sa").await;
+                assert_eq!(got.len(), 7, "{what}");
+                assert_distinct(&got, &what);
+                assert!(got[5] > 5, "{what}: sa drew a value at or below its floor: {got:?}");
+                if partitioned {
+                    let scans = match db.relation("sa") {
+                        Some(Relation::Partitioned(t)) => t.serial_max_scans(),
+                        _ => 99,
+                    };
+                    assert_eq!(scans, 0, "{what}: the partitioned floor scanned its partitions");
+                }
+
+                // And the restart after: whichever inserted first, the counter
+                // resumes above everything sa holds.
+                let db = restart(db).await;
+                exec(&db, "INSERT INTO sb (v) VALUES ('b2')").await;
+                exec(&db, "INSERT INTO sa (tenant_id, v) VALUES (8, 'd')").await;
+                let got = serial_ids(&db, "sa").await;
+                assert_eq!(got.len(), 8, "{what}");
+                assert_distinct(&got, &format!("{what}, after the next restart"));
+                close(&dir, db);
+            }
         }
     }
 }

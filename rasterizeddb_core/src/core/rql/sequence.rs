@@ -16,6 +16,14 @@
 //! already holds — [`seed_from_rows`]. A restart therefore resumes above every
 //! stored key, which is the property that actually matters.
 //!
+//! A sequence several tables read (a hand-written `DEFAULT nextval('…')` on a
+//! second table) is seeded by whichever inserts first, and every other table
+//! still raises it to its own floor before its first insert in the process
+//! ([`seed`] keeps the larger value, [`is_floored`] records who has). Seeded
+//! once per sequence instead, a table whose rows were higher than the first
+//! inserter's drew values it already held, silently, on a column with no
+//! unique key.
+//!
 //! The difference from PostgreSQL is visible in one place: values consumed by a
 //! transaction that then rolled back are handed out again after a restart,
 //! where PostgreSQL would leave the gap. A gap is not a guarantee `SERIAL`
@@ -47,6 +55,26 @@ static SEQUENCES: std::sync::LazyLock<DashMap<String, AtomicI64>> =
 /// occur in an identifier, so no database and name pair can spell another's.
 fn key(database: u64, name: &str) -> String {
     format!("{}\u{0}{}", database, name)
+}
+
+/// The tables that have raised a sequence to their floor in this process,
+/// by [`floor_key`]. An entry is only meaningful while its sequence has a
+/// counter: [`forget`], [`forget_database`] and [`rename`] drop a sequence's
+/// entries with its counter, so the next reader seeds afresh.
+static FLOORED: std::sync::LazyLock<DashMap<String, ()>> = std::sync::LazyLock::new(DashMap::new);
+
+/// Where `table`'s floor of `database`'s sequence `name` is recorded in
+/// [`FLOORED`]: the sequence's [`key`], a separator, the table. The separator
+/// cannot occur in an identifier, so every entry of a sequence starts with
+/// its key and a separator.
+fn floor_key(database: u64, name: &str, table: &str) -> String {
+    format!("{}\u{0}{}\u{0}{}", database, name, table)
+}
+
+/// Drops every [`FLOORED`] entry of `database`'s sequence `name`.
+fn forget_floors(database: u64, name: &str) {
+    let prefix = format!("{}\u{0}", key(database, name));
+    FLOORED.retain(|k, _| !k.starts_with(&prefix));
 }
 
 /// The name PostgreSQL gives the sequence behind `t.c`.
@@ -102,21 +130,42 @@ pub fn is_seeded(database: u64, name: &str) -> bool {
     SEQUENCES.contains_key(&key(database, name))
 }
 
-/// Records where a sequence resumes, if it has no value yet.
+/// Records where a sequence resumes: never below `last`.
 ///
-/// `last` is the largest value already stored, so the next value handed out is
-/// `last + 1`. A fresh table seeds with `0`.
+/// `last` is the largest value a table already stores (its floor), so the next
+/// value handed out is at least `last + 1`. A fresh table seeds with `0`.
 ///
 /// Returns whether this call seeded it: `false` when the sequence already had
-/// a counter (another table sharing it seeded it first), which is left as it
-/// was.
+/// a counter (another table sharing it seeded it first). That counter is
+/// raised to `last` if it is below it, and otherwise left as it was: seeded
+/// from the other table's rows, it could sit below this table's, and the
+/// next values would repeat keys this table holds.
 pub fn seed(database: u64, name: &str, last: i64) -> bool {
     let mut seeded = false;
-    SEQUENCES.entry(key(database, name)).or_insert_with(|| {
-        seeded = true;
-        AtomicI64::new(last)
-    });
+    SEQUENCES
+        .entry(key(database, name))
+        .or_insert_with(|| {
+            seeded = true;
+            AtomicI64::new(last)
+        })
+        .value()
+        .fetch_max(last, Ordering::SeqCst);
     seeded
+}
+
+/// Whether `table` has raised `database`'s sequence `name` to its floor in
+/// this process ([`mark_floored`]): what an insert into `table` must make
+/// true before it takes a value. Not whether the sequence has a counter:
+/// another table sharing it may have seeded it from lower rows.
+pub fn is_floored(database: u64, name: &str, table: &str) -> bool {
+    FLOORED.contains_key(&floor_key(database, name, table))
+}
+
+/// Records that `table`'s floor is in `database`'s counter `name`. After the
+/// [`seed`] that put it there, never before: a concurrent insert that sees
+/// the mark takes values straight away.
+pub fn mark_floored(database: u64, name: &str, table: &str) {
+    FLOORED.insert(floor_key(database, name, table), ());
 }
 
 /// The next value of `database`'s sequence `name`.
@@ -153,6 +202,7 @@ pub fn current(database: u64, name: &str) -> Option<i64> {
 pub fn forget(database: u64, names: &[String]) {
     for name in names {
         SEQUENCES.remove(&key(database, name));
+        forget_floors(database, name);
     }
 }
 
@@ -163,6 +213,7 @@ pub fn forget(database: u64, names: &[String]) {
 pub fn forget_database(database: u64) {
     let prefix = key(database, "");
     SEQUENCES.retain(|name, _| !name.starts_with(&prefix));
+    FLOORED.retain(|name, _| !name.starts_with(&prefix));
 }
 
 /// The sequences a table owns, which go when it does.
@@ -249,8 +300,10 @@ pub fn named_by(
 /// generated that same name: two tables on one counter. In one process their
 /// keys interleaved; after a restart whichever table inserted first seeded the
 /// counter from its own rows, and the other drew keys above *that* table's
-/// maximum — which can be keys it already holds, stored without complaint when
-/// nothing declares the column unique.
+/// maximum — which could be keys it already held, stored without complaint
+/// when nothing declares the column unique. (Each table now raises a shared
+/// counter to its own floor before its first insert, see [`seed`]; the
+/// tables' keys still interleave, which is why the sharing is removed.)
 ///
 /// Only a default of the shape a `SERIAL` creates moves, and only when nothing
 /// else names either sequence (`named_elsewhere`, as in [`owned_by`]): a
@@ -304,6 +357,9 @@ pub fn follow_rename(
 /// The larger of the two wins if `to` already counts, so no value either has
 /// handed out is handed out again.
 pub fn rename(database: u64, from: &str, to: &str) {
+    // The tables that floored `from` go with it: a table that later reads
+    // the name afresh seeds it from its own rows.
+    forget_floors(database, from);
     let Some((_, counter)) = SEQUENCES.remove(&key(database, from)) else {
         return;
     };
@@ -407,6 +463,33 @@ mod tests {
         // must not reset the counter and hand out 11 again.
         seed(DB, name, 10);
         assert_eq!(next(DB, name), 12);
+    }
+
+    /// A counter another table seeded from lower rows is raised to the
+    /// second table's floor, never lowered by a seed, and a forget or a
+    /// rename takes every table's floor mark with the counter.
+    ///
+    /// Mutation: `seed` without the `fetch_max` (`next` hands out 1).
+    #[test]
+    fn a_second_tables_floor_raises_a_seeded_counter() {
+        let name = "floor_test_seq";
+        assert!(seed(DB, name, 0));
+        mark_floored(DB, name, "sb");
+        assert!(is_floored(DB, name, "sb"));
+        assert!(!is_floored(DB, name, "sa"), "one table's floor counted as another's");
+        assert!(!seed(DB, name, 5), "a seeded counter was reported as seeded again");
+        mark_floored(DB, name, "sa");
+        assert_eq!(next(DB, name), 6, "the counter stayed below the second table's floor");
+        assert!(!seed(DB, name, 2));
+        assert_eq!(next(DB, name), 7, "a lower floor moved the counter back");
+        assert!(!is_floored(OTHER_DB, name, "sa"));
+
+        rename(DB, name, "floor_test_renamed_seq");
+        assert!(!is_floored(DB, name, "sa"), "a renamed-away counter kept its floor marks");
+        assert_eq!(next(DB, "floor_test_renamed_seq"), 8);
+        mark_floored(DB, "floor_test_renamed_seq", "sa");
+        forget(DB, &["floor_test_renamed_seq".to_string()]);
+        assert!(!is_floored(DB, "floor_test_renamed_seq", "sa"), "a forgotten counter kept its floor marks");
     }
 
     #[test]

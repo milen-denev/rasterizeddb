@@ -34,11 +34,12 @@
 //! reservation still covers the counter whoever seeds it: entries are
 //! tracked from the open, so [`SerialSource::cover`] raises one the counter
 //! has passed even when the other table seeded the counter first, and a
-//! clean shutdown lowers only an entry this table seeded (`Entry::
-//! seeded_here`), since a counter the other table seeded from its own rows
-//! can be below this table's values. (That low seed is itself an older
-//! defect, documented at `rql::sequence::follow_rename`: both tables then
-//! draw values this one already holds.)
+//! clean shutdown lowers only an entry this table has floored the counter
+//! with in this process (`Entry::seeded_here`): until then a counter the
+//! other table seeded from its own rows can be below this table's values.
+//! This table's first insert raises such a counter to the reservation
+//! ([`SerialSource::resume`]); it used to leave it, and drew values it
+//! already held.
 //!
 //! An explicit value written into a `SERIAL` column does not move the
 //! counter, as in PostgreSQL: a later default can repeat it.
@@ -191,24 +192,27 @@ impl SerialSource {
     /// the next value is one past it. `false` when it has none, and the
     /// caller seeds from the maximum and then [`Self::track`]s it.
     ///
-    /// The entry is seeded here only if this seed is the counter's: another
-    /// table may have seeded it between the caller's check and this.
+    /// A counter another table sharing the sequence seeded first, from its
+    /// own rows, is raised to the reservation rather than left below it:
+    /// left, this table drew values it already held. Either way the counter
+    /// is at or above every value this table holds afterwards, so the entry
+    /// is seeded here.
     pub(crate) fn resume(&self, name: &str) -> bool {
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(name) else {
             return false;
         };
-        if crate::core::rql::sequence::seed(self.db_id, name, entry.reserved) {
-            entry.seeded_here = true;
-        }
+        crate::core::rql::sequence::seed(self.db_id, name, entry.reserved);
+        entry.seeded_here = true;
         self.tracked.store(true, Ordering::Release);
         true
     }
 
     /// Tracks `name`, whose counter the caller seeded from the maximum `last`
-    /// (`seeded`: whether that seed was the counter's, as
-    /// `rql::sequence::seed` reports): reserved at `last`, so the first value
-    /// taken raises it. Before any value is taken.
+    /// (`seeded`: whether the counter is now known to be at or above `last`,
+    /// which `rql::sequence::seed` guarantees whoever seeded it first):
+    /// reserved at `last`, so the first value taken raises it. Before any
+    /// value is taken.
     pub(crate) fn track(&self, name: &str, last: i64, seeded: bool) {
         self.max_scans.fetch_add(1, Ordering::AcqRel);
         if self.io.is_none() {

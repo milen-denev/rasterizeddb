@@ -11339,6 +11339,14 @@ fn collect_condition_columns(
 /// process, and only for a table that actually declares a serial column. A
 /// table with none returns before reading anything.
 ///
+/// Per table, not per sequence: a sequence another table also reads (a
+/// hand-written `DEFAULT nextval('…')`) may already have been seeded, from
+/// that table's rows, which can be below this table's. Skipping the seed
+/// then, as this did, handed this table keys it already held. So each table
+/// raises the counter to its own floor ([`crate::core::rql::sequence::seed`]
+/// keeps the larger) and marks it done
+/// ([`crate::core::rql::sequence::mark_floored`]).
+///
 /// A partitioned table's sequence is the logical table's, one for all its
 /// partitions (§10), so it is seeded from the maximum over every materialized
 /// partition; an unmaterialized one holds no row. Read through the shell, the
@@ -11373,7 +11381,7 @@ async fn seed_sequences(
         let Some(name) = crate::core::rql::sequence::parse_nextval(expression) else {
             continue;
         };
-        if !crate::core::rql::sequence::is_seeded(database.id, &name) {
+        if !crate::core::rql::sequence::is_floored(database.id, &name, table_name) {
             wanted.push((name, field.clone()));
         }
     }
@@ -11388,14 +11396,18 @@ async fn seed_sequences(
     let empty = crate::core::rql::join::fetch_for(&[], schema);
     if let Some(pt) = partitioned {
         // From the durable reservation when the table has one (§10, phase 3
-        // P5a): no partition is opened or read. Only a sequence it has no
-        // entry for is seeded from the maximum, and then reserved.
+        // P5a): no partition is opened or read. The reservation is at or
+        // above every value a partition holds, so it is the table's floor.
+        // Only a sequence it has no entry for is seeded from the maximum,
+        // and then reserved.
         let mut unseeded = Vec::new();
         for (name, field) in wanted {
-            if !pt
+            if pt
                 .resume_serial(&name)
                 .map_err(|e| format!("could not read '{}' to seed its sequences: {}", table_name, e))?
             {
+                crate::core::rql::sequence::mark_floored(database.id, &name, table_name);
+            } else {
                 unseeded.push((name, field));
             }
         }
@@ -11427,9 +11439,11 @@ async fn seed_sequences(
             let last =
                 crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
                     .unwrap_or(0);
-            let seeded = crate::core::rql::sequence::seed(database.id, &name, last);
-            pt.track_serial(&name, last, seeded)
+            crate::core::rql::sequence::seed(database.id, &name, last);
+            // The counter is at or above `last` now, whoever seeded it.
+            pt.track_serial(&name, last, true)
                 .map_err(|e| format!("could not reserve '{}''s sequence {}: {}", table_name, name, e))?;
+            crate::core::rql::sequence::mark_floored(database.id, &name, table_name);
         }
         return Ok(());
     }
@@ -11456,21 +11470,28 @@ async fn seed_sequences(
             crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
                 .unwrap_or(0);
         crate::core::rql::sequence::seed(database.id, &name, last);
+        crate::core::rql::sequence::mark_floored(database.id, &name, table_name);
     }
     Ok(())
 }
 
-/// Whether `schema` declares a serial column whose sequence this process
-/// has not seeded yet: what [`seed_sequences`] would do anything for. One
-/// pass over the defaults, no allocation; false for nearly every insert.
-fn has_unseeded_sequence(database: &Database, schema: &crate::core::row::schema::TableSchema) -> bool {
+/// Whether `schema` (table `table_name`'s) declares a serial column whose
+/// sequence this table has not raised to its floor in this process: what
+/// [`seed_sequences`] would do anything for. One pass over the defaults; no
+/// allocation for a table without a `nextval` default, which is nearly every
+/// insert.
+fn has_unseeded_sequence(
+    database: &Database,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+) -> bool {
     if schema.defaults.is_empty() {
         return false;
     }
     schema.fields.iter().filter(|f| !f.is_deleted).any(|field| {
         crate::core::rql::column_default::expression_for(&field.name, &schema.defaults)
             .and_then(crate::core::rql::sequence::parse_nextval)
-            .is_some_and(|name| !crate::core::rql::sequence::is_seeded(database.id, &name))
+            .is_some_and(|name| !crate::core::rql::sequence::is_floored(database.id, &name, table_name))
     })
 }
 
@@ -16068,7 +16089,7 @@ pub(crate) async fn insert_loaded_row(
         .await
         .ok()
         .flatten()?;
-    if has_unseeded_sequence(database, &table.schema) {
+    if has_unseeded_sequence(database, table_name, &table.schema) {
         let target = crate::core::database::Relation::Plain(table.clone());
         Box::pin(seed_sequences(database, table_name, Some(&target))).await.ok()?;
     }
@@ -17124,7 +17145,7 @@ pub(crate) async fn execute_with_need(
             // in memory and a reopened database has not yet learned what the
             // table already holds. Skipped for a table with no serial column,
             // and after the first insert for one that has.
-            if target.as_ref().is_some_and(|t| has_unseeded_sequence(&database, t.schema())) {
+            if target.as_ref().is_some_and(|t| has_unseeded_sequence(&database, &row_data.table_name, t.schema())) {
                 if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name, target.as_ref())).await {
                     error!("{}", e);
                     return ddl_error(&e);
