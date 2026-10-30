@@ -88,6 +88,13 @@ async fn a_timestamp_expression_is_shown_without_an_offset() {
         .await,
         ["2024-01-01 08:00:00|2024-01-01 10:00:00+00|2024-01-01 08:00:00"]
     );
+    // A literal among the branches is read as their common type is.
+    run(&c, "CREATE TABLE tn (a TIMESTAMP, b TIMESTAMPTZ)").await;
+    run(&c, "INSERT INTO tn VALUES (NULL, NULL)").await;
+    assert_eq!(
+        rows(&c, "SELECT coalesce(a, '2000-01-01 12:00:00+05')::text, coalesce(b, '2000-01-01 12:00:00+05')::text FROM tn").await,
+        ["2000-01-01 12:00:00|2000-01-01 07:00:00+00"]
+    );
     // A generated text column over the column. (PostgreSQL refuses this as
     // not immutable; here it is computed, and its text is the select's.)
     run(&c, "CREATE TABLE gt (k INT, a TIMESTAMP, txt TEXT GENERATED ALWAYS AS (a::text) STORED, cat TEXT GENERATED ALWAYS AS ('at ' || a) STORED)").await;
