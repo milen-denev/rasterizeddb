@@ -2017,7 +2017,6 @@ fn emit_group(
             SelectItem::Computed {
                 expr,
                 inputs,
-                db_type,
                 ..
             } => {
                 // The finished aggregates become a one-row table the expression
@@ -2661,7 +2660,6 @@ mod fold_previous {
                     SelectItem::Computed {
                         expr,
                         inputs,
-                        db_type,
                         ..
                     } => {
                         // The finished aggregates become a one-row table the
@@ -4136,7 +4134,6 @@ mod fold_reference {
                     SelectItem::Computed {
                         expr,
                         inputs,
-                        db_type,
                         ..
                     } => {
                         // The finished aggregates become a one-row table the
