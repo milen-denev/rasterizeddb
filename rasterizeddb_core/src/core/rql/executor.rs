@@ -7571,13 +7571,15 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
 
 /// The bytes one arbiter column of one `VALUES` row keys on, for the batch
 /// 21000 check; `None` when the row can equal no other on it, so it is left
-/// out. A value written is evaluated into the column; an omitted column or
-/// `DEFAULT` takes the column's default when that is a constant (two rows
-/// both defaulting to `5` are one key). `None` for NULL, which equals
-/// nothing (`(1, NULL), (1, NULL)` under `UNIQUE (x, k)` inserts both), for
-/// a default computed per row (a sequence's next value), a generated column,
-/// and a value that cannot be evaluated here: compared as written, `NULL`
-/// and `'NULL'`, `DEFAULT` and `'DEFAULT'` were taken for one key.
+/// out. A value written is evaluated into the column (tagged 1); an omitted
+/// column or `DEFAULT` takes the column's default when that is a constant
+/// (two rows both defaulting to `5` are one key). A constant this cannot
+/// evaluate into the column (a TIME, an INET) is compared as written, tagged
+/// 0, so it meets only another such text, never an evaluated key, NULL or
+/// DEFAULT: two `'10:00:00'` are one key, as on base. `None` for NULL,
+/// which equals nothing (`(1, NULL), (1, NULL)` under `UNIQUE (x, k)`
+/// inserts both), for a default computed per row (a sequence's next
+/// value), and for a generated column.
 fn batch_key_part(
     written: Option<&str>,
     field: &crate::core::row::schema::SchemaField,
@@ -7596,7 +7598,22 @@ fn batch_key_part(
             }
         }
     };
-    stored_key_bytes(&literal, field)
+    if literal.eq_ignore_ascii_case("NULL") {
+        return None;
+    }
+    match stored_key_bytes(&literal, field) {
+        Some(bytes) => Some(std::iter::once(1u8).chain(bytes).collect()),
+        None => match crate::core::rql::expr::parse(&literal, &[]) {
+            // NULL however written (`NULL::text`, `(NULL)`) equals nothing.
+            Ok(expr)
+                if crate::core::rql::expr::eval(&expr, &crate::core::row::row::Row::default(), &[])
+                    .is_ok_and(|v| v.is_null()) =>
+            {
+                None
+            }
+            _ => Some(std::iter::once(0u8).chain(literal.bytes()).collect()),
+        },
+    }
 }
 
 /// The bytes `literal` is stored as in `field`, for comparing two rows'
@@ -7611,6 +7628,13 @@ fn stored_key_bytes(literal: &str, field: &crate::core::row::schema::SchemaField
     let text = literal.trim();
     if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
+    }
+    // An integer into a text column is its digits, as PostgreSQL's
+    // assignment cast writes them: `(5)` and `('5')` are one key.
+    if field.db_type == crate::core::db_type::DbType::STRING
+        && let Ok(n) = text.parse::<i128>()
+    {
+        return Some(n.to_string().into_bytes());
     }
     let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
     if !crate::core::rql::expr::columns_of(&expr).is_empty() {

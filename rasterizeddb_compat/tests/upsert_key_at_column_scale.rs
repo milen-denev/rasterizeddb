@@ -72,7 +72,8 @@ async fn upserts(partitioning: &str) {
              CREATE TABLE kn (id INT PRIMARY KEY, u TEXT UNIQUE, v INT); \
              CREATE TABLE kc (x INT, k INT, v INT, UNIQUE (x, k)); \
              CREATE TABLE ks (id SERIAL PRIMARY KEY, v INT); CREATE TABLE kt2 (k TEXT PRIMARY KEY, v INT); \
-             CREATE TABLE kf (id INT PRIMARY KEY, k INT UNIQUE DEFAULT 5, v INT)"
+             CREATE TABLE kf (id INT PRIMARY KEY, k INT UNIQUE DEFAULT 5, v INT); \
+             CREATE TABLE ktm (k TIME PRIMARY KEY, v INT); CREATE TABLE kin (k INET PRIMARY KEY, v INT)"
         ))
         .await
         .expect("setup");
@@ -123,6 +124,13 @@ async fn upserts(partitioning: &str) {
         // An omitted key, or DEFAULT, takes a constant default: both rows 5.
         "INSERT INTO kf (id, v) VALUES (1, 1), (2, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
         "INSERT INTO kf VALUES (1, DEFAULT, 1), (2, 5, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        // A key this cannot evaluate is compared as written (as on base):
+        // two identical ones are one key.
+        "INSERT INTO ktm VALUES ('10:00:00', 1), ('10:00:00', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO kin VALUES ('10.0.0.1', 1), ('10.0.0.1', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        // An integer into a text key is its digits, as the assignment cast.
+        "INSERT INTO ux VALUES (6, 1), (6, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO ux VALUES ('5', 1), (5, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
     ] {
         let got = text(&client, sql).await;
         if got != Err("21000".to_string()) {
@@ -137,6 +145,8 @@ async fn upserts(partitioning: &str) {
         ("SELECT count(*) FROM ut", &["0"]),
         ("SELECT count(*) FROM ub", &["0"]),
         ("SELECT count(*) FROM kf", &["0"]),
+        ("SELECT count(*) FROM ktm", &["0"]),
+        ("SELECT count(*) FROM kin", &["0"]),
         // NULL equals nothing, and is not the text 'NULL': every row stored,
         // as in PostgreSQL 17.
         ("INSERT INTO kn VALUES (1, NULL, 1), (2, NULL, 2) ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v", &[]),
