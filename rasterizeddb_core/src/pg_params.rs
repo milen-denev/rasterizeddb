@@ -504,8 +504,17 @@ fn push_text_param_literal(out: &mut String, oid: i32, text: &str) {
             } else {
                 crate::core::value_codec::parse_timestamp_local_us(text)
             };
-            match us.map(crate::core::value_codec::format_timestamp_us) {
-                Some(utc) if crate::core::value_codec::parse_timestamp_us(&utc) == us => push_quoted_literal(out, &utc),
+            // A `timestamptz` keeps an explicit `+00` (`zone_free_timestamp_literals`
+            // says why): into a text column it is shown as PostgreSQL shows it.
+            let rendered = us.map(|us| {
+                let mut t = crate::core::value_codec::format_timestamp_us(us);
+                if oid == OID_TIMESTAMPTZ {
+                    t.push_str("+00");
+                }
+                t
+            });
+            match rendered {
+                Some(t) if crate::core::value_codec::parse_timestamp_us(&t) == us => push_quoted_literal(out, &t),
                 _ => push_quoted_literal(out, text),
             }
         }
@@ -1095,13 +1104,13 @@ mod tests {
     #[test]
     fn a_timestamp_text_parameter_is_read_at_its_declared_type() {
         let zoned = "2024-01-01 10:00:00+02";
-        assert_eq!(param_to_literal(&text(OID_TIMESTAMPTZ, zoned)).unwrap(), "'2024-01-01 08:00:00'");
+        assert_eq!(param_to_literal(&text(OID_TIMESTAMPTZ, zoned)).unwrap(), "'2024-01-01 08:00:00+00'");
         assert_eq!(param_to_literal(&text(OID_TIMESTAMP, zoned)).unwrap(), "'2024-01-01 10:00:00'");
         assert_eq!(param_to_literal(&text(OID_TIMESTAMPTZ, "infinity")).unwrap(), "'infinity'");
         assert_eq!(
             inline_params("SELECT $1::timestamptz, $2::timestamp, $3::text", &[text(0, zoned), text(0, zoned), text(0, zoned)])
                 .unwrap(),
-            "SELECT '2024-01-01 08:00:00', '2024-01-01 10:00:00', '2024-01-01 10:00:00+02'"
+            "SELECT '2024-01-01 08:00:00+00', '2024-01-01 10:00:00', '2024-01-01 10:00:00+02'"
         );
     }
 

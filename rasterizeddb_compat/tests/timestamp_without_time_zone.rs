@@ -396,3 +396,40 @@ async fn a_generated_column_reads_the_timestamp_as_its_type_and_blocks_the_flip(
     run(&c, "INSERT INTO fl4 (k, a) VALUES (1, '2024-01-01 06:00:00'), (2, '2024-01-01 10:00:00')").await.expect("insert");
     assert_eq!(column(&c, "SELECT late FROM fl4 ORDER BY k").await, ["f", "t"]);
 }
+
+/// A timestamp-typed literal written into a text column is shown as
+/// PostgreSQL shows that type as text: `+00` for `timestamptz`, no zone for
+/// `timestamp`; a parenthesised literal is cast as one. PostgreSQL 17 for
+/// each.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timestamp_typed_literal_into_text_reads_as_postgresql_shows_it() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tt (k INT, v TEXT, a TIMESTAMP, b TIMESTAMPTZ)").await.expect("create");
+    run(
+        &c,
+        "INSERT INTO tt (k, v) VALUES (1, '2024-01-01 10:00:00+02'::timestamptz), \
+         (2, '2024-01-01 10:00:00+02'::timestamp), (3, '2024-01-01 10:00:00'::timestamptz), \
+         (4, '2024-01-01 10:00:00+02')",
+    )
+    .await
+    .expect("insert");
+    run(&c, "INSERT INTO tt (k, a, b) VALUES (5, ('2024-01-01 10:00:00+02')::timestamp, ('2024-01-01 10:00:00+02')::timestamp)")
+        .await
+        .expect("parenthesised");
+    run(&c, "INSERT INTO tt (k, v) VALUES (6, 'x')").await.expect("insert");
+    run(&c, "UPDATE tt SET v = '2024-01-01 10:00:00+02'::timestamptz WHERE k = 6").await.expect("update");
+    assert_eq!(
+        column(&c, "SELECT v FROM tt WHERE k IN (1, 2, 3, 4, 6) ORDER BY k").await,
+        [
+            "2024-01-01 08:00:00+00",
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00+00",
+            "2024-01-01 10:00:00+02",
+            "2024-01-01 08:00:00+00"
+        ]
+    );
+    let got = rows(&c, "SELECT a, b FROM tt WHERE k = 5").await;
+    assert_eq!(wall(got[0][0].as_deref().unwrap()), "2024-01-01 10:00:00", "{got:?}");
+    assert_eq!(got[0][1].as_deref(), Some("2024-01-01 10:00:00+00"), "{got:?}");
+}

@@ -675,9 +675,9 @@ fn escapes_resolved(sql: &str) -> Result<String, String> {
 /// Every string literal the statement types as `timestamp` or `timestamptz`
 /// (`'…'::timestamptz`, `TIMESTAMP '…'`, `CAST('…' AS timestamp with time
 /// zone)`, a precision allowed) whose text carries a zone, rewritten with no
-/// zone and the same meaning: the wall-clock time for `timestamp`, which
-/// discards the zone, and the UTC time for `timestamptz`, which converts by
-/// it (the session time zone is UTC).
+/// zone left to read two ways and the same meaning: the wall-clock time for
+/// `timestamp`, which discards the zone, and the UTC time with `+00` for
+/// `timestamptz`, which converts by it (the session time zone is UTC).
 ///
 /// The two types read the same text differently, and the cast or type name
 /// that says which does not reach every reader of the literal: the write path
@@ -737,6 +737,45 @@ pub fn zone_free_timestamp_literals(sql: &str) -> Cow<'_, str> {
     }
 }
 
+/// A lone literal cast to `timestamp` or `timestamptz` (`'…'::timestamptz`),
+/// as PostgreSQL shows the value as text: with `+00` for `timestamptz` (the
+/// session is UTC), with no zone for `timestamp`. `None` for anything else.
+///
+/// The value written into a text column. Evaluated as a cast it became the
+/// one storage type both are, and was shown without its `+00`.
+pub fn timestamp_cast_as_text(value: &str) -> Option<String> {
+    use crate::core::value_codec::{format_timestamp_us, parse_timestamp_local_us, parse_timestamp_us};
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'\'') {
+        return None;
+    }
+    let end = string_literal_end(bytes, 0, false);
+    if end < 2 || bytes[end - 1] != b'\'' {
+        return None;
+    }
+    let body = &value[1..end - 1];
+    let cast = value[end..].trim_start().strip_prefix("::")?.trim_start();
+    let (with_zone, len) = timestamp_type_at(cast)?;
+    let rest = cast[len..].trim();
+    let zone_words = |kind: &str| {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        words.len() == 3
+            && words[0].eq_ignore_ascii_case(kind)
+            && words[1].eq_ignore_ascii_case("time")
+            && words[2].eq_ignore_ascii_case("zone")
+    };
+    if !(rest.is_empty() || zone_words("with") || zone_words("without")) || body.contains('\'') {
+        return None;
+    }
+    let us = if with_zone { parse_timestamp_us(body)? } else { parse_timestamp_local_us(body)? };
+    let mut text = format_timestamp_us(us);
+    if with_zone {
+        text.push_str("+00");
+    }
+    Some(text)
+}
+
 /// Whether `text` holds a string literal that reads as a timestamp with a
 /// zone in it (`'… 09:00+05'`): one that `timestamp` and `timestamptz` read as
 /// two different values.
@@ -768,7 +807,13 @@ fn zone_free(body: &str, with_zone: bool) -> Option<String> {
         return None;
     }
     let us = if with_zone { utc } else { wall };
-    let text = format_timestamp_us(us);
+    // A `timestamptz` keeps an explicit `+00`, which every reader takes as
+    // the same instant and which is how PostgreSQL shows it as text: written
+    // into a text column, `'… 10:00+02'::timestamptz` is `… 08:00:00+00`.
+    let mut text = format_timestamp_us(us);
+    if with_zone {
+        text.push_str("+00");
+    }
     (parse_timestamp_us(&text) == Some(us)).then_some(text)
 }
 
@@ -777,6 +822,17 @@ fn zone_free(body: &str, with_zone: bool) -> Option<String> {
 /// or `CAST(… AS …)` around it; `None` when it is not typed either way.
 fn timestamp_type_of_literal(sql: &str, start: usize, end: usize) -> Option<bool> {
     let after = sql[end..].trim_start();
+    // `('…')::timestamp`: a literal alone in parentheses (not a call's
+    // argument, `f('…')::timestamp`), cast as one.
+    if let Some(rest) = after.strip_prefix(')') {
+        let before = sql[..start].trim_end();
+        if let Some(open) = before.strip_suffix('(') {
+            let call = open.trim_end().as_bytes().last().is_some_and(|b| is_identifier_byte(*b));
+            if let (false, Some(cast)) = (call, rest.trim_start().strip_prefix("::")) {
+                return timestamp_type_at(cast.trim_start()).map(|(tz, _)| tz);
+            }
+        }
+    }
     if let Some(cast) = after.strip_prefix("::") {
         return timestamp_type_at(cast.trim_start()).map(|(tz, _)| tz);
     }
@@ -1097,17 +1153,19 @@ mod tests {
         use super::zone_free_timestamp_literals as z;
         let t = "'2024-01-01 10:00:00+02'";
         for (sql, want) in [
-            (format!("SELECT {t}::timestamptz"), "SELECT '2024-01-01 08:00:00'::timestamptz"),
-            (format!("SELECT {t} :: TIMESTAMPTZ(3)"), "SELECT '2024-01-01 08:00:00' :: TIMESTAMPTZ(3)"),
+            (format!("SELECT {t}::timestamptz"), "SELECT '2024-01-01 08:00:00+00'::timestamptz"),
+            (format!("SELECT {t} :: TIMESTAMPTZ(3)"), "SELECT '2024-01-01 08:00:00+00' :: TIMESTAMPTZ(3)"),
             (format!("SELECT {t}::timestamp"), "SELECT '2024-01-01 10:00:00'::timestamp"),
-            (format!("SELECT {t}::timestamp with time zone"), "SELECT '2024-01-01 08:00:00'::timestamp with time zone"),
+            (format!("SELECT {t}::timestamp with time zone"), "SELECT '2024-01-01 08:00:00+00'::timestamp with time zone"),
             (format!("SELECT {t}::timestamp(0) without time zone"), "SELECT '2024-01-01 10:00:00'::timestamp(0) without time zone"),
-            (format!("VALUES (TIMESTAMPTZ {t})"), "VALUES (TIMESTAMPTZ '2024-01-01 08:00:00')"),
+            (format!("VALUES (TIMESTAMPTZ {t})"), "VALUES (TIMESTAMPTZ '2024-01-01 08:00:00+00')"),
             (format!("VALUES (timestamp {t})"), "VALUES (timestamp '2024-01-01 10:00:00')"),
             (format!("VALUES(TIMESTAMP(3) {t})"), "VALUES(TIMESTAMP(3) '2024-01-01 10:00:00')"),
-            (format!("VALUES (TIMESTAMP WITH TIME ZONE {t})"), "VALUES (TIMESTAMP WITH TIME ZONE '2024-01-01 08:00:00')"),
-            (format!("VALUES (CAST({t} AS timestamptz))"), "VALUES (CAST('2024-01-01 08:00:00' AS timestamptz))"),
+            (format!("VALUES (TIMESTAMP WITH TIME ZONE {t})"), "VALUES (TIMESTAMP WITH TIME ZONE '2024-01-01 08:00:00+00')"),
+            (format!("VALUES (CAST({t} AS timestamptz))"), "VALUES (CAST('2024-01-01 08:00:00+00' AS timestamptz))"),
             (format!("VALUES (cast ( {t} as timestamp))"), "VALUES (cast ( '2024-01-01 10:00:00' as timestamp))"),
+            (format!("VALUES (({t})::timestamp)"), "VALUES (('2024-01-01 10:00:00')::timestamp)"),
+            (format!("VALUES (( {t} ) :: timestamptz)"), "VALUES (( '2024-01-01 08:00:00+00' ) :: timestamptz)"),
         ] {
             assert_eq!(z(&sql), want, "{sql}");
         }
@@ -1121,6 +1179,7 @@ mod tests {
             "SELECT '2024-01-01 10:00:00Z'::timestamp".to_string(),
             format!("SELECT \"{t}\"::timestamptz"),
             format!("SELECT t.timestamp {t}"),
+            format!("SELECT f({t})::timestamp"),
             format!("SELECT 1 -- {t}::timestamptz\n"),
             format!("SELECT E{t}::text, $$x$$::timestamp"),
         ] {
@@ -1129,7 +1188,7 @@ mod tests {
         // Through the entry point every statement takes.
         assert_eq!(
             super::normalize_string_literals(&format!("SELECT E'a', {t}::timestamptz")).unwrap(),
-            "SELECT 'a', '2024-01-01 08:00:00'::timestamptz"
+            "SELECT 'a', '2024-01-01 08:00:00+00'::timestamptz"
         );
         assert!(super::has_zoned_timestamp_literal("a > '2024-01-01 09:00:00+05'"));
         assert!(!super::has_zoned_timestamp_literal("a > '2024-01-01 09:00:00'"));

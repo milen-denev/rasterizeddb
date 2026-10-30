@@ -207,6 +207,16 @@ async fn a_typed_timestamp_value_is_read_as_its_declared_type() {
     assert_eq!(texts(found), [["1"], ["2"]]);
     let found = c.run("", Some("SELECT k FROM ts WHERE b = $1 ORDER BY k"), &[1114], &[Some(zoned)]).await.expect("select");
     assert_eq!(texts(found), [["1"], ["2"]]);
+
+    // Into a text column each is shown as PostgreSQL shows its type as
+    // text: `+00` for timestamptz, no zone for timestamp.
+    c.simple("CREATE TABLE tx (k INT NOT NULL, v TEXT)").await;
+    c.run("", Some("INSERT INTO tx VALUES ($1, $2)"), &[23, 1184], &[Some("1"), Some(zoned)]).await.expect("1184");
+    c.run("", Some("INSERT INTO tx VALUES ($1, $2)"), &[23, 1114], &[Some("2"), Some(zoned)]).await.expect("1114");
+    assert_eq!(
+        texts(c.simple("SELECT v FROM tx ORDER BY k").await),
+        [["2024-01-01 08:00:00+00"], ["2024-01-01 10:00:00"]]
+    );
 }
 
 /// Wherever an untyped value lands in a text column, it is stored as sent:

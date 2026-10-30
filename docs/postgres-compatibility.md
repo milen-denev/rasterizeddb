@@ -124,9 +124,11 @@ yielding the column's value (`CASE … THEN ts`) is still described as
 
 A literal typed by a cast or a type name (`'… 10:00+02'::timestamptz`,
 `TIMESTAMP '…'`, `CAST('…' AS timestamp with time zone)`) is read at that type
-when the statement arrives and rewritten with no zone: the UTC time for
-`timestamptz`, the wall-clock time for `timestamp`
-(`sql_scan::zone_free_timestamp_literals`). Every reader of the literal then
+when the statement arrives and rewritten with no zone left to read two ways:
+the UTC time with `+00` for `timestamptz`, the wall-clock time for `timestamp`
+(`sql_scan::zone_free_timestamp_literals`). Written into a text column such a
+literal is shown as PostgreSQL shows its type as text (`… 08:00:00+00`,
+`… 10:00:00`). Every reader of the literal then
 agrees on it: the write path, a predicate, an index lookup, a stored `DEFAULT`
 or `CHECK`. A parameter sent as text with a declared type of `timestamptz`
 (OID 1184) or `timestamp` (1114), or bound to `$n::timestamptz`, is read the

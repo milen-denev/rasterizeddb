@@ -590,6 +590,16 @@ fn parse_update_row(
                 rendered_constant = crate::core::value_codec::quote_sql(&text);
                 &rendered_constant
             }
+            // A literal cast to a timestamp type is shown as PostgreSQL shows
+            // that type as text (`sql_scan::timestamp_cast_as_text`): evaluated
+            // as a cast, a `timestamptz` lost its `+00`.
+            (DbType::STRING | DbType::CHAR, None) => match crate::core::sql_scan::timestamp_cast_as_text(value) {
+                Some(text) => {
+                    rendered_constant = crate::core::value_codec::quote_sql(&text);
+                    &rendered_constant
+                }
+                None => value,
+            },
             _ => value,
         };
 
