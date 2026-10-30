@@ -565,6 +565,9 @@ async fn the_not_judged_rule_is_narrow_and_said_once() {
 /// `CHAR`, ALTER TABLE ADD CONSTRAINT on an existing CHAR(3) (alone and in an
 /// OR), and ADD COLUMN … CHAR(3) CHECK over a table with rows. They were
 /// kept unenforced, said so, and took 'ZZ'; PostgreSQL 17's answers below.
+///
+/// Mutation: `strip_trailing_spaces` doing nothing (`tag <> 'ZZ '` takes
+/// 'ZZ').
 /// And ADD CONSTRAINT says when stored rows go unjudged; SHOW CHECKS says a
 /// check over a locale-dependent pattern is enforced for ASCII text exactly.
 #[tokio::test(flavor = "multi_thread")]
@@ -594,6 +597,7 @@ async fn character_n_checks_are_enforced_on_every_ddl_path() {
         "ALTER TABLE c4 ADD CONSTRAINT c4_o CHECK (q > 0 OR tag = 'AB')",
         "ALTER TABLE c4 ADD COLUMN tg3 CHAR(3) CHECK (tg3 IN ('X'))",
         "CREATE TABLE c5 (id INT PRIMARY KEY, tag CHAR(3) CHECK (tag::text IN ('AB', 'CD')), c1 CHAR CHECK (c1 IN ('a')))",
+        "CREATE TABLE c6 (id INT PRIMARY KEY, tag CHAR(3) CHECK (tag <> 'ZZ '))",
     ] {
         client.batch_execute(ddl).await.unwrap_or_else(|e| panic!("{ddl}: {e}"));
         let warned = taken();
@@ -610,6 +614,9 @@ async fn character_n_checks_are_enforced_on_every_ddl_path() {
         ("INSERT INTO c5 VALUES (2, 'ZZ', 'a')", "23514"),
         ("INSERT INTO c5 VALUES (3, 'AB', 'b')", "23514"),
         ("INSERT INTO c5 VALUES (4, 'CD ', 'a ')", "ok"),
+        // The check's literal is read blank-padded too: 'ZZ ' is 'ZZ'.
+        ("INSERT INTO c6 VALUES (1, 'ZZ')", "23514"),
+        ("INSERT INTO c6 VALUES (2, 'AB  ')", "ok"),
     ] {
         let got = match client.batch_execute(sql).await {
             Ok(()) => "ok".to_string(),
@@ -646,6 +653,7 @@ async fn character_n_checks_are_enforced_on_every_ddl_path() {
         "c4_tg3_check enforced",
         "c5_tag_check enforced",
         "c5_c1_check enforced",
+        "c6_tag_check enforced",
         "w_c enforced (ASCII-exact)",
     ] {
         if !listed.iter().any(|l| l == want) {

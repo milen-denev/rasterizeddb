@@ -287,8 +287,10 @@ async fn a_character_value_compares_and_shows_as_postgresql() {
 /// parameter, `INSERT … SELECT`, `UPDATE` with a literal and with an
 /// expression, and `ON CONFLICT DO UPDATE`. Each stored the value whole.
 ///
-/// Mutations: `TextTypmod::assign` accepting any length; the table-level
-/// `hold_text_lengths` doing nothing (the expression UPDATE stores 'abczz').
+/// Mutation: `TextTypmod::assign` keeping the trailing spaces (the
+/// `character(3)` values come back unstripped). The table-level
+/// `hold_text_lengths` is the backstop behind the encoders: disabled alone it
+/// changes no answer here, every path tested being held before it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_declared_length_is_held_on_every_write_path() {
     let server = TestServer::start().await.expect("server");
