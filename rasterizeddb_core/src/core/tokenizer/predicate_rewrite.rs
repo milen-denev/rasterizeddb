@@ -2652,18 +2652,20 @@ fn spaced_text_literal(side: &str) -> bool {
 /// of the scans. It runs on every term of every statement.
 fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
+    let cast = memchr::memchr(b':', text.as_bytes()).is_some();
     let (mut padded, mut varying) = (false, false);
     for f in schema.iter() {
+        // Most fields have no modifier, and that is one word to test.
+        let Some(typmod) = f.typmod_packed else { continue };
         if f.is_deleted || f.db_type != crate::core::db_type::DbType::STRING {
             continue;
         }
-        match f.text_typmod() {
-            Some(TextTypmod::Bpchar(_)) => padded = true,
-            Some(TextTypmod::Varchar(_)) => varying = true,
-            _ => {}
+        match typmod.unpack() {
+            TextTypmod::Bpchar(_) => padded = true,
+            TextTypmod::Varchar(_) => varying = true,
+            TextTypmod::Precision(_) => {}
         }
     }
-    let cast = memchr::memchr(b':', text.as_bytes()).is_some();
     if !padded && !cast {
         return false;
     }
