@@ -2066,7 +2066,13 @@ fn emit_group(
                 };
                 let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
                 match value {
-                    crate::core::rql::expr::Value::Null => (Vec::new(), db_type.clone()),
+                    // Typed NULL, as `aggregate_output` emits a NULL
+                    // aggregate. Empty bytes wearing the expression's type
+                    // are a value: `''` for text, so `min(s) || '|'` over an
+                    // all-NULL group answered `''`, sorted as `''`, and an
+                    // `INSERT … SELECT` stored it. A number survived only
+                    // because no fixed-width value is zero bytes long.
+                    crate::core::rql::expr::Value::Null => (Vec::new(), DbType::NULL),
                     crate::core::rql::expr::Value::Data { bytes, db_type: ty } => (bytes, ty),
                 }
             }
@@ -2705,7 +2711,7 @@ mod fold_previous {
                         };
                         let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
                         match value {
-                            crate::core::rql::expr::Value::Null => (Vec::new(), db_type.clone()),
+                            crate::core::rql::expr::Value::Null => (Vec::new(), DbType::NULL),
                             crate::core::rql::expr::Value::Data { bytes, db_type: ty } => (bytes, ty),
                         }
                     }
@@ -4175,7 +4181,7 @@ mod fold_reference {
                         };
                         let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
                         match value {
-                            crate::core::rql::expr::Value::Null => (Vec::new(), db_type.clone()),
+                            crate::core::rql::expr::Value::Null => (Vec::new(), DbType::NULL),
                             crate::core::rql::expr::Value::Data { bytes, db_type: ty } => (bytes, ty),
                         }
                     }
