@@ -914,6 +914,94 @@ pub fn timestamp_cast_as_text(value: &str) -> Option<String> {
     timestamp_text(&body, whole_type(cast)?)
 }
 
+/// `expression` with each literal compared directly with one of `columns`
+/// (`a > '…'`, `'…' = a`; `columns` are `timestamp` columns) rewritten with
+/// its zone dropped, as such a column reads a literal: `'… 09:00+05'` is
+/// 09:00. For an expression evaluated with the columns replaced by their
+/// values (a generated column's), where the literal no longer stands beside a
+/// column that would say how to read it.
+pub fn local_literals_beside(expression: &str, columns: &[&str]) -> String {
+    if columns.is_empty() {
+        return expression.to_string();
+    }
+    let bytes = expression.as_bytes();
+    let comparison = |t: &str| matches!(t, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=");
+    // The identifier ending at `end` (trimmed of a qualifier and quotes).
+    let ident_before = |end: usize| -> Option<&str> {
+        let text = expression[..end].trim_end();
+        let tb = text.as_bytes();
+        let mut j = tb.len();
+        if tb.last() == Some(&b'"') {
+            j -= 1;
+            while j > 0 && tb[j - 1] != b'"' {
+                j -= 1;
+            }
+            return Some(&text[j..text.len() - 1]);
+        }
+        while j > 0 && is_identifier_byte(tb[j - 1]) {
+            j -= 1;
+        }
+        (j < tb.len()).then(|| &text[j..])
+    };
+    let ident_after = |start: usize| -> Option<&str> {
+        let text = expression[start..].trim_start();
+        let mut name = text;
+        loop {
+            let len = if name.starts_with('"') {
+                name[1..].find('"').map(|p| p + 2)?
+            } else {
+                name.bytes().take_while(|b| is_identifier_byte(*b)).count()
+            };
+            if len == 0 {
+                return None;
+            }
+            let (word, rest) = name.split_at(len);
+            if let Some(next) = rest.strip_prefix('.') {
+                name = next;
+                continue;
+            }
+            return Some(word.trim_matches('"'));
+        }
+    };
+    let op_before = |at: usize| -> Option<usize> {
+        let text = expression[..at].trim_end();
+        let tb = text.as_bytes();
+        let mut j = tb.len();
+        while j > 0 && matches!(tb[j - 1], b'<' | b'>' | b'=' | b'!') {
+            j -= 1;
+        }
+        comparison(&text[j..]).then_some(j)
+    };
+    let op_after = |at: usize| -> Option<usize> {
+        let text = &expression[at..];
+        let lead = text.len() - text.trim_start().len();
+        let len = text[lead..].bytes().take_while(|b| matches!(b, b'<' | b'>' | b'=' | b'!')).count();
+        comparison(&text[lead..lead + len]).then_some(at + lead + len)
+    };
+    let named = |name: Option<&str>| name.is_some_and(|n| columns.iter().any(|c| c.eq_ignore_ascii_case(n)));
+    let mut out = String::with_capacity(expression.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(p) = memchr::memchr(b'\'', &bytes[i..]).map(|p| i + p) {
+        let end = string_literal_end(bytes, p, is_escape_string_quote(bytes, p));
+        if end < p + 2 || end > bytes.len() {
+            break;
+        }
+        let beside = op_before(p).is_some_and(|o| named(ident_before(o)))
+            || op_after(end).is_some_and(|o| named(ident_after(o)));
+        if beside {
+            if let Some(text) = zone_free(&expression[p + 1..end - 1], false) {
+                out.push_str(&expression[copied..p + 1]);
+                out.push_str(&text);
+                copied = end - 1;
+            }
+        }
+        i = end;
+    }
+    out.push_str(&expression[copied..]);
+    out
+}
+
 /// Whether `text` holds a string literal that reads as a timestamp with a
 /// zone in it (`'… 09:00+05'`): one that `timestamp` and `timestamptz` read as
 /// two different values.

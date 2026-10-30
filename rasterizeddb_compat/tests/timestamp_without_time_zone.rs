@@ -501,3 +501,46 @@ async fn every_spelling_of_a_timestamptz_into_text_gets_the_same_rendering() {
         ["2024-01-01 08:00:00+00", "2024-01-01 10:00:00", "2024-01-01 08:00:00+00", "2024-01-01 10:00:00"]
     );
 }
+
+// A generated column over a TIMESTAMP compares it as a timestamp, as
+// PostgreSQL does: any spelling of the literal, and a zone on it ignored.
+// It used to compare the column's text with the literal's.
+#[tokio::test]
+async fn a_generated_column_compares_a_timestamp_as_a_timestamp() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(
+        &c,
+        "CREATE TABLE g4 (k INT, a TIMESTAMP, \
+         late BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01 09:00:00+05') STORED, \
+         iso BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01T09:00:00') STORED, \
+         short BOOLEAN GENERATED ALWAYS AS (a > '2024-1-1 9:00') STORED, \
+         frac BOOLEAN GENERATED ALWAYS AS (a = '2024-01-01 10:00:00.000') STORED, \
+         other BOOLEAN GENERATED ALWAYS AS (a < '2024-01-01 10:00:00+00') STORED)",
+    )
+    .await
+    .expect("create");
+    run(
+        &c,
+        "INSERT INTO g4 (k, a) VALUES (1, '2024-01-01 10:00:00'), (2, '2024-01-01 08:00:00'), \
+         (3, '2024-01-01 10:00:00.5'), (4, '2024-01-01 09:30:00+02')",
+    )
+    .await
+    .expect("insert");
+    let sql = "SELECT k, late, iso, short, frac, other FROM g4 ORDER BY k";
+    let flags = |got: Vec<Vec<Option<String>>>| -> Vec<String> {
+        got.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|")).collect()
+    };
+    assert_eq!(flags(rows(&c, sql).await), ["1|t|t|t|t|f", "2|f|f|f|f|t", "3|t|t|t|f|f", "4|t|t|t|f|t"]);
+    run(&c, "UPDATE g4 SET a = '2024-01-01 09:30:00+07' WHERE k = 2").await.expect("update");
+    assert_eq!(flags(rows(&c, "SELECT k, late, iso, short, frac, other FROM g4 WHERE k = 2").await), ["2|t|t|t|f|t"]);
+    run(
+        &c,
+        "CREATE TABLE g5 (k INT, a TIMESTAMPTZ, late BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01 09:00:00+05') STORED, \
+         iso BOOLEAN GENERATED ALWAYS AS (a > '2024-01-01T07:00:00') STORED)",
+    )
+    .await
+    .expect("create");
+    run(&c, "INSERT INTO g5 (k, a) VALUES (1, '2024-01-01 10:00:00+02'), (2, '2024-01-01 03:00:00')").await.expect("insert");
+    assert_eq!(flags(rows(&c, "SELECT k, late, iso FROM g5 ORDER BY k").await), ["1|t|t", "2|f|f"]);
+}

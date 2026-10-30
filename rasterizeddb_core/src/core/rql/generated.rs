@@ -213,13 +213,13 @@ pub fn as_stored(literal: &str, field: &crate::core::row::schema::SchemaField) -
             | DbType::DECIMAL
     );
     let text = literal.trim();
-    // A `timestamptz` is the value its column stores, typed as the column is:
+    // A timestamp is the value its column stores, typed as the column is:
     // substituted as bare text, `a > '… 09:00+05'` compared two strings, and
-    // a row at 06:00Z was not later than 04:00Z. (A `timestamp` column's is
-    // left as text: typed, the literal beside it would be read with its zone
-    // applied, where the column reads it without. Its comparison stays a
-    // text one, as it always was.)
-    if field.literal_type() == DbType::DATETIME && !text.eq_ignore_ascii_case("NULL") {
+    // a row at 06:00Z was not later than 04:00Z, nor 10:00 later than
+    // '2024-01-01T09:00:00'. For a `timestamp` column the literals beside it
+    // in the expression are read without their zone first
+    // (`sql_scan::local_literals_beside`), as the column reads them.
+    if field.db_type == DbType::DATETIME && !text.eq_ignore_ascii_case("NULL") {
         let bare = crate::core::rql::column_default::strip_redundant_cast(text);
         let unquoted = bare.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).unwrap_or(bare);
         let ty = field.literal_type();

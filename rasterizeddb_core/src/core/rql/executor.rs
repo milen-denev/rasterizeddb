@@ -8606,7 +8606,11 @@ fn supply_generated_values(
 
     let mut computed: Vec<(String, String)> = Vec::with_capacity(generated.len());
     for g in &generated {
-        let substituted = match substitute_columns(&g.expression, &values) {
+        // A literal beside a `timestamp` column is read as that column reads
+        // one, before the column becomes a typed value.
+        let local: Vec<&str> = fields.iter().filter(|f| !f.is_deleted && f.without_time_zone).map(|f| f.name.as_str()).collect();
+        let expression = crate::core::sql_scan::local_literals_beside(&g.expression, &local);
+        let substituted = match substitute_columns(&expression, &values) {
             Ok(text) => text,
             Err(reason) => return Some(Err(reason)),
         };
@@ -8968,7 +8972,11 @@ fn recompute_generated_in_update(
             continue;
         }
 
-        let substituted = substitute_columns(&g.expression, &inputs)?;
+        // As the INSERT path reads them (`sql_scan::local_literals_beside`).
+        let local: Vec<&str> =
+            schema.fields.iter().filter(|f| !f.is_deleted && f.without_time_zone).map(|f| f.name.as_str()).collect();
+        let expression = crate::core::sql_scan::local_literals_beside(&g.expression, &local);
+        let substituted = substitute_columns(&expression, &inputs)?;
         let expression = crate::core::rql::generated::parse_expression(&substituted, &fields)
             .map_err(|reason| {
                 format!(
