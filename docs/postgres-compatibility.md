@@ -122,9 +122,35 @@ refuses to read it as an instant, as against PostgreSQL. Not yet: an expression
 yielding the column's value (`CASE … THEN ts`) is still described as
 `timestamptz`.
 
+A literal typed by a cast or a type name (`'… 10:00+02'::timestamptz`,
+`TIMESTAMP '…'`, `CAST('…' AS timestamp with time zone)`) is read at that type
+when the statement arrives and rewritten with no zone: the UTC time for
+`timestamptz`, the wall-clock time for `timestamp`
+(`sql_scan::zone_free_timestamp_literals`). Every reader of the literal then
+agrees on it: the write path, a predicate, an index lookup, a stored `DEFAULT`
+or `CHECK`. A parameter sent as text with a declared type of `timestamptz`
+(OID 1184) or `timestamp` (1114), or bound to `$n::timestamptz`, is read the
+same way. A bare literal (`'… 10:00+02'`) takes its type from the column or the
+comparison it meets, as an unknown-typed literal does in PostgreSQL.
+
+`ALTER COLUMN … TYPE timestamp` / `TYPE timestamptz` is refused while the
+column's `DEFAULT`, or a `CHECK` naming it, holds a literal with a zone: the new
+type would read that text as another value, where PostgreSQL keeps the value it
+stored. Restate the default or check without the zone first.
+
 The column is a `DATETIME` whose field record carries a flag in its spare type
 byte (`SchemaField::without_time_zone`). A build from before the flag reads the
 record as `timestamptz`, which is what it always took the column for.
+
+**No downgrade after creating a `timestamp` column.** An older build opens such
+a table, but reads the column as `timestamptz` (zones applied, `+00` shown),
+and its next schema change on the table (an `ADD COLUMN`, a rewrite) writes the
+field records back without the flag: back on this build the column is then
+`timestamptz` for good, with nothing to say it changed. There is no cheap
+guard: an older build reads only the record's low type byte and checks nothing
+else, so nothing this build writes can make it refuse the table. Downgrade only
+a database that never ran `CREATE` or `ALTER` with `TIMESTAMP` here, or restate
+the flag afterwards with `ALTER COLUMN … TYPE timestamp`.
 
 **Data written before this change.** Until then both spellings were one type,
 so a literal with a zone written into a `TIMESTAMP` column was converted to UTC:

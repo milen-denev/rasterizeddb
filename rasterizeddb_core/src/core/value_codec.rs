@@ -1751,19 +1751,6 @@ fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {
     })
 }
 
-/// Single-quotes a value, doubling any quote it contains, so it cannot escape
-/// into the surrounding statement as syntax.
-/// The inverse of [`quote_sql`]: the text of a quoted literal, with SQL's
-/// doubled-quote escape collapsed.
-///
-/// `'it''s'` is one string containing an apostrophe — SQL escapes a quote by
-/// doubling it. Stripping the surrounding pair without collapsing the inner
-/// ones stored `it''s`, so any value containing an apostrophe (`O'Brien`,
-/// `it's`) round-tripped wrong, and each further re-quoting doubled the damage
-/// again.
-///
-/// Unquoted input is returned unchanged: only a quoted literal carries the
-/// escape, and an unquoted `NULL` has to stay distinguishable from `'NULL'`.
 /// An unquoted numeric constant (`1e1`, `+9`, `007`, `1.50`, `0x1F`,
 /// `1_000`), as PostgreSQL renders it when the constant is assigned to a text
 /// column: the value's text, not its spelling. `None` for anything that is
@@ -1814,22 +1801,40 @@ pub fn numeric_constant_text(raw: &str) -> Option<String> {
         let out: String = text.chars().filter(|c| *c != '_').collect();
         out.chars().all(|c| c.is_digit(radix)).then_some(out)
     }
-    // `digits` (most significant first) in `radix`, as decimal digits.
+    // `digits` (most significant first) in `radix`, as decimal digits. Held
+    // in limbs of nine decimal digits and fed several input digits at a time,
+    // so a long constant costs a small fraction of a digit-by-digit pass.
     fn to_decimal(digits: &str, radix: u32) -> String {
-        let mut out: Vec<u8> = vec![0]; // little-endian decimal digits
-        for c in digits.chars() {
-            let mut carry = c.to_digit(radix).unwrap_or(0);
-            for d in out.iter_mut() {
-                let v = u32::from(*d) * radix + carry;
-                *d = (v % 10) as u8;
-                carry = v / 10;
+        const LIMB: u64 = 1_000_000_000;
+        let per_step = match radix {
+            16 => 7,
+            8 => 9,
+            _ => 30,
+        };
+        let mut limbs: Vec<u64> = vec![0]; // little-endian, base 10^9
+        let values: Vec<u64> = digits.chars().map(|c| u64::from(c.to_digit(radix).unwrap_or(0))).collect();
+        for chunk in values.chunks(per_step) {
+            let scale = u64::from(radix).pow(chunk.len() as u32);
+            let mut carry = chunk.iter().fold(0u64, |acc, d| acc * u64::from(radix) + d);
+            for limb in limbs.iter_mut() {
+                let v = *limb * scale + carry;
+                *limb = v % LIMB;
+                carry = v / LIMB;
             }
             while carry > 0 {
-                out.push((carry % 10) as u8);
-                carry /= 10;
+                limbs.push(carry % LIMB);
+                carry /= LIMB;
             }
         }
-        out.iter().rev().map(|d| char::from(b'0' + d)).collect()
+        let mut out = String::with_capacity(limbs.len() * 9);
+        let mut it = limbs.iter().rev();
+        if let Some(top) = it.next() {
+            out.push_str(&top.to_string());
+        }
+        for limb in it {
+            out.push_str(&format!("{limb:09}"));
+        }
+        out
     }
     let signed = |magnitude: String| -> String {
         let magnitude = match magnitude.trim_start_matches('0') {
@@ -1922,6 +1927,19 @@ pub fn numeric_constant_text(raw: &str) -> Option<String> {
     Some(if fraction.is_empty() { format!("{sign}{whole}") } else { format!("{sign}{whole}.{fraction}") })
 }
 
+/// Single-quotes a value, doubling any quote it contains, so it cannot escape
+/// into the surrounding statement as syntax.
+/// The inverse of [`quote_sql`]: the text of a quoted literal, with SQL's
+/// doubled-quote escape collapsed.
+///
+/// `'it''s'` is one string containing an apostrophe — SQL escapes a quote by
+/// doubling it. Stripping the surrounding pair without collapsing the inner
+/// ones stored `it''s`, so any value containing an apostrophe (`O'Brien`,
+/// `it's`) round-tripped wrong, and each further re-quoting doubled the damage
+/// again.
+///
+/// Unquoted input is returned unchanged: only a quoted literal carries the
+/// escape, and an unquoted `NULL` has to stay distinguishable from `'NULL'`.
 pub fn unquote_sql(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
@@ -2553,6 +2571,11 @@ mod tests {
             assert_eq!(numeric_constant_text(raw).as_deref(), Some(pg), "{raw}");
         }
         assert_eq!(numeric_constant_text("1e400").map(|t| t.len()), Some(401));
+        // Long non-decimal constants, through the limb conversion.
+        let long_hex = numeric_constant_text(&format!("0x{}", "F".repeat(2000))).unwrap();
+        assert_eq!((long_hex.len(), &long_hex[..20], &long_hex[long_hex.len() - 20..]), (2409, "17376620319380945659", "29880747677634789375"));
+        assert_eq!(numeric_constant_text(&format!("0o{}", "7".repeat(50))).as_deref(), Some("1427247692705959881058285969449495136382746623"));
+        assert_eq!(numeric_constant_text(&format!("0b{}", "1".repeat(100))).as_deref(), Some("1267650600228229401496703205375"));
         // Not numeric constants (PostgreSQL refuses the malformed ones; here
         // they are left to the paths that read them as before).
         for raw in ["'1e1'", "1_", "1__0", "1e", ".e1", "1e+", "abc", "--5", "1.2.3", "0x", "0x1G", "", "-", "1e5000000000"] {
