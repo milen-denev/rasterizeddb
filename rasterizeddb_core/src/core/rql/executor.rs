@@ -7569,6 +7569,36 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
     evaluated_numeric_literal(text, field)
 }
 
+/// The bytes one arbiter column of one `VALUES` row keys on, for the batch
+/// 21000 check; `None` when the row can equal no other on it, so it is left
+/// out. A value written is evaluated into the column; an omitted column or
+/// `DEFAULT` takes the column's default when that is a constant (two rows
+/// both defaulting to `5` are one key). `None` for NULL, which equals
+/// nothing (`(1, NULL), (1, NULL)` under `UNIQUE (x, k)` inserts both), for
+/// a default computed per row (a sequence's next value), a generated column,
+/// and a value that cannot be evaluated here: compared as written, `NULL`
+/// and `'NULL'`, `DEFAULT` and `'DEFAULT'` were taken for one key.
+fn batch_key_part(
+    written: Option<&str>,
+    field: &crate::core::row::schema::SchemaField,
+    defaults: &[crate::core::rql::column_default::ColumnDefault],
+    generated: &[crate::core::rql::generated::GeneratedColumn],
+) -> Option<Vec<u8>> {
+    let literal = match written.map(str::trim) {
+        Some(w) if !w.eq_ignore_ascii_case("DEFAULT") => w.to_string(),
+        _ => {
+            if crate::core::rql::generated::expression_for(&field.name, generated).is_some() {
+                return None;
+            }
+            match crate::core::rql::column_default::expression_for(&field.name, defaults) {
+                Some(expression) if default_is_constant(expression) => expression.trim().to_string(),
+                _ => return None,
+            }
+        }
+    };
+    stored_key_bytes(&literal, field)
+}
+
 /// The bytes `literal` is stored as in `field`, for comparing two rows'
 /// keys: a number as [`stored_numeric_literal`] writes it, any other
 /// constant evaluated into the column (a UUID's sixteen bytes, a
@@ -8689,29 +8719,26 @@ async fn insert_values_tuples(
             // Compared as the column stores each key (`stored_numeric_literal`):
             // as written, `(0.995, …), (1.00, …)` into a NUMERIC(10,2) were two
             // keys, and `(5.0, …), (5.00, …)` applied last-wins.
-            let fields = database.schema_view(&row_data.table_name).map(|v| v.schema().fields.clone());
+            let schema = database.schema_view(&row_data.table_name).map(|v| {
+                let schema = v.schema();
+                (schema.fields.clone(), schema.defaults.clone(), schema.generated.clone())
+            });
             let mut seen: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
             for stmt in &statements {
                 let values = crate::core::rql::lexer_ir::assignments_of_insert(stmt).unwrap_or_default();
                 // Every type, not only numbers: `'A0EE…'` and `'a0ee…'` are
                 // one UUID, `'2020-01-01'` and `'2020-01-01 00:00:00'` one
                 // timestamp, `true` and `'t'` one boolean, and each pair
-                // applied last-wins.
+                // applied last-wins. A row whose key has a part that equals
+                // nothing (`batch_key_part`) is left out.
                 let key: Option<Vec<Vec<u8>>> = spec
                     .arbiter
                     .iter()
                     .map(|column| {
-                        values.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, literal)| {
-                            fields
-                                .as_ref()
-                                .and_then(|fields| {
-                                    fields
-                                        .iter()
-                                        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
-                                        .and_then(|f| stored_key_bytes(literal, f))
-                                })
-                                .unwrap_or_else(|| literal.trim().as_bytes().to_vec())
-                        })
+                        let (fields, defaults, generated) = schema.as_ref()?;
+                        let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))?;
+                        let written = values.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, l)| l.as_str());
+                        batch_key_part(written, field, defaults, generated)
                     })
                     .collect();
                 if let Some(key) = key {

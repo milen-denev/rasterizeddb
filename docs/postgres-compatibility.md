@@ -182,7 +182,9 @@ column stores it (`1.254` into a `NUMERIC(10,2)` key is `1.25`).
 Two rows of one `INSERT … ON CONFLICT DO UPDATE` with the same arbiter key
 refuse the statement with 21000, as in PostgreSQL, the keys compared as each
 column stores them: `5.0` and `5.00`, `'A0EE…'` and `'a0ee…'`, `'2020-01-01'`
-and `'2020-01-01 00:00:00'`, `true` and `'t'` are one key each.
+and `'2020-01-01 00:00:00'`, `true` and `'t'` are one key each. A NULL key
+equals nothing, and an omitted or `DEFAULT` key is its column's default when
+that is a constant (a sequence's is a new value per row).
 
 Statements accepted without acting, each for a stated reason rather than
 silently: index DDL (the engine maintains its own indexes), extensions, schemas,
@@ -397,8 +399,9 @@ not; a pinned snapshot makes them one. Write it as `UPDATE … FROM` /
 `DELETE … USING` to run it under `READ COMMITTED`. `IN (SELECT …)` and `NOT IN
 (SELECT …)` in a write share the snapshot gap and are not yet refused.
 
-A correlation may name the target schema-qualified (`"public"."t"."id"`), or,
-in `UPDATE … FROM`, the target beside its source. One that compares an outer
+A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
+either side (`u.tid = t.id::bigint`), or, in `UPDATE … FROM`, name the target
+beside its source. One that compares an outer
 column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
 (`x - EXISTS (…)::int`), is refused with 0A000.
 

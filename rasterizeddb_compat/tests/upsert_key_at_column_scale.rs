@@ -68,7 +68,11 @@ async fn upserts(partitioning: &str) {
              CREATE TABLE ui (id INT PRIMARY KEY, v INT){hash_i}; INSERT INTO ui VALUES (2, 1); \
              CREATE TABLE s2 (b NUMERIC(38,20)); INSERT INTO s2 VALUES (0.12345678912300000001); \
              CREATE TABLE uu (k UUID PRIMARY KEY, v INT); CREATE TABLE ut (k TIMESTAMP PRIMARY KEY, v INT); \
-             CREATE TABLE ub (k BOOLEAN PRIMARY KEY, v INT); CREATE TABLE ux (k TEXT PRIMARY KEY, v INT)"
+             CREATE TABLE ub (k BOOLEAN PRIMARY KEY, v INT); CREATE TABLE ux (k TEXT PRIMARY KEY, v INT); \
+             CREATE TABLE kn (id INT PRIMARY KEY, u TEXT UNIQUE, v INT); \
+             CREATE TABLE kc (x INT, k INT, v INT, UNIQUE (x, k)); \
+             CREATE TABLE ks (id SERIAL PRIMARY KEY, v INT); CREATE TABLE kt2 (k TEXT PRIMARY KEY, v INT); \
+             CREATE TABLE kf (id INT PRIMARY KEY, k INT UNIQUE DEFAULT 5, v INT)"
         ))
         .await
         .expect("setup");
@@ -116,6 +120,9 @@ async fn upserts(partitioning: &str) {
          ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
         "INSERT INTO ut VALUES ('2020-01-01', 1), ('2020-01-01 00:00:00', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
         "INSERT INTO ub VALUES (true, 1), ('t', 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        // An omitted key, or DEFAULT, takes a constant default: both rows 5.
+        "INSERT INTO kf (id, v) VALUES (1, 1), (2, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+        "INSERT INTO kf VALUES (1, DEFAULT, 1), (2, 5, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
     ] {
         let got = text(&client, sql).await;
         if got != Err("21000".to_string()) {
@@ -129,6 +136,17 @@ async fn upserts(partitioning: &str) {
         ("SELECT count(*) FROM uu", &["0"]),
         ("SELECT count(*) FROM ut", &["0"]),
         ("SELECT count(*) FROM ub", &["0"]),
+        ("SELECT count(*) FROM kf", &["0"]),
+        // NULL equals nothing, and is not the text 'NULL': every row stored,
+        // as in PostgreSQL 17.
+        ("INSERT INTO kn VALUES (1, NULL, 1), (2, NULL, 2) ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v", &[]),
+        ("INSERT INTO kn VALUES (3, NULL, 1), (4, 'NULL', 2) ON CONFLICT (u) DO UPDATE SET v = EXCLUDED.v", &[]),
+        ("SELECT count(*) FROM kn", &["4"]),
+        ("INSERT INTO kc VALUES (1, NULL, 1), (1, NULL, 2) ON CONFLICT (x, k) DO UPDATE SET v = EXCLUDED.v", &[]),
+        ("SELECT count(*) FROM kc", &["2"]),
+        // A sequence's default is a new value per row.
+        ("INSERT INTO ks VALUES (DEFAULT, 1), (DEFAULT, 2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v", &[]),
+        ("SELECT count(*) FROM ks", &["2"]),
         // Text keys spelled differently are different keys: both stored.
         ("INSERT INTO ux VALUES ('a', 1), ('A', 2), ('a ', 3) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", &[]),
         ("SELECT count(*) FROM ux", &["3"]),
@@ -138,6 +156,14 @@ async fn upserts(partitioning: &str) {
         if got.as_ref() != Ok(&want) {
             wrong.push(format!("{sql}\n    got  {got:?}\n    want {want:?}"));
         }
+    }
+    // DEFAULT with no default is NULL, never the text 'DEFAULT': not 21000.
+    // (PostgreSQL answers 23502; an explicit DEFAULT into a TEXT key with no
+    // default stores '' here, on base as well — left as it is.)
+    let sql = "INSERT INTO kt2 VALUES ('DEFAULT', 1), (DEFAULT, 2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v";
+    let got = text(&client, sql).await;
+    if got == Err("21000".to_string()) {
+        wrong.push(format!("{sql}\n    got  {got:?}\n    want anything but Err(21000)"));
     }
     assert!(wrong.is_empty(), "{partitioning}: {} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
