@@ -1038,6 +1038,19 @@ mod tests {
         assert_ne!(found & bit_of("CURRENT_DATE"), 0);
     }
 
+    /// Every spelling of the clock is a marker, `now()`'s and the others.
+    #[test]
+    fn every_clock_function_is_nondeterministic() {
+        for (sql, marker) in [
+            ("SELECT statement_timestamp()", "STATEMENT_TIMESTAMP("),
+            ("INSERT INTO t VALUES (clock_timestamp())", "CLOCK_TIMESTAMP("),
+            ("UPDATE t SET at = Transaction_Timestamp()", "TRANSACTION_TIMESTAMP("),
+            ("INSERT INTO t VALUES (LOCALTIMESTAMP)", "LOCALTIMESTAMP"),
+        ] {
+            assert_ne!(scan_nondeterministic(sql) & bit_of(marker), 0, "{sql}");
+        }
+    }
+
     /// A restart in the middle of a partial match must not lose the real one.
     #[test]
     fn a_false_start_does_not_hide_the_match_after_it() {
