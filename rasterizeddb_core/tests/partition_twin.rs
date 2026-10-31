@@ -403,6 +403,10 @@ struct Config {
     /// each partitioned table once more than [`FEW_OPEN`] are open, so the
     /// run reads and writes through reopened partitions throughout.
     few_open: bool,
+    /// Phase 3 P5b-2: the run's own open budget (`partition::budget`), with
+    /// idle close every second: opens past it close what nobody holds, by
+    /// the CLOCK, inside statements and blocks.
+    budget: Option<usize>,
 }
 
 /// What a [`Config::few_open`] run keeps open between statements, at most.
@@ -2415,6 +2419,13 @@ fn ops_per_seed() -> usize {
     env_u64("PART_TWIN_OPS").map(|n| n as usize).unwrap_or(300)
 }
 
+/// How long one seed may run before the twin calls it hung: 600 s per 300
+/// statements, so a longer run (`PART_TWIN_OPS`) gets proportionally longer
+/// rather than tripping a constant sized for the default.
+fn wall_cap(ops: usize) -> Duration {
+    Duration::from_secs(600) * (ops.div_ceil(300).max(1) as u32)
+}
+
 /// Total bytes under `dir`.
 fn dir_bytes(dir: &std::path::Path) -> u64 {
     let mut total = 0;
@@ -2447,6 +2458,9 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     let started = Instant::now();
     let label = format!("HASH ({}) PARTITIONS {}", cfg.key.join(", "), cfg.partitions);
     let dir = tempfile::tempdir().expect("a temp dir");
+    if let Some(n) = cfg.budget {
+        rasterizeddb_core::core::partition::budget::isolate_with(dir.path(), n, Some(1));
+    }
     let server = Server::start(dir.path().to_str().unwrap());
     let mut setup = server.connect();
     setup.ok(&format!(
@@ -2577,7 +2591,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
             twin.compare_storage(at, kind);
         }
         assert!(
-            started.elapsed() < Duration::from_secs(600),
+            started.elapsed() < wall_cap(ops),
             "{label} seed {seed:#x}: over the wall-clock cap at op {at}"
         );
     }
@@ -2664,22 +2678,22 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
 
 #[test]
 fn twin_hash_tenant_7() {
-    run_twin(Config { key: &["tenant_id"], partitions: 7, few_open: false });
+    run_twin(Config { key: &["tenant_id"], partitions: 7, few_open: false, budget: None });
 }
 
 #[test]
 fn twin_hash_tenant_64() {
-    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false });
+    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false, budget: None });
 }
 
 #[test]
 fn twin_hash_tenant_grp_64() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: None });
 }
 
 #[test]
 fn twin_hash_full_key_7() {
-    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7, few_open: false });
+    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7, few_open: false, budget: None });
 }
 
 /// Phase 3 P5b: many partitions, few open. 1024 declared, the tenants'
@@ -2688,13 +2702,27 @@ fn twin_hash_full_key_7() {
 /// and writes through partitions closed and reopened.
 #[test]
 fn twin_hash_tenant_1024_few_open() {
-    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: true });
+    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: true, budget: None });
 }
 
 /// The same over a two-level key, 64 partitions.
 #[test]
 fn twin_hash_tenant_grp_64_few_open() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true, budget: None });
+}
+
+/// Phase 3 P5b-2: a budget of three open partitions, idle close every
+/// second; every statement that reaches a closed partition past the budget
+/// evicts one first.
+#[test]
+fn twin_hash_tenant_1024_budget_3() {
+    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: false, budget: Some(3) });
+}
+
+/// The same over a composite key.
+#[test]
+fn twin_hash_tenant_grp_64_budget_3() {
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: Some(3) });
 }
 
 /// The two lists name each kind at most once, and only real kinds.
