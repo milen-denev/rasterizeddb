@@ -1131,6 +1131,12 @@ enum Tok {
     /// An operand [`lift_evaluated_operands`] encoded for the expression
     /// evaluator, carried whole and rendered back exactly as it came.
     Lifted(String),
+    /// A quoted float under a float cast (`'.5'::float8`): `number` is the
+    /// float's own text (`0.5`; a `real` widened to `float8`,
+    /// `0.10000000149011612`), which [`rewrite_where`] writes for the
+    /// tokenizer; `written` is the literal and cast as written, which every
+    /// other pass renders back so a later lex reads it again.
+    Float { number: String, written: String },
 }
 
 impl Tok {
@@ -1147,6 +1153,7 @@ impl Tok {
             Tok::RPar => ")".to_string(),
             Tok::Comma => ",".to_string(),
             Tok::Lifted(text) => text.clone(),
+            Tok::Float { written, .. } => written.clone(),
         }
     }
 }
@@ -1525,11 +1532,27 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 // failed the same way. Kept quoted when it does not read as a
                 // finite float (`'NaN'::float8`), as before.
                 let name = &clause[name_start..i];
-                if ["float8", "float4", "real", "double", "float"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                let single = ["float4", "real"].iter().any(|t| name.eq_ignore_ascii_case(t));
+                if single || ["float8", "double", "float"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
                     if let Some(Tok::Str(quoted)) = out.last() {
                         let text = crate::core::value_codec::unquote_sql(quoted).trim().to_string();
-                        if text.parse::<f64>().is_ok_and(f64::is_finite) && text.bytes().any(|b| b.is_ascii_digit()) {
-                            *out.last_mut().expect("a literal") = Tok::Word(text);
+                        // The float the cast makes, written as its own
+                        // shortest text, which the WHERE tokenizer reads back
+                        // as that float: `.5` it could not read (42601), and
+                        // a `real` is its widened value, so `f8 = '0.1'::real`
+                        // compares 0.10000000149011612 as PostgreSQL does.
+                        let number = if single {
+                            crate::core::value_codec::parse_float4(&text)
+                                .filter(|v| v.is_finite())
+                                .map(|v| crate::core::value_codec::pg_float8_text(f64::from(v)))
+                        } else {
+                            crate::core::value_codec::parse_float8(&text)
+                                .filter(|v| v.is_finite())
+                                .map(crate::core::value_codec::pg_float8_text)
+                        };
+                        if let Some(number) = number {
+                            let written = format!("{quoted}::{name}");
+                            *out.last_mut().expect("a literal") = Tok::Float { number, written };
                         }
                     }
                 }
@@ -3505,6 +3528,87 @@ fn lift_operand_typed(
     Ok((encode_lifted(trimmed, &reads), operand.db_type))
 }
 
+/// Every [`Tok::Float`] as the number it is, for the scan's tokenizer — unless
+/// the value it is compared with is text (a text, `character` or `varchar`
+/// column, or a JSON path read as text, `->>` / `#>>`), which PostgreSQL
+/// refuses: `text = double precision` has no operator (42883). Written as a
+/// number there, `j->>'x' = '0.5'::float8` compared the text with a float and
+/// matched nothing, reporting success.
+fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<Tok>, String> {
+    if !toks.iter().any(|t| matches!(t, Tok::Float { .. })) {
+        return Ok(toks);
+    }
+    let comparison = |t: Option<&Tok>| {
+        matches!(t, Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="))
+    };
+    // The PostgreSQL name of a text column's type, when `t` names one.
+    let text_column = |t: Option<&Tok>| -> Option<&'static str> {
+        use crate::core::rql::type_modifier::TextTypmod;
+        let Some(Tok::Word(w)) = t else { return None };
+        let name = resolve_column(w, schema)?;
+        let field = schema.iter().find(|f| {
+            !f.is_deleted
+                && f.name == name
+                && matches!(f.db_type, crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::CHAR)
+        })?;
+        Some(match field.text_typmod() {
+            Some(TextTypmod::Bpchar(_)) => "character",
+            Some(TextTypmod::Varchar(_)) => "character varying",
+            _ => "text",
+        })
+    };
+    let text_path = |t: &[Tok]| {
+        matches!(t, [.., Tok::Sym(op), Tok::Str(_)] if op == "->>" || op == "#>>")
+    };
+    for (at, tok) in toks.iter().enumerate() {
+        if !matches!(tok, Tok::Float { .. }) {
+            continue;
+        }
+        // `<text> op <float>`, or `<float> op <text>`.
+        let path_op = |t: Option<&Tok>| matches!(t, Some(Tok::Sym(op)) if op.starts_with("->") || op.starts_with("#>"));
+        let before = (at >= 2 && comparison(toks.get(at - 1)))
+            .then(|| {
+                if text_path(&toks[..at - 1]) {
+                    Some("text")
+                } else if at < 3 || !path_op(toks.get(at - 3)) {
+                    text_column(toks.get(at - 2))
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        let after = comparison(toks.get(at + 1))
+            .then(|| {
+                if matches!(toks.get(at + 3), Some(Tok::Sym(op)) if op == "->>" || op == "#>>") {
+                    Some("text")
+                } else if !path_op(toks.get(at + 3)) {
+                    text_column(toks.get(at + 2))
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(name) = before.or(after) {
+            let op = match toks.get(if before.is_some() { at - 1 } else { at + 1 }) {
+                Some(Tok::Sym(op)) => op.clone(),
+                _ => "=".to_string(),
+            };
+            return Err(if before.is_some() {
+                format!("operator does not exist: {name} {op} double precision")
+            } else {
+                format!("operator does not exist: double precision {op} {name}")
+            });
+        }
+    }
+    Ok(toks
+        .into_iter()
+        .map(|t| match t {
+            Tok::Float { number, .. } => Tok::Word(number),
+            other => other,
+        })
+        .collect())
+}
+
 pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
@@ -3532,7 +3636,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     // typed column is a compile error rather than a row that does not match.
     let clause = &fold_null_comparisons(clause);
 
-    let toks = lex(clause)?;
+    let toks = floats_for_the_scan(lex(clause)?, schema)?;
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     let mut i = 0usize;
     // Where the comparison currently being read began, as an index into `out`.

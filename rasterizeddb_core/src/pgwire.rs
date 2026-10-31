@@ -6681,6 +6681,9 @@ fn result_description(
             let schema_of = |name: &str| database.schema_view(name).map(|t| t.schema().fields.clone());
             match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
                 Ok(plan) => Some(join_output_columns(&plan, database)),
+                // A comparison with no operator (`text = double precision`)
+                // is PostgreSQL's 42883, not a syntax error.
+                Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
                 Err(e) => return Err(("42601", e)),
             }
         }
@@ -6773,6 +6776,9 @@ fn result_description(
                         })
                         .collect::<Vec<_>>(),
                 ),
+                // A comparison with no operator (`text = double precision`)
+                // is PostgreSQL's 42883, not a syntax error.
+                Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
                 Err(e) => return Err(("42601", e)),
             }
         }

@@ -184,3 +184,56 @@ async fn an_integer_column_compares_with_a_float_subquery() {
     run(&c, "DELETE FROM iq WHERE b < (SELECT f FROM fs WHERE k = 3)").await;
     assert_eq!(rows(&c, "SELECT count(*) FROM iq").await, ["4997"]);
 }
+
+async fn ids(c: &Client, sql: &str) -> String {
+    rows(c, sql).await.join(",")
+}
+
+async fn sqlstate(c: &Client, sql: &str) -> String {
+    let e = c.simple_query(sql).await.expect_err(sql);
+    e.code().map(|s| s.code().to_string()).unwrap_or_else(|| e.to_string())
+}
+
+/// A quoted float under a float cast in a WHERE clause is that float, read
+/// as PostgreSQL 17 reads it: `.5` and `-.5` (refused as 42601 "unexpected
+/// character '.'"), an exponent, a trailing point; a `real` is its widened
+/// value (`f8 * 2 = '0.2'::real` matched a row PostgreSQL does not, and `f8
+/// = '0.1'::real` a value that is not that float); and against text — a
+/// text, `character` or `varchar` column, or a JSON path read as text — it
+/// is 42883, as PostgreSQL has no such operator (`j->>'x' = '0.5'::float8`
+/// matched nothing and reported success).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_float_in_a_predicate_is_postgresqls() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE e (id INT PRIMARY KEY, f8 FLOAT8, f4 REAL, b BIGINT, t TEXT, c CHAR(4), v VARCHAR(10), j JSONB)").await;
+    run(
+        &c,
+        "INSERT INTO e VALUES (1, 0.5, 0.1, 1, '0.5', '0.5', '0.5', '{\"x\": 0.5}'), \
+         (2, 1.0, 0.5, 2, '1', '1', '1', '{\"x\": \"0.5\"}'), (3, 0.1, 0.25, 3, '0.1', '0.1', '0.1', '{\"x\": 1}')",
+    )
+    .await;
+    // PostgreSQL 17's ids for each.
+    for (predicate, pg) in [
+        ("f8 = '.5'::float8", "1"),
+        ("f8 > '-.5'::float8", "1,2,3"),
+        ("f8 = '5E-1'::float8", "1"),
+        ("f8 = '1.'::float8", "2"),
+        ("b > '.5'::float8", "1,2,3"),
+        ("f8 * 2 = '0.2'::real", ""),
+        ("f8 = '0.1'::real", ""),
+        ("f4 = '0.1'::real", "1"),
+        ("f8 = '0.1'::float8", "3"),
+    ] {
+        assert_eq!(ids(&c, &format!("SELECT id FROM e WHERE {predicate} ORDER BY id")).await, pg, "{predicate}");
+    }
+    for predicate in [
+        "j->>'x' = '0.5'::float8",
+        "t = '0.5'::float8",
+        "c = '0.5'::float8",
+        "v = '0.5'::float8",
+        "'0.5'::float8 = t",
+    ] {
+        assert_eq!(sqlstate(&c, &format!("SELECT id FROM e WHERE {predicate}")).await, "42883", "{predicate}");
+    }
+}
