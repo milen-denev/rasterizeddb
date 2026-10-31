@@ -3417,6 +3417,13 @@ fn numeric_constant(m: i128, e: i32, text: &str) -> Result<Expr, String> {
 /// A constant whose written places are those its value needs stays the
 /// plain literal, whose scale ([`display_scale`], [`pg_numeric`]) is its own.
 fn with_written_scale(literal: Expr, text: &str) -> Expr {
+    // Only a fraction ending in a zero, or an exponent, can be written with
+    // more places than its value needs; every other constant — nearly every
+    // one an INSERT carries — is decided on its last byte, unparsed.
+    let b = text.as_bytes();
+    if !b.iter().any(|c| matches!(c, b'e' | b'E')) && !(b.last() == Some(&b'0') && b.contains(&b'.')) {
+        return literal;
+    }
     let Some((_, e)) = decimal_digits(text) else { return literal };
     let written = u32::try_from(-(e.min(0) as i64)).unwrap_or(0);
     match display_scale(&literal) {
