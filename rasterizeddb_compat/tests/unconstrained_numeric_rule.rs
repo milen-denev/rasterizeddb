@@ -98,6 +98,8 @@ async fn every_path_into_an_unconstrained_column_follows_one_rule() {
         "UPDATE dst SET u = (SELECT f * 1.0000000001 FROM src WHERE id = 1) WHERE id = 1",
         "UPDATE dst SET u = (SELECT b::float8 FROM src WHERE id = 1) WHERE id = 1",
         "UPDATE dst SET u = u / 3 WHERE id = 8",
+        // Through the older exact reading (a constant carried as a float).
+        "UPDATE dst SET u = u * 1e30 / 3e30 WHERE id = 8",
         "INSERT INTO dst (id, u) VALUES (8, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 3",
     ] {
         assert_eq!(code(&c, sql).await, "0A000", "{sql}");
