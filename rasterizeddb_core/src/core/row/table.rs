@@ -258,6 +258,16 @@ pub struct Table<S: StorageIO> {
     /// leaves its round; never read through this field.
     #[allow(dead_code)]
     external: Option<StdArc<table_maintenance::ExternalUnit<S>>>,
+    /// Phase 3 P5b-2b: set while a scan-only open's starts wait
+    /// ([`Table::ensure_full`]); shared with the unit, which takes no idle
+    /// checkpoint meanwhile.
+    scan_only: StdArc<AtomicBool>,
+    /// The starts a scan-only open deferred; run once, under this lock, by
+    /// the first [`Table::ensure_full`].
+    deferred_starts: parking_lot::Mutex<Vec<DeferredStart>>,
+    /// Counted among the open plain tables the partitions' open budget
+    /// leaves descriptors for (`partition::budget::plain_tables_open`).
+    plain_counted: bool,
 }
 
 /// A table's row storage and what indexes it: the part a partition shell does
@@ -504,6 +514,13 @@ pub(crate) struct PartitionOpen<S: StorageIO> {
     pub mode: crate::core::partition::maintenance::MaintenanceMode,
     /// The slot's write watch; required for `External`.
     pub watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// Phase 3 P5b-2b: a fan-out's open, which only reads. The FILTER
+    /// section loads when the open's proof passes, but the index load or
+    /// build, the filter backfill and the load audit wait for
+    /// [`Table::ensure_full`] (the first routed access or write), so an
+    /// unrouted read wider than the open budget starts no rebuild it then
+    /// discards.
+    pub scan_only: bool,
 }
 
 /// What [`Table::assemble`] finishes a table from.
@@ -525,7 +542,15 @@ struct Assembly<'a, S: StorageIO> {
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
     /// `Some` for a partition opened `External` (see [`PartitionOpen::mode`]).
     watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// [`PartitionOpen::scan_only`]; false for every plain table.
+    deferred: bool,
 }
+
+/// One of an open's one-shot starts (its index load or build, its filter
+/// backfill, its load audit), deferred by a scan-only open to
+/// [`Table::ensure_full`]. Each raises what it raises (a load's barrier)
+/// before it returns and spawns the rest.
+type DeferredStart = Box<dyn FnOnce() + Send>;
 
 /// The `ErrorKind` and text a partition shell refuses data access with. The
 /// text says "not supported", which pgwire reports as 0A000.
@@ -604,6 +629,9 @@ impl<S: StorageIO> Drop for Table<S> {
         // Without this the per-table maintenance task would outlive the table
         // and keep ticking against storage that is going away.
         self.maintenance_alive.store(false, AtomicOrdering::Relaxed);
+        if self.plain_counted {
+            crate::core::partition::budget::note_plain_closed();
+        }
     }
 }
 
@@ -996,6 +1024,9 @@ impl<S: StorageIO> Table<S> {
             gate: FileGate::detached(),
             watch: None,
             external: None,
+            scan_only: StdArc::new(AtomicBool::new(false)),
+            deferred_starts: parking_lot::Mutex::new(Vec::new()),
+            plain_counted: false,
         }
     }
 
@@ -1146,6 +1177,7 @@ impl<S: StorageIO> Table<S> {
             cache_scope,
             maintenance_alive,
             watch: None,
+            deferred: false,
         })
         .await
     }
@@ -1172,6 +1204,7 @@ impl<S: StorageIO> Table<S> {
             cache_scope,
             mode,
             watch,
+            scan_only,
         } = p;
         use crate::core::partition::maintenance::MaintenanceMode;
         let watch = match (mode, watch) {
@@ -1249,6 +1282,7 @@ impl<S: StorageIO> Table<S> {
             cache_scope,
             maintenance_alive,
             watch,
+            deferred: scan_only,
         })
         .await)
     }
@@ -1323,6 +1357,7 @@ impl<S: StorageIO> Table<S> {
             cache_scope,
             maintenance_alive,
             watch,
+            deferred,
         } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
@@ -1477,6 +1512,9 @@ impl<S: StorageIO> Table<S> {
         let index_origin = StdArc::new(std::sync::atomic::AtomicU8::new(0));
         let mut indexes_vouch = true;
         let mut index_load = false;
+        // The open's one-shot starts: run now, or by `ensure_full` for a
+        // scan-only open (`DeferredStart`).
+        let mut starts: Vec<DeferredStart> = Vec::new();
         if let Some(indexes) = indexes.clone() {
             use crate::core::index_store::load;
             let storage = load::settings::index_storage_for(gate.dir());
@@ -1486,36 +1524,59 @@ impl<S: StorageIO> Table<S> {
             // what a seal would write now (§3 rule 2).
             indexes_vouch = !load::captures(&indexes, storage) || loading;
             index_load = loading;
-            let opened = load::OpenIndexes {
-                name: table_name.to_string(),
-                indexes: indexes.clone(),
-                // Read now, before any compaction can start: the build reads
-                // rows without the compaction gate, so it may mark the
-                // indexes ready only if no renumbering began or ended while
-                // it ran.
-                epoch: indexes.epoch(),
-                n_slots: existing_slots,
-                gate: gate.clone(),
-                barrier: loading.then(|| gate.loads().raise()),
-                vouch: filter_vouches,
-                sections_in_snapshot: index_sections.clone(),
-                origin: index_origin.clone(),
-            };
+            // Read now, before any compaction can start: a build may mark the
+            // indexes ready only if no renumbering began or ended while it
+            // ran, and a load only if none did since the open proved the
+            // snapshot.
+            let epoch_at_open = indexes.epoch();
+            let name = table_name.to_string();
+            let gate_task = gate.clone();
+            let index_sections_task = index_sections.clone();
+            let index_origin_task = index_origin.clone();
             let io_pointers_task = io_pointers.clone();
             let io_rows_task = io_rows.clone();
             let fields = schema.fields.clone();
             let readers_task = readers.clone();
             let alive = maintenance_alive.clone();
-            tokio::spawn(async move {
-                if !alive.load(AtomicOrdering::Relaxed) {
-                    return;
-                }
-                let build = gate::build_token();
-                load::open_indexes(&build, opened, plan, || {
-                    build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task))
-                })
-                .await;
-            });
+            starts.push(Box::new(move || {
+                // Deferred by a scan-only open: a load of the sections its
+                // proof found stands only if nothing touched the file set or
+                // renumbered its slots since (a vacuum or a forget sweep may
+                // have, with no write path, which would have started this
+                // first); otherwise the indexes build from the rows as they
+                // are now. Run at the open, this is the open's own plan.
+                let plan = match plan {
+                    load::Plan::Load { .. }
+                        if indexes.epoch() != epoch_at_open
+                            || gate_task.state() != crate::core::index_store::gate_word::GateState::Clean =>
+                    {
+                        load::Plan::BuildInstead("the file set changed after its scan-only open")
+                    }
+                    plan => plan,
+                };
+                let loading = matches!(plan, load::Plan::Load { .. });
+                let opened = load::OpenIndexes {
+                    name,
+                    indexes: indexes.clone(),
+                    epoch: if loading { epoch_at_open } else { indexes.epoch() },
+                    n_slots: existing_slots,
+                    gate: gate_task.clone(),
+                    barrier: loading.then(|| gate_task.loads().raise()),
+                    vouch: filter_vouches,
+                    sections_in_snapshot: index_sections_task,
+                    origin: index_origin_task,
+                };
+                tokio::spawn(async move {
+                    if !alive.load(AtomicOrdering::Relaxed) {
+                        return;
+                    }
+                    let build = gate::build_token();
+                    load::open_indexes(&build, opened, plan, || {
+                        build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task))
+                    })
+                    .await;
+                });
+            }));
         }
 
         // The filter's backfill, when it has one, runs on this task. No
@@ -1557,7 +1618,7 @@ impl<S: StorageIO> Table<S> {
             // open's backfill, may report it ready again.
             let epoch_at_open = filters.renumber_epoch();
 
-            tokio::spawn(async move {
+            starts.push(Box::new(move || { tokio::spawn(async move {
                 let resume = filters.resume_slot();
                 if resume < existing_slots && alive.load(AtomicOrdering::Relaxed) {
                     let started = std::time::Instant::now();
@@ -1588,7 +1649,7 @@ impl<S: StorageIO> Table<S> {
                 if filters.renumber_epoch() == epoch_at_open {
                     ready.store(true, AtomicOrdering::Release);
                 }
-            });
+            }); }));
         }
 
         // Reclamation runs on its own task for the same reason filter
@@ -1673,6 +1734,8 @@ impl<S: StorageIO> Table<S> {
             index_sections,
             index_origin,
         });
+        // Set while a scan-only open's starts wait; the unit reads it.
+        let scan_only_unit = StdArc::new(AtomicBool::new(deferred));
         let external = match &watch {
             Some(watch) => {
                 let sealer = table_seal::IdleSealer::new(&seal, maintenance_alive.clone(), cache_generation.clone());
@@ -1683,6 +1746,7 @@ impl<S: StorageIO> Table<S> {
                     watch.clone(),
                     vacuum.take(),
                     sealer,
+                    scan_only_unit.clone(),
                 ));
                 let weak: std::sync::Weak<dyn crate::core::partition::maintenance::Unit> =
                     StdArc::downgrade(&(unit.clone() as StdArc<dyn crate::core::partition::maintenance::Unit>));
@@ -1694,14 +1758,36 @@ impl<S: StorageIO> Table<S> {
                 None
             }
         };
-        // The audit of a load, 1 in `index_snapshot.audit_rate` (§4, B18).
-        table_audit::spawn_after_load(table_audit::AuditParts {
-            seal: seal.clone(),
-            fields: schema.fields.clone(),
-            readers: readers.clone(),
-            alive: maintenance_alive.clone(),
-            cache_generation: cache_generation.clone(),
-        });
+        // The audit of a load, 1 in `index_snapshot.audit_rate` (§4, B18),
+        // after the index start that raises the load's barrier.
+        {
+            let parts = table_audit::AuditParts {
+                seal: seal.clone(),
+                fields: schema.fields.clone(),
+                readers: readers.clone(),
+                alive: maintenance_alive.clone(),
+                cache_generation: cache_generation.clone(),
+            };
+            starts.push(Box::new(move || table_audit::spawn_after_load(parts)));
+        }
+        // A full open starts everything now; a scan-only one keeps it for
+        // its upgrade (`ensure_full`).
+        let scan_only_flag = scan_only_unit;
+        let deferred_starts = if deferred {
+            starts
+        } else {
+            for start in starts {
+                start();
+            }
+            Vec::new()
+        };
+        // A plain table's own descriptors, which the partitions' open budget
+        // leaves room for (`partition::budget`): a file-backed table with no
+        // range guard; a statement's memory-backed relation holds none.
+        let plain_counted = guard.is_none() && io_pointers.index_store_dir().is_some();
+        if plain_counted {
+            crate::core::partition::budget::note_plain_open();
+        }
 
         Self {
             schema,
@@ -1744,7 +1830,38 @@ impl<S: StorageIO> Table<S> {
             gate,
             watch,
             external,
+            scan_only: scan_only_flag,
+            deferred_starts: parking_lot::Mutex::new(deferred_starts),
+            plain_counted,
         }
+    }
+
+    /// Whether this instance was opened scan-only and has not been upgraded
+    /// yet ([`Self::ensure_full`]): its indexes neither load nor build, and
+    /// answer nothing (they are not ready), and its filter prunes only if
+    /// the open loaded it from the snapshot.
+    pub fn is_scan_only(&self) -> bool {
+        self.scan_only.load(AtomicOrdering::Acquire)
+    }
+
+    /// Upgrades a scan-only instance (phase 3 P5b-2b): runs the starts its
+    /// open deferred (the index load or build, the filter backfill, the
+    /// load audit), once. Called before any write takes its ticket
+    /// (`enter_write`) and when a routed access reaches the instance, so a
+    /// write never touches the indexes before a load's barrier is raised:
+    /// the starts run under the lock, and the flag clears only after them,
+    /// so a caller that finds it clear, or waited on the lock, sees every
+    /// start made. Scans racing it are unaffected: an index answers only
+    /// once ready, before and after.
+    pub fn ensure_full(&self) {
+        if !self.scan_only.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        let mut starts = self.deferred_starts.lock();
+        for start in starts.drain(..) {
+            start();
+        }
+        self.scan_only.store(false, AtomicOrdering::Release);
     }
 
     /// The file set's write gate.
@@ -1864,6 +1981,13 @@ impl<S: StorageIO> Table<S> {
     /// log does not vouch for, which no open trusts (`index_store::seal`).
     pub(crate) async fn close_exclusive(&self, seal: bool) {
         let already = self.is_retired();
+        // A seal only when it can publish (P5b-2b): an instance whose
+        // indexes or filter are not ready (a scan-only one, or one closed
+        // before its build or backfill finished) is not eligible, and the
+        // seal would first take its transient ticket, marking the file set's
+        // snapshot `DIRTY` for nothing: the next open would rebuild instead
+        // of loading it.
+        let seal = seal && !self.is_scan_only() && self.ready_to_seal();
         if seal && !already {
             self.quiesce_for_shutdown().await;
             if let Some(unit) = &self.external {
@@ -1897,6 +2021,13 @@ impl<S: StorageIO> Table<S> {
                 }
             }
         }
+    }
+
+    /// Whether this instance's indexes (if any) and filter are ready: what a
+    /// seal's eligibility asks of them.
+    fn ready_to_seal(&self) -> bool {
+        self.filters_ready().unwrap_or(false)
+            && self.indexes().ok().and_then(|ix| ix.as_ref().map(|ix| ix.is_ready())).unwrap_or(true)
     }
 
     /// Whether [`Table::retire`] has run (or the table was dropped, or is a
@@ -1986,6 +2117,9 @@ impl<S: StorageIO> Table<S> {
     /// durable here, before any stamp. `None` on every table but a partition
     /// opened `External`.
     async fn enter_write(&self) -> Result<Option<crate::core::partition::maintenance::WriteGuard<'_>>> {
+        // A scan-only instance is upgraded before its first write's ticket,
+        // so a load's barrier is up before anything is written (P5b-2b).
+        self.ensure_full();
         match &self.watch {
             None => Ok(None),
             Some(watch) => watch.enter().await.map(Some),

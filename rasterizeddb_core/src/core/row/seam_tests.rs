@@ -62,6 +62,10 @@ const SCHEMA_ONLY: &[&str] = &[
     // unit's round and its staged appends, reached through `self.data()`
     // only after the retirement; a shell has neither, and nothing to land.
     "close_exclusive",
+    // A scan-only open's flag and its deferred starts (phase 3 P5b-2b), on
+    // `Table` itself: a shell's flag is clear and it has no starts.
+    "is_scan_only",
+    "ensure_full",
     // Test-only: the cache scope string and generation counter.
     "cache_key",
 ];

@@ -999,7 +999,7 @@ impl PartitionedTable {
                         if old_slot.open_now().is_none() {
                             continue;
                         }
-                        let table = next.parts.open_instance(new).await.map_err(|err| format!("partition {}: {err}", new.pid))?;
+                        let table = next.parts.open_instance(new, false).await.map_err(|err| format!("partition {}: {err}", new.pid))?;
                         let token = next.parts.budget.enter(StdArc::downgrade(&next.parts), self.uid, new.pid);
                         #[cfg(test)]
                         instance_count::reopened(&self.root, self.uid, new.pid);
@@ -1321,6 +1321,8 @@ impl PartitionedTable {
                     }
                 },
             };
+            // What a write, a DDL or a VACUUM reaches is upgraded (P5b-2b).
+            table.ensure_full();
             out.push((pid, table));
         }
         Ok(out)
@@ -1358,8 +1360,12 @@ impl PartitionedTable {
         }
         // A routed access, one partition reached, sets its reference bit; a
         // fan-out's sets none (scan resistance, `partition::budget`).
-        if let [(pid, _)] = out.as_slice() {
+        if let [(pid, open)] = out.as_slice() {
             Self::slot(live, *pid)?.touch();
+            // A routed access upgrades a scan-only instance (P5b-2b).
+            if let Some(table) = open {
+                table.ensure_full();
+            }
         }
         Ok(out)
     }
@@ -1447,6 +1453,7 @@ impl PartitionedTable {
         let slot = Self::slot(live, pid)?;
         let mut out = Planned::new();
         if let Some(table) = slot.open_now() {
+            table.ensure_full();
             out.push((pid, Some(table)));
         } else if slot.materialized.load(Ordering::SeqCst) {
             out.push((pid, None));
@@ -1473,6 +1480,7 @@ impl PartitionedTable {
         }
         slot.touch();
         if let Some(table) = slot.open_now() {
+            table.ensure_full();
             return Ok(table);
         }
         live.parts.open_slow_erased(slot, true, true).await
@@ -1816,6 +1824,9 @@ impl Parts {
             slot.touch();
         }
         if let Some(table) = slot.open_now() {
+            if routed {
+                table.ensure_full();
+            }
             return Ok(table);
         }
         self.open_slow_erased(slot, false, routed).await
@@ -1877,7 +1888,12 @@ impl Parts {
         if !slot.materialized.load(Ordering::SeqCst) {
             self.materialize(slot).await?;
         }
-        let table = match self.open_instance(slot).await {
+        // A fan-out's (or a forget sweep's) open only reads: scan-only
+        // (P5b-2b), upgraded by the first routed access or write.
+        let scan_only = !routed;
+        #[cfg(test)]
+        let scan_only = scan_only && !scan_open_hooks::disabled(&self.root);
+        let table = match self.open_instance(slot, scan_only).await {
             Ok(table) => table,
             // Out of descriptors whatever the budget said (plain tables,
             // connections, another process's share of the system's): close
@@ -1893,7 +1909,7 @@ impl Parts {
                     slot.pid,
                     self.name
                 );
-                self.open_instance(slot).await?
+                self.open_instance(slot, scan_only).await?
             }
             Err(e) => return Err(e),
         };
@@ -1964,7 +1980,7 @@ impl Parts {
     /// Opens a slot's partition over files that exist, `External` (its
     /// maintenance the scheduler's, its pin the slot's), under this
     /// instance's schema. The caller holds the lifecycle lock.
-    async fn open_instance(&self, slot: &Slot) -> io::Result<Arc<Table<DbStorageProvider>>> {
+    async fn open_instance(&self, slot: &Slot, scan_only: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
         // Never a provider over a missing file, which it would create (I9).
         // Out of descriptors here is insufficient resources too: the check
         // opens the files it checks.
@@ -1981,6 +1997,7 @@ impl Parts {
             guard: RangeGuard::new(self.spec.clone(), slot.range),
             mode: MaintenanceMode::External,
             watch: Some(self.board.watch(slot.pid)?.clone()),
+            scan_only,
         })
         .await
         .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
@@ -2159,6 +2176,8 @@ impl Parts {
         }
         // Owned alone since the check above; dropping it drops the providers
         // (the scheduler holds the unit weakly).
+        #[cfg(test)]
+        let table = close_leak_hooks::maybe_leak(&self.root, pid, table);
         if let Err(still) = Arc::try_unwrap(table) {
             ::log::error!(
                 "partition {pid} of \"{}\" was referenced again while it closed ({} references)",
@@ -2167,6 +2186,17 @@ impl Parts {
             );
             #[cfg(test)]
             instance_count::leaked(&self.root, self.uid, pid);
+            // Still counted in the budget for as long as it lives, with its
+            // descriptors (review A round 2, N1): the token goes with the
+            // last reference, which a task waits for.
+            let token = slot.token.lock().take();
+            tokio::spawn(async move {
+                while Arc::strong_count(&still) > 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                drop(still);
+                drop(token);
+            });
         }
         #[cfg(test)]
         instance_count::closed(&self.root, self.uid, pid);
@@ -2207,6 +2237,61 @@ pub(crate) mod kept_sizes_hooks {
             let _ = reached.send(());
             let _ = resume.recv_timeout(std::time::Duration::from_secs(30));
         }
+    }
+}
+
+/// Test-only: fan-out opens made full again under a directory, as before
+/// P5b-2b, for the measurement's before and the tests' baselines.
+#[cfg(test)]
+pub(crate) mod scan_open_hooks {
+    use std::path::{Path, PathBuf};
+
+    static DISABLED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(crate) fn disable(dir: &Path) {
+        DISABLED.lock().push(dir.to_path_buf());
+    }
+
+    pub(crate) fn enable(dir: &Path) {
+        DISABLED.lock().retain(|d| d != dir);
+    }
+
+    pub(super) fn disabled(root: &Path) -> bool {
+        DISABLED.lock().iter().any(|d| root.starts_with(d))
+    }
+}
+
+/// Test-only: a close that finds its instance referenced again as it
+/// drops it (never reached otherwise): the hook keeps a clone, which the
+/// test drops later.
+#[cfg(test)]
+pub(crate) mod close_leak_hooks {
+    use std::path::{Path, PathBuf};
+
+    use rclite::Arc;
+
+    use super::{DbStorageProvider, Table};
+
+    type Kept = (PathBuf, u32, Option<Arc<Table<DbStorageProvider>>>);
+    static KEEP: parking_lot::Mutex<Vec<Kept>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next close of `pid` under `dir` keeps a reference to its instance
+    /// past its drop, until [`release`].
+    pub(crate) fn keep(dir: &Path, pid: u32) {
+        KEEP.lock().push((dir.to_path_buf(), pid, None));
+    }
+
+    /// Drops the reference [`keep`] kept.
+    pub(crate) fn release(dir: &Path) {
+        KEEP.lock().retain(|(d, _, _)| d != dir);
+    }
+
+    pub(super) fn maybe_leak(root: &Path, pid: u32, table: Arc<Table<DbStorageProvider>>) -> Arc<Table<DbStorageProvider>> {
+        let mut keep = KEEP.lock();
+        if let Some(entry) = keep.iter_mut().find(|(d, p, kept)| root.starts_with(d) && *p == pid && kept.is_none()) {
+            entry.2 = Some(table.clone());
+        }
+        table
     }
 }
 

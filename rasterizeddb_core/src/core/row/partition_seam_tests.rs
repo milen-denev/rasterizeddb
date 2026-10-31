@@ -101,6 +101,7 @@ async fn open(l: &Logical, pid: u32, range: PointRange) -> Table<P> {
         guard: RangeGuard::new(spec(&l.schema), range),
         mode: crate::core::partition::maintenance::MaintenanceMode::Own,
         watch: None,
+        scan_only: false,
     })
     .await
     .unwrap()
@@ -597,6 +598,7 @@ async fn a_failed_open_releases_its_files() {
         guard: RangeGuard::new(spec(&l.schema), PointRange::FULL),
         mode: crate::core::partition::maintenance::MaintenanceMode::Own,
         watch: None,
+        scan_only: false,
     })
     .await;
     crate::core::row::table::partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.set(false));

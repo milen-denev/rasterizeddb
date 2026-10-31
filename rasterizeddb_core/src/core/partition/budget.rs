@@ -371,19 +371,45 @@ fn ring_of(uid: u64, pid: u32) -> usize {
     (h ^ (h >> 29)) as usize % SHARDS
 }
 
-/// `min(4096, (soft RLIMIT_NOFILE − 2048) / 10)`, at least 16.
+/// `min(4096, (soft RLIMIT_NOFILE − 2048 − 25 × open plain tables) / 10)`,
+/// at least 16 (§7.1).
 fn derived_limit() -> usize {
     #[cfg(unix)]
     {
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: a valid out-pointer to an `rlimit`.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-            let soft = limit.rlim_cur as u64;
-            let n = (soft.saturating_sub(RESERVE) / PER_PARTITION) as usize;
-            return n.clamp(MIN_OPEN, MAX_OPEN);
+            return limit_for(limit.rlim_cur as u64, plain_tables_open());
         }
     }
     MAX_OPEN
+}
+
+/// The budget a soft descriptor limit of `soft` leaves with `plain` plain
+/// tables open: each holds about 25 descriptors (§7.1's term).
+pub fn limit_for(soft: u64, plain: usize) -> usize {
+    let n = soft.saturating_sub(RESERVE).saturating_sub(PER_PLAIN_TABLE * plain as u64) / PER_PARTITION;
+    (n as usize).clamp(MIN_OPEN, MAX_OPEN)
+}
+
+/// Descriptors an open plain table holds, for the budget (§7.1).
+const PER_PLAIN_TABLE: u64 = 25;
+
+/// Open plain tables (file-backed, `Own` maintenance) in the process,
+/// counted by `Table` as it opens and drops.
+static PLAIN_TABLES_OPEN: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn note_plain_open() {
+    PLAIN_TABLES_OPEN.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(crate) fn note_plain_closed() {
+    PLAIN_TABLES_OPEN.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Plain tables open in the process now.
+pub fn plain_tables_open() -> usize {
+    PLAIN_TABLES_OPEN.load(Ordering::Acquire)
 }
 
 /// The process's budget.
@@ -492,6 +518,17 @@ mod tests {
         assert_eq!(descriptor_target(wanted, 524_288), None);
         assert_eq!(descriptor_target(524_288, 524_288), None);
         assert_eq!(descriptor_target(2256, 2256), None);
+    }
+
+    /// §7.1's budget: each open plain table takes 25 descriptors off the
+    /// partitions' share, within the floor and the ceiling.
+    #[test]
+    fn open_plain_tables_shrink_the_derived_budget() {
+        assert_eq!(limit_for(20_000, 0), ((20_000 - RESERVE) / PER_PARTITION) as usize);
+        assert_eq!(limit_for(20_000, 400), ((20_000 - RESERVE - 400 * 25) / PER_PARTITION) as usize);
+        assert_eq!(limit_for(524_288, 1000), MAX_OPEN);
+        assert_eq!(limit_for(2_256, 10), MIN_OPEN);
+        assert!(limit_for(43_008, 100) < limit_for(43_008, 0));
     }
 
     /// Removing an entry keeps the others' order and the hand on the entry

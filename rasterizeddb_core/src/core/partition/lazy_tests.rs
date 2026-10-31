@@ -916,6 +916,12 @@ async fn closed_partitions_are_never_reported_ready() {
     let ready = crate::core::rql::catalog_views::index_ready_for_tests(&db, "pt").unwrap();
     assert_eq!(ready, Some(false), "indexes reported ready with every partition closed");
     let _ = rows(&db, "").await;
+    // A fan-out opens scan-only (P5b-2b): its partitions' indexes are not
+    // built, and not reported ready.
+    let ready = crate::core::rql::catalog_views::index_ready_for_tests(&db, "pt").unwrap();
+    assert_eq!(ready, Some(false), "indexes reported ready on scan-only partitions");
+    // Upgraded (what a write, a DDL or a VACUUM reaches), they build.
+    drop(t.all_partitions().await.unwrap());
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let filters = crate::core::introspect::row_figures_for_tests(&db, "pt").await.unwrap().0;
@@ -1950,6 +1956,237 @@ async fn an_open_refused_as_unmaterialized_evicts_nothing() {
     assert!(t.open_part(unmaterialized).await.is_err(), "an unmaterialized partition opened");
     assert_eq!(budget.evictions(), evictions, "a refused open closed a partition for the budget");
     assert_eq!(open_pids(&t), vec![p]);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+// ------------------------------------------------------------------ P5b-2b
+// Scan-only fan-out opens.
+
+/// A populated table with an index on `v`, under `index_storage =
+/// snapshot`, every partition closed by a sealing close (so each has a
+/// snapshot with INDEX sections), the scheduler parked.
+async fn sealed_and_closed(dir: &Path) -> (Arc<Database>, crate::core::index_store::load::storage_override::Guard) {
+    use crate::core::index_store::load::{settings::IndexStorage, storage_override};
+    let snap = storage_override::set(dir, IndexStorage::Snapshot);
+    let db = open(dir).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    assert_eq!(t.close_idle().await.unwrap(), t.materialized_pids().unwrap().len());
+    (db, snap)
+}
+
+/// A fan-out that only reads opens every partition scan-only (P5b-2b):
+/// no index load or build starts, the answers are whole, and closing them
+/// again writes nothing, so a routed open afterwards loads the snapshot the
+/// writes' closes sealed.
+///
+/// Mutations: the fan-out's open made full (the indexes load or build);
+/// a scan-only close sealing (its transient ticket marks the snapshot
+/// `DIRTY`, and the next open rebuilds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_opens_scan_only_and_its_close_writes_nothing() {
+    use crate::core::index_store::load::Origin;
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let open = t.open_partitions_now();
+    assert_eq!(open.len(), t.materialized_pids().unwrap().len());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (pid, part) in &open {
+        assert!(part.is_scan_only(), "partition {pid} opened full by a fan-out");
+        assert_eq!(part.index_origin(), Origin::Pending, "partition {pid}'s indexes started on a fan-out's open");
+    }
+    drop(open);
+    t.close_idle().await.unwrap();
+    let p = pid_of_tenant(&t, 3);
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    assert_eq!(part.index_origin(), Origin::Loaded, "a scan-only close spoiled the snapshot");
+    drop(part);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A routed read reaching a scan-only instance upgrades it in place: the
+/// same instance, its indexes loaded, every answer through them the same as
+/// a scan's, while a concurrent fan-out keeps reading.
+///
+/// Mutation: `planned` not upgrading the instance a routed read reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_routed_read_upgrades_a_scan_only_instance_in_place() {
+    use crate::core::index_store::load::Origin;
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let p = pid_of_tenant(&t, 3);
+    let before = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(before.is_scan_only());
+    let scanner = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            for _ in 0..20 {
+                assert_eq!(rows(&db, "").await, expected(), "a fan-out racing an upgrade lost rows");
+            }
+        })
+    };
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
+    assert_eq!(rows(&db, "tenant_id = 3").await, mine);
+    let after = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(Arc::ptr_eq(&before, &after), "the upgrade reopened the partition");
+    assert!(!after.is_scan_only(), "a routed read left the instance scan-only");
+    settled(&after).await;
+    assert_eq!(after.index_origin(), Origin::Loaded);
+    for v in [301i64, 302, 303, 304] {
+        assert_eq!(rows(&db, &format!("v = {v}")).await, rows(&db, &format!("v + 0 = {v}")).await, "v = {v}");
+    }
+    scanner.await.unwrap();
+    drop((before, after));
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A write reaching a scan-only instance upgrades it before its ticket,
+/// whatever path it took (here a row written straight through the instance
+/// a fan-out opened, which no routing step upgrades): the load's barrier is
+/// up before the write, so the loaded index holds the new row too.
+///
+/// Mutation: `enter_write` not upgrading the instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_upgrades_a_scan_only_instance_before_its_ticket() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let p = pid_of_tenant(&t, 3);
+    let part = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(part.is_scan_only());
+    let qp = crate::core::rql::lexer_s1::QueryPurpose::InsertRow(crate::core::rql::lexer_s1::InsertRowData {
+        table_name: "pt".into(),
+        query: "INSERT INTO pt (tenant_id, id, v) VALUES (3, 77, 99977)".into(),
+        on_conflict_do_nothing: false,
+        on_conflict_target: Vec::new(),
+        on_conflict_update: None,
+    });
+    let row = crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[], 0).unwrap();
+    let tx = db.transactions.begin();
+    part.insert_row_in_txn(row, tx).await.unwrap();
+    db.transactions.commit(tx);
+    assert!(!part.is_scan_only(), "a write left the instance scan-only");
+    settled(&part).await;
+    assert_eq!(rows(&db, "v = 99977").await, vec![(3, 77, 99977)], "the index missed a row written at the upgrade");
+    drop(part);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A scan-only instance whose file set something wrote with no write path
+/// (a forget sweep's neutralizing, a vacuum) since its open proved the
+/// snapshot does not load that snapshot at its upgrade: its indexes build
+/// from the rows as they are.
+///
+/// Mutation: the deferred load kept whatever happened after the open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upgrade_after_the_file_set_changed_builds_rather_than_loads() {
+    use crate::core::index_store::load::Origin;
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let p = pid_of_tenant(&t, 3);
+    let part = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(part.is_scan_only());
+    // A ticket on the word with no write path: what a sweep or a vacuum takes.
+    {
+        let _ticket = crate::core::index_store::gate::ticket(part.gate(), None).await.unwrap();
+    }
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
+    assert_eq!(rows(&db, "tenant_id = 3").await, mine);
+    settled(&part).await;
+    assert_ne!(part.index_origin(), Origin::Loaded, "a changed file set loaded the snapshot its open had proved");
+    for v in [301i64, 302, 303, 304] {
+        assert_eq!(rows(&db, &format!("v = {v}")).await, rows(&db, &format!("v + 0 = {v}")).await, "v = {v}");
+    }
+    drop(part);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Shutdown seals the open partitions, but not a scan-only one, whose
+/// seal's transient ticket would spoil the snapshot its next open loads;
+/// and its unit takes no idle checkpoint meanwhile.
+///
+/// Mutations: shutdown sealing scan-only partitions; the unit's idle
+/// checkpoint looking at a scan-only instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone() {
+    use crate::core::index_store::load::Origin;
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let _idle = crate::core::row::table::table_seal::idle_override::set(dir.path(), Duration::from_millis(50));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    // The scheduler running again, for the idle checkpoint's looks.
+    db.partition_maintenance().set_period(Duration::from_millis(20));
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let report = db.seal_for_shutdown(Duration::from_secs(30)).await;
+    let _ = report;
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    let t = pt(&db);
+    for pid in t.materialized_pids().unwrap() {
+        let part = t.open_part(pid).await.unwrap();
+        settled(&part).await;
+        assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid}'s snapshot was spoiled while it was scan-only");
+    }
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review A round 2's N1: an instance referenced again as its close drops
+/// it stays counted in the budget, with its descriptors, until the last
+/// reference goes.
+///
+/// Mutation: the token released whatever the instance's references.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_kept_past_its_close_stays_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let open_before = budget.open();
+    super::table::close_leak_hooks::keep(dir.path(), p);
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(budget.open(), open_before, "a partition still referenced stopped counting");
+    super::table::close_leak_hooks::release(dir.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while budget.open() != open_before - 1 {
+        assert!(std::time::Instant::now() < deadline, "the token never went with the last reference");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(t);
     close(dir.path(), db);
     super::budget::release(dir.path());

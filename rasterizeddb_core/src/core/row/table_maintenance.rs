@@ -41,6 +41,10 @@ pub(crate) struct ExternalUnit<S: StorageIO> {
     /// `None` with reclamation off: nothing is swept, and nothing forgotten.
     vacuum: Option<tokio::sync::Mutex<VacuumSlot<S>>>,
     sealer: Option<tokio::sync::Mutex<IdleSealer<S>>>,
+    /// Set while the instance is scan-only (phase 3 P5b-2b): no idle
+    /// checkpoint then, since its indexes are not built and a seal's
+    /// transient ticket would mark the snapshot `DIRTY` for nothing.
+    scan_only: StdArc<AtomicBool>,
     /// Held by each round of [`Unit::service`], from before it looks at
     /// `alive`: what an exclusive close waits on after clearing `alive`, so
     /// no landing of this instance is still writing when the next instance
@@ -56,8 +60,10 @@ impl<S: StorageIO> ExternalUnit<S> {
         watch: StdArc<WriteWatch>,
         vacuum: Option<VacuumService<S>>,
         sealer: Option<IdleSealer<S>>,
+        scan_only: StdArc<AtomicBool>,
     ) -> Self {
         ExternalUnit {
+            scan_only,
             io_rows,
             io_pointers,
             alive,
@@ -126,7 +132,7 @@ impl<S: StorageIO> ExternalUnit<S> {
             }
             busy |= !service.settled(state);
         }
-        if let Some(sealer) = &self.sealer {
+        if let Some(sealer) = self.sealer.as_ref().filter(|_| !self.scan_only.load(Ordering::Acquire)) {
             match sealer.lock().await.look().await {
                 IdleLook::Gone => return Service::Gone,
                 IdleLook::Pending => busy = true,

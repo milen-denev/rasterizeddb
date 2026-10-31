@@ -419,3 +419,141 @@ async fn budget_resident_cost_catalog_reads_and_first_touch() {
         median(&mut rebuilt),
     );
 }
+
+/// The process's CPU time (user + system) so far.
+fn cpu_time() -> Duration {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the command, which may hold spaces: utime and stime are
+    // the 14th and 15th fields overall.
+    let after = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let ticks: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0)
+        + fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    Duration::from_millis(ticks * 1000 / hz)
+}
+
+/// The bytes this process caused to be read from and written to storage.
+fn io_bytes() -> (u64, u64) {
+    let io = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+    let get = |key: &str| {
+        io.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    };
+    (get("read_bytes:"), get("write_bytes:"))
+}
+
+/// P5b-2b's measurement (docs/partitioning.md "Phase 3 P5b-2b as built"):
+/// the first unrouted read over `P5B2B_N` closed partitions (default 1,024)
+/// of `P5B2B_ROWS` rows each (default 200, an index on `v`), every one
+/// sealed by its close, with fan-out opens full (as before P5b-2b) against
+/// scan-only, under `index_storage = rebuild` and `= snapshot`: the
+/// statement, then everything its opens start until it settles (CPU, RSS,
+/// bytes read and written), then closing them. `P5B2B_DIR` puts the
+/// database there (an ext4 directory for the disk-bound part; the temp
+/// directory, tmpfs, by default). A measurement, `#[ignore]`d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run by hand with --ignored --nocapture"]
+async fn first_fan_out_cost_scan_only_against_full() {
+    use crate::core::index_store::load::{settings::IndexStorage, storage_override};
+    let n = env_u32("P5B2B_N", 1024);
+    let rows = env_u32("P5B2B_ROWS", 200) as i64;
+    let _ = crate::MAX_PERMITS_THREADS.set(4);
+    let _ = crate::BATCH_SIZE.set(512);
+    let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
+    let base = match std::env::var("P5B2B_DIR") {
+        Ok(parent) => tempfile::tempdir_in(parent).unwrap(),
+        Err(_) => tempfile::tempdir().unwrap(),
+    };
+    super::partitioned::cap_hooks::raise(base.path(), n.max(2048));
+    let _budget = crate::core::partition::budget::isolate_with(base.path(), (n as usize) * 2, Some(0));
+    for storage in [IndexStorage::Rebuild, IndexStorage::Snapshot] {
+        let root = base.path().join(format!("db_{}", storage.name()));
+        let root_s = path_str(&root);
+        let _mode = storage_override::set(&root, storage);
+        {
+            let db = rclite::Arc::new(Database::new_named(&root_s, false, "fan_out_cost").await);
+            db.partition_maintenance().set_period(Duration::from_secs(3600));
+            let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(
+                "CREATE TABLE acct (tenant_id BIGINT NOT NULL, v BIGINT NOT NULL, label TEXT)",
+            )
+            .unwrap();
+            let ct = crate::core::rql::lexer_ct::create_table_from_query_purpose(&purpose).unwrap();
+            db.create_partitioned_table(ct, &["tenant_id"], n).await.unwrap();
+            exec(&db, "CREATE INDEX acct_v ON acct (v)").await;
+            let t = partitioned(&db, "acct");
+            let epoch = t.epoch().unwrap();
+            let mut seen = vec![false; n as usize];
+            let (mut tenant, mut filled) = (0i64, 0u32);
+            while filled < n {
+                let pid = t.route_where(&format!("tenant_id = {tenant}")).unwrap().pids(&epoch.map)[0];
+                if !seen[pid as usize] {
+                    let values: Vec<String> = (0..rows).map(|i| format!("({tenant}, {}, 'x')", tenant * 1_000_000 + i)).collect();
+                    exec(&db, &format!("INSERT INTO acct (tenant_id, v, label) VALUES {}", values.join(", "))).await;
+                    seen[pid as usize] = true;
+                    filled += 1;
+                    if filled % 64 == 0 {
+                        for (_, part) in t.open_partitions_now() {
+                            settled(&part).await;
+                        }
+                        t.close_idle().await.unwrap();
+                    }
+                }
+                tenant += 1;
+            }
+            for (_, part) in t.open_partitions_now() {
+                settled(&part).await;
+            }
+            t.close_idle().await.unwrap();
+            db.sync_durable().unwrap();
+            drop(epoch);
+            drop(t);
+            drop(db);
+            crate::core::wal::remove_for(&root_s);
+        }
+        for scan_only in [false, true] {
+            if scan_only {
+                crate::core::partition::table::scan_open_hooks::enable(&root);
+            } else {
+                crate::core::partition::table::scan_open_hooks::disable(&root);
+            }
+            let db = rclite::Arc::new(Database::new_named(&root_s, false, "fan_out_cost").await);
+            db.partition_maintenance().set_period(Duration::from_secs(3600));
+            let t = partitioned(&db, "acct");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (cpu0, rss0, (r0, w0)) = (cpu_time(), rss_kib(), io_bytes());
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM acct WHERE label = 'x'").await;
+            let statement = at.elapsed();
+            for (_, part) in t.open_partitions_now() {
+                if !part.is_scan_only() {
+                    settled(&part).await;
+                }
+            }
+            let settled_at = at.elapsed();
+            let (cpu1, rss1, (r1, w1)) = (cpu_time(), rss_kib(), io_bytes());
+            let closing = Instant::now();
+            t.close_idle().await.unwrap();
+            let close = closing.elapsed();
+            let (_, w2) = io_bytes();
+            println!(
+                "FANOUT N={n} ROWS={rows} storage={} opens={}: statement {:.1} ms, settled at {:.1} ms; \
+                 CPU {:.0} ms, RSS +{} KiB, read {} KiB, written {} KiB; close of all {:.1} ms writing {} KiB",
+                storage.name(),
+                if scan_only { "scan-only" } else { "full" },
+                statement.as_secs_f64() * 1e3,
+                settled_at.as_secs_f64() * 1e3,
+                (cpu1 - cpu0).as_secs_f64() * 1e3,
+                rss1 as i64 - rss0 as i64,
+                (r1 - r0) / 1024,
+                (w1 - w0) / 1024,
+                close.as_secs_f64() * 1e3,
+                (w2 - w1) / 1024,
+            );
+            drop(t);
+            drop(db);
+            crate::core::wal::remove_for(&root_s);
+        }
+        crate::core::partition::table::scan_open_hooks::enable(&root);
+    }
+}

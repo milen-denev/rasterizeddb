@@ -479,7 +479,16 @@ async fn declared_indexes_are_listed_from_the_schema() {
         !closed.is_empty() && closed.iter().all(|r| get(r, "indisready") == "false"),
         "pt's indexes reported ready with every partition closed: {closed:?}"
     );
+    // A read opens them scan-only (P5b-2b): still not ready.
     exec_ok(&db, "SELECT * FROM pt").await;
+    let scanned = view(&db, "pg_index").await;
+    let scanned = twin_rows(&scanned, "indrelid", &pt_oid, &["indexrelid"]);
+    assert!(
+        scanned.iter().all(|r| get(r, "indisready") == "false"),
+        "pt's indexes reported ready on scan-only partitions: {scanned:?}"
+    );
+    // Upgraded, as a write, a DDL or a VACUUM reaches them: each builds.
+    drop(pt.all_partitions().await.unwrap());
     let mut ready = false;
     for _ in 0..200 {
         let index = view(&db, "pg_index").await;

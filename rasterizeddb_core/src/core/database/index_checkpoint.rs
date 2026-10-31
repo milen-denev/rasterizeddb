@@ -311,7 +311,10 @@ async fn seal_targets(
             pt.check().map_err(|e| e.to_string())?;
             let parts = match which {
                 Partitions::Every => pt.all_partitions().await.map_err(|e| e.to_string())?,
-                Partitions::Open => pt.open_partitions_now(),
+                // A scan-only partition (P5b-2b) has built nothing worth
+                // sealing, and a seal's transient ticket would mark its
+                // snapshot `DIRTY`: its next open loads that snapshot.
+                Partitions::Open => pt.open_partitions_now().into_iter().filter(|(_, t)| !t.is_scan_only()).collect(),
             };
             Ok(parts
                 .into_iter()
