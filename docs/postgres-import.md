@@ -209,6 +209,12 @@ A column of a domain takes the domain's type modifier (`typtypmod`): a
 domain over `char(5)` or `numeric(12,2)` keeps its length or scale, which the
 column's own `atttypmod` (-1) does not carry.
 
+A `numeric(p, s)` with a negative scale (`numeric(5, -2)`, PostgreSQL 15
+and later) becomes an unconstrained `NUMERIC`: every imported value is a
+whole number and is held exactly, but a value written afterwards is not
+rounded to the scale (PostgreSQL stores 12345 as 12300, this column keeps
+12345), and values show at the engine's nine places. The report says so.
+
 Nothing is dropped and nothing is guessed. A type with no counterpart becomes
 `TEXT` carrying PostgreSQL's rendering rather than being skipped, and every such
 decision is named in the report.

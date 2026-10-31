@@ -269,7 +269,9 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
                     // was read.
                     notes.push(format!(
                         "{}.{} is {}, whose negative scale this engine does not declare; it became \
-                         NUMERIC, which holds every value exactly but does not round new ones",
+                         NUMERIC, which holds every imported value exactly but does not round new ones \
+                         (PostgreSQL stores 12345 as 12300; this column keeps 12345) and shows them at \
+                         the engine's nine places",
                         table.name, column.name, column.formatted_type
                     ));
                 } else {

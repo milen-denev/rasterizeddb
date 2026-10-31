@@ -4498,12 +4498,19 @@ fn checks_stay_enforced(
         };
         return Err(format!(
             "ALTER COLUMN {} TYPE {} is not supported while check constraint \"{}\" reads the column: \
-             the check would no longer be enforced ({}). Drop the constraint first, or convert the \
-             column to character(n)",
+             the check would no longer be enforced ({}). Drop it, change the type, and add it back \
+             written for the new type, without the ::bpchar casts (ALTER TABLE … DROP CONSTRAINT \"{}\"; \
+             ALTER TABLE … ALTER COLUMN {} TYPE {}; ALTER TABLE … ADD CONSTRAINT \"{}\" CHECK (…)). \
+             It reads: {}",
             retyped.name,
             declared.trim(),
             check.name,
-            why
+            why,
+            check.name,
+            retyped.name,
+            declared.trim(),
+            check.name,
+            check.expression
         ));
     }
     Ok(())
