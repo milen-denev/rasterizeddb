@@ -282,7 +282,10 @@ character(1)` (which refuses with 23505 while they remain) is the repair.
 The open also notes whether every key cell is already in its stored form;
 while one is not (or the table has been reloaded by DDL since it opened),
 the uniqueness check walks the table rather than use the index and the
-filter, so a load into such a key costs a pass per row. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
+filter, so a load into such a key costs a pass per row. A partition of a
+partitioned table opens on first use, after the open's scan, so it is never
+called canonical (its keys are always checked by a walk) and its
+duplicates are not listed. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
 TRUE`) read a cell as its value too.
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does
