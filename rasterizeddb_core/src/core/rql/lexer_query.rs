@@ -253,6 +253,7 @@ fn parse_aggregate_call(
         .iter()
         .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
     {
+        func.check_argument(Some(field))?;
         return Ok((func, Some(field.clone())));
     }
     Err(format!("Column '{}' not found in schema", arg_text))
@@ -637,6 +638,7 @@ fn parse_select_items(
                 }
             };
 
+            func.check_argument(arg.as_ref())?;
             out.push(SelectItem::Aggregate {
                 func,
                 arg,

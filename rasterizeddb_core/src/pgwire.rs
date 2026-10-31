@@ -4900,6 +4900,12 @@ where
     } else if message.starts_with("missing FROM-clause entry for table") {
         // A qualifier naming no relation of the statement.
         "42P01"
+    } else if (message.starts_with("function ") && message.ends_with(") does not exist"))
+        || (message.starts_with("operator does not exist: ") && message.contains("character"))
+    {
+        // `sum(character)`, `character = boolean`: undefined_function, as
+        // PostgreSQL has no such function or operator.
+        "42883"
     } else if (message.contains("unknown type '") && message.contains("in a cast")) || casts_to_unknown_type(message) {
         "42704"
     } else if (message.ends_with(" not found in schema")
@@ -7260,7 +7266,7 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `undefined_function`: no operator between the two types. Decided before
     // the "does not exist" branches below, which the names of the types could
     // otherwise steer.
-    if has("operator does not exist") {
+    if has("operator does not exist") || (has("function ") && has(") does not exist")) {
         return "42883";
     }
     // `invalid_column_reference`: an ON CONFLICT target no unique key

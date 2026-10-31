@@ -256,11 +256,17 @@ number, and `c = 'é'` found nothing. The bytes are read as what they are
 now, so any value of one character (at most four bytes) reads back as
 written; a longer one was cut by the write that stored it (`'abcde'` is
 `'abcd'`) and reads as what survived. New writes are held to
-`character(1)`: one character, the rest spaces, `''` stored as `' '`, and
-anything longer 22001 where it was cut and reported stored. The column is
-still described as `text` and compared by its stored bytes, a literal
-read as a write would store it; `<`/`>` over non-ASCII
-values still follow the four bytes read as an integer (`docs/indexes.md`).
+`character(1)`: one character, the rest spaces, anything longer 22001
+where it was cut and reported stored. Every cell is read as
+`character(1)` reads a value: its text, without trailing spaces, shown
+padded, so an older build's `''` (four zeros), `' '` and `'a '` cells
+show, match, sort and group as the values they are (`' '`, `' '`, `'a'`),
+and a cut cell as what survived. Comparisons, patterns, joins, ORDER BY,
+GROUP BY, DISTINCT and min/max all use that text, in byte order; the
+filter, the prefilter and the indexes, which hold the stored bytes, are
+not used for such a column. The column is still described as `text`.
+`sum`/`avg` over it and comparing it with a boolean or a number are
+refused (42883), as PostgreSQL has no such function or operator.
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does
 not fit (22001) or two keys of a unique constraint would become one

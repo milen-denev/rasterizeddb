@@ -503,6 +503,9 @@ async fn a_legacy_char_cell_compares_as_the_text_it_shows() {
         ("SELECT count(DISTINCT c) FROM lc".to_string(), "[12]"),
         ("SELECT max(c), min(c) FROM lc".to_string(), "[😀]|[ ]"),
         ("SELECT id FROM lc ORDER BY c, id LIMIT 4".to_string(), "[7];[9];[1];[12]"),
+        ("SELECT sum(c) FROM lc".to_string(), "ERR 42883"),
+        ("SELECT avg(c) FROM lc".to_string(), "ERR 42883"),
+        (ids("c = true"), "ERR 42883"),
         // A join, by key and by a comma, and a subquery: text against the
         // cell's text, as `char = text` compares in PostgreSQL.
         ("CREATE TABLE jt (k TEXT, v INT)".to_string(), ""),

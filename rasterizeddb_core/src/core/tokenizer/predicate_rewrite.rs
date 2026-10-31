@@ -3110,6 +3110,29 @@ fn lift_comparison(
         // `character(n)` against a `character varying` column compares
         // blank-padded: the varying side is read without trailing spaces.
         let (left, right) = (&body[..at], &body[op_end..]);
+        // A legacy `CHAR` against a boolean or a number, which PostgreSQL has
+        // no operator for. Read as text, `c = true` answered no rows.
+        for (column, other) in [(left, right), (right, left)] {
+            if legacy_char_operand(column, schema).is_some() {
+                let other = other.trim();
+                let kind = if other.eq_ignore_ascii_case("TRUE") || other.eq_ignore_ascii_case("FALSE") {
+                    Some("boolean")
+                } else if is_numeric_literal_word(other.trim_start_matches(['-', '+'])) {
+                    Some(if other.contains(['.', 'e', 'E']) { "numeric" } else { "integer" })
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    let op = body[at..op_end].trim();
+                    let op = if op == "!=" { "<>" } else { op };
+                    return Err(if std::ptr::eq(column, left) {
+                        format!("operator does not exist: character {op} {kind}")
+                    } else {
+                        format!("operator does not exist: {kind} {op} character")
+                    });
+                }
+            }
+        }
         let (left, right): (std::borrow::Cow<str>, std::borrow::Cow<str>) =
             match (column_text_kind(left, schema), column_text_kind(right, schema)) {
                 (Some(TextSide::Padded), Some(TextSide::Varying)) => (left.into(), format!(" rtrim({})", right.trim()).into()),

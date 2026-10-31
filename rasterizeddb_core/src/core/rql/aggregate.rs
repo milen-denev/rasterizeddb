@@ -43,6 +43,16 @@ impl AggFunc {
         })
     }
 
+    /// Refuses `sum` and `avg` over a legacy `CHAR`, as PostgreSQL has no
+    /// such function. They folded nothing (its four bytes are no number) and
+    /// answered NULL.
+    pub fn check_argument(&self, arg: Option<&SchemaField>) -> Result<(), String> {
+        if matches!(self, AggFunc::Sum | AggFunc::Avg) && arg.is_some_and(|f| f.db_type == DbType::CHAR) {
+            return Err(format!("function {}(character) does not exist", self.name()));
+        }
+        Ok(())
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             AggFunc::Count => "count",
