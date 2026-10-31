@@ -503,6 +503,16 @@ async fn a_legacy_char_cell_compares_as_the_text_it_shows() {
         ("SELECT count(DISTINCT c) FROM lc".to_string(), "[12]"),
         ("SELECT max(c), min(c) FROM lc".to_string(), "[😀]|[ ]"),
         ("SELECT id FROM lc ORDER BY c, id LIMIT 4".to_string(), "[7];[9];[1];[12]"),
+        // A join, by key and by a comma, and a subquery: text against the
+        // cell's text, as `char = text` compares in PostgreSQL.
+        ("CREATE TABLE jt (k TEXT, v INT)".to_string(), ""),
+        ("INSERT INTO jt VALUES ('é', 1), ('A', 2), ('ab', 3), ('a', 4)".to_string(), ""),
+        ("CREATE TABLE jc (k CHAR(3), v INT)".to_string(), ""),
+        ("INSERT INTO jc VALUES ('é', 1), ('A', 2), ('ab', 3), ('a', 4)".to_string(), ""),
+        ("SELECT lc.id, jt.v FROM lc JOIN jt ON lc.c = jt.k ORDER BY lc.id".to_string(), "[1]|[2];[2]|[1];[5]|[3];[10]|[4];[14]|[4]"),
+        ("SELECT lc.id, jc.v FROM lc JOIN jc ON lc.c = jc.k ORDER BY lc.id".to_string(), "[1]|[2];[2]|[1];[5]|[3];[10]|[4];[14]|[4]"),
+        ("SELECT lc.id, jt.v FROM lc, jt WHERE lc.c = jt.k ORDER BY lc.id".to_string(), "[1]|[2];[2]|[1];[5]|[3];[10]|[4];[14]|[4]"),
+        (ids("c IN (SELECT k FROM jt)"), "[1,2,5,10,14]"),
     ];
     // `[7,9]` is the rows `[7];[9]`, and `∅` none.
     let cases: Vec<(String, String)> = cases

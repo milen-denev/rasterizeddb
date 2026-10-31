@@ -587,6 +587,10 @@ enum TextKind {
 
 fn text_kind(f: &SchemaField) -> TextKind {
     use crate::core::rql::type_modifier::TextTypmod;
+    // A legacy `CHAR` is `character(1)`, read without trailing spaces.
+    if f.db_type == DbType::CHAR {
+        return TextKind::Padded;
+    }
     match (f.db_type == DbType::STRING, f.text_typmod()) {
         (true, Some(TextTypmod::Bpchar(_))) => TextKind::Padded,
         (true, Some(TextTypmod::Varchar(_))) => TextKind::Varying,
@@ -606,6 +610,11 @@ struct KeyColumn {
     /// `bpchar`): this side's trailing spaces are not part of the key, as the
     /// other's are not stored (`type_modifier::TextTypmod`).
     blank_padded: bool,
+    /// This side is a legacy `CHAR`, matched by its text
+    /// (`value_codec::legacy_char_text`). Its four zero-padded bytes met no
+    /// text and no `character(n)` value: `lc JOIN jt ON lc.c = jt.k` joined
+    /// nothing.
+    legacy_char: bool,
 }
 
 /// One key column's value as the join matches it: by bytes, or for two
@@ -666,7 +675,9 @@ fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<KeyValue<'r>> {
             return None;
         }
     }
-    let bytes = if key.blank_padded {
+    let bytes = if key.legacy_char {
+        crate::core::value_codec::legacy_char_text(bytes).as_bytes()
+    } else if key.blank_padded {
         let end = bytes.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
         &bytes[..end]
     } else {
@@ -966,6 +977,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         flag: companion(left_relation, left_name),
                         document: false,
                         blank_padded: false,
+                        legacy_char: f.db_type == DbType::CHAR,
                     };
                     (key, f.db_type == DbType::JSONB, text_kind(f))
                 });
@@ -979,6 +991,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         flag: companion(relation, right_name),
                         document: false,
                         blank_padded: false,
+                        legacy_char: f.db_type == DbType::CHAR,
                     };
                     (key, f.db_type == DbType::JSONB, text_kind(f))
                 });
