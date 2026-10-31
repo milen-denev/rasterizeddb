@@ -20526,6 +20526,17 @@ async fn execute_query_rows_body(
                                             );
                                             continue;
                                         }
+                                        // A legacy `CHAR` by its one stored
+                                        // form: an older build's `'a '` and
+                                        // `'a'` cells are one value, as
+                                        // GROUP BY and `=` read them.
+                                        if !is_null && c.column_type == crate::core::db_type::DbType::CHAR {
+                                            key.push(u8::MAX);
+                                            key.extend_from_slice(
+                                                &crate::core::value_codec::legacy_char_canonical(c.data.into_slice()),
+                                            );
+                                            continue;
+                                        }
                                         key.extend_from_slice(
                                             &(c.data.into_slice().len() as u32)
                                                 .to_le_bytes(),

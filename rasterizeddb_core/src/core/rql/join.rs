@@ -1618,7 +1618,10 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
                 .get(position)
                 .is_some_and(|item| item.field.db_type == DbType::JSONB)
         };
-        let value_keys: Option<Vec<Vec<u8>>> = (0..plan.items.len()).any(document).then(|| {
+        // A legacy `CHAR` is keyed by its one stored form too (`value_key`).
+        let legacy_char = (0..plan.items.len())
+            .any(|position| plan.items.get(position).is_some_and(|item| item.field.db_type == DbType::CHAR));
+        let value_keys: Option<Vec<Vec<u8>>> = ((0..plan.items.len()).any(document) || legacy_char).then(|| {
             (0..starts.len() as u32)
                 .map(|i| {
                     let row = row_at(i);

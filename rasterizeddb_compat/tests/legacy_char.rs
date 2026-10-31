@@ -733,3 +733,46 @@ async fn a_key_over_a_legacy_char_column_judges_the_value_each_cell_shows() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// The rows the DISTINCT and truth-test tests read: the blank's zero and
+/// space cells, `'a'` and `'a '`, and one NULL.
+async fn distinct_fixture(name: &str) -> LegacyDb {
+    LegacyDb::make(
+        name,
+        &[
+            (1, Some("a"), None),
+            (2, Some("a "), None),
+            (3, Some(""), None),
+            (4, Some(" "), None),
+            (5, Some("b"), None),
+            (6, Some("é"), None),
+            (7, None, None),
+        ],
+    )
+    .await
+}
+
+/// `SELECT DISTINCT` over a legacy column keys each row by the value it
+/// shows, as GROUP BY and `count(DISTINCT)` do: the `'a'` and `'a '` cells,
+/// and the blank's zero and space cells, were two rows each. PostgreSQL 17's
+/// answer for the `char` values shown.
+///
+/// Mutation: the DISTINCT key raw (two blanks, two `'a'`).
+#[tokio::test(flavor = "multi_thread")]
+async fn select_distinct_keys_a_legacy_cell_by_its_value() {
+    let db = distinct_fixture("distinct").await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let wrong = check(
+        &c,
+        &[
+            ("SELECT DISTINCT c FROM lc ORDER BY c", "[ ];[a];[b];[é];∅"),
+            // DISTINCT inside a derived table or a CTE is refused (0A000) for
+            // every type here; over a join it goes through the join's own.
+            ("SELECT DISTINCT c FROM lc WHERE id IN (SELECT id FROM lc WHERE id > 1) ORDER BY c", "[ ];[a];[b];[é];∅"),
+            ("SELECT DISTINCT a.c FROM lc a JOIN lc b ON a.id = b.id ORDER BY a.c", "[ ];[a];[b];[é];∅"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

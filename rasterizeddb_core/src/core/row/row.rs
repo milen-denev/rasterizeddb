@@ -444,6 +444,11 @@ pub fn value_key(row: &[u8], document: impl Fn(usize) -> bool) -> Option<Vec<u8>
         {
             out.push(u8::MAX);
             crate::core::jsonb::push_group_key(cell.data, &mut out);
+        } else if cell.column_type == DbType::CHAR {
+            // A legacy `CHAR` by its one stored form
+            // (`value_codec::legacy_char_canonical`).
+            out.push(DbType::CHAR.to_byte());
+            out.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(cell.data));
         } else {
             out.push(cell.column_type.to_byte());
             out.extend_from_slice(&(cell.data.len() as u32).to_le_bytes());
