@@ -776,3 +776,34 @@ async fn select_distinct_keys_a_legacy_cell_by_its_value() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// A truth test over a comparison of a legacy column (`(c = 'a') IS TRUE`)
+/// is evaluated on the text as the comparison alone is; it reached the
+/// scan's comparator, which reads the four bytes as a `u32`, and an UPDATE
+/// through it missed rows. PostgreSQL 17's answers for the `char` values.
+///
+/// Mutation: the truth-test group not lifted (`(c = 'a') IS TRUE` finds one
+/// row).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truth_test_over_a_legacy_comparison_reads_its_text() {
+    let db = distinct_fixture("truth").await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let wrong = check(
+        &c,
+        &[
+            ("SELECT id FROM lc WHERE (c = 'a') IS TRUE ORDER BY id", "[1];[2]"),
+            ("SELECT id FROM lc WHERE (c < 'b') IS TRUE ORDER BY id", "[1];[2];[3];[4]"),
+            ("SELECT id FROM lc WHERE (c = 'a') IS NOT FALSE ORDER BY id", "[1];[2];[7]"),
+            ("SELECT id FROM lc WHERE (c = 'a') IS FALSE ORDER BY id", "[3];[4];[5];[6]"),
+            ("SELECT id FROM lc WHERE (c = 'a') IS NOT TRUE ORDER BY id", "[3];[4];[5];[6];[7]"),
+            ("SELECT id FROM lc WHERE (c = 'a') IS UNKNOWN ORDER BY id", "[7]"),
+            ("SELECT id FROM lc WHERE NOT (c = 'a') ORDER BY id", "[3];[4];[5];[6]"),
+            ("SELECT id FROM lc WHERE (c = 'a' OR c = 'b') IS TRUE ORDER BY id", "[1];[2];[5]"),
+            ("UPDATE lc SET after = 7 WHERE (c = 'a') IS TRUE", ""),
+            ("SELECT id FROM lc WHERE after = 7 ORDER BY id", "[1];[2]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

@@ -3188,6 +3188,26 @@ fn lift_comparison(
     };
     let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
+    // `(c = 'a') IS TRUE` over a legacy `CHAR` column: the truth test is of a
+    // condition, so the lift goes inside the group, as for an evaluated one
+    // below. Left whole, the comparison reached the scan's comparator, which
+    // reads the four stored bytes as a `u32`: 200 rows of 400.
+    let group = left_text.trim();
+    if group.starts_with('(')
+        && matching_paren_at(group, 0) == Some(group.len() - 1)
+        && reads_legacy_char(group, schema)
+        && !needs_evaluator(left_text)
+    {
+        let inner = &group[1..group.len() - 1];
+        if comparison_operator(inner).is_some()
+            || top_level_words(inner)
+                .iter()
+                .any(|(s, e)| inner[*s..*e].eq_ignore_ascii_case("AND") || inner[*s..*e].eq_ignore_ascii_case("OR"))
+        {
+            let lifted = lift_condition(inner, schema, depth + 1)?;
+            return Ok(format!("({}) {}", lifted, rest.trim_start()));
+        }
+    }
     if !needs_evaluator(left_text) {
         // The operand is the tokenizer's own. A list item or a bound that
         // needs the evaluator is lifted on its own: `price BETWEEN qty % 7
