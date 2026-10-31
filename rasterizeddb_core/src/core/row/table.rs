@@ -728,6 +728,13 @@ fn cache_generation_for(_visibility: &Visibility, generation: u64) -> Option<u64
 /// key stripe a check goes through already key them alike.
 #[inline]
 fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
+    // A legacy `CHAR` by its one stored form: an older build's `'a '` cell is
+    // the `'a'` a new write stores (`value_codec::legacy_char_canonical`), and
+    // compared byte for byte a UNIQUE column took the second.
+    if *db_type == DbType::CHAR {
+        return crate::core::value_codec::legacy_char_canonical(stored)
+            == crate::core::value_codec::legacy_char_canonical(value);
+    }
     if *db_type == DbType::JSONB {
         crate::core::jsonb::values_equal(stored, value).unwrap_or_else(|| stored == value)
     } else {
@@ -766,7 +773,9 @@ impl OwnKeys {
         let mut out = Vec::new();
         for (field, value) in values {
             let mut one = Vec::new();
-            if field.db_type == DbType::JSONB
+            if field.db_type == DbType::CHAR {
+                one.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(value));
+            } else if field.db_type == DbType::JSONB
                 && crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_some()
             {
             } else {
@@ -3198,7 +3207,11 @@ impl<S: StorageIO> Table<S> {
         // An index over exactly these columns names the candidate slots; the
         // iterator then reads only the chunks holding them, and anything
         // appended since the sample is a candidate by the list's own rule.
-        let from_index = match self.index_probe(d, tuple).await {
+        // A legacy `CHAR` column in the tuple: matched by its one stored
+        // form, which neither the index nor the filter keys (see
+        // `find_row_with_value`), so the table is walked.
+        let by_bytes = tuple.iter().all(|(field, _)| field.db_type != DbType::CHAR);
+        let from_index = match if by_bytes { self.index_probe(d, tuple).await } else { None } {
             Some((slots, n_slots)) => {
                 let slots: Vec<u64> = slots.into_iter().filter(|s| *s < n_slots).collect();
                 iterator.set_candidates(Some(Arc::new(CandidateBitmap::sparse(slots, n_slots))));
@@ -3207,7 +3220,7 @@ impl<S: StorageIO> Table<S> {
             None => false,
         };
 
-        if let (false, Some(filters)) = (from_index, d.filters.as_ref()) {
+        if let (false, Some(filters), true) = (from_index, d.filters.as_ref(), by_bytes) {
             match tuple
                 .iter()
                 .find(|(field, _)| filters.indexes(field.write_order as u32))
@@ -3395,6 +3408,14 @@ impl<S: StorageIO> Table<S> {
         let mut one = Vec::with_capacity(16);
         for (field, value) in values {
             one.clear();
+            // A legacy `CHAR`'s cells of one value take one stripe.
+            let legacy;
+            let value = if field.db_type == DbType::CHAR {
+                legacy = crate::core::value_codec::legacy_char_canonical(value);
+                &legacy[..]
+            } else {
+                value
+            };
             if crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_none() {
                 return crate::core::row::key_locks::KeyLocks::stripe_of(constraint, None);
             }
@@ -3643,12 +3664,16 @@ impl<S: StorageIO> Table<S> {
         // over half an hour. Reading the few candidate records by slot makes
         // the check O(candidates), plus a pass over the bitmap's words.
         let mut probe_slots: Option<std::vec::IntoIter<u64>> = None;
+        // A legacy `CHAR` is compared by its one stored form, which an older
+        // build's cells (`'a '`, `' '`) do not hold: neither the index nor the
+        // filter, keyed by the stored bytes, can name the rows that match.
+        let by_bytes = field.db_type != DbType::CHAR;
 
         // An index over exactly this column names the slots outright: a
         // descent rather than a pass over a bitmap of the whole table, so an
         // insert into a table with a primary key costs the same at a million
         // rows as at a thousand.
-        if let Some((slots, n_slots)) = self.index_probe(d, &[(field, value)]).await {
+        if by_bytes && let Some((slots, n_slots)) = self.index_probe(d, &[(field, value)]).await {
             let now = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
             let mut slots = slots;
             slots.extend(n_slots..now);
@@ -3657,7 +3682,7 @@ impl<S: StorageIO> Table<S> {
 
         // The mask is a superset, so a slot it clears genuinely cannot hold the
         // value; every slot it keeps is still compared byte for byte below.
-        if let (None, Some(filters)) = (probe_slots.as_ref(), d.filters.as_ref()) {
+        if let (None, Some(filters), true) = (probe_slots.as_ref(), d.filters.as_ref(), by_bytes) {
             if filters.indexes(field.write_order as u32) {
                 let program = SargProgram {
                     root: MaskExpr::Pred(SargPredicate {

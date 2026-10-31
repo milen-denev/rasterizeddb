@@ -267,6 +267,17 @@ filter, the prefilter and the indexes, which hold the stored bytes, are
 not used for such a column. The column is still described as `text`.
 `sum`/`avg` over it and comparing it with a boolean or a number are
 refused (42883), as PostgreSQL has no such function or operator.
+A UNIQUE or PRIMARY KEY over such a column judges each cell by the value it
+shows, so a write never adds a row equal to one that is stored, an
+`ON CONFLICT` finds the row it conflicts with, and `CREATE UNIQUE INDEX` /
+`ADD CONSTRAINT UNIQUE` refuse (23505) over cells that read as one value.
+Rows an older build already stored apart under such a key (`'a'` and
+`'a '`) cannot be told apart now and are left as they are: the open logs a
+warning naming the table, the key and the values; an `ON CONFLICT … DO
+UPDATE` that would update two of them is refused (21000); resolve them by
+hand, and `ALTER … TYPE character(1)` (which refuses with 23505 while they
+remain) is the repair. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
+TRUE`) read a cell as its value too.
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does
 not fit (22001) or two keys of a unique constraint would become one

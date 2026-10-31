@@ -1726,6 +1726,17 @@ impl Database {
         drop(startup_forget_pause);
         // The plain tables went into the map before the database existed.
         database.rebuild_fk_reverse();
+        // A key over a legacy `CHAR` column holding two rows an older build
+        // stored apart that now read as one: said once, at open.
+        let legacy: Vec<Arc<Table<DbStorageProvider>>> = database
+            .table_slots
+            .iter()
+            .map(|entry| entry.value().load())
+            .filter(|table| table.schema.fields.iter().any(|f| !f.is_deleted && f.db_type == DbType::CHAR))
+            .collect();
+        for table in legacy {
+            crate::core::rql::executor::warn_legacy_char_duplicates(&*table).await;
+        }
         Ok(database)
     }
 

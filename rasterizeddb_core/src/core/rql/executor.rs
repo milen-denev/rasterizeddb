@@ -4346,6 +4346,121 @@ async fn retype_legacy_char(
     .await
 }
 
+/// Logs each UNIQUE or PRIMARY KEY of `table` over a legacy `CHAR` column
+/// that holds two rows of one value, as the table opens.
+///
+/// An older build stored one `character(1)` value as several cells (`'a'`
+/// and `'a '`, `''` and `' '`), so a key over such a column can hold rows
+/// that every read now takes for one value. Writes no longer add more (the
+/// uniqueness check compares the one stored form), and an ON CONFLICT that
+/// would update two of them is refused; the rows themselves are the
+/// operator's to resolve, and `ALTER … TYPE character(1)` refuses (23505)
+/// until they are. Nothing is changed here. Returns the warnings, for tests.
+pub async fn warn_legacy_char_duplicates<S: crate::core::storage_providers::traits::StorageIO>(
+    table: &crate::core::row::table::Table<S>,
+) -> Vec<String> {
+    use crate::core::db_type::DbType;
+    let schema = &table.schema;
+    let char_field = |name: &str| {
+        schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+    };
+    let mut keys: Vec<(String, Vec<crate::core::row::schema::SchemaField>)> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && f.is_unique && f.db_type == DbType::CHAR)
+        .map(|f| (format!("UNIQUE ({})", f.name), vec![f.clone()]))
+        .collect();
+    for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
+        let fields: Option<Vec<_>> = key.columns.iter().map(|c| char_field(c).cloned()).collect();
+        if let Some(fields) = fields.filter(|fs| fs.iter().any(|f| f.db_type == DbType::CHAR)) {
+            keys.push((key.describe(), fields));
+        }
+    }
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut fetch_fields: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+    for (_, fields) in &keys {
+        for f in fields {
+            let flag = crate::core::rql::nullable::flag_field(&f.name, &schema.fields).cloned();
+            for g in std::iter::once(f.clone()).chain(flag) {
+                if !fetch_fields.iter().any(|h| h.write_order == g.write_order) {
+                    fetch_fields.push(g);
+                }
+            }
+        }
+    }
+    let fetch = crate::core::rql::join::fetch_for(&fetch_fields, &schema.fields);
+    let empty = crate::core::rql::join::fetch_for(&[], &schema.fields);
+    let rows = match table.query_row("", &schema.fields.to_vec(), empty, fetch, None, None).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("could not check table \"{}\" for legacy CHAR duplicates: {}", schema.name, e);
+            return Vec::new();
+        }
+    };
+    let mut warnings = Vec::new();
+    for (described, fields) in &keys {
+        let mut seen: ahash::HashMap<Vec<u8>, usize> = ahash::HashMap::default();
+        let mut shown: Vec<String> = Vec::new();
+        'rows: for row in &rows {
+            let mut key = Vec::new();
+            for f in fields {
+                let flag = crate::core::rql::nullable::flag_field(&f.name, &schema.fields);
+                let null = flag.is_some_and(|flag| {
+                    row.columns
+                        .iter()
+                        .find(|c| u64::from(c.schema_id) == flag.write_order)
+                        .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+                });
+                let Some(cell) = row.columns.iter().find(|c| u64::from(c.schema_id) == f.write_order) else {
+                    continue 'rows;
+                };
+                if null || cell.column_type == DbType::NULL {
+                    continue 'rows;
+                }
+                let bytes = cell.data.into_slice();
+                if f.db_type == DbType::CHAR {
+                    key.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(bytes));
+                } else {
+                    key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    key.extend_from_slice(bytes);
+                }
+            }
+            let count = seen.entry(key).or_insert(0);
+            *count += 1;
+            if *count == 2 && shown.len() < 5 {
+                let value: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let cell = row.columns.iter().find(|c| u64::from(c.schema_id) == f.write_order);
+                        let text = cell
+                            .and_then(|c| crate::core::rql::subquery::value_to_literal(&f.db_type, c.data.into_slice()))
+                            .unwrap_or_default();
+                        format!("{} = {}", f.name, text)
+                    })
+                    .collect();
+                shown.push(value.join(", "));
+            }
+        }
+        if !shown.is_empty() {
+            let message = format!(
+                "table \"{}\": {} holds rows an older build stored as different values that now read as one \
+                 ({}). Writes no longer add more, and an ON CONFLICT that would update two of them is refused; \
+                 resolve them, then ALTER TABLE \"{}\" ALTER COLUMN … TYPE character(1), which refuses (23505) \
+                 while they remain",
+                schema.name,
+                described,
+                shown.join("; "),
+                schema.name
+            );
+            warn!("{}", message);
+            warnings.push(message);
+        }
+    }
+    warnings
+}
+
 /// Refuses a change of `retyped`'s column to the type it now describes when
 /// a check enforced on the column before the change would not be after it.
 ///
@@ -6741,6 +6856,40 @@ async fn apply_conflict_update(
     // SET's are.
     let returning = crate::core::rql::join::find_keyword(insert_sql, "RETURNING", 0)
         .map(|at| crate::core::sql_scan::strip_qualifiers(insert_sql[at..].trim(), &known));
+
+    // A key over a legacy `CHAR` column may match more than one row: an older
+    // build stored one value as several cells (`'a'`, `'a '`), which a
+    // UNIQUE column then held as two rows and every read now takes for one
+    // value. Updating both for one proposed row would answer `INSERT 0 2`;
+    // the statement is refused instead, naming what to repair.
+    if let Some(entry) = target.clone() {
+        let legacy: Vec<&str> = keys
+            .iter()
+            .filter(|k| {
+                entry.schema.fields.iter().any(|f| {
+                    !f.is_deleted && f.name.eq_ignore_ascii_case(k) && f.db_type == crate::core::db_type::DbType::CHAR
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if !legacy.is_empty() {
+            let probe = format!("SELECT 1 FROM {} WHERE {} LIMIT 2", table_name, predicates.join(" AND "));
+            match run_subquery(&probe, database, tx).await {
+                Ok(rows) if rows.len() > 1 => {
+                    return ddl_error(&format!(
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time: more than one row of \
+                         \"{}\" holds the conflicting key, because legacy CHAR column {} holds values an older \
+                         build stored apart that now read as one; resolve the duplicates (ALTER TABLE … ALTER \
+                         COLUMN … TYPE character(1) refuses while they remain)",
+                        table_name,
+                        legacy.join(", ")
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    }
 
     let statement = format!(
         "UPDATE {} SET {} WHERE {}{}",
@@ -12252,6 +12401,14 @@ async fn existing_rows_break_unique(
             // A document by its value, as the insert-time check compares it.
             if field.db_type == crate::core::db_type::DbType::JSONB {
                 crate::core::jsonb::push_group_key(bytes, &mut encoded);
+                continue;
+            }
+            // A legacy `CHAR` by its one stored form, as the insert-time
+            // check compares it: an older build's `'x'` and `'x '` cells are
+            // one value, so a key over them is refused (23505).
+            if field.db_type == crate::core::db_type::DbType::CHAR {
+                encoded.push(u8::MAX);
+                encoded.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(bytes));
                 continue;
             }
             encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());

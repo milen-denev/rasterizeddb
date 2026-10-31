@@ -144,56 +144,90 @@ impl Drop for LegacyDb {
     }
 }
 
+/// One table of a [`LegacyDb`]: made with `create`, filled by `inserts`
+/// (the legacy columns written as the integers [`stored_by_older_build`]
+/// gives), then each of `legacy` retyped to `CHAR` as an older build
+/// declared it.
+struct LegacyTable<'a> {
+    name: &'a str,
+    create: &'a str,
+    legacy: &'a [&'a str],
+    inserts: Vec<String>,
+}
+
 impl LegacyDb {
     async fn make(name: &str, rows: &[(i32, Option<&str>, Option<&str>)]) -> LegacyDb {
+        let cell = |v: &Option<&str>| v.map(|v| stored_by_older_build(v).to_string()).unwrap_or_else(|| "NULL".to_string());
+        let inserts: Vec<String> = rows
+            .chunks(500)
+            .map(|chunk| {
+                let tuples: Vec<String> = chunk
+                    .iter()
+                    .map(|(id, value, key)| format!("({id}, {}, {}, {})", cell(value), cell(key), id * 10))
+                    .collect();
+                format!("INSERT INTO lc VALUES {}", tuples.join(", "))
+            })
+            .collect();
+        Self::make_tables(
+            name,
+            &[LegacyTable {
+                name: "lc",
+                create: "CREATE TABLE lc (id INT, c UINT4, k UINT4 UNIQUE, after INT)",
+                legacy: &["c", "k"],
+                inserts,
+            }],
+        )
+        .await
+    }
+
+    async fn make_tables(name: &str, tables: &[LegacyTable<'_>]) -> LegacyDb {
         let root = std::env::temp_dir().join(format!("legacy_char_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let db = LegacyDb { root };
         {
             let server = TestServer::start_file_backed(&db.root_text()).await.expect("server");
             let c = client(&server).await;
-            c.batch_execute("CREATE TABLE lc (id INT, c UINT4, k UINT4 UNIQUE, after INT)").await.expect("create");
-            let cell = |v: &Option<&str>| v.map(|v| stored_by_older_build(v).to_string()).unwrap_or_else(|| "NULL".to_string());
-            for chunk in rows.chunks(500) {
-                let tuples: Vec<String> = chunk
-                    .iter()
-                    .map(|(id, value, key)| format!("({id}, {}, {}, {})", cell(value), cell(key), id * 10))
-                    .collect();
-                c.batch_execute(&format!("INSERT INTO lc VALUES {}", tuples.join(", ")))
-                    .await
-                    .expect("insert");
+            for table in tables {
+                c.batch_execute(table.create).await.expect("create");
+                for insert in &table.inserts {
+                    c.batch_execute(insert).await.expect("insert");
+                }
             }
             // Into the files, so the log does not replay the records over the
             // edit below.
             rasterizeddb_core::core::wal::checkpoint_all().expect("checkpoint");
         }
-        // The field records of `c` and `k`, retyped from UINT4 (8) to the
-        // legacy CHAR (13): the record an older build wrote for `CHAR`.
-        let fields = db.root.join("lc_schema_FIELDS.db");
-        let mut bytes = std::fs::read(&fields).expect("the field records");
-        let mut retyped = 0;
-        for record in bytes.chunks_mut(153) {
-            let name_end = record[..129].iter().position(|b| *b == 0).unwrap_or(129);
-            if matches!(&record[..name_end], b"c" | b"k") {
-                assert_eq!(u16::from_le_bytes([record[129], record[130]]), 8, "a UINT4 record");
-                record[129..131].copy_from_slice(&13u16.to_le_bytes());
-                retyped += 1;
+        for table in tables {
+            // The field records of the legacy columns, retyped from UINT4 (8)
+            // to the legacy CHAR (13): the record an older build wrote for
+            // `CHAR`.
+            let fields = db.root.join(format!("{}_schema_FIELDS.db", table.name));
+            let mut bytes = std::fs::read(&fields).expect("the field records");
+            let mut retyped = 0;
+            for record in bytes.chunks_mut(153) {
+                let name_end = record[..129].iter().position(|b| *b == 0).unwrap_or(129);
+                if table.legacy.iter().any(|c| c.as_bytes() == &record[..name_end]) {
+                    assert_eq!(u16::from_le_bytes([record[129], record[130]]), 8, "a UINT4 record");
+                    record[129..131].copy_from_slice(&13u16.to_le_bytes());
+                    retyped += 1;
+                }
             }
+            assert_eq!(retyped, table.legacy.len(), "every legacy column retyped");
+            std::fs::write(&fields, &bytes).expect("write the field records");
+            // And the marker f89ed7ad recorded for every `CHAR` column: a
+            // `character(n)` marker with no length, which makes a check added
+            // on it cast the column `::bpchar`, as that binary's own checks
+            // were.
+            let typ = db.root.join(format!("{}_schema_TYP.db", table.name));
+            let mut records = std::fs::read(&typ).unwrap_or_default();
+            for column in table.legacy {
+                let mut record = vec![0u8; 134];
+                let name = format!("\u{1}bpchar:{column}");
+                record[..name.len()].copy_from_slice(name.as_bytes());
+                records.extend_from_slice(&record);
+            }
+            std::fs::write(&typ, &records).expect("write the marker records");
         }
-        assert_eq!(retyped, 2, "both columns retyped");
-        std::fs::write(&fields, &bytes).expect("write the field records");
-        // And the marker f89ed7ad recorded for every `CHAR` column: a
-        // `character(n)` marker with no length, which makes a check added on
-        // it cast the column `::bpchar`, as that binary's own checks were.
-        let typ = db.root.join("lc_schema_TYP.db");
-        let mut records = std::fs::read(&typ).unwrap_or_default();
-        for column in ["c", "k"] {
-            let mut record = vec![0u8; 134];
-            let name = format!("\u{1}bpchar:{column}");
-            record[..name.len()].copy_from_slice(name.as_bytes());
-            records.extend_from_slice(&record);
-        }
-        std::fs::write(&typ, &records).expect("write the marker records");
         db
     }
 
@@ -577,5 +611,125 @@ async fn a_large_legacy_char_table_answers_by_text_with_the_filter_and_an_index(
         let cases: Vec<(&str, &str)> = cases.iter().map(|(s, w)| (s.as_str(), *w)).collect();
         wrong.extend(check(&c, &cases).await.into_iter().map(|w| format!("{round}: {w}")));
     }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A key over a legacy column is judged by the value each cell shows. An
+/// older build stored `'a '` and `' '` with their spaces and `''` as zeros,
+/// which read as `'a'` and the blank, while a new write stores the one form
+/// and the uniqueness check compared bytes: `INSERT 'a'` beside an old `'a '`
+/// went in, and so did a PRIMARY KEY's second blank. ON CONFLICT then
+/// inserted where it should update, and over two rows of one value updated
+/// both and answered `INSERT 0 2`. `CREATE UNIQUE INDEX` and `ADD
+/// CONSTRAINT UNIQUE` were taken over `'x'` and `'x '`. PostgreSQL 17 refuses
+/// each duplicate (23505), updates the one row, and refuses the index.
+///
+/// Mutations: `same_unique_value` comparing bytes (the 23505s go in); the
+/// ON CONFLICT guard off (`INSERT 0 2`); `existing_rows_break_unique` keying
+/// bytes (the index is created).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_over_a_legacy_char_column_judges_the_value_each_cell_shows() {
+    let cell = |v: Option<&str>| v.map(|v| stored_by_older_build(v).to_string()).unwrap_or_else(|| "NULL".to_string());
+    let db = LegacyDb::make_tables(
+        "keys",
+        &[
+            LegacyTable {
+                name: "lun",
+                create: "CREATE TABLE lun (id INT, c UINT4 UNIQUE, v INT)",
+                legacy: &["c"],
+                inserts: vec![format!(
+                    "INSERT INTO lun VALUES (1, {}, 1), (2, {}, 2), (3, {}, 3)",
+                    cell(Some("a ")),
+                    cell(Some("")),
+                    cell(Some("b"))
+                )],
+            },
+            LegacyTable {
+                name: "lpk",
+                create: "CREATE TABLE lpk (c UINT4 PRIMARY KEY, v INT)",
+                legacy: &["c"],
+                inserts: vec![format!("INSERT INTO lpk VALUES ({}, 1), ({}, 2)", cell(Some("a ")), cell(Some(" ")))],
+            },
+            LegacyTable {
+                name: "lcomp",
+                create: "CREATE TABLE lcomp (a INT, c UINT4, v INT, UNIQUE (a, c))",
+                legacy: &["c"],
+                inserts: vec![format!("INSERT INTO lcomp VALUES (1, {}, 1)", cell(Some("a ")))],
+            },
+            // Two rows an older build held apart under a UNIQUE column, which
+            // now read as one value.
+            LegacyTable {
+                name: "ldup",
+                create: "CREATE TABLE ldup (id INT, c UINT4 UNIQUE, v INT)",
+                legacy: &["c"],
+                inserts: vec![format!("INSERT INTO ldup VALUES (1, {}, 1), (2, {}, 2)", cell(Some("x")), cell(Some("x ")))],
+            },
+            LegacyTable {
+                name: "lfree",
+                create: "CREATE TABLE lfree (id INT, c UINT4)",
+                legacy: &["c"],
+                inserts: vec![format!("INSERT INTO lfree VALUES (1, {}), (2, {})", cell(Some("x")), cell(Some("x ")))],
+            },
+        ],
+    )
+    .await;
+    {
+        let server = db.open().await;
+        // The open says which key holds such rows, and only that one.
+        let warned = |table: &str| {
+            let table = server.database().table_for_tests(table).expect("table");
+            async move { rasterizeddb_core::core::rql::executor::warn_legacy_char_duplicates(&*table).await }
+        };
+        let ldup = warned("ldup").await;
+        assert!(
+            ldup.len() == 1 && ldup[0].contains("\"ldup\"") && ldup[0].contains("UNIQUE (c)") && ldup[0].contains("character(1)"),
+            "{ldup:?}"
+        );
+        for clean in ["lun", "lpk", "lcomp", "lfree"] {
+            assert_eq!(warned(clean).await, Vec::<String>::new(), "{clean}");
+        }
+        let c = client(&server).await;
+        let wrong = check(
+            &c,
+            &[
+                ("INSERT INTO lun VALUES (10, 'a', 10)", "ERR 23505"),
+                ("INSERT INTO lun VALUES (11, ' ', 11)", "ERR 23505"),
+                ("INSERT INTO lun VALUES (12, 'c', 12)", ""),
+                ("UPDATE lun SET c = 'b' WHERE id = 12", "ERR 23505"),
+                ("UPDATE lun SET c = 'a  ' WHERE id = 12", "ERR 23505"),
+                ("SELECT id FROM lun WHERE c = 'a' ORDER BY id", "[1]"),
+                ("INSERT INTO lun VALUES (13, 'a', 13) ON CONFLICT (c) DO UPDATE SET v = 99", ""),
+                ("INSERT INTO lun VALUES (14, 'a', 14) ON CONFLICT (c) DO NOTHING", ""),
+                ("SELECT id, v FROM lun WHERE c = 'a' ORDER BY id", "[1]|[99]"),
+                ("SELECT count(*) FROM lun", "[4]"),
+                ("INSERT INTO lpk VALUES ('a', 10)", "ERR 23505"),
+                ("INSERT INTO lpk VALUES ('', 11)", "ERR 23505"),
+                ("INSERT INTO lpk VALUES ('r', 12)", ""),
+                ("INSERT INTO lcomp VALUES (1, 'a', 2)", "ERR 23505"),
+                ("INSERT INTO lcomp VALUES (2, 'a', 2)", ""),
+                // Writes add no third, and an upsert never updates two.
+                ("INSERT INTO ldup VALUES (3, 'x', 3)", "ERR 23505"),
+                ("INSERT INTO ldup VALUES (3, 'x', 3) ON CONFLICT (c) DO UPDATE SET v = 99", "ERR 21000"),
+                ("SELECT id, v FROM ldup ORDER BY id", "[1]|[1];[2]|[2]"),
+                ("CREATE UNIQUE INDEX lfree_c ON lfree (c)", "ERR 23505"),
+                ("ALTER TABLE lfree ADD CONSTRAINT lfree_u UNIQUE (c)", "ERR 23505"),
+                ("INSERT INTO lfree VALUES (3, 'x')", ""),
+            ],
+        )
+        .await;
+        assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    }
+    let server = db.open().await;
+    let c = client(&server).await;
+    let wrong = check(
+        &c,
+        &[
+            ("INSERT INTO lun VALUES (15, 'a', 15)", "ERR 23505"),
+            ("SELECT id, c, v FROM lun ORDER BY id", "[1]|[a]|[99];[2]|[ ]|[2];[3]|[b]|[3];[12]|[c]|[12]"),
+            ("INSERT INTO lpk VALUES ('', 13)", "ERR 23505"),
+            ("SELECT c, v FROM lpk ORDER BY v", "[a]|[1];[ ]|[2];[r]|[12]"),
+        ],
+    )
+    .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
