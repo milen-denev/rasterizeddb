@@ -13301,7 +13301,7 @@ async fn execute_alter_table_action(
         };
         // A partitioned table's rows are in its partitions: its length is
         // theirs, and its schema its shell's (docs/partitioning.md §11).
-        let row_count = match database.rows_len_held(&plan.table_name) {
+        let row_count = match database.rows_len_held(&plan.table_name).await {
             Ok(len) => len,
             Err(e) => return ddl_error(&e.to_string()),
         };
@@ -13331,7 +13331,7 @@ async fn execute_alter_table_action(
     }
     // What a partitioned table cannot do yet, under the lock, before a
     // sidecar is written (docs/partitioning.md §11).
-    if let Some(e) = database.partitioned_alter_refusal(&plan) {
+    if let Some(e) = database.partitioned_alter_refusal_held(&plan).await {
         return ddl_error(&e);
     }
 

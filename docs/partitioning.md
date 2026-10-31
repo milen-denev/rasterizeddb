@@ -468,7 +468,25 @@ starting gets the larger budget), or `SET CONFIG partition.open_budget =
 N` (0: derived). §7.1's term for open plain tables is left out; the 2,048
 reserve stands for it, and running out of descriptors anyway is handled
 where it happens (below). An open that finds the budget full first closes
-partitions nobody holds, by the CLOCK, until one more fits.
+partitions nobody holds, by the CLOCK, until one more fits, **at most two**
+(`CLOSES_PER_OPEN`): each is a sealing close inside the statement that is
+opening, so the rest of an overrun (one multi-tenant `INSERT` holds every
+partition it writes until it commits) is trimmed by the board rounds, up to
+eight closes per table per round (`TRIM_PER_ROUND`). Review B measured the
+untrimmed version at 7.4 s for a single-row `INSERT` after a 200-tenant one
+on ext4.
+
+**Descriptors at start.** A stock systemd unit's soft `RLIMIT_NOFILE` is
+1,024, whose derived budget is the floor of 16 (pgwire raises the soft
+limit only as far as its connection cap needs: 2,256 for the default cap,
+a budget of 20). The server now raises the soft limit at start to what the
+largest budget needs, 2,048 + 4,096 × 10 = 43,008, within the hard limit
+(`budget::raise_descriptor_limit`; not to the hard limit wholesale, for
+pgwire's reason, `select()` above 1,024), and prints the soft limit and
+the budget it derives with the SIMD line. A unit whose hard limit is low
+(`LimitNOFILE=` below 43,008, as `deploy.sh`'s 65,535 is not) gets a
+proportionally smaller budget; set `LimitNOFILE` to at least 43,008 (or
+size `partition.open_budget` to it).
 
 **Decision: the budget is soft.** With every open partition held (by a
 statement, a job, or a transaction's kept ticket, P5b-1's close rule), an
@@ -477,8 +495,18 @@ or refuse. §7.1 says a write past the budget "evicts and waits"; waiting
 can deadlock (a block whose kept ticket holds partition A open and which
 then writes B waits for itself), and refusing would make an answer depend
 on this node's open count (§12). The excess is trimmed by the next open
-that needs room, and by idle close. Its only hard bound is the
-descriptor limit.
+that needs room, the board rounds and idle close. Its only hard bound is
+the descriptor limit.
+
+**Closes are cancel-safe.** A close's body runs on a task of its own that
+its caller joins (`Parts::close_detached`): a close runs inside statements
+now (an eviction, a failed fan-out's cleanup), and its seal's file steps
+are blocking tasks that outlive a dropped future, so a caller dropped
+mid-close (a cancelled statement, a disconnect) must not release the
+lifecycle lock while a `.ixs` publish or a `CLEAN` append still runs (a
+reopen could see that `CLEAN` after its own `DIRTY`). The task holds the
+lock to the close's end. A closing partition stays counted in the budget
+until its instance, and so its descriptors, are gone.
 
 **Out of descriptors** at an open (EMFILE, ENFILE, whatever the budget
 said: plain tables, connections, other processes): the open closes up to 8
@@ -526,6 +554,10 @@ writes a snapshot only when the instance holds something the published
 one lacks (a write since its open, or indexes it rebuilt rather than
 loaded) and its indexes and filter are ready; otherwise it is the
 `AlreadyClean` no-op, so a read-only reopen and close writes nothing
+(under `index_storage = rebuild` it still pays: the next open loads the
+snapshot's FILTER section instead of backfilling the filter, though it
+rebuilds the indexes; review B measured the seal at about 32 ms per written
+partition on ext4, so a written partition's close costs that in either mode)
 (§7.1's "close writes nothing if `write_generation` did not move"). Under
 `index_snapshot.index_storage = snapshot` the next open loads the INDEX
 sections when the proof passes, rather than rebuilding (`Origin::Loaded`),
@@ -537,13 +569,26 @@ of that partition waits for it. Cost: a written partition's close pays a
 seal (its fsyncs), on tmpfs not measured here; idle close runs it on the
 board round, an eviction inside the statement whose open made room.
 
-**Closed sizes** (in place of `STATS`). A closed partition's (rows,
-pointers, index-store) lengths are kept in its slot: taken from the
-instance as it closes (after the seal, so they include the snapshot), or
-read once from its files' metadata the first time a catalog asks after a
-start, and kept until it opens again, when the instance answers for
-itself. A closed partition's files do not change while it is closed. So a
-catalog read costs no `stat` per closed partition after the first.
+**Closed sizes** (in place of `STATS`), **for the catalogs only**. A
+closed partition's (rows, pointers, index-store) lengths are kept in its
+slot (`KeptSizes`): stored by its close after the seal and the landing,
+under the lifecycle lock, before the lock is released; or read once from
+its files' metadata the first time a catalog asks after a start. They are
+**cleared when the partition opens** and **when a close takes the
+instance out**; while a close is under way a reader reads the files and
+keeps nothing, and a reader keeps what it read only if no open or close
+began or ended meanwhile (an epoch), so a read that raced a close never
+overwrites the close's lengths. So a catalog read costs no `stat` per
+closed partition after the first. **A DDL never reads them**: an `ALTER`'s
+"is the table populated" (`partitioned_alter_refusal_held`) and its row
+count (`rows_len_held`) read every materialized partition under its
+lifecycle lock, an open one's instance or a closed one's files
+(`rows_len_exact`), so an idle close or an eviction in flight, which take
+no table lock, finishes first. (Both reviews found the first cut letting
+`ADD COLUMN` through on a populated table during a close: the kept sizes
+were the previous close's, or zero from a catalog read of a partition
+whose materializing open had failed, and every row read the new column's
+default.)
 **Decision: no `STATS` record yet.** The map log's `STATS (pid, rows,
 bytes)` cannot carry the per-file breakdown `SHOW TABLES` reports, and one
 written at a close goes stale when the partition is reopened, written and
@@ -585,6 +630,21 @@ metadata-only test) reads the same kept sizes, which are the files' own.
   removed; dead entries are the oldest and go first.
 - *The twin's cap* is 600 s per 300 statements (`wall_cap`), not 600 s
   whatever `PART_TWIN_OPS` says.
+
+**Review round 1** (reviews A and B at `7ba631c9`). Fixed: the close
+window's kept sizes and the DDL checks (above; both reviews, reproduced
+two ways); the CLOCK dropping the last reference to a table instance under
+its ring's guard, whose token drops then locked the same ring and hung the
+opener (review B reasoned it, review A reproduced it: every instance the
+hand upgrades is now dropped after the guard); the per-open close cap and
+the board-round trim; cancel-safe closes; the token released after the
+seal; the ring's order kept when an entry leaves (`swap_remove` made the
+hand skip the moved entry for a lap); `make_room` after the
+not-materialized refusal; the descriptor raise at start; `SET CONFIG
+partition.open_budget = 0` naming the derived budget it now means, as
+`SHOW CONFIG` does. Kept: the seal under `index_storage = rebuild` (it buys
+the filter). Review B's probe that every answer is the same under a budget
+of one as unbounded is a test (`partition::budget_answers_tests`).
 
 **C5 (legacy `CHAR`).** The open-time scan of legacy `CHAR` keys runs in
 `Database`'s plain-table open only; a partition opens through

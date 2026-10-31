@@ -984,11 +984,17 @@ async fn an_open_failing_between_its_providers_leaves_nothing_behind() {
     assert_eq!(fds_under(dir.path()), fds_before, "a failed open kept descriptors on the partition's files");
     assert_eq!(registered(), files_before, "a failed open left a registration");
     assert_eq!(t.open_count(), 0);
-    // What a successful open and close leave, for comparison: the same.
+    // What a successful open and close leave, for comparison: the same, once
+    // the open's one-shot tasks (its index build, which holds the providers
+    // while it reads) have ended.
     drop(t.open_part(pid).await.unwrap());
     t.close_idle().await.unwrap();
     assert_eq!(registered(), files_before);
-    assert_eq!(fds_under(dir.path()), fds_before);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fds_under(dir.path()) != fds_before {
+        assert!(std::time::Instant::now() < deadline, "a closed partition kept its descriptors");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(t);
     close(dir.path(), db);
 }
@@ -1105,11 +1111,16 @@ async fn a_fan_out_wider_than_the_budget_reads_every_partition() {
         t.close_idle().await.unwrap();
         assert_eq!(rows(&db, "").await, expected());
         assert_eq!(budget.open(), t.open_count());
-        // The next open trims back to the budget: what the fan-out holds is
-        // released by now.
+        // The next open closes its share of the overrun, and the board
+        // rounds trim the rest: what the fan-out holds is released by now.
         assert_eq!(t.close_partition(p1).await.unwrap(), Close::Closed);
+        let before = t.open_count();
         assert_eq!(rows(&db, "tenant_id = 1").await, expected().into_iter().filter(|r| r.0 == 1).collect::<Vec<_>>());
-        assert!(t.open_count() <= 2, "{} open after a routed open under a budget of 2", t.open_count());
+        assert_eq!(t.open_count(), (before + 1 - super::budget::CLOSES_PER_OPEN).max(2));
+        let board = t.pin_board().unwrap().clone();
+        while t.open_count() > 2 {
+            assert!(board.trim_budget().await > 0, "a board round trimmed nothing of an overrun");
+        }
         assert_eq!(budget.open(), t.open_count());
     }
     drop(t);
@@ -1337,7 +1348,7 @@ async fn an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row() {
     assert_eq!(rows(&db, "").await, want, "the storm lost or duplicated rows");
     let (opens, closes) = t.open_close_counts();
     let (opens, closes) = (opens - opens_before, closes - closes_before);
-    assert!(opens > 100 && closes > 100, "{opens} opens, {closes} closes: not a storm");
+    assert!(opens > 50 && closes > 50, "{opens} opens, {closes} closes: not a storm");
     // Every open at a budget of one needed room: some was made by closing.
     assert!(budget.evictions() > 0, "the budget never closed a partition");
     let violations = super::table::instance_count::violations(dir.path());
@@ -1520,6 +1531,341 @@ async fn an_open_out_of_descriptors_closes_idle_partitions_and_retries() {
     assert_eq!(crate::pgwire::sqlstate_for(&failed), "53000", "{failed}");
     crate::core::storage_providers::file_sync::open_test_hooks::clear(&root);
     drop(holds);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+// ---------------------------------------------------------- P5b-2a reviews
+
+/// The catalogs' sizes and the rows length, as one tuple: (data, pointers,
+/// slots, SHOW PARTITIONS' (pid, state, slots), rows_len).
+async fn sizes_of(t: &PartitionedTable) -> (u64, u64, u64, Vec<(u32, &'static str, u64)>, u64) {
+    let tot = t.totals().await.unwrap();
+    let parts = t.partitions().await.unwrap().into_iter().map(|p| (p.pid, p.state, p.slots)).collect();
+    (tot.data, tot.pointers, tot.slots, parts, t.rows_len().unwrap())
+}
+
+/// Review B's probe: during a sealing close (the instance out of its slot)
+/// the catalogs and the rows length read what the files hold, not the
+/// previous close's kept sizes. (At 7ba631c9 they read the sizes the
+/// partition had before it was reopened and written.)
+///
+/// Mutation: `Slot::put` not clearing the kept sizes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_window_reads_the_files_not_the_previous_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 10_000, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(&db, CREATE).await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1)").await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    t.close_idle().await.unwrap();
+    let _first = sizes_of(&t).await;
+    let values: Vec<String> = (2..=300).map(|i| format!("(1, {i}, {i})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let (reached, resume) = super::table::lifecycle_hooks::park_close(dir.path(), p);
+    let closer = {
+        let t = t.clone();
+        tokio::spawn(async move { t.close_partition(p).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("parked");
+    let during = sizes_of(&t).await;
+    resume.notify_one();
+    assert_eq!(closer.await.unwrap().unwrap(), Close::Closed);
+    let after = sizes_of(&t).await;
+    assert_eq!((during.0, during.1, during.2, during.4), (after.0, after.1, after.2, after.4), "the close window's sizes");
+    assert_eq!(during.3, after.3, "the close window's partitions");
+    assert_eq!(after.2, 300, "the kept slots are not the partition's");
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Parks the next close of `p`, runs `sql` while it is parked, then lets
+/// the close go; the statement's outcome.
+async fn during_a_close(db: &Arc<Database>, t: &Arc<PartitionedTable>, dir: &Path, p: u32, sql: &str) -> Result<Vec<u8>, String> {
+    let (reached, resume) = super::table::lifecycle_hooks::park_close(dir, p);
+    let closer = {
+        let t = t.clone();
+        tokio::spawn(async move { t.close_partition(p).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("parked");
+    let statement = {
+        let (db, sql) = (db.clone(), sql.to_string());
+        tokio::spawn(async move { try_exec(&db, &sql).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    resume.notify_one();
+    assert_eq!(closer.await.unwrap().unwrap(), Close::Closed);
+    tokio::time::timeout(Duration::from_secs(20), statement).await.expect("the statement finished").unwrap()
+}
+
+/// Review B's B1: a partition emptied and closed (kept sizes zero), then
+/// written: during its next close `ALTER TABLE … ADD COLUMN`, which a
+/// populated partitioned table refuses (it would rewrite every row), must
+/// still be refused. (At 7ba631c9 it was accepted from the kept zero, and
+/// every row then read the new column's default.)
+///
+/// Mutations: the ALTER arm's check under its lock reading kept sizes
+/// (`partitioned_alter_refusal_held` back on `rows_len` with the cache).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_column_during_a_close_window_is_refused_on_a_populated_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 10_000, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(
+        &db,
+        "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
+         PARTITION BY HASH (tenant_id) PARTITIONS 1",
+    )
+    .await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1)").await;
+    exec(&db, "DELETE FROM pt WHERE tenant_id = 1").await;
+    let _ = try_exec(&db, "VACUUM FULL pt").await;
+    t.close_idle().await.unwrap();
+    let _ = sizes_of(&t).await;
+    let values: Vec<String> = (2..=50).map(|i| format!("(1, {i}, {i})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let alter = during_a_close(&db, &t, dir.path(), p, "ALTER TABLE pt ADD COLUMN z BIGINT").await;
+    assert!(alter.is_err(), "ADD COLUMN on a populated partitioned table was accepted in a close window");
+    assert_eq!(rows(&db, "").await, (2..=50).map(|i| (1, i, i)).collect::<Vec<_>>());
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review A's B1, the other way in: a materializing open that runs out of
+/// descriptors leaves the partition materialized, closed and empty, whose
+/// sizes a catalog read keeps as zero; two rows written, then during their
+/// close `ADD COLUMN w … DEFAULT 7` must be refused, and the rows keep no
+/// `w`, after a restart too. (At 7ba631c9 it was accepted.)
+///
+/// Mutation: the kept sizes not cleared when a close takes the instance
+/// out, with the DDL check reading them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_kept_sizes_never_let_an_alter_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 10_000, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(&db, CREATE).await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let root = path_str(dir.path());
+    // Materialized (its files created), then its open fails.
+    crate::core::storage_providers::file_sync::open_test_hooks::fail_next(&root, 1);
+    let failed = try_exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1)").await.expect_err("the open succeeded");
+    assert_eq!(crate::pgwire::sqlstate_for(&failed), "53000", "{failed}");
+    assert!(t.materialized_pids().unwrap().contains(&p));
+    assert_eq!(t.open_count(), 0);
+    // A catalog read keeps its (empty) sizes.
+    assert_eq!(sizes_of(&t).await.4, 0);
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1), (1, 2, 2)").await;
+    let alter = during_a_close(&db, &t, dir.path(), p, "ALTER TABLE pt ADD COLUMN w BIGINT DEFAULT 7").await;
+    assert!(alter.is_err(), "ADD COLUMN was accepted on a populated table from zero kept sizes");
+    assert_eq!(rows(&db, "").await, vec![(1, 1, 1), (1, 2, 2)]);
+    assert!(try_exec(&db, "SELECT w FROM pt").await.is_err(), "a refused ADD COLUMN left its column");
+    assert!(sizes_of(&t).await.4 > 0);
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    assert_eq!(rows(&db, "").await, vec![(1, 1, 1), (1, 2, 2)]);
+    assert!(try_exec(&db, "SELECT w FROM pt").await.is_err());
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review B's S2, reproduced by review A: the CLOCK upgrades an entry of a
+/// table that is dropped meanwhile, so the upgrade is its last reference;
+/// dropping it under the ring's guard ran the table's token drops, which
+/// lock the same ring, and the open making room hung for good holding its
+/// own lifecycle lock. The pause after the upgrade widens the window.
+///
+/// Mutation: the CLOCK dropping a passed-over instance under the guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clock_never_drops_the_last_reference_to_a_table_under_its_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    for name in ["a", "b"] {
+        exec(
+            &db,
+            &format!(
+                "CREATE TABLE {name} (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (tenant_id, id)) \
+                 PARTITION BY HASH (tenant_id) PARTITIONS 4"
+            ),
+        )
+        .await;
+    }
+    let a = match db.relation("a") {
+        Some(Relation::Partitioned(t)) => t,
+        _ => panic!(),
+    };
+    let values: Vec<String> = (1..=8).map(|i| format!("({i}, 1)")).collect();
+    exec(&db, &format!("INSERT INTO a (tenant_id, id) VALUES {}", values.join(", "))).await;
+    a.close_idle().await.unwrap();
+    // Two of a's partitions open and touched: the budget is full of a.
+    let pairs = tenants_of_distinct_partitions(&a, 2, 8);
+    for &(tenant, _) in &pairs {
+        exec(&db, &format!("SELECT id FROM a WHERE tenant_id = {tenant}")).await;
+    }
+    assert_eq!(a.open_count(), 2);
+    drop(a);
+    let (reached, resume) = super::budget::victim_hooks::park(dir.path());
+    let insert = {
+        let db = db.clone();
+        tokio::spawn(async move { try_exec(&db, "INSERT INTO b (tenant_id, id) VALUES (1, 1)").await })
+    };
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)).expect("the CLOCK never upgraded an entry"))
+        .await
+        .unwrap();
+    exec(&db, "DROP TABLE a").await;
+    resume.send(()).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(20), insert).await.expect("the insert hung in the CLOCK").unwrap();
+    assert!(done.is_ok(), "{done:?}");
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review B's S1: an open that finds the budget overrun closes at most
+/// `CLOSES_PER_OPEN` partitions, each a sealing close inside its statement;
+/// the board rounds trim the rest. (At 7ba631c9 the next statement closed
+/// the whole overrun: 7.4 s for a single-row INSERT after a 200-tenant one
+/// on ext4.)
+///
+/// Mutation: `make_room` without the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_closes_a_few_and_the_board_rounds_trim_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    let materialized = t.materialized_pids().unwrap().len();
+    // The populating INSERT held every partition it wrote: all open.
+    assert_eq!(t.open_count(), materialized, "the multi-tenant INSERT did not overrun");
+    let p = pid_of_tenant(&t, 1);
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    let (before, evictions) = (t.open_count(), budget.evictions());
+    assert_eq!(rows(&db, "tenant_id = 1").await, expected().into_iter().filter(|r| r.0 == 1).collect::<Vec<_>>());
+    assert_eq!(budget.evictions() - evictions, super::budget::CLOSES_PER_OPEN as u64, "the open closed other than its share");
+    assert_eq!(t.open_count(), before - super::budget::CLOSES_PER_OPEN + 1);
+    let board = t.pin_board().unwrap().clone();
+    let mut rounds = 0;
+    while t.open_count() > 2 {
+        let closed = board.trim_budget().await;
+        assert!(closed <= super::budget::TRIM_PER_ROUND);
+        rounds += 1;
+        assert!(rounds < 10, "the board rounds never trimmed the overrun");
+    }
+    assert_eq!(budget.open(), t.open_count());
+    drop(board);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review A's S2: a closing partition stays counted in the budget until its
+/// instance, and so its descriptors, are gone.
+///
+/// Mutation: the token released when the close takes the instance out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closing_partition_stays_counted_until_its_descriptors_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let open_before = budget.open();
+    let (reached, resume) = super::table::lifecycle_hooks::park_close(dir.path(), p);
+    let closer = {
+        let t = t.clone();
+        tokio::spawn(async move { t.close_partition(p).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("parked");
+    assert_eq!(budget.open(), open_before, "a partition mid-close stopped counting");
+    resume.notify_one();
+    assert_eq!(closer.await.unwrap().unwrap(), Close::Closed);
+    assert_eq!(budget.open(), open_before - 1);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Review A's S1: a close runs on a task of its own, so a caller dropped
+/// mid-close (a cancelled statement) leaves the close to finish under its
+/// lifecycle lock: an open of the partition waits for it, and the close
+/// counts.
+///
+/// Mutation: the close body run inline in its caller (`close_detached`
+/// without the task).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_caller_is_dropped_still_finishes_under_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let (_, closes_before) = t.open_close_counts();
+    let (reached, resume) = super::table::lifecycle_hooks::park_close(dir.path(), p);
+    let caller = {
+        let t = t.clone();
+        tokio::spawn(async move { t.close_partition(p).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("parked");
+    caller.abort();
+    let _ = caller.await;
+    let opener = {
+        let t = t.clone();
+        tokio::spawn(async move { t.open_part(p).await.map(|_| ()) })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!opener.is_finished(), "an open ran while the dropped caller's close was still under way");
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), opener).await.expect("the open never ran").unwrap().unwrap();
+    assert_eq!(t.open_close_counts().1, closes_before + 1, "the dropped caller's close did not finish");
+    assert!(super::table::instance_count::violations(dir.path()).is_empty());
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Under `index_storage = rebuild` the seal at close still buys the next
+/// open its filter: the snapshot's FILTER section is loaded (and vouched
+/// for) instead of backfilled, though the indexes rebuild. So the seal is
+/// kept in that mode.
+///
+/// Mutation: the close not sealing (the reopen backfills; nothing vouched).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_rebuild_the_seal_at_close_buys_the_reopen_its_filter() {
+    use crate::core::index_store::load::{settings::IndexStorage, storage_override};
+    let dir = tempfile::tempdir().unwrap();
+    let _rebuild = storage_override::set(dir.path(), IndexStorage::Rebuild);
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    let p = pid_of_tenant(&t, 1);
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    assert!(part.gate().vouched(), "the reopen did not load the filter its close sealed");
+    drop(part);
     drop(t);
     close(dir.path(), db);
     super::budget::release(dir.path());

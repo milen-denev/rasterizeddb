@@ -60,6 +60,11 @@ pub const MIN_OPEN: usize = 16;
 const RESERVE: u64 = 2048;
 /// Descriptors per open partition.
 const PER_PARTITION: u64 = 10;
+/// Partitions an open closes to make room, at most; the board rounds trim
+/// the rest of an overrun.
+pub const CLOSES_PER_OPEN: usize = 2;
+/// Partitions one board round closes to trim an overrun, at most.
+pub const TRIM_PER_ROUND: usize = 8;
 
 /// `SET CONFIG partition.open_budget` (0: derived) and `partition.idle_close_secs`.
 pub mod settings {
@@ -133,13 +138,25 @@ impl Drop for Token {
     fn drop(&mut self) {
         let mut ring = self.budget.rings[self.ring].lock();
         if let Some(at) = ring.entries.iter().position(|e| e.id == self.id) {
-            ring.entries.swap_remove(at);
-            if ring.hand > at {
-                ring.hand -= 1;
-            }
+            ring.remove_at(at);
         }
         drop(ring);
         self.budget.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Ring {
+    /// Removes the entry at `at`, keeping the others' order, so the hand
+    /// still points at the entry it would have visited next: the entries
+    /// after `at` move down one, and so does a hand past it. (`swap_remove`
+    /// moved the last entry into `at`, behind a hand past it, which then
+    /// skipped it for a lap and revisited another; a ring holds a few
+    /// hundred entries at most.)
+    fn remove_at(&mut self, at: usize) {
+        self.entries.remove(at);
+        if self.hand > at {
+            self.hand -= 1;
+        }
     }
 }
 
@@ -198,8 +215,14 @@ impl Budget {
     }
 
     /// Before an open: closes partitions nobody holds, by the CLOCK, until
-    /// one more fits, giving up (and counting an overrun) once every entry
-    /// has been offered twice. `skip` is the partition being opened, whose
+    /// one more fits, at most [`CLOSES_PER_OPEN`] of them: each is a sealing
+    /// close inside the statement that is opening, so an overrun left by a
+    /// statement that held many partitions (one multi-tenant `INSERT` keeps a
+    /// ticket on each until it commits) is trimmed by the board rounds
+    /// ([`Self::trim`]), not by the next statement alone (review B: a
+    /// single-row `INSERT` after a 200-tenant one took 7.4 s on ext4). Gives
+    /// up once every entry has been offered twice. An open that finds no
+    /// room counts an overrun. `skip` is the partition being opened, whose
     /// own lifecycle lock the caller holds.
     pub(crate) async fn make_room(&self, skip: (usize, u32)) {
         let limit = self.limit();
@@ -207,8 +230,9 @@ impl Budget {
             return;
         }
         let mut offers = 2 * self.open() + SHARDS;
+        let mut closed = 0;
         while self.open() >= limit {
-            if offers == 0 {
+            if offers == 0 || closed == CLOSES_PER_OPEN {
                 self.overruns.fetch_add(1, Ordering::AcqRel);
                 return;
             }
@@ -219,8 +243,27 @@ impl Budget {
             };
             if parts.close_for_budget(pid).await {
                 self.evictions.fetch_add(1, Ordering::AcqRel);
+                closed += 1;
             }
         }
+    }
+
+    /// A board round's share of trimming an overrun: closes up to `n`
+    /// partitions nobody holds, by the CLOCK, while more are open than the
+    /// budget allows. Returns how many closed.
+    pub(crate) async fn trim(&self, n: usize) -> usize {
+        let limit = self.limit();
+        let mut closed = 0;
+        let mut offers = 2 * self.open() + SHARDS;
+        while self.open() > limit && closed < n && offers > 0 {
+            offers -= 1;
+            let Some((parts, pid)) = self.victim((0, u32::MAX)) else { break };
+            if parts.close_for_budget(pid).await {
+                closed += 1;
+                self.evictions.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        closed
     }
 
     /// Closes up to `n` partitions nobody holds, by the CLOCK, whatever the
@@ -248,6 +291,13 @@ impl Budget {
     /// cleared make every entry an offer then, unless touched meanwhile).
     /// Entries whose table instance is gone are passed over.
     fn victim(&self, skip: (usize, u32)) -> Option<(StdArc<Parts>, u32)> {
+        // Every table instance upgraded here is dropped after the ring's
+        // guard, never under it: the last reference to one (a table dropped
+        // or replaced meanwhile) drops its slots' tokens, and a token's drop
+        // locks its ring, which parking_lot does not let this thread lock
+        // twice (review B, reproduced by review A: a hang holding the
+        // opener's lifecycle lock).
+        let mut passed: Vec<StdArc<Parts>> = Vec::new();
         let start = self.next_ring.fetch_add(1, Ordering::Relaxed);
         for _lap in 0..2 {
             for i in 0..SHARDS {
@@ -264,17 +314,55 @@ impl Budget {
                     // An entry whose table instance is gone is left by a
                     // token not yet dropped: passed over.
                     let Some(parts) = parts else { continue };
-                    if (StdArc::as_ptr(&parts) as usize, pid) == skip || parts.is_retired() {
+                    #[cfg(test)]
+                    victim_hooks::upgraded(&parts);
+                    if (StdArc::as_ptr(&parts) as usize, pid) == skip || parts.is_retired() || parts.take_reference(pid) {
+                        passed.push(parts);
                         continue;
                     }
-                    if parts.take_reference(pid) {
-                        continue;
-                    }
+                    drop(ring);
+                    drop(passed);
                     return Some((parts, pid));
                 }
             }
         }
+        drop(passed);
         None
+    }
+}
+
+/// Test-only: a pause inside [`Budget::victim`] once it has upgraded an
+/// entry of a table under a directory, holding that ring's guard, so a test
+/// can drop the table meanwhile and leave the upgrade the last reference.
+#[cfg(test)]
+pub(crate) mod victim_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    use super::{Parts, StdArc};
+
+    type Park = (PathBuf, Sender<()>, Receiver<()>);
+    static PARKS: parking_lot::Mutex<Vec<Park>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next upgrade of an entry under `dir` signals the returned
+    /// receiver, then blocks until the returned sender sends.
+    pub(crate) fn park(dir: &Path) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        PARKS.lock().push((dir.to_path_buf(), reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) fn upgraded(parts: &StdArc<Parts>) {
+        let found = {
+            let mut parks = PARKS.lock();
+            let root = parts.root_dir();
+            parks.iter().position(|(d, _, _)| root.starts_with(d)).map(|at| parks.remove(at))
+        };
+        if let Some((_, reached, resume)) = found {
+            let _ = reached.send(());
+            let _ = resume.recv_timeout(std::time::Duration::from_secs(30));
+        }
     }
 }
 
@@ -348,4 +436,80 @@ pub fn release(dir: &Path) {
 pub fn process_figures() -> (usize, usize, u64, u64) {
     let b = process();
     (b.limit(), b.open(), b.evictions(), b.overruns())
+}
+
+/// The soft descriptor limit a server raises itself to at start: as far as
+/// the largest open budget needs (`MAX_OPEN` partitions of ten descriptors
+/// over the 2,048 reserve), within the hard limit, and never lower than it
+/// is. `None` when the soft limit is already there or the hard limit leaves
+/// no room. pgwire raises it further if its connection cap needs more. Not
+/// to the hard limit wholesale, for pgwire's reason (`plan_descriptors`:
+/// anything still using `select()` breaks on a descriptor above 1,024, and a
+/// larger table is not free).
+pub fn descriptor_target(soft: u64, hard: u64) -> Option<u64> {
+    let wanted = RESERVE + MAX_OPEN as u64 * PER_PARTITION;
+    (soft < wanted && hard > soft).then(|| wanted.min(hard))
+}
+
+/// Raises the soft `RLIMIT_NOFILE` to [`descriptor_target`] and returns the
+/// soft limit before and after, and the open budget it derives (logged by
+/// the server at start). A stock systemd unit's soft limit is 1,024, whose
+/// budget is the floor of 16; the hard limit is usually far higher
+/// (docs/partitioning.md, "Phase 3 P5b-2a as built").
+pub fn raise_descriptor_limit() -> (u64, u64, usize) {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a valid out-pointer to an `rlimit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            let before = limit.rlim_cur as u64;
+            if let Some(to) = descriptor_target(before, limit.rlim_max as u64) {
+                let raised = libc::rlimit { rlim_cur: to as libc::rlim_t, rlim_max: limit.rlim_max };
+                // SAFETY: a valid pointer to an `rlimit`; a soft limit at or
+                // below the hard one is always permitted.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                    return (before, to, process().limit());
+                }
+            }
+            return (before, before, process().limit());
+        }
+    }
+    (0, 0, process().limit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stock systemd unit (soft 1,024) under a high hard limit is raised to
+    /// what the largest budget needs; a soft limit already there, or a hard
+    /// limit at it, is left alone; a hard limit below the target caps it.
+    #[test]
+    fn the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit() {
+        let wanted = RESERVE + MAX_OPEN as u64 * PER_PARTITION;
+        assert_eq!(descriptor_target(1024, 524_288), Some(wanted));
+        assert_eq!(descriptor_target(1024, 4096), Some(4096));
+        assert_eq!(descriptor_target(wanted, 524_288), None);
+        assert_eq!(descriptor_target(524_288, 524_288), None);
+        assert_eq!(descriptor_target(2256, 2256), None);
+    }
+
+    /// Removing an entry keeps the others' order and the hand on the entry
+    /// it would have visited next (review A: `swap_remove` revisited one and
+    /// skipped the moved one for a lap).
+    #[test]
+    fn removing_an_entry_keeps_the_hand_on_the_next_one() {
+        let mut ring = Ring::default();
+        for id in 0..6 {
+            ring.entries.push(Entry { id, parts: Weak::new(), pid: id as u32 });
+        }
+        ring.hand = 3;
+        ring.remove_at(1);
+        assert_eq!(ring.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![0, 2, 3, 4, 5]);
+        assert_eq!(ring.entries[ring.hand].id, 3, "the hand moved off the entry it was to visit next");
+        ring.remove_at(4);
+        assert_eq!(ring.entries[ring.hand].id, 3, "removing an entry past the hand moved it");
+        ring.remove_at(ring.hand);
+        assert_eq!(ring.entries[ring.hand].id, 4, "removing the hand's own entry did not leave it on the next");
+    }
 }

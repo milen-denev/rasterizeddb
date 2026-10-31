@@ -65,12 +65,14 @@ impl Database {
     }
 
     /// The bytes in `name`'s rows files: a plain table's `len`, a partitioned
-    /// table's summed over its materialized partitions, closed ones from
-    /// their files' metadata. What an ALTER decides
-    /// "metadata-only" by. The caller holds ACCESS EXCLUSIVE on `name`.
-    pub(crate) fn rows_len_held(&self, name: &str) -> io::Result<u64> {
+    /// table's summed over its materialized partitions, each read under its
+    /// lifecycle lock (an open one's instance, a closed one's files, never
+    /// sizes kept for the catalogs: `PartitionedTable::rows_len_exact`). What
+    /// an ALTER decides "metadata-only" by. The caller holds ACCESS
+    /// EXCLUSIVE on `name`.
+    pub(crate) async fn rows_len_held(&self, name: &str) -> io::Result<u64> {
         match self.relation(name) {
-            Some(Relation::Partitioned(table)) => table.rows_len(),
+            Some(Relation::Partitioned(table)) => table.rows_len_exact().await,
             Some(Relation::Plain(table)) => Ok(table.data()?.len.load(Ordering::Relaxed)),
             None => Err(io::Error::new(io::ErrorKind::NotFound, format!("relation '{name}' does not exist"))),
         }
@@ -98,7 +100,29 @@ impl Database {
     /// Why `plan` cannot run on the partitioned table it names, or `None`
     /// (also for a plain table): asked by the ALTER arm before anything is
     /// read or written. Each reason carries "not supported", so 0A000.
+    ///
+    /// Whether the table holds rows is read from the partitions' files
+    /// without their lifecycle locks (`PartitionedTable::rows_len`): an
+    /// early answer, before the arm's locks. The arm asks again under its
+    /// ACCESS EXCLUSIVE with [`Self::partitioned_alter_refusal_held`].
     pub(crate) fn partitioned_alter_refusal(&self, plan: &AlterTable) -> Option<String> {
+        let table = self.partitioned_table(&plan.table_name)?;
+        self.partitioned_alter_refusal_with(plan, &|| table.rows_len().map_or(true, |len| len > 0))
+    }
+
+    /// [`Self::partitioned_alter_refusal`] under the arm's ACCESS EXCLUSIVE:
+    /// whether the table holds rows read with every partition's lifecycle
+    /// lock (`PartitionedTable::rows_len_exact`), so an idle close or an
+    /// eviction in flight, which take no table lock, cannot answer for it
+    /// (P5b-2a review: a close window's stale sizes let `ADD COLUMN` through
+    /// on a populated table, and every row read the default).
+    pub(crate) async fn partitioned_alter_refusal_held(&self, plan: &AlterTable) -> Option<String> {
+        let table = self.partitioned_table(&plan.table_name)?;
+        let populated = table.rows_len_exact().await.map_or(true, |len| len > 0);
+        self.partitioned_alter_refusal_with(plan, &|| populated)
+    }
+
+    fn partitioned_alter_refusal_with(&self, plan: &AlterTable, populated: &dyn Fn() -> bool) -> Option<String> {
         let table = self.partitioned_table(&plan.table_name)?;
         // A table that cannot be opened: the arm's own read reports why.
         let key = table.key_columns().ok()?;
@@ -112,7 +136,6 @@ impl Database {
         };
         let is_key = |c: &str| key.iter().any(|k| k.eq_ignore_ascii_case(c));
         let t = plan.table_name.as_str();
-        let populated = || table.rows_len().map_or(true, |len| len > 0);
         match &plan.action {
             AlterAction::AddColumn { name, json, .. } => {
                 // A column already there is the arm's to answer (IF NOT

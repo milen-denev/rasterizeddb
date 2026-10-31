@@ -161,13 +161,40 @@ struct Slot {
     /// The CLOCK's reference bit: set by a routed access, cleared by the
     /// hand and by the idle round as they pass (P5b-2).
     referenced: AtomicBool,
-    /// A closed partition's (rows, pointers, index-store) file lengths: taken
-    /// from the instance as it closes, or from the files' metadata the first
-    /// time a catalog asks after a start (`closed_lens`), then kept: a
-    /// closed partition's files do not change until it opens again, and the
-    /// open instance answers for itself meanwhile. What the catalogs read
-    /// instead of six `stat`s per closed partition per read (P5b-2).
-    sizes: parking_lot::Mutex<Option<(u64, u64, u64)>>,
+    /// A closed partition's (rows, pointers, index-store) file lengths, for
+    /// the catalogs only (never a DDL's population check, which reads the
+    /// files: `PartitionedTable::rows_len_exact`). See [`KeptSizes`].
+    sizes: parking_lot::Mutex<KeptSizes>,
+}
+
+/// A closed partition's kept file lengths (P5b-2a): what the catalogs read
+/// instead of six `stat`s per closed partition per read.
+///
+/// - **Cleared when the partition opens** (`Slot::put`): the open instance
+///   answers for itself, and what it writes makes the old lengths wrong.
+/// - **Cleared when a close takes the instance out**, and marked `closing`
+///   until the close stores the final lengths (after its seal and landing,
+///   under the lifecycle lock, before the lock is released): a reader in
+///   between reads the files and keeps nothing, since the files are still
+///   changing (review A and B: a close window answered with the previous
+///   close's lengths, and an `ALTER` decided by them rewrote no rows).
+/// - **Filled from the files' metadata** by a reader only when no open or
+///   close began or ended while it read (`epoch` unchanged), so a read that
+///   raced a close never overwrites the close's final lengths.
+#[derive(Default)]
+struct KeptSizes {
+    kept: Option<(u64, u64, u64)>,
+    closing: bool,
+    epoch: u64,
+}
+
+impl KeptSizes {
+    /// Forgets the kept lengths; `closing` says whether a close is under way.
+    fn reset(&mut self, closing: bool) {
+        self.kept = None;
+        self.closing = closing;
+        self.epoch += 1;
+    }
 }
 
 impl Slot {
@@ -179,7 +206,7 @@ impl Slot {
             open: parking_lot::Mutex::new(None),
             token: parking_lot::Mutex::new(None),
             referenced: AtomicBool::new(false),
-            sizes: parking_lot::Mutex::new(None),
+            sizes: parking_lot::Mutex::new(KeptSizes::default()),
         }
     }
 
@@ -200,6 +227,7 @@ impl Slot {
     fn put(&self, table: Arc<Table<DbStorageProvider>>, token: budget::Token, referenced: bool) {
         self.referenced.store(referenced, Ordering::Relaxed);
         *self.token.lock() = Some(token);
+        self.sizes.lock().reset(false);
         *self.open.lock() = Some(table);
     }
 
@@ -208,15 +236,26 @@ impl Slot {
         drop(self.token.lock().take());
     }
 
-    /// This closed partition's (rows, pointers, index-store) lengths: kept
-    /// ones, else from its files' metadata (kept from then on).
+    /// This closed partition's (rows, pointers, index-store) lengths, for a
+    /// catalog: kept ones, else from its files' metadata, kept from then on
+    /// only if no open or close began or ended meanwhile and none is under
+    /// way ([`KeptSizes`]).
     fn closed_sizes(&self, root: &Path, uid: u64) -> io::Result<(u64, u64, u64)> {
-        if let Some(sizes) = *self.sizes.lock() {
-            return Ok(sizes);
+        let epoch = {
+            let sizes = self.sizes.lock();
+            if let Some(kept) = sizes.kept {
+                return Ok(kept);
+            }
+            (!sizes.closing).then_some(sizes.epoch)
+        };
+        let read = closed_lens(root, uid, self.pid)?;
+        if let Some(epoch) = epoch {
+            let mut sizes = self.sizes.lock();
+            if sizes.epoch == epoch && !sizes.closing && sizes.kept.is_none() {
+                sizes.kept = Some(read);
+            }
         }
-        let sizes = closed_lens(root, uid, self.pid)?;
-        *self.sizes.lock() = Some(sizes);
-        Ok(sizes)
+        Ok(read)
     }
 }
 
@@ -1082,6 +1121,12 @@ impl PartitionedTable {
     /// none is metadata-only to change). A closed partition counts its rows
     /// file and its staged `.tmp` from their metadata, so a table whose
     /// partitions are all closed is never taken for empty.
+    ///
+    /// Never from kept sizes (P5b-2a review): a closed partition's rows file
+    /// is read from its metadata each time. Taking no lifecycle lock, it can
+    /// race a close in flight, whose files already hold every row (partition
+    /// writes reach them through the log); a DDL's own check under ACCESS
+    /// EXCLUSIVE reads [`Self::rows_len_exact`], which waits it out.
     pub(crate) fn rows_len(&self) -> io::Result<u64> {
         let live = self.live()?;
         let mut total = 0u64;
@@ -1089,10 +1134,32 @@ impl PartitionedTable {
             match slot.open_now() {
                 Some(table) => total += table.data()?.len.load(Ordering::Relaxed),
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    total += slot.closed_sizes(&self.root, self.uid)?.0;
+                    total += closed_lens(&self.root, self.uid, slot.pid)?.0;
                 }
                 None => {}
             }
+        }
+        Ok(total)
+    }
+
+    /// [`Self::rows_len`] with each materialized partition read under its
+    /// lifecycle lock, so an open or a close in flight (an idle close or an
+    /// eviction, which take no table lock) finishes first: the instance's
+    /// length if it is open then, its files' if it is closed. What a DDL
+    /// decides "metadata-only" by, under ACCESS EXCLUSIVE on the table.
+    pub(crate) async fn rows_len_exact(&self) -> io::Result<u64> {
+        let live = self.live()?;
+        let mut total = 0u64;
+        for slot in live.parts.slots.iter() {
+            if !slot.materialized.load(Ordering::SeqCst) {
+                continue;
+            }
+            let lock = live.parts.board.lifecycle(slot.pid)?;
+            let _life = lock.lock().await;
+            total += match slot.open_now() {
+                Some(table) => table.data()?.len.load(Ordering::Relaxed),
+                None => closed_lens(&self.root, self.uid, slot.pid)?.0,
+            };
         }
         Ok(total)
     }
@@ -1650,6 +1717,24 @@ fn closed_lens(root: &Path, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
 /// PostgreSQL reports running out of them; any other failure as it was. The
 /// statement fails and the partition stays closed; the open budget that
 /// evicts and retries first is P5b-2's (§7.1).
+/// A close's hold on its slot from the moment it takes the instance out:
+/// dropped at the close's end (or on any early return), it ends the slot's
+/// `closing` mark if the close did not store final sizes, and releases the
+/// budget's token.
+struct Leaving<'a>(&'a Slot);
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        {
+            let mut sizes = self.0.sizes.lock();
+            if sizes.closing {
+                sizes.reset(false);
+            }
+        }
+        self.0.release_token();
+    }
+}
+
 /// Partitions an open that ran out of descriptors closes before its retry.
 const EVICT_ON_EMFILE: usize = 8;
 
@@ -1687,6 +1772,17 @@ impl Parts {
             Some(slot) if slot.pid == pid => Ok(slot),
             _ => Err(io::Error::other(format!("internal routing error: no slot for partition {pid}"))),
         }
+    }
+
+    /// The table's root directory.
+    pub(crate) fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
+    /// A board round's share of trimming the budget's overrun
+    /// (`Budget::trim`). Returns how many closed.
+    pub(crate) async fn trim_budget(&self) -> usize {
+        self.budget.trim(budget::TRIM_PER_ROUND).await
     }
 
     /// Whether a schema change replaced this instance, or a DROP removed the
@@ -1761,18 +1857,18 @@ impl Parts {
             return Ok(table);
         }
         self.refuse_retired()?;
+        if !slot.materialized.load(Ordering::SeqCst) && !materialize {
+            return Err(io::Error::other(format!(
+                "internal routing error: partition {} is not materialized",
+                slot.pid
+            )));
+        }
         // Room in the open budget first: partitions nobody holds closed by
         // the CLOCK, this one's own lifecycle lock skipped (held here). Soft:
         // with every open partition held, this opens anyway (`budget`).
         let me = (self as *const Parts as usize, slot.pid);
         self.budget.make_room(me).await;
         if !slot.materialized.load(Ordering::SeqCst) {
-            if !materialize {
-                return Err(io::Error::other(format!(
-                    "internal routing error: partition {} is not materialized",
-                    slot.pid
-                )));
-            }
             self.materialize(slot).await?;
         }
         let table = match self.open_instance(slot).await {
@@ -1919,10 +2015,46 @@ impl Parts {
     /// instance a schema change already retired is only dropped: what it had
     /// staged is the new instance's to land.
     async fn close(&self, pid: u32) -> io::Result<Close> {
-        let slot = self.slot_at(pid)?;
-        let lock = self.board.lifecycle(pid)?;
-        let _life = lock.lock().await;
-        self.close_held(slot, pid).await
+        self.close_detached(pid, true).await
+    }
+
+    /// The close's body on a task of its own, which the caller joins: a
+    /// close runs inside statements now (an eviction, a failed fan-out's
+    /// cleanup), and its seal's file steps are blocking tasks that outlive a
+    /// dropped future, so a caller dropped mid-close (a cancelled statement,
+    /// a disconnect) must not release the lifecycle lock while a `.ixs`
+    /// publish or a `CLEAN` append is still running: a reopen could then see
+    /// that `CLEAN` after its own `DIRTY` (review A). The task holds the lock
+    /// to the close's end, whatever happens to its caller. `wait` false
+    /// takes the lock only if it is free ([`Self::close_for_budget`]).
+    async fn close_detached(&self, pid: u32, wait: bool) -> io::Result<Close> {
+        let Some(me) = self.me.upgrade() else {
+            return self.close_body(pid, wait).await;
+        };
+        match tokio::spawn(async move { me.close_body(pid, wait).await }).await {
+            Ok(closed) => closed,
+            Err(e) => Err(io::Error::other(format!("closing partition {pid} of \"{}\" failed: {e}", self.name))),
+        }
+    }
+
+    fn close_body(
+        &self,
+        pid: u32,
+        wait: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Close>> + Send + '_>> {
+        Box::pin(async move {
+            let slot = self.slot_at(pid)?;
+            let lock = self.board.lifecycle(pid)?;
+            let _life = if wait {
+                lock.lock().await
+            } else {
+                match lock.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return Ok(Close::InUse),
+                }
+            };
+            self.close_held(slot, pid).await
+        })
     }
 
     /// [`Self::close`] for the open budget and the idle round, which never
@@ -1930,10 +2062,7 @@ impl Parts {
     /// flight means it is in use, and waiting could deadlock against an open
     /// that holds its own lock while it makes room. Whether it closed.
     pub(crate) async fn close_for_budget(&self, pid: u32) -> bool {
-        let Ok(slot) = self.slot_at(pid) else { return false };
-        let Ok(lock) = self.board.lifecycle(pid) else { return false };
-        let Ok(_life) = lock.try_lock() else { return false };
-        match Box::pin(self.close_held(slot, pid)).await {
+        match self.close_detached(pid, false).await {
             Ok(Close::Closed) => true,
             Ok(_) => false,
             Err(e) => {
@@ -1990,12 +2119,19 @@ impl Parts {
                 Some(t) if Arc::strong_count(t) > 1 => return Ok(Close::InUse),
                 Some(t) if t.gate().word().load().count() > 0 => return Ok(Close::InUse),
                 Some(_) => match open.take() {
-                    Some(t) => t,
+                    Some(t) => {
+                        // Readers from here to the end read the files and
+                        // keep nothing (`KeptSizes`).
+                        slot.sizes.lock().reset(true);
+                        t
+                    }
                     None => return Ok(Close::NotOpen),
                 },
             }
         };
-        slot.release_token();
+        // However the close ends from here, the slot stops reading as
+        // closing and the budget's token goes, once the instance is gone.
+        let leaving = Leaving(slot);
         #[cfg(test)]
         lifecycle_hooks::closing(&self.root, pid).await;
         #[cfg(test)]
@@ -2007,10 +2143,13 @@ impl Parts {
         table.close_exclusive(true).await;
         #[cfg(test)]
         crate::core::power_loss::failpoint::hit("test.p5b.close_landed", &self.root)?;
-        // Its sizes as it leaves, what the catalogs read while it is closed.
-        match PartitionedTable::file_lens(&table).await {
-            Ok(sizes) => *slot.sizes.lock() = Some(sizes),
-            Err(_) => *slot.sizes.lock() = None,
+        // Its sizes as it leaves, what the catalogs read while it is closed,
+        // stored before the lifecycle lock is released.
+        let final_sizes = PartitionedTable::file_lens(&table).await.ok();
+        {
+            let mut sizes = slot.sizes.lock();
+            sizes.reset(false);
+            sizes.kept = final_sizes;
         }
         // Owned alone since the check above; dropping it drops the providers
         // (the scheduler holds the unit weakly).
@@ -2025,6 +2164,10 @@ impl Parts {
         }
         #[cfg(test)]
         instance_count::closed(&self.root, self.uid, pid);
+        // Counted closed in the budget only now, once its descriptors are
+        // gone (review A: released before the seal, the budget counted it
+        // closed while it still held them).
+        drop(leaving);
         self.closes.fetch_add(1, Ordering::AcqRel);
         Ok(Close::Closed)
     }

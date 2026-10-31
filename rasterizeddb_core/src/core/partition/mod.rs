@@ -67,6 +67,8 @@
 //! `files` and `table`, which do IO and return `io::Error`s.
 
 pub mod budget;
+#[cfg(test)]
+mod budget_answers_tests;
 pub mod files;
 pub mod guard;
 #[cfg(test)]

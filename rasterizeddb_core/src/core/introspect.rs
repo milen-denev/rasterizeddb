@@ -2653,7 +2653,17 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 .parse()
                 .map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
             match name {
-                "open_budget" => settings::set_open_budget(n),
+                "open_budget" => {
+                    settings::set_open_budget(n);
+                    // The budget in effect, as SHOW CONFIG reports it: 0
+                    // derives it from the descriptor limit.
+                    let in_effect = crate::core::partition::budget::process_figures().0;
+                    return Ok(if n == 0 {
+                        format!("{key} is now derived from the descriptor limit: {in_effect}")
+                    } else {
+                        format!("{key} is now {in_effect}")
+                    });
+                }
                 "idle_close_secs" => settings::set_idle_close_secs(n),
                 _ => return Err(format!("`{}` has no live setter", key)),
             }

@@ -200,6 +200,15 @@ impl PinBoard {
         Box::pin(parts.close_idle_round()).await
     }
 
+    /// The live instance's share of trimming the open budget's overrun
+    /// (`Budget::trim`): what an open leaves past its own few closes.
+    pub(crate) async fn trim_budget(&self) -> usize {
+        let Some(parts) = self.parts.lock().upgrade() else {
+            return 0;
+        };
+        Box::pin(parts.trim_budget()).await
+    }
+
     /// The live instance's slots, for the forget rounds.
     pub(crate) fn set_parts(&self, parts: std::sync::Weak<super::table::Parts>) {
         *self.parts.lock() = parts;

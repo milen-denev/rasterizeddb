@@ -883,6 +883,11 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let mut args = Args::parse();
+    // The descriptors the partitions' open budget is derived from: a stock
+    // systemd unit's soft limit of 1,024 would leave a budget of 16 open
+    // partitions; raised toward the hard limit, as far as the largest
+    // budget needs (docs/partitioning.md, "Phase 3 P5b-2a as built").
+    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
     // Startup settings `SET CONFIG` saved, under the flags: a flag given here
     // wins (configuration::saved).
     apply_saved_settings(&mut args);
@@ -1141,6 +1146,12 @@ fn main() -> std::io::Result<()> {
                 cpu.flag_list(),
                 if cpu.fast_pext() { ", fast PEXT" } else { "" },
                 if rasterizeddb_core::core::processor::prefilter::enabled() { "on" } else { "off" },
+            );
+            // Printed for the same reason: a unit without LimitNOFILE leaves
+            // a small partition budget, which shows as closes and reopens.
+            println!(
+                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget}",
+                if nofile_now != nofile_before { format!(" (raised from {nofile_before})") } else { String::new() },
             );
         }
 
