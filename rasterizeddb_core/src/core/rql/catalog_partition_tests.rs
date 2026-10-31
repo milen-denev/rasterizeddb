@@ -467,10 +467,19 @@ async fn declared_indexes_are_listed_from_the_schema() {
     );
     assert_eq!(listed, twin_rows(&indexes, "tablename", "twin", &[]));
 
-    // Ready once every partition has built its own.
+    // Not ready while its partitions are closed (since phase 3 P5b none
+    // opens at a start, and a closed partition has built no index); ready
+    // once a read has opened every one and each has built its own.
     let class = view(&db, "pg_class").await;
     let pt_oid = get(only(&class, "relname", "pt"), "oid").to_string();
     let twin_oid = get(only(&class, "relname", "twin"), "oid").to_string();
+    let closed = view(&db, "pg_index").await;
+    let closed = twin_rows(&closed, "indrelid", &pt_oid, &["indexrelid"]);
+    assert!(
+        !closed.is_empty() && closed.iter().all(|r| get(r, "indisready") == "false"),
+        "pt's indexes reported ready with every partition closed: {closed:?}"
+    );
+    exec_ok(&db, "SELECT * FROM pt").await;
     let mut ready = false;
     for _ in 0..200 {
         let index = view(&db, "pg_index").await;
