@@ -114,6 +114,16 @@ pub struct Table<S: StorageIO> {
     /// Unqualified until [`Table::scope_cache_to_database`] says otherwise, so a
     /// table built outside a `Database` — tests, benchmarks — is unaffected.
     cache_scope: String,
+    /// This instance's number among every `Table` the process has opened
+    /// (its first cache generation, never reused): appended to
+    /// `cache_scope`, so a second instance over the same files (a
+    /// partition closed and opened again, a reload, `DROP` then `CREATE`)
+    /// never answers from the first's cache entries. A generation alone
+    /// cannot keep them apart: each instance climbs from its own floor by
+    /// one per write, so a later instance reaches stamps an earlier one
+    /// left (phase 3 P5b review: 40 of 40 probes of a reopened partition
+    /// were served the old instance's pointers).
+    cache_instance: u64,
     /// Serializes the mutating half of `DELETE` and `UPDATE`.
     ///
     /// Both statements scan for matches and then rewrite the pointer records
@@ -614,13 +624,23 @@ unsafe impl<S: StorageIO> Sync for Table<S> {}
 /// establishes, not one that was ever true by construction — which is exactly
 /// what someone would otherwise assume when reading the ALTER path.
 ///
-/// Making the counter global rather than per-table means a new instance can
-/// never collide with a previous one's entries, and costs nothing: entries are
-/// matched on exact equality, so a higher floor simply never matches. Same
-/// reasoning as `next_database_id`, one level down.
+/// A global floor alone does **not** keep a new instance off an old one's
+/// entries: each instance then climbs by one per write from its own floor,
+/// so a later instance reaches the stamps an earlier one left, and entries
+/// match on exact equality (the phase 3 P5b review served a reopened
+/// partition 40 of 40 stale answers that way). What keeps them apart is the
+/// instance number this counter also hands out, appended to the cache scope
+/// ([`instance_scope`]): two instances never share a scope, whatever their
+/// generations.
 fn next_cache_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// `scope` qualified with instance `instance`: the cache key no other
+/// instance over the same files can produce.
+fn instance_scope(scope: &str, instance: u64) -> String {
+    format!("{scope}\u{0}#{instance}")
 }
 
 /// Whether a candidate mask earns the per-record test it costs.
@@ -865,7 +885,7 @@ impl<S: StorageIO> Table<S> {
 
     /// The generation a scan starting now should stamp its cache entry with.
     #[inline]
-    pub(crate) fn cache_generation(&self) -> u64 {
+    pub fn cache_generation(&self) -> u64 {
         self.cache_generation.load(AtomicOrdering::Acquire)
     }
 
@@ -900,8 +920,9 @@ impl<S: StorageIO> Table<S> {
             return;
         }
         // A separator that cannot occur in an identifier, so `1` + `x_y` and
-        // `1_x` + `y` cannot produce the same key.
-        self.cache_scope = format!("{}\u{0}{}", database_id, self.schema.name);
+        // `1_x` + `y` cannot produce the same key; this instance's number
+        // after it (see `cache_instance`).
+        self.cache_scope = instance_scope(&format!("{}\u{0}{}", database_id, self.schema.name), self.cache_instance);
     }
 
     pub async fn new(table_name: &str, initial_io: Arc<S>, columns: Vec<CreateColumnData>) -> Self {
@@ -933,6 +954,7 @@ impl<S: StorageIO> Table<S> {
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),
             cache_scope,
+            cache_instance: 0,
             write_lock: StdArc::new(tokio::sync::RwLock::new(())),
             unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
             compaction_gate: StdArc::new(tokio::sync::RwLock::new(())),
@@ -1121,8 +1143,11 @@ impl<S: StorageIO> Table<S> {
             }
             (MaintenanceMode::Own, _) => None,
         };
-        let io_pointers = Arc::new(seed.create_new(format!("{}_pointers.db", physical)).await);
-        let io_rows = Arc::new(seed.create_new(format!("{}.db", physical)).await);
+        // Fallible: a closed partition opens inside a statement (phase 3 P5b),
+        // and running out of file descriptors there must fail the statement,
+        // not panic it.
+        let io_pointers = Arc::new(seed.try_create_new(format!("{}_pointers.db", physical)).await?);
+        let io_rows = Arc::new(seed.try_create_new(format!("{}.db", physical)).await?);
 
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
         let services_alive = maintenance_alive.clone();
@@ -1524,8 +1549,9 @@ impl<S: StorageIO> Table<S> {
         // table-level would otherwise be checked without it.
         let has_unique = schema.fields.iter().any(|f| f.is_unique && !f.is_deleted)
             || !schema.unique_keys.is_empty();
-        let cache_generation =
-            StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
+        let cache_instance = next_cache_generation();
+        let cache_generation = StdArc::new(CacheGuard::new(AtomicU64::new(cache_instance)));
+        let cache_scope = instance_scope(&cache_scope, cache_instance);
         let write_lock = StdArc::new(tokio::sync::RwLock::new(()));
         let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
         let forget = StdArc::new(std::sync::OnceLock::new());
@@ -1644,6 +1670,7 @@ impl<S: StorageIO> Table<S> {
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),
             cache_scope,
+            cache_instance,
             write_lock,
             unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
             compaction_gate,
@@ -6028,6 +6055,11 @@ async fn backfill_into<S: StorageIO>(
 
     let mut row = Row::default();
     let mut indexed: u64 = 0;
+    // Slots whose row could not be read: never given codes, so the prefix
+    // that keeps them candidates must not be cleared (below).
+    let mut unread: u64 = 0;
+    #[cfg(test)]
+    let failing = backfill_test_hooks::failing_slots(io_rows.get_location());
 
     // Rows are handed to the filter in runs so each column's lock is taken once
     // per run rather than once per row. A whole-table backfill is the largest
@@ -6044,11 +6076,22 @@ async fn backfill_into<S: StorageIO>(
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let Some((offset, pointer)) = next else { break };
 
-        if pointer
-            .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
-            .await
-            .is_err()
+        #[cfg(test)]
+        let injected = failing.contains(&(offset / ROW_POINTER_RECORD_LEN as u64));
+        #[cfg(not(test))]
+        let injected = false;
+        if injected
+            || pointer
+                .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
+                .await
+                .is_err()
         {
+            // Unreadable here is not unreadable to a query, which may read
+            // it later (the index build keeps such a slot for the same
+            // reason). Skipped, it would read as having no value once the
+            // prefix clears, and the filter would prune it: a row the query
+            // matches, silently missing. So it stays a candidate.
+            unread += 1;
             continue;
         }
 
@@ -6073,8 +6116,17 @@ async fn backfill_into<S: StorageIO>(
         return Err(renumbered());
     }
 
-    // Only a scan that started at the beginning can vouch for the prefix.
-    if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
+    // Only a scan that started at the beginning, and read every row, can
+    // vouch for the prefix. With a row unread the prefix stays: every slot
+    // below it is a candidate (correct, unpruned) until the next open's
+    // backfill. A scan from a later slot needs nothing: the frontier stops
+    // at the first slot it did not index (`valid_upto`).
+    if unread > 0 {
+        log::warn!(
+            "Filter backfill could not read {} rows from slot {}; the filter prunes none of them",
+            unread, start_slot
+        );
+    } else if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
         return Err(renumbered());
     }
     info!(
@@ -6215,6 +6267,23 @@ pub(crate) mod backfill_test_hooks {
         let park = Arc::new(Park::default());
         *PARK.lock() = Some((dir.to_string(), park.clone()));
         park
+    }
+
+    static FAILING: parking_lot::Mutex<Vec<(String, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Every backfill of a table whose rows are in `dir` fails to read slot
+    /// `slot` until [`clear_failing`].
+    pub(crate) fn fail_slot(dir: &str, slot: u64) {
+        FAILING.lock().push((dir.to_string(), slot));
+    }
+
+    pub(crate) fn clear_failing(dir: &str) {
+        FAILING.lock().retain(|(d, _)| d != dir);
+    }
+
+    pub(super) fn failing_slots(dir: Option<String>) -> Vec<u64> {
+        let Some(dir) = dir else { return Vec::new() };
+        FAILING.lock().iter().filter(|(d, _)| *d == dir).map(|(_, s)| *s).collect()
     }
 
     pub(super) async fn before_last_batch(dir: Option<String>) {

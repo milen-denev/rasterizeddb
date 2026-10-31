@@ -418,7 +418,8 @@ fn json_path_extent(bytes: &[u8], from: usize) -> Option<usize> {
 #[inline(always)]
 fn digits_after_sign(bytes: &[u8], i: usize) -> usize {
     let mut j = i + 1;
-    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+    // The whitespace `skip_whitespace_simd` skips between tokens.
+    while j < bytes.len() && is_whitespace_fast(bytes[j]) {
         j += 1;
     }
     j

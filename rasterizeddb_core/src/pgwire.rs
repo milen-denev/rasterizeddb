@@ -7226,6 +7226,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("could not reserve transaction ids") {
         return if has("(the disk is full)") { "53100" } else { "58030" };
     }
+    // A partition that could not be opened for lack of file descriptors
+    // (`partition::table::out_of_resources`): `insufficient_resources`, as
+    // PostgreSQL reports running out of them. Early, for the reason above.
+    if has("insufficient resources: partition") {
+        return "53000";
+    }
 
     // `reserved_name`: a table created under, or renamed to, the statement
     // temporaries' prefix (`cte::reserved_name_refusal`). Early: the message

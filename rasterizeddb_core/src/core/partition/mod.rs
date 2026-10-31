@@ -52,7 +52,8 @@
 //!
 //! - [`table::PartitionedTable`] (§1.1, §3, §4.3, §4.4): the logical table.
 //!   `create_files` writes a new table's map log and ids file; `open` replays
-//!   the log and opens every materialized partition, or leaves the table
+//!   the log and builds the slots, opening no partition (each opens on
+//!   demand, and closes only exclusively, phase 3 P5b), or leaves the table
 //!   broken (every data call returns why); `route_where(clause) -> Route`;
 //!   `materialized(epoch, route)` skips unmaterialized partitions by proof;
 //!   `insert_row_in_txn` routes a row and materializes its partition on first

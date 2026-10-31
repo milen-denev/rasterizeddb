@@ -520,6 +520,30 @@ impl FanOut {
         F: Fn(Arc<PartTable>, Visibility, bool) -> Fut,
         Fut: std::future::Future<Output = io::Result<T>>,
     {
+        let mut opened: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
+        let answers = self.each_opening(enough, read, &mut opened).await;
+        if answers.is_err() && !opened.is_empty() {
+            // A failed read closes again what it opened for itself, so a
+            // statement that ran out of file descriptors part-way through a
+            // fan-out does not leave the partitions it reached holding them
+            // (phase 3 P5b; the budget that evicts first is P5b-2's). One in
+            // use elsewhere by now stays open.
+            self.table.close_opened(&opened).await;
+        }
+        answers
+    }
+
+    /// [`Self::each`], recording in `opened` each closed partition it opened.
+    async fn each_opening<T, F, Fut>(
+        &self,
+        enough: impl Fn(&[T]) -> bool,
+        read: F,
+        opened: &mut smallvec::SmallVec<[u32; 4]>,
+    ) -> io::Result<Vec<T>>
+    where
+        F: Fn(Arc<PartTable>, Visibility, bool) -> Fut,
+        Fut: std::future::Future<Output = io::Result<T>>,
+    {
         let mut out: Vec<T> = Vec::with_capacity(self.parts.len());
         #[cfg(test)]
         let hook = test_hooks::after_first(self.table.uid());
@@ -539,7 +563,11 @@ impl FanOut {
                 // own, and the profile showed those copies (S16b).
                 let part = match part {
                     Some(part) => part.clone(),
-                    None => self.table.open_part(*pid).await?,
+                    None => {
+                        let part = self.table.open_part(*pid).await?;
+                        opened.push(*pid);
+                        part
+                    }
                 };
                 out.push(read(part, self.visibility.clone(), self.cache).await?);
             } else {
@@ -549,7 +577,11 @@ impl FanOut {
                 for (pid, part) in chunk {
                     group_parts.push(match part {
                         Some(part) => part.clone(),
-                        None => self.table.open_part(*pid).await?,
+                        None => {
+                            let part = self.table.open_part(*pid).await?;
+                            opened.push(*pid);
+                            part
+                        }
                     });
                 }
                 let reads = group_parts.into_iter().map(|part| read(part, self.visibility.clone(), self.cache));

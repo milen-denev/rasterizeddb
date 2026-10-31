@@ -738,3 +738,115 @@ async fn an_index_checkpoint_reaches_closed_partitions() {
     drop(t);
     close(dir.path(), db);
 }
+
+/// Opening a closed partition when the process is out of file descriptors
+/// (EMFILE, injected at the provider's open) fails the statement with
+/// SQLSTATE 53000, never a panic; a fan-out that fails part-way closes the
+/// partitions it opened for itself; and once descriptors are back the next
+/// statement answers in full. (At 8bdcc88c the provider's `unwrap` panicked
+/// the statement, and the partitions a fan-out had opened stayed open.)
+///
+/// Mutations: `Table::open_partition` back on the panicking `create_new`
+/// (the statement panics); `out_of_resources` not naming the failure (it is
+/// no 53000); `FanOut::each` not closing what it opened (partitions stay
+/// open after the failed fan-out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_out_of_file_descriptors_fails_the_statement_with_53000() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    let materialized = t.materialized_pids().unwrap().len();
+    t.close_idle().await.unwrap();
+    let root = path_str(dir.path());
+    // Two partitions open (two files each), then every open fails.
+    crate::core::storage_providers::file_sync::open_test_hooks::fail_after(&root, 4);
+    let fanned = try_rows(&db, "").await.expect_err("a fan-out over closed partitions answered with no descriptors left");
+    assert!(fanned.contains("insufficient resources"), "{fanned}");
+    assert!(!fanned.contains("panicked"), "{fanned}");
+    assert_eq!(crate::pgwire::sqlstate_for(&fanned), "53000", "{fanned}");
+    assert_eq!(t.open_count(), 0, "the failed fan-out left the partitions it opened open");
+    let routed = try_rows(&db, "tenant_id = 3").await.expect_err("a routed read opened with no descriptors left");
+    assert_eq!(crate::pgwire::sqlstate_for(&routed), "53000", "{routed}");
+    let written = try_exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (3, 99, 1)").await.expect_err("a write opened");
+    assert_eq!(crate::pgwire::sqlstate_for(&written), "53000", "{written}");
+    crate::core::storage_providers::file_sync::open_test_hooks::clear(&root);
+    assert_eq!(rows(&db, "").await, expected(), "after descriptors came back");
+    assert_eq!(t.open_count(), materialized);
+    drop(t);
+    close(dir.path(), db);
+}
+
+/// A reopened partition whose filter backfill cannot read a row keeps that
+/// row a candidate: a query for its value still finds it once the backfill
+/// is done. (At 8bdcc88c the backfill skipped the slot and then cleared the
+/// unindexed prefix, so the filter pruned the row: a silent miss on every
+/// reopen.)
+///
+/// Mutation: `backfill_into` clearing the prefix whatever it could not read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_the_backfill_cannot_read_stays_a_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    exec(
+        &db,
+        "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
+         PARTITION BY HASH (tenant_id) PARTITIONS 1",
+    )
+    .await;
+    // One row per statement: row i sits at slot i - 1 of the one partition.
+    for i in 1..=200i64 {
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({}, {i}, {})", i % 7, 1000 + i)).await;
+    }
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let root = path_str(dir.path());
+    // Row 51 (v = 1051) is unreadable to the reopen's backfill.
+    crate::core::row::table::backfill_test_hooks::fail_slot(&root, 50);
+    let part = t.open_part(0).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !part.filters_ready().unwrap() {
+        assert!(std::time::Instant::now() < deadline, "the backfill never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    crate::core::row::table::backfill_test_hooks::clear_failing(&root);
+    drop(part);
+    assert_eq!(rows(&db, "v = 1051").await, vec![(51 % 7, 51, 1051)], "the filter pruned a row its backfill could not read");
+    assert_eq!(rows(&db, "v = 1052").await, vec![(52 % 7, 52, 1052)]);
+    drop(t);
+    close(dir.path(), db);
+}
+
+/// The catalog never reports a closed partition's filter or indexes ready:
+/// with every partition closed `SHOW TABLE`'s `filters_ready` and
+/// `pg_indexes`' readiness are false, and true again once all are open
+/// and built.
+///
+/// Mutation: the readiness folds over the open partitions only (true when
+/// none is open).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_partitions_are_never_reported_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let figures = crate::core::introspect::row_figures_for_tests(&db, "pt").await.unwrap();
+    assert!(!figures.0, "filters reported ready with every partition closed");
+    let ready = crate::core::rql::catalog_views::index_ready_for_tests(&db, "pt").unwrap();
+    assert_eq!(ready, Some(false), "indexes reported ready with every partition closed");
+    let _ = rows(&db, "").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let filters = crate::core::introspect::row_figures_for_tests(&db, "pt").await.unwrap().0;
+        let indexes = crate::core::rql::catalog_views::index_ready_for_tests(&db, "pt").unwrap();
+        if filters && indexes == Some(true) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never ready with every partition open: {filters} {indexes:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(t);
+    close(dir.path(), db);
+}

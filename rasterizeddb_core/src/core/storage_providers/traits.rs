@@ -237,6 +237,14 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
 
     fn create_new(&self, name: String) -> impl Future<Output = Self> + Send + Sync;
 
+    /// [`StorageIO::create_new`] that returns an operating-system failure
+    /// (too many open files, permission denied) instead of panicking: what
+    /// opening a closed partition calls, since that runs inside a statement
+    /// (phase 3 P5b). The default cannot fail.
+    fn try_create_new(&self, name: String) -> impl Future<Output = IOResult<Self>> + Send + Sync {
+        async move { Ok(self.create_new(name).await) }
+    }
+
     /// As [`StorageIO::create_new`], but rooted at `location` rather than at
     /// this provider's own directory.
     ///

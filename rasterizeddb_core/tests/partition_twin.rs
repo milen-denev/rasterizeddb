@@ -2429,6 +2429,15 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
 }
 
 fn run_twin(cfg: Config) {
+    // `partition_twin_cache` includes this file whole and runs every
+    // configuration with the query cache on (phase 3 P5b review: a reopened
+    // partition was served the closed instance's cache entries, which no
+    // cache-off run can see). The cache is switched on once per process.
+    if env!("CARGO_CRATE_NAME") == "partition_twin_cache" {
+        rasterizeddb_core::cache::query_cache::init(10_000);
+        let _ = rasterizeddb_core::core::processor::concurrent_processor::ENABLE_CACHE.set(true);
+        assert!(rasterizeddb_core::cache::query_cache::enabled(), "the cache is off in the cache-on twin");
+    }
     for seed in seeds() {
         run_twin_seed(&cfg, seed);
     }

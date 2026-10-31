@@ -417,6 +417,13 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    async fn try_create_new(&self, name: String) -> std::io::Result<Self> {
+        match self {
+            Self::File(p) => Ok(Self::File(p.try_create_new(name).await?)),
+            other => Ok(other.create_new(name).await),
+        }
+    }
+
     #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
         match self {

@@ -2575,6 +2575,19 @@ impl StorageIO for LocalStorageProvider {
 
     #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
+        let shown = name.clone();
+        self.try_create_new(name)
+            .await
+            .unwrap_or_else(|e| panic!("could not open {shown} in {}: {e}", self.location))
+    }
+
+    /// The body of `create_new`, every file open and the map returned as an
+    /// error rather than unwrapped.
+    async fn try_create_new(&self, name: String) -> io::Result<Self> {
+        #[cfg(test)]
+        if open_test_hooks::fails(&self.location) {
+            return Err(io::Error::from_raw_os_error(24));
+        }
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -2598,39 +2611,35 @@ impl StorageIO for LocalStorageProvider {
         let file_path = Path::new(&new_table);
 
         if !file_path.exists() {
-            _ = std::fs::File::create(&file_path).unwrap();
+            std::fs::File::create(file_path)?;
             let _ = crate::core::wal::sync_parent_dir(file_path);
         }
 
         let file_append = std::fs::File::options()
             .read(true)
             .append(true)
-            .open(&file_path)
-            .unwrap();
+            .open(file_path)?;
 
         let file_write = std::fs::File::options()
             .read(true)
             .write(true)
-            .open(&file_path)
-            .unwrap();
+            .open(file_path)?;
 
         let file_read_mmap = std::fs::File::options()
             .read(true)
             .write(true)
-            .open(&file_path)
-            .unwrap();
+            .open(file_path)?;
 
         let read_file = RcArc::new(
             std::fs::File::options()
                 .read(true)
-                .open(&file_path)
-                .unwrap(),
+                .open(file_path)?,
         );
 
         let temp_file_str = format!("{}.tmp", new_table);
 
         if !Path::new(&temp_file_str).exists() {
-            _ = std::fs::File::create(&temp_file_str).unwrap();
+            std::fs::File::create(&temp_file_str)?;
             let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&temp_file_str));
         }
 
@@ -2638,21 +2647,19 @@ impl StorageIO for LocalStorageProvider {
             .create(true)
             .read(true)
             .write(true)
-            .open(&temp_file_str)
-            .unwrap();
+            .open(&temp_file_str)?;
 
         let temp_read_file = RcArc::new(
             std::fs::File::options()
                 .read(true)
-                .open(&temp_file_str)
-                .unwrap(),
+                .open(&temp_file_str)?,
         );
 
         let staged_len = std::fs::metadata(&temp_file_str)
             .map(|m| m.len())
             .unwrap_or(0);
 
-        let file_len = file_read_mmap.metadata().unwrap().len();
+        let file_len = file_read_mmap.metadata()?.len();
 
         let local_storage_provider = Self {
             append_file: Arc::new(RwLock::new(file_append)),
@@ -2669,9 +2676,7 @@ impl StorageIO for LocalStorageProvider {
             temp_file_len: AtomicU64::new(staged_len).into(),
             file_len: AtomicU64::new(file_len).into(),
             inplace_end: AtomicU64::new(0).into(),
-            _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
-                MmapOptions::new().map(&file_read_mmap).unwrap()
-            }))),
+            _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe { MmapOptions::new().map(&file_read_mmap)? }))),
             mmap_gen: AtomicU64::new(1).into(),
             mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
@@ -2696,7 +2701,7 @@ impl StorageIO for LocalStorageProvider {
             .inherit_from(&self.commit.gated, &self.table_name, &name);
 
         local_storage_provider.register_with_wal();
-        local_storage_provider
+        Ok(local_storage_provider)
     }
 
     fn drop_io(&self) {
@@ -2771,6 +2776,37 @@ impl StorageIO for LocalStorageProvider {
 
     async fn land_staged(&self) -> io::Result<()> {
         self.land_staged_durably().await
+    }
+}
+
+/// Test-only: opens that fail as the process running out of file
+/// descriptors would (EMFILE), per directory.
+#[cfg(test)]
+pub(crate) mod open_test_hooks {
+    static FAILING: parking_lot::Mutex<Vec<(String, u32)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next `skip` fallible opens under `dir` succeed, and every one
+    /// after fails with EMFILE until [`clear`].
+    pub(crate) fn fail_after(dir: &str, skip: u32) {
+        FAILING.lock().push((dir.trim_end_matches('/').to_string(), skip));
+    }
+
+    pub(crate) fn clear(dir: &str) {
+        let dir = dir.trim_end_matches('/');
+        FAILING.lock().retain(|(d, _)| d != dir);
+    }
+
+    pub(super) fn fails(location: &str) -> bool {
+        let location = location.trim_end_matches('/');
+        let mut g = FAILING.lock();
+        match g.iter_mut().find(|(d, _)| d == location) {
+            Some((_, 0)) => true,
+            Some((_, skip)) => {
+                *skip -= 1;
+                false
+            }
+            None => false,
+        }
     }
 }
 

@@ -583,6 +583,15 @@ struct RowFigures {
 /// The figures of `relation`. Errs when it cannot serve data (a broken
 /// partitioned table, or a shell with no partitioned entry) rather than
 /// reporting it empty.
+/// `(filters_ready, vacuum_enabled)` as `SHOW TABLE` reports them for
+/// `name`, for tests.
+#[cfg(test)]
+pub(crate) async fn row_figures_for_tests(database: &Arc<Database>, name: &str) -> Result<(bool, bool), String> {
+    let relation = database.relation(name).ok_or_else(|| format!("no relation {name}"))?;
+    let f = figures(&relation).await?;
+    Ok((f.filters_ready, f.vacuum_enabled))
+}
+
 async fn figures(relation: &Relation) -> Result<RowFigures, String> {
     let e = |e: std::io::Error| e.to_string();
     match relation {
@@ -629,6 +638,12 @@ async fn figures(relation: &Relation) -> Result<RowFigures, String> {
             if parts.is_empty() {
                 // What a partition opened or materialized now would get.
                 vacuum_enabled = table.vacuum_setting().unwrap_or_else(crate::vacuum_enabled);
+            }
+            // A closed partition's filter is not loaded (its next open builds
+            // or loads it), so it is not ready: never reported ready because
+            // nothing open said otherwise (phase 3 P5b).
+            if parts.len() < table.materialized_pids().map_err(e)?.len() {
+                filters_ready = false;
             }
             let schema = &table.shell().schema;
             let key = table

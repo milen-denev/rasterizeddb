@@ -11,28 +11,35 @@
 //! - the **map epoch**, read with `ArcSwap::load_full` only (§4.4): a plain
 //!   `load` guard is invisible to the strong count a reshape's reclamation
 //!   will wait on;
-//! - one **slot** per partition, whose `OnceCell` holds the open `Table` once
-//!   the partition is materialized. An empty cell is proof the partition has
-//!   no rows (§4.3): the cell is set before the first row is written, so a
-//!   reader whose snapshot sees a committed row, and which reads the cell
-//!   after taking that snapshot, finds it set;
+//! - one **slot** per partition (phase 3 P5b): a `materialized` flag and,
+//!   while the partition is open, its `Table`. A clear flag is proof the
+//!   partition has no rows (§4.3): the flag is set before the first row is
+//!   written, so a reader whose snapshot sees a committed row, and which
+//!   reads the flag after taking that snapshot, finds it set. An empty open
+//!   cell proves nothing: the partition may be closed;
 //! - the **map log** (§3.2), which replays to the state the slots mirror;
 //! - the **row-id source** every partition draws from (§3.5, I12).
 //!
 //! # Materializing (§3.2)
 //!
-//! A partition's first write, inside its slot's `OnceCell` initialisation so
-//! one runs per pid: delete any leftover files and create the three files
+//! A partition's first write, under its lifecycle lock (`PinBoard::lifecycle`)
+//! so one runs per pid: delete any leftover files and create the three files
 //! exclusively (one directory fsync); append `MATERIALIZE` with its WAL record
 //! issued at append time, in the root log the first row's outcome will follow,
 //! and sync that log (one fsync per partition, ever: otherwise a crash could
 //! keep the first rows' pages without the record, which the open refuses as
-//! unexplained data under a torn map); open the partition and register it for versioning; set the cell. Leftover
+//! unexplained data under a torn map); set the `materialized` flag; open the
+//! partition and register it for versioning; put it in its slot. Leftover
 //! files are never reused, and a file with no `MATERIALIZE` is never read.
 //! While the map log is torn, a non-empty leftover is refused instead, at
 //! open and at materialize: the lost tail may have been its `MATERIALIZE`.
 //!
 //! # Opening
+//!
+//! Opens no partition (phase 3 P5b): the map is replayed, the slots built,
+//! and each materialized partition's two data files checked to exist. A
+//! partition opens on demand (`Parts::open`) and closes only exclusively
+//! (`Parts::close`); see "Phase 3 P5b-1 as built" in the design.
 //!
 //! Never panics. Anything wrong (a missing map, ids or partition file, a map
 //! this phase cannot open, a key the schema no longer has) leaves the table
@@ -566,8 +573,10 @@ impl PartitionedTable {
         Ok(())
     }
 
-    /// Opens the table `uid`: replays its map log and opens every
-    /// materialized partition. A failure leaves it broken, never panics.
+    /// Opens the table `uid`: replays its map log and builds its slots,
+    /// opening no partition (each opens on demand), but checking that every
+    /// materialized partition's data files exist (I9). A failure leaves it
+    /// broken, never panics.
     pub(crate) async fn open(ctx: OpenCtx<'_>, name: &str, uid: u64, shell: Arc<Table<DbStorageProvider>>) -> Self {
         // Partitions reopen existing files: the forgotten horizon must not
         // move between one dropping out and its reopen registering.
@@ -1144,14 +1153,41 @@ impl PartitionedTable {
     ) -> io::Result<Vec<(u32, Arc<Table<DbStorageProvider>>)>> {
         let planned = self.planned(epoch, route)?;
         let mut out = Vec::with_capacity(planned.len());
+        let mut opened: SmallVec<[u32; 4]> = SmallVec::new();
         for (pid, open) in planned {
             let table = match open {
                 Some(table) => table,
-                None => self.open_part(pid).await?,
+                None => match self.open_part(pid).await {
+                    Ok(table) => {
+                        opened.push(pid);
+                        table
+                    }
+                    Err(e) => {
+                        // What this call opened is closed again, so a failed
+                        // open part-way (out of file descriptors) leaves no
+                        // partition held for nothing.
+                        drop(out);
+                        self.close_opened(&opened).await;
+                        return Err(e);
+                    }
+                },
             };
             out.push((pid, table));
         }
         Ok(out)
+    }
+
+    /// Closes each of `pids` that nothing else holds now: what a statement
+    /// that failed part-way through opening partitions gives back. Boxed:
+    /// it is the error path of every fan-out, whose futures stay small.
+    pub(crate) fn close_opened<'a>(&'a self, pids: &'a [u32]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            for &pid in pids {
+                if let Err(e) = self.close_partition(pid).await {
+                    ::log::warn!("partition {pid} of \"{}\" opened by a failed statement did not close: {e}", self.name);
+                }
+            }
+        })
     }
 
     /// The materialized partitions `route` reaches under `epoch`, by pid,
@@ -1516,6 +1552,23 @@ fn closed_lens(root: &Path, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
     ))
 }
 
+/// An open's failure for lack of file descriptors (EMFILE, ENFILE) named as
+/// insufficient resources, which a client sees as SQLSTATE 53000, as
+/// PostgreSQL reports running out of them; any other failure as it was. The
+/// statement fails and the partition stays closed; the open budget that
+/// evicts and retries first is P5b-2's (§7.1).
+fn out_of_resources(e: io::Error, table: &str, pid: u32) -> io::Error {
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+    match e.raw_os_error() {
+        Some(EMFILE) | Some(ENFILE) => io::Error::new(
+            e.kind(),
+            format!("insufficient resources: partition {pid} of \"{table}\" could not be opened: {e}"),
+        ),
+        _ => e,
+    }
+}
+
 impl Parts {
     fn slot_at(&self, pid: u32) -> io::Result<&Slot> {
         match self.slots.get(pid as usize) {
@@ -1673,7 +1726,8 @@ impl Parts {
             mode: MaintenanceMode::External,
             watch: Some(self.board.watch(slot.pid)?.clone()),
         })
-        .await?;
+        .await
+        .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
         table.enable_versioning(self.transactions.clone());
         self.apply_vacuum(&table)?;
         #[cfg(test)]

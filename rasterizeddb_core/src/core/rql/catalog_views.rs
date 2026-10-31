@@ -1425,6 +1425,13 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
 /// own from the same schema and the shell builds none; they are ready once
 /// every materialized partition's are. Errs on a table that cannot serve
 /// data: "no indexes" would make a migration tool re-issue every one.
+/// The readiness `pg_indexes` reports for `name`'s index set, for tests.
+#[cfg(test)]
+pub(crate) fn index_ready_for_tests(database: &crate::core::database::Database, name: &str) -> Result<Option<bool>, String> {
+    let relation = database.relation(name).ok_or_else(|| format!("no relation {name}"))?;
+    Ok(index_set(&relation)?.map(|(_, ready)| ready))
+}
+
 fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::index::TableIndexes>, bool)>, String> {
     match relation {
         Relation::Plain(table) => Ok(table
@@ -1443,9 +1450,11 @@ fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::
                 return Ok(None);
             }
             // Over the open partitions: a closed one serves no index until it
-            // opens, and its open builds or loads one before queries use it.
-            let mut ready = true;
-            for (_, partition) in table.open_partitions_now() {
+            // opens, and its open builds or loads one before queries use it,
+            // so it is not ready (never reported ready vacuously).
+            let open = table.open_partitions_now();
+            let mut ready = open.len() >= table.materialized_pids().map_err(|e| e.to_string())?.len();
+            for (_, partition) in open {
                 ready &= partition
                     .indexes()
                     .map_err(|e| e.to_string())?
