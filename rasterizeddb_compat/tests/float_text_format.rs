@@ -393,3 +393,18 @@ async fn excluded_default_is_the_columns_default() {
     run(&c, "INSERT INTO dd VALUES (1, DEFAULT, 9, 9, 'c') ON CONFLICT (id) DO UPDATE SET f8 = excluded.f4").await;
     assert_eq!(rows(&c, "SELECT * FROM dd").await, ["1|0.25|0.25|1.50|b"]);
 }
+
+/// An IN list built from a REAL subquery reads each real widened, so a
+/// double holding the widened real matches and a double holding 0.1 does
+/// not. Values from PostgreSQL 17.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_list_of_reals_reads_them_widened() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE x (id INT PRIMARY KEY, f8 FLOAT8, f4 REAL)").await;
+    run(&c, "INSERT INTO x VALUES (1, '0.1'::real, 0.1), (2, 0.1, 0.25)").await;
+    run(&c, "CREATE TABLE rs (id INT PRIMARY KEY, r REAL)").await;
+    run(&c, "INSERT INTO rs VALUES (1, 0.1), (2, 0.25)").await;
+    assert_eq!(ids(&c, "SELECT id FROM x WHERE f8 IN (SELECT r FROM rs) ORDER BY id").await, "1");
+    assert_eq!(ids(&c, "SELECT id FROM x WHERE f4 IN (SELECT r FROM rs) ORDER BY id").await, "1,2");
+}
