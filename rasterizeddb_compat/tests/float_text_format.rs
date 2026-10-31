@@ -105,3 +105,29 @@ async fn a_float_stored_as_text_is_postgresqls_text() {
         ["1|1e+20", "2|1e-07", "3|-0", "4|Infinity", "5|0.1", "6|123456789012345"]
     );
 }
+
+/// A float scalar subquery is a float: substituted back as a bare constant,
+/// `(SELECT max(f) …)` over a float8 column became a `numeric` constant, so
+/// the column was described as numeric (1700) where PostgreSQL 17 describes
+/// float8 (701) and float4 (700), and a driver decoding f64 refused it.
+/// (Read through the simple protocol: an extended-protocol Describe of a
+/// statement holding a scalar subquery answers NoData, before and after.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_float_scalar_subquery_is_described_as_a_float() {
+    use sqlx::{AssertSqlSafe, Row};
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE t (id INT PRIMARY KEY, f FLOAT8, r REAL)").await;
+    run(&c, "INSERT INTO t VALUES (1, 0.1, 0.25), (2, 1e20, 3.4e38)").await;
+    let pool = server.connect_sqlx().await.expect("sqlx");
+    let row = sqlx::raw_sql(AssertSqlSafe("SELECT (SELECT max(f) FROM t), (SELECT min(r) FROM t) FROM t WHERE id = 1".to_string()))
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(row.try_get::<f64, _>(0).expect("described float8"), 1e20);
+    assert_eq!(row.try_get::<f32, _>(1).expect("described float4"), 0.25);
+    // And it still compares and stores as the float it is.
+    assert_eq!(rows(&c, "SELECT id FROM t WHERE f > (SELECT min(f) FROM t)").await, ["2"]);
+    run(&c, "UPDATE t SET f = (SELECT max(f) FROM t) WHERE id = 1").await;
+    assert_eq!(rows(&c, "SELECT id, f FROM t ORDER BY id").await, ["1|1e+20", "2|1e+20"]);
+}

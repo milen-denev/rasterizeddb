@@ -393,6 +393,21 @@ pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool, zoned: boo
             };
             let literal = if zoned && db_type == DbType::DATETIME {
                 zoned_timestamp_literal(column.data.into_slice())
+            } else if matches!(db_type, DbType::F64 | DbType::F32) {
+                // A float stays a float: written back bare, `0.1` is a
+                // `numeric` constant, so `(SELECT max(f) …)` over a float8
+                // column was described and sent as numeric (1700), binary
+                // payload and all, where PostgreSQL sends float8 (701).
+                let bytes = column.data.into_slice();
+                if db_type == DbType::F64 {
+                    <[u8; 8]>::try_from(bytes)
+                        .ok()
+                        .map(|b| format!("{}::float8", value_codec::quote_sql(&value_codec::pg_float8_text(f64::from_le_bytes(b)))))
+                } else {
+                    <[u8; 4]>::try_from(bytes)
+                        .ok()
+                        .map(|b| format!("{}::real", value_codec::quote_sql(&value_codec::pg_float4_text(f32::from_le_bytes(b)))))
+                }
             } else {
                 subquery_literal(&db_type, column.data.into_slice(), exact_text)
             };
