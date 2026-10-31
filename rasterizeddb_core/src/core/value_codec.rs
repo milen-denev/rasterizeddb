@@ -684,71 +684,133 @@ pub fn check_numeric_precision(unscaled: i128, precision: u32, scale: u32) -> Re
 /// `100000000000000000000`, which also failed a `varchar(6)` PostgreSQL's
 /// six-character `1e+20` fits.
 pub fn pg_float8_text(v: f64) -> String {
-    pg_float_text(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0, || format!("{:e}", v), 15)
+    let mut out = Vec::with_capacity(24);
+    pg_float8_text_into(v, &mut out);
+    String::from_utf8(out).expect("a float renders as ASCII")
+}
+
+/// [`pg_float8_text`], appended to `out` with no allocation of its own.
+pub fn pg_float8_text_into(v: f64, out: &mut Vec<u8>) {
+    if let Some(name) = float_name(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0) {
+        out.extend_from_slice(name.as_bytes());
+        return;
+    }
+    let mut buf = ryu::Buffer::new();
+    pg_float_text_into(buf.format_finite(v).as_bytes(), 15, out);
 }
 
 /// A `real` value's text, as `float4out` writes it: [`pg_float8_text`]'s
 /// rule with the float's own shortest digits, and fixed notation for
 /// exponents from -4 to 5 — `3.4e+38`, `100000`, `1e+06`.
 pub fn pg_float4_text(v: f32) -> String {
-    pg_float_text(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0, || format!("{:e}", v), 6)
+    let mut out = Vec::with_capacity(16);
+    pg_float4_text_into(v, &mut out);
+    String::from_utf8(out).expect("a float renders as ASCII")
 }
 
-fn pg_float_text(
-    nan: bool,
-    infinite: bool,
-    negative: bool,
-    zero: bool,
-    shortest: impl FnOnce() -> String,
-    fixed_below: i32,
-) -> String {
+/// [`pg_float4_text`], appended to `out` with no allocation of its own.
+pub fn pg_float4_text_into(v: f32, out: &mut Vec<u8>) {
+    if let Some(name) = float_name(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0) {
+        out.extend_from_slice(name.as_bytes());
+        return;
+    }
+    let mut buf = ryu::Buffer::new();
+    pg_float_text_into(buf.format_finite(v).as_bytes(), 6, out);
+}
+
+fn float_name(nan: bool, infinite: bool, negative: bool, zero: bool) -> Option<&'static str> {
     if nan {
-        return "NaN".to_string();
+        Some("NaN")
+    } else if infinite {
+        Some(if negative { "-Infinity" } else { "Infinity" })
+    } else if zero {
+        Some(if negative { "-0" } else { "0" })
+    } else {
+        None
     }
-    if infinite {
-        return if negative { "-Infinity" } else { "Infinity" }.to_string();
-    }
-    if zero {
-        return if negative { "-0" } else { "0" }.to_string();
-    }
-    // `{:e}` is the shortest round-trip digits as `d[.ddd]e<exp>`.
-    let sci = shortest();
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(m) => ("-", m),
-        None => ("", mantissa),
+}
+
+/// Re-renders ryu's shortest digits (`1e20`, `1.5e-7`, `0.0001`,
+/// `123456789012345.0`) as PostgreSQL writes them: fixed notation when the
+/// decimal exponent of the first digit is from -4 to `fixed_below - 1`,
+/// exponential with a sign and at least two exponent digits otherwise.
+fn pg_float_text_into(shortest: &[u8], fixed_below: i32, out: &mut Vec<u8>) {
+    let (negative, body) = match shortest.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, shortest),
     };
-    let mut out = String::with_capacity(mantissa.len() + 8);
-    out.push_str(sign);
+    // The significant digits, without leading or trailing zeros, and the
+    // decimal exponent of the first of them. At most 17 digits.
+    let mut digits = [0u8; 24];
+    let mut n = 0usize;
+    let exp: i32;
+    match body.iter().position(|b| *b == b'e' || *b == b'E') {
+        Some(at) => {
+            for &b in &body[..at] {
+                if b != b'.' {
+                    digits[n] = b;
+                    n += 1;
+                }
+            }
+            exp = std::str::from_utf8(&body[at + 1..]).ok().and_then(|e| e.parse().ok()).unwrap_or(0);
+        }
+        None => {
+            let point = body.iter().position(|b| *b == b'.').unwrap_or(body.len());
+            let (int, frac) = (&body[..point], body.get(point + 1..).unwrap_or(&[]));
+            let lead = int.iter().take_while(|b| **b == b'0').count();
+            if lead < int.len() {
+                exp = (int.len() - lead) as i32 - 1;
+                for &b in int[lead..].iter().chain(frac) {
+                    digits[n] = b;
+                    n += 1;
+                }
+            } else {
+                let zeros = frac.iter().take_while(|b| **b == b'0').count();
+                exp = -(zeros as i32) - 1;
+                for &b in &frac[zeros..] {
+                    digits[n] = b;
+                    n += 1;
+                }
+            }
+        }
+    }
+    while n > 1 && digits[n - 1] == b'0' {
+        n -= 1;
+    }
+    let digits = &digits[..n];
+    if negative {
+        out.push(b'-');
+    }
     if (-4..fixed_below).contains(&exp) {
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
         if exp >= 0 {
             let whole = exp as usize + 1;
             if digits.len() <= whole {
-                out.push_str(&digits);
-                out.extend(std::iter::repeat_n('0', whole - digits.len()));
+                out.extend_from_slice(digits);
+                out.extend(std::iter::repeat_n(b'0', whole - digits.len()));
             } else {
-                out.push_str(&digits[..whole]);
-                out.push('.');
-                out.push_str(&digits[whole..]);
+                out.extend_from_slice(&digits[..whole]);
+                out.push(b'.');
+                out.extend_from_slice(&digits[whole..]);
             }
         } else {
-            out.push_str("0.");
-            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
-            out.push_str(&digits);
+            out.extend_from_slice(b"0.");
+            out.extend(std::iter::repeat_n(b'0', (-exp - 1) as usize));
+            out.extend_from_slice(digits);
         }
     } else {
-        out.push_str(mantissa);
-        out.push('e');
-        out.push(if exp < 0 { '-' } else { '+' });
+        out.push(digits[0]);
+        if digits.len() > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&digits[1..]);
+        }
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
         let magnitude = exp.unsigned_abs();
         if magnitude < 10 {
-            out.push('0');
+            out.push(b'0');
         }
-        out.push_str(&magnitude.to_string());
+        write_u64(out, u64::from(magnitude));
     }
-    out
 }
 
 /// Renders an unscaled value held at `scale`, keeping every declared place.
@@ -2990,6 +3052,7 @@ mod tests {
             (f64::NEG_INFINITY, "-Infinity"),
             (99999999999999.9, "99999999999999.9"),
             (999999999999999.9, "999999999999999.9"),
+            (720419008450196.2, "720419008450196.2"),
         ];
         for (v, pg) in doubles {
             assert_eq!(pg_float8_text(*v), *pg, "{v:e}");
@@ -3010,9 +3073,62 @@ mod tests {
             (f32::INFINITY, "Infinity"),
             (16777217.0, "1.6777216e+07"),
             (1234567.0, "1.234567e+06"),
+            (2634014.3, "2.6340142e+06"),
         ];
         for (v, pg) in reals {
             assert_eq!(pg_float4_text(*v), *pg, "{v:e}");
+        }
+    }
+
+    /// The ryu-based writer against a plain one built on Rust's own
+    /// shortest digits (`{:e}`), over random bit patterns: the same text
+    /// (but for ties between two shortest strings, where ryu picks what
+    /// PostgreSQL picks), and it reads back as the same float.
+    #[test]
+    fn the_float_writer_agrees_with_rusts_shortest_digits() {
+        fn reference(sci: String, fixed_below: i32) -> String {
+            let (mantissa, exp) = sci.split_once('e').unwrap();
+            let exp: i32 = exp.parse().unwrap();
+            let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+            let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+            let body = if (-4..fixed_below).contains(&exp) {
+                if exp >= 0 {
+                    let whole = exp as usize + 1;
+                    if digits.len() <= whole {
+                        format!("{digits}{}", "0".repeat(whole - digits.len()))
+                    } else {
+                        format!("{}.{}", &digits[..whole], &digits[whole..])
+                    }
+                } else {
+                    format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+                }
+            } else {
+                format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.unsigned_abs())
+            };
+            format!("{sign}{body}")
+        }
+        let mut rng = fastrand::Rng::with_seed(0x5eed);
+        for _ in 0..200_000 {
+            let v = f64::from_bits(rng.u64(..));
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            // Same digits, except where two shortest strings both read back
+            // and the two pick differently (720419008450196.2: ryu and
+            // PostgreSQL .2, Rust .3): there the same length, and the round
+            // trip.
+            let ours = pg_float8_text(v);
+            let theirs = reference(format!("{:e}", v), 15);
+            assert!(ours == theirs || ours.len() == theirs.len(), "{v:e}: {ours} vs {theirs}");
+            assert_eq!(ours.parse::<f64>().unwrap(), v);
+            // For `real` the two pick differently between two shortest
+            // digit strings that both read back (2634014.3: Rust
+            // 2.6340143e6, ryu and PostgreSQL 2.6340142e+06), so only the
+            // round trip is checked here; the table above pins PostgreSQL's.
+            let w = f32::from_bits(rng.u32(..));
+            if w.is_finite() && w != 0.0 {
+                assert_eq!(pg_float4_text(w).parse::<f32>().unwrap(), w, "{w:e}");
+            }
         }
     }
 

@@ -341,6 +341,17 @@ pub(super) fn encode_cell_text(
             vc::write_u64(out, u64::from_le_bytes(bytes.try_into().unwrap()));
             true
         }
+        // PostgreSQL's float text, written in place: through the String
+        // formatter below it cost a float-heavy scan about half again its
+        // instructions.
+        DbType::F64 if bytes.len() == 8 => {
+            vc::pg_float8_text_into(f64::from_le_bytes(bytes.try_into().unwrap()), out);
+            true
+        }
+        DbType::F32 if bytes.len() == 4 => {
+            vc::pg_float4_text_into(f32::from_le_bytes(bytes.try_into().unwrap()), out);
+            true
+        }
         DbType::BOOL => {
             out.push(if bytes.first().copied().unwrap_or(0) != 0 { b't' } else { b'f' });
             true
