@@ -148,7 +148,7 @@ enum Kind {
 
 impl Kind {
     /// The comparison `perform_comparison_operation` makes for each type:
-    /// `BOOL` as `u8`, `CHAR` as `u32`, `DATETIME` as `i64`.
+    /// `BOOL` as `u8`, `DATETIME` as `i64`.
     fn of(ty: &DbType) -> Option<Kind> {
         Some(match ty {
             DbType::I8 => Kind::I8,
@@ -156,7 +156,9 @@ impl Kind {
             DbType::I16 => Kind::I16,
             DbType::U16 => Kind::U16,
             DbType::I32 => Kind::I32,
-            DbType::U32 | DbType::CHAR => Kind::U32,
+            // Not a legacy `CHAR`: its order is its text's, not the `u32` its
+            // four bytes spell (`value_codec::legacy_char_text`).
+            DbType::U32 => Kind::U32,
             DbType::I64 | DbType::DATETIME => Kind::I64,
             DbType::U64 => Kind::U64,
             DbType::F32 => Kind::F32,

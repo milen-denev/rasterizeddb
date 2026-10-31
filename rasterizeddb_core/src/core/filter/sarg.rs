@@ -186,6 +186,14 @@ fn conjunct_to_pred(
     if !gate(write_order) {
         return None;
     }
+    // A legacy `CHAR` compares as its text (`value_codec::legacy_char_text`),
+    // under which several stored cells are one value (`''` and `' '`, `'a'`
+    // and `'a '`) and the order is not the `u32` the zone bounds were kept
+    // in. Neither a fingerprint of the bytes nor a bound can prune for it;
+    // not pruning is always sound.
+    if *db_type == DbType::CHAR {
+        return None;
+    }
 
     // Re-encode the literal at the column's type, exactly as
     // `QueryParser::reconcile_operand_types` does before evaluation.

@@ -3008,7 +3008,10 @@ pub(crate) fn compare_bytes_as_type(
         // Fixed-width and big-endian by construction, so a plain byte compare
         // already yields canonical UUID order and address order.
         DbType::UUID | DbType::INET => a.cmp(b),
-        DbType::CHAR => a.cmp(b),
+        // A legacy `CHAR` by its text (`value_codec::legacy_char_text`), so
+        // `'a '`, a cut `'aé€'` and the blank's two cells sort where the
+        // values they show do.
+        DbType::CHAR => crate::core::value_codec::legacy_char_text(a).cmp(crate::core::value_codec::legacy_char_text(b)),
         // Microseconds since the Unix epoch, stored little-endian. Comparing the
         // raw bytes would order by the low byte first, and would sort negative
         // (pre-1970) instants above positive ones.

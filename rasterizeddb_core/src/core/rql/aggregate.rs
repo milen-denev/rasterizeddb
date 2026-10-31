@@ -1322,6 +1322,10 @@ fn decode_float(bytes: &[u8], ty: &DbType) -> Option<f64> {
 }
 
 pub(crate) fn compare_values(a: &[u8], b: &[u8], ty: &DbType) -> std::cmp::Ordering {
+    // A legacy `CHAR` by the text it shows, as ORDER BY sorts it.
+    if *ty == DbType::CHAR {
+        return crate::core::value_codec::legacy_char_text(a).cmp(crate::core::value_codec::legacy_char_text(b));
+    }
     // Documents in PostgreSQL's `jsonb` order, as the ungrouped sort orders
     // them; the byte fallback below would order the encodings.
     if *ty == DbType::JSONB {

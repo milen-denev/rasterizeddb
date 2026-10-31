@@ -2616,7 +2616,7 @@ pub fn lift_evaluated_operands(
     if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
-    if !needs_evaluator(clause) && !char_lift_needed(clause, schema) {
+    if !needs_evaluator(clause) && !char_lift_needed(clause, schema) && !reads_legacy_char(clause, schema) {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
@@ -2798,6 +2798,71 @@ fn padded_for_pattern(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Op
     }
 }
 
+/// Whether `text` names a legacy `CHAR` column of `schema` (`DbType::CHAR`,
+/// what builds up to f89ed7ad made a bare `CHAR`). Cheap: most schemas have
+/// none.
+fn reads_legacy_char(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    schema.iter().any(|f| !f.is_deleted && f.db_type == crate::core::db_type::DbType::CHAR)
+        && text
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"'))
+            .any(|word| legacy_char_operand(word, schema).is_some())
+}
+
+/// A bare legacy `CHAR` column as every comparison reads it: its text
+/// without trailing spaces (`value_codec::legacy_char_text`), through the
+/// evaluator, as `rtrim(c)`. `None` for anything else.
+///
+/// The cell is the text's UTF-8 in four bytes, and the scan's comparator
+/// read those as a little-endian integer: `c BETWEEN 'a' AND 'z'` missed
+/// `'b'`, `c < 'b'` and `LIKE 'a%'` missed `'ab'`, `LIKE '%b'` matched
+/// nothing past the zero padding, and `c = 'hello'` was refused. The filter,
+/// the zone maps, the prefilter and the indexes order and hash the stored
+/// bytes, so none of them can answer for the text either; an evaluated
+/// operand is one they leave to the scan.
+fn legacy_char_operand(operand: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<String> {
+    let name = operand.trim();
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '\'' | ':')) {
+        return None;
+    }
+    let column = resolve_column(name, schema)?;
+    let field = schema.iter().find(|f| f.name == column && !f.is_deleted)?;
+    (field.db_type == crate::core::db_type::DbType::CHAR).then(|| {
+        let lead = &operand[..operand.len() - operand.trim_start().len()];
+        let tail = &operand[operand.trim_end().len()..];
+        format!("{lead}rtrim({name}){tail}")
+    })
+}
+
+/// `text` with each plain quoted literal's trailing spaces taken off, as
+/// `character(1)` reads a value compared with it (`'a '` is `'a'`). A literal
+/// followed by a cast (`'a '::text`) is typed and keeps them.
+fn trimmed_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            let literal = &text[i..end];
+            let typed = text[end..].trim_start().starts_with("::");
+            if !typed && literal.len() >= 2 && literal.ends_with('\'') {
+                let inner = literal[1..literal.len() - 1].trim_end_matches(' ');
+                out.push('\'');
+                out.push_str(inner);
+                out.push('\'');
+            } else {
+                out.push_str(literal);
+            }
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// How a bare text column compares with `character(n)`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextSide {
@@ -2947,7 +3012,7 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !needs_evaluator(term) && !char_lift_needed(term, schema) {
+    if !needs_evaluator(term) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -3049,7 +3114,12 @@ fn lift_comparison(
             match (column_text_kind(left, schema), column_text_kind(right, schema)) {
                 (Some(TextSide::Padded), Some(TextSide::Varying)) => (left.into(), format!(" rtrim({})", right.trim()).into()),
                 (Some(TextSide::Varying), Some(TextSide::Padded)) => (format!("rtrim({}) ", left.trim()).into(), right.into()),
-                _ => (left.into(), right.into()),
+                _ => match (legacy_char_operand(left, schema), legacy_char_operand(right, schema)) {
+                    (Some(l), Some(r)) => (l.into(), r.into()),
+                    (Some(l), None) => (l.into(), trimmed_literals(right).into()),
+                    (None, Some(r)) => (trimmed_literals(left).into(), r.into()),
+                    (None, None) => (left.into(), right.into()),
+                },
             };
         return Ok(format!(
             "{}{}{}",
@@ -3060,9 +3130,32 @@ fn lift_comparison(
     }
 
     let rest = &body[at..];
+    // A legacy `CHAR` column (`legacy_char_operand`) reads as its text in
+    // every form; its list items and bounds without trailing spaces, as
+    // `character(1)` compares them. A pattern is matched as written.
+    let legacy = legacy_char_operand(&body[..at], schema);
+    let legacy_rest;
+    let rest: &str = match &legacy {
+        Some(_) if !is_pattern_operator(rest) => {
+            legacy_rest = trimmed_literals(rest);
+            &legacy_rest
+        }
+        _ => rest,
+    };
     // A `character(n)` column under a pattern match reads padded, which only
     // the evaluator gives it (`padded_for_pattern`).
-    let padded = if is_pattern_operator(rest) { padded_for_pattern(&body[..at], schema) } else { None };
+    // A pattern matches `character(1)`'s padded value, as PostgreSQL's
+    // does: the blank value is `' '`, so `LIKE '_'` takes it and `LIKE ''`
+    // does not.
+    let padded = match legacy {
+        Some(text) if is_pattern_operator(rest) => {
+            let text = text.trim();
+            Some(format!("{text} || CASE WHEN {text} = '' THEN ' ' ELSE '' END"))
+        }
+        Some(text) => Some(text),
+        None if is_pattern_operator(rest) => padded_for_pattern(&body[..at], schema),
+        None => None,
+    };
     // Its `ESCAPE`, which nothing after a lifted operand reads, is folded
     // into the pattern here, in the backslash form the matcher reads: left
     // as written, `a LIKE 'a!%b%' ESCAPE '!'` was refused (42601).

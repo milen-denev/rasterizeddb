@@ -425,3 +425,47 @@ async fn a_type_change_never_leaves_a_check_unenforced() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// The same over 3000 rows, with the filter on (its threshold lowered to
+/// take the table), and through an index on the column: neither the filter's
+/// zone bounds nor its fingerprints nor the index hold the cell's text, so
+/// none of them may prune a comparison of it. Byte order: `'a'` and `'ab'`
+/// are below `'b'`, so `c < 'b'` is 1000; it was 500.
+///
+/// Mutation: `sarg` pruning a legacy `CHAR` predicate again, together with
+/// `legacy_char_operand` returning `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_legacy_char_table_answers_by_text_with_the_filter_and_an_index() {
+    rasterizeddb_core::filter_settings().update_global(|o| o.min_table_rows = Some(100));
+    let values = ["a", "ab", "b", "ba", "c", "é"];
+    let rows: Vec<(i32, Option<&str>, Option<&str>)> =
+        (0..3000).map(|i| (i, Some(values[(i % 6) as usize]), None)).collect();
+    let db = LegacyDb::make("large", &rows).await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let count = |sql: &str| format!("SELECT count(*) FROM lc WHERE {sql}");
+    let shapes = [
+        ("c < 'b'", "[1000]"),
+        ("c BETWEEN 'a' AND 'b'", "[1500]"),
+        ("c > 'c'", "[500]"),
+        ("c LIKE 'a%'", "[1000]"),
+        ("c NOT LIKE 'a%'", "[2000]"),
+        ("c LIKE '%b'", "[1000]"),
+        ("c ILIKE 'A%'", "[1000]"),
+        ("c SIMILAR TO '(a|b)%'", "[2000]"),
+        ("c LIKE '_'", "[2000]"),
+        ("c = 'ab'", "[500]"),
+        ("c = 'a  '", "[500]"),
+        ("c IN ('ba', 'é')", "[1000]"),
+    ];
+    let mut wrong = Vec::new();
+    for round in ["plain", "indexed"] {
+        if round == "indexed" {
+            c.batch_execute("CREATE INDEX lc_c ON lc (c)").await.expect("index");
+        }
+        let cases: Vec<(String, &str)> = shapes.iter().map(|(s, w)| (count(s), *w)).collect();
+        let cases: Vec<(&str, &str)> = cases.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        wrong.extend(check(&c, &cases).await.into_iter().map(|w| format!("{round}: {w}")));
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
