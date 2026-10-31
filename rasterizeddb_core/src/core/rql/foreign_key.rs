@@ -601,11 +601,31 @@ pub fn canonical_key_text(text: &str, ty: &crate::core::db_type::DbType) -> Stri
     }
 }
 
-/// A decimal number's canonical text; anything that is not a plain decimal
-/// (an exponent, `NaN`, `Infinity`) is returned as written, so it is equal
-/// only to itself.
+/// A decimal number's canonical text; anything that is not a number (`NaN`,
+/// `Infinity`) is returned as written, so it is equal only to itself.
+///
+/// An exponent is read as the number it writes: a float's text is
+/// PostgreSQL's (`9.007199254740992e+15`, `1e-07`), which must meet the
+/// integer or decimal it equals (`9007199254740992`).
 fn canonical_number(text: &str) -> String {
     let t = text.trim();
+    if t.contains(['e', 'E']) {
+        return match crate::core::rql::expr::decimal_digits(t) {
+            Some((m, e)) if (-400..=400).contains(&e) => {
+                let digits = m.unsigned_abs().to_string();
+                let plain = if e >= 0 {
+                    format!("{digits}{}", "0".repeat(e as usize))
+                } else {
+                    let places = e.unsigned_abs() as usize;
+                    let padded = format!("{}{digits}", "0".repeat(places.saturating_sub(digits.len()) + 1));
+                    let (int, frac) = padded.split_at(padded.len() - places);
+                    format!("{int}.{frac}")
+                };
+                canonical_number(&if m < 0 { format!("-{plain}") } else { plain })
+            }
+            _ => t.to_string(),
+        };
+    }
     let (negative, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
