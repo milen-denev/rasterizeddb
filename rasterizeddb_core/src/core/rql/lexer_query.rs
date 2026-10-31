@@ -149,7 +149,7 @@ fn parse_computed_item(
         // read — `MIN(v) + 1` over a `NUMERIC(10,2)` added 1 to 100 as 10^9
         // to 10^4.
         if matches!(ty, crate::core::db_type::DbType::DECIMAL) {
-            synth_field.scale = Some(func.decimal_output_scale(arg.as_ref()));
+            synth_field.scale = func.synthetic_scale(arg.as_ref());
         }
         // MIN and MAX of a `timestamp` (without time zone) column are one
         // too, so `max(a)::text` has no offset (`expr::yields_timestamp`).

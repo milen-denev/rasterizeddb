@@ -113,6 +113,20 @@ impl AggFunc {
     /// argument's scale when that is wider. pgwire's `select_scales` renders by
     /// this rule — the two must agree or the value is printed a power of ten
     /// away from itself.
+    /// The scale a finished aggregate is read at when an expression reads
+    /// it (`MIN(v) + 1`): [`Self::decimal_output_scale`], except that `SUM`,
+    /// `MIN` and `MAX` of an unconstrained `NUMERIC` say none — their values,
+    /// stored at the engine's nine places, have no declared scale, and are
+    /// read with the places they need (`expr::pg_numeric`), as the column is.
+    pub(crate) fn synthetic_scale(&self, arg: Option<&SchemaField>) -> Option<u32> {
+        match (self, arg) {
+            (AggFunc::Sum | AggFunc::Min | AggFunc::Max, Some(f)) if f.db_type == DbType::DECIMAL && f.scale.is_none() => {
+                None
+            }
+            _ => Some(self.decimal_output_scale(arg)),
+        }
+    }
+
     pub fn decimal_output_scale(&self, arg: Option<&SchemaField>) -> u32 {
         let declared = match arg {
             Some(f) if f.db_type == DbType::DECIMAL => f.scale.unwrap_or(DECIMAL_SCALE),
@@ -2081,7 +2095,7 @@ fn emit_group(
                     // The scale the result is *at*, which for `AVG` is not the
                     // argument's: the evaluator lifts by this.
                     if ty == DbType::DECIMAL {
-                        field.scale = Some(input.func.decimal_output_scale(input.arg.as_ref()));
+                        field.scale = input.func.synthetic_scale(input.arg.as_ref());
                     }
                     synth_schema.push(field);
 
@@ -2098,7 +2112,9 @@ fn emit_group(
                     columns: synth_columns,
                     length: 0,
                 };
-                let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
+                // A NUMERIC at PostgreSQL's display scale (`expr::pg_numeric`):
+                // `min(n) + 1` over a NUMERIC(10,2) is 2.50, not 2.500000000.
+                let value = crate::core::rql::expr::eval_output(expr, &synth, &synth_schema)?;
                 match value {
                     // Typed NULL, as `aggregate_output` emits a NULL
                     // aggregate. Empty bytes wearing the expression's type
@@ -2725,7 +2741,7 @@ mod fold_previous {
                             // The scale the result is *at*, which for `AVG` is not
                             // the argument's: the evaluator lifts by this.
                             if ty == DbType::DECIMAL {
-                                field.scale = Some(input.func.decimal_output_scale(input.arg.as_ref()));
+                                field.scale = input.func.synthetic_scale(input.arg.as_ref());
                             }
                             synth_schema.push(field);
 
@@ -2742,7 +2758,7 @@ mod fold_previous {
                             columns: synth_columns,
                             length: 0,
                         };
-                        let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
+                        let value = crate::core::rql::expr::eval_output(expr, &synth, &synth_schema)?;
                         match value {
                             crate::core::rql::expr::Value::Null => (Vec::new(), DbType::NULL),
                             crate::core::rql::expr::Value::Data { bytes, db_type: ty } => (bytes, ty),
@@ -4211,7 +4227,7 @@ mod fold_reference {
                             columns: synth_columns,
                             length: 0,
                         };
-                        let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
+                        let value = crate::core::rql::expr::eval_output(expr, &synth, &synth_schema)?;
                         match value {
                             crate::core::rql::expr::Value::Null => (Vec::new(), DbType::NULL),
                             crate::core::rql::expr::Value::Data { bytes, db_type: ty } => (bytes, ty),

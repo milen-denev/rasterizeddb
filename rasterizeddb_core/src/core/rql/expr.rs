@@ -1057,10 +1057,11 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     if let Ok(v) = text.parse::<f64>() {
         if text.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+')) {
             if let Some(units) = exact_engine_decimal(text) {
-                return Ok(Expr::Literal {
+                let literal = Expr::Literal {
                     bytes: units.to_le_bytes().to_vec(),
                     db_type: DbType::DECIMAL,
-                });
+                };
+                return Ok(with_written_scale(literal, text));
             }
             // Not exact at the engine scale: a float or a rounded NUMERIC,
             // whichever keeps the written number (see `numeric_constant`).
@@ -3406,6 +3407,28 @@ fn numeric_constant(m: i128, e: i32, text: &str) -> Result<Expr, String> {
     }
 }
 
+/// A written `NUMERIC` constant whose places include zeros at the end of its
+/// fraction — `2.50`, `2.0`, `100e-2` — as a cast to its own written scale:
+/// `numeric_in` gives it that display scale, and the constant's value at
+/// the engine scale cannot say it (the bytes of `2.50` and `2.5` are the
+/// same). So `2.50 * 2` is `5.00`, as PostgreSQL shows it, not `5.0`.
+///
+/// The cast's precision is 0, which checks nothing: it says only the scale.
+/// A constant whose written places are those its value needs stays the
+/// plain literal, whose scale ([`display_scale`], [`pg_numeric`]) is its own.
+fn with_written_scale(literal: Expr, text: &str) -> Expr {
+    let Some((_, e)) = decimal_digits(text) else { return literal };
+    let written = u32::try_from(-(e.min(0) as i64)).unwrap_or(0);
+    match display_scale(&literal) {
+        Some(own) if written > own && written <= crate::core::value_codec::DECIMAL_SCALE => Expr::NumericCast {
+            value: Box::new(literal),
+            precision: 0,
+            scale: written,
+        },
+        _ => literal,
+    }
+}
+
 /// The most places a written constant is carried exactly at (an i128 holds
 /// 38 digits); one with more is the float or rounded constant it was.
 const WIDE_LITERAL_PLACES: u32 = 38;
@@ -3732,6 +3755,19 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
     if matches!(target.db_type, DbType::STRING | DbType::CHAR) && yields_timestamp(expr) {
         return local_timestamp_text(eval(expr, row, schema)?);
     }
+    // A NUMERIC written into a text column is its text at the display scale
+    // PostgreSQL gives it: `SET v = nu` over a NUMERIC(10,3) 2.500 stores
+    // '2.500' and `SET v = 2.50 * 2` '5.00', where the engine-scale value's
+    // own text was '2.5' and '5'.
+    if matches!(target.db_type, DbType::STRING | DbType::CHAR) && static_type(expr) == DbType::DECIMAL {
+        if let Some(value) = pg_numeric(expr, row, schema)? {
+            let value = match value {
+                None => Value::Null,
+                Some(v) => Value::Data { bytes: v.to_text().into_bytes(), db_type: DbType::STRING },
+            };
+            return from_engine_scale(value, target);
+        }
+    }
     // `'{"a":1}' || '{"b":1}'` is text concatenation, which PostgreSQL
     // has no assignment cast from to `jsonb`: 42804, not the 22P02 of
     // reading the joined text as a document. (A document on either side
@@ -3740,6 +3776,14 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
         return Err(format!("column \"{}\" is of type jsonb but expression is of type text", target.name));
     }
     if target.db_type == DbType::DECIMAL {
+        // PostgreSQL's value, as its operators compute it — a quotient rounded
+        // at `select_div_scale`'s places first — then rounded to the column's
+        // scale, as its assignment cast rounds.
+        match pg_numeric(expr, row, schema)? {
+            Some(None) => return Ok(Value::Null),
+            Some(Some(v)) => return pg_numeric_into(v, target),
+            None => {}
+        }
         let scale = target.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
         let exact = match exact_numeric(expr, row, schema, scale) {
             // The exact form is past an i128. Through the engine this is cut
@@ -3775,6 +3819,31 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
         }
     }
     eval(expr, row, schema).and_then(|value| from_engine_scale(value, target))
+}
+
+/// A [`pg_numeric`] value stored in the `NUMERIC` column `target`: rounded
+/// half away from zero to its declared scale. An unconstrained column keeps
+/// the engine's nine places, and PostgreSQL would keep every place of the
+/// value; one with digits past nine is refused, as such a written constant
+/// is, rather than stored without them (`SET c = 2.0 / 3` stored
+/// 0.666666667 for PostgreSQL's 0.66666666666666666667).
+fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &SchemaField) -> Result<Value, String> {
+    use crate::core::value_codec::DECIMAL_SCALE;
+    let overflow = || "value overflows numeric format".to_string();
+    let units = match target.scale {
+        Some(scale) => v.units_at(scale).ok_or_else(overflow)?,
+        None if v.exact_at(DECIMAL_SCALE) => v.units_at(DECIMAL_SCALE).ok_or_else(overflow)?,
+        None => {
+            return Err(format!(
+                "numeric value \"{}\" has more than the {} decimal places an unconstrained NUMERIC column keeps \
+                 (not supported); declare the column NUMERIC(p, s) for column \"{}\"",
+                v.to_text(),
+                DECIMAL_SCALE,
+                target.name
+            ))
+        }
+    };
+    Ok(Value::Data { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL })
 }
 
 /// A number as `m × 10^e`, with an upper bound on how far it may be from the
@@ -3868,12 +3937,191 @@ pub(crate) fn eval_output(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Res
 /// to [`eval_output_planned`]: decided per row, the walk cost a select list
 /// or a sort key some 2–7% more instructions.
 pub(crate) fn output_is_wide(expr: &Expr) -> bool {
-    reads_wide_decimal(expr, &[]) && static_type(expr) == DbType::DECIMAL
+    // Any computed NUMERIC is read through [`pg_numeric`], whose display scale
+    // is PostgreSQL's; a plain column read is at its own declared scale.
+    static_type(expr) == DbType::DECIMAL && (!matches!(expr, Expr::Column(_)) || reads_wide_decimal(expr, &[]))
+}
+
+/// A `NUMERIC` expression's value with the display scale PostgreSQL gives it
+/// ([`crate::core::rql::pg_numeric`]): a column's declared scale, a written
+/// constant's own places, an integer's none; the larger for `+ - %`, the sum
+/// for `*`, `select_div_scale` for `/`; the branch taken for `CASE`,
+/// `COALESCE`, `LEAST`/`GREATEST` and `NULLIF`, whose result keeps the
+/// chosen value's scale. Every step is exact; a quotient is rounded half away
+/// from zero at its scale, as `numeric_div` rounds.
+///
+/// An unconstrained `NUMERIC` column is stored at the engine's nine places,
+/// its own display scale lost, and is read with the places its value needs.
+///
+/// `Ok(None)` for a part this does not compute (a float, a function it does
+/// not know, a value past an `i128`), for the caller's engine path to take;
+/// `Ok(Some(None))` for NULL.
+pub(crate) fn pg_numeric(
+    expr: &Expr,
+    row: &Row,
+    schema: &[SchemaField],
+) -> Result<Option<Option<crate::core::rql::pg_numeric::PgNum>>, String> {
+    use crate::core::rql::pg_numeric::{self as pgn, PgNum};
+    use crate::core::value_codec::DECIMAL_SCALE;
+    let integer = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    };
+    // A NUMERIC cell: sixteen bytes at `declared` places (the engine's, its
+    // value's own, when nothing declared them), or seventeen carrying its own.
+    let decimal = |bytes: &[u8], declared: Option<u32>| -> Option<PgNum> {
+        match crate::core::value_codec::split_decimal_cell(bytes)? {
+            (m, Some(own)) => PgNum::new(m, own),
+            (m, None) => match declared {
+                Some(s) => PgNum::new(m, s),
+                None => Some(PgNum::trimmed(m, DECIMAL_SCALE)),
+            },
+        }
+    };
+    let whole = |value: Value| -> Option<Option<PgNum>> {
+        match value {
+            Value::Null => Some(None),
+            value => as_i64(&value).map(|v| Some(PgNum::int(v as i128))),
+        }
+    };
+    Ok(match expr {
+        Expr::Null => Some(None),
+        Expr::Literal { bytes, db_type: DbType::DECIMAL } => decimal(bytes, None).map(Some),
+        Expr::Literal { bytes, db_type } if integer(db_type) => {
+            whole(Value::Data { bytes: bytes.clone(), db_type: db_type.clone() })
+        }
+        Expr::Column(field) => match column_value(field, row, schema) {
+            Value::Null => Some(None),
+            Value::Data { bytes, db_type: DbType::DECIMAL } => decimal(&bytes, field.scale).map(Some),
+            value @ Value::Data { .. } if integer(&field.db_type) => whole(value),
+            _ => None,
+        },
+        // Integer arithmetic is the engine's own, with PostgreSQL's integer
+        // division: `(i / 2) * 1.5` halves `i` as an integer first.
+        Expr::Arith(..) | Expr::Mod(..) if integer(&static_type(expr)) => whole(eval(expr, row, schema)?),
+        Expr::Arith(l, op, r) if static_type(expr) == DbType::DECIMAL => {
+            let (Some(a), Some(b)) = (pg_numeric(l, row, schema)?, pg_numeric(r, row, schema)?) else {
+                return Ok(None);
+            };
+            let (Some(a), Some(b)) = (a, b) else { return Ok(Some(None)) };
+            match op {
+                ArithOp::Add => a.add(b),
+                ArithOp::Sub => a.sub(b),
+                ArithOp::Mul => a.mul(b),
+                ArithOp::Div => a.div(b).map_err(str::to_string)?,
+                ArithOp::Rem => a.rem(b).map_err(str::to_string)?,
+            }
+            .map(Some)
+        }
+        Expr::Mod(l, r) if static_type(expr) == DbType::DECIMAL => {
+            let (Some(a), Some(b)) = (pg_numeric(l, row, schema)?, pg_numeric(r, row, schema)?) else {
+                return Ok(None);
+            };
+            let (Some(a), Some(b)) = (a, b) else { return Ok(Some(None)) };
+            a.rem(b).map_err(str::to_string)?.map(Some)
+        }
+        Expr::Cast(inner, DbType::DECIMAL) => match static_type(inner) {
+            t if t == DbType::DECIMAL || integer(&t) => pg_numeric(inner, row, schema)?,
+            // `float8_numeric` / `float4_numeric`: the float's fifteen (six)
+            // digit text, read back.
+            DbType::F64 | DbType::F32 => match eval(inner, row, schema)? {
+                Value::Null => Some(None),
+                Value::Data { bytes, db_type: DbType::F64 } => {
+                    <[u8; 8]>::try_from(bytes.as_slice()).ok().and_then(|b| pgn::from_f64(f64::from_le_bytes(b))).map(Some)
+                }
+                Value::Data { bytes, db_type: DbType::F32 } => {
+                    <[u8; 4]>::try_from(bytes.as_slice()).ok().and_then(|b| pgn::from_f32(f32::from_le_bytes(b))).map(Some)
+                }
+                _ => None,
+            },
+            // `'1.50'::numeric` is two places, as `numeric_in` reads it.
+            DbType::STRING => match eval(inner, row, schema)? {
+                Value::Null => Some(None),
+                Value::Data { bytes, db_type: DbType::STRING } => {
+                    std::str::from_utf8(&bytes).ok().and_then(pgn::parse_text).map(Some)
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::NumericCast { value, precision, scale } => match pg_numeric(value, row, schema)? {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(v)) => {
+                let Some(rounded) = v.round_to(*scale) else { return Ok(None) };
+                crate::core::value_codec::check_numeric_precision(rounded.m, *precision, *scale)?;
+                Some(Some(rounded))
+            }
+        },
+        Expr::Coalesce(args) => {
+            for arg in args {
+                match pg_numeric(arg, row, schema)? {
+                    None => return Ok(None),
+                    Some(Some(v)) => return Ok(Some(Some(v))),
+                    Some(None) => {}
+                }
+            }
+            Some(None)
+        }
+        Expr::Case { whens, otherwise } => {
+            for (cond, result) in whens {
+                if eval_cond_3vl(cond, row, schema)? == Some(true) {
+                    return pg_numeric(result, row, schema);
+                }
+            }
+            match otherwise {
+                Some(result) => pg_numeric(result, row, schema)?,
+                None => Some(None),
+            }
+        }
+        // NULLs ignored, NULL only when every one is. Of equal values the
+        // first is kept, scale and all.
+        Expr::Least(args) | Expr::Greatest(args) => {
+            let greatest = matches!(expr, Expr::Greatest(_));
+            let mut best: Option<PgNum> = None;
+            for arg in args {
+                let Some(value) = pg_numeric(arg, row, schema)? else { return Ok(None) };
+                let Some(x) = value else { continue };
+                best = Some(match best {
+                    None => x,
+                    Some(b) => {
+                        let order = x.cmp_value(b);
+                        if (greatest && order.is_gt()) || (!greatest && order.is_lt()) { x } else { b }
+                    }
+                });
+            }
+            Some(best)
+        }
+        Expr::NullIf(a, b) => {
+            let (Some(x), Some(y)) = (pg_numeric(a, row, schema)?, pg_numeric(b, row, schema)?) else {
+                return Ok(None);
+            };
+            match (x, y) {
+                (Some(x), Some(y)) if x.cmp_value(y).is_eq() => Some(None),
+                (x, _) => Some(x),
+            }
+        }
+        Expr::Call(TextFunc::Abs, args) if args.len() == 1 => match pg_numeric(&args[0], row, schema)? {
+            Some(Some(v)) => v.abs().map(Some),
+            other => other,
+        },
+        _ => None,
+    })
 }
 
 /// [`eval_output`] with [`output_is_wide`] already decided.
 pub(crate) fn eval_output_planned(expr: &Expr, wide: bool, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
     if wide {
+        // PostgreSQL's value at PostgreSQL's display scale, in a cell that
+        // carries it: `1.0 / 3` is twenty places, `0.00001 * 0.00001` ten,
+        // `2.50 * 2` two. Through the engine each was cut to nine places.
+        match pg_numeric(expr, row, schema)? {
+            Some(None) => return Ok(Value::Null),
+            Some(Some(v)) => return Ok(Value::Data { bytes: v.to_cell(), db_type: DbType::DECIMAL }),
+            None => {}
+        }
         if let Some(value) = wide_exact(expr, row, schema)? {
             let Some(x) = value else { return Ok(Value::Null) };
             let (m, scale) = if x.e <= 0 {
@@ -3906,6 +4154,32 @@ thread_local! {
 /// vouched for, if it could not.
 pub(crate) fn take_check_uncertainty() -> Option<String> {
     CHECK_UNCERTAIN.with(|u| u.borrow_mut().take())
+}
+
+/// Whether `expr` holds a `NUMERIC` product, quotient or remainder, whose
+/// value the engine's nine places can cut ([`pg_numeric`] computes it
+/// exactly). Decided once per condition ([`Condition::wide`]).
+fn numeric_product_or_quotient(expr: &Expr) -> bool {
+    match expr {
+        Expr::Arith(a, op, b) => {
+            (matches!(op, ArithOp::Mul | ArithOp::Div | ArithOp::Rem) && static_type(expr) == DbType::DECIMAL)
+                || numeric_product_or_quotient(a)
+                || numeric_product_or_quotient(b)
+        }
+        Expr::Mod(a, b) | Expr::NullIf(a, b) | Expr::Concat(a, b) => {
+            numeric_product_or_quotient(a) || numeric_product_or_quotient(b)
+        }
+        Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => {
+            args.iter().any(numeric_product_or_quotient)
+        }
+        Expr::Cast(inner, _) => numeric_product_or_quotient(inner),
+        Expr::NumericCast { value, .. } | Expr::TypmodCast { value, .. } => numeric_product_or_quotient(value),
+        Expr::Case { whens, otherwise } => {
+            whens.iter().any(|(_, r)| numeric_product_or_quotient(r))
+                || otherwise.as_deref().is_some_and(numeric_product_or_quotient)
+        }
+        Expr::Column(_) | Expr::Literal { .. } | Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
+    }
 }
 
 /// Whether `expr` reads a NUMERIC column with more places than the engine's.
@@ -4015,6 +4289,16 @@ fn exact_numeric(
             found
         }
         Expr::Cast(inner, DbType::DECIMAL) => exact_numeric(inner, row, schema, places)?,
+        // `x::numeric(p, s)`, and a written constant held to its own places
+        // (`with_written_scale`): rounded there, when the rounding is certain.
+        Expr::NumericCast { value, precision, scale } => match exact_numeric(value, row, schema, places)? {
+            Some(Some(x)) => {
+                let Some(units) = x.settle(*scale) else { return Ok(None) };
+                crate::core::value_codec::check_numeric_precision(units, *precision, *scale)?;
+                Some(Some(ExactNumber::exact(units, -(*scale as i32))))
+            }
+            other => other,
+        },
         // The branch taken, exactly: through the engine a branch with more
         // places than nine made the whole CASE a float.
         Expr::Case { whens, otherwise } => {
@@ -5414,6 +5698,18 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             }
         }
         Expr::Cast(inner, target) => {
+            // A NUMERIC's text is at the display scale PostgreSQL gives it:
+            // `(1.0 / 3)::text` has twenty places, `(2.50 * 2)::text` is
+            // '5.00' (`pg_numeric`). Through the engine both were its
+            // nine-place value with the zeros trimmed.
+            if *target == DbType::STRING && static_type(inner) == DbType::DECIMAL {
+                if let Some(value) = pg_numeric(inner, row, schema)? {
+                    return Ok(match value {
+                        None => Value::Null,
+                        Some(v) => Value::Data { bytes: v.to_text().into_bytes(), db_type: DbType::STRING },
+                    });
+                }
+            }
             let value = eval(inner, row, schema)?;
             // A NUMERIC rendered as text keeps the places PostgreSQL displays
             // it with: a NUMERIC(5,2) 2.50 is '2.50'. The value is at the
@@ -5665,7 +5961,27 @@ pub fn eval_condition_3vl(
     // through the engine it was refused for the places past nine, so `CASE
     // WHEN a > 1` failed on a NUMERIC(20,12) value with digits there.
     if let (Some(right), true) = (&condition.right, matches!(condition.cmp, Cmp::Eq | Cmp::Ne | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge)) {
-        if *condition.wide.0.get_or_init(|| reads_wide_decimal(&condition.left, schema) || reads_wide_decimal(right, schema)) {
+        if *condition.wide.0.get_or_init(|| {
+            reads_wide_decimal(&condition.left, schema)
+                || reads_wide_decimal(right, schema)
+                || numeric_product_or_quotient(&condition.left)
+                || numeric_product_or_quotient(right)
+        }) {
+            // PostgreSQL's values, exactly: through the engine a product or
+            // quotient was cut to nine places, so `CASE WHEN x * y > 0` was
+            // false for 0.00001 * 0.00001.
+            if let (Some(a), Some(b)) = (pg_numeric(&condition.left, row, schema)?, pg_numeric(right, row, schema)?) {
+                let (Some(a), Some(b)) = (a, b) else { return Ok(None) };
+                let ordering = a.cmp_value(b);
+                return Ok(Some(match condition.cmp {
+                    Cmp::Eq => ordering.is_eq(),
+                    Cmp::Ne => !ordering.is_eq(),
+                    Cmp::Lt => ordering.is_lt(),
+                    Cmp::Le => ordering.is_le(),
+                    Cmp::Gt => ordering.is_gt(),
+                    _ => ordering.is_ge(),
+                }));
+            }
             if let (Some(a), Some(b)) =
                 (exact_numeric_or_engine(&condition.left, row, schema, 30)?, exact_numeric_or_engine(right, row, schema, 30)?)
             {
