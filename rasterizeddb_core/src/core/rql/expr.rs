@@ -289,7 +289,11 @@ fn strip_trailing_spaces(expr: &mut Expr) {
 pub fn yields_bpchar(expr: &Expr) -> bool {
     use crate::core::rql::type_modifier::TextTypmod;
     match expr {
-        Expr::Column(f) => matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))) && f.db_type == DbType::STRING,
+        // A legacy `CHAR` is `character(1)` too (`value_codec::legacy_char_text`).
+        Expr::Column(f) => {
+            (matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))) && f.db_type == DbType::STRING)
+                || f.db_type == DbType::CHAR
+        }
         Expr::TypmodCast { typmod: CastTypmod::Text(TextTypmod::Bpchar(_)), .. } => true,
         // `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` over
         // `character(n)` values and untyped strings are `bpchar`, as

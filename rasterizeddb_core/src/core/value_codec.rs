@@ -1558,29 +1558,58 @@ pub const LEGACY_CHAR_WIDTH: usize = 4;
 /// four bytes — any one character — so reading the bytes as what they are
 /// gives every such value back. A longer one was cut by the write
 /// (`'abcde'` is `'abcd'`); what survives is read up to the last whole
-/// character.
+/// character (`'aé€'`, cut inside the euro sign, is `'aé'`).
+///
+/// Read as `character(1)` reads a value, which a bare `CHAR` is: without
+/// trailing spaces. An older build stored `''` as four zeros and `' '` and
+/// `'a '` with their spaces, so one value had several cells; this is the
+/// one text every display, comparison and group reads for all of them.
 pub fn legacy_char_text(bytes: &[u8]) -> &str {
     let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
     let bytes = &bytes[..end];
-    match std::str::from_utf8(bytes) {
+    let text = match std::str::from_utf8(bytes) {
         Ok(text) => text,
         Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    text.trim_end_matches(' ')
+}
+
+/// A legacy `CHAR` cell in its one stored form ([`legacy_char_text`],
+/// zero-padded): what [`legacy_char_assign`] writes, so a cell of either
+/// age compares, groups and sorts by it.
+pub fn legacy_char_canonical(bytes: &[u8]) -> [u8; LEGACY_CHAR_WIDTH] {
+    let text = legacy_char_text(bytes).as_bytes();
+    let mut out = [0u8; LEGACY_CHAR_WIDTH];
+    let n = text.len().min(LEGACY_CHAR_WIDTH);
+    out[..n].copy_from_slice(&text[..n]);
+    out
+}
+
+/// A legacy `CHAR` value as it is shown: `character(1)`'s padding, so the
+/// blank value is `' '` whichever cell holds it.
+pub fn legacy_char_display(bytes: &[u8]) -> &str {
+    match legacy_char_text(bytes) {
+        "" => " ",
+        text => text,
     }
 }
 
 /// `text` assigned to a legacy `CHAR` column, as PostgreSQL assigns to a
 /// `CHAR`, which is `character(1)`: one character, the rest only spaces
-/// (`'x  '` is `'x'`), and `''` padded to `' '`. Anything longer is 22001,
-/// where the cell kept its first four bytes and reported success. One
-/// character always fits the four bytes.
+/// (`'x  '` is `'x'`). Anything longer is 22001, where the cell kept its
+/// first four bytes and reported success. One character always fits the
+/// four bytes. Stored without trailing spaces, as `character(n)` is
+/// ([`legacy_char_canonical`]): the blank value is four zeros, shown `' '`.
 pub fn legacy_char_assign(text: &str) -> Result<[u8; LEGACY_CHAR_WIDTH], String> {
     let mut chars = text.chars();
-    let first = chars.next().unwrap_or(' ');
+    let first = chars.next().filter(|c| *c != ' ');
     if chars.any(|c| c != ' ') {
         return Err("value too long for type character(1)".to_string());
     }
     let mut out = [0u8; LEGACY_CHAR_WIDTH];
-    first.encode_utf8(&mut out);
+    if let Some(first) = first {
+        first.encode_utf8(&mut out);
+    }
     Ok(out)
 }
 
@@ -1591,6 +1620,7 @@ pub fn legacy_char_assign(text: &str) -> Result<[u8; LEGACY_CHAR_WIDTH], String>
 /// literal's code point, which no stored value of a non-ASCII character
 /// ever equalled: `c = 'é'` found nothing.
 pub fn legacy_char_literal(text: &str) -> Option<[u8; LEGACY_CHAR_WIDTH]> {
+    let text = text.trim_end_matches(' ');
     legacy_char_assign(text).ok().or_else(|| {
         (text.len() <= LEGACY_CHAR_WIDTH).then(|| {
             let mut out = [0u8; LEGACY_CHAR_WIDTH];
@@ -2987,8 +3017,9 @@ mod tests {
             ([0xf0, 0x9f, 0x98, 0x80], "😀"),
             ([0x61, 0x62, 0, 0], "ab"),
             ([0x61, 0x62, 0x63, 0x64], "abcd"),
-            ([0x20, 0, 0, 0], " "),
+            ([0x20, 0, 0, 0], ""),
             ([0, 0, 0, 0], ""),
+            ([0x61, 0x20, 0, 0], "a"),
             // 'aé€' cut inside the euro sign: what survives whole.
             ([0x61, 0xc3, 0xa9, 0xe2], "aé"),
         ] {
@@ -2996,7 +3027,15 @@ mod tests {
         }
         assert_eq!(legacy_char_assign("é"), Ok([0xc3, 0xa9, 0, 0]));
         assert_eq!(legacy_char_assign("x  "), Ok([0x78, 0, 0, 0]));
-        assert_eq!(legacy_char_assign(""), Ok([0x20, 0, 0, 0]));
+        assert_eq!(legacy_char_assign(""), Ok([0, 0, 0, 0]));
+        assert_eq!(legacy_char_assign(" "), Ok([0, 0, 0, 0]));
+        // Every cell of one value has one stored form, and one display.
+        for cell in [[0u8, 0, 0, 0], [0x20, 0, 0, 0], [0x20, 0x20, 0, 0]] {
+            assert_eq!(legacy_char_canonical(&cell), [0, 0, 0, 0]);
+            assert_eq!(legacy_char_display(&cell), " ");
+        }
+        assert_eq!(legacy_char_canonical(&[0x61, 0x20, 0, 0]), [0x61, 0, 0, 0]);
+        assert_eq!(legacy_char_canonical(&[0x61, 0xc3, 0xa9, 0xe2]), [0x61, 0xc3, 0xa9, 0]);
         assert_eq!(legacy_char_assign("😀"), Ok([0xf0, 0x9f, 0x98, 0x80]));
         assert!(legacy_char_assign("ab").is_err());
         assert!(legacy_char_assign("abcde").is_err());

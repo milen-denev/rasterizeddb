@@ -10159,7 +10159,7 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
         // A legacy `CHAR` cell is the value's UTF-8, zero-padded to four
         // bytes (`value_codec::legacy_char_text`). Read as a code point, `'é'`
         // went out as `'꧃'`.
-        DbType::CHAR => Some(crate::core::value_codec::legacy_char_text(bytes).as_bytes().to_vec()),
+        DbType::CHAR => Some(crate::core::value_codec::legacy_char_display(bytes).as_bytes().to_vec()),
         // `inet`'s binary form: family (2 = IPv4, 3 = IPv6), prefix bits, the
         // is-cidr flag, the address length, the address. It fell through to
         // the catch-all below, which sent the *text* rendering to a client
@@ -10521,7 +10521,7 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
         // The value's UTF-8, zero-padded to four bytes, as every build
         // stored it (`value_codec::legacy_char_text`). Read as a little-endian
         // code point, `'é'` came back as `'꧃'` and `'€'` as `11305698`.
-        DbType::CHAR => crate::core::value_codec::legacy_char_text(bytes).to_string(),
+        DbType::CHAR => crate::core::value_codec::legacy_char_display(bytes).to_string(),
 
         DbType::I8 => {
             // The declared width decides, not what the bytes look like.

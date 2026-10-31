@@ -835,6 +835,9 @@ impl Acc {
                     DbType::F32 if value.len() == 4 && f32::from_le_bytes(value.try_into().unwrap()) == 0.0 => {
                         Some(0f32.to_le_bytes().to_vec())
                     }
+                    // A legacy `CHAR`'s cells of one value are one value
+                    // (`value_codec::legacy_char_canonical`).
+                    DbType::CHAR => Some(crate::core::value_codec::legacy_char_canonical(value).to_vec()),
                     _ => None,
                 };
                 match zero {
@@ -1532,6 +1535,10 @@ pub struct Folder<'p> {
     /// computed key counts when its expression is typed `jsonb`, and then
     /// only a row whose value is one is keyed by value.
     document_keys: Vec<bool>,
+    /// Which plain-column keys are legacy `CHAR`, keyed by their one stored
+    /// form (`value_codec::legacy_char_canonical`): an older build's `''`
+    /// and `' '`, or `'a'` and `'a '`, are one value and one group.
+    legacy_char_keys: Vec<bool>,
     /// Set when any key source may be a document. A document's key part is
     /// then not the value the group shows, so each group also keeps its first
     /// row's key in the plain form, and that is what is emitted.
@@ -1660,6 +1667,11 @@ impl<'p> Folder<'p> {
             })
             .collect();
         let shown = document_keys.iter().any(|d| *d).then(Vec::new);
+        let legacy_char_keys: Vec<bool> = key_sources
+            .iter()
+            .zip(plan.group_by.iter())
+            .map(|(source, f)| matches!(source, KeySource::Column(_)) && f.db_type == DbType::CHAR)
+            .collect();
 
         Folder {
             plan,
@@ -1677,6 +1689,7 @@ impl<'p> Folder<'p> {
             key: Vec::new(),
             keys: Vec::new(),
             document_keys,
+            legacy_char_keys,
             shown,
             plain: Vec::new(),
             accs: Vec::new(),
@@ -1761,7 +1774,9 @@ impl<'p> Folder<'p> {
                 // A document is keyed by its value, with its plain form kept
                 // beside it for what the group shows.
                 let mut plain = self.shown.is_some().then_some(&mut self.plain);
-                for (source, document) in self.key_sources.iter().zip(&self.document_keys) {
+                for ((source, document), legacy_char) in
+                    self.key_sources.iter().zip(&self.document_keys).zip(&self.legacy_char_keys)
+                {
                     match source {
                         // A computed key has no scanned column: its bytes come
                         // from evaluating the expression against the row.
@@ -1780,12 +1795,18 @@ impl<'p> Folder<'p> {
                                 }
                             }
                         }
-                        KeySource::Column(slot) => push_key_part(
-                            &mut self.key,
-                            plain.as_deref_mut(),
-                            self.positions.get(row, *slot),
-                            *document,
-                        ),
+                        KeySource::Column(slot) => {
+                            let value = self.positions.get(row, *slot);
+                            let canonical;
+                            let value = match value {
+                                Some(b) if *legacy_char => {
+                                    canonical = crate::core::value_codec::legacy_char_canonical(b);
+                                    Some(&canonical[..])
+                                }
+                                other => other,
+                            };
+                            push_key_part(&mut self.key, plain.as_deref_mut(), value, *document)
+                        }
                     }
                 }
                 self.group_for_key(byte_cell)

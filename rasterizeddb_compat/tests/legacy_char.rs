@@ -153,9 +153,13 @@ impl LegacyDb {
             let server = TestServer::start_file_backed(&db.root_text()).await.expect("server");
             let c = client(&server).await;
             c.batch_execute("CREATE TABLE lc (id INT, c UINT4, k UINT4 UNIQUE, after INT)").await.expect("create");
-            for (id, value, key) in rows {
-                let cell = |v: &Option<&str>| v.map(|v| stored_by_older_build(v).to_string()).unwrap_or_else(|| "NULL".to_string());
-                c.batch_execute(&format!("INSERT INTO lc VALUES ({id}, {}, {}, {})", cell(value), cell(key), id * 10))
+            let cell = |v: &Option<&str>| v.map(|v| stored_by_older_build(v).to_string()).unwrap_or_else(|| "NULL".to_string());
+            for chunk in rows.chunks(500) {
+                let tuples: Vec<String> = chunk
+                    .iter()
+                    .map(|(id, value, key)| format!("({id}, {}, {}, {})", cell(value), cell(key), id * 10))
+                    .collect();
+                c.batch_execute(&format!("INSERT INTO lc VALUES {}", tuples.join(", ")))
                     .await
                     .expect("insert");
             }
@@ -238,7 +242,7 @@ async fn a_legacy_char_column_reads_and_writes_its_text() {
                     "SELECT id, c, c || '|', length(c), upper(c), c IS NULL FROM lc ORDER BY id",
                     "[1]|[A]|[A|]|[1]|[A]|[f];[2]|[é]|[é|]|[1]|[É]|[f];[3]|[€]|[€|]|[1]|[€]|[f];\
                      [4]|[😀]|[😀|]|[1]|[😀]|[f];[5]|[ab]|[ab|]|[2]|[AB]|[f];[6]|[abcd]|[abcd|]|[4]|[ABCD]|[f];\
-                     [7]|[ ]|[ |]|[1]|[ ]|[f];[8]|∅|∅|∅|∅|[t]",
+                     [7]|[ ]|[|]|[0]|[]|[f];[8]|∅|∅|∅|∅|[t]",
                 ),
                 ("SELECT id FROM lc WHERE c = 'é'", "[2]"),
                 ("SELECT id FROM lc WHERE c = '😀'", "[4]"),
@@ -296,7 +300,7 @@ async fn a_legacy_char_column_reads_and_writes_its_text() {
         &[
             (
                 "SELECT id, c, c || '|' FROM lc WHERE id IN (1, 2, 3, 20, 21, 22, 30) ORDER BY id",
-                "[1]|[ß]|[ß|];[2]|[é]|[é|];[3]|[5]|[5|];[20]|[Ö]|[Ö|];[21]|[x]|[x|];[22]|[ ]|[ |];[30]|[ü]|[ü|]",
+                "[1]|[ß]|[ß|];[2]|[é]|[é|];[3]|[5]|[5|];[20]|[Ö]|[Ö|];[21]|[x]|[x|];[22]|[ ]|[|];[30]|[ü]|[ü|]",
             ),
             ("SELECT count(*) FROM lc WHERE id IN (23, 31)", "[0]"),
             ("SELECT id FROM lc WHERE c = 'x' OR c = 'ü' ORDER BY id", "[21];[30]"),
@@ -346,7 +350,7 @@ async fn alter_type_converts_a_legacy_char_column() {
                 ("INSERT INTO lc VALUES (7, 'yy', 'g', 70)", "ERR 22001"),
                 // ' ' and '' were two keys; as character(1) they are one.
                 ("ALTER TABLE lc ALTER COLUMN k TYPE character(1)", "ERR 23505"),
-                ("SELECT id, k || '|' FROM lc WHERE id IN (2, 3) ORDER BY id", "[2]|[ |];[3]|[|]"),
+                ("SELECT id, k || '|' FROM lc WHERE id IN (2, 3) ORDER BY id", "[2]|[|];[3]|[|]"),
                 ("ALTER TABLE lc ALTER COLUMN k TYPE text", "ERR 23505"),
                 ("UPDATE lc SET k = 'c' WHERE id = 3", ""),
                 ("ALTER TABLE lc ALTER COLUMN k TYPE text", ""),
@@ -423,6 +427,99 @@ async fn a_type_change_never_leaves_a_check_unenforced() {
         ],
     )
     .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Every comparison reads a legacy cell as the text it shows, in
+/// `character(1)`'s terms: trailing spaces do not count and `''` is `' '`.
+/// An older build stored one value several ways — `''` as four zeros, `' '`
+/// and `'a '` with their spaces, `'aé€'` cut to `61 c3 a9 e2` — and the
+/// comparator read the four bytes as a `u32`: `c BETWEEN 'a' AND 'z'` missed
+/// `'b'`, `LIKE '%b'` matched nothing, `c = 'a'` missed the `'a '` cell
+/// showing `'a'`, `c = ''` missed the zero cell, the two blanks grouped
+/// apart, `c = 'hello'` was refused and `c = true` answered nothing.
+/// Expectations for one-character values are PostgreSQL 17's for a `char`
+/// column under `COLLATE "C"` (the engine's text order); the cells only an
+/// older build could write answer as the text they show.
+///
+/// Mutations: `legacy_char_operand` returning `None` (the comparisons reach
+/// the `u32` comparator: ranges and patterns wrong); `legacy_char_text`
+/// keeping trailing spaces (`'a '`, `' '` unreachable, groups split);
+/// the group key left raw (`''` and `' '` two groups).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_char_cell_compares_as_the_text_it_shows() {
+    let rows: Vec<(i32, Option<&str>, Option<&str>)> = vec![
+        (1, Some("A"), Some("A")),
+        (2, Some("é"), Some("x")),
+        (3, Some("€"), None),
+        (4, Some("😀"), None),
+        (5, Some("ab"), Some("ab")),
+        (6, Some("abcde"), None),
+        (7, Some(""), None),
+        (8, None, None),
+        (9, Some(" "), None),
+        (10, Some("a "), Some("a")),
+        (11, Some("z"), None),
+        (12, Some("B"), None),
+        (13, Some("aé€"), None),
+        (14, Some("a"), None),
+        (15, Some("b"), None),
+    ];
+    let db = LegacyDb::make("text", &rows).await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let ids = |sql: &str| format!("SELECT id FROM lc WHERE {sql} ORDER BY id");
+    let cases: Vec<(String, &str)> = vec![
+        (
+            "SELECT id, c, c || '|', length(c) FROM lc ORDER BY id".to_string(),
+            "[1]|[A]|[A|]|[1];[2]|[é]|[é|]|[1];[3]|[€]|[€|]|[1];[4]|[😀]|[😀|]|[1];[5]|[ab]|[ab|]|[2];\
+             [6]|[abcd]|[abcd|]|[4];[7]|[ ]|[|]|[0];[8]|∅|∅|∅;[9]|[ ]|[|]|[0];[10]|[a]|[a|]|[1];\
+             [11]|[z]|[z|]|[1];[12]|[B]|[B|]|[1];[13]|[aé]|[aé|]|[2];[14]|[a]|[a|]|[1];[15]|[b]|[b|]|[1]",
+        ),
+        (ids("c = ''"), "[7,9]"),
+        (ids("c = ' '"), "[7,9]"),
+        (ids("c = 'a'"), "[10,14]"),
+        (ids("c = 'a '"), "[10,14]"),
+        (ids("c = 'aé'"), "[13]"),
+        (ids("c = 'hello'"), "∅"),
+        (ids("c <> 'hello'"), "[1,2,3,4,5,6,7,9,10,11,12,13,14,15]"),
+        (ids("c IN ('é', 'hello')"), "[2]"),
+        (ids("c IN ('a ', ' ')"), "[7,9,10,14]"),
+        (ids("c BETWEEN 'a' AND 'z'"), "[5,6,10,11,13,14,15]"),
+        (ids("c < 'b'"), "[1,5,6,7,9,10,12,13,14]"),
+        (ids("c > 'z'"), "[2,3,4]"),
+        (ids("c LIKE 'a%'"), "[5,6,10,13,14]"),
+        (ids("c NOT LIKE 'a%'"), "[1,2,3,4,7,9,11,12,15]"),
+        (ids("c LIKE '%b'"), "[5,15]"),
+        (ids("c LIKE '_'"), "[1,2,3,4,7,9,10,11,12,14,15]"),
+        (ids("c LIKE ' '"), "[7,9]"),
+        (ids("c ILIKE 'A%'"), "[1,5,6,10,13,14]"),
+        (ids("c SIMILAR TO '(a|b)%'"), "[5,6,10,13,14,15]"),
+        (ids("c IS NULL"), "[8]"),
+        (ids("c = k"), "[1,5,10]"),
+        (ids("CASE WHEN c = ' ' THEN true ELSE false END"), "[7,9]"),
+        ("SELECT c, count(*) FROM lc GROUP BY c ORDER BY c".to_string(),
+         "[ ]|[2];[A]|[1];[B]|[1];[a]|[2];[ab]|[1];[abcd]|[1];[aé]|[1];[b]|[1];[z]|[1];[é]|[1];[€]|[1];[😀]|[1];∅|[1]"),
+        ("SELECT count(DISTINCT c) FROM lc".to_string(), "[12]"),
+        ("SELECT max(c), min(c) FROM lc".to_string(), "[😀]|[ ]"),
+        ("SELECT id FROM lc ORDER BY c, id LIMIT 4".to_string(), "[7];[9];[1];[12]"),
+    ];
+    // `[7,9]` is the rows `[7];[9]`, and `∅` none.
+    let cases: Vec<(String, String)> = cases
+        .into_iter()
+        .map(|(s, w)| {
+            let w = if w == "∅" {
+                String::new()
+            } else if w.starts_with('[') && w.ends_with(']') && w[1..w.len() - 1].bytes().all(|b| b.is_ascii_digit() || b == b',') {
+                w[1..w.len() - 1].split(',').map(|id| format!("[{id}]")).collect::<Vec<_>>().join(";")
+            } else {
+                w.to_string()
+            };
+            (s, w)
+        })
+        .collect();
+    let cases: Vec<(&str, &str)> = cases.iter().map(|(s, w)| (s.as_str(), w.as_str())).collect();
+    let wrong = check(&c, &cases).await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
 
