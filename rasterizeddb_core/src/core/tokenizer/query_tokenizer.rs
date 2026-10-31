@@ -413,6 +413,17 @@ fn json_path_extent(bytes: &[u8], from: usize) -> Option<usize> {
     }
 }
 
+/// Where the digits of a number whose `-` sign is at `i` start: past the
+/// sign and any spaces after it.
+#[inline(always)]
+fn digits_after_sign(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+        j += 1;
+    }
+    j
+}
+
 fn tokenize_inner<'a>(
     s: &str,
     schema: &'a SmallVec<[SchemaField; 20]>,
@@ -433,7 +444,14 @@ fn tokenize_inner<'a>(
     // Helper to determine if a minus sign should be considered part of a number
     #[inline(always)]
     fn is_negative_number_start(tokens: &[Token], bytes: &[u8], i: usize) -> bool {
-        let next_is_digit = i + 1 < bytes.len() && is_digit_fast(bytes[i + 1]);
+        // Spaces between the sign and its digits too: `= - 6` is `= -6`, as
+        // PostgreSQL reads it, and as `predicate_rewrite` renders a negative
+        // literal. Read as an operator, it hid the comparison from every
+        // extractor (the partition router fanned out, and the same-value key
+        // proof refused `ON CONFLICT … DO UPDATE SET k = EXCLUDED.k` for a
+        // negative key).
+        let digit_at = digits_after_sign(bytes, i);
+        let next_is_digit = digit_at < bytes.len() && is_digit_fast(bytes[digit_at]);
         if !next_is_digit {
             return false;
         }
@@ -538,10 +556,9 @@ fn tokenize_inner<'a>(
             }
 
             b'-' if is_negative_number_start(&out, bytes, i) => {
-                // Handle negative numbers
-                let start = i;
-                i += 1;
-                i = unsafe { scan_digits_simd(bytes, i) };
+                // Handle negative numbers, the sign's spaces dropped.
+                let start = digits_after_sign(bytes, i);
+                i = unsafe { scan_digits_simd(bytes, start) };
 
                 if i < bytes.len() && bytes[i] == b'.' {
                     i += 1;
@@ -549,7 +566,8 @@ fn tokenize_inner<'a>(
                 }
                 i = exponent_end(bytes, i);
 
-                let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+                let signed = format!("-{}", unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
+                let num_str = signed.as_str();
 
                 let numeric_value =
                     parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
@@ -1278,6 +1296,33 @@ pub fn numeric_type_to_db_type(nv: &NumericValue) -> DbType {
 
 #[cfg(test)]
 mod tests {
+
+    /// A minus sign in a number's place reads as the number's sign whatever
+    /// spaces follow it: `k = - 6` tokenizes as `k = -6` does (the form
+    /// `predicate_rewrite` renders a negative literal in), and a binary
+    /// minus stays an operator.
+    ///
+    /// Mutation: `digits_after_sign` not skipping the spaces: `= - 6` is an
+    /// operator and a positive number again.
+    #[test]
+    fn a_spaced_sign_reads_as_the_numbers_own() {
+        let fields: SmallVec<[SchemaField; 20]> =
+            SmallVec::from_vec(vec![SchemaField::new("k".to_string(), DbType::I64, 8, 0, 0, false)]);
+        let toks = |s: &str| try_tokenize(s, &fields).unwrap_or_else(|e| panic!("{s}: {e}"));
+        for spaced in ["k = - 6", "k = -  6", "k = -\t6", "(k = - 6)", "k = 1 OR k = - 6"] {
+            let tight = spaced.replace("-\t", "-").replace("- ", "-").replace("- ", "-");
+            let (a, b) = (toks(spaced), toks(&tight));
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "`{spaced}` and `{tight}` tokenize differently");
+            assert!(
+                a.iter().any(|t| matches!(t, Token::Number(n) if format!("{n:?}").contains("-6"))),
+                "`{spaced}` has no -6: {a:?}"
+            );
+        }
+        // A binary minus is untouched.
+        let bin = toks("k - 6 = 0");
+        assert!(bin.iter().any(|t| matches!(t, Token::Op(o) if o == "-")), "{bin:?}");
+        assert!(!bin.iter().any(|t| matches!(t, Token::Number(n) if format!("{n:?}").contains("-6"))), "{bin:?}");
+    }
 
     /// Every decimal `float_holds_exactly` lets past the round-trip is one
     /// the round-trip finds equal: the shortcut never hides a lossy literal.
