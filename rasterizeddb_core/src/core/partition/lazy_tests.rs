@@ -794,15 +794,18 @@ async fn a_row_the_backfill_cannot_read_stays_a_candidate() {
          PARTITION BY HASH (tenant_id) PARTITIONS 1",
     )
     .await;
-    // One row per statement: row i sits at slot i - 1 of the one partition.
-    for i in 1..=200i64 {
-        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({}, {i}, {})", i % 7, 1000 + i)).await;
+    // Past the filter's `min_table_rows` (4096), below which it builds no
+    // mask and prunes nothing. Row i sits at slot i - 1 of the one partition.
+    for batch in 0..12i64 {
+        let values: Vec<String> =
+            (batch * 500 + 1..=batch * 500 + 500).map(|i| format!("({}, {i}, {})", i % 7, 100_000 + i)).collect();
+        exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
     }
     let t = pt(&db);
     t.close_idle().await.unwrap();
     let root = path_str(dir.path());
-    // Row 51 (v = 1051) is unreadable to the reopen's backfill.
-    crate::core::row::table::backfill_test_hooks::fail_slot(&root, 50);
+    // Row 3001 (v = 103001) is unreadable to the reopen's backfill.
+    crate::core::row::table::backfill_test_hooks::fail_slot(&root, 3000);
     let part = t.open_part(0).await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !part.filters_ready().unwrap() {
@@ -811,8 +814,12 @@ async fn a_row_the_backfill_cannot_read_stays_a_candidate() {
     }
     crate::core::row::table::backfill_test_hooks::clear_failing(&root);
     drop(part);
-    assert_eq!(rows(&db, "v = 1051").await, vec![(51 % 7, 51, 1051)], "the filter pruned a row its backfill could not read");
-    assert_eq!(rows(&db, "v = 1052").await, vec![(52 % 7, 52, 1052)]);
+    assert_eq!(
+        rows(&db, "v = 103001").await,
+        vec![(3001 % 7, 3001, 103001)],
+        "the filter pruned a row its backfill could not read"
+    );
+    assert_eq!(rows(&db, "v = 103002").await, vec![(3002 % 7, 3002, 103002)]);
     drop(t);
     close(dir.path(), db);
 }
