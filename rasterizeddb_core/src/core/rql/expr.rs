@@ -7784,6 +7784,12 @@ mod mixed_numeric_compare_tests {
             assert_eq!(compare(&a, &b), Some(want), "{:?} vs {:?}", a, b);
             assert_eq!(compare(&b, &a), Some(want.reverse()), "{:?} vs {:?}", b, a);
         }
+        // A sort orders by the exact value, not by the operator.
+        let up = [(false, None)];
+        assert_eq!(
+            compare_key_values(&[i64v((1 << 53) + 1)], &[f64v((1u64 << 53) as f64)], &up),
+            Ordering::Greater
+        );
         // Without a float on either side the operator is the exact order.
         assert_eq!(compare(&i64v((1 << 53) + 1), &dec(9_007_199_254_740_992_000_000_000)), Some(Ordering::Greater));
         assert_eq!(compare(&cell(10_000_000_000_000_001, 17), &dec(100_000_000)), Some(Ordering::Greater));

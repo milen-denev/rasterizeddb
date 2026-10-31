@@ -5078,6 +5078,53 @@ fn parse_in_list(toks: &[Tok], start: usize) -> Result<(Vec<String>, usize), Str
 #[cfg(test)]
 mod tests {
 
+    /// A float constant against an exact column is the run of the column's
+    /// values whose nearest double it is (PostgreSQL's `numeric = float8`).
+    #[test]
+    fn a_float_against_an_exact_column_is_the_run_that_rounds_to_it() {
+        let mut schema: SmallVec<[crate::core::row::schema::SchemaField; 20]> = SmallVec::new();
+        schema.push(crate::core::row::schema::SchemaField::new(
+            "i".into(),
+            crate::core::db_type::DbType::I64,
+            8,
+            0,
+            0,
+            false,
+        ));
+        let mut n = crate::core::row::schema::SchemaField::new(
+            "n".into(),
+            crate::core::db_type::DbType::DECIMAL,
+            16,
+            8,
+            1,
+            false,
+        );
+        n.scale = Some(2);
+        schema.push(n);
+        let squash = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (sql, want) in [
+            // 2^53 + 1 rounds (to even) to 2^53; 2^53 + 2 is its own double.
+            ("i = 9007199254740992::float8", "( i >= 9007199254740992 AND i <= 9007199254740993 )"),
+            ("i <> 9007199254740992::float8", "( i < 9007199254740992 OR i > 9007199254740993 )"),
+            ("i = 2.5::float8", "( i >= 3 AND i <= 2 )"),
+            ("i <= 2.5::float8", "( i <= 2 )"),
+            ("i < 3::float8", "( i < 3 )"),
+            ("i > 2.5::float8", "( i > 2 )"),
+            ("i >= 2.5::float8", "( i >= 3 )"),
+            ("2.5::float8 < i", "( i > 2 )"),
+            ("n = '0.1'::float8", "( n >= 0.10 AND n <= 0.10 )"),
+            ("n = '0.1'::real", "( n >= 0.11 AND n <= 0.10 )"),
+            ("n IN ('0.5'::float8, '1e40'::float8)", "( ( n >= 0.50 AND n <= 0.50 ) OR ( n > 999999999999999999999999999999999999.99 ) )"),
+            ("n NOT IN ('-1e40'::float8)", "( ( n <= 999999999999999999999999999999999999.99 ) )"),
+        ] {
+            let out = squash(rewrite_where(sql, &schema).unwrap_or_else(|e| panic!("{sql}: {e}")));
+            assert!(out.contains(want), "{sql} -> {out}");
+        }
+        // An operand of more than the comparison is left to the evaluator.
+        let out = squash(rewrite_where("i * 2 = 5::float8", &schema).unwrap());
+        assert!(!out.contains(">="), "{out}");
+    }
+
     #[test]
     fn between_takes_negative_bounds() {
         let mut schema: SmallVec<[crate::core::row::schema::SchemaField; 20]> = SmallVec::new();
