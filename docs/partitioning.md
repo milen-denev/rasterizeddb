@@ -8,7 +8,9 @@ ways, [as built](#phase-3-p4-as-built)), P5a (the lazy-open plumbing:
 shared maintenance, forget pins, `SWEPT`/`DIRTY`, the persisted `SERIAL`
 high-water and map-log generations, [as built](#phase-3-p5a-as-built)) and
 P5b-1 (partitions opened on demand and closed only exclusively, pins kept
-across a close, [as built](#phase-3-p5b-1-as-built)). Phases 0 and 1 are
+across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
+budget, its sharded CLOCK, idle close and the seal at close,
+[as built](#phase-3-p5b-2a-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -435,7 +437,7 @@ expression on a key column: `SET k = EXCLUDED.k + 0` and `SET k = k`,
 which PostgreSQL accepts. The test holds each such form to "refused, or
 the row PostgreSQL leaves", the same verdict for either sign.
 
-**Left for P5b-2 and after.** The open budget and the sharded CLOCK
+**Left for P5b-2 and after** (P5b-2a built the budget, CLOCK, idle close, seal at close and 53000 on EMFILE: [as built](#phase-3-p5b-2a-as-built)). The open budget and the sharded CLOCK
 (scan-resistant fan-out opens), idle close with the persistent-index
 snapshot written at close and loaded on reopen, scan-only fan-out opens
 (the FILTER section), `STATS` at close for O(1) catalog totals, `53000` on
@@ -445,6 +447,223 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 3 P5b-2a as built
+
+Built on `feat/p5b2-idle-close` (from `a2cb4589`, rebased onto
+`0e659f1f`, 2026-10-31): the policy that closes partitions. Split from
+P5b-2 again: this part is the **open budget** with its **sharded CLOCK**,
+**idle close**, the **seal at close** (the persistent-index snapshot the
+next open loads), the closed partitions' sizes kept for the catalogs, and
+review A round 2's four items. **Scan-only fan-out opens** (no index
+rebuild for a partition a fan-out opens) are P5b-2b's; until then a
+fan-out's open is a full open, as in P5b-1, but enters the CLOCK
+unreferenced. P5b-3 (the cap raised to 65,536, the default N) is
+unchanged. Not advertised.
+
+**The budget** (`partition::budget`). At most `min(4096, (RLIMIT_NOFILE −
+2048) / 10)` partitions open per process, at least 16, read from the soft
+limit at each open that may need room (a server that raises its limit after
+starting gets the larger budget), or `SET CONFIG partition.open_budget =
+N` (0: derived). §7.1's term for open plain tables is left out; the 2,048
+reserve stands for it, and running out of descriptors anyway is handled
+where it happens (below). An open that finds the budget full first closes
+partitions nobody holds, by the CLOCK, until one more fits.
+
+**Decision: the budget is soft.** With every open partition held (by a
+statement, a job, or a transaction's kept ticket, P5b-1's close rule), an
+open goes past the budget (counted, `Budget::overruns`) rather than wait
+or refuse. §7.1 says a write past the budget "evicts and waits"; waiting
+can deadlock (a block whose kept ticket holds partition A open and which
+then writes B waits for itself), and refusing would make an answer depend
+on this node's open count (§12). The excess is trimmed by the next open
+that needs room, and by idle close. Its only hard bound is the
+descriptor limit.
+
+**Out of descriptors** at an open (EMFILE, ENFILE, whatever the budget
+said: plain tables, connections, other processes): the open closes up to 8
+idle partitions by the CLOCK and tries once more; with nothing idle to
+close, the statement fails with `53000`, as in P5b-1. Writes take the same
+path (no separate wait).
+
+**The CLOCK.** Each open partition is an entry in one of 16 rings, by a
+hash of its table and pid, each ring under its own mutex: an open or a
+close locks one ring, and an access locks none. An access sets the slot's
+reference bit (a load, and a store only when it was clear, so a hot
+partition writes nothing shared). The hand makes **one lap over every
+ring** clearing set bits and offering the first partition whose bit was
+already clear, and a second lap only when the first found none. (The
+first cut walked each ring twice before the next, so a ring whose entries
+were all referenced gave one up while another ring held an unreferenced
+partition; the scan-resistance test caught it.) An entry is a `Token` the
+slot holds beside the instance and drops when the instance leaves the slot
+by any path (closed, or its table instance dropped by a restart, a schema
+change or a `DROP`), so the open count is exact. Closes for the budget
+never wait for a lifecycle lock (`try_lock`): an open or close of that
+partition in flight means it is in use, and an open making room holds its
+own partition's lock.
+
+**Scan resistance.** Only a **routed** access sets the bit: one that
+reaches a single partition (`planned` or `materialized_in` returning one,
+`partition_for_point`, `open_part`). A fan-out over several partitions sets
+none, and opens the partitions it reaches with the bit clear
+(`open_part_scan`), so a scan wider than the budget evicts what it opened
+itself before what a routed workload keeps using. A forget round's
+sweep-open leaves it clear too.
+
+**Idle close** (§7.2). On the scheduler's board round (no wakeup of its
+own), at most once per `partition.idle_close_secs` (300; 0 turns it off):
+every open partition no routed access touched since the previous round
+closes, if nobody holds it; the rest have their bits cleared. So a
+partition idle for one to two periods closes, and a fan-out's opens close
+at the next round.
+
+**The seal at close** (§7.2 point 3). A close, owning the instance alone,
+quiesces it as shutdown does (background writers stopped and joined, the
+unit's round waited out), then runs an **optional seal**
+(`index_store::seal`), then retires and lands it as before. The seal
+writes a snapshot only when the instance holds something the published
+one lacks (a write since its open, or indexes it rebuilt rather than
+loaded) and its indexes and filter are ready; otherwise it is the
+`AlreadyClean` no-op, so a read-only reopen and close writes nothing
+(§7.1's "close writes nothing if `write_generation` did not move"). Under
+`index_snapshot.index_storage = snapshot` the next open loads the INDEX
+sections when the proof passes, rather than rebuilding (`Origin::Loaded`),
+in the same process or after a restart. A seal that skips, fails or is
+cut by a crash leaves the next open to rebuild: no open trusts a `.ixs`
+its marker log does not end `CLEAN` for (the persistent-index protocol,
+unchanged). The seal runs under the partition's lifecycle lock, so an open
+of that partition waits for it. Cost: a written partition's close pays a
+seal (its fsyncs), on tmpfs not measured here; idle close runs it on the
+board round, an eviction inside the statement whose open made room.
+
+**Closed sizes** (in place of `STATS`). A closed partition's (rows,
+pointers, index-store) lengths are kept in its slot: taken from the
+instance as it closes (after the seal, so they include the snapshot), or
+read once from its files' metadata the first time a catalog asks after a
+start, and kept until it opens again, when the instance answers for
+itself. A closed partition's files do not change while it is closed. So a
+catalog read costs no `stat` per closed partition after the first.
+**Decision: no `STATS` record yet.** The map log's `STATS (pid, rows,
+bytes)` cannot carry the per-file breakdown `SHOW TABLES` reports, and one
+written at a close goes stale when the partition is reopened, written and
+then lost in a crash, with nothing in the log saying so; trusting it at a
+start would need either a durable reopen marker (a fsync per reopen) or
+the `stat`s it exists to avoid. The first catalog read after a start pays
+P5b-1's per-partition `stat`s once. `rows_len` (an `ALTER`'s
+metadata-only test) reads the same kept sizes, which are the files' own.
+
+**Review A round 2.**
+
+- *EMFILE before the open.* `files::require_existing` (the open's
+  never-creating existence check) and `create_all` (a materialize's file
+  creation) return EMFILE and ENFILE bare, errno kept, instead of
+  rewrapping them with the path; the open names them insufficient
+  resources, so they are `53000` too
+  (`running_out_of_file_descriptors_in_the_existence_check_is_53000`).
+- *A half-failed open.* An open whose pointer provider opened and whose
+  rows provider ran out of descriptors leaves no descriptor on the
+  partition's files and no log registration other than the ones every
+  successful open makes (`an_open_failing_between_its_providers_leaves_nothing_behind`).
+  Its registration is the id-to-path entry `register_directory` made at
+  the start; §7.2 keeps registrations on purpose (a close never
+  unregisters), and removing one would let a checkpoint skip records
+  already logged under the id (I16). Nothing was removed.
+- *The cache under reopen.* The cache-on twin's few-open runs took 2.8
+  times the cache-off ones (1,500 statements, `0xdead`: 309 s against
+  112 s; 75 s against 108 s for `tenant_7`, which reopens nothing). The
+  profile: `AtomicGenericCache::remove_oldest`, which `force_insert`
+  called once per store at the entry limit, scanning every slot, cloning
+  each entry and sorting them. A stable table's stores reuse their keys'
+  slots; reopens cache under a new instance scope each time, so dead
+  entries filled the cache and every store paid the whole scan. A store
+  at the entry limit now evicts a sixteenth of it at once (one scan per
+  `max / 16` stores): 142 s against 81 s cache-off afterwards (the runs at
+  load 19 and 9), the rest being what the cache costs any run. **Decision:
+  no purge of a closed instance's scope**: the cache has no index by
+  scope, so a purge is a scan of every slot per close, the cost just
+  removed; dead entries are the oldest and go first.
+- *The twin's cap* is 600 s per 300 statements (`wall_cap`), not 600 s
+  whatever `PART_TWIN_OPS` says.
+
+**C5 (legacy `CHAR`).** The open-time scan of legacy `CHAR` keys runs in
+`Database`'s plain-table open only; a partition opens through
+`Table::open_partition`, whose instance never takes the canonical flag,
+and neither the budget's reopens nor the seal at close change that
+(`a_reopened_partition_never_takes_the_legacy_char_canonical_flag`).
+
+**Tests.** Lib `partition::lazy_tests`:
+`the_budget_closes_what_nobody_holds_to_open_more`,
+`the_budget_never_closes_a_partition_in_use`,
+`a_fan_out_wider_than_the_budget_reads_every_partition`,
+`a_fan_out_is_evicted_before_what_routed_reads_keep_using`,
+`idle_close_closes_only_what_no_routed_access_touched`,
+`an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row` (I14:
+four writers, two racing for 40 shared keys, routed readers, a fan-out, a
+closer and idle rounds at a budget of one; every acknowledged row once,
+exactly one winner per raced key, live instances counted at every open
+and close, again after a restart),
+`a_partition_closed_after_writes_reopens_from_the_snapshot_its_close_sealed`,
+`an_open_out_of_descriptors_closes_idle_partitions_and_retries`, the two
+review items above, the C5 test; `a_closed_partition_answers_like_an_open_one`
+now compares the kept sizes with the files' after a restart and with the
+reopened instances'. Power loss, `lazy_crash_tests::a_sealing_close_cut_anywhere_never_loads_a_snapshot_it_did_not_finish`
+(a close under `index_storage = snapshot` cut at every seal step of the
+first and last partition's seal and after every close: in every image
+every acknowledged row, and every partition's indexes answering as a scan
+for rows written after the previous seal; in the last, every partition
+loads). The cache's `the_byte_budget_bounds_what_is_cached` gains the
+entry-limit batch. The twin gains `twin_hash_tenant_1024_budget_3` and
+`twin_hash_tenant_grp_64_budget_3` (a budget of three, idle close every
+second).
+
+**Mutations** (each in a throwaway worktree with its own target
+directory; every one failed its test):
+
+| Mutation | Caught by |
+|---|---|
+| `Budget::make_room` returning at once | `the_budget_closes_what_nobody_holds_to_open_more` |
+| the CLOCK walking each ring twice before the next (the first cut) | `a_fan_out_is_evicted_before_what_routed_reads_keep_using` |
+| a fan-out's open setting the reference bit | the same |
+| a close taking an instance a statement holds (no strong-count check) | `the_budget_never_closes_a_partition_in_use` |
+| the idle round ignoring the reference bit | `idle_close_closes_only_what_no_routed_access_touched` |
+| a close not sealing | `a_partition_closed_after_writes_reopens_from_the_snapshot_its_close_sealed`, `lazy_crash_tests::a_sealing_close_cut_anywhere_never_loads_a_snapshot_it_did_not_finish` |
+| an open without its lifecycle lock | `an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row` (a raced key stored twice) |
+| the existence check rewrapping EMFILE | `running_out_of_file_descriptors_in_the_existence_check_is_53000` |
+| a half-failed open keeping its pointer provider | `an_open_failing_between_its_providers_leaves_nothing_behind` |
+| closed sizes taken before the seal | `a_closed_partition_answers_like_an_open_one` |
+| the cache evicting one entry per store at its limit | `cache::query_cache::budget_tests::the_byte_budget_bounds_what_is_cached` |
+| an open out of descriptors not evicting and retrying | `an_open_out_of_descriptors_closes_idle_partitions_and_retries` |
+| a reopened partition taking the legacy `CHAR` canonical flag | `a_reopened_partition_never_takes_the_legacy_char_canonical_flag` |
+
+**Measured** (`database::lazy_resident_tests::budget_resident_cost_catalog_reads_and_first_touch`,
+ignored, run by hand; `index_storage = snapshot`, an index on `v`, every
+partition sealed by its close before the start; tmpfs, so no fsync is a
+disk's; debug build on a shared box at load 10 to 20 while mutation builds
+ran, so times carry noise; fds and tasks are exact).
+
+| | N = 1,024 × 200 rows, budget 64 | N = 128 × 5,000 rows, budget 16 |
+|---|---|---|
+| routed reads of every partition in turn | median 1.43 ms, p99 3.92 ms; 960 evictions, 64 open after | median 6.39 ms, p99 10.55 ms; 112 evictions, 16 open after |
+| resident with the budget full, over none open | fds +678 (10.6 per open partition), RSS +7.8 MiB, tasks +3, idle wakeups 25.7/s vs 25.6/s | fds +198, RSS +22.9 MiB, tasks +3, 26.4/s vs 25.7/s |
+| `SHOW PARTITIONS`, every partition closed | first after the start 11.99 ms (each partition's sizes from its files, P5b-1's per-read cost), then median 2.66 ms (kept sizes) | 1.98 ms, then 0.44 ms |
+| `SHOW TABLES`, every partition closed | median 0.16 ms | 0.06 ms |
+| first touch to index ready (32 partitions) | loaded from the close's snapshot: median 1.37 ms (32 of 32 loaded); rebuilt (seal skipped at close): 2.66 ms | loaded 9.19 ms; rebuilt 25.33 ms |
+
+P5b-1 measured `SHOW PARTITIONS` at 25.9 ms with every one of 1,024
+partitions closed against 10.9 ms open; the kept sizes bring the closed
+read below the open one, which still asks each open instance. The
+budget's open set costs what P5b-1's open partitions did (ten
+descriptors each), and an idle box with the budget full wakes as often as
+with nothing open (no per-partition task). First touch grows with rows
+when rebuilt (2.7 times the loaded open at 5,000 rows) and far less when
+loaded.
+
+**Left for P5b-2b and after.** Scan-only fan-out opens (the FILTER
+section alone when the cheap proof passes, else an unpruned scan; index
+rebuild deferred to the first routed access or write); a durable `STATS`
+if a start must not pay the per-partition `stat`s once; the plain-table
+term of the budget; the cap raised and the default N (P5b-3).
 
 ## Phase 3 P5a as built
 
@@ -3392,9 +3611,9 @@ section specifying the mechanism.
 | I11 | A prepared statement never pins a partition | §4.1 | prepared SELECT, UPDATE, DELETE, 10 runs alternating tenants, past the learned third. *(Mutation: route before `note_plain`.)* **As built (S15):** `pgwire::prepared_partition_tests::each_execution_routes_its_own_values` (point SELECT and COUNT, two tenants in two partitions, 10 runs each: own rows, own partition's reads only, 2 parses per statement; mutations: the first execution's route kept, failed at run 3; `note_rewritten` restored, 20 parses), `a_tenant_first_written_after_learning_is_counted` (mutation: each `WHERE`'s first materialized list kept), `text_and_binary_keys_route_alike_from_the_cached_parse`, `a_learned_parse_is_not_parsed_again`; `tests/partition_prepared.rs` (writes, DROP and re-CREATE under the name, columns reordered, a type change, the name changing kind, a restart; mutation: no schema-generation reset, failed on the reordered columns); the twin's `PreparedSelect`, `PreparedCount`, `PreparedDescribeAlias` and `PreparedSelectAcrossDdl`, which fail a run past the second that the cache did not answer. |
 | I12 | Row ids are unique across the logical table | §3.5 | merge two partitions: no repeated id; ids file missing: table refused |
 | I13 | Close, reshape, restart and crash never resurrect an aborted row | §7.2, §12 | abort a write in p, close p, forget past it for several `FORGET_STEP`s, reopen: invisible; again across a restart and a reshape. Write in a new partition, SIGKILL before group commit with data pages forced out by a data-file-fsync failpoint; restart, force forgetting past the id, write the same tenant: the old row stays invisible. *(Mutations: unpin on close; all partitions clean on restart; `SWEPT` before durability; `DIRTY` group-commit only; reuse leftover files at materialize.)* **As built (P5a, partitions all open):** `partition::pin_tests` (an unswept partition pins in one process and across a restart, the first-write edge, sweeps with a writer inside or a running writer's stamp, a broken table) and `power_loss::pins_crash_tests` (a crash image, not a kill, of an aborted first write after a clean sweep with its pages forced out); the twin's `ForgetSweep`. *(Mutations, each failing its test: `MATERIALIZE` not lowering the handle; the handle ignoring replayed pins; no `DIRTY` edge; `DIRTY` group-commit only (four of ten images read the aborted row); clean despite a writer inside; clean despite a newer stamp; no `broken_pin`; `follow` pinning nothing (the twin).)* **Close (P5b-1):** `partition::lazy_tests::an_aborted_row_stays_hidden_across_a_close_a_forget_and_a_reopen` (closed, every other table swept and forgotten past, in one process and after a restart; the partition's own sweep opens it) and `a_forget_round_sweeps_closed_partitions_and_closes_them_again`; `power_loss::lazy_crash_tests::a_closed_partition_keeps_its_pin_in_every_image`; the twin's `ClosePartitions` beside `ForgetSweep`. *(Mutations: a close clearing its pin in memory; a close recording a clean `SWEPT`; a sweep skipping closed partitions.)* Reshape waits for phase 5. |
-| I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers. **As built (P5b-1, no budget yet):** `partition::lazy_tests::an_open_waits_for_a_close_in_flight` (a read of a partition whose close is parked waits; mutation: the open without the lifecycle lock), `a_close_leaves_an_instance_in_use_open` (mutation: no strong-count check), `a_replaced_instance_opens_and_closes_nothing` (mutation: a retired instance still opens), `closes_racing_writers_readers_and_sweeps_lose_nothing`, `schema_changes_racing_closes_keep_one_schema_and_every_row`; `tests/partition_lazy.rs` (a block's kept ticket keeps its partition open; mutation: the ticket check off). The budget-1 storm waits for P5b-2's budget. |
+| I14 | At most one live instance per file set | §7.2 | open/close storm at budget 1 under unique-key writers. **As built (P5b-1, no budget yet):** `partition::lazy_tests::an_open_waits_for_a_close_in_flight` (a read of a partition whose close is parked waits; mutation: the open without the lifecycle lock), `a_close_leaves_an_instance_in_use_open` (mutation: no strong-count check), `a_replaced_instance_opens_and_closes_nothing` (mutation: a retired instance still opens), `closes_racing_writers_readers_and_sweeps_lose_nothing`, `schema_changes_racing_closes_keep_one_schema_and_every_row`; `tests/partition_lazy.rs` (a block's kept ticket keeps its partition open; mutation: the ticket check off). **Budget (P5b-2a):** `partition::lazy_tests::an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row` (writers racing for shared unique keys, readers, fan-outs, a closer and idle rounds at a budget of one; live instances counted at every open and close); `the_budget_never_closes_a_partition_in_use`. *(Mutations: an open without its lifecycle lock; a close without its strong-count check.)* |
 | I15 | The reaper never deletes live data | §12 | corrupt one map, restart: every other table's files intact |
-| I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin. **Close (P5b-1):** `power_loss::lazy_crash_tests::a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row` (rows with unsynced pages, every partition closed, the log checkpointed, cut: every image holds every acknowledged row). *(Mutation: a close taking its files out of the log's map, `Wal::forget_files`.)* |
+| I16 | WAL registration is never silently wrong | §7.2 | a colliding registration errors; checkpoint after close and a crash, compare with the twin. **Close (P5b-1):** `power_loss::lazy_crash_tests::a_close_then_a_checkpoint_cut_anywhere_keeps_every_acknowledged_row` (rows with unsynced pages, every partition closed, the log checkpointed, cut: every image holds every acknowledged row). *(Mutation: a close taking its files out of the log's map, `Wal::forget_files`.)* **P5b-2a:** an open that fails between its two providers leaves no registration beyond the startup ones (`partition::lazy_tests::an_open_failing_between_its_providers_leaves_nothing_behind`); a sealing close cut anywhere (`lazy_crash_tests::a_sealing_close_cut_anywhere_never_loads_a_snapshot_it_did_not_finish`). |
 | I17 | No retry after a partial apply | §9 | a conflict in the second partition of a fan-out UPDATE, in autocommit and in BEGIN. **As built:** `row_source::write_tests::a_conflict_after_a_partition_applied_rows_is_not_replayed` and, with `RETURNING` (S17), `row_source::returning_tests::a_returning_conflict_after_a_partition_applied_rows_is_not_replayed`; a multi-row upsert keeps it by `insert_values_batch`, where a tuple's empty `RETURNING` reply no longer strips the marker (S18, §9). |
 | I18 | Downgrade fails loudly, leaving no shadowing duplicate | §3.1 | the previous release opens a phase-2 database: table absent, not empty; `CREATE TABLE t` there, insert, re-upgrade: the new binary refuses to start, naming both rows |
 | I19 | Every crash window leaks rather than loses | §12, §3.2 | failpoints at each step of create, materialize, rename, reshape, conversion and drop, under SIGKILL and the page-cache-drop harness, including a page-cache drop after the outcome is durable: rows equal before or after, never neither. *(Mutation: append `MATERIALIZE` with `append_data(_, false)`.)* |

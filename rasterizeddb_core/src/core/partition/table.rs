@@ -39,7 +39,11 @@
 //! Opens no partition (phase 3 P5b): the map is replayed, the slots built,
 //! and each materialized partition's two data files checked to exist. A
 //! partition opens on demand (`Parts::open`) and closes only exclusively
-//! (`Parts::close`); see "Phase 3 P5b-1 as built" in the design.
+//! (`Parts::close`); see "Phase 3 P5b-1 as built" in the design. What
+//! closes it (P5b-2a): the open budget's CLOCK when an open needs room
+//! (`partition::budget`, `Parts::close_for_budget`), idle close on the
+//! board round (`Parts::close_idle_round`), a forget sweep's own close, and
+//! callers' explicit closes; every close seals the file set first.
 //!
 //! Never panics. Anything wrong (a missing map, ids or partition file, a map
 //! this phase cannot open, a key the schema no longer has) leaves the table
