@@ -39,6 +39,8 @@ pub mod column_default;
 pub(crate) mod conflict_wait;
 pub mod cte;
 pub mod expr;
+/// PostgreSQL's `numeric` arithmetic with display scales.
+pub(crate) mod pg_numeric;
 pub mod foreign_key;
 pub mod join;
 pub mod lock_set;
