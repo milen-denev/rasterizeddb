@@ -4056,6 +4056,9 @@ mod wire_fast_path_tests {
         {
             return None;
         }
+        // Zeros past nine places are no places the value needs: accepted
+        // since round-2 review B2, as `parse_decimal` now accepts them.
+        let frac_part = if frac_part.len() > DECIMAL_SCALE as usize { frac_part.trim_end_matches('0') } else { frac_part };
 
         // Fold the exponent into the digit string so only one scaling step remains.
         let mut digits = String::with_capacity(int_part.len() + frac_part.len());

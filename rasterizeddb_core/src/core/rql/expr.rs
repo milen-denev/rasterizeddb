@@ -7503,6 +7503,9 @@ mod float_literal_fold_tests {
     fn literal_types(e: &Expr, out: &mut Vec<DbType>) {
         match e {
             Expr::Literal { db_type, .. } => out.push(db_type.clone()),
+            // A constant written with zeros past its value's places is held to
+            // its written scale (`with_written_scale`): still that literal.
+            Expr::NumericCast { value, precision: 0, .. } => literal_types(value, out),
             Expr::Arith(a, _, b) => {
                 literal_types(a, out);
                 literal_types(b, out);
