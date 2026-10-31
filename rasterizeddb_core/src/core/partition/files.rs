@@ -268,16 +268,54 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 /// Opens every one of `names` in `dir` read-write without ever creating it,
 /// so a missing file is a named error rather than a fresh empty table (I9).
 /// Made before any provider is built on them, since providers create.
+///
+/// Running out of file descriptors (EMFILE, ENFILE) comes back as the bare
+/// OS error, its errno kept, for the caller to name as insufficient
+/// resources (`partition::table::out_of_resources`): rewrapped with the path
+/// it would lose the errno, and a client would see an internal error where
+/// it should see `53000`.
 pub(crate) fn require_existing(dir: &Path, names: &[String]) -> io::Result<()> {
     for name in names {
         let path = dir.join(name);
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| io::Error::new(e.kind(), format!("partition file {} cannot be opened: {e}", path.display())))?;
+        #[cfg(test)]
+        let opened = if existence_test_hooks::fails(dir) {
+            Err(io::Error::from_raw_os_error(EMFILE))
+        } else {
+            OpenOptions::new().read(true).write(true).open(&path)
+        };
+        #[cfg(not(test))]
+        let opened = OpenOptions::new().read(true).write(true).open(&path);
+        opened.map_err(|e| match e.raw_os_error() {
+            Some(EMFILE) | Some(ENFILE) => e,
+            _ => io::Error::new(e.kind(), format!("partition file {} cannot be opened: {e}", path.display())),
+        })?;
     }
     Ok(())
+}
+
+/// Too many open files in this process, and in the system.
+pub(crate) const EMFILE: i32 = 24;
+pub(crate) const ENFILE: i32 = 23;
+
+/// Test-only: makes [`require_existing`] fail with EMFILE under a directory.
+#[cfg(test)]
+pub(crate) mod existence_test_hooks {
+    use std::path::{Path, PathBuf};
+
+    static FAILING: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Every existence check under `dir` fails with EMFILE until [`clear`].
+    pub(crate) fn fail(dir: &Path) {
+        FAILING.lock().push(dir.to_path_buf());
+    }
+
+    pub(crate) fn clear(dir: &Path) {
+        FAILING.lock().retain(|d| d != dir);
+    }
+
+    pub(super) fn fails(dir: &Path) -> bool {
+        FAILING.lock().iter().any(|d| dir.starts_with(d))
+    }
 }
 
 /// Creates each of `names` and its `.tmp` with `create_new(true)`, then
@@ -290,7 +328,11 @@ fn create_all(dir: &Path, names: &[String]) -> io::Result<()> {
                 .write(true)
                 .create_new(true)
                 .open(&path)
-                .map_err(|e| io::Error::new(e.kind(), format!("creating partition file {}: {e}", path.display())))?;
+                .map_err(|e| match e.raw_os_error() {
+                    // Kept bare, as `require_existing` keeps it.
+                    Some(EMFILE) | Some(ENFILE) => e,
+                    _ => io::Error::new(e.kind(), format!("creating partition file {}: {e}", path.display())),
+                })?;
         }
     }
     sync_dir(dir)

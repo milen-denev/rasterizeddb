@@ -512,6 +512,9 @@ impl Scheduler {
             };
             let work = std::panic::AssertUnwindSafe(async {
                 board.forget_round(SWEEPS_PER_ROUND).await;
+                // Idle close (P5b-2): on the same round, so an idle database
+                // gains no wakeup for it.
+                board.close_idle_round().await;
                 if let Err(e) = board.maybe_compact().await {
                     ::log::error!("compacting the partition map log of \"{}\" failed: {e}", board.name);
                 }

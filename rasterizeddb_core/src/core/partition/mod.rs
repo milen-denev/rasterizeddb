@@ -66,6 +66,7 @@
 //! Errors are `String`s, like the rest of the engine's DDL paths, except in
 //! `files` and `table`, which do IO and return `io::Error`s.
 
+pub mod budget;
 pub mod files;
 pub mod guard;
 #[cfg(test)]

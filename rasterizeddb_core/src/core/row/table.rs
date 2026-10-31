@@ -1816,8 +1816,34 @@ impl<S: StorageIO> Table<S> {
     /// nothing of this instance writes once its successor opens. An instance
     /// a schema change retired first is left as it was: the successor that
     /// change opened over the same files lands what it staged.
-    pub(crate) async fn close_exclusive(&self) {
+    ///
+    /// With `seal`, the file set is sealed first (P5b-2, §7.2 point 3), as
+    /// shutdown seals: background writers stopped and joined, the unit's
+    /// round waited out, then an optional seal, which writes a snapshot only
+    /// when this instance holds something the published one lacks (a
+    /// write since, or indexes it rebuilt rather than loaded) and every
+    /// index and the filter are ready, and lands the staged appends itself.
+    /// Nothing else writes the file set meanwhile: the caller owns the
+    /// instance alone. A seal that skips or fails leaves the next open to
+    /// rebuild, as before; one cut by a crash leaves a snapshot its marker
+    /// log does not vouch for, which no open trusts (`index_store::seal`).
+    pub(crate) async fn close_exclusive(&self, seal: bool) {
         let already = self.is_retired();
+        if seal && !already {
+            self.quiesce_for_shutdown().await;
+            if let Some(unit) = &self.external {
+                unit.quiesce().await;
+            }
+            #[cfg(test)]
+            let sealed = if close_seal_hooks::skipped() {
+                crate::core::index_store::seal::SealOutcome::Excluded
+            } else {
+                self.seal_snapshot(crate::core::index_store::gate_word::SealKind::Optional).await
+            };
+            #[cfg(not(test))]
+            let sealed = self.seal_snapshot(crate::core::index_store::gate_word::SealKind::Optional).await;
+            ::log::debug!("partition {} sealed at close: {sealed:?}", self.schema.name);
+        }
         self.retire().await;
         if let Some(unit) = &self.external {
             unit.quiesce().await;
@@ -6295,6 +6321,23 @@ pub(crate) mod compact_test_hooks {
 
 /// Parks a filter backfill between the rows it read and the batch it
 /// writes, for the tests of writers in that window.
+/// Test-only: a close that skips its seal, process-wide while set (P5b-2's
+/// mutation of the seal at close, and its tests' baseline).
+#[cfg(test)]
+pub(crate) mod close_seal_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SKIP: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn set_skipped(skip: bool) {
+        SKIP.store(skip, Ordering::SeqCst);
+    }
+
+    pub(crate) fn skipped() -> bool {
+        SKIP.load(Ordering::SeqCst)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod backfill_test_hooks {
     use std::sync::Arc;

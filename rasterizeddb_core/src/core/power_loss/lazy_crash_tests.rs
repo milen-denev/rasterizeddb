@@ -336,3 +336,168 @@ async fn a_closed_partition_keeps_its_pin_in_every_image() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// The seal steps of `index_store::seal`, in order (`phase1_tests`'s
+/// table): a cut at each must open the file set rebuilt, or loaded only
+/// once its `CLEAN` was made durable.
+const SEAL_STEPS: &[&str] = &[
+    "snapshot_before_fsync",
+    "snapshot_after_fsync",
+    "snapshot_after_rename",
+    "snapshot_after_dir_fsync",
+    "marker_compaction_after_rename",
+    "clean_append_before_fsync",
+    "clean_after_fsync",
+];
+
+/// `(tenant_id, id, v)` of `SELECT … WHERE <clause>` on the index test's
+/// table, sorted.
+async fn indexed_rows(db: &Arc<Database>, clause: &str) -> Result<Vec<(i64, i64, i64)>, String> {
+    let out = exec(db, &format!("SELECT tenant_id, id, v FROM px WHERE {clause}")).await?;
+    let mut v: Vec<(i64, i64, i64)> = decode(&out)?
+        .iter()
+        .map(|r| {
+            let n = |c: usize| i64::from_le_bytes(r.columns[c].data.into_slice().try_into().unwrap_or([0xFF; 8]));
+            (n(0), n(1), n(2))
+        })
+        .collect();
+    v.sort();
+    Ok(v)
+}
+
+/// A close seals (P5b-2, §7.2 point 3) under `index_snapshot.index_storage
+/// = snapshot`, cut at every step of each partition's seal (the first
+/// partition's and the last's), and once every close is done: every image
+/// holds every acknowledged row, and in each, every partition's indexes
+/// answer exactly as a scan does for every value, rows written after the
+/// previous seal included, so no image loaded a snapshot its marker log did
+/// not vouch for, or one older than its data. In the image cut after every
+/// close, every partition loads its indexes from the snapshot its close
+/// sealed.
+///
+/// Mutation: the close not sealing (`close_seal_hooks`): the last image's
+/// partitions rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealing_close_cut_anywhere_never_loads_a_snapshot_it_did_not_finish() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let base = tempfile::tempdir().unwrap();
+    let _snap = storage_override::set(base.path(), IndexStorage::Snapshot);
+    let dir = base.path().join("db");
+    let db = open(&dir, "lazy_cut").await.unwrap();
+    // No board round sealing or sweeping under the cut counts.
+    db.partition_maintenance().set_period(std::time::Duration::from_secs(3600));
+    exec(
+        &db,
+        "CREATE TABLE px (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
+         PARTITION BY HASH (tenant_id) PARTITIONS 4",
+    )
+    .await
+    .unwrap();
+    exec(&db, "CREATE INDEX px_v ON px (v)").await.unwrap();
+    let first: Vec<String> = (1..=8i64).map(|t| format!("({t}, 1, {})", t * 10)).collect();
+    exec(&db, &format!("INSERT INTO px (tenant_id, id, v) VALUES {}", first.join(", "))).await.unwrap();
+    let t = match db.relation("px") {
+        Some(Relation::Partitioned(t)) => t,
+        _ => panic!("px is not partitioned"),
+    };
+    let ready = |part: &rclite::Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>>| {
+        let part = part.clone();
+        async move {
+            part.index_load_settled().await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !part.filters_ready().unwrap() || part.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+                assert!(std::time::Instant::now() < deadline, "indexes never ready");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    };
+    for (_, part) in t.open_partitions_now() {
+        ready(&part).await;
+    }
+    // Sealed once by a close, then synced: the baseline every image starts
+    // from.
+    let n = t.materialized_pids().unwrap().len() as u64;
+    assert_eq!(t.close_idle().await.unwrap() as u64, n);
+    db.sync_durable().unwrap();
+    let dir_s = dir.to_string_lossy().into_owned();
+    let base_checkpoint = crate::core::wal::with_wal_for(&dir_s, |w| w.map(|w| w.checkpoint()));
+    assert!(matches!(base_checkpoint, Some(Ok(true))), "the baseline checkpoint: {base_checkpoint:?}");
+    let rec = Recorder::start(&dir);
+    // Rows after the first seal, every partition reopened and written: a
+    // snapshot from before them would miss them through the index.
+    let later: Vec<String> = (1..=8i64).map(|t| format!("({t}, 2, {})", 5000 + t)).collect();
+    exec(&db, &format!("INSERT INTO px (tenant_id, id, v) VALUES {}", later.join(", "))).await.unwrap();
+    let mut want: Vec<(i64, i64, i64)> = (1..=8i64).flat_map(|t| [(t, 1, t * 10), (t, 2, 5000 + t)]).collect();
+    want.sort();
+    for (_, part) in t.open_partitions_now() {
+        ready(&part).await;
+    }
+    assert_eq!(t.open_count() as u64, n);
+
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let points: Vec<(&str, u64)> = SEAL_STEPS.iter().flat_map(|s| [(*s, 1), (*s, n)]).collect();
+    let guards = arm_cuts(&rec, &dir, &points, &sink);
+    assert_eq!(t.close_idle().await.unwrap() as u64, n);
+    let fired: u64 = guards.iter().map(|g| g.fired()).sum();
+    drop(guards);
+    sink.lock().push(rec.cut_quiescent("after every sealing close"));
+    drop(t);
+    close(&dir, db);
+    drop(rec);
+    assert!(fired >= 2 * (SEAL_STEPS.len() as u64 - 1), "only {fired} seal steps were cut: the closes did not seal");
+
+    let points = taken(&sink);
+    assert!(points.len() as u64 > 2 * (SEAL_STEPS.len() as u64 - 1), "too many cuts were disturbed: {}", points.len());
+    let img = base.path().join("image");
+    let mut problems = Vec::new();
+    let last = points.len().saturating_sub(1);
+    assert!(points[last].label.contains("after every sealing close"), "the last cut is {}", points[last].label);
+    for (i, point) in points.iter().enumerate() {
+        for seed in 0..seeds() {
+            point.write_image(seed, &img);
+            let label = format!("{} seed {seed}", point.label);
+            let db = match open(&img, "lazy_cut").await {
+                Ok(db) => db,
+                Err(e) => {
+                    problems.push(format!("{label}: does not open: {e}"));
+                    let _ = std::fs::remove_dir_all(&img);
+                    continue;
+                }
+            };
+            db.partition_maintenance().set_period(std::time::Duration::from_secs(3600));
+            match indexed_rows(&db, "v > 0").await {
+                Ok(got) if got == want => {}
+                Ok(got) => problems.push(format!("{label}: rows {got:?}, want {want:?}")),
+                Err(e) => problems.push(format!("{label}: {e}")),
+            }
+            let t = match db.relation("px") {
+                Some(Relation::Partitioned(t)) => t,
+                _ => panic!("px is not partitioned"),
+            };
+            match t.all_partitions().await {
+                Err(e) => problems.push(format!("{label}: a partition does not open: {e}")),
+                Ok(parts) => {
+                    for (pid, part) in &parts {
+                        ready(part).await;
+                        if i == last && part.index_origin() != Origin::Loaded {
+                            problems.push(format!(
+                                "{label}: partition {pid} did not load the snapshot its close sealed ({:?})",
+                                part.index_origin()
+                            ));
+                        }
+                    }
+                }
+            }
+            for &(tenant, id, v) in &want {
+                match (indexed_rows(&db, &format!("v = {v}")).await, indexed_rows(&db, &format!("v + 0 = {v}")).await) {
+                    (Ok(by_index), Ok(by_scan)) if by_index == by_scan && by_index == vec![(tenant, id, v)] => {}
+                    (a, b) => problems.push(format!("{label}: v = {v}: by index {a:?}, by scan {b:?}")),
+                }
+            }
+            drop(t);
+            close(&img, db);
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+}

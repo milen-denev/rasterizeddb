@@ -2252,6 +2252,22 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "background reclamation, for every table in this database",
     },
     ConfigKey {
+        section: "partition",
+        key: "open_budget",
+        hot: true,
+        set_with: "SET CONFIG partition.open_budget = 0",
+        options: "",
+        help: "partitions open at once in this process, across tables; past it an open closes idle ones first; 0 derives it from the descriptor limit",
+    },
+    ConfigKey {
+        section: "partition",
+        key: "idle_close_secs",
+        hot: true,
+        set_with: "SET CONFIG partition.idle_close_secs = 300",
+        options: "",
+        help: "seconds a partition goes without a routed access before it closes; 0 turns idle close off",
+    },
+    ConfigKey {
         section: "index_snapshot",
         key: "idle_checkpoint_secs",
         hot: true,
@@ -2399,6 +2415,8 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             #[cfg(not(feature = "query_stats"))]
             ("query_stats", _) => "not built".to_string(),
             ("vacuum", "enabled") => "per table".to_string(),
+            ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
+            ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
             }
@@ -2626,6 +2644,20 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 }
                 _ => Err(format!("`{}` has no live setter", key)),
             }
+        }
+        "partition" => {
+            use crate::core::partition::budget::settings;
+            let n: u64 = value
+                .trim()
+                .trim_matches('\'')
+                .parse()
+                .map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
+            match name {
+                "open_budget" => settings::set_open_budget(n),
+                "idle_close_secs" => settings::set_idle_close_secs(n),
+                _ => return Err(format!("`{}` has no live setter", key)),
+            }
+            Ok(format!("{key} is now {n}"))
         }
         "index_snapshot" => {
             use crate::core::index_store::seal::settings;

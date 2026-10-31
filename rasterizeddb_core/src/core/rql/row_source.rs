@@ -564,7 +564,14 @@ impl FanOut {
                 let part = match part {
                     Some(part) => part.clone(),
                     None => {
-                        let part = self.table.open_part(*pid).await?;
+                        // A routed read when it is the only partition
+                        // planned; one partition of a fan-out otherwise,
+                        // opened with its reference bit clear.
+                        let part = if self.parts.len() == 1 {
+                            self.table.open_part(*pid).await?
+                        } else {
+                            self.table.open_part_scan(*pid).await?
+                        };
                         opened.push(*pid);
                         part
                     }
@@ -578,7 +585,7 @@ impl FanOut {
                     group_parts.push(match part {
                         Some(part) => part.clone(),
                         None => {
-                            let part = self.table.open_part(*pid).await?;
+                            let part = self.table.open_part_scan(*pid).await?;
                             opened.push(*pid);
                             part
                         }

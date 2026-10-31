@@ -71,6 +71,7 @@ use rclite::Arc;
 use smallvec::SmallVec;
 
 use super::files::{self, MapLogFile};
+use super::budget::{self, Budget};
 use super::guard::RangeGuard;
 use super::maintenance::{MaintenanceMode, Scheduler};
 use super::pins::{BoardFiles, PinBoard};
@@ -148,15 +149,70 @@ struct Slot {
     /// close that finds the strong count at 1 here holds the only reference
     /// anyone can reach.
     open: parking_lot::Mutex<Option<Arc<Table<DbStorageProvider>>>>,
+    /// The open instance's place in the open budget's CLOCK
+    /// (`partition::budget`), put and dropped with the instance, so the
+    /// budget's open count follows the instance out of the slot by whatever
+    /// path it leaves (closed, or this table instance dropped).
+    token: parking_lot::Mutex<Option<budget::Token>>,
+    /// The CLOCK's reference bit: set by a routed access, cleared by the
+    /// hand and by the idle round as they pass (P5b-2).
+    referenced: AtomicBool,
+    /// A closed partition's (rows, pointers, index-store) file lengths: taken
+    /// from the instance as it closes, or from the files' metadata the first
+    /// time a catalog asks after a start (`closed_lens`), then kept: a
+    /// closed partition's files do not change until it opens again, and the
+    /// open instance answers for itself meanwhile. What the catalogs read
+    /// instead of six `stat`s per closed partition per read (P5b-2).
+    sizes: parking_lot::Mutex<Option<(u64, u64, u64)>>,
 }
 
 impl Slot {
     fn new(pid: u32, range: PointRange, materialized: bool) -> Self {
-        Slot { pid, range, materialized: AtomicBool::new(materialized), open: parking_lot::Mutex::new(None) }
+        Slot {
+            pid,
+            range,
+            materialized: AtomicBool::new(materialized),
+            open: parking_lot::Mutex::new(None),
+            token: parking_lot::Mutex::new(None),
+            referenced: AtomicBool::new(false),
+            sizes: parking_lot::Mutex::new(None),
+        }
     }
 
     fn open_now(&self) -> Option<Arc<Table<DbStorageProvider>>> {
         self.open.lock().clone()
+    }
+
+    /// A routed access: the reference bit set, with a store only when it
+    /// was clear, so a hot partition's accesses write nothing shared.
+    fn touch(&self) {
+        if !self.referenced.load(Ordering::Relaxed) {
+            self.referenced.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Puts an opened instance in the slot with its budget token. The
+    /// caller holds the lifecycle lock.
+    fn put(&self, table: Arc<Table<DbStorageProvider>>, token: budget::Token, referenced: bool) {
+        self.referenced.store(referenced, Ordering::Relaxed);
+        *self.token.lock() = Some(token);
+        *self.open.lock() = Some(table);
+    }
+
+    /// The token, given back once the instance has left the slot.
+    fn release_token(&self) {
+        drop(self.token.lock().take());
+    }
+
+    /// This closed partition's (rows, pointers, index-store) lengths: kept
+    /// ones, else from its files' metadata (kept from then on).
+    fn closed_sizes(&self, root: &Path, uid: u64) -> io::Result<(u64, u64, u64)> {
+        if let Some(sizes) = *self.sizes.lock() {
+            return Ok(sizes);
+        }
+        let sizes = closed_lens(root, uid, self.pid)?;
+        *self.sizes.lock() = Some(sizes);
+        Ok(sizes)
     }
 }
 
@@ -288,6 +344,12 @@ pub(crate) struct Parts {
     /// Opens and closes so far, for tests and the measurements.
     opens: AtomicU64,
     closes: AtomicU64,
+    /// The open budget this table's partitions count against (P5b-2).
+    budget: StdArc<Budget>,
+    /// This instance, for the budget's CLOCK entries.
+    me: std::sync::Weak<Parts>,
+    /// When the last idle round ran (`Parts::close_idle_round`).
+    idle_round_at: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 pub struct PartitionedTable {
@@ -750,7 +812,10 @@ impl PartitionedTable {
                 Slot::new(pid, range, materialized.get(pid as usize).copied().unwrap_or(false))
             })
             .collect();
-        let parts = StdArc::new(Parts {
+        let parts = StdArc::new_cyclic(|me| Parts {
+            budget: budget::for_root(root),
+            me: me.clone(),
+            idle_round_at: parking_lot::Mutex::new(None),
             name: name.to_string(),
             uid,
             db_id: ctx.db_id,
@@ -844,7 +909,10 @@ impl PartitionedTable {
                         .iter()
                         .map(|s| Slot::new(s.pid, s.range, s.materialized.load(Ordering::SeqCst)))
                         .collect();
-                    let parts = StdArc::new(Parts {
+                    let parts = StdArc::new_cyclic(|me| Parts {
+                        budget: old.budget.clone(),
+                        me: me.clone(),
+                        idle_round_at: parking_lot::Mutex::new(None),
                         name: name.to_string(),
                         uid: self.uid,
                         db_id: self.db_id,
@@ -883,7 +951,10 @@ impl PartitionedTable {
                             continue;
                         }
                         let table = next.parts.open_instance(new).await.map_err(|err| format!("partition {}: {err}", new.pid))?;
-                        *new.open.lock() = Some(table);
+                        let token = next.parts.budget.enter(StdArc::downgrade(&next.parts), self.uid, new.pid);
+                        #[cfg(test)]
+                        instance_count::reopened(&self.root, self.uid, new.pid);
+                        new.put(table, token, old_slot.referenced.load(Ordering::Relaxed));
                         #[cfg(test)]
                         crate::core::power_loss::failpoint::hit("test.pddl.partition_reopened", &self.root)
                             .map_err(|e| e.to_string())?;
@@ -1014,7 +1085,7 @@ impl PartitionedTable {
             match slot.open_now() {
                 Some(table) => total += table.data()?.len.load(Ordering::Relaxed),
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    total += closed_lens(&self.root, self.uid, slot.pid)?.0;
+                    total += slot.closed_sizes(&self.root, self.uid)?.0;
                 }
                 None => {}
             }
@@ -1152,12 +1223,13 @@ impl PartitionedTable {
         route: &Route,
     ) -> io::Result<Vec<(u32, Arc<Table<DbStorageProvider>>)>> {
         let planned = self.planned(epoch, route)?;
+        let routed = planned.len() == 1;
         let mut out = Vec::with_capacity(planned.len());
         let mut opened: SmallVec<[u32; 4]> = SmallVec::new();
         for (pid, open) in planned {
             let table = match open {
                 Some(table) => table,
-                None => match self.open_part(pid).await {
+                None => match self.live()?.parts.open(pid, routed).await {
                     Ok(table) => {
                         opened.push(pid);
                         table
@@ -1207,15 +1279,30 @@ impl PartitionedTable {
                 out.push((pid, None));
             }
         }
+        // A routed access, one partition reached, sets its reference bit; a
+        // fan-out's sets none (scan resistance, `partition::budget`).
+        if let [(pid, _)] = out.as_slice() {
+            Self::slot(live, *pid)?.touch();
+        }
         Ok(out)
     }
 
     /// Materialized partition `pid`'s open instance, opened now if it is
-    /// closed. Errs for a partition that is not materialized, and when the
-    /// open fails: never an empty stand-in.
+    /// closed, as a routed access (its reference bit set). Errs for a
+    /// partition that is not materialized, and when the open fails: never an
+    /// empty stand-in.
     pub async fn open_part(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let live = self.live()?;
-        live.parts.open(pid).await
+        live.parts.open(pid, true).await
+    }
+
+    /// [`Self::open_part`] for a fan-out over several partitions: one it
+    /// opens enters the CLOCK with its reference bit clear, so a scan wider
+    /// than the budget evicts what it opened before what routed accesses
+    /// keep using (`partition::budget`).
+    pub async fn open_part_scan(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
+        let live = self.live()?;
+        live.parts.open(pid, false).await
     }
 
     /// Closes partition `pid` exclusively (§7.2 point 2): only while nothing
@@ -1287,6 +1374,7 @@ impl PartitionedTable {
         } else if slot.materialized.load(Ordering::SeqCst) {
             out.push((pid, None));
         }
+        slot.touch();
         Ok(out)
     }
 
@@ -1306,10 +1394,11 @@ impl PartitionedTable {
                 slot.pid
             )));
         }
+        slot.touch();
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
-        live.parts.open_slow_erased(slot, true).await
+        live.parts.open_slow_erased(slot, true, true).await
     }
 
     /// Inserts `row` under `tx` into the partition its key routes to,
@@ -1363,7 +1452,7 @@ impl PartitionedTable {
             let lens = match slot.open_now() {
                 Some(table) => Some(Self::file_lens(&table).await?),
                 // A closed partition, from its files' metadata.
-                None if slot.materialized.load(Ordering::SeqCst) => Some(closed_lens(&self.root, self.uid, slot.pid)?),
+                None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(&self.root, self.uid)?),
                 None => None,
             };
             if let Some((rows, pointers, filters)) = lens {
@@ -1395,7 +1484,7 @@ impl PartitionedTable {
                     (Some(root.clone()), "materialized", slots, bytes)
                 }
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    let (rows, pointers, filters) = closed_lens(&self.root, self.uid, slot.pid)?;
+                    let (rows, pointers, filters) = slot.closed_sizes(&self.root, self.uid)?;
                     (Some(root.clone()), "materialized", pointers / ROW_POINTER_RECORD_LEN as u64, rows + pointers + filters)
                 }
                 None => (None, "unmaterialized", 0, 0),
@@ -1557,15 +1646,34 @@ fn closed_lens(root: &Path, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
 /// PostgreSQL reports running out of them; any other failure as it was. The
 /// statement fails and the partition stays closed; the open budget that
 /// evicts and retries first is P5b-2's (§7.1).
+/// Partitions an open that ran out of descriptors closes before its retry.
+const EVICT_ON_EMFILE: usize = 8;
+
+/// Whether `e` is [`out_of_resources`]'s naming of EMFILE or ENFILE.
+fn is_out_of_resources(e: &io::Error) -> bool {
+    e.to_string().starts_with("insufficient resources: ")
+}
+
 fn out_of_resources(e: io::Error, table: &str, pid: u32) -> io::Error {
-    const EMFILE: i32 = 24;
-    const ENFILE: i32 = 23;
     match e.raw_os_error() {
-        Some(EMFILE) | Some(ENFILE) => io::Error::new(
+        Some(files::EMFILE) | Some(files::ENFILE) => io::Error::new(
             e.kind(),
             format!("insufficient resources: partition {pid} of \"{table}\" could not be opened: {e}"),
         ),
         _ => e,
+    }
+}
+
+/// A table instance dropped with partitions open (a restart, a schema
+/// change's replaced instance, a `DROP`) drops them with it.
+#[cfg(test)]
+impl Drop for Parts {
+    fn drop(&mut self) {
+        for slot in self.slots.iter() {
+            if slot.open.lock().is_some() {
+                instance_count::closed(&self.root, self.uid, slot.pid);
+            }
+        }
     }
 }
 
@@ -1594,13 +1702,23 @@ impl Parts {
     }
 
     /// Materialized partition `pid`'s open instance, opened now if it is
-    /// closed.
-    pub(crate) async fn open(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
+    /// closed. `routed` sets its reference bit (a routed access); a
+    /// fan-out's open leaves it clear (`partition::budget`).
+    pub(crate) async fn open(&self, pid: u32, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let slot = self.slot_at(pid)?;
+        if routed {
+            slot.touch();
+        }
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
-        self.open_slow_erased(slot, false).await
+        self.open_slow_erased(slot, false, routed).await
+    }
+
+    /// Clears partition `pid`'s reference bit; whether it was set. The
+    /// CLOCK's hand, passing.
+    pub(crate) fn take_reference(&self, pid: u32) -> bool {
+        self.slot_at(pid).is_ok_and(|s| s.referenced.swap(false, Ordering::Relaxed))
     }
 
     /// [`Self::open_slow`] behind a type-erased box: an open runs once per
@@ -1613,8 +1731,9 @@ impl Parts {
         &'a self,
         slot: &'a Slot,
         materialize: bool,
+        routed: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Arc<Table<DbStorageProvider>>>> + Send + 'a>> {
-        Box::pin(self.open_slow(slot, materialize))
+        Box::pin(self.open_slow(slot, materialize, routed))
     }
 
     fn refuse_retired(&self) -> io::Result<()> {
@@ -1631,13 +1750,18 @@ impl Parts {
     /// unmaterialized) partition, under its lifecycle lock: materialize it
     /// (§3.2) if it never was, then open it. A failure leaves the slot
     /// closed and fails the caller, never handing back a stand-in.
-    async fn open_slow(&self, slot: &Slot, materialize: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
+    async fn open_slow(&self, slot: &Slot, materialize: bool, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let lock = self.board.lifecycle(slot.pid)?;
         let _life = lock.lock().await;
         if let Some(table) = slot.open_now() {
             return Ok(table);
         }
         self.refuse_retired()?;
+        // Room in the open budget first: partitions nobody holds closed by
+        // the CLOCK, this one's own lifecycle lock skipped (held here). Soft:
+        // with every open partition held, this opens anyway (`budget`).
+        let me = (self as *const Parts as usize, slot.pid);
+        self.budget.make_room(me).await;
         if !slot.materialized.load(Ordering::SeqCst) {
             if !materialize {
                 return Err(io::Error::other(format!(
@@ -1647,8 +1771,29 @@ impl Parts {
             }
             self.materialize(slot).await?;
         }
-        let table = self.open_instance(slot).await?;
-        *slot.open.lock() = Some(table.clone());
+        let table = match self.open_instance(slot).await {
+            Ok(table) => table,
+            // Out of descriptors whatever the budget said (plain tables,
+            // connections, another process's share of the system's): close
+            // some partitions nobody holds and try once more; then the
+            // statement fails with `53000` (§7.1).
+            Err(e) if is_out_of_resources(&e) => {
+                let freed = self.budget.evict(EVICT_ON_EMFILE, me).await;
+                if freed == 0 {
+                    return Err(e);
+                }
+                ::log::warn!(
+                    "partition {} of \"{}\" ran out of file descriptors opening; closed {freed} idle partitions and retried",
+                    slot.pid,
+                    self.name
+                );
+                self.open_instance(slot).await?
+            }
+            Err(e) => return Err(e),
+        };
+        #[cfg(test)]
+        instance_count::opened(&self.root, self.uid, slot.pid);
+        slot.put(table.clone(), self.budget.enter(self.me.clone(), self.uid, slot.pid), routed);
         // Again once it is in its slot: a `SET CONFIG vacuum` that stored
         // its value after `open_instance` read it walked the slots before
         // this one was there (both sides store, then read the other's).
@@ -1677,7 +1822,8 @@ impl Parts {
                 if loc != ROOT_LOC {
                     return Err(io::Error::other(format!("partition {pid} is at location {loc}, outside the root")));
                 }
-                files::require_existing(&self.root, &files::data_files(self.uid, pid))?;
+                files::require_existing(&self.root, &files::data_files(self.uid, pid))
+                    .map_err(|e| out_of_resources(e, &self.name, pid))?;
             }
             Some(None) => {
                 // Checked again here, not only at open: deleting is the step
@@ -1685,7 +1831,8 @@ impl Parts {
                 if let Some(why) = self.torn.as_deref() {
                     refuse_torn_leftovers(&self.root, self.uid, self.board.log.generation(), pid, why)?;
                 }
-                files::create_partition_files(&self.root, self.uid, pid)?;
+                files::create_partition_files(&self.root, self.uid, pid)
+                    .map_err(|e| out_of_resources(e, &self.name, pid))?;
                 let floor = self.transactions.status().forgotten_below();
                 let rec = Record::Materialize { pid, floor, loc: ROOT_LOC };
                 let mut state = self.board.state.lock().await;
@@ -1713,7 +1860,10 @@ impl Parts {
     /// instance's schema. The caller holds the lifecycle lock.
     async fn open_instance(&self, slot: &Slot) -> io::Result<Arc<Table<DbStorageProvider>>> {
         // Never a provider over a missing file, which it would create (I9).
-        files::require_existing(&self.root, &files::data_files(self.uid, slot.pid))?;
+        // Out of descriptors here is insufficient resources too: the check
+        // opens the files it checks.
+        files::require_existing(&self.root, &files::data_files(self.uid, slot.pid))
+            .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
         let physical = files::data_stem(self.uid, slot.pid);
         let table = Table::open_partition(PartitionOpen {
             cache_scope: format!("{}\u{0}{}", self.db_id, physical),
@@ -1768,6 +1918,64 @@ impl Parts {
         let slot = self.slot_at(pid)?;
         let lock = self.board.lifecycle(pid)?;
         let _life = lock.lock().await;
+        self.close_held(slot, pid).await
+    }
+
+    /// [`Self::close`] for the open budget and the idle round, which never
+    /// wait for a lifecycle lock: an open or a close of the partition in
+    /// flight means it is in use, and waiting could deadlock against an open
+    /// that holds its own lock while it makes room. Whether it closed.
+    pub(crate) async fn close_for_budget(&self, pid: u32) -> bool {
+        let Ok(slot) = self.slot_at(pid) else { return false };
+        let Ok(lock) = self.board.lifecycle(pid) else { return false };
+        let Ok(_life) = lock.try_lock() else { return false };
+        match Box::pin(self.close_held(slot, pid)).await {
+            Ok(Close::Closed) => true,
+            Ok(_) => false,
+            Err(e) => {
+                ::log::warn!("closing partition {pid} of \"{}\" for the open budget failed: {e}", self.name);
+                false
+            }
+        }
+    }
+
+    /// One idle round (§7.2, P5b-2), at most once per
+    /// `partition.idle_close_secs`: every open partition no routed access
+    /// touched since the last round closes, if nobody holds it; the rest
+    /// have their reference bits cleared for the next. Returns how many
+    /// closed. A board round calls it.
+    pub(crate) async fn close_idle_round(&self) -> usize {
+        let secs = self.budget.idle_close_secs();
+        if secs == 0 || self.retired.load(Ordering::SeqCst) {
+            return 0;
+        }
+        {
+            let mut at = self.idle_round_at.lock();
+            let now = std::time::Instant::now();
+            match *at {
+                // The first round only starts the clock.
+                None => {
+                    *at = Some(now);
+                    return 0;
+                }
+                Some(last) if now.duration_since(last) < std::time::Duration::from_secs(secs) => return 0,
+                Some(_) => *at = Some(now),
+            }
+        }
+        let mut closed = 0;
+        for slot in self.slots.iter() {
+            if slot.open.lock().is_none() || slot.referenced.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            if self.close_for_budget(slot.pid).await {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// The exclusive close's body, the lifecycle lock held by the caller.
+    async fn close_held(&self, slot: &Slot, pid: u32) -> io::Result<Close> {
         if self.retired.load(Ordering::SeqCst) {
             return Ok(Close::Retired);
         }
@@ -1783,13 +1991,23 @@ impl Parts {
                 },
             }
         };
+        slot.release_token();
         #[cfg(test)]
         lifecycle_hooks::closing(&self.root, pid).await;
         #[cfg(test)]
         crate::core::power_loss::failpoint::hit("test.p5b.close_taken", &self.root)?;
-        table.close_exclusive().await;
+        // Sealed as it closes (§7.2 point 3): the snapshot the next open
+        // loads instead of rebuilding, written only when the instance has
+        // something the file set's snapshot lacks (`index_store::seal`'s
+        // step 0); then retired and landed.
+        table.close_exclusive(true).await;
         #[cfg(test)]
         crate::core::power_loss::failpoint::hit("test.p5b.close_landed", &self.root)?;
+        // Its sizes as it leaves, what the catalogs read while it is closed.
+        match PartitionedTable::file_lens(&table).await {
+            Ok(sizes) => *slot.sizes.lock() = Some(sizes),
+            Err(_) => *slot.sizes.lock() = None,
+        }
         // Owned alone since the check above; dropping it drops the providers
         // (the scheduler holds the unit weakly).
         if let Err(still) = Arc::try_unwrap(table) {
@@ -1798,9 +2016,59 @@ impl Parts {
                 self.name,
                 Arc::strong_count(&still)
             );
+            #[cfg(test)]
+            instance_count::leaked(&self.root, self.uid, pid);
         }
+        #[cfg(test)]
+        instance_count::closed(&self.root, self.uid, pid);
         self.closes.fetch_add(1, Ordering::AcqRel);
         Ok(Close::Closed)
+    }
+}
+
+/// Test-only: live instances per file set, as `Parts` puts them in a slot
+/// and drops them at close (open count; a second open while one is live, or
+/// an instance still referenced as its close drops it, is a violation). I14,
+/// as the budget storm checks it. Instances a schema change reopens are not
+/// counted (the replaced one stays alive, retired, beside it by design).
+#[cfg(test)]
+pub(crate) mod instance_count {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    type Key = (PathBuf, u64, u32);
+    static LIVE: parking_lot::Mutex<Option<HashMap<Key, i64>>> = parking_lot::Mutex::new(None);
+    static VIOLATIONS: parking_lot::Mutex<Vec<(PathBuf, String)>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(super) fn opened(root: &Path, uid: u64, pid: u32) {
+        let mut live = LIVE.lock();
+        let n = live.get_or_insert_with(HashMap::new).entry((root.to_path_buf(), uid, pid)).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            VIOLATIONS.lock().push((root.to_path_buf(), format!("partition {pid}: {n} live instances at an open")));
+        }
+    }
+
+    /// A schema change's reopen: counted, never a violation (the replaced
+    /// instance stays alive, retired, until its table instance drops).
+    pub(super) fn reopened(root: &Path, uid: u64, pid: u32) {
+        *LIVE.lock().get_or_insert_with(HashMap::new).entry((root.to_path_buf(), uid, pid)).or_insert(0) += 1;
+    }
+
+    pub(super) fn closed(root: &Path, uid: u64, pid: u32) {
+        if let Some(n) = LIVE.lock().get_or_insert_with(HashMap::new).get_mut(&(root.to_path_buf(), uid, pid)) {
+            *n -= 1;
+        }
+    }
+
+    pub(super) fn leaked(root: &Path, uid: u64, pid: u32) {
+        let _ = uid;
+        VIOLATIONS.lock().push((root.to_path_buf(), format!("partition {pid}: still referenced as its close dropped it")));
+    }
+
+    /// The violations recorded under `dir`.
+    pub(crate) fn violations(dir: &Path) -> Vec<String> {
+        VIOLATIONS.lock().iter().filter(|(d, _)| d.starts_with(dir)).map(|(_, v)| v.clone()).collect()
     }
 }
 

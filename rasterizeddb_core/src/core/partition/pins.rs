@@ -190,6 +190,16 @@ impl PinBoard {
             .ok_or_else(|| io::Error::other(format!("internal error: no lifecycle lock for partition {pid}")))
     }
 
+    /// The live instance's idle round (`Parts::close_idle_round`): its
+    /// partitions no routed access touched for `partition.idle_close_secs`
+    /// close. Run by the scheduler's board round. Returns how many closed.
+    pub(crate) async fn close_idle_round(&self) -> usize {
+        let Some(parts) = self.parts.lock().upgrade() else {
+            return 0;
+        };
+        Box::pin(parts.close_idle_round()).await
+    }
+
     /// The live instance's slots, for the forget rounds.
     pub(crate) fn set_parts(&self, parts: std::sync::Weak<super::table::Parts>) {
         *self.parts.lock() = parts;
@@ -307,7 +317,7 @@ impl PinBoard {
             if self.state.lock().await.part(pid).and_then(|p| p.pin).is_none() {
                 continue;
             }
-            match parts.open(pid).await {
+            match parts.open(pid, false).await {
                 Ok(table) => {
                     held.push(table);
                     opened.push(pid);

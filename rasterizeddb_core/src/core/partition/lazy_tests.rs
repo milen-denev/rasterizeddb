@@ -207,17 +207,38 @@ async fn a_start_opens_nothing_and_an_access_opens_only_what_it_reaches() {
     let mut want = expected();
     want.push((other, 99, 1));
     want.sort();
+    // Which partitions the fan-out read, not how many are open after it: a
+    // forget round may sweep-open a pinned partition and close it again
+    // once the fan-out lets go of it.
+    let _ = crate::core::rql::row_source::test_hooks::take_reads(t.uid());
     assert_eq!(rows(&db, "").await, want);
-    assert_eq!(t.open_count(), materialized.len(), "a fan-out left a partition unread");
+    let mut read = crate::core::rql::row_source::test_hooks::take_reads(t.uid());
+    read.sort();
+    read.dedup();
+    assert_eq!(read, materialized, "a fan-out left a partition unread");
     close(dir.path(), db);
+}
+
+/// A table's totals without the map log, which a forget round may append to
+/// at any time.
+fn partition_sizes(t: super::table::Totals) -> (u64, u64, u64, u64, u64, u32, u32) {
+    (t.data, t.pointers, t.filters, t.slots, t.schema, t.materialized, t.declared)
 }
 
 /// Every partition closed between statements: each read and write answers
 /// as with every partition open, the sizes reported are the same, and so
 /// is everything after a restart.
 ///
+/// Since P5b-2 a close seals (its index store gains a snapshot), so the
+/// sizes compared are the closed table's against what the same files report
+/// once reopened, and against a fresh read of their metadata after a
+/// restart: the sizes a close keeps for the catalogs (`Slot::sizes`) are the
+/// files' own.
+///
 /// Mutation: `closed_lens` leaving out the staged `.tmp` (or the totals
-/// skipping closed partitions): the sizes differ once closed.
+/// skipping closed partitions): the sizes differ once closed. (P5b-2) The
+/// close keeping the sizes the instance had before its seal: they differ
+/// from the files' after a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_partition_answers_like_an_open_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -225,12 +246,31 @@ async fn a_closed_partition_answers_like_an_open_one() {
     populated(&db).await;
     let t = pt(&db);
     let open_totals = t.totals().await.unwrap();
-    let open_parts = t.partitions().await.unwrap();
     let materialized = t.materialized_pids().unwrap().len();
     assert_eq!(t.close_idle().await.unwrap(), materialized);
     assert_eq!(t.open_count(), 0);
-    assert_eq!(t.totals().await.unwrap(), open_totals, "a closed table reports other sizes");
-    assert_eq!(t.partitions().await.unwrap(), open_parts, "a closed table reports other partitions");
+    let closed_totals = t.totals().await.unwrap();
+    let closed_parts = t.partitions().await.unwrap();
+    // The rows and pointers are what they were open; the seal added only
+    // index-store bytes.
+    assert_eq!(
+        (closed_totals.data, closed_totals.pointers, closed_totals.slots, closed_totals.materialized),
+        (open_totals.data, open_totals.pointers, open_totals.slots, open_totals.materialized),
+        "a closed table reports other sizes"
+    );
+    // A restart reads every closed partition's sizes from its files: the
+    // same as the close kept.
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    let t = pt(&db);
+    // (The map log is left out: a forget round may append to it meanwhile.)
+    assert_eq!(partition_sizes(t.totals().await.unwrap()), partition_sizes(closed_totals), "the sizes a close kept are not the files'");
+    assert_eq!(t.partitions().await.unwrap(), closed_parts, "the partitions a close kept are not the files'");
+    // And the instances report the same once reopened.
+    assert_eq!(rows(&db, "").await, expected());
+    assert_eq!(t.open_count(), materialized);
+    assert_eq!(partition_sizes(t.totals().await.unwrap()), partition_sizes(closed_totals), "an open table reports other sizes than closed");
+    assert_eq!(t.partitions().await.unwrap(), closed_parts, "an open table reports other partitions than closed");
 
     let mut want = expected();
     assert_eq!(rows(&db, "").await, want);
@@ -753,6 +793,9 @@ async fn an_index_checkpoint_reaches_closed_partitions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_out_of_file_descriptors_fails_the_statement_with_53000() {
     let dir = tempfile::tempdir().unwrap();
+    // Its own budget: an open out of descriptors evicts before its retry,
+    // and from the process's budget that would close other tests' partitions.
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     populated(&db).await;
     let t = pt(&db);
@@ -773,6 +816,35 @@ async fn running_out_of_file_descriptors_fails_the_statement_with_53000() {
     crate::core::storage_providers::file_sync::open_test_hooks::clear(&root);
     assert_eq!(rows(&db, "").await, expected(), "after descriptors came back");
     assert_eq!(t.open_count(), materialized);
+    drop(t);
+    close(dir.path(), db);
+}
+
+/// Running out of file descriptors in the open's existence check, before
+/// any provider is built, is `53000` as well. (At a2cb4589 the check
+/// rewrapped the error with its path, dropping the errno, so the statement
+/// failed with an internal error, review A round 2.)
+///
+/// Mutation: `require_existing` rewrapping EMFILE like any other failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_out_of_file_descriptors_in_the_existence_check_is_53000() {
+    let dir = tempfile::tempdir().unwrap();
+    // Its own budget: an open out of descriptors evicts before its retry,
+    // and from the process's budget that would close other tests' partitions.
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    super::files::existence_test_hooks::fail(dir.path());
+    let routed = try_rows(&db, "tenant_id = 3").await.expect_err("a routed read opened with no descriptors left");
+    assert!(routed.contains("insufficient resources"), "{routed}");
+    assert_eq!(crate::pgwire::sqlstate_for(&routed), "53000", "{routed}");
+    let written = try_exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (3, 99, 1)").await.expect_err("a write opened");
+    assert_eq!(crate::pgwire::sqlstate_for(&written), "53000", "{written}");
+    super::files::existence_test_hooks::clear(dir.path());
+    assert_eq!(t.open_count(), 0);
+    assert_eq!(rows(&db, "").await, expected(), "after descriptors came back");
     drop(t);
     close(dir.path(), db);
 }
@@ -856,4 +928,509 @@ async fn closed_partitions_are_never_reported_ready() {
     }
     drop(t);
     close(dir.path(), db);
+}
+
+/// The descriptors this process holds on files under `dir`.
+fn fds_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<_> = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|p| p.starts_with(dir))
+        .collect();
+    out.sort();
+    out
+}
+
+/// An open that fails between its two providers (the pointer file's open,
+/// then out of descriptors for the rows file's) leaves nothing behind: no
+/// descriptor on the partition's files, and no log registration other than
+/// the ones every successful open of the partition makes, which a close
+/// keeps on purpose (§7.2: a close never unregisters, so a checkpoint after
+/// it still syncs the files by path; dropping one would let a checkpoint
+/// skip records already logged under the id, I16). Review A round 2 asked
+/// whether the first provider's registration leaked: it is the startup
+/// directory registration's own entry, unchanged.
+///
+/// Mutation: the failed open keeping the pointer provider alive (its
+/// descriptors stay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_failing_between_its_providers_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    // Its own budget: an open out of descriptors evicts before its retry,
+    // and from the process's budget that would close other tests' partitions.
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let root = path_str(dir.path());
+    let wal = crate::core::wal::wal_for(&root).unwrap();
+    let registered = || {
+        let mut files: Vec<_> =
+            wal.registered_files().into_iter().filter(|(_, p)| p.starts_with(dir.path())).collect();
+        files.sort();
+        files
+    };
+    let (files_before, fds_before) = (registered(), fds_under(dir.path()));
+    let pid = t.materialized_pids().unwrap()[0];
+    for _ in 0..20 {
+        // The pointer file's provider opens; the rows file's fails.
+        crate::core::storage_providers::file_sync::open_test_hooks::fail_after(&root, 1);
+        let failed = t.open_part(pid).await.err().expect("the open succeeded with no descriptors left");
+        crate::core::storage_providers::file_sync::open_test_hooks::clear(&root);
+        assert_eq!(crate::pgwire::sqlstate_for(&failed.to_string()), "53000", "{failed}");
+    }
+    assert_eq!(fds_under(dir.path()), fds_before, "a failed open kept descriptors on the partition's files");
+    assert_eq!(registered(), files_before, "a failed open left a registration");
+    assert_eq!(t.open_count(), 0);
+    // What a successful open and close leave, for comparison: the same.
+    drop(t.open_part(pid).await.unwrap());
+    t.close_idle().await.unwrap();
+    assert_eq!(registered(), files_before);
+    assert_eq!(fds_under(dir.path()), fds_before);
+    drop(t);
+    close(dir.path(), db);
+}
+
+// ------------------------------------------------------------------ P5b-2
+// The open budget, its CLOCK and idle close (`partition::budget`).
+
+fn open_pids(t: &PartitionedTable) -> Vec<u32> {
+    let mut pids: Vec<u32> = t.open_partitions_now().into_iter().map(|(p, _)| p).collect();
+    pids.sort();
+    pids
+}
+
+/// Tenants routing to `n` distinct partitions, one tenant each, in pid order.
+fn tenants_of_distinct_partitions(t: &PartitionedTable, n: usize, tenants: i64) -> Vec<(i64, u32)> {
+    let mut seen = std::collections::BTreeMap::new();
+    for tenant in 1..=tenants {
+        seen.entry(pid_of_tenant(t, tenant)).or_insert(tenant);
+    }
+    let out: Vec<(i64, u32)> = seen.into_iter().map(|(p, tenant)| (tenant, p)).take(n).collect();
+    assert_eq!(out.len(), n, "only {} partitions are reached by tenants 1..={tenants}", out.len());
+    out
+}
+
+/// Routed reads of every partition in turn under a budget of 2: after each
+/// statement at most two partitions are open, every answer is whole, and
+/// the budget closed the rest to make room.
+///
+/// Mutation: `Budget::make_room` returning at once (every partition stays
+/// open).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_closes_what_nobody_holds_to_open_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    // No forget round sweep-opening partitions under the test's counts.
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let materialized = t.materialized_pids().unwrap().len();
+    // The populating INSERT keeps a ticket on every partition it writes
+    // until it commits, so its opens went past the budget: not counted.
+    let (evictions, overruns) = (budget.evictions(), budget.overruns());
+    for round in 0..3 {
+        for tenant in 1..=TENANTS {
+            let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == tenant).collect();
+            assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await, mine, "round {round}, tenant {tenant}");
+            assert!(t.open_count() <= 2, "{} partitions open under a budget of 2", t.open_count());
+            assert_eq!(budget.open(), t.open_count(), "the budget's count is not the slots'");
+        }
+    }
+    let evicted = (budget.evictions() - evictions) as usize;
+    assert!(evicted >= 3 * materialized - 2, "only {evicted} evictions");
+    assert_eq!(budget.overruns(), overruns);
+    assert!(super::table::instance_count::violations(dir.path()).is_empty());
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A partition a statement holds is never closed for the budget: an open
+/// that finds the budget full and nothing else to close opens past it
+/// (counted as an overrun), and the held instance stays the one in its slot.
+///
+/// Mutation: `Parts::close_held` without its strong-count check (the held
+/// instance is closed under its holder).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_never_closes_a_partition_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 1, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let overruns = budget.overruns();
+    let pairs = tenants_of_distinct_partitions(&t, 3, TENANTS);
+    let ((_, held_pid), (other_tenant, other_pid), (third_tenant, third_pid)) = (pairs[0], pairs[1], pairs[2]);
+    let held = t.open_part(held_pid).await.unwrap();
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == other_tenant).collect();
+    assert_eq!(rows(&db, &format!("tenant_id = {other_tenant}")).await, mine);
+    assert_eq!(open_pids(&t), {
+        let mut v = vec![held_pid, other_pid];
+        v.sort();
+        v
+    });
+    assert_eq!(budget.overruns(), overruns + 1, "the open did not go past the full budget");
+    let again = t.open_part(held_pid).await.unwrap();
+    assert!(Arc::ptr_eq(&held, &again), "the held partition was replaced");
+    drop((held, again));
+    // Released, both are what the next open closes to get back under it.
+    let theirs: Vec<_> = expected().into_iter().filter(|r| r.0 == third_tenant).collect();
+    assert_eq!(rows(&db, &format!("tenant_id = {third_tenant}")).await, theirs);
+    assert_eq!(open_pids(&t), vec![third_pid]);
+    assert!(super::table::instance_count::violations(dir.path()).is_empty());
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A fan-out wider than the budget reads every partition, and leaves the
+/// budget's count equal to what is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_wider_than_the_budget_reads_every_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    let p1 = pid_of_tenant(&t, 1);
+    for _ in 0..3 {
+        t.close_idle().await.unwrap();
+        assert_eq!(rows(&db, "").await, expected());
+        assert_eq!(budget.open(), t.open_count());
+        // The next open trims back to the budget: what the fan-out holds is
+        // released by now.
+        assert_eq!(t.close_partition(p1).await.unwrap(), Close::Closed);
+        assert_eq!(rows(&db, "tenant_id = 1").await, expected().into_iter().filter(|r| r.0 == 1).collect::<Vec<_>>());
+        assert!(t.open_count() <= 2, "{} open after a routed open under a budget of 2", t.open_count());
+        assert_eq!(budget.open(), t.open_count());
+    }
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Scan resistance: partitions a fan-out opened enter the CLOCK with their
+/// reference bits clear, so the next open that needs room closes one of
+/// them before any partition a routed access keeps using. Three rounds over
+/// different partitions of a 32-partition table, so a CLOCK that set the
+/// bit on a fan-out's open (and offered whichever came first after one lap)
+/// is caught with high probability.
+///
+/// Mutation: `open_part_scan` setting the reference bit, as a routed open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_is_evicted_before_what_routed_reads_keep_using() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 5, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(
+        &db,
+        "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, id)) \
+         PARTITION BY HASH (tenant_id) PARTITIONS 32",
+    )
+    .await;
+    let values: Vec<String> = (1..=200i64).map(|t| format!("({t}, 1, {t})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let t = pt(&db);
+    let parts = tenants_of_distinct_partitions(&t, 21, 200);
+    let overruns = budget.overruns();
+    for round in 0..3 {
+        t.close_idle().await.unwrap();
+        let group = &parts[round * 7..round * 7 + 7];
+        let (hot, rest) = group.split_at(3);
+        let (scanned, later) = rest.split_at(2);
+        for &(tenant, _) in hot {
+            assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await, vec![(tenant, 1, tenant)]);
+        }
+        let list = scanned.iter().map(|(tenant, _)| tenant.to_string()).collect::<Vec<_>>().join(", ");
+        assert_eq!(rows(&db, &format!("tenant_id IN ({list})")).await.len(), 2);
+        assert_eq!(t.open_count(), 5);
+        for &(tenant, _) in later {
+            assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await, vec![(tenant, 1, tenant)]);
+            // The routed workload keeps using its partitions (the hand
+            // clears their bits as it passes).
+            for &(tenant, _) in hot {
+                assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await, vec![(tenant, 1, tenant)]);
+            }
+        }
+        let open = open_pids(&t);
+        for &(tenant, pid) in hot {
+            assert!(open.contains(&pid), "round {round}: tenant {tenant}'s routed partition {pid} was evicted before the fan-out's ({open:?})");
+        }
+        for &(_, pid) in scanned {
+            assert!(!open.contains(&pid), "round {round}: the fan-out's partition {pid} outlived routed ones ({open:?})");
+        }
+    }
+    assert_eq!(budget.overruns(), overruns);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Idle close (§7.2): a board round closes every open partition no routed
+/// access touched for a whole period, and keeps the touched ones, and none
+/// a statement holds.
+///
+/// Mutation: `Parts::close_idle_round` ignoring the reference bit (the
+/// touched partition closes too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_close_closes_only_what_no_routed_access_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(1));
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let pairs = tenants_of_distinct_partitions(&t, 3, TENANTS);
+    let ((busy, busy_pid), (held_tenant, held_pid), (_, idle_pid)) = (pairs[0], pairs[1], pairs[2]);
+    // Every partition opened by a fan-out (bits clear), then one held.
+    assert_eq!(rows(&db, "").await, expected());
+    let materialized = t.materialized_pids().unwrap().len();
+    assert_eq!(t.open_count(), materialized);
+    let held = t.open_part_scan(held_pid).await.unwrap();
+    // The scheduler's board rounds run idle rounds too; this test drives
+    // more of them.
+    let board = t.pin_board().unwrap().clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // The busy tenant read throughout.
+        let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == busy).collect();
+        assert_eq!(rows(&db, &format!("tenant_id = {busy}")).await, mine);
+        board.close_idle_round().await;
+        if !open_pids(&t).contains(&idle_pid) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "idle close never closed partition {idle_pid}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let open = open_pids(&t);
+    assert!(open.contains(&busy_pid), "a partition read every round was closed as idle ({open:?})");
+    assert!(open.contains(&held_pid), "a held partition was closed as idle ({open:?})");
+    assert_eq!(open.len(), 2, "idle partitions stayed open: {open:?}");
+    drop(held);
+    let _ = held_tenant;
+    drop(board);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// I14 under the open budget (§16): an open/close storm at a budget of one
+/// partition, under unique-key writers that race each other for the same
+/// keys, routed readers, fan-outs and idle rounds every second. Every
+/// acknowledged row is stored once; of two writers inserting one key,
+/// exactly one is acknowledged and the other refused as a duplicate; no
+/// read misses a row; and no file set ever has two live instances (counted
+/// at every open and close). Again after a restart. Bounded: 4 writers of
+/// 120 rows, 2 of them racing for 40 shared keys.
+///
+/// Mutation: `Parts::open_slow` putting the instance before the lifecycle
+/// lock is taken (two opens of a pid build two instances).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 1, Some(1));
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..4i64 {
+        let db = db.clone();
+        writers.push(tokio::spawn(async move {
+            let mut acked = Vec::new();
+            for i in 0..120i64 {
+                let tenant = 1 + (w * 120 + i) % TENANTS;
+                let id = 5000 + w * 1000 + i;
+                exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, {id}, {id})")).await;
+                acked.push((tenant, id, id));
+                // A key every writer pair 0/1 races for: one of them wins.
+                if w < 2 && i < 40 {
+                    let (tenant, id) = (1 + i % TENANTS, 9000 + i);
+                    match try_exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, {id}, {w})")).await {
+                        Ok(_) => acked.push((tenant, id, w)),
+                        Err(e) => assert_eq!(crate::pgwire::sqlstate_for(&e), "23505", "a racing insert failed otherwise: {e}"),
+                    }
+                }
+                // An existing key: always refused.
+                let dup = try_exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES ({tenant}, 1, 0)")).await;
+                let e = dup.expect_err("a duplicate of a populated key was acknowledged");
+                assert_eq!(crate::pgwire::sqlstate_for(&e), "23505", "{e}");
+            }
+            acked
+        }));
+    }
+    let mut readers = Vec::new();
+    for r in 0..2i64 {
+        let (db, stop) = (db.clone(), stop.clone());
+        readers.push(tokio::spawn(async move {
+            let mut reads = 0u64;
+            let mut tenant = 1 + r;
+            while !stop.load(O::Acquire) {
+                let base: Vec<_> = expected().into_iter().filter(|x| x.0 == tenant).collect();
+                let got: Vec<_> = rows(&db, &format!("tenant_id = {tenant}")).await.into_iter().filter(|x| x.1 <= IDS).collect();
+                assert_eq!(got, base, "a routed read under the storm lost rows");
+                tenant = 1 + (tenant + 3) % TENANTS;
+                reads += 1;
+            }
+            reads
+        }));
+    }
+    let fan = {
+        let (db, stop) = (db.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut reads = 0u64;
+            while !stop.load(O::Acquire) {
+                let kept: Vec<_> = rows(&db, "").await.into_iter().filter(|x| x.1 <= IDS).collect();
+                assert_eq!(kept, expected(), "a fan-out under the storm lost rows");
+                reads += 1;
+            }
+            reads
+        })
+    };
+    let idle = {
+        let (board, stop) = (t.pin_board().unwrap().clone(), stop.clone());
+        tokio::spawn(async move {
+            while !stop.load(O::Acquire) {
+                board.close_idle_round().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+    // And a closer closing whatever nobody holds, over and over: the storm.
+    let closer = {
+        let (t, stop) = (t.clone(), stop.clone());
+        tokio::spawn(async move {
+            while !stop.load(O::Acquire) {
+                t.close_idle().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let (opens_before, closes_before) = t.open_close_counts();
+    let mut want = expected();
+    for w in writers {
+        want.extend(w.await.unwrap());
+    }
+    stop.store(true, O::Release);
+    for r in readers {
+        assert!(r.await.unwrap() > 0);
+    }
+    assert!(fan.await.unwrap() > 0);
+    idle.await.unwrap();
+    closer.await.unwrap();
+    want.sort();
+    // One of each racing pair won.
+    for i in 0..40i64 {
+        assert_eq!(want.iter().filter(|x| x.1 == 9000 + i).count(), 1, "key {} acknowledged other than once", 9000 + i);
+    }
+    assert_eq!(rows(&db, "").await, want, "the storm lost or duplicated rows");
+    let (opens, closes) = t.open_close_counts();
+    let (opens, closes) = (opens - opens_before, closes - closes_before);
+    assert!(opens > 100 && closes > 100, "{opens} opens, {closes} closes: not a storm");
+    // Every open at a budget of one needed room: some was made by closing.
+    assert!(budget.evictions() > 0, "the budget never closed a partition");
+    let violations = super::table::instance_count::violations(dir.path());
+    assert!(violations.is_empty(), "{violations:?}");
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    assert_eq!(rows(&db, "").await, want, "after a restart");
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// Waits for `t`'s index load or build and its filter backfill to finish.
+async fn settled(t: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    tokio::time::timeout(Duration::from_secs(60), t.index_load_settled()).await.expect("the index load never settled");
+    while !t.filters_ready().unwrap() || t.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+        assert!(std::time::Instant::now() < deadline, "the filter or the indexes never became ready");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Idle close with the persistent-index snapshot (§7.2 point 3, P5b-2): a
+/// partition closed after writes seals as it closes, and its next open, in
+/// the same process or after a restart, loads its indexes from that
+/// snapshot instead of rebuilding them, and answers through them as a scan
+/// does; a reopen that writes nothing closes without writing a new one.
+/// A write after the reopen makes the next close seal again.
+///
+/// Mutation: the close not sealing (`close_seal_hooks`, or
+/// `close_exclusive(false)`): the reopen rebuilds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_closed_after_writes_reopens_from_the_snapshot_its_close_sealed() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let dir = tempfile::tempdir().unwrap();
+    let _snap = storage_override::set(dir.path(), IndexStorage::Snapshot);
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    let p = pid_of_tenant(&t, 3);
+    let stem = super::files::data_stem(t.uid(), p);
+    let ixs = dir.path().join(format!("{stem}.ixs"));
+    assert_eq!(t.close_idle().await.unwrap(), t.materialized_pids().unwrap().len());
+    let sealed = std::fs::metadata(&ixs).expect("the close sealed no snapshot");
+
+    let check = |db: Arc<Database>| async move {
+        for v in [301i64, 302, 1604, 77777, 999] {
+            let by_index = rows(&db, &format!("v = {v}")).await;
+            let by_scan = rows(&db, &format!("v + 0 = {v}")).await;
+            assert_eq!(by_index, by_scan, "v = {v}");
+        }
+    };
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    assert_eq!(part.index_origin(), Origin::Loaded, "the reopen rebuilt rather than load the close's snapshot");
+    drop(part);
+    check(db.clone()).await;
+    // A reopen that wrote nothing closes without a new snapshot.
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    let after = std::fs::metadata(&ixs).unwrap();
+    assert_eq!(
+        (after.len(), after.modified().unwrap()),
+        (sealed.len(), sealed.modified().unwrap()),
+        "a read-only reopen's close wrote a new snapshot"
+    );
+    // A write, then a close: sealed again, and loaded again.
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (3, 77, 77777)").await;
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    drop(part);
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    assert_eq!(part.index_origin(), Origin::Loaded, "the close after a write sealed nothing the reopen loads");
+    drop(part);
+    assert_eq!(rows(&db, "v = 77777").await, vec![(3, 77, 77777)]);
+    // After a restart, closed partitions load what their closes sealed.
+    t.close_idle().await.unwrap();
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    let t = pt(&db);
+    let part = t.open_part(p).await.unwrap();
+    settled(&part).await;
+    assert_eq!(part.index_origin(), Origin::Loaded, "after a restart the partition rebuilt");
+    drop(part);
+    check(db.clone()).await;
+    assert_eq!(rows(&db, "v = 77777").await, vec![(3, 77, 77777)]);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
 }
