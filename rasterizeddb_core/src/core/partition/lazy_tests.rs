@@ -1434,3 +1434,45 @@ async fn a_partition_closed_after_writes_reopens_from_the_snapshot_its_close_sea
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
+
+/// C5's open-time scan of legacy `CHAR` keys runs for plain tables only; a
+/// partition never carries the canonical flag (documented there). Reopening
+/// partitions, by an explicit close and by the open budget's eviction (and
+/// after the seal a close now writes), keeps that: every reopened instance
+/// reads its `CHAR` keys as values, flag clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopened_partition_never_takes_the_legacy_char_canonical_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(
+        &db,
+        "CREATE TABLE pt (tenant_id BIGINT NOT NULL, code CHAR(4) NOT NULL, v BIGINT, PRIMARY KEY (tenant_id, code)) \
+         PARTITION BY HASH (tenant_id) PARTITIONS 8",
+    )
+    .await;
+    let values: Vec<String> = (1..=TENANTS).map(|t| format!("({t}, 'c{t}', {t})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, code, v) VALUES {}", values.join(", "))).await;
+    let t = pt(&db);
+    for round in 0..2 {
+        t.close_idle().await.unwrap();
+        // Routed reads past the budget: each open evicts another.
+        for tenant in 1..=TENANTS {
+            let out = exec(&db, &format!("SELECT v FROM pt WHERE tenant_id = {tenant} AND code = 'c{tenant}'")).await;
+            assert_eq!(decode_i64s(&out, 1).unwrap(), vec![vec![tenant]], "round {round}, tenant {tenant}");
+            for (pid, part) in t.open_partitions_now() {
+                assert!(!part.legacy_keys_canonical, "round {round}: partition {pid} took the canonical flag");
+            }
+        }
+    }
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    let t = pt(&db);
+    for (_, part) in t.all_partitions().await.unwrap() {
+        assert!(!part.legacy_keys_canonical, "a partition opened after a restart took the canonical flag");
+    }
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}

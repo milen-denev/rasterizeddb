@@ -228,3 +228,194 @@ async fn lazy_resident_cost_and_startup() {
         tasks3 as i64 - tasks0 as i64,
     );
 }
+
+/// What a `SHOW` statement takes, from parse to its rows.
+async fn timed_show(db: &rclite::Arc<Database>, sql: &str) -> Duration {
+    let statement = crate::core::introspect::parse(sql).unwrap().unwrap();
+    let at = Instant::now();
+    let out = crate::core::introspect::execute(&statement, db).await;
+    let took = at.elapsed();
+    assert!(!out.is_empty() && out[0] != 3, "{sql}: {}", String::from_utf8_lossy(&out));
+    took
+}
+
+/// Waits for a partition's index load or build and filter backfill.
+async fn settled(t: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>) {
+    t.index_load_settled().await;
+    while !t.filters_ready().unwrap() || t.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// P5b-2's measurements (docs/partitioning.md "Phase 3 P5b-2 as built"):
+/// `P5B2_N` partitions (default 1,024) of `P5B2_ROWS` rows each (default
+/// 200, an index on `v`), under an open budget of `P5B2_BUDGET` (default 64)
+/// with `index_storage = snapshot`:
+///
+/// - routed reads of every partition in turn, then the resident cost with
+///   the budget full (fds, RSS, tasks, idle wakeups) and the evictions;
+/// - catalog reads with every partition closed: the first after a start
+///   (each closed partition's sizes read from its files once) against the
+///   next (kept sizes), for `SHOW PARTITIONS` and `SHOW TABLES`;
+/// - first touch: a routed read that opens its partition and the time to
+///   its index ready, loading the snapshot the close sealed against
+///   rebuilding (the seal skipped at close).
+///
+/// A measurement, `#[ignore]`d; tmpfs, so no fsync here is a disk's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run by hand with --ignored --nocapture"]
+async fn budget_resident_cost_catalog_reads_and_first_touch() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let n = env_u32("P5B2_N", 1024);
+    let rows = env_u32("P5B2_ROWS", 200) as i64;
+    let budget_n = env_u32("P5B2_BUDGET", 64) as usize;
+    let _ = crate::MAX_PERMITS_THREADS.set(4);
+    let _ = crate::BATCH_SIZE.set(512);
+    let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
+    let base = tempfile::tempdir().unwrap();
+    super::partitioned::cap_hooks::raise(base.path(), n.max(2048));
+    let _snap = storage_override::set(base.path(), IndexStorage::Snapshot);
+    let budget = crate::core::partition::budget::isolate_with(base.path(), budget_n, Some(0));
+    let root = base.path().join("db");
+    let root_s = path_str(&root);
+    let mut tenant_of: Vec<Option<i64>> = vec![None; n as usize];
+    let populate_started = Instant::now();
+    {
+        let db = rclite::Arc::new(Database::new_named(&root_s, false, "budget_resident").await);
+        db.partition_maintenance().set_period(Duration::from_secs(3600));
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(
+            "CREATE TABLE acct (tenant_id BIGINT NOT NULL, v BIGINT NOT NULL, label TEXT)",
+        )
+        .unwrap();
+        let ct = crate::core::rql::lexer_ct::create_table_from_query_purpose(&purpose).unwrap();
+        db.create_partitioned_table(ct, &["tenant_id"], n).await.unwrap();
+        exec(&db, "CREATE INDEX acct_v ON acct (v)").await;
+        let t = partitioned(&db, "acct");
+        let epoch = t.epoch().unwrap();
+        let mut tenant = 0i64;
+        let mut filled = 0u32;
+        while filled < n {
+            let pid = t.route_where(&format!("tenant_id = {tenant}")).unwrap().pids(&epoch.map)[0];
+            if tenant_of[pid as usize].is_none() {
+                let values: Vec<String> =
+                    (0..rows).map(|i| format!("({tenant}, {}, 'x')", tenant * 1_000_000 + i)).collect();
+                exec(&db, &format!("INSERT INTO acct (tenant_id, v, label) VALUES {}", values.join(", "))).await;
+                tenant_of[pid as usize] = Some(tenant);
+                filled += 1;
+            }
+            tenant += 1;
+        }
+        drop(epoch);
+        // Every partition sealed by its close.
+        for (_, part) in t.open_partitions_now() {
+            settled(&part).await;
+        }
+        t.close_idle().await.unwrap();
+        db.sync_durable().unwrap();
+        drop(t);
+        drop(db);
+        crate::core::wal::remove_for(&root_s);
+    }
+    let populate = populate_started.elapsed();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (fd0, rss0, tasks0) = (fds(), rss_kib(), tasks());
+    let idle0 = idle_switches_per_sec().await;
+
+    let db = rclite::Arc::new(Database::new_named(&root_s, false, "budget_resident").await);
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    let t = partitioned(&db, "acct");
+    assert_eq!(t.open_count(), 0);
+
+    // Catalog reads with every partition closed.
+    let parts_first = timed_show(&db, "SHOW PARTITIONS acct").await;
+    let mut parts_next = Vec::new();
+    for _ in 0..5 {
+        parts_next.push(timed_show(&db, "SHOW PARTITIONS acct").await);
+    }
+    let mut tables_next = Vec::new();
+    for _ in 0..5 {
+        tables_next.push(timed_show(&db, "SHOW TABLES").await);
+    }
+
+    // Routed reads of every partition in turn, under the budget.
+    let evictions0 = budget.evictions();
+    let mut touch = Vec::with_capacity(n as usize);
+    for pid in 0..n {
+        let tenant = tenant_of[pid as usize].unwrap();
+        let at = Instant::now();
+        exec(&db, &format!("SELECT v FROM acct WHERE tenant_id = {tenant} AND v = {}", tenant * 1_000_000 + 7)).await;
+        touch.push(at.elapsed());
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let open_now = t.open_count();
+    let (fd1, rss1, tasks1) = (fds(), rss_kib(), tasks());
+    let idle1 = idle_switches_per_sec().await;
+    let evicted = budget.evictions() - evictions0;
+
+    // First touch to index ready: loaded from the close's snapshot, then
+    // with the seal skipped at close (rebuilt).
+    let sample: Vec<u32> = (0..n).step_by((n as usize / 32).max(1)).take(32).collect();
+    let mut loaded = Vec::new();
+    let mut origins_loaded = 0;
+    t.close_idle().await.unwrap();
+    for &pid in &sample {
+        let at = Instant::now();
+        let part = t.open_part(pid).await.unwrap();
+        settled(&part).await;
+        loaded.push(at.elapsed());
+        origins_loaded += (part.index_origin() == Origin::Loaded) as usize;
+    }
+    // Written once each, so the next close must seal, and closed without it.
+    crate::core::row::table::close_seal_hooks::set_skipped(true);
+    for &pid in &sample {
+        let tenant = tenant_of[pid as usize].unwrap();
+        exec(&db, &format!("INSERT INTO acct (tenant_id, v, label) VALUES ({tenant}, -1, 'w')")).await;
+    }
+    t.close_idle().await.unwrap();
+    crate::core::row::table::close_seal_hooks::set_skipped(false);
+    let mut rebuilt = Vec::new();
+    let mut origins_built = 0;
+    for &pid in &sample {
+        let at = Instant::now();
+        let part = t.open_part(pid).await.unwrap();
+        settled(&part).await;
+        rebuilt.push(at.elapsed());
+        origins_built += (part.index_origin() != Origin::Loaded) as usize;
+    }
+    t.close_idle().await.unwrap();
+    drop(t);
+    drop(db);
+    crate::core::wal::remove_for(&root_s);
+    crate::core::partition::budget::release(base.path());
+
+    let median = |v: &mut Vec<Duration>| {
+        v.sort();
+        v[v.len() / 2].as_secs_f64() * 1e3
+    };
+    let p99 = |v: &mut Vec<Duration>| {
+        v.sort();
+        v[(v.len() * 99 / 100).min(v.len() - 1)].as_secs_f64() * 1e3
+    };
+    println!(
+        "BUDGET N={n} ROWS={rows} BUDGET={budget_n} (tmpfs): populated in {:.1} s; \
+         catalog with all closed: SHOW PARTITIONS first {:.2} ms, next median {:.2} ms; SHOW TABLES next median {:.2} ms; \
+         {n} routed reads under the budget: median {:.2} ms p99 {:.2} ms, {evicted} evictions, {open_now} open after; \
+         fds +{} rss +{} KiB tasks +{} idle {:.1}/s vs {:.1}/s with none open; \
+         first touch to index ready over {} partitions: loaded median {:.2} ms ({origins_loaded} loaded), \
+         rebuilt median {:.2} ms ({origins_built} rebuilt)",
+        populate.as_secs_f64(),
+        parts_first.as_secs_f64() * 1e3,
+        median(&mut parts_next),
+        median(&mut tables_next),
+        median(&mut touch),
+        p99(&mut touch),
+        fd1 as i64 - fd0 as i64,
+        rss1 as i64 - rss0 as i64,
+        tasks1 as i64 - tasks0 as i64,
+        idle1,
+        idle0,
+        sample.len(),
+        median(&mut loaded),
+        median(&mut rebuilt),
+    );
+}
