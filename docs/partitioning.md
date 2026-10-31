@@ -644,7 +644,38 @@ not-materialized refusal; the descriptor raise at start; `SET CONFIG
 partition.open_budget = 0` naming the derived budget it now means, as
 `SHOW CONFIG` does. Kept: the seal under `index_storage = rebuild` (it buys
 the filter). Review B's probe that every answer is the same under a budget
-of one as unbounded is a test (`partition::budget_answers_tests`).
+of one as unbounded is a test (`partition::budget_answers_tests`). Tests (`partition::lazy_tests`):
+`a_close_window_reads_the_files_not_the_previous_close`,
+`add_column_during_a_close_window_is_refused_on_a_populated_table` (review
+B's scenario), `zero_kept_sizes_never_let_an_alter_through` (review A's,
+through a materializing open that failed), these three failing at
+`7ba631c9`; `a_catalog_read_overtaken_by_a_close_never_keeps_its_sizes`;
+`the_clock_never_drops_the_last_reference_to_a_table_under_its_ring` (a
+test-only pause after the CLOCK's upgrade while the table is dropped);
+`an_open_closes_a_few_and_the_board_rounds_trim_the_rest`;
+`a_closing_partition_stays_counted_until_its_descriptors_go`;
+`a_close_whose_caller_is_dropped_still_finishes_under_its_lock`;
+`under_rebuild_the_seal_at_close_buys_the_reopen_its_filter`;
+`an_open_refused_as_unmaterialized_evicts_nothing`; `partition::budget`'s
+`removing_an_entry_keeps_the_hand_on_the_next_one` and
+`the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit`.
+
+Round 1's mutations (a throwaway worktree, its own target directory):
+
+| Mutation | Caught by |
+|---|---|
+| kept sizes not cleared at the take nor when the partition opens | `a_close_window_reads_the_files_not_the_previous_close` |
+| both DDL checks (before the locks and under them) reading kept sizes, with the clearing undone | `add_column_during_a_close_window_is_refused_on_a_populated_table`, `zero_kept_sizes_never_let_an_alter_through` |
+| only the under-lock check reading kept sizes | survives: the check before the locks already reads the files and refuses |
+| `closed_sizes` keeping its read whatever happened meanwhile | `a_catalog_read_overtaken_by_a_close_never_keeps_its_sizes` |
+| the CLOCK dropping a passed-over instance under the ring's guard | `the_clock_never_drops_the_last_reference_to_a_table_under_its_ring` (the binary aborts: the deadlock blocks the runtime's timers, so a watchdog thread aborts it) |
+| `make_room` without the per-open cap | `an_open_closes_a_few_and_the_board_rounds_trim_the_rest` |
+| the close body run inline in its caller | `a_close_whose_caller_is_dropped_still_finishes_under_its_lock` |
+| the budget's token released at the take | `a_closing_partition_stays_counted_until_its_descriptors_go` |
+| ring removal by `swap_remove` | `removing_an_entry_keeps_the_hand_on_the_next_one` |
+| no descriptor raise | `the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit` |
+| `make_room` before the not-materialized refusal | `an_open_refused_as_unmaterialized_evicts_nothing` |
+| no seal at close under `index_storage = rebuild` | `under_rebuild_the_seal_at_close_buys_the_reopen_its_filter` |
 
 **C5 (legacy `CHAR`).** The open-time scan of legacy `CHAR` keys runs in
 `Database`'s plain-table open only; a partition opens through
