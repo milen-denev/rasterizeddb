@@ -7754,6 +7754,20 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                     crate::core::value_codec::quote_sql(&crate::core::value_codec::pg_float4_text(v))
                 ))
             }
+            // A double stays a double: as its bare digits it was a `numeric`
+            // constant, compared exactly with an integer or NUMERIC column,
+            // where PostgreSQL compares that column's nearest double
+            // (`n = 1234567890.123456789::float8` missed 1234567890.123456789).
+            crate::core::rql::expr::Value::Data { bytes, db_type: crate::core::db_type::DbType::F64 }
+                if bytes.len() == 8
+                    && f64::from_le_bytes(bytes.as_slice().try_into().expect("eight bytes")).is_finite() =>
+            {
+                let v = f64::from_le_bytes(bytes.as_slice().try_into().expect("eight bytes"));
+                wrap(format!(
+                    "{}::float8",
+                    crate::core::value_codec::quote_sql(&crate::core::value_codec::pg_float8_text(v))
+                ))
+            }
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 match crate::core::rql::subquery::value_to_literal(&db_type, &bytes) {
                     // A computed string is typed text (`CAST(… AS TEXT)`,

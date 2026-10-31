@@ -3609,13 +3609,258 @@ fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> 
             });
         }
     }
-    Ok(toks
+    Ok(exact_columns_against_floats(toks, schema)
         .into_iter()
         .map(|t| match t {
             Tok::Float { number, .. } => Tok::Word(number),
             other => other,
         })
         .collect())
+}
+
+/// An exact column's values as `m × 10^-scale` with `m` in `lo..=hi`, when
+/// `name` is an integer or NUMERIC column (a 128-bit integer is left alone).
+fn exact_column(name: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<(String, u32, i128, i128)> {
+    use crate::core::db_type::DbType;
+    let resolved = resolve_column(name, schema)?;
+    let field = schema.iter().find(|f| !f.is_deleted && f.name == resolved)?;
+    // A NUMERIC's thirty-eight digits; storage is an i128 of units.
+    let digits38 = 10i128.pow(38) - 1;
+    let (scale, lo, hi) = match field.db_type {
+        DbType::DECIMAL => (field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE), -digits38, digits38),
+        DbType::I8 => (0, i8::MIN as i128, i8::MAX as i128),
+        DbType::I16 => (0, i16::MIN as i128, i16::MAX as i128),
+        DbType::I32 => (0, i32::MIN as i128, i32::MAX as i128),
+        DbType::I64 => (0, i64::MIN as i128, i64::MAX as i128),
+        DbType::U8 => (0, 0, u8::MAX as i128),
+        DbType::U16 => (0, 0, u16::MAX as i128),
+        DbType::U32 => (0, 0, u32::MAX as i128),
+        DbType::U64 => (0, 0, u64::MAX as i128),
+        _ => return None,
+    };
+    Some((name.to_string(), scale, lo, hi))
+}
+
+/// The first `m` in `lo..=hi` where the monotone `holds` is true, searched
+/// outward from `guess` and then halved.
+fn first_holding(lo: i128, hi: i128, guess: i128, holds: impl Fn(i128) -> bool) -> Option<i128> {
+    let g = guess.clamp(lo, hi);
+    // `below` fails and `above` holds, below < above.
+    let (mut below, mut above);
+    let mut step: i128 = 1;
+    let mut at = g;
+    if holds(g) {
+        loop {
+            let next = at.saturating_sub(step).max(lo);
+            if next == at {
+                return Some(at);
+            }
+            if !holds(next) {
+                (below, above) = (next, at);
+                break;
+            }
+            at = next;
+            step = step.saturating_mul(2);
+        }
+    } else {
+        loop {
+            let next = at.saturating_add(step).min(hi);
+            if next == at {
+                return None;
+            }
+            if holds(next) {
+                (below, above) = (at, next);
+                break;
+            }
+            at = next;
+            step = step.saturating_mul(2);
+        }
+    }
+    while above.checked_sub(below).is_none_or(|d| d > 1) {
+        let mid = match above.checked_sub(below) {
+            Some(d) => below + d / 2,
+            None => below / 2 + above / 2,
+        };
+        if holds(mid) {
+            above = mid;
+        } else {
+            below = mid;
+        }
+    }
+    Some(above)
+}
+
+/// `column op float` over an exact column, as PostgreSQL decides it — the
+/// column's value converted to the nearest double — written as comparisons
+/// with exact values the scan and the condition evaluator read at the
+/// column's scale: the values that round to the float are one run of the
+/// column's values, `l..=h`. Written as the float's own digits, the column
+/// was compared exactly, and `n <> 1234567890.123456789::float8` admitted a
+/// NUMERIC(30,9) 1234567890.123456789 whose nearest double is that float.
+fn exact_against_float(column: &(String, u32, i128, i128), op: &str, number: &str) -> Option<Vec<Tok>> {
+    let (name, scale, lo, hi) = column;
+    let (scale, lo, hi) = (*scale, *lo, *hi);
+    let v: f64 = number.parse().ok()?;
+    let nearest = |m: i128| -> f64 {
+        crate::core::value_codec::format_decimal_scaled(m, scale).parse::<f64>().unwrap_or(f64::NAN)
+    };
+    let cmp = |m: i128| crate::core::processor::concurrent_processor::pg_float_cmp(nearest(m), v);
+    let guess = if v.is_nan() || v == f64::INFINITY {
+        hi
+    } else if v == f64::NEG_INFINITY {
+        lo
+    } else {
+        let fixed = format!("{:.*}", scale as usize, v).replace('.', "");
+        fixed.parse::<i128>().unwrap_or(if v < 0.0 { lo } else { hi })
+    };
+    // l: the first value at or above the float; h: the last at or below it.
+    let l = first_holding(lo, hi, guess, |m| cmp(m) != std::cmp::Ordering::Less);
+    let h = match first_holding(lo, hi, guess, |m| cmp(m) == std::cmp::Ordering::Greater) {
+        Some(m) if m == lo => None,
+        Some(m) => Some(m - 1),
+        None => Some(hi),
+    };
+    let lit = |m: i128| Tok::Word(crate::core::value_codec::format_decimal_scaled(m, scale));
+    let cmp_tok = |op: &str, m: i128| vec![Tok::Word(name.clone()), Tok::Sym(op.to_string()), lit(m)];
+    // Every value / none, each a comparison so NULL stays NULL.
+    let all = || cmp_tok("<=", hi);
+    let none = || cmp_tok(">", hi);
+    let below_l = || l.map_or_else(all, |l| cmp_tok("<", l));
+    let from_l = || l.map_or_else(none, |l| cmp_tok(">=", l));
+    let to_h = || h.map_or_else(none, |h| cmp_tok("<=", h));
+    let above_h = || h.map_or_else(all, |h| cmp_tok(">", h));
+    let joined = |a: Vec<Tok>, kw: &str, b: Vec<Tok>| {
+        let mut out = vec![Tok::LPar];
+        out.extend(a);
+        out.push(Tok::Word(kw.to_string()));
+        out.extend(b);
+        out.push(Tok::RPar);
+        out
+    };
+    let group = |inner: Vec<Tok>| {
+        let mut out = vec![Tok::LPar];
+        out.extend(inner);
+        out.push(Tok::RPar);
+        out
+    };
+    Some(match op {
+        "<" => group(below_l()),
+        ">=" => group(from_l()),
+        "<=" => group(to_h()),
+        ">" => group(above_h()),
+        "=" => match (l, h) {
+            (Some(_), Some(_)) => joined(from_l(), "AND", to_h()),
+            _ => group(none()),
+        },
+        "<>" | "!=" => match (l, h) {
+            (Some(_), Some(_)) => joined(below_l(), "OR", above_h()),
+            _ => group(all()),
+        },
+        _ => return None,
+    })
+}
+
+/// Every `column op float`, `float op column` and `column [NOT] IN (float,
+/// …)` over an exact column, rewritten by [`exact_against_float`]. Only a
+/// bare column and a bare float qualify: an arithmetic or cast neighbour
+/// makes either an operand of something else, left as it was.
+fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
+    let comparison = |t: Option<&Tok>| -> Option<String> {
+        match t {
+            Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(op.clone()),
+            _ => None,
+        }
+    };
+    // A neighbour that makes a column or a float an operand of more.
+    let binds = |t: Option<&Tok>| match t {
+        Some(Tok::Sym(op)) => !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="),
+        Some(Tok::Word(w)) => w.eq_ignore_ascii_case("between") || w.eq_ignore_ascii_case("collate"),
+        _ => false,
+    };
+    let column_at = |i: usize| -> Option<(String, u32, i128, i128)> {
+        match toks.get(i) {
+            Some(Tok::Word(w)) => exact_column(w, schema),
+            _ => None,
+        }
+    };
+    let float_at = |i: usize| -> Option<&str> {
+        match toks.get(i) {
+            Some(Tok::Float { number, .. }) => Some(number.as_str()),
+            _ => None,
+        }
+    };
+    let mirror = |op: &str| match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
+    }
+    .to_string();
+    let before = |i: usize| if i == 0 { None } else { toks.get(i - 1) };
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0usize;
+    while i < toks.len() {
+        // column op float
+        if let (Some(column), Some(op), Some(number)) = (column_at(i), comparison(toks.get(i + 1)), float_at(i + 2)) {
+            if !binds(before(i)) && !binds(toks.get(i + 3)) {
+                if let Some(lowered) = exact_against_float(&column, &op, number) {
+                    out.extend(lowered);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        // float op column
+        if let (Some(number), Some(op), Some(column)) = (float_at(i), comparison(toks.get(i + 1)), column_at(i + 2)) {
+            if !binds(before(i)) && !binds(toks.get(i + 3)) {
+                if let Some(lowered) = exact_against_float(&column, &mirror(&op), number) {
+                    out.extend(lowered);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        // column [NOT] IN (float, …)
+        if let Some(column) = column_at(i).filter(|_| !binds(before(i))) {
+            let negated = toks.get(i + 1).is_some_and(|t| t.is_keyword("not"));
+            let open = i + 1 + negated as usize + 1;
+            if toks.get(open - 1).is_some_and(|t| t.is_keyword("in")) && matches!(toks.get(open), Some(Tok::LPar)) {
+                let mut numbers = Vec::new();
+                let mut j = open + 1;
+                let mut closed = false;
+                while let Some(number) = float_at(j) {
+                    numbers.push(number);
+                    match toks.get(j + 1) {
+                        Some(Tok::Comma) => j += 2,
+                        Some(Tok::RPar) => {
+                            closed = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
+                let parts: Option<Vec<Vec<Tok>>> =
+                    numbers.iter().map(|n| exact_against_float(&column, op, n)).collect();
+                if let (true, Some(parts)) = (closed && !numbers.is_empty(), parts) {
+                    out.push(Tok::LPar);
+                    for (k, part) in parts.into_iter().enumerate() {
+                        if k > 0 {
+                            out.push(Tok::Word(kw.to_string()));
+                        }
+                        out.extend(part);
+                    }
+                    out.push(Tok::RPar);
+                    i = j + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    out
 }
 
 pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {

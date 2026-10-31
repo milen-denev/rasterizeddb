@@ -1419,17 +1419,29 @@ pub fn zoned_timestamp_literal(bytes: &[u8]) -> Option<String> {
 }
 
 pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
-    // A finite `real` as the double it is (`value_codec::widened_real_text`),
-    // which a `float8` column then reads as PostgreSQL widens it and a `real`
-    // column reads back as the same real: written as its own digits, `f8 IN
-    // (SELECT f4 …)` missed every widened value.
-    if *db_type == DbType::F32 {
-        if let Ok(b) = <[u8; 4]>::try_from(bytes) {
-            let v = f32::from_le_bytes(b);
-            if v.is_finite() {
-                return Some(value_codec::widened_real_text(v));
-            }
-        }
+    // A finite float as a typed `float8` constant, `'0.1'::float8`, a `real`
+    // widened to the double it is (`value_codec::widened_real_text`). The
+    // comparison it lands in is PostgreSQL's float one: a float column reads
+    // the number, and an integer or NUMERIC column is compared through its
+    // nearest double (`predicate_rewrite::exact_against_float`). Written as
+    // bare digits it was a NUMERIC constant: `n IN (SELECT f8 …)` compared a
+    // NUMERIC(30,9) 1234567890.123456789 exactly with 1234567890.1234567 and
+    // missed it, and `f8 IN (SELECT f4 …)` missed every widened value.
+    let float = match *db_type {
+        DbType::F32 => <[u8; 4]>::try_from(bytes)
+            .ok()
+            .map(f32::from_le_bytes)
+            .filter(|v| v.is_finite())
+            .map(value_codec::widened_real_text),
+        DbType::F64 => <[u8; 8]>::try_from(bytes)
+            .ok()
+            .map(f64::from_le_bytes)
+            .filter(|v| v.is_finite())
+            .map(value_codec::pg_float8_text),
+        _ => None,
+    };
+    if let Some(text) = float {
+        return Some(format!("{}::float8", value_codec::quote_sql(&text)));
     }
     let literal = value_to_literal(db_type, bytes)?;
     Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {

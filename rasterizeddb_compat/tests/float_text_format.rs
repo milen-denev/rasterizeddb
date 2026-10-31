@@ -408,3 +408,65 @@ async fn an_in_list_of_reals_reads_them_widened() {
     assert_eq!(ids(&c, "SELECT id FROM x WHERE f8 IN (SELECT r FROM rs) ORDER BY id").await, "1");
     assert_eq!(ids(&c, "SELECT id FROM x WHERE f4 IN (SELECT r FROM rs) ORDER BY id").await, "1,2");
 }
+
+/// A NUMERIC or an integer against a double is PostgreSQL's float8
+/// comparison: the exact value converted to its nearest double. Every
+/// operator, the scan, IN lists and the hash join agree on it. Values from
+/// PostgreSQL 17.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_number_against_a_double_is_its_nearest_double() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE c9 (id INT PRIMARY KEY, n NUMERIC(30,9), f8 FLOAT8)").await;
+    run(
+        &c,
+        "INSERT INTO c9 VALUES (1, 0.1, 0.1), (3, 1234567890.123456789, 1234567890.123456789), \
+         (5, 9007199254740.123456789, 9007199254740.123456789), (8, 99999999999999999999.999999999, 1e20)",
+    )
+    .await;
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT id, n = f8, n < f8, n > f8, CASE WHEN n = f8 THEN 'eq' WHEN n < f8 THEN 'lt' ELSE 'gt' END, \
+             GREATEST(n, f8) = f8, LEAST(n, f8) = n, NULLIF(n, f8) IS NULL FROM c9 ORDER BY id"
+        )
+        .await,
+        ["1|t|f|f|eq|t|t|t", "3|t|f|f|eq|t|t|t", "5|t|f|f|eq|t|t|t", "8|t|f|f|eq|t|t|t"]
+    );
+    assert_eq!(ids(&c, "SELECT id FROM c9 WHERE n IN (SELECT f8 FROM c9) ORDER BY id").await, "1,3,5,8");
+    assert_eq!(ids(&c, "SELECT id FROM c9 WHERE n NOT IN (SELECT f8 FROM c9 WHERE id < 5) ORDER BY id").await, "5,8");
+    assert_eq!(ids(&c, "SELECT id FROM c9 WHERE n = 1234567890.123456789::float8 ORDER BY id").await, "3");
+    assert_eq!(ids(&c, "SELECT id FROM c9 WHERE n < '1e20'::float8 ORDER BY id").await, "1,3,5");
+    assert_eq!(ids(&c, "SELECT id FROM c9 WHERE n >= '9007199254740.123456789'::float8 ORDER BY id").await, "5,8");
+    assert_eq!(
+        ids(&c, "SELECT id FROM c9 WHERE n IN ('1e20'::float8, '9007199254740.123456789'::float8) ORDER BY id").await,
+        "5,8"
+    );
+    // A NUMERIC with more digits than the double's shortest text.
+    assert_eq!(
+        rows(&c, "SELECT id, 0.10000000000000001 = f8, 0.10000000000000001 < f8 FROM c9 WHERE id = 1").await,
+        ["1|t|f"]
+    );
+    // The hash join and the projected comparison agree on every pair.
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT x.id, y.id, x.n = y.f8, CASE WHEN x.n = y.f8 THEN 'eq' ELSE 'ne' END \
+             FROM c9 x JOIN c9 y ON x.n = y.f8 ORDER BY 1, 2"
+        )
+        .await,
+        ["1|1|t|eq", "3|3|t|eq", "5|5|t|eq", "8|8|t|eq"]
+    );
+    run(&c, "CREATE TABLE ci (id INT PRIMARY KEY, i BIGINT, f8 FLOAT8)").await;
+    run(&c, "INSERT INTO ci VALUES (1, 9007199254740993, 9007199254740992), (2, 3, 2.5)").await;
+    assert_eq!(rows(&c, "SELECT id, i = f8, i > f8 FROM ci ORDER BY id").await, ["1|t|f", "2|f|t"]);
+    assert_eq!(ids(&c, "SELECT id FROM ci WHERE i = '9007199254740992'::float8 ORDER BY id").await, "1");
+    assert_eq!(ids(&c, "SELECT id FROM ci WHERE i > 2.5::float8 ORDER BY id").await, "1,2");
+    // A CHECK against a double: both NUMERICs whose nearest double it is.
+    run(&c, "CREATE TABLE ck9b (id INT PRIMARY KEY, n NUMERIC(30,9) CHECK (n <> 1234567890.123456789::float8))").await;
+    for sql in ["INSERT INTO ck9b VALUES (1, 1234567890.123456789)", "INSERT INTO ck9b VALUES (2, 1234567890.1234567)"] {
+        assert_eq!(sqlstate(&c, sql).await, "23514", "{sql}");
+    }
+    run(&c, "INSERT INTO ck9b VALUES (3, 1234567890.123457)").await;
+    assert_eq!(ids(&c, "SELECT id FROM ck9b ORDER BY id").await, "3");
+}
