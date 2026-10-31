@@ -7262,7 +7262,9 @@ fn returning_reads_joined_relation(
     let end = ["WHERE", "RETURNING"].iter().filter_map(|k| find_keyword(sql, k, start)).min().unwrap_or(sql.len());
     // Each relation of the list: its name and alias as qualifiers, and its
     // columns. A relation starts the list, follows a comma or follows JOIN.
-    let mut qualifiers: Vec<String> = Vec::new();
+    // Each qualifier (a relation's name and its alias) with its relation's
+    // columns, and every relation's columns together.
+    let mut qualifiers: Vec<(String, Vec<String>)> = Vec::new();
     let mut columns: Vec<String> = Vec::new();
     let spaced = sql[start..end].replace(',', " , ");
     let tokens: Vec<&str> = spaced.split_whitespace().collect();
@@ -7277,16 +7279,18 @@ fn returning_reads_joined_relation(
         let t = tokens[i];
         if expect_relation && !keyword_word(t) {
             let name = t.trim_matches('"');
-            qualifiers.push(name.to_ascii_lowercase());
-            if let Some(view) = database.schema_view(name) {
-                columns.extend(view.schema().fields.iter().map(|f| f.name.to_ascii_lowercase()));
-            }
+            let own: Vec<String> = database
+                .schema_view(name)
+                .map(|view| view.schema().fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.to_ascii_lowercase()).collect())
+                .unwrap_or_default();
+            columns.extend(own.iter().cloned());
+            qualifiers.push((name.to_ascii_lowercase(), own.clone()));
             let mut j = i + 1;
             if tokens.get(j).is_some_and(|w| w.eq_ignore_ascii_case("AS")) {
                 j += 1;
             }
             if let Some(alias) = tokens.get(j).filter(|w| !keyword_word(w)) {
-                qualifiers.push(alias.trim_matches('"').to_ascii_lowercase());
+                qualifiers.push((alias.trim_matches('"').to_ascii_lowercase(), own));
             }
             expect_relation = false;
         } else if t == "," || t.eq_ignore_ascii_case("JOIN") {
@@ -7314,7 +7318,8 @@ fn returning_reads_joined_relation(
         }
     }
     names.iter().any(|name| match name.split_once('.') {
-        Some((q, _)) => qualifiers.iter().any(|x| x == q),
+        // A column the named relation has: `s.nosuch` is still 42703.
+        Some((q, c)) => qualifiers.iter().any(|(x, cols)| x == q && cols.iter().any(|k| k == c)),
         None => columns.iter().any(|c| c == name) && !target.iter().any(|f| f.name.eq_ignore_ascii_case(name)),
     })
 }

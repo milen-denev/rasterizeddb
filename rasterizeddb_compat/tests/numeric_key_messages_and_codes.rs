@@ -67,11 +67,13 @@ async fn returning_over_the_from_list_is_unsupported_not_undefined() {
     ] {
         assert_eq!(refusal(&c, sql).await.0, "0A000", "{sql}");
     }
-    // A name no relation has is still an undefined column.
-    assert_eq!(
-        refusal(&c, "UPDATE u1 SET v = 5 FROM u2 WHERE u1.id = u2.id RETURNING nosuch").await.0,
-        "42703"
-    );
+    // A name no relation has is still an undefined column, qualified or not.
+    for sql in [
+        "UPDATE u1 SET v = 5 FROM u2 WHERE u1.id = u2.id RETURNING nosuch",
+        "UPDATE u1 SET v = 5 FROM u2 WHERE u1.id = u2.id RETURNING u2.nosuch",
+    ] {
+        assert_eq!(refusal(&c, sql).await.0, "42703", "{sql}");
+    }
     // The target's own columns are returned as before.
     let rows = c.simple_query("UPDATE u1 SET v = 5 FROM u2 WHERE u1.id = u2.id RETURNING v * 2").await.unwrap();
     assert_eq!(rows.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count(), 2);
@@ -92,7 +94,28 @@ async fn a_correlated_scalar_subquery_is_unsupported_not_a_syntax_error() {
     ] {
         assert_eq!(refusal(&c, sql).await.0, "0A000", "{sql}");
     }
-    // An uncorrelated one is still answered.
-    let rows = c.simple_query("SELECT id, (SELECT max(z) FROM u2) FROM u1 ORDER BY id").await.unwrap();
-    assert_eq!(rows.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count(), 2);
+    // An uncorrelated one is still answered, a schema-qualified name
+    // included (`pg_catalog.count`, `public.u2.z` were taken for outer
+    // references).
+    for sql in [
+        "SELECT id, (SELECT max(z) FROM u2) FROM u1 ORDER BY id",
+        "SELECT id, (SELECT pg_catalog.count(*) FROM u2) FROM u1 ORDER BY id",
+        "SELECT id, (SELECT max(public.u2.z) FROM public.u2) FROM u1 ORDER BY id",
+    ] {
+        let rows = c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(rows.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count(), 2, "{sql}");
+    }
+}
+
+/// A foreign key's message names the key as the column holds it, as
+/// PostgreSQL 17's does: a float written `2e20` is `2e+20`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_float_key_is_named_as_stored() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE pf (k FLOAT8 PRIMARY KEY)").await;
+    run(&c, "CREATE TABLE cf (id INT PRIMARY KEY, k FLOAT8 REFERENCES pf(k))").await;
+    let (code, message) = refusal(&c, "INSERT INTO cf VALUES (7, 2e20)").await;
+    assert_eq!(code, "23503");
+    assert!(message.contains("(k)=(2e+20)"), "{message}");
 }

@@ -1369,6 +1369,24 @@ async fn check_foreign_keys_of(
             ));
         }
 
+        // The key as the column holds it, as PostgreSQL's message shows it:
+        // a float written `2e20` is `2e+20`, a NUMERIC(10,2) `1.5` is 1.50.
+        let shown = schema
+            .and_then(|schema| {
+                let field = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))?;
+                if !matches!(
+                    field.db_type,
+                    crate::core::db_type::DbType::F32 | crate::core::db_type::DbType::F64 | crate::core::db_type::DbType::DECIMAL
+                ) {
+                    return None;
+                }
+                let block = crate::core::rql::lexer_ir::encode_column_value(literal.trim(), field, &schema.type_modifiers);
+                let _ = crate::core::rql::lexer_ir::take_refusal();
+                let bytes = block?.into_slice().to_vec();
+                crate::core::rql::subquery::stored_value_literal(field, &bytes)
+                    .map(|text| crate::core::value_codec::unquote_sql(&text).to_string())
+            })
+            .unwrap_or_else(|| key_display(literal));
         let violation = || {
             format!(
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\": \
@@ -1376,7 +1394,7 @@ async fn check_foreign_keys_of(
                 table_name,
                 fk.name,
                 fk.column,
-                key_display(literal),
+                shown,
                 fk.parent_table
             )
         };

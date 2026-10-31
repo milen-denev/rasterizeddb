@@ -347,9 +347,24 @@ pub fn is_correlated(inner_sql: &str) -> bool {
                 i += 1;
             }
             let word = &inner_sql[start..i];
-            if let Some(dot) = word.find('.') {
-                let qualifier = word[..dot].trim_matches('"');
-                if !qualifier.is_empty() && !own.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
+            // A schema name in front (`public.b.w`, `pg_catalog.count(*)`)
+            // is not a relation: the relation is the part after it, and a
+            // schema-qualified function has none.
+            let mut parts: Vec<&str> = word.split('.').map(|p| p.trim_matches('"')).collect();
+            if parts.len() > 1
+                && ["public", "pg_catalog", "information_schema"].iter().any(|s| parts[0].eq_ignore_ascii_case(s))
+            {
+                parts.remove(0);
+            }
+            if parts.len() > 1 {
+                let qualifier = parts[0];
+                // An own relation named with its schema (`FROM public.b`)
+                // is `b` too.
+                let named = |n: &String| {
+                    n.eq_ignore_ascii_case(qualifier)
+                        || n.rsplit('.').next().is_some_and(|last| last.trim_matches('"').eq_ignore_ascii_case(qualifier))
+                };
+                if !qualifier.is_empty() && !own.iter().any(named) {
                     return true;
                 }
             }
