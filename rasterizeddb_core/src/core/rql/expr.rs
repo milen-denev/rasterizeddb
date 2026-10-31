@@ -3427,7 +3427,7 @@ fn with_written_scale(literal: Expr, text: &str) -> Expr {
     let Some((_, e)) = decimal_digits(text) else { return literal };
     let written = u32::try_from(-(e.min(0) as i64)).unwrap_or(0);
     match display_scale(&literal) {
-        Some(own) if written > own && written <= crate::core::value_codec::DECIMAL_SCALE => Expr::NumericCast {
+        Some(own) if written > own && written <= crate::core::rql::pg_numeric::MAX_SCALE => Expr::NumericCast {
             value: Box::new(literal),
             precision: 0,
             scale: written,
@@ -5587,8 +5587,23 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             }
         }
         Expr::Concat(lhs, rhs) => {
-            let a = eval(lhs, row, schema)?;
-            let b = eval(rhs, row, schema)?;
+            // A NUMERIC operand is its text at its display scale, as `::text`
+            // gives it (`pg_numeric`): `'x' || (2.50 * 2)` is 'x5.00', and
+            // `'x' || a` over a NUMERIC(10,2) 2.50 'x2.50', where the
+            // engine-scale value's own text gave 'x5' and 'x2.5'.
+            let operand = |e: &Expr| -> Result<Value, String> {
+                if static_type(e) == DbType::DECIMAL {
+                    if let Some(v) = pg_numeric(e, row, schema)? {
+                        return Ok(match v {
+                            None => Value::Null,
+                            Some(v) => Value::Data { bytes: v.to_text().into_bytes(), db_type: DbType::STRING },
+                        });
+                    }
+                }
+                eval(e, row, schema)
+            };
+            let a = operand(lhs)?;
+            let b = operand(rhs)?;
             // Strict in NULL, as PostgreSQL is: a NULL operand makes the whole
             // expression NULL rather than silently vanishing from the result.
             if a.is_null() || b.is_null() {

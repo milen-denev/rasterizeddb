@@ -104,6 +104,14 @@ const SELECTS: &[(&str, &[&str])] = &[
         &["1|2.0251113811259619|3.086250", "2|3.3333333333333333|30.000000"],
     ),
     ("UPDATE t SET i = i WHERE id = 1 RETURNING a / 3, a * b, 2.50 * 2", &["0.83333333333333333333|3.086250|5.00"]),
+    // `||` renders a NUMERIC as `::text` does (it gave x5, x2.5, x0.833333333).
+    (
+        "SELECT id, 'x' || (2.50 * 2), 'x' || a, 'x' || (a / 3), a || 'y' FROM t WHERE id = 1",
+        &["1|x5.00|x2.50|x0.83333333333333333333|2.50y"],
+    ),
+    // A constant's written places past nine are kept: PostgreSQL 17 shows
+    // 2.500000000000 and 2.0000000000.
+    ("SELECT id, a * 1.0000000000, 1.0000000000 * 2 FROM t WHERE id = 1", &["1|2.500000000000|2.0000000000"]),
     // A condition compares the exact values: cut to nine places the product
     // was 0, and the quotient equal to its nine-place truncation; under a
     // function the older exact reading does not know (`abs`), too.
