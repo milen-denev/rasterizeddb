@@ -709,3 +709,35 @@ async fn character_columns_keep_their_length_and_their_equality() {
     let count = rows(&database, "SELECT count(*) FROM codes").await;
     assert_eq!(i64_of(&count[0], 0), 2, "every refused row stayed out");
 }
+
+/// A `numeric(5, -2)`, as a column and through a domain. Its type modifier's
+/// scale is eleven signed bits; read as unsigned, -2 was 2046 and the import
+/// refused the table, the domain one included, which imported before the
+/// domain's modifier was read. Values PostgreSQL 17 holds: 12300 and -500.
+#[tokio::test]
+async fn a_negative_numeric_scale_imports_its_values() {
+    const SCHEMA: &str = "rdb_import_negscale";
+    let params = skip_without_postgres!();
+    let mut connection = PgConnection::connect(&params).await.expect("connect");
+    connection
+        .simple_query(
+            &r#"
+DROP SCHEMA IF EXISTS rdb_import_test CASCADE;
+CREATE SCHEMA rdb_import_test;
+SET search_path TO rdb_import_test;
+CREATE DOMAIN rdb_import_test.hundreds AS numeric(5,-2);
+CREATE TABLE amounts (id integer PRIMARY KEY, a numeric(5,-2), d rdb_import_test.hundreds);
+INSERT INTO amounts VALUES (1, 12345, 12345), (2, -456, -456);
+"#
+            .replace(TEMPLATE_SCHEMA, SCHEMA),
+        )
+        .await
+        .expect("the fixture");
+    connection.close().await;
+    let (_dir, database, notes) = imported(&params, options(SCHEMA)).await;
+    let found = rows(&database, "SELECT id, a, d FROM amounts ORDER BY id").await;
+    let scale = 10i128.pow(rasterizeddb_core::core::value_codec::DECIMAL_SCALE);
+    let got: Vec<(i64, i128, i128)> = found.iter().map(|r| (i64_of(r, 0), decimal(r, 1), decimal(r, 2))).collect();
+    assert_eq!(got, vec![(1, 12300 * scale, 12300 * scale), (2, -500 * scale, -500 * scale)]);
+    assert!(notes.iter().any(|n| n.contains("negative scale")), "{notes:#?}");
+}

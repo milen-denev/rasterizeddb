@@ -261,6 +261,17 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
                     let precision = types::numeric_precision(column.type_modifier).unwrap_or(38);
                     mapping.declared = format!("NUMERIC({}, {})", precision, scale);
                     mapping.decimal_scale = Some(scale as u32);
+                } else if scale < 0 {
+                    // `numeric(5, -2)` rounds to hundreds, which no column
+                    // here declares. Its values are whole numbers, held
+                    // exactly by an unconstrained NUMERIC and checked one at
+                    // a time as they arrive, as before the declared scale
+                    // was read.
+                    notes.push(format!(
+                        "{}.{} is {}, whose negative scale this engine does not declare; it became \
+                         NUMERIC, which holds every value exactly but does not round new ones",
+                        table.name, column.name, column.formatted_type
+                    ));
                 } else {
                     match options.wide_numeric {
                         WideNumeric::Fail => {
@@ -925,6 +936,24 @@ mod tests {
         };
         let planned = plan(&schema, &options).unwrap();
         assert_eq!(planned.tables[0].columns[0].mapping.declared, "TEXT");
+    }
+
+    /// `numeric(5, -2)` (PostgreSQL 15 and later) is an unconstrained NUMERIC
+    /// here, with a note. Its scale, eleven signed bits in `atttypmod`, was
+    /// read as 2046 and the column refused as too many decimal places.
+    #[test]
+    fn a_negative_scale_is_an_unconstrained_numeric() {
+        let mut c = column("hundreds", "numeric", false);
+        c.type_modifier = 329730; // numeric(5, -2), as PostgreSQL 17 records it
+        c.formatted_type = "numeric(5,-2)".to_string();
+        let schema = SourceSchema {
+            tables: vec![table("t", vec![c])],
+            notes: Vec::new(),
+        };
+        let planned = plan(&schema, &ImportOptions::default()).expect("a negative scale is not refused");
+        let mapping = &planned.tables[0].columns[0].mapping;
+        assert_eq!((mapping.declared.as_str(), mapping.decimal_scale), ("NUMERIC", None));
+        assert!(planned.tables[0].notes.iter().any(|n| n.contains("negative scale")), "{:?}", planned.tables[0].notes);
     }
 
     #[test]

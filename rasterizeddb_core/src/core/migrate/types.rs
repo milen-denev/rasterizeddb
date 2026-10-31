@@ -603,8 +603,11 @@ pub fn numeric_scale(type_modifier: i32) -> Option<i32> {
     if type_modifier < 4 {
         return None;
     }
-    // `atttypmod` is `((precision << 16) | scale) + 4`.
-    Some((type_modifier - 4) & 0xffff)
+    // `atttypmod` is `((precision << 16) | (scale & 0x7ff)) + 4`: the scale
+    // is eleven bits, signed, since PostgreSQL 15 allows `numeric(5, -2)`
+    // (`numeric_typmod_scale`). Read as sixteen unsigned bits, -2 was 2046
+    // and the import refused the column as too many decimal places.
+    Some((((type_modifier - 4) & 0x7ff) ^ 1024) - 1024)
 }
 
 /// The declared length of a `character(n)` or `character varying(n)`:
@@ -848,6 +851,9 @@ mod tests {
         assert_eq!(numeric_precision(typmod), Some(10));
         assert_eq!(numeric_scale(typmod), Some(2));
         assert_eq!(numeric_scale(-1), None);
+        // numeric(5, -2) and numeric(3, 5), as PostgreSQL 17 records them.
+        assert_eq!((numeric_precision(329730), numeric_scale(329730)), (Some(5), Some(-2)));
+        assert_eq!(numeric_scale(((3 << 16) | 5) + 4), Some(5));
     }
 
     #[test]
