@@ -131,3 +131,25 @@ async fn a_float_scalar_subquery_is_described_as_a_float() {
     run(&c, "UPDATE t SET f = (SELECT max(f) FROM t) WHERE id = 1").await;
     assert_eq!(rows(&c, "SELECT id, f FROM t ORDER BY id").await, ["1|1e+20", "2|1e+20"]);
 }
+
+/// A `real` stored into a NUMERIC(p, s) is its six-digit text rounded to
+/// `s`, as PostgreSQL's `float4_numeric` reads it: 2.675 is 2.68. Rounded
+/// from its binary value (2.67499995…) it stored 2.67 — through INSERT …
+/// SELECT, a scalar subquery and a `::real` literal alike. PostgreSQL 17's
+/// values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_into_a_scaled_numeric_rounds_its_text() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rl (id INT PRIMARY KEY, r REAL, f FLOAT8)").await;
+    run(&c, "INSERT INTO rl VALUES (1, 2.675, 2.675), (2, 1.005, 1.005), (4, 1234.565, 1234.565), (6, 33.335, 33.335)").await;
+    run(&c, "CREATE TABLE rn (id INT PRIMARY KEY, n2 NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO rn SELECT id, r FROM rl").await;
+    run(&c, "INSERT INTO rn SELECT id + 30, f FROM rl").await;
+    run(&c, "INSERT INTO rn VALUES (61, 2.675::real), (62, '1.005'::real), (70, 0)").await;
+    run(&c, "UPDATE rn SET n2 = (SELECT r FROM rl WHERE id = 6) WHERE id = 70").await;
+    assert_eq!(
+        rows(&c, "SELECT id, n2 FROM rn ORDER BY id").await,
+        ["1|2.68", "2|1.01", "4|1234.56", "6|33.34", "31|2.68", "32|1.01", "34|1234.57", "36|33.34", "61|2.68", "62|1.01", "70|33.34"]
+    );
+}

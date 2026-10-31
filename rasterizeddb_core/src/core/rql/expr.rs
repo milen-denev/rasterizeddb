@@ -4579,17 +4579,20 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
     // when a nonzero digit lies past them — the same rule on every path in
     // (`pg_numeric_into`). A float is its fifteen-digit text (six for
     // `real`), as PostgreSQL's float-to-numeric cast reads it; it was rounded
-    // to nine places in silence: `SET u = f / 3` stored 0.033333333.
+    // to nine places in silence: `SET u = f / 3` stored 0.033333333. Into a
+    // NUMERIC(p, s) too: a `real` 2.675 is its six-digit text 2.675, and
+    // rounds to 2.68 as PostgreSQL's does; its binary value 2.67499995…
+    // rounded to 2.67.
     if field.db_type == DbType::DECIMAL {
         use crate::core::rql::pg_numeric::{self as pgn, PgNum};
         let read = match &value {
             Value::Data { bytes, db_type: DbType::DECIMAL } if bytes.len() == 17 => {
                 crate::core::value_codec::split_decimal_cell(bytes).and_then(|(m, own)| PgNum::new(m, own?))
             }
-            Value::Data { bytes, db_type: DbType::F64 } if field.scale.is_none() => {
+            Value::Data { bytes, db_type: DbType::F64 } => {
                 <[u8; 8]>::try_from(bytes.as_slice()).ok().map(f64::from_le_bytes).and_then(pgn::from_f64)
             }
-            Value::Data { bytes, db_type: DbType::F32 } if field.scale.is_none() => {
+            Value::Data { bytes, db_type: DbType::F32 } => {
                 <[u8; 4]>::try_from(bytes.as_slice()).ok().map(f32::from_le_bytes).and_then(pgn::from_f32)
             }
             _ => None,
