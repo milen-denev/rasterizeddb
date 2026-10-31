@@ -100,6 +100,9 @@ pub struct Table<S: StorageIO> {
     /// are table-level would otherwise run the check outside the lock — two
     /// concurrent inserts would each look, each find nothing, and each write.
     has_unique: bool,
+    /// The keys over a legacy `CHAR` column the open found holding two rows
+    /// of one value, each said as a sentence (`SHOW CHECKS` lists them).
+    pub(crate) legacy_char_duplicates: Vec<(String, String)>,
     pub hard_locked: CacheGuard<AtomicBool>,
     pub concurrent_processor: ConcurrentProcessor,
     /// Name this table answers to in the process-wide query cache.
@@ -960,6 +963,7 @@ impl<S: StorageIO> Table<S> {
             max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
             has_unique,
+            legacy_char_duplicates: Vec::new(),
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),
             cache_scope,
@@ -1675,6 +1679,7 @@ impl<S: StorageIO> Table<S> {
             max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below,
             has_unique,
+            legacy_char_duplicates: Vec::new(),
             in_place_column_updates: AtomicU64::new(0).into(),
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),

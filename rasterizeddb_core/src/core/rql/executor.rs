@@ -4346,38 +4346,73 @@ async fn retype_legacy_char(
     .await
 }
 
-/// Logs each UNIQUE or PRIMARY KEY of `table` over a legacy `CHAR` column
-/// that holds two rows of one value, as the table opens.
+/// What the open finds of `table`'s keys over legacy `CHAR` columns
+/// ([`scan_legacy_char_keys`]).
+#[derive(Debug, Default, Clone)]
+pub struct LegacyCharScan {
+    /// Each key holding two rows of one value: its description (`UNIQUE
+    /// (c)`, `PRIMARY KEY (c)`) and the sentence said of it.
+    pub duplicates: Vec<(String, String)>,
+    /// Every non-NULL cell of a legacy `CHAR` column under a key is in its
+    /// one stored form (`value_codec::legacy_char_canonical`), so its bytes
+    /// are its value (`Table::legacy_keys_canonical`).
+    pub canonical: bool,
+}
+
+/// Reads `table`'s keys over legacy `CHAR` columns, as the table opens.
 ///
 /// An older build stored one `character(1)` value as several cells (`'a'`
 /// and `'a '`, `''` and `' '`), so a key over such a column can hold rows
 /// that every read now takes for one value. Writes no longer add more (the
 /// uniqueness check compares the one stored form), and an ON CONFLICT that
-/// would update two of them is refused; the rows themselves are the
-/// operator's to resolve, and `ALTER … TYPE character(1)` refuses (23505)
-/// until they are. Nothing is changed here. Returns the warnings, for tests.
-pub async fn warn_legacy_char_duplicates<S: crate::core::storage_providers::traits::StorageIO>(
+/// would update two of them is refused; the rows are the operator's to
+/// resolve, and `ALTER … TYPE character(1)` refuses (23505) until they are.
+/// Each such key is logged as an error (the default log level shows it)
+/// and listed by `SHOW CHECKS`. Nothing is changed. The scan also says
+/// whether every key cell is already in its stored form, which lets the
+/// uniqueness check use the index and the filter again.
+pub async fn scan_legacy_char_keys<S: crate::core::storage_providers::traits::StorageIO>(
     table: &crate::core::row::table::Table<S>,
-) -> Vec<String> {
+) -> LegacyCharScan {
     use crate::core::db_type::DbType;
     let schema = &table.schema;
-    let char_field = |name: &str| {
-        schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+    let field_named = |name: &str| schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name));
+    let primary = |columns: &[&str]| {
+        schema.primary_key.as_deref().is_some_and(|p| {
+            let named: Vec<&str> = p.split(',').map(|c| c.trim().trim_matches('"')).collect();
+            named.len() == columns.len() && named.iter().zip(columns).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        })
+    };
+    let describe = |columns: &[&str]| {
+        format!("{} ({})", if primary(columns) { "PRIMARY KEY" } else { "UNIQUE" }, columns.join(", "))
     };
     let mut keys: Vec<(String, Vec<crate::core::row::schema::SchemaField>)> = schema
         .fields
         .iter()
         .filter(|f| !f.is_deleted && f.is_unique && f.db_type == DbType::CHAR)
-        .map(|f| (format!("UNIQUE ({})", f.name), vec![f.clone()]))
+        .map(|f| (describe(&[f.name.as_str()]), vec![f.clone()]))
         .collect();
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
-        let fields: Option<Vec<_>> = key.columns.iter().map(|c| char_field(c).cloned()).collect();
+        let fields: Option<Vec<_>> = key.columns.iter().map(|c| field_named(c).cloned()).collect();
         if let Some(fields) = fields.filter(|fs| fs.iter().any(|f| f.db_type == DbType::CHAR)) {
-            keys.push((key.describe(), fields));
+            let columns: Vec<&str> = key.columns.iter().map(String::as_str).collect();
+            // A composite PRIMARY KEY is the key named `<table>_pkey`.
+            let described = if key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&schema.name)) {
+                format!("PRIMARY KEY ({})", columns.join(", "))
+            } else {
+                describe(&columns)
+            };
+            keys.push((described, fields));
         }
     }
+    // A partial key's columns are compared under its predicate, and are
+    // walked whatever this says: only full keys are judged here, so a table
+    // with a partial key over a legacy column is not called canonical.
+    let partial = schema.unique_keys.iter().any(|k| {
+        !k.is_deleted && k.predicate.is_some() && k.columns.iter().any(|c| field_named(c).is_some_and(|f| f.db_type == DbType::CHAR))
+    });
     if keys.is_empty() {
-        return Vec::new();
+        return LegacyCharScan { duplicates: Vec::new(), canonical: !partial };
     }
     let mut fetch_fields: Vec<crate::core::row::schema::SchemaField> = Vec::new();
     for (_, fields) in &keys {
@@ -4395,11 +4430,11 @@ pub async fn warn_legacy_char_duplicates<S: crate::core::storage_providers::trai
     let rows = match table.query_row("", &schema.fields.to_vec(), empty, fetch, None, None).await {
         Ok(rows) => rows,
         Err(e) => {
-            warn!("could not check table \"{}\" for legacy CHAR duplicates: {}", schema.name, e);
-            return Vec::new();
+            error!("could not check table \"{}\" for legacy CHAR duplicates: {}", schema.name, e);
+            return LegacyCharScan::default();
         }
     };
-    let mut warnings = Vec::new();
+    let mut scan = LegacyCharScan { duplicates: Vec::new(), canonical: !partial };
     for (described, fields) in &keys {
         let mut seen: ahash::HashMap<Vec<u8>, usize> = ahash::HashMap::default();
         let mut shown: Vec<String> = Vec::new();
@@ -4421,7 +4456,11 @@ pub async fn warn_legacy_char_duplicates<S: crate::core::storage_providers::trai
                 }
                 let bytes = cell.data.into_slice();
                 if f.db_type == DbType::CHAR {
-                    key.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(bytes));
+                    let canonical = crate::core::value_codec::legacy_char_canonical(bytes);
+                    if canonical.as_slice() != bytes {
+                        scan.canonical = false;
+                    }
+                    key.extend_from_slice(&canonical);
                 } else {
                     key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                     key.extend_from_slice(bytes);
@@ -4454,11 +4493,11 @@ pub async fn warn_legacy_char_duplicates<S: crate::core::storage_providers::trai
                 shown.join("; "),
                 schema.name
             );
-            warn!("{}", message);
-            warnings.push(message);
+            error!("{}", message);
+            scan.duplicates.push((described.clone(), message));
         }
     }
-    warnings
+    scan
 }
 
 /// Refuses a change of `retyped`'s column to the type it now describes when

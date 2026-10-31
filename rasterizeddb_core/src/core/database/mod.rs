@@ -1661,6 +1661,15 @@ impl Database {
             }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
+            // A table with a legacy `CHAR` column: its keys are read once,
+            // before the instance is shared. A key holding two rows of one
+            // value is said (`executor::scan_legacy_char_keys`), and a table
+            // whose key cells are all in their stored form lets the
+            // uniqueness check use the index and the filter again.
+            if table.schema.fields.iter().any(|f| !f.is_deleted && f.db_type == DbType::CHAR) {
+                let scan = crate::core::rql::executor::scan_legacy_char_keys(&table).await;
+                table.legacy_char_duplicates = scan.duplicates;
+            }
             table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table), 0)));
         }
 
@@ -1726,16 +1735,6 @@ impl Database {
         drop(startup_forget_pause);
         // The plain tables went into the map before the database existed.
         database.rebuild_fk_reverse();
-        // A key over a legacy `CHAR` column holding two rows an older build
-        // stored apart that now read as one: said once, at open.
-        let legacy: Vec<Arc<Table<DbStorageProvider>>> = database
-            .tables_at_open()
-            .into_iter()
-            .filter(|table| table.schema.fields.iter().any(|f| !f.is_deleted && f.db_type == DbType::CHAR))
-            .collect();
-        for table in legacy {
-            crate::core::rql::executor::warn_legacy_char_duplicates(&*table).await;
-        }
         Ok(database)
     }
 

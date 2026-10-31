@@ -285,6 +285,17 @@ impl SchemaView {
         }
     }
 
+    /// The keys over a legacy `CHAR` column the open found holding two rows
+    /// of one value, each with its description and the sentence said of it
+    /// (`executor::scan_legacy_char_keys`); none for an instance a reload
+    /// made, or a partitioned table.
+    pub fn legacy_char_duplicates(&self) -> &[(String, String)] {
+        match &self.of {
+            ViewOf::Plain(table) => &table.legacy_char_duplicates,
+            ViewOf::Partitioned(_) => &[],
+        }
+    }
+
     /// The read-only stats accessor (Q3).
     pub fn stats(&self) -> SchemaStats<'_> {
         SchemaStats { of: &self.of }
@@ -502,13 +513,6 @@ impl Database {
     /// outside the crate, which have no lock owner. Never called by the
     /// engine (pinned by `slots_source_tests`).
     #[doc(hidden)]
-    /// Every plain table, for a check made as the database opens, before any
-    /// statement can hold or change one (no lock to take yet): the legacy
-    /// `CHAR` duplicate warning (`executor::warn_legacy_char_duplicates`).
-    pub(crate) fn tables_at_open(&self) -> Vec<Arc<DbTable>> {
-        self.table_slots.iter().map(|entry| entry.value().load()).collect()
-    }
-
     pub fn table_for_tests(&self, name: &str) -> Option<Arc<DbTable>> {
         self.resolve(name, |key| {
             self.table_slots.get(key).map(|slot| slot.load())

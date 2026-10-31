@@ -1698,6 +1698,17 @@ fn checks(database: &Arc<Database>) -> Vec<Row> {
                 Cell::Text(check.expression.clone()),
             ]));
         }
+        // A key over a legacy `CHAR` column holding two rows of one value, as
+        // the table's open found it (`executor::scan_legacy_char_keys`).
+        for (key, message) in table.legacy_char_duplicates() {
+            out.push(row(&[
+                Cell::Text(schema.name.clone()),
+                Cell::Text(key.clone()),
+                Cell::Text("duplicates".to_string()),
+                Cell::Text(message.clone()),
+                Cell::Text(String::new()),
+            ]));
+        }
     }
     out
 }

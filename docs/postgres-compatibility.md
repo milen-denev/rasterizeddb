@@ -272,11 +272,15 @@ shows, so a write never adds a row equal to one that is stored, an
 `ON CONFLICT` finds the row it conflicts with, and `CREATE UNIQUE INDEX` /
 `ADD CONSTRAINT UNIQUE` refuse (23505) over cells that read as one value.
 Rows an older build already stored apart under such a key (`'a'` and
-`'a '`) cannot be told apart now and are left as they are: the open logs a
-warning naming the table, the key and the values; an `ON CONFLICT … DO
-UPDATE` that would update two of them is refused (21000); resolve them by
-hand, and `ALTER … TYPE character(1)` (which refuses with 23505 while they
-remain) is the repair. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
+`'a '`) cannot be told apart now and are left as they are: the open logs an
+error naming the table, the key (`UNIQUE (c)`, `PRIMARY KEY (c)`) and the
+values, and `SHOW CHECKS` lists the key with the status `duplicates` (as
+found when the table was opened); an `ON CONFLICT … DO UPDATE` that would
+update two of them is refused (21000), and so is one statement proposing
+`'b'` and `'b '` (21000); resolve them by hand, and `ALTER … TYPE
+character(1)` (which refuses with 23505 while they remain) is the repair.
+The uniqueness check walks such a table rather than use the index and the
+filter. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
 TRUE`) read a cell as its value too.
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does

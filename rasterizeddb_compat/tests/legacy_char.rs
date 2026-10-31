@@ -665,6 +665,12 @@ async fn a_key_over_a_legacy_char_column_judges_the_value_each_cell_shows() {
                 inserts: vec![format!("INSERT INTO ldup VALUES (1, {}, 1), (2, {}, 2)", cell(Some("x")), cell(Some("x ")))],
             },
             LegacyTable {
+                name: "lpkd",
+                create: "CREATE TABLE lpkd (c UINT4 PRIMARY KEY, v INT)",
+                legacy: &["c"],
+                inserts: vec![format!("INSERT INTO lpkd VALUES ({}, 1), ({}, 2)", cell(Some("x")), cell(Some("x ")))],
+            },
+            LegacyTable {
                 name: "lfree",
                 create: "CREATE TABLE lfree (id INT, c UINT4)",
                 legacy: &["c"],
@@ -675,20 +681,21 @@ async fn a_key_over_a_legacy_char_column_judges_the_value_each_cell_shows() {
     .await;
     {
         let server = db.open().await;
-        // The open says which key holds such rows, and only that one.
-        let warned = |table: &str| {
-            let table = server.database().table_for_tests(table).expect("table");
-            async move { rasterizeddb_core::core::rql::executor::warn_legacy_char_duplicates(&*table).await }
-        };
-        let ldup = warned("ldup").await;
-        assert!(
-            ldup.len() == 1 && ldup[0].contains("\"ldup\"") && ldup[0].contains("UNIQUE (c)") && ldup[0].contains("character(1)"),
-            "{ldup:?}"
-        );
-        for clean in ["lun", "lpk", "lcomp", "lfree"] {
-            assert_eq!(warned(clean).await, Vec::<String>::new(), "{clean}");
-        }
         let c = client(&server).await;
+        // The open says which keys hold such rows, and only those, named as
+        // what they are; `SHOW CHECKS` lists them, without the log.
+        let listed: Vec<String> = rows(&c, "SHOW CHECKS")
+            .await
+            .expect("SHOW CHECKS")
+            .into_iter()
+            .filter(|r| r.contains("[duplicates]"))
+            .collect();
+        assert!(
+            listed.len() == 2
+                && listed.iter().any(|r| r.starts_with("[ldup]|[UNIQUE (c)]|[duplicates]|") && r.contains("character(1)"))
+                && listed.iter().any(|r| r.starts_with("[lpkd]|[PRIMARY KEY (c)]|[duplicates]|")),
+            "{listed:#?}"
+        );
         let wrong = check(
             &c,
             &[
@@ -807,6 +814,7 @@ async fn a_truth_test_over_a_legacy_comparison_reads_its_text() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
 /// A multi-row write into a key over a legacy column compares its own rows
 /// as the key does: `('b', …), ('b ', …)` are one key, so `ON CONFLICT DO
 /// UPDATE` refuses the statement (21000) rather than update the stored `'b'`
@@ -850,6 +858,7 @@ async fn a_multi_row_write_compares_its_own_legacy_keys() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+
 /// Every truth test, and NOT, over a legacy comparison wrapped in one to
 /// four pairs of redundant parentheses reads the cell's text, as with none:
 /// `((c = 'a')) IS TRUE` reached the scan's comparator and found 200 rows of
