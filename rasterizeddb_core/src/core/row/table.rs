@@ -3177,9 +3177,8 @@ impl<S: StorageIO> Table<S> {
                 let shown: Vec<String> = tuple
                     .iter()
                     .map(|(field, value)| {
-                        let rendered =
-                            crate::core::rql::subquery::value_to_literal(&field.db_type, value)
-                                .unwrap_or_else(|| format!("{:02x?}", value));
+                        let rendered = crate::core::rql::subquery::stored_value_literal(field, value)
+                            .unwrap_or_else(|| format!("{:02x?}", value));
                         format!("{} = {}", field.name, rendered)
                     })
                     .collect();

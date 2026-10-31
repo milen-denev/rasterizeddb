@@ -1196,6 +1196,20 @@ fn find_bare_equals(term: &str) -> Option<usize> {
     None
 }
 
+/// A value as stored in the column `field`, as the SQL literal for its type:
+/// a `NUMERIC(p, s)` at its declared scale, at which its bytes are held.
+/// [`value_to_literal`] reads a sixteen-byte `NUMERIC` at the engine's nine
+/// places, so a duplicate key's message showed a NUMERIC(8,3) 1.500 as
+/// 0.0000015.
+pub fn stored_value_literal(field: &crate::core::row::schema::SchemaField, bytes: &[u8]) -> Option<String> {
+    if field.db_type == DbType::DECIMAL {
+        if let (Some(scale), Ok(raw)) = (field.scale, <[u8; 16]>::try_from(bytes)) {
+            return Some(value_codec::format_decimal_scaled(i128::from_le_bytes(raw), scale));
+        }
+    }
+    value_to_literal(&field.db_type, bytes)
+}
+
 /// Renders one column value as the SQL literal for its type.
 pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
     fn le<const N: usize>(b: &[u8]) -> Option<[u8; N]> {

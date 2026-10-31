@@ -2408,17 +2408,9 @@ fn key_literal(
     field: &crate::core::row::schema::SchemaField,
     bytes: &[u8],
 ) -> Result<String, String> {
-    if field.db_type == crate::core::db_type::DbType::DECIMAL {
-        if let (Some(scale), Ok(raw)) = (field.scale, <[u8; 16]>::try_from(bytes)) {
-            return Ok(crate::core::value_codec::format_decimal_scaled(
-                i128::from_le_bytes(raw),
-                scale,
-            ));
-        }
-    }
     // Refused rather than skipped: a key that cannot be named cannot have its
     // referencing rows found, and skipping it would orphan them in silence.
-    crate::core::rql::subquery::value_to_literal(&field.db_type, bytes).ok_or_else(|| {
+    crate::core::rql::subquery::stored_value_literal(field, bytes).ok_or_else(|| {
         format!(
             "foreign keys on column \"{}\" of type {:?} cannot be maintained",
             field.name, field.db_type
@@ -12442,12 +12434,7 @@ async fn existing_rows_break_unique(
                     .columns
                     .iter()
                     .find(|c| u64::from(c.schema_id) == field.write_order)
-                    .and_then(|c| {
-                        crate::core::rql::subquery::value_to_literal(
-                            &field.db_type,
-                            c.data.into_slice(),
-                        )
-                    })
+                    .and_then(|c| crate::core::rql::subquery::stored_value_literal(field, c.data.into_slice()))
                     .unwrap_or_else(|| "?".to_string());
                 values.push(rendered);
             }
