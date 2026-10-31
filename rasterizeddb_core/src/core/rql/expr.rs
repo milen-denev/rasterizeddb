@@ -3942,6 +3942,26 @@ pub(crate) fn output_is_wide(expr: &Expr) -> bool {
     static_type(expr) == DbType::DECIMAL && (!matches!(expr, Expr::Column(_)) || reads_wide_decimal(expr, &[]))
 }
 
+/// Whether `expr` is integer-typed, as [`static_type`] would say, in one walk:
+/// [`pg_numeric`] asks it of every arithmetic node on every row, and
+/// `static_type` re-derives each operand's type several times over.
+fn integer_typed(expr: &Expr) -> bool {
+    let integer = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    };
+    match expr {
+        Expr::Literal { db_type, .. } => integer(db_type),
+        Expr::Column(field) => integer(&field.db_type),
+        Expr::Arith(l, _, r) | Expr::Mod(l, r) => integer_typed(l) && integer_typed(r),
+        Expr::Cast(_, t) => integer(t),
+        Expr::Null | Expr::NumericCast { .. } | Expr::Concat(..) | Expr::JsonPath { .. } | Expr::Scalar(_) => false,
+        _ => integer(&static_type(expr)),
+    }
+}
+
 /// A `NUMERIC` expression's value with the display scale PostgreSQL gives it
 /// ([`crate::core::rql::pg_numeric`]): a column's declared scale, a written
 /// constant's own places, an integer's none; the larger for `+ - %`, the sum
@@ -4000,8 +4020,10 @@ pub(crate) fn pg_numeric(
         },
         // Integer arithmetic is the engine's own, with PostgreSQL's integer
         // division: `(i / 2) * 1.5` halves `i` as an integer first.
-        Expr::Arith(..) | Expr::Mod(..) if integer(&static_type(expr)) => whole(eval(expr, row, schema)?),
-        Expr::Arith(l, op, r) if static_type(expr) == DbType::DECIMAL => {
+        Expr::Arith(..) | Expr::Mod(..) if integer_typed(expr) => whole(eval(expr, row, schema)?),
+        // Anything else over two numbers is NUMERIC; a side that is not one
+        // (a float, a date) is `None`, and so is the whole.
+        Expr::Arith(l, op, r) => {
             let (Some(a), Some(b)) = (pg_numeric(l, row, schema)?, pg_numeric(r, row, schema)?) else {
                 return Ok(None);
             };
@@ -4015,7 +4037,7 @@ pub(crate) fn pg_numeric(
             }
             .map(Some)
         }
-        Expr::Mod(l, r) if static_type(expr) == DbType::DECIMAL => {
+        Expr::Mod(l, r) => {
             let (Some(a), Some(b)) = (pg_numeric(l, row, schema)?, pg_numeric(r, row, schema)?) else {
                 return Ok(None);
             };

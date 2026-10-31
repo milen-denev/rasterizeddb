@@ -94,9 +94,11 @@ async fn avg_over_a_scaled_numeric_keeps_its_fraction() {
         for (sql, want) in [
             (format!("SELECT AVG(v) FROM {}", table), expected),
             (format!("SELECT g, AVG(v) FROM {} GROUP BY g", table), expected),
-            // Computed over the finished average: an expression evaluates at
-            // the engine's nine places, so `+ 1` reads the average cut there.
-            (format!("SELECT AVG(v) + 1 FROM {}", table), "2.666666666".parse().unwrap()),
+            // Computed over the finished average, with every place of it:
+            // PostgreSQL 17 answers 2.6666666666666667. (It read 2.666666666,
+            // the average cut to the engine's nine places, before
+            // `expr::pg_numeric`.)
+            (format!("SELECT AVG(v) + 1 FROM {}", table), "2.6666666666666667".parse().unwrap()),
             (format!("SELECT SUM(v) FROM {}", table), "5".parse().unwrap()),
         ] {
             for (protocol, row) in [
