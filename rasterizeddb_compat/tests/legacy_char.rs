@@ -850,3 +850,38 @@ async fn a_multi_row_write_compares_its_own_legacy_keys() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+/// Every truth test, and NOT, over a legacy comparison wrapped in one to
+/// four pairs of redundant parentheses reads the cell's text, as with none:
+/// `((c = 'a')) IS TRUE` reached the scan's comparator and found 200 rows of
+/// 400, and an UPDATE through it missed rows. PostgreSQL 17's answers.
+///
+/// Mutation: only one level of parentheses unwrapped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truth_test_reads_a_legacy_comparison_through_any_parentheses() {
+    let db = distinct_fixture("nesting").await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for depth in 1..=4 {
+        let wrap = |inner: &str| format!("{}{}{}", "(".repeat(depth), inner, ")".repeat(depth));
+        let eq = wrap("c = 'a'");
+        let lt = wrap("c < 'b'");
+        for (test, want) in [
+            (format!("{eq} IS TRUE"), "[1];[2]"),
+            (format!("{eq} IS NOT FALSE"), "[1];[2];[7]"),
+            (format!("{eq} IS FALSE"), "[3];[4];[5];[6]"),
+            (format!("{eq} IS NOT TRUE"), "[3];[4];[5];[6];[7]"),
+            (format!("{eq} IS UNKNOWN"), "[7]"),
+            (format!("NOT {eq}"), "[3];[4];[5];[6]"),
+            (format!("{lt} IS TRUE"), "[1];[2];[3];[4]"),
+            (format!("{lt} IS NOT FALSE"), "[1];[2];[3];[4];[7]"),
+        ] {
+            cases.push((format!("SELECT id FROM lc WHERE {test} ORDER BY id"), want.to_string()));
+        }
+        cases.push((format!("UPDATE lc SET after = {depth} WHERE {eq} IS TRUE"), String::new()));
+        cases.push((format!("SELECT id FROM lc WHERE after = {depth} ORDER BY id"), "[1];[2]".to_string()));
+    }
+    let cases: Vec<(&str, &str)> = cases.iter().map(|(s, w)| (s.as_str(), w.as_str())).collect();
+    let wrong = check(&c, &cases).await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

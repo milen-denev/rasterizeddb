@@ -3198,7 +3198,12 @@ fn lift_comparison(
         && reads_legacy_char(group, schema)
         && !needs_evaluator(left_text)
     {
-        let inner = &group[1..group.len() - 1];
+        // Redundant parentheses, at any depth: `((c = 'a')) IS TRUE` left the
+        // comparison whole as one level did.
+        let mut inner = group[1..group.len() - 1].trim();
+        while inner.starts_with('(') && matching_paren_at(inner, 0) == Some(inner.len() - 1) {
+            inner = inner[1..inner.len() - 1].trim();
+        }
         if comparison_operator(inner).is_some()
             || top_level_words(inner)
                 .iter()
