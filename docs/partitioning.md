@@ -10,7 +10,8 @@ high-water and map-log generations, [as built](#phase-3-p5a-as-built)) and
 P5b-1 (partitions opened on demand and closed only exclusively, pins kept
 across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
 budget, its sharded CLOCK, idle close and the seal at close,
-[as built](#phase-3-p5b-2a-as-built)). Phases 0 and 1 are
+[as built](#phase-3-p5b-2a-as-built)) and P5b-2b (scan-only fan-out opens,
+[as built](#phase-3-p5b-2b-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -447,6 +448,142 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 3 P5b-2b as built
+
+Built on `feat/p5b2b-scan-open` (from `7438572a`, 2026-11-01): **scan-only
+fan-out opens** (§7.1: "a fan-out open is scan-only"), and three smaller
+items left by P5b-2a.
+
+**What a scan-only open is.** A fan-out over several partitions, and a
+forget round's sweep, open a closed partition scan-only
+(`PartitionOpen::scan_only`, `Parts::open_slow` with `routed` false). The
+open is a full open in every respect but three, which wait: the **index
+load or build**, the **filter backfill** and the **load audit** are kept as
+the instance's deferred starts (`Table::deferred_starts`). The open's proof
+still runs, so the snapshot's **FILTER section loads** when it proves
+current and the scan prunes; otherwise the filter's whole prefix is a
+candidate and the scan is unpruned. Its indexes answer nothing: an index is
+used only once ready (the superset rule), and these are neither loaded nor
+built. The instance counts against the open budget like any other, enters
+the CLOCK unreferenced (P5b-2a's scan resistance) and opens and closes
+under its lifecycle lock (I14).
+
+**The upgrade** (`Table::ensure_full`) runs the deferred starts once, in
+place: no reopen, the same instance. It is called by the first **routed
+access** (`planned` or `materialized_in` reaching one partition,
+`partition_for_point`, `open_part`) and by **every write** before its
+ticket (`Table::enter_write`, the write watch every partition write path
+enters first; and `materialized`, which `UPDATE`, `DELETE`, DDL validation
+and `VACUUM` reach). Race-free: the starts run under the instance's lock
+and the flag clears only after them, so a caller that finds it clear, or
+waited on the lock, sees every start made; the index start raises a load's
+barrier before it returns, so a write's ticket waits for the load, which
+installs the snapshot's sections into indexes no write has touched (the
+load's own invariant). Scans racing an upgrade are unaffected: the indexes
+were not ready before and become ready only when built.
+
+**A deferred load that no longer holds.** The open proved the snapshot
+against the files as they were. A vacuum tick or a forget sweep can write
+the file set with no write path (they take tickets, not the write watch)
+before the upgrade; a compaction can renumber. At the upgrade, a `Load`
+plan whose word is no longer `Clean` or whose index epoch moved becomes a
+build from the rows as they are (`BuildInstead`).
+
+**Closing a scan-only instance writes nothing.** Its close does not seal,
+its unit takes no idle checkpoint (`ExternalUnit::scan_only`), and a
+shutdown's seals leave it out: each seal would first take a transient
+ticket, making `DIRTY` durable and spoiling the snapshot the next open
+loads, and then find the instance ineligible (its indexes not ready). For
+the same reason any close now seals only when the instance's indexes and
+filter are ready (`Table::ready_to_seal`): a partition evicted before its
+build or load finished no longer spoils its snapshot either. So an
+unrouted `SELECT` wider than the budget rewrites no O(P) checkpoints,
+starts no rebuilds it then discards, and feeds no map-log compaction
+(§7.1).
+
+**Readiness.** `pg_indexes`/`pg_index` report a scan-only partition's
+indexes not ready, as they are.
+
+**Review A round 2, N1.** A close that finds its instance referenced again
+as it drops it (logged, never reached) keeps the budget's token until the
+last reference goes, through a task that waits for it, so the budget
+counts the descriptors that instance still holds.
+
+**The budget's plain-table term** (§7.1). The derived budget is now
+`min(4096, (soft RLIMIT_NOFILE − 2048 − 25 × open plain tables) / 10)`, at
+least 16 (`budget::limit_for`): `Table` counts a file-backed table with no
+range guard as it opens and drops (a statement's memory-backed relation
+holds no descriptors and is not counted), and the limit is re-read at each
+open that may need room.
+
+**Durable `STATS`: not built, by measurement.** The first catalog read
+after a start reads each closed partition's sizes from its files once
+(P5b-2a's kept sizes then answer). Measured with
+`budget_resident_cost_catalog_reads_and_first_touch` at `P5B2_N=10000`
+one-row partitions (tmpfs, debug): `SHOW PARTITIONS` 81.5 ms for that
+first read against 18.1 ms for the next (the rest is the statement's own
+O(P) work), so the pass costs about 63 ms once per start, 6 µs per
+partition; at 1,024, 9 ms (P5b-2a's measurement). A cold inode cache on a
+disk makes the pass slower, but it is still one pass, once, on the first
+catalog read rather than on the start's path. Against it, a durable
+`STATS` record needs either a durable reopen marker (a fsync per reopen) or
+the same stats to tell a stale record from a fresh one (P5b-2a's
+decision), and its `(rows, bytes)` payload still could not carry `SHOW
+TABLES`' per-file breakdown. Revisit if a deployment's first catalog read
+after a start measures in seconds.
+
+**Measured** (`database::lazy_resident_tests::first_fan_out_cost_scan_only_against_full`,
+ignored, run by hand): 1,024 closed partitions of 1,000 rows each, an index
+on `v`, every one sealed by its close; the first `SELECT COUNT(*) … WHERE
+label = 'x'` (an unrouted read of every row), its opens full (as before,
+`scan_open_hooks`) against scan-only, three interleaved runs of each,
+medians; CPU is the process's from the statement until every full open's
+index load or build had finished. Debug build, the box at load 2 to 11.
+
+| | statement | CPU | RSS growth |
+|---|---|---|---|
+| tmpfs, `index_storage = rebuild`, full opens | 3,088 ms | 11,420 ms | +144 MiB |
+| tmpfs, rebuild, scan-only | 1,570 ms | 4,920 ms | +72 MiB |
+| tmpfs, `snapshot`, full opens | 2,438 ms | 9,290 ms | +130 MiB |
+| tmpfs, snapshot, scan-only | 1,392 ms | 4,400 ms | +72 MiB |
+| ext4, rebuild, full opens | 1,815 ms | 6,640 ms | +131 MiB |
+| ext4, rebuild, scan-only | 1,209 ms | 3,680 ms | +72 MiB |
+| ext4, snapshot, full opens | 1,279 ms | 4,900 ms | +130 MiB |
+| ext4, snapshot, scan-only | 1,232 ms | 3,720 ms | +72 MiB |
+
+The full opens' index builds (or loads) run beside the scan and finish
+with it at this size, so the statement itself pays them in CPU contention:
+scan-only takes about half the CPU and half the memory, and up to half the
+time. Neither writes anything at its close here (each partition's
+snapshot was current, so every full instance was vouched and its seal the
+no-op). The ext4 runs had a warm page cache (the snapshots were just
+written, and dropping the cache needs root), so their reads are memory
+reads too: the disk-bound part this measures is the absence of seals and
+of `.ixs` reads, which the warm cache understates. The tmpfs and ext4 rows
+ran minutes apart on a shared box and differ by its load as much as by
+the medium.
+
+**Tests** (`partition::lazy_tests`):
+`a_fan_out_opens_scan_only_and_its_close_writes_nothing` (no index load or
+build on a fan-out's open, and its close leaves the snapshot the next
+routed open loads),
+`a_routed_read_upgrades_a_scan_only_instance_in_place` (the same instance,
+loaded, answering as a scan, while a fan-out races it),
+`a_write_upgrades_a_scan_only_instance_before_its_ticket` (a row written
+straight through a fan-out's instance, which no routing upgrades, is in
+the loaded index),
+`an_upgrade_after_the_file_set_changed_builds_rather_than_loads`,
+`shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone`,
+`an_instance_kept_past_its_close_stays_counted` (N1), and
+`budget::tests::open_plain_tables_shrink_the_derived_budget`;
+`closed_partitions_are_never_reported_ready` and the catalog's
+`declared_indexes_are_listed_from_the_schema` now check that a fan-out's
+partitions report their indexes not ready, and upgrade them before
+waiting. The twin's budget configurations run every fan-out through
+scan-only opens and their upgrades.
+
+MUTATIONS_2B
 
 ## Phase 3 P5b-2a as built
 

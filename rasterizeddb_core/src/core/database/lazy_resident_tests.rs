@@ -511,7 +511,9 @@ async fn first_fan_out_cost_scan_only_against_full() {
             drop(db);
             crate::core::wal::remove_for(&root_s);
         }
-        for scan_only in [false, true] {
+        // Three runs of each, interleaved, against the box's drift; medians.
+        let mut results: Vec<(bool, f64, f64, f64, i64)> = Vec::new();
+        for scan_only in [false, true, false, true, false, true] {
             if scan_only {
                 crate::core::partition::table::scan_open_hooks::enable(&root);
             } else {
@@ -521,7 +523,7 @@ async fn first_fan_out_cost_scan_only_against_full() {
             db.partition_maintenance().set_period(Duration::from_secs(3600));
             let t = partitioned(&db, "acct");
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let (cpu0, rss0, (r0, w0)) = (cpu_time(), rss_kib(), io_bytes());
+            let (cpu0, rss0) = (cpu_time(), rss_kib());
             let at = Instant::now();
             exec(&db, "SELECT COUNT(*) FROM acct WHERE label = 'x'").await;
             let statement = at.elapsed();
@@ -531,28 +533,36 @@ async fn first_fan_out_cost_scan_only_against_full() {
                 }
             }
             let settled_at = at.elapsed();
-            let (cpu1, rss1, (r1, w1)) = (cpu_time(), rss_kib(), io_bytes());
+            let (cpu1, rss1) = (cpu_time(), rss_kib());
             let closing = Instant::now();
             t.close_idle().await.unwrap();
             let close = closing.elapsed();
-            let (_, w2) = io_bytes();
-            println!(
-                "FANOUT N={n} ROWS={rows} storage={} opens={}: statement {:.1} ms, settled at {:.1} ms; \
-                 CPU {:.0} ms, RSS +{} KiB, read {} KiB, written {} KiB; close of all {:.1} ms writing {} KiB",
-                storage.name(),
-                if scan_only { "scan-only" } else { "full" },
+            results.push((
+                scan_only,
                 statement.as_secs_f64() * 1e3,
                 settled_at.as_secs_f64() * 1e3,
-                (cpu1 - cpu0).as_secs_f64() * 1e3,
+                (cpu1 - cpu0).as_secs_f64() * 1e3 + close.as_secs_f64() * 0.0,
                 rss1 as i64 - rss0 as i64,
-                (r1 - r0) / 1024,
-                (w1 - w0) / 1024,
-                close.as_secs_f64() * 1e3,
-                (w2 - w1) / 1024,
-            );
+            ));
             drop(t);
             drop(db);
             crate::core::wal::remove_for(&root_s);
+        }
+        for scan_only in [false, true] {
+            let pick = |f: &dyn Fn(&(bool, f64, f64, f64, i64)) -> f64| {
+                let mut v: Vec<f64> = results.iter().filter(|r| r.0 == scan_only).map(f).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            println!(
+                "FANOUT N={n} ROWS={rows} storage={} opens={}: statement median {:.1} ms, settled median {:.1} ms; CPU median {:.0} ms; RSS median +{:.0} KiB",
+                storage.name(),
+                if scan_only { "scan-only" } else { "full" },
+                pick(&|r| r.1),
+                pick(&|r| r.2),
+                pick(&|r| r.3),
+                pick(&|r| r.4 as f64),
+            );
         }
         crate::core::partition::table::scan_open_hooks::enable(&root);
     }
