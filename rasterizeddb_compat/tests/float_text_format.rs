@@ -237,3 +237,20 @@ async fn a_typed_float_in_a_predicate_is_postgresqls() {
         assert_eq!(sqlstate(&c, &format!("SELECT id FROM e WHERE {predicate}")).await, "42883", "{predicate}");
     }
 }
+
+/// `UPDATE … SET u = f FROM …` reads a float into an unconstrained NUMERIC
+/// as every other path does, as its fifteen-digit text: its seventeen
+/// shortest digits, written back bare, stored 123456789012345678 as
+/// 123456789012345680 and refused 0.30000000000000004 and
+/// 1.0000000000000002. PostgreSQL 17 stores 123456789012346000, 0.3 and 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_writes_a_float_as_its_text() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fs (k INT PRIMARY KEY, f FLOAT8)").await;
+    run(&c, "INSERT INTO fs VALUES (1, 123456789012345678), (2, 0.30000000000000004), (3, 1.0000000000000002)").await;
+    run(&c, "CREATE TABLE d (id INT PRIMARY KEY, u NUMERIC)").await;
+    run(&c, "INSERT INTO d VALUES (1, 0), (2, 0), (3, 0)").await;
+    run(&c, "UPDATE d SET u = fs.f FROM fs WHERE fs.k = d.id").await;
+    assert_eq!(rows(&c, "SELECT id, u::text FROM d ORDER BY id").await, ["1|123456789012346000", "2|0.3", "3|1"]);
+}

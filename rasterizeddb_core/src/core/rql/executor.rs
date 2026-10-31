@@ -5971,7 +5971,16 @@ async fn update_from_join(
         let mut sets: Vec<String> = Vec::with_capacity(assignments.len());
         for ((column, _), source) in assignments.iter().zip(sources.iter()) {
             let literal = match source {
-                AssignedValue::Slot(at) => literal_at(*at)?,
+                // A float is written as the float it is, so the assignment
+                // reads it as every other path does (`expr::from_engine_scale`,
+                // `pg_numeric::from_f64`): bare, its seventeen shortest digits
+                // were a `numeric` constant, and an unconstrained column stored
+                // 123456789012345678.0 as 123456789012345680 (PostgreSQL
+                // 123456789012346000) and refused 0.30000000000000004.
+                AssignedValue::Slot(at) => match typed_float_literal(&row.columns[*at]) {
+                    Some(typed) => typed,
+                    None => literal_at(*at)?,
+                },
                 // Written into the generated statement as the expression it
                 // is, rather than evaluated here and written as a literal.
                 //
@@ -6425,6 +6434,20 @@ fn joined_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, 
     crate::core::rql::subquery::value_to_literal(&cell.column_type, bytes)
 }
 
+/// A float cell as a typed literal — `'1e+20'::float8`, `'0.25'::real` — so
+/// what reads it reads a float, not the `numeric` constant its bare digits
+/// are (as `insert_from_select` writes one). `None` for anything else.
+fn typed_float_literal(cell: &crate::core::row::row::Column) -> Option<String> {
+    use crate::core::db_type::DbType;
+    let bytes = cell.data.into_slice();
+    let (text, cast) = match cell.column_type {
+        DbType::F64 => (crate::core::value_codec::pg_float8_text(f64::from_le_bytes(bytes.try_into().ok()?)), "float8"),
+        DbType::F32 => (crate::core::value_codec::pg_float4_text(f32::from_le_bytes(bytes.try_into().ok()?)), "real"),
+        _ => return None,
+    };
+    Some(format!("{}::{cast}", crate::core::value_codec::quote_sql(&text)))
+}
+
 /// [`joined_literal`] for a value an assigned expression reads: a scaled
 /// decimal is typed at its scale, `CAST(-1.50 AS NUMERIC(38, 2))`, since the
 /// bare `-1.50` is a literal at the engine's scale and `s.d::text` on a
@@ -6434,6 +6457,9 @@ fn joined_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, 
 /// nine places a cast is refused, so those stay bare (and the expression
 /// reads them at nine places, as before).
 fn assigned_literal(cell: &crate::core::row::row::Column, scales: Option<&[u32]>, at: usize) -> Option<String> {
+    if let Some(typed) = typed_float_literal(cell) {
+        return Some(typed);
+    }
     let literal = joined_literal(cell, scales, at)?;
     let scale = scales.and_then(|s| s.get(at)).copied().unwrap_or(0);
     let typed = cell.column_type == crate::core::db_type::DbType::DECIMAL
