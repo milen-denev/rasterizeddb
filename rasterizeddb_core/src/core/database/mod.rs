@@ -1668,6 +1668,7 @@ impl Database {
             // uniqueness check use the index and the filter again.
             if table.schema.fields.iter().any(|f| !f.is_deleted && f.db_type == DbType::CHAR) {
                 let scan = crate::core::rql::executor::scan_legacy_char_keys(&table).await;
+                table.legacy_keys_canonical = scan.canonical;
                 table.legacy_char_duplicates = scan.duplicates;
             }
             table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table), 0)));

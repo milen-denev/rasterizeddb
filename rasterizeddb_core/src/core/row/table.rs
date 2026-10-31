@@ -100,6 +100,15 @@ pub struct Table<S: StorageIO> {
     /// are table-level would otherwise run the check outside the lock — two
     /// concurrent inserts would each look, each find nothing, and each write.
     has_unique: bool,
+    /// Every cell of a legacy `CHAR` column under a UNIQUE or PRIMARY KEY is
+    /// in its one stored form (`value_codec::legacy_char_canonical`), as the
+    /// open's scan found (`executor::scan_legacy_char_keys`). New writes store
+    /// only that form, so while this holds a key's stored bytes are its value
+    /// and the uniqueness check may find candidates through the index and the
+    /// filter; while it does not (an older build's `'a '` or `' '` cell, or a
+    /// table not scanned: any instance a reload makes), it walks the table.
+    /// Set once, before the instance is shared.
+    pub(crate) legacy_keys_canonical: bool,
     /// The keys over a legacy `CHAR` column the open found holding two rows
     /// of one value, each said as a sentence (`SHOW CHECKS` lists them).
     pub(crate) legacy_char_duplicates: Vec<(String, String)>,
@@ -963,6 +972,7 @@ impl<S: StorageIO> Table<S> {
             max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
             has_unique,
+            legacy_keys_canonical: false,
             legacy_char_duplicates: Vec::new(),
             hard_locked: AtomicBool::new(false).into(),
             concurrent_processor: ConcurrentProcessor::new(),
@@ -1679,6 +1689,7 @@ impl<S: StorageIO> Table<S> {
             max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below,
             has_unique,
+            legacy_keys_canonical: false,
             legacy_char_duplicates: Vec::new(),
             in_place_column_updates: AtomicU64::new(0).into(),
             hard_locked: AtomicBool::new(false).into(),
@@ -3215,7 +3226,7 @@ impl<S: StorageIO> Table<S> {
         // A legacy `CHAR` column in the tuple: matched by its one stored
         // form, which neither the index nor the filter keys (see
         // `find_row_with_value`), so the table is walked.
-        let by_bytes = tuple.iter().all(|(field, _)| field.db_type != DbType::CHAR);
+        let by_bytes = self.legacy_keys_canonical || tuple.iter().all(|(field, _)| field.db_type != DbType::CHAR);
         let from_index = match if by_bytes { self.index_probe(d, tuple).await } else { None } {
             Some((slots, n_slots)) => {
                 let slots: Vec<u64> = slots.into_iter().filter(|s| *s < n_slots).collect();
@@ -3672,7 +3683,7 @@ impl<S: StorageIO> Table<S> {
         // A legacy `CHAR` is compared by its one stored form, which an older
         // build's cells (`'a '`, `' '`) do not hold: neither the index nor the
         // filter, keyed by the stored bytes, can name the rows that match.
-        let by_bytes = field.db_type != DbType::CHAR;
+        let by_bytes = field.db_type != DbType::CHAR || self.legacy_keys_canonical;
 
         // An index over exactly this column names the slots outright: a
         // descent rather than a pass over a bitmap of the whole table, so an

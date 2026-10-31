@@ -279,8 +279,10 @@ found when the table was opened); an `ON CONFLICT … DO UPDATE` that would
 update two of them is refused (21000), and so is one statement proposing
 `'b'` and `'b '` (21000); resolve them by hand, and `ALTER … TYPE
 character(1)` (which refuses with 23505 while they remain) is the repair.
-The uniqueness check walks such a table rather than use the index and the
-filter. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
+The open also notes whether every key cell is already in its stored form;
+while one is not (or the table has been reloaded by DDL since it opened),
+the uniqueness check walks the table rather than use the index and the
+filter, so a load into such a key costs a pass per row. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
 TRUE`) read a cell as its value too.
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does
