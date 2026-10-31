@@ -1534,8 +1534,17 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 let name = &clause[name_start..i];
                 let single = ["float4", "real"].iter().any(|t| name.eq_ignore_ascii_case(t));
                 if single || ["float8", "double", "float"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
-                    if let Some(Tok::Str(quoted)) = out.last() {
-                        let text = crate::core::value_codec::unquote_sql(quoted).trim().to_string();
+                    // Quoted or not: `'0.1'::real` and `0.1::float4` are both
+                    // that real (a CHECK spelled the second way still read
+                    // the double 0.1).
+                    let spelled = match out.last() {
+                        Some(Tok::Str(quoted)) => {
+                            Some((crate::core::value_codec::unquote_sql(quoted).trim().to_string(), quoted.clone()))
+                        }
+                        Some(Tok::Word(word)) if is_numeric_literal_word(word) => Some((word.clone(), word.clone())),
+                        _ => None,
+                    };
+                    if let Some((text, quoted)) = spelled {
                         // The float the cast makes, written as its own
                         // shortest text, which the WHERE tokenizer reads back
                         // as that float: `.5` it could not read (42601), and
@@ -1544,7 +1553,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                         let number = if single {
                             crate::core::value_codec::parse_float4(&text)
                                 .filter(|v| v.is_finite())
-                                .map(|v| crate::core::value_codec::pg_float8_text(f64::from(v)))
+                                .map(crate::core::value_codec::widened_real_text)
                         } else {
                             crate::core::value_codec::parse_float8(&text)
                                 .filter(|v| v.is_finite())

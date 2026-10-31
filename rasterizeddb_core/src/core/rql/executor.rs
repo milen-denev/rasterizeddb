@@ -1220,7 +1220,7 @@ fn coerce_key_literal(
     use crate::core::db_type::DbType::{F32, F64};
     match (&from.db_type, &to.db_type, from_bytes.as_slice()) {
         (F32, F64, b) if b.len() == 4 => {
-            return Some(f64::from(f32::from_le_bytes(b.try_into().ok()?)).to_string());
+            return Some(crate::core::value_codec::widened_real_text(f32::from_le_bytes(b.try_into().ok()?)));
         }
         (F64, F32, b) if b.len() == 8 => {
             let wide = f64::from_le_bytes(b.try_into().ok()?);

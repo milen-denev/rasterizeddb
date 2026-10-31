@@ -335,3 +335,39 @@ async fn widened_reals_are_never_pruned() {
         assert_eq!(rows(&c, &format!("SELECT count(*) FROM fz WHERE {predicate}")).await, [pg], "{predicate}");
     }
 }
+
+/// A CHECK written with a `real` reads it as PostgreSQL does, the real
+/// widened, against the widened values the column now holds: `f8 <>
+/// '0.1'::real` refuses '0.1'::real whether it arrives by VALUES, INSERT …
+/// SELECT of a REAL column or UPDATE, `0.1::float4` too, and `g <
+/// '0.1'::real` refuses that real. They were admitted: the check compared the
+/// double 0.1, or compared a double with a NUMERIC exactly where PostgreSQL
+/// compares in `double precision`. PostgreSQL 17's 23514s and rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_with_a_real_reads_it_widened() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(
+        &c,
+        "CREATE TABLE ck (id INT PRIMARY KEY, f8 FLOAT8 CHECK (f8 <> '0.1'::real), g FLOAT8 CHECK (g < '0.1'::real), \
+         k FLOAT8 CHECK (k <> 0.1::float4), d FLOAT8 CHECK (d <> 0.1))",
+    )
+    .await;
+    run(&c, "CREATE TABLE rs (id INT PRIMARY KEY, r REAL)").await;
+    run(&c, "INSERT INTO rs VALUES (1, 0.1)").await;
+    run(&c, "INSERT INTO ck (id, f8) VALUES (3, 0.1)").await;
+    run(&c, "INSERT INTO ck (id, g) VALUES (4, 0.1)").await;
+    for sql in [
+        "INSERT INTO ck (id, f8) VALUES (1, '0.1'::real)",
+        "INSERT INTO ck (id, f8) SELECT 2, r FROM rs",
+        "UPDATE ck SET f8 = '0.1'::real WHERE id = 3",
+        "UPDATE ck SET f8 = (SELECT r FROM rs) WHERE id = 3",
+        "INSERT INTO ck (id, g) VALUES (5, '0.1'::real)",
+        "INSERT INTO ck (id, k) VALUES (6, '0.1'::real)",
+        // A plain NUMERIC literal against a double, compared as a double.
+        "INSERT INTO ck (id, d) VALUES (7, 0.1)",
+    ] {
+        assert_eq!(sqlstate(&c, sql).await, "23514", "{sql}");
+    }
+    assert_eq!(rows(&c, "SELECT id, f8, g FROM ck ORDER BY id").await, ["3|0.1|", "4||0.1"]);
+}

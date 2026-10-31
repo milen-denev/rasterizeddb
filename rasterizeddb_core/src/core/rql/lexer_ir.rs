@@ -1183,7 +1183,7 @@ pub(crate) fn encode_column_value(
                 if schema_field.db_type == DbType::F64 =>
             {
                 match <[u8; 4]>::try_from(bytes.as_slice()) {
-                    Ok(b) => crate::core::value_codec::pg_float8_text(f64::from(f32::from_le_bytes(b))),
+                    Ok(b) => crate::core::value_codec::widened_real_text(f32::from_le_bytes(b)),
                     Err(_) => "NULL".to_string(),
                 }
             }

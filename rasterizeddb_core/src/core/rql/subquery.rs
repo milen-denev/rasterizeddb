@@ -1419,6 +1419,18 @@ pub fn zoned_timestamp_literal(bytes: &[u8]) -> Option<String> {
 }
 
 pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
+    // A finite `real` as the double it is (`value_codec::widened_real_text`),
+    // which a `float8` column then reads as PostgreSQL widens it and a `real`
+    // column reads back as the same real: written as its own digits, `f8 IN
+    // (SELECT f4 …)` missed every widened value.
+    if *db_type == DbType::F32 {
+        if let Ok(b) = <[u8; 4]>::try_from(bytes) {
+            let v = f32::from_le_bytes(b);
+            if v.is_finite() {
+                return Some(value_codec::widened_real_text(v));
+            }
+        }
+    }
     let literal = value_to_literal(db_type, bytes)?;
     Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {
         format!("({literal} || '')")

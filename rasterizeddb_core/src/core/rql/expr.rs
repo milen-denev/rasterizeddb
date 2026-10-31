@@ -5386,6 +5386,30 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             }
         }
     }
+    // A NUMERIC against a float is compared as PostgreSQL compares it, in
+    // `double precision`: the NUMERIC is cast to the double nearest it (there
+    // is no exact `float8 = numeric`), a `real` widened. Compared exactly,
+    // `f8 = 0.1` was false for the double 0.1, and a CHECK whose `'0.1'::real`
+    // the predicate rewrite writes as 0.10000000149011612 admitted that real.
+    if let Value::Data { db_type: bt, .. } = b {
+        let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+        if (float(at) && *bt == DbType::DECIMAL) || (*at == DbType::DECIMAL && float(bt)) {
+            let as_double = |t: &DbType, bytes: &[u8]| -> Option<f64> {
+                match t {
+                    DbType::F64 => Some(f64::from_le_bytes(bytes.try_into().ok()?)),
+                    DbType::F32 => Some(f64::from(f32::from_le_bytes(bytes.try_into().ok()?))),
+                    _ => {
+                        let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
+                        let scale = own.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+                        crate::core::value_codec::format_decimal_scaled(m, scale).parse::<f64>().ok()
+                    }
+                }
+            };
+            if let (Some(x), Some(y)) = (as_double(at, ab), as_double(bt, bb)) {
+                return Some(crate::core::processor::concurrent_processor::pg_float_cmp(x, y));
+            }
+        }
+    }
     // Two numeric types: widened to a common one rather than reading `b`'s
     // bytes as `a`'s type, which made `compare(a, b)` and `compare(b, a)`
     // disagree for mixed widths (`COALESCE(bigint, int)`, `LEAST`, `CASE`) —

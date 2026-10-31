@@ -340,7 +340,7 @@ fn evaluate_in(
     // widened (`real_cast_literal`).
     if *db_type == DbType::F64 {
         if let Some(v) = real_cast_literal(expression) {
-            return Ok(crate::core::value_codec::pg_float8_text(f64::from(v)));
+            return Ok(crate::core::value_codec::widened_real_text(v));
         }
     }
     let text = strip_redundant_cast(expression.trim());

@@ -699,6 +699,15 @@ pub fn pg_float8_text_into(v: f64, out: &mut Vec<u8>) {
     pg_float_text_into(buf.format_finite(v).as_bytes(), 15, out);
 }
 
+/// A `real` read as `double precision` — `float4_float8`, exact — as the
+/// double's own shortest text: `'0.1'::real` is 0.10000000149011612. The one
+/// source for every place a `real` meets a double through text (a predicate
+/// literal, a value written into a `float8` column, a `DEFAULT`, an `IN`
+/// list), so they all read the same number.
+pub fn widened_real_text(v: f32) -> String {
+    pg_float8_text(f64::from(v))
+}
+
 /// A `real` value's text, as `float4out` writes it: [`pg_float8_text`]'s
 /// rule with the float's own shortest digits, and fixed notation for
 /// exponents from -4 to 5 — `3.4e+38`, `100000`, `1e+06`.
