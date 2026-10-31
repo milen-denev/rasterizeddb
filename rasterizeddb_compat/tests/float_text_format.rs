@@ -254,3 +254,84 @@ async fn update_from_writes_a_float_as_its_text() {
     run(&c, "UPDATE d SET u = fs.f FROM fs WHERE fs.k = d.id").await;
     assert_eq!(rows(&c, "SELECT id, u::text FROM d ORDER BY id").await, ["1|123456789012346000", "2|0.3", "3|1"]);
 }
+
+/// A `real` stored into a `double precision` column is that real, widened
+/// exactly (0.1::real is 0.10000000149011612), as PostgreSQL 17 stores it —
+/// through every path in: a typed literal (`::real`, `::float4`, `CAST(… AS
+/// real)`), INSERT … SELECT, UPDATE SET (a literal, a REAL column, a REAL
+/// subquery), UPDATE … FROM, ON CONFLICT … DO UPDATE (`excluded.f4`), a
+/// DEFAULT and a generated column, and `::float8` in a select list. Each
+/// stored the double nearest the real's digits (0.1), so `f8 = (SELECT f4 …)`
+/// found none of the rows PostgreSQL finds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_into_double_precision_is_widened() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    for sql in [
+        "CREATE TABLE src (id INT PRIMARY KEY, r REAL)",
+        "INSERT INTO src VALUES (1, 0.1)",
+        "CREATE TABLE x (id INT PRIMARY KEY, f8 FLOAT8 DEFAULT '0.1'::real, f4 REAL, g FLOAT8 GENERATED ALWAYS AS (f4) STORED)",
+        "INSERT INTO x (id, f8, f4) VALUES (1, '0.1'::real, '0.1'::real)",
+        "INSERT INTO x (id, f8, f4) VALUES (2, '0.1'::float4, 0.1)",
+        "INSERT INTO x (id, f8, f4) VALUES (3, CAST('0.1' AS real), 0.1)",
+        "INSERT INTO x (id, f8, f4) SELECT 4, r, r FROM src WHERE id = 1",
+        "INSERT INTO x (id, f4) VALUES (5, 0.1)",
+        "INSERT INTO x (id, f8, f4) VALUES (6, 0, 0.1), (7, 0, 0.1), (8, 0, 0.1), (9, 0, 0.1)",
+        "UPDATE x SET f8 = '0.1'::real WHERE id = 6",
+        "UPDATE x SET f8 = src.r FROM src WHERE src.id = 1 AND x.id = 7",
+        "UPDATE x SET f8 = (SELECT r FROM src WHERE id = 1) WHERE id = 8",
+        "UPDATE x SET f8 = f4 WHERE id = 9",
+        "INSERT INTO x (id, f8, f4) VALUES (9, 0, 0.1) ON CONFLICT (id) DO UPDATE SET f8 = excluded.f4",
+    ] {
+        run(&c, sql).await;
+    }
+    let widened: Vec<String> = (1..=9).map(|id| format!("{id}|0.10000000149011612|0.1|0.10000000149011612")).collect();
+    assert_eq!(rows(&c, "SELECT id, f8, f4, g FROM x ORDER BY id").await, widened);
+    assert_eq!(ids(&c, "SELECT id FROM x WHERE f8 = (SELECT r FROM src WHERE id = 1) ORDER BY id").await, "1,2,3,4,5,6,7,8,9");
+    // A REAL column itself is unchanged.
+    assert_eq!(ids(&c, "SELECT id FROM x WHERE f4 = '0.1'::real ORDER BY id").await, "1,2,3,4,5,6,7,8,9");
+    assert_eq!(
+        rows(&c, "SELECT r::float8, CAST(r AS float8) FROM src").await,
+        ["0.10000000149011612|0.10000000149011612"]
+    );
+
+    // q02's statement end to end: two rows written through a real, one not.
+    run(&c, "CREATE TABLE q (id INT PRIMARY KEY, f8 FLOAT8, f4 REAL)").await;
+    run(&c, "INSERT INTO q VALUES (1, 0.1, 0.1)").await;
+    run(&c, "INSERT INTO q VALUES (2, '0.1'::real, '0.1'::real)").await;
+    run(&c, "INSERT INTO q VALUES (3, 0.1, 0.1)").await;
+    run(&c, "UPDATE q SET f8 = '0.1'::real WHERE id = 1").await;
+    assert_eq!(ids(&c, "SELECT id FROM q WHERE f8 = (SELECT f4 FROM q WHERE id = 3) ORDER BY id").await, "1,2");
+    assert_eq!(ids(&c, "SELECT id FROM q WHERE f8 = 0.1 ORDER BY id").await, "3");
+    // A real into a NUMERIC(p, s) is still its six-digit text, rounded.
+    run(&c, "CREATE TABLE n (id INT PRIMARY KEY, a NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO n SELECT 1, f4 FROM q WHERE id = 1").await;
+    assert_eq!(rows(&c, "SELECT a FROM n").await, ["0.10"]);
+}
+
+/// Widened reals in a `double precision` column, over a table big enough for
+/// the filter index and zone maps: no bound prunes a row it matches.
+/// PostgreSQL 17's counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn widened_reals_are_never_pruned() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fz (id INT PRIMARY KEY, f8 FLOAT8)").await;
+    for chunk in 0..10 {
+        let values: Vec<String> = (1..=500)
+            .map(|k| chunk * 500 + k)
+            .map(|g| if g % 2 == 0 { format!("({g}, '0.1'::real)") } else { format!("({g}, {g})") })
+            .collect();
+        run(&c, &format!("INSERT INTO fz VALUES {}", values.join(","))).await;
+    }
+    run(&c, "CREATE TABLE s (k INT PRIMARY KEY, r REAL)").await;
+    run(&c, "INSERT INTO s VALUES (1, 0.1)").await;
+    for (predicate, pg) in [
+        ("f8 = (SELECT r FROM s)", "2500"),
+        ("f8 >= '0.1'::real AND f8 < 0.2", "2500"),
+        ("f8 > 0.1", "5000"),
+        ("f8 < '0.1'::real", "0"),
+    ] {
+        assert_eq!(rows(&c, &format!("SELECT count(*) FROM fz WHERE {predicate}")).await, [pg], "{predicate}");
+    }
+}

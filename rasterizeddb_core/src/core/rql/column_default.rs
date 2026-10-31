@@ -206,6 +206,26 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     }
 }
 
+/// The `real` a literal under a `real` cast spells (`'0.1'::real`,
+/// `0.1::float4`), when it is one: bound for a `double precision` column it
+/// is that `real` widened (0.10000000149011612), as PostgreSQL stores it,
+/// not the double the bare digits name — which the column would otherwise
+/// read once [`strip_redundant_cast`] dropped the cast. Read by a `DEFAULT`;
+/// a literal in `VALUES` with a cast is evaluated, its real widened where it
+/// is written (`lexer_ir`).
+pub fn real_cast_literal(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let head = strip_redundant_cast(text);
+    if head.len() == text.len() {
+        return None;
+    }
+    let cast = text[head.len()..].trim_start().trim_start_matches("::").trim();
+    if !(cast.eq_ignore_ascii_case("real") || cast.eq_ignore_ascii_case("float4")) {
+        return None;
+    }
+    crate::core::value_codec::parse_float4(head.trim().trim_matches('\''))
+}
+
 /// The quoted literal of `text 'x'`, `varchar 'x'`, `char 'x'` (and
 /// `character`, `bpchar`, `character varying`): the typed-literal spelling of
 /// `'x'::text`, whose type the column says too. Taken as anything else, the
@@ -316,6 +336,13 @@ fn evaluate_in(
     db_type: &DbType,
     database: Option<u64>,
 ) -> Result<String, String> {
+    // `DEFAULT '0.1'::real` on a `double precision` column is that real,
+    // widened (`real_cast_literal`).
+    if *db_type == DbType::F64 {
+        if let Some(v) = real_cast_literal(expression) {
+            return Ok(crate::core::value_codec::pg_float8_text(f64::from(v)));
+        }
+    }
     let text = strip_redundant_cast(expression.trim());
     let upper = text.to_ascii_uppercase();
 

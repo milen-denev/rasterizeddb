@@ -233,6 +233,16 @@ pub fn as_stored(literal: &str, field: &crate::core::row::schema::SchemaField) -
         }
         return literal.to_string();
     }
+    // A `real` is read by the expression as the `real` it is, so `g FLOAT8
+    // GENERATED ALWAYS AS (f4)` widens it (0.10000000149011612) as
+    // PostgreSQL does; as its bare digits it was the double nearest them.
+    if field.db_type == DbType::F32 && !text.eq_ignore_ascii_case("NULL") {
+        let bare = crate::core::rql::column_default::strip_redundant_cast(text);
+        let unquoted = bare.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).unwrap_or(bare);
+        if let Some(v) = crate::core::value_codec::parse_float4(unquoted) {
+            return format!("{}::real", crate::core::value_codec::quote_sql(&crate::core::value_codec::pg_float4_text(v)));
+        }
+    }
     if !numeric || text.eq_ignore_ascii_case("NULL") {
         return literal.to_string();
     }

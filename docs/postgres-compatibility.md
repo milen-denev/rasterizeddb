@@ -689,6 +689,19 @@ fifteen digits (six for `real`) or below 10^-4 — `1e+20`, `1e-07`, `3.4e+38`
 — and `NaN`, `Infinity`, `-Infinity`, `-0`. The wire, `::text`, `||`, a text
 column a float is stored in and `INSERT … SELECT` all agree.
 
+A `real` stored into a `double precision` column is that real widened
+exactly, as PostgreSQL stores it: `'0.1'::real` is 0.10000000149011612 in a
+`float8` column, through every path in (a typed literal, `INSERT … SELECT`,
+`UPDATE`, `UPDATE … FROM`, `ON CONFLICT … DO UPDATE`, a `DEFAULT`, a
+generated column) and in `real::float8`. A `real` into a `NUMERIC` is its
+six-digit text, rounded to the column's scale, as PostgreSQL's cast reads it.
+
+Release note: older binaries stored such a value as the double nearest the
+real's digits (0.1). Those rows are not rewritten — there is no migration — so
+a `float8` column written through a `real` before and after the upgrade can
+hold both forms, and `f8 = (SELECT f4 …)` finds only the rows written since
+(or rewritten: `UPDATE t SET f8 = f8::real`).
+
 Release note: a `STORED` generated column computed from a float's text
 (`GENERATED ALWAYS AS (f::text) STORED`) keeps the text an older binary
 wrote for rows it wrote (`100000000000000000000`); rows written or updated

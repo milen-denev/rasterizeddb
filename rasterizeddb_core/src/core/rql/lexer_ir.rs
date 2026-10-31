@@ -1176,6 +1176,17 @@ pub(crate) fn encode_column_value(
                     Err(_) => "NULL".to_string(),
                 }
             }
+            // A `real` (`CAST('0.1' AS real)`) bound for a `double
+            // precision` column: the real widened, written as the double it
+            // then is, which the column reads back exactly.
+            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::F32 }
+                if schema_field.db_type == DbType::F64 =>
+            {
+                match <[u8; 4]>::try_from(bytes.as_slice()) {
+                    Ok(b) => crate::core::value_codec::pg_float8_text(f64::from(f32::from_le_bytes(b))),
+                    Err(_) => "NULL".to_string(),
+                }
+            }
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
                     .unwrap_or_else(|| "NULL".to_string())

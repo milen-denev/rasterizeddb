@@ -6360,6 +6360,17 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         return to_integer_column(Value::Data { bytes, db_type }, target);
     }
 
+    // A `real` to `double precision` is the same number, widened exactly, as
+    // PostgreSQL's `float4_float8`: `0.1::real::float8` is
+    // 0.10000000149011612. Through its text (below) it became the double
+    // nearest 0.1, another number, so a REAL stored into a FLOAT8 column did
+    // not equal that REAL compared against it.
+    if db_type == DbType::F32 && *target == DbType::F64 {
+        if let Ok(b) = <[u8; 4]>::try_from(bytes.as_slice()) {
+            return Ok(Value::Data { bytes: f64::from(f32::from_le_bytes(b)).to_le_bytes().to_vec(), db_type: DbType::F64 });
+        }
+    }
+
     // Between numeric widths.
     let value = Value::Data {
         bytes,

@@ -6840,6 +6840,18 @@ async fn apply_conflict_update(
                 value.unwrap_or_else(|| format!("{}{}", EXCLUDED_UNAVAILABLE, field.name)),
             ));
         }
+        // `EXCLUDED.<real column>` is a `real`: as its bare digits it was
+        // the double nearest them, so `SET f8 = excluded.f4` stored 0.1
+        // where PostgreSQL stores the real widened (0.10000000149011612).
+        for (name, value) in inserted.iter_mut() {
+            let real = schema
+                .fields
+                .iter()
+                .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name) && f.db_type == crate::core::db_type::DbType::F32);
+            if real && !value.starts_with(EXCLUDED_UNAVAILABLE) && !value.trim().eq_ignore_ascii_case("NULL") {
+                *value = format!("({})::real", value.trim());
+            }
+        }
     }
 
     // The conflicting row is named by the table, by it in the default schema
@@ -7714,6 +7726,18 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         };
         match value {
             crate::core::rql::expr::Value::Null => wrap("NULL".to_string()),
+            // A `real` stays a `real`: as its bare digits it was a `numeric`
+            // constant, and `SET f8 = excluded.f4` stored the double nearest
+            // them instead of the real widened.
+            crate::core::rql::expr::Value::Data { bytes, db_type: crate::core::db_type::DbType::F32 }
+                if bytes.len() == 4 =>
+            {
+                let v = f32::from_le_bytes(bytes.as_slice().try_into().expect("four bytes"));
+                wrap(format!(
+                    "{}::real",
+                    crate::core::value_codec::quote_sql(&crate::core::value_codec::pg_float4_text(v))
+                ))
+            }
             crate::core::rql::expr::Value::Data { bytes, db_type } => {
                 match crate::core::rql::subquery::value_to_literal(&db_type, &bytes) {
                     // A computed string is typed text (`CAST(… AS TEXT)`,
