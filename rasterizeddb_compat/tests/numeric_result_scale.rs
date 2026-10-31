@@ -105,11 +105,13 @@ const SELECTS: &[(&str, &[&str])] = &[
     ),
     ("UPDATE t SET i = i WHERE id = 1 RETURNING a / 3, a * b, 2.50 * 2", &["0.83333333333333333333|3.086250|5.00"]),
     // A condition compares the exact values: cut to nine places the product
-    // was 0, and the quotient equal to its nine-place truncation.
+    // was 0, and the quotient equal to its nine-place truncation; under a
+    // function the older exact reading does not know (`abs`), too.
     (
         "SELECT id, CASE WHEN 0.00001 * 0.00001 > 0 THEN 'pos' ELSE 'zero' END, \
-         CASE WHEN a / 3 = 0.833333333 THEN 'cut' ELSE 'exact' END FROM t ORDER BY id",
-        &["1|pos|exact", "2|pos|exact"],
+         CASE WHEN a / 3 = 0.833333333 THEN 'cut' ELSE 'exact' END, \
+         CASE WHEN abs(0.00001 * 0.00001) > 0 THEN 'pos' ELSE 'zero' END FROM t ORDER BY id",
+        &["1|pos|exact|pos", "2|pos|exact|pos"],
     ),
 ];
 
