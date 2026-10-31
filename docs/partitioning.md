@@ -387,9 +387,12 @@ minus is unchanged). Pinned by
 (upserts and `UPDATE`s over BIGINT, INT and composite keys with a negative
 part, rows as PostgreSQL 17 leaves them; every key change, a sign flip
 included, still refused) and the tokenizer's
-`a_spaced_sign_reads_as_the_numbers_own`. Still refused, for either sign,
-as §4.5 says of any expression on a key column: `SET k = (6)`, `SET k =
-EXCLUDED.k + 0` and `SET k = k`, which PostgreSQL accepts.
+`a_spaced_sign_reads_as_the_numbers_own`. On `90472ed2` (F2 merged)
+`SET k = (6)` folds to a constant and is accepted for either sign, as
+PostgreSQL accepts it; still refused, for either sign, as §4.5 says of an
+expression on a key column: `SET k = EXCLUDED.k + 0` and `SET k = k`,
+which PostgreSQL accepts. The test holds each such form to "refused, or
+the row PostgreSQL leaves", the same verdict for either sign.
 
 **Left for P5b-2 and after.** The open budget and the sharded CLOCK
 (scan-resistant fan-out opens), idle close with the persistent-index

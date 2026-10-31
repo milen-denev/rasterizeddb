@@ -117,8 +117,7 @@ async fn a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_re
         try_exec(&db, &sql).await.unwrap_or_else(|e| panic!("`{sql}` was refused: {e}"));
     }
     // Refused, before anything is written: the key would change (a sign
-    // flip with the same digits included), or an expression computes it,
-    // unproven, alike for either sign.
+    // flip with the same digits included).
     for sql in [
         format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = -7, n = 18"),
         format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = 6, n = 18"),
@@ -126,12 +125,6 @@ async fn a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_re
         "UPDATE tp SET tenant_id = -7 WHERE tenant_id = -6".to_string(),
         "UPDATE tn SET k = 65, n = 2 WHERE k = -65".to_string(),
         "UPDATE tc SET grp = 3, n = 2 WHERE tenant_id = 5 AND grp = -3".to_string(),
-        format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = (-6), n = 16"),
-        format!("{upsert} (6, 3, 21, 0) {target} tenant_id = (6), n = 16"),
-        format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = EXCLUDED.tenant_id + 0, n = 17"),
-        format!("{upsert} (6, 3, 21, 0) {target} tenant_id = EXCLUDED.tenant_id + 0, n = 17"),
-        "UPDATE tp SET tenant_id = tenant_id, n = 5 WHERE tenant_id = -6".to_string(),
-        "UPDATE tp SET tenant_id = tenant_id, n = 5 WHERE tenant_id = 6".to_string(),
     ] {
         match try_exec(&db, &sql).await {
             Err(e) => assert!(e.contains(REFUSED), "`{sql}`: {e}"),
@@ -139,11 +132,44 @@ async fn a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_re
         }
     }
 
-    // PostgreSQL 17 after the accepted statements; the refused ones wrote
-    // nothing.
+    // PostgreSQL 17 after the accepted statements (`pg/accepted.sql`); the
+    // refused ones wrote nothing.
     assert_eq!(rows(&db, "SELECT tenant_id, grp, id, n FROM tp").await, vec![vec![-6, 3, 21, 3], vec![6, 3, 21, 14]]);
     assert_eq!(rows(&db, "SELECT k, id, n FROM tn").await, vec![vec![-65, 1, 9], vec![65, 1, 1]]);
     assert_eq!(rows(&db, "SELECT tenant_id, grp, id, n FROM tc").await, vec![vec![5, -3, 1, 9], vec![5, 3, 1, 1]]);
+
+    // An expression on the key keeps its value here, and PostgreSQL accepts
+    // each one; this engine may refuse what it cannot prove (§4.5), but the
+    // same way for either sign, and what it accepts must leave the row as
+    // PostgreSQL does: the key unchanged, `n` set.
+    for (tenant, n, sql) in [
+        (-6, 16, format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = (-6), n = 16")),
+        (6, 16, format!("{upsert} (6, 3, 21, 0) {target} tenant_id = (6), n = 16")),
+        (-6, 17, format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = EXCLUDED.tenant_id + 0, n = 17")),
+        (6, 17, format!("{upsert} (6, 3, 21, 0) {target} tenant_id = EXCLUDED.tenant_id + 0, n = 17")),
+        (-6, 5, "UPDATE tp SET tenant_id = tenant_id, n = 5 WHERE tenant_id = -6".to_string()),
+        (6, 5, "UPDATE tp SET tenant_id = tenant_id, n = 5 WHERE tenant_id = 6".to_string()),
+    ] {
+        let before = rows(&db, &format!("SELECT tenant_id, grp, id, n FROM tp WHERE tenant_id = {tenant}")).await;
+        let outcome = try_exec(&db, &sql).await;
+        let after = rows(&db, "SELECT tenant_id, grp, id, n FROM tp").await;
+        let mine: Vec<_> = after.iter().filter(|r| r[0] == tenant).cloned().collect();
+        assert_eq!(after.len(), 2, "`{sql}`: {after:?}");
+        match &outcome {
+            Ok(_) => assert_eq!(mine, vec![vec![tenant, 3, 21, n]], "`{sql}` was accepted but left {after:?}"),
+            Err(e) => {
+                assert!(e.contains(REFUSED), "`{sql}`: {e}");
+                assert_eq!(mine, before, "`{sql}` was refused but wrote");
+            }
+        }
+        // Alike for either sign: the positive twin of each statement gets
+        // the same verdict.
+        let twin = sql.replacen("(-6", "(6", 1).replace("= -6", "= 6").replace("(-6)", "(6)");
+        if twin != sql {
+            let twin_outcome = try_exec(&db, &twin).await;
+            assert_eq!(outcome.is_ok(), twin_outcome.is_ok(), "`{sql}` and `{twin}` disagree: {outcome:?} vs {twin_outcome:?}");
+        }
+    }
     drop(db);
     crate::core::wal::remove_for(&path_str(dir.path()));
 }
