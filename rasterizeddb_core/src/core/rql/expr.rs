@@ -5356,6 +5356,46 @@ fn as_i64(value: &Value) -> Option<i64> {
     })
 }
 
+/// `x` placed at the exact value of its shortest round-trip text, against
+/// the NUMERIC `m * 10^-scale`; `None` for a non-finite float or one at or
+/// beyond 2^53, which compares at its exact (integral) value instead.
+fn shortest_float_vs_decimal(x: f64, m: i128, scale: u32) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if !x.is_finite() || x.abs() >= 9_007_199_254_740_992.0 {
+        return None;
+    }
+    // `{:e}` is Rust's shortest round-trip form: `1.0000000149011612e-1`.
+    let text = format!("{:e}", x);
+    let (mantissa, exponent) = text.split_once('e')?;
+    let mut exponent: i64 = exponent.parse().ok()?;
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.trim_start_matches('-');
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    exponent -= frac_part.len() as i64;
+    let digits: i128 = format!("{int_part}{frac_part}").parse().ok()?;
+    let d = if negative { -digits } else { digits };
+    if d == 0 || m == 0 {
+        return Some(d.signum().cmp(&m.signum()));
+    }
+    // d * 10^exponent against m * 10^-scale: scale whichever side needs it.
+    let shift = exponent + i64::from(scale);
+    let pow = |k: i64| u32::try_from(k).ok().and_then(|k| 10i128.checked_pow(k));
+    Some(if shift >= 0 {
+        match pow(shift).and_then(|p| d.checked_mul(p)) {
+            Some(lhs) => lhs.cmp(&m),
+            // Too large for an i128: beyond any NUMERIC's magnitude.
+            None if d < 0 => Ordering::Less,
+            None => Ordering::Greater,
+        }
+    } else {
+        match pow(-shift).and_then(|p| m.checked_mul(p)) {
+            Some(rhs) => d.cmp(&rhs),
+            None if m < 0 => Ordering::Greater,
+            None => Ordering::Less,
+        }
+    })
+}
+
 /// Orders two values of the same type, for LEAST/GREATEST and comparisons.
 pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let (
@@ -5386,27 +5426,39 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             }
         }
     }
-    // A NUMERIC against a float is compared as PostgreSQL compares it, in
-    // `double precision`: the NUMERIC is cast to the double nearest it (there
-    // is no exact `float8 = numeric`), a `real` widened. Compared exactly,
-    // `f8 = 0.1` was false for the double 0.1, and a CHECK whose `'0.1'::real`
-    // the predicate rewrite writes as 0.10000000149011612 admitted that real.
+    // A NUMERIC against a float: the float stands at the exact value of its
+    // shortest text, the digits PostgreSQL writes and reads back as that
+    // float, so the double 0.1 equals `0.1` and a CHECK whose `'0.1'::real`
+    // the predicate rewrite writes as 0.10000000149011612 equals that real
+    // widened. Compared at the float's exact binary value both were unequal.
+    // PostgreSQL itself casts the NUMERIC to the nearest double, which no
+    // single order can do: `real 2^53 = bigint 2^53 < numeric 2^53+1` and yet
+    // that NUMERIC rounds to the real, and sorts need a transitive order.
+    // Below 2^53 every integer a float could equal is that float exactly, so
+    // this position agrees with the exact one integers compare against; at
+    // and beyond it a float is an integer and the exact path below decides.
     if let Value::Data { db_type: bt, .. } = b {
-        let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
-        if (float(at) && *bt == DbType::DECIMAL) || (*at == DbType::DECIMAL && float(bt)) {
-            let as_double = |t: &DbType, bytes: &[u8]| -> Option<f64> {
-                match t {
-                    DbType::F64 => Some(f64::from_le_bytes(bytes.try_into().ok()?)),
-                    DbType::F32 => Some(f64::from(f32::from_le_bytes(bytes.try_into().ok()?))),
-                    _ => {
-                        let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
-                        let scale = own.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
-                        crate::core::value_codec::format_decimal_scaled(m, scale).parse::<f64>().ok()
-                    }
-                }
-            };
-            if let (Some(x), Some(y)) = (as_double(at, ab), as_double(bt, bb)) {
-                return Some(crate::core::processor::concurrent_processor::pg_float_cmp(x, y));
+        let float = |t: &DbType, bytes: &[u8]| -> Option<f64> {
+            match t {
+                DbType::F64 => Some(f64::from_le_bytes(bytes.try_into().ok()?)),
+                DbType::F32 => Some(f64::from(f32::from_le_bytes(bytes.try_into().ok()?))),
+                _ => None,
+            }
+        };
+        let decimal = |t: &DbType, bytes: &[u8]| -> Option<(i128, u32)> {
+            if *t != DbType::DECIMAL {
+                return None;
+            }
+            let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
+            Some((m, own.unwrap_or(crate::core::value_codec::DECIMAL_SCALE)))
+        };
+        if let (Some(x), Some((m, scale))) = (float(at, ab), decimal(bt, bb)) {
+            if let Some(ord) = shortest_float_vs_decimal(x, m, scale) {
+                return Some(ord);
+            }
+        } else if let (Some((m, scale)), Some(y)) = (decimal(at, ab), float(bt, bb)) {
+            if let Some(ord) = shortest_float_vs_decimal(y, m, scale) {
+                return Some(ord.reverse());
             }
         }
     }
@@ -7688,6 +7740,10 @@ mod mixed_numeric_compare_tests {
     fn f32v(x: f32) -> Value { v(DbType::F32, x.to_le_bytes().to_vec()) }
     /// Engine scale: `units` is the value times 10^9.
     fn dec(units: i128) -> Value { v(DbType::DECIMAL, units.to_le_bytes().to_vec()) }
+    /// A NUMERIC carrying its own scale.
+    fn cell(unscaled: i128, scale: u32) -> Value {
+        v(DbType::DECIMAL, crate::core::value_codec::decimal_cell_with_scale(unscaled, scale))
+    }
 
     #[test]
     fn mixed_widths_compare_as_numbers() {
@@ -7718,6 +7774,20 @@ mod mixed_numeric_compare_tests {
             // 0.1f32 is 0.100000001490116…, above the decimal 0.1.
             (f32v(0.1), dec(100_000_000), Ordering::Greater),
             (f32v(0.5), f64v(0.5), Ordering::Equal),
+            // A float against a NUMERIC stands at its shortest text, the
+            // literal PostgreSQL wrote: the double 0.1 is `0.1`, the real 0.1
+            // widened is 0.10000000149011612.
+            (f64v(0.1), dec(100_000_000), Ordering::Equal),
+            (f64v(-0.1), dec(-100_000_000), Ordering::Equal),
+            (f64v(1e-9), dec(1), Ordering::Equal),
+            (f32v(0.1), cell(10_000_000_149_011_612, 17), Ordering::Equal),
+            (f32v(0.1), cell(10_000_000_149_011_611, 17), Ordering::Greater),
+            (f64v(0.1), cell(10_000_000_149_011_612, 17), Ordering::Less),
+            (f64v(5e-324), cell(0, 30), Ordering::Greater),
+            (f64v(-5e-324), cell(1, 38), Ordering::Less),
+            (f64v(1234.5), cell(-1, 38), Ordering::Greater),
+            (f64v(-1234.5), cell(1, 38), Ordering::Less),
+            (f64v(1e15), cell(1, 38), Ordering::Greater),
         ];
         for (a, b, want) in cases {
             assert_eq!(compare(&a, &b), Some(want), "{:?} vs {:?}", a, b);
@@ -7755,6 +7825,10 @@ mod mixed_numeric_compare_tests {
         pool.push(dec(i128::MIN));
         pool.push(dec(100_000_000));
         pool.push(dec(1_000_000_001));
+        pool.push(cell(10_000_000_149_011_612, 17));
+        pool.push(cell(10_000_000_000_000_001, 17));
+        pool.push(cell(90_071_992_547_409_921, 1));
+        pool.push(cell(1, 38));
 
         let c = |a: &Value, b: &Value| compare(a, b).expect("numbers always compare");
         for a in &pool {
