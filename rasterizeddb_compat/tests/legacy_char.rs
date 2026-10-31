@@ -178,6 +178,18 @@ impl LegacyDb {
         }
         assert_eq!(retyped, 2, "both columns retyped");
         std::fs::write(&fields, &bytes).expect("write the field records");
+        // And the marker f89ed7ad recorded for every `CHAR` column: a
+        // `character(n)` marker with no length, which makes a check added on
+        // it cast the column `::bpchar`, as that binary's own checks were.
+        let typ = db.root.join("lc_schema_TYP.db");
+        let mut records = std::fs::read(&typ).unwrap_or_default();
+        for column in ["c", "k"] {
+            let mut record = vec![0u8; 134];
+            let name = format!("\u{1}bpchar:{column}");
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            records.extend_from_slice(&record);
+        }
+        std::fs::write(&typ, &records).expect("write the marker records");
         db
     }
 
@@ -358,6 +370,56 @@ async fn alter_type_converts_a_legacy_char_column() {
         &[
             ("SELECT id, c, k FROM lc ORDER BY id", "[1]|[A]|[a];[2]|[é]|[];[3]|[😀]|[c];[5]|[x]|∅;[6]|∅|[f];[8]|[z]|[long text]"),
             ("SELECT id FROM lc WHERE c = 'é'", "[2]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A check on a legacy column is enforced, and an `ALTER … TYPE` that would
+/// leave it unenforced is refused rather than reported done. The check here
+/// is stored as f89ed7ad stored one on a `CHAR` column, `c::bpchar <> 'q'`,
+/// which is enforced over `character(n)` and kept unenforced over text
+/// (`compile_check`): `ALTER … TYPE text` used to succeed, and the next
+/// `INSERT 'q'` went in. The same holds for a `character(n)` column's
+/// `pg_dump`-spelled check; one without a `::bpchar` stays enforced over
+/// text, as in PostgreSQL. PostgreSQL 17 keeps each check through the ALTER
+/// and refuses every `'q'`, `'XY'` and `'zz'` below.
+///
+/// Mutation: `checks_stay_enforced` returning `Ok` (each ALTER to text
+/// succeeds and the next violating INSERT is stored).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_change_never_leaves_a_check_unenforced() {
+    let db = LegacyDb::make("check", &[(1, Some("é"), Some("a")), (2, Some("x "), Some("b"))]).await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let wrong = check(
+        &c,
+        &[
+            ("ALTER TABLE lc ADD CONSTRAINT lc_c_check CHECK (c <> 'q')", ""),
+            ("INSERT INTO lc (id, c) VALUES (3, 'q')", "ERR 23514"),
+            ("ALTER TABLE lc ALTER COLUMN c TYPE text", "ERR 0A000"),
+            ("ALTER TABLE lc ALTER COLUMN c TYPE varchar(3)", "ERR 0A000"),
+            ("INSERT INTO lc (id, c) VALUES (3, 'q')", "ERR 23514"),
+            ("ALTER TABLE lc ALTER COLUMN c TYPE character(1)", ""),
+            ("INSERT INTO lc (id, c) VALUES (3, 'q')", "ERR 23514"),
+            ("INSERT INTO lc (id, c) VALUES (3, 'q  ')", "ERR 23514"),
+            ("ALTER TABLE lc ALTER COLUMN c TYPE text", "ERR 0A000"),
+            ("INSERT INTO lc (id, c) VALUES (3, 'q')", "ERR 23514"),
+            ("SELECT id, c FROM lc ORDER BY id", "[1]|[é];[2]|[x]"),
+            // A character(n) column's own checks, as pg_dump writes one and
+            // as one is written by hand.
+            (
+                "CREATE TABLE m (id INT, tag CHAR(2) CHECK (tag = ANY (ARRAY['AB'::bpchar, 'CD'::bpchar])), \
+                 t2 CHAR(2) CHECK (t2 <> 'zz'))",
+                "",
+            ),
+            ("INSERT INTO m VALUES (1, 'AB', 'ok')", ""),
+            ("ALTER TABLE m ALTER COLUMN tag TYPE text", "ERR 0A000"),
+            ("INSERT INTO m VALUES (2, 'XY', 'ok')", "ERR 23514"),
+            ("ALTER TABLE m ALTER COLUMN t2 TYPE text", ""),
+            ("INSERT INTO m VALUES (3, 'CD', 'zz')", "ERR 23514"),
+            ("SELECT id, tag, t2 FROM m ORDER BY id", "[1]|[AB]|[ok]"),
         ],
     )
     .await;

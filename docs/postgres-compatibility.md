@@ -264,7 +264,12 @@ values still follow the four bytes read as an integer (`docs/indexes.md`).
 `ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
 `varchar(n)`) rewrites it into the new type, refused while a value does
 not fit (22001) or two keys of a unique constraint would become one
-(23505). Nothing converts it on open: a conversion is a rewrite of every
+(23505). Any `ALTER … TYPE` that would leave a check on the column
+unenforced is refused (0A000) rather than done: a check comparing
+`character(n)` values (`c::bpchar <> 'q'`, as an older binary stored every
+check on such a column and `pg_dump` writes them) is enforced over
+`character(n)` and not over text, so `TYPE text` stopped enforcing it with
+success reported. Nothing converts it on open: a conversion is a rewrite of every
 row, and DDL here is not transactional.
 
 Storing UUIDs natively rather than as `U128` matters for pruning. Canonical UUID

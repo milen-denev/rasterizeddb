@@ -4235,6 +4235,10 @@ async fn retype_legacy_char(
         Some(Err(e)) => return Err(e),
         None => None,
     };
+    let mut retyped = field.clone();
+    retyped.db_type = crate::core::db_type::DbType::STRING;
+    retyped.set_text_typmod(wanted);
+    checks_stay_enforced(schema, &retyped, declared)?;
     // The checks reading the column judge the rows first, read as the text
     // they hold: the rewrite cannot be asked afterwards.
     let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
@@ -4340,6 +4344,54 @@ async fn retype_legacy_char(
         Ok(versions)
     })
     .await
+}
+
+/// Refuses a change of `retyped`'s column to the type it now describes when
+/// a check enforced on the column before the change would not be after it.
+///
+/// A check comparing `character(n)` values (`c::bpchar <> 'q'`, which an
+/// older binary stored for every check on such a column, and `pg_dump`
+/// writes) is enforced while the column holds `character(n)`, and kept
+/// unenforced over text, which this engine does not compare blank-padded
+/// (`compile_check`). `ALTER … TYPE text` on such a column therefore stopped
+/// enforcing it, with the ALTER reporting success and a later `SHOW CHECKS`
+/// the only sign. PostgreSQL keeps the check, read at the new type.
+fn checks_stay_enforced(
+    schema: &crate::core::row::schema::TableSchema,
+    retyped: &crate::core::row::schema::SchemaField,
+    declared: &str,
+) -> Result<(), String> {
+    let after: Vec<crate::core::row::schema::SchemaField> = schema
+        .fields
+        .iter()
+        .map(|f| if !f.is_deleted && f.name == retyped.name { retyped.clone() } else { f.clone() })
+        .collect();
+    let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    let enforced = |compiled: &Result<CompiledCheck, String>| matches!(compiled, Ok(c) if !matches!(c, CompiledCheck::Unenforced(_)));
+    for check in schema.checks.iter().filter(|c| !c.is_deleted) {
+        let reads = crate::core::rql::check::columns_read(&check.expression, &names);
+        if !reads.iter().any(|c| *c == retyped.name) {
+            continue;
+        }
+        if !enforced(&compile_check(&check.expression, &schema.fields)) {
+            continue;
+        }
+        let why = match compile_check(&check.expression, &after) {
+            Ok(CompiledCheck::Unenforced(why)) => why,
+            Err(e) => e,
+            Ok(_) => continue,
+        };
+        return Err(format!(
+            "ALTER COLUMN {} TYPE {} is not supported while check constraint \"{}\" reads the column: \
+             the check would no longer be enforced ({}). Drop the constraint first, or convert the \
+             column to character(n)",
+            retyped.name,
+            declared.trim(),
+            check.name,
+            why
+        ));
+    }
+    Ok(())
 }
 
 /// Renders a JSON value as the literal a column of `db_type` takes.
@@ -12465,6 +12517,9 @@ async fn text_type_change(
     if wanted == had && !legacy {
         return Ok(Vec::new());
     }
+    let mut retyped = field.clone();
+    retyped.set_text_typmod(wanted);
+    checks_stay_enforced(schema, &retyped, declared)?;
     if row_count > 0 {
         // Its values already in `character(n)`'s stored form, or not.
         let stripped = matches!(had, Some(TextTypmod::Bpchar(_))) && !legacy;
