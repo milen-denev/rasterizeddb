@@ -1476,3 +1476,51 @@ async fn a_reopened_partition_never_takes_the_legacy_char_canonical_flag() {
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
+
+/// Out of descriptors at an open (§7.1): the open closes idle partitions
+/// and tries once more, and the statement succeeds when that freed enough;
+/// with nothing idle to close it fails with `53000`, as before.
+///
+/// Mutation: `Parts::open_slow` returning the error without evicting and
+/// retrying (the routed read fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_out_of_descriptors_closes_idle_partitions_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    let pairs = tenants_of_distinct_partitions(&t, 4, TENANTS);
+    // Three partitions open and idle.
+    for &(tenant, _) in &pairs[..3] {
+        assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await.len() as i64, IDS);
+    }
+    assert_eq!(t.open_count(), 3);
+    let root = path_str(dir.path());
+    let evictions = budget.evictions();
+    // The next provider open fails once, as a full descriptor table would.
+    crate::core::storage_providers::file_sync::open_test_hooks::fail_next(&root, 1);
+    let (tenant, pid) = pairs[3];
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == tenant).collect();
+    assert_eq!(rows(&db, &format!("tenant_id = {tenant}")).await, mine, "the retried open did not answer");
+    assert!(budget.evictions() > evictions, "nothing was closed before the retry");
+    assert!(open_pids(&t).contains(&pid));
+    // With every other partition held, nothing frees: 53000.
+    let held: Vec<_> = open_pids(&t).into_iter().filter(|p| *p != pid).collect();
+    let mut holds = Vec::new();
+    for p in &held {
+        holds.push(t.open_part(*p).await.unwrap());
+    }
+    holds.push(t.open_part(pid).await.unwrap());
+    let closed_tenant = (1..=TENANTS).find(|x| !open_pids(&t).contains(&pid_of_tenant(&t, *x))).unwrap();
+    crate::core::storage_providers::file_sync::open_test_hooks::fail_next(&root, 1);
+    let failed = try_rows(&db, &format!("tenant_id = {closed_tenant}")).await.expect_err("an open with nothing to free answered");
+    assert_eq!(crate::pgwire::sqlstate_for(&failed), "53000", "{failed}");
+    crate::core::storage_providers::file_sync::open_test_hooks::clear(&root);
+    drop(holds);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}

@@ -2796,8 +2796,26 @@ pub(crate) mod open_test_hooks {
         FAILING.lock().retain(|(d, _)| d != dir);
     }
 
+    static FAIL_NEXT: parking_lot::Mutex<Vec<(String, u32)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next `n` fallible opens under `dir` fail with EMFILE; the ones
+    /// after succeed.
+    pub(crate) fn fail_next(dir: &str, n: u32) {
+        FAIL_NEXT.lock().push((dir.trim_end_matches('/').to_string(), n));
+    }
+
     pub(super) fn fails(location: &str) -> bool {
         let location = location.trim_end_matches('/');
+        {
+            let mut next = FAIL_NEXT.lock();
+            if let Some(at) = next.iter().position(|(d, n)| d == location && *n > 0) {
+                next[at].1 -= 1;
+                if next[at].1 == 0 {
+                    next.remove(at);
+                }
+                return true;
+            }
+        }
         let mut g = FAILING.lock();
         match g.iter_mut().find(|(d, _)| d == location) {
             Some((_, 0)) => true,
