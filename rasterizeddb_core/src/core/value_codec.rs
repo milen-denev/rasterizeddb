@@ -516,8 +516,8 @@ const DECIMAL_SCALE_FACTOR: i128 = 1_000_000_000;
 /// Parses a decimal literal into unscaled `i128` units.
 ///
 /// Accepts an optional sign, digits, an optional fractional part, and an
-/// optional exponent. Fractional digits beyond [`DECIMAL_SCALE`] are rejected
-/// rather than rounded away: silently dropping precision from a money value is
+/// optional exponent. Nonzero fractional digits beyond [`DECIMAL_SCALE`] are
+/// rejected rather than rounded away: silently dropping precision from a money value is
 /// worse than refusing it.
 /// Parses a decimal literal at a given scale.
 ///
@@ -858,6 +858,11 @@ pub fn parse_decimal(text: &str) -> Option<i128> {
     {
         return None;
     }
+    // Zeros at the end of the fraction are no places the value needs: an
+    // exact value written at more places than nine (`0.200000000000`, a
+    // NUMERIC(20,12)'s text) is that value, where only a nonzero digit past
+    // nine is refused. It was refused whole, as a precision overflow.
+    let frac_part = if frac_part.len() > DECIMAL_SCALE as usize { frac_part.trim_end_matches('0') } else { frac_part };
 
     // Fast path: no exponent, and few enough digits to gather in a `u64`.
     if exponent == 0 && int_part.len() + frac_part.len() <= 19 {
