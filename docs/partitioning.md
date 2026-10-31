@@ -370,6 +370,47 @@ dominated by the per-partition stats; populating 10⁴ one-row partitions
 took 44 s here (a durable `MATERIALIZE` each, on tmpfs). Debug builds
 throughout.
 
+**Review round 2** (independent reviews A and B at `8bdcc88c`). Found and
+fixed:
+
+- **Blocker: a reopened partition was served the closed instance's
+  query-cache entries.** The cache keys an entry by scope, clause and
+  limit and matches its generation exactly; a partition's scope
+  (`"<db>\0__pt_<uid>_<pid>"`) was the same across a reopen, and each
+  instance's generation climbs by one per write from a floor the global
+  counter gives it, so the reopened instance reached the stamps the closed
+  one left and answered from its pointers (40 of 40 probes, with the cache
+  on; no harness turned it on). Every `Table` instance now carries its
+  own number in its cache scope (`Table::cache_instance`, from the same
+  never-reused counter), so no instance answers from another's entries:
+  a reopen, a plain table's reload, `DROP` then `CREATE`. The old
+  instance's entries are left to the cache's own replacement. Pinned by
+  `tests/partition_cache_reopen.rs` (its own process, cache on: a
+  reopened partition, and a plain table across `ALTER` and across `DROP`
+  plus `CREATE`) and by `tests/partition_twin_cache.rs`, which runs every
+  twin configuration with the cache on.
+- **Running out of file descriptors panicked a statement.** The file
+  provider's open `unwrap`ped every file it opened; reached at startup
+  before P5b, it is reached inside statements now. A partition open goes
+  through the fallible `StorageIO::try_create_new`, and EMFILE or ENFILE
+  fails the statement with `53000` (insufficient resources). A fan-out
+  read, or a write's `materialized`, that fails part-way closes again the
+  partitions it opened for itself, so the descriptors come back. The open
+  budget that evicts and retries first stays P5b-2's.
+- **The filter backfill skipped a row it could not read**, then cleared
+  the unindexed prefix, so the filter pruned that row: a silent miss, now
+  possible on every reopen. A backfill that leaves a row unread keeps the
+  prefix (every slot a candidate until the next open's backfill); a
+  backfill from a later slot was already safe, its frontier stopping at
+  the first slot it did not index.
+- `SHOW TABLE`'s `filters_ready` and `pg_indexes`' readiness no longer
+  read true vacuously with partitions closed: false while any
+  materialized partition is closed.
+
+Left as they were: catalog reads cost 2 to 3 times more with every
+partition closed (`SHOW PARTITIONS` 10.9 to 25.9 ms at 1,024, six `stat`s
+and their paths per partition), for P5b-2's `STATS`.
+
 **Found by the twin, older than P5b, fixed on this branch.** The twin at
 `0x5eed2b20` and 1,500 statements (its stream shifted by the new
 `ClosePartitions` kind) diverged in every configuration at op 1301: `INSERT
