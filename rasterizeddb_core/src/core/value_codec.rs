@@ -673,6 +673,84 @@ pub fn check_numeric_precision(unscaled: i128, precision: u32, scale: u32) -> Re
     Ok(())
 }
 
+/// A `double precision` value's text, as PostgreSQL's `float8out` writes it
+/// (`extra_float_digits` at its default of 1): the shortest digits that read
+/// back as the same float, in fixed notation when the decimal exponent is
+/// from -4 to 14 and in exponential notation otherwise, with a sign and at
+/// least two exponent digits — `1e+20`, `1e-07`, `0.1`, `123456789012345`.
+/// `NaN`, `Infinity` and `-Infinity` by name, and `-0` for negative zero.
+///
+/// Rust's own rendering never switches to an exponent: `1e20` was written
+/// `100000000000000000000`, which also failed a `varchar(6)` PostgreSQL's
+/// six-character `1e+20` fits.
+pub fn pg_float8_text(v: f64) -> String {
+    pg_float_text(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0, || format!("{:e}", v), 15)
+}
+
+/// A `real` value's text, as `float4out` writes it: [`pg_float8_text`]'s
+/// rule with the float's own shortest digits, and fixed notation for
+/// exponents from -4 to 5 — `3.4e+38`, `100000`, `1e+06`.
+pub fn pg_float4_text(v: f32) -> String {
+    pg_float_text(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0, || format!("{:e}", v), 6)
+}
+
+fn pg_float_text(
+    nan: bool,
+    infinite: bool,
+    negative: bool,
+    zero: bool,
+    shortest: impl FnOnce() -> String,
+    fixed_below: i32,
+) -> String {
+    if nan {
+        return "NaN".to_string();
+    }
+    if infinite {
+        return if negative { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if zero {
+        return if negative { "-0" } else { "0" }.to_string();
+    }
+    // `{:e}` is the shortest round-trip digits as `d[.ddd]e<exp>`.
+    let sci = shortest();
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(m) => ("-", m),
+        None => ("", mantissa),
+    };
+    let mut out = String::with_capacity(mantissa.len() + 8);
+    out.push_str(sign);
+    if (-4..fixed_below).contains(&exp) {
+        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+        if exp >= 0 {
+            let whole = exp as usize + 1;
+            if digits.len() <= whole {
+                out.push_str(&digits);
+                out.extend(std::iter::repeat_n('0', whole - digits.len()));
+            } else {
+                out.push_str(&digits[..whole]);
+                out.push('.');
+                out.push_str(&digits[whole..]);
+            }
+        } else {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+            out.push_str(&digits);
+        }
+    } else {
+        out.push_str(mantissa);
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        let magnitude = exp.unsigned_abs();
+        if magnitude < 10 {
+            out.push('0');
+        }
+        out.push_str(&magnitude.to_string());
+    }
+    out
+}
+
 /// Renders an unscaled value held at `scale`, keeping every declared place.
 ///
 /// `format_decimal` strips trailing zeros, so a `NUMERIC(10,4)` holding
@@ -2879,6 +2957,58 @@ mod tests {
             1,
             "trailing zeroes trimmed"
         );
+    }
+
+    /// Each `(value, PostgreSQL 17's ::text)`.
+    #[test]
+    fn floats_are_written_as_postgresql_writes_them() {
+        let doubles: &[(f64, &str)] = &[
+            (1e20, "1e+20"),
+            (1e-7, "1e-07"),
+            (0.1, "0.1"),
+            (123456789012345.0, "123456789012345"),
+            (1e15, "1e+15"),
+            (1e16, "1e+16"),
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (2.5, "2.5"),
+            (100.0, "100"),
+            (-1.5e-10, "-1.5e-10"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (5e-324, "5e-324"),
+            (1234567.891, "1234567.891"),
+            (0.000123456, "0.000123456"),
+            (-0.0, "-0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (99999999999999.9, "99999999999999.9"),
+            (999999999999999.9, "999999999999999.9"),
+        ];
+        for (v, pg) in doubles {
+            assert_eq!(pg_float8_text(*v), *pg, "{v:e}");
+        }
+        let reals: &[(f32, &str)] = &[
+            (3.4e38, "3.4e+38"),
+            (1e-7, "1e-07"),
+            (0.1, "0.1"),
+            (100000.0, "100000"),
+            (1e6, "1e+06"),
+            (123456.0, "123456"),
+            (1.5, "1.5"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (0.333333333, "0.33333334"),
+            (-0.0, "-0"),
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "Infinity"),
+            (16777217.0, "1.6777216e+07"),
+            (1234567.0, "1.234567e+06"),
+        ];
+        for (v, pg) in reals {
+            assert_eq!(pg_float4_text(*v), *pg, "{v:e}");
+        }
     }
 
     #[test]

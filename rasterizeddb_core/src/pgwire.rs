@@ -12238,43 +12238,21 @@ mod command_tag_tests {
     }
 }
 
-/// Renders a float the way PostgreSQL does.
+/// Renders a float the way PostgreSQL does (`value_codec::pg_float8_text`).
 ///
 /// Rust writes the non-finite values as `inf`, `-inf` and `NaN`; PostgreSQL
 /// writes `Infinity`, `-Infinity` and `NaN`, and that is what a client parses.
 /// A driver handed `inf` for a `float8` rejects the row — the value was right
-/// and unreadable, which is the worst combination.
+/// and unreadable, which is the worst combination. And Rust never writes an
+/// exponent, so `1e20` went out as `100000000000000000000` and `1e-7` as
+/// `0.0000001`, where PostgreSQL sends `1e+20` and `1e-07`.
 fn format_float(value: f64) -> String {
-    match non_finite(
-        value.is_nan(),
-        value.is_infinite(),
-        value.is_sign_negative(),
-    ) {
-        Some(text) => text.to_string(),
-        None => value.to_string(),
-    }
+    crate::core::value_codec::pg_float8_text(value)
 }
 
-/// The same, at single precision.
+/// The same, at single precision (`value_codec::pg_float4_text`).
 fn format_float_32(value: f32) -> String {
-    match non_finite(
-        value.is_nan(),
-        value.is_infinite(),
-        value.is_sign_negative(),
-    ) {
-        Some(text) => text.to_string(),
-        None => value.to_string(),
-    }
-}
-
-fn non_finite(is_nan: bool, is_infinite: bool, is_negative: bool) -> Option<&'static str> {
-    if is_nan {
-        Some("NaN")
-    } else if is_infinite {
-        Some(if is_negative { "-Infinity" } else { "Infinity" })
-    } else {
-        None
-    }
+    crate::core::value_codec::pg_float4_text(value)
 }
 
 #[cfg(test)]

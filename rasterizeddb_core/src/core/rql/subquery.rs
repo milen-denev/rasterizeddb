@@ -1240,8 +1240,20 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::U32 => u32::from_le_bytes(le::<4>(bytes)?).to_string(),
         DbType::U64 => u64::from_le_bytes(le::<8>(bytes)?).to_string(),
         DbType::U128 => u128::from_le_bytes(le::<16>(bytes)?).to_string(),
-        DbType::F32 => f32::from_le_bytes(le::<4>(bytes)?).to_string(),
-        DbType::F64 => f64::from_le_bytes(le::<8>(bytes)?).to_string(),
+        // PostgreSQL's text for the float (`1e+20`, `1e-07`), which reads
+        // back as the same float; a value with no digits (`NaN`,
+        // `Infinity`) is a quoted literal, which a float column reads as one
+        // and a bare word is not.
+        DbType::F32 => {
+            let v = f32::from_le_bytes(le::<4>(bytes)?);
+            let text = value_codec::pg_float4_text(v);
+            if v.is_finite() { text } else { value_codec::quote_sql(&text) }
+        }
+        DbType::F64 => {
+            let v = f64::from_le_bytes(le::<8>(bytes)?);
+            let text = value_codec::pg_float8_text(v);
+            if v.is_finite() { text } else { value_codec::quote_sql(&text) }
+        }
         DbType::CHAR => value_codec::quote_sql(value_codec::legacy_char_text(bytes)),
         // A document that has already been rebuilt — the bytes ARE the JSON
         // text, so it needs quoting and nothing else. Without this arm a

@@ -8769,6 +8769,18 @@ async fn insert_from_select(
                 && zoned.get(at).copied().flatten() == Some(true)
             {
                 crate::core::rql::subquery::zoned_timestamp_literal(column.data.into_slice())
+            } else if matches!(column_type, crate::core::db_type::DbType::F64 | crate::core::db_type::DbType::F32) {
+                // A float stays a float: as the bare constant `1e+20` it was
+                // a `numeric`, and a text column stored that numeric's text
+                // (`100000000000000000000`) where PostgreSQL stores the
+                // float's (`1e+20`); `-0` became '0'.
+                let bytes = column.data.into_slice();
+                let typed = if column_type == crate::core::db_type::DbType::F64 {
+                    <[u8; 8]>::try_from(bytes).ok().map(|b| (crate::core::value_codec::pg_float8_text(f64::from_le_bytes(b)), "float8"))
+                } else {
+                    <[u8; 4]>::try_from(bytes).ok().map(|b| (crate::core::value_codec::pg_float4_text(f32::from_le_bytes(b)), "real"))
+                };
+                typed.map(|(text, cast)| format!("{}::{cast}", crate::core::value_codec::quote_sql(&text)))
             } else {
                 crate::core::rql::subquery::value_to_literal(&column_type, column.data.into_slice())
             };
