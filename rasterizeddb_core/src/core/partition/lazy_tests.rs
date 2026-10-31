@@ -1870,3 +1870,72 @@ async fn under_rebuild_the_seal_at_close_buys_the_reopen_its_filter() {
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
+
+/// Review A's second race on the kept sizes: a catalog read that read a
+/// closed partition's files, then was overtaken by an open, writes and a
+/// close, must not keep what it read over the close's final sizes. (At
+/// 7ba631c9 `closed_sizes` dropped its lock between its check and its
+/// store, and the stale read stayed until the next open and close.)
+///
+/// Mutation: `closed_sizes` keeping its read whatever happened meanwhile
+/// (no epoch check).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalog_read_overtaken_by_a_close_never_keeps_its_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    let t = pt(&db);
+    t.close_idle().await.unwrap();
+    drop(t);
+    // After a restart nothing is kept: the next read reads the files.
+    let db = restart(dir.path(), db).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let (reached, resume) = super::table::kept_sizes_hooks::park(dir.path(), p);
+    let reader = {
+        let t = t.clone();
+        tokio::spawn(async move { t.totals().await.unwrap() })
+    };
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)).expect("the read never reached the files"))
+        .await
+        .unwrap();
+    // Meanwhile: opened, written, closed.
+    let values: Vec<String> = (100..400).map(|i| format!("(1, {i}, {i})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    assert_eq!(t.close_partition(p).await.unwrap(), Close::Closed);
+    let final_sizes = t.totals().await.unwrap();
+    resume.send(()).unwrap();
+    let _stale = reader.await.unwrap();
+    assert_eq!(t.totals().await.unwrap(), final_sizes, "a read overtaken by a close kept its sizes over the close's");
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// An open refused because its partition is not materialized closes
+/// nothing for the budget (review B: `make_room` ran before the refusal).
+///
+/// Mutation: `make_room` before the not-materialized refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_refused_as_unmaterialized_evicts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = super::budget::isolate_with(dir.path(), 1, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    exec(&db, CREATE).await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1)").await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let unmaterialized = (0..8u32).find(|q| !t.materialized_pids().unwrap().contains(q)).unwrap();
+    assert_eq!(open_pids(&t), vec![p]);
+    let evictions = budget.evictions();
+    assert!(t.open_part(unmaterialized).await.is_err(), "an unmaterialized partition opened");
+    assert_eq!(budget.evictions(), evictions, "a refused open closed a partition for the budget");
+    assert_eq!(open_pids(&t), vec![p]);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}

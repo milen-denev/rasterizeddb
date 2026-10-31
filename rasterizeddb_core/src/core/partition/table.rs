@@ -249,6 +249,8 @@ impl Slot {
             (!sizes.closing).then_some(sizes.epoch)
         };
         let read = closed_lens(root, uid, self.pid)?;
+        #[cfg(test)]
+        kept_sizes_hooks::read(root, self.pid);
         if let Some(epoch) = epoch {
             let mut sizes = self.sizes.lock();
             if sizes.epoch == epoch && !sizes.closing && sizes.kept.is_none() {
@@ -2170,6 +2172,37 @@ impl Parts {
         drop(leaving);
         self.closes.fetch_add(1, Ordering::AcqRel);
         Ok(Close::Closed)
+    }
+}
+
+/// Test-only: a pause in a catalog's read of a closed partition's sizes,
+/// after it read the files and before it keeps what it read.
+#[cfg(test)]
+pub(crate) mod kept_sizes_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    type Park = (PathBuf, u32, Sender<()>, Receiver<()>);
+    static PARKS: parking_lot::Mutex<Vec<Park>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next read of partition `pid`'s sizes under `dir` signals the
+    /// returned receiver, then blocks until the returned sender sends.
+    pub(crate) fn park(dir: &Path, pid: u32) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        PARKS.lock().push((dir.to_path_buf(), pid, reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    pub(super) fn read(root: &Path, pid: u32) {
+        let found = {
+            let mut parks = PARKS.lock();
+            parks.iter().position(|(d, p, _, _)| root.starts_with(d) && *p == pid).map(|at| parks.remove(at))
+        };
+        if let Some((_, _, reached, resume)) = found {
+            let _ = reached.send(());
+            let _ = resume.recv_timeout(std::time::Duration::from_secs(30));
+        }
     }
 }
 
