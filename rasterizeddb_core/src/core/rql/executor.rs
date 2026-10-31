@@ -617,97 +617,41 @@ pub(crate) fn query_output_types(
     None
 }
 
-/// Brings every `DECIMAL` cell of a subquery's rows to the engine scale, from
+/// Makes every `DECIMAL` cell of a subquery's rows say its own scale, from
 /// the scale [`query_output_scales`] says it is stored at.
 ///
 /// Rows leaving one query for another carry no scale, and everything that
-/// reads them — literal substitution, a derived table's temp relation —
-/// assumes the engine's. Without this a `sum(bigint)` (a numeric at scale 0)
-/// read through a derived table was a billionth of itself, and so was any
-/// `NUMERIC(p, s)` column with `s` other than nine. A value with digits past
-/// the engine's nine places is left whole, as a cell carrying its own scale,
-/// for its reader to write at that scale; one without is brought to nine.
+/// reads them — literal substitution, `INSERT … SELECT`'s rebuilt `VALUES` —
+/// reads a sixteen-byte cell at the engine's. Without this a `sum(bigint)` (a
+/// numeric at scale 0) read through a subquery was a billionth of itself, and
+/// so was any `NUMERIC(p, s)` column with `s` other than nine.
+///
+/// A cell at any scale but the engine's becomes one carrying that scale
+/// (`value_codec::decimal_cell_with_scale`), as an `AVG` result already is,
+/// and its readers write it at that scale: the scale is PostgreSQL's display
+/// scale for the value. Brought to the engine's nine places instead, a
+/// NUMERIC(10,2) 2.50 became the literal `2.5`, so `(SELECT a …)` showed 2.5
+/// and `INSERT INTO t (txt) SELECT a …` stored '2.5' where PostgreSQL has
+/// 2.50; and a column with more places than nine lost its digits there.
+/// A cell at the engine's scale (an unconstrained `NUMERIC`) is left as it
+/// is, its places those its value needs.
 fn normalize_decimal_scales(rows: &mut [crate::core::row::row::Row], scales: &[u32]) {
     use crate::core::db_type::DbType;
     let target = crate::core::value_codec::DECIMAL_SCALE;
-    // No early return when every column is at the engine scale: a cell that
-    // carries its own scale still has to be normalised, and that is a
-    // property of the cell, not of the column list.
     for row in rows.iter_mut() {
         for (i, cell) in row.columns.iter_mut().enumerate() {
             let Some(&from) = scales.get(i) else { break };
-            if cell.column_type != DbType::DECIMAL {
+            if cell.column_type != DbType::DECIMAL || from == target || from > crate::core::rql::pg_numeric::MAX_SCALE {
                 continue;
             }
-            // A value carrying its own scale (an `AVG` result, see
-            // `value_codec::decimal_cell_with_scale`) is brought to the engine
-            // scale like any other, from *its* scale, and becomes an ordinary
-            // sixteen-byte cell: what leaves a query for another is uniform.
-            let (from, v) = match crate::core::value_codec::split_decimal_cell(cell.data.into_slice()) {
-                // More places than the engine's, with digits there (`a + 1`
-                // over a NUMERIC(20,12)): kept whole. Rounded to nine here,
-                // `INSERT INTO t2 SELECT id, a + 1 FROM w` stored
-                // 1.123456789000; a reader of the cell writes it at its scale.
-                Some((v, Some(own))) if own > target && v % 10i128.pow(own - target) != 0 => continue,
-                Some((v, Some(own))) => {
-                    let lifted = if own <= target {
-                        10i128.checked_pow(target - own).and_then(|f| v.checked_mul(f))
-                    } else {
-                        10i128.checked_pow(own - target).map(|f| {
-                            let q = v / f;
-                            let r = v % f;
-                            if r.unsigned_abs() * 2 >= f as u128 {
-                                if v < 0 { q - 1 } else { q + 1 }
-                            } else {
-                                q
-                            }
-                        })
-                    };
-                    if let Some(lifted) = lifted {
-                        let mut block = crate::memory_pool::MEMORY_POOL.acquire(16);
-                        block.into_slice_mut().copy_from_slice(&lifted.to_le_bytes());
-                        cell.data = block;
-                    }
-                    continue;
-                }
-                Some((v, None)) => (from, v),
-                None => continue,
+            // A cell already carrying its own scale says it already.
+            let Some((v, None)) = crate::core::value_codec::split_decimal_cell(cell.data.into_slice()) else {
+                continue;
             };
-            if from == target {
-                continue;
-            }
-            // A column with more places than the engine's, holding digits
-            // there: kept whole, at its scale, as the cell carrying its own
-            // scale above is. Rounded to nine here, `INSERT INTO t2 SELECT b
-            // FROM t` over a NUMERIC(38,20) stored 1.12345678900000000000
-            // for 1.12345678912345678912 — a plain copy, a join, a derived
-            // table, a CTE, `min(b)`, every source whose cells are the
-            // column's own.
-            if from > target && 10i128.checked_pow(from - target).is_some_and(|f| v % f != 0) {
-                let bytes = crate::core::value_codec::decimal_cell_with_scale(v, from);
-                let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                block.into_slice_mut().copy_from_slice(&bytes);
-                cell.data = block;
-                continue;
-            }
-            let lifted = if from < target {
-                10i128.checked_pow(target - from).and_then(|f| v.checked_mul(f))
-            } else {
-                10i128.checked_pow(from - target).map(|f| {
-                    let q = v / f;
-                    let r = v % f;
-                    if r.unsigned_abs() * 2 >= f as u128 {
-                        if v < 0 { q - 1 } else { q + 1 }
-                    } else {
-                        q
-                    }
-                })
-            };
-            // A value the engine scale cannot hold is left as it was rather
-            // than replaced by a different number.
-            if let Some(lifted) = lifted {
-                cell.data.into_slice_mut().copy_from_slice(&lifted.to_le_bytes());
-            }
+            let bytes = crate::core::value_codec::decimal_cell_with_scale(v, from);
+            let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+            block.into_slice_mut().copy_from_slice(&bytes);
+            cell.data = block;
         }
     }
 }

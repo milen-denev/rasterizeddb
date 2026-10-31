@@ -1223,6 +1223,14 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
     if let Ok(v) = text.parse::<i64>() {
         return Some((v.to_le_bytes().to_vec(), DbType::I64));
     }
+    // A number with a point or an exponent, or past `bigint`, is PostgreSQL's
+    // `numeric`, exactly as written and at the places written: `2.50` is
+    // 2.50, and a scalar subquery's 0.83333333333333333333 keeps every digit.
+    // Carried as a float it was 2.5, 0.8333333333333334, and
+    // `SELECT 123456789012345678901234` answered 123456789012345690000000.
+    if let Some(v) = crate::core::rql::pg_numeric::parse_text(text) {
+        return Some((v.to_cell(), DbType::DECIMAL));
+    }
     if let Ok(v) = text.parse::<f64>() {
         return Some((v.to_le_bytes().to_vec(), DbType::F64));
     }

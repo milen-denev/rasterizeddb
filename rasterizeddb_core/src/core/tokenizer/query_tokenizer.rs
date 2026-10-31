@@ -1033,7 +1033,8 @@ fn parse_numeric_value<'a>(
 }
 
 /// The token for a numeric literal: the number as it was read, except a
-/// fraction beside a NUMERIC that a float cannot hold, which keeps its text.
+/// fraction (or an integer past `bigint`) beside a NUMERIC that a float
+/// cannot hold, which keeps its text.
 ///
 /// A fraction is read as an `f64`, and the planner re-reads that at the
 /// column's scale. Past a float's digits the re-read is another number:
@@ -1047,7 +1048,7 @@ fn parse_numeric_value<'a>(
 /// became 0.123456789123 and matched that row of a `NUMERIC(20,12)`.
 fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
     if let NumericValue::F64(f) = value {
-        if numeric_context && text.contains(['.', 'e', 'E']) && !float_holds_exactly(text) {
+        if numeric_context && !float_holds_exactly(text) {
             let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
             let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
             // More digits than an i128 holds is never what the float is.
@@ -1215,7 +1216,19 @@ fn parse_default(value_str: &str) -> Result<NumericValue, String> {
             value_str.parse().map_err(|_| out_of_range())?,
         ))
     } else {
-        let parsed_num: i64 = value_str.parse().map_err(|_| out_of_range())?;
+        // Past `bigint` an integer constant is PostgreSQL's `numeric`. It
+        // is read as a float here, as a fraction is, and `number_token`
+        // keeps its digits beside a NUMERIC that the float does not hold:
+        // `w = 123456789012345678901234` over a NUMERIC(30,0) — and `w IN
+        // (SELECT w …)`, whose values are written back as such constants —
+        // was refused as out of range.
+        let Ok(parsed_num) = value_str.parse::<i64>() else {
+            let digits = value_str.strip_prefix(['-', '+']).unwrap_or(value_str);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Ok(NumericValue::F64(value_str.parse().map_err(|_| out_of_range())?));
+            }
+            return Err(out_of_range());
+        };
         if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
             Ok(NumericValue::I32(parsed_num as i32))
         } else {
