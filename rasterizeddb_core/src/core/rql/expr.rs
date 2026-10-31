@@ -7788,6 +7788,8 @@ mod mixed_numeric_compare_tests {
             (f64v(1234.5), cell(-1, 38), Ordering::Greater),
             (f64v(-1234.5), cell(1, 38), Ordering::Less),
             (f64v(1e15), cell(1, 38), Ordering::Greater),
+            // At 2^53 and beyond a float is an integer, compared exactly.
+            (f64v(9_223_372_036_854_775_808.0), cell(9_223_372_036_854_775_900, 0), Ordering::Less),
         ];
         for (a, b, want) in cases {
             assert_eq!(compare(&a, &b), Some(want), "{:?} vs {:?}", a, b);
@@ -7829,6 +7831,10 @@ mod mixed_numeric_compare_tests {
         pool.push(cell(10_000_000_000_000_001, 17));
         pool.push(cell(90_071_992_547_409_921, 1));
         pool.push(cell(1, 38));
+        // Between the double 2^63's exact value (…808) and its shortest text
+        // (…6000): an integer and a NUMERIC that must agree against it.
+        pool.push(i128v(9_223_372_036_854_775_900));
+        pool.push(cell(9_223_372_036_854_775_900, 0));
 
         let c = |a: &Value, b: &Value| compare(a, b).expect("numbers always compare");
         for a in &pool {
