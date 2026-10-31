@@ -8240,6 +8240,19 @@ fn batch_key_part(
     if literal.eq_ignore_ascii_case("NULL") {
         return None;
     }
+    // A legacy `CHAR` key by its one stored form, as the conflict is found
+    // (`value_codec::legacy_char_canonical`): `'b'` and `'b '` are one key,
+    // and were two, so one row was updated twice and the reply counted two.
+    if field.db_type == crate::core::db_type::DbType::CHAR {
+        let text = crate::core::rql::column_default::typed_text_literal_or(literal.trim());
+        let quoted = text.len() >= 2 && text.starts_with('\'') && crate::core::sql_scan::quoted_end(text.as_bytes(), 0, b'\'') == text.len();
+        if quoted {
+            let unquoted = crate::core::value_codec::unquote_sql(text);
+            if let Some(cell) = crate::core::value_codec::legacy_char_literal(&unquoted) {
+                return Some(std::iter::once(1u8).chain(cell).collect());
+            }
+        }
+    }
     match stored_key_bytes(&literal, field) {
         Some(bytes) => Some(std::iter::once(1u8).chain(bytes).collect()),
         None => match crate::core::rql::expr::parse(&literal, &[]) {

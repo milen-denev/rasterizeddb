@@ -807,3 +807,46 @@ async fn a_truth_test_over_a_legacy_comparison_reads_its_text() {
     .await;
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }
+/// A multi-row write into a key over a legacy column compares its own rows
+/// as the key does: `('b', …), ('b ', …)` are one key, so `ON CONFLICT DO
+/// UPDATE` refuses the statement (21000) rather than update the stored `'b'`
+/// twice and answer two rows, `DO NOTHING` keeps one, and a plain INSERT or an
+/// INSERT … SELECT refuses the second (23505), writing neither. PostgreSQL
+/// 17's answers.
+///
+/// Mutation: `batch_key_part` keying the literal as written (`INSERT 0 2`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_row_write_compares_its_own_legacy_keys() {
+    let cell = |v: &str| stored_by_older_build(v).to_string();
+    let db = LegacyDb::make_tables(
+        "batch",
+        &[LegacyTable {
+            name: "lmu",
+            create: "CREATE TABLE lmu (id INT, c UINT4 UNIQUE, v INT)",
+            legacy: &["c"],
+            inserts: vec![format!("INSERT INTO lmu VALUES (1, {}, 1)", cell("b"))],
+        }],
+    )
+    .await;
+    let server = db.open().await;
+    let c = client(&server).await;
+    let wrong = check(
+        &c,
+        &[
+            ("INSERT INTO lmu VALUES (12, 'b', 7), (13, 'b ', 8) ON CONFLICT (c) DO UPDATE SET v = excluded.v", "ERR 21000"),
+            ("SELECT id, v FROM lmu ORDER BY id", "[1]|[1]"),
+            ("INSERT INTO lmu VALUES (14, 'q', 1), (15, 'q ', 2) ON CONFLICT (c) DO UPDATE SET v = excluded.v", "ERR 21000"),
+            ("SELECT count(*) FROM lmu WHERE c = 'q'", "[0]"),
+            ("INSERT INTO lmu VALUES (16, 'r', 1), (17, 'r ', 2) ON CONFLICT (c) DO NOTHING", ""),
+            ("SELECT id FROM lmu WHERE c = 'r'", "[16]"),
+            ("INSERT INTO lmu VALUES (18, 's', 1), (19, 's ', 2)", "ERR 23505"),
+            ("SELECT count(*) FROM lmu WHERE c = 's'", "[0]"),
+            ("CREATE TABLE src (id INT, k TEXT, v INT)", ""),
+            ("INSERT INTO src VALUES (20, 't', 1), (21, 't ', 2)", ""),
+            ("INSERT INTO lmu (id, c, v) SELECT id, k, v FROM src", "ERR 23505"),
+            ("SELECT count(*) FROM lmu WHERE c = 't'", "[0]"),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
