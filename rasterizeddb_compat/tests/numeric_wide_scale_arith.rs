@@ -112,16 +112,20 @@ async fn wide_scale(partitioning: &str) {
         assert_eq!(back, ["0.123456789124"], "{partitioning}");
 
         // What cannot be carried exactly is refused, not cut: WHERE-clause
-        // arithmetic over the column's digits past nine, a literal past nine
-        // there, and a quotient that does not end.
+        // arithmetic over the column's digits past nine, and a literal past
+        // nine there.
         for sql in [
             "SELECT id FROM w WHERE a + 1 > 1",
-            "SELECT a / 3 FROM w WHERE id = 1",
             "SELECT id FROM w WHERE a + 0.000000000001 > 1",
         ] {
             assert_eq!(refused(&pool, sql).await, "0A000", "{partitioning}: {sql}");
         }
         assert_eq!(rows(&pool).await, want, "{partitioning}: a refused statement changed a row");
+        // A quotient that does not end is PostgreSQL's, at `select_div_scale`'s
+        // twenty places (it was refused): PostgreSQL 17 answers
+        // 0.04115226304133333333.
+        let q = sqlx::query("SELECT (a / 3)::text FROM w WHERE id = 1").fetch_one(&pool).await.expect("quotient");
+        assert_eq!(q.get::<String, _>(0), "0.04115226304133333333", "{partitioning}");
 
         // A value the engine scale holds still computes in a SELECT.
         let r = sqlx::query("SELECT (a + 1)::text FROM w WHERE id = 5").fetch_one(&pool).await.expect("select");
@@ -240,10 +244,11 @@ async fn no_path_cuts_a_wide_numeric_to_nine_places() {
     // Past what even the exact reading holds: refused, the row unchanged.
     assert_eq!(refused(&pool, "UPDATE z SET a = a * 100000000000000000 + a / 3 WHERE id = 1").await, "0A000");
     assert_eq!(text("SELECT a::text FROM z WHERE id = 1").await, ["1428571428571.42857142857142857143"]);
-    // A value with no digits past nine, whose exact quotient is past an
-    // i128: through the engine it would be computed at nine places and
-    // stored cut; refused instead.
+    // A quotient of a value with no digits past nine whose older exact form
+    // passed an i128 (and was refused): PostgreSQL rounds it at its twenty
+    // places, which an i128 holds, and so does this now. PostgreSQL 17
+    // stores 128571428571428571.42857142857142857143.
     run(&pool, "INSERT INTO z VALUES (3, 900000000000000000)").await;
-    assert_eq!(refused(&pool, "UPDATE z SET a = a / 7 WHERE id = 3").await, "0A000");
-    assert_eq!(text("SELECT a::text FROM z WHERE id = 3").await, ["900000000000000000.00000000000000000000"]);
+    run(&pool, "UPDATE z SET a = a / 7 WHERE id = 3").await;
+    assert_eq!(text("SELECT a::text FROM z WHERE id = 3").await, ["128571428571428571.42857142857142857143"]);
 }
