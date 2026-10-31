@@ -226,17 +226,16 @@ fn conjunct_to_pred(
             // A literal with more places than the column holds is compared at
             // the engine scale by the evaluator, not at the column's; its
             // truncation here would bound zones against a different number.
-            // Not pruning is always sound.
-            let places = text
-                .split_once('.')
-                .map(|(_, fraction)| fraction.trim_end_matches('0').len())
-                .unwrap_or(0);
-            if places as u32 > *scale {
+            // Not pruning is always sound. The places are the value's, read
+            // with its exponent: a float's text is PostgreSQL's (`1e-05`),
+            // whose fraction holds no digits, and counted off the text after
+            // the point `a < 1e-05` over a NUMERIC(10,2) was bounded as
+            // `a < 0` and pruned every zone holding 0.00.
+            let v = crate::core::rql::pg_numeric::parse_text(&text)?;
+            if !v.exact_at(*scale) {
                 return None;
             }
-            crate::core::value_codec::parse_decimal_scaled(&text, *scale)?
-                .to_le_bytes()
-                .to_vec()
+            v.units_at(*scale)?.to_le_bytes().to_vec()
         }
         _ => coerce_literal(&raw, &from, db_type)?,
     };
