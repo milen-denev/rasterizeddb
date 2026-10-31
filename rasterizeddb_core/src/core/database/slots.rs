@@ -502,6 +502,13 @@ impl Database {
     /// outside the crate, which have no lock owner. Never called by the
     /// engine (pinned by `slots_source_tests`).
     #[doc(hidden)]
+    /// Every plain table, for a check made as the database opens, before any
+    /// statement can hold or change one (no lock to take yet): the legacy
+    /// `CHAR` duplicate warning (`executor::warn_legacy_char_duplicates`).
+    pub(crate) fn tables_at_open(&self) -> Vec<Arc<DbTable>> {
+        self.table_slots.iter().map(|entry| entry.value().load()).collect()
+    }
+
     pub fn table_for_tests(&self, name: &str) -> Option<Arc<DbTable>> {
         self.resolve(name, |key| {
             self.table_slots.get(key).map(|slot| slot.load())
