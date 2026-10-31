@@ -109,9 +109,19 @@ impl PgNum {
         Some(PgNum { m: self.at(s)?.checked_sub(other.at(s)?)?, s })
     }
 
-    /// Exact, at the sum of the two scales.
+    /// Exact, at the sum of the two scales. Past 38 places, or past an
+    /// i128, the zeros at the operands' ends are dropped first: the value is
+    /// still exact, at as many of its places as 38 hold (`None` when even
+    /// its own digits do not fit).
     pub(crate) fn mul(self, other: Self) -> Option<Self> {
-        PgNum::new(self.m.checked_mul(other.m)?, self.s + other.s)
+        if let Some(v) = self.m.checked_mul(other.m).and_then(|m| PgNum::new(m, self.s + other.s)) {
+            return Some(v);
+        }
+        let (a, b) = (PgNum::trimmed(self.m, self.s), PgNum::trimmed(other.m, other.s));
+        let v = PgNum::new(a.m.checked_mul(b.m)?, a.s + b.s)?;
+        // Shown with as many of its display places as an i128 holds.
+        let most = (self.s + other.s).min(MAX_SCALE);
+        Some((v.s..=most).rev().find_map(|s| v.round_to(s)).unwrap_or(v))
     }
 
     pub(crate) fn neg(self) -> Option<Self> {
@@ -130,7 +140,17 @@ impl PgNum {
         }
         let rscale = select_div_scale(self, other);
         if rscale > MAX_SCALE {
-            return Ok(None);
+            // Past 38 places: answered only when the quotient ends within
+            // them (`1e-9 / 1e11` is exactly 1e-20), at 38; anything else is
+            // `None`, for the caller to refuse rather than cut.
+            if self.s > MAX_SCALE {
+                return Ok(None);
+            }
+            let k = MAX_SCALE + other.s - self.s;
+            return Ok(match div_round_exact(self.m, k, other.m) {
+                Some((m, true)) => Some(PgNum { m, s: MAX_SCALE }),
+                _ => None,
+            });
         }
         // q = (a.m / 10^a.s) / (b.m / 10^b.s) at 10^-rscale
         //   = a.m · 10^(rscale + b.s − a.s) / b.m, and rscale ≥ a.s.
@@ -237,6 +257,11 @@ pub(crate) fn select_div_scale(a: PgNum, b: PgNum) -> u32 {
 /// `round(a · 10^k / d)`, half away from zero, through 256 bits; `None` when
 /// the quotient does not fit an `i128`. `d` is not zero.
 fn div_round(a: i128, k: u32, d: i128) -> Option<i128> {
+    div_round_exact(a, k, d).map(|(q, _)| q)
+}
+
+/// [`div_round`], and whether the division left no remainder.
+fn div_round_exact(a: i128, k: u32, d: i128) -> Option<(i128, bool)> {
     let negative = (a < 0) != (d < 0);
     let divisor = d.unsigned_abs();
     // The numerator a · 10^k as (hi, lo), lifted in steps an `u128` holds.
@@ -250,7 +275,7 @@ fn div_round(a: i128, k: u32, d: i128) -> Option<i128> {
     let (q, r) = div_rem_u256_u128(hi, lo, divisor)?;
     let q = if r >= divisor - r { q.checked_add(1)? } else { q };
     let q = i128::try_from(q).ok()?;
-    Some(if negative { -q } else { q })
+    Some((if negative { -q } else { q }, r == 0))
 }
 
 /// `(hi:lo) · f`, `None` past 256 bits.
@@ -422,6 +447,20 @@ mod tests {
         }
         assert_eq!(PgNum::trimmed(1_500_000_000, 9).to_text(), "1.5");
         assert_eq!(PgNum::trimmed(0, 9).to_text(), "0");
+    }
+
+    #[test]
+    fn past_38_places_only_an_exact_value_is_answered() {
+        // PostgreSQL 17: 0.000000001 / 100000000000 = 0.00000000000000000001000000000000000000
+        // (38 places shown here, the value exact); 1 / 3e30 has no end.
+        assert_eq!(n("0.000000001").div(n("100000000000")).unwrap().unwrap().to_text(), "0.00000000000000000001000000000000000000");
+        assert_eq!(n("1").div(n("3000000000000000000000000000000")).unwrap(), None);
+        // A product past 38 places whose own digits fit: exact.
+        assert_eq!(
+            n("1.50000000000000000000").mul(n("2.50000000000000000000")).unwrap().to_text(),
+            "3.7500000000000000000000000000000000000"
+        );
+        assert_eq!(n("0.00000000000000000001").mul(n("0.0000000000000000000003")).map(|v| v.to_text()), None);
     }
 
     #[test]

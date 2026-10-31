@@ -216,3 +216,21 @@ async fn integers_past_bigint_compare_exactly() {
         assert_eq!(rows(&c, sql).await, pg, "{sql}");
     }
 }
+
+/// A value past what 38 digits carry is refused, never cut to nine places:
+/// `u / 100000000000` over 0.000000001 was 0.000000000. One that ends within
+/// 38 places is answered (PostgreSQL 17 shows it at its 40-place display
+/// scale, 0.0000000000000000000100000000000000000000; this shows 38 of
+/// them, the value the same).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_past_38_digits_is_refused_not_cut() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE e (id INT PRIMARY KEY, u NUMERIC, s NUMERIC(38,20))").await;
+    run(&c, "INSERT INTO e VALUES (1, 0.000000001, 0.00000000000000000001)").await;
+    assert_eq!(rows(&c, "SELECT u / 100000000000 FROM e").await, ["0.00000000000000000001000000000000000000"]);
+    for sql in ["SELECT u / 3000000000000 FROM e", "SELECT s * s FROM e"] {
+        let err = c.simple_query(sql).await.expect_err(sql);
+        assert_eq!(err.code().map(|s| s.code()), Some("0A000"), "{sql}: {err}");
+    }
+}

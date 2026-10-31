@@ -3975,6 +3975,12 @@ pub(crate) fn output_is_wide(expr: &Expr) -> bool {
     static_type(expr) == DbType::DECIMAL && (!matches!(expr, Expr::Column(_)) || reads_wide_decimal(expr, &[]))
 }
 
+/// [`pg_numeric`]'s refusal of a value it cannot carry exactly: more places
+/// than 38 with digits there, or more digits than an i128 holds. PostgreSQL
+/// computes it; cut to the engine's nine places it was answered wrong.
+const PAST_38_DIGITS: &str = "the value of a NUMERIC expression needs more digits than the 38 this engine carries \
+     exactly (not supported)";
+
 /// Whether `expr` is integer-typed, as [`static_type`] would say, in one walk:
 /// [`pg_numeric`] asks it of every arithmetic node on every row, and
 /// `static_type` re-derives each operand's type several times over.
@@ -4061,21 +4067,23 @@ pub(crate) fn pg_numeric(
                 return Ok(None);
             };
             let (Some(a), Some(b)) = (a, b) else { return Ok(Some(None)) };
-            match op {
+            let value = match op {
                 ArithOp::Add => a.add(b),
                 ArithOp::Sub => a.sub(b),
                 ArithOp::Mul => a.mul(b),
                 ArithOp::Div => a.div(b).map_err(str::to_string)?,
                 ArithOp::Rem => a.rem(b).map_err(str::to_string)?,
-            }
-            .map(Some)
+            };
+            // Past what 38 digits hold, refused: the engine's nine places
+            // answered `u / 100000000000` over 0.000000001 as 0.000000000.
+            Some(Some(value.ok_or_else(|| PAST_38_DIGITS.to_string())?))
         }
         Expr::Mod(l, r) => {
             let (Some(a), Some(b)) = (pg_numeric(l, row, schema)?, pg_numeric(r, row, schema)?) else {
                 return Ok(None);
             };
             let (Some(a), Some(b)) = (a, b) else { return Ok(Some(None)) };
-            a.rem(b).map_err(str::to_string)?.map(Some)
+            Some(Some(a.rem(b).map_err(str::to_string)?.ok_or_else(|| PAST_38_DIGITS.to_string())?))
         }
         Expr::Cast(inner, DbType::DECIMAL) => match static_type(inner) {
             t if t == DbType::DECIMAL || integer(&t) => pg_numeric(inner, row, schema)?,
