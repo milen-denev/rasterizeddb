@@ -40,6 +40,18 @@ fn may_hold(sql: &str, word: &[u8]) -> bool {
             .any(|i| b.len() - i >= word.len() && b[i..i + word.len()].eq_ignore_ascii_case(word))
 }
 
+/// Whether `sql` holds a parenthesis and the word `SELECT` at least twice:
+/// the cheapest test that a `SELECT` statement may hold a subquery, asked
+/// before scanning it for one.
+pub fn may_nest_select(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    memchr::memchr(b'(', b).is_some()
+        && memchr::memchr2_iter(b'S', b's', b)
+            .filter(|&i| b.len() - i >= 6 && b[i..i + 6].eq_ignore_ascii_case(b"SELECT"))
+            .nth(1)
+            .is_some()
+}
+
 /// Finds the first `IN (SELECT …)` in a statement, ignoring string literals.
 pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
     if !may_hold(sql, b"SELECT") {

@@ -6504,6 +6504,25 @@ where
         }
     };
 
+    // A scalar subquery reading the outer row has a value per row, which
+    // nothing evaluates for a SELECT: left in place its text reached the
+    // select list or predicate parser, which called it a syntax error
+    // (42601, "function '' is not supported yet") or an unknown column
+    // (42703). It is valid SQL this engine does not implement: 0A000.
+    if matches!(purpose, QueryPurpose::QueryRows(_))
+        && crate::core::rql::subquery::may_nest_select(stmt)
+        && crate::core::rql::subquery::find_correlated_scalar_subquery(stmt).is_some()
+    {
+        fail_statement(
+            state,
+            stream,
+            "0A000",
+            "a correlated scalar subquery (one that reads the outer row) is not supported; write it as a join",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let purpose_kind = match &purpose {
         QueryPurpose::CreateTable(_) => PurposeKind::CreateTable,
         QueryPurpose::DropTable(_) => PurposeKind::DropTable,
@@ -6783,6 +6802,19 @@ fn result_description(
                                 .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                                 .collect::<Vec<_>>(),
                         ),
+                        // An item reading the FROM (USING) list's relations
+                        // names columns that exist: a construct this does not
+                        // implement, 0A000, not the 42703 of a misspelled one.
+                        Some(Err(e)) if returning_reads_joined_relation(sql, &e, &fields, database) => {
+                            return Err((
+                                "0A000",
+                                format!(
+                                    "{e}: RETURNING a column of a relation in the {} list is not supported; \
+                                     return the target's own columns",
+                                    if matches!(purpose, QueryPurpose::UpdateRow(_)) { "FROM" } else { "USING" }
+                                ),
+                            ))
+                        }
                         Some(Err(e)) => return Err((returning_sqlstate(&e), e)),
                         None => None,
                     }
@@ -7206,6 +7238,87 @@ fn materialize_class(code: &'static str) -> &'static str {
 /// The SQLSTATE of a `RETURNING` list that does not resolve: a column it
 /// names that is not there (42703), or a qualifier naming no relation of the
 /// statement (42P01), which this read as the column's error.
+/// Whether the `RETURNING` item `message` reports unresolved against the
+/// target's columns reads a relation of the statement's `FROM` list (an
+/// `UPDATE`) or `USING` list (a `DELETE`): it names one of those relations
+/// or their aliases as a qualifier, or a column one of them has and the
+/// target does not. `UPDATE t SET … FROM s … RETURNING t.v / s.z` was
+/// 42703, an undefined column, for columns that exist.
+fn returning_reads_joined_relation(
+    sql: &str,
+    message: &str,
+    target: &[crate::core::row::schema::SchemaField],
+    database: &Database,
+) -> bool {
+    use crate::core::rql::join::find_keyword;
+    let Some(item) = message.strip_prefix("RETURNING column '").and_then(|r| r.strip_suffix("' not found in schema"))
+    else {
+        return false;
+    };
+    let update = sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("UPDATE"));
+    let keyword = if update { "FROM" } else { "USING" };
+    let Some(at) = find_keyword(sql, keyword, 0) else { return false };
+    let start = at + keyword.len();
+    let end = ["WHERE", "RETURNING"].iter().filter_map(|k| find_keyword(sql, k, start)).min().unwrap_or(sql.len());
+    // Each relation of the list: its name and alias as qualifiers, and its
+    // columns. A relation starts the list, follows a comma or follows JOIN.
+    let mut qualifiers: Vec<String> = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    let spaced = sql[start..end].replace(',', " , ");
+    let tokens: Vec<&str> = spaced.split_whitespace().collect();
+    let keyword_word = |t: &str| {
+        ["ON", "AS", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "USING", ","]
+            .iter()
+            .any(|k| t.eq_ignore_ascii_case(k))
+    };
+    let mut expect_relation = true;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if expect_relation && !keyword_word(t) {
+            let name = t.trim_matches('"');
+            qualifiers.push(name.to_ascii_lowercase());
+            if let Some(view) = database.schema_view(name) {
+                columns.extend(view.schema().fields.iter().map(|f| f.name.to_ascii_lowercase()));
+            }
+            let mut j = i + 1;
+            if tokens.get(j).is_some_and(|w| w.eq_ignore_ascii_case("AS")) {
+                j += 1;
+            }
+            if let Some(alias) = tokens.get(j).filter(|w| !keyword_word(w)) {
+                qualifiers.push(alias.trim_matches('"').to_ascii_lowercase());
+            }
+            expect_relation = false;
+        } else if t == "," || t.eq_ignore_ascii_case("JOIN") {
+            expect_relation = true;
+        }
+        i += 1;
+    }
+    // The item's names: `q.c` or `c`, outside quoted text.
+    let mut names: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in item.chars().chain(std::iter::once(' ')) {
+        if c == '\'' {
+            quoted = !quoted;
+            current.clear();
+            continue;
+        }
+        if !quoted && (c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"') {
+            current.push(c);
+        } else {
+            if !current.is_empty() && !current.starts_with(|d: char| d.is_ascii_digit() || d == '.') {
+                names.push(current.replace('"', "").to_ascii_lowercase());
+            }
+            current.clear();
+        }
+    }
+    names.iter().any(|name| match name.split_once('.') {
+        Some((q, _)) => qualifiers.iter().any(|x| x == q),
+        None => columns.iter().any(|c| c == name) && !target.iter().any(|f| f.name.eq_ignore_ascii_case(name)),
+    })
+}
+
 fn returning_sqlstate(message: &str) -> &'static str {
     if message.starts_with("missing FROM-clause entry for table") {
         "42P01"
