@@ -639,38 +639,61 @@ does everywhere. One that compares an outer
 column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
 (`x - EXISTS (…)::int`), is refused with 0A000.
 
-### NUMERIC past nine places
+### NUMERIC results and display scale
 
-Expressions compute `NUMERIC` at the engine's nine places. A column declared
-with more (`NUMERIC(20,12)`) is still exact where it is stored, compared with
-a literal of any length or a column of another scale (`WHERE ja.a > jb.a`),
-compared in an expression (`CASE WHEN a > 1`), cast (`a::numeric(10,2)`,
-`a::float8`, `a::text`), assigned (`UPDATE … SET a = a + 0.000000000001`,
-computed exactly and rounded once to the column's scale), copied by `INSERT …
-SELECT` from any source (a join, a derived table, a CTE, `min`), and in a
-select list, `ORDER BY` key or `RETURNING` item built from `+`, `-`, `*`,
-unary minus, `COALESCE`, `CASE`, `LEAST` and `GREATEST` (`SELECT a + 1`,
-`-a`, `a * 2`). A `UNION` of NUMERIC columns at different scales, or of a
-NUMERIC and an integer, an expression, an aggregate or a numeric constant,
-gives each value at its own scale; one whose branch types cannot be resolved
-to NUMERIC (a float, a join or `SELECT` with no `FROM`) is refused with
-0A000 rather than mixed.
+A `NUMERIC` expression is computed as PostgreSQL computes it, with its
+display scale: the larger operand scale for `+`, `-` and `%`, their sum for
+`*`, `select_div_scale` for `/` (sixteen significant digits at least, never
+fewer places than either operand, rounded half away from zero), a written
+constant's own places (`2.50` is two), an integer's none, and for `CASE`,
+`COALESCE`, `LEAST`, `GREATEST` and `NULLIF` the scale of the value chosen.
+`1.0 / 3` is 0.33333333333333333333 and `2.50 * 2` is 5.00 in a select list,
+`ORDER BY` key, join item, `RETURNING`, an expression over aggregates
+(`min(n) + 1`), `::text`, `||`, a text column it is stored in, and a
+comparison (`CASE WHEN x * y > 0`). Stored into a `NUMERIC(p, s)` column the
+value is PostgreSQL's, rounded once more to `s`.
+
+Not yet at PostgreSQL's digits: arithmetic in a `WHERE` clause evaluated by
+the scan (`WHERE x * y > 0` over values whose product has digits past nine
+places), an aggregate's argument (`sum(a * 1.5)` shows nine places), and a
+`GROUP BY` key computed by an expression. A value that needs more than the 38
+digits an `i128` carries is refused (0A000); one that ends within 38 places
+past a display scale of more than 38 is shown at 38.
+
+An unconstrained `NUMERIC` column is stored at nine places here, so a value
+does not keep its own display scale: it is shown with nine places as a column
+and with the places its value needs in arithmetic. Until each value is stored
+at its own precision the rule on every path into such a column (`INSERT …
+VALUES`, `INSERT … SELECT`, `UPDATE`, `ON CONFLICT … DO UPDATE`, a generated
+column, a cast from a float) is one: a value exact at nine places (any digits
+past them zeros) is stored, and one with a nonzero digit past them is refused
+with 0A000, never rounded. The refusal depends on the data, so the same
+statement may run against some rows and be refused against others.
 
 A constant with more than nine places, written either way (`0.000000000001`,
 `43e-17`), is `numeric` as in PostgreSQL, carried with its digits (up to 38
-places) and computed exactly in the same places: `SELECT c + 43e-17` is
-44812.65000000000000043, and a `CASE` with such a branch stays `numeric`.
+places): `SELECT c + 43e-17` is 44812.65000000000000043. A `UNION` of NUMERIC
+columns at different scales gives each value at its own scale; one whose
+branch types cannot be resolved to NUMERIC is refused with 0A000 rather than
+mixed.
 
-Refused with 0A000 rather than answered without the value's last digits:
-a value with more than nine places stored into an unconstrained `NUMERIC`
-column, which keeps nine here (declare it `NUMERIC(p, s)`),
-`WHERE`-clause arithmetic on such a value or constant (`WHERE a + 0 > 1`), a
-quotient that does not end (`a / 3`), such a constant inside an aggregate's
-argument (`sum(c + 43e-17)`), and a `UNION` whose first branch is an integer
-and a later one NUMERIC (cast the first branch's column to `numeric`). The
-refusal for a column's value depends on the data: it fires only for rows whose
-value has nonzero digits past the ninth place, so the same statement may run
-against some rows and be refused against others.
+Join keys of two numeric types or scales meet by value, in PostgreSQL's
+common type: `numeric = float8` as `float8`, `numeric = numeric` whatever the
+scales.
+
+### Float text
+
+A `double precision` or `real` value's text is PostgreSQL's (`float8out`):
+the shortest digits that read back as the same float, with an exponent past
+fifteen digits (six for `real`) or below 10^-4 — `1e+20`, `1e-07`, `3.4e+38`
+— and `NaN`, `Infinity`, `-Infinity`, `-0`. The wire, `::text`, `||`, a text
+column a float is stored in and `INSERT … SELECT` all agree.
+
+Release note: a `STORED` generated column computed from a float's text
+(`GENERATED ALWAYS AS (f::text) STORED`) keeps the text an older binary
+wrote for rows it wrote (`100000000000000000000`); rows written or updated
+since carry PostgreSQL's (`1e+20`), so such a column can hold both forms
+until its rows are rewritten (`UPDATE t SET f = f`).
 
 ## JSON
 
