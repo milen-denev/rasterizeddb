@@ -615,6 +615,92 @@ struct KeyColumn {
     /// text and no `character(n)` value: `lc JOIN jt ON lc.c = jt.k` joined
     /// nothing.
     legacy_char: bool,
+    /// The two sides are numbers of different types or scales, which
+    /// PostgreSQL compares in a common type: the key is read as that number
+    /// rather than matched by bytes (a NUMERIC(10,2) 1.50 is 150 units, an
+    /// unconstrained 1.5 is 1500000000, and a float 1.5 is neither).
+    number: Option<KeyNumber>,
+}
+
+/// How a numeric join key is read when the two sides' types differ
+/// ([`KeyColumn::number`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyNumber {
+    /// Integers and NUMERICs: by exact value, a sixteen-byte NUMERIC at this
+    /// side's declared scale (a cell carrying its own scale at that).
+    Exact { scale: u32 },
+    /// Against a float, in double precision, as PostgreSQL resolves `numeric
+    /// = float8` (and `int = float8`, `real = float8`).
+    Float { scale: u32 },
+}
+
+/// A numeric key's value in the common type ([`KeyNumber`]): an exact
+/// `m × 10^-s` with the zeros of `m` moved into `s`, or a float's bits with
+/// `-0` as `0`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum KeyNumberValue {
+    Exact(i128, u32),
+    Float(u64),
+}
+
+impl KeyNumber {
+    fn read(self, bytes: &[u8], ty: &DbType) -> Option<KeyNumberValue> {
+        use crate::core::rql::pg_numeric::PgNum;
+        let exact = |scale: u32| -> Option<PgNum> {
+            match ty {
+                DbType::DECIMAL => match crate::core::value_codec::split_decimal_cell(bytes)? {
+                    (m, Some(own)) => Some(PgNum::trimmed(m, own)),
+                    (m, None) => Some(PgNum::trimmed(m, scale)),
+                },
+                DbType::I8 => Some(PgNum::int(i8::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::I16 => Some(PgNum::int(i16::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::I32 => Some(PgNum::int(i32::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::I64 => Some(PgNum::int(i64::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::U8 => Some(PgNum::int(u8::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::U16 => Some(PgNum::int(u16::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::U32 => Some(PgNum::int(u32::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                DbType::U64 => Some(PgNum::int(u64::from_le_bytes(bytes.try_into().ok()?) as i128)),
+                _ => None,
+            }
+        };
+        match self {
+            KeyNumber::Exact { scale } => exact(scale).map(|v| KeyNumberValue::Exact(v.m, v.s)),
+            KeyNumber::Float { scale } => {
+                let f = match ty {
+                    DbType::F64 => f64::from_le_bytes(bytes.try_into().ok()?),
+                    DbType::F32 => f64::from(f32::from_le_bytes(bytes.try_into().ok()?)),
+                    // A NUMERIC to float8 as PostgreSQL converts it, through
+                    // its text: the nearest float.
+                    _ => exact(scale)?.to_text().parse::<f64>().ok()?,
+                };
+                let f = if f == 0.0 { 0.0 } else if f.is_nan() { f64::NAN } else { f };
+                Some(KeyNumberValue::Float(f.to_bits()))
+            }
+        }
+    }
+}
+
+/// The numeric reading two key columns need, when they need one: numbers of
+/// different types or scales (an unconstrained NUMERIC is at nine places).
+fn key_numbers(l: &SchemaField, r: &SchemaField) -> Option<(KeyNumber, KeyNumber)> {
+    let integer = |t: &DbType| {
+        matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64)
+    };
+    let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+    let number = |t: &DbType| integer(t) || float(t) || *t == DbType::DECIMAL;
+    if !number(&l.db_type) || !number(&r.db_type) {
+        return None;
+    }
+    let scale = |f: &SchemaField| f.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+    if l.db_type == r.db_type && (l.db_type != DbType::DECIMAL || scale(l) == scale(r)) {
+        return None;
+    }
+    // Integers of two widths have bytes of two widths: read as numbers too.
+    Some(if float(&l.db_type) || float(&r.db_type) {
+        (KeyNumber::Float { scale: scale(l) }, KeyNumber::Float { scale: scale(r) })
+    } else {
+        (KeyNumber::Exact { scale: scale(l) }, KeyNumber::Exact { scale: scale(r) })
+    })
 }
 
 /// One key column's value as the join matches it: by bytes, or for two
@@ -626,11 +712,17 @@ struct KeyColumn {
 struct KeyValue<'r> {
     bytes: &'r [u8],
     document: bool,
+    /// The key read as a number in the two sides' common type, when they
+    /// differ ([`KeyColumn::number`]); matched and hashed by this instead.
+    number: Option<KeyNumberValue>,
 }
 
 impl PartialEq for KeyValue<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        if let (Some(a), Some(b)) = (self.number, other.number) {
+            return a == b;
+        }
         if self.document && other.document {
             crate::core::jsonb::values_equal(self.bytes, other.bytes)
                 .unwrap_or_else(|| self.bytes == other.bytes)
@@ -645,7 +737,9 @@ impl Eq for KeyValue<'_> {}
 impl std::hash::Hash for KeyValue<'_> {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        if self.document {
+        if let Some(n) = self.number {
+            n.hash(state);
+        } else if self.document {
             let mut key = Vec::with_capacity(self.bytes.len() + 8);
             crate::core::jsonb::push_group_key(self.bytes, &mut key);
             key.hash(state);
@@ -683,9 +777,16 @@ fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<KeyValue<'r>> {
     } else {
         bytes
     };
+    // A number this side cannot be read as (bytes of another width) matches
+    // nothing, as a value of no common type would not.
+    let number = match key.number {
+        Some(mode) => Some(mode.read(bytes, &ty)?),
+        None => None,
+    };
     Some(KeyValue {
         bytes,
         document: key.document,
+        number,
     })
 }
 
@@ -978,8 +1079,9 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         document: false,
                         blank_padded: false,
                         legacy_char: f.db_type == DbType::CHAR,
+                        number: None,
                     };
-                    (key, f.db_type == DbType::JSONB, text_kind(f))
+                    (key, f.db_type == DbType::JSONB, text_kind(f), f.clone())
                 });
             let r = relation
                 .fetch_columns
@@ -992,11 +1094,17 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         document: false,
                         blank_padded: false,
                         legacy_char: f.db_type == DbType::CHAR,
+                        number: None,
                     };
-                    (key, f.db_type == DbType::JSONB, text_kind(f))
+                    (key, f.db_type == DbType::JSONB, text_kind(f), f.clone())
                 });
             match (l, r) {
-                (Some((mut l, l_doc, l_kind)), Some((mut r, r_doc, r_kind))) => {
+                (Some((mut l, l_doc, l_kind, l_field)), Some((mut r, r_doc, r_kind, r_field))) => {
+                    // Numbers of different types or scales meet by value.
+                    if let Some((ln, rn)) = key_numbers(&l_field, &r_field) {
+                        l.number = Some(ln);
+                        r.number = Some(rn);
+                    }
                     // Matched by value only when both sides are documents;
                     // anything else keeps matching by bytes.
                     l.document = l_doc && r_doc;
