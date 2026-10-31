@@ -491,10 +491,13 @@ plan whose word is no longer `Clean` or whose index epoch moved becomes a
 build from the rows as they are (`BuildInstead`).
 
 **Closing a scan-only instance writes nothing.** Its close does not seal,
-its unit takes no idle checkpoint (`ExternalUnit::scan_only`), and a
-shutdown's seals leave it out: each seal would first take a transient
-ticket, making `DIRTY` durable and spoiling the snapshot the next open
-loads, and then find the instance ineligible (its indexes not ready). For
+and a shutdown's seals leave it out: each seal would first take a
+transient ticket, making `DIRTY` durable and spoiling the snapshot the
+next open loads, and then find the instance ineligible (its indexes not
+ready). Its unit takes no idle checkpoint either (`ExternalUnit::scan_only`),
+which only spares attempts: the idle checkpoint acts only on a word already
+`DIRTY` (something wrote), whose snapshot is spoiled anyway, and on a
+scan-only instance it would find the seal ineligible every round. For
 the same reason any close now seals only when the instance's indexes and
 filter are ready (`Table::ready_to_seal`): a partition evicted before its
 build or load finished no longer spoils its snapshot either. So an
@@ -583,7 +586,20 @@ partitions report their indexes not ready, and upgrade them before
 waiting. The twin's budget configurations run every fan-out through
 scan-only opens and their upgrades.
 
-MUTATIONS_2B
+**Mutations** (a throwaway worktree, its own target directory):
+
+| Mutation | Caught by |
+|---|---|
+| a fan-out's open made full | `a_fan_out_opens_scan_only_and_its_close_writes_nothing` |
+| a routed read not upgrading the instance it reaches | `a_routed_read_upgrades_a_scan_only_instance_in_place` |
+| a write not upgrading before its ticket | `a_write_upgrades_a_scan_only_instance_before_its_ticket` |
+| a deferred load kept after the file set changed | `an_upgrade_after_the_file_set_changed_builds_rather_than_loads` |
+| a scan-only or unready instance sealed at close | `a_fan_out_opens_scan_only_and_its_close_writes_nothing` |
+| only the scan-only guard at close removed | survives: a scan-only instance's indexes are not ready, so `ready_to_seal` refuses the seal too |
+| shutdown sealing scan-only partitions | `shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone` |
+| the idle checkpoint looking at a scan-only instance | survives, as it should: it acts only on a `DIRTY` word (above) |
+| N1: the token released while the instance lives | `an_instance_kept_past_its_close_stays_counted` |
+| the plain-table term ignored | `open_plain_tables_shrink_the_derived_budget` |
 
 ## Phase 3 P5b-2a as built
 

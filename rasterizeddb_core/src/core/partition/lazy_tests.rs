@@ -2130,10 +2130,10 @@ async fn an_upgrade_after_the_file_set_changed_builds_rather_than_loads() {
 
 /// Shutdown seals the open partitions, but not a scan-only one, whose
 /// seal's transient ticket would spoil the snapshot its next open loads;
-/// and its unit takes no idle checkpoint meanwhile.
+/// and nothing else (its unit's idle checkpoint, which acts only on a
+/// `DIRTY` word) spoils it while it is open.
 ///
-/// Mutations: shutdown sealing scan-only partitions; the unit's idle
-/// checkpoint looking at a scan-only instance.
+/// Mutation: shutdown sealing scan-only partitions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone() {
     use crate::core::index_store::load::Origin;
