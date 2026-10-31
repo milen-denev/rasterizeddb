@@ -1726,8 +1726,23 @@ async fn the_clock_never_drops_the_last_reference_to_a_table_under_its_ring() {
         .await
         .unwrap();
     exec(&db, "DROP TABLE a").await;
+    // A watchdog off the runtime: a deadlock in the CLOCK blocks worker
+    // threads one by one until no timer fires, so the test aborts the
+    // binary with a message rather than hang.
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            if !finished.load(std::sync::atomic::Ordering::Acquire) {
+                eprintln!("the_clock_never_drops_the_last_reference_to_a_table_under_its_ring: the insert hung in the CLOCK (a deadlock)");
+                std::process::abort();
+            }
+        });
+    }
     resume.send(()).unwrap();
     let done = tokio::time::timeout(Duration::from_secs(20), insert).await.expect("the insert hung in the CLOCK").unwrap();
+    finished.store(true, std::sync::atomic::Ordering::Release);
     assert!(done.is_ok(), "{done:?}");
     close(dir.path(), db);
     super::budget::release(dir.path());
