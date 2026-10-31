@@ -64,33 +64,12 @@ pub fn perform_comparison_operation(
         // value is little-endian, and pre-1970 instants are negative.
         DbType::DATETIME => generic_comparison::<i64>(input1, input2, operation),
         DbType::BOOL => generic_comparison::<u8>(input1, input2, operation),
-        // A legacy `CHAR` by its text (`value_codec::legacy_char_text`), as
-        // ORDER BY and min/max order it: the four bytes read as a `u32` put
-        // 'ab' after 'b'. A pattern is matched against the text, as written.
-        DbType::CHAR => {
-            let a = crate::core::value_codec::legacy_char_text(input1).as_bytes();
-            let pattern = matches!(
-                operation,
-                ComparerOperation::Contains
-                    | ComparerOperation::StartsWith
-                    | ComparerOperation::EndsWith
-                    | ComparerOperation::ContainsCaseInsensitive
-                    | ComparerOperation::StartsWithCaseInsensitive
-                    | ComparerOperation::EndsWithCaseInsensitive
-                    | ComparerOperation::EqualsCaseInsensitive
-                    | ComparerOperation::Like
-                    | ComparerOperation::LikeCaseInsensitive
-                    | ComparerOperation::SimilarTo
-            );
-            if pattern {
-                if matches!(operation, ComparerOperation::SimilarTo) {
-                    return super::common::similar_to_compare(a, input2);
-                }
-                return Ok(string_comparison(a, input2, operation));
-            }
-            let b = crate::core::value_codec::legacy_char_text(input2).as_bytes();
-            Ok(string_comparison(a, b, operation))
-        }
+        // A legacy `CHAR`'s stored bytes, in the order the filter's zone
+        // bounds, its fingerprints and the index keys were derived under
+        // (pinned by `derive_vectors_tests` and `hash_agrees_with_comparison`).
+        // A query never compares such a column here: the predicate rewrite
+        // evaluates it as its text (`predicate_rewrite::legacy_char_operand`).
+        DbType::CHAR => generic_comparison::<u32>(input1, input2, operation),
         // Unscaled units at one fixed scale, so the integer order is the
         // numeric order and equal values are bitwise identical.
         DbType::DECIMAL => generic_comparison::<i128>(input1, input2, operation),
