@@ -153,3 +153,34 @@ async fn a_real_into_a_scaled_numeric_rounds_its_text() {
         ["1|2.68", "2|1.01", "4|1234.56", "6|33.34", "31|2.68", "32|1.01", "34|1234.57", "36|33.34", "61|2.68", "62|1.01", "70|33.34"]
     );
 }
+
+/// An integer column compared with a float — a scalar subquery's value
+/// (substituted as `'0.5'::float8`), or that literal written out — is
+/// compared as PostgreSQL compares `int = float8`, over a table big enough
+/// for the filter index. The quoted float under a cast was text to the
+/// plan, which refused it (XX000).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_integer_column_compares_with_a_float_subquery() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE iq (id INT PRIMARY KEY, b BIGINT, i INT, s SMALLINT)").await;
+    for chunk in 0..10 {
+        let values: Vec<String> = (0..500).map(|k| chunk * 500 + k).map(|g| format!("({g}, {g}, {g}, {g})")).collect();
+        run(&c, &format!("INSERT INTO iq VALUES {}", values.join(","))).await;
+    }
+    run(&c, "CREATE TABLE fs (k INT PRIMARY KEY, f FLOAT8, r REAL)").await;
+    run(&c, "INSERT INTO fs VALUES (1, 0.5, 0.5), (2, 2.0, 2.0), (3, 2.5, 2.5), (4, 1e20, 1e20)").await;
+    // PostgreSQL 17's counts for each.
+    for (predicate, pg) in [
+        ("b > (SELECT f FROM fs WHERE k = 1)", "4999"),
+        ("i >= (SELECT f FROM fs WHERE k = 3)", "4997"),
+        ("b = (SELECT f FROM fs WHERE k = 2)", "1"),
+        ("b < (SELECT f FROM fs WHERE k = 4)", "5000"),
+        ("s < (SELECT r FROM fs WHERE k = 3)", "3"),
+        ("i > '0.5'::float8", "4999"),
+    ] {
+        assert_eq!(rows(&c, &format!("SELECT count(*) FROM iq WHERE {predicate}")).await, [pg], "{predicate}");
+    }
+    run(&c, "DELETE FROM iq WHERE b < (SELECT f FROM fs WHERE k = 3)").await;
+    assert_eq!(rows(&c, "SELECT count(*) FROM iq").await, ["4997"]);
+}

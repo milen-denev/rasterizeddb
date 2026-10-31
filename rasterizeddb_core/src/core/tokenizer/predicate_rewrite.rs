@@ -1517,6 +1517,22 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 if matches!(bytes.get(i), Some(b'(') | Some(b'[')) {
                     return Err("a `::` cast in a WHERE clause is not supported yet".to_string());
                 }
+                // A quoted float under a float cast is that number, not text:
+                // `b > '0.5'::float8` over a bigint compared the text '0.5'
+                // with the column and the plan refused it (XX000), where
+                // PostgreSQL compares the two as float8. A float scalar
+                // subquery is substituted in this form, so `b > (SELECT f …)`
+                // failed the same way. Kept quoted when it does not read as a
+                // finite float (`'NaN'::float8`), as before.
+                let name = &clause[name_start..i];
+                if ["float8", "float4", "real", "double", "float"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                    if let Some(Tok::Str(quoted)) = out.last() {
+                        let text = crate::core::value_codec::unquote_sql(quoted).trim().to_string();
+                        if text.parse::<f64>().is_ok_and(f64::is_finite) && text.bytes().any(|b| b.is_ascii_digit()) {
+                            *out.last_mut().expect("a literal") = Tok::Word(text);
+                        }
+                    }
+                }
 
                 // With the cast gone, a wrapper that existed only to carry it
                 // goes too. `(data->>'code')::bigint` has to become
