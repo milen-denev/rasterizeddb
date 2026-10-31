@@ -324,6 +324,20 @@ fn store_into(
         entry: arc_swap::ArcSwapOption::new(Some(std::sync::Arc::new(entry))),
     });
 
+    // At the entry limit, a sixteenth of it is evicted at once, oldest
+    // first. The eviction (`remove_oldest`) scans every slot and sorts what it
+    // finds; left to `force_insert`, which evicts one entry per store, every
+    // store paid that whole scan once a churn of keys had filled the cache:
+    // many distinct clauses, or partitions closed and reopened, whose new
+    // instances each cache under a scope of their own (phase 3 P5b-2: the
+    // cache-on twin's few-open runs took 2.8 times the cache-off ones). One
+    // scan per `max / 16` stores instead.
+    let max = cache.max_capacity();
+    if max > 0 && cache.len() >= max {
+        for (_, old, _, _) in cache.remove_oldest((max / 16).max(1)) {
+            old.release();
+        }
+    }
     match cache.force_insert(slot_hash(table, where_clause, limit), slot.clone()) {
         Ok((true, evicted)) => {
             STORES.fetch_add(1, Ordering::Relaxed);
@@ -426,6 +440,30 @@ mod budget_tests {
         clear_cache(&cache);
         assert_eq!(cached_bytes(), base);
         assert_eq!(cache.len(), 0);
+
+        // At the entry limit (1 024 here), a store evicts a sixteenth of it
+        // at once, so the stores after it evict nothing until the limit is
+        // reached again; the newest entry is kept. (Mutation: evicting one per
+        // store, as `force_insert` alone did, which scanned and sorted every
+        // slot on every store once the cache was full.)
+        let budget = u64::MAX / 2;
+        let mut i = 0;
+        while cache.len() < 1024 {
+            store_into(&cache, "t", &format!("c = {}", i), 1, None, pointers(1), budget);
+            i += 1;
+            assert!(i < 4096, "the cache never filled");
+        }
+        store_into(&cache, "t", &format!("c = {}", i), 1, None, pointers(1), budget);
+        let after = cache.len();
+        assert!(after <= 1024 - 32, "a store at the entry limit evicted {} entries, not a batch", 1024 + 1 - after);
+        assert!(cache.get(&slot_hash("t", &format!("c = {}", i), None)).is_some(), "the newest entry was evicted");
+        assert!(cache.get(&slot_hash("t", "c = 0", None)).is_none(), "the oldest entry survived the batch");
+        for k in 1..=16 {
+            store_into(&cache, "t", &format!("c = {}", i + k), 1, None, pointers(1), budget);
+        }
+        assert!(cache.len() >= after, "stores below the entry limit evicted");
+        clear_cache(&cache);
+        assert_eq!(cached_bytes(), base);
     }
 }
 

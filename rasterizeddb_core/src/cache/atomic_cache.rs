@@ -1118,6 +1118,13 @@ where
         self.capacity_mask + 1
     }
 
+    /// The most live entries this cache keeps (`new`'s `max_capacity`); 0 is
+    /// unbounded.
+    #[inline]
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
+    }
+
     /// Returns all entries in the cache with their metadata.
     ///
     /// Results are sorted by sequence number (most recent first).
