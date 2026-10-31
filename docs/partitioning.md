@@ -370,18 +370,26 @@ dominated by the per-partition stats; populating 10⁴ one-row partitions
 took 44 s here (a durable `MATERIALIZE` each, on tmpfs). Debug builds
 throughout.
 
-**Found, older than P5b, not fixed here.** The twin at `0x5eed2b20` and
-1,500 statements (its stream shifted by the new `ClosePartitions` kind)
-diverges in every configuration at op 1301: `INSERT … VALUES (-6, …) ON
-CONFLICT (tenant_id, grp, id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id,
-n = 14` is refused with `0A000` ("changing a partition key value is not
-supported yet") when the key already exists, where the plain twin updates.
-A positive key is accepted. It reproduces at `f89ed7ad` with every
-partition open and nothing closed (a two-statement repro on a fresh table),
-so it is the same-value key-assignment proof (§4.5) not reading a signed
-literal, as the router does not (2b's "a signed numeric literal is never
-learned"). A refusal, not a wrong answer; for its owner to fix. `0x5eedf1a1`
-and the default seeds pass in every configuration.
+**Found by the twin, older than P5b, fixed on this branch.** The twin at
+`0x5eed2b20` and 1,500 statements (its stream shifted by the new
+`ClosePartitions` kind) diverged in every configuration at op 1301: `INSERT
+… VALUES (-6, …) ON CONFLICT (tenant_id, grp, id) DO UPDATE SET tenant_id =
+EXCLUDED.tenant_id, n = 14` was refused with `0A000` when the key existed,
+where the plain twin and PostgreSQL 17 update. It reproduced at `f89ed7ad`
+with nothing closed. The cause: `predicate_rewrite` renders a negative
+literal as `- 6`, and the tokenizer read a sign followed by spaces as an
+operator, so `extract_gated` found no `key = v` conjunct and the
+same-value key proof (§4.5) failed; for the same reason the router fanned
+out for a negative key. The tokenizer now reads a sign in a number's place
+as the number's own whatever spaces follow it (`= - 6` is `= -6`; a binary
+minus is unchanged). Pinned by
+`partition::key_assign_tests::a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_refused`
+(upserts and `UPDATE`s over BIGINT, INT and composite keys with a negative
+part, rows as PostgreSQL 17 leaves them; every key change, a sign flip
+included, still refused) and the tokenizer's
+`a_spaced_sign_reads_as_the_numbers_own`. Still refused, for either sign,
+as §4.5 says of any expression on a key column: `SET k = (6)`, `SET k =
+EXCLUDED.k + 0` and `SET k = k`, which PostgreSQL accepts.
 
 **Left for P5b-2 and after.** The open budget and the sharded CLOCK
 (scan-resistant fan-out opens), idle close with the persistent-index
