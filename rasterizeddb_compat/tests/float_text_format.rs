@@ -371,3 +371,25 @@ async fn a_check_with_a_real_reads_it_widened() {
     }
     assert_eq!(rows(&c, "SELECT id, f8, g FROM ck ORDER BY id").await, ["3|0.1|", "4||0.1"]);
 }
+
+/// `EXCLUDED.<column>` written `DEFAULT` in the VALUES is that column's
+/// default, as PostgreSQL resolves it: a REAL default under `excluded.f4`
+/// failed with 42703 once wrapped as a real, a FLOAT8 reading
+/// `excluded.f4` stored NULL before that, and a NUMERIC default is that
+/// default at its scale. PostgreSQL 17's rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn excluded_default_is_the_columns_default() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE dd (id INT PRIMARY KEY, f4 REAL DEFAULT 0.25, f8 FLOAT8 DEFAULT 0.5, n NUMERIC(10,2) DEFAULT 1.5, t TEXT)").await;
+    run(&c, "INSERT INTO dd VALUES (1, 1, 1, 1, 'a')").await;
+    run(
+        &c,
+        "INSERT INTO dd VALUES (1, DEFAULT, DEFAULT, DEFAULT, 'b') ON CONFLICT (id) DO UPDATE \
+         SET f4 = excluded.f4, f8 = excluded.f8, n = excluded.n, t = excluded.t",
+    )
+    .await;
+    assert_eq!(rows(&c, "SELECT * FROM dd").await, ["1|0.25|0.5|1.50|b"]);
+    run(&c, "INSERT INTO dd VALUES (1, DEFAULT, 9, 9, 'c') ON CONFLICT (id) DO UPDATE SET f8 = excluded.f4").await;
+    assert_eq!(rows(&c, "SELECT * FROM dd").await, ["1|0.25|0.25|1.50|b"]);
+}

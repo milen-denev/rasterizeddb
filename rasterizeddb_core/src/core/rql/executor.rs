@@ -6840,6 +6840,22 @@ async fn apply_conflict_update(
                 value.unwrap_or_else(|| format!("{}{}", EXCLUDED_UNAVAILABLE, field.name)),
             ));
         }
+        // `EXCLUDED.<column>` written `DEFAULT` in the VALUES is the value the
+        // row took, its default, as for a column the INSERT does not write.
+        // Substituted as the bare keyword it was 42703 ("'DEFAULT' is
+        // neither a column nor a value") once wrapped below, and NULL before.
+        for (name, value) in inserted.iter_mut() {
+            if !value.trim().trim_start_matches('(').trim_end_matches(')').trim().eq_ignore_ascii_case("DEFAULT") {
+                continue;
+            }
+            let generated = crate::core::rql::generated::expression_for(name, &schema.generated).is_some();
+            *value = match crate::core::rql::column_default::expression_for(name, &schema.defaults) {
+                _ if generated => format!("{}{}", EXCLUDED_UNAVAILABLE, name),
+                None => "NULL".to_string(),
+                Some(expression) if default_is_constant(expression) => format!("({})", expression.trim()),
+                Some(_) => format!("{}{}", EXCLUDED_UNAVAILABLE, name),
+            };
+        }
         // `EXCLUDED.<real column>` is a `real`: as its bare digits it was
         // the double nearest them, so `SET f8 = excluded.f4` stored 0.1
         // where PostgreSQL stores the real widened (0.10000000149011612).
