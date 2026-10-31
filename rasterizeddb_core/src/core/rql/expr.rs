@@ -3812,6 +3812,15 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
         if let Some(value) = exact {
             return match value {
                 None => Ok(Value::Null),
+                // An unconstrained column keeps nine places: a value it cannot
+                // hold exactly is refused, never rounded (`pg_numeric_into`).
+                Some(exact) if target.scale.is_none() && !exact.exact_at(scale) => Err(format!(
+                    "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
+                     (not supported); declare the column NUMERIC(p, s) for column \"{}\"",
+                    if exact.err == 0.0 { format!("\"{}\"", exact.text()) } else { "of this expression".to_string() },
+                    scale,
+                    target.name
+                )),
                 Some(exact) => match exact.settle(scale) {
                     Some(units) => Ok(Value::Data { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL }),
                     // Not settled: the engine path's own refusal when it has
@@ -3834,7 +3843,7 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
 /// value; one with digits past nine is refused, as such a written constant
 /// is, rather than stored without them (`SET c = 2.0 / 3` stored
 /// 0.666666667 for PostgreSQL's 0.66666666666666666667).
-fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &SchemaField) -> Result<Value, String> {
+pub(crate) fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
     let overflow = || "value overflows numeric format".to_string();
     let units = match target.scale {
@@ -3866,6 +3875,23 @@ struct ExactNumber {
 impl ExactNumber {
     fn exact(m: i128, e: i32) -> Self {
         ExactNumber { m, e, err: 0.0 }
+    }
+
+    /// Whether this is certainly the number it says, with nothing past
+    /// `places` places but zeros.
+    fn exact_at(self, places: u32) -> bool {
+        self.err == 0.0
+            && (self.e >= -(places as i32)
+                || 10i128.checked_pow((-self.e - places as i32) as u32).is_some_and(|d| self.m % d == 0))
+    }
+
+    /// The number's text (for a message).
+    fn text(self) -> String {
+        if self.e >= 0 {
+            format!("{}{}", self.m, "0".repeat(self.e as usize))
+        } else {
+            crate::core::value_codec::format_decimal_scaled(self.m, self.e.unsigned_abs())
+        }
     }
 
     fn approx(self) -> f64 {
@@ -4537,6 +4563,31 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
                 },
                 _ => value,
             };
+        }
+    }
+    // A NUMERIC carrying its own scale, or a float, bound for a NUMERIC
+    // column: rounded to a declared scale; into an unconstrained column,
+    // which keeps nine places, stored when exact there and refused (0A000)
+    // when a nonzero digit lies past them — the same rule on every path in
+    // (`pg_numeric_into`). A float is its fifteen-digit text (six for
+    // `real`), as PostgreSQL's float-to-numeric cast reads it; it was rounded
+    // to nine places in silence: `SET u = f / 3` stored 0.033333333.
+    if field.db_type == DbType::DECIMAL {
+        use crate::core::rql::pg_numeric::{self as pgn, PgNum};
+        let read = match &value {
+            Value::Data { bytes, db_type: DbType::DECIMAL } if bytes.len() == 17 => {
+                crate::core::value_codec::split_decimal_cell(bytes).and_then(|(m, own)| PgNum::new(m, own?))
+            }
+            Value::Data { bytes, db_type: DbType::F64 } if field.scale.is_none() => {
+                <[u8; 8]>::try_from(bytes.as_slice()).ok().map(f64::from_le_bytes).and_then(pgn::from_f64)
+            }
+            Value::Data { bytes, db_type: DbType::F32 } if field.scale.is_none() => {
+                <[u8; 4]>::try_from(bytes.as_slice()).ok().map(f32::from_le_bytes).and_then(pgn::from_f32)
+            }
+            _ => None,
+        };
+        if let Some(v) = read {
+            return pg_numeric_into(v, field);
         }
     }
     let number = |v: &Value| {

@@ -7661,7 +7661,11 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
             length: 0,
             columns: smallvec::SmallVec::new(),
         };
-        let Ok(value) = crate::core::rql::expr::eval(&expr, &empty, &[]) else {
+        // At PostgreSQL's value and scale (`expr::eval_output`): folded at the
+        // engine's nine places, `ON CONFLICT … DO UPDATE SET u = excluded.u /
+        // 3` became the literal 0.333333333 and an unconstrained column
+        // stored it in silence, where the unfolded quotient is refused.
+        let Ok(value) = crate::core::rql::expr::eval_output(&expr, &empty, &[]) else {
             return operand.to_string();
         };
         match value {
@@ -8975,9 +8979,14 @@ fn supply_generated_values(
 
         // Folded against an empty row: every column reference is gone, so what
         // is left is a constant.
+        // At PostgreSQL's value and scale (`expr::eval_output`), so the
+        // insert below rounds a NUMERIC(p, s) column once from every digit
+        // and refuses for an unconstrained one what it cannot hold: through
+        // the engine's nine places `y NUMERIC GENERATED ALWAYS AS (x / 3)`
+        // stored 0.333333333 in silence.
         let literal = match crate::core::rql::generated::parse_expression(&substituted, &[])
             .and_then(|expr| {
-                crate::core::rql::expr::eval(&expr, &crate::core::row::row::Row::default(), &[])
+                crate::core::rql::expr::eval_output(&expr, &crate::core::row::row::Row::default(), &[])
             }) {
             Ok(crate::core::rql::expr::Value::Null) => "NULL".to_string(),
             Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {

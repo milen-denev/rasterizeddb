@@ -71,3 +71,63 @@ async fn an_exact_value_with_more_declared_places_is_stored() {
         ["1|0.2", "2|1.5", "6|0.2", "7|0.2", "9|0.2", "10|0.2", "12|1.5", "13|0.2", "14|0.2"]
     );
 }
+
+/// Every path into an unconstrained column answers alike: a value with a
+/// nonzero digit past nine places is refused (PostgreSQL 17 stores it whole,
+/// which this storage cannot yet), and one exact at nine is stored as
+/// PostgreSQL stores it. Several of these paths rounded to nine places in
+/// silence: INSERT … SELECT of a float quotient (`f / 3` stored
+/// 0.033333333), a float cast (`b::float8`), a float product, a generated
+/// column (`x / 3` stored 0.333333333), and an ON CONFLICT … DO UPDATE whose
+/// `excluded.u / 3` was folded at nine places before it was stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_path_into_an_unconstrained_column_follows_one_rule() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE src (id INT PRIMARY KEY, b NUMERIC(20,12), f FLOAT8, r REAL)").await;
+    run(&c, "INSERT INTO src VALUES (1, 1.123456789012, 0.1, 0.25), (2, 0.5, 0.2, 0.5)").await;
+    run(&c, "CREATE TABLE dst (id INT PRIMARY KEY, u NUMERIC)").await;
+    run(&c, "INSERT INTO dst VALUES (1, 0), (8, 1)").await;
+    // Refused: a nonzero digit past nine places.
+    for sql in [
+        "INSERT INTO dst (id, u) SELECT 2, f / 3 FROM src WHERE id = 1",
+        "INSERT INTO dst (id, u) SELECT 3, b FROM src WHERE id = 1",
+        "INSERT INTO dst (id, u) VALUES (4, 0.1::float8 / 3)",
+        "INSERT INTO dst (id, u) VALUES (5, 1.0000000000001)",
+        "UPDATE dst SET u = (SELECT b FROM src WHERE id = 1) WHERE id = 1",
+        "UPDATE dst SET u = (SELECT f * 1.0000000001 FROM src WHERE id = 1) WHERE id = 1",
+        "UPDATE dst SET u = (SELECT b::float8 FROM src WHERE id = 1) WHERE id = 1",
+        "UPDATE dst SET u = u / 3 WHERE id = 8",
+        "INSERT INTO dst (id, u) VALUES (8, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 3",
+    ] {
+        assert_eq!(code(&c, sql).await, "0A000", "{sql}");
+    }
+    assert_eq!(rows(&c, "SELECT id, u::text FROM dst ORDER BY id").await, ["1|0", "8|1"], "a refusal wrote");
+    // Stored: exact at nine places.
+    for sql in [
+        "INSERT INTO dst (id, u) SELECT 10, f FROM src WHERE id = 1",
+        "INSERT INTO dst (id, u) SELECT 11, b FROM src WHERE id = 2",
+        "INSERT INTO dst (id, u) VALUES (12, 0.5::float8)",
+        "INSERT INTO dst (id, u) VALUES (13, 1.00000000000000)",
+        "UPDATE dst SET u = (SELECT r FROM src WHERE id = 1) WHERE id = 1",
+        "INSERT INTO dst (id, u) VALUES (8, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 4",
+    ] {
+        run(&c, sql).await;
+    }
+    assert_eq!(
+        rows(&c, "SELECT id, u::text FROM dst ORDER BY id").await,
+        ["1|0.25", "8|0.25", "10|0.1", "11|0.5", "12|0.5", "13|1"]
+    );
+    // A generated column: refused where the value has digits past nine, and
+    // a declared scale still rounds from every digit.
+    run(
+        &c,
+        "CREATE TABLE gen (id INT PRIMARY KEY, x NUMERIC(10,2), y NUMERIC GENERATED ALWAYS AS (x / 4) STORED, \
+         z NUMERIC(20,12) GENERATED ALWAYS AS (x / 3) STORED)",
+    )
+    .await;
+    run(&c, "INSERT INTO gen (id, x) VALUES (1, 3.00)").await;
+    assert_eq!(rows(&c, "SELECT y::text, z::text FROM gen").await, ["0.75|1.000000000000"]);
+    run(&c, "CREATE TABLE gen3 (id INT PRIMARY KEY, x NUMERIC(10,2), y NUMERIC GENERATED ALWAYS AS (x / 3) STORED)").await;
+    assert_eq!(code(&c, "INSERT INTO gen3 (id, x) VALUES (1, 1.00)").await, "0A000");
+}
