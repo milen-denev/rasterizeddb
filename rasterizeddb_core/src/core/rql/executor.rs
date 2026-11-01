@@ -9371,6 +9371,26 @@ fn generated_update_statement(
         .ok_or_else(malformed)
 }
 
+/// The type a value assigned to `field` is cast to so that it reads as the
+/// column stores it: a NUMERIC(p, s) rounded at `s`, an integer rounded to a
+/// whole number at its width, a `real` as the real it is. `None` where the
+/// assigned value already is the stored one (or this cannot say so: a NUMERIC
+/// with more places than an expression carries).
+fn stored_type_name(field: &crate::core::row::schema::SchemaField) -> Option<String> {
+    use crate::core::db_type::DbType;
+    Some(match field.db_type {
+        DbType::DECIMAL => match field.scale {
+            Some(scale) if scale <= crate::core::value_codec::DECIMAL_SCALE => format!("NUMERIC(38, {scale})"),
+            _ => return None,
+        },
+        DbType::I16 => "SMALLINT".to_string(),
+        DbType::I32 => "INTEGER".to_string(),
+        DbType::I64 => "BIGINT".to_string(),
+        DbType::F32 => "REAL".to_string(),
+        _ => return None,
+    })
+}
+
 /// Adds to an `UPDATE`'s plan the generated columns it has to recompute.
 ///
 /// PostgreSQL computes a generated column from the row as updated. The plan's
@@ -9408,6 +9428,18 @@ fn recompute_generated_in_update(
                     let typed = crate::core::rql::generated::as_stored(&value, f);
                     (name, typed)
                 }
+                // A number goes in as its column stores it, as PostgreSQL
+                // computes a generated column from the stored row: `SET n2 =
+                // 8.345` on a NUMERIC(5,2) is 8.35 to `n2 * 1` and to
+                // `n2::text`. Substituted as written, `g1 NUMERIC(10,1)` was
+                // 8.3 (from 8.345) where PostgreSQL has 8.4, and `gt` '8.345'.
+                Some(f) => match stored_type_name(f) {
+                    Some(ty) => {
+                        let stored = crate::core::rql::generated::as_stored(&value, f);
+                        (name, format!("CAST(({stored}) AS {ty})"))
+                    }
+                    None => (name, value),
+                },
                 _ => (name, value),
             }
         })
