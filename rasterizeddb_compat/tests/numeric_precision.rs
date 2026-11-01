@@ -490,6 +490,19 @@ async fn an_own_scale_refusal_names_its_own_limit() {
             "{sql}"
         );
     }
+    // Through an evaluated cast too (`t::numeric` of a 39-place text).
+    run(&c, &format!("CREATE TABLE wt (id INT PRIMARY KEY, n NUMERIC, t TEXT)")).await;
+    run(&c, &format!("INSERT INTO wt VALUES (1, 0, '{too_long}')")).await;
+    for sql in ["UPDATE wt SET n = t::numeric WHERE id = 1", "UPDATE wt SET n = CAST(t AS NUMERIC) WHERE id = 1"] {
+        assert_eq!(
+            error_text(&c, sql).await,
+            format!(
+                "numeric value \"{too_long}\" needs more than the 38 digits or 38 decimal places column \"n\" holds \
+                 (not supported)"
+            ),
+            "{sql}"
+        );
+    }
     let message = error_text(&c, &format!("CREATE TABLE w2 (id INT PRIMARY KEY, n NUMERIC DEFAULT {too_long})")).await;
     assert!(message.contains("38 decimal places the column holds"), "{message}");
     assert!(!message.contains("predates") && !message.contains("nine") && !message.contains(" 9 "), "{message}");

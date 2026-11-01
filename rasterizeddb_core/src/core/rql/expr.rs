@@ -3893,9 +3893,9 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
                         )),
                     }
                 }
-                Some(_) if crate::core::value_codec::keeps_own_scale(target) => {
-                    eval(expr, row, schema).and_then(|value| from_engine_scale(value, target))
-                }
+                Some(_) if crate::core::value_codec::keeps_own_scale(target) => eval(expr, row, schema)
+                    .map_err(|e| column_refusal(e, target))
+                    .and_then(|value| from_engine_scale(value, target)),
                 Some(exact) if target.scale.is_none() && !exact.exact_at(scale) => {
                     Err(crate::core::value_codec::old_numeric_refusal(
                         &if exact.err == 0.0 { format!("\"{}\"", exact.text()) } else { "of this expression".to_string() },
@@ -3915,7 +3915,27 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
             };
         }
     }
-    eval(expr, row, schema).and_then(|value| from_engine_scale(value, target))
+    eval(expr, row, schema)
+        .map_err(|e| column_refusal(e, target))
+        .and_then(|value| from_engine_scale(value, target))
+}
+
+/// An expression's refusal of a number past the nine places the engine
+/// carries an evaluated NUMERIC at (`t::numeric` of a 39-place text), bound
+/// for an unconstrained NUMERIC column: the column's own refusal
+/// (`value_codec::refusal_for_column`), which names its limit, 38 places in
+/// the seventeen-byte slot, or nine with the conversion hint in the old one.
+/// Any other error is left as it is.
+fn column_refusal(e: String, target: &SchemaField) -> String {
+    if target.db_type != DbType::DECIMAL || target.scale.is_some() {
+        return e;
+    }
+    let Some(rest) = e.strip_prefix("numeric value \"") else { return e };
+    let Some((value, tail)) = rest.split_once('"') else { return e };
+    if !tail.contains("decimal places a NUMERIC keeps here") {
+        return e;
+    }
+    crate::core::value_codec::refusal_for_column(target, value)
 }
 
 /// A [`pg_numeric`] value stored in the `NUMERIC` column `target`: rounded
