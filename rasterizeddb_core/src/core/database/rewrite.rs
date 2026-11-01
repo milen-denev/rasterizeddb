@@ -361,6 +361,8 @@ impl Database {
         let own_scale = create.own_scale_numerics();
         if !own_scale.is_empty() {
             self.require_numeric_own_scale()?;
+            // Between the fence and the first field record that needs it.
+            point(self, "after_numeric_fence").map_err(io::Error::other)?;
         }
         let columns = std::mem::take(&mut create.columns);
         let seed = self.seed_of(&create.table_name).await;

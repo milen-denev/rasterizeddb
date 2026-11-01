@@ -264,6 +264,7 @@ async fn an_open_fences_a_numeric_column_found_without_its_flag() {
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",
     "test.rewrite.after_discard",
+    "test.rewrite.after_numeric_fence",
     "test.rewrite.after_create",
     "test.rewrite.mid_fill",
     "test.rewrite.after_fill",
@@ -333,6 +334,15 @@ async fn a_conversion_cut_anywhere_leaves_the_old_column_or_the_new() {
         for seed in 0..seeds {
             point.write_image(seed, &img);
             let label = format!("{} seed {seed}", point.label);
+            // Read before the open, which fences a directory missing the flag
+            // (`incompat::fence_numeric_own_scale`) and would hide one the
+            // conversion left unfenced.
+            let fenced = flagged(&img);
+            // The point sits after the fence and before the first field
+            // record that needs it: the flag is durable there already.
+            if point.label.ends_with("after_numeric_fence") && !fenced {
+                problems.push(format!("{label}: the fence is not durable before the field records"));
+            }
             match open(&img, "own_scale_cut").await {
                 Err(e) => problems.push(format!("{label}: does not open: {e}")),
                 Ok(db) => {
@@ -343,6 +353,8 @@ async fn a_conversion_cut_anywhere_leaves_the_old_column_or_the_new() {
                         problems.push(format!("{label}: {} rows, not the table's {}, or other values", got.len(), want.len()));
                     } else if widths == [16].into() && slot(&db, "rw", "u") == 16 {
                         olds += 1;
+                    } else if widths == [17].into() && slot(&db, "rw", "u") == 17 && !fenced {
+                        problems.push(format!("{label}: a seventeen-byte column in a directory without {}", crate::core::database::incompat::NUMERIC_OWN_SCALE_V1));
                     } else if widths == [17].into() && slot(&db, "rw", "u") == 17 {
                         news += 1;
                     } else {
