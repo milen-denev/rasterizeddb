@@ -2625,7 +2625,8 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             // NUMERIC(20,12)): no overflow, which 22003 said; a limit.
             Ok(_) if digits_past_scale(text, DECIMAL_SCALE) && !text.contains(['e', 'E']) => format!(
                 "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                 (not supported); declare the column NUMERIC(p, s)",
+                 (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
+                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC",
                 double_quoted(text.trim()),
                 DECIMAL_SCALE
             ),

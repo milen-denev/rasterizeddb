@@ -1,0 +1,215 @@
+//! C6: an unconstrained NUMERIC column created before cells kept their scale
+//! (sixteen bytes at nine places) still reads, keeps its refusal of digits
+//! past nine places with a hint, and converts — all or nothing, across a
+//! power cut — to the seventeen-byte slot that keeps each value's own scale
+//! (`value_codec::keeps_own_scale`). The old columns are made through the
+//! test-only `Database::legacy_numeric_slot`, the slot every earlier build
+//! wrote.
+
+use super::*;
+use crate::core::database::Relation;
+use parking_lot::Mutex;
+use std::sync::Arc as StdArc;
+use std::sync::atomic::Ordering;
+
+fn slot(db: &Arc<Database>, table: &str, column: &str) -> u32 {
+    match db.relation(table) {
+        Some(Relation::Plain(t)) => t.schema.fields.iter().find(|f| f.name == column && !f.is_deleted).expect("column").size,
+        _ => panic!("{table} is not a plain table"),
+    }
+}
+
+fn flagged(dir: &Path) -> bool {
+    crate::core::database::incompat::flags(dir)
+        .unwrap()
+        .iter()
+        .any(|f| f == crate::core::database::incompat::NUMERIC_OWN_SCALE_V1)
+}
+
+/// A NUMERIC cell's value as text at the places it needs: a sixteen-byte one
+/// at the engine's nine, a seventeen-byte one at its own scale; NULL as "-".
+fn value(cell: &[u8]) -> String {
+    match crate::core::value_codec::split_decimal_cell(cell) {
+        None => "-".to_string(),
+        Some((mut m, own)) => {
+            let mut s = own.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+            while s > 0 && m % 10 == 0 {
+                m /= 10;
+                s -= 1;
+            }
+            crate::core::value_codec::format_decimal_scaled(m, s)
+        }
+    }
+}
+
+/// `(id, the u column's value, its cell width)` for every row of `table`.
+async fn column(db: &Arc<Database>, table: &str) -> Vec<(Vec<u8>, String, usize)> {
+    rows(db, &format!("SELECT id, u FROM {table}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r[0].clone(), value(&r[1]), r[1].len()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_unconstrained_column_reads_refuses_and_converts() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale").await.unwrap();
+    db.legacy_numeric_slot.store(true, Ordering::Relaxed);
+    exec(&db, "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC, w NUMERIC(10,2))").await.unwrap();
+    exec(&db, "INSERT INTO t VALUES (1, 1.5, 2.25), (2, 0.000000001, 1), (3, NULL, 3), (4, 123456.789, 4)").await.unwrap();
+    exec(&db, "CREATE TABLE t2 (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    exec(&db, "INSERT INTO t2 VALUES (1, 2.5)").await.unwrap();
+    db.legacy_numeric_slot.store(false, Ordering::Relaxed);
+    assert_eq!(slot(&db, "t", "u"), 16);
+    assert_eq!(slot(&db, "t", "w"), 16, "a NUMERIC(p, s) column is never the own-scale slot");
+    assert!(!flagged(&dir), "no own-scale column yet, so nothing to refuse an older binary");
+
+    // It keeps nine places, and says how to keep more.
+    for sql in ["UPDATE t SET u = 2.0 / 3 WHERE id = 1", "INSERT INTO t VALUES (5, 0.0000000001, 0)"] {
+        let e = exec(&db, sql).await.expect_err(sql);
+        assert!(e.contains("ALTER COLUMN … TYPE NUMERIC"), "{sql}: {e}");
+    }
+    let before = column(&db, "t").await;
+    assert_eq!(
+        before.iter().map(|(_, v, w)| (v.as_str(), *w)).collect::<Vec<_>>(),
+        // A NULL's fixed-width slot holds zeros (its companion says NULL).
+        [("1.5", 16), ("0.000000001", 16), ("0", 16), ("123456.789", 16)]
+    );
+
+    // A reopen reads it as it was.
+    close(&dir, db);
+    let db = open(&dir, "own_scale").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 16);
+    assert_eq!(column(&db, "t").await, before);
+
+    // Converted: every value kept, each cell carrying its scale, and the
+    // database marked before the first such field was written.
+    exec(&db, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 17);
+    assert_eq!(slot(&db, "t", "w"), 16);
+    assert!(flagged(&dir));
+    let after = column(&db, "t").await;
+    assert_eq!(
+        after.iter().map(|(id, v, _)| (id.clone(), v.clone())).collect::<Vec<_>>(),
+        before.iter().map(|(id, v, _)| (id.clone(), v.clone())).collect::<Vec<_>>()
+    );
+    assert!(after.iter().all(|(_, _, w)| *w == 17), "{after:?}");
+    exec(&db, "UPDATE t SET u = 2.0 / 3 WHERE id = 1").await.unwrap();
+    exec(&db, "INSERT INTO t VALUES (5, 0.0000000001, 0)").await.unwrap();
+
+    // Any rewrite converts: an ADD COLUMN on a table with rows recreates it.
+    exec(&db, "ALTER TABLE t2 ADD COLUMN x BIGINT DEFAULT 7").await.unwrap();
+    assert_eq!(slot(&db, "t2", "u"), 17);
+    assert_eq!(column(&db, "t2").await.iter().map(|(_, v, _)| v.as_str()).collect::<Vec<_>>(), ["2.5"]);
+
+    // And it survives a reopen, as does a new column's own slot.
+    exec(&db, "CREATE TABLE t3 (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    close(&dir, db);
+    let db = open(&dir, "own_scale").await.unwrap();
+    assert_eq!((slot(&db, "t", "u"), slot(&db, "t2", "u"), slot(&db, "t3", "u")), (17, 17, 17));
+    let got: Vec<String> = column(&db, "t").await.into_iter().map(|(_, v, _)| v).collect();
+    assert_eq!(got, ["0.66666666666666666667", "0.000000001", "0", "123456.789", "0.0000000001"]);
+    close(&dir, db);
+}
+
+/// The rewrite's own points, in the order it reaches them.
+const POINTS: &[&str] = &[
+    "test.rewrite.after_backup",
+    "test.rewrite.after_discard",
+    "test.rewrite.after_create",
+    "test.rewrite.mid_fill",
+    "test.rewrite.after_fill",
+    "test.rewrite.after_sync",
+    "test.rewrite.after_commit",
+];
+
+/// `ALTER TABLE … ALTER COLUMN u TYPE NUMERIC` over an old column with
+/// committed, updated and deleted rows, cut at each of the rewrite's points
+/// and imaged under every seed kind. Each image must open and hold exactly
+/// the old rows' values: in the old slot (every cell sixteen bytes) or in the
+/// new one (every cell seventeen), never a table missing rows.
+///
+/// Mutation: `rewrite_payload` copies the old sixteen bytes into the new
+/// slot unconverted; the write fails and the ALTER with it, so no image is
+/// new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversion_cut_anywhere_leaves_the_old_column_or_the_new() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale_cut").await.unwrap();
+    db.legacy_numeric_slot.store(true, Ordering::Relaxed);
+    exec(&db, "CREATE TABLE rw (id BIGINT PRIMARY KEY, u NUMERIC, n BIGINT)").await.unwrap();
+    let values: Vec<String> = (0..40).map(|i| format!("({i}, {}.{:03}, {})", i * 7, i * 13 % 1000, i % 5)).collect();
+    exec(&db, &format!("INSERT INTO rw (id, u, n) VALUES {}", values.join(", "))).await.unwrap();
+    exec(&db, "DELETE FROM rw WHERE id >= 35").await.unwrap();
+    exec(&db, "UPDATE rw SET u = 0.000000001 WHERE id < 5").await.unwrap();
+    db.legacy_numeric_slot.store(false, Ordering::Relaxed);
+    db.sync_durable().unwrap();
+    let old: Vec<(Vec<u8>, String, usize)> = column(&db, "rw").await;
+    assert_eq!(old.len(), 35);
+    assert!(old.iter().all(|(_, _, w)| *w == 16));
+    let want: Vec<(Vec<u8>, String)> = old.iter().map(|(id, v, _)| (id.clone(), v.clone())).collect();
+
+    let rec = Recorder::start(&dir);
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let mut guards = Vec::new();
+    for point in POINTS {
+        let (rec, sink, label) = (rec.clone(), sink.clone(), point.to_string());
+        let action: failpoint::Action = StdArc::new(move |_hit| {
+            sink.lock().push(rec.cut_quiescent(label.clone()));
+            failpoint::Outcome::Continue
+        });
+        guards.push(failpoint::arm(point, &dir, 1, action));
+    }
+    exec(&db, "ALTER TABLE rw ALTER COLUMN u TYPE NUMERIC").await.unwrap();
+    for g in &guards {
+        assert_eq!(g.fired(), 1, "a cut point was never reached");
+    }
+    drop(guards);
+    let new: Vec<(Vec<u8>, String, usize)> = column(&db, "rw").await;
+    assert!(new.iter().all(|(_, _, w)| *w == 17), "{new:?}");
+    close(&dir, db);
+    drop(rec);
+
+    let points: Vec<CrashPoint> = sink
+        .lock()
+        .drain(..)
+        .filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok())
+        .collect();
+    assert!(points.len() >= POINTS.len(), "too many cuts were disturbed: {}", points.len());
+    let img = base.path().join("image");
+    let (mut olds, mut news) = (0, 0);
+    let mut problems = Vec::new();
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img);
+            let label = format!("{} seed {seed}", point.label);
+            match open(&img, "own_scale_cut").await {
+                Err(e) => problems.push(format!("{label}: does not open: {e}")),
+                Ok(db) => {
+                    let got = column(&db, "rw").await;
+                    let values: Vec<(Vec<u8>, String)> = got.iter().map(|(id, v, _)| (id.clone(), v.clone())).collect();
+                    let widths: std::collections::BTreeSet<usize> = got.iter().map(|(_, _, w)| *w).collect();
+                    if values != want {
+                        problems.push(format!("{label}: {} rows, not the table's {}, or other values", got.len(), want.len()));
+                    } else if widths == [16].into() && slot(&db, "rw", "u") == 16 {
+                        olds += 1;
+                    } else if widths == [17].into() && slot(&db, "rw", "u") == 17 {
+                        news += 1;
+                    } else {
+                        problems.push(format!("{label}: cells of widths {widths:?} in a {}-byte slot", slot(&db, "rw", "u")));
+                    }
+                    close(&img, db);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&img);
+        }
+    }
+    assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems.join("\n"));
+    assert!(olds > 0 && news > 0, "every image fell on one side (old {olds}, new {news}); the cuts test nothing");
+    eprintln!("conversion cut: {} points, {olds} old images, {news} new images", points.len());
+}

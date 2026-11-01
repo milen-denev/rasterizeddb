@@ -3326,6 +3326,25 @@ fn rewrite_payload(
             .iter()
             .find(|(name, _, _)| name.eq_ignore_ascii_case(&field.name));
         let data = match stored {
+            // A column created before cells kept their scale, recreated as
+            // one that keeps each value's: its sixteen-byte value at the
+            // engine's nine places becomes the cell of that value, at the
+            // places it needs (the scale it was written with is not kept).
+            Some((_, block, _))
+                if crate::core::value_codec::keeps_own_scale(field) && block.into_slice().len() == 16 =>
+            {
+                let m = i128::from_le_bytes(block.into_slice().try_into().expect("sixteen bytes"));
+                let mut s = crate::core::value_codec::DECIMAL_SCALE;
+                let mut m = m;
+                while s > 0 && m % 10 == 0 {
+                    m /= 10;
+                    s -= 1;
+                }
+                let cell = crate::core::value_codec::decimal_cell_with_scale(m, s);
+                let mut converted = crate::memory_pool::MEMORY_POOL.acquire(cell.len());
+                converted.into_slice_mut().copy_from_slice(&cell);
+                converted
+            }
             Some((_, block, _)) => block.clone(),
             // A column the row predates. Fixed-width slots have to be
             // filled, and the new column's companion marks it NULL.
@@ -13716,6 +13735,8 @@ async fn execute_alter_table_action(
             // at its own scale, in a seventeen-byte slot; the database is
             // marked for it before the field record is written.
             let own_scale = db_type == crate::core::db_type::DbType::DECIMAL && new_modifier.is_none();
+            #[cfg(test)]
+            let own_scale = own_scale && !database.legacy_numeric_slot.load(std::sync::atomic::Ordering::Relaxed);
             if own_scale {
                 if let Err(e) = database.require_numeric_own_scale() {
                     return ddl_error(&e.to_string());
@@ -14467,6 +14488,23 @@ async fn execute_alter_table_action(
                     }
                     // `literal_type`: a `timestamp` column restated as
                     // `timestamp` asks for no change.
+                    // `ALTER COLUMN c TYPE NUMERIC` over an unconstrained
+                    // column created before cells kept their scale: every
+                    // row rewritten into the slot that keeps each value's
+                    // own (`rewrite_payload` converts the values), all or
+                    // nothing (`rewrite_rows`).
+                    Ok((db_type, _))
+                        if db_type == field.literal_type()
+                            && field.db_type == crate::core::db_type::DbType::DECIMAL
+                            && field.size == 16
+                            && !schema.type_modifiers.iter().any(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&field.name))
+                            && crate::core::rql::type_modifier::parse_numeric_modifier(&type_tokens.join(" ")).is_none() =>
+                    {
+                        match rewrite_rows(&database, &plan.table_name, tx, |_, versions| Ok(versions)).await {
+                            Ok(()) => ddl_ok(0),
+                            Err(e) => ddl_error(&e),
+                        }
+                    }
                     Ok((db_type, _)) if db_type == field.literal_type() => {
                         let numeric = match numeric_modifier_change(&schema, &name, &type_tokens.join(" "), row_count) {
                             Ok(entry) => entry,

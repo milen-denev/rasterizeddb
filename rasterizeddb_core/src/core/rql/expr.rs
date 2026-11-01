@@ -3875,7 +3875,8 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
                 // hold exactly is refused, never rounded (`pg_numeric_into`).
                 Some(exact) if target.scale.is_none() && !exact.exact_at(scale) => Err(format!(
                     "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                     (not supported); declare the column NUMERIC(p, s) for column \"{}\"",
+                     (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
+                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC for column \"{}\"",
                     if exact.err == 0.0 { format!("\"{}\"", exact.text()) } else { "of this expression".to_string() },
                     scale,
                     target.name
@@ -3916,7 +3917,8 @@ pub(crate) fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &S
         None => {
             return Err(format!(
                 "numeric value \"{}\" has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                 (not supported); declare the column NUMERIC(p, s) for column \"{}\"",
+                 (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
+                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC for column \"{}\"",
                 v.to_text(),
                 DECIMAL_SCALE,
                 target.name

@@ -1428,6 +1428,8 @@ async fn a_lost_reservation_page_never_reissues_an_id() {
 
 #[path = "rewrite_crash_tests.rs"]
 mod rewrite_crash_tests;
+#[path = "numeric_own_scale_tests.rs"]
+mod numeric_own_scale_tests;
 
 #[path = "pddl_crash_tests.rs"]
 mod pddl_crash_tests;

@@ -1324,6 +1324,12 @@ pub struct Database {
     /// one failed with "No such file or directory".
     rename_serial: tokio::sync::Mutex<()>,
 
+    /// Tests only: create unconstrained NUMERIC columns in the sixteen-byte,
+    /// nine-place slot every build before `numeric_own_scale_v1` wrote, so a
+    /// test can hold such a column and convert it (`numeric_own_scale_tests`).
+    #[cfg(test)]
+    pub(crate) legacy_numeric_slot: std::sync::atomic::AtomicBool,
+
     /// The Redis-compatible key/value store (`KV …` statements and the RESP
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
@@ -1695,6 +1701,8 @@ impl Database {
         pool_forget_statement_relations(&storage);
 
         let database = Database {
+            #[cfg(test)]
+            legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
             id,
             name: name.to_string(),
             table_slots,
@@ -3725,6 +3733,12 @@ impl Database {
     /// tables older builds allowed, which the guards exist to keep out.
     async fn add_table_unguarded(&self, mut create_table: CreateTable) -> io::Result<()> {
         let own_scale = create_table.own_scale_numerics();
+        #[cfg(test)]
+        let own_scale = if self.legacy_numeric_slot.load(std::sync::atomic::Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            own_scale
+        };
         if !own_scale.is_empty() {
             self.require_numeric_own_scale()?;
         }
