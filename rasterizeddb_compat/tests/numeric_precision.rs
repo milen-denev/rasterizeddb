@@ -136,6 +136,12 @@ async fn equal_values_at_different_scales_are_one_value() {
 async fn a_cte_and_a_derived_table_keep_each_values_scale() {
     let server = TestServer::start().await.expect("server");
     let c = client(&server).await;
+    // An average below 1 is at twenty places, past the AVG item's sixteen:
+    // a CTE or derived table keeps all of them (it declared the item's).
+    run(&c, "CREATE TABLE sm (id INT PRIMARY KEY, w NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO sm VALUES (1, 0.10), (2, 0.25)").await;
+    assert_eq!(rows(&c, "WITH c AS (SELECT avg(w) AS a FROM sm) SELECT a FROM c").await, ["0.17500000000000000000"]);
+    assert_eq!(rows(&c, "SELECT a FROM (SELECT avg(w) AS a FROM sm) d").await, ["0.17500000000000000000"]);
     run(&c, "CREATE TABLE m (id INT PRIMARY KEY, v NUMERIC, w NUMERIC(10,2))").await;
     run(&c, "INSERT INTO m VALUES (1, 1.5, 1.50), (2, 2.250, 2.25), (3, 0.000000000001, 0), (4, 100, 100)").await;
     assert_eq!(rows(&c, "SELECT id, v + 1, v * 2, v - 0.5, -v, abs(v), v / 3 FROM m ORDER BY id").await, ["1|2.5|3.0|1.0|-1.5|1.5|0.50000000000000000000", "2|3.250|4.500|1.750|-2.250|2.250|0.75000000000000000000", "3|1.000000000001|0.000000000002|-0.499999999999|-0.000000000001|0.000000000001|0.00000000000033333333333333333333", "4|101|200|99.5|-100|100|33.3333333333333333"] as [&str; 4], "SELECT id, v + 1, v * 2, v - 0.5, -v, abs(v), v / 3 FROM m ORDER BY id");
@@ -177,7 +183,18 @@ async fn a_constant_past_one_point_seven_e29_is_numeric() {
 /// the 0.000000007 it equals.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_own_scale_column_answers_every_predicate() {
-    let server = TestServer::start().await.expect("server");
+    // File-backed, so the filter index is built and asked, as a server runs.
+    let root = std::env::temp_dir().join(format!("numeric_precision_large_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    struct Root(std::path::PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Root(root);
+    let server = TestServer::start_file_backed(&root.0.to_string_lossy()).await.expect("server");
     let c = client(&server).await;
     run(&c, "CREATE TABLE big (id INT PRIMARY KEY, v NUMERIC, n2 NUMERIC(12,2), k INT)").await;
     let values: Vec<String> = (1..=20_000u32)
