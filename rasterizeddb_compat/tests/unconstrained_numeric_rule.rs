@@ -1,12 +1,11 @@
-//! An unconstrained `NUMERIC` column keeps nine places here (until values
-//! are stored at their own precision). The rule meanwhile, the same on every
-//! path into one: a value exact at nine places — any digits past them zeros —
-//! is stored; one with a nonzero digit past them is refused (0A000), never
-//! rounded in silence.
+//! An unconstrained `NUMERIC` column keeps each value at its own scale, every
+//! digit as PostgreSQL stores it, on every path into it. (A column created
+//! before cells kept their scale stays at nine places and refuses a value with
+//! a nonzero digit past them until it is converted; those are the core's
+//! `numeric_own_scale_tests`.)
 //!
 //! Every stored expectation is PostgreSQL 17's value (`docker run --rm
-//! postgres:17`); its display keeps the source's places (0.200000000000),
-//! which this storage cannot, so values are read back through `::text`.
+//! postgres:17`), read back through `::text`.
 
 use rasterizeddb_compat::TestServer;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -37,14 +36,8 @@ async fn rows(c: &Client, sql: &str) -> Vec<String> {
         .collect()
 }
 
-async fn code(c: &Client, sql: &str) -> String {
-    let e = c.simple_query(sql).await.expect_err(sql);
-    e.code().map(|s| s.code().to_string()).unwrap_or_else(|| e.to_string())
-}
-
-/// A NUMERIC(20,12) 0.200000000000 has nothing past nine places but zeros:
-/// every path that copies it into an unconstrained column stores 0.2. It
-/// was refused with 22003, "does not fit the column's precision".
+/// A NUMERIC(20,12) 0.200000000000 copied into an unconstrained column keeps
+/// its twelve places on every path, as PostgreSQL shows it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exact_value_with_more_declared_places_is_stored() {
     let server = TestServer::start().await.expect("server");
@@ -68,18 +61,26 @@ async fn an_exact_value_with_more_declared_places_is_stored() {
     }
     assert_eq!(
         rows(&c, "SELECT id, u::text FROM d2 ORDER BY id").await,
-        ["1|0.2", "2|1.5", "6|0.2", "7|0.2", "9|0.2", "10|0.2", "12|1.5", "13|0.2", "14|0.2"]
+        [
+            "1|0.200000000000",
+            "2|1.50000000000000000000",
+            "6|0.200000000000",
+            "7|0.200000000000",
+            "9|0.200000000000",
+            "10|0.200000000000",
+            "12|1.50000000000000000000",
+            "13|0.200000000000",
+            "14|0.200000000000"
+        ]
     );
 }
 
-/// Every path into an unconstrained column answers alike: a value with a
-/// nonzero digit past nine places is refused (PostgreSQL 17 stores it whole,
-/// which this storage cannot yet), and one exact at nine is stored as
-/// PostgreSQL stores it. Several of these paths rounded to nine places in
-/// silence: INSERT … SELECT of a float quotient (`f / 3` stored
-/// 0.033333333), a float cast (`b::float8`), a float product, a generated
-/// column (`x / 3` stored 0.333333333), and an ON CONFLICT … DO UPDATE whose
-/// `excluded.u / 3` was folded at nine places before it was stored.
+/// Every path into an unconstrained column stores the value PostgreSQL does,
+/// every digit of it: INSERT … SELECT of a float quotient, a float cast, a
+/// float product, a quotient at `select_div_scale`'s places, a generated
+/// column, and an ON CONFLICT … DO UPDATE of `excluded.u / 3`. Each was
+/// refused (0A000) while the column kept nine places, or before that rounded
+/// to them in silence.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_path_into_an_unconstrained_column_follows_one_rule() {
     let server = TestServer::start().await.expect("server");
@@ -88,24 +89,31 @@ async fn every_path_into_an_unconstrained_column_follows_one_rule() {
     run(&c, "INSERT INTO src VALUES (1, 1.123456789012, 0.1, 0.25), (2, 0.5, 0.2, 0.5)").await;
     run(&c, "CREATE TABLE dst (id INT PRIMARY KEY, u NUMERIC)").await;
     run(&c, "INSERT INTO dst VALUES (1, 0), (8, 1)").await;
-    // Refused: a nonzero digit past nine places.
     for sql in [
         "INSERT INTO dst (id, u) SELECT 2, f / 3 FROM src WHERE id = 1",
         "INSERT INTO dst (id, u) SELECT 3, b FROM src WHERE id = 1",
         "INSERT INTO dst (id, u) VALUES (4, 0.1::float8 / 3)",
         "INSERT INTO dst (id, u) VALUES (5, 1.0000000000001)",
-        "UPDATE dst SET u = (SELECT b FROM src WHERE id = 1) WHERE id = 1",
-        "UPDATE dst SET u = (SELECT f * 1.0000000001 FROM src WHERE id = 1) WHERE id = 1",
-        "UPDATE dst SET u = (SELECT b::float8 FROM src WHERE id = 1) WHERE id = 1",
-        "UPDATE dst SET u = u / 3 WHERE id = 8",
-        // Through the older exact reading (a constant carried as a float).
-        "UPDATE dst SET u = u * 1e30 / 3e30 WHERE id = 8",
-        "INSERT INTO dst (id, u) VALUES (8, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 3",
     ] {
-        assert_eq!(code(&c, sql).await, "0A000", "{sql}");
+        run(&c, sql).await;
     }
-    assert_eq!(rows(&c, "SELECT id, u::text FROM dst ORDER BY id").await, ["1|0", "8|1"], "a refusal wrote");
-    // Stored: exact at nine places.
+    for (sql, id, want) in [
+        ("UPDATE dst SET u = (SELECT b FROM src WHERE id = 1) WHERE id = 1", 1, "1.123456789012"),
+        ("UPDATE dst SET u = (SELECT f * 1.0000000001 FROM src WHERE id = 1) WHERE id = 1", 1, "0.10000000001"),
+        ("UPDATE dst SET u = (SELECT b::float8 FROM src WHERE id = 1) WHERE id = 1", 1, "1.123456789012"),
+        ("UPDATE dst SET u = u / 3 WHERE id = 8", 8, "0.33333333333333333333"),
+        ("INSERT INTO dst (id, u) VALUES (8, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 3", 8, "0.33333333333333333333"),
+    ] {
+        run(&c, sql).await;
+        assert_eq!(rows(&c, &format!("SELECT u::text FROM dst WHERE id = {id}")).await, [want], "{sql}");
+    }
+    // Past what this engine carries: `u * 1e30` of a 20-place value has some
+    // 50 digits (PostgreSQL's 0.11111111111111111111 goes through them), and
+    // is refused whole rather than rounded.
+    let sql = "UPDATE dst SET u = u * 1e30 / 3e30 WHERE id = 8";
+    let e = c.simple_query(sql).await.expect_err(sql);
+    assert_eq!(e.code().map(|s| s.code().to_string()), Some("0A000".to_string()), "{sql}");
+    assert_eq!(rows(&c, "SELECT u::text FROM dst WHERE id = 8").await, ["0.33333333333333333333"]);
     for sql in [
         "INSERT INTO dst (id, u) SELECT 10, f FROM src WHERE id = 1",
         "INSERT INTO dst (id, u) SELECT 11, b FROM src WHERE id = 2",
@@ -118,10 +126,21 @@ async fn every_path_into_an_unconstrained_column_follows_one_rule() {
     }
     assert_eq!(
         rows(&c, "SELECT id, u::text FROM dst ORDER BY id").await,
-        ["1|0.25", "8|0.25", "10|0.1", "11|0.5", "12|0.5", "13|1"]
+        [
+            "1|0.25",
+            "2|0.0333333333333333",
+            "3|1.123456789012",
+            "4|0.0333333333333333",
+            "5|1.0000000000001",
+            "8|0.25000000000000000000",
+            "10|0.1",
+            "11|0.500000000000",
+            "12|0.5",
+            "13|1.00000000000000"
+        ]
     );
-    // A generated column: refused where the value has digits past nine, and
-    // a declared scale still rounds from every digit.
+    // A generated column keeps every digit too, and a declared scale still
+    // rounds from every digit.
     run(
         &c,
         "CREATE TABLE gen (id INT PRIMARY KEY, x NUMERIC(10,2), y NUMERIC GENERATED ALWAYS AS (x / 4) STORED, \
@@ -129,7 +148,8 @@ async fn every_path_into_an_unconstrained_column_follows_one_rule() {
     )
     .await;
     run(&c, "INSERT INTO gen (id, x) VALUES (1, 3.00)").await;
-    assert_eq!(rows(&c, "SELECT y::text, z::text FROM gen").await, ["0.75|1.000000000000"]);
+    assert_eq!(rows(&c, "SELECT y::text, z::text FROM gen").await, ["0.75000000000000000000|1.000000000000"]);
     run(&c, "CREATE TABLE gen3 (id INT PRIMARY KEY, x NUMERIC(10,2), y NUMERIC GENERATED ALWAYS AS (x / 3) STORED)").await;
-    assert_eq!(code(&c, "INSERT INTO gen3 (id, x) VALUES (1, 1.00)").await, "0A000");
+    run(&c, "INSERT INTO gen3 (id, x) VALUES (1, 1.00)").await;
+    assert_eq!(rows(&c, "SELECT y::text FROM gen3").await, ["0.33333333333333333333"]);
 }

@@ -767,10 +767,15 @@ pub(crate) enum Acc {
         /// places each needs. (PostgreSQL keeps a written `1.50` at two; here
         /// it counts as one — the one place this can print fewer digits.)
         track_dscale: bool,
-        /// Over a column that keeps each value's own scale: `scale` grows to
-        /// the most places any input carries (the total lifted with it), and
-        /// the result is a cell carrying its display scale.
+        /// Over values carrying their own scale (a column that keeps each
+        /// value's, or a computed NUMERIC past the engine's nine places): `scale`
+        /// grows to the most places any input carries (the total lifted with
+        /// it), and the result is a cell carrying its display scale. Set at the
+        /// start for such a column, or by the first such cell.
         own_scale: bool,
+        /// The scale a sixteen-byte input is at once `own_scale` is set: the
+        /// column's declared one, or the engine's nine.
+        base: u32,
     },
     FloatSum {
         total: f64,
@@ -848,6 +853,7 @@ impl Acc {
                         dscale: if scaled { declared.unwrap_or(0) } else { 0 },
                         track_dscale: scaled && declared.is_none() && func == AggFunc::Avg && !own_scale,
                         own_scale,
+                        base: declared.unwrap_or(DECIMAL_SCALE),
                     }
                 }
             },
@@ -903,16 +909,28 @@ impl Acc {
                 track_dscale,
                 scale,
                 own_scale,
+                base,
                 ..
             } => {
                 let (Some(b), Some(t)) = (bytes, ty) else {
                     return;
                 };
                 // A cell carrying its own scale: the total lifted to the most
-                // places seen, the value added at them.
+                // places seen, the value added at them. The first such cell
+                // turns a sixteen-byte total into one (it stands at `scale`).
+                if !*own_scale && b.len() == 17 && *t == DbType::DECIMAL {
+                    *own_scale = true;
+                    *track_dscale = false;
+                    // Nothing added yet: the total starts at the places the
+                    // values bring, not at the engine's nine (which lifted
+                    // `sum(i * 1e30)` past an i128).
+                    if *n == 0 {
+                        *scale = 0;
+                    }
+                }
                 if *own_scale {
                     let Some((m, own)) = crate::core::value_codec::split_decimal_cell(b) else { return };
-                    let own = own.unwrap_or(DECIMAL_SCALE);
+                    let own = own.unwrap_or(*base);
                     if own > *scale {
                         match 10i128.checked_pow(own - *scale).and_then(|p| total.checked_mul(p)) {
                             Some(lifted) => *total = lifted,
@@ -1045,12 +1063,14 @@ impl Acc {
                     overflow: o2,
                     dscale: d2,
                     scale: s2,
+                    own_scale: own2,
                     ..
                 },
             ) => {
-                // Partials over a column that keeps each value's own scale may
-                // stand at different places: both at the more.
+                // Partials over values carrying their own scale may stand at
+                // different places: both at the more.
                 let mut t2 = *t2;
+                *own_scale |= *own2;
                 if *own_scale && *s2 != *scale {
                     let lift = |v: i128, from: u32, to: u32| 10i128.checked_pow(to - from).and_then(|p| v.checked_mul(p));
                     if *s2 > *scale {
@@ -2334,7 +2354,7 @@ fn accumulate_aggregate(
             // dropped out of the aggregate, so `sum(1/(b-7))` answered
             // the other rows' sum and `count(…)` one fewer — a number
             // that looks like an answer.
-            let value = crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)?;
+            let value = crate::core::rql::expr::eval_aggregate_argument(&argument.expr, row, &argument.schema)?;
             // Coerced to the type this argument was *declared* as, which
             // is what the accumulator reads the bytes by. `column_order +
             // 1` evaluates to four bytes while its static type is eight,
@@ -4109,7 +4129,7 @@ mod fold_reference {
                                 // A failed evaluation fails the statement, as
                                 // the fold's does.
                                 computed =
-                                    Some(crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)?)
+                                    Some(crate::core::rql::expr::eval_aggregate_argument(&argument.expr, row, &argument.schema)?)
                                         // Coerced to the type this argument was *declared*
                                         // as, which is what the accumulator reads the bytes
                                         // by. `column_order + 1` evaluates to four bytes

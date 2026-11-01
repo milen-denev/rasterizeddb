@@ -148,22 +148,31 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         let got = text(&client, sql).await;
         expect(sql, got, want);
     }
-    // Refused, never answered without the places: a CHECK's violation, an
-    // integer first branch over a NUMERIC one, and an aggregate's argument.
+    // Refused, never answered without the places: a CHECK's violation and an
+    // integer first branch over a NUMERIC one.
     for (sql, code) in [
         ("INSERT INTO ck VALUES (2, 1.123456789124)", "23514"),
         ("SELECT i FROM r UNION ALL SELECT c FROM r", "0A000"),
         // Never mixed with a float, which read as NUMERIC rendered blanks.
         ("SELECT c FROM r UNION ALL SELECT c::float8 FROM r", "0A000"),
-        // More places than an unconstrained NUMERIC keeps here: a limit, not
-        // the overflow (22003) it was reported as.
-        ("INSERT INTO un SELECT id, b FROM r WHERE id = 2", "0A000"),
-        ("SELECT sum(c + 43e-17) FROM r", "0A000"),
     ] {
         let got = text(&client, sql).await;
         if got != Err(code.to_string()) {
             wrong.push(format!("{sql}\n    got  {got:?}\n    want Err({code})"));
         }
+    }
+    // An aggregate of an argument past nine places, exactly (refused while
+    // aggregates folded at nine).
+    let got = text(&client, "SELECT sum(c + 43e-17) FROM r").await;
+    if got != Ok(vec!["44810.10000000000000086".to_string()]) {
+        wrong.push(format!("SELECT sum(c + 43e-17) FROM r\n    got  {got:?}"));
+    }
+    // An unconstrained NUMERIC keeps all twenty places, as PostgreSQL does
+    // (refused while it kept nine).
+    let _ = text(&client, "INSERT INTO un SELECT id, b FROM r WHERE id = 2").await;
+    let got = text(&client, "SELECT n FROM un").await;
+    if got != Ok(vec!["1.12345678912345678912".to_string()]) {
+        wrong.push(format!("INSERT INTO un SELECT id, b FROM r WHERE id = 2\n    got  {got:?}"));
     }
     // Described as PostgreSQL describes it: `numeric`.
     for sql in ["SELECT c + 43e-17 FROM r", "SELECT CASE WHEN i > 0 THEN n2 ELSE 0.0000000001 END FROM r"] {

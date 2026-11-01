@@ -23,6 +23,24 @@ async fn refused(pool: &sqlx::PgPool, sql: &str, want: &str) {
     assert_eq!(code(&e), want, "{sql}: {e}");
 }
 
+/// One row's columns as the server's text, over the simple query protocol.
+async fn text_row(url: &str, sql: &str) -> Vec<String> {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(connection);
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_string()).collect())
+            }
+            _ => None,
+        })
+        .expect("a row")
+}
+
 async fn texts(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
     sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
@@ -45,17 +63,34 @@ async fn numeric_constants_are_exact_or_refused() {
     .unwrap();
     let row = || texts(&pool, "SELECT h::text || ' ' || w::text || ' ' || b::text || ' ' || i::text FROM h WHERE id = 1");
 
-    // Wider than the engine scale: refused, never rounded through a float.
-    for sql in [
-        "UPDATE h SET h = 123456789012345678901234567890123456.50 + 0 WHERE id = 1",
-        "UPDATE h SET h = 123456789012345678901234567890123456.50 - 1 WHERE id = 1",
-        "UPDATE h SET w = 1e30 + 1 WHERE id = 1",
-        "INSERT INTO h VALUES (2, 123456789012345678901234567890123456.50 + 0, 0, 0, 0, 0)",
-        "SELECT id FROM h WHERE h = 123456789012345678901234567890123456.50 + 0",
+    // Wider than the engine's nine-place scale, but within the 38 digits a
+    // NUMERIC carries: computed exactly, as PostgreSQL 17 computes it (it was
+    // refused, 22003, while such a constant could only be a float).
+    for (sql, check, want) in [
+        (
+            "UPDATE h SET h = 123456789012345678901234567890123456.50 + 0 WHERE id = 1",
+            "SELECT h::text FROM h WHERE id = 1",
+            "123456789012345678901234567890123456.50",
+        ),
+        (
+            "UPDATE h SET h = 123456789012345678901234567890123456.50 - 1 WHERE id = 1",
+            "SELECT h::text FROM h WHERE id = 1",
+            "123456789012345678901234567890123455.50",
+        ),
+        ("UPDATE h SET w = 1e30 + 1 WHERE id = 1", "SELECT w::text FROM h WHERE id = 1", "1000000000000000000000000000001"),
+        (
+            "INSERT INTO h VALUES (2, 123456789012345678901234567890123456.50 + 0, 0, 0, 0, 0)",
+            "SELECT id::text FROM h WHERE h = 123456789012345678901234567890123456.50 + 0 ORDER BY id",
+            "2",
+        ),
     ] {
-        refused(&pool, sql, "22003").await;
+        sqlx::query(sql).execute(&pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(texts(&pool, check).await, [want], "{sql}");
     }
-    assert_eq!(row().await, ["1.00 0 2147483648 5"]);
+    assert_eq!(
+        row().await,
+        ["123456789012345678901234567890123455.50 1000000000000000000000000000001 2147483648 5"]
+    );
 
     // The same value written as itself still stores exactly, and arithmetic
     // whose answer is exact still runs.
@@ -94,7 +129,7 @@ async fn numeric_constants_are_exact_or_refused() {
         refused(&pool, sql, "22003").await;
     }
     assert_eq!(
-        texts(&pool, "SELECT CAST('-Infinity' AS DOUBLE PRECISION)::text || ' ' || CAST('4.9e-324' AS float8)::text FROM h").await.len(),
+        texts(&pool, "SELECT CAST('-Infinity' AS DOUBLE PRECISION)::text || ' ' || CAST('4.9e-324' AS float8)::text FROM h WHERE id = 1").await.len(),
         1
     );
     let f: f64 = sqlx::query_scalar("SELECT f FROM h WHERE id = 1").fetch_one(&pool).await.unwrap();
@@ -128,20 +163,12 @@ async fn numeric_constants_are_exact_or_refused() {
     assert_eq!(b, 5);
 }
 
-fn close(got: f64, want: f64, what: &str) {
-    assert!((got - want).abs() <= want.abs() * 1e-12, "{what}: got {got}, want {want}");
-}
-
-/// A constant with more places than nine is `numeric`, as in PostgreSQL,
-/// and answered exactly every row; one too large for an i128 at nine places
-/// (`1e30`) is still carried as a float, and answered every row too. The
-/// first version of the exactness check compared each row's float product
-/// with the exact answer and refused the rows where float rounding differed
-/// (3 · 1e30 but not 5 · 1e30), and the aggregate fold turned that row's
-/// error into "no value": `sum(b * 0.00000000011)` silently lost a row. Such
-/// a wide constant inside an aggregate's argument is refused now (0A000), as
-/// the aggregate folds at nine places; it was summed as a float, described
-/// `float8` where PostgreSQL says `numeric`.
+/// A constant with more places than nine, or too large for an i128 at nine
+/// places (`1e30`), is `numeric`, as in PostgreSQL, and answered exactly every
+/// row, an aggregate of it included. (The first version of the exactness
+/// check compared each row's float product with the exact answer and refused
+/// the rows where float rounding differed, and the aggregate fold turned that
+/// row's error into "no value": `sum(b * 0.00000000011)` silently lost a row.)
 #[tokio::test(flavor = "multi_thread")]
 async fn float_carried_constants_answer_every_row() {
     let server = TestServer::start().await.expect("server");
@@ -157,21 +184,31 @@ async fn float_carried_constants_answer_every_row() {
         texts(&pool, "SELECT (b * 0.00000000011)::text FROM ag ORDER BY id").await,
         ["0.00000001100", "0.00000000077", "0.00000000011", "0.00000000022"]
     );
-    for sql in [
-        "SELECT sum(b * 0.00000000011) AS s, count(b * 0.00000000011) AS c, avg(b * 0.00000000011) AS a FROM ag",
-        "SELECT g, sum(b * 0.00000000011) FROM ag GROUP BY g ORDER BY g",
-    ] {
-        refused(&pool, sql, "0A000").await;
-    }
+    // An aggregate of such an argument, exactly (it was refused, 0A000).
+    let url = server.url();
+    let numerics = |sql: &'static str| text_row(&url, sql);
+    assert_eq!(
+        numerics("SELECT sum(b * 0.00000000011), count(b * 0.00000000011), avg(b * 0.00000000011) FROM ag").await,
+        ["0.00000001210", "4", "0.0000000030250000000000000000"]
+    );
+    assert_eq!(numerics("SELECT sum(b * 0.00000000011) FROM ag WHERE g = 1").await, ["0.00000001177"]);
+    assert_eq!(numerics("SELECT sum(b * 0.00000000011) FROM ag WHERE g = 2").await, ["0.00000000033"]);
 
-    // i = 3, 5, 7, 3: every row, each the float nearest i · 10^30.
-    let rows: Vec<f64> = sqlx::query_scalar("SELECT i * 1e30 FROM ag ORDER BY id").fetch_all(&pool).await.unwrap();
-    assert_eq!(rows, [3e30, 5e30, 7e30, 3e30]);
-    let r = sqlx::query("SELECT sum(i * 1e30) AS s, count(i * 1e30) AS c FROM ag").fetch_one(&pool).await.unwrap();
-    close(r.get::<f64, _>("s"), 18e30, "sum(i * 1e30)");
-    assert_eq!(r.get::<i64, _>("c"), 4);
-    let s: f64 = sqlx::query_scalar("SELECT sum(n * 1e30) FROM ag").fetch_one(&pool).await.unwrap();
-    close(s, 12e30, "sum(n * 1e30)");
+    // i = 3, 5, 7, 3: an integer times a constant past 1.7e29 is `numeric`,
+    // exactly, as PostgreSQL types it (a float while such a constant was one).
+    assert_eq!(
+        texts(&pool, "SELECT (i * 1e30)::text FROM ag ORDER BY id").await,
+        [
+            "3000000000000000000000000000000",
+            "5000000000000000000000000000000",
+            "7000000000000000000000000000000",
+            "3000000000000000000000000000000"
+        ]
+    );
+    assert_eq!(
+        numerics("SELECT sum(i * 1e30), count(i * 1e30), sum(n * 1e30) FROM ag").await,
+        ["18000000000000000000000000000000", "4", "12000000000000000000000000000000.0000"]
+    );
 
     // A per-row failure fails the statement; it used to drop the row.
     for sql in ["SELECT sum(1/(b-7)) FROM ag", "SELECT count(*) FILTER (WHERE 1/(b-7) > 0) FROM ag", "SELECT g, sum(1/(b-7)) FROM ag GROUP BY g"] {

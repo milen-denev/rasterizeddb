@@ -41,10 +41,13 @@ async fn an_overflowing_window_sum_is_an_error_not_a_null() {
     let server = TestServer::start().await.expect("server should start");
     let pool = server.connect_sqlx().await.expect("should connect");
     // `sum(bigint)` is a numeric, so `n`'s total past i64 is exact (see
-    // `sum_types.rs`); only `d`, past what the engine's numeric holds, overflows.
+    // `sum_types.rs`); only `d`, past the 38 digits the engine's numeric holds,
+    // overflows. (Two 1e29 values overflowed while an unconstrained NUMERIC
+    // kept nine places; held at their own scale, their sum is exact: see
+    // `an_unconstrained_sum_past_nine_places_is_exact`.)
     run(&pool, "CREATE TABLE big (id INT NOT NULL, g INT NOT NULL, n BIGINT NOT NULL, d NUMERIC NOT NULL)").await;
-    run(&pool, "INSERT INTO big (id, g, n, d) VALUES (1, 1, 9223372036854775807, 100000000000000000000000000000)").await;
-    run(&pool, "INSERT INTO big (id, g, n, d) VALUES (2, 1, 1, 100000000000000000000000000000)").await;
+    run(&pool, "INSERT INTO big (id, g, n, d) VALUES (1, 1, 9223372036854775807, 99999999999999999999999999999999999999)").await;
+    run(&pool, "INSERT INTO big (id, g, n, d) VALUES (2, 1, 1, 99999999999999999999999999999999999999)").await;
 
     // The aggregate's wording, for the window as for the fold.
     for (sql, wording) in [
@@ -58,6 +61,38 @@ async fn an_overflowing_window_sum_is_an_error_not_a_null() {
                 Ok(rows) => panic!("{} / {}: an overflowing sum answered {} rows", protocol, sql, rows.len()),
             }
         }
+    }
+}
+
+/// Two 1e29 values in an unconstrained NUMERIC, each held at its own scale:
+/// their sum and average are exact, the window's as the fold's, as
+/// PostgreSQL 17 answers (2e29, and 1e29 with no places: `select_div_scale`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unconstrained_sum_past_nine_places_is_exact() {
+    let server = TestServer::start().await.expect("server should start");
+    let (client, connection) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE big (id INT NOT NULL, d NUMERIC NOT NULL); \
+             INSERT INTO big (id, d) VALUES (1, 100000000000000000000000000000), (2, 100000000000000000000000000000)",
+        )
+        .await
+        .expect("setup");
+    for (sql, n) in [("SELECT SUM(d), AVG(d) FROM big", 1), ("SELECT SUM(d) OVER (), AVG(d) OVER () FROM big ORDER BY id", 2)] {
+        let got: Vec<String> = client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    Some(format!("{}|{}", r.get(0).unwrap_or(""), r.get(1).unwrap_or("")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec!["200000000000000000000000000000|100000000000000000000000000000"; n], "{sql}");
     }
 }
 

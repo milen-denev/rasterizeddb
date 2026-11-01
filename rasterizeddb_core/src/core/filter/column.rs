@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::core::db_type::DbType;
 
 use super::bloom::{self, SuperBloom};
-use super::hash::{CODE_EMPTY, HashSeed, canonical_hash, fingerprint, is_fingerprintable};
+use super::hash::{CODE_EMPTY, HashSeed, fingerprint, row_hash, is_fingerprintable};
 use super::kernels::{MAX_F, MIN_F, ZONE_ROWS, ZONE_WORDS, probe_fn, read_slot, write_slot};
 use super::zonemap::{SargOp, ZoneMap, zones_for};
 
@@ -652,7 +652,7 @@ impl ColumnFilter {
 
     fn set_value(&mut self, slot: u64, value: Option<&[u8]>, track_dirty: bool) {
         let hash = match (self.fingerprints, value) {
-            (true, Some(b)) => canonical_hash(&self.db_type, b, self.seed),
+            (true, Some(b)) => row_hash(&self.db_type, b, self.seed),
             _ => None,
         };
         self.set_prepared_inner(slot, value, hash, track_dirty);
@@ -678,7 +678,7 @@ impl ColumnFilter {
     /// fixed for the column's lifetime.
     #[inline]
     pub fn hash_of(db_type: &DbType, seed: HashSeed, value: &[u8]) -> Option<u64> {
-        canonical_hash(db_type, value, seed)
+        row_hash(db_type, value, seed)
     }
 
     fn set_prepared_inner(
@@ -893,7 +893,7 @@ impl ColumnFilter {
     /// `out` must be `ceil(n_slots / 64)` words. A set bit means "this slot may
     /// match" — the mask is always a **superset** of true matches.
     pub fn probe_into(&self, value: &[u8], n_slots: u64, out: &mut [u64]) -> bool {
-        match canonical_hash(&self.db_type, value, self.seed) {
+        match row_hash(&self.db_type, value, self.seed) {
             Some(h) => {
                 self.probe_hash_into(h, n_slots, out);
                 true
@@ -929,7 +929,7 @@ impl ColumnFilter {
         // Equality on a column that carries fingerprints consults both
         // structures, since they prune independently.
         if op == SargOp::Eq && self.fingerprints && !self.gated_out {
-            let Some(h) = canonical_hash(&self.db_type, value, self.seed) else {
+            let Some(h) = row_hash(&self.db_type, value, self.seed) else {
                 out.fill(u64::MAX);
                 mask_tail(out, n_slots);
                 return false;
@@ -1096,7 +1096,7 @@ impl ColumnFilter {
             zone >= zones_for(self.valid_upto.min(n_slots)) || zm.zone_may_match(zone, SargOp::Eq, value)
         };
         if self.fingerprints && !self.gated_out {
-            let Some(h) = canonical_hash(&self.db_type, value, self.seed) else {
+            let Some(h) = row_hash(&self.db_type, value, self.seed) else {
                 return true;
             };
             let first = zone * ZONE_ROWS as u64;

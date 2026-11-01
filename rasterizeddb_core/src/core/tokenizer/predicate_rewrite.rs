@@ -2422,6 +2422,54 @@ pub fn rewrite_scan_where(
     rewrite_where_in(&lifted, schema, true)
 }
 
+/// Whether `text` is arithmetic over a column that keeps each value's own
+/// scale (`value_codec::keeps_own_scale`): its seventeen-byte cells are not
+/// the scan's fixed-width units, so `v + 1 > 2` is the evaluator's, exactly
+/// (`expr::own_scale_arith`), rather than an operand-size error. Quoted text is
+/// skipped; a leading sign is not arithmetic.
+fn own_scale_arithmetic(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    if !schema.iter().any(|f| !f.is_deleted && crate::core::value_codec::keeps_own_scale(f)) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut quote = false;
+    let mut arithmetic = false;
+    let mut seen_operand = false;
+    for &c in bytes {
+        if c == b'\'' {
+            quote = !quote;
+            seen_operand = true;
+            continue;
+        }
+        if quote {
+            continue;
+        }
+        match c {
+            b'+' | b'*' | b'/' | b'-' if seen_operand => arithmetic = true,
+            b'=' | b'<' | b'>' | b'!' | b'(' | b',' => seen_operand = false,
+            c if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b')' => seen_operand = true,
+            _ => {}
+        }
+    }
+    arithmetic
+        && text
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"'))
+            .filter(|w| !w.is_empty())
+            .any(|w| {
+                resolve_column(w, schema).is_some_and(|name| {
+                    schema
+                        .iter()
+                        .any(|f| !f.is_deleted && f.name == name && crate::core::value_codec::keeps_own_scale(f))
+                })
+            })
+}
+
+/// [`needs_evaluator`], or arithmetic over a column that keeps each value's
+/// own scale ([`own_scale_arithmetic`]).
+fn evaluated(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    needs_evaluator(text) || own_scale_arithmetic(text, schema)
+}
+
 /// Whether `text` holds something only the expression evaluator can compute:
 /// a `CASE`, `||`, `%`, a bit-string literal, or a cast over a column (see
 /// [`column_cast_at`]). Outside quotes, and `?|` is the JSONB operator, not
@@ -2664,7 +2712,7 @@ pub fn lift_evaluated_operands(
     if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
-    if !needs_evaluator(clause) && !char_lift_needed(clause, schema) && !reads_legacy_char(clause, schema) {
+    if !evaluated(clause, schema) && !char_lift_needed(clause, schema) && !reads_legacy_char(clause, schema) {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
@@ -3060,7 +3108,7 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !needs_evaluator(term) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema) {
+    if !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -3261,7 +3309,7 @@ fn lift_comparison(
             return Ok(format!("({}) {}", lifted, rest.trim_start()));
         }
     }
-    if !needs_evaluator(left_text) {
+    if !evaluated(left_text, schema) {
         // The operand is the tokenizer's own. A list item or a bound that
         // needs the evaluator is lifted on its own: `price BETWEEN qty % 7
         // AND 10` was refused as "BETWEEN bounds must be separated by AND",
@@ -3269,7 +3317,7 @@ fn lift_comparison(
         // for the ordinary rewrite to read or refuse.
         // Also a list naming a `character varying` column beside a
         // `character(n)` one, which compares blank-padded.
-        if needs_evaluator(rest)
+        if evaluated(rest, schema)
             || contains_spaced_text_literal(rest)
             || contains_typed_text_spelling(rest)
             || padded_beside_varying(body, schema)
@@ -3477,14 +3525,14 @@ fn spell_out_list_or_range(
 /// One side of a comparison: lifted when it needs the evaluator, and a bare
 /// bit-string literal rewritten as the quoted bits the tokenizer reads.
 fn lift_list_item(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
-    if !needs_evaluator(side) {
+    if !evaluated(side, schema) {
         return Ok(side.to_string());
     }
     lift_side(side, schema)
 }
 
 fn lift_side(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
-    if !needs_evaluator(side) && !spaced_text_literal(side) {
+    if !evaluated(side, schema) && !spaced_text_literal(side) {
         return Ok(side.to_string());
     }
     let lead = &side[..side.len() - side.trim_start().len()];

@@ -217,7 +217,12 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         if !matches!(op, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=") {
             return None;
         }
-        let scale = self.scale_of(col_op).unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+        // A column that keeps each value's own scale holds at most 38 places.
+        let scale = if self.keeps_own_scale(col_op) {
+            crate::core::rql::pg_numeric::MAX_SCALE
+        } else {
+            self.scale_of(col_op).unwrap_or(crate::core::value_codec::DECIMAL_SCALE)
+        };
         let ComparisonOperand::Direct(mb) = lit_op else {
             return None;
         };
@@ -853,9 +858,23 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // than the column is compared with both sides at the engine scale
         // instead, below — which the filter index declines to prune, as it
         // declines any literal it cannot encode exactly.
-        // A column that keeps each value's own scale meets a literal as such
-        // a cell, compared by value; no scale of the column's to meet at.
+        // A column that keeps each value's own scale meets a literal as such a
+        // cell, compared by value; no scale of the column's to meet at. A
+        // literal with more digits than a cell holds is first bounded at the
+        // 38 places a stored value can have (`bound_inexact_decimal_literal`).
         let literal = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Direct(_));
+        let own_scale_pair = self.keeps_own_scale(&left_op) || self.keeps_own_scale(&right_op);
+        let unrepresentable = own_scale_pair
+            && ((literal(&right_op) && Self::own_scale_literal(&right_op, &right_type).is_none())
+                || (literal(&left_op) && Self::own_scale_literal(&left_op, &left_type).is_none()));
+        let (left_op, right_op, left_type, right_type, op_str) = if own_scale_pair && !unrepresentable {
+            (left_op, right_op, left_type, right_type, op_str)
+        } else {
+            match self.bound_inexact_decimal_literal(&left_op, &left_type, &right_op, &right_type, op_str) {
+                Some(bounded) => bounded,
+                None => (left_op, right_op, left_type, right_type, op_str),
+            }
+        };
         let (left_op, right_op, left_type, right_type) =
             if self.keeps_own_scale(&left_op) && literal(&right_op) && left_type == DbType::DECIMAL {
                 match Self::own_scale_literal(&right_op, &right_type) {
@@ -870,14 +889,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             } else {
                 (left_op, right_op, left_type, right_type)
             };
-        let own_scale_pair = self.keeps_own_scale(&left_op) || self.keeps_own_scale(&right_op);
-        let (left_op, right_op, left_type, right_type, op_str) = match own_scale_pair {
-            true => (left_op, right_op, left_type, right_type, op_str),
-            false => match self.bound_inexact_decimal_literal(&left_op, &left_type, &right_op, &right_type, op_str) {
-                Some(bounded) => bounded,
-                None => (left_op, right_op, left_type, right_type, op_str),
-            },
-        };
         let mut inexact_literal = false;
         let (left_op, right_op, left_type, right_type) = {
             let left_scale = self.scale_of(&left_op);

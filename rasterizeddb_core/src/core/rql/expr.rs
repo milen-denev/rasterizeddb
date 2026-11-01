@@ -3227,7 +3227,7 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         // so the common path pays nothing for it.
         let wide = |v: &Value| matches!(v, Value::Data { bytes, db_type: DbType::DECIMAL } if bytes.len() == 17);
         if wide(a) || wide(b) {
-            return Err(WIDE_CONSTANT_HERE.to_string());
+            return own_scale_arith(a, op, b);
         }
         return Err(format!("'{}' needs numeric operands", op.symbol()));
     };
@@ -3257,11 +3257,41 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     })
 }
 
-/// The refusal for a constant with more places than the engine's met where
-/// only the engine's nine-place arithmetic runs.
-pub(crate) const WIDE_CONSTANT_HERE: &str = "a NUMERIC constant with more than 9 decimal places is computed \
-     exactly in a select list, a sort key, a comparison or a stored value; in this expression it is not \
-     supported";
+/// NUMERIC arithmetic with an operand carrying its own scale — a value of a
+/// column that keeps each value's (`value_codec::keeps_own_scale`), or a
+/// constant with more places than the engine's nine — computed exactly, as
+/// PostgreSQL's `numeric` operators compute it (scales by `pg_numeric`'s
+/// rules), the result a cell carrying its own scale. A sixteen-byte NUMERIC
+/// beside it is at the engine's nine places; an integer is itself; a float is
+/// its fifteen-digit text, as `float8_numeric` reads it.
+fn own_scale_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
+    use crate::core::rql::pg_numeric::{self as pgn, PgNum};
+    let read = |v: &Value| -> Option<PgNum> {
+        match v {
+            Value::Data { bytes, db_type: DbType::DECIMAL } => {
+                let (m, own) = crate::core::value_codec::split_decimal_cell(bytes)?;
+                match own {
+                    Some(s) => PgNum::new(m, s),
+                    None => Some(PgNum::trimmed(m, crate::core::value_codec::DECIMAL_SCALE)),
+                }
+            }
+            Value::Data { db_type: DbType::F32 | DbType::F64, .. } => pgn::from_f64(as_f64(v)?),
+            other => as_i64(other).map(|n| PgNum::int(n as i128)),
+        }
+    };
+    let (Some(x), Some(y)) = (read(a), read(b)) else {
+        return Err(format!("'{}' needs numeric operands", op.symbol()));
+    };
+    let overflow = || format!("numeric overflow in '{}'", op.symbol());
+    let value = match op {
+        ArithOp::Add => x.add(y).ok_or_else(overflow)?,
+        ArithOp::Sub => x.sub(y).ok_or_else(overflow)?,
+        ArithOp::Mul => x.mul(y).ok_or_else(overflow)?,
+        ArithOp::Div => x.div(y).map_err(|e| e.to_string())?.ok_or_else(overflow)?,
+        ArithOp::Rem => x.rem(y).map_err(|e| e.to_string())?.ok_or_else(overflow)?,
+    };
+    Ok(Value::Data { bytes: value.to_cell(), db_type: DbType::DECIMAL })
+}
 
 /// Whether a float's shortest digits need no more places than the engine
 /// keeps, so taking it into `NUMERIC` loses nothing.
@@ -3769,6 +3799,22 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
 /// the exact reading cannot settle, takes the engine path as before — which
 /// refuses what it cannot carry rather than truncating it
 /// ([`to_engine_scale`], [`decimal_arith`]).
+/// An aggregate's argument for one row: a NUMERIC one as PostgreSQL computes
+/// it (`pg_numeric`), a cell carrying its display scale, so `sum(n * 2)` over
+/// a NUMERIC(10,4) shows 24.0000 and `sum(n * 1e30)` keeps its places;
+/// anything else as `eval` gives it. At the engine's nine places the first
+/// was 24.000000000, and a value past them could not be summed.
+pub(crate) fn eval_aggregate_argument(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
+    if static_type(expr) == DbType::DECIMAL {
+        match pg_numeric(expr, row, schema)? {
+            Some(None) => return Ok(Value::Null),
+            Some(Some(v)) => return Ok(Value::Data { bytes: v.to_cell(), db_type: DbType::DECIMAL }),
+            None => {}
+        }
+    }
+    eval(expr, row, schema)
+}
+
 pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: &SchemaField) -> Result<Value, String> {
     // A `timestamp` (without time zone) value written into a text column: its
     // text with no offset (`from_engine_scale` renders a `timestamptz`'s).

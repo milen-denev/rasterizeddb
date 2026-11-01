@@ -186,24 +186,20 @@ async fn stored_values_take_postgresqls_scale() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// An unconstrained `NUMERIC` column here keeps nine places, where
-/// PostgreSQL keeps every place of the value. A computed value with digits
-/// past nine is refused, as such a written constant is, rather than stored
-/// without them (it stored 0.666666667 for PostgreSQL's
-/// 0.66666666666666666667); one exact at nine places is stored.
+/// An unconstrained `NUMERIC` column keeps every place of the value, as
+/// PostgreSQL does: `2.0 / 3` is 0.66666666666666666667 (it was refused while
+/// the column kept nine places, and before that stored 0.666666667), and
+/// `1.0 / 4` is 0.25000000000000000000 at `select_div_scale`'s places.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unconstrained_column_refuses_digits_it_cannot_keep() {
     let server = TestServer::start().await.expect("server");
     let c = client(&server).await;
     run(&c, "CREATE TABLE u (id INT PRIMARY KEY, c NUMERIC)").await;
     run(&c, "INSERT INTO u VALUES (1, 1)").await;
-    let err = c.simple_query("UPDATE u SET c = 2.0 / 3 WHERE id = 1").await.expect_err("digits past nine places");
-    assert_eq!(err.code().map(|s| s.code()), Some("0A000"), "{err}");
-    assert_eq!(rows(&c, "SELECT c::text FROM u").await, ["1"], "the refused statement changed nothing");
-    // PostgreSQL 17 stores 0.25000000000000000000 and shows that; the value
-    // is kept here, at the places it needs.
+    run(&c, "UPDATE u SET c = 2.0 / 3 WHERE id = 1").await;
+    assert_eq!(rows(&c, "SELECT c::text FROM u").await, ["0.66666666666666666667"]);
     run(&c, "UPDATE u SET c = 1.0 / 4 WHERE id = 1").await;
-    assert_eq!(rows(&c, "SELECT c::text FROM u").await, ["0.25"]);
+    assert_eq!(rows(&c, "SELECT c::text FROM u").await, ["0.25000000000000000000"]);
 }
 
 /// An integer constant past `bigint` beside a NUMERIC is that number, and so

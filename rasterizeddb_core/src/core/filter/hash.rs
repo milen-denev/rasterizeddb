@@ -165,6 +165,22 @@ fn hash_bytes(b: &[u8], seed: HashSeed) -> u64 {
     mix(acc)
 }
 
+/// A column cell's hash for the filter: [`canonical_hash`], except a NUMERIC
+/// carrying its own scale (a column that keeps each value's,
+/// `value_codec::keeps_own_scale`), which is hashed by its one cell per value
+/// (`value_codec::canonical_numeric_cell`), so 1.5 and 1.50 fingerprint alike
+/// as `=` says they are equal. Kept beside `canonical_hash` rather than in it:
+/// that function's answers are the persisted derivation the golden vectors pin
+/// (a seventeen-byte DECIMAL there is no value), and no filter an older build
+/// persisted holds such a cell.
+#[inline]
+pub fn row_hash(db_type: &DbType, bytes: &[u8], seed: HashSeed) -> Option<u64> {
+    if *db_type == DbType::DECIMAL && bytes.len() == 17 {
+        return crate::core::value_codec::canonical_numeric_cell(bytes).map(|c| hash_bytes(&c, seed));
+    }
+    canonical_hash(db_type, bytes, seed)
+}
+
 /// Hash a column value in its canonical form.
 ///
 /// Returns `None` when the value cannot be indexed — a non-comparable type, or
@@ -178,12 +194,6 @@ pub fn canonical_hash(db_type: &DbType, bytes: &[u8], seed: HashSeed) -> Option<
         return Some(hash_bytes(bytes, seed));
     }
 
-    // A NUMERIC carrying its own scale (a column that keeps each value's):
-    // by its one cell per value, so 1.5 and 1.50 fingerprint alike as `=`
-    // says they are equal.
-    if *db_type == DbType::DECIMAL && bytes.len() == 17 {
-        return crate::core::value_codec::canonical_numeric_cell(bytes).map(|c| hash_bytes(&c, seed));
-    }
     let width = fixed_width(db_type)?;
     if bytes.len() != width {
         return None;

@@ -113,7 +113,9 @@ pub fn probes() -> Vec<Probe> {
         // ---- aggregates ----------------------------------------------------
         p("aggregate", "count_star", "SELECT COUNT(*) FROM users", FirstColumn(&["4"])),
         p("aggregate", "count_column", "SELECT COUNT(country) FROM users", FirstColumn(&["3"])),
-        p("aggregate", "sum", "SELECT SUM(net_amount) FROM invoice", FirstColumn(&["1930.5"])),
+        // An unconstrained NUMERIC keeps each value's written scale (`100.00`), and
+        // PostgreSQL's SUM shows the inputs' widest.
+        p("aggregate", "sum", "SELECT SUM(net_amount) FROM invoice", FirstColumn(&["1930.50"])),
         p("aggregate", "min_max", "SELECT MIN(invoice_number), MAX(invoice_number) FROM invoice", Grid(&["1001|1005"])),
         // PostgreSQL's `avg(int)` is a numeric at sixteen places here, and its
         // binary form keeps that display scale.
@@ -163,7 +165,8 @@ pub fn probes() -> Vec<Probe> {
         p("type", "inet_roundtrip", "SELECT ip_inet FROM user_session WHERE ip_inet = '10.0.0.1'", FirstColumn(&["10.0.0.1"])),
         p("type", "inet_ipv6_roundtrip", "SELECT ip_inet FROM user_session WHERE id = 'dddddddd-0000-4000-8000-000000000003'", FirstColumn(&["2001:db8::1"])),
         p("type", "uuid_roundtrip", "SELECT id FROM domain WHERE name = 'Acme'", FirstColumn(&[schema::ids::DOMAIN_ACME])),
-        p("type", "numeric_roundtrip", "SELECT vat_rate FROM users WHERE name = 'Carol'", FirstColumn(&["19"])),
+        // Written `19.00` into an unconstrained NUMERIC: PostgreSQL shows `19.00`.
+        p("type", "numeric_roundtrip", "SELECT vat_rate FROM users WHERE name = 'Carol'", FirstColumn(&["19.00"])),
         p("type", "timestamp_roundtrip", "SELECT created_at FROM users WHERE name = 'Alice'", FirstColumn(&["2026-01-01 08:00:00+00:00"])),
         p("type", "boolean_roundtrip", "SELECT billing_setup FROM users WHERE name = 'Alice'", FirstColumn(&["t"])),
         p("type", "null_roundtrip", "SELECT default_subscription FROM domain WHERE name = 'Globex'", FirstColumn(&[""])),
@@ -211,7 +214,7 @@ pub fn probes() -> Vec<Probe> {
         // that wrong makes the scan stop early and return a smaller number,
         // which is the worst kind of wrong answer: plausible, and silent.
         p("aggregate", "count_ignores_limit_on_input", "SELECT COUNT(*) FROM invoice LIMIT 2", FirstColumn(&["5"])),
-        p("aggregate", "sum_ignores_limit_on_input", "SELECT SUM(net_amount) FROM invoice LIMIT 2", FirstColumn(&["1930.5"])),
+        p("aggregate", "sum_ignores_limit_on_input", "SELECT SUM(net_amount) FROM invoice LIMIT 2", FirstColumn(&["1930.50"])),
     ]
 }
 
