@@ -5123,6 +5123,18 @@ mod tests {
         // An operand of more than the comparison is left to the evaluator.
         let out = squash(rewrite_where("i * 2 = 5::float8", &schema).unwrap());
         assert!(!out.contains(">="), "{out}");
+        let lowered = |sql: &str| {
+            exact_columns_against_floats(lex(sql).unwrap(), &schema)
+                .iter()
+                .map(Tok::render)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for sql in ["n + i = 5::float8", "i = 2.5::float8 * 2", "i = 5::float8 - n"] {
+            let out = lowered(sql);
+            assert!(!out.contains(">=") && !out.contains("<="), "{sql} -> {out}");
+        }
+        assert!(lowered("n = 1 AND i = 5::float8").contains("i >= 5 AND i <= 5"));
     }
 
     #[test]
