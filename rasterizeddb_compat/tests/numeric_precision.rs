@@ -569,6 +569,14 @@ async fn a_retype_that_breaks_a_check_is_refused() {
     run(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(6,3)").await;
     assert_eq!(sqlstate(&c, "INSERT INTO ck VALUES (2, 1.01)").await, "23514");
     assert_eq!(rows(&c, "SELECT * FROM ck").await, ["1|1.009"]);
+    // A check that cannot be judged through the cast here (a scale past
+    // nine places) is refused when rounding changes a value it reads, and
+    // the row stays as it was. PostgreSQL 17 refuses it too, with 23514
+    // (1.0000000000005 rounds to the 1.000000000001 the check forbids).
+    run(&c, "CREATE TABLE cx (id INT PRIMARY KEY, n NUMERIC CHECK (n <> 1.000000000001))").await;
+    run(&c, "INSERT INTO cx VALUES (1, 1.0000000000005)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE cx ALTER COLUMN n TYPE NUMERIC(20,12)").await, "0A000");
+    assert_eq!(rows(&c, "SELECT * FROM cx").await, ["1|1.0000000000005"]);
     run(&c, "CREATE TABLE gc (id INT PRIMARY KEY, u NUMERIC, g NUMERIC GENERATED ALWAYS AS (u * 2) STORED)").await;
     run(&c, "INSERT INTO gc (id, u) VALUES (1, 1.25)").await;
     assert_eq!(sqlstate(&c, "ALTER TABLE gc ALTER COLUMN u TYPE NUMERIC(4,1)").await, "0A000");
