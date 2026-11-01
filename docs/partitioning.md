@@ -555,7 +555,30 @@ and the catalog against the files within each. Its failure under load was
 that, not a race: a probe counting reused bytes matched every gap exactly,
 and the gap went either way between the budgets.
 
-S2_MEASUREMENTS
+**Eager loads, and the re-measurement.** In snapshot mode a deferred load
+still made each first routed read after a fan-out pay it alone, where full
+opens load every partition at once: so a scan-only open whose snapshot
+proves loadable (a `Load` plan) loads it at once while the open budget is
+under half full (`PartitionOpen::load_if_proven`), as a full open would; it
+stays scan-only past half the budget, where the partition is likely to be
+evicted again. Rebuild mode never has a `Load` plan and keeps its
+deferral. Review B's measurement, kept as
+`database::lazy_resident_tests::fan_out_then_routed_reads` (128 partitions
+of 8,000 rows, an index, ext4, debug, load 7 to 9), three repetitions:
+
+| | first fan-out | then the first routed read of each partition | 5 × (fan-out + 128 routed), budget unbounded / 32 |
+|---|---|---|---|
+| snapshot, scan-only (before this round) | 91 to 207 ms | 719 to 1,381 ms | 1.7 to 2.8 s / 7.6 to 9.3 s |
+| snapshot, scan-only (now) | 325 to 1,005 ms | 145 to 256 ms | 1.1 to 2.3 s / 7.7 to 9.2 s |
+| snapshot, full opens | 272 to 977 ms | 157 to 588 ms | 1.2 to 2.2 s / 9.4 to 9.8 s |
+| rebuild, scan-only | 56 to 101 ms | 1,358 to 1,392 ms | 2.0 to 2.7 s / 8.4 to 12.9 s |
+| rebuild, full opens | 1,239 to 1,963 ms | 144 to 162 ms | 2.0 to 2.6 s / 18.8 to 22.4 s |
+
+Snapshot mode's scan-only is now full open's equal (the loads run at the
+fan-out, in parallel); rebuild mode keeps its first fan-out under a tenth
+of a second against one to two, and under a budget of 32 does the
+alternating workload in about half the time, since full opens rebuild
+every partition each time it reopens.
 
 **Durable `STATS`: not built, by measurement.** The first catalog read
 after a start reads each closed partition's sizes from its files once
@@ -608,12 +631,15 @@ the medium.
 `a_fan_out_opens_scan_only_and_its_close_writes_nothing` (no index load or
 build on a fan-out's open, and its close leaves the snapshot the next
 routed open loads),
+`a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room`,
+`an_upgrade_after_a_ticket_without_new_slots_still_loads`,
+`an_upgrade_after_a_renumbering_builds_rather_than_loads`,
+`the_budget_counts_what_tables_and_partitions_hold`,
 `a_routed_read_upgrades_a_scan_only_instance_in_place` (the same instance,
 loaded, answering as a scan, while a fan-out races it),
 `a_write_upgrades_a_scan_only_instance_before_its_ticket` (a row written
 straight through a fan-out's instance, which no routing upgrades, is in
 the loaded index),
-`an_upgrade_after_the_file_set_changed_builds_rather_than_loads`,
 `shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone`,
 `an_instance_kept_past_its_close_stays_counted` (N1), and
 `budget::tests::open_plain_tables_shrink_the_derived_budget`;
@@ -630,7 +656,7 @@ scan-only opens and their upgrades.
 | a fan-out's open made full | `a_fan_out_opens_scan_only_and_its_close_writes_nothing` |
 | a routed read not upgrading the instance it reaches | `a_routed_read_upgrades_a_scan_only_instance_in_place` |
 | a write not upgrading before its ticket | `a_write_upgrades_a_scan_only_instance_before_its_ticket` |
-| a deferred load kept after the file set changed | `an_upgrade_after_the_file_set_changed_builds_rather_than_loads` |
+| a deferred load kept after the slots were renumbered | `an_upgrade_after_a_renumbering_builds_rather_than_loads` |
 | a scan-only or unready instance sealed at close | `a_fan_out_opens_scan_only_and_its_close_writes_nothing` |
 | only the scan-only guard at close removed | survives: a scan-only instance's indexes are not ready, so `ready_to_seal` refuses the seal too |
 | shutdown sealing scan-only partitions | `shutdown_and_idle_checkpoints_leave_scan_only_partitions_alone` |
