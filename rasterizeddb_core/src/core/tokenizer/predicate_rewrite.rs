@@ -3657,7 +3657,7 @@ fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, sca
             });
         }
     }
-    Ok(exact_columns_against_floats(toks, schema, scan)
+    Ok(exact_columns_against_floats(own_scale_against_floats(toks, schema, scan), schema, scan)
         .into_iter()
         .map(|t| match t {
             Tok::Float { number, .. } => Tok::Word(number),
@@ -3672,6 +3672,12 @@ fn exact_column(name: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<(Str
     use crate::core::db_type::DbType;
     let resolved = resolve_column(name, schema)?;
     let field = schema.iter().find(|f| !f.is_deleted && f.name == resolved)?;
+    // A column that keeps each value's own scale has no one scale to count a
+    // run at (a value may have 38 places, or 38 integer digits):
+    // `own_scale_against_floats` compares it as PostgreSQL does instead.
+    if crate::core::value_codec::keeps_own_scale(field) {
+        return None;
+    }
     // A NUMERIC's thirty-eight digits; storage is an i128 of units.
     let digits38 = 10i128.pow(38) - 1;
     let (scale, lo, hi) = match field.db_type {
@@ -3979,6 +3985,165 @@ fn exact_in_floats(
     }
     out.push(Tok::RPar);
     Some(out)
+}
+
+/// `column op float`, `float op column` and `column [NOT] IN (float, …)` over
+/// a column that keeps each value's own scale (`value_codec::keeps_own_scale`):
+/// the column's value converted to its nearest double, as PostgreSQL compares
+/// `numeric` with `float8`. Such a column has no one scale to count a run of
+/// values at ([`exact_against_float`]), and read at the engine's nine places
+/// `n = '0.1'::float8` missed 0.10000000000000001 (and a CHECK admitted it).
+///
+/// For the scan, a lifted `column::float8` (an IN list a hashed set over it,
+/// `transformer::collapse_in_sets`); for the expression evaluator (a CHECK, a
+/// join's post-filter), the float typed `'…'::float8`, which `expr::compare`
+/// reads by nearest double. A NULL in a NOT IN keeps it never true.
+fn own_scale_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Vec<Tok> {
+    if !toks.iter().any(|t| matches!(t, Tok::Float { .. }))
+        || !schema.iter().any(|f| !f.is_deleted && crate::core::value_codec::keeps_own_scale(f))
+    {
+        return toks;
+    }
+    let comparison = |t: Option<&Tok>| -> Option<String> {
+        match t {
+            Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(op.clone()),
+            _ => None,
+        }
+    };
+    let binds = |t: Option<&Tok>| match t {
+        Some(Tok::Sym(op)) => !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="),
+        Some(Tok::Word(w)) => w.eq_ignore_ascii_case("between") || w.eq_ignore_ascii_case("collate"),
+        _ => false,
+    };
+    let column_at = |i: usize| -> Option<String> {
+        let Some(Tok::Word(w)) = toks.get(i) else { return None };
+        let name = resolve_column(w, schema)?;
+        schema
+            .iter()
+            .any(|f| !f.is_deleted && f.name == name && crate::core::value_codec::keeps_own_scale(f))
+            .then(|| w.clone())
+    };
+    let float_at = |i: usize| -> Option<&str> {
+        match toks.get(i) {
+            Some(Tok::Float { number, .. }) => Some(number.as_str()),
+            _ => None,
+        }
+    };
+    let mirror = |op: &str| match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
+    }
+    .to_string();
+    // The column's side, and a float as its other side, in the reader's form.
+    let side = |column: &str| -> Option<Tok> {
+        if scan {
+            lift_operand_typed(&format!("{column}::float8"), schema).ok().map(|(text, _)| Tok::Lifted(text))
+        } else {
+            Some(Tok::Word(column.to_string()))
+        }
+    };
+    let value = |number: &str| -> Tok {
+        if scan {
+            Tok::Word(number.to_string())
+        } else {
+            Tok::Word(format!("'{number}'::float8"))
+        }
+    };
+    let before = |i: usize| if i == 0 { None } else { toks.get(i - 1) };
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0usize;
+    while i < toks.len() {
+        if !binds(before(i)) && !binds(toks.get(i + 3)) {
+            // column op float
+            if let (Some(column), Some(op), Some(number)) = (column_at(i), comparison(toks.get(i + 1)), float_at(i + 2)) {
+                if let Some(left) = side(&column) {
+                    out.extend([Tok::LPar, left, Tok::Sym(op), value(number), Tok::RPar]);
+                    i += 3;
+                    continue;
+                }
+            }
+            // float op column
+            if let (Some(number), Some(op), Some(column)) = (float_at(i), comparison(toks.get(i + 1)), column_at(i + 2)) {
+                if let Some(left) = side(&column) {
+                    out.extend([Tok::LPar, left, Tok::Sym(mirror(&op)), value(number), Tok::RPar]);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        // column [NOT] IN (float, …), NULLs among them
+        if let Some(column) = column_at(i).filter(|_| !binds(before(i))) {
+            let negated = toks.get(i + 1).is_some_and(|t| t.is_keyword("not"));
+            let open = i + 1 + negated as usize + 1;
+            if toks.get(open - 1).is_some_and(|t| t.is_keyword("in")) && matches!(toks.get(open), Some(Tok::LPar)) {
+                let mut numbers = Vec::new();
+                let mut null = false;
+                let mut floats = 0usize;
+                let mut j = open + 1;
+                let mut closed = false;
+                loop {
+                    // A plain number beside a float takes the list's common
+                    // type, float8, as PostgreSQL resolves it: `n IN
+                    // ('0.1'::float8, 2.5)` compares n's nearest double with
+                    // each item's.
+                    match (float_at(j), toks.get(j)) {
+                        (Some(number), _) => {
+                            floats += 1;
+                            numbers.push(number)
+                        }
+                        (None, Some(t)) if t.is_keyword("null") => null = true,
+                        (None, Some(Tok::Word(w)))
+                            if w.parse::<f64>().is_ok_and(f64::is_finite)
+                                && w.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')) =>
+                        {
+                            numbers.push(w.as_str())
+                        }
+                        _ => break,
+                    }
+                    match toks.get(j + 1) {
+                        Some(Tok::Comma) => j += 2,
+                        Some(Tok::RPar) => {
+                            closed = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // The evaluator has no IN of its own to keep a NULL's unknown in.
+                let fits = closed && floats > 0 && (scan || !null);
+                if let (true, Some(left)) = (fits, side(&column)) {
+                    let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
+                    out.push(Tok::LPar);
+                    for (k, number) in numbers.iter().enumerate() {
+                        if k > 0 {
+                            out.push(Tok::Word(kw.to_string()));
+                        }
+                        out.extend([left.clone(), Tok::Sym(op.to_string()), value(number)]);
+                    }
+                    if negated && null {
+                        out.extend([
+                            Tok::Word("AND".to_string()),
+                            Tok::Word(column.clone()),
+                            Tok::Word("NOT".to_string()),
+                            Tok::Word("IN".to_string()),
+                            Tok::LPar,
+                            Tok::Word("NULL".to_string()),
+                            Tok::RPar,
+                        ]);
+                    }
+                    out.push(Tok::RPar);
+                    i = j + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    out
 }
 
 /// Every `column op float`, `float op column` and `column [NOT] IN (float,

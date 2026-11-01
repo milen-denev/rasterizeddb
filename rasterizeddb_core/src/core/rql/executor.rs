@@ -8293,6 +8293,18 @@ pub(crate) fn stored_numeric_literal(literal: &str, field: &crate::core::row::sc
     if text.eq_ignore_ascii_case("NULL") || text.eq_ignore_ascii_case("DEFAULT") {
         return None;
     }
+    // A column that keeps each value's own scale stores the number as
+    // written: `1.50` stays two places (at the engine's nine, `EXCLUDED.v`
+    // became 1.500000000, and one past nine places was no constant at all).
+    // A whole number is written `numeric` (`1::numeric`): as a bare `1`,
+    // `SET u = excluded.u / 3` divided integers and stored 0.
+    if crate::core::value_codec::keeps_own_scale(field) {
+        let cell = crate::core::value_codec::own_scale_cell(text)?;
+        let (m, own) = crate::core::value_codec::split_decimal_cell(&cell)?;
+        let own = own?;
+        let written = crate::core::value_codec::format_decimal_scaled(m, own);
+        return Some(if own == 0 { format!("{written}::numeric") } else { written });
+    }
     // A plain number the column holds exactly, read without the parse
     // and evaluation below, which an upsert ran for every column of every
     // row: an integer into an integer column, or a decimal with no more
@@ -8416,6 +8428,14 @@ fn stored_text_literal(literal: &str, field: &crate::core::row::schema::SchemaFi
 /// timestamp's microseconds, a boolean's byte). `None` for anything that is
 /// not a constant the column takes.
 fn stored_key_bytes(literal: &str, field: &crate::core::row::schema::SchemaField) -> Option<Vec<u8>> {
+    // A column that keeps each value's own scale: by its one cell per value,
+    // as its unique check compares (1.5 is 1.50).
+    if crate::core::value_codec::keeps_own_scale(field) {
+        if let Some(number) = stored_numeric_literal(literal, field) {
+            let cell = crate::core::value_codec::own_scale_cell(number.trim_end_matches("::numeric"))?;
+            return crate::core::value_codec::canonical_numeric_cell(&cell);
+        }
+    }
     if let Some(number) = stored_numeric_literal(literal, field) {
         return Some(number.into_bytes());
     }

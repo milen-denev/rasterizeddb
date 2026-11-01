@@ -278,3 +278,70 @@ async fn an_own_scale_column_compares_with_a_literal_past_38_digits() {
         assert_eq!(rows(&c, &sql).await.join(","), want, "{sql}");
     }
 }
+
+/// An unconstrained NUMERIC compared with a float8 compares the stored value's own digits with the double's: =, <>, ranges (either side), IN, NOT IN, IN with NULL, a list mixing floats and numbers (float8, its common type), subqueries, a CHECK, UPDATE WHERE and DELETE WHERE. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn float_comparisons_on_an_own_scale_column() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fo (id INT PRIMARY KEY, n NUMERIC, f FLOAT8)").await;
+    run(&c, "INSERT INTO fo VALUES (1, 0.1, 0.1), (2, 0.10000000000000001, 0.1), (3, 0.10000000000000003, 0.10000000000000003), (4, 0.30000000000000004, 0.30000000000000004), (5, 0.3, 0.3), (6, 1234567890.123456789, 1234567890.123456789), (7, 1234567890.1234567, 1234567890.1234567), (8, 9007199254740993, 9007199254740992), (9, 0.1000000000000000055511151231257827, 0.1), (10, 2.5, 2.5), (11, NULL, NULL)").await;
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n = '0.1'::float8 ORDER BY id").await, ["1", "2", "9"] as [&str; 3], "SELECT id FROM fo WHERE n = '0.1'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n > '0.1'::float8 ORDER BY id").await, ["3", "4", "5", "6", "7", "8", "10"] as [&str; 7], "SELECT id FROM fo WHERE n > '0.1'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n >= '0.1'::float8 ORDER BY id").await, ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"] as [&str; 10], "SELECT id FROM fo WHERE n >= '0.1'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n < '0.1'::float8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM fo WHERE n < '0.1'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n <> '0.1'::float8 ORDER BY id").await, ["3", "4", "5", "6", "7", "8", "10"] as [&str; 7], "SELECT id FROM fo WHERE n <> '0.1'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n = '0.30000000000000004'::float8 ORDER BY id").await, ["4"] as [&str; 1], "SELECT id FROM fo WHERE n = '0.30000000000000004'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE '0.1'::float8 < n ORDER BY id").await, ["3", "4", "5", "6", "7", "8", "10"] as [&str; 7], "SELECT id FROM fo WHERE '0.1'::float8 < n ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE '0.1'::float8 >= n ORDER BY id").await, ["1", "2", "9"] as [&str; 3], "SELECT id FROM fo WHERE '0.1'::float8 >= n ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE '0.1'::float8 = n ORDER BY id").await, ["1", "2", "9"] as [&str; 3], "SELECT id FROM fo WHERE '0.1'::float8 = n ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n = '1234567890.123456789'::float8 ORDER BY id").await, ["6", "7"] as [&str; 2], "SELECT id FROM fo WHERE n = '1234567890.123456789'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n = '9007199254740992'::float8 ORDER BY id").await, ["8"] as [&str; 1], "SELECT id FROM fo WHERE n = '9007199254740992'::float8 ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n IN ('0.1'::float8, '0.30000000000000004'::float8, '2.5'::float8) ORDER BY id").await, ["1", "2", "4", "9", "10"] as [&str; 5], "SELECT id FROM fo WHERE n IN ('0.1'::float8, '0.30000000000000004'::float8, '2.5'::float8) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n NOT IN ('0.1'::float8, '0.30000000000000004'::float8) ORDER BY id").await, ["3", "5", "6", "7", "8", "10"] as [&str; 6], "SELECT id FROM fo WHERE n NOT IN ('0.1'::float8, '0.30000000000000004'::float8) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n IN ('0.1'::float8, NULL) ORDER BY id").await, ["1", "2", "9"] as [&str; 3], "SELECT id FROM fo WHERE n IN ('0.1'::float8, NULL) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n NOT IN ('0.1'::float8, NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM fo WHERE n NOT IN ('0.1'::float8, NULL) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n IN ('0.1'::float8, 2.5) ORDER BY id").await, ["1", "2", "9", "10"] as [&str; 4], "SELECT id FROM fo WHERE n IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n NOT IN (2.5, '0.1'::float8, 3) ORDER BY id").await, ["3", "4", "5", "6", "7", "8"] as [&str; 6], "SELECT id FROM fo WHERE n NOT IN (2.5, '0.1'::float8, 3) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n IN (SELECT f FROM fo WHERE id IN (1, 4)) ORDER BY id").await, ["1", "2", "4", "9"] as [&str; 4], "SELECT id FROM fo WHERE n IN (SELECT f FROM fo WHERE id IN (1, 4)) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id FROM fo WHERE n = (SELECT f FROM fo WHERE id = 1) ORDER BY id").await, ["1", "2", "9"] as [&str; 3], "SELECT id FROM fo WHERE n = (SELECT f FROM fo WHERE id = 1) ORDER BY id");
+    assert_eq!(rows(&c, "SELECT id, n = '0.1'::float8, n > '0.1'::float8 FROM fo ORDER BY id").await, ["1|t|f", "2|t|f", "3|f|t", "4|f|t", "5|f|t", "6|f|t", "7|f|t", "8|f|t", "9|t|f", "10|f|t", "11||"] as [&str; 11], "SELECT id, n = '0.1'::float8, n > '0.1'::float8 FROM fo ORDER BY id");
+    run(&c, "CREATE TABLE fc (id INT PRIMARY KEY, n NUMERIC CHECK (n <> '0.1'::float8))").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO fc VALUES (1, 0.10000000000000001)").await, "23514");
+    run(&c, "INSERT INTO fc VALUES (2, 0.2)").await;
+    assert_eq!(rows(&c, "SELECT id FROM fc ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM fc ORDER BY id");
+    run(&c, "CREATE TABLE fk (id INT PRIMARY KEY, n NUMERIC CHECK (n NOT IN ('0.1'::float8, 7)))").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO fk VALUES (1, 0.10000000000000001)").await, "23514");
+    run(&c, "INSERT INTO fk VALUES (2, 0.2)").await;
+    assert_eq!(rows(&c, "SELECT id FROM fk ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM fk ORDER BY id");
+    run(&c, "UPDATE fo SET f = 9 WHERE n = '0.1'::float8").await;
+    run(&c, "DELETE FROM fo WHERE n > '0.1'::float8 AND n < '0.2'::float8").await;
+    assert_eq!(rows(&c, "SELECT id, f FROM fo ORDER BY id").await, ["1|9", "2|9", "4|0.30000000000000004", "5|0.3", "6|1234567890.1234567", "7|1234567890.1234567", "8|9.007199254740992e+15", "9|9", "10|2.5", "11|"] as [&str; 10], "SELECT id, f FROM fo ORDER BY id");
+}
+
+/// ON CONFLICT over an unconstrained NUMERIC key: 1.5 and 1.50 are one key (in the table and within one statement, 21000), a key past nine places conflicts with itself written with a trailing zero, DO NOTHING keeps the first of two equal keys, and EXCLUDED of a whole number is numeric (excluded.u / 3 is 0.333…). PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_conflict_over_an_own_scale_key() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE up (k NUMERIC PRIMARY KEY, v NUMERIC, n INT)").await;
+    run(&c, "INSERT INTO up VALUES (1.5, 1.50, 1)").await;
+    run(&c, "INSERT INTO up VALUES (1.50, 2.250, 2) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = up.n + 10").await;
+    assert_eq!(rows(&c, "SELECT k, v, n FROM up").await, ["1.5|2.250|11"] as [&str; 1], "SELECT k, v, n FROM up");
+    run(&c, "INSERT INTO up VALUES (0.0000000000001, 3.0, 3) ON CONFLICT (k) DO UPDATE SET n = 99").await;
+    run(&c, "INSERT INTO up VALUES (0.00000000000010, 4.0, 4) ON CONFLICT (k) DO UPDATE SET v = excluded.v + 1, n = 98").await;
+    assert_eq!(rows(&c, "SELECT k, v, n FROM up ORDER BY k").await, ["0.0000000000001|5.0|98", "1.5|2.250|11"] as [&str; 2], "SELECT k, v, n FROM up ORDER BY k");
+    run(&c, "INSERT INTO up VALUES (7, 7, 7), (7.0, 8, 8) ON CONFLICT (k) DO NOTHING").await;
+    assert_eq!(rows(&c, "SELECT k, v, n FROM up ORDER BY k").await, ["0.0000000000001|5.0|98", "1.5|2.250|11", "7|7|7"] as [&str; 3], "SELECT k, v, n FROM up ORDER BY k");
+    run(&c, "CREATE TABLE ub (k NUMERIC PRIMARY KEY, n INT)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO ub VALUES (3.5, 1), (3.50, 2) ON CONFLICT (k) DO UPDATE SET n = 0").await, "21000");
+    run(&c, "INSERT INTO ub VALUES (3.5, 1), (4, 2) ON CONFLICT (k) DO UPDATE SET n = 0").await;
+    run(&c, "INSERT INTO ub VALUES (3.50, 5), (4.0, 6) ON CONFLICT (k) DO UPDATE SET n = excluded.n * 10").await;
+    assert_eq!(rows(&c, "SELECT k, n FROM ub ORDER BY k").await, ["3.5|50", "4|60"] as [&str; 2], "SELECT k, n FROM ub ORDER BY k");
+    run(&c, "CREATE TABLE ux (id INT PRIMARY KEY, u NUMERIC)").await;
+    run(&c, "INSERT INTO ux VALUES (1, 0)").await;
+    run(&c, "INSERT INTO ux VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u / 3").await;
+    run(&c, "INSERT INTO ux VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET u = 0").await;
+    run(&c, "INSERT INTO ux VALUES (2, 2) ON CONFLICT (id) DO UPDATE SET u = excluded.u + ux.u").await;
+    assert_eq!(rows(&c, "SELECT id, u FROM ux ORDER BY id").await, ["1|0.33333333333333333333", "2|9"] as [&str; 2], "SELECT id, u FROM ux ORDER BY id");
+}
