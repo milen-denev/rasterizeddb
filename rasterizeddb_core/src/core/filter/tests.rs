@@ -1409,6 +1409,21 @@ fn masks_are_supersets_of_truth() {
 /// disagrees with `get_size()` would make `canonical_hash` return `None` for
 /// every real value — the filter would silently stop pruning that column with
 /// no error anywhere. This catches that drift the moment a type is added.
+/// A NUMERIC cell carrying its own scale fingerprints by its value: 1.5 and
+/// 1.50 alike, -0 as 0, and never as "no value" (which a probe for it would
+/// prune against).
+#[test]
+fn an_own_scale_cell_fingerprints_by_its_value() {
+    use crate::core::value_codec::decimal_cell_with_scale as cell;
+    let seed = HashSeed::default();
+    let h = |c: Vec<u8>| super::hash::row_hash(&DbType::DECIMAL, &c, seed).expect("a fingerprint");
+    assert_eq!(h(cell(15, 1)), h(cell(150, 2)));
+    assert_eq!(h(cell(15, 1)), h(cell(15_000_000_000, 10)));
+    assert_eq!(h(cell(0, 0)), h(cell(0, 7)));
+    assert_ne!(h(cell(15, 1)), h(cell(15, 2)));
+    assert_ne!(h(cell(-15, 1)), h(cell(15, 1)));
+}
+
 #[test]
 fn fixed_width_agrees_with_db_type_size() {
     let seed = HashSeed::default();
