@@ -484,11 +484,22 @@ load's own invariant). Scans racing an upgrade are unaffected: the indexes
 were not ready before and become ready only when built.
 
 **A deferred load that no longer holds.** The open proved the snapshot
-against the files as they were. A vacuum tick or a forget sweep can write
-the file set with no write path (they take tickets, not the write watch)
-before the upgrade; a compaction can renumber. At the upgrade, a `Load`
-plan whose word is no longer `Clean` or whose index epoch moved becomes a
-build from the rows as they are (`BuildInstead`).
+against the files as they were. Before the upgrade, nothing with a write
+path writes them (every write upgrades first), but a vacuum tick or a
+forget sweep can (they take tickets, not the write watch): neither adds a
+slot or changes a row's indexed values, so the snapshot's INDEX sections
+are still a superset of the rows and the load stands. What would make them
+wrong is a renumbering (a compaction moves the index epoch) or more slots
+than the open proved. At the upgrade, a `Load` plan whose index epoch moved
+or whose pointer file grew becomes a build from the rows as they are
+(`BuildInstead`); the check runs on the load's task, after the barrier is
+already up, so a routed read waits for the load or the build's start either
+way. (The first cut demoted the load whenever the word had left `Clean`:
+with the scheduler running, a forget round's sweep of a freshly written,
+pinned partition did that to nearly every deferred load, and the first
+routed read after a fan-out scanned instead of waiting for the cheap load;
+review B measured snapshot mode 1.8 times slower than full opens for a
+fan-out then routed reads.)
 
 **Closing a scan-only instance writes nothing.** Its close does not seal,
 and a shutdown's seals leave it out: each seal would first take a
@@ -513,12 +524,38 @@ as it drops it (logged, never reached) keeps the budget's token until the
 last reference goes, through a task that waits for it, so the budget
 counts the descriptors that instance still holds.
 
-**The budget's plain-table term** (§7.1). The derived budget is now
-`min(4096, (soft RLIMIT_NOFILE − 2048 − 25 × open plain tables) / 10)`, at
-least 16 (`budget::limit_for`): `Table` counts a file-backed table with no
-range guard as it opens and drops (a statement's memory-backed relation
-holds no descriptors and is not counted), and the limit is re-read at each
-open that may need room.
+**The budget's plain-table term** (§7.1), **counted, not charged.** The
+derived budget is `min(4096, (soft RLIMIT_NOFILE − 2048 − descriptors in
+use that are not partitions') / 10)`, at least 16 (`budget::limit_for`):
+the descriptors in use are `/proc/self/fd`'s entries, read at most once a
+second (`budget::descriptors_in_use`; one directory read, about a
+millisecond per ten thousand descriptors), less ten per open partition.
+The first cut charged 25 per open plain table; review B measured 40 for a
+table with only its primary key's index, 60 and 80 with one and two more
+(each added index another 20, copies of the table's own four providers),
+more again after a restart, and 40 to 180 across schema changes (a growth
+that predates P5b, queued as its own item). With 500 indexed tables under a
+soft limit of 43,008 the charge of 25 left the budget at 4,096 and EMFILE
+came at about 1,100 open partitions; counting leaves it at about 1,100. A
+partition holds exactly ten (`PER_PARTITION`, pinned against
+`/proc/self/fd` by `the_budget_counts_what_tables_and_partitions_hold`).
+On a server (`raise_descriptor_limit` at start), the soft limit then
+follows: each plain table's open, and each derivation of a budget short of
+4,096, raises it toward `2048 + those descriptors + 40,960`, within the
+hard limit.
+
+**Review B round 1** (at `1375d600`: no wrong answers, 56 statements byte
+for byte the same scan-only as full; two should-fix items, both above: the
+counted plain-table term, and the deferred load demoted by a sweep's
+ticket). Also folded in: `budget_answers_tests` compared rows-file bytes
+across two databases, which background vacuum's extent reuse makes
+timing-dependent (the catalog's guarantee is stated under P5b-2a's closed
+sizes); it now compares pointers, slots and partitions across databases,
+and the catalog against the files within each. Its failure under load was
+that, not a race: a probe counting reused bytes matched every gap exactly,
+and the gap went either way between the budgets.
+
+S2_MEASUREMENTS
 
 **Durable `STATS`: not built, by measurement.** The first catalog read
 after a start reads each closed partition's sizes from its files once

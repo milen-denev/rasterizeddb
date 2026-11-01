@@ -1981,6 +1981,12 @@ impl Parts {
     /// maintenance the scheduler's, its pin the slot's), under this
     /// instance's schema. The caller holds the lifecycle lock.
     async fn open_instance(&self, slot: &Slot, scan_only: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
+        // A scan-only open loads a proven snapshot anyway while the budget
+        // is under half full: the partition is likely to stay open for the
+        // routed reads after the fan-out, and a load is cheap (P5b-2b review).
+        let load_if_proven = scan_only && self.budget.open() * 2 < self.budget.limit();
+        #[cfg(test)]
+        let load_if_proven = load_if_proven && !scan_open_hooks::loads_deferred(&self.root);
         // Never a provider over a missing file, which it would create (I9).
         // Out of descriptors here is insufficient resources too: the check
         // opens the files it checks.
@@ -1998,6 +2004,7 @@ impl Parts {
             mode: MaintenanceMode::External,
             watch: Some(self.board.watch(slot.pid)?.clone()),
             scan_only,
+            load_if_proven,
         })
         .await
         .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
@@ -2258,6 +2265,18 @@ pub(crate) mod scan_open_hooks {
 
     pub(super) fn disabled(root: &Path) -> bool {
         DISABLED.lock().iter().any(|d| root.starts_with(d))
+    }
+
+    static LOADS_DEFERRED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Scan-only opens under `dir` defer a proven load too, whatever the
+    /// budget's room: the tests of deferral itself.
+    pub(crate) fn defer_loads(dir: &Path) {
+        LOADS_DEFERRED.lock().push(dir.to_path_buf());
+    }
+
+    pub(super) fn loads_deferred(root: &Path) -> bool {
+        LOADS_DEFERRED.lock().iter().any(|d| root.starts_with(d))
     }
 }
 

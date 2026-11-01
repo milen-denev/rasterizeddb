@@ -1970,6 +1970,8 @@ async fn an_open_refused_as_unmaterialized_evicts_nothing() {
 async fn sealed_and_closed(dir: &Path) -> (Arc<Database>, crate::core::index_store::load::storage_override::Guard) {
     use crate::core::index_store::load::{settings::IndexStorage, storage_override};
     let snap = storage_override::set(dir, IndexStorage::Snapshot);
+    // These tests are of deferral: no proven load starts at a scan-only open.
+    super::table::scan_open_hooks::defer_loads(dir);
     let db = open(dir).await;
     db.partition_maintenance().set_period(Duration::from_secs(3600));
     populated(&db).await;
@@ -2095,13 +2097,15 @@ async fn a_write_upgrades_a_scan_only_instance_before_its_ticket() {
 }
 
 /// A scan-only instance whose file set something wrote with no write path
-/// (a forget sweep's neutralizing, a vacuum) since its open proved the
-/// snapshot does not load that snapshot at its upgrade: its indexes build
-/// from the rows as they are.
+/// before its upgrade (a forget sweep's neutralizing, a vacuum tick: a
+/// ticket, no new slot) still loads the snapshot its open proved, and the
+/// routed read that upgrades it waits for that load rather than scan
+/// (review B of P5b-2b: a sweep's ticket demoted every deferred load to a
+/// build, and the first routed read after a fan-out scanned).
 ///
-/// Mutation: the deferred load kept whatever happened after the open.
+/// Mutation: the deferred load demoted whenever the word left `Clean`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_upgrade_after_the_file_set_changed_builds_rather_than_loads() {
+async fn an_upgrade_after_a_ticket_without_new_slots_still_loads() {
     use crate::core::index_store::load::Origin;
     let dir = tempfile::tempdir().unwrap();
     let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
@@ -2118,7 +2122,41 @@ async fn an_upgrade_after_the_file_set_changed_builds_rather_than_loads() {
     let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
     assert_eq!(rows(&db, "tenant_id = 3").await, mine);
     settled(&part).await;
-    assert_ne!(part.index_origin(), Origin::Loaded, "a changed file set loaded the snapshot its open had proved");
+    assert_eq!(part.index_origin(), Origin::Loaded, "a ticket without new slots demoted the deferred load");
+    for v in [301i64, 302, 303, 304] {
+        assert_eq!(rows(&db, &format!("v = {v}")).await, rows(&db, &format!("v + 0 = {v}")).await, "v = {v}");
+    }
+    drop(part);
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A scan-only instance whose slots were renumbered after its open (what a
+/// compaction does) does not load the snapshot its open proved: its indexes
+/// build from the rows as they are.
+///
+/// Mutation: the deferred load kept whatever happened after the open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upgrade_after_a_renumbering_builds_rather_than_loads() {
+    use crate::core::index_store::load::Origin;
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let p = pid_of_tenant(&t, 3);
+    let part = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(part.is_scan_only());
+    // A renumbering's epoch moves, as `Table::compact` moves it.
+    {
+        let build = crate::core::index_store::gate::build_token();
+        part.data().unwrap().indexes.as_ref().unwrap().invalidate(crate::core::index_store::gate::Proof::from(&build));
+    }
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
+    assert_eq!(rows(&db, "tenant_id = 3").await, mine);
+    settled(&part).await;
+    assert_ne!(part.index_origin(), Origin::Loaded, "a renumbered file set loaded the snapshot its open had proved");
     for v in [301i64, 302, 303, 304] {
         assert_eq!(rows(&db, &format!("v = {v}")).await, rows(&db, &format!("v + 0 = {v}")).await, "v = {v}");
     }
@@ -2187,6 +2225,97 @@ async fn an_instance_kept_past_its_close_stays_counted() {
         assert!(std::time::Instant::now() < deadline, "the token never went with the last reference");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// What the open budget assumes of descriptors, against what `/proc/self/fd`
+/// counts on the files under the test's own directory: an open partition
+/// holds exactly `PER_PARTITION` (the budget subtracts that per open
+/// partition from the descriptors it counts in use), and the count the
+/// budget reads sees every descriptor a plain table holds. A plain table's
+/// own number is not a constant (40 with its primary key's index alone, 20
+/// more per added index, more after a restart or schema changes: review B
+/// of P5b-2b), which is why the budget counts rather than charges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_counts_what_tables_and_partitions_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    let held = |name: &str| fds_under(dir.path()).iter().filter(|p| p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(name))).count() as u64;
+    exec(&db, "CREATE TABLE plain (id BIGINT PRIMARY KEY, v BIGINT)").await;
+    exec(&db, "CREATE INDEX plain_v ON plain (v)").await;
+    exec(&db, "INSERT INTO plain (id, v) VALUES (1, 1), (2, 2)").await;
+    exec(&db, &"SELECT id FROM plain WHERE v = 1".to_string()).await;
+    exec(&db, CREATE).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1)").await;
+    let t = pt(&db);
+    let p = pid_of_tenant(&t, 1);
+    let stem = super::files::data_stem(t.uid(), p);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(held(&stem), super::budget::PER_PARTITION, "an open partition does not hold what the budget assumes");
+    let plain = held("plain");
+    assert!(plain >= 40, "a plain table holds {plain} descriptors");
+    assert!(
+        super::budget::descriptors_in_use() >= fds_under(dir.path()).len() as u64,
+        "the budget's count misses descriptors this process holds"
+    );
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// In snapshot mode, a fan-out's open whose snapshot proves loadable loads
+/// it at once while the open budget has room (P5b-2b review B: deferring a
+/// cheap load made every first routed read after a fan-out pay it alone,
+/// where full opens load every partition at once); with the budget past
+/// half full, it stays scan-only and defers the load.
+///
+/// Mutation: a proven load never started at a scan-only open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let dir = tempfile::tempdir().unwrap();
+    let _snap = storage_override::set(dir.path(), IndexStorage::Snapshot);
+    let budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    t.close_idle().await.unwrap();
+    assert_eq!(rows(&db, "").await, expected());
+    for (pid, part) in t.open_partitions_now() {
+        assert!(!part.is_scan_only(), "partition {pid}: a proven snapshot deferred with the budget's room");
+        settled(&part).await;
+        assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid}");
+    }
+    let _ = budget;
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+    // Past half the budget, the same fan-out stays scan-only.
+    let dir = tempfile::tempdir().unwrap();
+    let _snap = storage_override::set(dir.path(), IndexStorage::Snapshot);
+    let _budget = super::budget::isolate_with(dir.path(), 2, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    t.close_idle().await.unwrap();
+    assert_eq!(rows(&db, "").await, expected());
+    let scan_only = t.open_partitions_now().iter().filter(|(_, p)| p.is_scan_only()).count();
+    assert!(scan_only >= t.materialized_pids().unwrap().len() - 1, "only {scan_only} scan-only past half the budget");
     drop(t);
     close(dir.path(), db);
     super::budget::release(dir.path());

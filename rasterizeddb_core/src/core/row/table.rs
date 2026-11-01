@@ -265,9 +265,6 @@ pub struct Table<S: StorageIO> {
     /// The starts a scan-only open deferred; run once, under this lock, by
     /// the first [`Table::ensure_full`].
     deferred_starts: parking_lot::Mutex<Vec<DeferredStart>>,
-    /// Counted among the open plain tables the partitions' open budget
-    /// leaves descriptors for (`partition::budget::plain_tables_open`).
-    plain_counted: bool,
 }
 
 /// A table's row storage and what indexes it: the part a partition shell does
@@ -521,6 +518,13 @@ pub(crate) struct PartitionOpen<S: StorageIO> {
     /// unrouted read wider than the open budget starts no rebuild it then
     /// discards.
     pub scan_only: bool,
+    /// With `scan_only`: open full after all when the open's proof finds
+    /// the snapshot's INDEX sections loadable (P5b-2b review): a load is
+    /// cheap, and deferring it makes the first routed read pay it alone
+    /// where a full fan-out loads every partition at once. The caller sets
+    /// it while the open budget has room, so the partition is likely to
+    /// stay open for the routed reads that follow.
+    pub load_if_proven: bool,
 }
 
 /// What [`Table::assemble`] finishes a table from.
@@ -544,6 +548,8 @@ struct Assembly<'a, S: StorageIO> {
     watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
     /// [`PartitionOpen::scan_only`]; false for every plain table.
     deferred: bool,
+    /// [`PartitionOpen::load_if_proven`].
+    load_if_proven: bool,
 }
 
 /// One of an open's one-shot starts (its index load or build, its filter
@@ -629,9 +635,6 @@ impl<S: StorageIO> Drop for Table<S> {
         // Without this the per-table maintenance task would outlive the table
         // and keep ticking against storage that is going away.
         self.maintenance_alive.store(false, AtomicOrdering::Relaxed);
-        if self.plain_counted {
-            crate::core::partition::budget::note_plain_closed();
-        }
     }
 }
 
@@ -1026,7 +1029,6 @@ impl<S: StorageIO> Table<S> {
             external: None,
             scan_only: StdArc::new(AtomicBool::new(false)),
             deferred_starts: parking_lot::Mutex::new(Vec::new()),
-            plain_counted: false,
         }
     }
 
@@ -1178,6 +1180,7 @@ impl<S: StorageIO> Table<S> {
             maintenance_alive,
             watch: None,
             deferred: false,
+            load_if_proven: false,
         })
         .await
     }
@@ -1205,6 +1208,7 @@ impl<S: StorageIO> Table<S> {
             mode,
             watch,
             scan_only,
+            load_if_proven,
         } = p;
         use crate::core::partition::maintenance::MaintenanceMode;
         let watch = match (mode, watch) {
@@ -1283,6 +1287,7 @@ impl<S: StorageIO> Table<S> {
             maintenance_alive,
             watch,
             deferred: scan_only,
+            load_if_proven,
         })
         .await)
     }
@@ -1358,6 +1363,7 @@ impl<S: StorageIO> Table<S> {
             maintenance_alive,
             watch,
             deferred,
+            load_if_proven,
         } = a;
 
         let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
@@ -1539,37 +1545,46 @@ impl<S: StorageIO> Table<S> {
             let readers_task = readers.clone();
             let alive = maintenance_alive.clone();
             starts.push(Box::new(move || {
-                // Deferred by a scan-only open: a load of the sections its
-                // proof found stands only if nothing touched the file set or
-                // renumbered its slots since (a vacuum or a forget sweep may
-                // have, with no write path, which would have started this
-                // first); otherwise the indexes build from the rows as they
-                // are now. Run at the open, this is the open's own plan.
-                let plan = match plan {
-                    load::Plan::Load { .. }
-                        if indexes.epoch() != epoch_at_open
-                            || gate_task.state() != crate::core::index_store::gate_word::GateState::Clean =>
-                    {
-                        load::Plan::BuildInstead("the file set changed after its scan-only open")
-                    }
-                    plan => plan,
-                };
-                let loading = matches!(plan, load::Plan::Load { .. });
-                let opened = load::OpenIndexes {
-                    name,
-                    indexes: indexes.clone(),
-                    epoch: if loading { epoch_at_open } else { indexes.epoch() },
-                    n_slots: existing_slots,
-                    gate: gate_task.clone(),
-                    barrier: loading.then(|| gate_task.loads().raise()),
-                    vouch: filter_vouches,
-                    sections_in_snapshot: index_sections_task,
-                    origin: index_origin_task,
-                };
+                // A load's barrier is raised here, before the start returns,
+                // so a write that upgraded the instance waits for the load
+                // and a routed read waits for it too (`load_wait`), rather
+                // than scan.
+                let barrier = matches!(plan, load::Plan::Load { .. }).then(|| gate_task.loads().raise());
                 tokio::spawn(async move {
                     if !alive.load(AtomicOrdering::Relaxed) {
                         return;
                     }
+                    // Deferred by a scan-only open, a load of the sections its
+                    // proof found stands unless the slots moved since: renumbered
+                    // (a compaction), or more of them (nothing with a write path
+                    // writes before the upgrade, so none should be). A vacuum
+                    // tick's reclamation or a forget sweep's neutralizing may
+                    // have written meanwhile with no write path; neither adds a
+                    // slot or changes what a row's indexed values are, so the
+                    // loaded index is still a superset of the rows. Run at the
+                    // open, this is the open's own plan.
+                    let plan = match plan {
+                        load::Plan::Load { .. }
+                            if indexes.epoch() != epoch_at_open
+                                || io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64 != existing_slots =>
+                        {
+                            load::Plan::BuildInstead("the slots changed after its scan-only open")
+                        }
+                        plan => plan,
+                    };
+                    let loading = matches!(plan, load::Plan::Load { .. });
+                    let opened = load::OpenIndexes {
+                        name,
+                        indexes: indexes.clone(),
+                        epoch: if loading { epoch_at_open } else { indexes.epoch() },
+                        n_slots: existing_slots,
+                        gate: gate_task.clone(),
+                        // A build drops it at once (`open_indexes`).
+                        barrier,
+                        vouch: filter_vouches,
+                        sections_in_snapshot: index_sections_task,
+                        origin: index_origin_task,
+                    };
                     let build = gate::build_token();
                     load::open_indexes(&build, opened, plan, || {
                         build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task))
@@ -1734,6 +1749,9 @@ impl<S: StorageIO> Table<S> {
             index_sections,
             index_origin,
         });
+        // A scan-only open whose snapshot proved loadable, with the budget's
+        // room, opens full after all (`PartitionOpen::load_if_proven`).
+        let deferred = deferred && !(load_if_proven && index_load);
         // Set while a scan-only open's starts wait; the unit reads it.
         let scan_only_unit = StdArc::new(AtomicBool::new(deferred));
         let external = match &watch {
@@ -1781,11 +1799,10 @@ impl<S: StorageIO> Table<S> {
             }
             Vec::new()
         };
-        // A plain table's own descriptors, which the partitions' open budget
-        // leaves room for (`partition::budget`): a file-backed table with no
-        // range guard; a statement's memory-backed relation holds none.
-        let plain_counted = guard.is_none() && io_pointers.index_store_dir().is_some();
-        if plain_counted {
+        // A plain table's descriptors come off the partitions' open budget
+        // (`partition::budget`, which counts them); on a server the soft
+        // limit is raised as they grow. A memory-backed relation holds none.
+        if guard.is_none() && io_pointers.index_store_dir().is_some() {
             crate::core::partition::budget::note_plain_open();
         }
 
@@ -1832,7 +1849,6 @@ impl<S: StorageIO> Table<S> {
             external,
             scan_only: scan_only_flag,
             deferred_starts: parking_lot::Mutex::new(deferred_starts),
-            plain_counted,
         }
     }
 

@@ -567,3 +567,136 @@ async fn first_fan_out_cost_scan_only_against_full() {
         crate::core::partition::table::scan_open_hooks::enable(&root);
     }
 }
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn pct(mut v: Vec<f64>, p: f64) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+}
+
+async fn build_measure_db(dir: &Path, parts: u32, rows: i64) -> rclite::Arc<Database> {
+    let db = rclite::Arc::new(Database::new_named(&path_str(dir), false, "fan_out_routed").await);
+    exec(&db, &format!("CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, label TEXT, PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS {parts}")).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = partitioned(&db, "pt");
+    // One tenant per partition.
+    let mut tenants: Vec<(i64, u32)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut x = 1i64;
+    while tenants.len() < parts as usize {
+        let epoch = t.epoch().unwrap();
+        let pid = t.route_where(&format!("tenant_id = {x}")).unwrap().pids(&epoch.map)[0];
+        if seen.insert(pid) {
+            tenants.push((x, pid));
+        }
+        x += 1;
+    }
+    for (tenant, _) in &tenants {
+        let mut id = 1i64;
+        while id <= rows {
+            let hi = (id + 4999).min(rows);
+            let vals: Vec<String> = (id..=hi).map(|i| format!("({tenant}, {i}, {}, 'l{}')", i % 1000, i % 50)).collect();
+            exec(&db, &format!("INSERT INTO pt (tenant_id, id, v, label) VALUES {}", vals.join(", "))).await;
+            id = hi + 1;
+        }
+        // Each partition sealed by its close.
+        t.close_idle().await.unwrap();
+    }
+    std::fs::write(dir.join("revb_tenants"), tenants.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>().join(",")).unwrap();
+    db
+}
+
+fn tenants_of(dir: &Path) -> Vec<i64> {
+    std::fs::read_to_string(dir.join("revb_tenants")).unwrap().split(',').map(|s| s.parse().unwrap()).collect()
+}
+
+/// P5b-2b review B's measurement, kept: a first fan-out, then the first
+/// routed read of every partition after it, scan-only against full opens;
+/// and an alternating workload. REVB_DIR (required), REVB_PARTS,
+/// REVB_ROWS, REVB_BUDGET, REVB_SNAPSHOT=1. A measurement, `#[ignore]`d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn fan_out_then_routed_reads() {
+    let parent = std::env::var("REVB_DIR").expect("REVB_DIR");
+    let parts: u32 = std::env::var("REVB_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let rows: i64 = std::env::var("REVB_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8000);
+    let budget: usize = std::env::var("REVB_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let dir = tempfile::tempdir_in(&parent).unwrap();
+    crate::core::partition::budget::isolate_with(dir.path(), budget, Some(0));
+    let snapshot = std::env::var("REVB_SNAPSHOT").map_or(false, |v| v == "1");
+    let _storage = snapshot.then(|| crate::core::index_store::load::storage_override::set(dir.path(), crate::core::index_store::load::settings::IndexStorage::Snapshot));
+    let at = Instant::now();
+    let mut db = build_measure_db(dir.path(), parts, rows).await;
+    eprintln!("REVB2B-M setup {parts} x {rows} rows in {:.1} s", at.elapsed().as_secs_f64());
+    let tenants = tenants_of(dir.path());
+    let skip_m = std::env::var("REVB_SKIP_M").is_ok();
+    for rep in 0..(if skip_m { 0 } else { 3 }) {
+        for full in [false, true] {
+            if full {
+                crate::core::partition::table::scan_open_hooks::disable(dir.path());
+            } else {
+                crate::core::partition::table::scan_open_hooks::enable(dir.path());
+            }
+            let t = partitioned(&db, "pt");
+            t.close_idle().await.unwrap();
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM pt WHERE label = 'x'").await;
+            let fan = at.elapsed().as_secs_f64() * 1000.0;
+            let mut lat = Vec::new();
+            let at = Instant::now();
+            for (k, tenant) in tenants.iter().enumerate() {
+                let q = Instant::now();
+                exec(&db, &format!("SELECT id FROM pt WHERE tenant_id = {tenant} AND v = {}", (k * 7) % 1000)).await;
+                lat.push(q.elapsed().as_secs_f64() * 1000.0);
+            }
+            let routed_total = at.elapsed().as_secs_f64() * 1000.0;
+            // Second pass: indexes ready by now in both modes?
+            let mut lat2 = Vec::new();
+            for (k, tenant) in tenants.iter().enumerate() {
+                let q = Instant::now();
+                exec(&db, &format!("SELECT id FROM pt WHERE tenant_id = {tenant} AND v = {}", (k * 11) % 1000)).await;
+                lat2.push(q.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!(
+                "REVB2B-M snapshot={snapshot} rep{rep} {} budget={budget}: first fan-out {fan:.0} ms; first routed read per partition after it: total {routed_total:.0} ms, median {:.2} p90 {:.2} max {:.2} ms; second pass median {:.2} p90 {:.2} ms",
+                if full { "full     " } else { "scan-only" },
+                median(lat.clone()), pct(lat.clone(), 0.9), pct(lat.clone(), 1.0), median(lat2.clone()), pct(lat2, 0.9)
+            );
+        }
+    }
+    // Alternating: a fan-out, then a routed read of each partition, five
+    // times, without closing in between (the budget closes what it must).
+    for alt_budget in [budget, 32usize] {
+    if alt_budget != budget {
+        crate::core::partition::budget::isolate_with(dir.path(), alt_budget, Some(0));
+        drop(db);
+    crate::core::wal::remove_for(&path_str(dir.path()));
+        db = rclite::Arc::new(Database::new_named(&path_str(dir.path()), false, "fan_out_routed").await);
+    }
+    let budget = alt_budget;
+    for full in [false, true, false, true, false, true] {
+        if full {
+            crate::core::partition::table::scan_open_hooks::disable(dir.path());
+        } else {
+            crate::core::partition::table::scan_open_hooks::enable(dir.path());
+        }
+        partitioned(&db, "pt").close_idle().await.unwrap();
+        let at = Instant::now();
+        for round in 0..5usize {
+            exec(&db, &format!("SELECT COUNT(*) FROM pt WHERE label = 'l{}'", round)).await;
+            for (k, tenant) in tenants.iter().enumerate() {
+                exec(&db, &format!("SELECT id FROM pt WHERE tenant_id = {tenant} AND v = {}", (k * 13 + round) % 1000)).await;
+            }
+        }
+        eprintln!("REVB2B-ALT snapshot={snapshot} {} budget={budget}: 5 x (fan-out + {} routed) in {:.0} ms", if full { "full     " } else { "scan-only" }, tenants.len(), at.elapsed().as_secs_f64() * 1000.0);
+    }
+    }
+    crate::core::partition::table::scan_open_hooks::enable(dir.path());
+    drop(db);
+    crate::core::wal::remove_for(&path_str(dir.path()));
+}
+
