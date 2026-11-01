@@ -5329,6 +5329,10 @@ mod tests {
         assert_eq!(lifted, 2, "{rendered}");
         assert!(rendered.contains("i IN ( 5 , NULL )") && !rendered.contains(">="), "{rendered}");
         assert!(rendered.contains("= 9.007199254740992e+15 OR") && rendered.contains("= 9.007199254740994e+15 )"), "{rendered}");
+        // The scan's own entry asks for it; the CHECK's does not.
+        let clause = "i IN (9007199254740992::float8, 9007199254740994::float8)";
+        assert!(rewrite_scan_where(clause, &schema).unwrap().as_bytes().contains(&LIFTED_OPEN), "scan");
+        assert!(!rewrite_where(clause, &schema).unwrap().as_bytes().contains(&LIFTED_OPEN), "check");
         let negated = scanned("i NOT IN (9007199254740992::float8, 9007199254740994::float8)");
         let rendered = negated.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
         assert!(rendered.contains("<> 9.007199254740992e+15 AND") && !rendered.contains(" IN "), "{rendered}");

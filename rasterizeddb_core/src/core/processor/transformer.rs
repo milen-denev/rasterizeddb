@@ -2762,6 +2762,33 @@ mod in_set_differential {
             assert_eq!(folded < chain, folds, "{clause}");
         }
     }
+
+    /// A run over one evaluated operand yielding a float folds too; a run
+    /// mixing operands, or over an operand that is not a float, does not.
+    /// (This harness's bare rows give an evaluated operand nothing to read,
+    /// so the answers through it are compared end to end instead:
+    /// `float_text_format::a_large_in_list_mixing_single_values_and_runs`.)
+    #[test]
+    fn a_run_over_an_evaluated_float_folds() {
+        let schema = schema();
+        let mut rng = Lcg(0xf10a7);
+        let rows: Vec<_> = (0..300).map(|_| row(&mut rng)).collect();
+        for (clause, folds) in [
+            ("b::float8 IN (1, 2, 3, 7, -5)", true),
+            ("b::float8 NOT IN (1, 2, 3, 7)", true),
+            ("d::float8 IN (1.5, 2.25, 100, 0.01, 7)", true),
+            ("(b::float8 = 1 OR a::float8 = 2 OR b::float8 = 3 OR b::float8 = 7)", false),
+            ("b % 5 IN (1, 2, 3, 4)", false),
+        ] {
+            let rewritten =
+                crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(clause, &schema).unwrap();
+            let tokens = tokenize(&rewritten, &schema);
+            let (reference, chain) = evaluate(&tokens, &rows, false);
+            let (hashed, folded) = evaluate(&tokens, &rows, true);
+            assert_eq!(folded < chain, folds, "{clause}");
+            assert_eq!(reference, hashed, "{clause}");
+        }
+    }
 }
 
 /// `x IN (…)` per-row cost, the comparison chain against the hashed set.
