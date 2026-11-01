@@ -688,9 +688,12 @@ for a NUMERIC(30,9) 1234567890.123456789 and for 1234567890.1234567 (both
 round to that double), and `9007199254740993::bigint = 9007199254740992::float8`
 holds. Every operator (`=`, `<`, `CASE`, `NULLIF`, `GREATEST`, `LEAST`), a
 `WHERE` and a `CHECK` against a float constant, `IN` lists of floats
-(`n IN (SELECT f8 …)`) and the hash join agree. Against a bare column the scan
-reads such a constant as the run of the column's values that round to it, so
-an index still serves it. `ORDER BY` over values of mixed numeric types orders
+(`n IN (SELECT f8 …)`, a NULL among them keeping IN unknown and NOT IN never
+true) and the hash join agree. Against a bare column the scan reads such a
+constant as the run of the column's values that round to it, so an index still
+serves it; in an IN list the floats only one value rounds to are an ordinary
+IN list, and those many values round to (a NUMERIC(38,20) near 0.1, a bigint
+past 2^52) are matched by the column's nearest double against one hashed set. `ORDER BY` over values of mixed numeric types orders
 them at their exact values. Two column references (`WHERE n = f8`) are not yet
 read by the scan (XX000) and a `NaN` or `Infinity` constant against an exact
 column is refused.
