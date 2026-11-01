@@ -1571,6 +1571,21 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                                 .filter(|v| v.is_finite())
                                 .map(crate::core::value_codec::pg_float8_text)
                         };
+                        // A float that is not finite (`'NaN'::float8`,
+                        // `'-Infinity'::real`) is carried as its quoted
+                        // literal, which every reader takes as before; an
+                        // exact column reads it through `float_value`, and
+                        // answers as PostgreSQL orders NaN and infinity.
+                        // It was text, and against an integer or NUMERIC
+                        // column the plan refused it (XX000).
+                        let number = number.or_else(|| {
+                            let v = if single {
+                                crate::core::value_codec::parse_float4(&text).map(f64::from)
+                            } else {
+                                crate::core::value_codec::parse_float8(&text)
+                            };
+                            v.filter(|v| !v.is_finite()).map(|_| format!("'{}'", text.replace('\'', "''")))
+                        });
                         if let Some(number) = number {
                             let written = format!("{quoted}::{name}");
                             *out.last_mut().expect("a literal") = Tok::Float { number, written };
@@ -3604,41 +3619,145 @@ fn lift_operand_typed(
 /// number there, `j->>'x' = '0.5'::float8` compared the text with a float and
 /// matched nothing, reporting success.
 fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Result<Vec<Tok>, String> {
+    let toks = real_columns_against_doubles(toks, schema);
+    let toks = if scan { numeric_columns_against_float_columns(toks, schema) } else { toks };
     if !toks.iter().any(|t| matches!(t, Tok::Float { .. })) {
         return Ok(toks);
     }
     let comparison = |t: Option<&Tok>| {
         matches!(t, Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="))
     };
-    // The PostgreSQL name of a text column's type, when `t` names one.
+    // The PostgreSQL name of a column's type, when `t` names a column of a
+    // type with no comparison with a float: text, the date/time types,
+    // boolean, bytea, inet, interval.
     let text_column = |t: Option<&Tok>| -> Option<&'static str> {
-        use crate::core::rql::type_modifier::TextTypmod;
         let Some(Tok::Word(w)) = t else { return None };
         let name = resolve_column(w, schema)?;
-        let field = schema.iter().find(|f| {
-            !f.is_deleted
-                && f.name == name
-                && matches!(f.db_type, crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::CHAR)
-        })?;
-        Some(match field.text_typmod() {
-            Some(TextTypmod::Bpchar(_)) => "character",
-            Some(TextTypmod::Varchar(_)) => "character varying",
-            _ => "text",
-        })
+        let field = schema.iter().find(|f| !f.is_deleted && f.name == name)?;
+        no_float_comparison_type(field)
     };
     let text_path = |t: &[Tok]| {
         matches!(t, [.., Tok::Sym(op), Tok::Str(_)] if op == "->>" || op == "#>>")
+    };
+    // A lifted operand (`upper(t)`, a `CASE`), by the type the evaluator
+    // gives it: the same names as a column's.
+    let lifted_type = |t: Option<&Tok>| -> Option<&'static str> {
+        use crate::core::db_type::DbType;
+        let Some(Tok::Lifted(text)) = t else { return None };
+        let (expression, _) = read_lifted(text, 0)?;
+        let operand = crate::core::processor::transformer::EvaluatedOperand::new(&expression, schema).ok()?;
+        Some(match operand.db_type {
+            DbType::STRING | DbType::CHAR => "text",
+            DbType::BPCHAR(_) => "character",
+            DbType::TIMESTAMP => "timestamp without time zone",
+            DbType::DATETIME => "timestamp with time zone",
+            DbType::DATE => "date",
+            DbType::TIME => "time without time zone",
+            DbType::TIMETZ => "time with time zone",
+            DbType::BOOL => "boolean",
+            DbType::BYTEA => "bytea",
+            DbType::INTERVAL => "interval",
+            _ => return None,
+        })
+    };
+    // The text an expression ending just before `end` yields, when it is
+    // one this can see is text: a text function's call (`upper(t)`), a
+    // `CASE` whose results are text, or a `||` concatenation.
+    let text_expression_ending = |end: usize| -> bool {
+        match toks.get(end) {
+            Some(Tok::RPar) => {
+                let mut depth = 0i32;
+                let mut k = end;
+                loop {
+                    match toks.get(k) {
+                        Some(Tok::RPar) => depth += 1,
+                        Some(Tok::LPar) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        None => return false,
+                        _ => {}
+                    }
+                    if k == 0 {
+                        return false;
+                    }
+                    k -= 1;
+                }
+                k > 0 && matches!(toks.get(k - 1), Some(Tok::Word(f)) if TEXT_FUNCTIONS.iter().any(|t| f.eq_ignore_ascii_case(t)))
+            }
+            Some(t) if t.is_keyword("end") => {
+                let mut depth = 0i32;
+                let mut k = end;
+                let mut results: Vec<&Tok> = Vec::new();
+                loop {
+                    match toks.get(k) {
+                        Some(t) if t.is_keyword("end") => depth += 1,
+                        Some(t) if t.is_keyword("case") => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Some(t) if depth == 1 && (t.is_keyword("then") || t.is_keyword("else")) => {
+                            if let Some(r) = toks.get(k + 1) {
+                                results.push(r);
+                            }
+                        }
+                        None => return false,
+                        _ => {}
+                    }
+                    if k == 0 {
+                        return false;
+                    }
+                    k -= 1;
+                }
+                results.iter().any(|r| text_column(Some(r)).is_some_and(|n| n.contains("char") || n == "text"))
+                    || (!results.is_empty() && results.iter().all(|r| matches!(r, Tok::Str(_))))
+            }
+            Some(Tok::Str(_)) | Some(Tok::Word(_)) => {
+                end >= 1
+                    && matches!(toks.get(end - 1), Some(Tok::Sym(op)) if op == "||")
+                    && (matches!(toks.get(end), Some(Tok::Str(_))) || text_column(toks.get(end)).is_some())
+            }
+            _ => false,
+        }
     };
     for (at, tok) in toks.iter().enumerate() {
         if !matches!(tok, Tok::Float { .. }) {
             continue;
         }
+        let float = float_type_name(tok);
+        // `<text> [NOT] BETWEEN <float> AND …`: PostgreSQL's first
+        // comparison is `>=`.
+        if at >= 2 && toks[at - 1].is_keyword("between") {
+            let subject = if toks[at - 2].is_keyword("not") { at.checked_sub(3) } else { Some(at - 2) };
+            if let Some(name) = subject.and_then(|s| text_column(toks.get(s))) {
+                return Err(format!("operator does not exist: {name} >= {float}"));
+            }
+        }
+        // `<text> [NOT] IN (…, <float>, …)`: an item of the list.
+        {
+            let mut k = at;
+            while k > 0 && (matches!(toks[k - 1], Tok::Comma | Tok::Float { .. } | Tok::Str(_)) || matches!(&toks[k - 1], Tok::Word(w) if is_numeric_literal_word(w) || w.eq_ignore_ascii_case("null"))) {
+                k -= 1;
+            }
+            if k >= 3 && matches!(toks[k - 1], Tok::LPar) && toks[k - 2].is_keyword("in") {
+                let subject = if toks[k - 3].is_keyword("not") { k.checked_sub(4) } else { Some(k - 3) };
+                if let Some(name) = subject.and_then(|s| text_column(toks.get(s))) {
+                    return Err(format!("operator does not exist: {name} = {float}"));
+                }
+            }
+        }
         // `<text> op <float>`, or `<float> op <text>`.
         let path_op = |t: Option<&Tok>| matches!(t, Some(Tok::Sym(op)) if op.starts_with("->") || op.starts_with("#>"));
         let before = (at >= 2 && comparison(toks.get(at - 1)))
             .then(|| {
-                if text_path(&toks[..at - 1]) {
+                if text_path(&toks[..at - 1]) || text_expression_ending(at - 2) {
                     Some("text")
+                } else if let Some(name) = lifted_type(toks.get(at - 2)) {
+                    Some(name)
                 } else if at < 3 || !path_op(toks.get(at - 3)) {
                     text_column(toks.get(at - 2))
                 } else {
@@ -3650,8 +3769,12 @@ fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, sca
             .then(|| {
                 if matches!(toks.get(at + 3), Some(Tok::Sym(op)) if op == "->>" || op == "#>>") {
                     Some("text")
-                } else if !path_op(toks.get(at + 3)) {
+                } else if let Some(name) = lifted_type(toks.get(at + 2)) {
+                    Some(name)
+                } else if !path_op(toks.get(at + 3)) && !matches!(toks.get(at + 3), Some(Tok::Sym(op)) if op == "||") {
                     text_column(toks.get(at + 2))
+                } else if matches!(toks.get(at + 3), Some(Tok::Sym(op)) if op == "||") {
+                    Some("text")
                 } else {
                     None
                 }
@@ -3663,9 +3786,9 @@ fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, sca
                 _ => "=".to_string(),
             };
             return Err(if before.is_some() {
-                format!("operator does not exist: {name} {op} double precision")
+                format!("operator does not exist: {name} {op} {float}")
             } else {
-                format!("operator does not exist: double precision {op} {name}")
+                format!("operator does not exist: {float} {op} {name}")
             });
         }
     }
@@ -3828,6 +3951,280 @@ fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Op
     (l, h)
 }
 
+/// `real_column op v`, `v op real_column` and `real_column [NOT] IN (v, …)`
+/// where `v` is a double (`'0.1'::float8`) or a decimal constant (`0.1`):
+/// PostgreSQL widens the `real` to a double and compares there, so a `real`
+/// 0.1 (0.10000000149011612) is not `'0.1'::float8` and is greater than it.
+/// Compared as a `real`, the double was narrowed to 0.1f and `f4 = 0.1`
+/// matched, `f4 > 0.1` did not. Written as comparisons with the `real`
+/// nearest `v`, which the scan reads as the column reads it: the widened
+/// column is above `v` exactly when it is at or above the first `real` above
+/// `v`, and so on; equality with a `v` no `real` widens to holds for no row
+/// (`c <> c AND c = c`, so NULL stays NULL and NaN is not equal), and
+/// inequality for every row (`c = c OR c <> c`). A `real` constant, an
+/// integer, NaN and a list with a NULL are left as they were.
+fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
+    use crate::core::db_type::DbType;
+    if !schema.iter().any(|f| !f.is_deleted && f.db_type == DbType::F32) {
+        return toks;
+    }
+    let comparison = |t: Option<&Tok>| -> Option<String> {
+        match t {
+            Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(op.clone()),
+            _ => None,
+        }
+    };
+    let binds = |t: Option<&Tok>| match t {
+        Some(Tok::Sym(op)) => !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="),
+        Some(Tok::Word(w)) => w.eq_ignore_ascii_case("between") || w.eq_ignore_ascii_case("collate"),
+        _ => false,
+    };
+    let real_at = |i: usize| -> Option<String> {
+        let Some(Tok::Word(w)) = toks.get(i) else { return None };
+        let name = resolve_column(w, schema)?;
+        schema.iter().any(|f| !f.is_deleted && f.name == name && f.db_type == DbType::F32).then(|| w.clone())
+    };
+    // A double this compares in double precision: a float8 constant, or a
+    // decimal (not an integer) constant; finite, not NaN.
+    let double_at = |i: usize| -> Option<f64> {
+        let v = match toks.get(i)? {
+            Tok::Float { number, .. } if float_type_name(&toks[i]) == "double precision" => float_value(number)?,
+            Tok::Word(w) if is_numeric_literal_word(w) && w.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) => {
+                w.parse::<f64>().ok()?
+            }
+            _ => return None,
+        };
+        (!v.is_nan()).then_some(v)
+    };
+    let mirror = |op: &str| match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
+    }
+    .to_string();
+    // `column op v`, compared as PostgreSQL's widened real.
+    let lowered = |column: &str, op: &str, v: f64| -> Vec<Tok> {
+        // A double past a real's range against the largest finite real
+        // (every finite real is below it, an infinite one above).
+        let r = match v as f32 {
+            r if r.is_infinite() && v.is_finite() => f32::MAX.copysign(r),
+            r => r,
+        };
+        let rd = f64::from(r);
+        let c = || Tok::Word(column.to_string());
+        let cmp = |op: &str| vec![c(), Tok::Sym(op.to_string()), Tok::Word(format!("{r}"))];
+        let never = || vec![c(), Tok::Sym("<>".into()), c(), Tok::Word("AND".into()), c(), Tok::Sym("=".into()), c()];
+        let always = || vec![c(), Tok::Sym("=".into()), c(), Tok::Word("OR".into()), c(), Tok::Sym("<>".into()), c()];
+        let inner = if rd == v {
+            cmp(if op == "!=" { "<>" } else { op })
+        } else if rd > v {
+            match op {
+                ">" | ">=" => cmp(">="),
+                "<" | "<=" => cmp("<"),
+                "=" => never(),
+                _ => always(),
+            }
+        } else {
+            match op {
+                ">" | ">=" => cmp(">"),
+                "<" | "<=" => cmp("<="),
+                "=" => never(),
+                _ => always(),
+            }
+        };
+        // One comparison stands as it was written; the two-part forms are
+        // grouped so a neighbouring AND or OR cannot split them.
+        if inner.len() == 3 {
+            return inner;
+        }
+        let mut out = vec![Tok::LPar];
+        out.extend(inner);
+        out.push(Tok::RPar);
+        out
+    };
+    let before = |i: usize| if i == 0 { None } else { toks.get(i - 1) };
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0usize;
+    while i < toks.len() {
+        // The cheap tests first: a comparison or IN next, before any column
+        // is resolved (every statement over a table with a real passes here).
+        let compared = comparison(toks.get(i + 1));
+        if let Some(op) = compared.filter(|_| !binds(before(i)) && !binds(toks.get(i + 3))) {
+            if let Some(v) = double_at(i + 2) {
+                if let Some(column) = real_at(i) {
+                    out.extend(lowered(&column, &op, v));
+                    i += 3;
+                    continue;
+                }
+            }
+            if let Some(v) = double_at(i) {
+                if let Some(column) = real_at(i + 2) {
+                    out.extend(lowered(&column, &mirror(&op), v));
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        let listed = toks.get(i + 1).is_some_and(|t| t.is_keyword("in"))
+            || (toks.get(i + 1).is_some_and(|t| t.is_keyword("not")) && toks.get(i + 2).is_some_and(|t| t.is_keyword("in")));
+        if let Some(column) = listed.then(|| real_at(i)).flatten().filter(|_| !binds(before(i))) {
+            let negated = toks.get(i + 1).is_some_and(|t| t.is_keyword("not"));
+            let open = i + 1 + negated as usize + 1;
+            if toks.get(open - 1).is_some_and(|t| t.is_keyword("in")) && matches!(toks.get(open), Some(Tok::LPar)) {
+                let mut values = Vec::new();
+                let mut j = open + 1;
+                let mut closed = false;
+                while let Some(v) = double_at(j) {
+                    values.push(v);
+                    match toks.get(j + 1) {
+                        Some(Tok::Comma) => j += 2,
+                        Some(Tok::RPar) => {
+                            closed = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                if closed && !values.is_empty() {
+                    let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
+                    out.push(Tok::LPar);
+                    for (k, v) in values.iter().enumerate() {
+                        if k > 0 {
+                            out.push(Tok::Word(kw.to_string()));
+                        }
+                        out.extend(lowered(&column, op, *v));
+                    }
+                    out.push(Tok::RPar);
+                    i = j + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// `numeric_column op float_column` (either order) for the scan, compared as
+/// PostgreSQL compares them: both as double precision (`n::float8 = f8`;
+/// a `real` widened too, `n = f4` is `n::float8 = f4::float8`). The scan
+/// compared the two columns' bytes as one type and refused the plan
+/// (XX000 "operand size does not match"). An integer column against a
+/// float one the scan already answers so.
+fn numeric_columns_against_float_columns(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
+    use crate::core::db_type::DbType;
+    // Nothing to do (and nothing copied) unless the table has both kinds.
+    let live = || schema.iter().filter(|f| !f.is_deleted);
+    if !live().any(|f| f.db_type == DbType::DECIMAL) || !live().any(|f| matches!(f.db_type, DbType::F32 | DbType::F64)) {
+        return toks;
+    }
+    let kind = |i: usize| -> Option<(String, DbType)> {
+        let Some(Tok::Word(w)) = toks.get(i) else { return None };
+        let name = resolve_column(w, schema)?;
+        let field = schema.iter().find(|f| !f.is_deleted && f.name == name)?;
+        matches!(field.db_type, DbType::DECIMAL | DbType::F32 | DbType::F64).then(|| (w.clone(), field.db_type.clone()))
+    };
+    let comparison = |t: Option<&Tok>| {
+        matches!(t, Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="))
+    };
+    let binds = |t: Option<&Tok>| match t {
+        Some(Tok::Sym(op)) => !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="),
+        Some(Tok::Word(w)) => w.eq_ignore_ascii_case("between") || w.eq_ignore_ascii_case("collate"),
+        _ => false,
+    };
+    let as_double = |column: &str| -> Option<Tok> {
+        lift_operand_typed(&format!("{column}::float8"), schema).ok().map(|(text, _)| Tok::Lifted(text))
+    };
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut i = 0usize;
+    while i < toks.len() {
+        let before = if i == 0 { None } else { toks.get(i - 1) };
+        let pair = if comparison(toks.get(i + 1)) { kind(i).zip(kind(i + 2)) } else { None };
+        if let Some(((a, ta), (b, tb))) = pair {
+            let decimal = ta == DbType::DECIMAL || tb == DbType::DECIMAL;
+            let float = matches!(ta, DbType::F32 | DbType::F64) || matches!(tb, DbType::F32 | DbType::F64);
+            if decimal && float && !binds(before) && !binds(toks.get(i + 3)) {
+                // The NUMERIC side lifted to a double, and a `real` widened;
+                // a double column is read as it is.
+                let side = |name: &str, t: &DbType| -> Option<Tok> {
+                    if *t == DbType::F64 { Some(Tok::Word(name.to_string())) } else { as_double(name) }
+                };
+                if let (Some(left), Some(right)) = (side(&a, &ta), side(&b, &tb)) {
+                    out.extend([Tok::LPar, left, toks[i + 1].clone(), right, Tok::RPar]);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// Functions whose result is text, for the 42883 of `upper(t) = 0.1::float8`.
+const TEXT_FUNCTIONS: &[&str] = &[
+    "upper", "lower", "trim", "btrim", "ltrim", "rtrim", "substr", "substring", "concat", "concat_ws", "replace",
+    "left", "right", "lpad", "rpad", "initcap", "md5", "to_char", "reverse", "repeat", "split_part", "translate",
+    "format", "quote_ident", "quote_literal", "chr",
+];
+
+/// The PostgreSQL name of `field`'s type when it is one with no comparison
+/// with a float (PostgreSQL answers 42883): text and character types, the
+/// date and time types, boolean, bytea, inet and interval. `None` for a
+/// number, and for the rest, which keep their own answers.
+fn no_float_comparison_type(field: &SchemaField) -> Option<&'static str> {
+    use crate::core::db_type::DbType;
+    use crate::core::rql::type_modifier::TextTypmod;
+    Some(match field.literal_type() {
+        DbType::STRING | DbType::CHAR => match field.text_typmod() {
+            Some(TextTypmod::Bpchar(_)) => "character",
+            Some(TextTypmod::Varchar(_)) => "character varying",
+            _ => "text",
+        },
+        DbType::BPCHAR(_) => "character",
+        DbType::TIMESTAMP => "timestamp without time zone",
+        DbType::DATETIME => "timestamp with time zone",
+        DbType::DATE => "date",
+        DbType::TIME => "time without time zone",
+        DbType::TIMETZ => "time with time zone",
+        DbType::BOOL => "boolean",
+        DbType::BYTEA => "bytea",
+        DbType::INET => "inet",
+        DbType::INTERVAL => "interval",
+        _ => return None,
+    })
+}
+
+/// The PostgreSQL name of a float token's type: `real` for a `::real` or
+/// `::float4` cast, `double precision` otherwise (a 42883 message named a
+/// `::real` double precision).
+fn float_type_name(tok: &Tok) -> &'static str {
+    match tok {
+        Tok::Float { written, .. } => {
+            let lower = written.to_ascii_lowercase();
+            if lower.ends_with("::real") || lower.ends_with("::float4") {
+                "real"
+            } else {
+                "double precision"
+            }
+        }
+        _ => "double precision",
+    }
+}
+
+/// A float token's number: its shortest text, or for one that is not finite
+/// its quoted literal (`'NaN'`, `'-Infinity'`).
+fn float_value(number: &str) -> Option<f64> {
+    match number.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')) {
+        Some(quoted) => crate::core::value_codec::parse_float8(quoted),
+        None => number.parse().ok(),
+    }
+}
+
 /// `column op float` over an exact column, as PostgreSQL decides it — the
 /// column's value converted to the nearest double — written as comparisons
 /// with exact values the scan and the condition evaluator read at the
@@ -3838,7 +4235,7 @@ fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Op
 fn exact_against_float(column: &(String, u32, i128, i128), op: &str, number: &str) -> Option<Vec<Tok>> {
     let (name, scale, lo, hi) = column;
     let (scale, lo, hi) = (*scale, *lo, *hi);
-    let v: f64 = number.parse().ok()?;
+    let v = float_value(number)?;
     let (l, h) = float_run(scale, lo, hi, v);
     let lit = |m: i128| Tok::Word(crate::core::value_codec::format_decimal_scaled(m, scale));
     let cmp_tok = |op: &str, m: i128| vec![Tok::Word(name.clone()), Tok::Sym(op.to_string()), lit(m)];
@@ -3907,8 +4304,10 @@ fn exact_in_floats(
     let mut lifted = Some(lifted);
     let mut operand: Option<Option<String>> = None;
     for number in numbers {
-        let v: f64 = number.parse().ok()?;
-        if float_run_coarse(scale, lo, hi, v).is_none() {
+        let v = float_value(number)?;
+        // NaN and the infinities round from no value of the column: their
+        // runs (`float_run`) say so, with no float compare to lift.
+        if v.is_finite() && float_run_coarse(scale, lo, hi, v).is_none() {
             let op = operand.get_or_insert_with(|| lifted.take().and_then(|f| f()));
             if op.is_some() {
                 fine.push(number);
@@ -4059,7 +4458,17 @@ fn own_scale_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>
     };
     let value = |number: &str| -> Tok {
         if scan {
-            Tok::Word(number.to_string())
+            // NaN and the infinities as the largest finite double (NaN sorts
+            // above every number, as PostgreSQL has it), which compares with
+            // every value such a column holds (38 digits) exactly as they
+            // do: the scan reads no quoted float.
+            match float_value(number).filter(|v| !v.is_finite()) {
+                Some(v) if v == f64::NEG_INFINITY => Tok::Word("-1.7976931348623157e308".to_string()),
+                Some(_) => Tok::Word("1.7976931348623157e308".to_string()),
+                None => Tok::Word(number.to_string()),
+            }
+        } else if number.starts_with('\'') {
+            Tok::Word(format!("{number}::float8"))
         } else {
             Tok::Word(format!("'{number}'::float8"))
         }
@@ -4226,12 +4635,29 @@ fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
             if toks.get(open - 1).is_some_and(|t| t.is_keyword("in")) && matches!(toks.get(open), Some(Tok::LPar)) {
                 let mut numbers = Vec::new();
                 let mut null = false;
+                let mut floats = 0usize;
                 let mut j = open + 1;
                 let mut closed = false;
                 loop {
+                    // A plain number beside a float takes the list's common
+                    // type, float8, as PostgreSQL resolves it: `w IN
+                    // ('0.1'::float8, 2.5)` compares w's nearest double with
+                    // each item's, so it is one more run. Read as the
+                    // column's own type the float missed every value it
+                    // rounds from (0.10000000000000000001), and NOT IN kept
+                    // them.
                     match (float_at(j), toks.get(j)) {
-                        (Some(number), _) => numbers.push(number),
+                        (Some(number), _) => {
+                            floats += 1;
+                            numbers.push(number)
+                        }
                         (None, Some(t)) if t.is_keyword("null") => null = true,
+                        (None, Some(Tok::Word(w)))
+                            if w.parse::<f64>().is_ok_and(f64::is_finite)
+                                && w.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')) =>
+                        {
+                            numbers.push(w.as_str())
+                        }
                         _ => break,
                     }
                     match toks.get(j + 1) {
@@ -4243,7 +4669,7 @@ fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                         _ => break,
                     }
                 }
-                if closed && !numbers.is_empty() {
+                if closed && floats > 0 {
                     let lifted = || scan.then(|| lift_operand_typed(&format!("{}::float8", column.0), schema).ok().map(|(text, _)| text)).flatten();
                     if let Some(lowered) = exact_in_floats(&column, negated, &numbers, null, lifted) {
                         out.extend(lowered);

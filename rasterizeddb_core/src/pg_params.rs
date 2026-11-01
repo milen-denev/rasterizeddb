@@ -481,6 +481,16 @@ fn push_text_param_literal(out: &mut String, oid: i32, text: &str) {
             let t = matches!(text, "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on");
             out.push_str(if t { "1" } else { "0" });
         }
+        // A float parameter is a float, as PostgreSQL types it: `'1.5'::float8`
+        // (`::real` for a float4). Inlined as a bare number it was read as
+        // the column's own type, so `t = $1` with $1 a float8 compared text
+        // and answered where PostgreSQL refuses (42883), and an exact column
+        // compared the number exactly where PostgreSQL compares its nearest
+        // double.
+        OID_FLOAT4 | OID_FLOAT8 if crate::core::value_codec::parse_float8(text).is_some() => {
+            push_quoted_literal(out, text.trim());
+            out.push_str(if oid == OID_FLOAT4 { "::real" } else { "::float8" });
+        }
         OID_INT2 | OID_INT4 | OID_INT8 | OID_OID | OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC => {
             // Numeric shapes pass through; anything else is quoted so a
             // malformed value fails as a value rather than as syntax.
@@ -536,8 +546,15 @@ fn binary_param_literal(oid: i32, raw: &[u8]) -> Result<String, String> {
         OID_INT2 => Ok(be_i16(raw)?.to_string()),
         OID_INT4 | OID_OID => Ok(be_i32(raw)?.to_string()),
         OID_INT8 => Ok(be_i64(raw)?.to_string()),
-        OID_FLOAT4 => Ok(fmt_f64(f32::from_bits(be_i32(raw)? as u32) as f64)),
-        OID_FLOAT8 => Ok(fmt_f64(f64::from_bits(be_i64(raw)? as u64))),
+        // Typed, as a text-format one is (`push_text_param_literal`).
+        OID_FLOAT4 => Ok(format!(
+            "'{}'::real",
+            crate::core::value_codec::pg_float4_text(f32::from_bits(be_i32(raw)? as u32))
+        )),
+        OID_FLOAT8 => Ok(format!(
+            "'{}'::float8",
+            crate::core::value_codec::pg_float8_text(f64::from_bits(be_i64(raw)? as u64))
+        )),
         OID_TEXT | OID_VARCHAR | OID_BPCHAR | OID_NAME | OID_CHAR => {
             let s = std::str::from_utf8(raw)
                 .map_err(|_| "binary text parameter is not valid UTF-8".to_string())?;
@@ -909,14 +926,6 @@ pub fn push_quoted_literal(out: &mut String, s: &str) {
     out.push('\'');
 }
 
-fn fmt_f64(v: f64) -> String {
-    if v == v.trunc() && v.is_finite() && v.abs() < 1e15 {
-        format!("{:.1}", v)
-    } else {
-        format!("{}", v)
-    }
-}
-
 fn be_i16(raw: &[u8]) -> Result<i16, String> {
     if raw.len() != 2 {
         return Err("binary int2 parameter must be 2 bytes".to_string());
@@ -1253,12 +1262,16 @@ mod tests {
     fn decodes_binary_floats() {
         assert_eq!(
             param_to_literal(&binary(OID_FLOAT8, 1.5f64.to_be_bytes().to_vec())).unwrap(),
-            "1.5"
+            "'1.5'::float8"
         );
         assert_eq!(
             param_to_literal(&binary(OID_FLOAT4, 2.0f32.to_be_bytes().to_vec())).unwrap(),
-            "2.0"
+            "'2'::real"
         );
+        // A float is typed as one whatever its format, as PostgreSQL types
+        // it: inlined bare, a float8 $1 against a text column compared text.
+        assert_eq!(param_to_literal(&text(OID_FLOAT8, "0.1")).unwrap(), "'0.1'::float8");
+        assert_eq!(param_to_literal(&text(OID_FLOAT4, "0.1")).unwrap(), "'0.1'::real");
     }
 
     #[test]

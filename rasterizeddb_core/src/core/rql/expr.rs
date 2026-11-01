@@ -1826,6 +1826,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         if let Some(at) = find_operator(text, token) {
             let mut left = Box::new(parse(&text[..at], schema)?);
             let mut right = Box::new(parse(&text[at + token.len()..], schema)?);
+            text_against_float(&left, token, &right)?;
             // A string compared with a `character(n)` value is read without
             // its trailing spaces, as the value is held (`yields_bpchar`).
             if yields_bpchar(&left) {
@@ -1861,6 +1862,34 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         }
     }
     Err(format!("condition '{}' is not a comparison", text))
+}
+
+/// PostgreSQL's 42883 for a text value compared with a float: `text =
+/// double precision` has no operator (`t = '1'::float8` in a select list,
+/// a CHECK, a join's condition). A quoted literal is not text here: it is
+/// an untyped constant that takes the other side's type, as `f = '1.5'` does.
+/// It used to answer false.
+fn text_against_float(left: &Expr, op: &str, right: &Expr) -> Result<(), String> {
+    let text = |e: &Expr| {
+        !matches!(e, Expr::Literal { .. } | Expr::Null)
+            && matches!(static_type(e), DbType::STRING | DbType::CHAR | DbType::BPCHAR(_))
+    };
+    let float = |e: &Expr| match static_type(e) {
+        DbType::F64 => Some("double precision"),
+        DbType::F32 => Some("real"),
+        _ => None,
+    };
+    if text(left) {
+        if let Some(name) = float(right) {
+            return Err(format!("operator does not exist: text {op} {name}"));
+        }
+    }
+    if text(right) {
+        if let Some(name) = float(left) {
+            return Err(format!("operator does not exist: {name} {op} text"));
+        }
+    }
+    Ok(())
 }
 
 /// A quoted literal compared with a `timestamp` (without time zone) value,
@@ -6316,6 +6345,36 @@ pub fn eval_condition_3vl(
                 || numeric_product_or_quotient(&condition.left)
                 || numeric_product_or_quotient(right)
         }) {
+            // A wide NUMERIC against a float, as PostgreSQL compares
+            // `numeric` with `float8`: the NUMERIC's nearest double, from its
+            // exact digits. Read through the engine it was refused for the
+            // places past nine (`p < f8` over a NUMERIC(20,18)).
+            let float_side = |e: &Expr| matches!(static_type(e), DbType::F64 | DbType::F32);
+            if float_side(&condition.left) != float_side(right) {
+                let (exact, float, flipped) =
+                    if float_side(right) { (&*condition.left, &**right, false) } else { (&**right, &*condition.left, true) };
+                if let Some(n) = pg_numeric(exact, row, schema)? {
+                    let Some(n) = n else { return Ok(None) };
+                    let f = eval(float, row, schema)?;
+                    if f.is_null() {
+                        return Ok(None);
+                    }
+                    let Some(f) = as_f64(&f) else {
+                        return Err("a float could not be read".to_string());
+                    };
+                    let d: f64 = n.to_text().parse().map_err(|_| "a numeric could not be read".to_string())?;
+                    let ordering = crate::core::processor::concurrent_processor::pg_float_cmp(d, f);
+                    let ordering = if flipped { ordering.reverse() } else { ordering };
+                    return Ok(Some(match condition.cmp {
+                        Cmp::Eq => ordering.is_eq(),
+                        Cmp::Ne => !ordering.is_eq(),
+                        Cmp::Lt => ordering.is_lt(),
+                        Cmp::Le => ordering.is_le(),
+                        Cmp::Gt => ordering.is_gt(),
+                        _ => ordering.is_ge(),
+                    }));
+                }
+            }
             // PostgreSQL's values, exactly: through the engine a product or
             // quotient was cut to nine places, so `CASE WHEN x * y > 0` was
             // false for 0.00001 * 0.00001.
@@ -6356,7 +6415,15 @@ pub fn eval_condition_3vl(
             }
         }
     }
-    let left = eval(&condition.left, row, schema)?;
+    // `IS [NOT] NULL` needs no value: a NUMERIC with places past the
+    // engine's, which the evaluator refuses to carry, is a value, not NULL
+    // (`p < f8` in a select list is answered as a CASE that asks it first).
+    let left = match eval(&condition.left, row, schema) {
+        Err(e) if matches!(condition.cmp, Cmp::IsNull | Cmp::IsNotNull) && e.contains("cannot carry exactly") => {
+            return Ok(Some(condition.cmp == Cmp::IsNotNull));
+        }
+        other => other?,
+    };
     match condition.cmp {
         Cmp::IsNull => return Ok(Some(left.is_null())),
         Cmp::IsNotNull => return Ok(Some(!left.is_null())),

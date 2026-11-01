@@ -40,6 +40,98 @@ async fn sqlstate(c: &Client, sql: &str) -> String {
     e.code().map(|s| s.code().to_string()).unwrap_or_else(|| e.to_string())
 }
 
+/// A float compared with a column finer than a double (NUMERIC(38,20), BIGINT past 2^53) reads the column's nearest double, also in an IN list mixing floats and numbers (float8, the list's type) and its NOT IN; a REAL column against a double or a decimal constant is widened, as PostgreSQL compares it (0.1f is not '0.1'::float8 and is greater). PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_float_list_over_a_finer_column_is_compared_as_float8() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fn (id INT PRIMARY KEY, w NUMERIC(38,20), b BIGINT, f4 REAL, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO fn VALUES (1, 0.1, 9007199254740992, 0.1, 0.10), (2, 0.10000000000000000001, 9007199254740993, 0.2, 2.50), (3, 0.30000000000000004441, 9007199254740994, 0.30000001, 0.30), (4, 2.5, 1, 2.5, NULL)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE w = '0.1'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE w = '0.1'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE w IN ('0.1'::float8, '0.3'::float8) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE w IN ('0.1'::float8, '0.3'::float8) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE w NOT IN ('0.1'::float8, '0.3'::float8) ORDER BY id").await, ["3", "4"] as [&str; 2], "SELECT id FROM fn WHERE w NOT IN ('0.1'::float8, '0.3'::float8) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE w IN ('0.1'::float8, 2.5) ORDER BY id").await, ["1", "2", "4"] as [&str; 3], "SELECT id FROM fn WHERE w IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE w NOT IN ('0.1'::float8, 2.5) ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM fn WHERE w NOT IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE b = '9007199254740992'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE b = '9007199254740992'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE b IN ('9007199254740992'::float8, 5) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE b IN ('9007199254740992'::float8, 5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE b NOT IN ('9007199254740992'::float8, 5) ORDER BY id").await, ["3", "4"] as [&str; 2], "SELECT id FROM fn WHERE b NOT IN ('9007199254740992'::float8, 5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE b IN ('9007199254740992'::float8, '1'::float8) ORDER BY id").await, ["1", "2", "4"] as [&str; 3], "SELECT id FROM fn WHERE b IN ('9007199254740992'::float8, '1'::float8) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE p IN ('0.1'::float8, 2.5) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE p IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE p NOT IN ('0.1'::float8, 2.5) ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM fn WHERE p NOT IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 = '0.1'::float8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM fn WHERE f4 = '0.1'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 > '0.1'::float8 ORDER BY id").await, ["1", "2", "3", "4"] as [&str; 4], "SELECT id FROM fn WHERE f4 > '0.1'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 < '0.3'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM fn WHERE f4 < '0.3'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 = 0.1 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM fn WHERE f4 = 0.1 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 = '0.1'::real ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM fn WHERE f4 = '0.1'::real ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM fn WHERE f4 IN ('0.1'::float8, 2.5) ORDER BY id").await, ["4"] as [&str; 1], "SELECT id FROM fn WHERE f4 IN ('0.1'::float8, 2.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT count(*) FROM fn WHERE f4 = '0.1'::float8").await, ["0"] as [&str; 1], "SELECT count(*) FROM fn WHERE f4 = '0.1'::float8");
+    assert_eq!(rows_n(&c, "SELECT count(*) FROM fn WHERE f4 > '0.1'::float8").await, ["4"] as [&str; 1], "SELECT count(*) FROM fn WHERE f4 > '0.1'::float8");
+    assert_eq!(rows_n(&c, "SELECT id, f4 = '0.1'::float8, f4 > '0.1'::float8 FROM fn ORDER BY id").await, ["1|f|t", "2|f|t", "3|f|t", "4|f|t"] as [&str; 4], "SELECT id, f4 = '0.1'::float8, f4 > '0.1'::float8 FROM fn ORDER BY id");
+}
+
+/// Text (a column, a text function, a CASE of text, ||), varchar, char and timestamp values compared with a float: PostgreSQL has no operator (42883), in WHERE (=, IN, BETWEEN) and in a select list; the message names real for a ::real. PostgreSQL 17's answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_against_a_float_is_42883() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tx (id INT PRIMARY KEY, t TEXT, v VARCHAR(10), c CHAR(3), ts TIMESTAMP)").await;
+    run(&c, "INSERT INTO tx VALUES (1, '1', '1', '1', '2000-01-01')").await;
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE t = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE upper(t) = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE CASE WHEN id > 0 THEN t ELSE 'x' END = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE t IN ('1'::float8, '2'::float8)").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE t BETWEEN '0'::float8 AND '2'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE v = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE c = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE t = '1'::real").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE ts = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT id FROM tx WHERE t || 'a' = '1'::float8").await, "42883");
+    assert_eq!(sqlstate(&c, "SELECT t = '1'::float8 FROM tx").await, "42883");
+}
+
+/// NaN and the infinities compared with integer, NUMERIC(p,s), unconstrained NUMERIC and FLOAT8 columns, as PostgreSQL orders them (NaN above every number): <, >, =, <>, IN and NOT IN answer rather than failing the plan. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_and_infinity_constants_against_exact_columns() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE nx (id INT PRIMARY KEY, i INT, b BIGINT, p NUMERIC(10,2), n NUMERIC, f FLOAT8)").await;
+    run(&c, "INSERT INTO nx VALUES (1, 1, 1, 1.5, 1.5, 1.5), (2, -5, -5, -5, -5, -5)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE i < 'Infinity'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE i < 'Infinity'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE i > '-Infinity'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE i > '-Infinity'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE i = 'NaN'::float8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM nx WHERE i = 'NaN'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE i < 'NaN'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE i < 'NaN'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE i <> 'NaN'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE i <> 'NaN'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE p < 'Infinity'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE p < 'Infinity'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE p = 'NaN'::float8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM nx WHERE p = 'NaN'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE n > '-Infinity'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE n > '-Infinity'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE n IN ('NaN'::float8, 1.5) ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM nx WHERE n IN ('NaN'::float8, 1.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE b NOT IN ('Infinity'::float8) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE b NOT IN ('Infinity'::float8) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE f < 'Infinity'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM nx WHERE f < 'Infinity'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM nx WHERE f = 'NaN'::float8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM nx WHERE f = 'NaN'::float8 ORDER BY id");
+}
+
+/// A NUMERIC (unconstrained or NUMERIC(20,18)) column compared with a FLOAT8 or REAL column, either side, in WHERE, a select list and UPDATE … WHERE: both read as double precision, as PostgreSQL compares them. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numeric_column_against_a_float_column() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE cc (id INT PRIMARY KEY, n NUMERIC, p NUMERIC(20,18), i INT, b BIGINT, f8 FLOAT8, f4 REAL)").await;
+    run(&c, "INSERT INTO cc VALUES (1, 0.1, 0.1, 1, 9007199254740993, 0.1, 0.1), (2, 0.10000000000000000555, 0.100000000000000006, 2, 2, 0.1, 0.1), (3, 2.5, 2.5, 3, 3, 2.5, 2.5), (4, 1, 1, 9, 9007199254740992, 9007199254740992, 1), (5, NULL, NULL, NULL, NULL, NULL, NULL)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE n = f8 ORDER BY id").await, ["1", "2", "3"] as [&str; 3], "SELECT id FROM cc WHERE n = f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE f8 = n ORDER BY id").await, ["1", "2", "3"] as [&str; 3], "SELECT id FROM cc WHERE f8 = n ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE n < f8 ORDER BY id").await, ["4"] as [&str; 1], "SELECT id FROM cc WHERE n < f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE p = f8 ORDER BY id").await, ["1", "2", "3"] as [&str; 3], "SELECT id FROM cc WHERE p = f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE p > f8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM cc WHERE p > f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE b = f8 ORDER BY id").await, ["4"] as [&str; 1], "SELECT id FROM cc WHERE b = f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE i = f8 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM cc WHERE i = f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE f4 = f8 ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM cc WHERE f4 = f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE n = f4 ORDER BY id").await, ["3", "4"] as [&str; 2], "SELECT id FROM cc WHERE n = f4 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM cc WHERE n <> f8 ORDER BY id").await, ["4"] as [&str; 1], "SELECT id FROM cc WHERE n <> f8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, n = f8, p < f8 FROM cc ORDER BY id").await, ["1|t|f", "2|t|f", "3|t|f", "4|f|t", "5|NULL|NULL"] as [&str; 5], "SELECT id, n = f8, p < f8 FROM cc ORDER BY id");
+    run(&c, "UPDATE cc SET i = 0 WHERE n = f8").await;
+    assert_eq!(rows_n(&c, "SELECT id, i FROM cc ORDER BY id").await, ["1|0", "2|0", "3|0", "4|9", "5|NULL"] as [&str; 5], "SELECT id, i FROM cc ORDER BY id");
+}
+
 /// double alone is no type (42704), double precision is; the 42883 message names real for a real; a scalar subquery standing as a select item is named after its inner item (max, x, y, ?column?, count), and an aliased or nested one keeps its own name. PostgreSQL 17's answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn float_type_names_and_subquery_labels() {
@@ -108,6 +200,41 @@ async fn a_scalar_subquery_item_is_named_after_its_inner_item() {
     ] {
         assert_eq!(labels(&c, sql).await, want, "{sql}");
     }
+}
+
+/// The 42883 message names the float's own type: `real` for a `::real` or
+/// `::float4`, `double precision` for a double.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_42883_message_names_real_for_a_real() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tx (id INT PRIMARY KEY, t TEXT)").await;
+    run(&c, "INSERT INTO tx VALUES (1, '1')").await;
+    for (sql, want) in [
+        ("SELECT id FROM tx WHERE t = '1'::real", "operator does not exist: text = real"),
+        ("SELECT id FROM tx WHERE t = 1::float4", "operator does not exist: text = real"),
+        ("SELECT id FROM tx WHERE t = '1'::float8", "operator does not exist: text = double precision"),
+        ("SELECT id FROM tx WHERE upper(t) = '1'::real", "operator does not exist: text = real"),
+        ("SELECT t = '1'::float8 FROM tx", "operator does not exist: text = double precision"),
+    ] {
+        assert_eq!(error_text(&c, sql).await, want, "{sql}");
+    }
+}
+
+/// A float8 parameter compared with a text column is PostgreSQL's 42883 when
+/// the statement is prepared with that parameter type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_float8_parameter_against_text_is_42883() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE tx (id INT PRIMARY KEY, t TEXT)").await;
+    run(&c, "INSERT INTO tx VALUES (1, '1')").await;
+    let outcome = match c.prepare_typed("SELECT id FROM tx WHERE t = $1", &[tokio_postgres::types::Type::FLOAT8]).await {
+        Err(e) => Err(e),
+        Ok(statement) => c.query(&statement, &[&1.0f64]).await.map(|_| ()),
+    };
+    let e = outcome.expect_err("text = float8 parameter");
+    assert_eq!(e.code().map(|s| s.code().to_string()).as_deref(), Some("42883"), "{e}");
 }
 
 /// NaN and the infinities as a NUMERIC: PostgreSQL 17 stores them; this

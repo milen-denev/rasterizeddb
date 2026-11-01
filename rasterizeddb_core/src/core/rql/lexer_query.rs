@@ -509,6 +509,15 @@ fn parse_select_items(
         // A comparison is a boolean value — `n > 1`, `a = b` — which the
         // expression grammar does not read. Before the constant test, which
         // takes `'a' = 'b'` for one string literal.
+        // A comparison with no operator for its types (`t = '1'::float8`) is
+        // PostgreSQL's 42883, not an unknown column.
+        if expr.contains(['=', '<', '>']) {
+            if let Err(e) = crate::core::rql::expr::parse_condition(expr, schema) {
+                if e.starts_with("operator does not exist") {
+                    return Err(e);
+                }
+            }
+        }
         if let Some(parsed) = crate::core::rql::join::comparison_value(expr, schema) {
             out.push(SelectItem::RowExpr {
                 db_type: crate::core::rql::expr::static_type(&parsed),
