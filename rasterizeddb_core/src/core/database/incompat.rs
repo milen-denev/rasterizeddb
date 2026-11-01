@@ -175,12 +175,17 @@ pub fn fence_numeric_own_scale(dir: &Path, fields: &[crate::core::row::schema::S
     require(dir, NUMERIC_OWN_SCALE_V1)
 }
 
-/// Whether any schema field file under `dir` (every `…_schema_FIELDS.db`, in every
-/// subdirectory: a partitioned table's, a storage location's staged copy)
-/// records a seventeen-byte NUMERIC field. Read without a database: this is
-/// for a restored directory before anything opens it.
-pub fn directory_needs_numeric_own_scale(dir: &Path) -> io::Result<bool> {
+/// The database directories under `dir` (`dir` itself, and a `CREATE
+/// DATABASE` directory nested in it) whose tables record a seventeen-byte
+/// NUMERIC field, read from every `…_schema_FIELDS.db` in every
+/// subdirectory: a partitioned table's, a storage location's staged copy.
+/// A field file belongs to the nearest directory at or above it holding a
+/// catalogue (`db_data_schema.db`), or to `dir` when none does. Read without
+/// a database: this is for a restored directory before anything opens it.
+pub fn directories_needing_numeric_own_scale(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     use crate::core::row::schema::{SCHEMA_FIELD_SIZE, SchemaField};
+    const CATALOGUE: &str = "db_data_schema.db";
+    let mut needing: Vec<std::path::PathBuf> = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(at) = pending.pop() {
         for entry in std::fs::read_dir(&at)? {
@@ -200,19 +205,33 @@ pub fn directory_needs_numeric_own_scale(dir: &Path) -> io::Result<bool> {
                 .filter(|record| !crate::core::torn_tail::is_unwritten(record))
                 .filter_map(|record| SchemaField::from_vec(record).ok())
                 .any(|field| crate::core::value_codec::keeps_own_scale(&field));
-            if found {
-                return Ok(true);
+            if !found {
+                continue;
+            }
+            let mut owner = at.clone();
+            while owner != dir && !owner.join(CATALOGUE).is_file() {
+                match owner.parent() {
+                    Some(up) if up.starts_with(dir) => owner = up.to_path_buf(),
+                    _ => {
+                        owner = dir.to_path_buf();
+                        break;
+                    }
+                }
+            }
+            if !needing.contains(&owner) {
+                needing.push(owner);
             }
         }
     }
-    Ok(false)
+    Ok(needing)
 }
 
-/// [`directory_needs_numeric_own_scale`], and the flag set when it does: run
-/// by a restore before it hands the directory over.
+/// [`directories_needing_numeric_own_scale`], and the flag set in each: run
+/// by a restore before it hands the directory over, so a nested database
+/// is fenced too, not only when this binary first opens it.
 pub fn fence_restored_directory(dir: &Path) -> io::Result<()> {
-    if directory_needs_numeric_own_scale(dir)? {
-        require(dir, NUMERIC_OWN_SCALE_V1)?;
+    for database in directories_needing_numeric_own_scale(dir)? {
+        require(&database, NUMERIC_OWN_SCALE_V1)?;
     }
     Ok(())
 }

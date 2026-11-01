@@ -286,6 +286,29 @@ async fn an_old_partitioned_column_keeps_its_slot_and_refusal() {
     close(&dir, db);
 }
 
+/// A restored directory is fenced database by database: a nested `CREATE
+/// DATABASE` directory whose table has a seventeen-byte field gets the flag
+/// itself, and the root, whose tables have none, does not. It used to be
+/// written at the root only, so the nested database got its own when this
+/// binary first opened it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_fences_each_database_that_needs_it() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("db");
+    let nested = root.join("nx");
+    let db = open(&root, "own_scale_nested_root").await.unwrap();
+    exec(&db, "CREATE TABLE r (id BIGINT PRIMARY KEY, p NUMERIC(10,2))").await.unwrap();
+    close(&root, db);
+    let db = open(&nested, "own_scale_nested").await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    close(&nested, db);
+    assert!(!flagged(&root) && flagged(&nested));
+    std::fs::remove_file(nested.join(crate::core::database::incompat::FILE_NAME)).unwrap();
+    crate::core::database::incompat::fence_restored_directory(&root).unwrap();
+    assert!(flagged(&nested), "the nested database was not fenced");
+    assert!(!flagged(&root), "the root, with no seventeen-byte field, was fenced");
+}
+
 /// The rewrite's own points, in the order it reaches them.
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",
