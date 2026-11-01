@@ -242,3 +242,26 @@ async fn a_large_own_scale_column_answers_every_predicate() {
         assert_eq!(rows(&c, sql).await, *want, "{sql} (hash)");
     }
 }
+
+/// A literal with more digits than a NUMERIC cell holds (48) against an
+/// unconstrained column: bounded at the 38 places a stored value can have,
+/// so 0.123456789123 is below it and 0.12345678912300000000000000000000000001
+/// above it, as PostgreSQL 17 answers. Bounded at nine places, both were
+/// misread.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_own_scale_column_compares_with_a_literal_past_38_digits() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE lq (id INT PRIMARY KEY, v NUMERIC)").await;
+    run(
+        &c,
+        "INSERT INTO lq VALUES (1, 0.123456789123), (2, 0.123456789124), (3, 0.123456789), \
+         (4, 0.12345678912300000000000000000000000001)",
+    )
+    .await;
+    let lit = "0.123456789123000000000000000000000000000000000001";
+    for (op, want) in [("=", ""), ("<>", "1,2,3,4"), ("<", "1,3"), ("<=", "1,3"), (">", "2,4"), (">=", "2,4")] {
+        let sql = format!("SELECT id FROM lq WHERE v {op} {lit} ORDER BY id");
+        assert_eq!(rows(&c, &sql).await.join(","), want, "{sql}");
+    }
+}
