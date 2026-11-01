@@ -540,17 +540,18 @@ async fn a_retype_between_numeric_forms_converts_every_row() {
     assert_eq!(rows(&c, "SELECT * FROM e").await, ["1|1.00000000001"] as [&str; 1], "SELECT * FROM e");
 }
 
-/// A retype that rounds a value a CHECK reads is refused (judging the check
-/// again is not supported here) and leaves the table as it was, and so is a
-/// retype of a column a generated column reads (PostgreSQL refuses that
-/// too). One that rounds nothing keeps the check.
+/// A retype that rounds a value into one a CHECK rejects (1.009 to 1.01
+/// under `u <> 1.01`) is refused with 23514, as PostgreSQL refuses it, and
+/// leaves the table as it was; so is a retype of a column a generated column
+/// reads (0A000, as PostgreSQL refuses). One that rounds nothing keeps the
+/// check.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retype_that_rounds_what_a_check_reads_is_refused() {
+async fn a_retype_that_breaks_a_check_is_refused() {
     let server = TestServer::start().await.expect("server");
     let c = client(&server).await;
     run(&c, "CREATE TABLE ck (id INT PRIMARY KEY, u NUMERIC CHECK (u <> 1.01))").await;
     run(&c, "INSERT INTO ck VALUES (1, 1.009)").await;
-    assert_eq!(sqlstate(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(4,2)").await, "0A000");
+    assert_eq!(sqlstate(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(4,2)").await, "23514");
     assert_eq!(rows(&c, "SELECT * FROM ck").await, ["1|1.009"]);
     run(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(6,3)").await;
     assert_eq!(sqlstate(&c, "INSERT INTO ck VALUES (2, 1.01)").await, "23514");
@@ -610,4 +611,28 @@ async fn a_retype_keeps_foreign_keys_holding() {
     run(&c, "INSERT INTO sr2 VALUES (1.004, NULL), (2.000, 1.004)").await;
     assert_eq!(sqlstate(&c, "ALTER TABLE sr2 ALTER COLUMN k TYPE NUMERIC(10,2)").await, "23503");
     assert_eq!(rows(&c, "SELECT k, up FROM sr2 ORDER BY k").await, ["1.004|", "2.000|1.004"] as [&str; 2], "SELECT k, up FROM sr2 ORDER BY k");
+}
+
+/// ALTER COLUMN … TYPE NUMERIC(p, s) judges each CHECK reading the column over the rounded rows: allowed when they all pass (n < 100 over 1.004), refused with 23514 only on a real violation (n > 1 over 1.004 rounded to 1.00). PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_judges_checks_over_the_rounded_rows() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rcc (id INT PRIMARY KEY, n NUMERIC(10,3) CHECK (n < 100))").await;
+    run(&c, "INSERT INTO rcc VALUES (1, 1.004), (2, NULL)").await;
+    run(&c, "ALTER TABLE rcc ALTER COLUMN n TYPE NUMERIC(10,2)").await;
+    assert_eq!(rows(&c, "SELECT id, n FROM rcc ORDER BY id").await, ["1|1.00", "2|"] as [&str; 2], "SELECT id, n FROM rcc ORDER BY id");
+    assert_eq!(sqlstate(&c, "INSERT INTO rcc VALUES (3, 100)").await, "23514");
+    run(&c, "CREATE TABLE rc (id INT PRIMARY KEY, n NUMERIC(10,3) CHECK (n > 1))").await;
+    run(&c, "INSERT INTO rc VALUES (1, 1.004), (2, 5.555)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE rc ALTER COLUMN n TYPE NUMERIC(10,2)").await, "23514");
+    assert_eq!(rows(&c, "SELECT id, n FROM rc ORDER BY id").await, ["1|1.004", "2|5.555"] as [&str; 2], "SELECT id, n FROM rc ORDER BY id");
+    assert_eq!(sqlstate(&c, "ALTER TABLE rc ALTER COLUMN n TYPE NUMERIC(10,0)").await, "23514");
+    assert_eq!(rows(&c, "SELECT id, n FROM rc ORDER BY id").await, ["1|1.004", "2|5.555"] as [&str; 2], "SELECT id, n FROM rc ORDER BY id");
+    run(&c, "CREATE TABLE ru (id INT PRIMARY KEY, n NUMERIC CHECK (n * 2 <> 2.02 AND n <> 7))").await;
+    run(&c, "INSERT INTO ru VALUES (1, 1.009), (2, 3)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE ru ALTER COLUMN n TYPE NUMERIC(10,2)").await, "23514");
+    assert_eq!(rows(&c, "SELECT id, n FROM ru ORDER BY id").await, ["1|1.009", "2|3"] as [&str; 2], "SELECT id, n FROM ru ORDER BY id");
+    run(&c, "ALTER TABLE ru ALTER COLUMN n TYPE NUMERIC(10,3)").await;
+    assert_eq!(rows(&c, "SELECT id, n FROM ru ORDER BY id").await, ["1|1.009", "2|3.000"] as [&str; 2], "SELECT id, n FROM ru ORDER BY id");
 }

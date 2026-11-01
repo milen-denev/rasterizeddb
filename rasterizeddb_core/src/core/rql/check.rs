@@ -422,6 +422,14 @@ fn fold_regex_truth_tests(text: &str) -> String {
 /// (`tag::text` is `tag::bpchar::text`: PostgreSQL strips the padding
 /// there too); a function of that name is left alone.
 pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
+    suffix_columns(expression, columns, "::bpchar")
+}
+
+/// `expression` with each reference to one of `columns` followed by
+/// `suffix` (a cast, `::bpchar` or `::numeric(10,2)`), outside quotes and
+/// ahead of any cast it already has; a function of that name, a qualifier
+/// and a reference already carrying `suffix` are left alone.
+pub fn suffix_columns(expression: &str, columns: &[String], suffix: &str) -> String {
     let bytes = expression.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut out = String::with_capacity(expression.len() + 16);
@@ -446,8 +454,8 @@ pub fn cast_columns_to_bpchar(expression: &str, columns: &[String]) -> String {
             };
             let rest = expression[end..].trim_start();
             let named = columns.iter().any(|c| c.eq_ignore_ascii_case(&name));
-            if named && !rest.starts_with('(') && !rest.starts_with('.') && !rest.starts_with("::bpchar") {
-                out.push_str(&format!("{}::bpchar", &expression[i..end]));
+            if named && !rest.starts_with('(') && !rest.starts_with('.') && !rest.starts_with(suffix) {
+                out.push_str(&format!("{}{suffix}", &expression[i..end]));
             } else {
                 out.push_str(&expression[i..end]);
             }

@@ -13189,10 +13189,9 @@ async fn foreign_keys_hold_after_retype(
 /// Refused, leaving the table as it was, when a value does not fit the
 /// precision (22003), when rounding makes two keys of a unique constraint
 /// over the column one (23505, as PostgreSQL's rebuilt index refuses it),
-/// when rounding changes a value a CHECK reads (judging the check again
-/// over the rounded rows is not supported here), when a foreign key the
-/// column is a side of no longer holds (23503), and when a generated column
-/// reads the column (PostgreSQL refuses that too).
+/// when a CHECK reading the column rejects a rounded row (23514), when a
+/// foreign key the column is a side of no longer holds (23503), and when a
+/// generated column reads the column (PostgreSQL refuses that too).
 async fn retype_numeric(
     database: &Arc<Database>,
     table_name: &str,
@@ -13223,8 +13222,33 @@ async fn retype_numeric(
             field.name, g.column
         ));
     }
-    let check_reading: Option<String> =
-        schema.checks.iter().find(|c| !c.is_deleted && reads_column(&c.expression)).map(|c| c.name.clone());
+    // Each CHECK reading the column, judged over the rows as the new type
+    // rounds them (the column read through the cast to it), before anything
+    // is rewritten: 23514 on a row it rejects, as PostgreSQL's rewrite
+    // refuses. A check the cast cannot be judged through here (a scale past
+    // nine) is left to the rewrite, which refuses only when rounding changed
+    // a value it reads.
+    let mut check_reading: Option<String> = None;
+    if let NumericForm::Scaled { precision, scale } = to {
+        let cast = format!("::numeric({precision},{scale})");
+        for check in schema.checks.iter().filter(|c| !c.is_deleted && reads_column(&c.expression)) {
+            let normalized = crate::core::rql::check::normalize_expression(&check.expression);
+            let judged = crate::core::rql::check::suffix_columns(&normalized, std::slice::from_ref(&field.name), &cast);
+            let probe = format!("SELECT 1 FROM {table_name} WHERE NOT ({judged}) LIMIT 1");
+            match run_subquery(&probe, database, reader).await {
+                Ok(rows) if !rows.is_empty() => {
+                    return Err(format!(
+                        "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                        check.name, table_name
+                    ))
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    check_reading.get_or_insert_with(|| check.name.clone());
+                }
+            }
+        }
+    }
     // Each foreign key the column is a side of, over the values as the new
     // type converts them (`foreign_keys_hold_after_retype`): 23503 when a
     // child's key no longer names a parent row.
