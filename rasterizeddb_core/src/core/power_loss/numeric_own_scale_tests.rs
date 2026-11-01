@@ -79,6 +79,20 @@ async fn an_old_unconstrained_column_reads_refuses_and_converts() {
         [("1.5", 16), ("0.000000001", 16), ("0", 16), ("123456.789", 16)]
     );
 
+    // A query's temporary relation over it (a CTE, a derived table) is made
+    // in memory with the slot that keeps each value's scale, and does not mark
+    // the database: nothing an older binary could open.
+    let made = crate::core::rql::cte::materialize(
+        "WITH c AS (SELECT id, u FROM t) SELECT u FROM c",
+        &db,
+        crate::core::mvcc::transaction::FROZEN_TX,
+    )
+    .await
+    .unwrap()
+    .expect("a CTE to materialise");
+    crate::core::rql::cte::drop_temps(&db, &made.temps, crate::core::mvcc::transaction::FROZEN_TX).await;
+    assert!(!flagged(&dir), "a temporary relation marked the database");
+
     // A reopen reads it as it was.
     close(&dir, db);
     let db = open(&dir, "own_scale").await.unwrap();

@@ -792,8 +792,8 @@ mod tests {
     #[test]
     fn values_the_engine_would_silently_zero_are_refused() {
         assert!(
-            lit("numeric", "0.1234567891").is_err(),
-            "ten decimal places"
+            lit("numeric", "0.123456789012345678901234567890123456789").is_err(),
+            "39 decimal places: past what a NUMERIC cell holds"
         );
         assert!(lit("numeric", "NaN").is_err());
         assert!(lit("numeric", "1e40").is_err(), "past the DECIMAL range");
@@ -808,6 +808,13 @@ mod tests {
         assert_eq!(lit("numeric", "123.45").unwrap(), "'123.45'");
         assert_eq!(lit("numeric", "0.123456789").unwrap(), "'0.123456789'");
         assert_eq!(lit("numeric", "-1.5").unwrap(), "'-1.5'");
+        // An unconstrained numeric goes into a column that keeps each value's
+        // own scale: past nine places too, to 38.
+        assert_eq!(lit("numeric", "0.1234567891").unwrap(), "'0.1234567891'");
+        assert_eq!(
+            lit("numeric", "0.12345678901234567890123456789012345678").unwrap(),
+            "'0.12345678901234567890123456789012345678'"
+        );
         assert_eq!(
             lit("uuid", "550e8400-e29b-41d4-a716-446655440000").unwrap(),
             "'550e8400-e29b-41d4-a716-446655440000'"
