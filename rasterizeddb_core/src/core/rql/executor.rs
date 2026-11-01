@@ -21165,21 +21165,30 @@ async fn execute_query_rows_body(
                             // than the result.
                             let mut kept = kept;
                             if has_windows {
+                                // Every window is computed over the rows as
+                                // scanned, before any result is inserted: an
+                                // inserted value carries its select position
+                                // as its column id, which a later window
+                                // read as the column of that write order —
+                                // `row_number() OVER (PARTITION BY i …)`
+                                // after a `count(*)` partitioned by the
+                                // count instead of by `i`.
+                                let mut computed = Vec::with_capacity(window_slots.len());
                                 for (position, spec) in &window_slots {
                                     // An exact SUM/AVG that overflows
                                     // is an error, as the grouped
                                     // aggregate's is — never a NULL.
-                                    let values = match crate::core::rql::window::assign(
-                                        &kept, spec,
-                                    ) {
-                                        Ok(values) => values,
+                                    match crate::core::rql::window::assign(&kept, spec) {
+                                        Ok(values) => computed.push((position, spec, values)),
                                         Err(e) => {
                                             error!("Window function failed: {}", e);
                                             let mut result = vec![3u8];
                                             result.extend_from_slice(e.as_bytes());
                                             return result;
                                         }
-                                    };
+                                    }
+                                }
+                                for (position, spec, values) in computed {
                                     // The type the window produces, not
                                     // `I64`: an `AVG` is a decimal and
                                     // a `LAG(created_at)` is a
@@ -21196,6 +21205,15 @@ async fn execute_query_rows_body(
                                         // empty frame for an `AVG` —
                                         // is an empty block, which is
                                         // how a NULL travels here.
+                                        // Typed NULL, as a NULL cell of
+                                        // the scan is: an empty block typed
+                                        // as text was the value '', which
+                                        // is why '' used to be read as NULL.
+                                        let cell_type = if value.is_some() {
+                                            column_type.clone()
+                                        } else {
+                                            crate::core::db_type::DbType::NULL
+                                        };
                                         let bytes = value.unwrap_or_default();
                                         let mut mb = crate::memory_pool::MEMORY_POOL
                                             .acquire(bytes.len());
@@ -21206,7 +21224,7 @@ async fn execute_query_rows_body(
                                             crate::core::row::row::Column {
                                                 schema_id: crate::core::row::row::schema_id_of(*position as u64),
                                                 data: mb,
-                                                column_type: column_type.clone(),
+                                                column_type: cell_type,
                                             },
                                         );
                                     }

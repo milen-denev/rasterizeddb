@@ -173,8 +173,11 @@ pub struct WindowSpec {
     pub offset: i64,
     /// Rows are numbered independently within each distinct value of these.
     pub partition_by: Vec<SchemaField>,
-    /// The order rows are numbered in, each with its own direction.
-    pub order_by: Vec<(SchemaField, bool)>,
+    /// The order rows are numbered in, each with its own direction and where
+    /// its NULLs go: `(column, descending, nulls_first)`. NULLs sort as larger
+    /// than every value unless `NULLS FIRST`/`LAST` says otherwise, so last
+    /// for `ASC` and first for `DESC`, as in PostgreSQL.
+    pub order_by: Vec<(SchemaField, bool, bool)>,
     pub frame: Frame,
     pub label: String,
 }
@@ -183,7 +186,7 @@ impl WindowSpec {
     /// Every column the window reads, so the scan fetches them.
     pub fn columns(&self) -> Vec<SchemaField> {
         let mut out = self.partition_by.clone();
-        for (field, _) in &self.order_by {
+        for (field, _, _) in &self.order_by {
             if !out.iter().any(|f| f.name == field.name) {
                 out.push(field.clone());
             }
@@ -411,24 +414,44 @@ fn build(
     let order_at = find_word(&upper, "ORDER BY");
     let frame_at = find_word(&upper, "ROWS").or_else(|| find_word(&upper, "RANGE"));
 
-    let resolve = |list: &str| -> Result<Vec<(SchemaField, bool)>, String> {
+    let resolve = |list: &str| -> Result<Vec<(SchemaField, bool, bool)>, String> {
         let mut out = Vec::new();
         for raw in list.split(',') {
             let term = raw.trim();
             if term.is_empty() {
                 continue;
             }
-            let mut words = term.split_whitespace();
-            let column = words.next().unwrap_or("");
-            let descending = match words.next() {
-                Some(d) if d.eq_ignore_ascii_case("DESC") => true,
-                Some(d) if d.eq_ignore_ascii_case("ASC") => false,
-                None => false,
-                Some(other) => {
-                    return Err(format!("'{}' is not a sort direction", other));
+            let words: Vec<&str> = term.split_whitespace().collect();
+            let column = words.first().copied().unwrap_or("");
+            let mut at = 1;
+            let descending = match words.get(at) {
+                Some(d) if d.eq_ignore_ascii_case("DESC") => {
+                    at += 1;
+                    true
                 }
+                Some(d) if d.eq_ignore_ascii_case("ASC") => {
+                    at += 1;
+                    false
+                }
+                _ => false,
             };
-            out.push((resolve_column(column, schema)?, descending));
+            // `NULLS FIRST` / `NULLS LAST`; without one, NULLs are larger
+            // than every value: last ascending, first descending.
+            let nulls_first = match (words.get(at), words.get(at + 1)) {
+                (Some(n), Some(w)) if n.eq_ignore_ascii_case("NULLS") && w.eq_ignore_ascii_case("FIRST") => {
+                    at += 2;
+                    true
+                }
+                (Some(n), Some(w)) if n.eq_ignore_ascii_case("NULLS") && w.eq_ignore_ascii_case("LAST") => {
+                    at += 2;
+                    false
+                }
+                _ => descending,
+            };
+            if let Some(other) = words.get(at) {
+                return Err(format!("'{}' is not a sort direction", other));
+            }
+            out.push((resolve_column(column, schema)?, descending, nulls_first));
         }
         Ok(out)
     };
@@ -460,7 +483,7 @@ fn build(
 
     let partition_by = resolve(partition_text)?
         .into_iter()
-        .map(|(f, _)| f)
+        .map(|(f, _, _)| f)
         .collect();
     let order_by = resolve(order_text)?;
 
@@ -602,14 +625,18 @@ pub type WindowValue = Option<Vec<u8>>;
 /// to answer NULL, which a client cannot tell from an all-NULL frame.
 pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, String> {
     // A document partitions by its value, as `=` compares it: `{"a":1}` and
-    // `{"a":1.0}` are one partition.
-    let key_of = |row: &Row, fields: &[SchemaField]| -> Vec<Vec<u8>> {
+    // `{"a":1.0}` are one partition. A NULL is its own key (`None`), apart
+    // from every value: its cell holds the type's zeroes (the NULL lives in
+    // the column's companion, and the per-row retyping types the cell NULL),
+    // so keyed by its bytes it shared a partition with 0, 0.00, '' or false.
+    let key_of = |row: &Row, fields: &[SchemaField]| -> Vec<Option<Vec<u8>>> {
         fields
             .iter()
             .map(|f| {
                 row.columns
                     .iter()
                     .find(|c| u64::from(c.schema_id) == f.write_order)
+                    .filter(|c| c.column_type != DbType::NULL)
                     .map(|c| {
                         let bytes = c.data.into_slice();
                         if f.db_type == DbType::JSONB && !bytes.is_empty() {
@@ -625,14 +652,13 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                             bytes.to_vec()
                         }
                     })
-                    .unwrap_or_default()
             })
             .collect()
     };
 
     // Group the row indices by partition, preserving first-seen order so the
     // result is deterministic for equal keys.
-    let mut partitions: Vec<(Vec<Vec<u8>>, Vec<usize>)> = Vec::new();
+    let mut partitions: Vec<(Vec<Option<Vec<u8>>>, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let key = key_of(row, &spec.partition_by);
         match partitions.iter_mut().find(|(k, _)| *k == key) {
@@ -749,27 +775,44 @@ fn compare_by_order(
     rows: &[Row],
     a: usize,
     b: usize,
-    order_by: &[(SchemaField, bool)],
+    order_by: &[(SchemaField, bool, bool)],
 ) -> std::cmp::Ordering {
-    for (field, descending) in order_by {
-        let lhs = rows[a]
-            .columns
-            .iter()
-            .find(|c| u64::from(c.schema_id) == field.write_order)
-            .map(|c| c.data.into_slice())
-            .unwrap_or(&[]);
-        let rhs = rows[b]
-            .columns
-            .iter()
-            .find(|c| u64::from(c.schema_id) == field.write_order)
-            .map(|c| c.data.into_slice())
-            .unwrap_or(&[]);
-        let ord = crate::core::processor::concurrent_processor::compare_bytes_as_type(
-            field.db_type.clone(),
-            lhs,
-            rhs,
-        );
-        let ord = if *descending { ord.reverse() } else { ord };
+    use std::cmp::Ordering;
+    for (field, descending, nulls_first) in order_by {
+        // `None` for a NULL (typed NULL by the per-row retyping; its bytes
+        // are the type's zeroes, which sorted it among the 0s).
+        fn cell<'r>(row: &'r Row, field: &SchemaField) -> Option<&'r [u8]> {
+            row.columns
+                .iter()
+                .find(|c| u64::from(c.schema_id) == field.write_order)
+                .filter(|c| c.column_type != DbType::NULL)
+                .map(|c| c.data.into_slice())
+        }
+        let ord = match (cell(&rows[a], field), cell(&rows[b], field)) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => {
+                if *nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Some(_), None) => {
+                if *nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (Some(lhs), Some(rhs)) => {
+                let ord = crate::core::processor::concurrent_processor::compare_bytes_as_type(
+                    field.db_type.clone(),
+                    lhs,
+                    rhs,
+                );
+                if *descending { ord.reverse() } else { ord }
+            }
+        };
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
@@ -855,12 +898,9 @@ fn argument_bytes(rows: &[Row], index: usize, spec: &WindowSpec) -> Option<Vec<u
     if column.column_type == DbType::NULL {
         return None;
     }
-    let bytes = column.data.into_slice();
-    // A variable-width column with no bytes is a NULL, not an empty value.
-    if bytes.is_empty() && field.db_type.is_variable_width() {
-        return None;
-    }
-    Some(bytes.to_vec())
+    // A text column's '' is a value, not a NULL: COUNT counts it and MIN
+    // takes it, as PostgreSQL does.
+    Some(column.data.into_slice().to_vec())
 }
 
 /// The aggregate and value functions, over the rows the frame selected.
