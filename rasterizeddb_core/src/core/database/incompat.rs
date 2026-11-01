@@ -150,6 +150,73 @@ pub fn require(dir: &Path, flag: &str) -> io::Result<()> {
     crate::core::wal::sync_parent_dir(&path)
 }
 
+/// Whether a table with `fields` stores an unconstrained NUMERIC in the
+/// seventeen-byte slot ([`NUMERIC_OWN_SCALE_V1`]). A dropped column counts:
+/// it keeps its slot in the row layout, so an older binary would read every
+/// later column at the wrong offset.
+pub fn fields_need_numeric_own_scale(fields: &[crate::core::row::schema::SchemaField]) -> bool {
+    fields.iter().any(crate::core::value_codec::keeps_own_scale)
+}
+
+/// Sets [`NUMERIC_OWN_SCALE_V1`] in `dir` when `fields` need it and it is not
+/// set yet. The fence is set where the field record is written, but a file
+/// can arrive without it: a point-in-time restore lays down every file the
+/// snapshot listed and replays the log onto them, and the flag, written
+/// outside the log after the listing, is not among them. Asked whenever a
+/// table's schema is read, before anything else touches the table, so such a
+/// directory is fenced again before an older binary can be handed it.
+pub fn fence_numeric_own_scale(dir: &Path, fields: &[crate::core::row::schema::SchemaField]) -> io::Result<()> {
+    if !fields_need_numeric_own_scale(fields) {
+        return Ok(());
+    }
+    if flags(dir).map_err(io::Error::other)?.iter().any(|f| f == NUMERIC_OWN_SCALE_V1) {
+        return Ok(());
+    }
+    require(dir, NUMERIC_OWN_SCALE_V1)
+}
+
+/// Whether any schema field file under `dir` (every `…_schema_FIELDS.db`, in every
+/// subdirectory: a partitioned table's, a storage location's staged copy)
+/// records a seventeen-byte NUMERIC field. Read without a database: this is
+/// for a restored directory before anything opens it.
+pub fn directory_needs_numeric_own_scale(dir: &Path) -> io::Result<bool> {
+    use crate::core::row::schema::{SCHEMA_FIELD_SIZE, SchemaField};
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        for entry in std::fs::read_dir(&at)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name();
+            if !kind.is_file() || !name.to_string_lossy().ends_with("_schema_FIELDS.db") {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path())?;
+            let found = bytes
+                .chunks_exact(SCHEMA_FIELD_SIZE as usize)
+                .filter(|record| !crate::core::torn_tail::is_unwritten(record))
+                .filter_map(|record| SchemaField::from_vec(record).ok())
+                .any(|field| crate::core::value_codec::keeps_own_scale(&field));
+            if found {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// [`directory_needs_numeric_own_scale`], and the flag set when it does: run
+/// by a restore before it hands the directory over.
+pub fn fence_restored_directory(dir: &Path) -> io::Result<()> {
+    if directory_needs_numeric_own_scale(dir)? {
+        require(dir, NUMERIC_OWN_SCALE_V1)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

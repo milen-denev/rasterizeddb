@@ -207,6 +207,59 @@ async fn a_typed_retype_of_an_own_scale_column_converts_it() {
     close(&dir, db);
 }
 
+/// The width of `column` in any relation, a partitioned one's shell too.
+fn any_slot(db: &Arc<Database>, table: &str, column: &str) -> u32 {
+    db.relation(table)
+        .expect("relation")
+        .schema()
+        .fields
+        .iter()
+        .find(|f| f.name == column && !f.is_deleted)
+        .expect("column")
+        .size
+}
+
+/// A directory holding a seventeen-byte NUMERIC field without its fence (a
+/// point-in-time restore brings the field records and not the flag) is
+/// fenced when the table is opened, before anything else touches it, for a
+/// plain table and a partitioned one, and for a dropped such column, which
+/// keeps its slot in the row layout an older binary would misread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_fences_a_numeric_column_found_without_its_flag() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    for (table, create) in [
+        ("t", "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC)"),
+        ("p", "CREATE TABLE p (id BIGINT NOT NULL, u NUMERIC) PARTITION BY HASH (id) PARTITIONS 2"),
+    ] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir, "own_scale_open_fence").await.unwrap();
+        exec(&db, create).await.unwrap();
+        exec(&db, &format!("INSERT INTO {table} (id, u) VALUES (1, 0.0000000000001)")).await.unwrap();
+        assert_eq!(any_slot(&db, table, "u"), 17);
+        close(&dir, db);
+        assert!(flagged(&dir));
+        std::fs::remove_file(dir.join(crate::core::database::incompat::FILE_NAME)).unwrap();
+        assert!(!flagged(&dir));
+        let db = open(&dir, "own_scale_open_fence").await.unwrap();
+        assert!(flagged(&dir), "{table}: opened without fencing its seventeen-byte column");
+        let got = rows(&db, &format!("SELECT u::text FROM {table}")).await.unwrap();
+        assert_eq!(got, [[b"0.0000000000001".to_vec()]], "{table}");
+        close(&dir, db);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = open(&dir, "own_scale_open_fence").await.unwrap();
+    exec(&db, "CREATE TABLE d (id BIGINT PRIMARY KEY, u NUMERIC, w BIGINT)").await.unwrap();
+    exec(&db, "INSERT INTO d (id, u, w) VALUES (1, 0.0000000000001, 5)").await.unwrap();
+    exec(&db, "ALTER TABLE d DROP COLUMN u").await.unwrap();
+    close(&dir, db);
+    std::fs::remove_file(dir.join(crate::core::database::incompat::FILE_NAME)).unwrap();
+    let db = open(&dir, "own_scale_open_fence").await.unwrap();
+    assert!(flagged(&dir), "opened without fencing a dropped seventeen-byte column");
+    assert_eq!(rows(&db, "SELECT w FROM d").await.unwrap(), [[5i64.to_le_bytes().to_vec()]]);
+    close(&dir, db);
+}
+
 /// The rewrite's own points, in the order it reaches them.
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",

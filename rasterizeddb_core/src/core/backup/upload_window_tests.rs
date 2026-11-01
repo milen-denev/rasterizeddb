@@ -417,3 +417,70 @@ async fn a_move_during_the_upload_waits_for_it() {
     crate::core::wal::remove_for(&live_str);
     crate::core::wal::remove_for(&path_str(&disk));
 }
+
+fn numeric_fenced(dir: &Path) -> bool {
+    crate::core::database::incompat::flags(dir)
+        .unwrap()
+        .iter()
+        .any(|f| f == crate::core::database::incompat::NUMERIC_OWN_SCALE_V1)
+}
+
+/// The seventeen-byte NUMERIC slot's fence (`numeric_own_scale_v1`) survives
+/// a point-in-time restore of a snapshot taken before it was set. The flag is
+/// written outside the log, after the snapshot listed its files, so the
+/// restore laid down the field records (an ADD COLUMN, a conversion) and not
+/// the flag: a directory an older binary would open and misread. The restore
+/// fences the directory before it appears (checked before anything opens
+/// it), and the restored values are the live ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_fences_numeric_columns_the_snapshot_predates() {
+    init_globals();
+    let base = tempfile::tempdir().unwrap();
+    let live = base.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let live_str = path_str(&live);
+    let db = Arc::new(Database::new(&live_str).await);
+    db.legacy_numeric_slot.store(true, std::sync::atomic::Ordering::Relaxed);
+    ok(&db, "CREATE TABLE t (id INT PRIMARY KEY, u NUMERIC)").await;
+    ok(&db, "INSERT INTO t (id, u) VALUES (1, 1.5), (2, 0.000000001)").await;
+    ok(&db, "CREATE TABLE e (id INT PRIMARY KEY)").await;
+    ok(&db, "INSERT INTO e (id) VALUES (1)").await;
+    db.legacy_numeric_slot.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(!numeric_fenced(&live));
+
+    let config = config("numeric-fence", 0);
+    let service = BackupService::connect(config.clone(), &live_str).await.expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    ok(&db, "ALTER TABLE e ADD COLUMN v NUMERIC").await;
+    ok(&db, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC").await;
+    ok(&db, "INSERT INTO t (id, u) VALUES (3, 0.0000000000001)").await;
+    ok(&db, "UPDATE e SET v = 2.50 WHERE id = 1").await;
+    assert!(numeric_fenced(&live));
+    db.sync_durable().unwrap();
+    service.archive_wal_now().await.expect("archive");
+
+    let target = base.path().join("restored");
+    super::restore_from(&config, &target, RecoveryTarget::Latest).await.expect("restore");
+    assert!(
+        numeric_fenced(&target),
+        "the restored directory holds seventeen-byte NUMERIC fields and not their fence"
+    );
+    let back = Arc::new(Database::new(&path_str(&target)).await);
+    let text = |response: Vec<u8>| -> Vec<String> {
+        let mut out: Vec<String> = vec_into_rows(&response[1..])
+            .expect("rows decode")
+            .iter()
+            .map(|r| String::from_utf8_lossy(r.columns[0].data.into_slice()).into_owned())
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(text(run(&back, "SELECT u::text FROM t").await), ["0.0000000000001", "0.000000001", "1.5"]);
+    assert_eq!(text(run(&back, "SELECT v::text FROM e").await), ["2.50"]);
+
+    drop(back);
+    drop(db);
+    crate::core::wal::remove_for(&path_str(&target));
+    crate::core::wal::remove_for(&live_str);
+}

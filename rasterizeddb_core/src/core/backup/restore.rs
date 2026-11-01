@@ -130,6 +130,12 @@ pub async fn run(
 
     let (report, in_place_locations) = build(client, config, &staging, target, target_dir).await?;
 
+    // A table restored with a seventeen-byte NUMERIC field gets its fence
+    // before the directory appears: the flag is written outside the log, so
+    // a snapshot listed before it was set restores the field records and not
+    // the flag, and an older binary handed the directory would misread it.
+    crate::core::database::incompat::fence_restored_directory(&staging)?;
+
     // An in-place restore puts each storage location's files back where they
     // came from — another disk, so a copy rather than the rename the root
     // gets. Before that rename: a root that appears is a database that opens,

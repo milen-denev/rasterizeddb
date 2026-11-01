@@ -744,6 +744,13 @@ impl Database {
         let mut schema = TableSchema::load(io_schema.clone())
             .await
             .map_err(|e| format!("its schema {schema_file} could not be read: {e}"))?;
+        // Fenced before anything touches the table, as a plain table is at
+        // open (`incompat::fence_numeric_own_scale`).
+        if let Some(location) = self.location.as_deref() {
+            super::incompat::fence_numeric_own_scale(Path::new(location), &schema.fields).map_err(|e| {
+                format!("the directory could not be marked for its NUMERIC columns ({}): {e}", super::incompat::NUMERIC_OWN_SCALE_V1)
+            })?;
+        }
         if schema.name != name {
             warn!(
                 "partitioned table \"{name}\" ({uid:016x}) has a schema recorded under the name \"{}\"; it is \

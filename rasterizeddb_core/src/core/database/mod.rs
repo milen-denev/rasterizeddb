@@ -1665,6 +1665,22 @@ impl Database {
                 );
                 continue;
             }
+            // A seventeen-byte NUMERIC field in a directory without its
+            // fence (a point-in-time restore brings the field records and not
+            // the flag): fenced before anything touches the table, so an
+            // older binary is refused this directory rather than misreading it.
+            if !in_memory {
+                if let Err(e) = incompat::fence_numeric_own_scale(std::path::Path::new(location), &table.schema.fields) {
+                    error!(
+                        "table '{}' is left unopened: it keeps NUMERIC values at their own scale and the \
+                         directory could not be marked for it ({}): {}",
+                        table_name,
+                        incompat::NUMERIC_OWN_SCALE_V1,
+                        e
+                    );
+                    continue;
+                }
+            }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
             // A table with a legacy `CHAR` column: its keys are read once,
