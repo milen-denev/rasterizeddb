@@ -3703,8 +3703,17 @@ fn float_run_coarse(scale: u32, lo: i128, hi: i128, v: f64) -> Option<(Option<i1
     if !(spacing.is_finite() && step > 2.0 * spacing) {
         return None;
     }
-    // The value nearest `v`, rounded at the column's scale.
-    let c = format!("{:.*}", scale as usize, v).replace('.', "").parse::<i128>().ok()?;
+    // The value nearest `v` at the column's scale, in double arithmetic. Here
+    // |v| × 10^scale < 2^51, so the product is off by under a quarter of the
+    // column's step; that can pick the farther of two neighbours only when
+    // `v` is that close to their midpoint, where neither rounds to `v` (both
+    // are more than half the double's spacing away), and either gives the
+    // same run. Exact formatting (`{:.N}`) cost most of planning a long list.
+    let c = (v * 10f64.powi(scale as i32)).round();
+    if !c.is_finite() || c.abs() >= 2f64.powi(100) {
+        return None;
+    }
+    let c = c as i128;
     if !(lo..=hi).contains(&c) {
         return None;
     }
@@ -3726,10 +3735,12 @@ fn float_run_coarse(scale: u32, lo: i128, hi: i128, v: f64) -> Option<(Option<i1
 /// is the one nearest `v`: one conversion decides. Only a column finer than
 /// the double there (a NUMERIC(38,20) 0.1, a bigint past 2^52) is searched.
 fn float_run(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Option<i128>) {
+    float_run_coarse(scale, lo, hi, v).unwrap_or_else(|| float_run_search(scale, lo, hi, v))
+}
+
+/// [`float_run`] by searching the column's values, at any step.
+fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Option<i128>) {
     use std::cmp::Ordering;
-    if let Some(run) = float_run_coarse(scale, lo, hi, v) {
-        return run;
-    }
     let nearest = |m: i128| -> f64 {
         crate::core::value_codec::format_decimal_scaled(m, scale).parse::<f64>().unwrap_or(f64::NAN)
     };
@@ -5336,6 +5347,40 @@ mod tests {
         let negated = scanned("i NOT IN (9007199254740992::float8, 9007199254740994::float8)");
         let rendered = negated.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
         assert!(rendered.contains("<> 9.007199254740992e+15 AND") && !rendered.contains(" IN "), "{rendered}");
+    }
+
+    /// The one-conversion run agrees with the search wherever it answers:
+    /// on values, midpoints and neighbours of the column's steps.
+    #[test]
+    fn the_coarse_run_agrees_with_the_search() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (lo, hi) = (-(10i128.pow(38) - 1), 10i128.pow(38) - 1);
+        let mut answered = 0;
+        for _ in 0..20_000 {
+            let scale = (next() % 7) as u32;
+            let magnitude = 10f64.powi((next() % 16) as i32 - 3);
+            let grid = 10f64.powi(-(scale as i32));
+            let base = ((next() % 1_000_000) as f64 / 1_000_000.0 * magnitude / grid).round() * grid;
+            let v = match next() % 5 {
+                0 => base,
+                1 => base + grid / 2.0,
+                2 => f64::from_bits(base.to_bits() + 1),
+                3 => f64::from_bits(base.to_bits().saturating_sub(1)),
+                _ => base + grid * 0.37,
+            };
+            let v = if next() % 2 == 0 { v } else { -v };
+            if let Some(run) = float_run_coarse(scale, lo, hi, v) {
+                answered += 1;
+                assert_eq!(run, float_run_search(scale, lo, hi, v), "v = {v:e}, scale {scale}");
+            }
+        }
+        assert!(answered > 10_000, "only {answered} answered");
     }
 
     #[test]
