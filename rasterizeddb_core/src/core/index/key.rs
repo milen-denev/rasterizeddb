@@ -117,6 +117,40 @@ fn flip_sign_be(bytes_le: &[u8], out: &mut Vec<u8>) {
     out[start] ^= 0x80;
 }
 
+/// A NUMERIC cell carrying its own scale, in a form whose byte order is its
+/// numeric order and whose bytes are equal exactly when the values are: the
+/// value times 10^(38 - scale) (an integer, since a cell holds at most 38
+/// places), as a 256-bit two's complement integer, big-endian with the sign
+/// bit flipped — 32 bytes. Every such value fits: |m| < 2^127 and 10^38 <
+/// 2^127, so the product is below 2^254.
+fn own_scale_ordered(v: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let (m, own) = crate::core::value_codec::split_decimal_cell(v)?;
+    let p = 10u128.checked_pow(38u32.checked_sub(own?)?)?;
+    // |m| × p as two 128-bit halves, through 64-bit limbs.
+    let a = m.unsigned_abs();
+    let (a1, a0) = (a >> 64, a & u128::from(u64::MAX));
+    let (b1, b0) = (p >> 64, p & u128::from(u64::MAX));
+    let ll = a0 * b0;
+    let lh = a0 * b1;
+    let hl = a1 * b0;
+    let hh = a1 * b1;
+    let mid = (ll >> 64) + (lh & u128::from(u64::MAX)) + (hl & u128::from(u64::MAX));
+    let lo = (ll & u128::from(u64::MAX)) | (mid << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+    // Negated in two's complement for a negative value.
+    let (hi, lo) = if m < 0 {
+        let (lo, carry) = (!lo).overflowing_add(1);
+        (!hi + u128::from(carry), lo)
+    } else {
+        (hi, lo)
+    };
+    let start = out.len();
+    out.extend_from_slice(&hi.to_be_bytes());
+    out.extend_from_slice(&lo.to_be_bytes());
+    out[start] ^= 0x80;
+    Some(())
+}
+
 fn canonical_f64(v: f64) -> f64 {
     if v.is_nan() {
         f64::NAN
@@ -159,6 +193,10 @@ pub fn encode_ordered(t: &DbType, v: &[u8], last: bool, out: &mut Vec<u8>) -> Op
             width(8)?;
             flip_sign_be(v, out)
         }
+        // A NUMERIC carrying its own scale (a column that keeps each value's):
+        // its value at 38 places, a 256-bit integer, sign-flipped big-endian
+        // ([`own_scale_ordered`]). 1.5 and 1.50 key alike, and in order.
+        DbType::DECIMAL if v.len() == 17 => own_scale_ordered(v, out)?,
         DbType::I128 | DbType::DECIMAL => {
             width(16)?;
             flip_sign_be(v, out)
@@ -250,6 +288,13 @@ pub fn encode_canonical(t: &DbType, v: &[u8], out: &mut Vec<u8>) -> Option<()> {
             out.extend_from_slice(&f.to_bits().to_le_bytes());
         }
         DbType::F32 | DbType::F64 => return None,
+        // A NUMERIC carrying its own scale by its one cell per value
+        // (`value_codec::canonical_numeric_cell`): 1.5 and 1.50 are equal.
+        DbType::DECIMAL if v.len() == 17 => {
+            let canonical = crate::core::value_codec::canonical_numeric_cell(v)?;
+            out.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
+            out.extend_from_slice(&canonical);
+        }
         // Documents are equal as values (`1` = `1.0`), not as bytes; one the
         // walk cannot read is compared, and so keyed, by its bytes.
         DbType::JSONB => {
@@ -564,5 +609,61 @@ mod tests {
         assert!(!hash_supported(&DbType::INTERVAL));
         assert!(!hash_supported(&DbType::TIMETZ));
         assert!(encode_canonical(&DbType::INTERVAL, &[0; 16], &mut Vec::new()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod own_scale_key_tests {
+    use super::*;
+
+    /// A NUMERIC cell carrying its own scale keys in its numeric order, and
+    /// equal values (1.5, 1.50) key alike, ordered and hashed.
+    #[test]
+    fn own_scale_keys_order_and_equate_by_value() {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let digits38 = 10i128.pow(38) - 1;
+        let mut cells: Vec<Vec<u8>> = vec![
+            crate::core::value_codec::decimal_cell_with_scale(0, 0),
+            crate::core::value_codec::decimal_cell_with_scale(digits38, 0),
+            crate::core::value_codec::decimal_cell_with_scale(-digits38, 0),
+            crate::core::value_codec::decimal_cell_with_scale(digits38, 38),
+            crate::core::value_codec::decimal_cell_with_scale(-1, 38),
+            crate::core::value_codec::decimal_cell_with_scale(15, 1),
+            crate::core::value_codec::decimal_cell_with_scale(150, 2),
+            crate::core::value_codec::decimal_cell_with_scale(-150, 2),
+        ];
+        for _ in 0..400 {
+            let s = (next() % 39) as u32;
+            let magnitude = 10i128.pow((next() % 20) as u32);
+            let m = ((next() as i128) % magnitude) * if next() % 2 == 0 { 1 } else { -1 };
+            cells.push(crate::core::value_codec::decimal_cell_with_scale(m, s));
+            // The same value with trailing zeros, where the cell holds them.
+            if s < 38 && m.checked_mul(10).is_some_and(|x| x.unsigned_abs() <= digits38 as u128) {
+                cells.push(crate::core::value_codec::decimal_cell_with_scale(m * 10, s + 1));
+            }
+        }
+        let ordered = |c: &[u8]| {
+            let mut out = Vec::new();
+            encode_ordered(&DbType::DECIMAL, c, true, &mut out).expect("an own-scale key");
+            out
+        };
+        let hashed = |c: &[u8]| {
+            let mut out = Vec::new();
+            encode_canonical(&DbType::DECIMAL, c, &mut out).expect("an own-scale hash key");
+            out
+        };
+        for a in &cells {
+            for b in &cells {
+                let want = crate::core::value_codec::numeric_cell_cmp(a, b).unwrap();
+                assert_eq!(ordered(a).cmp(&ordered(b)), want, "{a:?} {b:?}");
+                assert_eq!(hashed(a) == hashed(b), want == std::cmp::Ordering::Equal, "{a:?} {b:?}");
+            }
+        }
     }
 }

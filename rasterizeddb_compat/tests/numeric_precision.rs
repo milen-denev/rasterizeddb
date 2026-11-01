@@ -169,11 +169,12 @@ async fn a_constant_past_one_point_seven_e29_is_numeric() {
     assert_eq!(rows(&c, "SELECT sum(n * 1e30), max(i * 1e29) FROM t").await, ["8250000000000000000000000000000.00|700000000000000000000000000000"] as [&str; 1], "SELECT sum(n * 1e30), max(i * 1e29) FROM t");
 }
 
-/// 20,000 rows of an unconstrained NUMERIC, at many scales, with and without
-/// a secondary index: every equality, IN list, range, aggregate and sort
+/// 20,000 rows of an unconstrained NUMERIC, at many scales, with no index, a
+/// B-tree and a hash index: every equality, IN list, range, aggregate and sort
 /// answers as PostgreSQL 17 does. The filter index fingerprinted each
 /// seventeen-byte cell as "no value", so an equality pruned every row and
-/// answered none, with no error.
+/// answered none, with no error; a hash index keyed 0.0000000070 apart from
+/// the 0.000000007 it equals.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_own_scale_column_answers_every_predicate() {
     let server = TestServer::start().await.expect("server");
@@ -216,6 +217,11 @@ async fn a_large_own_scale_column_answers_every_predicate() {
     }
     run(&c, "CREATE INDEX big_v ON big (v)").await;
     for (sql, want) in checks {
-        assert_eq!(rows(&c, sql).await, *want, "{sql} (indexed)");
+        assert_eq!(rows(&c, sql).await, *want, "{sql} (B-tree)");
+    }
+    run(&c, "DROP INDEX big_v").await;
+    run(&c, "CREATE INDEX big_h ON big USING hash (v)").await;
+    for (sql, want) in checks {
+        assert_eq!(rows(&c, sql).await, *want, "{sql} (hash)");
     }
 }
