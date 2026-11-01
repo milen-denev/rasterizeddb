@@ -13099,6 +13099,88 @@ fn convert_numeric_value(
     }
 }
 
+/// A NUMERIC value's text as the form `to` holds it: what it is shown as,
+/// and its value without trailing zeros (equal values give equal keys).
+fn converted_numeric_text(text: &str, to: Option<NumericForm>) -> Result<(String, String), String> {
+    use crate::core::rql::pg_numeric::{self as pgn, PgNum};
+    let Some(v) = pgn::parse_text(text.trim()) else {
+        let raw = text.trim().to_string();
+        return Ok((raw.clone(), raw));
+    };
+    let v = match to {
+        None | Some(NumericForm::Own) => v,
+        Some(NumericForm::Scaled { precision, scale }) => {
+            let rounded = v
+                .round_to(scale)
+                .ok_or_else(|| format!("numeric field overflow: {} does not fit the new type", v.to_text()))?;
+            crate::core::value_codec::check_numeric_precision(rounded.m, precision, scale)?;
+            rounded
+        }
+    };
+    Ok((v.to_text(), PgNum::trimmed(v.m, v.s).to_text()))
+}
+
+/// Whether every foreign key `column` of `table_name` is a side of still
+/// holds once the column's values are converted to `to`: each child key
+/// (converted when the child's column is the one retyped) names a parent
+/// key (converted when the parent's is). A self-referencing key converts
+/// both. Refused with PostgreSQL's 23503, before anything is rewritten:
+/// a parent key retyped from 1.005 to 1.01 left its child's 1.005 naming
+/// nothing, and a join lost the row.
+async fn foreign_keys_hold_after_retype(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    column: &str,
+    to: NumericForm,
+    reader: TxId,
+) -> Result<(), String> {
+    let mut keys: Vec<(String, crate::core::rql::foreign_key::ForeignKey)> = schema
+        .foreign_keys
+        .iter()
+        .filter(|fk| !fk.is_deleted && fk.column.eq_ignore_ascii_case(column))
+        .map(|fk| (table_name.to_string(), fk.clone()))
+        .collect();
+    for (child, fk) in referencing_keys(database, table_name) {
+        if !fk.is_deleted
+            && fk.parent_column.eq_ignore_ascii_case(column)
+            && !keys.iter().any(|(c, k)| c.eq_ignore_ascii_case(&child) && k.name == fk.name)
+        {
+            keys.push((child, fk));
+        }
+    }
+    let texts = |rows: Vec<crate::core::row::row::Row>| -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| r.columns.first().map(|c| String::from_utf8_lossy(c.data.into_slice()).into_owned()))
+            .collect()
+    };
+    for (child, fk) in keys {
+        let child_converts = child.eq_ignore_ascii_case(table_name) && fk.column.eq_ignore_ascii_case(column);
+        let parent_converts =
+            fk.parent_table.eq_ignore_ascii_case(table_name) && fk.parent_column.eq_ignore_ascii_case(column);
+        let read = |table: &str, col: &str| {
+            format!("SELECT {col}::text FROM {table} WHERE {col} IS NOT NULL")
+        };
+        let parents = texts(run_subquery(&read(&fk.parent_table, &fk.parent_column), database, reader).await?);
+        let mut held = std::collections::HashSet::new();
+        for text in parents {
+            held.insert(converted_numeric_text(&text, parent_converts.then_some(to))?.1);
+        }
+        let children = texts(run_subquery(&read(&child, &fk.column), database, reader).await?);
+        for text in children {
+            let (shown, key) = converted_numeric_text(&text, child_converts.then_some(to))?;
+            if !held.contains(&key) {
+                return Err(format!(
+                    "insert or update on table \"{}\" violates foreign key constraint \"{}\": \
+                     key ({})=({}) is not present in table \"{}\"",
+                    child, fk.name, fk.column, shown, fk.parent_table
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `ALTER COLUMN c TYPE NUMERIC[(p, s)]` that changes how `c` stores its
 /// values (`numeric_retype_needed`): every row rewritten (`rewrite_rows`, all
 /// or nothing, crash-safe), each value converted (`convert_numeric_value`),
@@ -13108,8 +13190,9 @@ fn convert_numeric_value(
 /// precision (22003), when rounding makes two keys of a unique constraint
 /// over the column one (23505, as PostgreSQL's rebuilt index refuses it),
 /// when rounding changes a value a CHECK reads (judging the check again
-/// over the rounded rows is not supported here), and when a generated
-/// column reads the column (PostgreSQL refuses that too).
+/// over the rounded rows is not supported here), when a foreign key the
+/// column is a side of no longer holds (23503), and when a generated column
+/// reads the column (PostgreSQL refuses that too).
 async fn retype_numeric(
     database: &Arc<Database>,
     table_name: &str,
@@ -13142,6 +13225,10 @@ async fn retype_numeric(
     }
     let check_reading: Option<String> =
         schema.checks.iter().find(|c| !c.is_deleted && reads_column(&c.expression)).map(|c| c.name.clone());
+    // Each foreign key the column is a side of, over the values as the new
+    // type converts them (`foreign_keys_hold_after_retype`): 23503 when a
+    // child's key no longer names a parent row.
+    foreign_keys_hold_after_retype(database, table_name, schema, &field.name, to, reader).await?;
     // Into the seventeen-byte slot, the rewrite marks the database first
     // (`create_files`).
     let column = field.name.clone();

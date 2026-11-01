@@ -574,3 +574,40 @@ async fn a_cast_to_numeric_p_s_of_an_own_scale_column() {
     run(&c, "UPDATE ck SET u = u::numeric(4,1) WHERE id = 4").await;
     assert_eq!(rows(&c, "SELECT * FROM ck ORDER BY id").await, ["2|2.5", "3|", "4|-1.0"] as [&str; 3], "SELECT * FROM ck ORDER BY id");
 }
+
+/// ALTER COLUMN … TYPE NUMERIC(p, s) on a foreign key's parent or child column is judged over the converted values: refused with 23503 when a child key would name no parent (1.005 against a parent rounded to 1.01, either side, and a self-referencing key), and allowed when every key still matches. NULL keys name nothing. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_keeps_foreign_keys_holding() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fp (k NUMERIC(10,3) PRIMARY KEY)").await;
+    run(&c, "INSERT INTO fp VALUES (1.005), (2.000)").await;
+    run(&c, "CREATE TABLE fc (id INT PRIMARY KEY, k NUMERIC(10,3) REFERENCES fp(k))").await;
+    run(&c, "INSERT INTO fc VALUES (1, 1.005), (2, 2.000), (3, NULL)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE fp ALTER COLUMN k TYPE NUMERIC(10,2)").await, "23503");
+    assert_eq!(rows(&c, "SELECT k FROM fp ORDER BY k").await, ["1.005", "2.000"] as [&str; 2], "SELECT k FROM fp ORDER BY k");
+    assert_eq!(rows(&c, "SELECT fc.id FROM fc JOIN fp ON fc.k = fp.k ORDER BY 1").await, ["1", "2"] as [&str; 2], "SELECT fc.id FROM fc JOIN fp ON fc.k = fp.k ORDER BY 1");
+    assert_eq!(sqlstate(&c, "ALTER TABLE fc ALTER COLUMN k TYPE NUMERIC(10,2)").await, "23503");
+    assert_eq!(rows(&c, "SELECT id, k FROM fc ORDER BY id").await, ["1|1.005", "2|2.000", "3|"] as [&str; 3], "SELECT id, k FROM fc ORDER BY id");
+    run(&c, "ALTER TABLE fp ALTER COLUMN k TYPE NUMERIC(12,3)").await;
+    run(&c, "ALTER TABLE fc ALTER COLUMN k TYPE NUMERIC(12,4)").await;
+    assert_eq!(rows(&c, "SELECT id, k FROM fc ORDER BY id").await, ["1|1.0050", "2|2.0000", "3|"] as [&str; 3], "SELECT id, k FROM fc ORDER BY id");
+    assert_eq!(rows(&c, "SELECT fc.id FROM fc JOIN fp ON fc.k = fp.k ORDER BY 1").await, ["1", "2"] as [&str; 2], "SELECT fc.id FROM fc JOIN fp ON fc.k = fp.k ORDER BY 1");
+    run(&c, "CREATE TABLE gp (k NUMERIC PRIMARY KEY)").await;
+    run(&c, "INSERT INTO gp VALUES (1.004), (2.5)").await;
+    run(&c, "CREATE TABLE gc (id INT PRIMARY KEY, k NUMERIC REFERENCES gp(k))").await;
+    run(&c, "INSERT INTO gc VALUES (1, 2.5)").await;
+    run(&c, "ALTER TABLE gp ALTER COLUMN k TYPE NUMERIC(10,2)").await;
+    assert_eq!(rows(&c, "SELECT k FROM gp ORDER BY k").await, ["1.00", "2.50"] as [&str; 2], "SELECT k FROM gp ORDER BY k");
+    run(&c, "ALTER TABLE gc ALTER COLUMN k TYPE NUMERIC(10,1)").await;
+    assert_eq!(rows(&c, "SELECT id, k FROM gc ORDER BY id").await, ["1|2.5"] as [&str; 1], "SELECT id, k FROM gc ORDER BY id");
+    run(&c, "CREATE TABLE sr (k NUMERIC(10,3) PRIMARY KEY, up NUMERIC(10,3) REFERENCES sr(k))").await;
+    run(&c, "INSERT INTO sr VALUES (1.005, NULL), (2.000, 1.005)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE sr ALTER COLUMN k TYPE NUMERIC(10,2)").await, "23503");
+    assert_eq!(sqlstate(&c, "ALTER TABLE sr ALTER COLUMN up TYPE NUMERIC(10,2)").await, "23503");
+    assert_eq!(rows(&c, "SELECT k, up FROM sr ORDER BY k").await, ["1.005|", "2.000|1.005"] as [&str; 2], "SELECT k, up FROM sr ORDER BY k");
+    run(&c, "CREATE TABLE sr2 (k NUMERIC(10,3) PRIMARY KEY, up NUMERIC(10,3) REFERENCES sr2(k))").await;
+    run(&c, "INSERT INTO sr2 VALUES (1.004, NULL), (2.000, 1.004)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE sr2 ALTER COLUMN k TYPE NUMERIC(10,2)").await, "23503");
+    assert_eq!(rows(&c, "SELECT k, up FROM sr2 ORDER BY k").await, ["1.004|", "2.000|1.004"] as [&str; 2], "SELECT k, up FROM sr2 ORDER BY k");
+}
