@@ -345,3 +345,54 @@ async fn on_conflict_over_an_own_scale_key() {
     run(&c, "INSERT INTO ux VALUES (2, 2) ON CONFLICT (id) DO UPDATE SET u = excluded.u + ux.u").await;
     assert_eq!(rows(&c, "SELECT id, u FROM ux ORDER BY id").await, ["1|0.33333333333333333333", "2|9"] as [&str; 2], "SELECT id, u FROM ux ORDER BY id");
 }
+
+/// An average PostgreSQL gives more than 38 places with a nonzero digit past
+/// them is refused (0A000), as `n / 2` is, by the aggregate, the window
+/// function, and on the way into a column (INSERT … SELECT, UPDATE SET
+/// (SELECT avg)), which store nothing. It was rounded to 38 places in
+/// silence. PostgreSQL 17 gives 0.000…0015000000000000000000 (56 places) for
+/// the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_average_past_38_places_is_refused() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE ar (id INT PRIMARY KEY, n NUMERIC, g INT)").await;
+    run(
+        &c,
+        "INSERT INTO ar VALUES (1, 0.00000000000000000000000000000000000001, 1), \
+         (2, 0.00000000000000000000000000000000000002, 1), (3, 0.1, 2), (4, 0.2, 2)",
+    )
+    .await;
+    for sql in [
+        "SELECT avg(n) FROM ar WHERE id IN (1, 2)",
+        "SELECT g, avg(n) FROM ar GROUP BY g ORDER BY g",
+        "SELECT avg(n) OVER () FROM ar WHERE id IN (1, 2) ORDER BY id",
+        "SELECT id, avg(n) OVER (PARTITION BY g) FROM ar ORDER BY id",
+    ] {
+        assert_eq!(sqlstate(&c, sql).await, "0A000", "{sql}");
+    }
+    // Within 38 places, PostgreSQL 17's values: its own scale for the second
+    // is 38, so it rounds there too.
+    assert_eq!(rows(&c, "SELECT avg(n) FROM ar WHERE id IN (1, 3)").await, ["0.05000000000000000000000000000000000001"]);
+    assert_eq!(rows(&c, "SELECT avg(n) FROM ar WHERE g = 2").await, ["0.15000000000000000000"]);
+    assert_eq!(rows(&c, "SELECT avg(n) OVER () FROM ar WHERE id = 3").await, ["0.10000000000000000000"]);
+    // Past 38 places with only zeros there: given at 38. PostgreSQL 17 shows
+    // the same value with 18 more zeros (0.000…0003000000000000000000).
+    run(&c, "CREATE TABLE ar3 (id INT PRIMARY KEY, n NUMERIC)").await;
+    run(
+        &c,
+        "INSERT INTO ar3 VALUES (1, 0.00000000000000000000000000000000000002), \
+         (2, 0.00000000000000000000000000000000000004)",
+    )
+    .await;
+    assert_eq!(rows(&c, "SELECT avg(n) FROM ar3").await, ["0.00000000000000000000000000000000000003"]);
+    run(&c, "CREATE TABLE ar2 (id INT PRIMARY KEY, n NUMERIC)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO ar2 SELECT 1, avg(n) FROM ar WHERE id IN (1, 2)").await, "0A000");
+    run(&c, "INSERT INTO ar2 VALUES (2, 7)").await;
+    assert_eq!(
+        sqlstate(&c, "UPDATE ar2 SET n = (SELECT avg(n) FROM ar WHERE id IN (1, 2)) WHERE id = 2").await,
+        "0A000"
+    );
+    run(&c, "INSERT INTO ar2 SELECT 3, avg(n) FROM ar WHERE g = 2").await;
+    assert_eq!(rows(&c, "SELECT id, n FROM ar2 ORDER BY id").await, ["2|7", "3|0.15000000000000000000"]);
+}

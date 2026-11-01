@@ -4044,7 +4044,7 @@ pub(crate) fn output_is_wide(expr: &Expr) -> bool {
 /// [`pg_numeric`]'s refusal of a value it cannot carry exactly: more places
 /// than 38 with digits there, or more digits than an i128 holds. PostgreSQL
 /// computes it; cut to the engine's nine places it was answered wrong.
-const PAST_38_DIGITS: &str = "the value of a NUMERIC expression needs more digits than the 38 this engine carries \
+pub(crate) const PAST_38_DIGITS: &str = "the value of a NUMERIC expression needs more digits than the 38 this engine carries \
      exactly (not supported)";
 
 /// Whether `expr` is integer-typed, as [`static_type`] would say, in one walk:

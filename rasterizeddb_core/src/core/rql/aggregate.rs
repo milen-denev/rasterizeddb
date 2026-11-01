@@ -1194,10 +1194,18 @@ impl Acc {
         if f1 <= f2 {
             qweight -= 1;
         }
-        let rscale = (16 - 4 * qweight).max(*dscale as i32).clamp(0, 1000) as u32;
-        let mut rscale = rscale.min(38);
+        let desired = (16 - 4 * qweight).max(*dscale as i32).clamp(0, 1000) as u32;
+        let mut rscale = desired.min(38);
         loop {
             if let Some(v) = div_at_scale(*total, *n as i128, rscale as i32 - from as i32) {
+                // PostgreSQL's scale is past what this engine carries (38
+                // places, or fewer where the quotient overflows there): the
+                // value at the scale it can carry stands only when nothing
+                // nonzero lies past it. Rounded there, avg(1e-38, 2e-38) was
+                // stored as 2e-38 for 1.5e-38.
+                if rscale < desired && !div_is_exact(*total, *n as i128, rscale as i32 - from as i32) {
+                    return Err(crate::core::rql::expr::PAST_38_DIGITS.to_string());
+                }
                 return Ok(Some((v, rscale)));
             }
             if rscale == 0 {
@@ -1319,6 +1327,29 @@ fn nbase_lead(m: u128, scale: u32) -> (i32, u32) {
 /// A positive shift is long division one decimal digit at a time, so no
 /// intermediate is wider than `10 * b`; a negative one divides by
 /// `b * 10^-shift` directly.
+/// Whether `a / b` at `shift` more decimal places (fewer when negative) is
+/// exact, nothing nonzero past them: the remainder of `div_at_scale`'s long
+/// division. An overflow is not exact.
+fn div_is_exact(a: i128, b: i128, shift: i32) -> bool {
+    let magnitude = a.unsigned_abs();
+    let b = b.unsigned_abs();
+    if b == 0 {
+        return false;
+    }
+    if shift >= 0 {
+        let mut r = magnitude % b;
+        for _ in 0..shift {
+            r = (r * 10) % b;
+        }
+        r == 0
+    } else {
+        match 10u128.checked_pow((-shift) as u32).and_then(|p| b.checked_mul(p)) {
+            Some(d) => magnitude % d == 0,
+            None => magnitude == 0,
+        }
+    }
+}
+
 fn div_at_scale(a: i128, b: i128, shift: i32) -> Option<i128> {
     let negative = a < 0;
     let magnitude = a.unsigned_abs();
