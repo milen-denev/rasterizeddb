@@ -290,7 +290,11 @@ fn is_integer_type(db_type: &DbType) -> bool {
 /// TABLE` or `ADD COLUMN` used to take a value from `s`, so the table's first
 /// row got 2 — and the declaration has no database whose sequence it could
 /// rightly take one from anyway.
-pub fn validate(expression: &str, db_type: &DbType) -> Result<(), String> {
+///
+/// `own_scale` says the column is an unconstrained NUMERIC in the
+/// seventeen-byte slot, which keeps a default's every decimal place rather
+/// than the sixteen-byte slot's nine.
+pub fn validate(expression: &str, db_type: &DbType, own_scale: bool) -> Result<(), String> {
     let literal = evaluate_in(expression, db_type, None)?;
     // A number column's constant default has to be one the column can hold:
     // `SMALLINT DEFAULT 100000` or `INT DEFAULT 1.5` was accepted here, and
@@ -314,7 +318,12 @@ pub fn validate(expression: &str, db_type: &DbType) -> Result<(), String> {
             | DbType::DECIMAL
     );
     if number && !literal.is_empty() && !literal.eq_ignore_ascii_case("NULL") {
-        let field = crate::core::row::schema::SchemaField::new(String::new(), db_type.clone(), db_type.get_size(), 0, 0, false);
+        let size = if own_scale && *db_type == DbType::DECIMAL {
+            crate::core::value_codec::NUMERIC_OWN_SCALE_SIZE
+        } else {
+            db_type.get_size()
+        };
+        let field = crate::core::row::schema::SchemaField::new(String::new(), db_type.clone(), size, 0, 0, false);
         let encoded = crate::core::rql::lexer_ir::encode_column_value(&literal, &field, &[]);
         let refusal = crate::core::rql::lexer_ir::take_refusal();
         if encoded.is_none_or(|block| block.into_slice().is_empty()) {
@@ -322,7 +331,7 @@ pub fn validate(expression: &str, db_type: &DbType) -> Result<(), String> {
                 "invalid DEFAULT {}: {}",
                 expression.trim(),
                 refusal
-                    .map(|r| r.trim_end_matches(" for column \"\"").to_string())
+                    .map(|r| r.trim_end_matches(" for column \"\"").replace(" column \"\" ", " the column "))
                     .unwrap_or_else(|| crate::core::value_codec::refusal_message(db_type, &literal))
             ));
         }
@@ -618,8 +627,8 @@ mod tests {
     fn validating_a_nextval_default_consumes_nothing() {
         let name = "validate_only_seq";
         let expression = format!("nextval('{}')", name);
-        validate(&expression, &DbType::I64).expect("nextval is understood");
-        validate(&expression, &DbType::I64).expect("nextval is understood");
+        validate(&expression, &DbType::I64, false).expect("nextval is understood");
+        validate(&expression, &DbType::I64, false).expect("nextval is understood");
         assert!(!crate::core::rql::sequence::is_seeded(NO_DB - 1, name));
         assert_eq!(evaluate(&expression, &DbType::I64, NO_DB - 1).unwrap(), "1");
     }

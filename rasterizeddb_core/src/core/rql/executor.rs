@@ -13535,7 +13535,8 @@ async fn execute_alter_table_action(
             // A default is validated before anything is written, so a bad
             // expression fails the statement rather than half of it.
             if let Some(expression) = default.as_deref() {
-                if let Err(e) = crate::core::rql::column_default::validate(expression, &db_type) {
+                let own_scale = db_type == crate::core::db_type::DbType::DECIMAL && modifier.is_none();
+                if let Err(e) = crate::core::rql::column_default::validate(expression, &db_type, own_scale) {
                     return ddl_error(&e);
                 }
                 // A JSON column stores a *document*: its fields become columns

@@ -510,7 +510,14 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
 
             if let Some(expression) = default_expression {
                 if let Err(reason) =
-                    crate::core::rql::column_default::validate(&expression, &data_type)
+                    crate::core::rql::column_default::validate(
+                        &expression,
+                        &data_type,
+                        data_type == DbType::DECIMAL
+                            && !type_modifiers
+                                .iter()
+                                .any(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&name)),
+                    )
                 {
                     rejection.replace(reason);
                     return None;

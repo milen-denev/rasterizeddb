@@ -396,3 +396,13 @@ async fn an_average_past_38_places_is_refused() {
     run(&c, "INSERT INTO ar2 SELECT 3, avg(n) FROM ar WHERE g = 2").await;
     assert_eq!(rows(&c, "SELECT id, n FROM ar2 ORDER BY id").await, ["2|7", "3|0.15000000000000000000"]);
 }
+
+/// A DEFAULT with more than nine places on an unconstrained NUMERIC is accepted and stored whole, as is a DEFAULT 1.50 at its scale. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numeric_default_keeps_its_places() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE d (id INT PRIMARY KEY, v NUMERIC DEFAULT 1.50, w NUMERIC DEFAULT 0.0000000000001)").await;
+    run(&c, "INSERT INTO d (id) VALUES (1)").await;
+    assert_eq!(rows(&c, "SELECT * FROM d").await, ["1|1.50|0.0000000000001"] as [&str; 1], "SELECT * FROM d");
+}
