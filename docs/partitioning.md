@@ -663,6 +663,10 @@ scan-only opens and their upgrades.
 | the idle checkpoint looking at a scan-only instance | survives, as it should: it acts only on a `DIRTY` word (above) |
 | N1: the token released while the instance lives | `an_instance_kept_past_its_close_stays_counted` |
 | the plain-table term ignored | `open_plain_tables_shrink_the_derived_budget` |
+| (review round) the descriptors in use not counted | `the_budget_counts_what_tables_and_partitions_hold` |
+| (review round) the deferred load demoted whenever the word left `Clean` | `an_upgrade_after_a_ticket_without_new_slots_still_loads` |
+| (review round) a proven load never started at a scan-only open | `a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room` |
+| (review round) the descriptor target ignoring the other descriptors in use | `the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit` |
 
 ## Phase 3 P5b-2a as built
 
