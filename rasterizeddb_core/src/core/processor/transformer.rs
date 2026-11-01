@@ -1280,9 +1280,28 @@ impl InSet {
     }
 }
 
+/// What a run's comparisons all read on their left: one column, or one
+/// evaluated operand ([`EvaluatedOperand`], identified by its text).
+#[derive(PartialEq)]
+enum InSetOperand<'a> {
+    Column(usize),
+    Evaluated(&'a EvaluatedOperand),
+}
+
 /// Whether `t` is a `column = constant` (or `<>`) comparison a run can absorb,
-/// and if so its operator (`false` for `=`, `true` for `<>`), column and type.
-fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
+/// and if so its operator (`false` for `=`, `true` for `<>`), left operand and
+/// type.
+///
+/// The left operand may also be an evaluated one yielding a float, which is
+/// how the predicate rewrite asks for PostgreSQL's `numeric = float8` over a
+/// NUMERIC or integer column finer than the double (`predicate_rewrite::
+/// exact_in_floats`: `n::float8 = v1 OR …`). The value it yields is the
+/// comparison's left bytes, and float keys are canonicalised as the
+/// comparison compares them, so one evaluation and one probe answer what the
+/// chain would; a NULL it yields fails the comparison before the set is
+/// asked. Only floats: an evaluated NUMERIC is compared at a scale the set's
+/// bytes are not lifted to.
+fn in_set_member(t: &ColumnTransformer) -> Option<(bool, InSetOperand<'_>, &DbType)> {
     let ColumnTransformerType::ComparerOperation(op) = &t.transformer_type else {
         return None;
     };
@@ -1304,16 +1323,26 @@ fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
         || t.column_2_cast.is_some()
         || t.column_2_scale.is_some()
         || t.column_2.is_none()
-        // An evaluated operand has a placeholder for its bytes, so a run of
-        // `col = <expression>` would be folded into a set of placeholders.
-        || t.column_1_eval.is_some()
+        // An evaluated right operand has a placeholder for its bytes, so a
+        // run of `col = <expression>` would be folded into a set of
+        // placeholders.
         || t.column_2_eval.is_some()
     {
         return None;
     }
-    let column = t.column_1_index?;
     InSetKey::of(&t.column_type)?;
-    Some((negated, column, &t.column_type))
+    let operand = match &t.column_1_eval {
+        Some((operand, as_type))
+            if t.column_1_index.is_none()
+                && matches!(as_type, DbType::F32 | DbType::F64)
+                && *as_type == t.column_type =>
+        {
+            InSetOperand::Evaluated(operand)
+        }
+        Some(_) => return None,
+        None => InSetOperand::Column(t.column_1_index?),
+    };
+    Some((negated, operand, &t.column_type))
 }
 
 /// Replaces every parenthesised run of `col = v1 OR … OR col = vN` (or `col <>
@@ -1330,7 +1359,7 @@ pub fn collapse_in_sets<A: smallvec::Array<Item = ColumnTransformer>>(transforme
     let mut changed = false;
     let mut i = 0usize;
     while i < transformers.len() {
-        let Some((negated, column, db_type)) = in_set_member(&transformers[i]) else {
+        let Some((negated, operand, db_type)) = in_set_member(&transformers[i]) else {
             i += 1;
             continue;
         };
@@ -1346,7 +1375,7 @@ pub fn collapse_in_sets<A: smallvec::Array<Item = ColumnTransformer>>(transforme
             let t = &transformers[j];
             if j > i {
                 match in_set_member(t) {
-                    Some((n, c, ty)) if n == negated && c == column && *ty == db_type => {}
+                    Some((n, c, ty)) if n == negated && c == operand && *ty == db_type => {}
                     _ => break,
                 }
                 if t.group_opens != 0 {

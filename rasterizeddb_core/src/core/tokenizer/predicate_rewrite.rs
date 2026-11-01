@@ -2419,7 +2419,7 @@ pub fn rewrite_scan_where(
     // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
     let expanded = expand_row_value_comparisons(clause)?;
     let lifted = lift_evaluated_operands(&expanded, schema)?;
-    rewrite_where(&lifted, schema)
+    rewrite_where_in(&lifted, schema, true)
 }
 
 /// Whether `text` holds something only the expression evaluator can compute:
@@ -3543,7 +3543,7 @@ fn lift_operand_typed(
 /// refuses: `text = double precision` has no operator (42883). Written as a
 /// number there, `j->>'x' = '0.5'::float8` compared the text with a float and
 /// matched nothing, reporting success.
-fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<Tok>, String> {
+fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Result<Vec<Tok>, String> {
     if !toks.iter().any(|t| matches!(t, Tok::Float { .. })) {
         return Ok(toks);
     }
@@ -3609,7 +3609,7 @@ fn floats_for_the_scan(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> 
             });
         }
     }
-    Ok(exact_columns_against_floats(toks, schema)
+    Ok(exact_columns_against_floats(toks, schema, scan)
         .into_iter()
         .map(|t| match t {
             Tok::Float { number, .. } => Tok::Word(number),
@@ -3690,6 +3690,32 @@ fn first_holding(lo: i128, hi: i128, guess: i128, holds: impl Fn(i128) -> bool) 
     Some(above)
 }
 
+/// [`float_run`] where the column's step is coarser than the double's
+/// spacing at `v`, decided by one conversion; `None` elsewhere.
+fn float_run_coarse(scale: u32, lo: i128, hi: i128, v: f64) -> Option<(Option<i128>, Option<i128>)> {
+    use std::cmp::Ordering;
+    if !v.is_finite() {
+        return None;
+    }
+    let a = v.abs();
+    let spacing = f64::from_bits(a.to_bits() + 1) - a;
+    let step = 10f64.powi(-(scale as i32));
+    if !(spacing.is_finite() && step > 2.0 * spacing) {
+        return None;
+    }
+    // The value nearest `v`, rounded at the column's scale.
+    let c = format!("{:.*}", scale as usize, v).replace('.', "").parse::<i128>().ok()?;
+    if !(lo..=hi).contains(&c) {
+        return None;
+    }
+    let nearest = crate::core::value_codec::format_decimal_scaled(c, scale).parse::<f64>().ok()?;
+    Some(match crate::core::processor::concurrent_processor::pg_float_cmp(nearest, v) {
+        Ordering::Equal => (Some(c), Some(c)),
+        Ordering::Greater => (Some(c), (c > lo).then(|| c - 1)),
+        Ordering::Less => ((c < hi).then(|| c + 1), Some(c)),
+    })
+}
+
 /// The run of an exact column's values (`m × 10^-scale`, `m` in `lo..=hi`)
 /// whose nearest double is `v`: `l`, the first value whose nearest double
 /// is at or above `v` (`None`: no value's is), and `h`, the last at or below
@@ -3701,26 +3727,14 @@ fn first_holding(lo: i128, hi: i128, guess: i128, holds: impl Fn(i128) -> bool) 
 /// the double there (a NUMERIC(38,20) 0.1, a bigint past 2^52) is searched.
 fn float_run(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Option<i128>) {
     use std::cmp::Ordering;
+    if let Some(run) = float_run_coarse(scale, lo, hi, v) {
+        return run;
+    }
     let nearest = |m: i128| -> f64 {
         crate::core::value_codec::format_decimal_scaled(m, scale).parse::<f64>().unwrap_or(f64::NAN)
     };
     let cmp = |m: i128| crate::core::processor::concurrent_processor::pg_float_cmp(nearest(m), v);
     let fixed = || format!("{:.*}", scale as usize, v).replace('.', "").parse::<i128>().ok();
-    if v.is_finite() {
-        let a = v.abs();
-        let spacing = f64::from_bits(a.to_bits() + 1) - a;
-        let step = 10f64.powi(-(scale as i32));
-        if spacing.is_finite() && step > 2.0 * spacing {
-            // The value nearest `v`, rounded at the column's scale.
-            if let Some(c) = fixed().filter(|c| (lo..=hi).contains(c)) {
-                return match cmp(c) {
-                    Ordering::Equal => (Some(c), Some(c)),
-                    Ordering::Greater => (Some(c), (c > lo).then(|| c - 1)),
-                    Ordering::Less => ((c < hi).then(|| c + 1), Some(c)),
-                };
-            }
-        }
-    }
     let guess = if v.is_nan() || v == f64::INFINITY {
         hi
     } else if v == f64::NEG_INFINITY {
@@ -3798,13 +3812,32 @@ fn exact_against_float(column: &(String, u32, i128, i128), op: &str, number: &st
 /// written as its own pair of comparisons made a list of 500 floats a chain
 /// of 500 ORs every row walked. A NULL stays in the IN list, so `IN` without
 /// a match is unknown and `NOT IN` is never true, as PostgreSQL has them.
-fn exact_in_floats(column: &(String, u32, i128, i128), negated: bool, numbers: &[&str], null: bool) -> Option<Vec<Tok>> {
+fn exact_in_floats(
+    column: &(String, u32, i128, i128),
+    negated: bool,
+    numbers: &[&str],
+    null: bool,
+    lifted: impl FnOnce() -> Option<String>,
+) -> Option<Vec<Tok>> {
     let (name, scale, lo, hi) = column;
     let (scale, lo, hi) = (*scale, *lo, *hi);
     let mut singles: Vec<i128> = Vec::new();
     let mut runs: Vec<(i128, i128)> = Vec::new();
+    // The floats finer than the column there, for the scan: compared as
+    // `column::float8 = v`, which the scan answers from one hashed set
+    // (`transformer::collapse_in_sets`), PostgreSQL's comparison itself.
+    let mut fine: Vec<&str> = Vec::new();
+    let mut lifted = Some(lifted);
+    let mut operand: Option<Option<String>> = None;
     for number in numbers {
         let v: f64 = number.parse().ok()?;
+        if float_run_coarse(scale, lo, hi, v).is_none() {
+            let op = operand.get_or_insert_with(|| lifted.take().and_then(|f| f()));
+            if op.is_some() {
+                fine.push(number);
+                continue;
+            }
+        }
         match float_run(scale, lo, hi, v) {
             (Some(l), Some(h)) if l == h => singles.push(l),
             (Some(l), Some(h)) if l < h => runs.push((l, h)),
@@ -3847,6 +3880,19 @@ fn exact_in_floats(column: &(String, u32, i128, i128), negated: bool, numbers: &
         list.push(Tok::RPar);
         parts.push(list);
     }
+    if let (false, Some(Some(operand))) = (fine.is_empty(), &operand) {
+        let mut group = vec![Tok::LPar];
+        for (k, number) in fine.iter().enumerate() {
+            if k > 0 {
+                group.push(word(if negated { "AND" } else { "OR" }));
+            }
+            group.push(Tok::Lifted(operand.clone()));
+            group.push(Tok::Sym((if negated { "<>" } else { "=" }).to_string()));
+            group.push(Tok::Word(number.to_string()));
+        }
+        group.push(Tok::RPar);
+        parts.push(group);
+    }
     for (l, h) in merged {
         let (a, kw, b) = if negated { ("<", "OR", ">") } else { (">=", "AND", "<=") };
         parts.push(vec![
@@ -3880,7 +3926,7 @@ fn exact_in_floats(column: &(String, u32, i128, i128), negated: bool, numbers: &
 /// …)` over an exact column, rewritten by [`exact_against_float`]. Only a
 /// bare column and a bare float qualify: an arithmetic or cast neighbour
 /// makes either an operand of something else, left as it was.
-fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
+fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Vec<Tok> {
     let comparison = |t: Option<&Tok>| -> Option<String> {
         match t {
             Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(op.clone()),
@@ -3962,7 +4008,8 @@ fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                     }
                 }
                 if closed && !numbers.is_empty() {
-                    if let Some(lowered) = exact_in_floats(&column, negated, &numbers, null) {
+                    let lifted = || scan.then(|| lift_operand_typed(&format!("{}::float8", column.0), schema).ok().map(|(text, _)| text)).flatten();
+                    if let Some(lowered) = exact_in_floats(&column, negated, &numbers, null, lifted) {
                         out.extend(lowered);
                         i = j + 2;
                         continue;
@@ -3977,6 +4024,12 @@ fn exact_columns_against_floats(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
 }
 
 pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+    rewrite_where_in(clause, schema, false)
+}
+
+/// [`rewrite_where`]; `scan` when the scan reads the result
+/// ([`rewrite_scan_where`]), which can take a lifted operand.
+fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
@@ -4003,7 +4056,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     // typed column is a compile error rather than a row that does not match.
     let clause = &fold_null_comparisons(clause);
 
-    let toks = floats_for_the_scan(lex(clause)?, schema)?;
+    let toks = floats_for_the_scan(lex(clause)?, schema, scan)?;
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     let mut i = 0usize;
     // Where the comparison currently being read began, as an index into `out`.
@@ -5235,7 +5288,7 @@ mod tests {
         let out = squash(rewrite_where("i * 2 = 5::float8", &schema).unwrap());
         assert!(!out.contains(">="), "{out}");
         let lowered = |sql: &str| {
-            exact_columns_against_floats(lex(sql).unwrap(), &schema)
+            exact_columns_against_floats(lex(sql).unwrap(), &schema, false)
                 .iter()
                 .map(Tok::render)
                 .collect::<Vec<_>>()
@@ -5266,6 +5319,19 @@ mod tests {
             let out = lowered(sql);
             assert!(out.contains(want), "{sql} -> {out}");
         }
+        // For the scan, a float finer than the column there is compared as
+        // the column's double, one lifted operand the scan hashes the floats
+        // against; the coarse ones stay an IN list.
+        let scanned = |sql: &str| exact_columns_against_floats(lex(sql).unwrap(), &schema, true);
+        let toks = scanned("i IN (9007199254740992::float8, 9007199254740994::float8, 5::float8, NULL)");
+        let rendered = toks.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
+        let lifted = toks.iter().filter(|t| matches!(t, Tok::Lifted(_))).count();
+        assert_eq!(lifted, 2, "{rendered}");
+        assert!(rendered.contains("i IN ( 5 , NULL )") && !rendered.contains(">="), "{rendered}");
+        assert!(rendered.contains("= 9.007199254740992e+15 OR") && rendered.contains("= 9.007199254740994e+15 )"), "{rendered}");
+        let negated = scanned("i NOT IN (9007199254740992::float8, 9007199254740994::float8)");
+        let rendered = negated.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
+        assert!(rendered.contains("<> 9.007199254740992e+15 AND") && !rendered.contains(" IN "), "{rendered}");
     }
 
     #[test]
