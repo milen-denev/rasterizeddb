@@ -4742,11 +4742,7 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
                         &field.name,
                     )
                 } else {
-                    format!(
-                        "cannot convert {} to numeric for column \"{}\"",
-                        crate::core::value_codec::pg_float8_text(v),
-                        field.name
-                    )
+                    crate::core::value_codec::numeric_special_refusal(v, field.scale.is_some())
                 });
             }
         }

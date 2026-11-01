@@ -457,11 +457,8 @@ pub fn literal(mapping: &Mapping, value: Option<&str>) -> Result<String, String>
 
         Conversion::Decimal => {
             if matches!(value, "NaN" | "Infinity" | "-Infinity") {
-                return Err(format!(
-                    "NUMERIC '{}' has no representation here: this engine's DECIMAL is an exact \
-                     fixed-point number and has no not-a-number or infinity",
-                    value
-                ));
+                // The engine's one refusal of them, on every path in.
+                return Err(format!("NUMERIC '{}': {}", value, value_codec::NUMERIC_SPECIAL_REFUSAL));
             }
             // An unconstrained `numeric` is created here as a column that keeps
             // each value at its own scale (`value_codec::own_scale_cell`): any

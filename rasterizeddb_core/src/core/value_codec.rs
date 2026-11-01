@@ -2448,6 +2448,32 @@ pub fn old_numeric_refusal(value: &str, column: &str) -> String {
     )
 }
 
+/// The refusal of NaN and the infinities as a NUMERIC: PostgreSQL stores
+/// them (and refuses an infinity in a NUMERIC(p, s), 22003); this engine
+/// has no NUMERIC NaN or infinity, and refuses both on every path in
+/// (0A000), never stores a number for them. A known difference.
+pub const NUMERIC_SPECIAL_REFUSAL: &str = "numeric NaN and infinity are not supported";
+
+/// NaN or an infinity, when `text` spells one as `numeric_in` and
+/// `float8in` read them (`NaN`, `Infinity`, `-inf`, any case).
+pub fn numeric_special(text: &str) -> Option<f64> {
+    let t = text.trim().trim_matches('\'').trim();
+    if !t.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|v| !v.is_finite())
+}
+
+/// [`NUMERIC_SPECIAL_REFUSAL`], or PostgreSQL's own 22003 for an infinity
+/// bound for a NUMERIC(p, s), which PostgreSQL refuses too.
+pub fn numeric_special_refusal(v: f64, constrained: bool) -> String {
+    if v.is_infinite() && constrained {
+        "numeric field overflow: a field with a declared precision and scale cannot hold an infinite value".to_string()
+    } else {
+        NUMERIC_SPECIAL_REFUSAL.to_string()
+    }
+}
+
 /// The refusal of a value past what a column that keeps each value's own
 /// scale holds: 38 digits, 38 places.
 pub fn own_scale_refusal(value: &str, column: &str) -> String {
@@ -2462,6 +2488,11 @@ pub fn own_scale_refusal(value: &str, column: &str) -> String {
 /// other with the column after it.
 pub fn refusal_for_column(field: &crate::core::row::schema::SchemaField, value: &str) -> String {
     let text = value.trim().trim_matches('\'').trim();
+    if field.db_type == crate::core::db_type::DbType::DECIMAL {
+        if let Some(v) = numeric_special(text) {
+            return numeric_special_refusal(v, field.scale.is_some());
+        }
+    }
     if keeps_own_scale(field) && text.parse::<f64>().is_ok() {
         return own_scale_refusal(&double_quoted(text), &field.name);
     }
@@ -2659,6 +2690,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             Ok(_) => format!("{} is out of range for type {}", double_quoted(text.trim()), name),
             Err(_) => syntax(),
         },
+        DbType::DECIMAL if numeric_special(text).is_some() => NUMERIC_SPECIAL_REFUSAL.to_string(),
         DbType::DECIMAL => match text.trim().parse::<f64>() {
             // More places than the nine an unconstrained `NUMERIC` keeps here
             // (`INSERT INTO un SELECT a + 0.0000000000001` from a

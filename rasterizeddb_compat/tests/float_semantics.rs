@@ -109,3 +109,57 @@ async fn a_scalar_subquery_item_is_named_after_its_inner_item() {
         assert_eq!(labels(&c, sql).await, want, "{sql}");
     }
 }
+
+/// NaN and the infinities as a NUMERIC: PostgreSQL 17 stores them; this
+/// engine has no NUMERIC NaN or infinity and refuses them on every path in,
+/// 0A000 "numeric NaN and infinity are not supported" (an infinity into a
+/// NUMERIC(p, s) keeps PostgreSQL's own 22003), and stores nothing. They used
+/// to be refused with four different errors, two of them XX000. A known
+/// difference (docs/postgres-compatibility.md).
+#[tokio::test(flavor = "multi_thread")]
+async fn numeric_nan_and_infinity_are_refused_on_every_path() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE src (id INT PRIMARY KEY, f FLOAT8, r REAL, t TEXT)").await;
+    run(&c, "INSERT INTO src VALUES (1, 'NaN', 'Infinity', 'NaN'), (2, '-Infinity', 'NaN', 'Infinity')").await;
+    run(&c, "CREATE TABLE nn (id INT PRIMARY KEY, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO nn VALUES (40, 1, 1)").await;
+    let refused = "numeric NaN and infinity are not supported";
+    for sql in [
+        "INSERT INTO nn VALUES (1, 'NaN', 0)",
+        "INSERT INTO nn VALUES (2, 'Infinity', 0)",
+        "INSERT INTO nn VALUES (3, '-inf', 0)",
+        "INSERT INTO nn VALUES (4, 0, 'NaN')",
+        "INSERT INTO nn VALUES (6, 'NaN'::numeric, 0)",
+        "INSERT INTO nn VALUES (7, 'NaN'::float8, 0)",
+        "INSERT INTO nn VALUES (8, 'Infinity'::real, 0)",
+        "INSERT INTO nn SELECT id + 10, f, 0 FROM src WHERE id = 1",
+        "INSERT INTO nn SELECT id + 20, r, 0 FROM src WHERE id = 1",
+        "UPDATE nn SET n = 'NaN' WHERE id = 40",
+        "UPDATE nn SET n = 'NaN'::float8 WHERE id = 40",
+        "UPDATE nn SET n = (SELECT f FROM src WHERE id = 2) WHERE id = 40",
+        "UPDATE nn SET n = src.f FROM src WHERE src.id = 1 AND nn.id = 40",
+        "UPDATE nn SET n = src.t::numeric FROM src WHERE src.id = 2 AND nn.id = 40",
+        "INSERT INTO nn VALUES (40, 'NaN', 0) ON CONFLICT (id) DO UPDATE SET n = excluded.n",
+        "INSERT INTO nn VALUES (40, 0, 0) ON CONFLICT (id) DO UPDATE SET n = 'Infinity'",
+        "CREATE TABLE nd (id INT PRIMARY KEY, n NUMERIC DEFAULT 'NaN')",
+    ] {
+        assert_eq!(sqlstate(&c, sql).await, "0A000", "{sql}");
+        assert!(error_text(&c, sql).await.ends_with(refused), "{sql}");
+    }
+    // An infinity into a NUMERIC(p, s): PostgreSQL refuses it too, 22003.
+    for sql in [
+        "INSERT INTO nn VALUES (5, 0, 'Infinity')",
+        "INSERT INTO nn VALUES (9, 0, '-Infinity'::float8)",
+        "UPDATE nn SET p = 'Infinity'::float8 WHERE id = 40",
+    ] {
+        assert_eq!(sqlstate(&c, sql).await, "22003", "{sql}");
+    }
+    // A generated column computed from a float NaN.
+    run(&c, "CREATE TABLE ng (id INT PRIMARY KEY, f FLOAT8, n NUMERIC GENERATED ALWAYS AS (f) STORED)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO ng (id, f) VALUES (1, 'NaN')").await, "0A000");
+    run(&c, "INSERT INTO ng (id, f) VALUES (2, 1.5)").await;
+    assert_eq!(sqlstate(&c, "UPDATE ng SET f = 'Infinity' WHERE id = 2").await, "0A000");
+    assert_eq!(rows_n(&c, "SELECT id, n FROM ng ORDER BY id").await, ["2|1.5"]);
+    assert_eq!(rows_n(&c, "SELECT id, n, p FROM nn ORDER BY id").await, ["40|1|1.00"]);
+}

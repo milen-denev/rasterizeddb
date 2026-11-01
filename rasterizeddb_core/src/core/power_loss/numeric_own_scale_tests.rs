@@ -309,6 +309,33 @@ async fn a_restore_fences_each_database_that_needs_it() {
     assert!(!flagged(&root), "the root, with no seventeen-byte field, was fenced");
 }
 
+/// NaN and the infinities into an old (sixteen-byte) unconstrained column are
+/// refused as into every NUMERIC: "numeric NaN and infinity are not
+/// supported", nothing stored, the slot left as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_column_refuses_nan_and_infinity() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale_nan").await.unwrap();
+    db.legacy_numeric_slot.store(true, Ordering::Relaxed);
+    exec(&db, "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    db.legacy_numeric_slot.store(false, Ordering::Relaxed);
+    assert_eq!(slot(&db, "t", "u"), 16);
+    exec(&db, "INSERT INTO t VALUES (1, 2)").await.unwrap();
+    for sql in [
+        "INSERT INTO t VALUES (2, 'NaN')",
+        "INSERT INTO t VALUES (3, 'Infinity'::float8)",
+        "INSERT INTO t VALUES (4, '-Infinity'::real)",
+        "UPDATE t SET u = 'NaN'::numeric WHERE id = 1",
+        "UPDATE t SET u = 'Infinity' WHERE id = 1",
+    ] {
+        let e = exec(&db, sql).await.expect_err(sql);
+        assert!(e.contains("numeric NaN and infinity are not supported"), "{sql}: {e}");
+    }
+    assert_eq!(column(&db, "t").await.iter().map(|(_, v, w)| (v.as_str(), *w)).collect::<Vec<_>>(), [("2", 16)]);
+    close(&dir, db);
+}
+
 /// The rewrite's own points, in the order it reaches them.
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",
