@@ -763,9 +763,52 @@ constant as the run of the column's values that round to it, so an index still
 serves it; in an IN list the floats only one value rounds to are an ordinary
 IN list, and those many values round to (a NUMERIC(38,20) near 0.1, a bigint
 past 2^52) are matched by the column's nearest double against one hashed set. `ORDER BY` over values of mixed numeric types orders
-them at their exact values. Two column references (`WHERE n = f8`) are not yet
-read by the scan (XX000) and a `NaN` or `Infinity` constant against an exact
-column is refused.
+them at their exact values. An IN list mixing floats and plain numbers
+(`w IN ('0.1'::float8, 2.5)`) takes the list's type, float8, so every item is
+compared with the column's nearest double. Two columns (`WHERE n = f8`,
+`n < f4`) are compared the same way, in a `WHERE`, a select list and
+`UPDATE … WHERE`. A `NaN` or infinity constant against an exact column is
+answered as PostgreSQL orders them: NaN above every number, `n < 'Infinity'`
+true for every value.
+
+A `real` column compared with a `double precision` or a decimal constant is
+widened, as PostgreSQL compares it: a `real` 0.1 (0.10000000149011612) is not
+`'0.1'::float8` and is greater than it, and `f4 = 0.1` holds for no row.
+Against a `real` constant (`'0.1'::real`) it is compared as a `real`.
+
+Text compared with a float has no operator in PostgreSQL, and is refused
+here with its 42883, naming the float's type (`text = real` for a `::real`):
+a text, `character` or `character varying` column, a text function's result
+(`upper(t)`), a `CASE` of text and a `||` concatenation, under `=`, `IN` and
+`BETWEEN`, in a `WHERE` and a select list. So are a timestamp, date, time,
+boolean, bytea, inet or interval column against a float. A float parameter
+(`$1` bound as float8 or float4) is that float, as PostgreSQL types it, so a
+text column compared with it is refused too.
+
+`double` alone is not a type name (42704, as in PostgreSQL); `double precision`
+is, in a cast and in a `WHERE`. A DDL column type `DOUBLE` stays accepted, as
+the engine's other extension names (`STRING`, `UBIGINT`) are.
+
+A scalar subquery standing as a whole select item is named after its inner
+item, as PostgreSQL names it: `(SELECT max(x) FROM t)` is `max`, `(SELECT x AS
+y …)` is `y`, an expression is `?column?`.
+
+#### NUMERIC NaN and infinity (a known difference)
+
+PostgreSQL stores `NaN`, `Infinity` and `-Infinity` in a `numeric` (and
+refuses an infinity in a `numeric(p, s)`). This engine's NUMERIC is an exact
+fixed-point number with no NaN or infinity, so every path in refuses them
+with 0A000 "numeric NaN and infinity are not supported", and stores nothing:
+a literal (`'NaN'`, `'-inf'`), `'NaN'::numeric`, a float or real NaN or
+infinity (`'NaN'::float8`, a float column through `INSERT … SELECT` or
+`UPDATE … FROM`), `UPDATE … SET`, `ON CONFLICT … DO UPDATE`, a `DEFAULT`, a
+generated column, and pg-import's per-value conversion, into an unconstrained
+column of either slot and into a `NUMERIC(p, s)`. An infinity bound for a
+`NUMERIC(p, s)` keeps PostgreSQL's own 22003, since PostgreSQL refuses it too.
+Supporting them would mean a sentinel in every NUMERIC consumer (comparison,
+sort, indexes, filters, arithmetic, aggregates, casts, the wire), each of which
+could answer a silent wrong number if it missed one; a float NaN or infinity
+compared with a NUMERIC column is answered as PostgreSQL answers it.
 
 ### Float text
 
