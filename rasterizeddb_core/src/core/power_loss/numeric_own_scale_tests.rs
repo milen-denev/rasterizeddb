@@ -169,6 +169,44 @@ async fn an_old_column_refuses_a_float_it_cannot_keep() {
     close(&dir, db);
 }
 
+/// `ALTER COLUMN u TYPE NUMERIC(p, s)` over a seventeen-byte column converts
+/// every value to sixteen bytes at `s` places and records the declaration
+/// with them: it is enforced, it survives a reopen, and a later rewrite
+/// (ADD COLUMN) and `TYPE NUMERIC` back both work. The declaration used to
+/// be recorded over the old slot, never enforced, and every later rewrite
+/// failed with "holds 17 bytes but its type needs 16".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_retype_of_an_own_scale_column_converts_it() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale_retype").await.unwrap();
+    exec(&db, "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    exec(&db, "INSERT INTO t VALUES (1, 1.005), (2, 123.4), (3, NULL), (4, -2.675)").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 17);
+    exec(&db, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC(5,2)").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 16);
+    let e = exec(&db, "INSERT INTO t VALUES (5, 1000)").await.expect_err("past the precision");
+    assert!(e.contains("numeric field overflow"), "{e}");
+    close(&dir, db);
+    let db = open(&dir, "own_scale_retype").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 16);
+    // `rows` gives them sorted by their bytes.
+    let shown = |r: Vec<Vec<Vec<u8>>>| -> Vec<String> { r.into_iter().map(|r| String::from_utf8_lossy(&r[0]).into_owned()).collect() };
+    assert_eq!(shown(rows(&db, "SELECT u::text FROM t ORDER BY id").await.unwrap()), ["", "-2.68", "1.01", "123.40"]);
+    exec(&db, "ALTER TABLE t ADD COLUMN x BIGINT DEFAULT 7").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 16);
+    exec(&db, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC").await.unwrap();
+    assert_eq!(slot(&db, "t", "u"), 17);
+    exec(&db, "INSERT INTO t VALUES (6, 0.0000000000001, 0)").await.unwrap();
+    close(&dir, db);
+    let db = open(&dir, "own_scale_retype").await.unwrap();
+    assert_eq!(
+        shown(rows(&db, "SELECT u::text FROM t ORDER BY id").await.unwrap()),
+        ["", "-2.68", "0.0000000000001", "1.01", "123.40"]
+    );
+    close(&dir, db);
+}
+
 /// The rewrite's own points, in the order it reaches them.
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",

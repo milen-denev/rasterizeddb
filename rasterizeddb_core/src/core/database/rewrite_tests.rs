@@ -97,7 +97,9 @@ async fn a_failed_metadata_alter_writes_nothing() {
         ("m_drop", "ALTER TABLE m_drop DROP COLUMN d"),
         ("m_ren", "ALTER TABLE m_ren RENAME COLUMN d TO dd"),
         ("m_nn", "ALTER TABLE m_nn ALTER COLUMN d SET NOT NULL"),
-        ("m_num", "ALTER TABLE m_num ALTER COLUMN d TYPE NUMERIC(12,4)"),
+        // A wider precision at the same scale is a record; a scale change
+        // rewrites the rows (`retype_numeric`), which is not this test's.
+        ("m_num", "ALTER TABLE m_num ALTER COLUMN d TYPE NUMERIC(12,2)"),
     ];
     let mut before = Vec::new();
     for (table, sql) in cases {

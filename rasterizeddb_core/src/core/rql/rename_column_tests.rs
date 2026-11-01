@@ -720,7 +720,9 @@ async fn a_column_added_under_a_generated_columns_old_name_is_plain() {
 /// `ALTER COLUMN … TYPE NUMERIC(p, s)` on a NUMERIC column is not a same-type
 /// no-op when the scale moves. It used to report success and keep the old
 /// scale, so every later value was rounded to it. An empty table takes the new
-/// scale; a populated one is refused, since its stored integers are scaled.
+/// scale; a populated one is rewritten, each value rounded to the new scale as
+/// PostgreSQL's cast rounds it (it was refused), and `TYPE NUMERIC` keeps each
+/// value whole at the scale it has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alter_column_type_numeric_scale_is_not_a_no_op() {
     init_globals();
@@ -738,14 +740,6 @@ async fn alter_column_type_numeric_scale_is_not_a_no_op() {
     assert!(ints(&db, "SELECT k FROM n WHERE p = 1.23").await.is_empty());
     // The same declaration again changes nothing, and is accepted.
     ok(&db, "ALTER TABLE n ALTER COLUMN p TYPE NUMERIC(12,4)").await;
-    // The table holds a row now: moving the scale would reinterpret it.
-    assert!(
-        is_error(&run(&db, "ALTER TABLE n ALTER COLUMN p TYPE NUMERIC(12,2)").await),
-        "a scale change on a populated table was accepted"
-    );
-    assert!(is_error(&run(&db, "ALTER TABLE n ALTER COLUMN p TYPE NUMERIC").await));
-    assert_eq!(ints(&db, "SELECT k FROM n WHERE p = 1.2345").await, vec![Some(1)]);
-
     drop(db);
     let db = open(dir.path()).await;
     assert_eq!(
@@ -753,6 +747,14 @@ async fn alter_column_type_numeric_scale_is_not_a_no_op() {
         vec![Some(1)],
         "the new scale did not survive a restart"
     );
+    // The table holds a row now: the scale change rewrites it, rounded.
+    ok(&db, "ALTER TABLE n ALTER COLUMN p TYPE NUMERIC(12,2)").await;
+    assert_eq!(ints(&db, "SELECT k FROM n WHERE p = 1.23").await, vec![Some(1)]);
+    assert!(ints(&db, "SELECT k FROM n WHERE p = 1.2345").await.is_empty());
+    ok(&db, "ALTER TABLE n ALTER COLUMN p TYPE NUMERIC").await;
+    ok(&db, "INSERT INTO n (p, k) VALUES (1.0000000000001, 2)").await;
+    assert_eq!(ints(&db, "SELECT k FROM n WHERE p = 1.23").await, vec![Some(1)]);
+    assert_eq!(ints(&db, "SELECT k FROM n WHERE p = 1.0000000000001").await, vec![Some(2)]);
 }
 
 /// Dropping a constraint is a tombstone written over a logged record. Written

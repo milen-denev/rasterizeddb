@@ -13010,6 +13010,232 @@ fn numeric_modifier_change(
     Ok(Some(entry))
 }
 
+/// How a NUMERIC column stores its values.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NumericForm {
+    /// Seventeen bytes: each value with its own scale (unconstrained, made
+    /// by this build).
+    Own,
+    /// Sixteen bytes of units at `scale` places: a `NUMERIC(precision,
+    /// scale)`, or an unconstrained column made before cells kept their scale
+    /// (`precision` 0, `scale` 9).
+    Scaled { precision: u32, scale: u32 },
+}
+
+fn numeric_form_now(schema: &crate::core::row::schema::TableSchema, field: &crate::core::row::schema::SchemaField) -> NumericForm {
+    if let Some(m) = schema.type_modifiers.iter().find(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&field.name)) {
+        return NumericForm::Scaled { precision: m.precision.into(), scale: m.scale.into() };
+    }
+    if crate::core::value_codec::keeps_own_scale(field) {
+        NumericForm::Own
+    } else {
+        NumericForm::Scaled { precision: 0, scale: crate::core::value_codec::DECIMAL_SCALE }
+    }
+}
+
+/// Whether `ALTER COLUMN … TYPE declared` changes how `field` stores its
+/// values, or narrows what they may be: a rewrite rather than a record.
+fn numeric_retype_needed(
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    declared: &str,
+) -> bool {
+    let wanted = match crate::core::rql::type_modifier::parse_numeric_modifier(declared) {
+        Some(Ok((precision, scale))) => NumericForm::Scaled { precision: precision.into(), scale: scale.into() },
+        // A malformed modifier is refused by `numeric_modifier_change`.
+        Some(Err(_)) => return false,
+        None => NumericForm::Own,
+    };
+    match (numeric_form_now(schema, field), wanted) {
+        (NumericForm::Own, NumericForm::Own) => false,
+        (NumericForm::Scaled { precision: p, scale: s }, NumericForm::Scaled { precision: p2, scale: s2 }) => {
+            s != s2 || p == 0 || p2 < p
+        }
+        _ => true,
+    }
+}
+
+/// One stored NUMERIC value moved from one form to another, as PostgreSQL's
+/// cast moves it: rounded half away from zero to a declared scale, refused
+/// (22003) past the declared precision, kept whole with its display scale
+/// into the slot that keeps each value's own. An old column's value at the
+/// engine's nine places takes the places it needs. Also says whether the
+/// rounding changed the value.
+fn convert_numeric_value(
+    bytes: &[u8],
+    from: NumericForm,
+    to: NumericForm,
+    column: &str,
+) -> Result<(Vec<u8>, bool), String> {
+    use crate::core::rql::pg_numeric::PgNum;
+    let unreadable = || format!("a value of column \"{}\" could not be read for the conversion", column);
+    let value = match from {
+        NumericForm::Own => {
+            let (m, own) = crate::core::value_codec::split_decimal_cell(bytes).ok_or_else(unreadable)?;
+            match own {
+                Some(s) => PgNum::new(m, s).ok_or_else(unreadable)?,
+                None => PgNum::trimmed(m, crate::core::value_codec::DECIMAL_SCALE),
+            }
+        }
+        NumericForm::Scaled { precision, scale } => {
+            let m = i128::from_le_bytes(bytes.try_into().map_err(|_| unreadable())?);
+            if precision == 0 {
+                PgNum::trimmed(m, scale)
+            } else {
+                PgNum::new(m, scale).ok_or_else(unreadable)?
+            }
+        }
+    };
+    match to {
+        NumericForm::Own => Ok((value.to_cell(), false)),
+        NumericForm::Scaled { precision, scale } => {
+            let rounded = value.round_to(scale).ok_or_else(|| {
+                format!("numeric field overflow: {} does not fit column \"{}\"", value.to_text(), column)
+            })?;
+            crate::core::value_codec::check_numeric_precision(rounded.m, precision, scale)?;
+            let changed = rounded.cmp_value(value) != std::cmp::Ordering::Equal;
+            Ok((rounded.m.to_le_bytes().to_vec(), changed))
+        }
+    }
+}
+
+/// `ALTER COLUMN c TYPE NUMERIC[(p, s)]` that changes how `c` stores its
+/// values (`numeric_retype_needed`): every row rewritten (`rewrite_rows`, all
+/// or nothing, crash-safe), each value converted (`convert_numeric_value`),
+/// and the declaration recorded with the rows that obey it, never before.
+///
+/// Refused, leaving the table as it was, when a value does not fit the
+/// precision (22003), when rounding makes two keys of a unique constraint
+/// over the column one (23505, as PostgreSQL's rebuilt index refuses it),
+/// when rounding changes a value a CHECK reads (judging the check again
+/// over the rounded rows is not supported here), and when a generated
+/// column reads the column (PostgreSQL refuses that too).
+async fn retype_numeric(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    declared: &str,
+    reader: TxId,
+) -> Result<(), String> {
+    use crate::core::rql::nullable;
+    let from = numeric_form_now(schema, field);
+    let wanted = match crate::core::rql::type_modifier::parse_numeric_modifier(declared) {
+        Some(Ok(pair)) => Some(pair),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    let to = match wanted {
+        Some((precision, scale)) => NumericForm::Scaled { precision: precision.into(), scale: scale.into() },
+        None => NumericForm::Own,
+    };
+    let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    let reads_column = |text: &str| {
+        crate::core::rql::check::columns_read(text, &names).iter().any(|c| c.eq_ignore_ascii_case(&field.name))
+    };
+    if let Some(g) = schema.generated.iter().find(|g| !g.is_deleted && reads_column(&g.expression)) {
+        return Err(format!(
+            "cannot alter type of a column used by a generated column: column \"{}\" is used by generated \
+             column \"{}\" (not supported)",
+            field.name, g.column
+        ));
+    }
+    let check_reading: Option<String> =
+        schema.checks.iter().find(|c| !c.is_deleted && reads_column(&c.expression)).map(|c| c.name.clone());
+    // Into the seventeen-byte slot, the rewrite marks the database first
+    // (`create_files`).
+    let column = field.name.clone();
+    let table = table_name.to_string();
+    rewrite_rows(database, table_name, reader, move |definition, mut versions| {
+        definition.type_modifiers.retain(|m| !m.column.eq_ignore_ascii_case(&column));
+        if let Some((precision, scale)) = wanted {
+            definition.type_modifiers.push(crate::core::rql::type_modifier::TypeModifier {
+                column: column.clone(),
+                precision,
+                scale,
+                is_deleted: false,
+            });
+        }
+        let is_null = |values: &[(String, crate::memory_pool::MemoryBlock, DbTypeRef)], name: &str| {
+            let flag = nullable::flag_column_name(name);
+            values
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(&flag))
+                .is_some_and(|(_, block, _)| nullable::flag_is_set(block.into_slice()))
+        };
+        let mut rounded_any = false;
+        for version in versions.iter_mut() {
+            let null = is_null(&version.values, &column);
+            for (name, block, _) in version.values.iter_mut() {
+                if !name.eq_ignore_ascii_case(&column) || block.into_slice().is_empty() {
+                    continue;
+                }
+                let (bytes, changed) = convert_numeric_value(block.into_slice(), from, to, &column)?;
+                rounded_any |= changed && !null;
+                let mut converted = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                converted.into_slice_mut().copy_from_slice(&bytes);
+                *block = converted;
+            }
+        }
+        if rounded_any {
+            if let Some(check) = &check_reading {
+                return Err(format!(
+                    "ALTER COLUMN {} TYPE {} rounds values check constraint \"{}\" of relation \"{}\" reads, \
+                     and judging it again over the rounded rows is not supported; drop the check, alter the \
+                     column, and add the check back",
+                    column, declared, check, table
+                ));
+            }
+            // Each unique constraint over the column, over the rows no one has
+            // deleted: two keys the rounding made one are 23505.
+            let mut keys: Vec<Vec<String>> = definition
+                .unique_columns
+                .iter()
+                .chain(definition.primary_key.iter())
+                .filter(|c| c.eq_ignore_ascii_case(&column))
+                .map(|c| vec![c.clone()])
+                .collect();
+            keys.extend(
+                definition
+                    .unique_keys
+                    .iter()
+                    .filter(|k| !k.is_deleted && k.columns.iter().any(|c| c.eq_ignore_ascii_case(&column)))
+                    .map(|k| k.columns.clone()),
+            );
+            for key in keys {
+                let mut seen = std::collections::HashSet::new();
+                for version in versions.iter().filter(|v| v.xmax == crate::core::mvcc::transaction::NO_TX) {
+                    if key.iter().any(|c| is_null(&version.values, c)) {
+                        continue;
+                    }
+                    let tuple: Option<Vec<Vec<u8>>> = key
+                        .iter()
+                        .map(|c| {
+                            version
+                                .values
+                                .iter()
+                                .find(|(n, _, _)| n.eq_ignore_ascii_case(c))
+                                .map(|(_, block, _)| block.into_slice().to_vec())
+                        })
+                        .collect();
+                    if let Some(tuple) = tuple {
+                        if !seen.insert(tuple) {
+                            return Err(format!(
+                                "could not create unique index on \"{}\" ({}): duplicate key value, two rows \
+                                 hold one key under the new type",
+                                table,
+                                key.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(versions)
+    })
+    .await
+}
+
 /// `expression` with every reference to column `from` spelled `to` instead.
 ///
 /// For the stored text of a `CHECK` or a generation expression, which names
@@ -14529,6 +14755,24 @@ async fn execute_alter_table_action(
                             && crate::core::rql::type_modifier::parse_numeric_modifier(&type_tokens.join(" ")).is_none() =>
                     {
                         match rewrite_rows(&database, &plan.table_name, tx, |_, versions| Ok(versions)).await {
+                            Ok(()) => ddl_ok(0),
+                            Err(e) => ddl_error(&e),
+                        }
+                    }
+                    // A NUMERIC column whose stored form the new declaration
+                    // changes: into or out of the slot that keeps each value's
+                    // own scale, to another scale, or to a narrower precision.
+                    // Every value is converted as PostgreSQL's cast converts
+                    // it (rounded to the scale, 22003 past the precision),
+                    // all or nothing. A NUMERIC(p, s) over a seventeen-byte
+                    // column used to be recorded without converting, so it
+                    // was never enforced and every later rewrite failed.
+                    Ok((db_type, _))
+                        if db_type == field.literal_type()
+                            && field.db_type == crate::core::db_type::DbType::DECIMAL
+                            && numeric_retype_needed(&schema, &field, &type_tokens.join(" ")) =>
+                    {
+                        match retype_numeric(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), tx).await {
                             Ok(()) => ddl_ok(0),
                             Err(e) => ddl_error(&e),
                         }

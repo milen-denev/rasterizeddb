@@ -506,3 +506,57 @@ async fn a_numeric_default_fills_existing_rows() {
     run(&c, "ALTER TABLE t ADD COLUMN w NUMERIC DEFAULT 0.0000000000001").await;
     assert_eq!(rows(&c, "SELECT * FROM t ORDER BY id").await, ["1|1.005|1.5|0.0000000000001", "2|123.4|1.5|0.0000000000001", "3||1.5|0.0000000000001", "4|-2.675|1.5|0.0000000000001", "5|0.0000000001|1.5|0.0000000000001"] as [&str; 5], "SELECT * FROM t ORDER BY id");
 }
+
+/// ALTER COLUMN … TYPE NUMERIC(p, s) over an unconstrained column and back: rounded as the cast rounds, 22003 past the precision, 23505 when two keys become one, the rows obey the new declaration, and a later rewrite (ADD COLUMN) keeps working. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_between_numeric_forms_converts_every_row() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE t (id INT PRIMARY KEY, u NUMERIC)").await;
+    run(&c, "INSERT INTO t VALUES (1, 1.005), (2, 123.4), (3, NULL), (4, -2.675), (5, 0.0000000001)").await;
+    run(&c, "ALTER TABLE t ADD COLUMN v NUMERIC DEFAULT 1.5").await;
+    run(&c, "ALTER TABLE t ADD COLUMN w NUMERIC DEFAULT 0.0000000000001").await;
+    assert_eq!(rows(&c, "SELECT * FROM t ORDER BY id").await, ["1|1.005|1.5|0.0000000000001", "2|123.4|1.5|0.0000000000001", "3||1.5|0.0000000000001", "4|-2.675|1.5|0.0000000000001", "5|0.0000000001|1.5|0.0000000000001"] as [&str; 5], "SELECT * FROM t ORDER BY id");
+    run(&c, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC(5,2)").await;
+    assert_eq!(rows(&c, "SELECT id, u FROM t ORDER BY id").await, ["1|1.01", "2|123.40", "3|", "4|-2.68", "5|0.00"] as [&str; 5], "SELECT id, u FROM t ORDER BY id");
+    run(&c, "INSERT INTO t (id, u) VALUES (6, 1.234)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO t (id, u) VALUES (7, 1000)").await, "22003");
+    assert_eq!(rows(&c, "SELECT id, u FROM t WHERE u > 1 ORDER BY id").await, ["1|1.01", "2|123.40", "6|1.23"] as [&str; 3], "SELECT id, u FROM t WHERE u > 1 ORDER BY id");
+    run(&c, "ALTER TABLE t ADD COLUMN x INT DEFAULT 7").await;
+    assert_eq!(rows(&c, "SELECT id, u, x FROM t ORDER BY id").await, ["1|1.01|7", "2|123.40|7", "3||7", "4|-2.68|7", "5|0.00|7", "6|1.23|7"] as [&str; 6], "SELECT id, u, x FROM t ORDER BY id");
+    assert_eq!(sqlstate(&c, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC(3,1)").await, "22003");
+    run(&c, "ALTER TABLE t ALTER COLUMN u TYPE NUMERIC").await;
+    run(&c, "INSERT INTO t (id, u) VALUES (8, 1.0000000000001)").await;
+    assert_eq!(rows(&c, "SELECT id, u FROM t ORDER BY id").await, ["1|1.01", "2|123.40", "3|", "4|-2.68", "5|0.00", "6|1.23", "8|1.0000000000001"] as [&str; 7], "SELECT id, u FROM t ORDER BY id");
+    run(&c, "ALTER TABLE t ALTER COLUMN v TYPE NUMERIC(4,3)").await;
+    assert_eq!(rows(&c, "SELECT DISTINCT v FROM t").await, ["1.500"] as [&str; 1], "SELECT DISTINCT v FROM t");
+    run(&c, "CREATE TABLE q (id INT PRIMARY KEY, u NUMERIC UNIQUE)").await;
+    run(&c, "INSERT INTO q VALUES (1, 1.001), (2, 1.002)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE q ALTER COLUMN u TYPE NUMERIC(5,2)").await, "23505");
+    assert_eq!(rows(&c, "SELECT * FROM q ORDER BY id").await, ["1|1.001", "2|1.002"] as [&str; 2], "SELECT * FROM q ORDER BY id");
+    run(&c, "CREATE TABLE e (id INT PRIMARY KEY, u NUMERIC(6,2))").await;
+    run(&c, "ALTER TABLE e ALTER COLUMN u TYPE NUMERIC").await;
+    run(&c, "INSERT INTO e VALUES (1, 1.00000000001)").await;
+    assert_eq!(rows(&c, "SELECT * FROM e").await, ["1|1.00000000001"] as [&str; 1], "SELECT * FROM e");
+}
+
+/// A retype that rounds a value a CHECK reads is refused (judging the check
+/// again is not supported here) and leaves the table as it was, and so is a
+/// retype of a column a generated column reads (PostgreSQL refuses that
+/// too). One that rounds nothing keeps the check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retype_that_rounds_what_a_check_reads_is_refused() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE ck (id INT PRIMARY KEY, u NUMERIC CHECK (u <> 1.01))").await;
+    run(&c, "INSERT INTO ck VALUES (1, 1.009)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(4,2)").await, "0A000");
+    assert_eq!(rows(&c, "SELECT * FROM ck").await, ["1|1.009"]);
+    run(&c, "ALTER TABLE ck ALTER COLUMN u TYPE NUMERIC(6,3)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO ck VALUES (2, 1.01)").await, "23514");
+    assert_eq!(rows(&c, "SELECT * FROM ck").await, ["1|1.009"]);
+    run(&c, "CREATE TABLE gc (id INT PRIMARY KEY, u NUMERIC, g NUMERIC GENERATED ALWAYS AS (u * 2) STORED)").await;
+    run(&c, "INSERT INTO gc (id, u) VALUES (1, 1.25)").await;
+    assert_eq!(sqlstate(&c, "ALTER TABLE gc ALTER COLUMN u TYPE NUMERIC(4,1)").await, "0A000");
+    assert_eq!(rows(&c, "SELECT * FROM gc").await, ["1|1.25|2.50"]);
+}
