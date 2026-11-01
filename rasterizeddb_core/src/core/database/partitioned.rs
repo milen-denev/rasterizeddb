@@ -534,6 +534,13 @@ impl Database {
             .filter(|c| !ct.type_modifiers.iter().any(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&c.name)))
             .map(|c| c.name.clone())
             .collect();
+        // The slot every earlier build wrote, for tests of such tables.
+        #[cfg(test)]
+        let own_scale = if self.legacy_numeric_slot.load(std::sync::atomic::Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            own_scale
+        };
         if !own_scale.is_empty() {
             self.require_numeric_own_scale()?;
         }

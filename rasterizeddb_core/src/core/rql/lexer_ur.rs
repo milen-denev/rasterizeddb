@@ -183,13 +183,10 @@ fn encode_assignment(
     // PostgreSQL's reason, from which the wire layer derives its SQLSTATE.
     // A `timestamp` column's literal keeps its wall-clock time.
     let literal_type = crate::core::rql::lexer_ir::literal_type_for(trimmed, field);
-    let encoded = value_to_mb(trimmed, &literal_type).ok_or_else(|| {
-        format!(
-            "{} for column \"{}\"",
-            crate::core::value_codec::refusal_message(&field.db_type, trimmed),
-            field.name
-        )
-    })?;
+    // `refusal_for_column`: an unconstrained NUMERIC's refusal names the
+    // limit its slot has, and an old one's carries the conversion hint.
+    let encoded = value_to_mb(trimmed, &literal_type)
+        .ok_or_else(|| crate::core::value_codec::refusal_for_column(field, trimmed))?;
 
     if field.db_type == DbType::DECIMAL
         && encoded.into_slice().is_empty()

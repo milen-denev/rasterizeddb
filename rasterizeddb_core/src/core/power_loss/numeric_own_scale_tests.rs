@@ -260,6 +260,32 @@ async fn an_open_fences_a_numeric_column_found_without_its_flag() {
     close(&dir, db);
 }
 
+/// A partitioned table made with the old slot (the test switch reaches its
+/// CREATE too): sixteen bytes at nine places, the old refusal with its hint,
+/// and no fence, across a reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_partitioned_column_keeps_its_slot_and_refusal() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale_partitioned").await.unwrap();
+    db.legacy_numeric_slot.store(true, Ordering::Relaxed);
+    exec(&db, "CREATE TABLE p (id BIGINT NOT NULL, u NUMERIC) PARTITION BY HASH (id) PARTITIONS 2").await.unwrap();
+    db.legacy_numeric_slot.store(false, Ordering::Relaxed);
+    assert_eq!(any_slot(&db, "p", "u"), 16);
+    assert!(!flagged(&dir));
+    exec(&db, "INSERT INTO p (id, u) VALUES (1, 1.5), (2, 0.000000001), (3, 2.0 / 3)").await.expect_err("past nine places");
+    exec(&db, "INSERT INTO p (id, u) VALUES (1, 1.5), (2, 0.000000001)").await.unwrap();
+    let e = exec(&db, "UPDATE p SET u = 0.0000000001 WHERE id = 1").await.expect_err("past nine places");
+    assert!(e.contains("ALTER TABLE … ALTER COLUMN \"u\" TYPE NUMERIC"), "{e}");
+    close(&dir, db);
+    let db = open(&dir, "own_scale_partitioned").await.unwrap();
+    assert_eq!(any_slot(&db, "p", "u"), 16);
+    assert!(!flagged(&dir));
+    let got: Vec<String> = rows(&db, "SELECT u::text FROM p").await.unwrap().into_iter().map(|r| String::from_utf8_lossy(&r[0]).into_owned()).collect();
+    assert_eq!(got, ["0.000000001", "1.5"]);
+    close(&dir, db);
+}
+
 /// The rewrite's own points, in the order it reaches them.
 const POINTS: &[&str] = &[
     "test.rewrite.after_backup",
