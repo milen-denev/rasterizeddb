@@ -6066,6 +6066,24 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             let Value::Data { bytes, .. } = eval(value, row, schema)? else {
                 return Ok(Value::Null);
             };
+            // A cell that keeps its own scale (an unconstrained column's
+            // seventeen bytes): rounded from its own digits. Read as sixteen
+            // bytes it failed `WHERE u::numeric(4,2) = 1.01` with "could not
+            // be evaluated".
+            if bytes.len() == 17 {
+                let (m, own) = crate::core::value_codec::split_decimal_cell(&bytes)
+                    .ok_or_else(|| "a numeric could not be read".to_string())?;
+                let v = crate::core::rql::pg_numeric::PgNum::new(m, own.unwrap_or(DECIMAL_SCALE))
+                    .ok_or_else(|| "a numeric could not be read".to_string())?;
+                let rounded = v.round_to(*scale).ok_or_else(|| "value overflows numeric format".to_string())?;
+                crate::core::value_codec::check_numeric_precision(rounded.m, *precision, *scale)?;
+                if *scale > DECIMAL_SCALE {
+                    return Ok(Value::Data { bytes: rounded.to_cell(), db_type: DbType::DECIMAL });
+                }
+                let lifted = rescale_decimal(rounded.m, *scale, DECIMAL_SCALE)
+                    .ok_or_else(|| "value overflows numeric format".to_string())?;
+                return Ok(Value::Data { bytes: lifted.to_le_bytes().to_vec(), db_type: DbType::DECIMAL });
+            }
             let raw = i128::from_le_bytes(
                 bytes.as_slice().try_into().map_err(|_| "a numeric could not be read".to_string())?,
             );

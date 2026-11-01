@@ -560,3 +560,17 @@ async fn a_retype_that_rounds_what_a_check_reads_is_refused() {
     assert_eq!(sqlstate(&c, "ALTER TABLE gc ALTER COLUMN u TYPE NUMERIC(4,1)").await, "0A000");
     assert_eq!(rows(&c, "SELECT * FROM gc").await, ["1|1.25|2.50"]);
 }
+
+/// A cast to NUMERIC(p, s) of an unconstrained column in WHERE, a CHECK and SET rounds the stored value. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_numeric_p_s_of_an_own_scale_column() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE ck (id INT PRIMARY KEY, u NUMERIC CHECK (u::numeric(4,2) <> 1.01))").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO ck VALUES (1, 1.009)").await, "23514");
+    run(&c, "INSERT INTO ck VALUES (2, 2.5), (3, NULL), (4, -1.005)").await;
+    assert_eq!(rows(&c, "SELECT id FROM ck WHERE u::numeric(4,2) = 2.5").await, ["2"] as [&str; 1], "SELECT id FROM ck WHERE u::numeric(4,2) = 2.5");
+    assert_eq!(rows(&c, "SELECT id FROM ck WHERE u::numeric(3,1) < 0").await, ["4"] as [&str; 1], "SELECT id FROM ck WHERE u::numeric(3,1) < 0");
+    run(&c, "UPDATE ck SET u = u::numeric(4,1) WHERE id = 4").await;
+    assert_eq!(rows(&c, "SELECT * FROM ck ORDER BY id").await, ["2|2.5", "3|", "4|-1.0"] as [&str; 3], "SELECT * FROM ck ORDER BY id");
+}
