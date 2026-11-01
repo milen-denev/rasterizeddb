@@ -2436,6 +2436,46 @@ pub fn keeps_own_scale(field: &crate::core::row::schema::SchemaField) -> bool {
     field.db_type == crate::core::db_type::DbType::DECIMAL && field.size == NUMERIC_OWN_SCALE_SIZE
 }
 
+/// The refusal of a value with a nonzero digit past nine places bound for an
+/// unconstrained NUMERIC column created before such columns kept each
+/// value's scale: what the column keeps, and how to make it keep more.
+/// `value` is the value as shown (`"0.1234567891"`, or `of this expression`).
+pub fn old_numeric_refusal(value: &str, column: &str) -> String {
+    format!(
+        "numeric value {value} has more than the {DECIMAL_SCALE} decimal places column \"{column}\" keeps (not \
+         supported): it was created before an unconstrained NUMERIC kept each value's scale; declare it \
+         NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN \"{column}\" TYPE NUMERIC"
+    )
+}
+
+/// The refusal of a value past what a column that keeps each value's own
+/// scale holds: 38 digits, 38 places.
+pub fn own_scale_refusal(value: &str, column: &str) -> String {
+    format!(
+        "numeric value {value} needs more than the 38 digits or 38 decimal places column \"{column}\" holds \
+         (not supported)"
+    )
+}
+
+/// [`refusal_message`] for a value bound for `field`, naming it: an
+/// unconstrained NUMERIC's own refusal (the limit its format has), every
+/// other with the column after it.
+pub fn refusal_for_column(field: &crate::core::row::schema::SchemaField, value: &str) -> String {
+    let text = value.trim().trim_matches('\'').trim();
+    if keeps_own_scale(field) && text.parse::<f64>().is_ok() {
+        return own_scale_refusal(&double_quoted(text), &field.name);
+    }
+    if field.db_type == crate::core::db_type::DbType::DECIMAL
+        && field.scale.is_none()
+        && text.parse::<f64>().is_ok()
+        && digits_past_scale(text, DECIMAL_SCALE)
+        && !text.contains(['e', 'E'])
+    {
+        return old_numeric_refusal(&double_quoted(text), &field.name);
+    }
+    format!("{} for column \"{}\"", refusal_message(&field.db_type, value), field.name)
+}
+
 /// A written number as the cell of a column that keeps its own scale
 /// ([`NUMERIC_OWN_SCALE_SIZE`]), at the display scale `numeric_in` gives it:
 /// `1.50` is 150 at two places, `1e-10` 1 at ten. `None` for text that is not
@@ -2624,9 +2664,7 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             // (`INSERT INTO un SELECT a + 0.0000000000001` from a
             // NUMERIC(20,12)): no overflow, which 22003 said; a limit.
             Ok(_) if digits_past_scale(text, DECIMAL_SCALE) && !text.contains(['e', 'E']) => format!(
-                "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                 (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
-                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC",
+                "numeric value {} has more than the {} decimal places a NUMERIC keeps here (not supported)",
                 double_quoted(text.trim()),
                 DECIMAL_SCALE
             ),

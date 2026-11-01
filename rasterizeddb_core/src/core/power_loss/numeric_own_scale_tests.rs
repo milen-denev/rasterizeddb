@@ -70,7 +70,8 @@ async fn an_old_unconstrained_column_reads_refuses_and_converts() {
     // It keeps nine places, and says how to keep more.
     for sql in ["UPDATE t SET u = 2.0 / 3 WHERE id = 1", "INSERT INTO t VALUES (5, 0.0000000001, 0)"] {
         let e = exec(&db, sql).await.expect_err(sql);
-        assert!(e.contains("ALTER COLUMN … TYPE NUMERIC"), "{sql}: {e}");
+        assert!(e.contains("ALTER TABLE … ALTER COLUMN \"u\" TYPE NUMERIC"), "{sql}: {e}");
+        assert!(!e.ends_with("for column \"u\""), "the column is named in the hint, not after it: {e}");
     }
     let before = column(&db, "t").await;
     assert_eq!(
@@ -126,6 +127,45 @@ async fn an_old_unconstrained_column_reads_refuses_and_converts() {
     assert_eq!((slot(&db, "t", "u"), slot(&db, "t2", "u"), slot(&db, "t3", "u")), (17, 17, 17));
     let got: Vec<String> = column(&db, "t").await.into_iter().map(|(_, v, _)| v).collect();
     assert_eq!(got, ["0.66666666666666666667", "0.000000001", "0", "123456.789", "0.0000000001"]);
+    close(&dir, db);
+}
+
+/// A float an old column cannot keep at its nine places, or one past the
+/// digits it holds, is refused on every path in, with the old column's hint,
+/// and nothing is stored: INSERT VALUES (a literal and an expression),
+/// INSERT … SELECT, UPDATE SET (a literal, a subquery, a column of UPDATE …
+/// FROM). It was stored as 0. One within nine places is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_column_refuses_a_float_it_cannot_keep() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir, "own_scale_float").await.unwrap();
+    db.legacy_numeric_slot.store(true, Ordering::Relaxed);
+    exec(&db, "CREATE TABLE t (id BIGINT PRIMARY KEY, u NUMERIC)").await.unwrap();
+    db.legacy_numeric_slot.store(false, Ordering::Relaxed);
+    assert_eq!(slot(&db, "t", "u"), 16);
+    exec(&db, "CREATE TABLE fs (id BIGINT PRIMARY KEY, f DOUBLE PRECISION)").await.unwrap();
+    exec(&db, "INSERT INTO fs VALUES (1, 1e-300), (2, 1e-39), (3, 0.5), (4, 1e40)").await.unwrap();
+    exec(&db, "INSERT INTO t VALUES (1, 3), (2, 3)").await.unwrap();
+    for sql in [
+        "INSERT INTO t VALUES (10, '1e-300'::float8)",
+        "INSERT INTO t VALUES (11, '1e-20'::float8 * '1e-20'::float8)",
+        "INSERT INTO t SELECT id + 20, f FROM fs WHERE id = 2",
+        "UPDATE t SET u = '1e-200'::float8 WHERE id = 1",
+        "UPDATE t SET u = (SELECT f FROM fs WHERE id = 1) WHERE id = 1",
+        "UPDATE t SET u = fs.f FROM fs WHERE fs.id = 2 AND t.id = 2",
+    ] {
+        let e = exec(&db, sql).await.expect_err(sql);
+        assert!(e.contains("ALTER COLUMN") && e.contains("TYPE NUMERIC"), "{sql}: {e}");
+    }
+    for sql in ["INSERT INTO t VALUES (12, '1e40'::float8)", "UPDATE t SET u = fs.f FROM fs WHERE fs.id = 4 AND t.id = 2"] {
+        let e = exec(&db, sql).await.expect_err(sql);
+        assert!(e.contains("numeric field overflow") || e.contains("overflow"), "{sql}: {e}");
+    }
+    exec(&db, "UPDATE t SET u = fs.f FROM fs WHERE fs.id = 3 AND t.id = 2").await.unwrap();
+    let got: Vec<(Vec<u8>, String, usize)> = column(&db, "t").await;
+    assert_eq!(got.iter().map(|(_, v, w)| (v.as_str(), *w)).collect::<Vec<_>>(), [("3", 16), ("0.5", 16)]);
+    assert!(!flagged(&dir));
     close(&dir, db);
 }
 

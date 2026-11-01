@@ -3873,14 +3873,35 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
                 None => Ok(Value::Null),
                 // An unconstrained column keeps nine places: a value it cannot
                 // hold exactly is refused, never rounded (`pg_numeric_into`).
-                Some(exact) if target.scale.is_none() && !exact.exact_at(scale) => Err(format!(
-                    "numeric value {} has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                     (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
-                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC for column \"{}\"",
-                    if exact.err == 0.0 { format!("\"{}\"", exact.text()) } else { "of this expression".to_string() },
-                    scale,
-                    target.name
-                )),
+                // A column that keeps each value's own scale takes the exact
+                // value whole, to 38 digits; one carried as a float goes the
+                // float's way (`from_engine_scale`, `float8_numeric`).
+                Some(exact) if crate::core::value_codec::keeps_own_scale(target) && exact.err == 0.0 => {
+                    let v = if exact.e >= 0 {
+                        10i128
+                            .checked_pow(exact.e as u32)
+                            .and_then(|p| exact.m.checked_mul(p))
+                            .map(crate::core::rql::pg_numeric::PgNum::int)
+                    } else {
+                        crate::core::rql::pg_numeric::PgNum::new(exact.m, exact.e.unsigned_abs())
+                    };
+                    match v {
+                        Some(v) => pg_numeric_into(v, target),
+                        None => Err(crate::core::value_codec::own_scale_refusal(
+                            &format!("\"{}\"", exact.text()),
+                            &target.name,
+                        )),
+                    }
+                }
+                Some(_) if crate::core::value_codec::keeps_own_scale(target) => {
+                    eval(expr, row, schema).and_then(|value| from_engine_scale(value, target))
+                }
+                Some(exact) if target.scale.is_none() && !exact.exact_at(scale) => {
+                    Err(crate::core::value_codec::old_numeric_refusal(
+                        &if exact.err == 0.0 { format!("\"{}\"", exact.text()) } else { "of this expression".to_string() },
+                        &target.name,
+                    ))
+                }
                 Some(exact) => match exact.settle(scale) {
                     Some(units) => Ok(Value::Data { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL }),
                     // Not settled: the engine path's own refusal when it has
@@ -3915,14 +3936,7 @@ pub(crate) fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &S
         Some(scale) => v.units_at(scale).ok_or_else(overflow)?,
         None if v.exact_at(DECIMAL_SCALE) => v.units_at(DECIMAL_SCALE).ok_or_else(overflow)?,
         None => {
-            return Err(format!(
-                "numeric value \"{}\" has more than the {} decimal places an unconstrained NUMERIC column keeps \
-                 (not supported); the column predates unconstrained NUMERIC columns keeping each value's scale: \
-                 declare it NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN … TYPE NUMERIC for column \"{}\"",
-                v.to_text(),
-                DECIMAL_SCALE,
-                target.name
-            ))
+            return Err(crate::core::value_codec::old_numeric_refusal(&format!("\"{}\"", v.to_text()), &target.name))
         }
     };
     Ok(Value::Data { bytes: units.to_le_bytes().to_vec(), db_type: DbType::DECIMAL })
@@ -4666,6 +4680,52 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
         if let Some(v) = read {
             return pg_numeric_into(v, field);
         }
+        // A float `float8_numeric` cannot read into the 38 places a NUMERIC
+        // carries here (`1e-300`, `1e-39`), or one with no numeric value (NaN,
+        // an infinity): refused, as `f::numeric` is. It fell through to the
+        // nine-place path below and was stored as 0 with no error.
+        if let Value::Data { bytes, db_type: DbType::F64 | DbType::F32 } = &value {
+            let v = match bytes.len() {
+                8 => <[u8; 8]>::try_from(bytes.as_slice()).ok().map(f64::from_le_bytes),
+                4 => <[u8; 4]>::try_from(bytes.as_slice()).ok().map(|b| f64::from(f32::from_le_bytes(b))),
+                _ => None,
+            };
+            // A declared scale rounds a float too small for 38 places to zero,
+            // as PostgreSQL's assignment does (`1e-200` into a NUMERIC(10,2)
+            // is 0.00), and one too large for it overflows the field.
+            if let (Some(v), Some(_)) = (v, field.scale) {
+                if v.is_finite() && v.abs() < 1.0 {
+                    return pg_numeric_into(PgNum::int(0), field);
+                }
+                if v.is_finite() {
+                    return Err(format!("numeric field overflow for column \"{}\"", field.name));
+                }
+            }
+            if let Some(v) = v {
+                let old_format = !crate::core::value_codec::keeps_own_scale(field);
+                return Err(if v.is_finite() && old_format && v.abs() < 1.0 {
+                    // A sixteen-byte column keeps nine places: its own refusal,
+                    // with the conversion hint.
+                    crate::core::value_codec::old_numeric_refusal(
+                        &crate::core::value_codec::double_quoted(&crate::core::value_codec::pg_float8_text(v)),
+                        &field.name,
+                    )
+                } else if v.is_finite() && old_format {
+                    format!("numeric field overflow for column \"{}\"", field.name)
+                } else if v.is_finite() {
+                    crate::core::value_codec::own_scale_refusal(
+                        &crate::core::value_codec::double_quoted(&crate::core::value_codec::pg_float8_text(v)),
+                        &field.name,
+                    )
+                } else {
+                    format!(
+                        "cannot convert {} to numeric for column \"{}\"",
+                        crate::core::value_codec::pg_float8_text(v),
+                        field.name
+                    )
+                });
+            }
+        }
         // Into a column that keeps each value's own scale: an engine-scale
         // NUMERIC at the places its value needs (the zeros past them are the
         // engine's, not the value's), an integer as itself, text as written.
@@ -4677,13 +4737,10 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
                     .map(|b| PgNum::trimmed(i128::from_le_bytes(b), DECIMAL_SCALE)),
                 Value::Data { db_type: DbType::STRING | DbType::CHAR, .. } => {
                     let text = as_text(&value);
-                    Some(pgn::parse_text(text.trim()).ok_or_else(|| {
-                        format!(
-                            "{} for column \"{}\"",
-                            crate::core::value_codec::refusal_message(&DbType::DECIMAL, text.trim()),
-                            field.name
-                        )
-                    })?)
+                    Some(
+                        pgn::parse_text(text.trim())
+                            .ok_or_else(|| crate::core::value_codec::refusal_for_column(field, text.trim()))?,
+                    )
                 }
                 other @ Value::Data {
                     db_type:
@@ -4794,7 +4851,10 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
     {
         let text = as_text(&value);
         value = cast(value, &field.db_type).map_err(|e| {
-            if e.contains(" cannot be read as ") {
+            if e.contains(" cannot be read as ") && field.db_type == DbType::DECIMAL {
+                // An unconstrained NUMERIC's own refusal, with its limit.
+                crate::core::value_codec::refusal_for_column(field, &text)
+            } else if e.contains(" cannot be read as ") {
                 crate::core::value_codec::refusal_message(&field.db_type, &text)
             } else {
                 e

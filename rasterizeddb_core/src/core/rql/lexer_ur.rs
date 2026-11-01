@@ -155,13 +155,8 @@ fn encode_assignment(
     // number as written, every digit and its display scale.
     if crate::core::value_codec::keeps_own_scale(field) && !trimmed.eq_ignore_ascii_case("NULL") {
         let text = crate::core::rql::column_default::strip_redundant_cast(trimmed);
-        let cell = crate::core::value_codec::own_scale_cell(text).ok_or_else(|| {
-            format!(
-                "{} for column \"{}\"",
-                crate::core::value_codec::refusal_message(&DbType::DECIMAL, text.trim_matches('\'')),
-                field.name
-            )
-        })?;
+        let cell = crate::core::value_codec::own_scale_cell(text)
+            .ok_or_else(|| crate::core::value_codec::refusal_for_column(field, text))?;
         let mut mb = MEMORY_POOL.acquire(cell.len());
         mb.into_slice_mut().copy_from_slice(&cell);
         return Ok(mb);

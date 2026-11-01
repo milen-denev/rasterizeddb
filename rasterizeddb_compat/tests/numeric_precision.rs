@@ -406,3 +406,91 @@ async fn a_numeric_default_keeps_its_places() {
     run(&c, "INSERT INTO d (id) VALUES (1)").await;
     assert_eq!(rows(&c, "SELECT * FROM d").await, ["1|1.50|0.0000000000001"] as [&str; 1], "SELECT * FROM d");
 }
+
+async fn error_text(c: &Client, sql: &str) -> String {
+    let e = c.simple_query(sql).await.expect_err(sql);
+    e.as_db_error().map(|d| d.message().to_string()).unwrap_or_else(|| e.to_string())
+}
+
+/// A float written into NUMERIC columns: an unconstrained one keeps what float8_numeric gives within 38 places, a NUMERIC(p, s) rounds one too small for its scale to zero and overflows on one too large. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn float_into_a_numeric_rounds_to_its_scale() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fz (id INT PRIMARY KEY, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO fz VALUES (1, '1e-12'::float8, '1e-300'::float8)").await;
+    run(&c, "INSERT INTO fz VALUES (2, '1e-38'::float8, '-1e-45'::real)").await;
+    run(&c, "INSERT INTO fz VALUES (3, '0.1'::real, '1e-40'::float8)").await;
+    run(&c, "INSERT INTO fz VALUES (4, 0, 5)").await;
+    run(&c, "UPDATE fz SET p = '1e-200'::float8 WHERE id = 4").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO fz VALUES (5, 0, '1e40'::float8)").await, "22003");
+    assert_eq!(rows(&c, "SELECT id, n, p FROM fz ORDER BY id").await, ["1|0.000000000001|0.00", "2|0.00000000000000000000000000000000000001|0.00", "3|0.1|0.00", "4|0|0.00"] as [&str; 4], "SELECT id, n, p FROM fz ORDER BY id");
+}
+
+/// A float too small or too large for the 38 digits a NUMERIC carries here,
+/// written into an unconstrained column, is refused (0A000) on every path
+/// in, as `f::numeric` is, and nothing is stored: INSERT VALUES (a literal
+/// and an expression), INSERT … SELECT, UPDATE SET (a literal, a subquery,
+/// a column of UPDATE … FROM). It was stored as 0. PostgreSQL 17 stores
+/// `1e-300` whole (a 300-place value).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_float_past_38_digits_into_an_unconstrained_numeric_is_refused() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE fs (id INT PRIMARY KEY, f FLOAT8)").await;
+    run(&c, "INSERT INTO fs VALUES (1, 1e-300), (2, 1e-39), (3, 0.5), (4, 1e40)").await;
+    run(&c, "CREATE TABLE fz (id INT PRIMARY KEY, n NUMERIC)").await;
+    run(&c, "INSERT INTO fz VALUES (1, 3), (2, 3)").await;
+    for sql in [
+        "INSERT INTO fz VALUES (10, '1e-300'::float8)",
+        "INSERT INTO fz VALUES (11, '1e-20'::float8 * '1e-20'::float8)",
+        "INSERT INTO fz VALUES (12, '1e-45'::real)",
+        "INSERT INTO fz VALUES (13, '1e40'::float8)",
+        "INSERT INTO fz SELECT id + 20, f FROM fs WHERE id = 2",
+        "UPDATE fz SET n = '1e-200'::float8 WHERE id = 1",
+        "UPDATE fz SET n = (SELECT f FROM fs WHERE id = 1) WHERE id = 1",
+        "UPDATE fz SET n = fs.f FROM fs WHERE fs.id = 2 AND fz.id = 2",
+        "UPDATE fz SET n = fs.f FROM fs WHERE fs.id = 4 AND fz.id = 2",
+    ] {
+        assert_eq!(sqlstate(&c, sql).await, "0A000", "{sql}");
+    }
+    assert_eq!(
+        error_text(&c, "INSERT INTO fz VALUES (10, '1e-300'::float8)").await,
+        "numeric value \"1e-300\" needs more than the 38 digits or 38 decimal places column \"n\" holds (not supported)"
+    );
+    // Within 38 places it is stored, as PostgreSQL 17 stores it.
+    run(&c, "UPDATE fz SET n = fs.f FROM fs WHERE fs.id = 3 AND fz.id = 2").await;
+    assert_eq!(rows(&c, "SELECT id, n FROM fz ORDER BY id").await, ["1|3", "2|0.5"]);
+}
+
+/// A value an unconstrained column made by this build cannot hold is refused
+/// with the limit it has (38 digits, 38 places), not the nine places and
+/// conversion hint of a column made before cells kept their scale.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_own_scale_refusal_names_its_own_limit() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE w (id INT PRIMARY KEY, n NUMERIC)").await;
+    run(&c, "INSERT INTO w VALUES (1, 0)").await;
+    let too_long = format!("0.{}1", "0".repeat(38));
+    for sql in [
+        format!("INSERT INTO w VALUES (2, {too_long})"),
+        format!("INSERT INTO w VALUES (2, '{too_long}')"),
+        format!("UPDATE w SET n = {too_long} WHERE id = 1"),
+        format!("UPDATE w SET n = '{too_long}' WHERE id = 1"),
+        format!("UPDATE w SET n = '{too_long}' || '' WHERE id = 1"),
+    ] {
+        let message = error_text(&c, &sql).await;
+        assert_eq!(
+            message,
+            format!(
+                "numeric value \"{too_long}\" needs more than the 38 digits or 38 decimal places column \"n\" holds \
+                 (not supported)"
+            ),
+            "{sql}"
+        );
+    }
+    let message = error_text(&c, &format!("CREATE TABLE w2 (id INT PRIMARY KEY, n NUMERIC DEFAULT {too_long})")).await;
+    assert!(message.contains("38 decimal places the column holds"), "{message}");
+    assert!(!message.contains("predates") && !message.contains("nine") && !message.contains(" 9 "), "{message}");
+}

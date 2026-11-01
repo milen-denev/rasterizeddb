@@ -114,12 +114,8 @@ pub fn take_refusal() -> Option<String> {
     REFUSAL.with(|r| r.borrow_mut().take())
 }
 
-fn note_refusal(column: &str, db_type: &DbType, value: &str) {
-    let message = format!(
-        "{} for column \"{}\"",
-        crate::core::value_codec::refusal_message(db_type, value),
-        column
-    );
+fn note_refusal(field: &SchemaField, value: &str) {
+    let message = crate::core::value_codec::refusal_for_column(field, value);
     REFUSAL.with(|r| *r.borrow_mut() = Some(message));
 }
 
@@ -1218,7 +1214,7 @@ pub(crate) fn encode_column_value(
     .or_else(|| {
         // A reason already given — an overflow — is the real one.
         if REFUSAL.with(|r| r.borrow().is_none()) {
-            note_refusal(&schema_field.name, &schema_field.db_type, value);
+            note_refusal(schema_field, value);
         }
         None
     })?;
@@ -1552,7 +1548,7 @@ pub fn insert_row_with_defaults(
                         Some(data) => Some(data),
                         None => {
                             if REFUSAL.with(|r| r.borrow().is_none()) {
-                                note_refusal(&field.name, &field.db_type, &literal);
+                                note_refusal(field, &literal);
                             }
                             return None;
                         }
