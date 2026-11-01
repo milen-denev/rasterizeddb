@@ -494,3 +494,15 @@ async fn an_own_scale_refusal_names_its_own_limit() {
     assert!(message.contains("38 decimal places the column holds"), "{message}");
     assert!(!message.contains("predates") && !message.contains("nine") && !message.contains(" 9 "), "{message}");
 }
+
+/// ADD COLUMN v NUMERIC DEFAULT on a table with rows fills every row with the default at its own scale. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numeric_default_fills_existing_rows() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE t (id INT PRIMARY KEY, u NUMERIC)").await;
+    run(&c, "INSERT INTO t VALUES (1, 1.005), (2, 123.4), (3, NULL), (4, -2.675), (5, 0.0000000001)").await;
+    run(&c, "ALTER TABLE t ADD COLUMN v NUMERIC DEFAULT 1.5").await;
+    run(&c, "ALTER TABLE t ADD COLUMN w NUMERIC DEFAULT 0.0000000000001").await;
+    assert_eq!(rows(&c, "SELECT * FROM t ORDER BY id").await, ["1|1.005|1.5|0.0000000000001", "2|123.4|1.5|0.0000000000001", "3||1.5|0.0000000000001", "4|-2.675|1.5|0.0000000000001", "5|0.0000000001|1.5|0.0000000000001"] as [&str; 5], "SELECT * FROM t ORDER BY id");
+}

@@ -3362,6 +3362,13 @@ fn rewrite_payload(
                 })
                 .filter(|literal| literal != "NULL")
                 .and_then(|literal| {
+                    // An unconstrained NUMERIC in the seventeen-byte slot
+                    // keeps the default at the scale it is written with:
+                    // `ADD COLUMN v NUMERIC DEFAULT 1.5` on a table with rows
+                    // wrote sixteen bytes into it and failed every time.
+                    if crate::core::value_codec::keeps_own_scale(field) {
+                        return crate::core::value_codec::own_scale_cell(literal.trim_matches('\''));
+                    }
                     // A NUMERIC(p, s) column stores its values at its own
                     // scale; the plain encoder writes the engine's.
                     if field.db_type == crate::core::db_type::DbType::DECIMAL {
