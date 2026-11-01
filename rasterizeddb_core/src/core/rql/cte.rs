@@ -538,7 +538,13 @@ async fn relation_columns(
         let sql_type = match &declared {
             // A decimal is declared at the scale its cells were stored at, so
             // it prints the places it was written with rather than nine.
-            Some(DbType::DECIMAL) => match self_scaled_width(rows, index, scale).or(scale) {
+            // Cells carrying their own scale (a column that keeps each
+            // value's, an AVG, a quotient): an unconstrained NUMERIC, which
+            // keeps each value at its own scale as PostgreSQL's relation
+            // does. Declared at the widest of them, the narrower ones printed
+            // trailing zeros (1.500000000000 for 1.5).
+            Some(DbType::DECIMAL) if self_scaled_width(rows, index, scale).is_some() => "NUMERIC".to_string(),
+            Some(DbType::DECIMAL) => match scale {
                 Some(scale) if scale != engine => format!("NUMERIC(38,{})", scale),
                 _ => "NUMERIC".to_string(),
             },

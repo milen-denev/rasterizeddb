@@ -3739,7 +3739,9 @@ impl Database {
         } else {
             own_scale
         };
-        if !own_scale.is_empty() {
+        // A temporary relation (a CTE's, a derived table's) lives in memory:
+        // nothing an older binary could open, so nothing to mark.
+        if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
             self.require_numeric_own_scale()?;
         }
         let table_name = &create_table.table_name;

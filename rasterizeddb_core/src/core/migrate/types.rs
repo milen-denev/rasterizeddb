@@ -463,19 +463,28 @@ pub fn literal(mapping: &Mapping, value: Option<&str>) -> Result<String, String>
                     value
                 ));
             }
+            // An unconstrained `numeric` is created here as a column that keeps
+            // each value at its own scale (`value_codec::own_scale_cell`): any
+            // value of up to 38 digits and 38 places carries over whole.
             let representable = match mapping.decimal_scale {
                 Some(scale) => value_codec::parse_decimal_scaled(value, scale).is_some(),
-                None => value_codec::encode_literal(&mapping.db_type, value).is_some(),
+                None => value_codec::own_scale_cell(value).is_some(),
             };
             if representable {
                 Ok(quote(value))
             } else {
-                Err(format!(
-                    "NUMERIC {} cannot be carried over exactly: this column keeps {} decimal \
-                     places and a magnitude below about 1.7e29",
-                    value,
-                    mapping.decimal_scale.unwrap_or(value_codec::DECIMAL_SCALE)
-                ))
+                Err(match mapping.decimal_scale {
+                    Some(scale) => format!(
+                        "NUMERIC {} cannot be carried over exactly: this column keeps {} decimal \
+                         places and a magnitude below about 1.7e29",
+                        value, scale
+                    ),
+                    None => format!(
+                        "NUMERIC {} cannot be carried over exactly: this engine's NUMERIC carries at \
+                         most 38 digits and 38 decimal places",
+                        value
+                    ),
+                })
             }
         }
 
