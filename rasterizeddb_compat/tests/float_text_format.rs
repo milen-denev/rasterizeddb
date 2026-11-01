@@ -470,3 +470,78 @@ async fn a_number_against_a_double_is_its_nearest_double() {
     run(&c, "INSERT INTO ck9b VALUES (3, 1234567890.123457)").await;
     assert_eq!(ids(&c, "SELECT id FROM ck9b ORDER BY id").await, "3");
 }
+
+/// An IN list of floats with a NULL among them: the floats compared as
+/// PostgreSQL compares them (a NUMERIC(38,20) 0.10000000000000001 is the
+/// double 0.1), the NULL keeping IN unknown without a match and NOT IN never
+/// true. Values from PostgreSQL 17.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_list_of_floats_with_a_null() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE t (id INT PRIMARY KEY, n NUMERIC(10,2), v NUMERIC(38,20))").await;
+    run(&c, "INSERT INTO t VALUES (1, 1.00, 0.1), (2, 2.00, 0.10000000000000001), (3, NULL, 2), (4, 4.00, 0.3)").await;
+    run(&c, "CREATE TABLE fs (id INT PRIMARY KEY, f FLOAT8)").await;
+    run(&c, "INSERT INTO fs VALUES (1, 0.1), (2, NULL), (3, 2)").await;
+    for (sql, want) in [
+        ("SELECT id FROM t WHERE v IN ('0.1'::float8, NULL, '2'::float8) ORDER BY id", "1,2,3"),
+        ("SELECT id FROM t WHERE v NOT IN ('0.1'::float8, NULL) ORDER BY id", ""),
+        ("SELECT id FROM t WHERE v NOT IN ('0.1'::float8, '2'::float8) ORDER BY id", "4"),
+        ("SELECT id FROM t WHERE n IN ('1'::float8, NULL, '2'::float8) ORDER BY id", "1,2"),
+        ("SELECT id FROM t WHERE n NOT IN ('1'::float8, NULL) ORDER BY id", ""),
+        ("SELECT id FROM t WHERE NOT (v IN ('0.1'::float8, NULL)) ORDER BY id", ""),
+        ("SELECT id FROM t WHERE v IN (SELECT f FROM fs) ORDER BY id", "1,2,3"),
+        ("SELECT id FROM t WHERE n NOT IN (SELECT f FROM fs) ORDER BY id", ""),
+    ] {
+        assert_eq!(ids(&c, sql).await, want, "{sql}");
+    }
+}
+
+/// A large IN list of floats over an integer and a NUMERIC column, mixing
+/// floats only one value rounds to (an integer below 2^53, a NUMERIC(30,9)
+/// 300.5), floats many values round to (a bigint past 2^53, a NUMERIC(30,9)
+/// past 10^7) and floats nothing rounds to. Values from PostgreSQL 17.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_in_list_mixing_single_values_and_runs() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    let m_row = |k: u64| -> (u64, String) {
+        if k <= 600 {
+            (k * 1000 + 7, format!("{}.{}", k / 2, if k % 2 == 1 { 5 } else { 0 }))
+        } else {
+            (9_007_199_254_740_992 + (k - 600) * 3, format!("10000000.{:03}", k - 600))
+        }
+    };
+    run(&c, "CREATE TABLE m (id INT PRIMARY KEY, i BIGINT, n NUMERIC(30,9))").await;
+    run(&c, "CREATE TABLE src (id INT PRIMARY KEY, f FLOAT8, g FLOAT8)").await;
+    let rows_m: Vec<String> = (1..=1200).map(|k| {
+        let (i, n) = m_row(k);
+        format!("({k}, {i}, {n})")
+    }).collect();
+    for chunk in rows_m.chunks(200) {
+        run(&c, &format!("INSERT INTO m VALUES {}", chunk.join(", "))).await;
+    }
+    let rows_src: Vec<String> = (1..=1500u64).map(|j| {
+        if j <= 1200 {
+            let (i, n) = m_row(j);
+            let f = if j % 10 == 0 { format!("{i}.5") } else { i.to_string() };
+            let g = if j % 7 == 0 { format!("{n}1") } else { n };
+            format!("({j}, {f}, {g})")
+        } else {
+            format!("({j}, {}.25, {j}.123456789123)", j * 1000 + 7)
+        }
+    }).collect();
+    for chunk in rows_src.chunks(250) {
+        run(&c, &format!("INSERT INTO src VALUES {}", chunk.join(", "))).await;
+    }
+    for (sql, want) in [
+        ("SELECT count(*), sum(id) FROM m WHERE i IN (SELECT f FROM src)", "1140|702300"),
+        ("SELECT count(*), sum(id) FROM m WHERE i NOT IN (SELECT f FROM src)", "60|18300"),
+        ("SELECT count(*), sum(id) FROM m WHERE n IN (SELECT g FROM src)", "1029|617658"),
+        ("SELECT count(*), sum(id) FROM m WHERE n NOT IN (SELECT g FROM src)", "171|102942"),
+        ("SELECT count(*), sum(id) FROM m WHERE i IN (SELECT f FROM src WHERE id > 600)", "600|540300"),
+        ("SELECT count(*), sum(id) FROM m WHERE n IN (SELECT g FROM src WHERE id > 600)", "514|462943"),
+    ] {
+        assert_eq!(rows(&c, sql).await, [want], "{sql}");
+    }
+}
