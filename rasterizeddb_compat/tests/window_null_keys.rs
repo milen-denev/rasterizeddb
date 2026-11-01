@@ -39,7 +39,7 @@ async fn sqlstate(c: &Client, sql: &str) -> String {
     e.code().map(|s| s.code().to_string()).unwrap_or_else(|| e.to_string())
 }
 
-/// A NULL partitions apart from 0, 0.00, '', false, the epoch and {} for every type (INT, BIGINT, NUMERIC, NUMERIC(p,s), TEXT, VARCHAR, CHAR, BOOLEAN, timestamps, DATE, FLOAT8, JSONB, UUID), sorts last ascending and first descending in a window's ORDER BY (peers, ranks, RANGE frames, LAG/LEAD) unless NULLS FIRST/LAST says otherwise, and a text '' is a value to COUNT and MIN. PostgreSQL 17's values; NULL shown as NULL.
+/// A NULL partitions apart from 0, 0.00, '', false, the epoch and {} for every type (INT, BIGINT, NUMERIC, NUMERIC(p,s), TEXT, VARCHAR, CHAR, BOOLEAN, timestamps, DATE, FLOAT8, JSONB, UUID), sorts last ascending and first descending in a window's ORDER BY (peers, ranks, RANGE frames, LAG/LEAD) unless NULLS FIRST/LAST says otherwise, a text '' is a value to COUNT and MIN, and a NULL window value of text type is NULL, not ''. PostgreSQL 17's values; NULL shown as NULL.
 #[tokio::test(flavor = "multi_thread")]
 async fn window_null_is_its_own_partition_and_sorts_last() {
     let server = TestServer::start().await.expect("server");
@@ -88,6 +88,8 @@ async fn window_null_is_its_own_partition_and_sorts_last() {
     assert_eq!(rows_n(&c, "SELECT id FROM wt ORDER BY n DESC NULLS LAST, id").await, ["4", "1", "3", "2", "5"] as [&str; 5], "SELECT id FROM wt ORDER BY n DESC NULLS LAST, id");
     assert_eq!(rows_n(&c, "SELECT id FROM wt ORDER BY bo, id").await, ["1", "3", "4", "2", "5"] as [&str; 5], "SELECT id FROM wt ORDER BY bo, id");
     assert_eq!(rows_n(&c, "SELECT id FROM wt ORDER BY ts DESC, id").await, ["2", "5", "4", "1", "3"] as [&str; 5], "SELECT id FROM wt ORDER BY ts DESC, id");
+    assert_eq!(rows_n(&c, "SELECT id, lag(t) OVER (ORDER BY id), lead(t) OVER (ORDER BY id), first_value(t) OVER (ORDER BY id DESC), max(t) OVER (PARTITION BY i) FROM wt ORDER BY id").await, ["1|NULL|NULL|NULL|", "2|||NULL|NULL", "3|NULL|a|NULL|", "4||NULL|NULL|a", "5|a|NULL|NULL|NULL"] as [&str; 5], "SELECT id, lag(t) OVER (ORDER BY id), lead(t) OVER (ORDER BY id), first_value(t) OVER (ORDER BY id DESC), max(t) OVER (PARTITION BY i) FROM wt ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, lag(n) OVER (ORDER BY id), min(p) OVER (PARTITION BY t) FROM wt ORDER BY id").await, ["1|NULL|0.00", "2|0|NULL", "3|NULL|0.00", "4|0.00|1.00", "5|1|NULL"] as [&str; 5], "SELECT id, lag(n) OVER (ORDER BY id), min(p) OVER (PARTITION BY t) FROM wt ORDER BY id");
 }
 
 /// The reviewer's probe: PARTITION BY over a nullable NUMERIC, NUMERIC(10,2) and INT, beside GROUP BY, DISTINCT, UNION, joins and IN over the same NULLs. PostgreSQL 17's values.
