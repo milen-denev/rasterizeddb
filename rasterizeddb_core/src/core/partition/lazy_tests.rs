@@ -2150,8 +2150,8 @@ async fn an_upgrade_after_a_renumbering_builds_rather_than_loads() {
     assert!(part.is_scan_only());
     // A renumbering's epoch moves, as `Table::compact` moves it.
     {
-        let build = crate::core::index_store::gate::build_token();
-        part.data().unwrap().indexes.as_ref().unwrap().invalidate(crate::core::index_store::gate::Proof::from(&build));
+        let ticket = crate::core::index_store::gate::test_mint();
+        part.data().unwrap().indexes.as_ref().unwrap().invalidate(crate::core::index_store::gate::Proof::from(&ticket));
     }
     let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
     assert_eq!(rows(&db, "tenant_id = 3").await, mine);
