@@ -695,6 +695,26 @@ the table converts it the same way: an `ADD COLUMN` on a table with rows,
 `DROP NOT NULL`. A partitioned table is not rewritten yet, so its old columns
 stay as they are.
 
+`ALTER COLUMN c TYPE NUMERIC(p, s)` over an unconstrained column, a scale
+change of a `NUMERIC(p, s)` column, a narrower precision, and `TYPE NUMERIC`
+over a `NUMERIC(p, s)` column each rewrite every row the same way. Each value
+is converted as PostgreSQL's cast converts it: rounded half away from zero to
+`s`, refused with 22003 past `p`, and kept whole at its scale into an
+unconstrained column (1.50 stays 1.50). The rewrite is refused, leaving the
+table as it was, when rounding makes two keys of a unique constraint one
+(23505), when rounding changes a value a `CHECK` reads (0A000: drop the check,
+alter, and add it back), and when a generated column reads the column (0A000,
+as PostgreSQL refuses). A wider precision at the same scale only records the
+declaration.
+
+A float written into an unconstrained column is its `float8_numeric` value.
+One that needs more than the 38 digits or places carried here (`1e-300`,
+`1e40`) is refused with 0A000, never stored as 0. Into a `NUMERIC(p, s)` it is
+rounded to `s`, as PostgreSQL's assignment rounds it (`1e-200` is 0.00). An
+`avg` whose PostgreSQL scale passes 38 places with a nonzero digit there is
+refused with 0A000, as `n / 2` is. One whose digits past 38 places are all
+zero is shown at 38.
+
 Upgrade and downgrade: no rewrite is needed on upgrade. The first time a
 seventeen-byte column is written, the database records the on-disk feature
 `numeric_own_scale_v1` in its `incompat_features` file, and from then on a
@@ -702,7 +722,11 @@ binary that does not know it refuses to open the database at start, naming
 the feature, rather than misreading those columns (an older binary would read
 the seventeen bytes at nine places and write sixteen into them). A binary from
 before `incompat_features` existed ignores the file and must not be used on
-such a database. A backup carries the file with the rest. Replication ships
+such a database. The flag is written outside the log, so a
+snapshot taken before it was set does not carry it. A point-in-time restore
+therefore sets the flag itself when the restored tables hold a seventeen-byte
+column, before the directory appears. Opening a table with such a column in a
+directory without the flag sets it too, before anything else reads the table. Replication ships
 statements, so a replica must run a binary that knows the feature before the
 primary writes a value with more than nine places.
 
