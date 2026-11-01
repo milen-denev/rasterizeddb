@@ -767,6 +767,10 @@ pub(crate) enum Acc {
         /// places each needs. (PostgreSQL keeps a written `1.50` at two; here
         /// it counts as one — the one place this can print fewer digits.)
         track_dscale: bool,
+        /// Over a column that keeps each value's own scale: `scale` grows to
+        /// the most places any input carries (the total lifted with it), and
+        /// the result is a cell carrying its display scale.
+        own_scale: bool,
     },
     FloatSum {
         total: f64,
@@ -834,14 +838,16 @@ impl Acc {
                 other => {
                     let scaled = matches!(other, Some(DbType::DECIMAL));
                     let declared = arg.and_then(|f| f.scale);
+                    let own_scale = arg.is_some_and(crate::core::value_codec::keeps_own_scale);
                     Acc::ExactSum {
                         total: 0,
                         n: 0,
                         scaled,
-                        scale: declared.unwrap_or(DECIMAL_SCALE),
+                        scale: if own_scale { 0 } else { declared.unwrap_or(DECIMAL_SCALE) },
                         overflow: false,
                         dscale: if scaled { declared.unwrap_or(0) } else { 0 },
-                        track_dscale: scaled && declared.is_none() && func == AggFunc::Avg,
+                        track_dscale: scaled && declared.is_none() && func == AggFunc::Avg && !own_scale,
+                        own_scale,
                     }
                 }
             },
@@ -862,6 +868,8 @@ impl Acc {
                     // A legacy `CHAR`'s cells of one value are one value
                     // (`value_codec::legacy_char_canonical`).
                     DbType::CHAR => Some(crate::core::value_codec::legacy_char_canonical(value).to_vec()),
+                    // A NUMERIC carrying its own scale: 1.5 and 1.50 are one.
+                    DbType::DECIMAL => crate::core::value_codec::canonical_numeric_cell(value),
                     _ => None,
                 };
                 match zero {
@@ -894,11 +902,36 @@ impl Acc {
                 dscale,
                 track_dscale,
                 scale,
+                own_scale,
                 ..
             } => {
                 let (Some(b), Some(t)) = (bytes, ty) else {
                     return;
                 };
+                // A cell carrying its own scale: the total lifted to the most
+                // places seen, the value added at them.
+                if *own_scale {
+                    let Some((m, own)) = crate::core::value_codec::split_decimal_cell(b) else { return };
+                    let own = own.unwrap_or(DECIMAL_SCALE);
+                    if own > *scale {
+                        match 10i128.checked_pow(own - *scale).and_then(|p| total.checked_mul(p)) {
+                            Some(lifted) => *total = lifted,
+                            None => *overflow = true,
+                        }
+                        *scale = own;
+                    }
+                    match 10i128
+                        .checked_pow(*scale - own)
+                        .and_then(|p| m.checked_mul(p))
+                        .and_then(|v| total.checked_add(v))
+                    {
+                        Some(sum) => *total = sum,
+                        None => *overflow = true,
+                    }
+                    *dscale = (*dscale).max(own);
+                    *n += 1;
+                    return;
+                }
                 if *track_dscale {
                     if let Some(v) = decode_exact(b, t) {
                         // The fewest places this value needs at `scale`.
@@ -963,11 +996,14 @@ impl Acc {
                     None => *best = Some(b.to_vec()),
                     Some(current) => {
                         let ord = compare_values(b, current, acc_ty);
+                        // A NUMERIC carrying its own scale ties to the later
+                        // value, as `numeric_larger`/`numeric_smaller` return
+                        // their second argument: max(1.5, 1.50) is 1.50.
                         let replace = if *want_max {
                             ord == std::cmp::Ordering::Greater
                         } else {
                             ord == std::cmp::Ordering::Less
-                        };
+                        } || (ord == std::cmp::Ordering::Equal && b.len() == 17 && *acc_ty == DbType::DECIMAL);
                         // Overwritten in place: the winner changes often on
                         // unordered input, and a fresh allocation per change
                         // was most of what MIN/MAX cost.
@@ -999,6 +1035,8 @@ impl Acc {
                     n,
                     overflow,
                     dscale,
+                    scale,
+                    own_scale,
                     ..
                 },
                 Acc::ExactSum {
@@ -1006,9 +1044,29 @@ impl Acc {
                     n: n2,
                     overflow: o2,
                     dscale: d2,
+                    scale: s2,
                     ..
                 },
             ) => {
+                // Partials over a column that keeps each value's own scale may
+                // stand at different places: both at the more.
+                let mut t2 = *t2;
+                if *own_scale && *s2 != *scale {
+                    let lift = |v: i128, from: u32, to: u32| 10i128.checked_pow(to - from).and_then(|p| v.checked_mul(p));
+                    if *s2 > *scale {
+                        match lift(*total, *scale, *s2) {
+                            Some(v) => *total = v,
+                            None => *overflow = true,
+                        }
+                        *scale = *s2;
+                    } else {
+                        match lift(t2, *s2, *scale) {
+                            Some(v) => t2 = v,
+                            None => *overflow = true,
+                        }
+                    }
+                }
+                let t2 = &t2;
                 match total.checked_add(*t2) {
                     Some(sum) => *total = sum,
                     None => *overflow = true,
@@ -1150,10 +1208,23 @@ impl Acc {
                 scaled,
                 scale,
                 overflow,
+                own_scale,
                 ..
             } => {
                 if *overflow {
                     return Err(out_of_range(result_type));
+                }
+                // Over a column that keeps each value's own scale: a cell at
+                // PostgreSQL's display scale, the inputs' most for SUM,
+                // `select_div_scale`'s for AVG.
+                if *own_scale && matches!(result_type, DbType::DECIMAL) {
+                    return match func {
+                        AggFunc::Avg => match self.pg_avg()? {
+                            Some((v, rscale)) => Ok(crate::core::value_codec::decimal_cell_with_scale(v, rscale)),
+                            None => Ok(Vec::new()),
+                        },
+                        _ => Ok(crate::core::value_codec::decimal_cell_with_scale(*total, *scale)),
+                    };
                 }
                 match func {
                     AggFunc::Avg => {
@@ -1690,7 +1761,14 @@ impl<'p> Folder<'p> {
                 KeySource::Column(_) => f.db_type == DbType::JSONB,
             })
             .collect();
-        let shown = document_keys.iter().any(|d| *d).then(Vec::new);
+        // A NUMERIC carrying its own scale is keyed by its one cell per value
+        // (`value_codec::canonical_numeric_cell`): the group shows its first
+        // row's value as written, 1.50 and not the key's 1.5.
+        let own_scale_keys = key_sources.iter().zip(plan.group_by.iter()).any(|(source, f)| match source {
+            KeySource::Computed(k) => crate::core::rql::expr::static_type(&k.expr) == DbType::DECIMAL,
+            KeySource::Column(_) => crate::core::value_codec::keeps_own_scale(f),
+        });
+        let shown = (document_keys.iter().any(|d| *d) || own_scale_keys).then(Vec::new);
         let legacy_char_keys: Vec<bool> = key_sources
             .iter()
             .zip(plan.group_by.iter())
@@ -1979,6 +2057,10 @@ fn push_key_part(
         Some(b) => {
             if document {
                 crate::core::jsonb::push_group_key(b, key);
+            } else if let Some(canonical) = crate::core::value_codec::canonical_numeric_cell(b) {
+                // A NUMERIC carrying its own scale by its value: 1.5 groups
+                // with 1.50, as `=` says.
+                put(key, &canonical);
             } else {
                 put(key, b);
             }

@@ -2417,6 +2417,67 @@ pub fn strip_type_prefix(literal: &str) -> &str {
 /// cannot be described by one column scale, so its cells say their own. Only
 /// result rows carry this form; every reader of `DECIMAL` result bytes goes
 /// through [`split_decimal_cell`], which accepts both.
+/// The slot width of an unconstrained NUMERIC column that keeps each value at
+/// its own scale: the sixteen-byte value and its scale byte, the cell of
+/// [`decimal_cell_with_scale`]. A column created before it holds sixteen bytes
+/// at [`DECIMAL_SCALE`] places, and the field's recorded size says which.
+pub const NUMERIC_OWN_SCALE_SIZE: u32 = 17;
+
+/// The scale a column that keeps each value's own scale is listed under where
+/// a planner passes `(write order, declared scale)` pairs for the NUMERIC
+/// columns (`sarg::extract_with_scales`): no declared scale, and its literal
+/// is the own-scale cell of [`own_scale_cell`].
+pub const OWN_SCALE_SENTINEL: u32 = u32::MAX;
+
+/// Whether `field` is an unconstrained NUMERIC column that keeps each value
+/// at its own scale ([`NUMERIC_OWN_SCALE_SIZE`]).
+#[inline]
+pub fn keeps_own_scale(field: &crate::core::row::schema::SchemaField) -> bool {
+    field.db_type == crate::core::db_type::DbType::DECIMAL && field.size == NUMERIC_OWN_SCALE_SIZE
+}
+
+/// A written number as the cell of a column that keeps its own scale
+/// ([`NUMERIC_OWN_SCALE_SIZE`]), at the display scale `numeric_in` gives it:
+/// `1.50` is 150 at two places, `1e-10` 1 at ten. `None` for text that is not
+/// such a number, or past what the cell holds (38 digits, 38 places).
+pub fn own_scale_cell(text: &str) -> Option<Vec<u8>> {
+    let t = text.trim().trim_matches('\'').trim_matches('"').trim();
+    crate::core::rql::pg_numeric::parse_text(t).map(|v| v.to_cell())
+}
+
+/// Two NUMERIC cells compared by value, where either may carry its own scale
+/// ([`decimal_cell_with_scale`]): a seventeen-byte cell at the scale it
+/// carries, a sixteen-byte one at [`DECIMAL_SCALE`] (the engine's, which is
+/// what every sixteen-byte operand meeting an own-scale cell is at: an
+/// arithmetic result, a column lifted there, a column created before cells
+/// kept their scale). `None` when either is not a NUMERIC cell.
+pub fn numeric_cell_cmp(a: &[u8], b: &[u8]) -> Option<std::cmp::Ordering> {
+    use crate::core::rql::pg_numeric::PgNum;
+    let read = |c: &[u8]| -> Option<PgNum> {
+        let (m, own) = split_decimal_cell(c)?;
+        Some(PgNum { m, s: own.unwrap_or(DECIMAL_SCALE) })
+    };
+    Some(read(a)?.cmp_value(read(b)?))
+}
+
+/// A cell carrying its own scale ([`decimal_cell_with_scale`]) in its one
+/// form per value: the zeros at the end of its fraction dropped, so 1.5 and
+/// 1.50 are the same bytes. What a group, a DISTINCT, a set operation, a join
+/// or a unique check keys such a cell by, where its bytes alone keyed equal
+/// values apart. `None` for anything else.
+pub fn canonical_numeric_cell(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() != 17 {
+        return None;
+    }
+    let (mut m, own) = split_decimal_cell(bytes)?;
+    let mut s = own?;
+    while s > 0 && m % 10 == 0 {
+        m /= 10;
+        s -= 1;
+    }
+    Some(decimal_cell_with_scale(if m == 0 { 0 } else { m }, s))
+}
+
 pub fn decimal_cell_with_scale(unscaled: i128, scale: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(17);
     out.extend_from_slice(&unscaled.to_le_bytes());

@@ -692,7 +692,10 @@ fn key_numbers(l: &SchemaField, r: &SchemaField) -> Option<(KeyNumber, KeyNumber
         return None;
     }
     let scale = |f: &SchemaField| f.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
-    if l.db_type == r.db_type && (l.db_type != DbType::DECIMAL || scale(l) == scale(r)) {
+    // A column that keeps each value's own scale has one value in many byte
+    // forms (1.5, 1.50): always read as a number.
+    let own_scale = crate::core::value_codec::keeps_own_scale(l) || crate::core::value_codec::keeps_own_scale(r);
+    if l.db_type == r.db_type && (l.db_type != DbType::DECIMAL || scale(l) == scale(r)) && !own_scale {
         return None;
     }
     // Integers of two widths have bytes of two widths: read as numbers too.

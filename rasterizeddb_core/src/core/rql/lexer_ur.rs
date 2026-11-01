@@ -151,6 +151,21 @@ fn encode_assignment(
     precision: Option<u32>,
 ) -> Result<MemoryBlock, String> {
     let trimmed = value_str.trim();
+    // An unconstrained NUMERIC that keeps each value's own scale takes the
+    // number as written, every digit and its display scale.
+    if crate::core::value_codec::keeps_own_scale(field) && !trimmed.eq_ignore_ascii_case("NULL") {
+        let text = crate::core::rql::column_default::strip_redundant_cast(trimmed);
+        let cell = crate::core::value_codec::own_scale_cell(text).ok_or_else(|| {
+            format!(
+                "{} for column \"{}\"",
+                crate::core::value_codec::refusal_message(&DbType::DECIMAL, text.trim_matches('\'')),
+                field.name
+            )
+        })?;
+        let mut mb = MEMORY_POOL.acquire(cell.len());
+        mb.into_slice_mut().copy_from_slice(&cell);
+        return Ok(mb);
+    }
     if let (DbType::DECIMAL, Some(scale)) = (&field.db_type, scale) {
         if !trimmed.eq_ignore_ascii_case("NULL") {
             let text = trimmed.trim_matches('\'').trim_matches('"');

@@ -3395,6 +3395,19 @@ fn numeric_constant(m: i128, e: i32, text: &str) -> Result<Expr, String> {
             db_type: DbType::DECIMAL,
         });
     }
+    // Too large for the engine scale (past about 1.7e29) yet whole digits an
+    // i128 holds at its own scale: the same own-scale cell, so `1e30` and
+    // `123456789012345678901234567890` are `numeric` as PostgreSQL types
+    // them. As a float, `s0 * 1e30` was 7e+30 and `1e30 + 1` lost the 1.
+    if e >= -scale {
+        let own = if e >= 0 { 10i128.checked_pow(e as u32).and_then(|p| m.checked_mul(p)) } else { Some(m) };
+        if let Some(own) = own {
+            return Ok(Expr::Literal {
+                bytes: crate::core::value_codec::decimal_cell_with_scale(own, (-e).max(0) as u32),
+                db_type: DbType::DECIMAL,
+            });
+        }
+    }
     let written = format!("{m}e{e}");
     if let Ok(v) = written.parse::<f64>() {
         if v.is_finite() && (float_holds_literal(&written, v) || v.abs() < FLOAT_KEEPS_BELOW) {
@@ -3845,6 +3858,11 @@ pub(crate) fn eval_into(expr: &Expr, row: &Row, schema: &[SchemaField], target: 
 /// 0.666666667 for PostgreSQL's 0.66666666666666666667).
 pub(crate) fn pg_numeric_into(v: crate::core::rql::pg_numeric::PgNum, target: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
+    // An unconstrained column that keeps each value's own scale stores it
+    // whole, with its display scale, as PostgreSQL does.
+    if crate::core::value_codec::keeps_own_scale(target) {
+        return Ok(Value::Data { bytes: v.to_cell(), db_type: DbType::DECIMAL });
+    }
     let overflow = || "value overflows numeric format".to_string();
     let units = match target.scale {
         Some(scale) => v.units_at(scale).ok_or_else(overflow)?,
@@ -4599,6 +4617,37 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
         };
         if let Some(v) = read {
             return pg_numeric_into(v, field);
+        }
+        // Into a column that keeps each value's own scale: an engine-scale
+        // NUMERIC at the places its value needs (the zeros past them are the
+        // engine's, not the value's), an integer as itself, text as written.
+        if crate::core::value_codec::keeps_own_scale(field) {
+            let own = match &value {
+                Value::Null => return Ok(Value::Null),
+                Value::Data { bytes, db_type: DbType::DECIMAL } => <[u8; 16]>::try_from(bytes.as_slice())
+                    .ok()
+                    .map(|b| PgNum::trimmed(i128::from_le_bytes(b), DECIMAL_SCALE)),
+                Value::Data { db_type: DbType::STRING | DbType::CHAR, .. } => {
+                    let text = as_text(&value);
+                    Some(pgn::parse_text(text.trim()).ok_or_else(|| {
+                        format!(
+                            "{} for column \"{}\"",
+                            crate::core::value_codec::refusal_message(&DbType::DECIMAL, text.trim()),
+                            field.name
+                        )
+                    })?)
+                }
+                other @ Value::Data {
+                    db_type:
+                        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                        | DbType::U64,
+                    ..
+                } => as_i64(other).map(|n| PgNum::int(n as i128)),
+                _ => None,
+            };
+            if let Some(v) = own {
+                return pg_numeric_into(v, field);
+            }
         }
     }
     let number = |v: &Value| {

@@ -1483,6 +1483,11 @@ pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Res
             let mut key = Vec::with_capacity(bytes.len() + 8);
             crate::core::jsonb::push_group_key(bytes, &mut key);
             std::borrow::Cow::Owned(key)
+        } else if let Some(canonical) = (db_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(bytes))
+            .flatten()
+        {
+            std::borrow::Cow::Owned(canonical)
         } else {
             std::borrow::Cow::Borrowed(bytes)
         };

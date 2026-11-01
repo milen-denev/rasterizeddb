@@ -178,6 +178,12 @@ pub fn canonical_hash(db_type: &DbType, bytes: &[u8], seed: HashSeed) -> Option<
         return Some(hash_bytes(bytes, seed));
     }
 
+    // A NUMERIC carrying its own scale (a column that keeps each value's):
+    // by its one cell per value, so 1.5 and 1.50 fingerprint alike as `=`
+    // says they are equal.
+    if *db_type == DbType::DECIMAL && bytes.len() == 17 {
+        return crate::core::value_codec::canonical_numeric_cell(bytes).map(|c| hash_bytes(&c, seed));
+    }
     let width = fixed_width(db_type)?;
     if bytes.len() != width {
         return None;

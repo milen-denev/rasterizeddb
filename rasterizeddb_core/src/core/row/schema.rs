@@ -866,6 +866,23 @@ impl TableSchema {
         db_type: DbType,
         is_unique: bool,
     ) -> io::Result<()> {
+        let size = db_type.get_size();
+        self.try_add_field_sized(schema_io, field_name, db_type, size, is_unique).await
+    }
+
+    /// [`Self::try_add_field`] with the slot width given: an unconstrained
+    /// NUMERIC that keeps each value's own scale is
+    /// `value_codec::NUMERIC_OWN_SCALE_SIZE` wide, not the type's sixteen. The
+    /// caller has marked the database (`Database::require_numeric_own_scale`)
+    /// before asking for that width.
+    pub async fn try_add_field_sized<S: StorageIO>(
+        &mut self,
+        schema_io: Arc<S>,
+        field_name: String,
+        db_type: DbType,
+        size: u32,
+        is_unique: bool,
+    ) -> io::Result<()> {
         let mut field_io = schema_io
             .create_new(format!(
                 "{}_{}",
@@ -896,14 +913,7 @@ impl TableSchema {
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let field = SchemaField::new(
-            field_name,
-            db_type.clone(),
-            db_type.get_size(),
-            offset,
-            write_order,
-            is_unique,
-        );
+        let field = SchemaField::new(field_name, db_type.clone(), size, offset, write_order, is_unique);
 
         field.save_field(&mut field_io).await?;
         self.fields.push(field);

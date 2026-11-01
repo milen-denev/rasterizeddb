@@ -749,6 +749,9 @@ fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
     }
     if *db_type == DbType::JSONB {
         crate::core::jsonb::values_equal(stored, value).unwrap_or_else(|| stored == value)
+    } else if *db_type == DbType::DECIMAL && (stored.len() == 17 || value.len() == 17) {
+        // A NUMERIC carrying its own scale by its value: 1.50 duplicates 1.5.
+        crate::core::value_codec::numeric_cell_cmp(stored, value) == Some(std::cmp::Ordering::Equal)
     } else {
         stored == value
     }
@@ -1010,6 +1013,18 @@ impl<S: StorageIO> Table<S> {
         columns: Vec<CreateColumnData>,
         unique_columns: &[String],
     ) -> Self {
+        Self::new_with_constraints_sized(table_name, initial_io, columns, unique_columns, &[]).await
+    }
+
+    /// [`Self::new_with_constraints`], the NUMERIC columns named in `own_scale`
+    /// keeping each value at its own scale ([`Self::create_schema_files_with`]).
+    pub async fn new_with_constraints_sized(
+        table_name: &str,
+        initial_io: Arc<S>,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+        own_scale: &[String],
+    ) -> Self {
         let io_pointers = Arc::new(
             initial_io
                 .create_new(format!("{}_pointers.db", table_name))
@@ -1091,7 +1106,7 @@ impl<S: StorageIO> Table<S> {
                 // must not replace them with an empty one.
                 TableSchema::new(table_name.to_string(), false)
             } else {
-                match Self::create_schema_files(io_schema.clone(), table_name, columns, unique_columns).await {
+                match Self::create_schema_files_with(io_schema.clone(), table_name, columns, unique_columns, own_scale).await {
                     Ok(schema) => schema,
                     // A CREATE whose schema or a field record could not be
                     // written (a full disk, a file-size limit, a refused
@@ -1245,14 +1260,34 @@ impl<S: StorageIO> Table<S> {
         columns: Vec<CreateColumnData>,
         unique_columns: &[String],
     ) -> std::io::Result<TableSchema> {
+        Self::create_schema_files_with(io_schema, name, columns, unique_columns, &[]).await
+    }
+
+    /// [`Self::create_schema_files`], the columns named in `own_scale` (NUMERIC
+    /// declared without a precision or scale, `CreateTable::own_scale_numerics`)
+    /// keeping each value at its own scale in a seventeen-byte slot.
+    pub(crate) async fn create_schema_files_with(
+        io_schema: Arc<S>,
+        name: &str,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+        own_scale: &[String],
+    ) -> std::io::Result<TableSchema> {
         let mut schema = TableSchema::new(name.to_string(), false);
         schema.save(io_schema.clone()).await?;
         for column in columns {
             let is_unique = unique_columns
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&column.name));
+            let size = if column.data_type == crate::core::db_type::DbType::DECIMAL
+                && own_scale.iter().any(|n| n.eq_ignore_ascii_case(&column.name))
+            {
+                crate::core::value_codec::NUMERIC_OWN_SCALE_SIZE
+            } else {
+                column.data_type.get_size()
+            };
             schema
-                .try_add_field(io_schema.clone(), column.name, column.data_type, is_unique)
+                .try_add_field_sized(io_schema.clone(), column.name, column.data_type, size, is_unique)
                 .await?;
         }
         Ok(schema)
@@ -4126,6 +4161,10 @@ impl<S: StorageIO> Table<S> {
             .iter()
             .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
             .filter_map(|f| {
+                // A column that keeps each value's own scale, by its sentinel.
+                if crate::core::value_codec::keeps_own_scale(f) {
+                    return Some((f.write_order as u32, crate::core::value_codec::OWN_SCALE_SENTINEL));
+                }
                 f.scale
                     .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
                     .map(|s| (f.write_order as u32, s))

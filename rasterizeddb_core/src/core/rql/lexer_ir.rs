@@ -62,8 +62,17 @@ fn value_to_mb_scaled(
     db_type: &DbType,
     scale: Option<u32>,
     precision: Option<u32>,
+    own_scale: bool,
 ) -> Option<MemoryBlock> {
     let value_str = crate::core::rql::column_default::strip_redundant_cast(value_str.trim());
+    // An unconstrained NUMERIC that keeps each value's own scale: the number
+    // as written, every digit and its display scale.
+    if *db_type == DbType::DECIMAL && own_scale && !value_str.trim().eq_ignore_ascii_case("NULL") {
+        let cell = crate::core::value_codec::own_scale_cell(value_str)?;
+        let mut mb = MEMORY_POOL.acquire(cell.len());
+        mb.into_slice_mut().copy_from_slice(&cell);
+        return Some(mb);
+    }
     if let (DbType::DECIMAL, Some(scale)) = (db_type, scale) {
         let text = value_str.trim().trim_matches('\'').trim_matches('"');
         // NULL is not a number to be parsed at a scale; it is the absence of
@@ -1167,13 +1176,14 @@ pub(crate) fn encode_column_value(
                 if schema_field.db_type == DbType::DECIMAL =>
             {
                 // At the column's scale now, which the engine-scale renderer
-                // would read a power of ten wrong.
-                match <[u8; 16]>::try_from(bytes.as_slice()) {
-                    Ok(raw) => crate::core::value_codec::format_decimal_scaled(
-                        i128::from_le_bytes(raw),
-                        scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+                // would read a power of ten wrong; a cell carrying its own
+                // scale (a column that keeps it) at that scale.
+                match crate::core::value_codec::split_decimal_cell(&bytes) {
+                    Some((m, own)) => crate::core::value_codec::format_decimal_scaled(
+                        m,
+                        own.or(scale).unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
                     ),
-                    Err(_) => "NULL".to_string(),
+                    None => "NULL".to_string(),
                 }
             }
             // A `real` (`CAST('0.1' AS real)`) bound for a `double
@@ -1203,6 +1213,7 @@ pub(crate) fn encode_column_value(
         &literal_type_for(value, schema_field),
         declared_scale(&schema_field.name, modifiers),
         crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
+        crate::core::value_codec::keeps_own_scale(schema_field),
     )
     .or_else(|| {
         // A reason already given — an overflow — is the real one.
@@ -1536,6 +1547,7 @@ pub fn insert_row_with_defaults(
                         &literal_type_for(&literal, field),
                         declared_scale(&field.name, modifiers),
                         crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
+                        crate::core::value_codec::keeps_own_scale(field),
                     ) {
                         Some(data) => Some(data),
                         None => {

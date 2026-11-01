@@ -444,6 +444,13 @@ pub fn value_key(row: &[u8], document: impl Fn(usize) -> bool) -> Option<Vec<u8>
         {
             out.push(u8::MAX);
             crate::core::jsonb::push_group_key(cell.data, &mut out);
+        } else if let Some(canonical) = (cell.column_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(cell.data))
+            .flatten()
+        {
+            // A NUMERIC carrying its own scale by its value: 1.5 is 1.50.
+            out.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
+            out.extend_from_slice(&canonical);
         } else if cell.column_type == DbType::CHAR {
             // A legacy `CHAR` by its one stored form
             // (`value_codec::legacy_char_canonical`).

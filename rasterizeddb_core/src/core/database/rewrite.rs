@@ -355,9 +355,18 @@ impl Database {
     /// any row goes in.
     async fn create_files(&self, create: CreateTable) -> io::Result<Arc<DbTable>> {
         let mut create = create;
+        // A rewrite recreates every NUMERIC declared without a precision or
+        // scale in the seventeen-byte slot that keeps each value's own scale;
+        // the rows' values are converted on the way in (`fill`).
+        let own_scale = create.own_scale_numerics();
+        if !own_scale.is_empty() {
+            self.require_numeric_own_scale()?;
+        }
         let columns = std::mem::take(&mut create.columns);
         let seed = self.seed_of(&create.table_name).await;
-        let mut table = Table::new_with_constraints(&create.table_name, seed, columns, &create.unique_columns).await;
+        let mut table =
+            Table::new_with_constraints_sized(&create.table_name, seed, columns, &create.unique_columns, &own_scale)
+                .await;
         // Its schema or a field record could not be written: the table holds
         // an empty schema, and going on wrote the rows under none of their
         // columns. An error, so the rewrite puts its backup back.

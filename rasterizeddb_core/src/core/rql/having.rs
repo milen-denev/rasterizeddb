@@ -158,7 +158,12 @@ impl HValue {
             DbType::I32 => exact(i32::from_le_bytes(le::<4>(bytes)?) as i128, 0),
             DbType::I64 => exact(i64::from_le_bytes(le::<8>(bytes)?) as i128, 0),
             DbType::I128 => exact(i128::from_le_bytes(le::<16>(bytes)?), 0),
-            DbType::DECIMAL => exact(i128::from_le_bytes(le::<16>(bytes)?), scale),
+            // A cell carrying its own scale (an aggregate over a column that
+            // keeps each value's) at that scale.
+            DbType::DECIMAL => match crate::core::value_codec::split_decimal_cell(bytes)? {
+                (m, Some(own)) => exact(m, own),
+                (m, None) => exact(m, scale),
+            },
             DbType::U8 => exact(u8::from_le_bytes(le::<1>(bytes)?) as i128, 0),
             DbType::U16 => exact(u16::from_le_bytes(le::<2>(bytes)?) as i128, 0),
             DbType::U32 => exact(u32::from_le_bytes(le::<4>(bytes)?) as i128, 0),

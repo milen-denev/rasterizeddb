@@ -527,8 +527,18 @@ impl Database {
     ) -> io::Result<(Arc<DbStorageProvider>, TableSchema)> {
         files::create_parent_files(root, uid)?;
         let io_schema = Arc::new(self.db_io_pointers.create_new(format!("{}.db", files::schema_stem(uid))).await);
+        // `ct.columns` was taken for `columns`: asked of the columns given.
+        let own_scale: Vec<String> = columns
+            .iter()
+            .filter(|c| c.data_type == crate::core::db_type::DbType::DECIMAL)
+            .filter(|c| !ct.type_modifiers.iter().any(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&c.name)))
+            .map(|c| c.name.clone())
+            .collect();
+        if !own_scale.is_empty() {
+            self.require_numeric_own_scale()?;
+        }
         let mut schema =
-            Table::create_schema_files(io_schema.clone(), &ct.table_name, columns, &ct.unique_columns)
+            Table::create_schema_files_with(io_schema.clone(), &ct.table_name, columns, &ct.unique_columns, &own_scale)
                 .await?;
         super::write_schema_sidecars(io_schema.clone(), &mut schema, ct).await?;
         // From the schema as written: the write orders are the file's.

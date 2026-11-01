@@ -754,6 +754,19 @@ fn duplicate_key(
                 continue;
             }
         }
+        // A NUMERIC carrying its own scale, by value (1.5 is 1.50).
+        if *ty == DbType::DECIMAL {
+            if let Some((mut m, Some(mut scale))) = crate::core::value_codec::split_decimal_cell(data) {
+                while scale > 0 && m % 10 == 0 {
+                    m /= 10;
+                    scale -= 1;
+                }
+                out.push(7);
+                out.extend_from_slice(&m.to_le_bytes());
+                out.extend_from_slice(&scale.to_le_bytes());
+                continue;
+            }
+        }
         if *ty == DbType::JSONB || documents.get(position).copied().unwrap_or(false) {
             out.push(1);
             crate::core::jsonb::push_group_key(data, out);

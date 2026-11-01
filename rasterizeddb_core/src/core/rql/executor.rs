@@ -12549,6 +12549,11 @@ async fn existing_rows_break_unique(
                 crate::core::jsonb::push_group_key(bytes, &mut encoded);
                 continue;
             }
+            // A NUMERIC carrying its own scale by its value: 1.5 is 1.50.
+            if let Some(canonical) = crate::core::value_codec::canonical_numeric_cell(bytes) {
+                encoded.extend_from_slice(&canonical);
+                continue;
+            }
             // A legacy `CHAR` by its one stored form, as the insert-time
             // check compares it: an older build's `'x'` and `'x '` cells are
             // one value, so a key over them is refused (23505).
@@ -13707,6 +13712,15 @@ async fn execute_alter_table_action(
                     Err(e) => return ddl_error(&e),
                 };
             let table_name = plan.table_name.clone();
+            // A NUMERIC declared without a precision or scale keeps each value
+            // at its own scale, in a seventeen-byte slot; the database is
+            // marked for it before the field record is written.
+            let own_scale = db_type == crate::core::db_type::DbType::DECIMAL && new_modifier.is_none();
+            if own_scale {
+                if let Err(e) = database.require_numeric_own_scale() {
+                    return ddl_error(&e.to_string());
+                }
+            }
             // Every write of this arm as one reload's work, all or nothing
             // (B5): the dead names retired, the DEFAULT, NUMERIC scale and
             // generation expression, the field and its companion, the JSON
@@ -13762,8 +13776,13 @@ async fn execute_alter_table_action(
                     }
                     // A field record that cannot be written fails the change,
                     // which puts the schema files back (`reload_atomic`).
+                    let size = if own_scale {
+                        crate::core::value_codec::NUMERIC_OWN_SCALE_SIZE
+                    } else {
+                        db_type.get_size()
+                    };
                     schema
-                        .try_add_field(io_schema.clone(), name.clone(), db_type, false)
+                        .try_add_field_sized(io_schema.clone(), name.clone(), db_type, size, false)
                         .await
                         .map_err(|e| e.to_string())?;
                     if is_nullable {
@@ -20676,6 +20695,17 @@ async fn execute_query_rows_body(
                                             key.extend_from_slice(
                                                 &crate::core::value_codec::legacy_char_canonical(c.data.into_slice()),
                                             );
+                                            continue;
+                                        }
+                                        // A NUMERIC carrying its own scale
+                                        // by its value: 1.5 is 1.50.
+                                        if let Some(canonical) = (!is_null
+                                            && c.column_type == crate::core::db_type::DbType::DECIMAL)
+                                            .then(|| crate::core::value_codec::canonical_numeric_cell(c.data.into_slice()))
+                                            .flatten()
+                                        {
+                                            key.push(u8::MAX - 1);
+                                            key.extend_from_slice(&canonical);
                                             continue;
                                         }
                                         key.extend_from_slice(

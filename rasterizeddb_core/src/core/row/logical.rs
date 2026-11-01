@@ -72,6 +72,14 @@ pub fn perform_comparison_operation(
         DbType::CHAR => generic_comparison::<u32>(input1, input2, operation),
         // Unscaled units at one fixed scale, so the integer order is the
         // numeric order and equal values are bitwise identical.
+        // An unconstrained column that keeps each value's own scale: its
+        // seventeen-byte cells, and whatever meets them, compared by value
+        // (`value_codec::numeric_cell_cmp`). Sixteen-byte pairs never come here.
+        DbType::DECIMAL if input1.len() == 17 || input2.len() == 17 => {
+            let ordering = crate::core::value_codec::numeric_cell_cmp(input1, input2)
+                .ok_or(EvalError::OperandSizeMismatch)?;
+            ordered_answer(ordering, operation)
+        }
         DbType::DECIMAL => generic_comparison::<i128>(input1, input2, operation),
         // Fixed-width and big-endian by construction, so `memcmp` gives both
         // equality and the canonical ordering with no decoding step.
@@ -213,6 +221,21 @@ fn bytes_comparison(
 }
 
 #[inline(always)]
+/// An ordered comparison's answer from the two operands' ordering; a string
+/// or structural operator is not one.
+fn ordered_answer(ordering: std::cmp::Ordering, operation: &ComparerOperation) -> std::result::Result<bool, EvalError> {
+    use std::cmp::Ordering;
+    Ok(match operation {
+        ComparerOperation::Equals => ordering == Ordering::Equal,
+        ComparerOperation::NotEquals => ordering != Ordering::Equal,
+        ComparerOperation::Greater => ordering == Ordering::Greater,
+        ComparerOperation::GreaterOrEquals => ordering != Ordering::Less,
+        ComparerOperation::Less => ordering == Ordering::Less,
+        ComparerOperation::LessOrEquals => ordering != Ordering::Greater,
+        _ => return Err(EvalError::UnsupportedType),
+    })
+}
+
 fn generic_comparison<T>(
     input1: &[u8],
     input2: &[u8],

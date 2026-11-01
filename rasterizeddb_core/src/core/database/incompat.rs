@@ -30,23 +30,29 @@ const HEADER: &str = "rasterizeddb incompat_features 1";
 /// directory. Set before the first of them is created.
 pub const INDEX_STORE_V1: &str = "index_store_v1";
 
+/// An unconstrained NUMERIC column holds each value at its own scale, in a
+/// seventeen-byte slot (`value_codec::NUMERIC_OWN_SCALE_SIZE`). Set before the
+/// first such field record is written: a binary that does not know the slot
+/// reads it at sixteen bytes and nine places, and writes into it sixteen
+/// bytes padded with a scale of zero — wrong values both ways, never an error.
+pub const NUMERIC_OWN_SCALE_V1: &str = "numeric_own_scale_v1";
+
 /// Every flag any build has defined, with what it means, for the refusal
 /// message. Not the set this build supports: that is [`KNOWN`].
-const DESCRIBED: &[(&str, &str)] = &[(
-    INDEX_STORE_V1,
-    "persistent index snapshots (Cargo feature `persistent_indexes`)",
-)];
+const DESCRIBED: &[(&str, &str)] = &[
+    (INDEX_STORE_V1, "persistent index snapshots (Cargo feature `persistent_indexes`)"),
+    (NUMERIC_OWN_SCALE_V1, "unconstrained NUMERIC columns that keep each value's own scale"),
+];
 
 /// The flags this build understands.
 #[cfg(feature = "persistent_indexes")]
-const KNOWN: &[&str] = &[INDEX_STORE_V1];
+const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1];
 /// The flags this build understands.
 #[cfg(not(feature = "persistent_indexes"))]
-const KNOWN: &[&str] = &[];
+const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1];
 
-/// Serialises [`require`] within the process: two first snapshots in one
+/// Serialises [`require`] within the process: two first writers in one
 /// directory would otherwise race on the temporary file.
-#[cfg(feature = "persistent_indexes")]
 static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The flags `text` holds, or why it cannot be read as this file.
@@ -112,7 +118,6 @@ pub fn check(dir: &Path) -> Result<(), String> {
 /// Written whole to a temporary file, synced, renamed over the old one and the
 /// directory synced, so a crash leaves the old set or the new, never a torn
 /// one.
-#[cfg(feature = "persistent_indexes")]
 pub fn require(dir: &Path, flag: &str) -> io::Result<()> {
     if !KNOWN.contains(&flag) {
         return Err(io::Error::new(

@@ -79,6 +79,25 @@ pub struct CreateTable {
     pub checks: Vec<crate::core::rql::check::CheckConstraint>,
 }
 
+impl CreateTable {
+    /// The NUMERIC columns declared without a precision or scale: each keeps
+    /// every value at its own scale, in a seventeen-byte slot
+    /// (`value_codec::NUMERIC_OWN_SCALE_SIZE`).
+    pub fn own_scale_numerics(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .filter(|c| c.data_type == DbType::DECIMAL)
+            .filter(|c| {
+                !self
+                    .type_modifiers
+                    .iter()
+                    .any(|m| !m.is_deleted && m.column.eq_ignore_ascii_case(&c.name))
+            })
+            .map(|c| c.name.clone())
+            .collect()
+    }
+}
+
 /// Attempts to parse a QueryPurpose::CreateTable variant into a CreateTable struct.
 /// Returns None if the QueryPurpose is not CreateTable or parsing fails.
 pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable> {

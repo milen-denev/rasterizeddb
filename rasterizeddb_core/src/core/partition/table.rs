@@ -602,6 +602,10 @@ fn decimal_scales(schema: &crate::core::row::schema::TableSchema) -> SmallVec<[(
         .iter()
         .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
         .filter_map(|f| {
+            // A column that keeps each value's own scale, by its sentinel.
+            if crate::core::value_codec::keeps_own_scale(f) {
+                return Some((f.write_order as u32, crate::core::value_codec::OWN_SCALE_SENTINEL));
+            }
             f.scale
                 .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
                 .map(|s| (f.write_order as u32, s))

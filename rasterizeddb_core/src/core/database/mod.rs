@@ -3724,6 +3724,10 @@ impl Database {
     /// `add_table` past its name checks. Separate so a test can make the
     /// tables older builds allowed, which the guards exist to keep out.
     async fn add_table_unguarded(&self, mut create_table: CreateTable) -> io::Result<()> {
+        let own_scale = create_table.own_scale_numerics();
+        if !own_scale.is_empty() {
+            self.require_numeric_own_scale()?;
+        }
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
@@ -3769,7 +3773,8 @@ impl Database {
         }
 
         let mut table =
-            Table::new_with_constraints(table_name, seed, columns, &create_table.unique_columns).await;
+            Table::new_with_constraints_sized(table_name, seed, columns, &create_table.unique_columns, &own_scale)
+                .await;
         // Its schema or a field record could not be written: nothing is
         // catalogued, and the files go.
         if table.schema_unreadable {
@@ -3841,6 +3846,18 @@ impl Database {
     /// a statement-scoped relation (in memory, created by every CTE, and kept
     /// off the sync path) nor in a directory being bulk-loaded (an import that
     /// dies is discarded whole).
+    /// Marks the database as holding unconstrained NUMERIC columns that keep
+    /// each value at its own scale (`incompat::NUMERIC_OWN_SCALE_V1`), before
+    /// the first such field record is written, so a binary that would misread
+    /// them refuses to open it instead. Nothing to mark for a database in
+    /// memory.
+    pub(crate) fn require_numeric_own_scale(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::NUMERIC_OWN_SCALE_V1),
+            None => Ok(()),
+        }
+    }
+
     fn creates_durably(&self, table_name: &str) -> bool {
         temp_seed(table_name).is_none()
             && self.survives_a_crash(table_name)

@@ -220,6 +220,19 @@ fn conjunct_to_pred(
     // engine default instead, `v > 50` over `NUMERIC(10,2)` bounded every zone
     // against 50 × 10^9 and pruned all of them: no rows, and no error.
     let value = match scales.iter().find(|(wo, _)| *wo == write_order) {
+        // A column that keeps each value's own scale: an equality probes its
+        // fingerprints with the literal's one cell per value
+        // (`value_codec::canonical_numeric_cell`), which is what they were
+        // derived from (`hash::canonical_hash`). Its zones are not bounded
+        // (their cells are not one integer order), so nothing else prunes.
+        Some((_, scale)) if *db_type == DbType::DECIMAL && *scale == crate::core::value_codec::OWN_SCALE_SENTINEL => {
+            if op != SargOp::Eq {
+                return None;
+            }
+            let text = crate::core::rql::subquery::value_to_literal(&from, &raw)?;
+            let cell = crate::core::value_codec::own_scale_cell(&crate::core::value_codec::unquote_sql(&text))?;
+            crate::core::value_codec::canonical_numeric_cell(&cell)?
+        }
         Some((_, scale)) if *db_type == DbType::DECIMAL => {
             let text = crate::core::rql::subquery::value_to_literal(&from, &raw)?;
             let text = crate::core::value_codec::unquote_sql(&text);

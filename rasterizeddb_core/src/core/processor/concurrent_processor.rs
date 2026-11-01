@@ -3017,6 +3017,12 @@ pub(crate) fn compare_bytes_as_type(
         // (pre-1970) instants above positive ones.
         DbType::DATETIME | DbType::TIMESTAMP => read_num::<8, i64>(a, b, i64::from_le_bytes),
         // Fixed-scale unscaled units, so the integer order is the numeric order.
+        // A column that keeps each value's own scale: its cells by value
+        // (`value_codec::numeric_cell_cmp`); its first sixteen bytes alone
+        // ignore the scale byte, and 1.50 sorted above 2.
+        DbType::DECIMAL if a.len() == 17 || b.len() == 17 => {
+            crate::core::value_codec::numeric_cell_cmp(a, b).unwrap_or_else(|| a.cmp(b))
+        }
         DbType::DECIMAL => read_num::<16, i128>(a, b, i128::from_le_bytes),
         DbType::I8 => read_num::<1, i8>(a, b, i8::from_le_bytes),
         DbType::I16 => read_num::<2, i16>(a, b, i16::from_le_bytes),

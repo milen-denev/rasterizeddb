@@ -616,6 +616,11 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                             let mut key = Vec::new();
                             crate::core::jsonb::push_group_key(bytes, &mut key);
                             key
+                        } else if let Some(canonical) = (f.db_type == DbType::DECIMAL)
+                            .then(|| crate::core::value_codec::canonical_numeric_cell(bytes))
+                            .flatten()
+                        {
+                            canonical
                         } else {
                             bytes.to_vec()
                         }

@@ -27,6 +27,9 @@ pub struct QueryParser<'a, 'b> {
     /// without reconciling the scales is off by a power of ten — and answers,
     /// rather than failing. See [`Self::rescale_decimal_literal`].
     decimal_scales: SmallVec<[(usize, u32); 8]>,
+    /// The unconstrained NUMERIC columns that keep each value's own scale
+    /// (`value_codec::keeps_own_scale`), by write order.
+    own_scale_columns: SmallVec<[usize; 4]>,
 }
 
 impl<'a, 'b> QueryParser<'a, 'b> {
@@ -41,6 +44,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             first_iteration: true,
             used_column_indices: SmallVec::new(),
             decimal_scales: SmallVec::new(),
+            own_scale_columns: SmallVec::new(),
         }
     }
 
@@ -56,6 +60,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             if field.db_type != DbType::DECIMAL {
                 continue;
             }
+            if crate::core::value_codec::keeps_own_scale(field) {
+                self.own_scale_columns.push(field.write_order as usize);
+                continue;
+            }
             if let Some(scale) = field.scale {
                 if scale != crate::core::value_codec::DECIMAL_SCALE {
                     self.decimal_scales
@@ -64,6 +72,36 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             }
         }
         self
+    }
+
+    /// Whether `operand` names a column that keeps each value's own scale.
+    fn keeps_own_scale(&self, operand: &ComparisonOperand) -> bool {
+        operand.is_column()
+            && operand.get_column_index().is_some_and(|index| self.own_scale_columns.contains(&index))
+    }
+
+    /// A literal compared with a column that keeps each value's own scale, as
+    /// such a cell: every digit as written, so `v = 0.0000000001` and `v =
+    /// 1.50` compare by value (`value_codec::numeric_cell_cmp`) where the
+    /// engine scale would cut the first and could not say the second.
+    fn own_scale_literal(literal: &ComparisonOperand, from: &DbType) -> Option<ComparisonOperand> {
+        let ComparisonOperand::Direct(mb) = literal else {
+            return None;
+        };
+        let cell = match (from, mb.into_slice().len()) {
+            (DbType::DECIMAL, 17) => mb.into_slice().to_vec(),
+            (DbType::DECIMAL, 16) => {
+                let m = i128::from_le_bytes(mb.into_slice().try_into().ok()?);
+                crate::core::value_codec::decimal_cell_with_scale(m, crate::core::value_codec::DECIMAL_SCALE)
+            }
+            _ => {
+                let text = crate::core::rql::subquery::value_to_literal(from, mb.into_slice())?;
+                crate::core::value_codec::own_scale_cell(&crate::core::value_codec::unquote_sql(&text))?
+            }
+        };
+        let mut out = MEMORY_POOL.acquire(cell.len());
+        out.into_slice_mut().copy_from_slice(&cell);
+        Some(ComparisonOperand::Direct(out))
     }
 
     /// The declared scale of the column an operand names, when it differs from
@@ -815,11 +853,31 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // than the column is compared with both sides at the engine scale
         // instead, below — which the filter index declines to prune, as it
         // declines any literal it cannot encode exactly.
-        let (left_op, right_op, left_type, right_type, op_str) =
-            match self.bound_inexact_decimal_literal(&left_op, &left_type, &right_op, &right_type, op_str) {
+        // A column that keeps each value's own scale meets a literal as such
+        // a cell, compared by value; no scale of the column's to meet at.
+        let literal = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Direct(_));
+        let (left_op, right_op, left_type, right_type) =
+            if self.keeps_own_scale(&left_op) && literal(&right_op) && left_type == DbType::DECIMAL {
+                match Self::own_scale_literal(&right_op, &right_type) {
+                    Some(cell) => (left_op, cell, left_type, DbType::DECIMAL),
+                    None => (left_op, right_op, left_type, right_type),
+                }
+            } else if self.keeps_own_scale(&right_op) && literal(&left_op) && right_type == DbType::DECIMAL {
+                match Self::own_scale_literal(&left_op, &left_type) {
+                    Some(cell) => (cell, right_op, DbType::DECIMAL, right_type),
+                    None => (left_op, right_op, left_type, right_type),
+                }
+            } else {
+                (left_op, right_op, left_type, right_type)
+            };
+        let own_scale_pair = self.keeps_own_scale(&left_op) || self.keeps_own_scale(&right_op);
+        let (left_op, right_op, left_type, right_type, op_str) = match own_scale_pair {
+            true => (left_op, right_op, left_type, right_type, op_str),
+            false => match self.bound_inexact_decimal_literal(&left_op, &left_type, &right_op, &right_type, op_str) {
                 Some(bounded) => bounded,
                 None => (left_op, right_op, left_type, right_type, op_str),
-            };
+            },
+        };
         let mut inexact_literal = false;
         let (left_op, right_op, left_type, right_type) = {
             let left_scale = self.scale_of(&left_op);
