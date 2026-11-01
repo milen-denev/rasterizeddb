@@ -212,6 +212,17 @@ async fn a_large_own_scale_column_answers_every_predicate() {
     for chunk in values.chunks(1000) {
         run(&c, &format!("INSERT INTO big VALUES {}", chunk.join(", "))).await;
     }
+    // The filter (and below, each index) built and asked, as on a server
+    // that has had a moment: before it is ready a scan does not consult it.
+    let ready = || async {
+        let t = server.database().table_for_tests("big").expect("the table");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !t.filters_ready().unwrap() || t.indexes().unwrap().is_some_and(|ix| !ix.is_ready()) {
+            assert!(std::time::Instant::now() < deadline, "the filter or the indexes never became ready");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    };
+    ready().await;
     let checks: &[(&str, &[&str])] = &[
         ("SELECT count(*) FROM big WHERE v = 12.34", &["1"]),
         ("SELECT count(*) FROM big WHERE v = 12.340", &["1"]),
@@ -233,11 +244,13 @@ async fn a_large_own_scale_column_answers_every_predicate() {
         assert_eq!(rows(&c, sql).await, *want, "{sql}");
     }
     run(&c, "CREATE INDEX big_v ON big (v)").await;
+    ready().await;
     for (sql, want) in checks {
         assert_eq!(rows(&c, sql).await, *want, "{sql} (B-tree)");
     }
     run(&c, "DROP INDEX big_v").await;
     run(&c, "CREATE INDEX big_h ON big USING hash (v)").await;
+    ready().await;
     for (sql, want) in checks {
         assert_eq!(rows(&c, sql).await, *want, "{sql} (hash)");
     }
