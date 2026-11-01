@@ -732,7 +732,19 @@ instance out**; while a close is under way a reader reads the files and
 keeps nothing, and a reader keeps what it read only if no open or close
 began or ended meanwhile (an epoch), so a read that raced a close never
 overwrites the close's lengths. So a catalog read costs no `stat` per
-closed partition after the first. **A DDL never reads them**: an `ALTER`'s
+closed partition after the first. **What the figures guarantee:** the
+rows, pointer and index-store bytes are the files' lengths as they are
+(exactly, once no close is in flight), and the slot count is the pointer
+file's records. Slots and pointer bytes are a function of the statements
+run (one append-only record per row version; background vacuum leaves
+tombstoned records in place). Rows bytes are not: vacuum reclaims a dead
+version's extent on its own schedule, and a later write fills a reclaimed
+extent instead of appending, so the same statements can leave rows files
+whose lengths differ by the reused bytes. Two databases, or two runs, are
+compared on slots, pointers and answers, never on rows bytes
+(`budget_answers_tests`, which compared them and failed under load by
+exactly the reused bytes, 39 to 79, with either budget the smaller).
+**A DDL never reads them**: an `ALTER`'s
 "is the table populated" (`partitioned_alter_refusal_held`) and its row
 count (`rows_len_held`) read every materialized partition under its
 lifecycle lock, an open one's instance or a closed one's files

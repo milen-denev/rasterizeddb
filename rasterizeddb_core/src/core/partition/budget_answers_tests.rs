@@ -63,6 +63,40 @@ async fn sizes_of(t: &PartitionedTable) -> (u64, u64, u64, Vec<(u32, &'static st
     (tot.data, tot.pointers, tot.slots, parts, t.rows_len().unwrap())
 }
 
+/// What two databases that ran the same statements must agree on, whatever
+/// their open budgets: the pointer files (one record per row version
+/// written, append-only: background vacuum leaves tombstoned records in
+/// place, `core::vacuum`), so the slot counts and pointer bytes, and each
+/// partition's state and slots.
+///
+/// Not the rows files' bytes: vacuum reclaims a dead version's extent when
+/// its own schedule lets it, and a later write fills a reclaimed extent
+/// instead of appending, so the same statements leave rows files whose
+/// lengths differ by the reused bytes, in either database, on timing alone
+/// (seen under load: 39, 40 and 79 bytes, each exactly the bytes written
+/// into reused extents, as often with the unbounded budget smaller as with
+/// the budget of one). What the catalog guarantees for those is checked per
+/// database instead ([`catalog_matches_files`]).
+fn guaranteed(s: &(u64, u64, u64, Vec<(u32, &'static str, u64)>, u64)) -> (u64, u64, Vec<(u32, &'static str, u64)>) {
+    (s.1, s.2, s.3.clone())
+}
+
+/// The catalog's rows bytes and the rows length, with every partition
+/// closed (so no close is in flight and each kept size was stored by its
+/// close), are the rows files' own lengths (each file and its `.tmp`).
+async fn catalog_matches_files(t: &PartitionedTable, dir: &Path) {
+    t.close_idle().await.unwrap();
+    let mut files = 0u64;
+    for pid in t.materialized_pids().unwrap() {
+        let [rows, _] = super::files::data_files(t.uid(), pid);
+        for name in [rows.clone(), format!("{rows}.tmp")] {
+            files += std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    let (data, _, _, _, rows_len) = sizes_of(t).await;
+    assert_eq!((data, rows_len), (files, files), "{}: the catalog's rows bytes are not the files'", t.name());
+}
+
 const SCRIPT: &[&str] = &[
     "CREATE TABLE parent (pid BIGINT PRIMARY KEY, name TEXT)",
     "CREATE TABLE pt (tenant_id BIGINT NOT NULL REFERENCES parent(pid), id BIGINT NOT NULL, v BIGINT, s TEXT, PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS 16",
@@ -157,8 +191,9 @@ async fn answers_never_depend_on_the_open_budget() {
     }
     for name in ["pt", "pu"] {
         let (s, l) = (sizes_of(&table(&ds, name)).await, sizes_of(&table(&db, name)).await);
-        assert_eq!(s.3, l.3, "{name}: SHOW PARTITIONS slots");
-        assert_eq!((s.0, s.1, s.2, s.4), (l.0, l.1, l.2, l.4), "{name}: totals");
+        assert_eq!(guaranteed(&s), guaranteed(&l), "{name}: pointers, slots and partitions");
+        catalog_matches_files(&table(&ds, name), small.path()).await;
+        catalog_matches_files(&table(&db, name), big.path()).await;
     }
     // After a restart (first catalog read stats the files).
     close(small.path(), ds);
@@ -167,7 +202,9 @@ async fn answers_never_depend_on_the_open_budget() {
     let db = open(big.path()).await;
     for name in ["pt", "pu"] {
         let (s, l) = (sizes_of(&table(&ds, name)).await, sizes_of(&table(&db, name)).await);
-        assert_eq!(s.3, l.3, "{name}: SHOW PARTITIONS slots after restart");
+        assert_eq!(guaranteed(&s), guaranteed(&l), "{name}: pointers, slots and partitions after restart");
+        catalog_matches_files(&table(&ds, name), small.path()).await;
+        catalog_matches_files(&table(&db, name), big.path()).await;
     }
     for sql in ["SELECT tenant_id, id, v, s FROM pt ORDER BY tenant_id, id", "SELECT tenant_id, k, w FROM pu ORDER BY tenant_id, k"] {
         assert_eq!(try_exec(&ds, sql).await, try_exec(&db, sql).await, "after restart: {sql}");
