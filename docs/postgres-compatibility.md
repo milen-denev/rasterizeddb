@@ -653,26 +653,64 @@ constant's own places (`2.50` is two), an integer's none, and for `CASE`,
 comparison (`CASE WHEN x * y > 0`). Stored into a `NUMERIC(p, s)` column the
 value is PostgreSQL's, rounded once more to `s`.
 
-Not yet at PostgreSQL's digits: arithmetic in a `WHERE` clause evaluated by
-the scan (`WHERE x * y > 0` over values whose product has digits past nine
-places), an aggregate's argument (`sum(a * 1.5)` shows nine places), and a
-`GROUP BY` key computed by an expression. A value that needs more than the 38
-digits an `i128` carries is refused (0A000); one that ends within 38 places
-past a display scale of more than 38 is shown at 38.
+An aggregate's NUMERIC argument is computed the same way (`sum(n * 2)` over a
+NUMERIC(10,4) is 24.0000), and so is arithmetic over an unconstrained column in
+a `WHERE` clause (the scan hands it to the expression evaluator). A value that
+needs more than the 38 digits an `i128` carries is refused (0A000 or 22003),
+never rounded — PostgreSQL's `numeric` has no such limit, so a product like a
+twenty-place value times `1e30` is refused here; one that ends within 38 places
+past a display scale of more than 38 is shown at 38. Not yet at PostgreSQL's
+digits: a `GROUP BY` key computed by an expression.
 
-An unconstrained `NUMERIC` column is stored at nine places here, so a value
-does not keep its own display scale: it is shown with nine places as a column
-and with the places its value needs in arithmetic. Until each value is stored
-at its own precision the rule on every path into such a column (`INSERT …
-VALUES`, `INSERT … SELECT`, `UPDATE`, `ON CONFLICT … DO UPDATE`, a generated
-column, a cast from a float) is one: a value exact at nine places (any digits
-past them zeros) is stored, and one with a nonzero digit past them is refused
-with 0A000, never rounded. The refusal depends on the data, so the same
-statement may run against some rows and be refused against others.
+#### Unconstrained NUMERIC storage (C6)
+
+An unconstrained `NUMERIC` column keeps each value at its own scale, as
+PostgreSQL does: `INSERT 1.50` reads back `1.50`, `'1e-10'` is stored, and
+`UPDATE … SET c = 2.0 / 3` stores 0.66666666666666666667. Up to 38 digits and
+38 places; past that a value is refused, never rounded. Equal values at
+different scales (1.5, 1.50) are one value to `=`, `GROUP BY`, `DISTINCT`, a
+join, `UNIQUE` and the indexes; each is shown as written, and `MIN`/`MAX` of
+tied values gives the later one, as PostgreSQL's `numeric_larger` does.
+
+Such a column's slot is seventeen bytes (the value and its scale); the
+field's recorded width says which format a column holds, and one column never
+mixes them. `CREATE TABLE`, `ALTER TABLE … ADD COLUMN`, a partitioned table,
+pg-import and a CTE or derived table make every new unconstrained `NUMERIC`
+column this way (`CREATE TABLE … AS` and `SELECT INTO` are not supported yet).
+Range predicates on such a column are not pruned by zone maps yet; equality
+is pruned by the filter index, and both B-tree and hash indexes key it.
+
+A column created before this release keeps the sixteen-byte slot at nine
+places, its values and its speed unchanged, and with them the earlier rule: a
+value with a nonzero digit past nine places is refused (0A000), and the error
+says how to keep them. Convert the column with
+
+    ALTER TABLE t ALTER COLUMN c TYPE NUMERIC;
+
+which rewrites every row into the new slot, all or nothing (a crash or a
+failure part-way leaves the old column, `database/rewrite.rs`). Each value
+keeps its value and is shown at the places it needs (1.500000000 becomes
+1.5; the scale it was written with was never stored). Any other rewrite of
+the table converts it the same way: an `ADD COLUMN` on a table with rows,
+`DROP NOT NULL`. A partitioned table is not rewritten yet, so its old columns
+stay as they are.
+
+Upgrade and downgrade: no rewrite is needed on upgrade. The first time a
+seventeen-byte column is written, the database records the on-disk feature
+`numeric_own_scale_v1` in its `incompat_features` file, and from then on a
+binary that does not know it refuses to open the database at start, naming
+the feature, rather than misreading those columns (an older binary would read
+the seventeen bytes at nine places and write sixteen into them). A binary from
+before `incompat_features` existed ignores the file and must not be used on
+such a database. A backup carries the file with the rest. Replication ships
+statements, so a replica must run a binary that knows the feature before the
+primary writes a value with more than nine places.
 
 A constant with more than nine places, written either way (`0.000000000001`,
 `43e-17`), is `numeric` as in PostgreSQL, carried with its digits (up to 38
-places): `SELECT c + 43e-17` is 44812.65000000000000043. A `UNION` of NUMERIC
+places): `SELECT c + 43e-17` is 44812.65000000000000043. So is one too large
+for nine places (past about 1.7e29: `1e30`, a 30-digit integer), which was a
+`float8`: `n * 1e30` and `1e30 + 1` are exact. A `UNION` of NUMERIC
 columns at different scales gives each value at its own scale; one whose
 branch types cannot be resolved to NUMERIC is refused with 0A000 rather than
 mixed.
