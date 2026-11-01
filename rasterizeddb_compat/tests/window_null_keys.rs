@@ -112,3 +112,39 @@ async fn window_partitions_from_the_review_probe() {
     assert_eq!(sqlstate(&c, "INSERT INTO nu VALUES (0.0)").await, "23505");
     assert_eq!(rows_n(&c, "SELECT count(*) FROM nu").await, ["3"] as [&str; 1], "SELECT count(*) FROM nu");
 }
+
+/// DISTINCT, count(DISTINCT), count(col), UNION, joins, IN subqueries, GROUP BY and ORDER BY over NULL beside 0, '', false and {}, and a window over a CTE and a derived table: NULL is never a zero value. PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn null_keys_outside_windows() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE wt (id INT PRIMARY KEY, i INT, n NUMERIC, p NUMERIC(10,2), t TEXT, bo BOOLEAN, f FLOAT8, j JSONB)").await;
+    run(&c, "INSERT INTO wt VALUES (1, 0, 0, 0, '', false, 0, '{}'), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (3, 0, 0.00, 0.00, '', false, 0, '{}'), (4, 1, 1, 1, 'a', true, 1, '{\"a\":1}'), (5, NULL, NULL, NULL, NULL, NULL, NULL, NULL)").await;
+    assert_eq!(rows_n(&c, "SELECT DISTINCT i, t FROM wt ORDER BY 1, 2").await, ["0|", "1|a", "NULL|NULL"] as [&str; 3], "SELECT DISTINCT i, t FROM wt ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT bo FROM wt ORDER BY 1").await, ["f", "t", "NULL"] as [&str; 3], "SELECT DISTINCT bo FROM wt ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT p FROM wt ORDER BY 1").await, ["0.00", "1.00", "NULL"] as [&str; 3], "SELECT DISTINCT p FROM wt ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT count(DISTINCT t), count(DISTINCT i), count(DISTINCT bo), count(DISTINCT p), count(DISTINCT f) FROM wt").await, ["2|2|2|2|2"] as [&str; 1], "SELECT count(DISTINCT t), count(DISTINCT i), count(DISTINCT bo), count(DISTINCT p), count(DISTINCT f) FROM wt");
+    assert_eq!(rows_n(&c, "SELECT count(t), count(i), count(bo), count(p), count(j) FROM wt").await, ["3|3|3|3|3"] as [&str; 1], "SELECT count(t), count(i), count(bo), count(p), count(j) FROM wt");
+    assert_eq!(rows_n(&c, "SELECT i FROM wt UNION SELECT i FROM wt ORDER BY 1").await, ["0", "1", "NULL"] as [&str; 3], "SELECT i FROM wt UNION SELECT i FROM wt ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT t FROM wt UNION SELECT t FROM wt ORDER BY 1").await, ["", "a", "NULL"] as [&str; 3], "SELECT t FROM wt UNION SELECT t FROM wt ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT i, t FROM wt UNION ALL SELECT i, t FROM wt WHERE id = 2 ORDER BY 1, 2").await, ["0|", "0|", "1|a", "NULL|NULL", "NULL|NULL", "NULL|NULL"] as [&str; 6], "SELECT i, t FROM wt UNION ALL SELECT i, t FROM wt WHERE id = 2 ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a JOIN wt b ON a.t = b.t ORDER BY 1, 2").await, ["1|1", "1|3", "3|1", "3|3", "4|4"] as [&str; 5], "SELECT a.id, b.id FROM wt a JOIN wt b ON a.t = b.t ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a JOIN wt b ON a.i = b.i ORDER BY 1, 2").await, ["1|1", "1|3", "3|1", "3|3", "4|4"] as [&str; 5], "SELECT a.id, b.id FROM wt a JOIN wt b ON a.i = b.i ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a JOIN wt b ON a.bo = b.bo ORDER BY 1, 2").await, ["1|1", "1|3", "3|1", "3|3", "4|4"] as [&str; 5], "SELECT a.id, b.id FROM wt a JOIN wt b ON a.bo = b.bo ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a JOIN wt b ON a.i = b.i AND a.t = b.t ORDER BY 1, 2").await, ["1|1", "1|3", "3|1", "3|3", "4|4"] as [&str; 5], "SELECT a.id, b.id FROM wt a JOIN wt b ON a.i = b.i AND a.t = b.t ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT id FROM wt WHERE t IN (SELECT t FROM wt WHERE id = 2) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM wt WHERE t IN (SELECT t FROM wt WHERE id = 2) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM wt WHERE i NOT IN (SELECT i FROM wt WHERE id = 4) ORDER BY id").await, ["1", "3"] as [&str; 2], "SELECT id FROM wt WHERE i NOT IN (SELECT i FROM wt WHERE id = 4) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM wt WHERE t IN (SELECT t FROM wt WHERE id = 1) ORDER BY id").await, ["1", "3"] as [&str; 2], "SELECT id FROM wt WHERE t IN (SELECT t FROM wt WHERE id = 1) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT i, t, count(*) FROM wt GROUP BY i, t ORDER BY 1, 2").await, ["0||2", "1|a|1", "NULL|NULL|2"] as [&str; 3], "SELECT i, t, count(*) FROM wt GROUP BY i, t ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT bo, count(*) FROM wt GROUP BY bo ORDER BY 1").await, ["f|2", "t|1", "NULL|2"] as [&str; 3], "SELECT bo, count(*) FROM wt GROUP BY bo ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT j, count(*) FROM wt GROUP BY j ORDER BY 2, 1").await, ["{\"a\": 1}|1", "{}|2", "NULL|2"] as [&str; 3], "SELECT j, count(*) FROM wt GROUP BY j ORDER BY 2, 1");
+    assert_eq!(rows_n(&c, "WITH c AS (SELECT id, i, t FROM wt) SELECT id, count(*) OVER (PARTITION BY i), count(*) OVER (PARTITION BY t), row_number() OVER (ORDER BY i, id) FROM c ORDER BY id").await, ["1|2|2|1", "2|2|2|4", "3|2|2|2", "4|1|1|3", "5|2|2|5"] as [&str; 5], "WITH c AS (SELECT id, i, t FROM wt) SELECT id, count(*) OVER (PARTITION BY i), count(*) OVER (PARTITION BY t), row_number() OVER (ORDER BY i, id) FROM c ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, count(*) OVER (PARTITION BY i) FROM wt WHERE id < 5 ORDER BY id").await, ["1|2", "2|1", "3|2", "4|1"] as [&str; 4], "SELECT id, count(*) OVER (PARTITION BY i) FROM wt WHERE id < 5 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, count(*) OVER (PARTITION BY bo), count(*) OVER (PARTITION BY j) FROM wt ORDER BY id").await, ["1|2|2", "2|2|2", "3|2|2", "4|1|1", "5|2|2"] as [&str; 5], "SELECT id, count(*) OVER (PARTITION BY bo), count(*) OVER (PARTITION BY j) FROM wt ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM wt ORDER BY p DESC, id").await, ["2", "5", "4", "1", "3"] as [&str; 5], "SELECT id FROM wt ORDER BY p DESC, id");
+    assert_eq!(rows_n(&c, "SELECT id FROM wt ORDER BY j, id").await, ["1", "3", "4", "2", "5"] as [&str; 5], "SELECT id FROM wt ORDER BY j, id");
+    assert_eq!(rows_n(&c, "WITH c AS (SELECT id, i FROM wt) SELECT id FROM c ORDER BY i, id").await, ["1", "3", "4", "2", "5"] as [&str; 5], "WITH c AS (SELECT id, i FROM wt) SELECT id FROM c ORDER BY i, id");
+    assert_eq!(rows_n(&c, "SELECT id, i FROM wt ORDER BY i NULLS FIRST, id LIMIT 3").await, ["2|NULL", "5|NULL", "1|0"] as [&str; 3], "SELECT id, i FROM wt ORDER BY i NULLS FIRST, id LIMIT 3");
+    assert_eq!(rows_n(&c, "SELECT id, count(*) OVER (PARTITION BY i) FROM (SELECT id, i FROM wt) d ORDER BY id").await, ["1|2", "2|2", "3|2", "4|1", "5|2"] as [&str; 5], "SELECT id, count(*) OVER (PARTITION BY i) FROM (SELECT id, i FROM wt) d ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a LEFT JOIN wt b ON a.p = b.p ORDER BY 1, 2").await, ["1|1", "1|3", "2|NULL", "3|1", "3|3", "4|4", "5|NULL"] as [&str; 7], "SELECT a.id, b.id FROM wt a LEFT JOIN wt b ON a.p = b.p ORDER BY 1, 2");
+}
