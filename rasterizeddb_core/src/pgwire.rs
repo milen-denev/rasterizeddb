@@ -4906,7 +4906,10 @@ where
         // `sum(character)`, `character = boolean`: undefined_function, as
         // PostgreSQL has no such function or operator.
         "42883"
-    } else if (message.contains("unknown type '") && message.contains("in a cast")) || casts_to_unknown_type(message) {
+    } else if (message.contains("unknown type '") && message.contains("in a cast"))
+        || casts_to_unknown_type(message)
+        || (message.starts_with("type \"") && message.ends_with("\" does not exist"))
+    {
         "42704"
     } else if (message.ends_with(" not found in schema")
         || message.contains("is neither a column nor a value")
@@ -7510,7 +7513,7 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "42501"
     } else if has("missing from-clause entry for table") {
         "42P01"
-    } else if has("unknown type") && has("in a cast") {
+    } else if (has("unknown type") && has("in a cast")) || (has_raw("type \"") && has("\" does not exist")) {
         // `x::nosuchtype`: undefined_object, as PostgreSQL's "type … does
         // not exist".
         "42704"

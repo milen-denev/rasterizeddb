@@ -331,7 +331,54 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     result
 }
 
-/// Runs one subquery and returns its rows.
+/// The name PostgreSQL gives a scalar subquery standing as a whole item of
+/// the outer select list, unaliased: its inner item's name. `None` anywhere
+/// else (a WHERE, an argument, an aliased item), and for an inner list of
+/// more than one item.
+fn scalar_subquery_label(sql: &str, start: usize, end: usize, inner: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let trimmed = sql.trim_start();
+    if !trimmed.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        return None;
+    }
+    if find_keyword(sql, "FROM", 0).is_some_and(|from| from < start) {
+        return None;
+    }
+    let before = sql[..start].trim_end();
+    let upper_before = before.to_ascii_uppercase();
+    let opens_item = before.ends_with(',')
+        || upper_before.ends_with("SELECT")
+        || upper_before.ends_with(" DISTINCT")
+        || upper_before.ends_with(" ALL");
+    let after = sql[end..].trim_start();
+    let closes_item = after.is_empty()
+        || after.starts_with(',')
+        || after.starts_with(';')
+        || after.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("FROM"))
+            && !after[4..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+    if !opens_item || !closes_item {
+        return None;
+    }
+    let inner = inner.trim();
+    let body = inner.get(6..).filter(|_| inner.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")))?;
+    let body = body.trim_start();
+    let body = match body.get(..8) {
+        Some(w) if w.eq_ignore_ascii_case("DISTINCT") => body[8..].trim_start(),
+        _ => body,
+    };
+    let item = match find_keyword(body, "FROM", 0) {
+        Some(at) => &body[..at],
+        None => body,
+    };
+    let item = item.trim();
+    if crate::core::rql::join::split_top_level_commas(item).len() != 1 {
+        return None;
+    }
+    let (expression, alias) = crate::core::rql::lexer_query::split_alias(item);
+    Some(alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expression)))
+}
+
+/// Runs one subquery and returns its rows./// Runs one subquery and returns its rows.
 async fn run_subquery(
     sql: &str,
     database: &Arc<Database>,
@@ -1051,6 +1098,14 @@ pub async fn substitute_in_subqueries(
             .flatten()
             .unwrap_or(false);
         let literal = subquery::rows_to_scalar(&rows, document, exact, zoned)?;
+        // A whole select item keeps the name PostgreSQL gives it: the inner
+        // item's (`(SELECT max(x) …)` is `max`, `(SELECT x AS y …)` is `y`,
+        // an expression `?column?`). The constant was named after itself
+        // (`float8`, `float8 * 2`).
+        let literal = match scalar_subquery_label(&current, found.start, found.end, &found.inner_sql) {
+            Some(label) => format!("{literal} AS \"{}\"", label.replace('"', "\"\"")),
+            None => literal,
+        };
         current = format!(
             "{}{}{}",
             &current[..found.start],

@@ -1532,6 +1532,18 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 // failed the same way. Kept quoted when it does not read as a
                 // finite float (`'NaN'::float8`), as before.
                 let name = &clause[name_start..i];
+                // `double` alone names no type in PostgreSQL; `double
+                // precision` does: its second word is consumed with it.
+                if name.eq_ignore_ascii_case("double") {
+                    let rest = clause[i..].trim_start();
+                    let precision = rest.get(..9).is_some_and(|w| w.eq_ignore_ascii_case("precision"))
+                        && !rest[9..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                    if !precision {
+                        return Err("type \"double\" does not exist".to_string());
+                    }
+                    i = clause.len() - rest.len() + 9;
+                }
+                let name = if name.eq_ignore_ascii_case("double") { "float8" } else { name };
                 let single = ["float4", "real"].iter().any(|t| name.eq_ignore_ascii_case(t));
                 if single || ["float8", "double", "float"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
                     // Quoted or not: `'0.1'::real` and `0.1::float4` are both

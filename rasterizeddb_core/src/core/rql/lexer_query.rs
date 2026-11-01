@@ -382,6 +382,10 @@ fn parse_select_items(
         // is therefore that width times the number of rows, which the ordinary
         // aggregate path can answer.
         let rewritten_size = rewrite_row_size(raw.trim(), schema);
+        // `::double precision` is `::float8`: as two words the second was
+        // read as an alias, and the cast then named a type PostgreSQL does
+        // not have (`double` alone).
+        let rewritten_size = double_precision_casts(&rewritten_size);
         let raw = rewritten_size.as_str();
         let item = raw.trim();
         if item.is_empty() {
@@ -496,6 +500,8 @@ fn parse_select_items(
                 // A type error is the statement's answer; falling through
                 // would report the item as an unsupported construct instead.
                 Err(e) if e.ends_with(" cannot be matched") => return Err(e),
+                // A cast to a type name PostgreSQL does not have (42704).
+                Err(e) if e.starts_with("type \"") && e.ends_with("\" does not exist") => return Err(e),
                 Err(_) => {}
             }
         }
@@ -906,6 +912,47 @@ pub(crate) fn null_test_item(item: &str) -> Option<(String, Option<String>)> {
         _ => return None,
     };
     Some((format!("{} IS {}", operand, words[..test_len].join(" ")), alias))
+}
+
+/// `text` with each `::double precision` cast written `::float8`, outside
+/// quotes; any other text unchanged (and not copied when there is none).
+fn double_precision_casts(text: &str) -> String {
+    if !text.to_ascii_lowercase().contains("precision") {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if text[i..].starts_with("::") {
+            let rest = &text[i + 2..];
+            let lead = rest.len() - rest.trim_start().len();
+            let after = &rest[lead..];
+            if after.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("double")) {
+                let tail = &after[6..];
+                let gap = tail.len() - tail.trim_start().len();
+                let word = &tail[gap..];
+                if gap > 0
+                    && word.get(..9).is_some_and(|w| w.eq_ignore_ascii_case("precision"))
+                    && !word[9..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push_str("::float8");
+                    i += 2 + lead + 6 + gap + 9;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {

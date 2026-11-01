@@ -669,7 +669,7 @@ fn cast_target(name: &str) -> Option<DbType> {
             // engine's interval unit — rendered as `00:00:00.000003+00`.
             "DATE" => DbType::DATE,
             "NUMERIC" | "DECIMAL" => DbType::DECIMAL,
-            "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DbType::F64,
+            "FLOAT8" | "DOUBLE PRECISION" => DbType::F64,
             // `real` IS float4 — mapping it to F64 made the described type float8,
             // and a client decoding the column as f32 then refused the row.
             "REAL" | "FLOAT4" => DbType::F32,
@@ -725,6 +725,10 @@ fn timestamp_cast_zone(name: &str) -> Option<bool> {
 }
 
 fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
+    // `double` alone names no type in PostgreSQL (`double precision` does).
+    if target.trim().eq_ignore_ascii_case("double") {
+        return Err("type \"double\" does not exist".to_string());
+    }
     let db_type = cast_target(target)
         .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
     let cast = Expr::Cast(Box::new(inner), db_type.clone());
