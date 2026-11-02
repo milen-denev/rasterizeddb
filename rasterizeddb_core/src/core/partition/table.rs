@@ -93,9 +93,13 @@ use crate::core::row::table::{IdSource, PartitionOpen, Table};
 use crate::core::storage_providers::backend::DbStorageProvider;
 use crate::core::storage_providers::traits::StorageIO;
 
-/// Partitions a `PARTITION BY HASH` table gets when it names no count. 64
-/// while every materialized partition stays open (phase 2a); 1024 once phase
-/// 3's lazy open lands.
+/// Partitions a `PARTITION BY HASH` table gets when it names no count: 64.
+/// Phase 2a chose it while every materialized partition stayed open; the
+/// plan was 1024 once phase 3's lazy open landed, but P5b-3's measurement
+/// (`lazy_resident_tests::default_partition_count_cost`, docs/
+/// partitioning.md "Phase 3 P5b-3 as built") kept 64: at 2,000 tenants
+/// 1024 partitions made unrouted reads 10 to 20 times slower, and 250
+/// times under an open budget of 64, for point reads no faster.
 pub const DEFAULT_PARTITIONS: u32 = 64;
 
 /// The most partitions one database may declare across all its tables

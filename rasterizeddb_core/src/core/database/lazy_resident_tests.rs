@@ -700,3 +700,144 @@ async fn fan_out_then_routed_reads() {
     crate::core::wal::remove_for(&path_str(dir.path()));
 }
 
+
+/// P5b-3's measurement of the default partition count (docs/partitioning.md
+/// §1.2, "Phase 3 P5b-3 as built"): one table per `N` in `P5B3_NS` (default
+/// 64, 256, 1024), `P5B3_TENANTS` tenants (default 2,000) of `P5B3_ROWS`
+/// rows each (default 5) written one INSERT per tenant, an index on `v`,
+/// default index storage and budget; `P5B3_DIR` puts the databases under a
+/// directory of its own (tmpfs by default; an ext4 one shows the
+/// materializations' fsyncs). For each N: the load (per-tenant INSERT
+/// latency, materialized partitions), warm unrouted reads, routed point
+/// reads, `SHOW PARTITIONS`, the start after a restart, the first unrouted
+/// read after it (every materialized partition opened scan-only) and what
+/// it leaves open, and the same read under a budget of 64 (each repeat
+/// opens and closes). A measurement, `#[ignore]`d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run by hand with --ignored --nocapture"]
+async fn default_partition_count_cost() {
+    let ns: Vec<u32> = std::env::var("P5B3_NS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![64, 256, 1024]);
+    let tenants = env_u32("P5B3_TENANTS", 2000) as i64;
+    let rows = env_u32("P5B3_ROWS", 5) as i64;
+    let _ = crate::MAX_PERMITS_THREADS.set(4);
+    let _ = crate::BATCH_SIZE.set(512);
+    let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
+    let base = match std::env::var("P5B3_DIR") {
+        Ok(parent) => tempfile::tempdir_in(parent).unwrap(),
+        Err(_) => tempfile::tempdir().unwrap(),
+    };
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    for n in ns {
+        let root = base.path().join(format!("n{n}"));
+        let root_s = path_str(&root);
+        let (fd0, rss0) = (fds(), rss_kib());
+        let db = rclite::Arc::new(Database::new_named(&root_s, false, "default_n").await);
+        let at = Instant::now();
+        exec(&db, &format!(
+            "CREATE TABLE acct (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, \
+             PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS {n}"
+        ))
+        .await;
+        exec(&db, "CREATE INDEX acct_v ON acct (v)").await;
+        let create = at.elapsed();
+        let mut insert = Vec::new();
+        let loading = Instant::now();
+        for tenant in 1..=tenants {
+            let values: Vec<String> = (1..=rows).map(|i| format!("({tenant}, {i}, {})", (tenant * 7 + i) % 100)).collect();
+            let at = Instant::now();
+            exec(&db, &format!("INSERT INTO acct (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+            insert.push(ms(at.elapsed()));
+        }
+        let load = loading.elapsed();
+        db.sync_durable().unwrap();
+        let t = partitioned(&db, "acct");
+        let materialized = t.materialized_pids().unwrap().len();
+        let (fd1, rss1) = (fds(), rss_kib());
+        let mut warm_count = Vec::new();
+        let mut warm_v = Vec::new();
+        for _ in 0..5 {
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM acct").await;
+            warm_count.push(ms(at.elapsed()));
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM acct WHERE v = 42").await;
+            warm_v.push(ms(at.elapsed()));
+        }
+        let mut point = Vec::new();
+        for k in 0..200i64 {
+            let tenant = 1 + (k * 7919) % tenants;
+            let at = Instant::now();
+            exec(&db, &format!("SELECT v FROM acct WHERE tenant_id = {tenant} AND id = 1")).await;
+            point.push(ms(at.elapsed()));
+        }
+        let show = timed_show(&db, "SHOW PARTITIONS acct").await;
+        drop(t);
+        drop(db);
+        crate::core::wal::remove_for(&root_s);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let at = Instant::now();
+        let db = rclite::Arc::new(Database::new_named(&root_s, false, "default_n").await);
+        let start = at.elapsed();
+        let t = partitioned(&db, "acct");
+        let fd2 = fds();
+        let at = Instant::now();
+        exec(&db, "SELECT COUNT(*) FROM acct WHERE v = 42").await;
+        let cold = at.elapsed();
+        let opened = t.open_partitions_now().len();
+        let fd3 = fds();
+        let mut warm_after = Vec::new();
+        for _ in 0..3 {
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM acct WHERE v = 42").await;
+            warm_after.push(ms(at.elapsed()));
+        }
+        t.close_idle().await.unwrap();
+        drop(t);
+        drop(db);
+        crate::core::wal::remove_for(&root_s);
+        // Under a budget of 64: every repeat of the fan-out opens and closes.
+        let _budget = crate::core::partition::budget::isolate_with(&root, 64, Some(0));
+        let wal = std::fs::metadata(root.join("rasterized.wal")).map_or(0, |m| m.len());
+        let at = Instant::now();
+        let db = rclite::Arc::new(Database::new_named(&root_s, false, "default_n").await);
+        let start_again = at.elapsed();
+        let mut churn = Vec::new();
+        for _ in 0..3 {
+            let at = Instant::now();
+            exec(&db, "SELECT COUNT(*) FROM acct WHERE v = 42").await;
+            churn.push(ms(at.elapsed()));
+        }
+        drop(db);
+        crate::core::wal::remove_for(&root_s);
+        crate::core::partition::budget::release(&root);
+        println!(
+            "DEFAULT_N N={n} tenants={tenants} rows={rows}: create {:.1} ms; load {:.1} s (insert median {:.2} p99 {:.2} max {:.1} ms), \
+             {materialized} materialized, +{} fds +{} KiB; warm COUNT(*) median {:.1} ms, warm v=42 median {:.1} ms; \
+             point read median {:.2} p99 {:.2} ms; SHOW PARTITIONS {:.1} ms; start {:.1} ms (+{} fds); first unrouted read {:.1} ms \
+             opening {opened} (+{} fds), then median {:.1} ms; a third start {:.1} ms (log {} KiB); under a budget of 64, median {:.1} ms",
+            ms(create),
+            load.as_secs_f64(),
+            median(insert.clone()),
+            pct(insert.clone(), 0.99),
+            insert.iter().cloned().fold(0.0, f64::max),
+            fd1 as i64 - fd0 as i64,
+            rss1 as i64 - rss0 as i64,
+            median(warm_count),
+            median(warm_v),
+            median(point.clone()),
+            pct(point, 0.99),
+            ms(show),
+            ms(start),
+            fd2 as i64 - fd0 as i64,
+            ms(cold),
+            fd3 as i64 - fd2 as i64,
+            median(warm_after),
+            ms(start_again),
+            wal / 1024,
+            median(churn),
+        );
+    }
+}
