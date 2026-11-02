@@ -614,15 +614,24 @@ mod tests {
     /// lock on every open cost 58 ms at fifty thousand descriptors): a
     /// thousand reads make no listing (other tests' board rounds may make
     /// one or two meanwhile, at most one a second), and a refresh does.
-    /// A scheduler's board round refreshes the count, once its last count
-    /// is a second old.
+    /// A scheduler's board round keeps the count fresh: after one, the
+    /// count is at most a second (and a little) old, whether this round
+    /// recounted or another round, in any database, just had (they share
+    /// the count, and one recount at a time runs).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_board_round_refreshes_the_count() {
         let _ = descriptors_in_use();
-        tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
-        let listings = LISTINGS.load(Ordering::Relaxed);
+        // Two periods, so any count taken before (another test's) is older
+        // than the bound below.
+        tokio::time::sleep(2 * RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
         crate::core::partition::maintenance::Scheduler::new().run_board_round().await;
-        assert!(LISTINGS.load(Ordering::Relaxed) > listings, "a board round left the count stale");
+        let age = || COUNTED_AT.lock().map_or(std::time::Duration::MAX, |t| t.elapsed());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // A recount another round started just before may still be landing.
+        while age() > RECOUNT_EVERY + std::time::Duration::from_millis(200) {
+            assert!(std::time::Instant::now() < deadline, "a board round left the count {:?} old", age());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[test]
