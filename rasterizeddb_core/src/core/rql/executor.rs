@@ -378,7 +378,32 @@ fn scalar_subquery_label(sql: &str, start: usize, end: usize, inner: &str) -> Op
     Some(alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expression)))
 }
 
-/// Runs one subquery and returns its rows./// Runs one subquery and returns its rows.
+/// Whether the operand of the `[NOT] IN (` ending at `before` is a REAL
+/// column of one of the statement's relations.
+fn in_operand_is_real(text: &str, before: usize, sql: &str, database: &Arc<Database>) -> bool {
+    let head = text[..before].trim_end();
+    let head = match head.len().checked_sub(2).and_then(|at| head.get(at..)) {
+        Some(w) if w.eq_ignore_ascii_case("IN") => head[..head.len() - 2].trim_end(),
+        _ => head,
+    };
+    let start = head
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"'))
+        .map_or(0, |at| at + 1);
+    let operand = &head[start..];
+    let name = operand.rsplit('.').next().unwrap_or(operand).trim_matches('"');
+    if name.is_empty() {
+        return false;
+    }
+    outer_relation_names(sql).iter().any(|relation| {
+        database.schema_view(relation).is_some_and(|view| {
+            view.schema().fields.iter().any(|f| {
+                !f.is_deleted && f.name.eq_ignore_ascii_case(name) && f.db_type == crate::core::db_type::DbType::F32
+            })
+        })
+    })
+}
+
+/// Runs one subquery and returns its rows.
 async fn run_subquery(
     sql: &str,
     database: &Arc<Database>,
@@ -1151,7 +1176,13 @@ pub async fn substitute_in_subqueries(
             .first()
             .copied()
             .unwrap_or(false);
-        let (list, had_null) = subquery::rows_to_value_list(&rows, document, exact)?;
+        // `real IN (SELECT numeric …)` is `real = ANY (…)`, the scalar
+        // operator, which compares in double precision; written as a list of
+        // plain numbers it would take the list's common type, real. Its
+        // numbers are written typed float8 so the list says what the operator
+        // does.
+        let real_operand = in_operand_is_real(&current, found.negated_start.unwrap_or(found.start), sql, database);
+        let (list, had_null) = subquery::rows_to_value_list_as(&rows, document, exact, real_operand)?;
 
         // `x NOT IN (…, NULL)` is never true: x either equals a value (false)
         // or is compared against NULL (unknown). `x IN ()` expresses exactly

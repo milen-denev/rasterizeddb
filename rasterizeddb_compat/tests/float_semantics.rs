@@ -337,3 +337,19 @@ async fn a_real_between_and_integer_compare_in_float8() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE 16777217 > f4 ORDER BY id").await, ["1", "2", "3", "6"] as [&str; 4], "SELECT id FROM rl WHERE 16777217 > f4 ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 < 16777217 AND f4 > 1 ORDER BY id").await, ["6"] as [&str; 1], "SELECT id FROM rl WHERE f4 < 16777217 AND f4 > 1 ORDER BY id");
 }
+
+/// REAL IN (SELECT numeric) is the scalar = ANY, in double precision: a real 0.1 is not numeric 0.1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_in_subquery_of_numerics_compares_in_float8() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rl (id INT PRIMARY KEY, f4 REAL, f8 FLOAT8, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO rl VALUES (1, 0.1, 0.1, 0.1, 0.10), (2, 0.5, 0.5, 0.5, 0.50), (3, 0.3, 0.3, 0.3, 0.30), (4, NULL, NULL, NULL, NULL), (5, 'NaN', 'NaN', 2, 2), (6, 16777216, 16777216, 16777216, 7)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT n FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (SELECT n FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (SELECT n FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["1", "3", "5", "6"] as [&str; 4], "SELECT id FROM rl WHERE f4 NOT IN (SELECT n FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE rl.f4 IN (SELECT n FROM rl r2 WHERE r2.id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE rl.f4 IN (SELECT n FROM rl r2 WHERE r2.id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT f8 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (SELECT f8 FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE f4 IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id");
+}

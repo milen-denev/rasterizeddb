@@ -1452,6 +1452,18 @@ pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Opt
 }
 
 pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Result<(String, bool), String> {
+    rows_to_value_list_as(rows, document, exact_text, false)
+}
+
+/// [`rows_to_value_list`]; with `as_double`, an exact number (NUMERIC, an
+/// integer) is written typed float8, for a REAL operand, which PostgreSQL's
+/// `= ANY` compares with it in double precision.
+pub fn rows_to_value_list_as(
+    rows: &[Row],
+    document: bool,
+    exact_text: bool,
+    as_double: bool,
+) -> Result<(String, bool), String> {
     let mut out = String::with_capacity(2 + rows.len() * 8);
     out.push('(');
     let mut had_null = false;
@@ -1500,6 +1512,23 @@ pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Res
                 db_type
             )
         })?;
+        let exact_number = matches!(
+            db_type,
+            DbType::DECIMAL
+                | DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+        );
+        let literal = if as_double && exact_number {
+            format!("{}::float8", value_codec::quote_sql(literal.trim_matches('\'')))
+        } else {
+            literal
+        };
         if !first {
             out.push_str(", ");
         }
