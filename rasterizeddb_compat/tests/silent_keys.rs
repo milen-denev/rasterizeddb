@@ -103,3 +103,42 @@ async fn wire_format_types_order_as_values() {
     assert_eq!(rows_n(&c, "SELECT id FROM od ORDER BY d LIMIT 2").await, ["4", "5"] as [&str; 2], "SELECT id FROM od ORDER BY d LIMIT 2");
 }
 
+/// -0 and 0 are one value, and every NaN one value, in GROUP BY, DISTINCT, window partitions, joins, UNION, UNIQUE and hash or btree index lookups.
+#[tokio::test(flavor = "multi_thread")]
+async fn float_zero_and_nan_are_one_key_each() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE z (id INT PRIMARY KEY, f FLOAT8, r REAL)").await;
+    run(&c, "INSERT INTO z VALUES (1, 0, 0), (2, '-0', '-0'), (3, 'NaN', 'NaN'), (4, 'NaN', 'NaN'), (5, 1, 1), (6, NULL, NULL)").await;
+    assert_eq!(rows_n(&c, "SELECT f, count(*) FROM z GROUP BY f ORDER BY f").await, ["0|2", "1|1", "NaN|2", "NULL|1"] as [&str; 4], "SELECT f, count(*) FROM z GROUP BY f ORDER BY f");
+    assert_eq!(rows_n(&c, "SELECT r, count(*) FROM z GROUP BY r ORDER BY r").await, ["0|2", "1|1", "NaN|2", "NULL|1"] as [&str; 4], "SELECT r, count(*) FROM z GROUP BY r ORDER BY r");
+    assert_eq!(rows_n(&c, "SELECT count(DISTINCT f), count(DISTINCT r) FROM z").await, ["3|3"] as [&str; 1], "SELECT count(DISTINCT f), count(DISTINCT r) FROM z");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT f FROM z ORDER BY f").await, ["0", "1", "NaN", "NULL"] as [&str; 4], "SELECT DISTINCT f FROM z ORDER BY f");
+    assert_eq!(rows_n(&c, "SELECT id, count(*) OVER (PARTITION BY f), count(*) OVER (PARTITION BY r) FROM z ORDER BY id").await, ["1|2|2", "2|2|2", "3|2|2", "4|2|2", "5|1|1", "6|1|1"] as [&str; 6], "SELECT id, count(*) OVER (PARTITION BY f), count(*) OVER (PARTITION BY r) FROM z ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, rank() OVER (ORDER BY f) FROM z ORDER BY id").await, ["1|1", "2|1", "3|4", "4|4", "5|3", "6|6"] as [&str; 6], "SELECT id, rank() OVER (ORDER BY f) FROM z ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM z a JOIN z b ON a.f = b.f ORDER BY 1, 2").await, ["1|1", "1|2", "2|1", "2|2", "3|3", "3|4", "4|3", "4|4", "5|5"] as [&str; 9], "SELECT a.id, b.id FROM z a JOIN z b ON a.f = b.f ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM z a JOIN z b ON a.r = b.r ORDER BY 1, 2").await, ["1|1", "1|2", "2|1", "2|2", "3|3", "3|4", "4|3", "4|4", "5|5"] as [&str; 9], "SELECT a.id, b.id FROM z a JOIN z b ON a.r = b.r ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT f FROM z UNION SELECT f FROM z ORDER BY 1").await, ["0", "1", "NaN", "NULL"] as [&str; 4], "SELECT f FROM z UNION SELECT f FROM z ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE f = 0 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM z WHERE f = 0 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE f = '-0'::float8 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM z WHERE f = '-0'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE f IN (0, 1) ORDER BY id").await, ["1", "2", "5"] as [&str; 3], "SELECT id FROM z WHERE f IN (0, 1) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE f = 'NaN'::float8 ORDER BY id").await, ["3", "4"] as [&str; 2], "SELECT id FROM z WHERE f = 'NaN'::float8 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE r = 0 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM z WHERE r = 0 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM z WHERE f IN (SELECT f FROM z WHERE id = 2) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM z WHERE f IN (SELECT f FROM z WHERE id = 2) ORDER BY id");
+    run(&c, "CREATE TABLE zu (id INT PRIMARY KEY, f FLOAT8 UNIQUE)").await;
+    run(&c, "INSERT INTO zu VALUES (1, 0)").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO zu VALUES (2, '-0')").await, "23505");
+    run(&c, "INSERT INTO zu VALUES (3, 'NaN')").await;
+    assert_eq!(sqlstate(&c, "INSERT INTO zu VALUES (4, 'NaN')").await, "23505");
+    assert_eq!(rows_n(&c, "SELECT id, f FROM zu ORDER BY id").await, ["1|0", "3|NaN"] as [&str; 2], "SELECT id, f FROM zu ORDER BY id");
+    run(&c, "CREATE TABLE zh (id INT PRIMARY KEY, f FLOAT8, r REAL)").await;
+    run(&c, "CREATE INDEX zh_f ON zh USING hash (f)").await;
+    run(&c, "CREATE INDEX zh_r ON zh (r)").await;
+    run(&c, "INSERT INTO zh VALUES (1, 0, 0), (2, '-0', '-0'), (3, 'NaN', 'NaN')").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE f = 0 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM zh WHERE f = 0 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE f = '-0' ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM zh WHERE f = '-0' ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE r = 0 ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM zh WHERE r = 0 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE r = '-0' ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM zh WHERE r = '-0' ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE f = 'NaN' ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM zh WHERE f = 'NaN' ORDER BY id");
+}
+

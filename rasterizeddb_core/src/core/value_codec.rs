@@ -2429,6 +2429,36 @@ pub const NUMERIC_OWN_SCALE_SIZE: u32 = 17;
 /// is the own-scale cell of [`own_scale_cell`].
 pub const OWN_SCALE_SENTINEL: u32 = u32::MAX;
 
+/// A float's one key per value, as `=` sees it: -0 is 0, and every NaN is one
+/// NaN (PostgreSQL's `float8eq` and its hash say both). `None` when the bytes
+/// are already that form, or are not a float of `db_type`'s width.
+pub fn canonical_float_cell(db_type: &crate::core::db_type::DbType, bytes: &[u8]) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType;
+    match db_type {
+        DbType::F64 => {
+            let v = f64::from_le_bytes(bytes.try_into().ok()?);
+            if v == 0.0 && v.is_sign_negative() {
+                Some(0f64.to_le_bytes().to_vec())
+            } else if v.is_nan() && v.to_bits() != f64::NAN.to_bits() {
+                Some(f64::NAN.to_le_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        DbType::F32 => {
+            let v = f32::from_le_bytes(bytes.try_into().ok()?);
+            if v == 0.0 && v.is_sign_negative() {
+                Some(0f32.to_le_bytes().to_vec())
+            } else if v.is_nan() && v.to_bits() != f32::NAN.to_bits() {
+                Some(f32::NAN.to_le_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether `field` is an unconstrained NUMERIC column that keeps each value
 /// at its own scale ([`NUMERIC_OWN_SCALE_SIZE`]).
 #[inline]

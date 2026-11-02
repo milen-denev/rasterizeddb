@@ -778,6 +778,12 @@ fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
         return crate::core::value_codec::legacy_char_canonical(stored)
             == crate::core::value_codec::legacy_char_canonical(value);
     }
+    // A float by its value: -0 duplicates 0, and NaN duplicates NaN, as
+    // PostgreSQL's unique index has them.
+    if matches!(db_type, DbType::F32 | DbType::F64) {
+        let one = |b: &[u8]| crate::core::value_codec::canonical_float_cell(db_type, b).unwrap_or_else(|| b.to_vec());
+        return one(stored) == one(value);
+    }
     if *db_type == DbType::JSONB {
         crate::core::jsonb::values_equal(stored, value).unwrap_or_else(|| stored == value)
     } else if *db_type == DbType::DECIMAL && (stored.len() == 17 || value.len() == 17) {
@@ -821,6 +827,9 @@ impl OwnKeys {
             let mut one = Vec::new();
             if field.db_type == DbType::CHAR {
                 one.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(value));
+            } else if let Some(canonical) = crate::core::value_codec::canonical_float_cell(&field.db_type, value) {
+                // -0 is 0 and every NaN one NaN (`same_unique_value`).
+                one.extend_from_slice(&canonical);
             } else if field.db_type == DbType::JSONB
                 && crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_some()
             {

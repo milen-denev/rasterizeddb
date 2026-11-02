@@ -1689,6 +1689,9 @@ pub struct Folder<'p> {
     /// form (`value_codec::legacy_char_canonical`): an older build's `''`
     /// and `' '`, or `'a'` and `'a '`, are one value and one group.
     legacy_char_keys: Vec<bool>,
+    /// The float columns among the key (`F32`/`F64`): keyed by their one cell
+    /// per value (`value_codec::canonical_float_cell`), so -0 groups with 0.
+    float_keys: Vec<Option<DbType>>,
     /// Set when any key source may be a document. A document's key part is
     /// then not the value the group shows, so each group also keeps its first
     /// row's key in the plain form, and that is what is emitted.
@@ -1823,7 +1826,21 @@ impl<'p> Folder<'p> {
             KeySource::Computed(k) => crate::core::rql::expr::static_type(&k.expr) == DbType::DECIMAL,
             KeySource::Column(_) => crate::core::value_codec::keeps_own_scale(f),
         });
-        let shown = (document_keys.iter().any(|d| *d) || own_scale_keys).then(Vec::new);
+        // A float key shows its first row's value too (-0 or 0, as written).
+        let float_keys: Vec<Option<DbType>> = key_sources
+            .iter()
+            .zip(plan.group_by.iter())
+            .map(|(source, f)| match source {
+                KeySource::Column(_) if matches!(f.db_type, DbType::F32 | DbType::F64) => Some(f.db_type.clone()),
+                KeySource::Computed(k) => {
+                    let t = crate::core::rql::expr::static_type(&k.expr);
+                    matches!(t, DbType::F32 | DbType::F64).then_some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        let shown = (document_keys.iter().any(|d| *d) || own_scale_keys || float_keys.iter().any(Option::is_some))
+            .then(Vec::new);
         let legacy_char_keys: Vec<bool> = key_sources
             .iter()
             .zip(plan.group_by.iter())
@@ -1847,6 +1864,7 @@ impl<'p> Folder<'p> {
             keys: Vec::new(),
             document_keys,
             legacy_char_keys,
+            float_keys,
             shown,
             plain: Vec::new(),
             accs: Vec::new(),
@@ -1931,8 +1949,12 @@ impl<'p> Folder<'p> {
                 // A document is keyed by its value, with its plain form kept
                 // beside it for what the group shows.
                 let mut plain = self.shown.is_some().then_some(&mut self.plain);
-                for ((source, document), legacy_char) in
-                    self.key_sources.iter().zip(&self.document_keys).zip(&self.legacy_char_keys)
+                for (((source, document), legacy_char), float) in self
+                    .key_sources
+                    .iter()
+                    .zip(&self.document_keys)
+                    .zip(&self.legacy_char_keys)
+                    .zip(&self.float_keys)
                 {
                     match source {
                         // A computed key has no scanned column: its bytes come
@@ -1943,26 +1965,53 @@ impl<'p> Folder<'p> {
                                     push_key_part(&mut self.key, plain.as_deref_mut(), None, false)
                                 }
                                 crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                                    let canonical = crate::core::value_codec::canonical_float_cell(&db_type, &bytes);
                                     push_key_part(
                                         &mut self.key,
                                         plain.as_deref_mut(),
-                                        Some(&bytes),
+                                        Some(canonical.as_deref().unwrap_or(&bytes)),
                                         *document && db_type == DbType::JSONB,
-                                    )
+                                    );
+                                    // What the group shows is the value as it is.
+                                    if let (Some(_), Some(plain)) = (canonical, plain.as_deref_mut()) {
+                                        let n = plain.len() - 4 - bytes.len();
+                                        plain.truncate(n);
+                                        plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                                        plain.extend_from_slice(&bytes);
+                                    }
                                 }
                             }
                         }
                         KeySource::Column(slot) => {
                             let value = self.positions.get(row, *slot);
                             let canonical;
+                            let float_canonical;
+                            let raw = value;
                             let value = match value {
                                 Some(b) if *legacy_char => {
                                     canonical = crate::core::value_codec::legacy_char_canonical(b);
                                     Some(&canonical[..])
                                 }
-                                other => other,
+                                Some(b) => match float.as_ref().and_then(|t| crate::core::value_codec::canonical_float_cell(t, b)) {
+                                    Some(c) => {
+                                        float_canonical = c;
+                                        Some(&float_canonical[..])
+                                    }
+                                    None => Some(b),
+                                },
+                                None => None,
                             };
-                            push_key_part(&mut self.key, plain.as_deref_mut(), value, *document)
+                            push_key_part(&mut self.key, plain.as_deref_mut(), value, *document);
+                            // What the group shows is the float as written
+                            // (-0 stays -0 when it came first).
+                            if let (Some(b), Some(v), Some(plain)) = (raw, value, plain.as_deref_mut()) {
+                                if !*legacy_char && b != v {
+                                    let n = plain.len() - 4 - v.len();
+                                    plain.truncate(n);
+                                    plain.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                                    plain.extend_from_slice(b);
+                                }
+                            }
                         }
                     }
                 }

@@ -20956,6 +20956,16 @@ async fn execute_query_rows_body(
                                         key.extend_from_slice(&canonical);
                                         continue;
                                     }
+                                    // A float by its value: -0 is 0,
+                                    // NaN is one NaN.
+                                    if let Some(canonical) = (!is_null)
+                                        .then(|| crate::core::value_codec::canonical_float_cell(&c.column_type, c.data.into_slice()))
+                                        .flatten()
+                                    {
+                                        key.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
+                                        key.extend_from_slice(&canonical);
+                                        continue;
+                                    }
                                     key.extend_from_slice(
                                         &(c.data.into_slice().len() as u32)
                                             .to_le_bytes(),

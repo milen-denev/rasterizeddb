@@ -648,6 +648,9 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                             .flatten()
                         {
                             canonical
+                        } else if let Some(canonical) = crate::core::value_codec::canonical_float_cell(&f.db_type, bytes) {
+                            // -0 partitions with 0, every NaN with NaN.
+                            canonical
                         } else {
                             bytes.to_vec()
                         }
