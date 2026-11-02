@@ -142,3 +142,21 @@ async fn float_zero_and_nan_are_one_key_each() {
     assert_eq!(rows_n(&c, "SELECT id FROM zh WHERE f = 'NaN' ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM zh WHERE f = 'NaN' ORDER BY id");
 }
 
+/// Bit strings order as PostgreSQL's bit_cmp: the bits first, then the shorter one first (B'0001' < B'1' < B'10'), in ORDER BY, GROUP BY, comparisons, windows and joins.
+#[tokio::test(flavor = "multi_thread")]
+async fn bit_strings_order_bits_first() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE bt (id INT PRIMARY KEY, vb VARBIT(8), b BIT(4))").await;
+    run(&c, "INSERT INTO bt VALUES (1, B'1', B'0101'), (2, B'10', B'1111'), (3, B'0001', B'0001'), (4, NULL, NULL), (5, B'', B'1000'), (6, B'11111111', B'0000'), (7, B'1000', B'0001')").await;
+    assert_eq!(rows_n(&c, "SELECT id, vb FROM bt ORDER BY vb, id").await, ["5|", "3|0001", "1|1", "2|10", "7|1000", "6|11111111", "4|NULL"] as [&str; 7], "SELECT id, vb FROM bt ORDER BY vb, id");
+    assert_eq!(rows_n(&c, "SELECT id, vb FROM bt ORDER BY vb DESC, id").await, ["4|NULL", "6|11111111", "7|1000", "2|10", "1|1", "3|0001", "5|"] as [&str; 7], "SELECT id, vb FROM bt ORDER BY vb DESC, id");
+    assert_eq!(rows_n(&c, "SELECT vb, count(*) FROM bt GROUP BY vb ORDER BY vb").await, ["|1", "0001|1", "1|1", "10|1", "1000|1", "11111111|1", "NULL|1"] as [&str; 7], "SELECT vb, count(*) FROM bt GROUP BY vb ORDER BY vb");
+    assert_eq!(rows_n(&c, "SELECT id FROM bt WHERE vb < B'1' ORDER BY id").await, ["3", "5"] as [&str; 2], "SELECT id FROM bt WHERE vb < B'1' ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM bt WHERE vb > B'1' ORDER BY id").await, ["2", "6", "7"] as [&str; 3], "SELECT id FROM bt WHERE vb > B'1' ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM bt WHERE vb BETWEEN B'0' AND B'10' ORDER BY id").await, ["1", "2", "3"] as [&str; 3], "SELECT id FROM bt WHERE vb BETWEEN B'0' AND B'10' ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, b FROM bt ORDER BY b, id").await, ["6|0000", "3|0001", "7|0001", "1|0101", "5|1000", "2|1111", "4|NULL"] as [&str; 7], "SELECT id, b FROM bt ORDER BY b, id");
+    assert_eq!(rows_n(&c, "SELECT id, row_number() OVER (ORDER BY vb) FROM bt ORDER BY id").await, ["1|3", "2|4", "3|2", "4|7", "5|1", "6|6", "7|5"] as [&str; 7], "SELECT id, row_number() OVER (ORDER BY vb) FROM bt ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM bt a JOIN bt b ON a.vb = b.vb ORDER BY 1, 2").await, ["1|1", "2|2", "3|3", "5|5", "6|6", "7|7"] as [&str; 6], "SELECT a.id, b.id FROM bt a JOIN bt b ON a.vb = b.vb ORDER BY 1, 2");
+    assert_eq!(rows_n(&c, "SELECT id, vb FROM bt ORDER BY vb LIMIT 3").await, ["5|", "3|0001", "1|1"] as [&str; 3], "SELECT id, vb FROM bt ORDER BY vb LIMIT 3");
+}

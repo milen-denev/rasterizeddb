@@ -3073,12 +3073,18 @@ pub(crate) fn compare_bytes_as_type(
         // Geometric values have no ordering PostgreSQL defines either, so a
         // byte compare is used for the same reason it is used for an array: it
         // is stable, which is all a sort or a join key needs.
-        // A bit string orders by its bytes, which is its bit order: the length
-        // prefix is big-endian and the bits are packed most-significant-first,
-        // so the byte compare is the lexicographic bit compare PostgreSQL
-        // defines — for two strings of equal length. Different lengths compare
-        // by length first here, where PostgreSQL compares the bits first.
-        DbType::BIT | DbType::VARBIT => a.cmp(b),
+        // A bit string orders as PostgreSQL's `bit_cmp`: the packed bits
+        // (most-significant-first, zero-padded) over the bytes both have,
+        // then the shorter first (the big-endian length prefix compares as the
+        // length): B'0001' < B'1' < B'10'. The whole cell compared, prefix
+        // first, ordered by length and put B'1' before B'0001'.
+        DbType::BIT | DbType::VARBIT => match (a.split_at_checked(4), b.split_at_checked(4)) {
+            (Some((la, ba)), Some((lb, bb))) => {
+                let common = ba.len().min(bb.len());
+                ba[..common].cmp(&bb[..common]).then_with(|| la.cmp(lb))
+            }
+            _ => a.cmp(b),
+        },
         DbType::POINT
         | DbType::LINE
         | DbType::LSEG
