@@ -780,7 +780,11 @@ compared as a `real`. An IN list follows PostgreSQL's common type: two or
 more plain numbers are a `real` list (`f4 IN (0.1, 0.5)` holds for the `real`
 0.1), while a `double precision` item or a single item widens; a column in
 the list (`f4 IN (f8, 0.1)`) and a subquery's numbers (`f4 IN (SELECT n …)`)
-are each compared as the scalar `=`, in double precision.
+are each compared as the scalar `=`, in double precision. A NULL item counts
+as an item but has no type (`f4 IN (0.1, NULL)` is a `real` list, `f4 IN
+('0.1'::float8, NULL)` a double one), and NOT IN with a NULL is never true.
+`'0.1'::numeric` is the numeric 0.1, and a negative constant is widened as a
+positive one is.
 
 Text compared with a float has no operator in PostgreSQL, and is refused
 here with its 42883, naming the float's type (`text = real` for a `::real`):
