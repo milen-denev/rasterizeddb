@@ -411,7 +411,8 @@ pub(crate) const RECOUNT_EVERY: std::time::Duration = std::time::Duration::from_
 
 /// The last count; `u64::MAX` before the first.
 static COUNTED: AtomicU64 = AtomicU64::new(u64::MAX);
-/// When it was taken, and whether a refresh is under way.
+/// When it was taken or a refresh claimed it ([`claim_due`]), and whether
+/// a refresh is under way.
 static COUNTED_AT: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
 static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -465,7 +466,7 @@ pub fn descriptors_in_use() -> u64 {
 /// thread. A scheduler's board round calls it, off every statement's path;
 /// a caller meanwhile reads the previous count.
 pub(crate) async fn refresh_descriptors() {
-    if count_due() {
+    if claim_due() {
         recount().await;
     }
 }
@@ -494,9 +495,19 @@ impl Drop for CountingGuard {
     }
 }
 
-/// Whether the last count is older than [`RECOUNT_EVERY`].
-fn count_due() -> bool {
-    COUNTED_AT.lock().is_none_or(|t| t.elapsed() >= RECOUNT_EVERY)
+/// Claims a due refresh: when the last count is older than
+/// [`RECOUNT_EVERY`], stamps it now and says so, so the next period's
+/// callers find it fresh. Stamped before the listing rather than after, or
+/// every plain open in the listing's window (a migration opening tables
+/// one after another) would find it still due and spawn a refresh of its
+/// own, each of them then returning at the in-progress flag (P5b-3).
+fn claim_due() -> bool {
+    let mut at = COUNTED_AT.lock();
+    if at.is_some_and(|t| t.elapsed() < RECOUNT_EVERY) {
+        return false;
+    }
+    *at = Some(std::time::Instant::now());
+    true
 }
 
 /// When the count was last taken: tests.
@@ -530,15 +541,16 @@ static RAISE_AS_TABLES_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::
 /// and its count would otherwise stay the start's for good (P5b-2b review).
 /// On a task of its own: the open does not wait for a listing.
 pub(crate) fn note_plain_open() {
-    if !count_due() {
+    // No runtime, no refresh: nothing is claimed that would not follow.
+    let rt = tokio::runtime::Handle::try_current().ok();
+    let Some(rt) = rt.filter(|_| claim_due()) else {
         if RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
             raise_to_target();
         }
         return;
-    }
-    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+    };
     rt.spawn(async {
-        refresh_descriptors().await;
+        recount().await;
         if RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
             raise_to_target();
         }
@@ -722,6 +734,26 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A plain open that finds the count due claims the refresh before it
+    /// spawns it, so the opens after it in the same period, before that
+    /// refresh has listed anything, find the count fresh and spawn nothing
+    /// (P5b-3: stamped only when the listing landed, every open in the
+    /// window spawned a refresh, each then returning at the in-progress
+    /// flag). On a current-thread runtime the spawned refresh cannot run
+    /// before the check.
+    ///
+    /// Mutation: stamping the count only when the listing lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_plain_open_claims_a_due_refresh_before_spawning_it() {
+        let _ = descriptors_in_use();
+        // Due, unless another test's refresh claims it meanwhile (then the
+        // claim below is that one's, and fresh all the same).
+        std::thread::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100));
+        note_plain_open();
+        let age = counted_at().map_or(std::time::Duration::MAX, |t| t.elapsed());
+        assert!(age < RECOUNT_EVERY, "a plain open left a due count unclaimed ({age:?} old)");
     }
 
     #[test]

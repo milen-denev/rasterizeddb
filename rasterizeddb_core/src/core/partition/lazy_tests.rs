@@ -2424,8 +2424,14 @@ async fn plain_tables_opening_keep_the_descriptor_count_fresh() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let after = super::budget::descriptors_in_use();
-    assert_ne!(after, before, "the recount after twenty plain tables opened did not move");
+    // The claim is stamped before its listing lands.
+    while super::budget::descriptors_in_use() == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recount after twenty plain tables opened did not move from {before}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(db.partitioned_table("plain0").is_none());
     close(dir.path(), db);
 }
