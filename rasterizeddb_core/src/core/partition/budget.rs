@@ -407,7 +407,7 @@ pub fn limit_for(soft: u64, others: u64) -> usize {
 }
 
 /// How often the descriptors in use are counted, at most.
-const RECOUNT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const RECOUNT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The last count; `u64::MAX` before the first.
 static COUNTED: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -420,9 +420,19 @@ static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// 0 where it cannot be read.
 fn count_now() -> u64 {
     #[cfg(test)]
-    LISTINGS.fetch_add(1, Ordering::Relaxed);
+    {
+        LISTINGS.fetch_add(1, Ordering::Relaxed);
+        while LISTING_HELD.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count() as u64)
 }
+
+/// Test-only: a listing waits while this is set, so a test can cancel a
+/// refresh mid-listing.
+#[cfg(test)]
+static LISTING_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Listings made, for the test that the budget's path makes none.
 #[cfg(test)]
@@ -455,14 +465,36 @@ pub fn descriptors_in_use() -> u64 {
 /// thread. A scheduler's board round calls it, off every statement's path;
 /// a caller meanwhile reads the previous count.
 pub(crate) async fn refresh_descriptors() {
-    let due = COUNTED_AT.lock().is_none_or(|t| t.elapsed() >= RECOUNT_EVERY);
-    if !due || COUNTING.swap(true, Ordering::AcqRel) {
+    if !count_due() || COUNTING.swap(true, Ordering::AcqRel) {
         return;
     }
+    // Cleared however this ends: a refresh dropped mid-listing (its caller
+    // cancelled, a timeout) must not leave the flag set, which would stop
+    // every later refresh for good (P5b-2b review).
+    let _counting = CountingGuard;
     if let Ok(n) = tokio::task::spawn_blocking(count_now).await {
         store_count(n);
     }
-    COUNTING.store(false, Ordering::Release);
+}
+
+/// Clears [`COUNTING`] when the refresh that set it ends, by any path.
+struct CountingGuard;
+
+impl Drop for CountingGuard {
+    fn drop(&mut self) {
+        COUNTING.store(false, Ordering::Release);
+    }
+}
+
+/// Whether the last count is older than [`RECOUNT_EVERY`].
+fn count_due() -> bool {
+    COUNTED_AT.lock().is_none_or(|t| t.elapsed() >= RECOUNT_EVERY)
+}
+
+/// When the count was last taken: tests.
+#[cfg(test)]
+pub(crate) fn counted_at() -> Option<std::time::Instant> {
+    *COUNTED_AT.lock()
 }
 
 /// Recounts now, whatever the last count's age: tests.
@@ -483,12 +515,26 @@ pub fn others_in_use() -> u64 {
 /// alone.
 static RAISE_AS_TABLES_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A plain table opened (`Table`): on a server, the soft limit follows what
-/// the budget needs ([`descriptor_target`]) as the descriptors in use grow.
+/// A plain table opened (`Table`): the count is refreshed if it is due, and
+/// then, on a server, the soft limit follows what the budget needs
+/// ([`descriptor_target`]). The refresh is here as well as on the board
+/// rounds because a database with no partitioned table runs no scheduler,
+/// and its count would otherwise stay the start's for good (P5b-2b review).
+/// On a task of its own: the open does not wait for a listing.
 pub(crate) fn note_plain_open() {
-    if RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
-        raise_to_target();
+    if !count_due() {
+        if RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
+            raise_to_target();
+        }
+        return;
     }
+    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+    rt.spawn(async {
+        refresh_descriptors().await;
+        if RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
+            raise_to_target();
+        }
+    });
 }
 
 /// The process's budget.
@@ -631,6 +677,43 @@ mod tests {
         while age() > RECOUNT_EVERY + std::time::Duration::from_millis(200) {
             assert!(std::time::Instant::now() < deadline, "a board round left the count {:?} old", age());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A refresh dropped mid-listing (its caller cancelled) does not leave
+    /// the in-progress flag set: the next refresh recounts. (Without the
+    /// guard the flag stayed set and every later refresh returned at once,
+    /// freezing the count; review of P5b-2b reproduced it 20 of 20 with a
+    /// 2 ms timeout at forty thousand descriptors.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_dropped_mid_listing_leaves_the_next_free_to_recount() {
+        let _ = descriptors_in_use();
+        let mut cancelled = false;
+        for _ in 0..20 {
+            tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
+            LISTING_HELD.store(true, Ordering::Release);
+            // Dropped while its listing is held (unless another round's
+            // refresh was under way, which returns at once: tried again).
+            let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), refresh_descriptors()).await.is_err();
+            LISTING_HELD.store(false, Ordering::Release);
+            if timed_out {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled, "no refresh was ever cancelled mid-listing");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while COUNTING.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "a cancelled refresh left the in-progress flag set");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
+        let listings = LISTINGS.load(Ordering::Relaxed);
+        refresh_descriptors().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while LISTINGS.load(Ordering::Relaxed) == listings {
+            assert!(std::time::Instant::now() < deadline, "no refresh recounted after one was cancelled");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 

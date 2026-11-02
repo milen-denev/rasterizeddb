@@ -2390,3 +2390,42 @@ async fn writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole() {
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
+
+/// A database with no partitioned table runs no scheduler, so no board
+/// round refreshes the open budget's count of descriptors; plain tables'
+/// opens do, once it is due (P5b-2b review: the count stayed the start's,
+/// and a server holding only plain tables stopped raising its soft limit as
+/// they opened). Twenty plain tables opened, a period waited, one more
+/// opened: the count moves by what they hold.
+///
+/// Mutation: `note_plain_open` not refreshing the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_tables_opening_keep_the_descriptor_count_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    let _ = super::budget::descriptors_in_use();
+    tokio::time::sleep(2 * super::budget::RECOUNT_EVERY + Duration::from_millis(100)).await;
+    let before = super::budget::descriptors_in_use();
+    for i in 0..20 {
+        exec(&db, &format!("CREATE TABLE plain{i} (id BIGINT PRIMARY KEY, v BIGINT)")).await;
+        exec(&db, &format!("INSERT INTO plain{i} (id, v) VALUES (1, 1)")).await;
+    }
+    tokio::time::sleep(super::budget::RECOUNT_EVERY + Duration::from_millis(100)).await;
+    // Another test's board round may recount meanwhile in a full run; what
+    // this one needs is a count taken after the last open, holding them.
+    let last_open = std::time::Instant::now();
+    exec(&db, "CREATE TABLE plain_last (id BIGINT PRIMARY KEY, v BIGINT)").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while super::budget::counted_at().is_none_or(|t| t < last_open) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no recount after twenty plain tables opened: the count stayed {} (was {before})",
+            super::budget::descriptors_in_use()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let after = super::budget::descriptors_in_use();
+    assert_ne!(after, before, "the recount after twenty plain tables opened did not move");
+    assert!(db.partitioned_table("plain0").is_none());
+    close(dir.path(), db);
+}

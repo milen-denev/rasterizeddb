@@ -502,7 +502,8 @@ writes while the load is in flight. That is sound because a load is a
 union, never a replacement (`index_store::load`'s module docs):
 `load_sorted` adds the snapshot's entries beside the write's and removes
 nothing, a paged index adopts the snapshot's run as its oldest
-(`PagedStore::adopt`), so a newer write's entries shadow it, and a load
+(`PagedStore::adopt`) and its lookups take the union of every run and the
+delta, so both the write's entries and the snapshot's are found, and a load
 that fails clears the indexes and rebuilds them from the rows, which hold
 every write. Pinned by
 `writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole` (an

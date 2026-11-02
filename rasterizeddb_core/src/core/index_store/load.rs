@@ -28,8 +28,9 @@
 //!   `LiveIndex::load_sorted` (and `GinIndex`'s) adds the snapshot's entries
 //!   beside whatever a write inserted and removes nothing; a paged index's
 //!   adopted run goes in as the store's oldest (`PagedStore::adopt`, inserted
-//!   at the front of the runs), so a newer write's entries still shadow it;
-//!   and a load that fails clears the indexes and rebuilds them from the
+//!   at the front of the runs), and a paged lookup takes the union of every
+//!   run and the delta, so the write's entries and the snapshot's are both
+//!   found; and a load that fails clears the indexes and rebuilds them from the
 //!   rows, which hold every write. The snapshot is a valid base after
 //!   `DIRTY` (§4): its entries are a superset of the rows it was sealed over,
 //!   and the open proved no slot was renumbered or added since.
