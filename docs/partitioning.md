@@ -10,8 +10,9 @@ high-water and map-log generations, [as built](#phase-3-p5a-as-built)) and
 P5b-1 (partitions opened on demand and closed only exclusively, pins kept
 across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
 budget, its sharded CLOCK, idle close and the seal at close,
-[as built](#phase-3-p5b-2a-as-built)) and P5b-2b (scan-only fan-out opens,
-[as built](#phase-3-p5b-2b-as-built)). Phases 0 and 1 are
+[as built](#phase-3-p5b-2a-as-built)), P5b-2b (scan-only fan-out opens,
+[as built](#phase-3-p5b-2b-as-built)) and P5b-3 (prompt descriptor release,
+the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -55,7 +56,7 @@ vacuum state (§5), and can sit on its own disk.
 
 | Ask | What this design does |
 |---|---|
-| A distinct subtable per tenant | **Not by default.** Tenants map many-to-one onto 1024 partitions by default from phase 3 (64 in phase 2a, §1.2); a tenant's rows are always in one partition. `ISOLATE KEY` gives one tenant a partition of its own. Isolating every tenant, or `PARTITIONS` near the tenant count, gives the literal version at 3 files and, when open, 15 fds per tenant, affordable to about 10⁵ partitions per node (§7); phase 3 caps a node at 65,536 (§15). |
+| A distinct subtable per tenant | **Not by default.** Tenants map many-to-one onto 64 partitions by default (§1.2: phase 3 measured 1024 and kept 64); a tenant's rows are always in one partition. `ISOLATE KEY` gives one tenant a partition of its own. Isolating every tenant, or `PARTITIONS` near the tenant count, gives the literal version at 3 files and, when open, 15 fds per tenant, affordable to about 10⁵ partitions per node (§7); phase 3 caps a database at 65,536 (P5b-3). |
 | 100 tenants at once touch 100 files | **Mostly.** 100 random tenants land on about 95 distinct partitions of 1024, about 91 of them alone. 64 partitions give about 51 distinct, 256 give 83, 4096 give 99. Isolated tenants always get their own. |
 | No contention | **Partly.** Today one tenant's `DELETE` blocks every `UPDATE` and `DELETE` of the table for its whole scan and rewrite (not `INSERT` or `SELECT`); here it blocks only its own partition. `INSERT` and point-`SELECT` throughput should not change: they never took that lock. Until phase 4 all partitions share one disk's log and fsync stream, and every commit shares the transaction manager and root outcome log (§5). |
 | Practically infinite scale | **No, not in one process.** One outcome log and one transaction manager per database bound commit throughput. "Infinite" means sharding across nodes, a separate design ([Sharding](sharding.md)) that reuses this one's frozen hash, range map and statement-level routing. |
@@ -448,6 +449,123 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 3 P5b-3 as built
+
+Built on `feat/p5b3-partition-scale` (from `2a963411`, 2026-11-02): the
+plain-table descriptor "leak", the cap raised, the default N re-measured,
+and four queued notes.
+
+**No leak: a two-second release.** Review B of P5b-2b measured a plain
+table's descriptors growing with every schema change, 40, 60, 100, 120,
+140, 180 over CREATE INDEX, ADD COLUMN and RENAME, and read 40 for a table
+with its primary key's index and 20 more per index. Measured to the end
+(`/proc/self/fd`, waiting past every poll), they never grew: settled, a
+plain table holds **twenty** (four providers, five each) whatever its
+indexes, before and after any number of schema changes and a restart. The
+rest was the instance each change replaced. A table's provider services
+(`StorageIO::start_service`, which never return) run on a task holding a
+clone of every provider, and that task stopped only at a poll of the drop
+flag every two seconds, so a replaced instance kept its twenty for up to
+two seconds after it was dropped, and an ALTER rewrite's build and reopen
+kept the old, deleted files the same way (60 at once). A migration's burst
+of ALTERs held twenty per statement per table until the polls caught up:
+a thousand statements in two seconds is twenty thousand descriptors.
+
+*Fix.* The drop now wakes the task (`Table::services_released`, a
+`tokio::sync::Notify`: a stored permit, so a drop before the task first
+waits is not lost; `spawn_provider_services`). The poll stays, for
+retirement, which signals nothing. What is left is the vacuum service's
+quarter-second sleep slice after a retirement (it holds the rows and
+pointer providers, ten descriptors). Partitions were never affected: they
+open `External`, with no service task of their own, and a partitioned
+table's metadata change leaves every descriptor where it was.
+
+*Tests.* `schema_changes_give_a_plain_tables_descriptors_back_at_once`: ten
+changes (rewrites among them), and after each the table's descriptors are
+back to their count before within a second, then the same after a restart.
+`schema_changes_leave_a_partitioned_tables_descriptors_alone` pins the
+partitioned case (it held before). `the_budget_counts_what_tables_and_
+partitions_hold` now pins the settled twenty (it asserted at least 40).
+
+**The cap: 65,536 per database** (`MAX_DECLARED_PER_DATABASE`), from
+2,048. Phase 2's figure stood because every materialized partition opened at
+startup; from P5b a declared partition costs a map entry at rest and, once
+written, its files and a slot. 65,536 is the most one map lays out
+(`map::MAX_INITIAL`), so one table may take all of it. It stays per
+database, not per node as §15 phrases it: a refusal must depend only on
+replicated state (§12), and what one node hosts is not. A CREATE of 65,536
+partitions takes milliseconds (the tests make two tables of 32,768, and one
+of 65,536 in `tests/partition_ddl.rs`).
+
+**The default N: 64, kept.** §1.2 proposed 1024 once phase 3 measured the
+price of unrouted fan-out. `lazy_resident_tests::default_partition_count_
+cost` (ignored, by hand): one table per N, 2,000 tenants of five rows written
+one INSERT per tenant, an index on `v`, default budget and index storage.
+Debug builds; tmpfs, then ext4 (`/`), a second ext4 run for the third start.
+
+| | N = 64 | N = 256 | N = 1024 |
+|---|---|---|---|
+| materialized | 64 | 256 | 884 |
+| load, tmpfs / ext4 | 3.7 / 12.3–27.3 s | 4.9 / 29.3 s | 7.0 / 26.0–39.2 s |
+| insert median, ext4 | 5.7–9.6 ms | 11.1 ms | 9.9–15.1 ms |
+| warm `COUNT(*)`, tmpfs / ext4 | 3.4 / 3.0 ms | 13.9 / 16.6 ms | 49.2 / 37.7 ms |
+| warm `COUNT(*) WHERE v = 42` (indexed), tmpfs / ext4 | 7.7 / 6.4 ms | 37.7 / 49.5 ms | 148.3 / 108.7 ms |
+| routed point read, median | 0.5–1.4 ms | 0.5–0.8 ms | 0.4–2.3 ms |
+| `SHOW PARTITIONS`, tmpfs | 0.4 ms | 1.5 ms | 29.5 ms |
+| first unrouted read after a start, ext4 | 17–97 ms | 105 ms | 312–402 ms |
+| the same read under an open budget of 64, ext4 | 6.2–7.5 ms | 447 ms | 1.6–2.4 s |
+| descriptors with all open | +678 | +2,598 | +8,878 |
+| first start after the load, ext4 | 0.8–1.3 s | 2.4 s | 6.3–8.3 s |
+| a start after a clean run, ext4 | 57 ms | — | 140 ms |
+
+1024 partitions made every unrouted read 10 to 20 times slower warm, and
+250 times under an open budget of 64, where each repeat closes and reopens
+(a library embedder's derived budget at the default soft limit of 1,024 is
+16); the load took half again as long (884 durable `MATERIALIZE` records);
+point reads were no faster. Its gain, a finer grain for phase 4's moves and
+splits, is not built yet, so the default stays 64 and a table that wants
+more names `PARTITIONS`. The first start after a load scales with the
+partitions the unreplayed log touches (about 7 ms each on ext4); a start
+after a clean run does not.
+
+**The queued notes.**
+
+- *The `loads()` barrier before the deferred start's check* (review A of
+  P5b-2b round 1): already so since `af7b1737`. The start raises the
+  barrier before it spawns, and the epoch and slot-count check that may
+  demote the load runs in the spawned task, after it; the `Clean` check the
+  note named is gone.
+- *A partitioned table's shell is not a plain table*: checked.
+  `Table::partition_shell` builds it without `assemble`, so it never reaches
+  `budget::note_plain_open`; its schema provider's descriptors are counted
+  in use, as every descriptor is.
+- *Eager proven loads bounded by routed evidence.* P5b-2b's eager load at a
+  scan-only open (a proven snapshot, the budget under half full) loaded
+  every partition a fan-out reached. `Slot::routed`, set by the first
+  routed access or write in this process and kept across closes, is now
+  the evidence it needs (`Parts::open_instance`); without it the load stays
+  deferred. A start begins with none, so the first fan-out after a start
+  defers every load: review B's cost (each first routed read after a
+  fan-out pays its load alone) returns for partitions not yet routed since
+  the start, by design. Test: `a_fan_out_loads_at_once_only_where_routed_
+  traffic_went`.
+- *`COUNTED_AT` stamped before the plain-open refresh spawns*
+  (`budget::claim_due`): a due count is claimed, then counted, so the opens
+  in the listing's window find it fresh and spawn nothing. The board round's
+  refresh claims the same way. Test: `a_plain_open_claims_a_due_refresh_
+  before_spawning_it` (current-thread runtime, so the spawned refresh
+  cannot run before the check).
+
+**Mutations** (a throwaway worktree, its own target directory):
+
+| Mutation | Caught by |
+|---|---|
+| a dropped instance not waking its services task | `schema_changes_give_a_plain_tables_descriptors_back_at_once` |
+| the declared cap left at 2,048 | `the_declared_partition_cap_is_per_database_and_inclusive`, `the_cap_counts_declared_partitions_per_database` |
+| a plain open stamping the count only when its listing lands | `budget::tests::a_plain_open_claims_a_due_refresh_before_spawning_it` |
+| the eager load not asking for routed evidence | `a_fan_out_loads_at_once_only_where_routed_traffic_went` |
+| a plain open claiming the refresh but never counting | `plain_tables_opening_keep_the_descriptor_count_fresh` |
 
 ## Phase 3 P5b-2b as built
 
@@ -2575,7 +2693,10 @@ database (§7.1) would admit only two tables at 1024. **From phase 3 the propose
 default is 1024**, for the arithmetic above; an unused partition costs a map
 entry, since files and location come at first write (§3.2, §6.1). The price,
 unrouted fan-out, is unmeasured, so phase 2a's fan-out and phase 3's open-cost
-measurements fix that default (§8). `RangeMap::initial` lays out at most
+measurements fix that default (§8). **Measured in P5b-3, it stays 64**: at
+2,000 tenants 1024 partitions made unrouted reads 10 to 20 times slower, and
+250 times under a small open budget, for point reads no faster ([Phase 3
+P5b-3 as built](#phase-3-p5b-3-as-built)). `RangeMap::initial` lays out at most
 65,536 (`MAX_INITIAL`, `core/partition/map.rs:13`).
 
 ### 1.3 The hash
@@ -3377,7 +3498,8 @@ here beyond its measure: Σ of persistent-indexes' O(1) `resident_bytes()`
 
 **Phase 2 has no idle close** and opens every materialized partition at
 startup, so it caps declared partitions at 2,048 per database, across its
-tables (about 31k fds when all are written), checked by `CREATE`: a constant decides alike on
+tables (about 31k fds when all are written; P5b-3 raised it to 65,536 once
+partitions opened on demand), checked by `CREATE`: a constant decides alike on
 every node, unlike an `RLIMIT`-derived budget, and no write hits it. Plain
 tables open first; a table whose partitions cannot all open stays a shell,
 erroring loudly (§3.3), and the rest of the database starts.
@@ -3926,7 +4048,7 @@ Each phase is safe alone and refuses what it does not support.
 | **1** | Pure, unwired modules: the hash (`partition::xxh64`, `partition::key`), `RangeMap`, the map-log codec, `route(MaskExpr)` | — | route ns/op; I1, I2-pure, I3, I5 |
 | **2a** | **Built** (S1–S11; S12, the worker budget and cheap merge, not built, §8). **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants (their worker cap is S12; 2a bounds partitions in flight with `FANOUT_IN_FLIGHT = 8`, §8), the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE, VACUUM over the partitions. **Prepared SELECT, UPDATE and DELETE** skip the learned-parse cache (`note_rewritten`), using the text path (2b gives `SELECT` the cache).<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals (the as-built list is in §2) | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** **As measured:** on tmpfs only, partbench and jsonbench (the 2b row's figures); the ext4 items wait for a venue (.7); 2b went ahead without them. |
 | **2b** | **Built** (S15–S20, 2026-10-24; [as built](#phase-2b-as-built)). Joins (per-relation routing, one `Visibility`, no transitive inference; partitioned sources of `UPDATE … FROM`/`DELETE … USING`), the prepared-SELECT cache with late routing (I11) and a cached route derivation for full-key point reads (S16b), `ON CONFLICT` and `RETURNING` on partitioned tables; a same-value key assignment overwrites in place (§4.5). **Not advertised** until the wall-clock A/B below. | as 2a, less these: partitioned targets of `UPDATE … FROM`/`DELETE … USING`, `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `ALTER`/`RENAME`/`CREATE INDEX`, FKs (phase 3); key changes, including by `DO UPDATE` (phase 6); conversion and reshapes (phase 5) | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). S15's learned parse brought them to 0.81–0.88× (point) and 0.86–0.93× (`COUNT`), wall-clock on a loaded box; S16b's profile put the rest in re-deriving the route, `join_all` and one async layer. **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs`. **As measured (S16b, user-mode instructions per op, part/plain): point 1.02 at c=1 and c=16 (1.19 and 1.18 before), `COUNT` 1.005 (1.04 before): the merge gate is met.** Wall-clock on that box (load 7–30) ranged 0.49–1.96 for one binary, so it is not evidence either way. **"Advertised" additionally needs**, and is still pending, an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. |
-| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11) under ACCESS EXCLUSIVE on the logical name (the table-lock manager, §11), map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per node, default N = 1024 once measured (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
+| **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11) under ACCESS EXCLUSIVE on the logical name (the table-lock manager, §11), map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per database (P5b-3), default N measured and kept at 64 (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
 | **4** | Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions; touched-only `sync_durable`. **Gated on** the cross-session crash test and fix (§12). Databases without `s3_backup` only. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
 | **4b** | S3 snapshots and log archive stream every pool location, with a multi-location restore test; phase-4 refusals lift | — | snapshot time vs location count |
 | **5** | Reshape: MOVE, SPLIT, ISOLATE KEY, SPLIT KEY, MERGE, bounded-parallel REBALANCE, conversion; each with crash recovery, range-bounded re-routes, epoch-gated reclamation | — | fence duration vs partition size; throughput during a reshape |
