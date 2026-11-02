@@ -391,6 +391,10 @@ async fn a_real_in_list_with_a_null_keeps_the_common_type() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN (NULL) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id").await, ["2", "5", "6"] as [&str; 3], "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id");
+    // With a column item too: the NULL stays with the constants.
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (f8, NULL) ORDER BY id").await, [] as [&str; 0]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (f8, 0.1, 0.5, NULL) ORDER BY id").await, [] as [&str; 0]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (n, 0.1, NULL) ORDER BY id").await, ["1", "2", "6"]);
 }
 
 /// '0.1'::numeric is a numeric constant: against a REAL it compares in double precision, alone, under IN, NOT IN, BETWEEN and either side of a comparison; two of them in a list are a list of reals.
@@ -435,4 +439,9 @@ async fn a_negative_constant_against_real_compares_in_float8() {
     assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i = '2'::numeric ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rn WHERE i = '2'::numeric ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i IN ('2.0'::numeric, 3) ORDER BY id").await, ["2", "3"] as [&str; 2], "SELECT id FROM rn WHERE i IN ('2.0'::numeric, 3) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i = '1.5'::numeric ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE i = '1.5'::numeric ORDER BY id");
+    // A minus between two operands is subtraction, not a sign: folded, `i - 1
+    // > f4` read as `i` then `f4 < -1`.
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i - 1 > f4 ORDER BY id").await, ["1", "2", "3"]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 < i - 2 ORDER BY id").await, ["3"]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 * -1 > 0.2 ORDER BY id").await, ["3"]);
 }
