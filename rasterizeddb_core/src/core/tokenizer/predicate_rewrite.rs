@@ -3998,6 +3998,31 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
     if !schema.iter().any(|f| !f.is_deleted && f.db_type == DbType::F32) {
         return toks;
     }
+    // A negative number arrives as its sign and its digits; read as one
+    // constant here (a unary sign: at the start, after `(`, a comma, an
+    // operator or AND/OR/NOT/BETWEEN/IN), or `f4 = -0.1` was never widened
+    // and matched the real -0.1. Rendered back it is the same text.
+    let toks = {
+        let mut folded: Vec<Tok> = Vec::with_capacity(toks.len());
+        let mut it = toks.into_iter().peekable();
+        while let Some(tok) = it.next() {
+            let unary = match folded.last() {
+                None | Some(Tok::LPar | Tok::Comma | Tok::Sym(_)) => true,
+                Some(Tok::Word(w)) => ["and", "or", "not", "between", "in"].iter().any(|k| w.eq_ignore_ascii_case(k)),
+                _ => false,
+            };
+            if let (Tok::Sym(sign), true, Some(Tok::Word(digits))) = (&tok, unary, it.peek()) {
+                if sign == "-" && is_numeric_literal_word(digits) && digits.bytes().any(|b| b.is_ascii_digit()) {
+                    let digits = format!("-{digits}");
+                    it.next();
+                    folded.push(Tok::Word(digits));
+                    continue;
+                }
+            }
+            folded.push(tok);
+        }
+        folded
+    };
     let comparison = |t: Option<&Tok>| -> Option<String> {
         match t {
             Some(Tok::Sym(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(op.clone()),
@@ -4022,7 +4047,7 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
     let double_at = |i: usize| -> Option<(f64, bool)> {
         let (v, double) = match toks.get(i)? {
             Tok::Float { number, .. } if float_type_name(&toks[i]) == "double precision" => (float_value(number)?, true),
-            Tok::Word(w) if is_numeric_literal_word(w) => (w.parse::<f64>().ok()?, false),
+            Tok::Word(w) if is_numeric_literal_word(w.strip_prefix('-').unwrap_or(w)) => (w.parse::<f64>().ok()?, false),
             _ => return None,
         };
         (!v.is_nan()).then_some((v, double))

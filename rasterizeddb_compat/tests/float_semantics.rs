@@ -415,3 +415,24 @@ async fn a_numeric_cast_constant_against_real_compares_in_float8() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n = '0.1'::numeric ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM rl WHERE n = '0.1'::numeric ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE n IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id");
 }
+
+/// A negative constant against a REAL is widened as a positive one is: the real -0.1 is not -0.1, and is below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_negative_constant_against_real_compares_in_float8() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rn (id INT PRIMARY KEY, f4 REAL, n NUMERIC, t TEXT, i INT)").await;
+    run(&c, "INSERT INTO rn VALUES (1, -0.1, -0.1, '0.1', 1), (2, 0.1, 0.1, '-0.1', 2), (3, -0.5, -0.5, 'x', 3)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 = -0.1 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE f4 = -0.1 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 < -0.1 ORDER BY id").await, ["1", "3"] as [&str; 2], "SELECT id FROM rn WHERE f4 < -0.1 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 = '-0.1'::numeric ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE f4 = '-0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 IN (-0.1) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE f4 IN (-0.1) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 IN (-0.1, -0.5) ORDER BY id").await, ["1", "3"] as [&str; 2], "SELECT id FROM rn WHERE f4 IN (-0.1, -0.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 IN ('-0.1'::float8, -0.5) ORDER BY id").await, ["3"] as [&str; 1], "SELECT id FROM rn WHERE f4 IN ('-0.1'::float8, -0.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE f4 BETWEEN -0.1 AND 0 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE f4 BETWEEN -0.1 AND 0 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE n = '-0.1'::numeric ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM rn WHERE n = '-0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE n IN ('0.1'::numeric, '-0.5'::numeric) ORDER BY id").await, ["2", "3"] as [&str; 2], "SELECT id FROM rn WHERE n IN ('0.1'::numeric, '-0.5'::numeric) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i = '2'::numeric ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rn WHERE i = '2'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i IN ('2.0'::numeric, 3) ORDER BY id").await, ["2", "3"] as [&str; 2], "SELECT id FROM rn WHERE i IN ('2.0'::numeric, 3) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rn WHERE i = '1.5'::numeric ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rn WHERE i = '1.5'::numeric ORDER BY id");
+}
