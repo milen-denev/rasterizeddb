@@ -392,3 +392,26 @@ async fn a_real_in_list_with_a_null_keeps_the_common_type() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id").await, ["2", "5", "6"] as [&str; 3], "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id");
 }
+
+/// '0.1'::numeric is a numeric constant: against a REAL it compares in double precision, alone, under IN, NOT IN, BETWEEN and either side of a comparison; two of them in a list are a list of reals.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numeric_cast_constant_against_real_compares_in_float8() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rl (id INT PRIMARY KEY, f4 REAL, f8 FLOAT8, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO rl VALUES (1, 0.1, 0.1, 0.1, 0.10), (2, 0.5, 0.5, 0.5, 0.50), (3, 0.3, 0.3, 0.3, 0.30), (4, NULL, NULL, NULL, NULL), (5, 'NaN', 'NaN', 2, 2), (6, 16777216, 16777216, 16777216, 7)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 = '0.1'::numeric ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 = '0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE '0.1'::numeric = f4 ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE '0.1'::numeric = f4 ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 <> '0.1'::numeric ORDER BY id").await, ["1", "2", "3", "5", "6"] as [&str; 5], "SELECT id FROM rl WHERE f4 <> '0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN ('0.1'::numeric) ORDER BY id").await, ["1", "2", "3", "5", "6"] as [&str; 5], "SELECT id FROM rl WHERE f4 NOT IN ('0.1'::numeric) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 > '0.1'::numeric ORDER BY id").await, ["1", "2", "3", "5", "6"] as [&str; 5], "SELECT id FROM rl WHERE f4 > '0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric, 0.5) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE f4 IN ('0.1'::numeric, 0.5) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN ('16777217'::numeric) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN ('16777217'::numeric) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 BETWEEN '0'::numeric AND '0.1'::numeric ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 BETWEEN '0'::numeric AND '0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (CAST('0.1' AS numeric)) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN (CAST('0.1' AS numeric)) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 = '0.1'::decimal ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 = '0.1'::decimal ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n = '0.1'::numeric ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM rl WHERE n = '0.1'::numeric ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE n IN ('0.1'::numeric, '0.5'::numeric) ORDER BY id");
+}

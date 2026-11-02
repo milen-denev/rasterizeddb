@@ -1591,6 +1591,29 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                             *out.last_mut().expect("a literal") = Tok::Float { number, written };
                         }
                     }
+                } else if ["numeric", "decimal"].iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                    // A quoted number cast to numeric is that numeric
+                    // constant, `'0.1'::numeric` as `0.1`. With the cast
+                    // dropped it stayed the untyped '0.1', which against a
+                    // `real` is a real (`f4 = '0.1'` holds for 0.1f), where
+                    // PostgreSQL compares a numeric with a real in double
+                    // precision and `f4 = '0.1'::numeric` holds for no row.
+                    let number = match out.last() {
+                        Some(Tok::Str(quoted)) => {
+                            let text = crate::core::value_codec::unquote_sql(quoted).trim().to_string();
+                            let digits = text.strip_prefix(['-', '+']).unwrap_or(&text);
+                            (is_numeric_literal_word(digits) && digits.bytes().any(|b| b.is_ascii_digit()))
+                                .then(|| (text.starts_with('-'), digits.to_string()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((negative, digits)) = number {
+                        *out.last_mut().expect("a literal") = Tok::Word(digits);
+                        if negative {
+                            let at = out.len() - 1;
+                            out.insert(at, Tok::Sym("-".to_string()));
+                        }
+                    }
                 }
 
                 // With the cast gone, a wrapper that existed only to carry it
@@ -3968,7 +3991,8 @@ fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Op
 /// scalar `=` (`f4 IN (f8, 0.1)` is `f4 = f8 OR f4 = 0.1`, both in double
 /// precision), which the passes after this one compare. A NULL item counts
 /// as an item but not toward the type, and stays in the list. A `real`
-/// constant and NaN are left as they were.
+/// constant and NaN are left as they were; `'0.1'::numeric` reaches here as
+/// the decimal it is.
 fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
     use crate::core::db_type::DbType;
     if !schema.iter().any(|f| !f.is_deleted && f.db_type == DbType::F32) {
