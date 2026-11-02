@@ -465,8 +465,15 @@ pub fn descriptors_in_use() -> u64 {
 /// thread. A scheduler's board round calls it, off every statement's path;
 /// a caller meanwhile reads the previous count.
 pub(crate) async fn refresh_descriptors() {
-    if !count_due() || COUNTING.swap(true, Ordering::AcqRel) {
-        return;
+    if count_due() {
+        recount().await;
+    }
+}
+
+/// Recounts unless another recount is under way; whether this one ran.
+async fn recount() -> bool {
+    if COUNTING.swap(true, Ordering::AcqRel) {
+        return false;
     }
     // Cleared however this ends: a refresh dropped mid-listing (its caller
     // cancelled, a timeout) must not leave the flag set, which would stop
@@ -475,6 +482,7 @@ pub(crate) async fn refresh_descriptors() {
     if let Ok(n) = tokio::task::spawn_blocking(count_now).await {
         store_count(n);
     }
+    true
 }
 
 /// Clears [`COUNTING`] when the refresh that set it ends, by any path.
@@ -687,32 +695,31 @@ mod tests {
     /// 2 ms timeout at forty thousand descriptors.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refresh_dropped_mid_listing_leaves_the_next_free_to_recount() {
-        let _ = descriptors_in_use();
+        // `recount`, not `refresh_descriptors`: in a full run other tests'
+        // opens refresh the count every period, so one this test asks for
+        // would rarely be due.
         let mut cancelled = false;
-        for _ in 0..20 {
-            tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
+        for _ in 0..500 {
             LISTING_HELD.store(true, Ordering::Release);
-            // Dropped while its listing is held (unless another round's
-            // refresh was under way, which returns at once: tried again).
-            let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), refresh_descriptors()).await.is_err();
+            // Dropped while its listing is held (unless another test's
+            // recount was under way, which returns at once: tried again).
+            let ran = tokio::time::timeout(std::time::Duration::from_millis(50), recount()).await;
             LISTING_HELD.store(false, Ordering::Release);
-            if timed_out {
+            if ran.is_err() {
                 cancelled = true;
                 break;
             }
-        }
-        assert!(cancelled, "no refresh was ever cancelled mid-listing");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while COUNTING.load(Ordering::Acquire) {
-            assert!(std::time::Instant::now() < deadline, "a cancelled refresh left the in-progress flag set");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
-        let listings = LISTINGS.load(Ordering::Relaxed);
-        refresh_descriptors().await;
+        assert!(cancelled, "no recount was ever cancelled mid-listing");
+        // Another test's recount may hold the flag a moment; a stuck flag
+        // holds it for good.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while LISTINGS.load(Ordering::Relaxed) == listings {
-            assert!(std::time::Instant::now() < deadline, "no refresh recounted after one was cancelled");
+        while !recount().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cancelled recount left the in-progress flag set: no later one ran"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
