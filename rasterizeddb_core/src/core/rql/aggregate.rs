@@ -1512,8 +1512,12 @@ pub(crate) fn compare_values(a: &[u8], b: &[u8], ty: &DbType) -> std::cmp::Order
         // column holding NaN is NaN, and MIN/MAX are order-independent.
         return crate::core::processor::concurrent_processor::pg_float_cmp(x, y);
     }
-    // STRING, UUID and INET are all ordered by their bytes.
-    a.cmp(b)
+    // Everything else as ORDER BY orders it (`compare_bytes_as_type`): text,
+    // UUID and INET by their bytes, and the types stored in PostgreSQL's wire
+    // layout (DATE, TIME, TIMETZ, INTERVAL, bit strings, …) by their values.
+    // Their big-endian bytes compared raw sorted a 2024 date before 1960 in a
+    // grouped ORDER BY and took the wrong MIN and MAX.
+    crate::core::processor::concurrent_processor::compare_bytes_as_type(ty.clone(), a, b)
 }
 
 fn mb_from(bytes: &[u8]) -> MemoryBlock {

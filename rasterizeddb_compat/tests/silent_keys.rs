@@ -68,3 +68,38 @@ async fn constants_and_windows_keep_their_places() {
     assert_eq!(rows_n(&c, "SELECT 'x', id, v * 2 FROM t ORDER BY id").await, ["x|1|20", "x|2|40", "x|3|NULL"] as [&str; 3], "SELECT 'x', id, v * 2 FROM t ORDER BY id");
 }
 
+/// DATE, TIME, TIMETZ, INTERVAL, UUID, INET, TIMESTAMP, MACADDR, BIT and VARBIT order by value in GROUP BY, DISTINCT, windows, UNION, ORDER BY and min/max, not by their stored bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn wire_format_types_order_as_values() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE od (id INT PRIMARY KEY, d DATE, tm TIME, tz TIMETZ, iv INTERVAL, u UUID, ip INET, ts TIMESTAMP, mc MACADDR, b BIT(4), vb VARBIT(8))").await;
+    run(&c, "INSERT INTO od VALUES (1, '1999-01-01', '10:00', '10:00+00', '1 day', '00000000-0000-0000-0000-000000000001', '10.0.0.1', '1999-01-01', '08:00:2b:01:02:03', B'0101', B'1'), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (3, '2024-01-01', '23:59', '23:59+00', '-2 days', 'ffffffff-0000-0000-0000-000000000001', '192.168.1.1', '2024-01-01', 'ff:00:2b:01:02:03', B'1111', B'10'), (4, '1960-01-01', '00:01', '00:01+00', '3 hours', '00000000-0000-0000-0000-000000000000', '1.2.3.4', '1960-01-01', '00:00:2b:01:02:03', B'0001', B'0001'), (5, '1960-01-01', '00:01', '00:01+00', '3 hours', '00000000-0000-0000-0000-000000000000', '1.2.3.4', '1960-01-01', '00:00:2b:01:02:03', B'0001', B'0001')").await;
+    assert_eq!(rows_n(&c, "SELECT d, count(*) FROM od GROUP BY d ORDER BY d").await, ["1960-01-01|2", "1999-01-01|1", "2024-01-01|1", "NULL|1"] as [&str; 4], "SELECT d, count(*) FROM od GROUP BY d ORDER BY d");
+    assert_eq!(rows_n(&c, "SELECT d, count(*) FROM od GROUP BY d ORDER BY d DESC").await, ["NULL|1", "2024-01-01|1", "1999-01-01|1", "1960-01-01|2"] as [&str; 4], "SELECT d, count(*) FROM od GROUP BY d ORDER BY d DESC");
+    assert_eq!(rows_n(&c, "SELECT tm, count(*) FROM od GROUP BY tm ORDER BY tm").await, ["00:01:00|2", "10:00:00|1", "23:59:00|1", "NULL|1"] as [&str; 4], "SELECT tm, count(*) FROM od GROUP BY tm ORDER BY tm");
+    assert_eq!(rows_n(&c, "SELECT tz, count(*) FROM od GROUP BY tz ORDER BY tz").await, ["00:01:00+00|2", "10:00:00+00|1", "23:59:00+00|1", "NULL|1"] as [&str; 4], "SELECT tz, count(*) FROM od GROUP BY tz ORDER BY tz");
+    assert_eq!(rows_n(&c, "SELECT iv, count(*) FROM od GROUP BY iv ORDER BY iv").await, ["-2 days|1", "03:00:00|2", "1 day|1", "NULL|1"] as [&str; 4], "SELECT iv, count(*) FROM od GROUP BY iv ORDER BY iv");
+    assert_eq!(rows_n(&c, "SELECT u, count(*) FROM od GROUP BY u ORDER BY u").await, ["00000000-0000-0000-0000-000000000000|2", "00000000-0000-0000-0000-000000000001|1", "ffffffff-0000-0000-0000-000000000001|1", "NULL|1"] as [&str; 4], "SELECT u, count(*) FROM od GROUP BY u ORDER BY u");
+    assert_eq!(rows_n(&c, "SELECT ip, count(*) FROM od GROUP BY ip ORDER BY ip").await, ["1.2.3.4|2", "10.0.0.1|1", "192.168.1.1|1", "NULL|1"] as [&str; 4], "SELECT ip, count(*) FROM od GROUP BY ip ORDER BY ip");
+    assert_eq!(rows_n(&c, "SELECT ts, count(*) FROM od GROUP BY ts ORDER BY ts").await, ["1960-01-01 00:00:00|2", "1999-01-01 00:00:00|1", "2024-01-01 00:00:00|1", "NULL|1"] as [&str; 4], "SELECT ts, count(*) FROM od GROUP BY ts ORDER BY ts");
+    assert_eq!(rows_n(&c, "SELECT mc, count(*) FROM od GROUP BY mc ORDER BY mc").await, ["00:00:2b:01:02:03|2", "08:00:2b:01:02:03|1", "ff:00:2b:01:02:03|1", "NULL|1"] as [&str; 4], "SELECT mc, count(*) FROM od GROUP BY mc ORDER BY mc");
+    assert_eq!(rows_n(&c, "SELECT b, count(*) FROM od GROUP BY b ORDER BY b").await, ["0001|2", "0101|1", "1111|1", "NULL|1"] as [&str; 4], "SELECT b, count(*) FROM od GROUP BY b ORDER BY b");
+    assert_eq!(rows_n(&c, "SELECT vb, count(*) FROM od GROUP BY vb ORDER BY vb").await, ["0001|2", "1|1", "10|1", "NULL|1"] as [&str; 4], "SELECT vb, count(*) FROM od GROUP BY vb ORDER BY vb");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT d FROM od ORDER BY d").await, ["1960-01-01", "1999-01-01", "2024-01-01", "NULL"] as [&str; 4], "SELECT DISTINCT d FROM od ORDER BY d");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT tm FROM od ORDER BY tm").await, ["00:01:00", "10:00:00", "23:59:00", "NULL"] as [&str; 4], "SELECT DISTINCT tm FROM od ORDER BY tm");
+    assert_eq!(rows_n(&c, "SELECT DISTINCT iv FROM od ORDER BY iv").await, ["-2 days", "03:00:00", "1 day", "NULL"] as [&str; 4], "SELECT DISTINCT iv FROM od ORDER BY iv");
+    assert_eq!(rows_n(&c, "SELECT id, rank() OVER (ORDER BY d) FROM od ORDER BY id").await, ["1|3", "2|5", "3|4", "4|1", "5|1"] as [&str; 5], "SELECT id, rank() OVER (ORDER BY d) FROM od ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, rank() OVER (ORDER BY tm DESC) FROM od ORDER BY id").await, ["1|3", "2|1", "3|2", "4|4", "5|4"] as [&str; 5], "SELECT id, rank() OVER (ORDER BY tm DESC) FROM od ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, rank() OVER (ORDER BY iv) FROM od ORDER BY id").await, ["1|4", "2|5", "3|1", "4|2", "5|2"] as [&str; 5], "SELECT id, rank() OVER (ORDER BY iv) FROM od ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id, rank() OVER (ORDER BY u) FROM od ORDER BY id").await, ["1|3", "2|5", "3|4", "4|1", "5|1"] as [&str; 5], "SELECT id, rank() OVER (ORDER BY u) FROM od ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT d FROM od UNION SELECT d FROM od ORDER BY 1").await, ["1960-01-01", "1999-01-01", "2024-01-01", "NULL"] as [&str; 4], "SELECT d FROM od UNION SELECT d FROM od ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT iv FROM od UNION SELECT iv FROM od ORDER BY 1").await, ["-2 days", "03:00:00", "1 day", "NULL"] as [&str; 4], "SELECT iv FROM od UNION SELECT iv FROM od ORDER BY 1");
+    assert_eq!(rows_n(&c, "SELECT min(d), max(d), min(tm), max(tm), min(iv), max(iv) FROM od").await, ["1960-01-01|2024-01-01|00:01:00|23:59:00|-2 days|1 day"] as [&str; 1], "SELECT min(d), max(d), min(tm), max(tm), min(iv), max(iv) FROM od");
+    assert_eq!(rows_n(&c, "SELECT id FROM od ORDER BY d, id").await, ["4", "5", "1", "3", "2"] as [&str; 5], "SELECT id FROM od ORDER BY d, id");
+    assert_eq!(rows_n(&c, "SELECT id FROM od ORDER BY iv, id").await, ["3", "4", "5", "1", "2"] as [&str; 5], "SELECT id FROM od ORDER BY iv, id");
+    assert_eq!(rows_n(&c, "SELECT id FROM od ORDER BY tm DESC, id").await, ["2", "3", "1", "4", "5"] as [&str; 5], "SELECT id FROM od ORDER BY tm DESC, id");
+    assert_eq!(rows_n(&c, "SELECT d, count(*) FROM od GROUP BY d ORDER BY d LIMIT 2").await, ["1960-01-01|2", "1999-01-01|1"] as [&str; 2], "SELECT d, count(*) FROM od GROUP BY d ORDER BY d LIMIT 2");
+    assert_eq!(rows_n(&c, "SELECT id FROM od ORDER BY d LIMIT 2").await, ["4", "5"] as [&str; 2], "SELECT id FROM od ORDER BY d LIMIT 2");
+}
+
