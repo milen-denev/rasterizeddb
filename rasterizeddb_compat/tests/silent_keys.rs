@@ -64,6 +64,17 @@ async fn constants_and_windows_keep_their_places() {
     assert_eq!(rows_n(&c, "SELECT 'x', id FROM t ORDER BY id").await, ["x|1", "x|2", "x|3"] as [&str; 3], "SELECT 'x', id FROM t ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT DISTINCT 'a', sum(id) OVER () FROM t").await, ["a|6"] as [&str; 1], "SELECT DISTINCT 'a', sum(id) OVER () FROM t");
     assert_eq!(rows_n(&c, "SELECT DISTINCT sum(id) OVER () FROM t").await, ["6"] as [&str; 1], "SELECT DISTINCT sum(id) OVER () FROM t");
+    // Rows equal as scanned whose windows differ: DISTINCT at the scan
+    // merged them before the windows ran.
+    run(&c, "CREATE TABLE d (id INT PRIMARY KEY, v INT)").await;
+    run(&c, "INSERT INTO d VALUES (1, 1), (2, 1), (3, 2)").await;
+    // (Sorted here: ORDER BY a window item is refused, a separate gap.)
+    let sorted = |mut rows: Vec<String>| {
+        rows.sort();
+        rows
+    };
+    assert_eq!(sorted(rows_n(&c, "SELECT DISTINCT v, row_number() OVER (ORDER BY v) FROM d").await), ["1|1", "1|2", "2|3"]);
+    assert_eq!(sorted(rows_n(&c, "SELECT DISTINCT v, count(*) OVER () FROM d").await), ["1|3", "2|3"]);
     assert_eq!(rows_n(&c, "SELECT id + 0, count(*) OVER (), NULL, s FROM t ORDER BY id").await, ["1|3|NULL|a", "2|3|NULL|b", "3|3|NULL|NULL"] as [&str; 3], "SELECT id + 0, count(*) OVER (), NULL, s FROM t ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT 'x', id, v * 2 FROM t ORDER BY id").await, ["x|1|20", "x|2|40", "x|3|NULL"] as [&str; 3], "SELECT 'x', id, v * 2 FROM t ORDER BY id");
 }
@@ -130,6 +141,13 @@ async fn float_zero_and_nan_are_one_key_each() {
     assert_eq!(sqlstate(&c, "INSERT INTO zu VALUES (2, '-0')").await, "23505");
     run(&c, "INSERT INTO zu VALUES (3, 'NaN')").await;
     assert_eq!(sqlstate(&c, "INSERT INTO zu VALUES (4, 'NaN')").await, "23505");
+    // One UPDATE writing 0 and -0 (or two NaNs): its own rows are checked
+    // against each other too.
+    run(&c, "CREATE TABLE zu2 (id INT PRIMARY KEY, f FLOAT8 UNIQUE)").await;
+    run(&c, "INSERT INTO zu2 VALUES (1, 1), (2, 2), (3, 3)").await;
+    assert_eq!(sqlstate(&c, "UPDATE zu2 SET f = CASE WHEN id = 1 THEN 0 ELSE '-0'::float8 END WHERE id < 3").await, "23505");
+    assert_eq!(sqlstate(&c, "UPDATE zu2 SET f = 'NaN' WHERE id > 1").await, "23505");
+    assert_eq!(rows_n(&c, "SELECT id, f FROM zu2 ORDER BY id").await, ["1|1", "2|2", "3|3"]);
     assert_eq!(rows_n(&c, "SELECT id, f FROM zu ORDER BY id").await, ["1|0", "3|NaN"] as [&str; 2], "SELECT id, f FROM zu ORDER BY id");
     run(&c, "CREATE TABLE zh (id INT PRIMARY KEY, f FLOAT8, r REAL)").await;
     run(&c, "CREATE INDEX zh_f ON zh USING hash (f)").await;
