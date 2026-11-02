@@ -373,3 +373,22 @@ async fn infinity_text_into_constrained_numeric_is_22003() {
     assert_eq!(sqlstate(&c, "UPDATE rl SET p = 'abc' WHERE id = 1").await, "22P02");
     assert_eq!(rows_n(&c, "SELECT id, p FROM rl WHERE id = 1").await, ["1|0.10"] as [&str; 1], "SELECT id, p FROM rl WHERE id = 1");
 }
+
+/// A NULL in a REAL IN list is an item with no type: it counts toward the list (f4 IN (0.1, NULL) is a list of reals) but not toward its type (a float8 item still widens), and keeps IN unknown and NOT IN never true.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_in_list_with_a_null_keeps_the_common_type() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rl (id INT PRIMARY KEY, f4 REAL, f8 FLOAT8, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO rl VALUES (1, 0.1, 0.1, 0.1, 0.10), (2, 0.5, 0.5, 0.5, 0.50), (3, 0.3, 0.3, 0.3, 0.30), (4, NULL, NULL, NULL, NULL), (5, 'NaN', 'NaN', 2, 2), (6, 16777216, 16777216, 16777216, 7)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN ('0.1'::float8, NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN ('0.1'::float8, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (0.1, NULL) ORDER BY id").await, ["1"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (0.1, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN ('0.1'::float8, NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN ('0.1'::float8, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (0.1, NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN (0.1, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN ('0.3'::float8, NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN ('0.3'::float8, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (16777217, NULL) ORDER BY id").await, ["6"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (16777217, NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (NULL, '0.5'::float8, f8) ORDER BY id").await, ["2", "5", "6"] as [&str; 3], "SELECT id FROM rl WHERE f4 IN (NULL, '0.5'::float8, f8) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 IN (NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id").await, [] as [&str; 0], "SELECT id FROM rl WHERE f4 NOT IN (NULL) ORDER BY id");
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id").await, ["2", "5", "6"] as [&str; 3], "SELECT id FROM rl WHERE f4 IN (f8, NULL) ORDER BY id");
+}

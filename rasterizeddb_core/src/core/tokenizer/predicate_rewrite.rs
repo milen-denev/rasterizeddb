@@ -3966,8 +3966,9 @@ fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Op
 /// type is float8: one typed float8, or a single constant (the scalar `=`); a
 /// list of plain numbers compares as `real`. A column in the list is its own
 /// scalar `=` (`f4 IN (f8, 0.1)` is `f4 = f8 OR f4 = 0.1`, both in double
-/// precision), which the passes after this one compare. A `real` constant,
-/// NaN and a list with a NULL are left as they were.
+/// precision), which the passes after this one compare. A NULL item counts
+/// as an item but not toward the type, and stays in the list. A `real`
+/// constant and NaN are left as they were.
 fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
     use crate::core::db_type::DbType;
     if !schema.iter().any(|f| !f.is_deleted && f.db_type == DbType::F32) {
@@ -4135,6 +4136,7 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                 let mut values = Vec::new();
                 let mut columns: Vec<String> = Vec::new();
                 let mut doubles = 0usize;
+                let mut nulls = 0usize;
                 let mut j = open + 1;
                 let mut closed = false;
                 loop {
@@ -4143,6 +4145,8 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                         doubles += double as usize;
                     } else if let Some(word) = column_item(j) {
                         columns.push(word);
+                    } else if toks.get(j).is_some_and(|t| t.is_keyword("null")) {
+                        nulls += 1;
                     } else {
                         break;
                     }
@@ -4158,14 +4162,29 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                 // The constants' common type comes from the column and every
                 // constant: float8 only when one is typed float8, real when
                 // all are plain numbers (`f4 IN (0.1, 0.5)` compares 0.1 as a
-                // real). One constant is the scalar `=`, in double precision.
-                let widened = doubles > 0 || values.len() == 1;
+                // real). A NULL is a constant with no type: it takes no part
+                // in the choice, but it is an item, so `f4 IN (0.1, NULL)` is
+                // a list of reals. One constant is the scalar `=`, in double
+                // precision. A NULL stays an item of its own (`f4 IN (NULL)`),
+                // so IN without a match is unknown and NOT IN never true.
+                let widened = doubles > 0 || (values.len() == 1 && nulls == 0);
                 if closed && (widened || !columns.is_empty()) {
                     let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
                     let mut parts: Vec<Vec<Tok>> = Vec::new();
+                    let in_null = || {
+                        let mut list = vec![Tok::Word(column.clone())];
+                        if negated {
+                            list.push(Tok::Word("NOT".into()));
+                        }
+                        list.extend([Tok::Word("IN".into()), Tok::LPar, Tok::Word("NULL".into()), Tok::RPar]);
+                        list
+                    };
                     if widened {
                         parts.extend(values.iter().map(|v| lowered(&column, op, *v)));
-                    } else if !values.is_empty() {
+                        if nulls > 0 {
+                            parts.push(in_null());
+                        }
+                    } else if !values.is_empty() || nulls > 0 {
                         // The constants stay a list, compared as real as it
                         // was written; the columns are parted out below.
                         let mut kept = vec![Tok::Word(column.clone())];
@@ -4174,7 +4193,10 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                         }
                         kept.push(Tok::Word("IN".into()));
                         kept.push(Tok::LPar);
-                        for k in (open + 1..=j).step_by(2).filter(|&k| double_at(k).is_some()) {
+                        for k in (open + 1..=j)
+                            .step_by(2)
+                            .filter(|&k| double_at(k).is_some() || toks[k].is_keyword("null"))
+                        {
                             if kept.len() > 3 + negated as usize {
                                 kept.push(Tok::Comma);
                             }
