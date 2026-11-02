@@ -21314,27 +21314,21 @@ async fn execute_query_rows_body(
                                 // The row as scanned is the selected columns
                                 // in select order, then the columns only a
                                 // window reads (`max(v) OVER ()` with `v`
-                                // not selected). Cut back to the selected
-                                // ones, then the constants, row expressions
-                                // and window values go in together, in
-                                // ascending select position, so each lands
-                                // where it was written: inserted around the
-                                // window-only columns, `SELECT 'x', id,
-                                // sum(id) OVER (), 'z', max(v) OVER ()` put
-                                // 'z' and the max out of place.
+                                // not selected). The constants, row
+                                // expressions and window values go in
+                                // together, in ascending select position, so
+                                // each lands where it was written and the
+                                // window-only columns stay last, for the
+                                // truncate below: inserted constants first
+                                // and windows after, `SELECT 'x', id, sum(id)
+                                // OVER (), 'z', max(v) OVER ()` put 'z' and
+                                // the max out of place.
                                 let mut windows: Vec<(usize, crate::core::db_type::DbType, std::vec::IntoIter<Option<Vec<u8>>>)> = computed
                                     .into_iter()
                                     .map(|(position, spec, values)| (*position, spec.result_type(), values.into_iter()))
                                     .collect();
                                 for (k, row) in kept.iter_mut().enumerate() {
                                     let literals = kept_literals.get(k).map(Vec::as_slice).unwrap_or(&[]);
-                                    let fetched = query_row
-                                        .select_items
-                                        .len()
-                                        .saturating_sub(literals.len() + windows.len());
-                                    if fetched <= row.columns.len() {
-                                        row.columns.truncate(fetched);
-                                    }
                                     let mut cells: Vec<(usize, Vec<u8>, crate::core::db_type::DbType)> =
                                         Vec::with_capacity(literals.len() + windows.len());
                                     cells.extend(literals.iter().cloned());
