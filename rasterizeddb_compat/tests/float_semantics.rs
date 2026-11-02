@@ -353,3 +353,16 @@ async fn a_real_in_subquery_of_numerics_compares_in_float8() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id");
 }
+
+/// UPDATE SET p = 'Infinity' (text) into NUMERIC(p,s) is PostgreSQL's 22003, as the literal path is; the row keeps its value.
+#[tokio::test(flavor = "multi_thread")]
+async fn infinity_text_into_constrained_numeric_is_22003() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rl (id INT PRIMARY KEY, f4 REAL, f8 FLOAT8, n NUMERIC, p NUMERIC(10,2))").await;
+    run(&c, "INSERT INTO rl VALUES (1, 0.1, 0.1, 0.1, 0.10), (2, 0.5, 0.5, 0.5, 0.50), (3, 0.3, 0.3, 0.3, 0.30), (4, NULL, NULL, NULL, NULL), (5, 'NaN', 'NaN', 2, 2), (6, 16777216, 16777216, 16777216, 7)").await;
+    assert_eq!(sqlstate(&c, "UPDATE rl SET p = 'Infinity' WHERE id = 1").await, "22003");
+    assert_eq!(sqlstate(&c, "UPDATE rl SET p = '-Infinity' WHERE id = 1").await, "22003");
+    assert_eq!(sqlstate(&c, "UPDATE rl SET p = 'abc' WHERE id = 1").await, "22P02");
+    assert_eq!(rows_n(&c, "SELECT id, p FROM rl WHERE id = 1").await, ["1|0.10"] as [&str; 1], "SELECT id, p FROM rl WHERE id = 1");
+}

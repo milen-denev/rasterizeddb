@@ -164,14 +164,10 @@ fn encode_assignment(
     if let (DbType::DECIMAL, Some(scale)) = (&field.db_type, scale) {
         if !trimmed.eq_ignore_ascii_case("NULL") {
             let text = trimmed.trim_matches('\'').trim_matches('"');
-            let value =
-                crate::core::value_codec::parse_decimal_rounded(text, scale).ok_or_else(|| {
-                    format!(
-                        "{} for column \"{}\"",
-                        crate::core::value_codec::refusal_message(&DbType::DECIMAL, text),
-                        field.name
-                    )
-                })?;
+            // `refusal_for_column`: an infinity into a NUMERIC(p, s) is
+            // PostgreSQL's 22003, as on every other path in.
+            let value = crate::core::value_codec::parse_decimal_rounded(text, scale)
+                .ok_or_else(|| crate::core::value_codec::refusal_for_column(field, text))?;
             crate::core::value_codec::check_numeric_precision(value, precision.unwrap_or(0), scale)?;
             let bytes = value.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
