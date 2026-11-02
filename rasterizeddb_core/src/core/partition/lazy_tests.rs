@@ -2429,3 +2429,115 @@ async fn plain_tables_opening_keep_the_descriptor_count_fresh() {
     assert!(db.partitioned_table("plain0").is_none());
     close(dir.path(), db);
 }
+
+
+/// The descriptors held on files under `dir` whose names start with
+/// `prefix`, a deleted file's included.
+fn fds_named(dir: &Path, prefix: &str) -> usize {
+    fds_under(dir)
+        .iter()
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)))
+        .count()
+}
+
+/// Polls until `count()` is `want`, for at most `within`; the last count.
+async fn count_returns_to(count: impl Fn() -> usize, want: usize, within: Duration) -> usize {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let now = count();
+        if now == want || std::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A schema change gives the replaced instance's descriptors back at once
+/// (P5b-3). Review B's probe read a plain table's descriptors as growing
+/// with every schema change, 40 to 180 over six; measured to the end, they
+/// never grew: the instance a change replaced held its providers until its
+/// service task's next two-second poll, and a rewrite's two instances
+/// (its build and its reopen) on the old, deleted files the same. A burst of
+/// ALTERs (a migration) held twenty per statement per table until the polls
+/// caught up. Now the drop wakes the task, and what is left is the vacuum
+/// service's quarter-second slice after the retirement.
+///
+/// Ten changes, rewrites among them: after each, the table's descriptors are
+/// back to what it held before within a second. Then a restart holds the
+/// same.
+///
+/// Mutation: the drop not waking the task (`services_released`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_changes_give_a_plain_tables_descriptors_back_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    super::budget::isolate_with(dir.path(), 100_000, Some(0));
+    let db = open(dir.path()).await;
+    exec(&db, "CREATE TABLE q (id BIGINT PRIMARY KEY, v BIGINT, s TEXT)").await;
+    exec(&db, "INSERT INTO q (id, v, s) VALUES (1, 1, 'a'), (2, 2, 'b')").await;
+    exec(&db, "SELECT * FROM q WHERE v = 1").await;
+    // Past any poll the creation left behind, under either version.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let base = fds_named(dir.path(), "q");
+    assert!(base > 0, "the table holds no descriptors");
+    for sql in [
+        "CREATE INDEX q_v0 ON q (v)",
+        "ALTER TABLE q ADD COLUMN c1 BIGINT",
+        "ALTER TABLE q RENAME COLUMN s TO s2",
+        "ALTER TABLE q ALTER COLUMN v SET DEFAULT 5",
+        "ALTER TABLE q ADD COLUMN c4 BIGINT",
+        "ALTER TABLE q DROP COLUMN c1",
+        "DROP INDEX q_v0",
+        "CREATE INDEX q_v7 ON q (v)",
+        "ALTER TABLE q RENAME COLUMN s2 TO s",
+        "ALTER TABLE q ADD COLUMN c9 BIGINT",
+    ] {
+        exec(&db, sql).await;
+        exec(&db, "SELECT * FROM q WHERE v = 1").await;
+        let now = count_returns_to(|| fds_named(dir.path(), "q"), base, Duration::from_secs(1)).await;
+        assert_eq!(
+            now,
+            base,
+            "a second after {sql} the table held {now} descriptors, {base} before: {:?}",
+            fds_under(dir.path())
+        );
+    }
+    let db = restart(dir.path(), db).await;
+    exec(&db, "SELECT * FROM q WHERE v = 1").await;
+    let now = count_returns_to(|| fds_named(dir.path(), "q"), base, Duration::from_secs(1)).await;
+    assert_eq!(now, base, "after a restart the table held {now} descriptors, {base} before");
+    close(dir.path(), db);
+}
+
+/// A partitioned table's schema changes leave its open partitions' and its
+/// shell's descriptors where they were (P5b-3, the same check as the plain
+/// table's): a partition opens `External`, with no service task of its own,
+/// and a metadata change reloads it in place. A pin, not a fix: this held
+/// before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_changes_leave_a_partitioned_tables_descriptors_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    super::budget::isolate_with(dir.path(), 100_000, Some(0));
+    let db = open(dir.path()).await;
+    populated(&db).await;
+    exec(&db, "SELECT * FROM pt").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let opened = open_pids(&pt(&db));
+    let base = fds_under(dir.path()).len();
+    for sql in [
+        "CREATE INDEX pt_v0 ON pt (v)",
+        "ALTER TABLE pt RENAME COLUMN v TO v2",
+        "ALTER TABLE pt ALTER COLUMN v2 SET DEFAULT 5",
+        "ALTER TABLE pt ADD COLUMN c3 BIGINT DEFAULT NULL",
+        "DROP INDEX pt_v0",
+        "ALTER TABLE pt RENAME COLUMN v2 TO v",
+    ] {
+        // A change this engine refuses on a partitioned table changes
+        // nothing either; the count is what is checked.
+        let _ = try_exec(&db, sql).await;
+        exec(&db, "SELECT * FROM pt").await;
+        let now = count_returns_to(|| fds_under(dir.path()).len(), base, Duration::from_secs(1)).await;
+        assert_eq!(now, base, "a second after {sql} {now} descriptors were held, {base} before");
+        assert_eq!(open_pids(&pt(&db)), opened, "{sql} changed which partitions are open");
+    }
+    close(dir.path(), db);
+}

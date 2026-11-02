@@ -236,6 +236,10 @@ pub struct Table<S: StorageIO> {
     filters_ready: StdArc<CacheGuard<AtomicBool>>,
     /// Drop signal for the maintenance task.
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    /// Wakes the providers' service task when the instance is dropped, so
+    /// it lets go of the providers' descriptors at once rather than at its
+    /// next poll of `maintenance_alive` ([`spawn_provider_services`]).
+    services_released: StdArc<tokio::sync::Notify>,
     /// Held by the reclamation service for each piece of work it does on
     /// this instance, and by [`Table::vacuum_now`]: what [`Table::retire`]
     /// waits on, so a retired instance has no vacuum still writing through
@@ -544,6 +548,7 @@ struct Assembly<'a, S: StorageIO> {
     guard: Option<crate::core::partition::guard::RangeGuard>,
     cache_scope: String,
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    services_released: StdArc<tokio::sync::Notify>,
     /// `Some` for a partition opened `External` (see [`PartitionOpen::mode`]).
     watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
     /// [`PartitionOpen::scan_only`]; false for every plain table.
@@ -630,11 +635,45 @@ impl<S: StorageIO> Table<S> {
     }
 }
 
+/// Runs a table's provider services (`StorageIO::start_service`, which never
+/// return on their own) until the instance is retired or dropped. The task
+/// holds a clone of each provider, so it holds their descriptors (five per
+/// file), mmap and staging buffer for as long as it runs.
+///
+/// It used to stop only at a poll of `alive` every two seconds, so every
+/// instance a schema change replaced kept its descriptors up to two seconds
+/// after it was dropped (P5b-3: a migration's burst of ALTERs held twenty per
+/// statement per table until the polls caught up, and review B's probe read
+/// that as a leak). The drop now wakes it (`released`); the poll stays for
+/// retirement, which signals nothing.
+fn spawn_provider_services(
+    services: impl std::future::Future<Output = ()> + Send + 'static,
+    alive: StdArc<CacheGuard<AtomicBool>>,
+    released: StdArc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = services => {}
+            _ = released.notified() => {}
+            _ = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if !alive.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    });
+}
+
 impl<S: StorageIO> Drop for Table<S> {
     fn drop(&mut self) {
         // Without this the per-table maintenance task would outlive the table
         // and keep ticking against storage that is going away.
         self.maintenance_alive.store(false, AtomicOrdering::Relaxed);
+        // A stored permit if the task is not waiting yet: never lost.
+        self.services_released.notify_one();
     }
 }
 
@@ -1031,6 +1070,7 @@ impl<S: StorageIO> Table<S> {
             filters_ready: StdArc::new(CacheGuard::new(AtomicBool::new(true))),
             // Nothing watches it: the shell spawns no task.
             maintenance_alive: StdArc::new(CacheGuard::new(AtomicBool::new(false))),
+            services_released: StdArc::new(tokio::sync::Notify::new()),
             maintenance_tick: StdArc::new(tokio::sync::Mutex::new(())),
             // No rows, so nothing to gate: its partitions have their own.
             gate: FileGate::detached(),
@@ -1101,31 +1141,19 @@ impl<S: StorageIO> Table<S> {
         // A table rebuilt on each new JSON key leaked a generation per key, and
         // the process ran at the descriptor limit within the hour.
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
-        let services_alive = maintenance_alive.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = async {
-                    tokio::join!(
-                        io_rows_clone.start_service(),
-                        io_pointers_clone.start_service(),
-                        io_schema_clone.start_service(),
-                        io_sequence_clone.start_service()
-                    );
-                } => {}
-                _ = async {
-                    // Polled rather than signalled, so nothing new has to be
-                    // threaded through `Drop`. A few seconds of latency on
-                    // releasing a dropped table's handles is nothing next to
-                    // never.
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if !services_alive.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                    }
-                } => {}
-            }
-        });
+        let services_released = StdArc::new(tokio::sync::Notify::new());
+        spawn_provider_services(
+            async move {
+                tokio::join!(
+                    io_rows_clone.start_service(),
+                    io_pointers_clone.start_service(),
+                    io_schema_clone.start_service(),
+                    io_sequence_clone.start_service()
+                );
+            },
+            maintenance_alive.clone(),
+            services_released.clone(),
+        );
 
         // An open passes no columns; only `CREATE TABLE` passes them. So a
         // failed load with no columns to build from is a table whose schema
@@ -1187,6 +1215,7 @@ impl<S: StorageIO> Table<S> {
             guard: None,
             cache_scope,
             maintenance_alive,
+            services_released,
             watch: None,
             deferred: false,
             load_if_proven: false,
@@ -1234,30 +1263,21 @@ impl<S: StorageIO> Table<S> {
         let io_rows = Arc::new(seed.try_create_new(format!("{}.db", physical)).await?);
 
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
-        let services_alive = maintenance_alive.clone();
+        let services_released = StdArc::new(tokio::sync::Notify::new());
         let (rows_task, pointers_task) = (io_rows.clone(), io_pointers.clone());
-        // As in `new_with_constraints`: watches the drop signal so the task
-        // does not hold the providers for the life of the process. Not for
-        // an `External` partition, whose scheduler lands its staged bytes
+        // As in `new_with_constraints`: released when the instance drops, so
+        // the task does not hold the providers past it. Not for an
+        // `External` partition, whose scheduler lands its staged bytes
         // (`StorageIO::land_background`).
-        if watch.is_none() { tokio::spawn(async move {
-            tokio::select! {
-                _ = async {
-                    tokio::join!(
-                        rows_task.start_service(),
-                        pointers_task.start_service()
-                    );
-                } => {}
-                _ = async {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if !services_alive.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                    }
-                } => {}
-            }
-        }); }
+        if watch.is_none() {
+            spawn_provider_services(
+                async move {
+                    tokio::join!(rows_task.start_service(), pointers_task.start_service());
+                },
+                maintenance_alive.clone(),
+                services_released.clone(),
+            );
+        }
 
         #[cfg(test)]
         let opened = if partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.replace(false)) {
@@ -1273,6 +1293,7 @@ impl<S: StorageIO> Table<S> {
             Ok(iterator) => iterator,
             Err(e) => {
                 maintenance_alive.store(false, AtomicOrdering::Relaxed);
+                services_released.notify_one();
                 return Err(e);
             }
         };
@@ -1294,6 +1315,7 @@ impl<S: StorageIO> Table<S> {
             guard: Some(guard),
             cache_scope,
             maintenance_alive,
+            services_released,
             watch,
             deferred: scan_only,
             load_if_proven,
@@ -1370,6 +1392,7 @@ impl<S: StorageIO> Table<S> {
             guard,
             cache_scope,
             maintenance_alive,
+            services_released,
             watch,
             deferred,
             load_if_proven,
@@ -1856,6 +1879,7 @@ impl<S: StorageIO> Table<S> {
             cache_generation,
             filters_ready,
             maintenance_alive,
+            services_released,
             maintenance_tick,
             gate,
             watch,
