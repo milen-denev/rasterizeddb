@@ -771,10 +771,16 @@ compared with the column's nearest double. Two columns (`WHERE n = f8`,
 answered as PostgreSQL orders them: NaN above every number, `n < 'Infinity'`
 true for every value.
 
-A `real` column compared with a `double precision` or a decimal constant is
-widened, as PostgreSQL compares it: a `real` 0.1 (0.10000000149011612) is not
-`'0.1'::float8` and is greater than it, and `f4 = 0.1` holds for no row.
-Against a `real` constant (`'0.1'::real`) it is compared as a `real`.
+A `real` column compared with a `double precision`, a decimal or an integer
+constant is widened, as PostgreSQL compares it: a `real` 0.1
+(0.10000000149011612) is not `'0.1'::float8` and is greater than it,
+`f4 = 0.1` holds for no row, `f4 = 16777217` for none, and `f4 BETWEEN 0 AND
+0.1` excludes the `real` 0.1. Against a `real` constant (`'0.1'::real`) it is
+compared as a `real`. An IN list follows PostgreSQL's common type: two or
+more plain numbers are a `real` list (`f4 IN (0.1, 0.5)` holds for the `real`
+0.1), while a `double precision` item or a single item widens; a column in
+the list (`f4 IN (f8, 0.1)`) and a subquery's numbers (`f4 IN (SELECT n …)`)
+are each compared as the scalar `=`, in double precision.
 
 Text compared with a float has no operator in PostgreSQL, and is refused
 here with its 42883, naming the float's type (`text = real` for a `::real`):
