@@ -687,6 +687,9 @@ scan-only opens and their upgrades.
 | (review round) the deferred load demoted whenever the word left `Clean` | `an_upgrade_after_a_ticket_without_new_slots_still_loads` |
 | (review round) a proven load never started at a scan-only open | `a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room` |
 | (review round) the descriptor target ignoring the other descriptors in use | `the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit` |
+| (round 2) the budget listing the descriptors on every read | `budget::tests::the_budget_reads_the_last_count_without_listing` |
+| (round 2) the board round never refreshing the count | `budget::tests::a_board_round_refreshes_the_count` |
+| (round 2) a load clearing what writes inserted before it installs the snapshot (memory and disk residency) | `writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole` |
 
 ## Phase 3 P5b-2a as built
 
