@@ -597,8 +597,9 @@ impl LiveIndex {
     ///
     /// A superset, never a subset: the load adds and removes nothing. Into
     /// the empty index an open builds, that is the snapshot. Beside a write
-    /// that got in first (writes wait for the load, §4, but nothing here
-    /// relies on it) it is the union, which lists every version either did.
+    /// that got in first (one can, during a scan-only partition's deferred
+    /// load on a `Dirty` word: `index_store::load`'s module docs) it is the
+    /// union, which lists every version either did.
     pub fn load_sorted(&self, proof: Proof<'_>, stream: sorted::SortedLoad<KeyBuf>) -> Result<(), sorted::SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::load_sorted");
         let (entries, unkeyed, present) = stream.into_parts()?;

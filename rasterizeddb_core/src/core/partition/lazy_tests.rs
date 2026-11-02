@@ -2320,3 +2320,73 @@ async fn a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room() {
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
+
+/// Review A round 2 of P5b-2b: a scan-only partition's deferred load can
+/// run on a word already `Dirty` (a sweep or a vacuum tick wrote first),
+/// where a write's ticket takes the fast path and writes while the load is
+/// in flight. A load is a union, so the index still answers as a scan: the
+/// load held (`load::hooks::hold`) while an INSERT, an UPDATE of the indexed
+/// column, a DELETE and a vacuum run, then every probe through the index
+/// equals the scan, a duplicate key is refused, and so after a restart. Run
+/// in memory residency by the lib suite and in disk residency by its
+/// `RASTERIZEDDB_INDEX_RESIDENCY=disk` run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let (db, _snap) = sealed_and_closed(dir.path()).await;
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let p = pid_of_tenant(&t, 3);
+    let part = t.open_partitions_now().into_iter().find(|(q, _)| *q == p).unwrap().1;
+    assert!(part.is_scan_only());
+    // The word made `Dirty` with no write path, as a sweep makes it.
+    {
+        let _ticket = crate::core::index_store::gate::ticket(part.gate(), None).await.unwrap();
+    }
+    let hold = crate::core::index_store::load::hooks::hold(dir.path());
+    // A routed read upgrades the instance; its load waits in the hold (the
+    // read waits `load_wait`, then scans).
+    let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == 3).collect();
+    assert_eq!(rows(&db, "tenant_id = 3").await, mine);
+    assert!(part.gate().loads().loading(), "the deferred load did not start");
+    let writer = {
+        let (db, part) = (db.clone(), part.clone());
+        tokio::spawn(async move {
+            exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (3, 50, 99950)").await;
+            exec(&db, "UPDATE pt SET v = 99951 WHERE tenant_id = 3 AND id = 1").await;
+            exec(&db, "DELETE FROM pt WHERE tenant_id = 3 AND id = 2").await;
+            let _ = part.vacuum_now().await;
+        })
+    };
+    // Writes on a `Dirty` word do not wait for the load; give them time,
+    // then let the load go whatever they did.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while !writer.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop(hold);
+    writer.await.unwrap();
+    settled(&part).await;
+    drop(part);
+    let check = |db: Arc<Database>| async move {
+        for v in [99950i64, 99951, 301, 302, 303, 304, 1601] {
+            assert_eq!(rows(&db, &format!("v = {v}")).await, rows(&db, &format!("v + 0 = {v}")).await, "v = {v}");
+        }
+        assert_eq!(rows(&db, "v = 99951").await, vec![(3, 1, 99951)]);
+        assert!(rows(&db, "v = 302").await.is_empty(), "a deleted row read through the index");
+        for dup in ["(3, 50, 0)", "(3, 1, 0)", "(3, 3, 0)"] {
+            let e = try_exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {dup}")).await.expect_err("a duplicate key was stored");
+            assert_eq!(crate::pgwire::sqlstate_for(&e), "23505", "{dup}: {e}");
+        }
+    };
+    check(db.clone()).await;
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    check(db.clone()).await;
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}

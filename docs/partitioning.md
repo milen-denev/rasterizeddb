@@ -494,7 +494,22 @@ than the open proved. At the upgrade, a `Load` plan whose index epoch moved
 or whose pointer file grew becomes a build from the rows as they are
 (`BuildInstead`); the check runs on the load's task, after the barrier is
 already up, so a routed read waits for the load or the build's start either
-way. (The first cut demoted the load whenever the word had left `Clean`:
+way. **Writes during such a load.** On a word the proof found `Clean`,
+a write's first ticket takes the slow path and waits for the load's
+barrier. A deferred load can run on a word already `Dirty` (the sweep or
+the vacuum that wrote), where a write's ticket takes the fast path and
+writes while the load is in flight. That is sound because a load is a
+union, never a replacement (`index_store::load`'s module docs):
+`load_sorted` adds the snapshot's entries beside the write's and removes
+nothing, a paged index adopts the snapshot's run as its oldest
+(`PagedStore::adopt`), so a newer write's entries shadow it, and a load
+that fails clears the indexes and rebuilds them from the rows, which hold
+every write. Pinned by
+`writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole` (an
+INSERT, an indexed-column UPDATE, a DELETE and a vacuum during a held load;
+the index answers as the scan, duplicates are refused, after a restart
+too; in memory residency and in the disk-residency lib run). (The first
+cut demoted the load whenever the word had left `Clean`:
 with the scheduler running, a forget round's sweep of a freshly written,
 pinned partition did that to nearly every deferred load, and the first
 routed read after a fan-out scanned instead of waiting for the cheap load;
@@ -527,9 +542,14 @@ counts the descriptors that instance still holds.
 **The budget's plain-table term** (§7.1), **counted, not charged.** The
 derived budget is `min(4096, (soft RLIMIT_NOFILE − 2048 − descriptors in
 use that are not partitions') / 10)`, at least 16 (`budget::limit_for`):
-the descriptors in use are `/proc/self/fd`'s entries, read at most once a
-second (`budget::descriptors_in_use`; one directory read, about a
-millisecond per ten thousand descriptors), less ten per open partition.
+the descriptors in use are `/proc/self/fd`'s entries less ten per open
+partition. The count is an atomic the budget reads
+(`budget::descriptors_in_use`), refreshed off every statement's path by
+the scheduler's board round at most once a second, on a blocking thread
+(`budget::refresh_descriptors`); only the first read counts synchronously,
+so a server's first budget is right. (The first cut listed the directory
+on the open path under a global lock: review B measured 2.9 ms at ten
+thousand descriptors and 58 ms at fifty thousand per open that asked.)
 The first cut charged 25 per open plain table; review B measured 40 for a
 table with only its primary key's index, 60 and 80 with one and two more
 (each added index another 20, copies of the table's own four providers),

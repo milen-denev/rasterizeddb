@@ -16,12 +16,23 @@
 //! # The load
 //!
 //! Started by the open on a task of its own, single-flight per instance.
-//! - **Writes wait for it.** The open raises the file set's [`LoadBarrier`]
-//!   before it returns, and `gate::ticket` waits for the barrier before its
-//!   slow path. A load runs only on a word the proof found `Clean`, so every
-//!   write's first ticket takes the slow path, and none is issued before the
-//!   load has finished or failed: the snapshot equals the data at open,
-//!   and stays a valid base after `DIRTY` (§4).
+//! - **Correct whether or not a write lands during it.** The open (or a
+//!   scan-only open's upgrade, phase 3 P5b-2b) raises the file set's
+//!   [`LoadBarrier`] before it returns, and `gate::ticket` waits for the
+//!   barrier on its slow path. On a word the proof found `Clean` every
+//!   write's first ticket takes that slow path and waits. A scan-only
+//!   instance's deferred load can run on a word that is already `Dirty` (a
+//!   forget sweep or a vacuum tick wrote meanwhile, which adds no slot), and
+//!   there a write's ticket takes the fast path and writes during the load.
+//!   That is sound because a load is a union, never a replacement:
+//!   `LiveIndex::load_sorted` (and `GinIndex`'s) adds the snapshot's entries
+//!   beside whatever a write inserted and removes nothing; a paged index's
+//!   adopted run goes in as the store's oldest (`PagedStore::adopt`, inserted
+//!   at the front of the runs), so a newer write's entries still shadow it;
+//!   and a load that fails clears the indexes and rebuilds them from the
+//!   rows, which hold every write. The snapshot is a valid base after
+//!   `DIRTY` (§4): its entries are a superset of the rows it was sealed over,
+//!   and the open proved no slot was renumbered or added since.
 //! - **Readers wait for it** up to `index_snapshot.load_wait_ms` (600), then
 //!   scan (`Table::build_candidates`).
 //! - **Loads queue** on one process-wide queue of
@@ -855,8 +866,10 @@ where
                     FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     log::warn!("{}: the index snapshot did not load ({e}); rebuilding from rows", o.name);
                     // Nothing a load installed is kept: the build below
-                    // starts from empty indexes. No write has touched them,
-                    // since writes wait for the barrier.
+                    // starts from empty indexes and reads every row, so a
+                    // write that landed during the load (a deferred load on
+                    // a `Dirty` word, module docs) is rebuilt with the rest,
+                    // and writes after the clear insert as always.
                     o.indexes.clear(proof);
                     true
                 }

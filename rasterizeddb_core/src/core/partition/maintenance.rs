@@ -506,6 +506,9 @@ impl Scheduler {
             q.broken.retain(|(_, t)| t.strong_count() > 0);
             (q.boards.clone(), q.broken.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>())
         };
+        // The open budget's count of descriptors in use, refreshed here, off
+        // every statement's path (P5b-2b review B), at most once a second.
+        crate::core::partition::budget::refresh_descriptors().await;
         for board in boards {
             let Some(board) = board.upgrade() else {
                 continue;

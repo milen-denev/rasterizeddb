@@ -409,23 +409,66 @@ pub fn limit_for(soft: u64, others: u64) -> usize {
 /// How often the descriptors in use are counted, at most.
 const RECOUNT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-static COUNTED: AtomicU64 = AtomicU64::new(0);
+/// The last count; `u64::MAX` before the first.
+static COUNTED: AtomicU64 = AtomicU64::new(u64::MAX);
+/// When it was taken, and whether a refresh is under way.
 static COUNTED_AT: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The descriptors this process has open: `/proc/self/fd`'s entries, read
-/// at most once per [`RECOUNT_EVERY`] (one directory read, about a
-/// millisecond per ten thousand descriptors); 0 where it cannot be read.
+/// `/proc/self/fd`'s entries now: one directory read, about 3 ms at ten
+/// thousand descriptors and 58 ms at fifty thousand (review B of P5b-2b);
+/// 0 where it cannot be read.
+fn count_now() -> u64 {
+    #[cfg(test)]
+    LISTINGS.fetch_add(1, Ordering::Relaxed);
+    std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count() as u64)
+}
+
+/// Listings made, for the test that the budget's path makes none.
+#[cfg(test)]
+static LISTINGS: AtomicU64 = AtomicU64::new(0);
+
+fn store_count(n: u64) {
+    COUNTED.store(n, Ordering::Release);
+    *COUNTED_AT.lock() = Some(std::time::Instant::now());
+}
+
+/// The descriptors this process has open, as last counted: an atomic read,
+/// never a directory listing, so an open that asks the budget pays nothing
+/// for it (the listing held a global lock on the open path, review B). The
+/// first call counts, synchronously, so a server's first budget is right
+/// (`raise_descriptor_limit` makes it at the start); the board rounds keep
+/// it fresh ([`refresh_descriptors`]).
 pub fn descriptors_in_use() -> u64 {
-    {
-        let mut at = COUNTED_AT.lock();
-        let now = std::time::Instant::now();
-        if at.is_none_or(|t| now.duration_since(t) >= RECOUNT_EVERY) {
-            *at = Some(now);
-            let n = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count() as u64);
-            COUNTED.store(n, Ordering::Release);
+    match COUNTED.load(Ordering::Acquire) {
+        u64::MAX => {
+            let n = count_now();
+            store_count(n);
+            n
         }
+        n => n,
     }
-    COUNTED.load(Ordering::Acquire)
+}
+
+/// Recounts the descriptors in use if the last count is older than
+/// [`RECOUNT_EVERY`] and no other recount is under way, on a blocking
+/// thread. A scheduler's board round calls it, off every statement's path;
+/// a caller meanwhile reads the previous count.
+pub(crate) async fn refresh_descriptors() {
+    let due = COUNTED_AT.lock().is_none_or(|t| t.elapsed() >= RECOUNT_EVERY);
+    if !due || COUNTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Ok(n) = tokio::task::spawn_blocking(count_now).await {
+        store_count(n);
+    }
+    COUNTING.store(false, Ordering::Release);
+}
+
+/// Recounts now, whatever the last count's age: tests.
+#[cfg(test)]
+pub(crate) fn refresh_descriptors_now() {
+    store_count(count_now());
 }
 
 /// The descriptors in use by everything but the process budget's open
@@ -564,6 +607,37 @@ mod tests {
         assert_eq!(descriptor_target(2256, 2256, 0), None);
         // Open plain tables raise the target by what they hold.
         assert_eq!(descriptor_target(wanted, 524_288, 6_000), Some(wanted + 6_000));
+    }
+
+    /// The count the budget reads is the last one taken, not a listing per
+    /// call (review B of P5b-2b: listing `/proc/self/fd` under a global
+    /// lock on every open cost 58 ms at fifty thousand descriptors): a
+    /// thousand reads make no listing (other tests' board rounds may make
+    /// one or two meanwhile, at most one a second), and a refresh does.
+    /// A scheduler's board round refreshes the count, once its last count
+    /// is a second old.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_board_round_refreshes_the_count() {
+        let _ = descriptors_in_use();
+        tokio::time::sleep(RECOUNT_EVERY + std::time::Duration::from_millis(100)).await;
+        let listings = LISTINGS.load(Ordering::Relaxed);
+        crate::core::partition::maintenance::Scheduler::new().run_board_round().await;
+        assert!(LISTINGS.load(Ordering::Relaxed) > listings, "a board round left the count stale");
+    }
+
+    #[test]
+    fn the_budget_reads_the_last_count_without_listing() {
+        let _ = descriptors_in_use();
+        let listings = LISTINGS.load(Ordering::Relaxed);
+        let mut sum = 0u64;
+        for _ in 0..1000 {
+            sum = sum.wrapping_add(descriptors_in_use());
+        }
+        assert!(sum > 0);
+        let made = LISTINGS.load(Ordering::Relaxed) - listings;
+        assert!(made < 10, "a thousand reads of the budget's count made {made} listings");
+        refresh_descriptors_now();
+        assert!(LISTINGS.load(Ordering::Relaxed) > listings + made, "a refresh made no listing");
     }
 
     /// §7.1's budget: the descriptors in use that are not partitions' come

@@ -1546,9 +1546,13 @@ impl<S: StorageIO> Table<S> {
             let alive = maintenance_alive.clone();
             starts.push(Box::new(move || {
                 // A load's barrier is raised here, before the start returns,
-                // so a write that upgraded the instance waits for the load
-                // and a routed read waits for it too (`load_wait`), rather
-                // than scan.
+                // so a routed read waits for the load (`load_wait`) rather
+                // than scan, and a write whose ticket takes the slow path
+                // waits too. On a word already `Dirty` a write's ticket takes
+                // the fast path and writes during the load: sound, since a
+                // load is a union with what writes inserted (`index_store::
+                // load`'s module docs: `load_sorted` merges, a paged run is
+                // adopted as the oldest, a failed load clears and rebuilds).
                 let barrier = matches!(plan, load::Plan::Load { .. }).then(|| gate_task.loads().raise());
                 tokio::spawn(async move {
                     if !alive.load(AtomicOrdering::Relaxed) {
@@ -4448,9 +4452,12 @@ impl<S: StorageIO> Table<S> {
         }
         let judge_constant = sarg::worth_judging_constant(where_clause);
         // A load of the snapshot's INDEX sections in flight (B17): waited for
-        // up to `index_snapshot.load_wait_ms` rather than scan unpruned. No
-        // write lands meanwhile (writes wait for the load), so the caller's
-        // snapshot, taken before this, sees nothing the loaded index lacks.
+        // up to `index_snapshot.load_wait_ms` rather than scan unpruned. The
+        // loaded index lacks nothing the caller's snapshot, taken before
+        // this, can see: the snapshot covers every row it was sealed over,
+        // and a write that landed during the load (a deferred load on a
+        // `Dirty` word) inserted its own entries, which the load merges with
+        // and never removes (`index_store::load`'s module docs).
         if self.gate.loads().loading() && d.indexes.as_ref().is_some_and(|i| !i.is_ready()) {
             let wait = crate::core::index_store::load::settings::load_wait();
             self.gate.loads().settled_within(wait).await;
