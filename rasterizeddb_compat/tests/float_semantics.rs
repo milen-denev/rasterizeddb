@@ -352,6 +352,13 @@ async fn a_real_in_subquery_of_numerics_compares_in_float8() {
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["1", "2"] as [&str; 2], "SELECT id FROM rl WHERE f4 IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE f4 IN (SELECT p FROM rl WHERE id IN (1, 2)) ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id").await, ["2"] as [&str; 1], "SELECT id FROM rl WHERE n IN (SELECT f4 FROM rl WHERE id IN (1, 2)) ORDER BY id");
+    // A bigint past a real's exact range: as a list of plain numbers, real,
+    // 16777217 would round to the real 16777216 and match.
+    run(&c, "CREATE TABLE ri (b BIGINT)").await;
+    run(&c, "INSERT INTO ri VALUES (16777217), (16777218)").await;
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (SELECT b FROM ri) ORDER BY id").await, [] as [&str; 0]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 NOT IN (SELECT b FROM ri) ORDER BY id").await, ["1", "2", "3", "5", "6"]);
+    assert_eq!(rows_n(&c, "SELECT id FROM rl WHERE f4 IN (16777217, 16777218) ORDER BY id").await, ["6"]);
 }
 
 /// UPDATE SET p = 'Infinity' (text) into NUMERIC(p,s) is PostgreSQL's 22003, as the literal path is; the row keeps its value.
