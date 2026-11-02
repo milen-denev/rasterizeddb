@@ -344,16 +344,16 @@ async fn duplicate_catalogue_rows_refuse_only_with_a_partitioned_row() {
     close(db, root);
 }
 
-/// 2,048 declared partitions per database: two tables of 1024 fit, a third
-/// partition does not, and a DROP gives the room back. Another database is
-/// counted on its own.
+/// 65,536 declared partitions per database: two tables of 32,768 fit, a
+/// third partition does not, and a DROP gives the room back. Another
+/// database is counted on its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cap_counts_declared_partitions_per_database() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let db = open(root).await;
-    create(&db, "t1", 1024).await;
-    create(&db, "t2", 1024).await;
+    create(&db, "t1", 32_768).await;
+    create(&db, "t2", 32_768).await;
     let refused = db.create_partitioned_table(acct("t3"), &["tenant_id"], 1).await.unwrap_err();
     assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "{refused}");
     assert!(refused.to_string().contains("not supported"), "{refused}");

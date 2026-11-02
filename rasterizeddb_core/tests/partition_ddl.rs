@@ -465,7 +465,7 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
     });
 }
 
-/// The cap is 2,048 declared partitions per database, not per process: a
+/// The cap is 65,536 declared partitions per database, not per process: a
 /// full database refuses one more, a second database beside it does not, and
 /// a DROP frees the room.
 #[test]
@@ -475,16 +475,16 @@ fn the_cap_is_per_database() {
         let dir_b = tempfile::tempdir().expect("dir");
         let a = open(dir_a.path()).await;
         let b = open(dir_b.path()).await;
-        run(&a, "CREATE TABLE pd_full (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 2048")
+        run(&a, "CREATE TABLE pd_full (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 65536")
             .await
-            .expect("2048 in one table");
+            .expect("65536 in one table");
         let sql = "CREATE TABLE pd_more (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 1";
         let len = catalogue_len(&a).await;
-        let e = run(&a, sql).await.expect_err("a 2049th partition");
-        assert!(e.contains("2048"), "{e}");
+        let e = run(&a, sql).await.expect_err("a 65537th partition");
+        assert!(e.contains("65536"), "{e}");
         assert_0a000(sql, &e);
         assert_eq!(catalogue_len(&a).await, len);
-        run(&b, "CREATE TABLE pd_full (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 2048")
+        run(&b, "CREATE TABLE pd_full (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 65536")
             .await
             .expect("another database has its own cap");
         run(&a, "DROP TABLE pd_full").await.expect("drop");

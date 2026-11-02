@@ -57,7 +57,7 @@
 //!   broken (every data call returns why); `route_where(clause) -> Route`;
 //!   `materialized(epoch, route)` skips unmaterialized partitions by proof;
 //!   `insert_row_in_txn` routes a row and materializes its partition on first
-//!   write (§3.2's order). [`table::check_declared_cap`] is the 2,048 declared
+//!   write (§3.2's order). [`table::check_declared_cap`] is the 65,536 declared
 //!   partitions per database refusal, over `table::declared_in`, which
 //!   refuses while any table's count is unknown; [`table::DEFAULT_PARTITIONS`]
 //!   is 64. Pools with backup mirrors are refused, read from the pool at

@@ -98,10 +98,14 @@ use crate::core::storage_providers::traits::StorageIO;
 /// 3's lazy open lands.
 pub const DEFAULT_PARTITIONS: u32 = 64;
 
-/// The most partitions one database may declare across all its tables while
-/// every materialized partition is opened at startup (§7.1). Per database,
-/// not per process: a refusal must depend only on replicated state (§12).
-pub const MAX_DECLARED_PER_DATABASE: u32 = 2048;
+/// The most partitions one database may declare across all its tables
+/// (§7.1): 65,536 from phase 3 P5b-3, the most one map lays out
+/// (`map::MAX_INITIAL`). Phase 2's 2,048 stood because every materialized
+/// partition opened at startup; from P5b partitions open on demand under the
+/// open budget, so what a declared partition costs at rest is a map entry
+/// and, once written, its files and a slot. Per database, not per process or
+/// node: a refusal must depend only on replicated state (§12).
+pub const MAX_DECLARED_PER_DATABASE: u32 = 65_536;
 
 /// The only location index phase 2a writes or opens: the root.
 const ROOT_LOC: u32 = 0;

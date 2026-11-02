@@ -668,19 +668,21 @@ async fn route_where_narrows_only_on_key_predicates() {
 
 #[test]
 fn the_declared_partition_cap_is_per_database_and_inclusive() {
-    assert_eq!(MAX_DECLARED_PER_DATABASE, 2048);
+    assert_eq!(MAX_DECLARED_PER_DATABASE, 65_536);
+    assert_eq!(MAX_DECLARED_PER_DATABASE, super::map::MAX_INITIAL);
     assert_eq!(DEFAULT_PARTITIONS, 64);
-    check_declared_cap(0, 2048).unwrap();
-    check_declared_cap(1024, 1024).unwrap();
-    check_declared_cap(2048 - 64, 64).unwrap();
-    for (declared, adding) in [(0, 2049), (2048 - 63, 64), (2048, 1), (u64::MAX, 1)] {
+    let cap = MAX_DECLARED_PER_DATABASE as u64;
+    check_declared_cap(0, 65_536).unwrap();
+    check_declared_cap(cap / 2, (cap / 2) as u32).unwrap();
+    check_declared_cap(cap - 64, 64).unwrap();
+    for (declared, adding) in [(0, 65_537), (cap - 63, 64), (cap, 1), (u64::MAX, 1)] {
         let e = check_declared_cap(declared, adding).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
         assert!(e.to_string().contains("not supported"), "{e}");
     }
-    // A map of the default size fits 32 times.
+    // A map of the default size fits cap / default times.
     let mut declared = 0u64;
-    for _ in 0..32 {
+    for _ in 0..MAX_DECLARED_PER_DATABASE / DEFAULT_PARTITIONS {
         check_declared_cap(declared, DEFAULT_PARTITIONS).unwrap();
         declared += DEFAULT_PARTITIONS as u64;
     }
