@@ -165,6 +165,13 @@ struct Slot {
     /// The CLOCK's reference bit: set by a routed access, cleared by the
     /// hand and by the idle round as they pass (P5b-2).
     referenced: AtomicBool,
+    /// Set by the first routed access or write in this process and never
+    /// cleared, across closes: the evidence a fan-out's scan-only open needs
+    /// before it loads a proven snapshot at once (`Parts::open_instance`,
+    /// P5b-3). A partition only fan-outs reach stays scan-only, its load
+    /// deferred to a routed access that may never come. In memory: a start
+    /// begins with none.
+    routed: AtomicBool,
     /// A closed partition's (rows, pointers, index-store) file lengths, for
     /// the catalogs only (never a DDL's population check, which reads the
     /// files: `PartitionedTable::rows_len_exact`). See [`KeptSizes`].
@@ -210,6 +217,7 @@ impl Slot {
             open: parking_lot::Mutex::new(None),
             token: parking_lot::Mutex::new(None),
             referenced: AtomicBool::new(false),
+            routed: AtomicBool::new(false),
             sizes: parking_lot::Mutex::new(KeptSizes::default()),
         }
     }
@@ -224,12 +232,18 @@ impl Slot {
         if !self.referenced.load(Ordering::Relaxed) {
             self.referenced.store(true, Ordering::Relaxed);
         }
+        if !self.routed.load(Ordering::Relaxed) {
+            self.routed.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Puts an opened instance in the slot with its budget token. The
     /// caller holds the lifecycle lock.
     fn put(&self, table: Arc<Table<DbStorageProvider>>, token: budget::Token, referenced: bool) {
         self.referenced.store(referenced, Ordering::Relaxed);
+        if referenced {
+            self.routed.store(true, Ordering::Relaxed);
+        }
         *self.token.lock() = Some(token);
         self.sizes.lock().reset(false);
         *self.open.lock() = Some(table);
@@ -1988,7 +2002,12 @@ impl Parts {
         // A scan-only open loads a proven snapshot anyway while the budget
         // is under half full: the partition is likely to stay open for the
         // routed reads after the fan-out, and a load is cheap (P5b-2b review).
-        let load_if_proven = scan_only && self.budget.open() * 2 < self.budget.limit();
+        // Only where routed traffic reached it before, in this process
+        // (`Slot::routed`): a fan-out over thousands of partitions only
+        // fan-outs read would otherwise load every one of their indexes for
+        // routed reads that never come (P5b-3).
+        let load_if_proven =
+            scan_only && slot.routed.load(Ordering::Relaxed) && self.budget.open() * 2 < self.budget.limit();
         #[cfg(test)]
         let load_if_proven = load_if_proven && !scan_open_hooks::loads_deferred(&self.root);
         // Never a provider over a missing file, which it would create (I9).

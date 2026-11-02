@@ -2234,10 +2234,13 @@ async fn an_instance_kept_past_its_close_stays_counted() {
 /// counts on the files under the test's own directory: an open partition
 /// holds exactly `PER_PARTITION` (the budget subtracts that per open
 /// partition from the descriptors it counts in use), and the count the
-/// budget reads sees every descriptor a plain table holds. A plain table's
-/// own number is not a constant (40 with its primary key's index alone, 20
-/// more per added index, more after a restart or schema changes: review B
-/// of P5b-2b), which is why the budget counts rather than charges.
+/// budget reads sees every descriptor a plain table holds. Settled, a plain
+/// table holds twenty (four providers, five each), whatever its indexes:
+/// review B of P5b-2b measured 40 with its primary key's index and 20 more
+/// per added index, which was the instances each DDL replaced still held
+/// for up to two seconds (fixed in P5b-3, `schema_changes_give_a_plain_
+/// tables_descriptors_back_at_once`). The budget counts rather than charges
+/// all the same: what a plain table holds in passing is not a constant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_budget_counts_what_tables_and_partitions_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -2258,7 +2261,7 @@ async fn the_budget_counts_what_tables_and_partitions_hold() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(held(&stem), super::budget::PER_PARTITION, "an open partition does not hold what the budget assumes");
     let plain = held("plain");
-    assert!(plain >= 40, "a plain table holds {plain} descriptors");
+    assert_eq!(plain, 20, "a plain table with two indexes holds {plain} descriptors, settled");
     assert!(
         super::budget::descriptors_in_use() >= fds_under(dir.path()).len() as u64,
         "the budget's count misses descriptors this process holds"
@@ -2316,6 +2319,64 @@ async fn a_fan_out_loads_a_proven_snapshot_while_the_budget_has_room() {
     assert_eq!(rows(&db, "").await, expected());
     let scan_only = t.open_partitions_now().iter().filter(|(_, p)| p.is_scan_only()).count();
     assert!(scan_only >= t.materialized_pids().unwrap().len() - 1, "only {scan_only} scan-only past half the budget");
+    drop(t);
+    close(dir.path(), db);
+    super::budget::release(dir.path());
+}
+
+/// A fan-out's eager proven load needs evidence of routed traffic (P5b-3):
+/// after a start, where no routed access has reached any partition yet, a
+/// fan-out with all the budget's room leaves every partition scan-only;
+/// once a routed read has reached one, the next fan-out loads that one's
+/// snapshot at once and still defers the rest. The evidence outlives the
+/// partition's close.
+///
+/// Mutation: the eager load not asking for routed evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_loads_at_once_only_where_routed_traffic_went() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let dir = tempfile::tempdir().unwrap();
+    let _snap = storage_override::set(dir.path(), IndexStorage::Snapshot);
+    let _budget = super::budget::isolate_with(dir.path(), 64, Some(0));
+    let db = open(dir.path()).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    populated(&db).await;
+    exec(&db, "CREATE INDEX pt_v ON pt (v)").await;
+    let t = pt(&db);
+    for (_, part) in t.open_partitions_now() {
+        settled(&part).await;
+    }
+    t.close_idle().await.unwrap();
+    drop(t);
+    let db = restart(dir.path(), db).await;
+    db.partition_maintenance().set_period(Duration::from_secs(3600));
+    let t = pt(&db);
+    assert_eq!(rows(&db, "").await, expected());
+    let opened = t.open_partitions_now();
+    assert_eq!(opened.len(), t.materialized_pids().unwrap().len());
+    for (pid, part) in &opened {
+        assert!(part.is_scan_only(), "partition {pid}: loaded at once with no routed access since the start");
+    }
+    drop(opened);
+    let routed = pid_of_tenant(&t, 3);
+    assert_eq!(rows(&db, "tenant_id = 3").await.len(), IDS as usize);
+    for (_, part) in t.open_partitions_now() {
+        if !part.is_scan_only() {
+            settled(&part).await;
+        }
+    }
+    t.close_idle().await.unwrap();
+    assert!(t.open_partitions_now().is_empty());
+    assert_eq!(rows(&db, "").await, expected());
+    for (pid, part) in t.open_partitions_now() {
+        if pid == routed {
+            assert!(!part.is_scan_only(), "partition {pid}: routed before, its proven snapshot deferred");
+            settled(&part).await;
+            assert_eq!(part.index_origin(), Origin::Loaded, "partition {pid}");
+        } else {
+            assert!(part.is_scan_only(), "partition {pid}: loaded at once with no routed access");
+        }
+    }
     drop(t);
     close(dir.path(), db);
     super::budget::release(dir.path());
