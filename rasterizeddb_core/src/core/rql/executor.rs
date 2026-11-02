@@ -20877,6 +20877,11 @@ async fn execute_query_rows_body(
                             };
                             // A locking read's key cells, one entry per kept row.
                             let mut kept_keys: Vec<Vec<crate::core::row::row::Column>> = Vec::new();
+                            // With windows, each kept row's constants and row
+                            // expressions, spliced in only once every window
+                            // is computed (see the splice below).
+                            let mut kept_literals: Vec<Vec<(usize, Vec<u8>, crate::core::db_type::DbType)>> = Vec::new();
+                            let mut row_literals: Vec<(usize, Vec<u8>, crate::core::db_type::DbType)> = Vec::new();
                             // Sized only when `DISTINCT` will use it:
                             // a hash table with room for every row is
                             // tens of megabytes on a large result.
@@ -20889,6 +20894,76 @@ async fn execute_query_rows_body(
                                     },
                                     Default::default(),
                                 );
+
+                            // The DISTINCT identity of an output row.
+                            // Compare the serialized value
+                            // bytes, which is the same identity
+                            // the client sees — and whether
+                            // the cell is NULL. A NULL's value
+                            // bytes are its type's zeroes,
+                            // empty for TEXT and BYTEA, so a
+                            // key of bytes alone merged NULL
+                            // with '' and answered two rows
+                            // for {NULL, '', 'a'}.
+                            //
+                            // A document is the exception: it
+                            // is keyed by its value, so
+                            // `{"a":1}` and `{"a":1.0}` are one
+                            // row, as `=` says. A stored one
+                            // arrives typed as text, so its
+                            // column is known from the schema;
+                            // a computed one carries `jsonb`.
+                            let distinct_key = |row: &crate::core::row::row::Row| -> Vec<u8> {
+                                let mut key = Vec::new();
+                                for (position, c) in row.columns.iter().enumerate() {
+                                    let is_null = c.column_type
+                                        == crate::core::db_type::DbType::NULL;
+                                    key.push(is_null as u8);
+                                    let document = !is_null
+                                        && (c.column_type
+                                            == crate::core::db_type::DbType::JSONB
+                                            || (!value_slots
+                                                .iter()
+                                                .any(|(p, ..)| *p == position)
+                                                && document_ids
+                                                    .contains(&u64::from(c.schema_id))));
+                                    if document {
+                                        crate::core::jsonb::push_group_key(
+                                            c.data.into_slice(),
+                                            &mut key,
+                                        );
+                                        continue;
+                                    }
+                                    // A legacy `CHAR` by its one stored
+                                    // form: an older build's `'a '` and
+                                    // `'a'` cells are one value, as
+                                    // GROUP BY and `=` read them.
+                                    if !is_null && c.column_type == crate::core::db_type::DbType::CHAR {
+                                        key.push(u8::MAX);
+                                        key.extend_from_slice(
+                                            &crate::core::value_codec::legacy_char_canonical(c.data.into_slice()),
+                                        );
+                                        continue;
+                                    }
+                                    // A NUMERIC carrying its own scale
+                                    // by its value: 1.5 is 1.50.
+                                    if let Some(canonical) = (!is_null
+                                        && c.column_type == crate::core::db_type::DbType::DECIMAL)
+                                        .then(|| crate::core::value_codec::canonical_numeric_cell(c.data.into_slice()))
+                                        .flatten()
+                                    {
+                                        key.push(u8::MAX - 1);
+                                        key.extend_from_slice(&canonical);
+                                        continue;
+                                    }
+                                    key.extend_from_slice(
+                                        &(c.data.into_slice().len() as u32)
+                                            .to_le_bytes(),
+                                    );
+                                    key.extend_from_slice(c.data.into_slice());
+                                }
+                                key
+                            };
 
                             let mut processed = 0usize;
                             loop {
@@ -21125,6 +21200,18 @@ async fn execute_query_rows_body(
                                         };
                                         computed.push((*position, value, ty));
                                     }
+                                    // A window reads its columns by write
+                                    // order, and a spliced constant carries
+                                    // its select position as its column id:
+                                    // `SELECT 'x', id, sum(id) OVER ()` summed
+                                    // the 'x' in position 0 for `id` (write
+                                    // order 0) and answered NULL, and `id * 2`
+                                    // first summed the doubled ids. With
+                                    // windows the slots wait for them.
+                                    if has_windows {
+                                        row_literals = computed;
+                                        computed = Vec::new();
+                                    }
                                     for (position, value, db_type) in &computed {
                                         let mut mb = crate::memory_pool::MEMORY_POOL
                                             .acquire(value.len());
@@ -21151,79 +21238,16 @@ async fn execute_query_rows_body(
                                     // count in D message".
                                     let output_columns =
                                         query_row.select_items.len().max(value_slots.len());
-                                    row.columns.truncate(output_columns);
+                                    if !has_windows {
+                                        row.columns.truncate(output_columns);
+                                    }
                                 }
                                 let row = row;
 
-                                if distinct {
-                                    // Compare the serialized value
-                                    // bytes, which is the same identity
-                                    // the client sees — and whether
-                                    // the cell is NULL. A NULL's value
-                                    // bytes are its type's zeroes,
-                                    // empty for TEXT and BYTEA, so a
-                                    // key of bytes alone merged NULL
-                                    // with '' and answered two rows
-                                    // for {NULL, '', 'a'}.
-                                    //
-                                    // A document is the exception: it
-                                    // is keyed by its value, so
-                                    // `{"a":1}` and `{"a":1.0}` are one
-                                    // row, as `=` says. A stored one
-                                    // arrives typed as text, so its
-                                    // column is known from the schema;
-                                    // a computed one carries `jsonb`.
-                                    let mut key = Vec::new();
-                                    for (position, c) in row.columns.iter().enumerate() {
-                                        let is_null = c.column_type
-                                            == crate::core::db_type::DbType::NULL;
-                                        key.push(is_null as u8);
-                                        let document = !is_null
-                                            && (c.column_type
-                                                == crate::core::db_type::DbType::JSONB
-                                                || (!value_slots
-                                                    .iter()
-                                                    .any(|(p, ..)| *p == position)
-                                                    && document_ids
-                                                        .contains(&u64::from(c.schema_id))));
-                                        if document {
-                                            crate::core::jsonb::push_group_key(
-                                                c.data.into_slice(),
-                                                &mut key,
-                                            );
-                                            continue;
-                                        }
-                                        // A legacy `CHAR` by its one stored
-                                        // form: an older build's `'a '` and
-                                        // `'a'` cells are one value, as
-                                        // GROUP BY and `=` read them.
-                                        if !is_null && c.column_type == crate::core::db_type::DbType::CHAR {
-                                            key.push(u8::MAX);
-                                            key.extend_from_slice(
-                                                &crate::core::value_codec::legacy_char_canonical(c.data.into_slice()),
-                                            );
-                                            continue;
-                                        }
-                                        // A NUMERIC carrying its own scale
-                                        // by its value: 1.5 is 1.50.
-                                        if let Some(canonical) = (!is_null
-                                            && c.column_type == crate::core::db_type::DbType::DECIMAL)
-                                            .then(|| crate::core::value_codec::canonical_numeric_cell(c.data.into_slice()))
-                                            .flatten()
-                                        {
-                                            key.push(u8::MAX - 1);
-                                            key.extend_from_slice(&canonical);
-                                            continue;
-                                        }
-                                        key.extend_from_slice(
-                                            &(c.data.into_slice().len() as u32)
-                                                .to_le_bytes(),
-                                        );
-                                        key.extend_from_slice(c.data.into_slice());
-                                    }
-                                    if !seen.insert(key) {
-                                        continue;
-                                    }
+                                // With windows the row is not whole yet:
+                                // DISTINCT is applied once they are in.
+                                if distinct && !has_windows && !seen.insert(distinct_key(&row)) {
+                                    continue;
                                 }
 
                                 if streaming {
@@ -21236,6 +21260,9 @@ async fn execute_query_rows_body(
                                     continue;
                                 }
                                 kept.push(row);
+                                if has_windows && has_literals {
+                                    kept_literals.push(std::mem::take(&mut row_literals));
+                                }
                                 if let Some(cells) = row_key_cells {
                                     kept_keys.push(cells);
                                 }
@@ -21274,43 +21301,61 @@ async fn execute_query_rows_body(
                                         }
                                     }
                                 }
-                                for (position, spec, values) in computed {
-                                    // The type the window produces, not
-                                    // `I64`: an `AVG` is a decimal and
-                                    // a `LAG(created_at)` is a
-                                    // timestamp, and describing either
-                                    // as a bigint sends the client
-                                    // eight bytes it decodes as the
-                                    // wrong thing.
-                                    let column_type = spec.result_type();
-                                    for (row, value) in
-                                        kept.iter_mut().zip(values.into_iter())
-                                    {
-                                        // A NULL window value — no
-                                        // preceding row for a `LAG`, an
-                                        // empty frame for an `AVG` —
-                                        // is an empty block, which is
-                                        // how a NULL travels here.
-                                        // Typed NULL, as a NULL cell of
-                                        // the scan is: an empty block typed
-                                        // as text was the value '', which
-                                        // is why '' used to be read as NULL.
-                                        let cell_type = if value.is_some() {
-                                            column_type.clone()
-                                        } else {
-                                            crate::core::db_type::DbType::NULL
-                                        };
-                                        let bytes = value.unwrap_or_default();
-                                        let mut mb = crate::memory_pool::MEMORY_POOL
-                                            .acquire(bytes.len());
-                                        mb.into_slice_mut().copy_from_slice(&bytes);
-                                        let at = (*position).min(row.columns.len());
+                                // The row as scanned is the selected columns
+                                // in select order, then the columns only a
+                                // window reads (`max(v) OVER ()` with `v`
+                                // not selected). Cut back to the selected
+                                // ones, then the constants, row expressions
+                                // and window values go in together, in
+                                // ascending select position, so each lands
+                                // where it was written: inserted around the
+                                // window-only columns, `SELECT 'x', id,
+                                // sum(id) OVER (), 'z', max(v) OVER ()` put
+                                // 'z' and the max out of place.
+                                let mut windows: Vec<(usize, crate::core::db_type::DbType, std::vec::IntoIter<Option<Vec<u8>>>)> = computed
+                                    .into_iter()
+                                    .map(|(position, spec, values)| (*position, spec.result_type(), values.into_iter()))
+                                    .collect();
+                                for (k, row) in kept.iter_mut().enumerate() {
+                                    let literals = kept_literals.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                                    let fetched = query_row
+                                        .select_items
+                                        .len()
+                                        .saturating_sub(literals.len() + windows.len());
+                                    if fetched <= row.columns.len() {
+                                        row.columns.truncate(fetched);
+                                    }
+                                    let mut cells: Vec<(usize, Vec<u8>, crate::core::db_type::DbType)> =
+                                        Vec::with_capacity(literals.len() + windows.len());
+                                    cells.extend(literals.iter().cloned());
+                                    for (position, column_type, values) in windows.iter_mut() {
+                                        // A NULL window value — no preceding
+                                        // row for a `LAG`, an empty frame for
+                                        // an `AVG` — is a typed-NULL empty
+                                        // block, as a NULL cell of the scan
+                                        // is: an empty block typed as text
+                                        // was the value ''. The type is the
+                                        // window's, not `I64`: an `AVG` is a
+                                        // decimal, a `LAG(created_at)` a
+                                        // timestamp.
+                                        match values.next().flatten() {
+                                            Some(bytes) => cells.push((*position, bytes, column_type.clone())),
+                                            None => cells.push((*position, Vec::new(), crate::core::db_type::DbType::NULL)),
+                                        }
+                                    }
+                                    cells.sort_by_key(|(position, _, _)| *position);
+                                    for (position, value, db_type) in cells {
+                                        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(value.len());
+                                        if !value.is_empty() {
+                                            mb.into_slice_mut().copy_from_slice(&value);
+                                        }
+                                        let at = position.min(row.columns.len());
                                         row.columns.insert(
                                             at,
                                             crate::core::row::row::Column {
-                                                schema_id: crate::core::row::row::schema_id_of(*position as u64),
+                                                schema_id: crate::core::row::row::schema_id_of(position as u64),
                                                 data: mb,
-                                                column_type: cell_type,
+                                                column_type: db_type,
                                             },
                                         );
                                     }
@@ -21318,6 +21363,14 @@ async fn execute_query_rows_body(
                                 for row in kept.iter_mut() {
                                     row.columns
                                         .truncate(query_row.select_items.len().max(1));
+                                }
+                                // DISTINCT over the rows as the client sees
+                                // them, windows included: deduplicated at
+                                // the scan, `SELECT DISTINCT sum(id) OVER ()`
+                                // kept every row (each was distinct before
+                                // its window value went in).
+                                if distinct {
+                                    kept.retain(|row| seen.insert(distinct_key(row)));
                                 }
                             }
 
