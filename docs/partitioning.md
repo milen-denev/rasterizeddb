@@ -548,7 +548,12 @@ partition. The count is an atomic the budget reads
 (`budget::descriptors_in_use`), refreshed off every statement's path by
 the scheduler's board round at most once a second, on a blocking thread
 (`budget::refresh_descriptors`); only the first read counts synchronously,
-so a server's first budget is right. (The first cut listed the directory
+so a server's first budget is right. A database with no partitioned table
+runs no scheduler, so a plain table's open spawns the refresh when one is
+due, then raises the soft limit from the fresh count (the in-progress flag
+keeps one listing at a time). That flag is cleared by a guard, so a
+refresh dropped mid-listing (a cancelled caller, a timeout) cannot leave it
+set and stop every later recount (round 3). (The first cut listed the directory
 on the open path under a global lock: review B measured 2.9 ms at ten
 thousand descriptors and 58 ms at fifty thousand per open that asked.)
 The first cut charged 25 per open plain table; review B measured 40 for a
@@ -691,6 +696,8 @@ scan-only opens and their upgrades.
 | (round 2) the budget listing the descriptors on every read | `budget::tests::the_budget_reads_the_last_count_without_listing` |
 | (round 2) the board round never refreshing the count | `budget::tests::a_board_round_refreshes_the_count` |
 | (round 2) a load clearing what writes inserted before it installs the snapshot (memory and disk residency) | `writes_during_a_deferred_load_on_a_dirty_word_keep_the_index_whole` |
+| (round 3) the in-progress flag cleared after the listing's await, not by a guard | `budget::tests::a_refresh_dropped_mid_listing_leaves_the_next_free_to_recount` |
+| (round 3) a plain table's open never refreshing the count | `plain_tables_opening_keep_the_descriptor_count_fresh` |
 
 ## Phase 3 P5b-2a as built
 
