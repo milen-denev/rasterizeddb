@@ -4220,13 +4220,9 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                 if closed && (widened || !columns.is_empty()) {
                     let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
                     let mut parts: Vec<Vec<Tok>> = Vec::new();
+                    // The NULL item: unknown for every row, IN or NOT IN.
                     let in_null = || {
-                        let mut list = vec![Tok::Word(column.clone())];
-                        if negated {
-                            list.push(Tok::Word("NOT".into()));
-                        }
-                        list.extend([Tok::Word("IN".into()), Tok::LPar, Tok::Word("NULL".into()), Tok::RPar]);
-                        list
+                        vec![Tok::Word(column.clone()), Tok::Word("IN".into()), Tok::LPar, Tok::Word("NULL".into()), Tok::RPar]
                     };
                     if widened {
                         parts.extend(values.iter().map(|v| lowered(&column, op, *v)));
