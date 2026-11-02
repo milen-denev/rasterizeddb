@@ -3961,8 +3961,13 @@ fn float_run_search(scale: u32, lo: i128, hi: i128, v: f64) -> (Option<i128>, Op
 /// column is above `v` exactly when it is at or above the first `real` above
 /// `v`, and so on; equality with a `v` no `real` widens to holds for no row
 /// (`c <> c AND c = c`, so NULL stays NULL and NaN is not equal), and
-/// inequality for every row (`c = c OR c <> c`). A `real` constant, an
-/// integer, NaN and a list with a NULL are left as they were.
+/// inequality for every row (`c = c OR c <> c`). `BETWEEN` is its two
+/// comparisons. An IN list's constants widen only where PostgreSQL's common
+/// type is float8: one typed float8, or a single constant (the scalar `=`); a
+/// list of plain numbers compares as `real`. A column in the list is its own
+/// scalar `=` (`f4 IN (f8, 0.1)` is `f4 = f8 OR f4 = 0.1`, both in double
+/// precision), which the passes after this one compare. A `real` constant,
+/// NaN and a list with a NULL are left as they were.
 fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 20]>) -> Vec<Tok> {
     use crate::core::db_type::DbType;
     if !schema.iter().any(|f| !f.is_deleted && f.db_type == DbType::F32) {
@@ -3984,17 +3989,18 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
         let name = resolve_column(w, schema)?;
         schema.iter().any(|f| !f.is_deleted && f.name == name && f.db_type == DbType::F32).then(|| w.clone())
     };
-    // A double this compares in double precision: a float8 constant, or a
-    // decimal (not an integer) constant; finite, not NaN.
-    let double_at = |i: usize| -> Option<f64> {
-        let v = match toks.get(i)? {
-            Tok::Float { number, .. } if float_type_name(&toks[i]) == "double precision" => float_value(number)?,
-            Tok::Word(w) if is_numeric_literal_word(w) && w.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) => {
-                w.parse::<f64>().ok()?
-            }
+    // A constant a scalar comparison with a real reads in double precision:
+    // a float8 constant, a decimal or an integer (`f4 = 16777217` holds for
+    // no real; as a real the integer was 16777216); finite, not NaN. The
+    // second answer says whether it is typed float8, which decides an IN
+    // list's common type.
+    let double_at = |i: usize| -> Option<(f64, bool)> {
+        let (v, double) = match toks.get(i)? {
+            Tok::Float { number, .. } if float_type_name(&toks[i]) == "double precision" => (float_value(number)?, true),
+            Tok::Word(w) if is_numeric_literal_word(w) => (w.parse::<f64>().ok()?, false),
             _ => return None,
         };
-        (!v.is_nan()).then_some(v)
+        (!v.is_nan()).then_some((v, double))
     };
     let mirror = |op: &str| match op {
         "<" => ">",
@@ -4045,21 +4051,70 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
         out
     };
     let before = |i: usize| if i == 0 { None } else { toks.get(i - 1) };
+    // A plain numeric column as an IN item, ending at a comma or the close.
+    let column_item = |i: usize| -> Option<String> {
+        let Some(Tok::Word(w)) = toks.get(i) else { return None };
+        if !matches!(toks.get(i + 1), Some(Tok::Comma | Tok::RPar)) {
+            return None;
+        }
+        let name = resolve_column(w, schema)?;
+        schema
+            .iter()
+            .any(|f| {
+                !f.is_deleted
+                    && f.name == name
+                    && matches!(
+                        f.db_type,
+                        DbType::F32
+                            | DbType::F64
+                            | DbType::DECIMAL
+                            | DbType::I8
+                            | DbType::I16
+                            | DbType::I32
+                            | DbType::I64
+                            | DbType::U8
+                            | DbType::U16
+                            | DbType::U32
+                            | DbType::U64
+                    )
+            })
+            .then(|| w.clone())
+    };
     let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
     let mut i = 0usize;
     while i < toks.len() {
         // The cheap tests first: a comparison or IN next, before any column
         // is resolved (every statement over a table with a real passes here).
+        // `real [NOT] BETWEEN a AND b`: two scalar comparisons, each in
+        // double precision (`f4 BETWEEN 0 AND 0.1` holds for no real 0.1).
+        let negated_between = toks.get(i + 1).is_some_and(|t| t.is_keyword("not"))
+            && toks.get(i + 2).is_some_and(|t| t.is_keyword("between"));
+        if (negated_between || toks.get(i + 1).is_some_and(|t| t.is_keyword("between"))) && !binds(before(i)) {
+            let at = i + 2 + negated_between as usize;
+            let bounds = (double_at(at), toks.get(at + 1).is_some_and(|t| t.is_keyword("and")), double_at(at + 2));
+            if let ((Some((low, _)), true, Some((high, _))), false) = (bounds, binds(toks.get(at + 3))) {
+                if let Some(column) = real_at(i) {
+                    let (a, kw, b) = if negated_between { ("<", "OR", ">") } else { (">=", "AND", "<=") };
+                    out.push(Tok::LPar);
+                    out.extend(lowered(&column, a, low));
+                    out.push(Tok::Word(kw.to_string()));
+                    out.extend(lowered(&column, b, high));
+                    out.push(Tok::RPar);
+                    i = at + 3;
+                    continue;
+                }
+            }
+        }
         let compared = comparison(toks.get(i + 1));
         if let Some(op) = compared.filter(|_| !binds(before(i)) && !binds(toks.get(i + 3))) {
-            if let Some(v) = double_at(i + 2) {
+            if let Some((v, _)) = double_at(i + 2) {
                 if let Some(column) = real_at(i) {
                     out.extend(lowered(&column, &op, v));
                     i += 3;
                     continue;
                 }
             }
-            if let Some(v) = double_at(i) {
+            if let Some((v, _)) = double_at(i) {
                 if let Some(column) = real_at(i + 2) {
                     out.extend(lowered(&column, &mirror(&op), v));
                     i += 3;
@@ -4073,11 +4128,24 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
             let negated = toks.get(i + 1).is_some_and(|t| t.is_keyword("not"));
             let open = i + 1 + negated as usize + 1;
             if toks.get(open - 1).is_some_and(|t| t.is_keyword("in")) && matches!(toks.get(open), Some(Tok::LPar)) {
+                // Items: constants, and plain numeric columns, which
+                // PostgreSQL compares one at a time with the scalar operator
+                // (`f4 IN (f8, 0.1)` is `f4 = f8 OR f4 = 0.1`), outside the
+                // list's common type.
                 let mut values = Vec::new();
+                let mut columns: Vec<String> = Vec::new();
+                let mut doubles = 0usize;
                 let mut j = open + 1;
                 let mut closed = false;
-                while let Some(v) = double_at(j) {
-                    values.push(v);
+                loop {
+                    if let Some((v, double)) = double_at(j) {
+                        values.push(v);
+                        doubles += double as usize;
+                    } else if let Some(word) = column_item(j) {
+                        columns.push(word);
+                    } else {
+                        break;
+                    }
                     match toks.get(j + 1) {
                         Some(Tok::Comma) => j += 2,
                         Some(Tok::RPar) => {
@@ -4087,14 +4155,43 @@ fn real_columns_against_doubles(toks: Vec<Tok>, schema: &SmallVec<[SchemaField; 
                         _ => break,
                     }
                 }
-                if closed && !values.is_empty() {
+                // The constants' common type comes from the column and every
+                // constant: float8 only when one is typed float8, real when
+                // all are plain numbers (`f4 IN (0.1, 0.5)` compares 0.1 as a
+                // real). One constant is the scalar `=`, in double precision.
+                let widened = doubles > 0 || values.len() == 1;
+                if closed && (widened || !columns.is_empty()) {
                     let (op, kw) = if negated { ("<>", "AND") } else { ("=", "OR") };
+                    let mut parts: Vec<Vec<Tok>> = Vec::new();
+                    if widened {
+                        parts.extend(values.iter().map(|v| lowered(&column, op, *v)));
+                    } else if !values.is_empty() {
+                        // The constants stay a list, compared as real as it
+                        // was written; the columns are parted out below.
+                        let mut kept = vec![Tok::Word(column.clone())];
+                        if negated {
+                            kept.push(Tok::Word("NOT".into()));
+                        }
+                        kept.push(Tok::Word("IN".into()));
+                        kept.push(Tok::LPar);
+                        for k in (open + 1..=j).step_by(2).filter(|&k| double_at(k).is_some()) {
+                            if kept.len() > 3 + negated as usize {
+                                kept.push(Tok::Comma);
+                            }
+                            kept.push(toks[k].clone());
+                        }
+                        kept.push(Tok::RPar);
+                        parts.push(kept);
+                    }
+                    for item in &columns {
+                        parts.push(vec![Tok::Word(column.clone()), Tok::Sym(op.to_string()), Tok::Word(item.clone())]);
+                    }
                     out.push(Tok::LPar);
-                    for (k, v) in values.iter().enumerate() {
+                    for (k, part) in parts.into_iter().enumerate() {
                         if k > 0 {
                             out.push(Tok::Word(kw.to_string()));
                         }
-                        out.extend(lowered(&column, op, *v));
+                        out.extend(part);
                     }
                     out.push(Tok::RPar);
                     i = j + 2;
