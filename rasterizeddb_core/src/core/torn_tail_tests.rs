@@ -693,13 +693,25 @@ fn a_partitions_pointers_and_its_tables_sidecars_are_fixed_record_files() {
     let rows = format!("{}.db", files::data_stem(uid, 7));
     let filter = format!("{}_flt.db", files::data_stem(uid, 7));
     let fields = format!("{}_FIELDS.db", files::schema_stem(uid));
-    let others = [rows.clone(), filter.clone(), files::map_file(uid, 0), files::ids_file(uid), files::seq_file(uid)];
+    let others = [filter.clone(), files::map_file(uid, 0), files::ids_file(uid), files::seq_file(uid)];
     for name in others.iter().chain([&pointers, &fields]) {
         std::fs::write(d.join(name), b"").unwrap();
     }
-    // No schema yet: nothing is anyone's.
+    // No schema yet and no rows file: nothing is anyone's.
     assert_eq!(classify(d, &pointers), None);
     assert_eq!(classify(d, &fields), None);
+    // The partition's rows file beside them is a partition on another
+    // storage location (phase 4), whose schema is in the root.
+    std::fs::write(d.join(&rows), b"").unwrap();
+    assert_eq!(classify(d, &pointers).map(|k| k.stride), Some(ROW_POINTER_RECORD_LEN as u64));
+    assert_eq!(classify(d, &fields), None);
+    assert_eq!(classify(d, &rows), None, "a partition's rows file taken for a fixed-record file");
+    // A plain table an older build let take the pointer file's name: its
+    // own schema beside it, so the file is its row data, never cut.
+    let plain_schema = format!("{}_schema.db", pointers.trim_end_matches(".db"));
+    std::fs::write(d.join(&plain_schema), b"").unwrap();
+    assert_eq!(classify(d, &pointers), None, "a plain table's row data taken for partition pointers");
+    std::fs::remove_file(d.join(&plain_schema)).unwrap();
     std::fs::write(d.join(format!("{}.db", files::schema_stem(uid))), b"").unwrap();
     assert_eq!(classify(d, &pointers).map(|k| k.stride), Some(ROW_POINTER_RECORD_LEN as u64));
     assert_eq!(classify(d, &fields).map(|k| k.stride), Some(crate::core::row::schema::SCHEMA_FIELD_SIZE));
@@ -781,6 +793,63 @@ async fn torn_partition_pointers_are_cut_before_the_next_insert() {
         );
         std::fs::remove_dir_all(&work).unwrap();
     }
+}
+
+/// Phase 4: a partition on another storage location keeps its two data
+/// files there and its table's schema in the root. A torn tail of its
+/// pointer file is cut when that location's log recovers, as the root's is,
+/// so the inserts after it land on record boundaries and every row reads
+/// back after a restart.
+#[cfg(feature = "storage_pools")]
+#[tokio::test]
+async fn torn_partition_pointers_on_another_location_are_cut() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let disk = base.path().join("disk");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&disk).unwrap();
+    let stride = ROW_POINTER_RECORD_LEN as u64;
+    let shut = |db: Arc<Database>| {
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&root));
+        crate::core::wal::remove_for(&path_str(&disk));
+    };
+    let db = open(&root).await.unwrap();
+    db.storage
+        .add_location(&path_str(&disk), crate::core::storage::LocationRole::Primary, 1, true)
+        .unwrap();
+    db.storage.set_policy(crate::core::storage::PlacementPolicy::RoundRobin);
+    exec(&db, "CREATE TABLE t (id BIGINT NOT NULL, a INTEGER) PARTITION BY HASH (id) PARTITIONS 2")
+        .await
+        .unwrap();
+    for i in 1..=12 {
+        exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
+    }
+    checkpoint(&root);
+    checkpoint(&disk);
+    shut(db);
+    let on_disk = partition_pointer_files(&disk);
+    assert_eq!(on_disk.len(), 1, "one partition is dealt to the second location: {on_disk:?}");
+    let (name, whole) = on_disk[0].clone();
+    assert!(whole > 0 && whole % stride == 0, "{name}: {whole} bytes is not whole records");
+    let file = disk.join(&name);
+    {
+        let mut f = File::options().append(true).open(&file).unwrap();
+        f.write_all(&vec![0xab; (stride / 2) as usize]).unwrap();
+    }
+
+    let db = open(&root).await.unwrap_or_else(|e| panic!("{name} torn: {e}"));
+    assert_eq!(len(&file), whole, "{name}: the second location's recovery did not cut the torn tail");
+    for i in 100..=140 {
+        exec(&db, &format!("INSERT INTO t (id, a) VALUES ({i}, {i})")).await.unwrap();
+    }
+    shut(db);
+    assert!(len(&file) > whole, "no insert after the cut reached the second location's partition");
+    assert_eq!(len(&file) % stride, 0, "{name}: an insert landed off a record boundary");
+    let db = open(&root).await.unwrap();
+    let got = ids(&db).await;
+    shut(db);
+    assert_eq!(got, (1..=12).chain(100..=140).collect::<Vec<i64>>(), "rows after the cut and a restart");
 }
 
 /// A checkpoint records a partition's pointer file's floor like any other

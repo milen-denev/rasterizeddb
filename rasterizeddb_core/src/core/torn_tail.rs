@@ -112,7 +112,9 @@
 //! `__pt_<u>_schema_<SIDECAR>.db`, the rule above for the table `__pt_<u>`.
 //! Each partition's pointers, `__pt_<u>_<pid>_pointers.db`, have no schema of
 //! their own; they count when the table's shared one sits beside them
-//! (`partition::files::pointers_schema`). The rest under the prefix (rows,
+//! (`partition::files::pointers_schema`), or the partition's own rows file
+//! does: a partition on another storage location (phase 4) has its two data
+//! files there and its table's schema in the root. The rest under the prefix (rows,
 //! filters, the map log, which cuts its own torn tail at open, the ids and
 //! sequence files) are none of these.
 //!
@@ -217,13 +219,19 @@ pub fn classify(dir: &Path, name: &str) -> Option<FixedRecordFile> {
     None
 }
 
-/// Whether `name` is a partition's pointer file whose table's shared schema
-/// sits beside it ([`crate::core::partition::files::pointers_schema`]), and
-/// not the row data of a plain table that an older build let take a name
-/// under the partition prefix (`<name less .db>_schema.db` beside it).
+/// Whether `name` is a partition's pointer file: its table's shared schema
+/// sits beside it ([`crate::core::partition::files::pointers_schema`]), or
+/// the partition's own rows file does, which is how a partition on another
+/// storage location is known (phase 4: the two data files are created
+/// together, `files::create_partition_files`, and the schema stays in the
+/// root). Missed, its torn tail was never cut and the next insert landed
+/// inside the torn record. Never the row data of a plain table that an
+/// older build let take a name under the partition prefix
+/// (`<name less .db>_schema.db` beside it).
 fn partition_pointers(dir: &Path, name: &str) -> bool {
     crate::core::partition::files::pointers_schema(name).is_some_and(|schema| {
-        dir.join(schema).is_file()
+        let stem = name.trim_end_matches("_pointers.db");
+        (dir.join(schema).is_file() || dir.join(format!("{stem}.db")).is_file())
             && !dir
                 .join(format!("{}_schema.db", name.trim_end_matches(".db")))
                 .is_file()
