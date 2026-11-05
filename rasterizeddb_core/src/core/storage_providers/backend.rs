@@ -424,6 +424,16 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    async fn try_create_new_at(&self, location: &str, name: String) -> std::io::Result<Self> {
+        match self {
+            Self::File(p) => Ok(Self::File(p.try_create_new_at(location, name).await?)),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{name} cannot be created in {location}: only a plain file provider places files by directory"),
+            )),
+        }
+    }
+
     #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
         match self {

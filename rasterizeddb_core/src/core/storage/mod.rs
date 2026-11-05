@@ -190,6 +190,9 @@ pub struct LocationReport {
     /// True for the database's own directory, which cannot be dropped.
     pub is_root: bool,
     pub tables: u64,
+    /// Materialized partitions of partitioned tables here, counted as each
+    /// table opened (docs/partitioning.md §6.1).
+    pub partitions: u64,
     /// `None` when the filesystem could not be interrogated — a permission
     /// error, or a platform with no implementation here. Reported as unknown
     /// rather than as zero, which would read as "full".
@@ -309,6 +312,14 @@ pub struct StorageManager {
     /// *reads* the state, so serialising it through the write lock would block
     /// every reader for the duration of a write and an fsync.
     writing: Mutex<()>,
+    /// Materialized partitions per location, per partitioned table (by
+    /// uid): what the partition dealer balances on (docs/partitioning.md
+    /// §6.1). Kept beside `state`, not in it, so reloading the pool file
+    /// never forgets them; replaced whole per table as it opens, so a count
+    /// cannot drift past a restart. Balance only: the guards that protect a
+    /// location's files read its directory instead
+    /// ([`StorageManager::partition_files_in`]).
+    partitions: Mutex<HashMap<u64, HashMap<String, u64>>>,
 }
 
 impl StorageManager {
@@ -317,6 +328,7 @@ impl StorageManager {
         Self {
             root: None,
             writing: Mutex::new(()),
+            partitions: Mutex::new(HashMap::new()),
             state: RwLock::new(PoolState {
                 policy: PlacementPolicy::Primary,
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
@@ -348,6 +360,7 @@ impl StorageManager {
         let manager = Self {
             root: Some(root.clone()),
             writing: Mutex::new(()),
+            partitions: Mutex::new(HashMap::new()),
             state: RwLock::new(PoolState {
                 policy: PlacementPolicy::Primary,
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
@@ -557,7 +570,7 @@ impl StorageManager {
                     .directory()
                     .map(str::to_string);
             }
-            let chosen = choose(&state, root);
+            let chosen = choose(&state, root, &self.partition_totals());
             // Recorded even when it is the database's own directory. The
             // alternative — recording only the exceptions — makes the map an
             // undercount of the root, and `round-robin` reads those counts: the
@@ -763,6 +776,10 @@ impl StorageManager {
             ));
         }
 
+        if let Some(why) = self.partitions_holding(&path) {
+            return Err(why);
+        }
+
         state.locations.remove(index);
         drop(state);
         self.persist();
@@ -801,6 +818,11 @@ impl StorageManager {
                      and would overwrite them",
                     normalized
                 ));
+            }
+            if role == LocationRole::Backup
+                && let Some(why) = self.partitions_holding(&normalized)
+            {
+                return Err(why);
             }
         }
         self.alter(path, |location| location.role = role)
@@ -848,6 +870,7 @@ impl StorageManager {
     pub fn locations(&self) -> Vec<LocationReport> {
         let state = self.state.read();
         let root = self.root.as_deref().unwrap_or("");
+        let partitions = self.partition_totals();
         state
             .locations
             .iter()
@@ -868,6 +891,7 @@ impl StorageManager {
                     location: location.clone(),
                     is_root: location.path == root,
                     tables,
+                    partitions: partitions.get(&location.path).copied().unwrap_or(0),
                     available_bytes: available_bytes(&location.path),
                     total_bytes: total_bytes(&location.path),
                 }
@@ -893,7 +917,113 @@ impl StorageManager {
     pub fn would_place(&self) -> Option<String> {
         let root = self.root.as_deref()?;
         let state = self.state.read();
-        Some(choose(&state, root))
+        Some(choose(&state, root, &self.partition_totals()))
+    }
+
+    // -- partitions (docs/partitioning.md §6.1) --------------------------
+
+    /// Materialized partitions per location, summed over every partitioned
+    /// table this pool has been told about.
+    fn partition_totals(&self) -> HashMap<String, u64> {
+        sum_partitions(&self.partitions.lock())
+    }
+
+    /// Records where `uid`'s materialized partitions are, replacing what was
+    /// recorded for it: a partitioned table as it opens.
+    pub fn register_partitions(&self, uid: u64, counts: HashMap<String, u64>) {
+        let counts = counts.into_iter().map(|(path, n)| (normalize(&path), n)).collect();
+        self.partitions.lock().insert(uid, counts);
+    }
+
+    /// Forgets `uid`'s partitions: a partitioned table dropped.
+    pub fn forget_partitions(&self, uid: u64) {
+        self.partitions.lock().remove(&uid);
+    }
+
+    /// Picks the directory a partition of `uid` about to be materialized
+    /// goes to, and counts it there at once, so a concurrent dealer sees it
+    /// and [`StorageManager::drop_location`] refuses the location before its
+    /// files exist. [`StorageManager::undeal_partition`] takes it back when
+    /// the materialization fails. `root_only` keeps it in the database's own
+    /// directory whatever the policy says. `None` for an in-memory database.
+    ///
+    /// The dealer is cross-table: a location's count is every partitioned
+    /// table's partitions there, so small tables cannot pile onto one disk.
+    /// Under `primary`, the first enabled primary; under `round-robin`, the
+    /// location holding the fewest tables and partitions; under
+    /// `free-space`, the one furthest below its share, the shares
+    /// proportional to available bytes times weight. Never the emptiest disk
+    /// outright, which would send every partition materialized in a burst to
+    /// the same one: free space only moves once rows arrive.
+    pub fn deal_partition(&self, uid: u64, root_only: bool) -> Option<String> {
+        let root = self.root.as_deref()?;
+        let state = self.state.read();
+        let mut partitions = self.partitions.lock();
+        let chosen = if root_only {
+            root.to_string()
+        } else {
+            deal(&state, root, &sum_partitions(&partitions))
+        };
+        *partitions.entry(uid).or_default().entry(chosen.clone()).or_insert(0) += 1;
+        Some(chosen)
+    }
+
+    /// Takes back a [`StorageManager::deal_partition`] whose
+    /// materialization failed.
+    pub fn undeal_partition(&self, uid: u64, path: &str) {
+        let mut partitions = self.partitions.lock();
+        if let Some(counts) = partitions.get_mut(&uid)
+            && let Some(n) = counts.get_mut(path)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(path);
+            }
+        }
+    }
+
+    /// Whether a partition recorded at `path` may open there: the database's
+    /// own directory, or a primary location of this pool, enabled or not
+    /// (a disabled location keeps what it holds). A path the pool does not
+    /// name is a map copied or restored from elsewhere, whose files there
+    /// are not this database's to read or write.
+    pub fn holds_partitions_at(&self, path: &str) -> bool {
+        let path = normalize(path);
+        if self.root.as_deref() == Some(path.as_str()) {
+            return true;
+        }
+        self.state
+            .read()
+            .locations
+            .iter()
+            .any(|l| l.path == path && l.role == LocationRole::Primary)
+    }
+
+    /// Why `path` may not stop being a primary location of this pool because
+    /// of partitions, or `None`. A partition dealt there whose files are not
+    /// written yet counts (the dealer's reservation), and so does any
+    /// partition data file in the directory: that covers a table whose map
+    /// could not be read this start, which never registered its counts.
+    fn partitions_holding(&self, path: &str) -> Option<String> {
+        let dealt = self.partition_totals().get(path).copied().unwrap_or(0);
+        let files = match partition_data_files(Path::new(path)) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Some(format!(
+                    "{path} could not be checked for partitions of partitioned tables ({e})"
+                ));
+            }
+        };
+        if dealt == 0 && files == 0 {
+            return None;
+        }
+        Some(format!(
+            "{path} holds partitions of partitioned tables ({} materialized, {files} partition file(s)); \
+             partitions cannot be moved off a location yet. DISABLE the location to stop new partitions \
+             landing there",
+            dealt
+        ))
     }
 
     // -- persistence ------------------------------------------------------
@@ -1421,7 +1551,7 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
 }
 
 /// Picks a directory for a new table.
-fn choose(state: &PoolState, root: &str) -> String {
+fn choose(state: &PoolState, root: &str, partitions: &HashMap<String, u64>) -> String {
     let candidates: Vec<&StorageLocation> = state
         .locations
         .iter()
@@ -1468,7 +1598,13 @@ fn choose(state: &PoolState, root: &str) -> String {
             // older than the file have no line and are undercounted against the
             // root; the effect is a bias towards the other locations until they
             // catch up, which is the direction an operator adding a disk wants.
-            let counted = |path: &str| state.placements.values().filter(|at| *at == path).count();
+            // Materialized partitions count beside tables (§6.1 of
+            // docs/partitioning.md): a location full of partitions is not
+            // empty to this policy.
+            let counted = |path: &str| {
+                state.placements.values().filter(|at| *at == path).count() as u64
+                    + partitions.get(path).copied().unwrap_or(0)
+            };
             pool.iter()
                 .min_by_key(|l| counted(&l.path))
                 .map(|l| l.path.clone())
@@ -1483,6 +1619,98 @@ fn choose(state: &PoolState, root: &str) -> String {
             })
             .map(|l| l.path.clone())
             .unwrap_or_else(|| root.to_string()),
+    }
+}
+
+fn sum_partitions(by_table: &HashMap<u64, HashMap<String, u64>>) -> HashMap<String, u64> {
+    let mut totals: HashMap<String, u64> = HashMap::new();
+    for counts in by_table.values() {
+        for (path, n) in counts {
+            *totals.entry(path.clone()).or_insert(0) += n;
+        }
+    }
+    totals
+}
+
+/// Partition data files (`__pt_<uid>_<pid>.db` and its pointers file) in
+/// `dir`.
+fn partition_data_files(dir: &Path) -> io::Result<usize> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        if matches!(
+            crate::core::partition::files::parse_name(&name),
+            Some(crate::core::partition::files::PartFile::Data { .. })
+        ) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Picks a directory for a partition (see [`StorageManager::deal_partition`]).
+///
+/// The candidates are [`choose`]'s: enabled primaries, those below
+/// `min_free_bytes` left out unless that leaves none. Ties go to declaration
+/// order, so the choice is a function of what is on disk.
+fn deal(state: &PoolState, root: &str, partitions: &HashMap<String, u64>) -> String {
+    let candidates: Vec<&StorageLocation> = state
+        .locations
+        .iter()
+        .filter(|l| l.enabled && l.role == LocationRole::Primary)
+        .collect();
+    if candidates.is_empty() {
+        return root.to_string();
+    }
+    if candidates.len() == 1 {
+        return candidates[0].path.clone();
+    }
+    let roomy: Vec<&StorageLocation> = candidates
+        .iter()
+        .copied()
+        .filter(|l| available_bytes(&l.path).is_none_or(|free| free >= state.min_free_bytes))
+        .collect();
+    let pool = if roomy.is_empty() { candidates } else { roomy };
+    let held = |path: &str| partitions.get(path).copied().unwrap_or(0);
+
+    match state.policy {
+        PlacementPolicy::Primary => pool[0].path.clone(),
+        PlacementPolicy::RoundRobin => {
+            let tables = |path: &str| state.placements.values().filter(|at| *at == path).count() as u64;
+            pool.iter()
+                .min_by_key(|l| tables(&l.path) + held(&l.path))
+                .map(|l| l.path.clone())
+                .unwrap_or_else(|| root.to_string())
+        }
+        PlacementPolicy::FreeSpace => {
+            // Each location's share is proportional to available bytes times
+            // weight; the next partition goes where `(held + 1) / share` is
+            // least, compared crosswise so nothing divides. A location whose
+            // free space cannot be read has no share and is taken only when
+            // no location has one.
+            let share = |l: &StorageLocation| {
+                available_bytes(&l.path).unwrap_or(0) as u128 * l.weight.max(1) as u128
+            };
+            let mut best: Option<&StorageLocation> = None;
+            for &l in &pool {
+                best = match best {
+                    None => Some(l),
+                    Some(b) => {
+                        let (sl, sb) = (share(l), share(b));
+                        let better = match (sl, sb) {
+                            (0, 0) => held(&l.path) < held(&b.path),
+                            (0, _) => false,
+                            (_, 0) => true,
+                            _ => (held(&l.path) as u128 + 1) * sb < (held(&b.path) as u128 + 1) * sl,
+                        };
+                        Some(if better { l } else { b })
+                    }
+                };
+            }
+            best.map(|l| l.path.clone()).unwrap_or_else(|| root.to_string())
+        }
     }
 }
 

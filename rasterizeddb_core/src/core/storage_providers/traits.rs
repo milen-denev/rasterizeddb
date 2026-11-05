@@ -245,6 +245,20 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         async move { Ok(self.create_new(name).await) }
     }
 
+    /// [`StorageIO::try_create_new`] rooted at `location`: a partition
+    /// materialized on another storage location (phase 4). Unlike
+    /// [`StorageIO::create_new_at`] the default refuses rather than ignore
+    /// `location`, which would put the partition's files in the seed's
+    /// directory while its map says they are elsewhere.
+    fn try_create_new_at(
+        &self,
+        location: &str,
+        name: String,
+    ) -> impl Future<Output = IOResult<Self>> + Send + Sync {
+        let why = format!("{name} cannot be created in {location}: this storage has no directories");
+        async move { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, why)) }
+    }
+
     /// As [`StorageIO::create_new`], but rooted at `location` rather than at
     /// this provider's own directory.
     ///

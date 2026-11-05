@@ -92,6 +92,7 @@ fn point_of(schema: &TableSchema, tenant: i64) -> u64 {
 async fn open(l: &Logical, pid: u32, range: PointRange) -> Table<P> {
     let physical = files::data_stem(UID, pid);
     Table::open_partition(PartitionOpen {
+        dir: None,
         cache_scope: format!("1\u{0}{}", physical),
         physical,
         seed: l.seed.clone(),
@@ -590,6 +591,7 @@ async fn a_failed_open_releases_its_files() {
     let physical = files::data_stem(UID, 3);
     crate::core::row::table::partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.set(true));
     let opened = Table::open_partition(PartitionOpen {
+        dir: None,
         cache_scope: format!("1\u{0}{}", physical),
         physical: physical.clone(),
         seed: l.seed.clone(),

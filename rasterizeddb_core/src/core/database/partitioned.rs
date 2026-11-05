@@ -26,8 +26,11 @@ use crate::core::partition::files;
 use crate::core::partition::key::KeySpec;
 use crate::core::partition::route::Route;
 use crate::core::partition::table::{
-    MAX_DECLARED_PER_DATABASE, MirrorsConfigured, OpenCtx, PartitionedTable, check_declared_cap, declared_in,
+    MAX_DECLARED_PER_DATABASE, MirrorsConfigured, OpenCtx, PartitionedTable, Placement, check_declared_cap,
+    declared_in,
 };
+#[cfg(not(feature = "storage_pools"))]
+use crate::core::partition::table::RootOnly;
 use crate::core::row::schema::TableSchema;
 use crate::core::row::table::Table;
 use crate::core::rql::lexer_ct::CreateTable;
@@ -234,11 +237,35 @@ pub(super) fn reap_at_startup(
         .filter(|(_, c)| *c != 0)
         .map(|(_, uid)| (*uid, files::read_live_map(root, *uid)))
         .collect();
-    let report = files::reap(root, &live, |names| {
+    // Other storage locations first (phase 4): partitions before the parent
+    // files that say what they were, as a DROP orders them.
+    let root_key = files::dir_key(location);
+    let mut report = files::ReapReport::default();
+    for dir in super::pool_table_paths(pool) {
+        if files::dir_key(&dir) == root_key {
+            continue;
+        }
+        let at = files::reap_at(Path::new(&dir), &live, |names| {
+            let Some(wal) = crate::core::wal::wal_for(&dir) else {
+                return Ok(());
+            };
+            let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
+            forget_logged_ids(&[wal], &ids, Barrier::Drop).map_err(|f| f.error)
+        });
+        report.deleted.extend(at.deleted);
+        if report.kept.is_none() {
+            report.kept = at.kept.map(|why| format!("in {dir}: {why}"));
+        }
+    }
+    let at_root = files::reap(root, &live, |names| {
         let logs = logs_holding(io_pointers, pool, Some(location));
         let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
         forget_logged_ids(&logs, &ids, Barrier::Drop).map_err(|f| f.error)
     });
+    report.deleted.extend(at_root.deleted);
+    if report.kept.is_none() {
+        report.kept = at_root.kept;
+    }
     if let Some(why) = &report.kept {
         warn!("Partition file reaping deleted nothing this start: {why}");
     } else if !report.deleted.is_empty() {
@@ -249,6 +276,62 @@ pub(super) fn reap_at_startup(
         );
     }
     report
+}
+
+/// The storage pool as partitions see it (phase 4, docs/partitioning.md
+/// §6.1): its dealer, its counts, and which directories it names.
+#[cfg(feature = "storage_pools")]
+struct PoolPlacement(super::StoragePool);
+
+#[cfg(feature = "storage_pools")]
+impl Placement for PoolPlacement {
+    fn deal(&self, uid: u64) -> Option<String> {
+        self.0.deal_partition(uid, backup_keeps_partitions_in_root())
+    }
+
+    fn undeal(&self, uid: u64, dir: &str) {
+        self.0.undeal_partition(uid, dir)
+    }
+
+    fn register(&self, uid: u64, counts: HashMap<String, u64>) {
+        self.0.register_partitions(uid, counts)
+    }
+
+    fn holds(&self, dir: &str) -> bool {
+        self.0.holds_partitions_at(dir)
+    }
+
+    fn others(&self) -> Vec<PathBuf> {
+        let root = self.0.root().map(files::dir_key);
+        super::pool_table_paths(&self.0)
+            .into_iter()
+            .filter(|p| Some(files::dir_key(p)) != root)
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+/// Whether partitions stay in the root whatever the pool's policy: while a
+/// backup service runs. A snapshot copies every location, but a restore
+/// into a new directory moves them, and a partition map names its
+/// locations by absolute path, so the restored table would refuse to open
+/// (`partition::table::partition_dir`). Phase 4b's restore rewrites them
+/// and lifts this; a restore in place, to the same paths, already works.
+#[cfg(feature = "storage_pools")]
+fn backup_keeps_partitions_in_root() -> bool {
+    #[cfg(feature = "s3_backup")]
+    if crate::core::backup::service().is_some() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            info!(
+                "Partitions materialize in the database directory while S3 backup is configured, whatever the \
+                 storage placement policy: a restore into a new directory cannot yet repoint partitions on \
+                 other storage locations"
+            );
+        }
+        return true;
+    }
+    false
 }
 
 /// Every file name in `dir` under `uid`: what [`files::remove_all`] deletes,
@@ -307,6 +390,19 @@ impl Database {
             transactions: &self.transactions,
             mirrored: self.mirrors_configured(),
             scheduler: &self.partition_maintenance,
+            placement: self.partition_placement(),
+        }
+    }
+
+    /// Where this database's partitions materialize (phase 4, §6.1).
+    fn partition_placement(&self) -> StdArc<dyn Placement> {
+        #[cfg(feature = "storage_pools")]
+        {
+            StdArc::new(PoolPlacement(self.storage.clone()))
+        }
+        #[cfg(not(feature = "storage_pools"))]
+        {
+            StdArc::new(RootOnly)
         }
     }
 
@@ -575,7 +671,29 @@ impl Database {
     /// restore empties a file at its barrier only when the barrier committed
     /// after the snapshot's copy began, so the barrier and the deletion must
     /// be on the same side of that point.
+    ///
+    /// Partitions on other storage locations go first (phase 4): voided in
+    /// their location's log and deleted there, so the parent files in the
+    /// root, which say what the rest were, go last (§12's DROP order).
     fn discard_uid_files(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
+        let root_key = files::dir_key(&root.to_string_lossy());
+        for dir in super::pool_table_paths(&self.storage) {
+            if files::dir_key(&dir) == root_key {
+                continue;
+            }
+            let at = Path::new(&dir);
+            let names = match uid_file_names(at, uid) {
+                Ok(names) => names,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(DiscardFailure::Delete(e)),
+            };
+            if names.is_empty() {
+                continue;
+            }
+            let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
+            self.forget_dropped_ids_in(&dir, &ids).map_err(DiscardFailure::Void)?;
+            files::remove_all(at, uid).map_err(DiscardFailure::Delete)?;
+        }
         let names = uid_file_names(root, uid).map_err(DiscardFailure::Delete)?;
         if names.is_empty() {
             return Ok(());
@@ -585,9 +703,23 @@ impl Database {
         files::remove_all(root, uid).map(|_| ()).map_err(DiscardFailure::Delete)
     }
 
-    /// [`super::deletion_permit`] for a partitioned table's files, which are
-    /// all in the root, so the logs [`Self::discard_uid_files`] voids them in
-    /// are the root's. `None` when no log is there (in memory) or without
+    /// [`Self::forget_dropped_ids`] for files in `dir`, another storage
+    /// location: its own log's barrier, after the database's own log is
+    /// synced so the catalogue tombstone ahead of it is durable.
+    fn forget_dropped_ids_in(&self, dir: &str, ids: &[u64]) -> Result<(), ForgetFailure> {
+        let Some(wal) = crate::core::wal::wal_for(dir) else {
+            return Ok(());
+        };
+        self.sync_own_log().map_err(|error| ForgetFailure {
+            error,
+            maybe_logged: false,
+        })?;
+        forget_logged_ids(&[wal], ids, Barrier::Drop)
+    }
+
+    /// [`super::deletion_permit`] for a partitioned table's files. The gate
+    /// is one for the whole process, so asking with the root's logs covers
+    /// the partitions on other locations too. `None` when no log is there (in memory) or without
     /// the `s3_backup` feature.
     async fn uid_deletion_permit(&self) -> Option<impl Sized> {
         let logs = logs_holding(&self.db_io_pointers, &self.storage, self.location.as_deref());
@@ -647,6 +779,8 @@ impl Database {
         self.take_partitioned(name, &table);
 
         let uid = table.uid();
+        #[cfg(feature = "storage_pools")]
+        self.storage.forget_partitions(uid);
         let kept = |what: &str, e: &dyn std::fmt::Display| {
             error!(
                 "Dropped partitioned table {name} ({uid:016x}), but {what} failed, so its files were kept for \

@@ -2584,8 +2584,16 @@ impl StorageIO for LocalStorageProvider {
     /// The body of `create_new`, every file open and the map returned as an
     /// error rather than unwrapped.
     async fn try_create_new(&self, name: String) -> io::Result<Self> {
+        let location = self.location.clone();
+        self.try_create_new_at(&location, name).await
+    }
+
+    /// The body of `try_create_new`, the name resolved against `location`
+    /// rather than this provider's own directory: a partition on another
+    /// storage location (phase 4).
+    async fn try_create_new_at(&self, location: &str, name: String) -> io::Result<Self> {
         #[cfg(test)]
-        if open_test_hooks::fails(&self.location) {
+        if open_test_hooks::fails(location) {
             return Err(io::Error::from_raw_os_error(24));
         }
         let delimiter = if cfg!(unix) {
@@ -2596,14 +2604,13 @@ impl StorageIO for LocalStorageProvider {
             panic!("OS not supported");
         };
 
-        let location_path = Path::new(&self.location);
+        let location_path = Path::new(location);
 
         if !location_path.exists() {
             _ = std::fs::create_dir_all(location_path);
         }
 
-        let final_location = self
-            .location
+        let final_location = location
             .trim_end_matches(|c| c == '\\' || c == '/')
             .to_string();
 

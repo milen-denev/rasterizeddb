@@ -206,7 +206,9 @@ pub fn parse_name(name: &str) -> Option<PartFile> {
 /// The torn-tail cutter (`torn_tail::classify`) counts a pointer file only
 /// when its schema sits beside it, and looks for `<stem>_schema.db`, which a
 /// partition never has; without this its pointers were never cut back after
-/// a power cut, and the next insert landed inside the torn record.
+/// a power cut, and the next insert landed inside the torn record. On
+/// another storage location (phase 4) the schema is not beside them and the
+/// partition's rows file stands in for it (`torn_tail::partition_pointers`).
 pub fn pointers_schema(name: &str) -> Option<String> {
     let stem = name.strip_suffix("_pointers.db")?;
     match parse_name(name)? {
@@ -491,6 +493,25 @@ pub(crate) fn remove_all(dir: &Path, uid: u64) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// A directory as the storage pool spells it (`storage::normalize`): what
+/// a map's interned locations are compared with the pool's by. The same
+/// rule in a build without `storage_pools`.
+pub(crate) fn dir_key(path: &str) -> String {
+    #[cfg(feature = "storage_pools")]
+    {
+        crate::core::storage::normalize(path)
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    {
+        let trimmed = path.trim().trim_matches('"').trim_matches('\'').trim();
+        let trimmed = trimmed.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return path.trim().chars().take(1).collect();
+        }
+        trimmed.to_string()
+    }
+}
+
 /// What the startup reaper did (§12).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReapReport {
@@ -562,7 +583,8 @@ fn live_generation_and_unreadable(root: &Path, uid: u64) -> Result<(u64, Vec<u64
 /// which partitions are materialized: missing, staged bytes in its `.tmp`,
 /// a torn tail or [`TORN`] evidence, a replay error, another table's uid, a
 /// `DROPPED` record, or a shape this version cannot open (reshaped, retired
-/// partitions, a partition off the root). Any of these turns reaping off.
+/// partitions). Any of these turns reaping off. Partitions on other storage
+/// locations are understood (phase 4): [`reap_at`] reads where each is.
 pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<LiveMap, String> {
     let (generation, unreadable) = live_generation_and_unreadable(root, uid)?;
     if let Some(g) = unreadable.first() {
@@ -603,9 +625,9 @@ pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<LiveMap, String> {
     if !dense
         || state.next_pid() != map.len() as u64
         || state.reshapes().next().is_some()
-        || state.parts().any(|(_, p)| p.retired || p.location.is_some_and(|l| l != 0))
+        || state.parts().any(|(_, p)| p.retired)
     {
-        return Err(format!("its map log {name} describes a reshaped or spread map, which this version cannot read"));
+        return Err(format!("its map log {name} describes a reshaped map, which this version cannot read"));
     }
     Ok(LiveMap { generation, state })
 }
@@ -627,7 +649,17 @@ pub(crate) struct LiveMap {
 /// uid other than its live one (a compaction's old generation, or one that
 /// never finished, §3.2). A live uid's schema, ids, seq and live map are
 /// kept. Nothing is deleted if any live map is `Err`.
-fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<LiveMap, String>>) -> io::Result<Result<Vec<String>, String>> {
+///
+/// `here` is `None` for the root and the directory's normalized path for
+/// another storage location. A partition file is kept only in the directory
+/// its `MATERIALIZE` names: in the root for location 0, else where the
+/// interned path says. Off the root only partitions' files are ever written,
+/// so a live uid's other files there are left alone.
+fn reapable(
+    root: &Path,
+    here: Option<&str>,
+    live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+) -> io::Result<Result<Vec<String>, String>> {
     let mut failed: Vec<(&u64, &String)> = live.iter().filter_map(|(u, m)| m.as_ref().err().map(|e| (u, e))).collect();
     if !failed.is_empty() {
         failed.sort();
@@ -657,10 +689,19 @@ fn reapable(root: &Path, live: &std::collections::HashMap<u64, Result<LiveMap, S
         let live_map = state.as_ref().expect("an Err map returned above");
         match file {
             PartFile::Data { pid, .. } => {
-                if live_map.state.part(pid).and_then(|p| p.location).is_none() {
+                let placed_here = match live_map.state.part(pid).and_then(|p| p.location) {
+                    None => false,
+                    Some(0) => here.is_none(),
+                    Some(loc) => match (live_map.state.locations().get(loc as usize), here) {
+                        (Some(path), Some(here)) => dir_key(path) == here,
+                        _ => false,
+                    },
+                };
+                if !placed_here {
                     doomed.push((rank, name));
                 }
             }
+            _ if here.is_some() => {}
             PartFile::Map { generation, .. } if generation != live_map.generation => {
                 doomed.push((rank, name));
             }
@@ -682,7 +723,28 @@ pub(crate) fn reap(
     live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
     void: impl FnOnce(&[String]) -> io::Result<()>,
 ) -> ReapReport {
-    let names = match reapable(root, live) {
+    reap_in(root, None, live, void)
+}
+
+/// [`reap`] over `dir`, another storage location of the pool (phase 4),
+/// with the root's live maps: deletes the partition files there that no
+/// live map places there.
+pub(crate) fn reap_at(
+    dir: &Path,
+    live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+    void: impl FnOnce(&[String]) -> io::Result<()>,
+) -> ReapReport {
+    let here = dir_key(&dir.to_string_lossy());
+    reap_in(dir, Some(&here), live, void)
+}
+
+fn reap_in(
+    root: &Path,
+    here: Option<&str>,
+    live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+    void: impl FnOnce(&[String]) -> io::Result<()>,
+) -> ReapReport {
+    let names = match reapable(root, here, live) {
         Ok(Ok(names)) => names,
         Ok(Err(why)) => {
             return ReapReport {

@@ -68,6 +68,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc as StdArc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
@@ -180,6 +181,11 @@ struct Slot {
     /// the catalogs only (never a DDL's population check, which reads the
     /// files: `PartitionedTable::rows_len_exact`). See [`KeptSizes`].
     sizes: parking_lot::Mutex<KeptSizes>,
+    /// The directory its files are in, once it is materialized somewhere
+    /// other than the root (phase 4, §6.1): set from the replayed map at
+    /// open or by [`Parts::materialize`], before the flag. Unset means the
+    /// root. Never changes: a move is a reshape, to a new pid.
+    dir: OnceLock<PathBuf>,
 }
 
 /// A closed partition's kept file lengths (P5b-2a): what the catalogs read
@@ -213,10 +219,11 @@ impl KeptSizes {
 }
 
 impl Slot {
-    fn new(pid: u32, range: PointRange, materialized: bool) -> Self {
+    fn new(pid: u32, range: PointRange, materialized: bool, dir: Option<PathBuf>) -> Self {
         Slot {
             pid,
             range,
+            dir: dir.map(OnceLock::from).unwrap_or_default(),
             materialized: AtomicBool::new(materialized),
             open: parking_lot::Mutex::new(None),
             token: parking_lot::Mutex::new(None),
@@ -228,6 +235,11 @@ impl Slot {
 
     fn open_now(&self) -> Option<Arc<Table<DbStorageProvider>>> {
         self.open.lock().clone()
+    }
+
+    /// The directory its files are in: its own, or `root`.
+    fn dir<'a>(&'a self, root: &'a Path) -> &'a Path {
+        self.dir.get().map_or(root, PathBuf::as_path)
     }
 
     /// A routed access: the reference bit set, with a store only when it
@@ -343,6 +355,42 @@ pub struct PartitionInfo {
 /// file provider, so the seed's kind cannot answer it.
 pub(crate) type MirrorsConfigured = StdArc<dyn Fn() -> bool + Send + Sync>;
 
+/// Where a partition's files go (phase 4, docs/partitioning.md §6.1): the
+/// database's storage pool, behind a trait so this module builds without
+/// `storage_pools`, where every partition stays in the root ([`RootOnly`]).
+pub(crate) trait Placement: Send + Sync {
+    /// The directory the next partition of `uid` to materialize goes to,
+    /// counted there at once (the pool's dealer); `None` for the root.
+    fn deal(&self, uid: u64) -> Option<String>;
+    /// Takes back a [`Placement::deal`] whose materialization failed.
+    fn undeal(&self, uid: u64, dir: &str);
+    /// Replaces what is counted for `uid`: its materialized partitions per
+    /// directory, the root's included, as the table opens.
+    fn register(&self, uid: u64, counts: std::collections::HashMap<String, u64>);
+    /// Whether a partition recorded at `dir`, not the root, may open there:
+    /// `dir` is a location of this database's pool.
+    fn holds(&self, dir: &str) -> bool;
+    /// Every directory other than the root a partition may be in.
+    fn others(&self) -> Vec<PathBuf>;
+}
+
+/// Every partition in the root.
+pub(crate) struct RootOnly;
+
+impl Placement for RootOnly {
+    fn deal(&self, _uid: u64) -> Option<String> {
+        None
+    }
+    fn undeal(&self, _uid: u64, _dir: &str) {}
+    fn register(&self, _uid: u64, _counts: std::collections::HashMap<String, u64>) {}
+    fn holds(&self, _dir: &str) -> bool {
+        false
+    }
+    fn others(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+}
+
 /// What [`PartitionedTable::open`] needs from the database.
 pub(crate) struct OpenCtx<'a> {
     /// The database's root provider, a plain file provider: partition
@@ -355,6 +403,8 @@ pub(crate) struct OpenCtx<'a> {
     /// The database's one maintenance scheduler (§7.3), which every
     /// partition, opened `External`, is serviced by.
     pub scheduler: &'a StdArc<Scheduler>,
+    /// Where partitions materialize (phase 4).
+    pub placement: StdArc<dyn Placement>,
 }
 
 /// Everything a table that opened has; a broken one has none of it.
@@ -417,6 +467,8 @@ pub(crate) struct Parts {
     me: std::sync::Weak<Parts>,
     /// When the last idle round ran (`Parts::close_idle_round`).
     idle_round_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Where partitions materialize (phase 4, §6.1).
+    placement: StdArc<dyn Placement>,
 }
 
 pub struct PartitionedTable {
@@ -528,6 +580,28 @@ fn refuse_torn_leftovers(root: &Path, uid: u64, generation: u64, pid: u32, torn:
         files::map_file(uid, generation),
         files::TORN,
     )))
+}
+
+/// The directory of a partition recorded at interned location `loc`:
+/// `None` for the root (location 0, wherever the database now is), else
+/// the interned path, which must be a location of this database's pool. A
+/// map copied or restored from elsewhere names another installation's
+/// directory, whose files are not this database's to read or write, so the
+/// table is refused rather than opened over them.
+fn partition_dir(locations: &[String], loc: u32, placement: &dyn Placement) -> Result<Option<PathBuf>, String> {
+    if loc == ROOT_LOC {
+        return Ok(None);
+    }
+    let Some(path) = locations.get(loc as usize) else {
+        return Err(format!("is at location {loc}, but only {} are interned", locations.len()));
+    };
+    if !placement.holds(path) {
+        return Err(format!(
+            "is in {path}, which is not a storage location of this database; add it back with \
+             STORAGE ADD LOCATION '{path}', or restore the partition's files there"
+        ));
+    }
+    Ok(Some(PathBuf::from(path)))
 }
 
 /// The partitions a database's partitioned tables declare, for
@@ -855,32 +929,50 @@ impl PartitionedTable {
 
         let entries = map.entries();
         let mut materialized = vec![false; entries.len()];
+        let mut dirs: Vec<Option<PathBuf>> = vec![None; entries.len()];
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let root_key = files::dir_key(&root.to_string_lossy());
         for (pid, part) in state.parts() {
             let Some(loc) = part.location else {
-                // §4.3's skip is a proof only while the log is whole.
+                // §4.3's skip is a proof only while the log is whole, and the
+                // leftovers may be on any location a crashed materialize was
+                // dealt.
                 if let Some(why) = torn.as_deref() {
                     refuse_torn_leftovers(root, uid, generation, pid, why).map_err(e)?;
+                    for other in ctx.placement.others() {
+                        refuse_torn_leftovers(&other, uid, generation, pid, why).map_err(e)?;
+                    }
                 }
                 continue;
             };
-            if loc != ROOT_LOC {
-                return Err(format!("partition {pid} is at location {loc}, outside the root"));
-            }
+            let dir = partition_dir(state.locations(), loc, &*ctx.placement).map_err(|why| format!("partition {pid} {why}"))?;
             // Nothing opens here (phase 3 P5b: a partition opens on demand),
             // but a materialized partition's missing file still refuses the
             // table now, as it did when every partition opened (I9): a stat
             // per file, never a provider, which would create it.
-            files::require_existing(root, &files::data_files(uid, pid)).map_err(e)?;
+            files::require_existing(dir.as_deref().unwrap_or(root), &files::data_files(uid, pid)).map_err(e)?;
+            let key = dir.as_ref().map_or_else(|| root_key.clone(), |d| files::dir_key(&d.to_string_lossy()));
+            *counts.entry(key).or_insert(0) += 1;
             if let Some(m) = materialized.get_mut(pid as usize) {
                 *m = true;
             }
+            if let Some(d) = dirs.get_mut(pid as usize) {
+                *d = dir;
+            }
         }
+        // The dealer's counts (§6.1), every location's, the root's included.
+        ctx.placement.register(uid, counts);
         let slots: Box<[Slot]> = entries
             .iter()
             .enumerate()
             .map(|(j, &(lo, pid))| {
                 let range = PointRange { lo, hi: entries.get(j + 1).map_or(SPACE_END, |&(next, _)| next as u128) };
-                Slot::new(pid, range, materialized.get(pid as usize).copied().unwrap_or(false))
+                Slot::new(
+                    pid,
+                    range,
+                    materialized.get(pid as usize).copied().unwrap_or(false),
+                    dirs.get(pid as usize).cloned().flatten(),
+                )
             })
             .collect();
         let parts = StdArc::new_cyclic(|me| Parts {
@@ -899,6 +991,7 @@ impl PartitionedTable {
             board,
             slots,
             mirrored: ctx.mirrored.clone(),
+            placement: ctx.placement.clone(),
             torn: torn.clone(),
             retired: AtomicBool::new(false),
             vacuum: AtomicU8::new(0),
@@ -978,7 +1071,7 @@ impl PartitionedTable {
                     let slots: Box<[Slot]> = old
                         .slots
                         .iter()
-                        .map(|s| Slot::new(s.pid, s.range, s.materialized.load(Ordering::SeqCst)))
+                        .map(|s| Slot::new(s.pid, s.range, s.materialized.load(Ordering::SeqCst), s.dir.get().cloned()))
                         .collect();
                     let parts = StdArc::new_cyclic(|me| Parts {
                         budget: old.budget.clone(),
@@ -996,6 +1089,7 @@ impl PartitionedTable {
                         board: old.board.clone(),
                         slots,
                         mirrored: self.mirrored.clone(),
+                        placement: old.placement.clone(),
                         torn: self.torn.clone(),
                         retired: AtomicBool::new(false),
                         vacuum: AtomicU8::new(old.vacuum.load(Ordering::Acquire)),
@@ -1162,7 +1256,7 @@ impl PartitionedTable {
             match slot.open_now() {
                 Some(table) => total += table.data()?.len.load(Ordering::Relaxed),
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    total += closed_lens(&self.root, self.uid, slot.pid)?.0;
+                    total += closed_lens(slot.dir(&self.root), self.uid, slot.pid)?.0;
                 }
                 None => {}
             }
@@ -1186,7 +1280,7 @@ impl PartitionedTable {
             let _life = lock.lock().await;
             total += match slot.open_now() {
                 Some(table) => table.data()?.len.load(Ordering::Relaxed),
-                None => closed_lens(&self.root, self.uid, slot.pid)?.0,
+                None => closed_lens(slot.dir(&self.root), self.uid, slot.pid)?.0,
             };
         }
         Ok(total)
@@ -1559,7 +1653,7 @@ impl PartitionedTable {
             let lens = match slot.open_now() {
                 Some(table) => Some(Self::file_lens(&table).await?),
                 // A closed partition, from its files' metadata.
-                None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(&self.root, self.uid)?),
+                None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(slot.dir(&self.root), self.uid)?),
                 None => None,
             };
             if let Some((rows, pointers, filters)) = lens {
@@ -1582,17 +1676,18 @@ impl PartitionedTable {
     /// Every declared partition, by pid.
     pub async fn partitions(&self) -> io::Result<Vec<PartitionInfo>> {
         let live = self.live()?;
-        let root = self.root.to_string_lossy().into_owned();
         let mut out = Vec::with_capacity(live.parts.slots.len());
         for slot in live.parts.slots.iter() {
+            let dir = slot.dir(&self.root);
+            let shown = || Some(dir.to_string_lossy().into_owned());
             let (location, state, slots, bytes) = match slot.open_now() {
                 Some(table) => {
                     let (slots, bytes) = Self::sizes(&table).await?;
-                    (Some(root.clone()), "materialized", slots, bytes)
+                    (shown(), "materialized", slots, bytes)
                 }
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    let (rows, pointers, filters) = slot.closed_sizes(&self.root, self.uid)?;
-                    (Some(root.clone()), "materialized", pointers / ROW_POINTER_RECORD_LEN as u64, rows + pointers + filters)
+                    let (rows, pointers, filters) = slot.closed_sizes(dir, self.uid)?;
+                    (shown(), "materialized", pointers / ROW_POINTER_RECORD_LEN as u64, rows + pointers + filters)
                 }
                 None => (None, "unmaterialized", 0, 0),
             };
@@ -1956,47 +2051,108 @@ impl Parts {
         // them go unmirrored.
         refuse_mirrored((self.mirrored)())?;
         let pid = slot.pid;
-        let recorded = self.board.state.lock().await.part(pid).map(|p| p.location);
+        let recorded = {
+            let state = self.board.state.lock().await;
+            state.part(pid).map(|p| (p.location, state.locations().to_vec()))
+        };
         match recorded {
             None => return Err(io::Error::other(format!("internal routing error: the map has no partition {pid}"))),
             // Recorded, its flag not set: never left so (the flag is set as
             // the record applies), but the files are this partition's, and a
             // second record would be refused at every later open.
-            Some(Some(loc)) => {
-                if loc != ROOT_LOC {
-                    return Err(io::Error::other(format!("partition {pid} is at location {loc}, outside the root")));
-                }
-                files::require_existing(&self.root, &files::data_files(self.uid, pid))
+            Some((Some(loc), locations)) => {
+                let dir = partition_dir(&locations, loc, &*self.placement)
+                    .map_err(|why| io::Error::other(format!("partition {pid} {why}")))?;
+                files::require_existing(dir.as_deref().unwrap_or(&self.root), &files::data_files(self.uid, pid))
                     .map_err(|e| out_of_resources(e, &self.name, pid))?;
+                if let Some(dir) = dir {
+                    let _ = slot.dir.set(dir);
+                }
             }
-            Some(None) => {
+            Some((None, _)) => {
                 // Checked again here, not only at open: deleting is the step
                 // that cannot be undone.
                 if let Some(why) = self.torn.as_deref() {
-                    refuse_torn_leftovers(&self.root, self.uid, self.board.log.generation(), pid, why)?;
+                    let generation = self.board.log.generation();
+                    refuse_torn_leftovers(&self.root, self.uid, generation, pid, why)?;
+                    for other in self.placement.others() {
+                        refuse_torn_leftovers(&other, self.uid, generation, pid, why)?;
+                    }
                 }
-                files::create_partition_files(&self.root, self.uid, pid)
-                    .map_err(|e| out_of_resources(e, &self.name, pid))?;
-                let floor = self.transactions.status().forgotten_below();
-                let rec = Record::Materialize { pid, floor, loc: ROOT_LOC };
-                let mut state = self.board.state.lock().await;
-                let mut next = state.clone();
-                next.apply(&rec).map_err(invalid)?;
-                // Durable before any row reaches the partition's files, once
-                // per partition. Left to the rows' own sync, a crash could
-                // lose the record while writeback kept row pages in the new
-                // files, and with the map's tail torn the open refuses the
-                // whole table for unexplained data (`refuse_torn_leftovers`).
-                self.board.log.append_durable(&rec).await?;
-                *state = next;
+                // The pool's dealer (§6.1), which counts it there at once;
+                // taken back if anything below fails.
+                let dealt = self.placement.deal(self.uid);
+                let placed = self.materialize_at(slot, dealt.as_deref()).await;
+                if placed.is_err()
+                    && let Some(dir) = &dealt
+                {
+                    self.placement.undeal(self.uid, dir);
+                }
                 // The new pin, covered by the table's handle before the
                 // first row (§7.2); sound since that row's writer is at
-                // least `oldest_active`.
-                self.board.materialized(pid, floor)?;
+                // least `oldest_active`. After the undeal's decision: the
+                // partition is recorded where it was dealt by now.
+                self.board.materialized(pid, placed?)?;
             }
         }
         slot.materialized.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// [`Self::materialize`]'s steps once a directory is dealt (`None` or
+    /// the root's own path for the root): the files there with their
+    /// directory synced, the location interned by a durable `LOCATIONS` if
+    /// the map does not name it yet, then the durable `MATERIALIZE` naming
+    /// it (§3.2). A crash before `MATERIALIZE` leaves files the startup
+    /// reaper deletes wherever they are, and an interned location nothing
+    /// uses; recorded placement is never recomputed. Returns the recorded
+    /// floor, for the caller's pin.
+    async fn materialize_at(&self, slot: &Slot, dealt: Option<&str>) -> io::Result<u64> {
+        let pid = slot.pid;
+        let root_key = files::dir_key(&self.root.to_string_lossy());
+        let off_root = dealt.map(files::dir_key).filter(|d| *d != root_key);
+        let dir = off_root.as_ref().map(PathBuf::from);
+        files::create_partition_files(dir.as_deref().unwrap_or(&self.root), self.uid, pid)
+            .map_err(|e| out_of_resources(e, &self.name, pid))?;
+        let floor = self.transactions.status().forgotten_below();
+        let mut state = self.board.state.lock().await;
+        let loc = match &off_root {
+            None => ROOT_LOC,
+            // Never location 0, whatever path it was interned as: it is the
+            // root wherever the database now is, and a directory the root
+            // was created in that is now another location is not it.
+            Some(path) => match state.locations().iter().skip(1).position(|l| files::dir_key(l) == *path) {
+                Some(i) => i as u32 + 1,
+                None => {
+                    // Interned first, and installed as soon as it is
+                    // durable: the log holds it from then on whatever the
+                    // `MATERIALIZE` below does, and a second `LOCATIONS`
+                    // must extend the list the log has.
+                    let mut paths = state.locations().to_vec();
+                    paths.push(path.clone());
+                    let rec = Record::Locations(paths);
+                    let mut next = state.clone();
+                    next.apply(&rec).map_err(invalid)?;
+                    self.board.log.append_durable(&rec).await?;
+                    *state = next;
+                    (state.locations().len() - 1) as u32
+                }
+            },
+        };
+        let rec = Record::Materialize { pid, floor, loc };
+        let mut next = state.clone();
+        next.apply(&rec).map_err(invalid)?;
+        // Durable before any row reaches the partition's files, once per
+        // partition. Left to the rows' own sync, a crash could lose the
+        // record while writeback kept row pages in the new files, and with
+        // the map's tail torn the open refuses the whole table for
+        // unexplained data (`refuse_torn_leftovers`).
+        self.board.log.append_durable(&rec).await?;
+        *state = next;
+        if let Some(dir) = dir {
+            let _ = slot.dir.set(dir);
+        }
+        Ok(floor)
     }
 
     /// Opens a slot's partition over files that exist, `External` (its
@@ -2017,13 +2173,14 @@ impl Parts {
         // Never a provider over a missing file, which it would create (I9).
         // Out of descriptors here is insufficient resources too: the check
         // opens the files it checks.
-        files::require_existing(&self.root, &files::data_files(self.uid, slot.pid))
+        files::require_existing(slot.dir(&self.root), &files::data_files(self.uid, slot.pid))
             .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
         let physical = files::data_stem(self.uid, slot.pid);
         let table = Table::open_partition(PartitionOpen {
             cache_scope: format!("{}\u{0}{}", self.db_id, physical),
             physical,
             seed: self.seed.clone(),
+            dir: slot.dir.get().map(|d| d.to_string_lossy().into_owned()),
             io_schema: self.shell.io_schema.clone(),
             schema: self.shell.schema.clone(),
             ids: self.ids.clone(),

@@ -497,6 +497,9 @@ pub(crate) struct PartitionOpen<S: StorageIO> {
     /// Opens `<physical>.db` and `_pointers.db` and nothing else.
     /// The caller has already checked they exist (I9): providers create.
     pub seed: Arc<S>,
+    /// The directory the two files are in when it is not the seed's: a
+    /// partition materialized on another storage location (phase 4).
+    pub dir: Option<String>,
     /// The shell's schema provider. Shared, never written through here: the
     /// partition has no schema file of its own.
     pub io_schema: Arc<S>,
@@ -1238,6 +1241,7 @@ impl<S: StorageIO> Table<S> {
         let PartitionOpen {
             physical,
             seed,
+            dir,
             io_schema,
             schema,
             ids,
@@ -1259,8 +1263,17 @@ impl<S: StorageIO> Table<S> {
         // Fallible: a closed partition opens inside a statement (phase 3 P5b),
         // and running out of file descriptors there must fail the statement,
         // not panic it.
-        let io_pointers = Arc::new(seed.try_create_new(format!("{}_pointers.db", physical)).await?);
-        let io_rows = Arc::new(seed.try_create_new(format!("{}.db", physical)).await?);
+        let open = |name: String| {
+            let (seed, dir) = (&seed, dir.as_deref());
+            async move {
+                match dir {
+                    Some(dir) => seed.try_create_new_at(dir, name).await,
+                    None => seed.try_create_new(name).await,
+                }
+            }
+        };
+        let io_pointers = Arc::new(open(format!("{}_pointers.db", physical)).await?);
+        let io_rows = Arc::new(open(format!("{}.db", physical)).await?);
 
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
         let services_released = StdArc::new(tokio::sync::Notify::new());

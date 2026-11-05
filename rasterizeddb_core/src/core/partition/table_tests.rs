@@ -104,6 +104,7 @@ async fn open(f: &Fixture, uid: u64) -> PartitionedTable {
         transactions: &f.tx,
         mirrored: f.mirrored(),
         scheduler: &crate::core::partition::maintenance::Scheduler::new(),
+        placement: std::sync::Arc::new(crate::core::partition::table::RootOnly),
     };
     PartitionedTable::open(ctx, "acct", uid, shell).await
 }
@@ -592,6 +593,7 @@ async fn in_memory_storage_is_refused() {
             transactions: &tx,
             mirrored: unmirrored(),
             scheduler: &crate::core::partition::maintenance::Scheduler::new(),
+            placement: std::sync::Arc::new(crate::core::partition::table::RootOnly),
         },
         "acct",
         UID,
@@ -728,6 +730,7 @@ async fn a_key_the_schema_disagrees_with_refuses_the_table() {
         transactions: &f.tx,
         mirrored: f.mirrored(),
         scheduler: &crate::core::partition::maintenance::Scheduler::new(),
+        placement: std::sync::Arc::new(crate::core::partition::table::RootOnly),
     };
     let t = PartitionedTable::open(ctx, "acct", UID, shell).await;
     let why = t.broken().expect("opened with a key of another family");
@@ -903,10 +906,12 @@ async fn a_reshaped_map_log_refuses_the_table() {
     }
 }
 
-/// Phase 2a opens partitions only at the root: one recorded elsewhere would
-/// be opened from the wrong directory, or not at all.
+/// A partition recorded in a directory that is not a location of this
+/// database's pool (here none is: `RootOnly`) refuses the table, naming the
+/// directory: it would be opened from another installation's files, or not
+/// at all (phase 4, `partition_dir`).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partition_outside_the_root_refuses_the_table() {
+async fn a_partition_outside_the_pool_refuses_the_table() {
     let f = fixture().await;
     drop(create(&f, UID, DbType::I64, 8).await);
     let t = reopen_after(&f, UID, |s| {
@@ -915,7 +920,7 @@ async fn a_partition_outside_the_root_refuses_the_table() {
         vec![Record::Locations(locations), Record::Materialize { pid: 3, floor: 0, loc: 1 }]
     })
     .await;
-    assert_refused(&t, "partition 3 is at location 1, outside the root").await;
+    assert_refused(&t, "partition 3 is in /elsewhere, which is not a storage location of this database").await;
 }
 
 // ---------------------------------------------------------------------------

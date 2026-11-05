@@ -17,6 +17,8 @@ mod recovery_refusal_tests;
 mod drop_recreate_replay_tests;
 #[cfg(all(test, feature = "storage_pools"))]
 mod cross_dir_commit_tests;
+#[cfg(all(test, feature = "storage_pools"))]
+mod partition_placement_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
 mod create_intent;

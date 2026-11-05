@@ -1071,3 +1071,339 @@ async fn an_in_place_overwrite_happens_only_in_the_outcome_log() {
         assert_eq!(rows.len(), 1, "{table}: the UPDATE did not change its row");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Partitions spread over both locations (phase 4, docs/partitioning.md §12).
+// ---------------------------------------------------------------------------
+
+/// Hash-partitioned on `id`, two partitions, dealt one to each location.
+const PART_TABLE: &str = "atom_part";
+
+/// A database whose partitioned table has one partition in its own
+/// directory and one on a second location, each holding one durable row,
+/// at a fsynced baseline; and an id that routes to each.
+///
+/// Its image is opened at the original paths, the originals removed first,
+/// as an in-place restore puts them: a partition map names its locations
+/// by absolute path, so an image elsewhere would refuse the table
+/// (`partition::table::partition_dir`), which is phase 4b's to repoint.
+struct PartFixture {
+    base: tempfile::TempDir,
+    root: PathBuf,
+    disk: PathBuf,
+    db: Arc<Database>,
+    root_base: Baseline,
+    disk_base: Baseline,
+    root_watch: sync_audit::Watch,
+    disk_watch: sync_audit::Watch,
+    /// An id whose row lands in the root's partition, and one for the
+    /// second location's.
+    root_id: i32,
+    disk_id: i32,
+}
+
+/// The partition `id` routes to, and the directory it is in.
+async fn part_of(db: &Arc<Database>, id: i32) -> (u32, Option<String>) {
+    let t = db.partitioned_table(PART_TABLE).expect("the partitioned table is missing");
+    let epoch = t.epoch().unwrap();
+    let pids = t.route_where(&format!("id = {id}")).unwrap().pids(&epoch.map);
+    assert_eq!(pids.len(), 1, "id {id} routed to {pids:?}");
+    let at = t
+        .partitions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.pid == pids[0])
+        .and_then(|p| p.location);
+    (pids[0], at.map(|l| crate::core::partition::files::dir_key(&l)))
+}
+
+impl PartFixture {
+    async fn new() -> PartFixture {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let disk = base.path().join("disk");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&disk).unwrap();
+
+        let db = open(&root).await;
+        db.storage
+            .add_location(&path_str(&disk), LocationRole::Primary, 1, true)
+            .unwrap();
+        db.storage
+            .set_policy(crate::core::storage::PlacementPolicy::RoundRobin);
+        db.create_partitioned_table(create_statement(PART_TABLE), &["id"], 2)
+            .await
+            .unwrap();
+        assert!(
+            crate::core::wal::wal_for(&path_str(&disk)).is_some(),
+            "the second location has no log of its own, so there is nothing to test"
+        );
+
+        // A durable row in each partition, which materializes both (the
+        // first dealt to the root, the second to the disk), so every file
+        // exists before the baseline. Ids until both are reached.
+        let (root_key, disk_key) = (
+            crate::core::partition::files::dir_key(&path_str(&root)),
+            crate::core::partition::files::dir_key(&path_str(&disk)),
+        );
+        let (mut root_id, mut disk_id) = (None, None);
+        for id in 1..64 {
+            if root_id.is_some() && disk_id.is_some() {
+                break;
+            }
+            let (pid, _) = part_of(&db, id).await;
+            let t = db.partitioned_table(PART_TABLE).unwrap();
+            let fresh = !t.materialized_pids().unwrap().contains(&pid);
+            if !fresh {
+                continue;
+            }
+            insert_autocommit(&db, PART_TABLE, id, if root_id.is_none() { "base_root" } else { "base_disk" }).await;
+            let (_, at) = part_of(&db, id).await;
+            if at.as_deref() == Some(root_key.as_str()) {
+                root_id = Some(id);
+            } else if at.as_deref() == Some(disk_key.as_str()) {
+                disk_id = Some(id);
+            }
+        }
+        let (Some(root_id), Some(disk_id)) = (root_id, disk_id) else {
+            panic!("the two partitions were not dealt one to each location");
+        };
+        assert!(
+            regular_files(&disk)
+                .iter()
+                .any(|p| crate::core::partition::files::parse_name(&p.file_name().unwrap().to_string_lossy())
+                    .is_some()),
+            "no partition file on the second location"
+        );
+        db.sync_durable().unwrap();
+
+        let root_base = take_baseline(&root, &base.path().join("img_root"));
+        let disk_base = take_baseline(&disk, &base.path().join("img_disk"));
+        let root_watch = sync_audit::watch(&root);
+        let disk_watch = sync_audit::watch(&disk);
+        let _ = root_watch.take_events();
+        let _ = disk_watch.take_events();
+
+        PartFixture {
+            base,
+            root,
+            disk,
+            db,
+            root_base,
+            disk_base,
+            root_watch,
+            disk_watch,
+            root_id,
+            disk_id,
+        }
+    }
+
+    /// Cuts power now and opens what the disks would hold, at the original
+    /// paths. Returns the labels a fresh snapshot sees (in `in_root`; the
+    /// table is one) and the syncs inside the scenario.
+    async fn crash_and_recover(self, candidates: &[&str]) -> Seen {
+        let mut events = self.root_watch.take_events();
+        events.extend(self.disk_watch.take_events());
+        assert_no_data_file_sync(&events);
+
+        let (_, _) = finish_image(&self.root_base, &events);
+        let (disk_len, disk_source_len) = finish_image(&self.disk_base, &events);
+
+        let new_files: Vec<PathBuf> = regular_files(&self.root)
+            .into_iter()
+            .chain(regular_files(&self.disk))
+            .filter(|p| !self.root_base.files.contains(p) && !self.disk_base.files.contains(p))
+            .collect();
+        assert!(
+            new_files.is_empty(),
+            "files appeared inside the scenario; the image would leave them out and \
+             could fail for that reason instead: {new_files:?}"
+        );
+        let total = dir_bytes(&self.root)
+            + dir_bytes(&self.disk)
+            + dir_bytes(&self.root_base.img)
+            + dir_bytes(&self.disk_base.img);
+        assert!(total < MAX_SCENARIO_BYTES, "the scenario wrote {total} bytes, past its bound");
+
+        drop(self.root_watch);
+        drop(self.disk_watch);
+        drop(self.db);
+        crate::core::wal::remove_for(&path_str(&self.root));
+        crate::core::wal::remove_for(&path_str(&self.disk));
+        std::fs::remove_dir_all(&self.root).unwrap();
+        std::fs::remove_dir_all(&self.disk).unwrap();
+        std::fs::rename(&self.root_base.img, &self.root).unwrap();
+        std::fs::rename(&self.disk_base.img, &self.disk).unwrap();
+
+        let db = open(&self.root).await;
+        let t = db.partitioned_table(PART_TABLE).expect("the image lost the partitioned table");
+        assert!(t.broken().is_none(), "the image refused the table: {:?}", t.broken());
+        drop(t);
+        let seen = labels(&db, PART_TABLE, candidates).await;
+        assert!(
+            seen.contains("base_root") && seen.contains("base_disk"),
+            "the image lost rows that were durable before the scenario began: {seen:?}"
+        );
+
+        drop(db);
+        crate::core::wal::remove_for(&path_str(&self.root));
+        crate::core::wal::remove_for(&path_str(&self.disk));
+        drop(self.base);
+        Seen {
+            in_root: seen.clone(),
+            in_disk: seen,
+            events,
+            disk_cut: disk_len,
+            disk_source_len,
+        }
+    }
+}
+
+/// Transaction A: one row in each partition, so one in each directory,
+/// uncommitted.
+async fn a_writes_both_partitions(fx: &PartFixture) -> TxId {
+    let db = &fx.db;
+    let tx = db.transactions.begin();
+    write_in(db, tx, &insert_sql(PART_TABLE, fx.disk_id, "alpha_disk")).await;
+    write_in(db, tx, &insert_sql(PART_TABLE, fx.root_id, "alpha_root")).await;
+    tx
+}
+
+/// The control: A's whole commit, as the executor runs it, keeps both of
+/// its partitions' rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_control_a_committed_and_synced_keeps_both_rows() {
+    let seen = run_undisturbed("partitions_control", || async {
+        let fx = PartFixture::new().await;
+        let db = fx.db.clone();
+        let tx = a_writes_both_partitions(&fx).await;
+        db.commit_written_transaction(tx).unwrap();
+        db.transactions.flush_deferred().unwrap();
+        db.sync_own_location().unwrap();
+        drop(db);
+        (fx.crash_and_recover(CANDIDATES).await, vec![std::thread::current().id()])
+    })
+    .await;
+    assert!(
+        seen.in_root.contains("alpha_root") && seen.in_root.contains("alpha_disk"),
+        "a commit that completed lost a partition's row: {:?}; syncs: {:#?}",
+        seen.in_root,
+        seen.events
+    );
+}
+
+/// The control the other way: A staged and never synced keeps neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_control_a_never_synced_keeps_neither_row() {
+    let seen = run_undisturbed("partitions_control_unsynced", || async {
+        let fx = PartFixture::new().await;
+        let db = fx.db.clone();
+        let tx = a_writes_both_partitions(&fx).await;
+        db.commit_transaction(tx);
+        db.transactions.flush_deferred().unwrap();
+        drop(db);
+        (fx.crash_and_recover(CANDIDATES).await, vec![std::thread::current().id()])
+    })
+    .await;
+    assert!(seen.events.is_empty(), "nothing was synced, yet: {:?}", seen.events);
+    assert!(
+        !seen.in_root.contains("alpha_root") && !seen.in_root.contains("alpha_disk"),
+        "rows never synced survived: {:?}",
+        seen.in_root
+    );
+}
+
+/// §12's cross-session ordering gap, for a transaction across two
+/// partitions on two disks: session C's `sync_durable` has synced the
+/// second location and not yet the root when A writes both partitions and
+/// stages its outcome; C's root sync then carries A's outcome. A's row on
+/// the second disk must be durable by then, or A is torn.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_another_sessions_root_sync_cannot_tear_a_transaction() {
+    let seen = run_undisturbed("partitions_variant_1", || async {
+        let fx = PartFixture::new().await;
+        let db = fx.db.clone();
+
+        let tx_c = db.transactions.begin();
+        write_in(&db, tx_c, &insert_sql(PART_TABLE, fx.disk_id, "charlie_disk")).await;
+        db.commit_written_transaction(tx_c).unwrap();
+        db.transactions.flush_deferred().unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let db_c = db.clone();
+        let c = std::thread::spawn(move || {
+            super::test_hooks::AFTER_POOL_SYNC.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the scenario never resumed C");
+                }))
+            });
+            let r = db_c.sync_durable();
+            super::test_hooks::AFTER_POOL_SYNC.with(|h| *h.borrow_mut() = None);
+            r
+        });
+        let c_thread = c.thread().id();
+        paused_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("C never reached the point between its two syncs");
+
+        let tx_a = a_writes_both_partitions(&fx).await;
+        db.commit_written_transaction(tx_a).unwrap();
+        db.transactions.flush_deferred().unwrap();
+
+        resume_tx.send(()).unwrap();
+        c.join().expect("C panicked").expect("C's sync_durable failed");
+        drop(db);
+        (
+            fx.crash_and_recover(CANDIDATES).await,
+            vec![std::thread::current().id(), c_thread],
+        )
+    })
+    .await;
+    assert!(
+        seen.in_root.contains("charlie_disk"),
+        "C's acknowledged row is missing from the image: {:?}; syncs: {:#?}",
+        seen.in_root,
+        seen.events
+    );
+    let (root, disk) = (seen.in_root.contains("alpha_root"), seen.in_root.contains("alpha_disk"));
+    assert_eq!(
+        root, disk,
+        "transaction A is partly committed across its partitions: root row {root}, second-location row {disk}; \
+         syncs: {:#?}",
+        seen.events
+    );
+}
+
+/// Variant 2 for partitions: another session's rollback flushes the root
+/// log only, carrying A's outcome recorded at its commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_a_root_only_outcome_flush_cannot_tear_a_transaction() {
+    let seen = run_undisturbed("partitions_variant_2", || async {
+        let fx = PartFixture::new().await;
+        let db = fx.db.clone();
+        let tx_a = a_writes_both_partitions(&fx).await;
+        db.commit_written_transaction(tx_a).unwrap();
+
+        let tx_b = db.transactions.begin();
+        write_in(&db, tx_b, &insert_sql(PART_TABLE, fx.root_id, "bravo_root")).await;
+        assert!(db.transactions.wrote_family(tx_b), "B's insert did not register as a write");
+        db.abort_transaction(tx_b);
+        db.transactions.flush().unwrap();
+        drop(db);
+        (fx.crash_and_recover(CANDIDATES).await, vec![std::thread::current().id()])
+    })
+    .await;
+    assert!(!seen.in_root.contains("bravo_root"), "B rolled back, yet its row is visible");
+    let (root, disk) = (seen.in_root.contains("alpha_root"), seen.in_root.contains("alpha_disk"));
+    assert_eq!(
+        root, disk,
+        "transaction A is partly committed across its partitions: root row {root}, second-location row {disk}; \
+         syncs: {:#?}",
+        seen.events
+    );
+}
