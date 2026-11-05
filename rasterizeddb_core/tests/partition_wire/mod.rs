@@ -34,6 +34,9 @@ pub struct Server {
     pub port: u16,
     pub db: Arc<Database>,
     pub dir: String,
+    /// Storage locations other than `dir` a test added, whose logs a stop
+    /// releases too, so a restart recovers them afresh.
+    pub extra_dirs: Vec<String>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -84,7 +87,14 @@ impl Server {
             })
             .expect("spawn the server thread");
         let (db, port) = db_rx.recv_timeout(Duration::from_secs(120)).expect("the database opened");
-        let server = Server { port, db, dir: dir.to_string(), shutdown: Some(shutdown_tx), handle: Some(handle) };
+        let server = Server {
+            port,
+            db,
+            dir: dir.to_string(),
+            extra_dirs: Vec::new(),
+            shutdown: Some(shutdown_tx),
+            handle: Some(handle),
+        };
         // Wait until it accepts.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -115,15 +125,21 @@ impl Server {
             let _ = h.join();
         }
         rasterizeddb_core::core::wal::remove_for(&self.dir);
+        for extra in &self.extra_dirs {
+            rasterizeddb_core::core::wal::remove_for(extra);
+        }
     }
 
     /// Stops this server and opens the same directory again.
     pub fn restart(self) -> Server {
         let dir = self.dir.clone();
+        let extra = self.extra_dirs.clone();
         // Dropping the server stops its runtime (and with it every session's
         // handle) and then drops ours.
         drop(self);
-        Server::start(&dir)
+        let mut server = Server::start(&dir);
+        server.extra_dirs = extra;
+        server
     }
 }
 

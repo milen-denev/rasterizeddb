@@ -507,6 +507,8 @@ struct Gen {
     /// seeded stream (adding the P4 kinds moved 0x5eed7a11's stream to one
     /// whose only drops named indexes that were not there).
     unique_dropped: bool,
+    /// `PART_TWIN_SPREAD`: tables on two storage locations.
+    spread: bool,
 }
 
 const WORDS: &[&str] = &["alpha", "beta", "gamma", "delta", "", "x y", "it''s"];
@@ -1528,8 +1530,19 @@ impl Gen {
             CatalogTables => {
                 self.simple(kind, "SELECT * FROM information_schema.tables WHERE table_name = '{t}'".into())
             }
+            // The tuple counts are estimates from pointer slots. In spread
+            // mode a table off the root never overwrites in place (its log
+            // is not the outcome log's, `write_columns_in_place`), so its
+            // UPDATEs append versions that the other side's in-place ones
+            // did not: the same rows, more slots. Compared without them.
+            CatalogClass if self.spread => {
+                self.simple(kind, "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'".into())
+            }
             CatalogClass => {
                 self.simple(kind, "SELECT relname, relkind, reltuples FROM pg_class WHERE relname = '{t}'".into())
+            }
+            CatalogStat if self.spread => {
+                self.simple(kind, "SELECT schemaname, relname FROM pg_stat_user_tables WHERE relname = '{t}'".into())
             }
             CatalogStat => self.simple(
                 kind,
@@ -1964,6 +1977,16 @@ impl Twin {
     }
 
     fn fail(&self, at: usize, op_kind: Kind, why: String) -> ! {
+        if std::env::var("PART_TWIN_DEBUG").is_ok()
+            && let Some(server) = self.server.as_ref()
+        {
+            let db = server.db.clone();
+            let (totals, parts) = block_on_big(async move {
+                let pt = db.partitioned_table(PART).unwrap();
+                (format!("{:?}", pt.totals().await), format!("{:?}", pt.partitions().await))
+            });
+            eprintln!("DEBUG totals {totals}\nDEBUG partitions {parts}");
+        }
         let tail: Vec<&String> = self.log.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
         panic!(
             "twin divergence: {} seed {:#x} (PART_TWIN_SEED={}), op {at}, kind {op_kind:?}\n{why}\n\
@@ -2461,8 +2484,29 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     if let Some(n) = cfg.budget {
         rasterizeddb_core::core::partition::budget::isolate_with(dir.path(), n, Some(1));
     }
-    let server = Server::start(dir.path().to_str().unwrap());
+    let mut server = Server::start(dir.path().to_str().unwrap());
     let mut setup = server.connect();
+    // Phase 4: with `PART_TWIN_SPREAD=1` the partitions (and the plain
+    // twin's tables) are dealt round-robin over the root and a second
+    // location, so every statement kind, the restart and the DDL run over
+    // partitions on two disks.
+    // A sibling directory: a location inside the database's own is refused.
+    // `PART_TWIN_SPREAD=parts` keeps every plain table in the root, so only
+    // partitions are dealt to the second location.
+    let spread = std::env::var("PART_TWIN_SPREAD").ok().filter(|v| v == "1" || v == "parts");
+    let second = spread.is_some().then(|| tempfile::tempdir().expect("a temp dir for the second location"));
+    if let Some(second) = &second {
+        let disk = second.path().to_str().unwrap().to_string();
+        setup.ok(&format!("STORAGE ADD LOCATION '{disk}'"));
+        setup.ok("STORAGE SET POLICY = 'round-robin'");
+        if spread.as_deref() == Some("parts") {
+            let root = dir.path().to_str().unwrap();
+            for plain in [PLAIN, "dim_part", "sink_part", "dim_plain", "sink_plain", "pair_plain", "kpar_plain", "stage"] {
+                setup.ok(&format!("STORAGE PLACE TABLE {plain} AT '{root}'"));
+            }
+        }
+        server.extra_dirs.push(disk);
+    }
     setup.ok(&format!(
         "CREATE TABLE {PART} {COLUMNS} PARTITION BY HASH ({}) PARTITIONS {}",
         cfg.key.join(", "),
@@ -2522,7 +2566,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     while keys.len() < 40 {
         keys.insert((seed_rng.i64(1..=TENANTS), seed_rng.i64(1..=GROUPS), seed_rng.i64(1..=IDS)));
     }
-    let mut seeder = Gen { rng: seed_rng, key: cfg.key, unique_dropped: false };
+    let mut seeder = Gen { rng: seed_rng, key: cfg.key, unique_dropped: false, spread: second.is_some() };
     let inserts: Vec<String> = keys
         .iter()
         .map(|(t, g, i)| {
@@ -2552,7 +2596,8 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     };
     // The seeded rows, before anything else runs.
     twin.compare_storage(0, Restart);
-    let mut generator = Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key, unique_dropped: false };
+    let mut generator =
+        Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key, unique_dropped: false, spread: second.is_some() };
 
     // First every kind once, in a seeded order; then weighted draws.
     let mut order: Vec<Kind> = ALL_KINDS.iter().copied().filter(|k| *k != Restart).collect();
@@ -2649,6 +2694,16 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     assert_eq!(files_of_table(dir.path(), PART), Vec::<String>::new(), "{label}: files under the logical name");
     let bytes = dir_bytes(dir.path());
     assert!(bytes < 50 * 1024 * 1024, "{label}: the run wrote {bytes} bytes");
+    // Spread mode compared something only if partitions really were dealt
+    // to the second location.
+    if let Some(disk) = server.extra_dirs.first() {
+        let spread = std::fs::read_dir(disk)
+            .expect("the second location")
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("__pt_") && n.ends_with("_pointers.db")))
+            .count();
+        assert!(spread > 0, "{label}: spread mode dealt no partition to the second location");
+    }
 
     let summary: Vec<String> = twin
         .tally
