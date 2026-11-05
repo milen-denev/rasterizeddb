@@ -12,7 +12,8 @@ across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
 budget, its sharded CLOCK, idle close and the seal at close,
 [as built](#phase-3-p5b-2a-as-built)), P5b-2b (scan-only fan-out opens,
 [as built](#phase-3-p5b-2b-as-built)) and P5b-3 (prompt descriptor release,
-the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)). Phases 0 and 1 are
+the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)), and phase 4's P6
+(placement across storage locations, [as built](#phase-4-p6-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -449,6 +450,123 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 4 P6 as built
+
+Built on `feat/p6-placement` (from `b78aa933`, 2026-11-05): partitions
+materialize on the storage pool's locations, by its policy, counted across
+tables.
+
+**The gate was already met.** §12's cross-session ordering gap was closed
+on 2026-10-17 by `cf943c71`, a day after this design named it, by a
+different fix from the one proposed: `Database::commit_written_transaction`
+syncs every other location's log *before* the in-memory commit, so no
+outcome of a transaction committed through it can reach the root log ahead
+of its rows elsewhere, whoever stages it (`stage()` was left alone). Its
+crash test is `database/cross_dir_commit_tests.rs`, a page-cache image built
+from `sync_audit`'s record of every `fdatasync`, not a SIGKILL. P6 adds the
+same scenarios over a partitioned table with one partition on each disk
+(`partitions_*`: both controls, another session's root sync, a rollback's
+root-only flush). The image opens at the original paths, as an in-place
+restore puts them (below). *(Mutation: drop the pre-commit sync; the three
+partitioned scenarios that commit fail.)*
+
+**Placement** (§6.1). `Parts::materialize` asks the pool's dealer
+(`StorageManager::deal_partition`, behind `partition::table::Placement` so
+the partition code builds without `storage_pools`), which counts the
+partition at once; a failed materialization takes it back
+(`undeal_partition`). The dealer is cross-table: per location, every
+partitioned table's materialized partitions, registered as each table opens
+(`register_partitions`, replaced whole per table, so a count cannot drift
+past a restart) and forgotten at its DROP. Under `primary`, the first
+enabled primary; under `round-robin`, the fewest tables *plus* partitions,
+ties to declaration order (and plain-table placement now counts partitions
+too); under `free-space`, the location furthest below its share, shares
+proportional to available bytes × weight, compared crosswise as
+`(held + 1) × share`. Never `choose`'s argmax: free space only moves once
+rows arrive, so a burst would all go to one disk. Candidates are `choose`'s
+(enabled primaries, those under `min_free_bytes` left out unless none is
+left). Then: the files at the dealt directory with that directory synced;
+the path interned by a durable `LOCATIONS` if the map does not name it yet
+(installed at once, so a second one extends what the log has); the durable
+`MATERIALIZE { loc }`. Location 0 is the root wherever the database now is;
+any other is read through `partition_dir`, which **refuses the table** when
+the interned path is not a primary location of this pool, enabled or not:
+a map copied or restored elsewhere names another installation's directory.
+Recorded placement is never recomputed.
+
+**While a backup service runs, partitions stay in the root**
+(`backup_keeps_partitions_in_root`). The S3 paragraph of §12 is stale:
+since `78175c5c` (2026-10-17) snapshots copy every storage location and
+archive each one's log. What is missing is the restore *into a new
+directory*: it moves the locations (`restore::location_destinations`) and
+repoints `db_storage.cfg`, but a partition map names its locations by
+absolute path, so the restored table would refuse to open. An in-place
+restore, to the same paths, already works. Phase 4b (P6b) repoints the maps
+and lifts this; it no longer needs the backup service to refuse anything.
+The plan's "backup refuses to run beside off-root partitions" was not built
+for the same reason.
+
+**The pool's guards** (`StorageManager::partitions_holding`): `STORAGE DROP
+LOCATION` and a role change to `BACKUP` refuse a location while the dealer
+counts a partition there (a reservation whose files are not written yet
+included) or its directory holds any partition data file. The directory
+scan covers a table whose map did not read this start, which never
+registered its counts. The pool's location report carries the counts
+(`LocationReport::partitions`); `SHOW STORAGE` does not show them yet, since
+a new column changes what its clients parse. Disabling a location still works: it keeps
+what it holds and takes no new partitions.
+
+**Every file path goes through the slot's directory** (`Slot::dir`, set
+from the replayed map at open or by the materialize, before the flag, and
+carried across a schema change's reopen): the existence check (I9), the
+providers (`StorageIO::try_create_new_at`; its default refuses rather than
+ignore the directory, as `create_new_at`'s does), a closed partition's
+sizes, `PartitionInfo::location`. A partition's index-store pair lives
+beside its data files, under that location's `rdb.ixe`, as a plain table's
+on a pool location does.
+
+**DROP and the reaper reach every location.** DROP voids each other
+location's records in that location's log (after the root's log is synced,
+so the tombstone is durable) and deletes the partition files there first,
+then the root's, parent files last (§12's order). The startup reaper runs
+over every primary location before the root: off the root it deletes the
+partition files no live map places there (a stray left by a crashed
+materialize dealt elsewhere, or a file of a uid with no catalogue row) and
+leaves any other file alone. `read_live_map` now accepts spread maps. A
+torn map's leftover check looks on every location.
+
+**A torn tail off the root.** The torn-tail cutter counted a partition's
+pointer file only when its table's shared schema sat beside it, which off
+the root it never does: the tail would not have been cut, and the next
+insert would land inside the torn record. The partition's own rows file
+beside it now stands in (`torn_tail::partition_pointers`); a plain table
+that an older build let take such a name still has its own schema beside it
+and is never cut (`torn_partition_pointers_on_another_location_are_cut`).
+
+**The partition twin over two disks.** `PART_TWIN_SPREAD=1` adds a second
+location (a sibling temp directory: one inside the root is refused) under
+`round-robin` before the tables are created, so partitions and the plain
+twin's tables are both dealt across the two; `=parts` pins every plain table
+to the root so only partitions move. Every statement kind, the restart and
+the DDL run over partitions on two disks, and the run asserts that some
+partition did land on the second. The catalog kinds then compare without
+their tuple estimates (`reltuples`, `n_live_tup`, `n_dead_tup`): those count
+pointer slots, and a table off the root never overwrites in place (its log
+is not the outcome log, `write_columns_in_place`), so its UPDATEs append
+versions the other side overwrote: the same rows, more slots. The first
+spread run found exactly that (106 slots against 105 at op 134), not a
+wrong row. `PART_TWIN_DEBUG=1` prints the partitioned table's totals and
+partitions at a divergence.
+
+**Not built.** In-place overwrites off the root: they are allowed only in
+the outcome log's directory, so a partition on another location appends a
+version for every UPDATE a root partition would overwrite in place, and an
+update-heavy partition there grows faster and leans on vacuum more (the cost
+of spreading, unmeasured). Touched-only `sync_durable` (a location with no pending
+writes costs a check, not a sync); the per-disk group-commit measurement;
+moving a partition (P7's reshape). An older binary refuses a table with a
+partition off the root ("outside the root"), loudly.
 
 ## Phase 3 P5b-3 as built
 
@@ -3379,7 +3497,8 @@ never `choose`'s argmax (`storage/mod.rs:1314`), which sends every new
 partition to the emptiest disk. Reshape targets use the same dealer, recorded
 in `RESHAPE_COMMIT`. A new location gets its share of later materializations
 at once; recorded placement is never recomputed ([storage
-pools](storage-pools.md)). Until phase 4, all is in root.
+pools](storage-pools.md)). Built in phase 4 ([as built](#phase-4-p6-as-built)),
+by counts, not `STATS` bytes: a fresh partition holds none.
 
 ### 6.2 One primitive: reshape
 
@@ -3980,7 +4099,9 @@ outside the database directory. Its only check today reads `db_storage.cfg`
 (`warn_about_excluded_tables`, `core/backup/mod.rs:987-1010`), which never names
 a partition, and only warns. Both lift in phase 4b.
 
-**The cross-session ordering gap** (inferred, untested): session C syncs disk
+**The cross-session ordering gap** (closed on 2026-10-17 by `cf943c71`,
+which syncs the other locations before the in-memory commit instead; tested
+for partitions in phase 4, [as built](#phase-4-p6-as-built)): session C syncs disk
 D; A writes to D and stages its outcome in the root log; C's root sync makes A's
 outcome durable before A's rows on D; a crash breaks A's all-or-nothing.
 Spread partitions make multi-directory transactions normal, so phase 4 is
@@ -4049,7 +4170,7 @@ Each phase is safe alone and refuses what it does not support.
 | **2a** | **Built** (S1–S11; S12, the worker budget and cheap merge, not built, §8). **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants (their worker cap is S12; 2a bounds partitions in flight with `FANOUT_IN_FLIGHT = 8`, §8), the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE, VACUUM over the partitions. **Prepared SELECT, UPDATE and DELETE** skip the learned-parse cache (`note_rewritten`), using the text path (2b gives `SELECT` the cache).<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals (the as-built list is in §2) | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** **As measured:** on tmpfs only, partbench and jsonbench (the 2b row's figures); the ext4 items wait for a venue (.7); 2b went ahead without them. |
 | **2b** | **Built** (S15–S20, 2026-10-24; [as built](#phase-2b-as-built)). Joins (per-relation routing, one `Visibility`, no transitive inference; partitioned sources of `UPDATE … FROM`/`DELETE … USING`), the prepared-SELECT cache with late routing (I11) and a cached route derivation for full-key point reads (S16b), `ON CONFLICT` and `RETURNING` on partitioned tables; a same-value key assignment overwrites in place (§4.5). **Not advertised** until the wall-clock A/B below. | as 2a, less these: partitioned targets of `UPDATE … FROM`/`DELETE … USING`, `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `ALTER`/`RENAME`/`CREATE INDEX`, FKs (phase 3); key changes, including by `DO UPDATE` (phase 6); conversion and reshapes (phase 5) | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). S15's learned parse brought them to 0.81–0.88× (point) and 0.86–0.93× (`COUNT`), wall-clock on a loaded box; S16b's profile put the rest in re-deriving the route, `join_all` and one async layer. **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs`. **As measured (S16b, user-mode instructions per op, part/plain): point 1.02 at c=1 and c=16 (1.19 and 1.18 before), `COUNT` 1.005 (1.04 before): the merge gate is met.** Wall-clock on that box (load 7–30) ranged 0.49–1.96 for one binary, so it is not evidence either way. **"Advertised" additionally needs**, and is still pending, an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. |
 | **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11) under ACCESS EXCLUSIVE on the logical name (the table-lock manager, §11), map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per database (P5b-3), default N measured and kept at 64 (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
-| **4** | Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions; touched-only `sync_durable`. **Gated on** the cross-session crash test and fix (§12). Databases without `s3_backup` only. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
+| **4** | **Built (P6, 2026-11-05; [as built](#phase-4-p6-as-built)).** Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions. The gate's fix was already in (`cf943c71`), its crash test extended to partitions. Partitions stay in the root while a backup service runs. Touched-only `sync_durable` not built. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
 | **4b** | S3 snapshots and log archive stream every pool location, with a multi-location restore test; phase-4 refusals lift | — | snapshot time vs location count |
 | **5** | Reshape: MOVE, SPLIT, ISOLATE KEY, SPLIT KEY, MERGE, bounded-parallel REBALANCE, conversion; each with crash recovery, range-bounded re-routes, epoch-gated reclamation | — | fence duration vs partition size; throughput during a reshape |
 | **6** | Row moves on key UPDATE, generational physical ALTER, co-location and partition-wise joins, `process_many` and `Folder` merge, `PARTITION OF` write-only alias | — | conversion time per GB |
@@ -4094,7 +4215,7 @@ section specifying the mechanism.
 | I18 | Downgrade fails loudly, leaving no shadowing duplicate | §3.1 | the previous release opens a phase-2 database: table absent, not empty; `CREATE TABLE t` there, insert, re-upgrade: the new binary refuses to start, naming both rows |
 | I19 | Every crash window leaks rather than loses | §12, §3.2 | failpoints at each step of create, materialize, rename, reshape, conversion and drop, under SIGKILL and the page-cache-drop harness, including a page-cache drop after the outcome is durable: rows equal before or after, never neither. *(Mutation: append `MATERIALIZE` with `append_data(_, false)`.)* |
 | I20 | Cache scopes are distinct | §3.4 | one `WHERE` on two partitions with different rows. *(Mutation: scope from `schema.name`.)* |
-| I21 | Placement is balanced and never reaches `db_storage.cfg` | §6.1, §3.1 | 1024 materializations over 3 locations: within ±1 (round-robin) or proportional (free-space); a location added mid-run gets its share of later ones, one below `min_free_bytes` none; `db_storage.cfg` unchanged |
+| I21 | Placement is balanced and never reaches `db_storage.cfg` | §6.1, §3.1 | 1024 materializations over 3 locations: within ±1 (round-robin) or proportional (free-space); a location added mid-run gets its share of later ones, one below `min_free_bytes` none; `db_storage.cfg` unchanged **Phase 4 (as built):** `database/partition_placement_tests.rs`: `the_dealer_balances_by_policy` (round-robin within one over 1024, a location added mid-run catching up, disabled none, free-space 1:1:2 by weight, a failed deal taken back, root-only) and `round_robin_spreads_partitions_and_a_restart_finds_them` (`db_storage.cfg` byte-identical across the materializations). *(Mutations: dealer always root; undeal a no-op.)* |
 | I22 | Reshape writes are neither lost nor applied twice | §6.2 | writers through `MOVE PARTITION`; a `MERGE` with a fan-out `UPDATE … SET n = n + 1` parked between its sources; a statement crossing a split then a merge; all vs the twin, row count and `RETURNING` included. *(Mutations: skip the re-route; re-route without the range bound.)* |
 | I23 | Replicas route on their own and refuse alike | §12 | primary 1024, replica 64: identical results; primary 64, replica 1024 plus a `SPLIT KEY`, key-assigning `UPDATE`s (same value, same point, different point) under each conflict policy: identical rows, nothing skipped on one side only |
 | I24 | FK actions reach partitioned children | §10 | a parent delete cascades into every partition holding children. **As built (P4):** `tests/partition_fk.rs` (four configurations, each answer the plain twin's, every action, through a restart); the twin's `ForeignKeyFromT`, `ForeignKeyOntoPartitioned`, `ForeignKeyFromSink` |
