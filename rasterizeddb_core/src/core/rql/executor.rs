@@ -18486,6 +18486,31 @@ async fn insert_row_resolved(
 
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
+/// Refuses `DROP TABLE` and `ALTER TABLE` on the role catalogue
+/// (`auth::ROLE_TABLE`), as PostgreSQL refuses them on `pg_authid` (42501,
+/// "permission denied: \"pg_authid\" is a system catalog").
+///
+/// It is an ordinary table to the storage, and it showed up in `SHOW TABLES`
+/// like one, so a script dropping every table in the default database
+/// dropped it: every login after that failed as a wrong password until a
+/// restart recreated it with the bootstrap superuser alone, and every other
+/// role was gone. Role management writes it through its own statements
+/// (`auth`), which never drop or alter it; every other way in, a client's
+/// statement or a replicated one, comes through here.
+fn system_catalog_refusal(query: &QueryPurpose) -> Option<String> {
+    let sql = match query {
+        QueryPurpose::DropTable(sql)
+        | QueryPurpose::AddColumn(sql)
+        | QueryPurpose::DropColumn(sql)
+        | QueryPurpose::RenameColumn(sql) => sql,
+        _ => return None,
+    };
+    crate::core::rql::lock_set::statement_lock_set(sql)
+        .iter()
+        .any(|(table, _)| table == crate::auth::ROLE_TABLE)
+        .then(|| format!("permission denied: \"{}\" is a system catalog", crate::auth::ROLE_TABLE))
+}
+
 pub(crate) async fn execute_with_need(
     query: QueryPurpose,
     database: Arc<Database>,
@@ -18503,6 +18528,9 @@ pub(crate) async fn execute_with_need(
         }
         other => other,
     };
+    if let Some(refusal) = system_catalog_refusal(&query) {
+        return ddl_error(&refusal);
+    }
     match &query {
         // Taken above, before the borrow.
         QueryPurpose::PreparedRows(_) => ddl_error("internal error: a prepared parse reached the text dispatch"),
