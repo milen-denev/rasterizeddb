@@ -253,7 +253,7 @@ fn refused_shapes_write_nothing() {
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) WITH (fillfactor = 70)", "WITH"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) TABLESPACE fast", "TABLESPACE"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 0", "PARTITIONS 0"),
-            ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 4096", "PARTITIONS 4096"),
+            ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 65537", "PARTITIONS 65537"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (lower(k))", "column names"),
             ("CREATE TABLE pr (k INT NOT NULL) INHERITS (pd_parent)", "INHERITS"),
             ("CREATE TABLE pr PARTITION OF pd_parent FOR VALUES WITH (MODULUS 2, REMAINDER 0)", "PARTITION OF"),
