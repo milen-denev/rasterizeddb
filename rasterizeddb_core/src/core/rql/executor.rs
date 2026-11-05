@@ -9039,6 +9039,25 @@ async fn insert_from_select(
     Some(Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await)
 }
 
+/// PostgreSQL's 42601 for an `INSERT … VALUES` into a table with `schema`
+/// whose tuples do not fit their target columns
+/// ([`crate::core::rql::lexer_ir::values_arity_error`]). The columns a tuple
+/// without a column list maps onto are every column but the dropped ones
+/// and the engine's nullability companions, generated ones included, as
+/// [`supply_insert_column_list`] lists them. One function for the INSERT
+/// arm and pgwire's describe of a prepared statement, so they cannot drift.
+pub(crate) fn insert_arity_refusal(
+    schema: &crate::core::row::schema::TableSchema,
+    sql: &str,
+) -> Option<&'static str> {
+    let writable = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .count();
+    crate::core::rql::lexer_ir::values_arity_error(sql, writable)
+}
+
 /// The statement with its column list supplied, for an `INSERT … VALUES`
 /// that named none; `None` when it already had one or is another form.
 ///
@@ -9051,16 +9070,14 @@ fn supply_insert_column_list(
     schema: Option<&crate::core::row::schema::TableSchema>,
 ) -> Option<Result<QueryPurpose, String>> {
     let schema = schema?;
-    let (fields, generated) = (schema.fields.clone(), schema.generated.clone());
-    // A generated column takes no value from the client, so it is not one of
-    // the positions `INSERT INTO t VALUES (…)` fills — PostgreSQL maps the
-    // tuple across the columns that *can* be written. Leaving it in the list
-    // shifted every value after it by one.
-    let fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> = fields
-        .into_iter()
-        .filter(|f| crate::core::rql::generated::expression_for(&f.name, &generated).is_none())
-        .collect();
-    let rewritten = crate::core::rql::lexer_ir::supply_column_list(&row_data.query, &fields)?;
+    // Every column, generated ones included: PostgreSQL maps the tuple
+    // across all of them in order, and a generated column's position takes
+    // `DEFAULT` or refuses the value (428C9), which the explicit list's path
+    // already does. Leaving generated columns out shifted the tuple: `VALUES
+    // (1, 'x')` into `(a, b GENERATED …, c)` stored `c = 'x'` where
+    // PostgreSQL refuses it, and the `VALUES (2, DEFAULT, 'y')` it accepts
+    // was refused.
+    let rewritten = crate::core::rql::lexer_ir::supply_column_list(&row_data.query, &schema.fields)?;
     let Some(mut purpose) = recognize_query_purpose(&rewritten) else {
         return Some(Err(
             "could not parse the statement after supplying its column list".to_string(),
@@ -18813,6 +18830,14 @@ pub(crate) async fn execute_with_need(
                         crate::core::value_codec::double_quoted(&row_data.table_name)
                     ));
                 }
+            }
+
+            // Every tuple fits its target columns, before anything reads a
+            // default or splits the rows: PostgreSQL's 42601. The row parser
+            // refused a misfit without a reason, so a plain table answered
+            // XX000 and a partitioned one blamed its key column (23502).
+            if let Some(refusal) = target.as_ref().and_then(|t| insert_arity_refusal(t.schema(), &row_data.query)) {
+                return ddl_error(refusal);
             }
 
             // Before anything reads a default: a `SERIAL` column's counter is

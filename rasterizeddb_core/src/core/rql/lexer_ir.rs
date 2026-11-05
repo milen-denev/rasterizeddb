@@ -611,6 +611,76 @@ pub fn named_columns(sql: &str) -> Option<Vec<String>> {
     )
 }
 
+/// PostgreSQL's `INSERT has more expressions than target columns` (42601).
+pub const MORE_EXPRESSIONS: &str = "INSERT has more expressions than target columns";
+/// PostgreSQL's `INSERT has more target columns than expressions` (42601).
+pub const MORE_TARGETS: &str = "INSERT has more target columns than expressions";
+/// PostgreSQL's `VALUES lists must all be the same length` (42601).
+pub const UNEQUAL_TUPLES: &str = "VALUES lists must all be the same length";
+
+/// PostgreSQL's arity refusal for an `INSERT … VALUES`, or `None` when every
+/// tuple fits its target columns.
+///
+/// Checked once per statement, before anything reads a default or splits
+/// the tuples. Without it the row parser saw the counts differ and gave up
+/// without a reason: a plain table answered `XX000 Cannot insert row due to
+/// schema mismatch`, and a partitioned one reached its NOT NULL check first
+/// and blamed the key column (`23502 null value in column "tenant_id"`), for
+/// a statement whose only fault was one value too many, as a locale's
+/// decimal comma (`204,60`) makes one value two.
+///
+/// PostgreSQL's order (`transformInsertStmt`): the tuples one by one, each
+/// after the first held to the first one's length, then each against the
+/// targets. With a column list the targets are its columns and a short
+/// tuple is refused too; without one they are the `writable` columns the
+/// tuple maps onto in order, and a short tuple leaves the rest to their
+/// defaults.
+///
+/// Only `INSERT INTO name [(columns)] VALUES (…)[, (…)]…` is read. Any other
+/// shape (`… SELECT`, `DEFAULT VALUES`, an alias) is `None`, left to the
+/// paths that handle it.
+pub fn values_arity_error(sql: &str, writable: usize) -> Option<&'static str> {
+    let trimmed = sql.trim_start();
+    if !trimmed.get(.."INSERT INTO".len())?.eq_ignore_ascii_case("INSERT INTO") {
+        return None;
+    }
+    let values_at = find_word(trimmed, "VALUES", "INSERT INTO".len())?;
+    let head = trimmed["INSERT INTO".len()..values_at].trim();
+    let (targets, explicit) = match head.find('(') {
+        None if head.split_whitespace().count() == 1 => (writable, false),
+        None => return None,
+        Some(open) => {
+            let close = matching_paren(head, open)?;
+            if head[..open].split_whitespace().count() != 1 || !head[close + 1..].trim().is_empty() {
+                return None;
+            }
+            (named_columns(trimmed)?.len(), true)
+        }
+    };
+    let mut rest = trimmed[values_at + "VALUES".len()..].trim_start();
+    let mut first: Option<usize> = None;
+    while rest.starts_with('(') {
+        let close = matching_paren(rest, 0)?;
+        let n = split_values(&rest[1..close]).len();
+        if first.is_some_and(|f| f != n) {
+            return Some(UNEQUAL_TUPLES);
+        }
+        first.get_or_insert(n);
+        if n > targets {
+            return Some(MORE_EXPRESSIONS);
+        }
+        if explicit && n < targets {
+            return Some(MORE_TARGETS);
+        }
+        rest = rest[close + 1..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => break,
+        }
+    }
+    None
+}
+
 /// Position of `word` in `upper` at or after `from`, outside quotes and on a
 /// word boundary, or `None`. The match ignores ASCII case, so `upper` may be
 /// the statement as written.
@@ -3024,5 +3094,46 @@ mod csv_values_reference {
             let got: Vec<String> = super::parse_csv_values(&s).into_iter().map(str::to_string).collect();
             assert_eq!(got, reference(&s), "{:?}", s);
         }
+    }
+}
+
+#[cfg(test)]
+mod values_arity {
+    use super::{MORE_EXPRESSIONS, MORE_TARGETS, UNEQUAL_TUPLES, values_arity_error as arity};
+
+    /// PostgreSQL 17's order and answers, against three writable columns.
+    #[test]
+    fn misfits_in_postgresqls_order() {
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (1, 2, 3)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 2)", 3), Some(MORE_TARGETS));
+        assert_eq!(arity("insert into t values (1, 2, 'x', 4)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (7, 8), (9, 10, 11)", 3), Some(UNEQUAL_TUPLES));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (12, 13, 14), (15, 16)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t VALUES (1, 2, 3), (4, 5)", 3), Some(UNEQUAL_TUPLES));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (1, 2, 3) RETURNING a", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 204,60, 'x')", 3), Some(MORE_EXPRESSIONS));
+    }
+
+    /// Fits, and commas no separator: nested, quoted, in a string, a
+    /// function's arguments. A short tuple with no column list is a row
+    /// whose last columns take their defaults.
+    #[test]
+    fn fits_are_none() {
+        assert_eq!(arity("INSERT INTO t VALUES (5, 6)", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (abs(-7), (8), 'q,r')", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 'it''s, two', 3), (4, 5, 6)", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, DEFAULT, coalesce(NULL, 2, 3))", 3), None);
+        assert_eq!(arity("INSERT INTO t (a) VALUES (1), (2), (3) ON CONFLICT DO NOTHING", 3), None);
+    }
+
+    /// Shapes it does not read are left to the paths that do.
+    #[test]
+    fn other_shapes_are_none() {
+        assert_eq!(arity("INSERT INTO t SELECT 1, 2, 3, 4", 3), None);
+        assert_eq!(arity("INSERT INTO t SELECT * FROM (VALUES (1, 2, 3, 4)) v", 3), None);
+        assert_eq!(arity("INSERT INTO t DEFAULT VALUES", 3), None);
+        assert_eq!(arity("INSERT INTO t AS x (a) VALUES (1, 2)", 3), None);
+        assert_eq!(arity("UPDATE t SET a = 1", 3), None);
+        assert_eq!(arity("INSERT INTO t (a) VALUES ('VALUES (1, 2, 3)')", 3), None);
     }
 }

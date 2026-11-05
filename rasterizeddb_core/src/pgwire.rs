@@ -1940,7 +1940,7 @@ where
             }
             // Extended query protocol (Parse/Bind/Describe/Execute/Sync/...)
             b'P' => {
-                handle_parse(state, stream, &payload).await?;
+                handle_parse(database, state, stream, &payload).await?;
             }
             b'B' => {
                 handle_bind(database, state, stream, &payload).await?;
@@ -2947,7 +2947,12 @@ where
     Ok(false)
 }
 
-async fn handle_parse<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
+async fn handle_parse<S>(
+    database: &Database,
+    state: &mut SessionState,
+    stream: &mut S,
+    payload: &[u8],
+) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -2968,11 +2973,21 @@ where
     // Stored with escape and dollar-quoted strings already rewritten as the
     // standard strings they mean, so describing, inlining and executing it all
     // read one kind of literal; see `sql_scan`.
-    let query = match crate::core::sql_scan::normalize_string_literals(&query) {
-        Ok(std::borrow::Cow::Borrowed(_)) => query,
-        Ok(std::borrow::Cow::Owned(text)) => text,
-        Err(e) => return fail_statement(state, stream, "22025", &e).await,
+    let (query, failed) = match crate::core::sql_scan::normalize_string_literals(&query) {
+        Ok(std::borrow::Cow::Borrowed(_)) => (query, None),
+        Ok(std::borrow::Cow::Owned(text)) => (text, None),
+        Err(e) => (query, Some(("22025", e))),
     };
+    // An `INSERT … VALUES` whose tuples do not fit their columns is refused
+    // here, at parse, as PostgreSQL refuses it (42601). Prepared, its extra
+    // placeholder was inferred as `text` and the client failed binding a
+    // value the server would never take. Decided synchronously, and one
+    // await for both refusals: this future sits inside the connection's,
+    // whose type is at the compiler's recursion limit.
+    let failed = failed.or_else(|| insert_arity_refusal_of(database, &query).map(|r| ("42601", r.to_string())));
+    if let Some((code, message)) = failed {
+        return fail_statement(state, stream, code, &message).await;
+    }
 
     // Re-preparing the identical text with the identical parameter types — an
     // unnamed statement re-sent with every command — keeps what was learned
@@ -7341,6 +7356,17 @@ fn returning_sqlstate(message: &str) -> &'static str {
     }
 }
 
+/// [`crate::core::rql::executor::insert_arity_refusal`] for a statement
+/// being prepared, its target looked up by name; `None` when it is not an
+/// `INSERT` or its table is unknown (the execute reports that).
+fn insert_arity_refusal_of(database: &Database, sql: &str) -> Option<&'static str> {
+    let Some(QueryPurpose::InsertRow(data)) = recognize_query_purpose(sql) else {
+        return None;
+    };
+    let view = database.schema_view(&data.table_name)?;
+    crate::core::rql::executor::insert_arity_refusal(view.schema(), sql)
+}
+
 pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     let raw = message.to_ascii_lowercase();
     // Matched outside quoted text: a message quotes the value or statement
@@ -7364,6 +7390,14 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // PostgreSQL reports running out of them. Early, for the reason above.
     if has("insufficient resources: partition") {
         return "53000";
+    }
+    // `INSERT … VALUES` arity (`lexer_ir::values_arity_error`):
+    // PostgreSQL's syntax_error.
+    if has("insert has more expressions than target columns")
+        || has("insert has more target columns than expressions")
+        || has("values lists must all be the same length")
+    {
+        return "42601";
     }
 
     // `reserved_name`: a table created under, or renamed to, the statement

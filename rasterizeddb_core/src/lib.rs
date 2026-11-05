@@ -1,3 +1,10 @@
+// The pgwire connection future nests every statement path's future, and
+// proving it `Send` walks that whole type: the default limit of 128 was met
+// exactly, so a one-line change to any statement path stopped the crate
+// compiling (E0275, "overflow evaluating the requirement … Send"). A
+// compile-time limit only; nothing at run time depends on it.
+#![recursion_limit = "256"]
+
 use cacheguard::CacheGuard;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
