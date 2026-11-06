@@ -191,3 +191,42 @@ async fn distinct_on_over_joins_and_aggregates_matches_postgresql() {
         assert!(c.simple_query(sql).await.is_err(), "{sql}");
     }
 }
+
+/// `date_part(field, x)` with the field read from the row, each value's field
+/// checked against its source as a constant one is, a NULL field giving
+/// NULL: answered as PostgreSQL 17 answers it. It was refused ("reads its
+/// field from a constant here").
+#[tokio::test(flavor = "multi_thread")]
+async fn date_part_with_a_field_from_the_row_matches_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE dp (id INT, unit TEXT, ts TIMESTAMP, d DATE, iv INTERVAL)",
+        "INSERT INTO dp VALUES (1,'year','2024-03-15 10:20:30','2024-03-15','1 day 2 hours'),\
+         (2,'Month','2024-03-15 10:20:30','2024-03-15','3 months'),(3,'hour','2024-03-15 10:20:30','2024-03-15','5 hours'),\
+         (4,NULL,'2024-03-15 10:20:30','2024-03-15','1 day'),(5,'epoch','2024-03-15 10:20:30','2024-03-15','1 minute'),\
+         (6,'dow','2024-03-15 10:20:30','2024-03-15',NULL)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT id, date_part(unit, ts) FROM dp ORDER BY id", &["1|2024", "2|3", "3|10", "4|NULL", "5|1710498030", "6|5"]),
+        ("SELECT id, date_part(unit, d) FROM dp ORDER BY id", &["1|2024", "2|3", "3|0", "4|NULL", "5|1710460800", "6|5"]),
+        ("SELECT id, date_part(unit, iv) FROM dp ORDER BY id", &["1|0", "2|3", "3|5", "4|NULL", "5|60", "6|NULL"]),
+        ("SELECT id FROM dp WHERE date_part(unit, ts) > 10 ORDER BY id", &["1", "5"]),
+        ("SELECT id, date_part(upper(unit), ts) FROM dp WHERE id = 1", &["1|2024"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    for sql in [
+        "SELECT date_part(unit, id) FROM dp",
+        "SELECT id, date_part('bogus' || unit, ts) FROM dp WHERE id = 1",
+        // An interval has no weekday, whichever row names it.
+        "SELECT date_part(CASE WHEN id > 0 THEN 'dow' END, iv) FROM dp WHERE id = 1",
+    ] {
+        assert!(c.simple_query(sql).await.is_err(), "{sql}");
+    }
+}
+

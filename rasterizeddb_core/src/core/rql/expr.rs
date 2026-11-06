@@ -1334,7 +1334,17 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("date_part takes a field and a timestamp, date or interval".to_string());
                     }
                     let Expr::Literal { bytes, db_type: DbType::STRING } = &args[0] else {
-                        return Err("date_part reads its field from a constant here, as in date_part('year', ts)".to_string());
+                        // A field read from the row (`date_part(unit, ts)`):
+                        // checked per value when evaluated. The source's type
+                        // is checked now, with a field every type has.
+                        if !matches!(static_type(&args[0]), DbType::STRING | DbType::CHAR | DbType::BPCHAR(_) | DbType::NULL) {
+                            return Err(format!(
+                                "function date_part({}, …) does not exist",
+                                static_type(&args[0]).to_string().to_lowercase()
+                            ));
+                        }
+                        date_field_applies("YEAR", &static_type(&args[1]), false)?;
+                        return Ok(Expr::Call(TextFunc::DatePart, args));
                     };
                     let canonical = date_field(&String::from_utf8_lossy(bytes).to_ascii_uppercase())?;
                     date_field_applies(canonical, &static_type(&args[1]), false)?;
@@ -3294,7 +3304,15 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             }
         }
         TextFunc::ExtractField | TextFunc::DatePart => {
-            let field = date_field(&as_text(&args[0]))?;
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let field = date_field(&as_text(&args[0]).to_ascii_uppercase())?;
+            // A field read from the row is checked against the value here,
+            // as a constant one is when the call is parsed.
+            if let Value::Data { db_type: db_type @ (DbType::DATE | DbType::INTERVAL), .. } = &args[1] {
+                date_field_applies(field, db_type, func == TextFunc::ExtractField)?;
+            }
             match date_field_value(field, &args[1])? {
                 None => Value::Null,
                 Some(v) if func == TextFunc::ExtractField => pgnum_as_decimal_value(v),
