@@ -25,6 +25,11 @@
 //! query computes every value exactly as the statement would before its
 //! `DISTINCT ON`; the outer one only sorts, keeps and pages.
 //!
+//! A plain `SELECT DISTINCT` whose `ORDER BY` places NULLs against its
+//! direction (`ASC NULLS FIRST`, `DESC NULLS LAST`), which the scan's byte
+//! sort cannot do, is rewritten the same way: made distinct inside, sorted
+//! outside.
+//!
 //! A statement this cannot rewrite faithfully is left alone, and so keeps the
 //! refusal it had: a `*` (its columns cannot be named here), a set operation,
 //! a row lock, an ambiguous output name, an ordinal out of range.
@@ -326,15 +331,18 @@ fn last_word(text: &str) -> Option<(&str, String)> {
 fn rewrite_select(sql: &str) -> Option<String> {
     let after_select = strip_word(sql, "SELECT")?;
     let after_distinct = strip_word(after_select, "DISTINCT")?;
-    let on = strip_word(after_distinct, "ON")?;
-    if !on.starts_with('(') {
-        return None;
-    }
-    let open = sql.len() - on.len();
-    let close = crate::core::rql::expr::matching_paren(sql, open)?;
-    let keys_text = &sql[open + 1..close];
-    let from_at = find_keyword(sql, "FROM", close + 1)?;
-    let list = sql[close + 1..from_at].trim();
+    // `DISTINCT ON (keys)`, or a plain `DISTINCT` (`keys_text` None).
+    let (keys_text, list_at) = match strip_word(after_distinct, "ON") {
+        Some(on) if on.starts_with('(') => {
+            let open = sql.len() - on.len();
+            let close = crate::core::rql::expr::matching_paren(sql, open)?;
+            (Some(&sql[open + 1..close]), close + 1)
+        }
+        Some(_) => return None,
+        None => (None, sql.len() - after_distinct.len()),
+    };
+    let from_at = find_keyword(sql, "FROM", list_at)?;
+    let list = sql[list_at..from_at].trim();
 
     // A set operation or a row lock is not one select's rows.
     for word in ["UNION", "INTERSECT", "EXCEPT", "FOR"] {
@@ -355,8 +363,36 @@ fn rewrite_select(sql: &str) -> Option<String> {
     let order_text = order_at.filter(|&at| at < tail_at).map(|_| &sql[after_order..tail_at]);
     let tail = sql[tail_at..].trim();
 
-    // Only what the native path refuses: a join (or a comma list) in FROM, a
-    // GROUP BY or HAVING, an aggregate or a window function.
+    // Only what the native path refuses. A plain DISTINCT: a sort term
+    // placing NULLs where its direction does not (`ASC NULLS FIRST`, `DESC
+    // NULLS LAST`), which the scan's byte sort cannot do; the rows are made
+    // distinct inside and sorted outside, which is PostgreSQL's order.
+    let Some(keys_text) = keys_text else {
+        let order_terms: Vec<(String, String)> = match order_text {
+            Some(text) => crate::core::rql::lexer_ct::split_definitions(text)
+                .iter()
+                .map(|raw| sort_term(raw).map(|(e, m)| (e.to_string(), m)))
+                .collect::<Option<_>>()?,
+            None => return None,
+        };
+        if !order_terms.iter().any(|(_, m)| m == " NULLS FIRST" || m == " DESC NULLS LAST") {
+            return None;
+        }
+        let mut columns = select_columns(list)?;
+        let mut order = Vec::new();
+        for (expr, modifiers) in &order_terms {
+            order.push(format!("{}{modifiers}", columns.resolve(expr)?));
+        }
+        // PostgreSQL's rule: a DISTINCT's sort terms are in its select list.
+        // One that is not is left to the native refusal.
+        if !columns.extra.is_empty() {
+            return None;
+        }
+        return Some(assemble("SELECT DISTINCT", "SELECT", &columns, body, &order, tail));
+    };
+
+    // DISTINCT ON: a join (or a comma list) in FROM, a GROUP BY or HAVING,
+    // an aggregate or a window function.
     let source_end = ["WHERE", "GROUP", "HAVING", "WINDOW"]
         .iter()
         .filter_map(|w| find_keyword(body, w, 0))
@@ -374,28 +410,7 @@ fn rewrite_select(sql: &str) -> Option<String> {
         return None;
     }
 
-    let mut columns = Columns { items: Vec::new(), extra: Vec::new() };
-    for raw in crate::core::rql::lexer_ct::split_definitions(list) {
-        let raw = raw.trim();
-        if raw.is_empty() || raw == "*" || raw.ends_with(".*") {
-            return None;
-        }
-        let (expr, alias) = split_as(raw);
-        let (label, name, quoted) = match alias {
-            Some(alias) => {
-                let (name, quoted) = as_identifier(alias)?;
-                (alias.to_string(), name.to_string(), quoted)
-            }
-            None => {
-                let name = figure_name(expr);
-                (format!("\"{name}\""), name, false)
-            }
-        };
-        columns.items.push(Item { expr: expr.to_string(), label, name, quoted });
-    }
-    if columns.items.is_empty() {
-        return None;
-    }
+    let mut columns = select_columns(list)?;
 
     let mut keys = Vec::new();
     for key in crate::core::rql::lexer_ct::split_definitions(keys_text) {
@@ -415,19 +430,43 @@ fn rewrite_select(sql: &str) -> Option<String> {
             order.push(format!("{column}{modifiers}"));
         }
     }
+    Some(assemble("SELECT", &format!("SELECT DISTINCT ON ({})", keys.join(", ")), &columns, body, &order, tail))
+}
 
+/// The select list's items, each with its output name; `None` for a `*`.
+fn select_columns(list: &str) -> Option<Columns> {
+    let mut columns = Columns { items: Vec::new(), extra: Vec::new() };
+    for raw in crate::core::rql::lexer_ct::split_definitions(list) {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "*" || raw.ends_with(".*") {
+            return None;
+        }
+        let (expr, alias) = split_as(raw);
+        let (label, name, quoted) = match alias {
+            Some(alias) => {
+                let (name, quoted) = as_identifier(alias)?;
+                (alias.to_string(), name.to_string(), quoted)
+            }
+            None => {
+                let name = figure_name(expr);
+                (format!("\"{name}\""), name, false)
+            }
+        };
+        columns.items.push(Item { expr: expr.to_string(), label, name, quoted });
+    }
+    (!columns.items.is_empty()).then_some(columns)
+}
+
+/// `<outer_head> <outer items> FROM (<inner_head> <inner items> <body>) __don
+/// [ORDER BY …] [tail]`.
+fn assemble(inner_head: &str, outer_head: &str, columns: &Columns, body: &str, order: &[String], tail: &str) -> String {
     let mut inner: Vec<String> =
         columns.items.iter().enumerate().map(|(i, item)| format!("{} AS __don_c{i}", item.expr)).collect();
     inner.extend(columns.extra.iter().enumerate().map(|(j, (_, text))| format!("{text} AS __don_k{j}")));
     let outer: Vec<String> =
         columns.items.iter().enumerate().map(|(i, item)| format!("__don_c{i} AS {}", item.label)).collect();
-    let mut out = format!(
-        "SELECT DISTINCT ON ({}) {} FROM (SELECT {} {}) __don",
-        keys.join(", "),
-        outer.join(", "),
-        inner.join(", "),
-        body.trim()
-    );
+    let mut out =
+        format!("{outer_head} {} FROM ({inner_head} {} {}) __don", outer.join(", "), inner.join(", "), body.trim());
     if !order.is_empty() {
         out.push_str(" ORDER BY ");
         out.push_str(&order.join(", "));
@@ -436,7 +475,7 @@ fn rewrite_select(sql: &str) -> Option<String> {
         out.push(' ');
         out.push_str(tail);
     }
-    Some(out)
+    out
 }
 
 #[cfg(test)]
@@ -509,6 +548,26 @@ mod tests {
         assert_eq!(sort_term("CASE WHEN a THEN 1 ELSE 2 END"), Some(("CASE WHEN a THEN 1 ELSE 2 END", "".into())));
         assert_eq!(sort_term("x || 'DESC'"), Some(("x || 'DESC'", "".into())));
         assert_eq!(sort_term("lastname"), Some(("lastname", "".into())));
+    }
+
+    #[test]
+    fn a_distinct_placing_nulls_against_its_direction_sorts_outside() {
+        assert_eq!(
+            rw("SELECT DISTINCT n, t AS tee FROM x ORDER BY n NULLS FIRST, tee DESC LIMIT 2").unwrap(),
+            "SELECT __don_c0 AS \"n\", __don_c1 AS tee FROM (SELECT DISTINCT n AS __don_c0, t AS __don_c1 FROM x) __don \
+             ORDER BY __don_c0 NULLS FIRST, __don_c1 DESC LIMIT 2"
+        );
+        // The default placement, no placement, and a term outside the select
+        // list (PostgreSQL refuses it) stay native.
+        for sql in [
+            "SELECT DISTINCT n FROM x ORDER BY n NULLS LAST",
+            "SELECT DISTINCT n FROM x ORDER BY n DESC NULLS FIRST",
+            "SELECT DISTINCT n FROM x ORDER BY n",
+            "SELECT DISTINCT n FROM x",
+            "SELECT DISTINCT n FROM x ORDER BY m NULLS FIRST",
+        ] {
+            assert_eq!(rw(sql), None, "{sql}");
+        }
     }
 
     #[test]

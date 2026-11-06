@@ -1270,7 +1270,10 @@ fn resolve_order_spec(
         // This spec sorts inside the scan, which compares stored bytes and
         // cannot place NULLs; a placement it cannot honour is refused rather
         // than quietly dropped. (The expression-sort path handles it.)
-        if term.nulls_first.is_some() {
+        // The scan's placement is PostgreSQL's default (NULLs last ascending,
+        // first descending), so spelling that default out is accepted; the
+        // other placement is rewritten at the wire (`distinct_on`).
+        if term.nulls_first.is_some_and(|first| first != term.descending) {
             return Err(
                 "ORDER BY ... NULLS FIRST/LAST is not supported in this position yet".to_string(),
             );

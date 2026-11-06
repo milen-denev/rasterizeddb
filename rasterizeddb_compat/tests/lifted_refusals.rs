@@ -230,3 +230,39 @@ async fn date_part_with_a_field_from_the_row_matches_postgresql() {
     }
 }
 
+/// `SELECT DISTINCT … ORDER BY … NULLS FIRST/LAST`, every placement, with
+/// ordinals, an alias, an expression, LIMIT and OFFSET: answered as
+/// PostgreSQL 17 answers it. Any placement was refused under DISTINCT ("not
+/// supported in this position yet"); the default one is the scan's own, the
+/// other is sorted outside a derived table (`core::rql::distinct_on`).
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_with_a_nulls_placement_matches_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE dn (id INT PRIMARY KEY, n NUMERIC, i INT, t TEXT)",
+        "INSERT INTO dn VALUES (1, 0, 0, 'z'), (2, NULL, NULL, NULL), (3, 0.00, 0, 'z'), (4, 1, 1, 'a'), (5, -1, -1, 'b'), (6, NULL, 7, 'b')",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT DISTINCT n FROM dn ORDER BY n NULLS LAST", &["-1", "0", "1", "NULL"]),
+        ("SELECT DISTINCT n FROM dn ORDER BY n NULLS FIRST", &["NULL", "-1", "0", "1"]),
+        ("SELECT DISTINCT n FROM dn ORDER BY n DESC NULLS FIRST", &["NULL", "1", "0", "-1"]),
+        ("SELECT DISTINCT n FROM dn ORDER BY n DESC NULLS LAST", &["1", "0", "-1", "NULL"]),
+        ("SELECT DISTINCT i, t FROM dn ORDER BY t NULLS FIRST, i DESC", &["NULL|NULL", "1|a", "7|b", "-1|b", "0|z"]),
+        ("SELECT DISTINCT i, t FROM dn ORDER BY 2 DESC NULLS LAST, 1 LIMIT 3", &["0|z", "-1|b", "7|b"]),
+        ("SELECT DISTINCT i, t FROM dn ORDER BY 2 DESC NULLS LAST, 1 OFFSET 2", &["7|b", "1|a", "NULL|NULL"]),
+        ("SELECT DISTINCT t AS label FROM dn ORDER BY label NULLS FIRST", &["NULL", "a", "b", "z"]),
+        ("SELECT DISTINCT n FROM dn WHERE id > 1 ORDER BY n NULLS FIRST", &["NULL", "-1", "0.00", "1"]),
+        ("SELECT DISTINCT i * 2 FROM dn ORDER BY i * 2 NULLS FIRST", &["NULL", "-2", "0", "2", "14"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    // A sort key outside a DISTINCT's select list: refused, as PostgreSQL
+    // refuses it.
+    let sql = "SELECT DISTINCT n FROM dn ORDER BY i NULLS FIRST";
+    assert!(c.simple_query(sql).await.is_err(), "{sql}");
+}
