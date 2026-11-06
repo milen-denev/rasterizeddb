@@ -166,9 +166,11 @@ pub fn parse_interval(text: &str) -> Option<Interval> {
             None => (token, None),
         };
         let value: f64 = number.parse().ok()?;
+        // A number with nothing after it is seconds, as PostgreSQL reads
+        // `'0'`, `'5'` or `'1 day 5'`; it was refused as invalid input.
         let unit = match inline_unit {
             Some(u) => u.to_string(),
-            None => tokens.next()?.to_string(),
+            None => tokens.next().unwrap_or("seconds").to_string(),
         };
         apply_unit(&mut out, value, unit.trim_end_matches(','))?;
         seen_any = true;

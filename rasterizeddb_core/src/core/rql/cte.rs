@@ -166,6 +166,38 @@ fn item_label(item: &str) -> Option<String> {
     }
 }
 
+/// A select list past a leading `DISTINCT`, `DISTINCT ON (…)` or `ALL`,
+/// which belong to the statement and not to its first item: `SELECT DISTINCT
+/// a` names its column `a`, as PostgreSQL does. Read as part of the item, the
+/// first column was `DISTINCT a`, which names nothing, and a derived table or
+/// a `WITH` over it was refused as having "a column this cannot name".
+fn without_set_quantifier(list: &str) -> &str {
+    let trimmed = list.trim_start();
+    let word = |w: &str| {
+        trimmed.len() > w.len()
+            && trimmed[..w.len()].eq_ignore_ascii_case(w)
+            && !trimmed.as_bytes()[w.len()].is_ascii_alphanumeric()
+            && trimmed.as_bytes()[w.len()] != b'_'
+    };
+    if word("ALL") {
+        return &trimmed[3..];
+    }
+    if !word("DISTINCT") {
+        return list;
+    }
+    let rest = trimmed["DISTINCT".len()..].trim_start();
+    let on = rest.len() > 2
+        && rest[..2].eq_ignore_ascii_case("ON")
+        && rest[2..].trim_start().starts_with('(');
+    if on {
+        let open = rest.len() - rest[2..].trim_start().len();
+        if let Some(close) = crate::core::rql::expr::matching_paren(rest, open) {
+            return &rest[close + 1..];
+        }
+    }
+    rest
+}
+
 /// One select-list item as its expression and its ` AS name` alias, if it has
 /// one at the top level.
 fn split_alias(item: &str) -> (&str, Option<&str>) {
@@ -338,7 +370,7 @@ pub(crate) fn constant_body(body: &str) -> Option<Vec<ConstantColumn>> {
 /// which expands the star the way the outer statement's describe will:
 /// `WITH x AS (SELECT * FROM t)` was refused as "a column this cannot name".
 async fn select_labels(query: &str, database: &Arc<Database>) -> Option<Vec<String>> {
-    let list = select_list_of(query)?;
+    let list = without_set_quantifier(select_list_of(query)?);
     let items = crate::core::rql::lexer_ct::split_definitions(list);
     if let Some(labels) = items
         .iter()

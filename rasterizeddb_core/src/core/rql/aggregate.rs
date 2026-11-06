@@ -29,6 +29,15 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp` and
+    /// `var_pop`: each its own variant so the column is labelled as written,
+    /// as PostgreSQL labels it. [`AggFunc::moments`] says which they are.
+    Stddev,
+    StddevSamp,
+    StddevPop,
+    Variance,
+    VarSamp,
+    VarPop,
 }
 
 impl AggFunc {
@@ -39,6 +48,24 @@ impl AggFunc {
             "MIN" => AggFunc::Min,
             "MAX" => AggFunc::Max,
             "AVG" => AggFunc::Avg,
+            "STDDEV" => AggFunc::Stddev,
+            "STDDEV_SAMP" => AggFunc::StddevSamp,
+            "STDDEV_POP" => AggFunc::StddevPop,
+            "VARIANCE" => AggFunc::Variance,
+            "VAR_SAMP" => AggFunc::VarSamp,
+            "VAR_POP" => AggFunc::VarPop,
+            _ => return None,
+        })
+    }
+
+    /// For the dispersion aggregates, `(variance, sample)`: a variance rather
+    /// than its square root, divided by `n - 1` rather than `n`.
+    pub fn moments(&self) -> Option<(bool, bool)> {
+        Some(match self {
+            AggFunc::Stddev | AggFunc::StddevSamp => (false, true),
+            AggFunc::StddevPop => (false, false),
+            AggFunc::Variance | AggFunc::VarSamp => (true, true),
+            AggFunc::VarPop => (true, false),
             _ => return None,
         })
     }
@@ -50,6 +77,38 @@ impl AggFunc {
         if matches!(self, AggFunc::Sum | AggFunc::Avg) && arg.is_some_and(|f| f.db_type == DbType::CHAR) {
             return Err(format!("function {}(character) does not exist", self.name()));
         }
+        // The dispersion aggregates exist for numbers only.
+        if self.moments().is_some() {
+            if let Some(f) = arg {
+                let number = matches!(
+                    f.db_type,
+                    DbType::I8
+                        | DbType::I16
+                        | DbType::I32
+                        | DbType::I64
+                        | DbType::I128
+                        | DbType::U8
+                        | DbType::U16
+                        | DbType::U32
+                        | DbType::U64
+                        | DbType::U128
+                        | DbType::DECIMAL
+                        | DbType::F32
+                        | DbType::F64
+                );
+                if !number {
+                    let name = match f.db_type {
+                        DbType::STRING => "text".to_string(),
+                        DbType::BOOL => "boolean".to_string(),
+                        DbType::DATETIME if f.without_time_zone => "timestamp without time zone".to_string(),
+                        DbType::DATETIME => "timestamp with time zone".to_string(),
+                        DbType::TIMESTAMP => "timestamp without time zone".to_string(),
+                        ref t => t.to_string().to_lowercase(),
+                    };
+                    return Err(format!("function {}({}) does not exist", self.name(), name));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -60,6 +119,12 @@ impl AggFunc {
             AggFunc::Min => "min",
             AggFunc::Max => "max",
             AggFunc::Avg => "avg",
+            AggFunc::Stddev => "stddev",
+            AggFunc::StddevSamp => "stddev_samp",
+            AggFunc::StddevPop => "stddev_pop",
+            AggFunc::Variance => "variance",
+            AggFunc::VarSamp => "var_samp",
+            AggFunc::VarPop => "var_pop",
         }
     }
 
@@ -97,7 +162,14 @@ impl AggFunc {
                 // `COUNT(*)`'s shape; a `SUM` always has an argument.
                 None => DbType::I64,
             },
-            AggFunc::Avg => match arg {
+            // `double precision` over a float, `numeric` over anything exact.
+            AggFunc::Avg
+            | AggFunc::Stddev
+            | AggFunc::StddevSamp
+            | AggFunc::StddevPop
+            | AggFunc::Variance
+            | AggFunc::VarSamp
+            | AggFunc::VarPop => match arg {
                 Some(DbType::F32) | Some(DbType::F64) => DbType::F64,
                 _ => DbType::DECIMAL,
             },
@@ -134,6 +206,8 @@ impl AggFunc {
         };
         match self {
             AggFunc::Avg => declared.max(AVG_SCALE),
+            // Their cells carry their own display scale (`Acc::Moments`).
+            f if f.moments().is_some() => declared.max(AVG_SCALE),
             _ => declared,
         }
     }
@@ -819,6 +893,27 @@ pub(crate) enum Acc {
         total: f64,
         n: i64,
     },
+    /// `stddev`/`variance` over exact values, as PostgreSQL's
+    /// `NumericAggState`: the count, sum and sum of squares, exactly. `sum`
+    /// stands at `scale` places (the most any value had) and `sum_sq` at
+    /// twice that.
+    Moments {
+        n: i64,
+        sum: i128,
+        sum_sq: i128,
+        scale: u32,
+        /// The argument's declared scale; `None` for an unconstrained NUMERIC,
+        /// whose sixteen-byte cells are at the engine's nine places.
+        declared: Option<u32>,
+        overflow: bool,
+    },
+    /// `stddev`/`variance` over floats, as PostgreSQL's `float8_accum`
+    /// (Youngs–Cramer): the count, sum and sum of squared deviations.
+    FloatMoments {
+        n: f64,
+        sx: f64,
+        sxx: f64,
+    },
     /// `MIN`/`MAX` keep the winning value's raw bytes, so the result has the
     /// argument's own type without a decode/encode round trip.
     Extreme {
@@ -875,6 +970,25 @@ impl Acc {
                 best: None,
                 ty: arg.map(|f| f.db_type.clone()).unwrap_or(DbType::I64),
                 want_max: func == AggFunc::Max,
+            },
+            AggFunc::Stddev
+            | AggFunc::StddevSamp
+            | AggFunc::StddevPop
+            | AggFunc::Variance
+            | AggFunc::VarSamp
+            | AggFunc::VarPop => match arg.map(|a| &a.db_type) {
+                Some(DbType::F32) | Some(DbType::F64) => Acc::FloatMoments { n: 0.0, sx: 0.0, sxx: 0.0 },
+                other => Acc::Moments {
+                    n: 0,
+                    sum: 0,
+                    sum_sq: 0,
+                    scale: 0,
+                    declared: match other {
+                        Some(DbType::DECIMAL) => arg.and_then(|a| a.scale),
+                        _ => Some(0),
+                    },
+                    overflow: false,
+                },
             },
             AggFunc::Sum | AggFunc::Avg => match arg.map(|f| &f.db_type) {
                 Some(DbType::F32) | Some(DbType::F64) => Acc::FloatSum { total: 0.0, n: 0 },
@@ -1033,6 +1147,50 @@ impl Acc {
                     *n += 1;
                 }
             }
+            Acc::Moments { n, sum, sum_sq, scale, declared, overflow } => {
+                let (Some(b), Some(t)) = (bytes, ty) else {
+                    return;
+                };
+                let Some(v) = moment_value(b, t, *declared) else { return };
+                // Both sums lifted to the most places seen, then the value
+                // added at them; checked, as a wrapped sum is a number.
+                if v.s > *scale {
+                    let d = v.s - *scale;
+                    match (
+                        10i128.checked_pow(d).and_then(|p| sum.checked_mul(p)),
+                        10i128.checked_pow(2 * d).and_then(|p| sum_sq.checked_mul(p)),
+                    ) {
+                        (Some(a), Some(b)) => (*sum, *sum_sq) = (a, b),
+                        _ => *overflow = true,
+                    }
+                    *scale = v.s;
+                }
+                match 10i128.checked_pow(*scale - v.s).and_then(|p| v.m.checked_mul(p)) {
+                    Some(x) => match (sum.checked_add(x), x.checked_mul(x).and_then(|x2| sum_sq.checked_add(x2))) {
+                        (Some(a), Some(b)) => (*sum, *sum_sq) = (a, b),
+                        _ => *overflow = true,
+                    },
+                    None => *overflow = true,
+                }
+                *n += 1;
+            }
+            Acc::FloatMoments { n, sx, sxx } => {
+                let (Some(b), Some(t)) = (bytes, ty) else {
+                    return;
+                };
+                if let Some(v) = decode_float(b, t) {
+                    // `float8_accum`, step for step, so the last bits agree.
+                    let before = *n;
+                    *n += 1.0;
+                    *sx += v;
+                    if before > 0.0 {
+                        let tmp = v * *n - *sx;
+                        *sxx += tmp * tmp / (*n * before);
+                    } else {
+                        *sxx = 0.0;
+                    }
+                }
+            }
             Acc::Extreme {
                 best,
                 ty: acc_ty,
@@ -1085,6 +1243,40 @@ impl Acc {
         }
         match (self, other) {
             (Acc::Count(a), Acc::Count(b)) => *a += *b,
+            (
+                Acc::Moments { n, sum, sum_sq, scale, overflow, .. },
+                Acc::Moments { n: n2, sum: sum2, sum_sq: sq2, scale: s2, overflow: o2, .. },
+            ) => {
+                let lift = |v: i128, d: u32| 10i128.checked_pow(d).and_then(|p| v.checked_mul(p));
+                let to = (*scale).max(*s2);
+                let mine = lift(*sum, to - *scale).zip(lift(*sum_sq, 2 * (to - *scale)));
+                let theirs = lift(*sum2, to - *s2).zip(lift(*sq2, 2 * (to - *s2)));
+                match (mine, theirs) {
+                    (Some((a, a2)), Some((b, b2))) => match (a.checked_add(b), a2.checked_add(b2)) {
+                        (Some(x), Some(x2)) => (*sum, *sum_sq) = (x, x2),
+                        _ => *overflow = true,
+                    },
+                    _ => *overflow = true,
+                }
+                *scale = to;
+                *n += *n2;
+                *overflow |= *o2;
+            }
+            // `float8_combine`.
+            (Acc::FloatMoments { n, sx, sxx }, Acc::FloatMoments { n: n2, sx: sx2, sxx: sxx2 }) => {
+                if *n2 == 0.0 {
+                    return;
+                }
+                if *n == 0.0 {
+                    (*n, *sx, *sxx) = (*n2, *sx2, *sxx2);
+                    return;
+                }
+                let total = *n + *n2;
+                let tmp = *sx / *n - *sx2 / *n2;
+                *sxx = *sxx + *sxx2 + *n * *n2 * tmp * tmp / total;
+                *sx += *sx2;
+                *n = total;
+            }
             (
                 Acc::ExactSum {
                     total,
@@ -1175,6 +1367,9 @@ impl Acc {
         if let Some(resolved) = self.resolve() {
             return resolved.finish_nullable(func, result_type);
         }
+        if let Some((variance, sample)) = func.moments() {
+            return self.finish_moments(variance, sample);
+        }
         match self {
             Acc::Extreme { best: None, .. } => Ok(None),
             // SUM and AVG over no rows at all are NULL in SQL; COUNT is not.
@@ -1184,6 +1379,46 @@ impl Acc {
                 Ok(None)
             }
             _ => self.finish(func, result_type).map(Some),
+        }
+    }
+
+    /// `stddev`/`variance`, as PostgreSQL's `numeric_stddev_internal` and
+    /// `float8_var_*`/`float8_stddev_*`: NULL over no rows, and for a sample
+    /// over one. The exact answer is a cell carrying its display scale:
+    /// `(n·Σx² − (Σx)²) / (n(n−1))` at `select_div_scale`'s places (0 when
+    /// the numerator is not positive), its square root at the same places.
+    fn finish_moments(&self, variance: bool, sample: bool) -> Result<Option<Vec<u8>>, String> {
+        use crate::core::rql::pg_numeric::PgNum;
+        match self {
+            Acc::Moments { n, sum, sum_sq, scale, overflow, .. } => {
+                if *overflow {
+                    return Err(out_of_range(&DbType::DECIMAL));
+                }
+                if *n == 0 || (sample && *n == 1) {
+                    return Ok(None);
+                }
+                let past = || crate::core::rql::expr::PAST_38_DIGITS.to_string();
+                let x = PgNum::new(*sum, *scale).ok_or_else(past)?;
+                let x2 = PgNum::new(*sum_sq, 2 * *scale).ok_or_else(past)?;
+                let n_num = PgNum::int(*n as i128);
+                let numerator = n_num.mul(x2).and_then(|nx2| x.mul(x).and_then(|xx| nx2.sub(xx))).ok_or_else(past)?;
+                if numerator.m <= 0 {
+                    return Ok(Some(crate::core::value_codec::decimal_cell_with_scale(0, 0)));
+                }
+                let pairs = if sample { (*n as i128) * (*n as i128 - 1) } else { (*n as i128) * (*n as i128) };
+                let var = numerator.div(PgNum::int(pairs)).map_err(str::to_string)?.ok_or_else(past)?;
+                let value = if variance { var } else { var.sqrt_at(var.s).ok_or_else(past)? };
+                Ok(Some(crate::core::value_codec::decimal_cell_with_scale(value.m, value.s)))
+            }
+            Acc::FloatMoments { n, sxx, .. } => {
+                if *n == 0.0 || (sample && *n <= 1.0) {
+                    return Ok(None);
+                }
+                let var = *sxx / if sample { *n - 1.0 } else { *n };
+                let value = if variance { var } else { var.sqrt() };
+                Ok(Some(value.to_le_bytes().to_vec()))
+            }
+            _ => Err("a dispersion aggregate reached the wrong accumulator".to_string()),
         }
     }
 
@@ -1267,6 +1502,10 @@ impl Acc {
         Ok(match self {
             // Resolved into its function's accumulator before this match.
             Acc::Distinct { .. } => return Err("a DISTINCT aggregate reached finish unresolved".to_string()),
+            // Finished by `finish_moments`, which `finish_nullable` takes first.
+            Acc::Moments { .. } | Acc::FloatMoments { .. } => {
+                return Err("a dispersion aggregate reached finish".to_string());
+            }
             Acc::Count(n) => n.to_le_bytes().to_vec(),
             Acc::ExactSum {
                 total,
@@ -1454,6 +1693,26 @@ fn out_of_range(ty: &DbType) -> String {
 /// An exact value as a signed 128-bit integer. `U128` above `i128::MAX` has
 /// none, and is `None` here rather than the negative number `as i128` makes of
 /// it — callers that must order or total such a value handle `U128` first.
+/// One input of an exact `stddev`/`variance` as the value it is, at its
+/// display scale: a NUMERIC cell at its own or declared scale (an
+/// unconstrained one with the places it needs), an integer at none.
+fn moment_value(bytes: &[u8], ty: &DbType, declared: Option<u32>) -> Option<crate::core::rql::pg_numeric::PgNum> {
+    use crate::core::rql::pg_numeric::PgNum;
+    match ty {
+        DbType::DECIMAL => match crate::core::value_codec::split_decimal_cell(bytes)? {
+            (m, Some(own)) => PgNum::new(m, own),
+            (m, None) => match declared {
+                Some(s) => PgNum::new(m, s),
+                None => Some(PgNum::trimmed(m, DECIMAL_SCALE)),
+            },
+        },
+        DbType::U128 if bytes.len() == 16 => {
+            i128::try_from(u128::from_le_bytes(bytes.try_into().ok()?)).ok().map(PgNum::int)
+        }
+        _ => decode_exact(bytes, ty).map(PgNum::int),
+    }
+}
+
 fn decode_exact(bytes: &[u8], ty: &DbType) -> Option<i128> {
     fn le<const N: usize>(b: &[u8]) -> Option<[u8; N]> {
         if b.len() != N {
@@ -2010,12 +2269,29 @@ impl<'p> Folder<'p> {
                                         Some(canonical.as_deref().unwrap_or(&bytes)),
                                         *document && db_type == DbType::JSONB,
                                     );
-                                    // What the group shows is the value as it is.
-                                    if let (Some(_), Some(plain)) = (canonical, plain.as_deref_mut()) {
-                                        let n = plain.len() - 4 - bytes.len();
+                                    let pushed = canonical.as_deref().unwrap_or(&bytes).len();
+                                    // What the group shows is the value as it is,
+                                    // and a NUMERIC at its expression's display
+                                    // scale, in a cell carrying it: evaluated at
+                                    // the engine's nine places, `EXTRACT(DOW FROM
+                                    // ts)` showed 5.000000000 where PostgreSQL
+                                    // shows 5. The key itself stays as it was.
+                                    let shown = if db_type == DbType::DECIMAL && bytes.len() == 16 {
+                                        crate::core::rql::expr::display_scale(&k.expr)
+                                            .filter(|s| *s != DECIMAL_SCALE)
+                                            .and_then(|s| {
+                                                let m = i128::from_le_bytes(bytes.as_slice().try_into().ok()?);
+                                                let v = crate::core::rql::pg_numeric::PgNum::new(m, DECIMAL_SCALE)?.round_to(s)?;
+                                                Some(crate::core::value_codec::decimal_cell_with_scale(v.m, v.s))
+                                            })
+                                    } else {
+                                        canonical.as_ref().map(|_| bytes.clone())
+                                    };
+                                    if let (Some(shown), Some(plain)) = (shown, plain.as_deref_mut()) {
+                                        let n = plain.len() - 4 - pushed;
                                         plain.truncate(n);
-                                        plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                                        plain.extend_from_slice(&bytes);
+                                        plain.extend_from_slice(&(shown.len() as u32).to_le_bytes());
+                                        plain.extend_from_slice(&shown);
                                     }
                                 }
                             }

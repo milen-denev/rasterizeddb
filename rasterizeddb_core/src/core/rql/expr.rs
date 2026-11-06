@@ -429,6 +429,13 @@ pub enum TextFunc {
     /// float alone becomes `double precision` rounded half to even (`rint`).
     /// `places` is a constant, held as an `I32` literal (or `Expr::Null`).
     Round,
+    /// `EXTRACT(field FROM x)` for a field other than `EPOCH`: a `numeric`,
+    /// as PostgreSQL 14 and later return it, at the field's display scale
+    /// (six places for `SECOND`, three for `MILLISECONDS`, none otherwise).
+    /// The field is a canonical name ([`date_field`]) in an argument literal.
+    ExtractField,
+    /// `date_part('field', x)`: the same fields as a `double precision`.
+    DatePart,
     /// `btrim` / `ltrim` / `rtrim(text [, characters])`: the characters
     /// (a space when none are given) taken off both ends, the start or the end.
     Btrim,
@@ -886,7 +893,7 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
 pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
-    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
 ];
 
@@ -1224,13 +1231,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     })?;
                 let field = inner[..at].trim().trim_matches('\'').to_ascii_uppercase();
                 let source = parse(inner[at + "FROM".len()..].trim(), schema)?;
+                // `EPOCH` keeps the `double precision` this engine has always
+                // answered it with; the calendar fields are PostgreSQL's
+                // `numeric` (`TextFunc::ExtractField`).
                 if field != "EPOCH" {
-                    // Refused by name rather than approximated: the calendar
-                    // fields need a civil-date decomposition this does not have,
-                    // and a plausible wrong number is worse than a refusal.
-                    return Err(format!(
-                        "EXTRACT({} FROM …) is not supported yet; only EPOCH is",
-                        field
+                    let canonical = date_field(&field)?;
+                    date_field_applies(canonical, &static_type(&source), true)?;
+                    return Ok(Expr::Call(
+                        TextFunc::ExtractField,
+                        vec![Expr::Literal { bytes: canonical.as_bytes().to_vec(), db_type: DbType::STRING }, source],
                     ));
                 }
                 return Ok(Expr::Call(
@@ -1335,6 +1344,19 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("date_trunc takes a unit and a timestamp".to_string());
                     }
                     Ok(Expr::Call(TextFunc::DateTrunc, args))
+                }
+                "DATE_PART" => {
+                    if args.len() != 2 {
+                        return Err("date_part takes a field and a timestamp, date or interval".to_string());
+                    }
+                    let Expr::Literal { bytes, db_type: DbType::STRING } = &args[0] else {
+                        return Err("date_part reads its field from a constant here, as in date_part('year', ts)".to_string());
+                    };
+                    let canonical = date_field(&String::from_utf8_lossy(bytes).to_ascii_uppercase())?;
+                    date_field_applies(canonical, &static_type(&args[1]), false)?;
+                    let mut args = args;
+                    args[0] = Expr::Literal { bytes: canonical.as_bytes().to_vec(), db_type: DbType::STRING };
+                    Ok(Expr::Call(TextFunc::DatePart, args))
                 }
                 "REPLACE" => {
                     if args.len() != 3 {
@@ -2362,6 +2384,8 @@ pub fn static_type(expr: &Expr) -> DbType {
         // before it moved to `numeric`, and what every driver decodes without a
         // decimal type.
         Expr::Call(TextFunc::Extract, _) => DbType::F64,
+        Expr::Call(TextFunc::ExtractField, _) => DbType::DECIMAL,
+        Expr::Call(TextFunc::DatePart, _) => DbType::F64,
         Expr::Call(TextFunc::UuidExtractTimestamp, _) => DbType::DATETIME,
         Expr::Call(TextFunc::UuidExtractVersion, _) => DbType::I16,
         // `integer`, as PostgreSQL's length family returns.
@@ -2507,6 +2531,7 @@ pub fn display_scale(expr: &Expr) -> Option<u32> {
         }
         Expr::Arith(..) if integer(&static_type(expr)) => Some(0),
         Expr::Call(TextFunc::Abs, args) => args.first().and_then(display_scale),
+        Expr::Call(TextFunc::ExtractField, args) => args.first().and_then(field_literal).map(field_scale),
         Expr::Call(TextFunc::Round, args) if static_type(expr) == DbType::DECIMAL => match args.get(1) {
             None => Some(0),
             Some(places) => round_places(places).map(|p| p.max(0) as u32).filter(|s| *s <= DECIMAL_SCALE),
@@ -3226,6 +3251,17 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                         db_type: ty,
                     }
                 }
+            }
+        }
+        TextFunc::ExtractField | TextFunc::DatePart => {
+            let field = date_field(&as_text(&args[0]))?;
+            match date_field_value(field, &args[1])? {
+                None => Value::Null,
+                Some(v) if func == TextFunc::ExtractField => pgnum_as_decimal_value(v),
+                Some(v) => Value::Data {
+                    bytes: (v.m as f64 / 10f64.powi(v.s as i32)).to_le_bytes().to_vec(),
+                    db_type: DbType::F64,
+                },
             }
         }
         TextFunc::Round => {
@@ -4417,6 +4453,10 @@ pub(crate) fn pg_numeric(
             Some(Some(v)) => v.abs().map(Some),
             other => other,
         },
+        Expr::Call(TextFunc::ExtractField, args) if args.len() == 2 => {
+            let field = args.first().and_then(field_literal).ok_or("EXTRACT lost its field")?;
+            Some(date_field_value(field, &eval(&args[1], row, schema)?)?)
+        }
         Expr::Call(TextFunc::Round, args) if static_type(expr) == DbType::DECIMAL => {
             let places = match args.get(1) {
                 None => Some(0),
@@ -5672,6 +5712,146 @@ fn is_integer_type(t: &DbType) -> bool {
         t,
         DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
     )
+}
+
+/// A date/time field's canonical name, from any spelling PostgreSQL takes
+/// for it (upper case): `YEARS`, `MILLISECOND`, … An unknown one is
+/// PostgreSQL's 22023.
+fn date_field(upper: &str) -> Result<&'static str, String> {
+    Ok(match upper.trim() {
+        "YEAR" | "YEARS" | "Y" | "YR" | "YRS" => "YEAR",
+        "MONTH" | "MONTHS" | "MON" | "MONS" => "MONTH",
+        "DAY" | "DAYS" | "D" => "DAY",
+        "HOUR" | "HOURS" | "H" | "HR" | "HRS" => "HOUR",
+        "MINUTE" | "MINUTES" | "M" | "MIN" | "MINS" => "MINUTE",
+        "SECOND" | "SECONDS" | "S" | "SEC" | "SECS" => "SECOND",
+        "MILLISECOND" | "MILLISECONDS" | "MS" | "MSEC" | "MSECS" | "MSECOND" | "MSECONDS" => "MILLISECONDS",
+        "MICROSECOND" | "MICROSECONDS" | "US" | "USEC" | "USECS" | "USECOND" | "USECONDS" => "MICROSECONDS",
+        "DOW" => "DOW",
+        "ISODOW" => "ISODOW",
+        "DOY" => "DOY",
+        "QUARTER" => "QUARTER",
+        "WEEK" => "WEEK",
+        "ISOYEAR" => "ISOYEAR",
+        "DECADE" | "DECADES" => "DECADE",
+        "CENTURY" | "CENTURIES" => "CENTURY",
+        "MILLENNIUM" | "MILLENNIA" | "MILLENNIUMS" => "MILLENNIUM",
+        "EPOCH" => "EPOCH",
+        other => {
+            return Err(format!("unit \"{}\" not recognized for type timestamp with time zone", other.to_lowercase()))
+        }
+    })
+}
+
+/// Whether `field` exists for a value of `ty`: an interval has no weekday or
+/// week, and `EXTRACT` refuses a time-of-day field of a date (PostgreSQL 14+;
+/// `date_part` reads the date as its midnight).
+fn date_field_applies(field: &str, ty: &DbType, extract: bool) -> Result<(), String> {
+    let time_of_day = matches!(field, "HOUR" | "MINUTE" | "SECOND" | "MILLISECONDS" | "MICROSECONDS");
+    match ty {
+        DbType::INTERVAL if matches!(field, "DOW" | "ISODOW" | "DOY" | "WEEK" | "ISOYEAR") => {
+            Err(format!("unit \"{}\" not supported for type interval", field.to_lowercase()))
+        }
+        DbType::DATE if extract && time_of_day => {
+            Err(format!("unit \"{}\" not supported for type date", field.to_lowercase()))
+        }
+        DbType::DATE | DbType::DATETIME | DbType::TIMESTAMP | DbType::INTERVAL | DbType::NULL => Ok(()),
+        other => Err(format!(
+            "function {}({}) does not exist",
+            if extract { "extract" } else { "date_part" },
+            match other {
+                DbType::STRING => "text".to_string(),
+                t => t.to_string().to_lowercase(),
+            }
+        )),
+    }
+}
+
+/// The canonical field an `ExtractField`/`DatePart` call holds.
+fn field_literal(arg: &Expr) -> Option<&'static str> {
+    match arg {
+        Expr::Literal { bytes, db_type: DbType::STRING } => date_field(&String::from_utf8_lossy(bytes)).ok(),
+        _ => None,
+    }
+}
+
+/// The display scale of `EXTRACT(field …)`'s `numeric`, as PostgreSQL 14+
+/// gives it.
+fn field_scale(field: &str) -> u32 {
+    match field {
+        "SECOND" | "EPOCH" => 6,
+        "MILLISECONDS" => 3,
+        _ => 0,
+    }
+}
+
+/// `field` of a timestamp, date (its midnight) or interval, exactly, at
+/// [`field_scale`]'s places; `None` for NULL. Timestamps are read in UTC,
+/// this engine's only time zone.
+fn date_field_value(field: &str, value: &Value) -> Result<Option<crate::core::rql::pg_numeric::PgNum>, String> {
+    use crate::core::rql::pg_numeric::PgNum;
+    let Value::Data { bytes, db_type } = value else {
+        return Ok(None);
+    };
+    let at = |m: i128| PgNum::new(m, field_scale(field)).ok_or_else(|| "a date field could not be read".to_string());
+    if *db_type == DbType::INTERVAL {
+        let span = crate::core::pg_types::decode_interval(bytes).ok_or("an interval could not be read")?;
+        let us = span.micros as i128;
+        let minute_us = 60_000_000i128;
+        return Ok(Some(match field {
+            "YEAR" => PgNum::int(span.months as i128 / 12),
+            "MONTH" => PgNum::int(span.months as i128 % 12),
+            "DAY" => PgNum::int(span.days as i128),
+            "HOUR" => PgNum::int(us / 3_600_000_000),
+            "MINUTE" => PgNum::int(us / minute_us % 60),
+            "SECOND" | "MILLISECONDS" => at(us % minute_us)?,
+            "MICROSECONDS" => PgNum::int(us % minute_us),
+            "QUARTER" => PgNum::int((span.months as i128 % 12) / 3 + 1),
+            "DECADE" => PgNum::int(span.months as i128 / 120),
+            "CENTURY" => PgNum::int(span.months as i128 / 1200),
+            "MILLENNIUM" => PgNum::int(span.months as i128 / 12000),
+            "EPOCH" => at(us + (span.days as i128 + span.months as i128 * 30) * 86_400_000_000)?,
+            other => return Err(format!("unit \"{}\" not supported for type interval", other.to_lowercase())),
+        }));
+    }
+    let us = match db_type {
+        DbType::DATE | DbType::DATETIME => instant_of(db_type, bytes),
+        _ if bytes.len() == 8 => Some(i64::from_le_bytes(bytes.as_slice().try_into().expect("eight bytes"))),
+        _ => None,
+    }
+    .ok_or("a timestamp could not be read")?;
+    let days = us.div_euclid(DAY_US);
+    let tod = us.rem_euclid(DAY_US) as i128;
+    let (y, m, d) = crate::core::value_codec::civil_from_days(days);
+    if y <= 0 && matches!(field, "YEAR" | "DECADE" | "CENTURY" | "MILLENNIUM" | "ISOYEAR") {
+        return Err(format!("EXTRACT({field}) of a year before 1 AD is not supported yet"));
+    }
+    let dow = (days + 4).rem_euclid(7) as i128;
+    let isodow = if dow == 0 { 7 } else { dow };
+    // The ISO week is the one holding this week's Thursday.
+    let thursday = days - (isodow as i64 - 1) + 3;
+    let (iso_year, _, _) = crate::core::value_codec::civil_from_days(thursday);
+    let minute_us = 60_000_000i128;
+    Ok(Some(match field {
+        "YEAR" => PgNum::int(y as i128),
+        "MONTH" => PgNum::int(m as i128),
+        "DAY" => PgNum::int(d as i128),
+        "HOUR" => PgNum::int(tod / 3_600_000_000),
+        "MINUTE" => PgNum::int(tod / minute_us % 60),
+        "SECOND" | "MILLISECONDS" => at(tod % minute_us)?,
+        "MICROSECONDS" => PgNum::int(tod % minute_us),
+        "DOW" => PgNum::int(dow),
+        "ISODOW" => PgNum::int(isodow),
+        "DOY" => PgNum::int((days - crate::core::value_codec::days_from_civil(y, 1, 1) + 1) as i128),
+        "QUARTER" => PgNum::int((m as i128 - 1) / 3 + 1),
+        "WEEK" => PgNum::int(((thursday - crate::core::value_codec::days_from_civil(iso_year, 1, 1)) / 7 + 1) as i128),
+        "ISOYEAR" => PgNum::int(iso_year as i128),
+        "DECADE" => PgNum::int(y as i128 / 10),
+        "CENTURY" => PgNum::int((y as i128 + 99) / 100),
+        "MILLENNIUM" => PgNum::int((y as i128 + 999) / 1000),
+        "EPOCH" => at(us as i128)?,
+        other => return Err(format!("unit \"{}\" not supported", other.to_lowercase())),
+    }))
 }
 
 /// `round`'s constant places, as its parse left them; `None` for NULL.

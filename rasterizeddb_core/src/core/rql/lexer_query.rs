@@ -501,6 +501,13 @@ fn parse_select_items(
         };
         let item = item_owned.as_deref().unwrap_or(item);
 
+        // `SELECT ALL a` is `SELECT a`: the default spelled out, which
+        // belongs to the statement and not to its first item ("Column 'ALL
+        // a' not found").
+        let item = match item.get(..4) {
+            Some(head) if head.eq_ignore_ascii_case("ALL ") && out.is_empty() => item[4..].trim_start(),
+            _ => item,
+        };
         let upper = item.to_ascii_uppercase();
         if upper.starts_with("DISTINCT ") || upper == "DISTINCT" {
             if starts_with_distinct_on(item["DISTINCT".len()..].trim_start()) {
@@ -633,14 +640,32 @@ fn parse_select_items(
         if crate::core::rql::expr::needs_evaluation(expr)
             || crate::core::rql::lexer_query::looks_like_row_expression(expr)
         {
-            if let Ok(parsed) = crate::core::rql::expr::parse(expr, schema) {
-                let db_type = crate::core::rql::expr::static_type(&parsed);
-                out.push(SelectItem::RowExpr {
-                    expr: parsed,
-                    db_type,
-                    label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
-                });
-                continue;
+            match crate::core::rql::expr::parse(expr, schema) {
+                Ok(parsed) => {
+                    let db_type = crate::core::rql::expr::static_type(&parsed);
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type,
+                        label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+                    });
+                    continue;
+                }
+                // A call to a function the evaluator knows, which it could
+                // not read: its reason is the statement's answer. Falling
+                // through, the path below reported the function itself as
+                // unknown — `ROUND(STDDEV(x), 2)` blamed ROUND, and
+                // `EXTRACT(DOW FROM ts)` blamed EXTRACT. Aggregates were
+                // tried above.
+                Err(e) => {
+                    if let Some(open) = expr.find('(') {
+                        let head = expr[..open].trim().to_ascii_uppercase();
+                        let known = crate::core::rql::expr::FUNCTIONS.contains(&head.as_str())
+                            || matches!(head.as_str(), "EXTRACT" | "CAST");
+                        if known && AggFunc::parse(&head).is_none() {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
 

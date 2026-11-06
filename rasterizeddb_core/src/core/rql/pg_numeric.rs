@@ -183,6 +183,48 @@ impl PgNum {
         Ok(div_round(self.m, k, other.m).map(|m| PgNum { m, s: rscale }))
     }
 
+    /// `sqrt_var`: the square root at `rscale` places, rounded half away
+    /// from zero (PostgreSQL's `round_var` of its truncated root). `None` for
+    /// a negative value or past what an `i128` holds.
+    ///
+    /// Exact: the root is floored at one place more, through 256 bits, and
+    /// then rounded. Flooring at more places would change nothing: the digit
+    /// past `rscale` decides, and its floor is the digit.
+    pub(crate) fn sqrt_at(self, rscale: u32) -> Option<Self> {
+        if self.m < 0 || rscale > MAX_SCALE {
+            return None;
+        }
+        if self.m == 0 {
+            return Some(PgNum { m: 0, s: rscale });
+        }
+        // floor(sqrt(m · 10^(2(rscale + 1) − s))) is the root at rscale + 1
+        // places; a negative exponent floors the target first, which leaves
+        // the floored root unchanged.
+        let k = 2 * (rscale as i64 + 1) - self.s as i64;
+        let (mut hi, mut lo) = (0u128, self.m as u128);
+        if k >= 0 {
+            let mut left = k as u32;
+            while left > 0 {
+                let step = left.min(38);
+                (hi, lo) = mul_u256_u128(hi, lo, 10u128.pow(step))?;
+                left -= step;
+            }
+        } else {
+            lo /= pow10((-k) as u32)? as u128;
+        }
+        let (mut low, mut high) = (0u128, u128::MAX);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if widening_mul(mid, mid) <= (hi, lo) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let rounded = low / 10 + u128::from(low % 10 >= 5);
+        Some(PgNum { m: i128::try_from(rounded).ok()?, s: rscale })
+    }
+
     /// `numeric_mod`: the remainder of truncating division, at the larger
     /// scale, with the dividend's sign.
     pub(crate) fn rem(self, other: Self) -> Result<Option<Self>, &'static str> {
