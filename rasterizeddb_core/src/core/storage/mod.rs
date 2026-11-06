@@ -946,9 +946,18 @@ impl StorageManager {
         self.partitions.lock().insert(uid, counts);
     }
 
-    /// Forgets `uid`'s partitions: a partitioned table dropped.
+    /// Forgets `uid`'s partitions: a partitioned table dropped, or the uid a
+    /// physical rewrite left (or abandoned).
     pub fn forget_partitions(&self, uid: u64) {
         self.partitions.lock().remove(&uid);
+    }
+
+    /// Test-only: the uids whose partitions are counted, sorted.
+    #[cfg(test)]
+    pub(crate) fn counted_uids(&self) -> Vec<u64> {
+        let mut uids: Vec<u64> = self.partitions.lock().keys().copied().collect();
+        uids.sort_unstable();
+        uids
     }
 
     /// Picks the directory a partition of `uid` about to be materialized

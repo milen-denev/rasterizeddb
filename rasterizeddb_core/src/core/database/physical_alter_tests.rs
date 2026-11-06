@@ -130,6 +130,8 @@ async fn every_physical_alter_answers_as_the_plain_twin() {
     let uid = db.partitioned_table("pt").unwrap().uid();
     assert_ne!(uid, first_uid, "the rewrite took a new uid");
     assert_eq!(uids_on_disk(&dir), vec![uid], "only the live uid has files");
+    #[cfg(feature = "storage_pools")]
+    assert_eq!(db.storage.counted_uids(), vec![uid], "the pool counts only the live uid's partitions");
     // Writes after, a NULL into the column now nullable.
     for w in [
         "INSERT INTO {t} (tenant_id, id, n, s, extra) VALUES (7, 50, NULL, 'after', 9)",
@@ -172,6 +174,8 @@ async fn a_failed_rewrite_changes_nothing() {
     assert_eq!(db.partitioned_table("pt").unwrap().uid(), uid);
     assert_eq!(exec(&db, "SELECT * FROM pt ORDER BY tenant_id, id").await, before);
     assert_eq!(uids_on_disk(&dir), vec![uid], "the new uid's files are gone");
+    #[cfg(feature = "storage_pools")]
+    assert_eq!(db.storage.counted_uids(), vec![uid], "the pool forgot the abandoned uid's partitions");
     // Writable, and the same ALTER then goes through.
     exec(&db, "INSERT INTO pt (tenant_id, id, n, s) VALUES (7, 70, 1, 'x')").await;
     exec(&db, "DELETE FROM pt WHERE tenant_id = 7 AND id = 70").await;

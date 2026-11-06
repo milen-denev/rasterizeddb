@@ -1152,6 +1152,8 @@ impl Database {
                 if let Some(t) = self.partitioned_tables_all().into_iter().find(|t| t.uid() == new_uid) {
                     t.retire_partitions().await;
                 }
+                #[cfg(feature = "storage_pools")]
+                self.storage.forget_partitions(new_uid);
                 if let Err(d) = self.discard_uid_files(&root, new_uid) {
                     error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
                 }
@@ -1165,6 +1167,8 @@ impl Database {
             error!("Rewriting partitioned table {name}: the catalogue could not be switched: {e}");
             table.retire_partitions().await;
             drop(table);
+            #[cfg(feature = "storage_pools")]
+            self.storage.forget_partitions(new_uid);
             if let Err(d) = self.discard_uid_files(&root, new_uid) {
                 error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
             }
@@ -1181,6 +1185,10 @@ impl Database {
         self.swap_partitioned(name, table, Some(shell));
         drop(changed);
         let old_uid = old.uid();
+        // The pool's per-location counts for the old uid, as a DROP's: left,
+        // they would refuse a location drop for partitions that are gone.
+        #[cfg(feature = "storage_pools")]
+        self.storage.forget_partitions(old_uid);
         if let Err(e) = old.mark_dropped().await {
             warn!("Rewrote partitioned table {name}; closing the old map log failed, the startup reaper deletes it: {e}");
         } else if let Err(e) = self.discard_uid_files(&root, old_uid) {
