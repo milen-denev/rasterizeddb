@@ -4393,6 +4393,13 @@ async fn describe_resolved(
             || lower.starts_with("show ")
             || lower.starts_with("reset "))
             || recognize_query_purpose(stmt).is_none() && parse_database_statement(stmt).is_none();
+        // A SELECT with no FROM, answered above the engine from the same
+        // parse that describes it here (`rql::no_from`).
+        if recognize_query_purpose(stmt).is_none() {
+            if let Some(Ok(select)) = crate::core::rql::no_from::parse(stmt) {
+                return Ok(Some((select.columns(), true)));
+            }
+        }
         // Answered above the engine with one row (B13).
         if parse_index_checkpoint(stmt).is_some() {
             return Ok(Some((vec![("rdb_index_checkpoint".to_string(), DbType::STRING)], true)));
@@ -6523,6 +6530,43 @@ where
     let purpose = match recognize_query_purpose(stmt) {
         Some(p) => p,
         None => {
+            // `SELECT 1 + 1`, `SELECT now()`: a SELECT with no FROM, one row
+            // evaluated with no columns (`rql::no_from`). After the builtins
+            // above, which answer `version()` and the rest, and after the
+            // scalar subqueries were replaced by their values.
+            match crate::core::rql::no_from::parse(stmt) {
+                Some(Ok(select)) => {
+                    let rows = match select.rows() {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            let code = sqlstate_for(&e);
+                            fail_statement(state, stream, code, &e).await?;
+                            return Ok(());
+                        }
+                    };
+                    let (columns, scales) = (select.columns(), select.scales());
+                    let tag = format!("SELECT {}", rows.len());
+                    return send_query_result(
+                        stream,
+                        Some(&columns),
+                        Some(&scales),
+                        &rows,
+                        result_formats,
+                        &tag,
+                        omit_description,
+                    )
+                    .await;
+                }
+                Some(Err(e)) => {
+                    let code = match sqlstate_for(&e) {
+                        "XX000" => "42601",
+                        code => code,
+                    };
+                    fail_statement(state, stream, code, &e).await?;
+                    return Ok(());
+                }
+                None => {}
+            }
             fail_statement(state, stream, "42601", "syntax error or unsupported query").await?;
             return Ok(());
         }

@@ -471,6 +471,19 @@ async fn run_subquery_scaled(
         sql
     };
 
+    // A subquery with no FROM — `(SELECT 7)`, `(SELECT now())` — is its one
+    // row, evaluated as the top level evaluates it (`rql::no_from`).
+    if recognize_query_purpose(sql).is_none() {
+        if let Some(parsed) = crate::core::rql::no_from::parse(sql) {
+            let select = parsed?;
+            let mut rows = select.rows()?;
+            let scales = select.scales();
+            if normalize {
+                normalize_decimal_scales(&mut rows, &scales);
+            }
+            return Ok((rows, Some(scales)));
+        }
+    }
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery {}", sql_literal(sql)))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {
@@ -737,6 +750,16 @@ async fn run_subquery_serialized(
 ) -> Result<Vec<u8>, String> {
     let folded = fold_where_constants_checked(sql)?;
     let sql = folded.as_str();
+    // A subquery with no FROM, as [`run_subquery_scaled`] answers it.
+    if recognize_query_purpose(sql).is_none() {
+        if let Some(parsed) = crate::core::rql::no_from::parse(sql) {
+            let mut out = Vec::new();
+            for row in parsed?.rows()? {
+                row.extend_serialized(&mut out);
+            }
+            return Ok(out);
+        }
+    }
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery {}", sql_literal(sql)))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {

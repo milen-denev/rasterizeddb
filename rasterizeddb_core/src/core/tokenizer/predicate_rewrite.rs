@@ -2580,6 +2580,10 @@ fn needs_evaluator(text: &str) -> bool {
                     // `CAST(qty AS bigint)`, the standard spelling of a cast,
                     // which the rewrite has no form for.
                     || word.eq_ignore_ascii_case("CAST") && text[end..].trim_start().starts_with('(')
+                    // `EXTRACT(HOUR FROM ts)`, whose arguments are separated
+                    // by FROM rather than a comma, so it is in no function
+                    // list; refused as an unknown keyword before.
+                    || word.eq_ignore_ascii_case("EXTRACT") && text[end..].trim_start().starts_with('(')
                     // `COALESCE(s, 'z')`, `UPPER(name)`: a call only the
                     // evaluator knows, refused as an unknown column before.
                     || crate::core::rql::expr::FUNCTIONS.iter().any(|f| word.eq_ignore_ascii_case(f))
