@@ -2198,14 +2198,21 @@ e2e_test!(a_table_on_another_storage_location_survives_a_restore, config, {
         .await
         .expect("restore");
 
-    // Nothing may point back at either source directory.
+    // Nothing may place anything at either source directory. The moved disk
+    // is named once more, by the alias partition maps resolve through (phase
+    // 4b), and only as where its files came from: its target is in the copy.
     let pool = std::fs::read_to_string(target.join("db_storage.cfg")).unwrap_or_default();
+    let placing: String = pool.lines().filter(|l| !l.starts_with("alias\t")).collect::<Vec<_>>().join("\n");
     for source in [&live, &disk2] {
         assert!(
-            !pool.contains(source.to_str().unwrap()),
+            !placing.contains(source.to_str().unwrap()),
             "the restored storage pool still names {}:\n{pool}",
             source.display()
         );
+    }
+    for alias in pool.lines().filter(|l| l.starts_with("alias\t")) {
+        let to = alias.split('\t').nth(2).unwrap_or_default();
+        assert!(to.starts_with(target.to_str().unwrap()), "an alias points outside the copy: {alias}");
     }
 
     // The copy has to stand on its own with both sources gone.
