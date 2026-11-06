@@ -58,22 +58,35 @@ async fn epoch_of_a_timestamp_is_seconds_since_1970() {
     assert_eq!(seconds, 1_767_225_600.0);
 }
 
-/// A field this cannot compute must say so, rather than return a number.
+/// The calendar fields are answered (a `numeric` from `EXTRACT`, a `double
+/// precision` from `date_part`, as in PostgreSQL 17); a field that does not
+/// exist must say so, rather than return a number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unsupported_field_is_refused() {
     let (_server, mut conn) = seeded().await;
-    let outcome = sqlx::query(AssertSqlSafe(
-        "SELECT EXTRACT(YEAR FROM created_at) AS y FROM ev",
+    let year: i64 = sqlx::query(AssertSqlSafe(
+        "SELECT CAST(EXTRACT(YEAR FROM created_at) AS BIGINT) AS y FROM ev WHERE id = 1",
     ))
-    .fetch_all(&mut conn)
-    .await;
+    .fetch_one(&mut conn)
+    .await
+    .expect("EXTRACT(YEAR FROM timestamptz)")
+    .try_get("y")
+    .expect("y");
+    assert_eq!(year, 2026);
+    let year: f64 = sqlx::query(AssertSqlSafe("SELECT date_part('year', created_at) AS y FROM ev WHERE id = 1"))
+        .fetch_one(&mut conn)
+        .await
+        .expect("date_part('year', timestamptz)")
+        .try_get("y")
+        .expect("y");
+    assert_eq!(year, 2026.0);
+
+    let outcome = sqlx::query(AssertSqlSafe("SELECT EXTRACT(FORTNIGHT FROM created_at) AS y FROM ev"))
+        .fetch_all(&mut conn)
+        .await;
     let error = outcome.err().map(|e| e.to_string()).unwrap_or_default();
-    // Refused, not answered. The message currently comes from the select-list
-    // parser's generic "function is not supported yet" rather than the specific
-    // reason EXTRACT itself gives, which is worth improving but is not the
-    // property under test: a field this cannot compute must not return a number.
     assert!(
-        error.contains("not supported yet"),
-        "an unsupported field must be refused: {error}"
+        error.contains("unit \"fortnight\" not recognized"),
+        "an unknown field must be refused: {error}"
     );
 }
