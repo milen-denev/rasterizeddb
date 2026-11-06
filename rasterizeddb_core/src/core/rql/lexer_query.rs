@@ -39,6 +39,10 @@ pub struct QueryRows {
     /// deduplicated output, so neither is handed to the scan — they are taken
     /// from `written_limit` / `offset` instead.
     pub distinct: bool,
+    /// `SELECT DISTINCT ON (k, …)`: the first row of each key in the
+    /// statement's order, the keys evaluated on the row as fetched. As with
+    /// [`Self::distinct`], `LIMIT` and `OFFSET` apply to what is kept.
+    pub distinct_on: Vec<crate::core::rql::expr::Expr>,
     /// `LIMIT` exactly as written, before `OFFSET` was folded into it for the
     /// scan. Used by the passes that run after the scan.
     pub written_limit: Option<u64>,
@@ -1904,6 +1908,7 @@ pub fn row_fetch_from_select_query(
     // `SELECT DISTINCT` is a post-pass over the fetched rows, so the keyword is
     // stripped here and the rest of the list parses normally.
     let columns_upper = columns_part.trim_start().to_ascii_uppercase();
+    let mut distinct_on_text: Option<String> = None;
     let (columns_part, distinct) = if columns_upper.starts_with("DISTINCT ") {
         let rest = columns_part.trim_start()["DISTINCT ".len()..].trim();
         // `DISTINCT ON (...)` is a different operator, not `DISTINCT` with a
@@ -1912,13 +1917,15 @@ pub fn row_fetch_from_select_query(
         // function call and the error blames a function named `on`, sending the
         // reader to look for something that does not exist.
         if starts_with_distinct_on(rest) {
-            return Err(
-                "SELECT DISTINCT ON is not supported yet — it keeps one row per key, \
-                 which plain DISTINCT does not do, so it cannot be treated as one"
-                    .to_string(),
-            );
+            // `ON (k, …)`, then the select list proper.
+            let open = rest.find('(').expect("checked by starts_with_distinct_on");
+            let close = crate::core::rql::expr::matching_paren(rest, open)
+                .ok_or_else(|| "SELECT DISTINCT ON has an unclosed key list".to_string())?;
+            distinct_on_text = Some(rest[open + 1..close].to_string());
+            (rest[close + 1..].trim(), false)
+        } else {
+            (rest, true)
         }
-        (rest, true)
     } else if columns_upper == "DISTINCT" {
         return Err("SELECT DISTINCT is missing its column list".to_string());
     } else {
@@ -1926,6 +1933,63 @@ pub fn row_fetch_from_select_query(
     };
 
     let select_items = parse_select_items(columns_part, schema)?;
+
+    // `DISTINCT ON (k, …)`: each key a select item it names or an expression
+    // over the row. PostgreSQL's rule that an ORDER BY starts with the keys
+    // (42P10) is kept: it is what makes "the first row of each key" mean one
+    // row.
+    let mut distinct_on: Vec<crate::core::rql::expr::Expr> = Vec::new();
+    if let Some(text) = distinct_on_text.as_deref() {
+        if select_items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Window { .. } | SelectItem::Aggregate { .. } | SelectItem::Computed { .. }))
+        {
+            return Err("SELECT DISTINCT ON with an aggregate or a window function is not supported yet".to_string());
+        }
+        let keys: Vec<String> = crate::core::rql::lexer_ct::split_definitions(text)
+            .into_iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Err("SELECT DISTINCT ON needs at least one key".to_string());
+        }
+        // Compared as written, less whitespace, case, a qualifier and any
+        // enclosing parentheses (an ORDER BY expression arrives as `(ts % 2)`).
+        let norm = |t: &str| {
+            let mut t: String = t.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+            while t.starts_with('(') && crate::core::rql::expr::matching_paren(&t, 0) == Some(t.len() - 1) {
+                t = t[1..t.len() - 1].to_string();
+            }
+            let t = match t.rsplit_once('.') {
+                Some((q, c)) if !q.contains(['(', ' ', '%', '+', '-', '*', '/']) => c.to_string(),
+                _ => t,
+            };
+            t.trim_matches('"').to_string()
+        };
+        if !order_terms.is_empty() {
+            let leading = keys.iter().enumerate().all(|(i, key)| {
+                order_terms.get(i).is_some_and(|t| norm(&t.token) == norm(key))
+            });
+            if !leading {
+                return Err("SELECT DISTINCT ON expressions must match initial ORDER BY expressions".to_string());
+            }
+        }
+        for key in &keys {
+            let bare = key.rsplit('.').next().unwrap_or(key).trim_matches('"');
+            let named = select_items.iter().find(|i| i.label().eq_ignore_ascii_case(bare)).and_then(|i| match i {
+                SelectItem::Column { field, .. } => Some(crate::core::rql::expr::Expr::Column(field.clone())),
+                SelectItem::RowExpr { expr, .. } => Some(expr.clone()),
+                _ => None,
+            });
+            let expr = match named {
+                Some(expr) if !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) => expr,
+                _ => crate::core::rql::expr::parse(key, schema)
+                    .map_err(|e| format!("DISTINCT ON key '{key}' could not be read: {e}"))?,
+            };
+            distinct_on.push(expr);
+        }
+    }
 
     // `ORDER BY 2` names the second select item. Resolved before anything below
     // looks at a sort key, so every path sees an ordinary one.
@@ -2524,7 +2588,9 @@ pub fn row_fetch_from_select_query(
             }
         }
 
-        (order_by, limit, offset)
+        // Under DISTINCT ON the limit counts kept rows, so the scan is not
+        // bounded by it (the executor takes `written_limit` after the keys).
+        (order_by, if distinct_on.is_empty() { limit } else { None }, offset)
     } else {
         // `ORDER BY NULLIF(data->>'2', '')::date ASC NULLS FIRST` — the shape
         // an application sorting on a document field emits. The keys resolve
@@ -2610,6 +2676,21 @@ pub fn row_fetch_from_select_query(
         (None, None, offset)
     };
 
+    // DISTINCT ON's keys are evaluated on the row as fetched, before the
+    // columns only they read are trimmed off.
+    if !distinct_on.is_empty() {
+        if !window_order.is_empty() {
+            return Err("SELECT DISTINCT ON with an ORDER BY over a window function is not supported yet".to_string());
+        }
+        for expr in &distinct_on {
+            for f in expr_reads(expr, schema) {
+                if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&f.name)) {
+                    requested_columns.push(f.name.clone());
+                }
+            }
+        }
+    }
+
     // Build requested_row_fetch for SELECT columns
     let mut requested_columns_fetching_data = SmallVec::new();
     for col in &requested_columns {
@@ -2673,7 +2754,7 @@ pub fn row_fetch_from_select_query(
         // to the select list once its values are in). Cut at the visible
         // columns, a key on a column not selected read NULL in every row, and
         // `ORDER BY user_id, rnk` sorted by `rnk` alone.
-        visible_columns: if window_order.iter().any(|(k, _, _)| matches!(k, WindowOrderKey::Expr(_))) {
+        visible_columns: if window_order.iter().any(|(k, _, _)| matches!(k, WindowOrderKey::Expr(_))) && distinct_on.is_empty() {
             requested_columns.len()
         } else {
             visible_columns
@@ -2682,6 +2763,7 @@ pub fn row_fetch_from_select_query(
         window_order,
         aggregate,
         distinct,
+        distinct_on,
         written_limit: original_limit,
         null_flag_positions,
         literal_slots,

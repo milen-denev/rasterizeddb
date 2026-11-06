@@ -20676,6 +20676,8 @@ async fn execute_query_rows_body(
         })
     );
     let distinct = query_row.distinct;
+    let distinct_on = query_row.distinct_on.clone();
+    let has_distinct_on = !distinct_on.is_empty();
     let written_limit = query_row.written_limit;
     let null_flags = query_row.null_flag_positions.clone();
     let has_nullable = null_flags.iter().any(Option::is_some);
@@ -20807,6 +20809,7 @@ async fn execute_query_rows_body(
                 // without decoding anything (below).
                 let needs_rows = trim_sort_key
                     || distinct
+                    || has_distinct_on
                     || has_nullable
                     || has_literals
                     || has_json
@@ -20847,10 +20850,12 @@ async fn execute_query_rows_body(
                 //    what every LIMIT pushed into the scan already does.
                 //  * `where_clause`, the fetches, `table_name` — spent
                 //    by the scan.
+                //  * `distinct_on` — as `distinct`: which rows are
+                //    kept is known only after the keys: blocks.
                 // A field added to `QueryRows` that looks at more than
                 // one row has to be added here as a blocker.
                 let expr_sort_cap: Option<usize> =
-                    if !distinct && !has_windows && row_lock.is_none() && !skip_locked {
+                    if !distinct && !has_distinct_on && !has_windows && row_lock.is_none() && !skip_locked {
                         written_limit.map(|limit| {
                             usize::try_from(limit.saturating_add(offset))
                                 .unwrap_or(usize::MAX)
@@ -20962,6 +20967,7 @@ async fn execute_query_rows_body(
                             // expression sort ran over an unbounded
                             // scan, so the page is cut here too.
                             let (skip, take) = if distinct
+                                || has_distinct_on
                                 || skip_locked
                                 || has_order_exprs
                                 || has_windows
@@ -21005,6 +21011,7 @@ async fn execute_query_rows_body(
                             // Sized only when `DISTINCT` will use it:
                             // a hash table with room for every row is
                             // tens of megabytes on a large result.
+                            let mut seen_on: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
                             let mut seen: ahash::HashSet<Vec<u8>> =
                                 ahash::HashSet::with_capacity_and_hasher(
                                     if distinct {
@@ -21153,6 +21160,35 @@ async fn execute_query_rows_body(
                                     }
                                 }
 
+                                // `DISTINCT ON (k, …)`: the first row of each
+                                // key, in the order the rows arrive (the
+                                // scan's sort or the expression sort above),
+                                // read before the trim drops the columns
+                                // only the keys read.
+                                if has_distinct_on {
+                                    let mut key: Vec<u8> = Vec::new();
+                                    for expr in &distinct_on {
+                                        match crate::core::rql::expr::eval_output_planned(
+                                            expr,
+                                            crate::core::rql::expr::output_is_wide(expr),
+                                            &row,
+                                            slot_schema,
+                                        ) {
+                                            Ok(value) => {
+                                                key.extend_from_slice(format!("{value:?}").as_bytes());
+                                                key.push(0);
+                                            }
+                                            Err(e) => {
+                                                let mut result = vec![3u8];
+                                                result.extend_from_slice(e.as_bytes());
+                                                return result;
+                                            }
+                                        }
+                                    }
+                                    if !seen_on.insert(key) {
+                                        continue;
+                                    }
+                                }
                                 // Trimming is driven by the row itself
                                 // rather than by the plan: the scan may
                                 // return more columns than were asked

@@ -726,21 +726,8 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         assert_eq!(got, want, "{}", sql);
     }
 
-    for (sql, expected) in [
-        // Still unsupported, and each must name the construct rather than
-        // report a missing column: saying so is the difference between a
-        // reader fixing the query and a reader auditing a schema that is fine.
-        // `CAST(v AS TEXT)` in the select list, and a cast in a `WHERE`, moved
-        // to the working lists below when they were implemented.
-        ("SELECT DISTINCT ON (id, v) id FROM ue", "distinct on"),
-    ] {
-        let err = run(&pool, sql).await.expect_err(sql).to_ascii_lowercase();
-        assert!(err.contains(expected), "{} -> {}", sql, err);
-        assert!(!err.contains("not found in schema"), "{} blamed the schema: {}", sql, err);
-    }
-
-    // Window functions, and now `CAST(x AS type)`, were on the list above until
-    // they were implemented. Asserted as *working* rather than deleted, so the
+    // Window functions, `CAST(x AS type)` and `DISTINCT ON` were on a list of
+    // refusals here until they were implemented. Asserted as *working* rather than deleted, so the
     // entry keeps earning its place: an unsupported-feature list that quietly
     // loses items stops being evidence of anything.
     //
@@ -752,6 +739,7 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         "SELECT ROW_NUMBER() OVER (PARTITION BY id ORDER BY v, nm) FROM ue",
         "SELECT CAST(v AS TEXT) FROM ue",
         "SELECT CAST(v AS BIGINT) FROM ue",
+        "SELECT DISTINCT ON (id, v) id FROM ue",
     ] {
         run(&pool, sql).await.unwrap_or_else(|e| panic!("{} -> {}", sql, e));
     }
@@ -774,9 +762,8 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
     run(&pool, "SELECT v AS alias_name FROM ue").await.expect("alias");
     run(&pool, "SELECT nm FROM ue").await.expect("plain column");
 
-    // Plain `DISTINCT` works, and the `DISTINCT ON` check above must not have
-    // taken it with it — the mirror of that fix would be refusing a query whose
-    // first column merely starts with those letters.
+    // Plain `DISTINCT` works beside `DISTINCT ON`: a query whose first column
+    // merely starts with those letters is not one.
     run(&pool, "SELECT DISTINCT nm, id FROM ue").await.expect("plain distinct");
 }
 
