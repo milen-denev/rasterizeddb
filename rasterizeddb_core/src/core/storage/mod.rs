@@ -292,6 +292,14 @@ struct PoolState {
     locations: Vec<StorageLocation>,
     /// Table name to location path. Absent means the database directory.
     placements: HashMap<String, String>,
+    /// `(recorded, now)`: a location a restore into a new directory moved,
+    /// as partition maps recorded it and where its files are now
+    /// ([`repoint_restored_pool`] writes them). A map names its locations by
+    /// absolute path and is never rewritten, so a partition recorded at the
+    /// old path opens at the new one ([`StorageManager::partition_dir_now`]).
+    /// Written only by a restore: a directory copied by hand has none, and
+    /// its maps still refuse to read the original's files.
+    aliases: Vec<(String, String)>,
 }
 
 /// A database's storage pool.
@@ -334,6 +342,7 @@ impl StorageManager {
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                 locations: Vec::new(),
                 placements: HashMap::new(),
+                aliases: Vec::new(),
             }),
         }
     }
@@ -366,6 +375,7 @@ impl StorageManager {
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                 locations: vec![StorageLocation::root(root.clone())],
                 placements: HashMap::new(),
+                aliases: Vec::new(),
             }),
         };
 
@@ -386,6 +396,7 @@ impl StorageManager {
                         min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                         locations: vec![StorageLocation::root(root.clone())],
                         placements: HashMap::new(),
+                        aliases: Vec::new(),
                     };
                 }
             }
@@ -987,6 +998,18 @@ impl StorageManager {
     /// (a disabled location keeps what it holds). A path the pool does not
     /// name is a map copied or restored from elsewhere, whose files there
     /// are not this database's to read or write.
+    /// Where a partition a map recorded at `recorded` (not the root) is now:
+    /// `recorded` itself while it is a primary location of this pool, else
+    /// where a restore moved it, when that is one. `None` refuses the table.
+    pub fn partition_dir_now(&self, recorded: &str) -> Option<String> {
+        if self.holds_partitions_at(recorded) {
+            return Some(normalize(recorded));
+        }
+        let recorded = normalize(recorded);
+        let now = self.state.read().aliases.iter().find(|(from, _)| *from == recorded).map(|(_, to)| to.clone())?;
+        self.holds_partitions_at(&now).then_some(now)
+    }
+
     pub fn holds_partitions_at(&self, path: &str) -> bool {
         let path = normalize(path);
         if self.root.as_deref() == Some(path.as_str()) {
@@ -1113,6 +1136,10 @@ impl StorageManager {
                 },
                 location.path,
             ));
+        }
+
+        for (from, to) in &state.aliases {
+            out.push_str(&format!("alias\t{}\t{}\n", from, to));
         }
 
         let mut placements: Vec<(&String, &String)> = state.placements.iter().collect();
@@ -1264,6 +1291,22 @@ pub fn repoint_restored_pool(
 
     let mut out = String::new();
     let mut dropped = Vec::new();
+    // `(recorded, now)` for every primary location this moves, and for every
+    // alias an earlier restore wrote, its target followed here too: partition
+    // maps keep the path they recorded, so a restore of a restore still finds
+    // the files (`StorageManager::partition_dir_now`). The root needs none: a
+    // map records it as location 0, wherever the database is.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    // The directory this file was written for (its first `location` line):
+    // the root of a database created with `CREATE DATABASE` is a
+    // subdirectory of the backup's root, and location 0 to its own maps.
+    let own_root = first_location(&text);
+    let mut alias = |from: String, to: String| {
+        aliases.retain(|(f, _)| *f != from);
+        if from != to {
+            aliases.push((from, to));
+        }
+    };
     for line in text.lines() {
         if line.trim().is_empty() || line.starts_with('#') {
             out.push_str(line);
@@ -1276,14 +1319,21 @@ pub fn repoint_restored_pool(
                 // A backup location is never carried: the snapshot copied the
                 // primary its files mirror, and a clone mirroring into the
                 // source's backup disk would write over it.
-                let carried = LocationRole::parse(role) == Some(LocationRole::Primary)
-                    || normalize(path) == old_root;
+                let primary = LocationRole::parse(role) == Some(LocationRole::Primary);
+                let carried = primary || normalize(path) == old_root;
                 if let Some(restored) = map(path).filter(|_| carried) {
                     out.push_str(&format!(
                         "location\t{role}\t{weight}\t{enabled}\t{restored}\n"
                     ));
+                    if primary && normalize(path) != old_root && Some(normalize(path)) != own_root {
+                        alias(normalize(path), restored);
+                    }
                 }
                 // Any other disk: dropped, and its tables with it below.
+            }
+            ["alias", from, to] => {
+                let to = map(to).unwrap_or_else(|| normalize(to));
+                alias(normalize(from), to);
             }
             ["table", at, table] => match map(at) {
                 Some(restored) => out.push_str(&format!("table\t{restored}\t{table}\n")),
@@ -1294,6 +1344,9 @@ pub fn repoint_restored_pool(
                 out.push('\n');
             }
         }
+    }
+    for (from, to) in &aliases {
+        out.push_str(&format!("alias\t{from}\t{to}\n"));
     }
 
     // Through a temporary file and a rename, for the reason `persist` gives.
@@ -1385,6 +1438,7 @@ pub fn data_locations(db_dir: &Path) -> io::Result<Vec<String>> {
         min_free_bytes: DEFAULT_MIN_FREE_BYTES,
         locations: Vec::new(),
         placements: HashMap::new(),
+        aliases: Vec::new(),
     };
     parse_into(&text, &root, &mut state).map_err(|e| {
         io::Error::new(
@@ -1441,6 +1495,7 @@ fn first_location(text: &str) -> Option<String> {
 fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), String> {
     let mut locations: Vec<StorageLocation> = vec![StorageLocation::root(root.to_string())];
     let mut placements: HashMap<String, String> = HashMap::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
     let mut policy = PlacementPolicy::Primary;
     let mut min_free_bytes = DEFAULT_MIN_FREE_BYTES;
     let mut version = None;
@@ -1501,6 +1556,13 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
                     enabled: enabled.trim() != "disabled",
                 });
             }
+            "alias" => {
+                let from = fields.next().ok_or_else(|| at("alias"))?;
+                let to = fields.next().ok_or_else(|| at("alias"))?;
+                let from = normalize(from);
+                aliases.retain(|(f, _)| *f != from);
+                aliases.push((from, normalize(to)));
+            }
             "table" => {
                 let at_path = fields.next().ok_or_else(|| at("table"))?;
                 // The name is the rest of the line, so a table name containing
@@ -1547,6 +1609,7 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
     state.min_free_bytes = min_free_bytes;
     state.locations = locations;
     state.placements = placements;
+    state.aliases = aliases;
     Ok(())
 }
 

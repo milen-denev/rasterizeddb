@@ -484,3 +484,88 @@ async fn a_restore_fences_numeric_columns_the_snapshot_predates() {
     crate::core::wal::remove_for(&path_str(&target));
     crate::core::wal::remove_for(&live_str);
 }
+
+/// Partitions spread over two disks while a backup service runs (phase 4b),
+/// restored into a new directory, and opened there with every row: the
+/// snapshot's and the archived log's after it. Each partition map names its
+/// disk by the absolute path it had; the restore records where it moved it
+/// (`alias` in the pool file), so the maps are never rewritten and a hand-made
+/// copy of the directory, which has no alias, still refuses to read the
+/// original's files. Before this, partitions stayed in the root whenever a
+/// backup service was configured, because the restored table would refuse
+/// to open.
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spread_partitions_restore_into_a_new_directory() {
+    use crate::core::storage::{LocationRole, PlacementPolicy};
+    init_globals();
+    let base = tempfile::tempdir().unwrap();
+    let live = base.path().join("live");
+    let disk = base.path().join("disk");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&disk).unwrap();
+    let live_str = path_str(&live);
+    let db = Arc::new(Database::new(&live_str).await);
+    db.storage.add_location(&path_str(&disk), LocationRole::Primary, 1, true).unwrap();
+    db.storage.set_policy(PlacementPolicy::RoundRobin);
+
+    let config = config("spread-partitions", 0);
+    let service = BackupService::connect(config.clone(), &live_str).await.expect("connect");
+    ok(&db, "CREATE TABLE sp (tenant_id BIGINT NOT NULL, v INT) PARTITION BY HASH (tenant_id) PARTITIONS 8").await;
+    let insert = |from: i64, to: i64| {
+        let values: Vec<String> = (from..to).map(|i| format!("({}, {})", i % 40, i)).collect();
+        format!("INSERT INTO sp VALUES {}", values.join(", "))
+    };
+    ok(&db, &insert(0, 300)).await;
+    let partition_files = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("__pt_") && n.ends_with(".db"))
+            .count()
+    };
+    assert!(partition_files(&disk) > 0, "no partition was placed off the root while the backup service ran");
+    assert!(partition_files(&live) > 0, "no partition was placed in the root");
+
+    let report = service.snapshot_now().await.expect("snapshot");
+    // After the snapshot: replayed from the archived log, into partitions on
+    // both disks.
+    ok(&db, &insert(300, 400)).await;
+    ok(&db, "UPDATE sp SET v = v + 1000000 WHERE tenant_id = 7").await;
+    ok(&db, "DELETE FROM sp WHERE tenant_id = 13").await;
+    db.sync_durable().unwrap();
+    service.archive_wal_now().await.expect("archive");
+    let live_rows = count(&db, "SELECT * FROM sp").await;
+    let live_seven = count(&db, "SELECT * FROM sp WHERE v > 1000000").await;
+    assert_eq!(live_rows, 400 - 10);
+    assert_eq!(live_seven, 10);
+    let _ = report;
+
+    let target = base.path().join("restored");
+    super::restore_from(&config, &target, RecoveryTarget::Latest).await.expect("restore");
+    let pool = std::fs::read_to_string(target.join(crate::core::storage::POOL_FILE)).unwrap();
+    assert!(
+        pool.lines().any(|l| l.starts_with("alias\t") && l.contains(&path_str(&disk))),
+        "the restore recorded no alias for the moved disk:\n{pool}"
+    );
+    let back = Arc::new(Database::new(&path_str(&target)).await);
+    assert_eq!(count(&back, "SELECT * FROM sp").await, live_rows, "the restored table lost rows");
+    assert_eq!(count(&back, "SELECT * FROM sp WHERE v > 1000000").await, live_seven);
+    assert_eq!(count(&back, "SELECT * FROM sp WHERE tenant_id = 13").await, 0);
+    // Written and read again after a reopen: new partitions go to the
+    // restored disk, and the old ones stay readable through the alias.
+    ok(&back, "INSERT INTO sp VALUES (13, 1), (41, 2), (42, 3)").await;
+    drop(back);
+    crate::core::wal::remove_for(&path_str(&target));
+    let back = Arc::new(Database::new(&path_str(&target)).await);
+    assert_eq!(count(&back, "SELECT * FROM sp").await, live_rows + 3);
+    // The live database is untouched by the restored one's writes.
+    assert_eq!(count(&db, "SELECT * FROM sp").await, live_rows);
+
+    drop(back);
+    drop(db);
+    crate::core::wal::remove_for(&path_str(&target));
+    crate::core::wal::remove_for(&live_str);
+    crate::core::wal::remove_for(&path_str(&disk));
+}
+

@@ -367,9 +367,10 @@ pub(crate) trait Placement: Send + Sync {
     /// Replaces what is counted for `uid`: its materialized partitions per
     /// directory, the root's included, as the table opens.
     fn register(&self, uid: u64, counts: std::collections::HashMap<String, u64>);
-    /// Whether a partition recorded at `dir`, not the root, may open there:
-    /// `dir` is a location of this database's pool.
-    fn holds(&self, dir: &str) -> bool;
+    /// Where a partition recorded at `dir`, not the root, opens now: `dir`
+    /// while it is a location of this database's pool, or where a restore
+    /// moved it; `None` when neither.
+    fn resolve(&self, dir: &str) -> Option<String>;
     /// Every directory other than the root a partition may be in.
     fn others(&self) -> Vec<PathBuf>;
 }
@@ -383,8 +384,8 @@ impl Placement for RootOnly {
     }
     fn undeal(&self, _uid: u64, _dir: &str) {}
     fn register(&self, _uid: u64, _counts: std::collections::HashMap<String, u64>) {}
-    fn holds(&self, _dir: &str) -> bool {
-        false
+    fn resolve(&self, _dir: &str) -> Option<String> {
+        None
     }
     fn others(&self) -> Vec<PathBuf> {
         Vec::new()
@@ -595,13 +596,13 @@ fn partition_dir(locations: &[String], loc: u32, placement: &dyn Placement) -> R
     let Some(path) = locations.get(loc as usize) else {
         return Err(format!("is at location {loc}, but only {} are interned", locations.len()));
     };
-    if !placement.holds(path) {
-        return Err(format!(
+    match placement.resolve(path) {
+        Some(now) => Ok(Some(PathBuf::from(now))),
+        None => Err(format!(
             "is in {path}, which is not a storage location of this database; add it back with \
              STORAGE ADD LOCATION '{path}', or restore the partition's files there"
-        ));
+        )),
     }
-    Ok(Some(PathBuf::from(path)))
 }
 
 /// The partitions a database's partitioned tables declare, for

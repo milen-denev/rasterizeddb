@@ -659,6 +659,7 @@ fn reapable(
     root: &Path,
     here: Option<&str>,
     live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+    now: &dyn Fn(&str) -> String,
 ) -> io::Result<Result<Vec<String>, String>> {
     let mut failed: Vec<(&u64, &String)> = live.iter().filter_map(|(u, m)| m.as_ref().err().map(|e| (u, e))).collect();
     if !failed.is_empty() {
@@ -692,8 +693,13 @@ fn reapable(
                 let placed_here = match live_map.state.part(pid).and_then(|p| p.location) {
                     None => false,
                     Some(0) => here.is_none(),
+                    // Where that location is now: a restore into a new
+                    // directory moved it, and the map keeps the path it
+                    // recorded. Compared as recorded, every restored
+                    // partition on a moved disk read as unplaced and was
+                    // deleted at the first open (phase 4b).
                     Some(loc) => match (live_map.state.locations().get(loc as usize), here) {
-                        (Some(path), Some(here)) => dir_key(path) == here,
+                        (Some(path), Some(here)) => dir_key(&now(path)) == here,
                         _ => false,
                     },
                 };
@@ -723,28 +729,33 @@ pub(crate) fn reap(
     live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
     void: impl FnOnce(&[String]) -> io::Result<()>,
 ) -> ReapReport {
-    reap_in(root, None, live, void)
+    reap_in(root, None, live, &|p: &str| p.to_string(), void)
 }
 
 /// [`reap`] over `dir`, another storage location of the pool (phase 4),
 /// with the root's live maps: deletes the partition files there that no
 /// live map places there.
+///
+/// `now` is where a location a map recorded is now (the pool's restore
+/// aliases, `StorageManager::partition_dir_now`), itself when unmoved.
 pub(crate) fn reap_at(
     dir: &Path,
     live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+    now: &dyn Fn(&str) -> String,
     void: impl FnOnce(&[String]) -> io::Result<()>,
 ) -> ReapReport {
     let here = dir_key(&dir.to_string_lossy());
-    reap_in(dir, Some(&here), live, void)
+    reap_in(dir, Some(&here), live, now, void)
 }
 
 fn reap_in(
     root: &Path,
     here: Option<&str>,
     live: &std::collections::HashMap<u64, Result<LiveMap, String>>,
+    now: &dyn Fn(&str) -> String,
     void: impl FnOnce(&[String]) -> io::Result<()>,
 ) -> ReapReport {
-    let names = match reapable(root, here, live) {
+    let names = match reapable(root, here, live, now) {
         Ok(Ok(names)) => names,
         Ok(Err(why)) => {
             return ReapReport {

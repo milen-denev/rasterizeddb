@@ -507,6 +507,30 @@ and lifts this; it no longer needs the backup service to refuse anything.
 The plan's "backup refuses to run beside off-root partitions" was not built
 for the same reason.
 
+**Phase 4b (P6b), as built (2026-11-06): a restore follows the disks.** A
+restore into a new directory moves each primary location into the restored
+root and writes `alias <recorded path> <new path>` lines into the pool file
+(`storage::repoint_restored_pool`); an earlier restore's aliases have their
+targets followed too, so a restore of a restore still resolves the original
+path. The maps are never rewritten. `Placement::resolve` (was `holds`) opens a
+partition recorded at a path at that path while it is a primary location of
+the pool, else at its alias's target when that is one
+(`StorageManager::partition_dir_now`). Only a restore writes aliases, so a
+directory copied by hand still refuses to read the original's files, as P6
+intended. The pool parses and renders `alias` lines; an older binary ignores
+them with a warning and refuses the table, loudly. The startup reaper compares
+a partition's location *as resolved* with the directory it scans: compared as
+recorded, every restored partition on a moved disk read as unplaced and was
+deleted at the first open; the end-to-end test caught that before it shipped.
+With that, **partitions are placed by the pool's policy whether or not a
+backup service runs** (`backup_keeps_partitions_in_root` is gone). The test is
+`backup::upload_window_tests::spread_partitions_restore_into_a_new_directory`:
+partitions on two disks, a snapshot, writes after it replayed from the
+archived log, a restore into a new directory, every row, a write and a reopen.
+It connects a backup service but cannot install the process-wide one
+(`backup::service()` is a `OnceLock`), so the lift itself is checked by
+reading: nothing consults the service for placement any more.
+
 **The pool's guards** (`StorageManager::partitions_holding`): `STORAGE DROP
 LOCATION` and a role change to `BACKUP` refuse a location while the dealer
 counts a partition there (a reservation whose files are not written yet

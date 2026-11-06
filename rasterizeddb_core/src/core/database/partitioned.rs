@@ -245,7 +245,8 @@ pub(super) fn reap_at_startup(
         if files::dir_key(&dir) == root_key {
             continue;
         }
-        let at = files::reap_at(Path::new(&dir), &live, |names| {
+        let now = |recorded: &str| pool.partition_dir_now(recorded).unwrap_or_else(|| recorded.to_string());
+        let at = files::reap_at(Path::new(&dir), &live, &now, |names| {
             let Some(wal) = crate::core::wal::wal_for(&dir) else {
                 return Ok(());
             };
@@ -286,7 +287,11 @@ struct PoolPlacement(super::StoragePool);
 #[cfg(feature = "storage_pools")]
 impl Placement for PoolPlacement {
     fn deal(&self, uid: u64) -> Option<String> {
-        self.0.deal_partition(uid, backup_keeps_partitions_in_root())
+        // Placed by the pool's policy with or without a backup service: a
+        // restore into a new directory records where it moved each location
+        // (`storage::repoint_restored_pool`'s aliases), and the restored map
+        // opens its partitions there (phase 4b).
+        self.0.deal_partition(uid, false)
     }
 
     fn undeal(&self, uid: u64, dir: &str) {
@@ -297,8 +302,8 @@ impl Placement for PoolPlacement {
         self.0.register_partitions(uid, counts)
     }
 
-    fn holds(&self, dir: &str) -> bool {
-        self.0.holds_partitions_at(dir)
+    fn resolve(&self, dir: &str) -> Option<String> {
+        self.0.partition_dir_now(dir)
     }
 
     fn others(&self) -> Vec<PathBuf> {
@@ -309,29 +314,6 @@ impl Placement for PoolPlacement {
             .map(PathBuf::from)
             .collect()
     }
-}
-
-/// Whether partitions stay in the root whatever the pool's policy: while a
-/// backup service runs. A snapshot copies every location, but a restore
-/// into a new directory moves them, and a partition map names its
-/// locations by absolute path, so the restored table would refuse to open
-/// (`partition::table::partition_dir`). Phase 4b's restore rewrites them
-/// and lifts this; a restore in place, to the same paths, already works.
-#[cfg(feature = "storage_pools")]
-fn backup_keeps_partitions_in_root() -> bool {
-    #[cfg(feature = "s3_backup")]
-    if crate::core::backup::service().is_some() {
-        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            info!(
-                "Partitions materialize in the database directory while S3 backup is configured, whatever the \
-                 storage placement policy: a restore into a new directory cannot yet repoint partitions on \
-                 other storage locations"
-            );
-        }
-        return true;
-    }
-    false
 }
 
 /// Every file name in `dir` under `uid`: what [`files::remove_all`] deletes,

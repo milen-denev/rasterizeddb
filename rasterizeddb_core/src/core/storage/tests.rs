@@ -549,10 +549,72 @@ fn a_location_the_snapshot_carried_is_repointed_rather_than_dropped() {
         "{text}"
     );
     // Neither source disk, and not the source's mirror: a clone mirroring into
-    // it would write over the backup of the live database.
+    // it would write over the backup of the live database. The moved disk is
+    // named once more, by its alias, which partition maps resolve through and
+    // nothing places a table by.
+    let placing: String = text.lines().filter(|l| !l.starts_with("alias\t")).collect::<Vec<_>>().join("\n");
     for gone in ["/mnt/fast", "/mnt/mirror", "/srv/live"] {
-        assert!(!text.contains(gone), "{gone} survived:\n{text}");
+        assert!(!placing.contains(gone), "{gone} survived:\n{text}");
     }
+    assert!(text.contains("alias\t/mnt/fast\t/restored/pool-location-1\n"), "{text}");
+    // Only a primary that moved: no alias for the root, which a map records
+    // as location 0, nor for the mirror, which is not carried.
+    assert_eq!(text.matches("alias\t").count(), 1, "{text}");
+}
+
+/// A restore of a restore: the first one's alias follows the disk again, so a
+/// partition map recorded on the original still finds its files, and the
+/// disk's intermediate path gets an alias of its own. An in-place restore
+/// writes none.
+#[test]
+fn aliases_follow_a_disk_through_every_restore() {
+    let target = std::path::PathBuf::from(temp_root("repoint_alias_chain"));
+    std::fs::write(
+        target.join(POOL_FILE),
+        "version\t1\nlocation\tprimary\t1\tenabled\t/r1\n\
+         location\tprimary\t1\tenabled\t/r1/pool-location-1\n\
+         alias\t/mnt/fast\t/r1/pool-location-1\n",
+    )
+    .unwrap();
+    repoint_restored_pool(&target, &target, Some("/r1"), &[]).unwrap();
+    let text = std::fs::read_to_string(target.join(POOL_FILE)).unwrap();
+    let root = normalize(&target.to_string_lossy());
+    let moved = normalize(&format!("{root}/pool-location-1"));
+    assert!(text.contains(&format!("alias\t/mnt/fast\t{moved}\n")), "{text}");
+    assert!(text.contains(&format!("alias\t/r1/pool-location-1\t{moved}\n")), "{text}");
+    assert_eq!(text.matches("alias\t").count(), 2, "{text}");
+}
+
+/// The pool reads its aliases, writes them back on every change, and
+/// resolves a recorded path through one only to a primary location it has.
+#[test]
+fn a_partition_recorded_on_a_moved_disk_resolves_to_where_it_is_now() {
+    let root = temp_root("alias_resolve");
+    let now = temp_root("alias_resolve_disk");
+    std::fs::write(
+        Path::new(&root).join(POOL_FILE),
+        format!(
+            "version\t1\nlocation\tprimary\t1\tenabled\t{root}\n\
+             location\tprimary\t1\tenabled\t{now}\n\
+             alias\t/mnt/gone\t{now}\n\
+             alias\t/mnt/elsewhere\t/mnt/not-in-this-pool\n"
+        ),
+    )
+    .unwrap();
+    let pool = StorageManager::open(&root);
+    assert_eq!(pool.partition_dir_now(&now).as_deref(), Some(normalize(&now).as_str()));
+    assert_eq!(pool.partition_dir_now("/mnt/gone").as_deref(), Some(normalize(&now).as_str()));
+    // An alias to a directory this pool does not hold is no licence to read it.
+    assert_eq!(pool.partition_dir_now("/mnt/elsewhere"), None);
+    assert_eq!(pool.partition_dir_now("/mnt/unknown"), None);
+    // Rewritten by any change, the aliases are kept.
+    pool.set_policy(PlacementPolicy::RoundRobin);
+    let text = std::fs::read_to_string(Path::new(&root).join(POOL_FILE)).unwrap();
+    assert!(text.contains(&format!("alias\t/mnt/gone\t{}\n", normalize(&now))), "{text}");
+    assert!(text.contains("alias\t/mnt/elsewhere\t/mnt/not-in-this-pool\n"), "{text}");
+    drop(pool);
+    crate::core::wal::remove_for(&now);
+    crate::core::wal::remove_for(&root);
 }
 
 #[test]
