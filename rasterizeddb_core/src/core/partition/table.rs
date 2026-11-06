@@ -1608,7 +1608,53 @@ impl PartitionedTable {
     pub async fn insert_row_in_txn(&self, row: RowWrite, tx: TxId) -> io::Result<()> {
         let live = self.live()?;
         let point = live.router.point_of_write(&row).map_err(io::Error::other)?;
+        if crate::core::notice::tracing_partitions() {
+            let map = &live.epoch.load_full().map;
+            crate::core::notice::trace_insert(self.name(), || format!("routed by {}", self.key_names()), map.len(), map.pid_of(point));
+        }
         self.partition_for_point(point).await?.insert_row_in_txn(row, tx).await
+    }
+
+    /// The partition key's columns, as `partition_trace` names them:
+    /// `tenant_id` or `(tenant_id, asset_group_id)`.
+    pub(crate) fn key_names(&self) -> String {
+        let Ok(live) = self.live() else {
+            return "the partition key".to_string();
+        };
+        let names: Vec<&str> = live
+            .spec
+            .levels()
+            .iter()
+            .map(|level| {
+                self.shell
+                    .schema
+                    .fields
+                    .iter()
+                    .find(|f| f.write_order == level.write_order as u64 && !f.is_deleted)
+                    .map_or("?", |f| f.name.as_str())
+            })
+            .collect();
+        match names.as_slice() {
+            [one] => one.to_string(),
+            many => format!("({})", many.join(", ")),
+        }
+    }
+
+    /// `partition_trace`'s NOTICE for a statement that `verb`s the partitions
+    /// `route` reaches under `epoch` (`None`: a prepared statement's bound
+    /// key, one partition), and why those.
+    pub(crate) fn trace_route(&self, verb: &str, epoch: &MapEpoch, route: Option<&Route>, where_clause: &str) {
+        crate::core::notice::trace(|| {
+            let declared = epoch.map.len();
+            let (routed, why) = match route {
+                None => (1, format!("routed by the bound value of {}", self.key_names())),
+                Some(Route::Zero) => (0, "the WHERE clause is constant false".to_string()),
+                Some(route @ Route::Points(_)) => (route.pids(&epoch.map).len(), format!("routed by {}", self.key_names())),
+                Some(Route::All) if where_clause.trim().is_empty() => (declared, "no WHERE clause".to_string()),
+                Some(Route::All) => (declared, format!("the WHERE clause does not pin {}", self.key_names())),
+            };
+            format!("\"{}\": {verb} {routed} of {declared} partitions ({why})", self.name())
+        });
     }
 
     /// The routing point of a row about to be written.

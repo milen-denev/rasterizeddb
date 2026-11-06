@@ -32,6 +32,12 @@ pub struct Notice {
 struct Collected {
     notices: Vec<Notice>,
     counted: Vec<(String, String, u64)>,
+    /// `SET partition_trace = on` for the session running this statement.
+    /// Kept across a [`drain`]: it is the session's, not a notice.
+    trace_partitions: bool,
+    /// `INSERT` routing under `partition_trace`, said once per table per
+    /// statement: (table, why, partitions declared, partitions written, rows).
+    inserts: Vec<(String, String, usize, std::collections::BTreeSet<u32>, u64)>,
 }
 
 tokio::task_local! {
@@ -45,6 +51,43 @@ tokio::task_local! {
 /// its future is copied whole each time it moves.
 pub fn collect<F: Future>(fut: F) -> impl Future<Output = F::Output> {
     NOTICES.scope(RefCell::new(Collected::default()), fut)
+}
+
+/// [`collect`], with the session's `partition_trace` setting: the routing
+/// layer says where each statement's rows were looked for ([`trace`]).
+pub fn collect_with<F: Future>(trace_partitions: bool, fut: F) -> impl Future<Output = F::Output> {
+    NOTICES.scope(RefCell::new(Collected { trace_partitions, ..Collected::default() }), fut)
+}
+
+/// Whether this statement's session asked for `partition_trace`.
+pub fn tracing_partitions() -> bool {
+    NOTICES.try_with(|n| n.borrow().trace_partitions).unwrap_or(false)
+}
+
+/// A `partition_trace` NOTICE, when the session asked for them.
+pub fn trace(message: impl FnOnce() -> String) {
+    if tracing_partitions() {
+        push("NOTICE", "00000", format!("partition_trace: {}", message()));
+    }
+}
+
+/// One row an `INSERT` routed to partition `pid` of `table`, under
+/// `partition_trace`; said once per table when the statement's notices are
+/// drained, as one line rather than one per row.
+pub fn trace_insert(table: &str, why: impl FnOnce() -> String, declared: usize, pid: u32) {
+    let _ = NOTICES.try_with(|n| {
+        let mut n = n.borrow_mut();
+        if !n.trace_partitions {
+            return;
+        }
+        match n.inserts.iter_mut().find(|(t, ..)| t == table) {
+            Some(entry) => {
+                entry.3.insert(pid);
+                entry.4 += 1;
+            }
+            None => n.inserts.push((table.to_string(), why(), declared, [pid].into(), 1)),
+        }
+    });
 }
 
 /// Raises a notice for the current statement's client. Returns whether a
@@ -105,9 +148,26 @@ pub fn count(key: &str, message: impl FnOnce() -> String) {
 /// Takes every notice collected so far in this task, the counted ones last.
 pub fn drain() -> Vec<Notice> {
     let collected = NOTICES
-        .try_with(|n| std::mem::take(&mut *n.borrow_mut()))
+        .try_with(|n| {
+            let mut n = n.borrow_mut();
+            let trace_partitions = n.trace_partitions;
+            let taken = std::mem::take(&mut *n);
+            n.trace_partitions = trace_partitions;
+            taken
+        })
         .unwrap_or_default();
     let mut out = collected.notices;
+    for (table, why, declared, written, rows) in collected.inserts {
+        out.push(Notice {
+            severity: "NOTICE",
+            sqlstate: "00000",
+            message: format!(
+                "partition_trace: \"{table}\": INSERT of {rows} {} into {} of {declared} partitions ({why})",
+                if rows == 1 { "row" } else { "rows" },
+                written.len()
+            ),
+        });
+    }
     for (_, message, n) in collected.counted {
         let message = format!("{message} ({n} {})", if n == 1 { "row" } else { "rows" });
         log::warn!("{message}");

@@ -2130,6 +2130,9 @@ struct SessionState {
     /// and zero both mean no bound, PostgreSQL's default (§7: a bounded
     /// default would fail long migrations under load).
     lock_timeout_ms: Option<u64>,
+    /// `SET partition_trace = on`: a NOTICE per statement naming the
+    /// partitions it routed to and why (docs/partitioning.md §2).
+    partition_trace: bool,
     /// `SET synchronous_commit = off` for this session, if it set one.
     ///
     /// `None` means follow the server, which is what a session that never asks
@@ -2531,6 +2534,7 @@ impl SessionState {
             default_read_only: false,
             statement_timeout_ms: None,
             lock_timeout_ms: None,
+            partition_trace: false,
             synchronous_commit: None,
             statement_tx: None,
             statement_failed: false,
@@ -2560,6 +2564,7 @@ impl SessionState {
         self.default_read_only = false;
         self.statement_timeout_ms = statement_timeout;
         self.lock_timeout_ms = lock_timeout;
+        self.partition_trace = false;
         self.synchronous_commit = None;
         self.idle_in_transaction_timeout = self.limits.idle_in_transaction_session_timeout;
         self.idle_session_timeout = self.limits.idle_session_timeout;
@@ -5268,6 +5273,7 @@ where
     let block_root = state.transaction.as_ref().map(|t| t.id);
     let (transactions, row_locks) = (database.transactions.clone(), database.row_locks.clone());
     let signal = cancel.clone();
+    let trace_partitions = state.partition_trace;
     // `now()` is the open block's start, or this statement's under
     // autocommit; `statement_timestamp()` is the message's: PostgreSQL
     // stamps the Query or Execute that carried the statement, so the
@@ -5288,7 +5294,7 @@ where
                         &transactions,
                         root,
                         crate::core::mvcc::owner::OwnerKind::Block,
-                        crate::core::notice::collect(execute_recorded_inner(
+                        crate::core::notice::collect_with(trace_partitions, execute_recorded_inner(
                             database,
                             state,
                             stream,
@@ -5338,7 +5344,7 @@ where
                         &transactions,
                         &row_locks,
                         crate::core::mvcc::owner::OwnerKind::Statement,
-                        crate::core::notice::collect(inner),
+                        crate::core::notice::collect_with(trace_partitions, inner),
                     )
                     .await
                 }
@@ -9093,6 +9099,33 @@ where
         return Ok(true);
     }
 
+    // `partition_trace`: a NOTICE per statement on a partitioned table,
+    // saying where its rows were looked for (docs/partitioning.md §2).
+    // Answered before the generic branch, which would acknowledge and drop it.
+    if let Some(rest) = strip_setting(&s_lower, "partition_trace") {
+        match rest {
+            None => {
+                state.partition_trace = false;
+                send_command_complete(stream, "SET").await?;
+            }
+            Some(value) => match parse_bool_setting(&value) {
+                Some(on) => {
+                    state.partition_trace = on;
+                    send_command_complete(stream, "SET").await?;
+                }
+                None => {
+                    send_error_response(
+                        stream,
+                        "22023",
+                        &format!("parameter \"partition_trace\" requires a Boolean value: \"{}\"", value),
+                    )
+                    .await?;
+                }
+            },
+        }
+        return Ok(true);
+    }
+
     // `lock_timeout` bounds every table-lock wait (55P03 past it; `0` is no
     // bound), so it is a real setting, answered before the generic branch
     // that would acknowledge it and drop it.
@@ -9579,6 +9612,7 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
             Some(ms) => format!("{}ms", ms),
             None => "0".to_string(),
         },
+        "partition_trace" => on_off(state.partition_trace).to_string(),
         // Enforced on every table-lock wait, and reported as this session set
         // it: `0` (no bound) unless it set one.
         "lock_timeout" => match state.lock_timeout_ms {

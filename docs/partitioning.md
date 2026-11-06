@@ -3020,6 +3020,15 @@ SHOW PARTITIONS t;
 SET partition_trace = on;   -- a NOTICE per statement: partitions routed, and why
 ```
 
+`partition_trace` as built (2026-11-06): session-level, `SHOW`/`RESET`/`RESET
+ALL` as any setting; a NOTICE (00000) per read or write plan, `"t": read 1 of
+64 partitions (routed by tenant_id)`, with the reason `the WHERE clause does
+not pin …`, `no WHERE clause`, `the WHERE clause is constant false` or `routed
+by the bound value of …` (a cached prepared shape); an `INSERT` says once per
+table `INSERT of n rows into k of 64 partitions`. Foreign-key probes are not
+traced. `partitions_touched` and `partition_fanout_warn` (§8) are still not
+built.
+
 **Refused**, with `0A000` or `42P16` and a reason:
 
 | Refused | Reason |

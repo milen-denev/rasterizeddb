@@ -505,9 +505,14 @@ impl FanOut {
             Some(range) => {
                 #[cfg(test)]
                 test_hooks::note_keyed(table.uid());
+                table.trace_route("read", &epoch, None, where_clause);
                 table.materialized_in(&epoch, range)?
             }
-            None => table.planned(&epoch, &table.route_where(where_clause)?)?,
+            None => {
+                let route = table.route_where(where_clause)?;
+                table.trace_route("read", &epoch, Some(&route), where_clause);
+                table.planned(&epoch, &route)?
+            }
         };
         Ok((visibility, epoch, parts))
     }
@@ -674,6 +679,7 @@ where
     let visibility = statement.unwrap_or_else(|| table.visibility_for(tx));
     let epoch = table.epoch()?;
     let route = table.route_where(where_clause)?;
+    table.trace_route("write", &epoch, Some(&route), where_clause);
     let parts = table.materialized(&epoch, &route).await?;
     #[cfg(test)]
     test_hooks::note_writes(table.uid(), parts.iter().map(|(pid, _)| *pid));
