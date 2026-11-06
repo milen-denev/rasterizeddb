@@ -18484,8 +18484,6 @@ async fn insert_row_resolved(
     }
 }
 
-/// [`execute_with_context`] for a statement whose caller needs only part of
-/// its result. See [`SubqueryNeed`].
 /// Refuses `DROP TABLE` and `ALTER TABLE` on the role catalogue
 /// (`auth::ROLE_TABLE`), as PostgreSQL refuses them on `pg_authid` (42501,
 /// "permission denied: \"pg_authid\" is a system catalog").
@@ -18511,6 +18509,8 @@ fn system_catalog_refusal(query: &QueryPurpose) -> Option<String> {
         .then(|| format!("permission denied: \"{}\" is a system catalog", crate::auth::ROLE_TABLE))
 }
 
+/// [`execute_with_context`] for a statement whose caller needs only part of
+/// its result. See [`SubqueryNeed`].
 pub(crate) async fn execute_with_need(
     query: QueryPurpose,
     database: Arc<Database>,

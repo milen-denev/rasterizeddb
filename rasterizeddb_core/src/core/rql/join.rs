@@ -4365,6 +4365,13 @@ fn build_aggregate_stage(
         });
         let entry = rebuilt.as_deref().unwrap_or(entry);
         let (expr, alias) = split_expr_alias(entry);
+        // A FILTER inside an expression over aggregates belongs to one call,
+        // and this path's computed inputs carry none: the clause was peeled
+        // and applied to nothing, so `COUNT(*) FILTER (…) * 100.0 / COUNT(*)`
+        // answered 100. Refused until it is carried.
+        if filter_text.is_some() && !crate::core::rql::lexer_query::is_one_aggregate_call(expr) {
+            return Err("FILTER on an aggregate inside an expression is not supported in a join yet".to_string());
+        }
 
         // An expression *around* an aggregate — `COALESCE(SUM(x), 0)`,
         // `SUM(x) / COUNT(*)`. Each aggregate is pulled out into its own input
@@ -4416,7 +4423,7 @@ fn build_aggregate_stage(
                     slot as u64,
                     false,
                 ));
-                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg });
+                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter: None });
                 rewritten.push_str(&synth_name);
                 cursor = *end;
             }

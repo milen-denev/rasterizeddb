@@ -270,6 +270,44 @@ pub(crate) const COMPUTED_INPUT_PREFIX: &str = "__agg_";
 pub struct ComputedInput {
     pub func: AggFunc,
     pub arg: Option<SchemaField>,
+    /// A computed argument (`100.0 * SUM(CASE WHEN … END) / COUNT(*)`), as
+    /// on [`SelectItem::Aggregate`]: `arg` then carries its type, not a
+    /// column to read.
+    pub arg_expr: Option<ArgExpression>,
+    /// This call's own `FILTER (WHERE …)`: `COUNT(*) FILTER (WHERE x) *
+    /// 100.0 / COUNT(*)` filters one input and not the other.
+    pub filter: Option<AggregateFilter>,
+}
+
+impl ComputedInput {
+    /// Folds `row` into `acc`, unless this input's FILTER rejects it.
+    fn fold(&self, row: &Row, acc: &mut Acc) -> Result<(), String> {
+        if let Some(filter) = &self.filter {
+            if !crate::core::rql::expr::eval_cond(&filter.condition, row, &filter.schema)? {
+                return Ok(());
+            }
+        }
+        let mut held = None;
+        let (bytes, ty) = self.value(row, &mut held)?;
+        acc.accumulate(bytes, ty);
+        Ok(())
+    }
+
+    /// The value this input folds from `row`, as [`accumulate_aggregate`]
+    /// reads a select-list aggregate's.
+    fn value<'a>(&'a self, row: &'a Row, held: &'a mut Option<Vec<u8>>) -> Result<(Option<&'a [u8]>, Option<&'a DbType>), String> {
+        Ok(match (&self.arg, &self.arg_expr) {
+            (Some(f), Some(argument)) => {
+                *held = evaluated_argument(argument, f, row)?;
+                (held.as_deref(), Some(&f.db_type))
+            }
+            // `bytes` is `None` for a NULL or an absent column, and `ty` is
+            // `None` only for `COUNT(*)`. Keeping those separate is what lets
+            // `COUNT(col)` skip a NULL without also skipping the empty string.
+            (Some(f), None) => (column_bytes(row, f.write_order), Some(&f.db_type)),
+            _ => (None, None),
+        })
+    }
 }
 
 /// A scalar function that takes no arguments.
@@ -2365,15 +2403,7 @@ fn accumulate_row(
             }
             SelectItem::Computed { inputs, .. } => {
                 for (j, input) in inputs.iter().enumerate() {
-                    let (bytes, ty) = match &input.arg {
-                        // `bytes` is `None` for a NULL or an absent column, and
-                        // `ty` is `None` only for `COUNT(*)`. Keeping those
-                        // separate is what lets `COUNT(col)` skip a NULL without
-                        // also skipping the empty string.
-                        Some(f) => (column_bytes(row, f.write_order), Some(&f.db_type)),
-                        None => (None, None),
-                    };
-                    run[computed_at[i] + j].accumulate(bytes, ty);
+                    input.fold(row, &mut run[computed_at[i] + j])?;
                 }
             }
             _ => {}
@@ -2393,6 +2423,30 @@ fn accumulate_row(
         }
     }
     Ok(())
+}
+
+/// A computed aggregate argument's bytes for `row`, at `declared`'s type;
+/// `None` for a NULL, which accumulates as an absent value — what makes `SUM`
+/// skip it rather than add a zero.
+fn evaluated_argument(argument: &ArgExpression, declared: &SchemaField, row: &Row) -> Result<Option<Vec<u8>>, String> {
+    // A failed evaluation fails the statement, as PostgreSQL's does. It was
+    // logged and folded as "no value": the row dropped out of the aggregate,
+    // so `sum(1/(b-7))` answered the other rows' sum and `count(…)` one fewer
+    // — a number that looks like an answer.
+    let value = crate::core::rql::expr::eval_aggregate_argument(&argument.expr, row, &argument.schema)?;
+    // Coerced to the type this argument was *declared* as, which is what the
+    // accumulator reads the bytes by. `column_order + 1` evaluates to four
+    // bytes while its static type is eight, and accumulating the narrow value
+    // under the wide type summed to **zero** — a wrong number, not an error.
+    let value = if value.is_null() || value.db_type() == Some(&declared.db_type) {
+        value
+    } else {
+        crate::core::rql::expr::cast(value, &declared.db_type)?
+    };
+    Ok(match value {
+        crate::core::rql::expr::Value::Data { bytes, .. } => Some(bytes),
+        crate::core::rql::expr::Value::Null => None,
+    })
 }
 
 /// Folds one row into one aggregate's accumulator. `slot` is where the
@@ -2429,30 +2483,8 @@ fn accumulate_aggregate(
     }
     let computed;
     let (bytes, ty) = match (arg, arg_expr) {
-        // Computed per row. A NULL result accumulates as an
-        // absent value, which is what makes `SUM` skip it
-        // rather than adding a zero.
         (Some(f), Some(argument)) => {
-            // A failed evaluation fails the statement, as PostgreSQL's
-            // does. It was logged and folded as "no value": the row
-            // dropped out of the aggregate, so `sum(1/(b-7))` answered
-            // the other rows' sum and `count(…)` one fewer — a number
-            // that looks like an answer.
-            let value = crate::core::rql::expr::eval_aggregate_argument(&argument.expr, row, &argument.schema)?;
-            // Coerced to the type this argument was *declared* as, which
-            // is what the accumulator reads the bytes by. `column_order +
-            // 1` evaluates to four bytes while its static type is eight,
-            // and accumulating the narrow value under the wide type summed
-            // to **zero** — a wrong number, not an error.
-            let value = if value.is_null() || value.db_type() == Some(&f.db_type) {
-                value
-            } else {
-                crate::core::rql::expr::cast(value, &f.db_type)?
-            };
-            computed = match value {
-                crate::core::rql::expr::Value::Data { bytes, .. } => Some(bytes),
-                crate::core::rql::expr::Value::Null => None,
-            };
+            computed = evaluated_argument(argument, f, row)?;
             (computed.as_deref(), Some(&f.db_type))
         }
         // `bytes` is `None` for a NULL or an absent column, and `ty`
@@ -3397,6 +3429,8 @@ mod tests {
             inputs: vec![ComputedInput {
                 func: AggFunc::Max,
                 arg: Some(f.clone()),
+                arg_expr: None,
+                filter: None,
             }],
             db_type: DbType::I64,
             label: "next".to_string(),
@@ -3490,6 +3524,8 @@ mod tests {
             inputs: vec![ComputedInput {
                 func: AggFunc::Count,
                 arg: Some(f),
+                arg_expr: None,
+                filter: None,
             }],
             db_type: DbType::I64,
             label: "x".to_string(),

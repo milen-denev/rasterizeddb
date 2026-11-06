@@ -123,9 +123,19 @@ fn parse_computed_item(
     let mut cursor = 0usize;
 
     for (start, end) in &calls {
+        // A call found inside the previous call's FILTER clause.
+        if *start < cursor {
+            continue;
+        }
         rewritten.push_str(&expr[cursor..*start]);
         let call = &expr[*start..*end];
-        let (func, arg) = parse_aggregate_call(call, schema)?;
+        let (func, arg, arg_expr) = parse_aggregate_call(call, schema)?;
+        // `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)`: the clause is this
+        // call's, and the synthetic column replaces both.
+        let (filter, end) = match trailing_filter(expr, *end) {
+            Some((text, past)) => (Some(aggregate_filter(text, schema)?), past),
+            None => (None, *end),
+        };
 
         let slot = inputs.len();
         let ty = func.result_type(arg.as_ref().map(|f| &f.db_type));
@@ -161,9 +171,9 @@ fn parse_computed_item(
             synth_field.without_time_zone = arg.as_ref().is_some_and(|f| f.without_time_zone);
         }
         synth_schema.push(synth_field);
-        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg });
+        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr, filter });
         rewritten.push_str(&name);
-        cursor = *end;
+        cursor = end;
     }
     rewritten.push_str(&expr[cursor..]);
 
@@ -220,10 +230,32 @@ fn leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     (head.eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
+/// An aggregate's argument: the column it names, or — for an argument that
+/// is computed rather than read, `SUM(CAST(NULLIF(data ->> 'y', '') AS
+/// NUMERIC))`, `SUM(CASE WHEN flag THEN 1 ELSE 0 END)` — a field carrying the
+/// expression's type plus the expression. Its type is known right here — the
+/// schema is in hand — so the result type is decided the same way a column's
+/// is, with no placeholder to be filled in later.
+fn aggregate_argument(
+    arg_text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<(SchemaField, Option<crate::core::rql::aggregate::ArgExpression>), String> {
+    let name = arg_text.rsplit('.').next().unwrap_or(arg_text).trim_matches('"');
+    if let Some(field) = schema.iter().find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted) {
+        return Ok((field.clone(), None));
+    }
+    let parsed = crate::core::rql::expr::parse(arg_text, schema)
+        .map_err(|_| format!("Column '{}' not found in schema", arg_text))?;
+    let db_type = crate::core::rql::expr::static_type(&parsed);
+    let reads = expr_reads(&parsed, schema);
+    let field = SchemaField::new(arg_text.to_string(), db_type.clone(), db_type.get_size(), 0, u64::MAX, false);
+    Ok((field, Some(crate::core::rql::aggregate::ArgExpression { expr: parsed, schema: reads })))
+}
+
 fn parse_aggregate_call(
     call: &str,
     schema: &SmallVec<[SchemaField; 20]>,
-) -> Result<(AggFunc, Option<SchemaField>), String> {
+) -> Result<(AggFunc, Option<SchemaField>, Option<crate::core::rql::aggregate::ArgExpression>), String> {
     let open = call
         .find('(')
         .ok_or_else(|| format!("'{}' is not a call", call))?;
@@ -242,21 +274,61 @@ fn parse_aggregate_call(
         if func != AggFunc::Count {
             return Err(format!("{}(*) is not valid", name.to_uppercase()));
         }
-        return Ok((func, None));
+        return Ok((func, None, None));
     }
-    let bare = arg_text
-        .rsplit('.')
-        .next()
-        .unwrap_or(arg_text)
-        .trim_matches('"');
-    if let Some(field) = schema
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
-    {
-        func.check_argument(Some(field))?;
-        return Ok((func, Some(field.clone())));
+    let (field, computed) = aggregate_argument(arg_text, schema)?;
+    func.check_argument(Some(&field))?;
+    Ok((func, Some(field), computed))
+}
+
+/// Whether `expr` is exactly one aggregate call, nothing around it.
+pub(crate) fn is_one_aggregate_call(expr: &str) -> bool {
+    let expr = expr.trim();
+    let calls = find_aggregate_calls(expr);
+    calls.len() == 1 && calls[0] == (0, expr.len())
+}
+
+/// The `FILTER (WHERE …)` right after a call ending at `end`: its condition
+/// text and where the clause ends.
+fn trailing_filter(expr: &str, end: usize) -> Option<(&str, usize)> {
+    let rest = &expr[end..];
+    let after_space = rest.trim_start();
+    let head = after_space.get(..6)?;
+    if !head.eq_ignore_ascii_case("FILTER") {
+        return None;
     }
-    Err(format!("Column '{}' not found in schema", arg_text))
+    let past_word = &after_space[6..];
+    let open_rel = past_word.len() - past_word.trim_start().len();
+    if !past_word[open_rel..].starts_with('(') {
+        return None;
+    }
+    let open = expr.len() - past_word.len() + open_rel;
+    let close = matching_paren_at(expr, open)?;
+    let inside = expr[open + 1..close].trim();
+    let condition = leading_word(inside, "WHERE")?;
+    Some((condition, close + 1))
+}
+
+/// An aggregate's `FILTER (WHERE …)`, with the columns it reads.
+fn aggregate_filter(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<crate::core::rql::aggregate::AggregateFilter, String> {
+    let condition = crate::core::rql::expr::parse_cond(text, schema)?;
+    // The condition's columns, plus their NULL companions: the fold has no
+    // schema of its own to tell a NULL from a zero.
+    let mut fields: Vec<SchemaField> = Vec::new();
+    for field in crate::core::rql::expr::cond_columns(&condition) {
+        if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema) {
+            if !fields.iter().any(|f| f.name == flag.name) {
+                fields.push(flag.clone());
+            }
+        }
+        if !fields.iter().any(|f| f.name == field.name) {
+            fields.push(field);
+        }
+    }
+    Ok(crate::core::rql::aggregate::AggregateFilter { condition, schema: fields })
 }
 
 /// Byte ranges of every top-level aggregate call inside `expr`.
@@ -413,6 +485,14 @@ fn parse_select_items(
                 None => text,
             }
         });
+        // Only a FILTER on the item's one aggregate is the item's. Inside an
+        // expression — `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)` — it
+        // belongs to its own call, which the computed path reads; peeled here
+        // it was applied to nothing, and the ratio answered 100.
+        let (item_owned, filter_text) = match &item_owned {
+            Some(text) if !is_one_aggregate_call(split_alias(text).0) => (None, None),
+            _ => (item_owned, filter_text),
+        };
         let item = item_owned.as_deref().unwrap_or(item);
 
         let upper = item.to_ascii_uppercase();
@@ -447,27 +527,7 @@ fn parse_select_items(
 
         let aggregate_filter = match &filter_text {
             None => None,
-            Some(text) => {
-                let condition = crate::core::rql::expr::parse_cond(text, schema)?;
-                // The condition's columns, plus their NULL companions: the fold
-                // has no schema of its own to tell a NULL from a zero.
-                let mut fields: Vec<SchemaField> = Vec::new();
-                for field in crate::core::rql::expr::cond_columns(&condition) {
-                    if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema)
-                    {
-                        if !fields.iter().any(|f| f.name == flag.name) {
-                            fields.push(flag.clone());
-                        }
-                    }
-                    if !fields.iter().any(|f| f.name == field.name) {
-                        fields.push(field);
-                    }
-                }
-                Some(crate::core::rql::aggregate::AggregateFilter {
-                    condition,
-                    schema: fields,
-                })
-            }
+            Some(text) => Some(aggregate_filter(text, schema)?),
         };
 
         // A window function looks like a call but is neither an aggregate nor a
@@ -502,6 +562,11 @@ fn parse_select_items(
                 Err(e) if e.ends_with(" cannot be matched") => return Err(e),
                 // A cast to a type name PostgreSQL does not have (42704).
                 Err(e) if e.starts_with("type \"") && e.ends_with("\" does not exist") => return Err(e),
+                // No overload for the arguments' types (42883), and what a
+                // known function refuses: falling through reported the
+                // function itself as unknown.
+                Err(e) if e.starts_with("function ") && e.ends_with(") does not exist") => return Err(e),
+                Err(e) if e.starts_with("round ") => return Err(e),
                 Err(_) => {}
             }
         }
@@ -609,48 +674,14 @@ fn parse_select_items(
                 return Err(format!("{}(DISTINCT *) is not valid", func_name.to_uppercase()));
             }
 
-            let mut argument_expression: Option<crate::core::rql::aggregate::ArgExpression> = None;
-            let arg = if arg_text == "*" {
+            let (arg, argument_expression) = if arg_text == "*" {
                 if func != AggFunc::Count {
                     return Err(format!("{}(*) is not valid", func_name.to_uppercase()));
                 }
-                None
+                (None, None)
             } else {
-                let name = arg_text
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(arg_text)
-                    .trim_matches('"');
-                match schema
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-                {
-                    Some(field) => Some(field.clone()),
-                    // An argument that is computed rather than read:
-                    // `SUM(CAST(NULLIF(data ->> 'y', '') AS NUMERIC))`, which is
-                    // how an aggregate over a document field is written. Its
-                    // type is known right here — the schema is in hand — so the
-                    // result type is decided the same way a column's is, with
-                    // no placeholder to be filled in later.
-                    None => {
-                        let parsed = crate::core::rql::expr::parse(arg_text, schema)
-                            .map_err(|_| format!("Column '{}' not found in schema", arg_text))?;
-                        let db_type = crate::core::rql::expr::static_type(&parsed);
-                        let reads = expr_reads(&parsed, schema);
-                        argument_expression = Some(crate::core::rql::aggregate::ArgExpression {
-                            expr: parsed,
-                            schema: reads,
-                        });
-                        Some(SchemaField::new(
-                            arg_text.to_string(),
-                            db_type.clone(),
-                            db_type.get_size(),
-                            0,
-                            u64::MAX,
-                            false,
-                        ))
-                    }
-                }
+                let (field, computed) = aggregate_argument(arg_text, schema)?;
+                (Some(field), computed)
             };
 
             func.check_argument(arg.as_ref())?;
@@ -2209,7 +2240,14 @@ pub fn row_fetch_from_select_query(
                 // scan returned, so a column missed here reads back as NULL.
                 SelectItem::Computed { inputs, .. } => {
                     for input in inputs {
-                        if let Some(f) = &input.arg {
+                        // A computed argument's field names the expression;
+                        // what it reads is what the scan fetches.
+                        let mut reads: Vec<&SchemaField> = match &input.arg_expr {
+                            Some(argument) => argument.schema.iter().collect(),
+                            None => input.arg.iter().collect(),
+                        };
+                        reads.extend(input.filter.iter().flat_map(|f| f.schema.iter()));
+                        for f in reads {
                             if !cols.iter().any(|c| c == &f.name) {
                                 cols.push(f.name.clone());
                             }

@@ -99,6 +99,31 @@ impl PgNum {
         Some(PgNum { m, s })
     }
 
+    /// `round(x, places)`: half away from zero, as `round_var`. A negative
+    /// `places` rounds to tens, hundreds, … at scale 0 (`round(1250, -2)` is
+    /// 1300), in one step: rounding to 0 places first would round twice
+    /// (1249.5 to 1250, then to 1300, where PostgreSQL gives 1200).
+    pub(crate) fn round_places(self, places: i32) -> Option<Self> {
+        if places >= 0 {
+            return self.round_to(places as u32);
+        }
+        let k = places.unsigned_abs();
+        // A unit wider than any i128 value: every value rounds to zero.
+        let Some(divisor) = self.s.checked_add(k).and_then(pow10) else {
+            return Some(PgNum { m: 0, s: 0 });
+        };
+        let (q, r) = (self.m / divisor, self.m % divisor);
+        let q = if r.unsigned_abs() >= divisor.unsigned_abs() - r.unsigned_abs() {
+            q.checked_add(self.m.signum())?
+        } else {
+            q
+        };
+        if q == 0 {
+            return Some(PgNum { m: 0, s: 0 });
+        }
+        Some(PgNum { m: q.checked_mul(pow10(k)?)?, s: 0 })
+    }
+
     pub(crate) fn add(self, other: Self) -> Option<Self> {
         let s = self.s.max(other.s);
         Some(PgNum { m: self.at(s)?.checked_add(other.at(s)?)?, s })
