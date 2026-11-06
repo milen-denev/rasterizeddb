@@ -2370,8 +2370,13 @@ mod tests {
             );
         }
 
+        // Not exactly 100: the hasher is seeded per instance
+        // (`ahash::RandomState::default()`), and `insert` reports `true` when
+        // `place` made room by evicting a neighbour from a full probe window,
+        // so an unlucky seed keeps 98 of 100 (once in a full `--tests` run on
+        // 2026-11-06). What is under test is the drain.
         let initial_len = cache.len();
-        assert_eq!(initial_len, 100);
+        assert!(initial_len > 0 && initial_len <= 100, "{initial_len}");
 
         // Concurrent drain operations
         let mut handles = vec![];
