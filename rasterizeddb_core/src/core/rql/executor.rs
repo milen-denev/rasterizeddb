@@ -15736,29 +15736,47 @@ fn query_sql(query: &QueryPurpose) -> String {
 /// sort moves `(keys, index)` pairs rather than ~1.5 KB rows, and with a cap
 /// no row outside the page is kept at all — each is decoded only for as long
 /// as its keys take to evaluate, and the page is decoded again from its bytes.
-/// Sorts rows in the client's layout by the window values at the given
-/// select positions (`QueryRows::window_order`). A NULL window value is a
-/// cell typed NULL.
-fn sort_by_window_output(rows: &mut [crate::core::row::row::Row], keys: &[(usize, bool, Option<bool>)]) {
+/// The order `ORDER BY` puts `rows` in when a key names a window function
+/// (`QueryRows::window_order`): indexes into `rows`, stable among ties.
+fn window_sort_order(
+    rows: &[crate::core::row::row::Row],
+    windows: &[(&usize, &crate::core::rql::window::WindowSpec, Vec<Option<Vec<u8>>>)],
+    keys: &[(crate::core::rql::lexer_query::WindowOrderKey, bool, Option<bool>)],
+    schema: &[crate::core::row::schema::SchemaField],
+) -> Result<Vec<usize>, String> {
     use crate::core::rql::expr::Value;
+    use crate::core::rql::lexer_query::WindowOrderKey;
     let directions: Vec<(bool, Option<bool>)> = keys.iter().map(|(_, d, n)| (*d, *n)).collect();
-    let key_of = |row: &crate::core::row::row::Row| -> Vec<Value> {
-        keys.iter()
-            .map(|(position, _, _)| match row.columns.get(*position) {
-                Some(c) if c.column_type != crate::core::db_type::DbType::NULL => Value::Data {
-                    bytes: c.data.into_slice().to_vec(),
-                    db_type: c.column_type.clone(),
-                },
-                _ => Value::Null,
-            })
-            .collect()
-    };
-    let mut keyed: Vec<(Vec<Value>, crate::core::row::row::Row)> =
-        rows.iter_mut().map(|row| (key_of(row), std::mem::take(row))).collect();
-    keyed.sort_by(|a, b| crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions));
-    for (slot, (_, row)) in rows.iter_mut().zip(keyed) {
-        *slot = row;
+    let wide: Vec<bool> = keys
+        .iter()
+        .map(|(k, _, _)| matches!(k, WindowOrderKey::Expr(e) if crate::core::rql::expr::output_is_wide(e)))
+        .collect();
+    let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rows.len());
+    for (k, row) in rows.iter().enumerate() {
+        let mut key = Vec::with_capacity(keys.len());
+        for ((part, _, _), wide) in keys.iter().zip(&wide) {
+            key.push(match part {
+                WindowOrderKey::Window(position) => {
+                    match windows.iter().find(|(p, _, _)| **p == *position).and_then(|(_, spec, values)| {
+                        values.get(k).map(|v| (spec.result_type(), v))
+                    }) {
+                        Some((ty, Some(bytes))) => Value::Data { bytes: bytes.clone(), db_type: ty },
+                        _ => Value::Null,
+                    }
+                }
+                WindowOrderKey::Expr(expr) => crate::core::rql::expr::eval_output_planned(expr, *wide, row, schema)?,
+            });
+        }
+        keyed.push((key, k));
     }
+    keyed.sort_by(|a, b| crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions));
+    Ok(keyed.into_iter().map(|(_, k)| k).collect())
+}
+
+/// `items` reordered so position `i` holds what was at `order[i]`.
+fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order.iter().filter_map(|&k| slots.get_mut(k).and_then(Option::take)).collect()
 }
 
 fn sort_rows_by_expressions(
@@ -21413,6 +21431,32 @@ async fn execute_query_rows_body(
                                         }
                                     }
                                 }
+                                // `ORDER BY id, rnk`: every key, now that the
+                                // window values exist and before they go in
+                                // the rows, which are permuted with all that
+                                // runs beside them. A window key reads its
+                                // value; any other is evaluated on the row as
+                                // scanned, NULL companions in it.
+                                if !window_order.is_empty() {
+                                    let order = match window_sort_order(&kept, &computed, &window_order, &slot_schema) {
+                                        Ok(order) => order,
+                                        Err(e) => {
+                                            let mut result = vec![3u8];
+                                            result.extend_from_slice(e.as_bytes());
+                                            return result;
+                                        }
+                                    };
+                                    kept = permute(kept, &order);
+                                    if kept_literals.len() == order.len() {
+                                        kept_literals = permute(std::mem::take(&mut kept_literals), &order);
+                                    }
+                                    if kept_keys.len() == order.len() {
+                                        kept_keys = permute(std::mem::take(&mut kept_keys), &order);
+                                    }
+                                    for (_, _, values) in computed.iter_mut() {
+                                        *values = permute(std::mem::take(values), &order);
+                                    }
+                                }
                                 // The row as scanned is the selected columns
                                 // in select order, then the columns only a
                                 // window reads (`max(v) OVER ()` with `v`
@@ -21482,9 +21526,6 @@ async fn execute_query_rows_body(
                                 // that they are in, before paging. Stable,
                                 // so the keys after them, sorted before the
                                 // windows, still order the ties.
-                                if !window_order.is_empty() {
-                                    sort_by_window_output(&mut kept, &window_order);
-                                }
                             }
 
                             // `FOR UPDATE` claims the rows before they

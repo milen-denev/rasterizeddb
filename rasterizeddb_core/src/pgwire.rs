@@ -1038,6 +1038,10 @@ where
     }
 }
 
+/// What `version()` answers, alone (`SELECT version()`, above the engine) or
+/// inside an expression (`ScalarFunc::Version`).
+pub(crate) const SERVER_VERSION_TEXT: &str = "rasterizeddb (pgwire) 0.2.0";
+
 const SSL_REQUEST_CODE: i32 = 80877103; // 0x04D2162F (1234, 5679)
 const CANCEL_REQUEST_CODE: i32 = 80877102; // 0x04D2162E (1234, 5678)
 const GSSENC_REQUEST_CODE: i32 = 80877104; // 0x04D21630 (1234, 5680)
@@ -9395,7 +9399,7 @@ where
         if !omit_description {
             send_row_description(stream, &[("version", DbType::STRING)], &[]).await?;
         }
-        send_data_row(stream, &[Some(b"rasterizeddb (pgwire) 0.2.0")]).await?;
+        send_data_row(stream, &[Some(SERVER_VERSION_TEXT.as_bytes())]).await?;
         send_command_complete(stream, "SELECT 1").await?;
         return Ok(true);
     }

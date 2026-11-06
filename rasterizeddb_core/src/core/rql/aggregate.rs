@@ -412,6 +412,9 @@ pub enum ScalarFunc {
     /// PostgreSQL 18's `uuidv7()`: a time-ordered UUID, monotonic within this
     /// process. See [`uuid_v7`].
     UuidV7,
+    /// `version()`: the server's name and version, as `SELECT version()`
+    /// answers it, inside an expression too (`version() IS NOT NULL`).
+    Version,
 }
 
 /// The last `uuidv7()` timestamp handed out, in nanoseconds since the epoch.
@@ -504,6 +507,7 @@ impl ScalarFunc {
                 Some((ScalarFunc::GenRandomUuid, DbType::UUID))
             }
             "UUIDV7" => Some((ScalarFunc::UuidV7, DbType::UUID)),
+            "VERSION" => Some((ScalarFunc::Version, DbType::STRING)),
             _ => None,
         }
     }
@@ -529,6 +533,7 @@ impl ScalarFunc {
                 crate::core::value_codec::random_uuid_v4().to_vec()
             }
             ScalarFunc::UuidV7 => uuid_v7().to_vec(),
+            ScalarFunc::Version => crate::pgwire::SERVER_VERSION_TEXT.as_bytes().to_vec(),
         }
     }
 }

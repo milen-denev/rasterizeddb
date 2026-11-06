@@ -240,9 +240,11 @@ async fn round_matches_postgresql() {
         let (got, message) = refused(&c, sql).await;
         assert_eq!(got, code, "{sql}: {message}");
     }
-    // Places read from a column are not carried yet: refused, not guessed.
-    let (_, message) = refused(&c, "SELECT round(revenue, id) FROM ev").await;
-    assert!(message.contains("not supported"), "{message}");
+    // Places read from the row: each value at its own scale (PostgreSQL 17).
+    assert_eq!(
+        rows(&c, "SELECT round(revenue, id) FROM ev ORDER BY id").await,
+        ["0.0", "10.50", "0.000", "20.0000", "NULL", "5.250000"]
+    );
 }
 
 /// `ORDER BY` a window's alias sorts by its values, before paging; and an
@@ -302,13 +304,6 @@ async fn windows_sort_by_alias_and_compute_around_a_call() {
             assert_eq!(rows(&c, sql).await, *want, "{sql}");
         }
     }
-    // Not carried yet, and refused rather than answered in another order or
-    // from one of the two windows.
-    for sql in [
-        "SELECT id, RANK() OVER (ORDER BY revenue DESC) AS rnk FROM ev ORDER BY id, rnk",
-        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) - RANK() OVER (ORDER BY revenue) FROM ev ORDER BY id",
-    ] {
-        let (_, message) = refused(&c, sql).await;
-        assert!(message.contains("not supported"), "{sql}: {message}");
-    }
+    // A window key after another key, and two window calls in one item, are
+    // answered now: `lifted_refusals.rs`.
 }

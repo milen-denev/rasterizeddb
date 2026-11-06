@@ -194,7 +194,11 @@ pub struct WindowAround {
     /// The window's value as a column: its type and the scale its bytes
     /// are at, under a write order no table column has.
     pub slot: SchemaField,
-    /// The table's columns and `slot`, which the expression is read against.
+    /// The other window calls of the expression, each with its column:
+    /// `ROW_NUMBER() OVER (…) - RANK() OVER (…)`.
+    pub more: Vec<(WindowSpec, SchemaField)>,
+    /// The table's columns and every slot, which the expression is read
+    /// against.
     pub schema: Vec<SchemaField>,
 }
 
@@ -204,7 +208,8 @@ pub struct WindowAround {
 pub(crate) const WINDOW_VALUE_COLUMN: &str = "__win_0";
 
 /// The write order of [`WINDOW_VALUE_COLUMN`]: past any real column's, and
-/// inside a column id's 32 bits (`row::schema_id_of`).
+/// inside a column id's 32 bits (`row::schema_id_of`). The expression's
+/// further window calls take the ones below it.
 const WINDOW_VALUE_WRITE_ORDER: u64 = u32::MAX as u64 - 1;
 
 impl WindowSpec {
@@ -224,8 +229,15 @@ impl WindowSpec {
         // What the expression around the call reads, with the NULL
         // companions: without one a NULL reads back as the type's zero.
         if let Some(around) = &self.around {
+            for (spec, _) in &around.more {
+                for field in spec.columns() {
+                    if !out.iter().any(|o| o.name == field.name) {
+                        out.push(field);
+                    }
+                }
+            }
             for field in crate::core::rql::expr::columns_of(&around.expr) {
-                if field.name == WINDOW_VALUE_COLUMN {
+                if field.name.starts_with("__win_") {
                     continue;
                 }
                 let flag = crate::core::rql::nullable::flag_field(&field.name, &around.schema).cloned();
@@ -574,24 +586,16 @@ pub fn parse_around(expr: &str, alias: Option<String>, schema: &[SchemaField]) -
     match calls.as_slice() {
         [] => None,
         [(start, end)] if *start == 0 && *end == expr.len() => None,
-        [(start, end)] => Some(around_call(expr, *start, *end, alias, schema)),
-        _ => Some(Err("more than one window function in one select item is not supported yet".to_string())),
+        _ => Some(around_calls(expr, &calls, alias, schema)),
     }
 }
 
-fn around_call(
-    expr: &str,
-    start: usize,
-    end: usize,
-    alias: Option<String>,
-    schema: &[SchemaField],
-) -> Result<WindowSpec, String> {
-    let mut spec = match parse(&expr[start..end], schema) {
-        Some(outcome) => outcome?,
-        None => return Err(format!("'{}' is not a window call", &expr[start..end])),
-    };
+/// The column window call number `n` of an expression is read as: its value's
+/// type and the scale its bytes are at.
+fn window_slot(spec: &WindowSpec, n: usize) -> SchemaField {
     let ty = spec.value_type();
-    let mut slot = SchemaField::new(WINDOW_VALUE_COLUMN.to_string(), ty.clone(), ty.get_size(), 0, WINDOW_VALUE_WRITE_ORDER, false);
+    let name = if n == 0 { WINDOW_VALUE_COLUMN.to_string() } else { format!("__win_{n}") };
+    let mut slot = SchemaField::new(name, ty.clone(), ty.get_size(), 0, WINDOW_VALUE_WRITE_ORDER - n as u64, false);
     if ty == DbType::DECIMAL {
         // The scale the value's bytes are at, so the expression lifts it as
         // it lifts a column. A value function over an unconstrained NUMERIC
@@ -604,12 +608,37 @@ fn around_call(
             Some(spec.decimal_output_scale())
         };
     }
-    let rewritten = format!("{}{}{}", &expr[..start], WINDOW_VALUE_COLUMN, &expr[end..]);
+    slot
+}
+
+fn around_calls(
+    expr: &str,
+    calls: &[(usize, usize)],
+    alias: Option<String>,
+    schema: &[SchemaField],
+) -> Result<WindowSpec, String> {
+    let mut specs: Vec<(WindowSpec, SchemaField)> = Vec::with_capacity(calls.len());
+    let mut rewritten = String::with_capacity(expr.len());
+    let mut cursor = 0usize;
+    for (n, (start, end)) in calls.iter().enumerate() {
+        let spec = match parse(&expr[*start..*end], schema) {
+            Some(outcome) => outcome?,
+            None => return Err(format!("'{}' is not a window call", &expr[*start..*end])),
+        };
+        let slot = window_slot(&spec, n);
+        rewritten.push_str(&expr[cursor..*start]);
+        rewritten.push_str(&slot.name);
+        cursor = *end;
+        specs.push((spec, slot));
+    }
+    rewritten.push_str(&expr[cursor..]);
     let mut around_schema = schema.to_vec();
-    around_schema.push(slot.clone());
+    around_schema.extend(specs.iter().map(|(_, slot)| slot.clone()));
     let parsed = crate::core::rql::expr::parse(&rewritten, &around_schema)?;
+    let mut specs = specs.into_iter();
+    let (mut spec, slot) = specs.next().expect("at least one call");
     spec.label = alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr));
-    spec.around = Some(Box::new(WindowAround { expr: parsed, slot, schema: around_schema }));
+    spec.around = Some(Box::new(WindowAround { expr: parsed, slot, more: specs.collect(), schema: around_schema }));
     Ok(spec)
 }
 
@@ -677,21 +706,27 @@ pub fn assign_output(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>
     let Some(around) = &spec.around else {
         return Ok(values);
     };
+    // Every window call of the expression, each over the same rows.
+    let mut slots: Vec<(&SchemaField, Vec<WindowValue>)> = vec![(&around.slot, values)];
+    for (more, slot) in &around.more {
+        slots.push((slot, assign(rows, more)?));
+    }
     let wide = crate::core::rql::expr::output_is_wide(&around.expr);
     let scale = crate::core::rql::expr::display_scale(&around.expr);
     let ty = spec.result_type();
-    let mut out = Vec::with_capacity(values.len());
-    for (row, value) in rows.iter().zip(values) {
+    let mut out = Vec::with_capacity(rows.len());
+    for (k, row) in rows.iter().enumerate() {
         let mut row = row.clone();
-        if let Some(bytes) = value {
+        for (slot, values) in &slots {
+            let Some(Some(bytes)) = values.get(k) else { continue };
             let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
             if !bytes.is_empty() {
-                mb.into_slice_mut().copy_from_slice(&bytes);
+                mb.into_slice_mut().copy_from_slice(bytes);
             }
             row.columns.push(crate::core::row::row::Column {
-                schema_id: crate::core::row::row::schema_id_of(WINDOW_VALUE_WRITE_ORDER),
+                schema_id: crate::core::row::row::schema_id_of(slot.write_order),
                 data: mb,
-                column_type: around.slot.db_type.clone(),
+                column_type: slot.db_type.clone(),
             });
         }
         let value = crate::core::rql::expr::eval_output_planned(&around.expr, wide, &row, &around.schema)

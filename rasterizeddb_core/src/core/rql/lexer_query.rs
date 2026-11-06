@@ -12,6 +12,15 @@ use crate::core::{
     rql::lexer_s1::QueryPurpose,
 };
 
+/// One key of [`QueryRows::window_order`].
+#[derive(Debug, Clone)]
+pub enum WindowOrderKey {
+    /// The window function at this select position.
+    Window(usize),
+    /// Anything else, evaluated on the row as scanned.
+    Expr(crate::core::rql::expr::Expr),
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryRows {
     pub table_name: String,
@@ -80,12 +89,13 @@ pub struct QueryRows {
     /// the scan runs unsorted and unbounded and the executor evaluates each
     /// key per row, sorts, and pages. `(expr, descending, nulls_first)`.
     pub order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)>,
-    /// `ORDER BY` keys naming a window function's output (`ORDER BY rnk`),
-    /// sorted once the window values are in: `(select position, descending,
-    /// nulls_first)`. They lead the `ORDER BY`; the keys after them are
-    /// [`Self::order_expressions`], sorted first, so a stable sort here keeps
-    /// their order among ties.
-    pub window_order: Vec<(usize, bool, Option<bool>)>,
+    /// The whole `ORDER BY` when any of its keys names a window function's
+    /// output (`ORDER BY id, rnk`): sorted at the window stage, once the
+    /// window values are computed and before they are put in the rows, a
+    /// window key reading its value and any other key evaluated on the row as
+    /// scanned. `(key, descending, nulls_first)`. Empty otherwise, the keys
+    /// then being [`Self::order_expressions`] or the scan's own.
+    pub window_order: Vec<(WindowOrderKey, bool, Option<bool>)>,
     /// How many of `requested_row_fetch`'s columns the client asked for.
     ///
     /// Sorting reads the key out of the fetched row, so an `ORDER BY` over a
@@ -2448,7 +2458,7 @@ pub fn row_fetch_from_select_query(
         }
     });
     let mut order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
-    let mut window_order: Vec<(usize, bool, Option<bool>)> = Vec::new();
+    let mut window_order: Vec<(WindowOrderKey, bool, Option<bool>)> = Vec::new();
 
     // An aggregate query sorts, limits and offsets its own output after the
     // fold, so none of the three is handed to the scan. Passing a limit down
@@ -2533,17 +2543,9 @@ pub fn row_fetch_from_select_query(
             });
             let named_column = schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
             if let (Some(position), false) = (window_item, named_column) {
-                // A window's value exists only once every row is in, so it
-                // is sorted after the windows, by a stable sort that the
-                // keys after it have already ordered. A window key after
-                // another key would need the other sorted after it.
-                if !order_expressions.is_empty() {
-                    return Err(format!(
-                        "ORDER BY a window function's output ('{}') after another key is not supported yet",
-                        term.token
-                    ));
-                }
-                window_order.push((position, term.descending, term.nulls_first));
+                // A window's value exists only once every row is in: the
+                // whole ORDER BY is sorted then (`window_order`).
+                window_order.push((WindowOrderKey::Window(position), term.descending, term.nulls_first));
                 continue;
             }
             let expr = if let Some(field) = schema
@@ -2583,6 +2585,27 @@ pub fn row_fetch_from_select_query(
                 }
             }
             order_expressions.push((expr, term.descending, term.nulls_first));
+        }
+        // With a window key anywhere, every key is sorted at the window
+        // stage, in the order written, and nothing before it.
+        if !window_order.is_empty() {
+            let mut all: Vec<(WindowOrderKey, bool, Option<bool>)> = Vec::with_capacity(order_terms.len());
+            let mut windows = std::mem::take(&mut window_order).into_iter();
+            let mut exprs = std::mem::take(&mut order_expressions).into_iter();
+            for term in &order_terms {
+                let bare = term.token.rsplit('.').next().unwrap_or(&term.token).trim_matches('"');
+                let is_window = select_items
+                    .iter()
+                    .any(|s| matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare))
+                    && !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
+                let next = if is_window {
+                    windows.next()
+                } else {
+                    exprs.next().map(|(e, d, n)| (WindowOrderKey::Expr(e), d, n))
+                };
+                all.extend(next);
+            }
+            window_order = all;
         }
         (None, None, offset)
     };
@@ -2645,7 +2668,16 @@ pub fn row_fetch_from_select_query(
         limit,
         order_by,
         offset,
-        visible_columns,
+        // An ORDER BY sorted at the window stage reads its keys there, from
+        // the row as fetched: nothing is cut before it (the stage truncates
+        // to the select list once its values are in). Cut at the visible
+        // columns, a key on a column not selected read NULL in every row, and
+        // `ORDER BY user_id, rnk` sorted by `rnk` alone.
+        visible_columns: if window_order.iter().any(|(k, _, _)| matches!(k, WindowOrderKey::Expr(_))) {
+            requested_columns.len()
+        } else {
+            visible_columns
+        },
         order_expressions,
         window_order,
         aggregate,

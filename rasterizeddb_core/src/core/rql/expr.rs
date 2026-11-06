@@ -1434,10 +1434,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         let list: Vec<String> = args.iter().map(|a| pg_name(&static_type(a))).collect();
                         return Err(format!("function round({}) does not exist", list.join(", ")));
                     }
-                    if args.len() == 2 {
-                        if !columns_of(&args[1]).is_empty() {
-                            return Err("round with places that are not a constant is not supported yet".to_string());
+                    if args.len() == 2 && !columns_of(&args[1]).is_empty() {
+                        // Places read from the row: evaluated per row, each
+                        // value at its own scale (`round(v, n)` shows 0.0,
+                        // 10.50, 0.000 down a column, as PostgreSQL does).
+                        let places_ty = static_type(&args[1]);
+                        if !is_integer_type(&places_ty) {
+                            return Err(format!("function round(numeric, {}) does not exist", pg_name(&places_ty)));
                         }
+                    } else if args.len() == 2 {
                         let places = eval(&args[1], &Row::default(), &[])?;
                         args[1] = match places {
                             Value::Null => Expr::Null,
@@ -2443,6 +2448,7 @@ pub fn static_type(expr: &Expr) -> DbType {
             crate::core::rql::aggregate::ScalarFunc::CurrentDate => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => DbType::STRING,
             crate::core::rql::aggregate::ScalarFunc::UuidV7 => DbType::UUID,
+            crate::core::rql::aggregate::ScalarFunc::Version => DbType::STRING,
         },
         // A `timestamp` is stored as the `DATETIME` it is; `yields_timestamp`
         // says which of the two it is.
@@ -3305,7 +3311,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             let places = match args.get(1) {
                 None => None,
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(p) => Some(as_i64(p).ok_or_else(|| "round's places must be an integer".to_string())? as i32),
+                Some(p) => Some(as_i64(p).ok_or_else(|| "round's places must be an integer".to_string())?.clamp(-1000, 1000) as i32),
             };
             let exact = match db_type {
                 DbType::DECIMAL => Some(decimal_value_as_pgnum(bytes)?),
@@ -4494,7 +4500,12 @@ pub(crate) fn pg_numeric(
         Expr::Call(TextFunc::Round, args) if static_type(expr) == DbType::DECIMAL => {
             let places = match args.get(1) {
                 None => Some(0),
-                Some(places) => round_places(places),
+                Some(Expr::Null) => None,
+                Some(places) => match round_places(places) {
+                    Some(p) => Some(p),
+                    // Read from the row; past either end every answer is the same.
+                    None => as_i64(&eval(places, row, schema)?).map(|p| p.clamp(-1000, 1000) as i32),
+                },
             };
             match (pg_numeric(&args[0], row, schema)?, places) {
                 (None, _) => None,
@@ -6307,6 +6318,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 crate::core::rql::aggregate::ScalarFunc::CurrentDate => "current_date",
                 crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => "gen_random_uuid",
                 crate::core::rql::aggregate::ScalarFunc::UuidV7 => "uuidv7",
+                crate::core::rql::aggregate::ScalarFunc::Version => "version",
             })
             .expect("known function");
             Value::Data {
