@@ -4088,6 +4088,10 @@ pub(crate) async fn describe_query(
     if stmt.is_empty() {
         return Ok(None);
     }
+    // Described as it runs: a `DISTINCT ON` the executor rewrites over a
+    // derived table (`execute_single_statement`) is described in that form.
+    let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
+    let stmt = distinct_on.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
     // instead — but the outer query usually reads a CTE *as its source
     // relation*, and that name is not in `database.tables`. Describing the
@@ -5958,6 +5962,17 @@ where
         uncommented.as_str()
     } else {
         stmt
+    };
+    // `DISTINCT ON` over a join or with an aggregate or a window: the same
+    // statement over a derived table, before anything reads its table set
+    // (`core::rql::distinct_on`).
+    let distinct_on;
+    let stmt = match crate::core::rql::distinct_on::rewrite_statement(stmt) {
+        Some(rewritten) => {
+            distinct_on = rewritten;
+            distinct_on.as_str()
+        }
+        None => stmt,
     };
 
     // A quoted identifier holding a quote (`"a""b"`) is refused before

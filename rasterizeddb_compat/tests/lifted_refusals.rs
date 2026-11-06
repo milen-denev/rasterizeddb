@@ -8,7 +8,9 @@
 //! - `round(v, n)` with the places read from the row, each value at its own
 //!   scale.
 //! - `version()` inside an expression.
-//! - `SELECT DISTINCT ON (k, …)`, single-table (a join still refuses it).
+//! - `SELECT DISTINCT ON (k, …)`, single-table; and over a join, a GROUP BY,
+//!   an aggregate or a window function, through a derived table
+//!   (`core::rql::distinct_on`).
 //! - `IN (SELECT …)` inside a CASE or a FILTER condition (pinned; it worked
 //!   once the condition reader had IN, the subquery being substituted first).
 
@@ -105,4 +107,87 @@ async fn distinct_on_matches_postgresql() {
     drop(c);
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `SELECT DISTINCT ON` over a join (inner, left, comma), over a GROUP BY,
+/// with an aggregate or a window function in the select list or the ORDER BY,
+/// under a WITH, with LIMIT/OFFSET and through the extended protocol: each
+/// answered as PostgreSQL 17 answers it, with its column names. Each was
+/// refused ("not supported yet").
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_on_over_joins_and_aggregates_matches_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE ev (id INT, user_id INT, kind TEXT, ts INT, revenue NUMERIC(10,2))",
+        "CREATE TABLE users (uid INT, name TEXT, tier TEXT)",
+        "INSERT INTO ev VALUES (1,1,'a',10,1.00),(2,1,'b',30,2.00),(3,1,'a',20,3.00),(4,2,'a',5,4.00),(5,2,'b',50,NULL),(6,NULL,'c',1,6.00),(7,NULL,'c',2,7.00),(8,3,'a',8,8.00)",
+        "INSERT INTO users VALUES (1,'ann','gold'),(2,'bob','silver'),(3,'cy','gold'),(4,'dee',NULL)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT DISTINCT ON (u.tier) u.tier, u.name, e.ts FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier, e.ts DESC", &["gold|ann|30", "silver|bob|50"]),
+        ("SELECT DISTINCT ON (u.uid) u.uid, e.id FROM users u LEFT JOIN ev e ON e.user_id = u.uid ORDER BY u.uid, e.id DESC NULLS LAST", &["1|3", "2|5", "3|8", "4|NULL"]),
+        ("SELECT DISTINCT ON (1) u.name, e.kind FROM users u, ev e WHERE e.user_id = u.uid ORDER BY 1, e.revenue DESC NULLS LAST", &["ann|a", "bob|a", "cy|a"]),
+        ("SELECT DISTINCT ON (user_id) user_id, kind, count(*) AS n FROM ev GROUP BY user_id, kind ORDER BY user_id, n DESC, kind", &["1|a|2", "2|a|1", "3|a|1", "NULL|c|2"]),
+        ("SELECT DISTINCT ON (user_id) user_id, kind FROM ev GROUP BY user_id, kind ORDER BY user_id, sum(ts) DESC", &["1|a", "2|b", "3|a", "NULL|c"]),
+        ("SELECT DISTINCT ON (kind) kind, id, row_number() OVER (PARTITION BY kind ORDER BY ts DESC) AS rn FROM ev ORDER BY kind, id", &["a|1|2", "b|2|2", "c|6|2"]),
+        ("SELECT DISTINCT ON (kind) kind, id FROM ev ORDER BY kind, rank() OVER (ORDER BY ts) DESC", &["a|3", "b|5", "c|7"]),
+        ("SELECT DISTINCT ON (u.tier) u.tier, u.name, sum(e.ts) AS total FROM ev e JOIN users u ON e.user_id = u.uid GROUP BY u.tier, u.name ORDER BY u.tier NULLS FIRST, total DESC LIMIT 2", &["gold|ann|60", "silver|bob|55"]),
+        ("SELECT DISTINCT ON (u.tier) u.tier, e.ts * 2 FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier, e.ts * 2", &["gold|16", "silver|10"]),
+        ("WITH g AS (SELECT * FROM users WHERE tier IS NOT NULL) SELECT DISTINCT ON (g.tier) g.tier, e.id FROM g JOIN ev e ON e.user_id = g.uid ORDER BY g.tier, e.id", &["gold|1", "silver|4"]),
+        ("SELECT DISTINCT ON (t) u.tier AS t, e.id FROM ev e JOIN users u ON e.user_id=u.uid ORDER BY t, e.id DESC", &["gold|8", "silver|5"]),
+        ("SELECT DISTINCT ON (e.kind) u.name FROM ev e JOIN users u ON e.user_id=u.uid ORDER BY e.kind, u.name", &["ann", "ann"]),
+        ("SELECT DISTINCT ON (u.tier) u.tier, e.id FROM ev e JOIN users u ON e.user_id = u.uid WHERE e.ts > 5 ORDER BY u.tier, e.id", &["gold|1", "silver|5"]),
+        ("SELECT DISTINCT ON (user_id) user_id, count(*) FILTER (WHERE kind = 'a') AS na, max(ts) FROM ev GROUP BY user_id, kind ORDER BY user_id, max(ts) DESC", &["1|0|30", "2|0|50", "3|1|8", "NULL|0|2"]),
+        ("SELECT DISTINCT ON (u.tier) u.tier, e.id FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier, e.id LIMIT 1 OFFSET 1", &["silver|4"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+
+    // Described (extended protocol) with PostgreSQL's names, and run with a
+    // parameter: over a join, and with windows.
+    let sql = "SELECT DISTINCT ON (u.tier) u.tier, e.ts * 2, e.id FROM ev e JOIN users u ON e.user_id = u.uid \
+               WHERE e.ts > $1 ORDER BY u.tier, e.ts * 2";
+    let statement = c.prepare(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let names: Vec<&str> = statement.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["tier", "?column?", "id"]);
+    let got: Vec<(String, i32, i32)> = c
+        .query(&statement, &[&5i32])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(got, [("gold".to_string(), 16, 8), ("silver".to_string(), 100, 5)]);
+    let sql = "SELECT DISTINCT ON (kind) kind, count(*) OVER (), max(id) OVER () FROM ev WHERE ts > $1 ORDER BY kind, id";
+    let statement = c.prepare(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let names: Vec<&str> = statement.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["kind", "count", "max"]);
+    let got: Vec<(String, i64, i32)> = c
+        .query(&statement, &[&5i32])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(got, [("a".to_string(), 5, 8), ("b".to_string(), 5, 8)]);
+
+    // 42P10 over a join, as on one table.
+    let sql = "SELECT DISTINCT ON (u.tier) u.tier FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY e.id";
+    let e = c.simple_query(sql).await.expect_err(sql);
+    assert_eq!(e.code().map(|c| c.code()), Some("42P10"), "{e}");
+    // Still refused, never answered wrong: `*` (its columns are not named
+    // here), an ambiguous output name (PostgreSQL's 42702), and a window over
+    // a join (refused without DISTINCT ON too).
+    for sql in [
+        "SELECT DISTINCT ON (u.tier) * FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier",
+        "SELECT DISTINCT ON (u.tier) u.tier, count(*) OVER () FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier",
+        "SELECT DISTINCT ON (id) u.uid AS id, e.id FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY id",
+    ] {
+        assert!(c.simple_query(sql).await.is_err(), "{sql}");
+    }
 }
