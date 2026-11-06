@@ -548,7 +548,7 @@ pub fn parse_alter(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
     } else {
         return None;
     };
-    Some(parsed.map(|op| (table, op)))
+    Some(parsed.map(|op| (table, op)).map_err(|e| format!("syntax error: {e}")))
 }
 
 /// `STORAGE MOVE PARTITION t FOR (…) TO '<dir>'`: `None` when `sql` is
@@ -559,7 +559,7 @@ pub fn parse_move(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
         return None;
     }
     let Some(table) = name_of(toks.get(3)) else {
-        return Some(Err("STORAGE MOVE PARTITION expects a table name".to_string()));
+        return Some(Err("syntax error: STORAGE MOVE PARTITION expects a table name".to_string()));
     };
     let parsed = for_group(&toks, 4, "MOVE PARTITION").and_then(|(at, j)| {
         let (to, k) = to_dir(&toks, j, "MOVE PARTITION")?;
@@ -567,7 +567,7 @@ pub fn parse_move(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
         done(&toks, k, "MOVE PARTITION")?;
         Ok(ReshapeOp::MovePartition { at, to })
     });
-    Some(parsed.map(|op| (table, op)))
+    Some(parsed.map(|op| (table, op)).map_err(|e| format!("syntax error: {e}")))
 }
 
 #[cfg(test)]

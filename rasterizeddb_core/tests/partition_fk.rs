@@ -237,15 +237,13 @@ fn on_update_actions_from_a_plain_parent_answer_like_the_twin() {
         create_parent(&mut q);
         create_child(&mut q, &format!("ON UPDATE {action}"));
         q.ok("INSERT INTO {c} (cid, pid, v) VALUES (1, 1, 1), (2, 2, 2), (3, 2, 3), (4, 7, 4)");
-        // A key no child references moves on every configuration whose parent
-        // allows the key to change; a partitioned parent's key is its
-        // partition key, which no UPDATE may change yet (phase 6).
-        for (i, (suffix, part_parent, _)) in CONFIGS.iter().enumerate() {
+        // A referenced key changes on every configuration as its action
+        // says: a partitioned parent's key is its partition key, and since
+        // phase 6 (P9) the UPDATE moves its row and acts on the children as
+        // a plain parent's does.
+        for (i, (suffix, _, _)) in CONFIGS.iter().enumerate() {
             let moved = q.on(i, "UPDATE {p} SET id = 50 WHERE id = 2");
-            if *part_parent {
-                let e = moved.expect_err("a key change on a partitioned parent");
-                assert!(e.is_unsupported(), "{suffix}: {e}");
-            } else if matches!(action, "NO ACTION" | "RESTRICT") {
+            if matches!(action, "NO ACTION" | "RESTRICT") {
                 assert_eq!(moved.expect_err(action).code, "23503", "{suffix}");
             } else {
                 moved.unwrap_or_else(|e| panic!("{suffix} {action}: {e}"));
@@ -255,11 +253,12 @@ fn on_update_actions_from_a_plain_parent_answer_like_the_twin() {
         let rows = |q: &mut Quad, i: usize| q.on(i, "SELECT cid, pid FROM {c} ORDER BY cid").unwrap().rows;
         assert_eq!(rows(&mut q, 0), rows(&mut q, 1), "{action}: pq unlike pp");
         assert_eq!(rows(&mut q, 2), rows(&mut q, 3), "{action}: qq unlike qp");
+        assert_eq!(rows(&mut q, 0), rows(&mut q, 2), "{action}: a partitioned parent unlike a plain one");
         // A same-value assignment of the key changes nothing a child sees.
         q.ok("UPDATE {p} SET id = 1, label = 'one' WHERE id = 1");
         assert_eq!(rows(&mut q, 0), rows(&mut q, 1), "{action}: pq unlike pp");
         assert_eq!(rows(&mut q, 2), rows(&mut q, 3), "{action}: qq unlike qp");
-        assert_eq!(rows(&mut q, 2)[1], vec![Some("2".to_string()), Some("2".to_string())], "{action}: qp moved");
+        assert_eq!(rows(&mut q, 0), rows(&mut q, 2), "{action}: a partitioned parent unlike a plain one");
         drop_both(&mut q);
     }
 }

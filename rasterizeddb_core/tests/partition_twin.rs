@@ -328,8 +328,8 @@ const REFUSED: &[Refusal] = &[
     // UpdateKeySameValue (a key assigned the value its WHERE pins), DeleteByKey,
     // DeleteByPrefix, DeleteByNonKey, DeleteIn, PreparedUpdate, PreparedDelete,
     // Vacuum and VacuumFull are compared with the twin, inside blocks too.
-    // A key change moves a row between partitions (I4): phase 6.
-    refused(UpdateKeyChange, "phase 6"),
+    // A key change moves a row between partitions (I4): built in phase 6
+    // (P9), UpdateKeyChange is compared with the twin.
     // Phase 3 P3 (composite identifying keys) is built: UpdateFrom and
     // DeleteUsing with a partitioned target (joined to a plain or a
     // partitioned source, RETURNING, an expression over the target), and
@@ -917,11 +917,40 @@ impl Gen {
                     format!("UPDATE {{t}} SET tenant_id = {t}, grp = {g}, n = n + 1 WHERE tenant_id = {t} AND grp = {g}"),
                 )
             }
-            UpdateKeyChange => {
-                let w = self.pk_eq();
-                let t = self.tenant() + 100;
-                self.simple(kind, format!("UPDATE {{t}} SET tenant_id = {t} WHERE {w}"))
-            }
+            // Phase 6 row moves (§9): each shape moves rows to points no
+            // other moved row of the statement shares, so a collision can only
+            // be with a row already there, which both tables refuse alike.
+            UpdateKeyChange => match self.rng.u8(..6) {
+                0 => {
+                    let w = self.pk_eq();
+                    let t = self.tenant() + 100;
+                    self.simple(kind, format!("UPDATE {{t}} SET tenant_id = {t} WHERE {w}"))
+                }
+                1 => {
+                    let t = self.tenant();
+                    self.simple(kind, format!("UPDATE {{t}} SET tenant_id = tenant_id + 1000 WHERE tenant_id = {t}"))
+                }
+                2 => {
+                    let v = self.rng.i32(-50..100);
+                    self.simple(
+                        kind,
+                        format!(
+                            "UPDATE {{t}} SET tenant_id = tenant_id + 1000, n = n + 1 WHERE n > {v} AND tenant_id < 1000 \
+                             RETURNING tenant_id, grp, id, n"
+                        ),
+                    )
+                }
+                3 => self.simple(kind, "UPDATE {t} SET tenant_id = tenant_id - 1000 WHERE tenant_id > 1000".into()),
+                4 => {
+                    let t = self.tenant();
+                    self.simple(kind, format!("UPDATE {{t}} SET grp = grp + 10 WHERE tenant_id = {t} AND grp < 10"))
+                }
+                _ => {
+                    let w = self.pk_eq();
+                    let t = self.tenant() + 200;
+                    self.simple(kind, format!("UPDATE {{t}} SET tenant_id = {t}, s = 'moved' WHERE {w} RETURNING *"))
+                }
+            },
             UpdateReturning => {
                 let t = self.tenant();
                 self.simple(
@@ -2335,9 +2364,7 @@ impl Twin {
                         // isolated again, a one-point split, a tenant on
                         // two partitions) is no finding; anything else is.
                         let e = format!("{e:?}");
-                        let explained = ["already has", "single point", "span more", "cannot be split", "same partition", "both FOR", "not adjacent", "one point"]
-                            .iter()
-                            .any(|w| e.contains(w));
+                        let explained = e.contains("cannot reshape:") && e.contains("22023");
                         if !explained {
                             self.fail(at, op.kind, format!("{sql} failed: {e}"));
                         }

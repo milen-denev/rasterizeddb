@@ -1060,6 +1060,8 @@ impl PartitionedTable {
     /// a partition that does not open, leaves the new table broken with the
     /// reason, as a startup open would.
     pub(crate) async fn reopened(&self, name: &str, shell: Arc<Table<DbStorageProvider>>) -> PartitionedTable {
+        // The map's partitions now: a reshape changes them (phase 5).
+        let mut declared = self.declared;
         let live = match &self.live {
             Ok(live) => {
                 let opened: Result<Live, String> = async {
@@ -1094,6 +1096,7 @@ impl PartitionedTable {
                     // `MATERIALIZE` is in the state.
                     let (slots, index, epoch) = {
                         let state = old.board.state.lock().await;
+                        declared = Some(state.map().len() as u32);
                         old.board.grow(&state);
                         let (slots, index, counts) = slots_of(&state, &self.root, self.uid, &*old.placement)?;
                         // The dealer's counts from the map as it is now: a
@@ -1187,7 +1190,7 @@ impl PartitionedTable {
             db_id: self.db_id,
             transactions: self.transactions.clone(),
             live,
-            declared: self.declared,
+            declared,
             torn: self.torn.clone(),
             mirrored: self.mirrored.clone(),
             dropped: AtomicBool::new(false),
@@ -1913,7 +1916,8 @@ impl PartitionedTable {
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "FOR ({for_clause}) must fix the leading columns of the partition key ({}) by equality",
+                    "cannot reshape: FOR ({for_clause}) must fix the leading columns of the partition key ({}) by \
+                     equality",
                     self.key_names()
                 ),
             )),
@@ -1936,7 +1940,10 @@ impl PartitionedTable {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("'{dir}' is not a storage location of this database; add it with STORAGE ADD LOCATION '{dir}'"),
+                    format!(
+                        "cannot reshape: '{dir}' is not a storage location of this database; add it with STORAGE ADD \
+                         LOCATION '{dir}'"
+                    ),
                 )
             })
     }
@@ -1948,7 +1955,7 @@ impl PartitionedTable {
         let live = self.live()?;
         let epoch = live.epoch.load_full();
         let map = &epoch.map;
-        let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidInput, why);
+        let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidInput, format!("cannot reshape: {why}"));
         let owner = |r: PointRange| -> io::Result<(u32, PointRange)> {
             let pid = map.pid_of(r.lo);
             let range = map.range_of(pid).ok_or_else(|| io::Error::other(format!("partition {pid} is not in the map")))?;

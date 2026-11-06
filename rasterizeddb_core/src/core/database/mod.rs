@@ -41,6 +41,8 @@ mod relation_dispatch_tests;
 mod reaper_tests;
 #[cfg(test)]
 mod reshape_tests;
+#[cfg(test)]
+mod row_move_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;

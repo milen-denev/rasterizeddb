@@ -5621,9 +5621,61 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
         visibility: Option<Visibility>,
-        mut collect: Option<&mut Vec<Row>>,
+        collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
         self.data()?;
+        self.update_rows_body(where_clause, query_row_fetch, updates, expressions, limit, written_by, visibility, collect, None)
+            .await
+    }
+
+    /// [`Self::update_rows_as_of`] on a partition whose assignments may move
+    /// a row's point (docs/partitioning.md §9, phase 6 row moves): a matched
+    /// version whose merged row has another point is stamped deleted here,
+    /// as a DELETE stamps it, counted as updated (and collected, as it was),
+    /// and its merged row pushed to `moves` instead of written. The caller
+    /// inserts each into the partition its point routes to, after every
+    /// partition of the statement was visited, so no later visit matches a
+    /// moved row again. A version keeping its point is updated as ever.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_rows_moving(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        collect: Option<&mut Vec<Row>>,
+        moves: &mut Vec<RowWrite>,
+    ) -> Result<u64> {
+        self.data()?;
+        self.update_rows_body(
+            where_clause,
+            query_row_fetch,
+            updates,
+            expressions,
+            None,
+            written_by,
+            visibility,
+            collect,
+            Some(moves),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_rows_body(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        mut collect: Option<&mut Vec<Row>>,
+        mut moves: Option<&mut Vec<RowWrite>>,
+    ) -> Result<u64> {
         info!("Updating rows");
 
         // A statement naming its row by a unique key tries the point path
@@ -5642,6 +5694,7 @@ impl<S: StorageIO> Table<S> {
                     visibility.clone(),
                     Some(stripe),
                     collect.as_deref_mut(),
+                    moves.as_deref_mut(),
                 )
                 .await?
             {
@@ -5650,6 +5703,9 @@ impl<S: StorageIO> Table<S> {
             // The point path wrote nothing; neither may it have reported any.
             if let Some(collect) = collect.as_deref_mut() {
                 collect.clear();
+            }
+            if let Some(moves) = moves.as_deref_mut() {
+                moves.clear();
             }
         }
         self.update_rows_locked(
@@ -5662,6 +5718,7 @@ impl<S: StorageIO> Table<S> {
             visibility,
             None,
             collect,
+            moves,
         )
         .await
         .map(|n| n.unwrap_or_default())
@@ -5725,6 +5782,7 @@ impl<S: StorageIO> Table<S> {
         visibility: Option<Visibility>,
         point: Option<usize>,
         mut collect: Option<&mut Vec<Row>>,
+        mut moves: Option<&mut Vec<RowWrite>>,
     ) -> Result<Option<u64>> {
         let d = self.data()?;
         // A caller that brings its own snapshot is a statement with work left
@@ -6092,6 +6150,29 @@ impl<S: StorageIO> Table<S> {
             // report success, and hide it from routed queries. Assigning the
             // value a key already holds keeps the point and passes.
             if let (Some(guard), Some(before)) = (d.guard.as_ref(), point_before) {
+                // A row move (§9): the merged row's point is another, and the
+                // caller takes moves. Any changed point moves, even one this
+                // partition would still own, so every node, whatever its
+                // map, does the same (§4.5). The version is retired here as a
+                // DELETE retires one (its key locks were taken above, as an
+                // update takes them); its merged row is the caller's to insert.
+                if let (Some(moves), Ok(before)) = (moves.as_deref_mut(), before.as_ref())
+                    && guard.point_of_write(&row_write).is_ok_and(|after| after != *before)
+                {
+                    if let Err(e) = pointer.delete(d.io_pointers.clone(), record_pos, Some(txn), written_by).await {
+                        d.io_pointers.abort_txn(txn).await;
+                        return Err(e.into());
+                    }
+                    if written_by == FROZEN_TX && d.filters.is_some() {
+                        pending_filters.push(PendingFilterOp::Delete(record_pos / ROW_POINTER_RECORD_LEN as u64));
+                    }
+                    updated_count = updated_count.saturating_add(1);
+                    if let Some(collect) = collect.as_deref_mut() {
+                        collect.push(row.clone());
+                    }
+                    moves.push(row_write);
+                    continue;
+                }
                 let checked = before
                     .map_err(std::io::Error::other)
                     .and_then(|before| guard.check_update_from(before, &row_write));

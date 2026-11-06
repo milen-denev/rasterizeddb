@@ -244,9 +244,16 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p ENABLE ROW LEVEL SECURITY", Expect::LikeTwin, "a no-op on both"),
     site("ALTER TABLE site_p DISABLE TRIGGER ALL", Expect::LikeTwin, "a no-op on both"),
     site("ALTER TABLE site_p PARTITION BY HASH (tenant_id) PARTITIONS 4", Expect::Refused, "phase 5"),
-    site("ALTER TABLE site_p SPLIT KEY (tenant_id = 1) INTO 4", Expect::Refused, "phase 5"),
-    site("ALTER TABLE site_p ISOLATE KEY (tenant_id = 1)", Expect::Refused, "phase 5"),
-    site("ALTER TABLE site_p MERGE PARTITIONS FOR (tenant_id = 1), FOR (tenant_id = 2)", Expect::Refused, "phase 5"),
+    // Reshapes are built (phase 5 P7; `database::reshape_tests`, the twin's
+    // `Reshape`). Here, ones the map refuses whatever it is, so the table
+    // the later sites read is unchanged: 22023, nothing written.
+    site("ALTER TABLE site_p SPLIT KEY (tenant_id = 1) INTO 3", Expect::Error("22023"), "P7: not a power of two"),
+    site("ALTER TABLE site_p ISOLATE KEY (tenant_id = 1) TO '/nonexistent'", Expect::Error("22023"), "P7: no such location"),
+    site(
+        "ALTER TABLE site_p MERGE PARTITIONS FOR (tenant_id = 1), FOR (tenant_id = 1)",
+        Expect::Error("22023"),
+        "P7: one partition",
+    ),
     site("ALTER TABLE site_p DETACH PARTITION site_q", Expect::Refused, "never"),
     // Indexes (phase 3 P1). Index names are database-wide, so these run on
     // the partitioned table alone, created and dropped in pairs.
@@ -489,8 +496,13 @@ const SITES: &[Site] = &[
         Expect::LikeTwin,
         "S11: a key column assigned the value the WHERE pins it to",
     ),
-    site("UPDATE site_p SET tenant_id = 5 WHERE tenant_id = 1", Expect::Refused, "a key change: phase 6"),
-    site("UPDATE site_p SET asset_group_id = asset_group_id + 1", Expect::Refused, "a key change: phase 6"),
+    // Key changes move rows (phase 6 P9), like the twin's; each there and
+    // back, onto keys no row holds, so the later sites read the same rows.
+    site("UPDATE site_p SET tenant_id = 500 WHERE tenant_id = 1", Expect::LikeTwinAnswered, "P9: a row move"),
+    site("SELECT * FROM site_p WHERE tenant_id = 500", Expect::LikeTwinAnswered, "P9: routed to its new key"),
+    site("UPDATE site_p SET tenant_id = 1 WHERE tenant_id = 500", Expect::LikeTwinAnswered, "P9: and back"),
+    site("UPDATE site_p SET asset_group_id = asset_group_id + 100", Expect::LikeTwinAnswered, "P9: every row moves once"),
+    site("UPDATE site_p SET asset_group_id = asset_group_id - 100", Expect::LikeTwinAnswered, "P9: and back"),
     site(
         "UPDATE site_p SET n = 2 WHERE tenant_id = 1 RETURNING n",
         Expect::LikeTwinAnswered,

@@ -7094,8 +7094,24 @@ async fn apply_conflict_update(
     let Some(purpose) = recognize_query_purpose(&statement) else {
         return ddl_error(&format!("could not parse the rewritten {}", sql_literal(&statement)));
     };
-    Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await
+    // Marked at this depth, so a partitioned table refuses moving the row
+    // (`execute_partitioned_update`), as PostgreSQL refuses it; statements
+    // its foreign-key actions run, one level down, are not marked.
+    CONFLICT_UPDATE_DEPTH
+        .scope(depth, Box::pin(execute_with_context(purpose, database.clone(), depth, tx)))
+        .await
 }
+
+tokio::task_local! {
+    /// The depth of the `UPDATE` an `ON CONFLICT DO UPDATE` runs, while it
+    /// runs (`apply_conflict_update`).
+    static CONFLICT_UPDATE_DEPTH: usize;
+}
+
+/// PostgreSQL's refusal of an `ON CONFLICT DO UPDATE` whose `SET` moves the
+/// row to another partition; "not supported" makes it 0A000, as there.
+pub(crate) const CONFLICT_MOVE_REFUSAL: &str = "invalid ON UPDATE specification: the result tuple would appear in a \
+     different partition than the original tuple (moving a row by ON CONFLICT DO UPDATE is not supported)";
 
 /// The columns of the unique constraint `name` on `schema`'s table, for `ON
 /// CONFLICT ON CONSTRAINT name`: a table-level key (a composite `PRIMARY KEY`
@@ -20147,17 +20163,25 @@ async fn execute_partitioned_update(
         let computed: Vec<u32> = update_plan.expressions.iter().map(|(wo, _)| *wo).collect();
         pt.assignments_keep_point(&update_plan.where_clause, &assigned, &computed)
     };
-    match keeps_point {
-        Ok(true) => {}
-        Ok(false) => {
-            error!("UPDATE on {}: {}", table_name, crate::core::partition::guard::KEY_CHANGE_REFUSAL);
-            return ddl_error(crate::core::partition::guard::KEY_CHANGE_REFUSAL);
-        }
+    // A key assignment not proven to keep every point moves the rows whose
+    // point it changes (phase 6, §9): each partition retires such a version
+    // and hands its merged row back, and every one is inserted where its
+    // point routes once all partitions were visited, so no visit of this
+    // statement matches a moved row again. An ON CONFLICT DO UPDATE never
+    // moves, as in PostgreSQL: unproven, it runs as an ordinary update of
+    // its one row, and the range guard refuses it only if the point really
+    // changes (`SET tenant_id = EXCLUDED.tenant_id + 0` goes through, as
+    // there), with PostgreSQL's words.
+    let in_conflict_update = CONFLICT_UPDATE_DEPTH.try_with(|d| *d == depth).unwrap_or(false);
+    let moving = match keeps_point {
+        Ok(true) => false,
+        Ok(false) => !in_conflict_update,
         Err(e) => {
             error!("Cannot update partitioned table {}: {}", table_name, e);
             return ddl_error(&e.to_string());
         }
-    }
+    };
+    let moved: std::sync::Arc<parking_lot::Mutex<Vec<crate::core::row::row::RowWrite>>> = Default::default();
     // Foreign keys (phase 3 P4), as the plain arm runs them and in its
     // order: one snapshot for the statement when they need to know which
     // rows it changes, the child side's checks, the parent side's keys
@@ -20211,10 +20235,27 @@ async fn execute_partitioned_update(
                 })
                 .collect();
             let (fetch, expressions, where_clause) = (query_row_fetch.clone(), &expressions[..], &where_clause);
+            let moved = moved.clone();
             async move {
                 let mut before = Vec::new();
-                let n = part
-                    .update_rows_as_of(
+                let n = if moving {
+                    let mut moves = Vec::new();
+                    let n = part
+                        .update_rows_moving(
+                            where_clause,
+                            fetch,
+                            updates,
+                            expressions,
+                            tx,
+                            visibility,
+                            collecting.then_some(&mut before),
+                            &mut moves,
+                        )
+                        .await?;
+                    moved.lock().extend(moves);
+                    n
+                } else {
+                    part.update_rows_as_of(
                         where_clause,
                         fetch,
                         updates,
@@ -20224,12 +20265,36 @@ async fn execute_partitioned_update(
                         visibility,
                         collecting.then_some(&mut before),
                     )
-                    .await?;
+                    .await?
+                };
                 Ok((n, before))
             }
         },
     )
     .await;
+    // The moved rows, each inserted where its new point routes (its unique
+    // keys checked there), after every partition was visited. Any failure
+    // fails the statement, whose retirements its abort takes back; never
+    // retryable, since rows were already retired.
+    let outcome = match outcome {
+        Ok(n) if moving => {
+            let rows = std::mem::take(&mut *moved.lock());
+            let mut failed = None;
+            for row in rows {
+                if let Err(e) = Box::pin(pt.insert_row_in_txn(row, tx)).await {
+                    let text = e.to_string();
+                    let text = text.strip_suffix(crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::CONFLICT_RETRYABLE).unwrap_or(&text);
+                    failed = Some(std::io::Error::new(e.kind(), text.to_string()));
+                    break;
+                }
+            }
+            match failed {
+                Some(e) => Err(e),
+                None => Ok(n),
+            }
+        }
+        other => other,
+    };
     match outcome {
         Ok(n) => {
             info!("Updated {} rows", n);
@@ -20242,6 +20307,10 @@ async fn execute_partitioned_update(
             note_write(database, tx, depth, &sql, Some(table_name));
             let returning = returning_updates.as_ref().map(|u| (before, Some(u), &expressions[..]));
             partitioned_write_reply(&pt, &sql, n, returning, database, tx).await
+        }
+        Err(e) if in_conflict_update && e.to_string() == crate::core::partition::guard::KEY_CHANGE_REFUSAL => {
+            error!("UPDATE on {}: {}", table_name, CONFLICT_MOVE_REFUSAL);
+            ddl_error(CONFLICT_MOVE_REFUSAL)
         }
         Err(e) => {
             // The retry marker is for the retry loops, never a log.

@@ -95,7 +95,10 @@ async fn populated(dir: &Path) -> Arc<Database> {
 fn layout(db: &Database) -> Vec<(u32, u64)> {
     let pt = db.partitioned_table("pt").expect("pt");
     let epoch = pt.epoch().expect("an epoch");
-    epoch.map.entries().iter().map(|&(lo, pid)| (pid, lo)).collect()
+    let out: Vec<(u32, u64)> = epoch.map.entries().iter().map(|&(lo, pid)| (pid, lo)).collect();
+    // What SHOW TABLE STATS and the database's partition cap count.
+    assert_eq!(pt.declared(), Some(out.len() as u32), "the declared count follows the map");
+    out
 }
 
 /// The pids with data files in `dir`.

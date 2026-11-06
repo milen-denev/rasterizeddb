@@ -162,8 +162,10 @@ fn blocks_commit_or_roll_back_every_partition_together() {
     // A refused statement in a block poisons it; the earlier fan-out goes.
     c.ok("BEGIN");
     c.ok("UPDATE bp SET n = 77 WHERE grp = 1");
-    let e = c.simple("UPDATE bp SET tenant_id = 3 WHERE grp = 1").expect_err("a key change");
-    assert_eq!(e.code, "0A000", "{e}");
+    // A key change moves rows (phase 6 P9); onto keys tenant 3 holds, a
+    // duplicate, as in PostgreSQL.
+    let e = c.simple("UPDATE bp SET tenant_id = 3 WHERE grp = 1").expect_err("a key change onto existing keys");
+    assert_eq!(e.code, "23505", "{e}");
     let e = c.simple("SELECT 1").expect_err("the block is aborted");
     assert_eq!(e.code, "25P02", "{e}");
     let end = c.simple("COMMIT");
@@ -173,8 +175,8 @@ fn blocks_commit_or_roll_back_every_partition_together() {
     drop(server);
 }
 
-/// The refusals, each before anything is written, with its SQLSTATE: a key
-/// change (phase 6). Assigning a key the value its WHERE pins is not a
+/// Key changes, which move rows since phase 6 (P9), answer as the twin's.
+/// Assigning a key the value its WHERE pins is not a
 /// change. UPDATE … FROM and DELETE … USING with a partitioned target, refused
 /// until phase 3 P3, write what the twin's write. (RETURNING is built since
 /// S17: `partition_returning.rs`.)
@@ -187,16 +189,28 @@ fn refused_writes_change_nothing() {
     c.ok("CREATE TABLE rdim (tenant_id BIGINT NOT NULL, label TEXT)");
     c.ok("INSERT INTO rdim (tenant_id, label) VALUES (1, 'one'), (2, 'two')");
     let before = stored_rows(&server.db, "rp");
+    // Key changes move rows since phase 6 (P9): each answers as the twin's
+    // (a duplicate key alike, the same rows after alike).
     for sql in [
-        "UPDATE rp SET tenant_id = 99 WHERE tenant_id = 1",
-        "UPDATE rp SET tenant_id = 2 WHERE n > 10",
-        "UPDATE rp SET tenant_id = tenant_id + 1 WHERE tenant_id = 1",
+        "UPDATE {t} SET tenant_id = 2 WHERE n > 10",
+        "UPDATE {t} SET tenant_id = tenant_id + 1 WHERE tenant_id = 1",
+        "UPDATE {t} SET tenant_id = 99 WHERE tenant_id = 1",
     ] {
-        let e = c.simple(sql).expect_err(sql);
-        assert_eq!(e.code, "0A000", "{sql}: {e}");
-        assert!(e.message.contains("not supported"), "{sql}: {e}");
-        assert_eq!(stored_rows(&server.db, "rp"), before, "{sql} wrote something");
+        let p = c.simple(&sql.replace("{t}", "rp"));
+        let q = c.simple(&sql.replace("{t}", "rq"));
+        match (&p, &q) {
+            (Ok(p), Ok(q)) => assert_eq!(p.tags, q.tags, "{sql}"),
+            (Err(p), Err(q)) => assert_eq!(p.code, q.code, "{sql}"),
+            _ => panic!("{sql}: {p:?} vs {q:?}"),
+        }
+        same_rows(&mut c, "rp", "rq", sql);
     }
+    assert_ne!(stored_rows(&server.db, "rp"), before, "no key change went through, so none was compared");
+    // And back, so the rest below reads tenant 1.
+    for t in ["rp", "rq"] {
+        c.ok(&format!("UPDATE {t} SET tenant_id = 1 WHERE tenant_id = 99"));
+    }
+    same_rows(&mut c, "rp", "rq", "moved back");
     for t in ["rp", "rq"] {
         let r = c.ok(&format!("UPDATE {t} SET tenant_id = 3, grp = 1, n = 5 WHERE tenant_id = 3 AND grp = 1"));
         assert_eq!(r.tags, vec!["UPDATE 3".to_string()], "{t}");

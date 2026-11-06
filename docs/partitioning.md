@@ -15,7 +15,8 @@ budget, its sharded CLOCK, idle close and the seal at close,
 the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)), phase 4's P6
 (placement across storage locations, [as built](#phase-4-p6-as-built)), and phase 5's P7
 (reshape: `SPLIT PARTITION`, `MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`,
-`STORAGE MOVE PARTITION`, under ACCESS EXCLUSIVE, [as built](#phase-5-p7-as-built)). Phases 0 and 1 are
+`STORAGE MOVE PARTITION`, under ACCESS EXCLUSIVE, [as built](#phase-5-p7-as-built)), and
+phase 6's P9 (row moves: an `UPDATE` changing a key value, [as built](#phase-6-p9-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -140,7 +141,7 @@ idle-box wall-clock A/B is still to run.
 |---|---|
 | ~~`UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT`~~ | built in phase 3 P3 ([as built](#phase-3-p3-as-built)) |
 | ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4) | physical-rewrite `ALTER` 6 |
-| A key change: an `UPDATE` or `DO UPDATE` assigning a key column anything its `WHERE` does not pin to the same value | 6 (row moves, §9) |
+| ~~A key change: an `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value~~ moves the row since phase 6 P9 ([as built](#phase-6-p9-as-built)); a `DO UPDATE` that would move it stays refused, as in PostgreSQL | 6 (row moves, §9) |
 | Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`); ~~reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`)~~ built in phase 5 P7 ([as built](#phase-5-p7-as-built)) | 5 |
 | `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
 
@@ -452,6 +453,69 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 6 P9 as built
+
+Row moves (§9), built 2026-11-06 on `feat/p9-row-moves`. An `UPDATE` whose
+key assignments are not proven to keep every matched row's point
+(`assignments_keep_point`) is no longer refused: it **moves** each row whose
+point changes. Code: `Table::update_rows_moving` (`core/row/table.rs`),
+`execute_partitioned_update` (`core/rql/executor.rs`).
+
+- **Each partition visit** runs the ordinary update (one snapshot for the
+  statement when it reaches several partitions, §4.4), and at the range
+  guard, a merged row whose point differs from the version's is not
+  written: the version is retired as a DELETE retires it (`xmax` stamped
+  under the statement's storage transaction, its key locks taken as an
+  update takes them), counted as updated, its pre-image collected for
+  `RETURNING`, and its merged row handed back. **Any** changed point moves,
+  even one the same partition would still own, so every node does the same
+  whatever its map (§4.5).
+- **After the last visit**, every moved row is inserted where its new point
+  routes (`PartitionedTable::insert_row_in_txn`: materializing the target
+  if need be, its unique keys checked there). This is the per-statement
+  record §9 asked for: no visit of the statement can match a row it moved,
+  because none is in any partition until every visit is over. Inserted
+  during the visits, a row moved into a partition visited later was matched
+  again and moved twice (`SET tenant_id = tenant_id + 1000` moved rows by
+  2000).
+- **All or nothing**: an insert that fails (a duplicate key, 23505) fails
+  the statement with its own error, never marked retryable (rows were
+  already retired); the statement's transaction takes the retirements back.
+- **Concurrency**: first-updater-wins, as for any update. A second writer of
+  a row another transaction moved fails with the write conflict (40001 when
+  that transaction committed), as PostgreSQL's "tuple to be locked was
+  already moved to another partition due to concurrent update" does.
+- **Uniqueness is checked once the rows land**, after every retirement, so
+  a shift whose final keys are distinct (`SET k = k + 1` over consecutive
+  keys) succeeds, where PostgreSQL's immediate per-row check can fail
+  depending on the order rows are visited. Never a silent duplicate: every
+  landed row is checked against every visible row.
+- **`ON CONFLICT DO UPDATE` still refuses a move**, as PostgreSQL does (0A000,
+  "invalid ON UPDATE specification: the result tuple would appear in a
+  different partition than the original tuple"): the generated `UPDATE` runs
+  marked with its depth (`CONFLICT_UPDATE_DEPTH`), so statements its
+  foreign-key actions run one level down are not marked.
+- **Not moved**: a partitioned target of `UPDATE … FROM` changing its key is
+  still refused by the range guard (0A000).
+- RETURNING is built from the pre-images and the assignments, as for every
+  partitioned update, so it shows the new row. A prepared `UPDATE` stays on
+  the text path. Replication ships the statement; each node moves by its own
+  map.
+
+**Tests.** `database::row_move_tests` (one row moved: routed reads find it
+under the new key only, `RETURNING`, a restart; every row of the table
+shifted by 1000 in one statement moves exactly once, and a second key
+level moves; a move onto an existing key changes nothing; a rolled-back
+move changes nothing; a concurrent second mover fails and the first's move
+stands; `ON CONFLICT DO UPDATE` refuses a move and runs a non-moving one).
+The twin's `UpdateKeyChange` leaves `REFUSED` and is compared, in six
+shapes: one row, a whole tenant, a fan-out over a non-key predicate with
+`RETURNING`, tenants moved back, a second key level, a move with
+`RETURNING *`; each moves rows to points no other row of the statement
+shares, so a collision is only ever with a row already there, which both
+tables refuse alike. *(Mutation: each partition's moved rows inserted right
+after its visit: the 1000 shift moves rows twice.)*
 
 ## Phase 5 P7 as built
 

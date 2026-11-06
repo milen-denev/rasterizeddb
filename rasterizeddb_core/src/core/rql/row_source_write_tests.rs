@@ -19,7 +19,6 @@ use super::tests::{
 };
 use crate::core::database::Database;
 use crate::core::mvcc::transaction::TxId;
-use crate::core::partition::guard::KEY_CHANGE_REFUSAL;
 use crate::core::partition::table::PartitionedTable;
 use crate::core::rql::lexer_s1::recognize_query_purpose;
 use crate::core::storage_providers::traits::StorageIO;
@@ -464,28 +463,21 @@ async fn a_conflict_after_a_partition_applied_rows_is_not_replayed() {
     close(db, dir.path());
 }
 
-/// I4 through SQL: an UPDATE assigning a key a value the WHERE does not pin
-/// is refused with 0A000 before anything is written, in any partition: the
-/// rows, every partition's slot count and in-place counter are unchanged.
-/// The statement below reaches two partitions, the lower holding only rows
-/// the assignment leaves where they are; the range guard alone would refuse
-/// it only after writing that partition's new versions. Assigning a key the
-/// value its WHERE pins it to is ordinary.
+/// I4 through SQL, since phase 6 (P9): an UPDATE assigning a key a value
+/// the WHERE does not pin moves the rows whose point it changes, and answers
+/// exactly as the same statement on a plain twin does: refused alike onto a
+/// key that exists (a duplicate), the same rows after alike when it goes
+/// through. Every stored row is found again by a routed read of its own key,
+/// so each moved row is in the partition its new key routes to. Assigning a
+/// key the value its WHERE pins it to is ordinary.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_key_change_is_refused_before_any_partition_is_written() {
+async fn a_key_change_moves_rows_as_a_plain_twin_would_change_them() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "write_i4").await;
     let pt = ledger(&db, "acct", 7).await;
+    exec_ok(&db, &format!("CREATE TABLE twin {}", super::tests::DDL)).await;
+    exec_ok(&db, "INSERT INTO twin (tenant_id, seq, amt, note) SELECT tenant_id, seq, amt, note FROM acct").await;
     let (low, high) = two_partitions(&pt);
-    let original = ledger_rows(&db, "acct").await;
-    let slots = slots_by_partition(&pt).await;
-    let in_place = |pt: &PartitionedTable| -> Vec<u64> {
-        pt.open_partitions_now()
-            .iter()
-            .map(|(_, t)| t.in_place_column_updates())
-            .collect()
-    };
-    let in_place_before = in_place(&pt);
     for sql in [
         format!("UPDATE acct SET tenant_id = {low} WHERE tenant_id IN ({low}, {high}) AND amt > 0"),
         format!("UPDATE acct SET tenant_id = {low}, amt = 1 WHERE amt > 0"),
@@ -493,12 +485,22 @@ async fn a_key_change_is_refused_before_any_partition_is_written() {
         format!("UPDATE acct SET tenant_id = tenant_id + 0 WHERE tenant_id = {low}"),
         format!("UPDATE acct SET tenant_id = {high} WHERE tenant_id = {low}"),
         format!("UPDATE acct SET tenant_id = {low} WHERE tenant_id = {low} OR tenant_id = {high}"),
+        "UPDATE acct SET tenant_id = tenant_id + 1000, amt = amt + 1 WHERE amt > 0".to_string(),
+        // And back, so the tail below finds tenant `low` (high's row, moved).
+        "UPDATE acct SET tenant_id = tenant_id - 1000, amt = amt - 1 WHERE tenant_id > 1000".to_string(),
     ] {
-        let e = exec_err(&db, &sql).await;
-        assert!(e.contains(KEY_CHANGE_REFUSAL), "{sql}: {e}");
-        assert_eq!(ledger_rows(&db, "acct").await, original, "{sql} changed a row");
-        assert_eq!(slots_by_partition(&pt).await, slots, "{sql} wrote a version");
-        assert_eq!(in_place(&pt), in_place_before, "{sql} overwrote in place");
+        let p = exec(&db, &sql).await;
+        let q = exec(&db, &sql.replace("acct", "twin")).await;
+        assert_eq!(p.first() == Some(&3), q.first() == Some(&3), "{sql}: {} vs {}", String::from_utf8_lossy(&p), String::from_utf8_lossy(&q));
+        if p.first() != Some(&3) {
+            assert_eq!(affected(&p, &sql), affected(&q, &sql), "{sql}");
+        }
+        let rows = ledger_rows(&db, "acct").await;
+        assert_eq!(rows, ledger_rows(&db, "twin").await, "{sql}");
+        for (t, seq, _) in &rows {
+            let found = ints(&db, &format!("SELECT COUNT(*) FROM acct WHERE tenant_id = {t} AND seq = {seq}")).await;
+            assert_eq!(found, vec![1], "{sql}: ({t}, {seq}) is not where its key routes");
+        }
     }
     // The same value, spelled as the WHERE spells it or otherwise.
     for sql in [

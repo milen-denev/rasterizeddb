@@ -66,6 +66,8 @@ async fn rows(db: &Arc<Database>, sql: &str) -> Vec<Vec<i64>> {
 }
 
 const REFUSED: &str = "changing a partition key value is not supported yet";
+/// PostgreSQL's words for a DO UPDATE that would move its row.
+const MOVE_REFUSED: &str = "invalid ON UPDATE specification";
 
 /// Mutation: `query_tokenizer::digits_after_sign` not skipping spaces (the
 /// tokenizer's behaviour at c3a06643): every accepted statement with a
@@ -116,21 +118,36 @@ async fn a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_re
     ] {
         try_exec(&db, &sql).await.unwrap_or_else(|e| panic!("`{sql}` was refused: {e}"));
     }
-    // Refused, before anything is written: the key would change (a sign
-    // flip with the same digits included).
+    // A DO UPDATE that would move the row is refused, as by PostgreSQL
+    // (0A000), before anything is written (a sign flip with the same digits
+    // included).
     for sql in [
         format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = -7, n = 18"),
         format!("{upsert} (-6, 3, 21, 0) {target} tenant_id = 6, n = 18"),
+    ] {
+        match try_exec(&db, &sql).await {
+            Err(e) => assert!(e.contains(MOVE_REFUSED) && e.contains("not supported"), "`{sql}`: {e}"),
+            Ok(_) => panic!("`{sql}` was accepted"),
+        }
+    }
+    // An UPDATE moves the row (phase 6 P9): onto a key that is there, it is
+    // a duplicate in PostgreSQL too, and writes nothing (a sign flip is a
+    // different key, never the same value)...
+    for sql in [
         "UPDATE tp SET tenant_id = 6, n = 6 WHERE tenant_id = -6".to_string(),
-        "UPDATE tp SET tenant_id = -7 WHERE tenant_id = -6".to_string(),
         "UPDATE tn SET k = 65, n = 2 WHERE k = -65".to_string(),
         "UPDATE tc SET grp = 3, n = 2 WHERE tenant_id = 5 AND grp = -3".to_string(),
     ] {
         match try_exec(&db, &sql).await {
-            Err(e) => assert!(e.contains(REFUSED), "`{sql}`: {e}"),
-            Ok(_) => panic!("`{sql}` was accepted"),
+            Err(e) => assert!(e.contains("duplicate"), "`{sql}`: {e}"),
+            Ok(_) => panic!("`{sql}` stored a duplicate key"),
         }
     }
+    // ...and onto a free one it moves, there and back.
+    try_exec(&db, "UPDATE tp SET tenant_id = -7 WHERE tenant_id = -6").await.expect("a move");
+    assert_eq!(rows(&db, "SELECT tenant_id, grp, id FROM tp WHERE tenant_id = -7").await, vec![vec![-7, 3, 21]]);
+    assert!(rows(&db, "SELECT tenant_id FROM tp WHERE tenant_id = -6").await.is_empty());
+    try_exec(&db, "UPDATE tp SET tenant_id = -6 WHERE tenant_id = -7").await.expect("a move back");
 
     // PostgreSQL 17 after the accepted statements (`pg/accepted.sql`); the
     // refused ones wrote nothing.
@@ -158,7 +175,7 @@ async fn a_negative_key_assigned_its_own_value_is_accepted_and_a_change_still_re
         match &outcome {
             Ok(_) => assert_eq!(mine, vec![vec![tenant, 3, 21, n]], "`{sql}` was accepted but left {after:?}"),
             Err(e) => {
-                assert!(e.contains(REFUSED), "`{sql}`: {e}");
+                assert!(e.contains(REFUSED) || e.contains(MOVE_REFUSED), "`{sql}`: {e}");
                 assert_eq!(mine, before, "`{sql}` was refused but wrote");
             }
         }

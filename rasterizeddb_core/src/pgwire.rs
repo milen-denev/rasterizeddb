@@ -7451,6 +7451,13 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("insufficient resources: partition") {
         return "53000";
     }
+    // A reshape the map cannot do (docs/partitioning.md §6.2, P7: two
+    // partitions that are not neighbours, a one-point split, a directory
+    // that is no storage location): `invalid_parameter_value`. Early: the
+    // message quotes the statement's key values and paths.
+    if has("cannot reshape:") {
+        return "22023";
+    }
     // `INSERT … VALUES` arity (`lexer_ir::values_arity_error`):
     // PostgreSQL's syntax_error.
     if has("insert has more expressions than target columns")

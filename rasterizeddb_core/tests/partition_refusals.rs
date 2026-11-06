@@ -303,24 +303,28 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
         "CREATE TEMP TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
         "CREATE TEMPORARY TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
         "CREATE UNLOGGED TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
-        // `STORAGE MOVE PARTITION` is read today as a MOVE of a table named
-        // PARTITION, so it is refused for that table or its location rather
-        // than as unsupported; checked only for being refused. `STORAGE
+        // `STORAGE MOVE PARTITION` is a reshape since P7, refused here for
+        // its directory (22023); checked only for being refused. `STORAGE
         // REBALANCE PARTITIONS` is left out: the STORAGE parser ignores the
         // trailing word and runs a whole-database REBALANCE.
         "STORAGE MOVE PARTITION pu_part FOR (k = 42) TO '/nonexistent'".to_string(),
     ];
     for table in ["pu_plain", "pu_part"] {
-        for tail in [
-            "PARTITION BY HASH (k)",
-            "PARTITION BY HASH (k) PARTITIONS 4",
-            "SPLIT PARTITION FOR (k = 42)",
-            "ISOLATE KEY (k = 42)",
-            "ISOLATE KEY (k = 42) TO '/nonexistent'",
-            "SPLIT KEY (k = 42) INTO 8",
-            "MERGE PARTITIONS FOR (k = 1), FOR (k = 2)",
-        ] {
+        for tail in ["PARTITION BY HASH (k)", "PARTITION BY HASH (k) PARTITIONS 4"] {
             statements.push(format!("ALTER TABLE {table} {tail}"));
+        }
+        // The reshapes are built (phase 5 P7, `database::reshape_tests` and
+        // the twin's `Reshape`); on a plain table they are refused.
+        if table == "pu_plain" {
+            for tail in [
+                "SPLIT PARTITION FOR (k = 42)",
+                "ISOLATE KEY (k = 42)",
+                "ISOLATE KEY (k = 42) TO '/nonexistent'",
+                "SPLIT KEY (k = 42) INTO 8",
+                "MERGE PARTITIONS FOR (k = 1), FOR (k = 2)",
+            ] {
+                statements.push(format!("ALTER TABLE {table} {tail}"));
+            }
         }
         statements.push(format!("CREATE INDEX {table}_by ON {table} USING partition (k)"));
         statements.push(format!(
