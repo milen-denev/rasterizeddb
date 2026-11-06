@@ -399,9 +399,9 @@ fn foreign_keys_onto_a_partitioned_table_reference_its_partition_key() {
     });
 }
 
-/// Metadata DDL on a partitioned table runs (phase 3 P1, §11); what would
-/// rewrite every row, a key column's change and a foreign key are refused
-/// with 0A000 before they write: the shell's schema file is unchanged and
+/// Metadata DDL on a partitioned table runs (phase 3 P1, §11), and what
+/// rewrites every row does so (phase 6 P8); a storage-type change and a key
+/// column's change are refused with 0A000 before they write: the shell's schema file is unchanged and
 /// no catalogue row is written.
 #[test]
 fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
@@ -419,9 +419,8 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
         let before = on_disk_schema(&db, "pd_alt").await;
         let len = catalogue_len(&db).await;
         for (sql, why) in [
-            ("ALTER TABLE pd_alt ADD COLUMN x INT", "rewrites every row"),
-            ("ALTER TABLE IF EXISTS pd_alt ADD COLUMN y INT", "rewrites every row"),
-            ("ALTER TABLE pd_alt ALTER COLUMN n TYPE BIGINT", "rewrites every row"),
+            // A storage-type change, refused on any table.
+            ("ALTER TABLE pd_alt ALTER COLUMN n TYPE BIGINT", "rewrite every row"),
             ("ALTER TABLE pd_alt ALTER COLUMN k TYPE BIGINT", "partition key column"),
             ("ALTER TABLE pd_alt ALTER COLUMN k DROP NOT NULL", "must be NOT NULL"),
             ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
@@ -462,6 +461,11 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
         }
         assert!(db.is_partitioned("pd_alt2") && !db.is_partitioned("pd_alt"));
         assert_ne!(on_disk_schema(&db, "pd_alt2").await, before);
+        // A populated ADD COLUMN rewrites every row into a new uid (phase 6
+        // P8): the rows keep their values, the new column its default.
+        run(&db, "ALTER TABLE pd_alt2 ADD COLUMN x INT DEFAULT 7").await.expect("a populated ADD COLUMN");
+        run(&db, "ALTER TABLE IF EXISTS pd_alt2 ADD COLUMN y INT").await.expect("IF EXISTS");
+        assert!(db.is_partitioned("pd_alt2"));
     });
 }
 

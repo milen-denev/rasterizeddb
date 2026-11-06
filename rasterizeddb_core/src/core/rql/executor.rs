@@ -3125,6 +3125,194 @@ async fn rewrite_table_with_columns(
     .await
 }
 
+/// Every version of `old` a snapshot can still see, its values by column
+/// name and its own stamps (`rewrite_rows`, R5): one table, or one partition
+/// of a partitioned table (phase 6 P8).
+async fn read_rewrite_versions(
+    old: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>,
+    fetch: &crate::core::row::row::RowFetch,
+    name_of: &std::collections::HashMap<u64, String>,
+    read_db: &Arc<Database>,
+) -> Result<Vec<RewrittenVersion>, String> {
+    let horizon = old.version_horizon();
+    let io_pointers = old.io_pointers().map_err(|e| e.to_string())?.clone();
+    let io_rows = old.io_rows().map_err(|e| e.to_string())?.clone();
+    let mut pointers = crate::core::row::row_pointer::RowPointerIterator::new(io_pointers)
+        .await
+        .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?;
+    let mut versions = Vec::new();
+    while let Some((_, pointer)) = pointers
+        .next_row_pointer_with_offset()
+        .await
+        .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?
+    {
+        // Aborted, or dead for every snapshot that exists or can.
+        if pointer.deleted || horizon.is_reclaimable(false, pointer.xmin, pointer.xmax) {
+            continue;
+        }
+        // An aborted deleter's stamp never retired anything.
+        let xmax = if pointer.xmax != crate::core::mvcc::transaction::NO_TX
+            && read_db.transactions.outcome(pointer.xmax) == crate::core::mvcc::TxOutcome::Aborted
+        {
+            crate::core::mvcc::transaction::NO_TX
+        } else {
+            pointer.xmax
+        };
+        let row = pointer
+            .fetch_row(io_rows.clone(), &fetch)
+            .await
+            .map_err(|e| format!("could not read a row of '{}' for rewrite: {}", old.schema.name, e))?;
+        let values = row
+            .columns
+            .iter()
+            .filter_map(|c| {
+                name_of
+                    .get(&u64::from(c.schema_id))
+                    .map(|name| (name.clone(), c.data.clone(), c.column_type.clone()))
+            })
+            .collect();
+        versions.push(RewrittenVersion {
+            xmin: pointer.xmin,
+            xmax,
+            values,
+        });
+    }
+    Ok(versions)
+}
+
+/// The definition a rewrite starts from, `table_schema`'s every declaration
+/// carried (see `rewrite_rows`), with the index and path-index declarations
+/// it re-stages by column name.
+#[allow(clippy::type_complexity)]
+fn rewrite_definition(
+    table_schema: &crate::core::row::schema::TableSchema,
+    ordered: &[crate::core::row::schema::SchemaField],
+) -> (
+    crate::core::rql::lexer_ct::CreateTable,
+    Vec<(crate::core::index::IndexDecl, Vec<Option<String>>)>,
+    Vec<crate::core::rql::path_index::PathIndex>,
+) {
+    use crate::core::rql::lexer_ct::{CreateColumnData, CreateTable};
+    let schema = &table_schema.fields;
+    let unique_columns: Vec<String> =
+        ordered.iter().filter(|f| f.is_unique).map(|f| f.name.clone()).collect();
+    let definition = CreateTable {
+        table_name: table_schema.name.clone(),
+        columns: ordered
+            .iter()
+            .map(|f| CreateColumnData {
+                name: f.name.clone(),
+                // `literal_type`: a `timestamp` column is
+                // recreated as one, not as the `timestamptz`
+                // its storage type alone would declare.
+                data_type: f.literal_type(),
+            })
+            .collect(),
+        is_immutable: false,
+        if_not_exists: false,
+        foreign_keys: table_schema.foreign_keys.iter().cloned().collect(),
+        defaults: table_schema.defaults.iter().cloned().collect(),
+        json_columns: table_schema.json_columns.iter().cloned().collect(),
+        // Losing a column's declared scale here would silently
+        // reinterpret every decimal it holds.
+        type_modifiers: table_schema.type_modifiers.iter().cloned().collect(),
+        // A generation expression lost here would leave the column
+        // present and permanently NULL.
+        generated: table_schema.generated.iter().cloned().collect(),
+        // A constraint lost here stops being enforced with nothing said.
+        checks: table_schema.checks.iter().cloned().collect(),
+        unique_columns,
+        // Only the keys the rows were checked under. A predicate that
+        // no longer compiles has not been enforced, and recreated next
+        // to a new column of the name it reads, it would compile
+        // against values no row was checked against.
+        unique_keys: table_schema
+            .unique_keys
+            .iter()
+            .filter(|k| match k.condition(schema) {
+                Ok(_) => true,
+                Err(e) => {
+                    info!("unique index {} not carried across the rewrite: {}", k.describe(), e);
+                    false
+                }
+            })
+            .cloned()
+            .collect(),
+        // The declared key goes back into the header: a rewrite used
+        // to drop it, and clients asking which column is the key got
+        // none after an ADD COLUMN.
+        primary_key: table_schema.primary_key.clone(),
+    };
+    // Index declarations, each with its columns by name: the rewrite
+    // renumbers columns, and a name is what survives it.
+    let carried_indexes = table_schema
+        .secondary_indexes
+        .iter()
+        .map(|decl| {
+            let names: Vec<Option<String>> = decl
+                .columns
+                .iter()
+                .map(|wo| {
+                    schema
+                        .iter()
+                        .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
+                        .map(|f| f.name.clone())
+                })
+                .collect();
+            (decl.clone(), names)
+        })
+        .collect();
+    // Path-index declarations, which a rewrite used to lose.
+    let carried_path_indexes = table_schema.path_indexes.clone();
+    (definition, carried_indexes, carried_path_indexes)
+}
+
+/// A rewrite's index and path-index declarations staged into the new
+/// schema, by column name, before any row (see `rewrite_rows`).
+async fn carry_rewrite_indexes(
+    io_schema: rclite::Arc<crate::core::storage_providers::backend::DbStorageProvider>,
+    fields: Vec<crate::core::row::schema::SchemaField>,
+    carried_indexes: Vec<(crate::core::index::IndexDecl, Vec<Option<String>>)>,
+    carried_path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
+) -> Result<(), String> {
+
+    // Declarations go in before any row, so the open that
+    // follows builds the (empty) indexes and every row is
+    // indexed by its insert. Staged, then committed as one
+    // transaction (`torn_tail::SidecarWrites`).
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    for (decl, names) in carried_indexes {
+        // An index over a column this rewrite dropped goes
+        // with it, as in PostgreSQL.
+        let columns: Option<Vec<u32>> = names
+            .iter()
+            .map(|name| {
+                let name = name.as_ref()?;
+                fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+                    .map(|f| f.write_order as u32)
+            })
+            .collect();
+        let Some(columns) = columns else {
+            info!("index {} dropped with its column", decl.name);
+            continue;
+        };
+        let decl = crate::core::index::IndexDecl { columns, ..decl };
+        crate::core::index::decl::stage(&*io_schema, &mut writes, &decl)
+            .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
+    }
+    for path_index in &carried_path_indexes {
+        crate::core::rql::path_index::stage(&*io_schema, &mut writes, path_index)
+            .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
+    }
+    writes
+        .commit(&*io_schema)
+        .await
+        .map_err(|e| format!("could not carry the indexes: {e}"))?;
+    Ok(())
+}
+
 /// One row version as a rewrite read it from the old files: its stamps, and
 /// its values by **column name**.
 ///
@@ -3174,17 +3362,21 @@ where
         Vec<RewrittenVersion>,
     ) -> Result<Vec<RewrittenVersion>, String>,
 {
-    use crate::core::rql::lexer_ct::{CreateColumnData, CreateTable};
-
     // The rewrite recreates the table's files under its name. A name older
     // builds accepted can be refused by the create; asked after the old files
     // were released, that refusal would lose every row.
-    database
-        .check_recreatable(table_name)
-        .map_err(|e| format!("cannot rewrite '{}': {}", table_name, e))?;
-    // The statement holds ACCESS EXCLUSIVE already (the ALTER arm, or a JSON
-    // shadow's internal lock); confirmed, never newly waited for, here.
-    database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
+    let partitioned = database.partitioned_table(table_name).is_some();
+    if partitioned {
+        // A partitioned table's files are its uid's, never its name's.
+        database.relation_for(table_name, owner(), TableMode::AccessExclusive).await?;
+    } else {
+        database
+            .check_recreatable(table_name)
+            .map_err(|e| format!("cannot rewrite '{}': {}", table_name, e))?;
+        // The statement holds ACCESS EXCLUSIVE already (the ALTER arm, or a
+        // JSON shadow's internal lock); confirmed, never newly waited for.
+        database.table_for(table_name, owner(), TableMode::AccessExclusive).await?;
+    }
 
     struct Plan {
         versions: Vec<RewrittenVersion>,
@@ -3196,6 +3388,68 @@ where
     let family = database.transactions.top_level(reader);
     let database_id = database.id;
     let read_db = database.clone();
+
+    // A partitioned table (phase 6 P8): every partition's versions, into a
+    // new uid committed by the catalogue (`Database::rewrite_partitioned`),
+    // each version routed by its own point. The same definition, plan and
+    // payloads as a plain table's.
+    if partitioned {
+        let written_by_family = database
+            .rewrite_partitioned(
+                table_name,
+                move |shell, parts| async move {
+                    let schema = &shell.schema.fields;
+                    let mut ordered: Vec<crate::core::row::schema::SchemaField> =
+                        schema.iter().filter(|f| !f.is_deleted).cloned().collect();
+                    ordered.sort_by_key(|f| f.write_order);
+                    let fetch = crate::core::rql::join::fetch_for(&ordered, schema);
+                    let name_of: std::collections::HashMap<u64, String> =
+                        schema.iter().map(|f| (f.write_order, f.name.clone())).collect();
+                    let mut versions = Vec::new();
+                    for part in &parts {
+                        versions.extend(read_rewrite_versions(part, &fetch, &name_of, &read_db).await?);
+                    }
+                    let (mut definition, carried_indexes, carried_path_indexes) = rewrite_definition(&shell.schema, &ordered);
+                    let versions = reshape(&mut definition, versions)?;
+                    let defaults = definition.defaults.clone();
+                    Ok((definition, Plan { versions, carried_indexes, carried_path_indexes, defaults }))
+                },
+                |plan, io_schema, fields| {
+                    carry_rewrite_indexes(io_schema, fields, plan.carried_indexes.clone(), plan.carried_path_indexes.clone())
+                },
+                |plan, table| {
+                    let database = database.clone();
+                    async move {
+                        let table_name = table.name().to_string();
+                        let schema = table.shell().schema.fields.clone();
+                        let mut family_versions = 0u64;
+                        for version in plan.versions {
+                            let row = rewrite_payload(&table_name, &schema, &plan.defaults, &version.values, database_id)?;
+                            for id in [version.xmin, version.xmax] {
+                                if id != crate::core::mvcc::transaction::NO_TX
+                                    && id != crate::core::mvcc::transaction::FROZEN_TX
+                                    && database.transactions.top_level(id) == family
+                                {
+                                    family_versions += 1;
+                                }
+                            }
+                            let point = table.point_of_write(&row).map_err(|e| e.to_string())?;
+                            let part = table.partition_for_point(point).await.map_err(|e| e.to_string())?;
+                            part.insert_version(row, version.xmin, version.xmax)
+                                .await
+                                .map_err(|e| format!("could not rewrite a row of '{}': {}", table_name, e))?;
+                        }
+                        Ok(family_versions > 0)
+                    }
+                },
+            )
+            .await?;
+        if written_by_family {
+            database.relation_for(table_name, owner(), TableMode::RowExclusive).await?;
+        }
+        return Ok(());
+    }
+
     let written_by_family = database
         .rewrite_table(
             table_name,
@@ -3209,122 +3463,9 @@ where
                 let name_of: std::collections::HashMap<u64, String> =
                     schema.iter().map(|f| (f.write_order, f.name.clone())).collect();
 
-                let horizon = old.version_horizon();
-                let io_pointers = old.io_pointers().map_err(|e| e.to_string())?.clone();
-                let io_rows = old.io_rows().map_err(|e| e.to_string())?.clone();
-                let mut pointers = crate::core::row::row_pointer::RowPointerIterator::new(io_pointers)
-                    .await
-                    .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?;
-                let mut versions = Vec::new();
-                while let Some((_, pointer)) = pointers
-                    .next_row_pointer_with_offset()
-                    .await
-                    .map_err(|e| format!("could not read '{}' for rewrite: {}", old.schema.name, e))?
-                {
-                    // Aborted, or dead for every snapshot that exists or can.
-                    if pointer.deleted || horizon.is_reclaimable(false, pointer.xmin, pointer.xmax) {
-                        continue;
-                    }
-                    // An aborted deleter's stamp never retired anything.
-                    let xmax = if pointer.xmax != crate::core::mvcc::transaction::NO_TX
-                        && read_db.transactions.outcome(pointer.xmax) == crate::core::mvcc::TxOutcome::Aborted
-                    {
-                        crate::core::mvcc::transaction::NO_TX
-                    } else {
-                        pointer.xmax
-                    };
-                    let row = pointer
-                        .fetch_row(io_rows.clone(), &fetch)
-                        .await
-                        .map_err(|e| format!("could not read a row of '{}' for rewrite: {}", old.schema.name, e))?;
-                    let values = row
-                        .columns
-                        .iter()
-                        .filter_map(|c| {
-                            name_of
-                                .get(&u64::from(c.schema_id))
-                                .map(|name| (name.clone(), c.data.clone(), c.column_type.clone()))
-                        })
-                        .collect();
-                    versions.push(RewrittenVersion {
-                        xmin: pointer.xmin,
-                        xmax,
-                        values,
-                    });
-                }
+                let versions = read_rewrite_versions(&old, &fetch, &name_of, &read_db).await?;
 
-                let unique_columns: Vec<String> =
-                    ordered.iter().filter(|f| f.is_unique).map(|f| f.name.clone()).collect();
-                let mut definition = CreateTable {
-                    table_name: old.schema.name.clone(),
-                    columns: ordered
-                        .iter()
-                        .map(|f| CreateColumnData {
-                            name: f.name.clone(),
-                            // `literal_type`: a `timestamp` column is
-                            // recreated as one, not as the `timestamptz`
-                            // its storage type alone would declare.
-                            data_type: f.literal_type(),
-                        })
-                        .collect(),
-                    is_immutable: false,
-                    if_not_exists: false,
-                    foreign_keys: old.schema.foreign_keys.iter().cloned().collect(),
-                    defaults: old.schema.defaults.iter().cloned().collect(),
-                    json_columns: old.schema.json_columns.iter().cloned().collect(),
-                    // Losing a column's declared scale here would silently
-                    // reinterpret every decimal it holds.
-                    type_modifiers: old.schema.type_modifiers.iter().cloned().collect(),
-                    // A generation expression lost here would leave the column
-                    // present and permanently NULL.
-                    generated: old.schema.generated.iter().cloned().collect(),
-                    // A constraint lost here stops being enforced with nothing said.
-                    checks: old.schema.checks.iter().cloned().collect(),
-                    unique_columns,
-                    // Only the keys the rows were checked under. A predicate that
-                    // no longer compiles has not been enforced, and recreated next
-                    // to a new column of the name it reads, it would compile
-                    // against values no row was checked against.
-                    unique_keys: old
-                        .schema
-                        .unique_keys
-                        .iter()
-                        .filter(|k| match k.condition(schema) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                info!("unique index {} not carried across the rewrite: {}", k.describe(), e);
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect(),
-                    // The declared key goes back into the header: a rewrite used
-                    // to drop it, and clients asking which column is the key got
-                    // none after an ADD COLUMN.
-                    primary_key: old.schema.primary_key.clone(),
-                };
-                // Index declarations, each with its columns by name: the rewrite
-                // renumbers columns, and a name is what survives it.
-                let carried_indexes = old
-                    .schema
-                    .secondary_indexes
-                    .iter()
-                    .map(|decl| {
-                        let names: Vec<Option<String>> = decl
-                            .columns
-                            .iter()
-                            .map(|wo| {
-                                schema
-                                    .iter()
-                                    .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
-                                    .map(|f| f.name.clone())
-                            })
-                            .collect();
-                        (decl.clone(), names)
-                    })
-                    .collect();
-                // Path-index declarations, which a rewrite used to lose.
-                let carried_path_indexes = old.schema.path_indexes.clone();
+                let (mut definition, carried_indexes, carried_path_indexes) = rewrite_definition(&old.schema, &ordered);
                 let versions = reshape(&mut definition, versions)?;
                 let defaults = definition.defaults.clone();
                 Ok((
@@ -3339,46 +3480,10 @@ where
             },
             |plan, created| {
                 let io_schema = created.io_schema.clone();
-                let fields = created.schema.fields.clone();
+                let fields = created.schema.fields.to_vec();
                 let carried_indexes = plan.carried_indexes.clone();
                 let carried_path_indexes = plan.carried_path_indexes.clone();
-                async move {
-                    // Declarations go in before any row, so the open that
-                    // follows builds the (empty) indexes and every row is
-                    // indexed by its insert. Staged, then committed as one
-                    // transaction (`torn_tail::SidecarWrites`).
-                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
-                    for (decl, names) in carried_indexes {
-                        // An index over a column this rewrite dropped goes
-                        // with it, as in PostgreSQL.
-                        let columns: Option<Vec<u32>> = names
-                            .iter()
-                            .map(|name| {
-                                let name = name.as_ref()?;
-                                fields
-                                    .iter()
-                                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
-                                    .map(|f| f.write_order as u32)
-                            })
-                            .collect();
-                        let Some(columns) = columns else {
-                            info!("index {} dropped with its column", decl.name);
-                            continue;
-                        };
-                        let decl = crate::core::index::IndexDecl { columns, ..decl };
-                        crate::core::index::decl::stage(&*io_schema, &mut writes, &decl)
-                            .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
-                    }
-                    for path_index in &carried_path_indexes {
-                        crate::core::rql::path_index::stage(&*io_schema, &mut writes, path_index)
-                            .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
-                    }
-                    writes
-                        .commit(&*io_schema)
-                        .await
-                        .map_err(|e| format!("could not carry the indexes: {e}"))?;
-                    Ok(())
-                }
+                carry_rewrite_indexes(io_schema, fields, carried_indexes, carried_path_indexes)
             },
             |plan, table| {
                 let database = database.clone();
@@ -15130,10 +15235,15 @@ async fn execute_alter_table_action(
                     if currently_nullable {
                         return ddl_ok(0);
                     }
-                    // A partitioned table here holds no rows (a populated one
-                    // was refused above): the companion is a metadata change,
-                    // as ADD COLUMN on an empty table adds one.
-                    if database.is_partitioned(&plan.table_name) {
+                    // An empty partitioned table: the companion is a
+                    // metadata change, as ADD COLUMN on an empty table adds
+                    // one. A populated one is rewritten below (phase 6 P8),
+                    // every companion filled from its row: added as metadata
+                    // alone, every existing row would read the column as
+                    // NULL. Read under the ACCESS EXCLUSIVE the arm holds.
+                    if database.is_partitioned(&plan.table_name)
+                        && database.rows_len_held(&plan.table_name).await.is_ok_and(|len| len == 0)
+                    {
                         let flag = nullable::flag_column_name(&name);
                         return match database
                             .reload_atomic(&plan.table_name, |old| async move {

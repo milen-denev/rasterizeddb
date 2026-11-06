@@ -119,6 +119,7 @@ const CALLED_ON_SHELL: &[&str] = &[
     "update_rows_in_txn",
     "update_rows_with_expressions",
     "update_rows_as_of",
+    "update_rows_moving",
 ];
 
 // ---------------------------------------------------------------------------
@@ -554,6 +555,10 @@ async fn a_shell_refuses_every_data_method() {
     expect(
         "update_rows_as_of",
         unit(shell.update_rows_as_of("id = 1", fetch(&shell), set(), &[], None, FROZEN_TX, Some(vis()), None).await),
+    );
+    expect(
+        "update_rows_moving",
+        unit(shell.update_rows_moving("id = 1", fetch(&shell), set(), &[], FROZEN_TX, Some(vis()), None, &mut Vec::new()).await),
     );
 
     assert!(failures.is_empty(), "{:#?}", failures);

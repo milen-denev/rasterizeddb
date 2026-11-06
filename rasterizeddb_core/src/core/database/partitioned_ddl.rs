@@ -43,12 +43,6 @@ type DbTable = Table<DbStorageProvider>;
 /// supported", so the wire reports 0A000 as `CREATE … PARTITION BY`'s do.
 const SUFFIX: &str = "(not supported on a partitioned table)";
 
-fn rewrite_refusal(what: &str, table: &str) -> String {
-    format!(
-        "{what} on partitioned table \"{table}\" rewrites every row, which is not supported yet: a later \
-         version rewrites a partitioned table as a whole (physical ALTER)"
-    )
-}
 
 impl Database {
     /// The stem `name`'s schema files hang off: the name itself for a plain
@@ -148,7 +142,10 @@ impl Database {
                         "JSON columns stored as shadow tables are not supported on a partitioned table yet".to_string(),
                     );
                 }
-                populated().then(|| rewrite_refusal(&format!("ADD COLUMN {name}"), t))
+                // Populated: every row rewritten into a new uid (phase 6 P8,
+                // `Database::rewrite_partitioned`).
+                let _ = populated;
+                None
             }
             AlterAction::DropColumn { name, .. } => (is_key(name) && name_of(name).is_some()).then(|| {
                 format!(
@@ -192,7 +189,8 @@ impl Database {
                              decides where every row is stored; changing it is not supported"
                         ));
                     }
-                    return Some(rewrite_refusal(&format!("ALTER COLUMN {name} TYPE"), t));
+                    // Rewritten into a new uid (phase 6 P8).
+                    return None;
                 }
                 if first == "DROP" && detail.to_ascii_uppercase().contains("NOT NULL") {
                     if is_key(name) {
@@ -201,8 +199,8 @@ impl Database {
                              partition key column must be NOT NULL"
                         ));
                     }
-                    let nullable = crate::core::rql::nullable::is_nullable(name, &schema.fields);
-                    return (!nullable && populated()).then(|| rewrite_refusal(&format!("ALTER COLUMN {name} DROP NOT NULL"), t));
+                    // A populated one is rewritten into a new uid (phase 6 P8).
+                    return None;
                 }
                 None
             }

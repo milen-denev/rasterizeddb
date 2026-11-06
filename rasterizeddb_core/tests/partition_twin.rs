@@ -350,13 +350,10 @@ const REFUSED: &[Refusal] = &[
     refused(UniqueWithoutKey, "never (§1b)"),
     refused(DropNotNullKey, "never (§1.5)"),
     refused(DropKeyColumn, "never (§1.5)"),
-    Refusal {
-        kind: AddColumnPopulated,
-        code: "0A000",
-        lifted_by: "phase 6 (physical ALTER)",
-        or_like_twin: Some("metadata-only on a table whose partitions hold no row bytes"),
-    },
-    refused(AlterType, "phase 6 (physical ALTER)"),
+    // AddColumnPopulated is built (phase 6 P8, every row rewritten into a
+    // new uid) and compared with the twin. AlterType (INT to BIGINT) is a
+    // storage-type change, which no table supports yet.
+    refused(AlterType, "a storage-type change, on any table"),
     Refusal {
         kind: DropNotNull,
         code: "0A000",
@@ -2744,6 +2741,13 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         let op = generator.op(kind);
         twin.run(at, &op);
         generator.reshaped = twin.reshaped;
+        // A populated ADD COLUMN rewrites the table into a new uid (phase 6
+        // P8), and only it does.
+        if kind == AddColumnPopulated
+            && let Some(now) = twin.server.as_ref().unwrap().db.partitioned_table(PART).map(|t| t.uid())
+        {
+            twin.uid = now;
+        }
         if cfg.few_open {
             keep_few_open(&twin.server.as_ref().unwrap().db);
         }
@@ -2808,7 +2812,8 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     // I8's tail: the shell is still the partitioned table's, and the root
     // holds no file under the logical name.
     let server = twin.server.take().unwrap();
-    assert_eq!(server.db.partitioned_table(PART).map(|t| t.uid()), Some(uid), "{label}");
+    assert_eq!(server.db.partitioned_table(PART).map(|t| t.uid()), Some(twin.uid), "{label}");
+    let _ = uid;
     assert!(server.db.table_for_tests(PART).is_some_and(|t| t.schema.name == PART), "{label}: the shell is gone");
     assert_eq!(files_of_table(dir.path(), PART), Vec::<String>::new(), "{label}: files under the logical name");
     let bytes = dir_bytes(dir.path());

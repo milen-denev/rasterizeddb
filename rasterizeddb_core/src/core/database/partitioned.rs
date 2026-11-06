@@ -1040,6 +1040,157 @@ impl Database {
     }
 }
 
+/// Physical ALTER of a partitioned table (docs/partitioning.md "Phase 6 P8
+/// as built"): every row rewritten under a new definition, into a new uid.
+impl Database {
+    /// Rewrites partitioned table `name` under the ACCESS EXCLUSIVE the
+    /// caller holds:
+    ///
+    /// 1. the old table's open partitions retired (maintenance stopped), and
+    ///    `read` handed every materialized partition: it returns the new
+    ///    definition (a `CreateTable`, columns included) and its plan;
+    /// 2. a new uid's files written from the definition, with the old
+    ///    table's key (by its columns' names now) and partition count;
+    ///    `prepare` stages what must precede the rows into its schema
+    ///    (index declarations), and the shell is read back from it;
+    /// 3. the new table opened, and `fill` writes every version into it
+    ///    (each routed by its own point), all made durable;
+    /// 4. **the commit point**: the catalogue row switched from the old uid
+    ///    to the new one in one transaction (`swap_catalogue_uid`);
+    /// 5. the new table installed, the old one's map log closed with
+    ///    `DROPPED` and its files deleted after voiding their log records.
+    ///
+    /// A failure before 4 deletes the new uid's files and reopens the old
+    /// table, unchanged; a crash before 4 leaves the new uid with no
+    /// catalogue row and one after it the old, and the startup reaper
+    /// deletes whichever is unnamed. A failure deleting the old files after
+    /// 4 is logged, the reaper's to finish. Returns `fill`'s answer.
+    pub(crate) async fn rewrite_partitioned<P, R, RF, PR, PF, F, FF>(
+        &self,
+        name: &str,
+        read: R,
+        prepare: PR,
+        fill: F,
+    ) -> Result<bool, String>
+    where
+        R: FnOnce(Arc<Table<DbStorageProvider>>, Vec<Arc<Table<DbStorageProvider>>>) -> RF,
+        RF: std::future::Future<Output = Result<(CreateTable, P), String>>,
+        PR: FnOnce(&P, Arc<DbStorageProvider>, Vec<crate::core::row::schema::SchemaField>) -> PF,
+        PF: std::future::Future<Output = Result<(), String>>,
+        F: FnOnce(P, Arc<PartitionedTable>) -> FF,
+        FF: std::future::Future<Output = Result<bool, String>>,
+    {
+        let resolved = self.resolve_key(name);
+        let name = resolved.as_deref().unwrap_or(name);
+        let _ddl = self.partition_ddl.lock().await;
+        let Some(old) = self.partitioned_table(name) else {
+            return Err(format!("partitioned table \"{name}\" does not exist"));
+        };
+        old.check().map_err(|e| e.to_string())?;
+        let key = old.key_columns().map_err(|e| e.to_string())?;
+        let partitions = old.declared().ok_or("the partition count is unknown")?;
+        let root = self.partition_root().map_err(|e| e.to_string())?;
+        let _snapshot_gate = self.uid_deletion_permit().await;
+        let _forget_pause = self.transactions.forget_pause();
+        let changed = super::SchemaChanged(&self.schema_generation);
+        self.schema_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        // 1. Every materialized partition, then the instance retired.
+        let parts: Vec<Arc<Table<DbStorageProvider>>> = match old.all_partitions().await {
+            Ok(parts) => parts.into_iter().map(|(_, t)| t).collect(),
+            Err(e) => return Err(e.to_string()),
+        };
+        old.retire_partitions().await;
+        let reopen_old = || async {
+            let (shell, table) = self.reopen_partitioned(name, &old).await;
+            self.swap_partitioned(name, Arc::new(table), shell);
+        };
+        let (mut definition, plan) = match read(old.shell().clone(), parts).await {
+            Ok(read) => read,
+            Err(e) => {
+                reopen_old().await;
+                return Err(e);
+            }
+        };
+
+        // 2 and 3: the new uid, written and filled.
+        let open = self.partitioned_tables_all();
+        let new_uid = match files::new_uid(&root, |u| open.iter().any(|t| t.uid() == u)) {
+            Ok(u) => u,
+            Err(e) => {
+                reopen_old().await;
+                return Err(e.to_string());
+            }
+        };
+        drop(open);
+        let built: Result<(bool, Arc<PartitionedTable>, Arc<Table<DbStorageProvider>>), String> = async {
+            let key_refs: Vec<&str> = key.iter().map(String::as_str).collect();
+            let columns = std::mem::take(&mut definition.columns);
+            let (io_schema, schema) = self
+                .write_partitioned_files(&root, &definition, columns, &key_refs, partitions, new_uid)
+                .await
+                .map_err(|e| e.to_string())?;
+            prepare(&plan, io_schema.clone(), schema.fields.to_vec()).await?;
+            let schema = TableSchema::load(io_schema.clone()).await.map_err(|e| e.to_string())?;
+            let mut shell = Table::partition_shell(io_schema, schema);
+            shell.scope_cache_to_database(self.id);
+            shell.enable_versioning(self.transactions.clone());
+            let shell = Arc::new(shell);
+            let table = Arc::new(PartitionedTable::open(self.open_ctx(), name, new_uid, shell.clone()).await);
+            table.check().map_err(|e| e.to_string())?;
+            let wrote_family = fill(plan, table.clone()).await?;
+            #[cfg(test)]
+            super::rewrite::point(self, "partitioned_before_commit")?;
+            self.sync_durable().map_err(|e| e.to_string())?;
+            Ok((wrote_family, table, shell))
+        }
+        .await;
+        let (wrote_family, table, shell) = match built {
+            Ok(built) => built,
+            Err(e) => {
+                error!("Rewriting partitioned table {name} failed before its commit point: {e}");
+                if let Some(t) = self.partitioned_tables_all().into_iter().find(|t| t.uid() == new_uid) {
+                    t.retire_partitions().await;
+                }
+                if let Err(d) = self.discard_uid_files(&root, new_uid) {
+                    error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
+                }
+                reopen_old().await;
+                return Err(e);
+            }
+        };
+
+        // 4. The commit point.
+        if let Err(e) = self.swap_catalogue_uid(name, old.uid(), new_uid).await {
+            error!("Rewriting partitioned table {name}: the catalogue could not be switched: {e}");
+            table.retire_partitions().await;
+            drop(table);
+            if let Err(d) = self.discard_uid_files(&root, new_uid) {
+                error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
+            }
+            reopen_old().await;
+            return Err(e.to_string());
+        }
+        #[cfg(test)]
+        if super::rewrite::point(self, "partitioned_after_commit").is_err() {
+            // A "crash" right after the commit point: nothing more runs.
+            return Ok(wrote_family);
+        }
+
+        // 5. Installed; the old uid gone.
+        self.swap_partitioned(name, table, Some(shell));
+        drop(changed);
+        let old_uid = old.uid();
+        if let Err(e) = old.mark_dropped().await {
+            warn!("Rewrote partitioned table {name}; closing the old map log failed, the startup reaper deletes it: {e}");
+        } else if let Err(e) = self.discard_uid_files(&root, old_uid) {
+            warn!("Rewrote partitioned table {name}; deleting the old files under uid {old_uid:016x} failed, the startup reaper deletes them: {e}");
+        }
+        info!("Rewrote partitioned table {name}: uid {old_uid:016x} -> {new_uid:016x}");
+        Ok(wrote_family)
+    }
+}
+
 /// Test-only: a raised declared-partitions cap for databases under a
 /// directory, for the scale measurements (`lazy_resident_tests`).
 #[cfg(test)]

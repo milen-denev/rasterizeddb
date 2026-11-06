@@ -264,7 +264,9 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     pair.ok("ALTER TABLE {t} ALTER COLUMN n SET NOT NULL");
     pair.fails("INSERT INTO {t} (tenant_id, id, n) VALUES (7, 104, NULL)", "23502");
     pair.ok("ALTER TABLE {t} ALTER COLUMN tenant_id SET NOT NULL");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN n DROP NOT NULL", "rewrites every row");
+    // Populated: every row rewritten into a new uid (phase 6 P8), like the twin.
+    pair.ok("ALTER TABLE {t} ALTER COLUMN n DROP NOT NULL");
+    pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
     pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
     pair.compare("not null");
 
@@ -286,9 +288,12 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     pair.ok("ALTER TABLE {t} DROP COLUMN f");
     pair.fails_alike("SELECT f FROM {t}");
     pair.refused("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column");
-    pair.refused("ALTER TABLE {t} ADD COLUMN extra INT", "rewrites every row");
-    pair.refused("ALTER TABLE {t} ADD COLUMN extra INT DEFAULT 5", "rewrites every row");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT", "rewrites every row");
+    // Rewritten into a new uid (phase 6 P8), like the twin; a storage-type
+    // change is refused on both.
+    pair.ok("ALTER TABLE {t} ADD COLUMN extra INT");
+    pair.ok("ALTER TABLE {t} ADD COLUMN extra2 INT DEFAULT 5");
+    pair.ok("SELECT tenant_id, id, extra, extra2 FROM {t} ORDER BY tenant_id, id");
+    pair.fails_alike("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT");
     pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column");
     pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS n INT");
     pair.fails("ALTER TABLE {t} ADD COLUMN n INT", "42701");
@@ -340,8 +345,12 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     pair.restart();
     pair.compare("restarted");
     pair.ok("SELECT tenant_id, extra, filled, dec, twice, must FROM {t} WHERE tenant_id = 2");
-    // Once it holds rows, the same statement rewrites, and is refused.
-    pair.refused("ALTER TABLE {t} ADD COLUMN late INT", "rewrites every row");
+    // Once it holds rows, the same statement rewrites every row (phase 6
+    // P8), and answers as the twin.
+    pair.ok("ALTER TABLE {t} ADD COLUMN late INT");
+    pair.compare("rewritten with rows");
+    pair.restart();
+    pair.compare("rewritten, restarted");
 }
 
 /// A prepared statement made before a DDL and executed after it answers on

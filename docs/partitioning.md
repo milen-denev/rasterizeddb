@@ -16,7 +16,8 @@ the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)),
 (placement across storage locations, [as built](#phase-4-p6-as-built)), and phase 5's P7
 (reshape: `SPLIT PARTITION`, `MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`,
 `STORAGE MOVE PARTITION`, under ACCESS EXCLUSIVE, [as built](#phase-5-p7-as-built)), and
-phase 6's P9 (row moves: an `UPDATE` changing a key value, [as built](#phase-6-p9-as-built)). Phases 0 and 1 are
+phase 6's P9 (row moves: an `UPDATE` changing a key value, [as built](#phase-6-p9-as-built)) and
+P8 (physical ALTER: every row rewritten into a new uid, [as built](#phase-6-p8-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -140,7 +141,7 @@ idle-box wall-clock A/B is still to run.
 | Refused | Phase |
 |---|---|
 | ~~`UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT`~~ | built in phase 3 P3 ([as built](#phase-3-p3-as-built)) |
-| ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4) | physical-rewrite `ALTER` 6 |
+| ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4); ~~physical-rewrite `ALTER`~~ (built in phase 6 P8, [as built](#phase-6-p8-as-built)) | 6 |
 | ~~A key change: an `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value~~ moves the row since phase 6 P9 ([as built](#phase-6-p9-as-built)); a `DO UPDATE` that would move it stays refused, as in PostgreSQL | 6 (row moves, §9) |
 | Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`); ~~reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`)~~ built in phase 5 P7 ([as built](#phase-5-p7-as-built)) | 5 |
 | `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
@@ -453,6 +454,68 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 6 P8 as built
+
+Physical ALTER of a partitioned table (§11), built 2026-11-06 on
+`feat/p8-physical-alter`. What rewrites every row of a plain table now does
+so on a partitioned one too: a populated `ADD COLUMN` (with a `DEFAULT`, a
+generated expression, a `REFERENCES` it validates), `DROP NOT NULL` of a
+populated column (its `__null_` companion filled from each row), and the
+type changes a plain table rewrites (NUMERIC precision and scale, a legacy
+`CHAR` column). A storage-type change (`INT` to `BIGINT`) is refused on
+every table alike; a key column's type and nullability stay refused (§1.5).
+
+**Not the generational reshape §11 sketched.** The schema is one set of
+sidecar files per uid (`__pt_<uid>_schema*`), which cannot flip in the same
+record as a map epoch. So a rewrite builds a **new uid** whole and the
+catalogue switches to it in one transaction
+(`Database::rewrite_partitioned`, `Database::swap_catalogue_uid`):
+
+1. The old table's partitions retired (maintenance stopped); every version
+   a snapshot can still see read from every materialized partition, values
+   by column name, own `xmin` and `xmax` kept (`read_rewrite_versions`, the
+   plain rewrite's R5 reader, shared).
+2. The definition built and reshaped as for a plain table
+   (`rewrite_definition`, the same `reshape` closures); a new uid's parent
+   files, schema and sidecars, map log (the same partition count, dense:
+   reshaped boundaries are not carried) and ids file written
+   (`write_partitioned_files`, CREATE's), index and path-index declarations
+   staged by column name (`carry_rewrite_indexes`), the shell read back.
+3. The new table opened and filled: each version's payload built as a plain
+   rewrite builds it (`rewrite_payload`), routed by its own point, and
+   written with its stamps (`Table::insert_version`). Synced.
+4. **The commit point**: the catalogue row `(name, old uid)` tombstoned and
+   `(name, new uid)` written in **one** storage transaction, one durable
+   commit. Never both live (the next start refuses two rows sharing a name),
+   never neither.
+5. The new table installed (the prepared statements' generation moved),
+   the old map log closed with `DROPPED`, its files deleted after voiding
+   their log records.
+
+A failure before 4 deletes the new uid's files and reopens the old table,
+unchanged. A crash before 4 leaves the new uid with no catalogue row, after
+it the old one; either way the startup reaper deletes the unnamed uid's
+files (it deletes every uid no catalogue row holds).
+
+**A trap this closed.** The DROP NOT NULL arm had a partitioned shortcut
+that added the `__null_` companion as metadata, written when populated
+tables were refused before reaching it. With the refusal lifted it would
+have read every existing value as NULL with the bytes intact (memory
+`silent-wrong-answers-not-errors`); the twin comparison in
+`physical_alter_tests` caught it (type tag 253, NULL, on a row holding 11).
+The shortcut now runs only on a table whose partitions hold no row bytes,
+read under the arm's ACCESS EXCLUSIVE.
+
+**Tests.** `database::physical_alter_tests` (every physical ALTER answered
+as the plain twin, rows, aggregates and an index lookup after each, writes
+after, a restart; the old uid's files gone; a key column's retype refused;
+a failure before the commit point changes nothing and leaves no new file; a
+crash right after it opens the new uid and the reaper deletes the old). The
+twin's `AddColumnPopulated` leaves `REFUSED` and is compared;
+`partition_alter`, `partition_ddl`, `partition_fk` and `partition_shell_sites`
+now compare these statements with their twins instead of pinning refusals,
+and follow the uid across a rewrite.
 
 ## Phase 6 P9 as built
 

@@ -967,7 +967,7 @@ fn a_name_holding_references_is_no_foreign_key() {
 /// fails validation (23503) on the populated child and the column is
 /// dropped again; a type mismatch is 42804 and the column goes; `NOT VALID`
 /// keeps the rows unchecked; and ADD FOREIGN KEY in a READ ONLY block is
-/// 25006. A populated partitioned child refuses ADD COLUMN itself (phase 6).
+/// 25006. A populated partitioned child rewrites every row (phase 6 P8).
 #[test]
 fn add_column_references_goes_through_the_foreign_key_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -994,13 +994,8 @@ fn add_column_references_goes_through_the_foreign_key_path() {
         c.ok(&format!("INSERT INTO {t} (cid, v, pid) VALUES (8, 8, 2)"));
         c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pid_fkey"));
         c.ok(&format!("INSERT INTO {t} (cid, v, pid) VALUES (9, 9, 9)"));
-        if !part.is_empty() {
-            // Populated now: ADD COLUMN itself is the physical rewrite
-            // phase 6 builds.
-            let e = c.simple(&format!("ALTER TABLE {t} ADD COLUMN q INT DEFAULT 5 REFERENCES ap(id)")).expect_err("populated");
-            assert!(e.is_unsupported(), "{t}: {e}");
-            continue;
-        }
+        // Populated now, a partitioned child too: ADD COLUMN rewrites every
+        // row (phase 6 P8), and validates them as a plain child does.
         // Rows no parent 5 covers: refused, and the column goes again.
         assert_eq!(code(&mut c, &format!("ALTER TABLE {t} ADD COLUMN q INT DEFAULT 5 REFERENCES ap(id)")), "23503", "{t}");
         assert!(c.simple(&format!("SELECT q FROM {t}")).is_err(), "{t}: the column was not dropped again");
@@ -1012,7 +1007,10 @@ fn add_column_references_goes_through_the_foreign_key_path() {
     }
     c.ok("CREATE TABLE acp (cid BIGINT NOT NULL PRIMARY KEY, v INT) PARTITION BY HASH (cid) PARTITIONS 4");
     c.ok("INSERT INTO acp (cid, v) VALUES (1, 1)");
-    assert!(c.simple("ALTER TABLE acp ADD COLUMN pid INT REFERENCES ap(id)").expect_err("populated").is_unsupported());
+    // Populated: rewritten (phase 6 P8); a NULL key references nothing.
+    c.ok("ALTER TABLE acp ADD COLUMN pid INT REFERENCES ap(id)");
+    assert_eq!(code(&mut c, "INSERT INTO acp (cid, v, pid) VALUES (2, 2, 9)"), "23503");
+    c.ok("INSERT INTO acp (cid, v, pid) VALUES (3, 3, 1)");
 }
 
 /// Foreign keys on tables placed on a key/value store (a local directory

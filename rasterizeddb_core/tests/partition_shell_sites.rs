@@ -198,10 +198,11 @@ const SITES: &[Site] = &[
     site("CREATE TABLE site_p (k INT NOT NULL)", Expect::Error("42P07"), "duplicate name"),
     site("CREATE TABLE site_p (k INT NOT NULL) PARTITION BY HASH (k)", Expect::Error("42P07"), "duplicate name"),
     // ALTER (phase 3 P1, §11): the metadata forms answer like the twin, in
-    // pairs that leave the table as it was; what would rewrite every row,
-    // a key column's change and foreign keys are refused before writing.
-    site("ALTER TABLE IF EXISTS site_p ADD COLUMN x INT", Expect::Refused, "populated: rewrites every row (physical ALTER)"),
-    site("ALTER TABLE site_p ADD COLUMN x INT", Expect::Refused, "populated: physical ALTER"),
+    // pairs that leave the table as it was; what rewrites every row does so
+    // into a new uid (phase 6 P8), like the twin; a key column's change is
+    // refused before writing.
+    site("ALTER TABLE IF EXISTS site_p ADD COLUMN x INT", Expect::LikeTwin, "populated: every row rewritten (phase 6 P8)"),
+    site("ALTER TABLE site_p ADD COLUMN x INT", Expect::LikeTwin, "already there: 42701 on both"),
     site("ALTER TABLE site_p ADD COLUMN IF NOT EXISTS n INT", Expect::LikeTwin, "an existing column: a no-op on both"),
     site("ALTER TABLE site_p DROP COLUMN IF EXISTS nope", Expect::LikeTwin, "no such column: a no-op on both"),
     site("ALTER TABLE site_p DROP COLUMN tenant_id", Expect::Refused, "§1.5: a partition key column"),
@@ -212,7 +213,7 @@ const SITES: &[Site] = &[
     site("SELECT * FROM site_p WHERE tenant_id = 1 AND grp = 2", Expect::LikeTwinAnswered, "routed on the renamed key"),
     site("ALTER TABLE site_p RENAME COLUMN grp TO asset_group_id", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_q RENAME TO site_p", Expect::Error("42710"), "onto the partitioned name: as onto a plain one"),
-    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::Refused, "physical ALTER"),
+    site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::LikeTwin, "a storage-type change: refused on both"),
     site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE INT", Expect::Refused, "a partition key column"),
     site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT USING n::bigint", Expect::Refused, "USING: refused on both"),
     site("ALTER TABLE site_p ALTER COLUMN n SET DEFAULT 5", Expect::LikeTwin, "phase 3 P1"),
@@ -225,12 +226,18 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p DROP CONSTRAINT site_p_c", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_p ADD CHECK (n > 100)", Expect::LikeTwin, "violated by rows on both: 23514"),
     site("ALTER TABLE site_p ADD CONSTRAINT site_p_u2 UNIQUE (n)", Expect::Refused, "§1b: every key column"),
-    site("ALTER TABLE site_p ADD COLUMN m NUMERIC(12, 3)", Expect::Refused, "populated: physical ALTER"),
+    site("ALTER TABLE site_p ADD COLUMN m NUMERIC(12, 3)", Expect::LikeTwin, "populated: phase 6 P8"),
     site(
         "ALTER TABLE site_p ADD COLUMN g INT GENERATED ALWAYS AS (n + 1) STORED",
-        Expect::Refused,
-        "populated: physical ALTER",
+        Expect::LikeTwin,
+        "populated: phase 6 P8, every row's g computed",
     ),
+    site("SELECT * FROM site_p ORDER BY tenant_id, asset_group_id, n", Expect::LikeTwinAnswered, "P8: the rewritten rows"),
+    // And the added columns dropped again (a marking drop), so the later
+    // sites see the columns they were written for.
+    site("ALTER TABLE site_p DROP COLUMN g", Expect::LikeTwin, "phase 3 P1: marking"),
+    site("ALTER TABLE site_p DROP COLUMN m", Expect::LikeTwin, "phase 3 P1: marking"),
+    site("ALTER TABLE site_p DROP COLUMN x", Expect::LikeTwin, "phase 3 P1: marking"),
     site(
         "ALTER TABLE site_p ADD CONSTRAINT site_p_fk FOREIGN KEY (n) REFERENCES site_parent(id)",
         Expect::LikeTwin,
@@ -811,7 +818,7 @@ fn every_site_is_correct_or_an_error() {
         }
     }
     let db = server.db.clone();
-    let inv = Invariant {
+    let mut inv = Invariant {
         uid: db.partitioned_table(T).expect("partitioned").uid(),
         schema: rt.block_on(on_disk_schema(&db, T)),
     };
@@ -820,6 +827,7 @@ fn every_site_is_correct_or_an_error() {
     let mut cp = server.connect();
     let mut cq = server.connect();
     let mut wrong = Vec::new();
+    let mut rewritten = false;
     for site in SITES {
         let catalogue_before = rt.block_on(catalogue_len(&db));
         let schema_before = rt.block_on(on_disk_text(&db, T));
@@ -861,12 +869,26 @@ fn every_site_is_correct_or_an_error() {
             assert_eq!(rt.block_on(catalogue_len(&db)), catalogue_before, "`{}` failed and wrote a catalogue row", site.sql);
             assert_eq!(rt.block_on(on_disk_text(&db, T)), schema_before, "`{}` failed and changed the schema", site.sql);
         }
+        // A rewrite (phase 6 P8) moves the table to a new uid, and only a
+        // rewrite: every other site keeps it.
+        if let Some(now) = db.partitioned_table(T).map(|t| t.uid())
+            && now != inv.uid
+            && p.is_ok()
+            && site.note.contains("P8")
+        {
+            inv.uid = now;
+            rewritten = true;
+        }
         check_invariant(&rt, &db, dir.path(), &inv, site.sql);
     }
     assert!(wrong.is_empty(), "sites that answered wrongly:\n  {}", wrong.join("\n  "));
     // The DDL sites came in pairs: the schema is the one the catalogue
-    // started with.
-    assert_eq!(rt.block_on(on_disk_schema(&db, T)), inv.schema, "the DDL pairs left the schema changed");
+    // started with. Not after a rewrite, which adds columns for good (the
+    // twin's rows below still compare).
+    assert!(rewritten, "no site rewrote the table, so P8 was not reached");
+    if !rewritten {
+        assert_eq!(rt.block_on(on_disk_schema(&db, T)), inv.schema, "the DDL pairs left the schema changed");
+    }
     // What the LikeTwin writes stored is the twin's, row for row.
     assert_eq!(stored_rows(&db, T), stored_rows(&db, TWIN), "the partitioned table stores other rows");
 

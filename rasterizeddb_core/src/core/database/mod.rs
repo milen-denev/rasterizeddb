@@ -43,6 +43,8 @@ mod reaper_tests;
 mod reshape_tests;
 #[cfg(test)]
 mod row_move_tests;
+#[cfg(test)]
+mod physical_alter_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;
@@ -3656,6 +3658,93 @@ impl Database {
         .await
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
 
+        Ok(())
+    }
+
+    /// The commit point of a partitioned table's physical rewrite
+    /// (docs/partitioning.md "Phase 6 P8 as built"): `table_name`'s
+    /// catalogue row naming `old_uid` replaced by one naming `new_uid`, the
+    /// tombstone and the new row in **one** storage transaction, made durable
+    /// with one commit. A crash leaves exactly one of them live, never both
+    /// (the next start refuses two live rows sharing a name) and never
+    /// neither; the uid the catalogue no longer names is the startup
+    /// reaper's.
+    pub(crate) async fn swap_catalogue_uid(&self, table_name: &str, old_uid: u64, new_uid: u64) -> io::Result<()> {
+        let schema = load_db_data_schema(self.db_io_schema.clone()).await?;
+        let fetch = create_db_data_row_fetch(&schema.fields);
+        let mut iterator = RowPointerIterator::new(self.db_io_pointers.clone())
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let mut found = None;
+        while let Ok(Some((record_pos, pointer))) = iterator.next_row_pointer_with_offset().await {
+            if pointer.deleted {
+                continue;
+            }
+            let Ok(row) = pointer.fetch_row(self.db_io_rows.clone(), &fetch).await else {
+                continue;
+            };
+            let name = row.columns.iter().find(|c| c.schema_id == 0).map(|c| c.data.into_slice().to_vec());
+            let clusters = row
+                .columns
+                .iter()
+                .find(|c| c.schema_id == 1)
+                .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+                .map(u64::from_le_bytes);
+            if name.as_deref() == Some(table_name.as_bytes()) && clusters == Some(old_uid) {
+                found = Some((record_pos, pointer));
+                break;
+            }
+        }
+        let Some((record_pos, mut pointer)) = found else {
+            return Err(io::Error::other(format!(
+                "the catalogue has no row naming \"{table_name}\" with uid {old_uid:016x}"
+            )));
+        };
+        let mut name_mb = MEMORY_POOL.acquire(table_name.len());
+        name_mb.into_slice_mut().copy_from_slice(table_name.as_bytes());
+        let mut clusters_mb = MEMORY_POOL.acquire(8);
+        clusters_mb.into_slice_mut().copy_from_slice(&new_uid.to_le_bytes());
+        let row_write = RowWrite {
+            columns_writing_data: smallvec![
+                ColumnWritePayload { column_type: DbType::STRING, size: 8 + 4, data: name_mb, write_order: 0 },
+                ColumnWritePayload { column_type: DbType::U64, size: 8, data: clusters_mb, write_order: 1 }
+            ],
+        };
+        let mut last = RowPointerIterator::new(self.db_io_pointers.clone())
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        #[allow(clippy::unnecessary_cast)]
+        let (last_id, table_length) = match last.read_last().await {
+            Some(p) => (p.id as u64, p.position),
+            None => (0, 0),
+        };
+        let txn = self.db_io_pointers.begin_txn();
+        let written = RowPointer::write_row_with_pointer_record_pos(
+            self.db_io_pointers.clone(),
+            self.db_io_rows.clone(),
+            &AtomicU64::new(last_id),
+            &AtomicU64::new(table_length),
+            #[cfg(feature = "enable_long_row")]
+            0,
+            &row_write,
+            Some(txn),
+            None,
+            None,
+            crate::core::mvcc::transaction::FROZEN_TX,
+        )
+        .await;
+        if let Err(e) = written {
+            self.db_io_pointers.abort_txn(txn).await;
+            return Err(io::Error::other(format!("{e:?}")));
+        }
+        if let Err(e) = pointer
+            .delete(self.db_io_pointers.clone(), record_pos, Some(txn), crate::core::mvcc::transaction::FROZEN_TX)
+            .await
+        {
+            self.db_io_pointers.abort_txn(txn).await;
+            return Err(io::Error::other(format!("{e:?}")));
+        }
+        self.db_io_pointers.commit_durable(txn).await?;
         Ok(())
     }
 
