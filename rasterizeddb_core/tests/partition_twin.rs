@@ -249,6 +249,14 @@ enum Kind {
     // exclusively; the next statement reaching one reopens it. Also inside
     // blocks, where a partition the block wrote stays open (its ticket).
     ClosePartitions,
+    // Phase 5 (§6.2): a reshape of the partitioned table, run on its own
+    // connection between operations (never inside a block, where it would
+    // wait for the block's own lock): a split, a merge of neighbours, an
+    // isolation, or a sub-split of a tenant. Local and physical, so the twin
+    // runs nothing. Every later read is compared as before, and what both
+    // tables store right after; the tuple-count estimates are not, once a
+    // reshape ran (see `CatalogStat`).
+    Reshape,
 }
 
 use Kind::*;
@@ -276,7 +284,7 @@ const ALL_KINDS: &[Kind] = &[
     DropDefault, SetNotNull, DropNotNull, DropNotNullKey, RenameColumnRoundTrip, RenameKeyRoundTrip,
     RenameTableRoundTrip, DropColumn, DropKeyColumn, AddColumnPopulated, AlterType, ForeignKeyFromT,
     ForeignKeyOntoPartitioned, ForeignKeyFromSink, PreparedSelectAcrossAlter,
-    TxCommit, TxRollback, Restart, ForgetSweep, ClosePartitions,
+    TxCommit, TxRollback, Restart, ForgetSweep, ClosePartitions, Reshape,
 ];
 
 /// A kind the partitioned table refuses today: the SQLSTATE the refusal
@@ -489,6 +497,8 @@ enum Step {
     /// [`ClosePartitions`]: the bits of the value pick which of the table's
     /// idle partitions close (bit `pid % 64`).
     ClosePartitions(u64),
+    /// [`Reshape`]: the value picks the statement and its tenant.
+    Reshape(u64),
 }
 
 struct Op {
@@ -509,6 +519,8 @@ struct Gen {
     unique_dropped: bool,
     /// `PART_TWIN_SPREAD`: tables on two storage locations.
     spread: bool,
+    /// A reshape has run (copied from the twin after each operation).
+    reshaped: bool,
 }
 
 const WORDS: &[&str] = &["alpha", "beta", "gamma", "delta", "", "x y", "it''s"];
@@ -1534,14 +1546,18 @@ impl Gen {
             // mode a table off the root never overwrites in place (its log
             // is not the outcome log's, `write_columns_in_place`), so its
             // UPDATEs append versions that the other side's in-place ones
-            // did not: the same rows, more slots. Compared without them.
-            CatalogClass if self.spread => {
+            // did not: the same rows, more slots. Compared without them. So
+            // once a reshape ran: it compacts its sources as VACUUM FULL does,
+            // and a cut inside a tenant's block makes that tenant's UPDATEs
+            // touch two partitions, which never overwrite in place (one
+            // statement snapshot, `row_source::write_partitions`).
+            CatalogClass if self.spread || self.reshaped => {
                 self.simple(kind, "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'".into())
             }
             CatalogClass => {
                 self.simple(kind, "SELECT relname, relkind, reltuples FROM pg_class WHERE relname = '{t}'".into())
             }
-            CatalogStat if self.spread => {
+            CatalogStat if self.spread || self.reshaped => {
                 self.simple(kind, "SELECT schemaname, relname FROM pg_stat_user_tables WHERE relname = '{t}'".into())
             }
             CatalogStat => self.simple(
@@ -1693,6 +1709,7 @@ impl Gen {
             Restart => Op { kind, step: Step::Restart, ordered: false },
             ForgetSweep => Op { kind, step: Step::ForgetSweep(self.rng.u64(..)), ordered: false },
             ClosePartitions => Op { kind, step: Step::ClosePartitions(self.rng.u64(..)), ordered: false },
+            Reshape => Op { kind, step: Step::Reshape(self.rng.u64(..)), ordered: false },
         }
     }
 
@@ -1796,6 +1813,7 @@ fn weight(kind: Kind) -> u32 {
         Restart => 0,
         ForgetSweep => 1,
         ClosePartitions => 2,
+        Reshape => 8,
         CatalogColumns | CatalogTables | CatalogClass | CatalogStat | CatalogIndexes | Describe => 1,
         Vacuum | VacuumFull | Analyze => 1,
         CreateIndex | DropIndex | CreateUniqueIndex | DropUniqueIndex | UniqueWithoutKey | AddCheck | DropCheck
@@ -1845,6 +1863,8 @@ const SUCCEEDING_DDL: &[Kind] = &[
 ];
 
 struct Twin {
+    /// A [`Reshape`] succeeded: the tuple-count estimates stop comparing.
+    reshaped: bool,
     server: Option<Server>,
     cp: Option<Client>,
     cq: Option<Client>,
@@ -1916,6 +1936,7 @@ fn writes_t(kind: Kind) -> bool {
             | Restart
             | ForgetSweep
             | ClosePartitions
+            | Reshape
             | CreateIndex
             | DropIndex
             | CreateUniqueIndex
@@ -2301,6 +2322,33 @@ impl Twin {
                 self.note(op.kind, &Verdict::Agreed { failed: false });
                 false
             }
+            Step::Reshape(pick) => {
+                let db = self.server.as_ref().unwrap().db.clone();
+                let sql = reshape_sql(&db, *pick);
+                let done = match self.cp().simple(&sql) {
+                    Ok(_) => {
+                        self.log.push(format!("-- {sql}: done"));
+                        true
+                    }
+                    Err(e) => {
+                        // A refusal the map explains (an isolated tenant
+                        // isolated again, a one-point split, a tenant on
+                        // two partitions) is no finding; anything else is.
+                        let e = format!("{e:?}");
+                        let explained = ["already has", "single point", "span more", "cannot be split", "same partition", "both FOR", "not adjacent", "one point"]
+                            .iter()
+                            .any(|w| e.contains(w));
+                        if !explained {
+                            self.fail(at, op.kind, format!("{sql} failed: {e}"));
+                        }
+                        self.log.push(format!("-- {sql}: refused ({e})"));
+                        false
+                    }
+                };
+                self.reshaped |= done;
+                self.note(op.kind, &Verdict::Agreed { failed: !done });
+                false
+            }
             Step::Restart => {
                 self.log.push("-- restart".into());
                 self.cp = None;
@@ -2316,6 +2364,45 @@ impl Twin {
                 false
             }
         }
+    }
+}
+
+/// [`Reshape`]: the statement `pick` chooses against the map now: a split
+/// of a tenant's partition, a merge of it with a neighbour (by a tenant
+/// found there), an isolation, or (with a composite key) a sub-split.
+fn reshape_sql(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, pick: u64) -> String {
+    use rasterizeddb_core::core::partition::route::Route;
+    let t = 1 + (pick % TENANTS as u64) as i64;
+    let pt = db.partitioned_table(PART).expect("the partitioned table");
+    let composite = pt.spec().map(|k| k.levels().len() > 1).unwrap_or(false);
+    match (pick >> 8) % 4 {
+        0 => format!("ALTER TABLE {PART} SPLIT PARTITION FOR (tenant_id = {t})"),
+        1 => {
+            let epoch = pt.epoch().expect("an epoch");
+            let lo_of = |k: i64| match pt.route_where(&format!("tenant_id = {k}")) {
+                Ok(Route::Points(r)) => Some(r[0].lo),
+                _ => None,
+            };
+            let Some(mine) = lo_of(t).map(|lo| epoch.map.pid_of(lo)) else {
+                return format!("ALTER TABLE {PART} SPLIT PARTITION FOR (tenant_id = {t})");
+            };
+            let entries = epoch.map.entries();
+            let at = entries.iter().position(|&(_, p)| p == mine).unwrap();
+            // A neighbour's key: any value whose point lands in the next (or
+            // previous) partition.
+            for k in 1..20_000i64 {
+                if let Some(lo) = lo_of(k) {
+                    let owner = entries.iter().rposition(|&(l, _)| l <= lo).unwrap();
+                    if owner == at + 1 || owner + 1 == at {
+                        return format!("ALTER TABLE {PART} MERGE PARTITIONS FOR (tenant_id = {t}), FOR (tenant_id = {k})");
+                    }
+                }
+            }
+            format!("ALTER TABLE {PART} SPLIT PARTITION FOR (tenant_id = {t})")
+        }
+        2 => format!("ALTER TABLE {PART} ISOLATE KEY (tenant_id = {t})"),
+        _ if composite => format!("ALTER TABLE {PART} SPLIT KEY (tenant_id = {t}) INTO {}", 2u32 << ((pick >> 12) % 3)),
+        _ => format!("ALTER TABLE {PART} SPLIT PARTITION FOR (tenant_id = {t})"),
     }
 }
 
@@ -2566,7 +2653,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     while keys.len() < 40 {
         keys.insert((seed_rng.i64(1..=TENANTS), seed_rng.i64(1..=GROUPS), seed_rng.i64(1..=IDS)));
     }
-    let mut seeder = Gen { rng: seed_rng, key: cfg.key, unique_dropped: false, spread: second.is_some() };
+    let mut seeder = Gen { rng: seed_rng, key: cfg.key, unique_dropped: false, spread: second.is_some(), reshaped: false };
     let inserts: Vec<String> = keys
         .iter()
         .map(|(t, g, i)| {
@@ -2582,6 +2669,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     let uid = server.db.partitioned_table(PART).expect("the partitioned table").uid();
 
     let mut twin = Twin {
+        reshaped: false,
         cp: Some(server.connect()),
         cq: Some(server.connect()),
         server: Some(server),
@@ -2597,7 +2685,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     // The seeded rows, before anything else runs.
     twin.compare_storage(0, Restart);
     let mut generator =
-        Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key, unique_dropped: false, spread: second.is_some() };
+        Gen { rng: fastrand::Rng::with_seed(seed), key: cfg.key, unique_dropped: false, spread: second.is_some(), reshaped: false };
 
     // First every kind once, in a seeded order; then weighted draws.
     let mut order: Vec<Kind> = ALL_KINDS.iter().copied().filter(|k| *k != Restart).collect();
@@ -2628,6 +2716,7 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         };
         let op = generator.op(kind);
         twin.run(at, &op);
+        generator.reshaped = twin.reshaped;
         if cfg.few_open {
             keep_few_open(&twin.server.as_ref().unwrap().db);
         }
@@ -2666,6 +2755,9 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         let agreed = twin.tally.get(kind).map_or(0, |t| t.agreed);
         assert!(agreed > 0, "{label} seed {seed:#x}: {kind:?} never succeeded on both tables");
     }
+    // Reshapes that were all refused reshaped nothing.
+    let reshaped = twin.tally.get(&Reshape).map_or(0, |t| t.agreed);
+    assert!(reshaped > 0, "{label} seed {seed:#x}: every reshape was refused");
     // A refused kind ran and was refused; a kind not in REFUSED was never refused.
     for (kind, t) in &twin.tally {
         if refusal(*kind).is_none() {

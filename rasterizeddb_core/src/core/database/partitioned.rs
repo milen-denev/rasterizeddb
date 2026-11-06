@@ -907,6 +907,139 @@ impl Database {
     }
 }
 
+/// Reshape (docs/partitioning.md §6.2, phase 5; `partition::reshape`).
+impl Database {
+    /// Runs `op` on partitioned table `name`. The caller holds ACCESS
+    /// EXCLUSIVE on the logical name. Returns the statement's summary.
+    ///
+    /// Under the partitioned DDL lock, the deletion gate (files are deleted
+    /// below) and a forget pause, as a schema change's reload: the plan read
+    /// from the map, the reshape run to its commit point, then the table
+    /// reopened over whatever map the log now holds (the new one, or the old
+    /// one after an abort; the old instance is retired either way) and the
+    /// prepared statements' generation moved. After a commit the sources'
+    /// files are deleted, their log records voided first, then
+    /// `RETIRED_GONE`; a failure there leaves them to the startup reaper, and
+    /// the statement still succeeds. After a failure, the targets' files.
+    pub(crate) async fn reshape_partitioned(
+        &self,
+        name: &str,
+        op: &crate::core::partition::reshape::ReshapeOp,
+    ) -> io::Result<String> {
+        let resolved = self.resolve_key(name);
+        let name = resolved.as_deref().unwrap_or(name);
+        let _ddl = self.partition_ddl.lock().await;
+        let Some(old) = self.partitioned_table(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} needs a partitioned table, and \"{name}\" is not one", op.verb()),
+            ));
+        };
+        old.check()?;
+        let plan = old.plan_reshape(op)?;
+        let _snapshot_gate = self.uid_deletion_permit().await;
+        let _forget_pause = self.transactions.forget_pause();
+        let changed = super::SchemaChanged(&self.schema_generation);
+        self.schema_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        let result = old.reshape(&plan).await;
+        let (new_shell, table) = self.reopen_partitioned(name, &old).await;
+        let broken = table.broken().map(str::to_string);
+        let table = Arc::new(table);
+        self.swap_partitioned(name, table.clone(), new_shell);
+        drop(changed);
+        let uid = table.uid();
+        match result {
+            Ok(sources) => {
+                // Test-only: the process "dies" right after the commit point,
+                // leaving the retired sources' files for the next open.
+                #[cfg(test)]
+                if let Ok(root) = self.partition_root()
+                    && crate::core::partition::table::reshape_hooks::crash(&root, "crash_after_commit")
+                {
+                    return Ok("crashed after the commit".to_string());
+                }
+                let pids: Vec<u32> = sources.doomed.iter().map(|(pid, _)| *pid).collect();
+                match self.discard_pid_files(uid, &sources.doomed) {
+                    Ok(()) => {
+                        if let Err(e) = table.retired_gone(&pids).await {
+                            warn!("{} of \"{name}\": recording partitions {pids:?} gone failed; the next open does: {e}", op.verb());
+                        }
+                    }
+                    Err(e) => warn!(
+                        "{} of \"{name}\" committed, but deleting the retired partitions' files failed; the startup \
+                         reaper deletes them: {e}",
+                        op.verb()
+                    ),
+                }
+                if let Some(why) = broken {
+                    return Err(io::Error::other(why));
+                }
+                let made = plan.targets.len();
+                info!("{} of \"{name}\" ({uid:016x}): partitions {:?} replaced by {made}", op.verb(), plan.sources);
+                Ok(format!(
+                    "{}: {} partition(s) replaced by {made}",
+                    op.verb(),
+                    plan.sources.len()
+                ))
+            }
+            Err((e, targets)) => {
+                if let Err(d) = self.discard_pid_files(uid, &targets.doomed) {
+                    warn!(
+                        "{} of \"{name}\" failed, and deleting its targets' files failed too; the startup reaper \
+                         deletes them: {d}",
+                        op.verb()
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Deletes the files of partitions `doomed` (`(pid, directory)`) of
+    /// table `uid`, their log records voided first in the log of the
+    /// directory they are in (as a DROP voids, `discard_uid_files`), each
+    /// directory synced. The caller holds the deletion gate. A failure
+    /// leaves the rest for the startup reaper, which deletes every file of a
+    /// pid the map does not place.
+    fn discard_pid_files(&self, uid: u64, doomed: &[(u32, PathBuf)]) -> io::Result<()> {
+        let root = self.partition_root()?;
+        let root_key = files::dir_key(&root.to_string_lossy());
+        let mut by_dir: HashMap<String, (PathBuf, Vec<u32>)> = HashMap::new();
+        for (pid, dir) in doomed {
+            by_dir
+                .entry(files::dir_key(&dir.to_string_lossy()))
+                .or_insert_with(|| (dir.clone(), Vec::new()))
+                .1
+                .push(*pid);
+        }
+        for (key, (dir, pids)) in by_dir {
+            let names: Vec<String> = uid_file_names(&dir, uid)?
+                .into_iter()
+                .filter(|n| matches!(files::parse_name(n), Some(files::PartFile::Data { pid, .. }) if pids.contains(&pid)))
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let ids: Vec<u64> = names.iter().map(|n| crate::core::wal::file_id_for_name(n)).collect();
+            if key == root_key {
+                self.forget_dropped_ids(&self.db_io_pointers, &ids).map_err(|f| f.error)?;
+            } else {
+                self.forget_dropped_ids_in(&dir.to_string_lossy(), &ids).map_err(|f| f.error)?;
+            }
+            for n in &names {
+                match std::fs::remove_file(dir.join(n)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            files::sync_dir(&dir)?;
+        }
+        Ok(())
+    }
+}
+
 /// Test-only: a raised declared-partitions cap for databases under a
 /// directory, for the scale measurements (`lazy_resident_tests`).
 #[cfg(test)]

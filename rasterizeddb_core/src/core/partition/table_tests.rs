@@ -876,7 +876,7 @@ async fn a_dropped_map_log_refuses_the_table() {
 /// A later phase's reshape, open, abandoned or committed: routing by the
 /// placed map would put rows where the log says no partition is.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reshaped_map_log_refuses_the_table() {
+async fn a_reshaped_map_log_opens_and_finishes_what_a_crash_cut_short() {
     let f = fixture().await;
     let split = |state: &log::MapState| {
         Record::ReshapeBegin(ReshapeBegin {
@@ -889,20 +889,29 @@ async fn a_reshaped_map_log_refuses_the_table() {
             }],
         })
     };
+    // Phase 5: a reshaped map opens. An open reshape is aborted at the open
+    // and an abandoned one only spent its pid: both open with the map as it
+    // was. A committed one whose target has no files is refused for the
+    // missing file (I9), never read as empty.
     let cases: [(&str, Box<dyn Fn(&log::MapState) -> Vec<Record>>); 3] = [
-        // Open: a reshape listed, and next_pid past the map.
         ("open", Box::new(move |s| vec![split(s)])),
-        // Abandoned: only next_pid says so.
         ("aborted", Box::new(move |s| vec![split(s), Record::ReshapeAbort { id: 1 }])),
-        // Committed: pid 0 retired and pid 8 in its place.
         ("committed", Box::new(move |s| vec![split(s), Record::ReshapeCommit { id: 1, pins: vec![(8, None)] }])),
     ];
     for (i, (case, recs)) in cases.into_iter().enumerate() {
         let uid = UID + i as u64;
         drop(create(&f, uid, DbType::I64, 8).await);
         let t = reopen_after(&f, uid, |s| recs(s)).await;
-        println!("{case}: {:?}", t.broken());
-        assert_refused(&t, "reshaped").await;
+        if case == "committed" {
+            assert_refused(&t, "__pt_").await;
+            continue;
+        }
+        assert!(t.broken().is_none(), "{case}: {:?}", t.broken());
+        let board = t.pin_board().unwrap();
+        let state = board.state.lock().await;
+        assert_eq!(state.reshapes().count(), 0, "{case}: the open reshape was aborted");
+        assert_eq!(state.next_pid(), 9, "{case}: the target's pid stays spent");
+        assert_eq!(state.map().len(), 8, "{case}: the map as it was");
     }
 }
 

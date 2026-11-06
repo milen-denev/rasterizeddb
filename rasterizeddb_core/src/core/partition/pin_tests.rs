@@ -1434,3 +1434,42 @@ async fn torn_evidence_holding_compaction_is_reported() {
     assert!(pt(&db).pin_board().unwrap().compact().await.unwrap());
     close(&dir, db);
 }
+
+/// I13 across a reshape (phase 5): a target holds its sources' raw-copied
+/// aborted stamps, so it pins at or below them, in one process and after a
+/// restart; the aborted row stays invisible however far the rest forgets,
+/// and once the target is swept forgetting passes it.
+///
+/// Mutation: `RESHAPE_COMMIT` pinning its targets at `None`: the map log's
+/// own check refuses the commit (`MapState::apply_commit`), and with that
+/// check off the horizon passes the aborted id and the row comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reshape_target_keeps_its_sources_pins() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("db");
+    let db = open(&dir).await;
+    let x = populated_with_an_abort(&db).await;
+    let before = pid_of_tenant(&pt(&db), 1);
+    exec(&db, "ALTER TABLE pt SPLIT PARTITION FOR (tenant_id = 1)").await;
+    let q = pid_of_tenant(&pt(&db), 1);
+    assert_ne!(q, before, "tenant 1 moved to a new partition");
+    assert!(pt(&db).pin_of(q).await.unwrap().is_some_and(|pin| pin <= x), "the target does not pin at or below {x}");
+    for round in 0..2 {
+        let forgotten = forget_except(&db, &[q]).await;
+        assert!(forgotten <= x, "round {round}: forgotten below {forgotten}, past aborted {x}, with the target unswept");
+        assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "round {round}: the aborted row came back");
+    }
+    db.sync_durable().unwrap();
+    close(&dir, db);
+
+    let db = open(&dir).await;
+    assert!(pt(&db).pin_of(q).await.unwrap().is_some_and(|pin| pin <= x), "the target lost its pin in the restart");
+    let forgotten = forget_except(&db, &[q]).await;
+    assert!(forgotten <= x, "after the restart: forgotten below {forgotten}, past {x}");
+    assert_eq!(ids(&db, "tenant_id = 1").await, vec![1]);
+    let forgotten = forget_except(&db, &[]).await;
+    assert!(forgotten > x, "with every partition swept, forgetting stopped at {forgotten}");
+    assert_eq!(ids(&db, "tenant_id = 1").await, vec![1], "the aborted row came back once forgotten");
+    assert_eq!(ids(&db, "id > 0").await, (1..=8).collect::<Vec<_>>());
+    close(&dir, db);
+}

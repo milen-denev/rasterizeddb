@@ -5667,6 +5667,19 @@ impl<S: StorageIO> Table<S> {
         .map(|n| n.unwrap_or_default())
     }
 
+    /// The partition point of a stored row, fetched in full (every column,
+    /// as [`Self::build_full_row_fetch`] reads one), by this partition's
+    /// guard: what a reshape routes each raw-copied version by
+    /// (docs/partitioning.md §6.2). Errs on a table that is no partition.
+    pub(crate) fn point_of_row(&self, row: &Row) -> Result<u64> {
+        let d = self.data()?;
+        let guard = d
+            .guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("internal error: a reshape read a table that is not a partition"))?;
+        guard.point_of_write(&self.row_write_of(row)).map_err(std::io::Error::other)
+    }
+
     /// A row's columns as a write, every column keyed by `write_order`.
     fn row_write_of(&self, row: &Row) -> RowWrite {
         let mut row_write = RowWrite {

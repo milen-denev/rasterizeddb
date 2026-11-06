@@ -27,7 +27,8 @@
 //! - names this directory defines itself (`level_hash`, a local `hashes`),
 //!   whose bodies are checked like everything else;
 //! - `crc32fast::hash` in `log.rs`, the map log's record checksum, which is
-//!   framing and never routes.
+//!   framing and never routes; and `crc32fast::Hasher` in `reshape.rs`, the
+//!   copy's read-back check, which never routes either.
 //!
 //! Attributes are not read, so `#[derive(Hash)]` passes. And positively:
 //! `level_hash`, which every point is built from, must call `xxh64`, and
@@ -53,7 +54,13 @@ const ALLOWED: &[&str] = &["HashMap", "HashSet", "hash_map", "hash_set"];
 /// not routing.
 // The map log's framing and the SERIAL reservations file's checksum: never a
 // routed point.
-const ALLOWED_IN: &[(&str, &str)] = &[("log.rs", "crc32fast::hash"), ("serial.rs", "crc32fast::hash")];
+const ALLOWED_IN: &[(&str, &str)] = &[
+    ("log.rs", "crc32fast::hash"),
+    ("serial.rs", "crc32fast::hash"),
+    // A reshape's read-back check of the bytes it copied (§6.2 step 5).
+    ("reshape.rs", "crc32fast::Hasher"),
+    ("reshape.rs", "crc32fast::Hasher::new"),
+];
 
 fn names_a_hash(ident: &str) -> bool {
     let lower = ident.to_ascii_lowercase();

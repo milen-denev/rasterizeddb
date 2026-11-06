@@ -12,8 +12,10 @@ across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
 budget, its sharded CLOCK, idle close and the seal at close,
 [as built](#phase-3-p5b-2a-as-built)), P5b-2b (scan-only fan-out opens,
 [as built](#phase-3-p5b-2b-as-built)) and P5b-3 (prompt descriptor release,
-the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)), and phase 4's P6
-(placement across storage locations, [as built](#phase-4-p6-as-built)). Phases 0 and 1 are
+the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)), phase 4's P6
+(placement across storage locations, [as built](#phase-4-p6-as-built)), and phase 5's P7
+(reshape: `SPLIT PARTITION`, `MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`,
+`STORAGE MOVE PARTITION`, under ACCESS EXCLUSIVE, [as built](#phase-5-p7-as-built)). Phases 0 and 1 are
 the trailer scan and the pure `core/partition` modules; 2a the seam, the
 table, `CREATE`, catalogs, routed `INSERT`, single-snapshot fan-out
 `SELECT`/`COUNT`, routed `UPDATE`/`DELETE` and `VACUUM` over the partitions;
@@ -139,7 +141,7 @@ idle-box wall-clock A/B is still to run.
 | ~~`UPDATE … FROM` / `DELETE … USING` with a partitioned target; `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT`~~ | built in phase 3 P3 ([as built](#phase-3-p3-as-built)) |
 | ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4) | physical-rewrite `ALTER` 6 |
 | A key change: an `UPDATE` or `DO UPDATE` assigning a key column anything its `WHERE` does not pin to the same value | 6 (row moves, §9) |
-| Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`) and reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`) | 5 |
+| Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`); ~~reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`)~~ built in phase 5 P7 ([as built](#phase-5-p7-as-built)) | 5 |
 | `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
 
 **Known limits** (correct answers, not refusals, unless stated):
@@ -450,6 +452,126 @@ pin each round (P5a's note). The open's one-shot tasks (index build,
 filter backfill, load audit) are not cancelled by a close: they read
 through the old instance's providers until they end, and write nothing to
 the file set but their own per-instance paged runs.
+
+## Phase 5 P7 as built
+
+Reshape (§6.2) and its statements, built 2026-11-06 on `feat/p7-reshape`.
+Code: `core/partition/reshape.rs` (the copy, the parser),
+`PartitionedTable::{plan_reshape, reshape, retired_gone}`
+(`core/partition/table.rs`), `Database::reshape_partitioned` and
+`discard_pid_files` (`core/database/partitioned.rs`), the executor's
+`run_reshape`.
+
+```sql
+ALTER TABLE t SPLIT PARTITION FOR (tenant_id = 42);          -- its partition, cut at the midpoint
+ALTER TABLE t MERGE PARTITIONS FOR (tenant_id = 42), FOR (tenant_id = 77);   -- adjacent only
+ALTER TABLE t ISOLATE KEY (tenant_id = 42) [TO '/mnt/nvme2']; -- the key's block, a partition of its own
+ALTER TABLE t SPLIT KEY (tenant_id = 42) INTO 8;             -- a leading prefix's block in 2..1024 pieces
+STORAGE MOVE PARTITION t FOR (tenant_id = 42) TO '/mnt/nvme2';
+```
+
+`FOR (…)` and `KEY (…)` take `col = value` pairs, comma- or `AND`-separated,
+fixing a leading prefix of the key; they are routed exactly as a `WHERE` is
+(`route_where`), so a value hashes as an insert of it does (I2). A target
+directory must be a storage location of the database (the root or one the
+pool lists). Unless `TO` names one, a target stays where the source it
+starts in is; a never-materialized source's targets go where the dealer
+says. Refused with a reason: a plain table; a non-leading column; a
+one-point partition split; non-adjacent merges; `SPLIT KEY` on a one-column
+key or naming every key column (one point), or a count that is not a power
+of two in 2..1024; a key whose block already spans partitions (merge
+first); more than 65,536 partitions.
+
+**As built, the whole reshape runs under ACCESS EXCLUSIVE on the logical
+name**, not with writers running and a fence for the delta (§6.2 steps
+2–4). Every statement takes that lock before any partition, and a
+transaction that touched the table holds it until it ends, so during a
+reshape no statement holds a map epoch (step 8's epoch-gated reclaim has
+nothing to wait for), and no uncommitted version exists in the table: the
+copy never races a stamp. A `REPEATABLE READ` snapshot taken earlier by a
+transaction that has not touched the table yet can still read it after: the
+copy is raw (`xmin`, `xmax`, row id kept), so every snapshot sees in the
+targets what it saw in the sources. The cost is the table's availability for
+the copy; the online copy is left until a measurement says it matters.
+
+Steps, as built:
+
+1. Open the sources, then retire the instance (every open partition's
+   maintenance stopped and joined; nothing opens through it again) and
+   quiesce the sources' scheduler units. Forget sweeps of the table are held
+   off for the whole reshape (`PinBoard::hold_sweeps`), as they rewrite
+   stamps the copy reads.
+2. Intern each target's location (a durable `LOCATIONS` if new), then a
+   durable `RESHAPE_BEGIN`; the board grows a write watch and lifecycle lock
+   for each new pid (`PinBoard::grow`: pids are dense below `next_pid`, the
+   map's entries only until a reshape).
+3. Create each target's files (one directory fsync) and open it `External`,
+   its maintenance retired at once.
+4. Copy every version a snapshot may still see. **A reclaimable version
+   (`VersionHorizon::is_reclaimable`, sampled once per source) is skipped, as
+   `VACUUM FULL` skips it, and must be**: vacuum frees a dead version's extent
+   without tombstoning its pointer, so its bytes can be another row's. The
+   first twin runs copied such versions and read strangers' bytes (a point
+   outside every target, "likely misread header"); the reshape refused, so
+   nothing was lost, but nothing reshaped either. Each version is routed by
+   its own recomputed point (`Table::point_of_row`, the partition guard's
+   hash) to the target holding it; a point outside every target aborts.
+   Appends are storage transactions committed durably.
+5. Verify each target: pointer bytes = records × record length, row bytes =
+   bytes appended, and the CRC32 of the rows file read back equals the CRC32
+   of what was written. Then land what the targets staged.
+6. Durable `RESHAPE_COMMIT`, each target pinned at the lowest pin of the
+   sources it overlaps (the map log refuses a higher one): **the commit
+   point**.
+
+Then `Database::reshape_partitioned` reopens the table over whatever the log
+holds (`PartitionedTable::reopened` now builds its slots from the map state,
+not the old instance's slots, so the same path serves a schema change and a
+reshape), moves `schema_generation` (prepared statements re-plan), deletes the
+sources' files after voiding their log records in their location's log
+(`discard_pid_files`, under the deletion gate), and appends `RETIRED_GONE`. A
+failure before the commit appends `RESHAPE_ABORT` and deletes the targets'
+files the same way. A failure deleting files leaves them to the startup
+reaper; the statement still reports its outcome.
+
+**Recovery.** At open, `PinBoard::finish_reshapes` aborts every open
+reshape and records every retired partition gone, before any partition
+opens. The startup reaper, which now reads reshaped maps, deletes an open
+reshape's targets (no location: never materialized) and a retired
+partition's files (a retired partition is never counted as placed). So a
+crash before the commit leaves the sources and their rows; after it, the
+targets and theirs.
+
+**Slots in map order.** `Parts::slots` holds one slot per live partition in
+map order, with a pid index (`Parts::index`); `SHOW PARTITIONS` lists them in
+map order (by pid only until a reshape).
+
+**Not replicated.** Reshapes are physical and local (§12): neither form is
+captured for replication, and each node keeps its own map.
+
+**Tests.** `database::reshape_tests` (every statement against a fingerprint
+of rows, routed reads and aggregates, byte for byte, with dead, relocated
+and aborted versions in every partition; new writes after; a restart;
+refusals; a move to a second location and back; failures injected before the
+copy and before the commit change nothing and leave no file; a crash before
+the commit rolls back and one after rolls forward at the next open, files
+reaped, `RETIRED_GONE` recorded). `partition::pin_tests::
+a_reshape_target_keeps_its_sources_pins` (I13 across a reshape and a
+restart). `partition::reshape::parse_tests`. The twin's new `Reshape` kind
+(a split, a neighbour merge, an isolation or a sub-split between operations,
+then what both tables store compared): at 0x5eed2b20 and 0x5eedf1a1 with
+1,500 statements, 33 to 47 reshapes per configuration, all agreeing. Its
+tuple-count estimates stop comparing once a reshape ran, as in spread mode:
+a reshape compacts its sources, and a cut inside a tenant's block makes that
+tenant's UPDATEs reach two partitions, which never overwrite in place. Same
+rows, more slots. *(Mutations: the copy resetting `xmin` to frozen fails all
+four reshape tests; targets committed unpinned, with the log's check off,
+fails the pin test.)*
+
+**Not built (phase 5's rest):** the online copy with a write fence and
+range-bounded re-routes (§6.2 steps 2–4, 7); `STORAGE REBALANCE PARTITIONS`
+(§6.3); conversion (`ALTER TABLE … PARTITION BY`, `CREATE INDEX … USING
+partition`, §11).
 
 ## Phase 4 P6 as built
 
@@ -3081,15 +3203,14 @@ answers like a plain table (below).
 | ~~`ALTER TABLE` in every form, `CREATE INDEX` in every form~~: lifted by phase 3 P1 except the rows of [its table](#phase-3-p1-as-built) | the DDL arms, before any sidecar is written | phase 3 P1 (metadata DDL, §11); physical-rewrite forms phase 6 |
 | ~~`FOREIGN KEY` from a partitioned table (`CREATE … PARTITION BY`, `ADD CONSTRAINT`), and onto one (`REFERENCES`, `ADD CONSTRAINT`)~~ | ~~`CREATE` and the DDL arms~~ | lifted by phase 3 P4 ([as built](#phase-3-p4-as-built)); onto one by any column but its whole partition key: 42830, not a refusal |
 | An `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value (`SET tenant_id = 5 WHERE tenant_id = 1`, `SET g = g + 1`), and a `DO UPDATE` that does so when its conflict happens | `assignments_keep_point` before routing (`DO UPDATE`: before the update writes); the range guard on every merged row behind it | phase 6 (row moves, §9) |
-| `ALTER … PARTITION BY`, `CREATE INDEX … USING partition` (on plain tables too), `SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`; `STORAGE MOVE TABLE` on the logical name, which points at `MOVE PARTITION` | the ALTER, CREATE INDEX and STORAGE arms | phase 5 |
+| `ALTER … PARTITION BY`, `CREATE INDEX … USING partition` (on plain tables too); ~~`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`~~ (built in phase 5 P7); `STORAGE MOVE TABLE` on the logical name, which points at `MOVE PARTITION` (built in P7) | the ALTER, CREATE INDEX and STORAGE arms | phase 5 |
 | Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; KV-backed partitions; shredded JSON columns | `CREATE … PARTITION BY` | not scheduled; KV until measured |
 
 `ON CONFLICT` with a target that is not exactly one unique key (one that leaves
 out a key column, a subset or a superset) is not a refusal but PostgreSQL's
 42P10, on plain tables too, and a multi-row `DO UPDATE` proposing one key
-twice is 21000 (§9). Two phase-5 spellings are not yet parsed as such:
-`STORAGE MOVE PARTITION t FOR (…)` is read as a move of a table named
-`PARTITION` and refused for that, and `STORAGE REBALANCE PARTITIONS` as a
+twice is 21000 (§9). `STORAGE MOVE PARTITION t FOR (…) TO '…'` is a
+reshape since P7; `STORAGE REBALANCE PARTITIONS` is still read as a
 whole-database `STORAGE REBALANCE`, which never proposes the shell.
 `SELECT` with `ORDER BY` across partitions is **not** refused: it is correct
 and not yet cheap (§8, S12).

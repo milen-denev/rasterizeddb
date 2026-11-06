@@ -448,8 +448,12 @@ pub(crate) struct Parts {
     /// change reopens this one as ([`PartitionedTable::reopened`]), so one
     /// map log has one writer at a time and the pins outlive the reopen.
     board: StdArc<PinBoard>,
-    /// By pid; phase 2a pids are `0..n`.
+    /// One per live partition, in map order (ascending `lo`).
     slots: Box<[Slot]>,
+    /// By pid: the index of that pid's slot in `slots`, or `u32::MAX` for a
+    /// pid with none (retired by a reshape, or gone). Pids are dense below
+    /// the map's `next_pid`, its entries only until a reshape (phase 5).
+    index: Box<[u32]>,
     mirrored: MirrorsConfigured,
     torn: Option<String>,
     /// Set when a schema change replaced this instance or a DROP removed the
@@ -603,6 +607,45 @@ fn partition_dir(locations: &[String], loc: u32, placement: &dyn Placement) -> R
              STORAGE ADD LOCATION '{path}', or restore the partition's files there"
         )),
     }
+}
+
+/// The slots of `state`'s live partitions, in map order, and the pid index
+/// over them (`Parts::index`): each materialized one with the directory its
+/// location is in now, checked to hold its two data files (I9; a stat per
+/// file, never a provider, which would create it). Also the dealer's count
+/// per directory (§6.1).
+fn slots_of(
+    state: &super::log::MapState,
+    root: &Path,
+    uid: u64,
+    placement: &dyn Placement,
+) -> Result<(Box<[Slot]>, Box<[u32]>, std::collections::HashMap<String, u64>), String> {
+    let entries = state.map().entries();
+    let n = usize::try_from(state.next_pid()).map_err(|e| e.to_string())?;
+    let mut index = vec![u32::MAX; n];
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let root_key = files::dir_key(&root.to_string_lossy());
+    let mut slots = Vec::with_capacity(entries.len());
+    for (j, &(lo, pid)) in entries.iter().enumerate() {
+        let range = PointRange { lo, hi: entries.get(j + 1).map_or(SPACE_END, |&(next, _)| next as u128) };
+        let part = state.part(pid).ok_or_else(|| format!("live partition {pid} has no state"))?;
+        let (materialized, dir) = match part.location {
+            None => (false, None),
+            Some(loc) => {
+                let dir = partition_dir(state.locations(), loc, placement).map_err(|why| format!("partition {pid} {why}"))?;
+                files::require_existing(dir.as_deref().unwrap_or(root), &files::data_files(uid, pid))
+                    .map_err(|e| e.to_string())?;
+                let key = dir.as_ref().map_or_else(|| root_key.clone(), |d| files::dir_key(&d.to_string_lossy()));
+                *counts.entry(key).or_insert(0) += 1;
+                (true, dir)
+            }
+        };
+        *index
+            .get_mut(pid as usize)
+            .ok_or_else(|| format!("live partition {pid} is past the map's next pid {n}"))? = j as u32;
+        slots.push(Slot::new(pid, range, materialized, dir));
+    }
+    Ok((slots.into_boxed_slice(), index.into_boxed_slice(), counts))
 }
 
 /// The partitions a database's partitioned tables declare, for
@@ -872,22 +915,13 @@ impl PartitionedTable {
         let (log, replay) = MapLogFile::open(map_io).await.map_err(e)?;
         *torn = replay.torn.as_ref().map(|t| t.reason.clone());
         let state = replay.state;
-        let map = state.map().clone();
-        *declared = Some(map.len() as u32);
+        *declared = Some(state.map().len() as u32);
 
         if state.header().uid != uid {
             return Err(format!("its map log belongs to table {:016x}", state.header().uid));
         }
         if state.dropped() {
             return Err("its map log says it was dropped".to_string());
-        }
-        let dense = map.entries().iter().enumerate().all(|(i, &(_, pid))| pid as usize == i);
-        if !dense
-            || state.next_pid() != map.len() as u64
-            || state.reshapes().next().is_some()
-            || state.parts().any(|(_, p)| p.retired)
-        {
-            return Err("its map has been reshaped, which this version cannot open".to_string());
         }
         if let Some(recorded) = state.locations().first()
             && Path::new(recorded) != root
@@ -928,54 +962,36 @@ impl PartitionedTable {
             board.set_snapshot_len(opened_len);
         }
 
-        let entries = map.entries();
-        let mut materialized = vec![false; entries.len()];
-        let mut dirs: Vec<Option<PathBuf>> = vec![None; entries.len()];
-        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        let root_key = files::dir_key(&root.to_string_lossy());
+        // A reshape a crash interrupted (§12): one with only its
+        // `RESHAPE_BEGIN` rolls back (its targets hold nothing a snapshot
+        // can need: the sources were never written past; the startup reaper
+        // deleted their files, which no `MATERIALIZE` names), and a
+        // committed one's retired sources go (their files are reaped: a
+        // retired partition is never placed). Before any partition opens,
+        // so nothing reads either.
+        let state = board.finish_reshapes().await.map_err(e)?;
         for (pid, part) in state.parts() {
-            let Some(loc) = part.location else {
-                // §4.3's skip is a proof only while the log is whole, and the
-                // leftovers may be on any location a crashed materialize was
-                // dealt.
-                if let Some(why) = torn.as_deref() {
-                    refuse_torn_leftovers(root, uid, generation, pid, why).map_err(e)?;
-                    for other in ctx.placement.others() {
-                        refuse_torn_leftovers(&other, uid, generation, pid, why).map_err(e)?;
-                    }
-                }
+            if part.location.is_some() || part.retired {
                 continue;
-            };
-            let dir = partition_dir(state.locations(), loc, &*ctx.placement).map_err(|why| format!("partition {pid} {why}"))?;
-            // Nothing opens here (phase 3 P5b: a partition opens on demand),
-            // but a materialized partition's missing file still refuses the
-            // table now, as it did when every partition opened (I9): a stat
-            // per file, never a provider, which would create it.
-            files::require_existing(dir.as_deref().unwrap_or(root), &files::data_files(uid, pid)).map_err(e)?;
-            let key = dir.as_ref().map_or_else(|| root_key.clone(), |d| files::dir_key(&d.to_string_lossy()));
-            *counts.entry(key).or_insert(0) += 1;
-            if let Some(m) = materialized.get_mut(pid as usize) {
-                *m = true;
             }
-            if let Some(d) = dirs.get_mut(pid as usize) {
-                *d = dir;
+            // §4.3's skip is a proof only while the log is whole, and the
+            // leftovers may be on any location a crashed materialize was
+            // dealt.
+            if let Some(why) = torn.as_deref() {
+                refuse_torn_leftovers(root, uid, generation, pid, why).map_err(e)?;
+                for other in ctx.placement.others() {
+                    refuse_torn_leftovers(&other, uid, generation, pid, why).map_err(e)?;
+                }
             }
         }
+        let map = state.map().clone();
+        *declared = Some(map.len() as u32);
+        // Nothing opens here (phase 3 P5b: a partition opens on demand), but
+        // a materialized partition's missing file still refuses the table
+        // now, as it did when every partition opened (I9).
+        let (slots, index, counts) = slots_of(&state, root, uid, &*ctx.placement)?;
         // The dealer's counts (§6.1), every location's, the root's included.
         ctx.placement.register(uid, counts);
-        let slots: Box<[Slot]> = entries
-            .iter()
-            .enumerate()
-            .map(|(j, &(lo, pid))| {
-                let range = PointRange { lo, hi: entries.get(j + 1).map_or(SPACE_END, |&(next, _)| next as u128) };
-                Slot::new(
-                    pid,
-                    range,
-                    materialized.get(pid as usize).copied().unwrap_or(false),
-                    dirs.get(pid as usize).cloned().flatten(),
-                )
-            })
-            .collect();
         let parts = StdArc::new_cyclic(|me| Parts {
             budget: budget::for_root(root),
             me: me.clone(),
@@ -991,6 +1007,7 @@ impl PartitionedTable {
             ids,
             board,
             slots,
+            index,
             mirrored: ctx.mirrored.clone(),
             placement: ctx.placement.clone(),
             torn: torn.clone(),
@@ -1069,11 +1086,23 @@ impl PartitionedTable {
                     old.retired.store(true, Ordering::SeqCst);
                     let ids_io = Arc::new(old.seed.create_new(files::ids_file(self.uid)).await);
                     let ids = StdArc::new(IdSource::open_strict(ids_io).await.map_err(|e| e.to_string())?);
-                    let slots: Box<[Slot]> = old
-                        .slots
-                        .iter()
-                        .map(|s| Slot::new(s.pid, s.range, s.materialized.load(Ordering::SeqCst), s.dir.get().cloned()))
-                        .collect();
+                    // The slots from the map as the log has it now: the old
+                    // instance's after a schema change, a new layout after a
+                    // reshape (phase 5), whose new pids get their watches and
+                    // lifecycle locks first. A partition materialized since
+                    // the old instance opened is materialized here too: its
+                    // `MATERIALIZE` is in the state.
+                    let (slots, index, epoch) = {
+                        let state = old.board.state.lock().await;
+                        old.board.grow(&state);
+                        let (slots, index, counts) = slots_of(&state, &self.root, self.uid, &*old.placement)?;
+                        // The dealer's counts from the map as it is now: a
+                        // reshape's targets, wherever `TO` put them, count
+                        // where they are (the pool's location guards read
+                        // these).
+                        old.placement.register(self.uid, counts);
+                        (slots, index, MapEpoch { epoch: state.epoch(), map: state.map().clone() })
+                    };
                     let parts = StdArc::new_cyclic(|me| Parts {
                         budget: old.budget.clone(),
                         me: me.clone(),
@@ -1089,6 +1118,7 @@ impl PartitionedTable {
                         ids,
                         board: old.board.clone(),
                         slots,
+                        index,
                         mirrored: self.mirrored.clone(),
                         placement: old.placement.clone(),
                         torn: self.torn.clone(),
@@ -1100,7 +1130,13 @@ impl PartitionedTable {
                     let next = Live {
                         router: RangeGuard::new(spec.clone(), PointRange::FULL),
                         spec,
-                        epoch: ArcSwap::new(live.epoch.load_full()),
+                        // The same epoch, unless a reshape moved it: then
+                        // the new map, under the epoch its commit recorded.
+                        epoch: if live.epoch.load().epoch == epoch.epoch {
+                            ArcSwap::new(live.epoch.load_full())
+                        } else {
+                            ArcSwap::from_pointee(epoch)
+                        },
                         parts,
                         scheduler: live.scheduler.clone(),
                     };
@@ -1110,7 +1146,10 @@ impl PartitionedTable {
                     // closed and opens under the new schema on demand. Each
                     // under its lifecycle lock: the old instance is retired,
                     // so no close of it runs from here on.
-                    for (old_slot, new) in old.slots.iter().zip(next.parts.slots.iter()) {
+                    for new in next.parts.slots.iter() {
+                        // A pid the old instance had no slot for is a
+                        // reshape's target: it opens on demand.
+                        let Ok(old_slot) = old.slot_at(new.pid) else { continue };
                         let lock = next.parts.board.lifecycle(new.pid).map_err(|e| e.to_string())?;
                         let _life = lock.lock().await;
                         if old_slot.open_now().is_none() {
@@ -1720,7 +1759,7 @@ impl PartitionedTable {
         Ok(self.live()?.parts.board.state.lock().await.header().route_v)
     }
 
-    /// Every declared partition, by pid.
+    /// Every declared partition, in map order (by pid until a reshape).
     pub async fn partitions(&self) -> io::Result<Vec<PartitionInfo>> {
         let live = self.live()?;
         let mut out = Vec::with_capacity(live.parts.slots.len());
@@ -1863,6 +1902,404 @@ impl PartitionedTable {
     }
 }
 
+/// Reshape (docs/partitioning.md §6.2, phase 5; `partition::reshape`).
+impl PartitionedTable {
+    /// The one range `for_clause` (`k = v [AND …]`, the inside of a `FOR
+    /// (…)`) pins: a leading prefix of the key fixed by equality.
+    fn pinned_range(&self, for_clause: &str) -> io::Result<PointRange> {
+        let clause = for_clause.replace(',', " AND ");
+        match self.route_where(&clause)? {
+            Route::Points(ranges) if ranges.len() == 1 => Ok(ranges[0]),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "FOR ({for_clause}) must fix the leading columns of the partition key ({}) by equality",
+                    self.key_names()
+                ),
+            )),
+        }
+    }
+
+    /// `dir` if it is a storage location of this database (the root or
+    /// another), as the pool now names it.
+    fn location_dir(&self, dir: &str) -> io::Result<PathBuf> {
+        let live = self.live()?;
+        let key = files::dir_key(dir);
+        if key == files::dir_key(&self.root.to_string_lossy()) {
+            return Ok(self.root.clone());
+        }
+        live.parts
+            .placement
+            .others()
+            .into_iter()
+            .find(|p| files::dir_key(&p.to_string_lossy()) == key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("'{dir}' is not a storage location of this database; add it with STORAGE ADD LOCATION '{dir}'"),
+                )
+            })
+    }
+
+    /// Plans `op` against the map now: its sources and its targets' starts
+    /// and directories. Reads only the map and the statement.
+    pub fn plan_reshape(&self, op: &super::reshape::ReshapeOp) -> io::Result<super::reshape::ReshapePlan> {
+        use super::reshape::{ReshapeOp, ReshapePlan, starts};
+        let live = self.live()?;
+        let epoch = live.epoch.load_full();
+        let map = &epoch.map;
+        let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidInput, why);
+        let owner = |r: PointRange| -> io::Result<(u32, PointRange)> {
+            let pid = map.pid_of(r.lo);
+            let range = map.range_of(pid).ok_or_else(|| io::Error::other(format!("partition {pid} is not in the map")))?;
+            Ok((pid, range))
+        };
+        let plan = match op {
+            ReshapeOp::SplitPartition { at } => {
+                let (pid, r) = owner(self.pinned_range(at)?)?;
+                let width = r.hi - r.lo as u128;
+                if width < 2 {
+                    return Err(refuse(format!("partition {pid} holds a single point and cannot be split")));
+                }
+                let mid = r.lo as u128 + width / 2;
+                ReshapePlan { sources: vec![pid], targets: starts(r.lo, r.hi, &[mid]).into_iter().map(|lo| (lo, None)).collect() }
+            }
+            ReshapeOp::MergePartitions { first, second } => {
+                let (a, ra) = owner(self.pinned_range(first)?)?;
+                let (b, rb) = owner(self.pinned_range(second)?)?;
+                if a == b {
+                    return Err(refuse(format!("both FOR clauses name partition {a}; nothing to merge")));
+                }
+                let (lo, hi, sources) = if ra.lo < rb.lo { (ra, rb, vec![a, b]) } else { (rb, ra, vec![b, a]) };
+                if lo.hi != hi.lo as u128 {
+                    return Err(refuse(format!(
+                        "partitions {} and {} are not adjacent; only adjacent partitions merge",
+                        sources[0], sources[1]
+                    )));
+                }
+                ReshapePlan { sources, targets: vec![(lo.lo, None)] }
+            }
+            ReshapeOp::MovePartition { at, to } => {
+                let (pid, r) = owner(self.pinned_range(at)?)?;
+                ReshapePlan { sources: vec![pid], targets: vec![(r.lo, Some(self.location_dir(to)?))] }
+            }
+            ReshapeOp::IsolateKey { key, to } => {
+                let block = self.pinned_range(key)?;
+                let (pid, r) = owner(block)?;
+                if block.hi > r.hi {
+                    return Err(refuse(format!(
+                        "the rows of ({key}) span more than partition {pid}; MERGE PARTITIONS first"
+                    )));
+                }
+                let to = to.as_deref().map(|d| self.location_dir(d)).transpose()?;
+                let lows = starts(r.lo, r.hi, &[block.lo as u128, block.hi]);
+                if lows.len() == 1 && to.is_none() {
+                    return Err(refuse(format!("({key}) already has partition {pid} to itself")));
+                }
+                ReshapePlan {
+                    sources: vec![pid],
+                    targets: lows.into_iter().map(|lo| (lo, if lo == block.lo { to.clone() } else { None })).collect(),
+                }
+            }
+            ReshapeOp::SplitKey { key, into } => {
+                let n = *into;
+                if !(2..=1024).contains(&n) || !n.is_power_of_two() {
+                    return Err(refuse(format!("SPLIT KEY … INTO {n}: the piece count must be a power of two from 2 to 1024")));
+                }
+                if live.spec.levels().len() < 2 {
+                    return Err(refuse(format!(
+                        "SPLIT KEY needs a partition key of two or three columns; ({}) is one, and one value's \
+                         hash is a single point (ISOLATE KEY gives it a partition of its own)",
+                        self.key_names()
+                    )));
+                }
+                let block = self.pinned_range(key)?;
+                let width = block.hi - block.lo as u128;
+                if width < n as u128 || width % n as u128 != 0 {
+                    return Err(refuse(format!(
+                        "({key}) fixes every column of the partition key, so it is one point and cannot be split; \
+                         name a leading prefix"
+                    )));
+                }
+                let (pid, r) = owner(block)?;
+                if block.hi > r.hi {
+                    return Err(refuse(format!(
+                        "the rows of ({key}) span more than partition {pid}; MERGE PARTITIONS first"
+                    )));
+                }
+                let step = width / n as u128;
+                let mut cuts: Vec<u128> = (0..=n as u128).map(|j| block.lo as u128 + j * step).collect();
+                cuts.retain(|&c| c > r.lo as u128 && c < r.hi);
+                ReshapePlan { sources: vec![pid], targets: starts(r.lo, r.hi, &cuts).into_iter().map(|lo| (lo, None)).collect() }
+            }
+        };
+        if plan.targets.len() > 1 + 1024 + 1 {
+            return Err(refuse("a reshape may make at most 1026 partitions".to_string()));
+        }
+        let declared = map.len() as u64 - plan.sources.len() as u64 + plan.targets.len() as u64;
+        if declared > MAX_DECLARED_PER_DATABASE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("the reshape would give the table {declared} partitions; more than {MAX_DECLARED_PER_DATABASE} is not supported yet"),
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// Runs `plan` up to its commit point (`partition::reshape`, steps 1 to
+    /// 6). The caller holds ACCESS EXCLUSIVE on the logical name and a
+    /// forget pause, and reopens the table afterwards whatever this returns
+    /// (this instance is retired either way). `Ok`: the committed sources'
+    /// files, for the caller to delete. `Err`: why, and the targets' files,
+    /// for the caller to delete (the reshape was aborted, durably if the
+    /// append succeeded; the open aborts it otherwise).
+    pub(crate) async fn reshape(
+        &self,
+        plan: &super::reshape::ReshapePlan,
+    ) -> Result<super::reshape::ReshapeFiles, (io::Error, super::reshape::ReshapeFiles)> {
+        use super::reshape::{CopyTarget, ReshapeFiles, copy, land};
+        let none = |e: io::Error| (e, ReshapeFiles::default());
+        let live = self.live().map_err(none)?;
+        let parts = &live.parts;
+        let board = &parts.board;
+        let _no_sweeps = board.hold_sweeps().await;
+
+        // 1. The sources, opened, then the instance retired: maintenance
+        // stopped and joined, each source's scheduler unit quiesced.
+        let mut sources: Vec<(u32, Arc<Table<DbStorageProvider>>)> = Vec::new();
+        let mut source_dirs: Vec<(u32, PointRange, Option<PathBuf>)> = Vec::new();
+        for &pid in &plan.sources {
+            let slot = parts.slot_at(pid).map_err(none)?;
+            if slot.materialized.load(Ordering::SeqCst) {
+                let table = parts.open(pid, false).await.map_err(none)?;
+                sources.push((pid, table));
+                source_dirs.push((pid, slot.range, Some(slot.dir(&self.root).to_path_buf())));
+            } else {
+                source_dirs.push((pid, slot.range, None));
+            }
+        }
+        self.retire_partitions().await;
+        for (_, table) in &sources {
+            table.close_exclusive(false).await;
+        }
+
+        // 2. RESHAPE_BEGIN, durable, its locations interned first.
+        let mut state = board.state.lock().await;
+        let mut dealt: Vec<String> = Vec::new();
+        let mut targets: Vec<(super::log::ReshapeTarget, PointRange, PathBuf)> = Vec::new();
+        let span_hi = source_dirs.iter().map(|(_, r, _)| r.hi).max().unwrap_or(0);
+        let begun: io::Result<super::log::ReshapeBegin> = async {
+            let mut next_pid = u32::try_from(state.next_pid()).map_err(|_| io::Error::other("partition ids exhausted"))?;
+            for (i, (lo, dir)) in plan.targets.iter().enumerate() {
+                let hi = plan.targets.get(i + 1).map_or(span_hi, |(next, _)| *next as u128);
+                let dir = match dir {
+                    Some(d) => d.clone(),
+                    None => match source_dirs.iter().find(|(_, r, _)| r.contains(*lo)).and_then(|(_, _, d)| d.clone()) {
+                        Some(d) => d,
+                        None => match parts.placement.deal(self.uid) {
+                            Some(d) => {
+                                dealt.push(d.clone());
+                                PathBuf::from(d)
+                            }
+                            None => self.root.clone(),
+                        },
+                    },
+                };
+                let loc = intern_location(board, &mut state, &self.root, &dir).await?;
+                targets.push((super::log::ReshapeTarget { lo: *lo, pid: next_pid, loc }, PointRange { lo: *lo, hi }, dir));
+                next_pid = next_pid.checked_add(1).ok_or_else(|| io::Error::other("partition ids exhausted"))?;
+            }
+            let begin = super::log::ReshapeBegin {
+                id: state.last_reshape() + 1,
+                sources: plan.sources.clone(),
+                targets: targets.iter().map(|(t, _, _)| *t).collect(),
+            };
+            let rec = Record::ReshapeBegin(begin.clone());
+            let mut next = state.clone();
+            next.apply(&rec).map_err(invalid)?;
+            board.log.append_durable(&rec).await?;
+            *state = next;
+            board.grow(&state);
+            Ok(begin)
+        }
+        .await;
+        let undeal = |dealt: &[String]| {
+            for d in dealt {
+                parts.placement.undeal(self.uid, d);
+            }
+        };
+        let begin = match begun {
+            Ok(b) => b,
+            Err(e) => {
+                undeal(&dealt);
+                return Err(none(e));
+            }
+        };
+        let target_files = ReshapeFiles { doomed: targets.iter().map(|(t, _, d)| (t.pid, d.clone())).collect() };
+
+        // 3 to 5: the targets' files, the copy, the check.
+        let copied: io::Result<()> = async {
+            let mut copying = Vec::with_capacity(targets.len());
+            for (t, range, dir) in &targets {
+                files::create_partition_files(dir, self.uid, t.pid)?;
+                let physical = files::data_stem(self.uid, t.pid);
+                let table = Table::open_partition(PartitionOpen {
+                    cache_scope: format!("{}\u{0}{}", self.db_id, physical),
+                    physical,
+                    seed: parts.seed.clone(),
+                    dir: (!super::reshape::is_root(dir, &self.root)).then(|| dir.to_string_lossy().into_owned()),
+                    io_schema: self.shell.io_schema.clone(),
+                    schema: self.shell.schema.clone(),
+                    ids: parts.ids.clone(),
+                    guard: RangeGuard::new(parts.spec.clone(), *range),
+                    mode: MaintenanceMode::External,
+                    watch: Some(board.watch(t.pid)?),
+                    scan_only: true,
+                    load_if_proven: false,
+                })
+                .await?;
+                table.retire().await;
+                copying.push(CopyTarget::new(*range, Arc::new(table)));
+            }
+            #[cfg(test)]
+            reshape_hooks::hit(&self.root, "before_copy")?;
+            copy(&sources, &mut copying).await?;
+            for t in &copying {
+                land(&t.table).await;
+                t.table.close_exclusive(false).await;
+            }
+            #[cfg(test)]
+            reshape_hooks::hit(&self.root, "before_commit")?;
+            Ok(())
+        }
+        .await;
+        // Test-only: the process "dies" here, before the commit, leaving the
+        // open `RESHAPE_BEGIN` and the targets' files for the next open.
+        #[cfg(test)]
+        if copied.is_ok() && reshape_hooks::crash(&self.root, "crash_before_commit") {
+            return Err((io::Error::other("injected crash before the commit"), ReshapeFiles::default()));
+        }
+
+        // 6. RESHAPE_COMMIT, durable: the commit point. Each target pinned at
+        // the lowest pin of the sources it overlaps.
+        let committed: io::Result<()> = match copied {
+            Err(e) => Err(e),
+            Ok(()) => {
+                let pins: Vec<(u32, Option<u64>)> = targets
+                    .iter()
+                    .map(|(t, range, _)| {
+                        let pin = source_dirs
+                            .iter()
+                            .filter(|(_, r, _)| (r.lo as u128) < range.hi && (range.lo as u128) < r.hi)
+                            .filter_map(|(pid, _, _)| state.part(*pid).and_then(|p| p.pin))
+                            .min();
+                        (t.pid, pin)
+                    })
+                    .collect();
+                let rec = Record::ReshapeCommit { id: begin.id, pins };
+                let mut next = state.clone();
+                match next.apply(&rec).map_err(invalid) {
+                    Err(e) => Err(e),
+                    Ok(()) => match board.log.append_durable(&rec).await {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            *state = next;
+                            board.follow(&state);
+                            Ok(())
+                        }
+                    },
+                }
+            }
+        };
+        match committed {
+            Ok(()) => Ok(ReshapeFiles {
+                doomed: source_dirs.into_iter().filter_map(|(pid, _, d)| d.map(|d| (pid, d))).collect(),
+            }),
+            Err(e) => {
+                let rec = Record::ReshapeAbort { id: begin.id };
+                let mut next = state.clone();
+                if next.apply(&rec).is_ok() && board.log.append_durable(&rec).await.is_ok() {
+                    *state = next;
+                }
+                undeal(&dealt);
+                Err((e, target_files))
+            }
+        }
+    }
+
+    /// Records `pids`, retired by a committed reshape whose files are now
+    /// deleted, as gone (`RETIRED_GONE`).
+    pub(crate) async fn retired_gone(&self, pids: &[u32]) -> io::Result<()> {
+        if pids.is_empty() {
+            return Ok(());
+        }
+        let live = self.live()?;
+        let mut state = live.parts.board.state.lock().await;
+        let rec = Record::RetiredGone(pids.to_vec());
+        let mut next = state.clone();
+        next.apply(&rec).map_err(invalid)?;
+        live.parts.board.log.append_durable(&rec).await?;
+        *state = next;
+        Ok(())
+    }
+}
+
+/// The index of `dir` among `state`'s interned locations, interned by a
+/// durable `LOCATIONS` first if it is new: the root is always location 0,
+/// whatever path it was interned as (see `Parts::materialize_at`).
+async fn intern_location(
+    board: &PinBoard,
+    state: &mut super::log::MapState,
+    root: &Path,
+    dir: &Path,
+) -> io::Result<u32> {
+    let key = files::dir_key(&dir.to_string_lossy());
+    if key == files::dir_key(&root.to_string_lossy()) {
+        return Ok(ROOT_LOC);
+    }
+    if let Some(i) = state.locations().iter().skip(1).position(|l| files::dir_key(l) == key) {
+        return Ok(i as u32 + 1);
+    }
+    let mut paths = state.locations().to_vec();
+    paths.push(key);
+    let rec = Record::Locations(paths);
+    let mut next = state.clone();
+    next.apply(&rec).map_err(invalid)?;
+    board.log.append_durable(&rec).await?;
+    *state = next;
+    Ok((state.locations().len() - 1) as u32)
+}
+
+/// Test-only failpoints inside a reshape: `arm(dir, point)` makes the
+/// reshape of a table under `dir` fail at `point` ("before_copy",
+/// "before_commit"), once.
+#[cfg(test)]
+pub(crate) mod reshape_hooks {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    static ARMED: parking_lot::Mutex<Vec<(PathBuf, &'static str)>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(crate) fn arm(dir: &Path, point: &'static str) {
+        ARMED.lock().push((dir.to_path_buf(), point));
+    }
+
+    /// Whether the armed `point` is reached (and disarms it): a simulated
+    /// crash, which the caller follows by doing nothing more.
+    pub(crate) fn crash(root: &Path, point: &'static str) -> bool {
+        hit(root, point).is_err()
+    }
+
+    pub(super) fn hit(root: &Path, point: &'static str) -> io::Result<()> {
+        let mut armed = ARMED.lock();
+        if let Some(i) = armed.iter().position(|(d, p)| root.starts_with(d) && *p == point) {
+            armed.remove(i);
+            return Err(io::Error::other(format!("injected reshape failure at {point}")));
+        }
+        Ok(())
+    }
+}
+
 /// A routed partition as a fan-out plans it: its open instance, or `None`
 /// while it is materialized and closed, for [`PartitionedTable::open_part`]
 /// to open when the fan-out reaches it. Inline for the one a routed point
@@ -1946,7 +2383,7 @@ impl Drop for Parts {
 
 impl Parts {
     fn slot_at(&self, pid: u32) -> io::Result<&Slot> {
-        match self.slots.get(pid as usize) {
+        match self.index.get(pid as usize).and_then(|&i| self.slots.get(i as usize)) {
             Some(slot) if slot.pid == pid => Ok(slot),
             _ => Err(io::Error::other(format!("internal routing error: no slot for partition {pid}"))),
         }

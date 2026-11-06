@@ -74,6 +74,7 @@ const SCHEMA_ONLY: &[&str] = &[
 /// structural test requires this to cover every data method it finds, so a
 /// new one cannot be added without also being proven to refuse.
 const CALLED_ON_SHELL: &[&str] = &[
+    "point_of_row",
     "io_rows",
     "io_pointers",
     "index_store_bytes",
@@ -440,6 +441,7 @@ async fn a_shell_refuses_every_data_method() {
     let fields = shell.schema.fields.to_vec();
     let vis = || Visibility::All;
 
+    expect("point_of_row", unit(shell.point_of_row(&crate::core::row::row::Row::default())));
     expect("io_rows", unit(shell.io_rows()));
     expect("io_pointers", unit(shell.io_pointers()));
     expect("index_store_bytes", unit(shell.index_store_bytes()));

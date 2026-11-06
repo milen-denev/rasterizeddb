@@ -39,6 +39,8 @@ mod lazy_resident_tests;
 mod relation_dispatch_tests;
 #[cfg(test)]
 mod reaper_tests;
+#[cfg(test)]
+mod reshape_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;

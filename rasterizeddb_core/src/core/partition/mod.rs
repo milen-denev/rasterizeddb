@@ -82,6 +82,7 @@ pub mod log;
 pub mod maintenance;
 pub mod map;
 pub mod pins;
+pub mod reshape;
 #[cfg(test)]
 mod pin_tests;
 pub mod route;

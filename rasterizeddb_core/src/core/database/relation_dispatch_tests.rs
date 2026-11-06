@@ -189,6 +189,11 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("catalogue_contains", "test-only catalogue read"),
     ("claim_name", "an in-memory claim on the name, whatever it names"),
     ("drop_partitioned", "the partitioned branch of drop_table_to_depth's dispatch"),
+    (
+        "reshape_partitioned",
+        "partitioned only: its caller resolved the relation under ACCESS EXCLUSIVE (run_reshape's relation_for), \
+         and it refuses a name that is no partitioned table before touching anything",
+    ),
     ("open_partitioned", "startup: builds the partitioned table relation() resolves"),
     ("refuse_held_name", "an in-memory check of the names a held rename keeps; touches no table"),
     ("hold_intent", "records a rename's two names in memory; rename dispatches before it"),

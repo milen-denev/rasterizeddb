@@ -10064,6 +10064,17 @@ async fn insert_values_tuples(
 /// see the note on the `CREATE TABLE` arm.
 #[cfg(feature = "storage_pools")]
 async fn execute_storage(sql: &str, database: &Arc<Database>) -> Vec<u8> {
+    // `STORAGE MOVE PARTITION`: a reshape (docs/partitioning.md §6.2), local
+    // to this node like every STORAGE statement.
+    if let Some(parsed) = crate::core::partition::reshape::parse_move(sql) {
+        return match Box::pin(run_reshape(parsed, database)).await {
+            Ok(summary) => crate::core::storage::sql::text_result(&[summary]),
+            Err(e) => {
+                error!("storage statement failed: {}", e);
+                ddl_error(&e)
+            }
+        };
+    }
     // The structured forms return rows rather than lines; everything else in
     // this surface is text meant to be read.
     if crate::core::storage::sql::is_structured(sql) {
@@ -10085,6 +10096,29 @@ async fn execute_storage(sql: &str, database: &Arc<Database>) -> Vec<u8> {
             ddl_error(&e)
         }
     }
+}
+
+/// A reshape statement (docs/partitioning.md §6.2, phase 5): ACCESS
+/// EXCLUSIVE on the logical name, then the reshape. Its summary, or why it
+/// was refused. Reshapes are physical and local (§12): never replicated, as
+/// `STORAGE MOVE TABLE` is not; each node keeps its own map.
+#[inline(never)]
+async fn run_reshape(
+    parsed: Result<(String, crate::core::partition::reshape::ReshapeOp), String>,
+    database: &Arc<Database>,
+) -> Result<String, String> {
+    let (table, op) = parsed?;
+    match database.relation_for(&table, owner(), TableMode::AccessExclusive).await? {
+        None => return Err(format!("relation \"{table}\" does not exist")),
+        Some(crate::core::database::relation::Relation::Plain(_)) => {
+            return Err(format!(
+                "{} needs a partitioned table, and \"{table}\" is not one (not supported on a plain table)",
+                op.verb()
+            ));
+        }
+        Some(crate::core::database::relation::Relation::Partitioned(_)) => {}
+    }
+    database.reshape_partitioned(&table, &op).await.map_err(|e| e.to_string())
 }
 
 fn create_table_already_satisfied(
@@ -18869,6 +18903,21 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::AddColumn(sql)
         | QueryPurpose::DropColumn(sql)
         | QueryPurpose::RenameColumn(sql) => {
+            // A reshaping ALTER (`SPLIT PARTITION`, `MERGE PARTITIONS`,
+            // `ISOLATE KEY`, `SPLIT KEY`): physical and local, never
+            // replicated (docs/partitioning.md §12).
+            if let Some(parsed) = crate::core::partition::reshape::parse_alter(sql) {
+                return match Box::pin(run_reshape(parsed, &database)).await {
+                    Ok(summary) => {
+                        info!("{summary}");
+                        ddl_ok(0)
+                    }
+                    Err(e) => {
+                        error!("{e}");
+                        ddl_error(&e)
+                    }
+                };
+            }
             let response = Box::pin(execute_alter_table(sql, &database, tx)).await;
             if response.first() != Some(&3) {
                 note_write(&database, tx, depth, sql, None);

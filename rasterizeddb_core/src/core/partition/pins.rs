@@ -80,14 +80,19 @@ pub struct PinBoard {
     pub(crate) state: StdArc<tokio::sync::Mutex<MapState>>,
     handle: ForgetHandle,
     pub(crate) transactions: StdArc<TransactionManager>,
-    /// By pid (pids are `0..n` until reshapes, phase 5).
-    watches: Box<[StdArc<WriteWatch>]>,
-    /// By pid: held by every open, materialize and close of the partition
-    /// (phase 3 P5b, `table::Parts`), so at most one instance of a file set
-    /// is live and no open builds providers over files a close still lands
-    /// into (I14). Here rather than in a table instance's slots, so a schema
-    /// change's new instance shares it.
-    lifecycle: Box<[tokio::sync::Mutex<()>]>,
+    /// By pid, every pid below the map's `next_pid` (live, retired or
+    /// gone): grown when a reshape hands out new pids ([`Self::grow`]), and
+    /// never shrunk, so an index once valid stays valid.
+    watches: parking_lot::RwLock<Vec<StdArc<WriteWatch>>>,
+    /// By pid, as `watches`: held by every open, materialize and close of the
+    /// partition (phase 3 P5b, `table::Parts`), so at most one instance of a
+    /// file set is live and no open builds providers over files a close still
+    /// lands into (I14). Here rather than in a table instance's slots, so a
+    /// schema change's or a reshape's new instance shares it.
+    lifecycle: parking_lot::RwLock<Vec<StdArc<tokio::sync::Mutex<()>>>>,
+    /// This board and the scheduler, for the watches [`Self::grow`] adds.
+    me: std::sync::Weak<PinBoard>,
+    scheduler: std::sync::Weak<Scheduler>,
     /// The table's live instance's slots, through which a forget round opens
     /// a closed, pinned partition to sweep it (§7.2); replaced by a schema
     /// change's reopen. Weak: the instance owns this board.
@@ -142,22 +147,27 @@ impl PinBoard {
     ) -> StdArc<Self> {
         let handle = transactions.register_table();
         handle.set(state.forget_pin().unwrap_or(TxId::MAX));
-        let pins: Vec<(u32, bool)> = state.map().entries().iter().map(|&(_, pid)| (pid, state.part(pid).is_some_and(|p| p.pin.is_some()))).collect();
+        // Every pid ever handed out has a watch and a lifecycle lock, live or
+        // not: pids are dense below `next_pid`, the map's entries only once
+        // no reshape ran (phase 5).
+        let n = usize::try_from(state.next_pid()).unwrap_or(usize::MAX).min(u32::MAX as usize);
+        let pins: Vec<bool> = (0..n as u32).map(|pid| state.part(pid).is_some_and(|p| p.pin.is_some())).collect();
         let board = StdArc::new_cyclic(|me| {
             let mut watches: Vec<StdArc<WriteWatch>> = Vec::with_capacity(pins.len());
-            for (i, &(pid, pinned)) in pins.iter().enumerate() {
-                debug_assert_eq!(pid as usize, i, "dense pids until reshapes");
-                watches.push(WriteWatch::new(pid, pinned, me.clone(), StdArc::downgrade(scheduler)));
+            for (pid, &pinned) in pins.iter().enumerate() {
+                watches.push(WriteWatch::new(pid as u32, pinned, me.clone(), StdArc::downgrade(scheduler)));
             }
             PinBoard {
+                me: me.clone(),
+                scheduler: StdArc::downgrade(scheduler),
                 name: name.to_string(),
                 log,
                 state: StdArc::new(tokio::sync::Mutex::new(state)),
                 handle,
                 transactions: transactions.clone(),
-                lifecycle: (0..pins.len()).map(|_| tokio::sync::Mutex::new(())).collect(),
+                lifecycle: parking_lot::RwLock::new((0..pins.len()).map(|_| StdArc::new(tokio::sync::Mutex::new(()))).collect()),
                 parts: parking_lot::Mutex::new(std::sync::Weak::new()),
-                watches: watches.into_boxed_slice(),
+                watches: parking_lot::RwLock::new(watches),
                 sweeping: tokio::sync::Mutex::new(()),
                 cursor: AtomicUsize::new(0),
                 step: std::sync::atomic::AtomicU64::new(FORGET_STEP),
@@ -176,18 +186,72 @@ impl PinBoard {
         board
     }
 
-    pub(crate) fn watch(&self, pid: u32) -> io::Result<&StdArc<WriteWatch>> {
+    pub(crate) fn watch(&self, pid: u32) -> io::Result<StdArc<WriteWatch>> {
         self.watches
+            .read()
             .get(pid as usize)
             .filter(|w| w.pid() == pid)
+            .cloned()
             .ok_or_else(|| io::Error::other(format!("internal error: no write watch for partition {pid}")))
     }
 
     /// Partition `pid`'s lifecycle lock (see the field).
-    pub(crate) fn lifecycle(&self, pid: u32) -> io::Result<&tokio::sync::Mutex<()>> {
+    pub(crate) fn lifecycle(&self, pid: u32) -> io::Result<StdArc<tokio::sync::Mutex<()>>> {
         self.lifecycle
+            .read()
             .get(pid as usize)
+            .cloned()
             .ok_or_else(|| io::Error::other(format!("internal error: no lifecycle lock for partition {pid}")))
+    }
+
+    /// A watch and a lifecycle lock for every pid below `state`'s
+    /// `next_pid`: what a reshape's `RESHAPE_BEGIN` handed out (phase 5).
+    /// A new watch starts pinned as `state` says.
+    pub(crate) fn grow(&self, state: &MapState) {
+        let n = usize::try_from(state.next_pid()).unwrap_or(usize::MAX).min(u32::MAX as usize);
+        let mut watches = self.watches.write();
+        let mut lifecycle = self.lifecycle.write();
+        while watches.len() < n {
+            let pid = watches.len() as u32;
+            let pinned = state.part(pid).is_some_and(|p| p.pin.is_some());
+            watches.push(WriteWatch::new(pid, pinned, self.me.clone(), self.scheduler.clone()));
+        }
+        while lifecycle.len() < n {
+            lifecycle.push(StdArc::new(tokio::sync::Mutex::new(())));
+        }
+    }
+
+    /// Holds off every forget sweep of this table until the guard drops: a
+    /// reshape's copy reads its sources' stamps raw, and a sweep rewriting
+    /// them meanwhile would race it (phase 5).
+    pub(crate) async fn hold_sweeps(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sweeping.lock().await
+    }
+
+    /// Finishes what a crash cut short of a reshape (§12, phase 5), as the
+    /// table opens and before any partition does: every open reshape is
+    /// aborted (`RESHAPE_ABORT`; its targets were never materialized, so
+    /// their files are the reaper's), and every retired partition is
+    /// recorded gone (`RETIRED_GONE`; its files are the reaper's, which
+    /// never counts a retired partition as placed). Returns the state after.
+    pub(crate) async fn finish_reshapes(&self) -> io::Result<MapState> {
+        let mut state = self.state.lock().await;
+        let mut records: Vec<Record> = state.reshapes().map(|b| Record::ReshapeAbort { id: b.id }).collect();
+        let retired: Vec<u32> = state.parts().filter(|(_, p)| p.retired).map(|(pid, _)| pid).collect();
+        if !retired.is_empty() {
+            records.push(Record::RetiredGone(retired));
+        }
+        if records.is_empty() {
+            return Ok(state.clone());
+        }
+        let mut next = state.clone();
+        for rec in &records {
+            next.apply(rec).map_err(invalid)?;
+        }
+        self.log.append_all_durable(&records).await?;
+        *state = next;
+        self.follow(&state);
+        Ok(state.clone())
     }
 
     /// The live instance's idle round (`Parts::close_idle_round`): its

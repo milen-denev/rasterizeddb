@@ -620,15 +620,9 @@ pub(crate) fn read_live_map(root: &Path, uid: u64) -> Result<LiveMap, String> {
     if state.dropped() {
         return Err(format!("its map log {name} says it was dropped, but its catalogue row is live"));
     }
-    let map = state.map();
-    let dense = map.entries().iter().enumerate().all(|(i, &(_, pid))| pid as usize == i);
-    if !dense
-        || state.next_pid() != map.len() as u64
-        || state.reshapes().next().is_some()
-        || state.parts().any(|(_, p)| p.retired)
-    {
-        return Err(format!("its map log {name} describes a reshaped map, which this version cannot read"));
-    }
+    // A reshaped map is understood (phase 5): an open reshape's targets
+    // have no location yet, so their files are reaped, and a retired
+    // partition's are reaped too (see `reapable`).
     Ok(LiveMap { generation, state })
 }
 
@@ -690,7 +684,10 @@ fn reapable(
         let live_map = state.as_ref().expect("an Err map returned above");
         match file {
             PartFile::Data { pid, .. } => {
-                let placed_here = match live_map.state.part(pid).and_then(|p| p.location) {
+                // A retired partition (a reshape's committed source) is never
+                // placed: its rows are in its targets, and its open finishes
+                // with `RETIRED_GONE` (`PinBoard::finish_reshapes`).
+                let placed_here = match live_map.state.part(pid).filter(|p| !p.retired).and_then(|p| p.location) {
                     None => false,
                     Some(0) => here.is_none(),
                     // Where that location is now: a restore into a new
