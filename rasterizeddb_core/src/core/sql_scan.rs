@@ -514,6 +514,125 @@ pub fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// The typed literals [`typed_literals_as_casts`] rewrites: the words of the
+/// type, longest spelling first, and the cast it becomes.
+const TYPED_LITERAL_TYPES: &[(&[&str], &str)] = &[
+    (&["TIMESTAMP", "WITH", "TIME", "ZONE"], "timestamptz"),
+    (&["TIMESTAMP", "WITHOUT", "TIME", "ZONE"], "timestamp"),
+    (&["TIME", "WITHOUT", "TIME", "ZONE"], "time"),
+    (&["DOUBLE", "PRECISION"], "float8"),
+    (&["TIMESTAMPTZ"], "timestamptz"),
+    (&["TIMESTAMP"], "timestamp"),
+    (&["TIME"], "time"),
+    (&["DATE"], "date"),
+    (&["INTERVAL"], "interval"),
+    (&["NUMERIC"], "numeric"),
+    (&["DECIMAL"], "numeric"),
+    (&["INTEGER"], "integer"),
+    (&["INT"], "integer"),
+    (&["INT4"], "integer"),
+    (&["INT2"], "smallint"),
+    (&["SMALLINT"], "smallint"),
+    (&["INT8"], "bigint"),
+    (&["BIGINT"], "bigint"),
+    (&["BOOLEAN"], "boolean"),
+    (&["BOOL"], "boolean"),
+    (&["REAL"], "real"),
+    (&["FLOAT4"], "real"),
+    (&["FLOAT8"], "float8"),
+    (&["TEXT"], "text"),
+    (&["VARCHAR"], "varchar"),
+    (&["UUID"], "uuid"),
+    (&["JSON"], "json"),
+    (&["JSONB"], "jsonb"),
+];
+
+/// SQL's typed literal — `DATE '2024-01-02'`, `NUMERIC '1.50'`, `TIMESTAMP
+/// WITH TIME ZONE '…'` — rewritten as the cast it means (`'2024-01-02'::date`),
+/// which every reader of a value already handles; `None` when there is none.
+///
+/// Read as written, the prefix form reached a text column as its own source
+/// characters (`DATE '2024-01-02'` stored as `DATE '2024-01-02'`, silently),
+/// was refused by a NUMERIC or BOOLEAN column, and failed to plan against a
+/// DATE column in a `WHERE`. Strings, quoted identifiers, dollar quotes and
+/// comments are skipped; a type word is one only at a word boundary and
+/// directly before a standard string, so `AT TIME ZONE 'UTC'` and a column
+/// named `date` are left alone, and so is `INTERVAL '1' DAY` (a field
+/// qualifier the cast form has no place for).
+pub fn typed_literals_as_casts(sql: &str) -> Option<String> {
+    if !sql.contains('\'') {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !(is_identifier_byte(bytes[i - 1]) || matches!(bytes[i - 1], b'.' | b':' | b'"'));
+        if !(boundary && bytes[i].is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let word_end = |from: usize| bytes[from..].iter().position(|b| !is_identifier_byte(*b)).map_or(bytes.len(), |p| from + p);
+        let found = TYPED_LITERAL_TYPES.iter().find_map(|(words, cast)| {
+            let mut at = i;
+            for (n, word) in words.iter().enumerate() {
+                if n > 0 {
+                    let gap = bytes[at..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+                    if gap == 0 {
+                        return None;
+                    }
+                    at += gap;
+                }
+                let end = word_end(at);
+                if !sql[at..end].eq_ignore_ascii_case(word) {
+                    return None;
+                }
+                at = end;
+            }
+            let gap = bytes[at..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+            let quote = at + gap;
+            // A standard string directly after the type, not an escape string
+            // (`E'…'` begins with a letter, so it never matches here).
+            if gap == 0 || bytes.get(quote) != Some(&b'\'') {
+                return None;
+            }
+            let close = string_literal_end(bytes, quote, false);
+            if close > bytes.len() || bytes[close - 1] != b'\'' || close == quote + 1 {
+                return None;
+            }
+            if *cast == "interval" {
+                let after = sql[close..].trim_start();
+                let next = &after[..after.bytes().position(|b| !is_identifier_byte(b)).unwrap_or(after.len())];
+                if ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"].iter().any(|f| next.eq_ignore_ascii_case(f)) {
+                    return None;
+                }
+            }
+            Some((quote, close, *cast))
+        });
+        match found {
+            Some((quote, close, cast)) => {
+                let o = out.get_or_insert_with(|| String::with_capacity(sql.len() + 16));
+                o.push_str(&sql[copied..i]);
+                o.push_str(&sql[quote..close]);
+                o.push_str("::");
+                o.push_str(cast);
+                copied = close;
+                i = close;
+            }
+            None => i = word_end(i),
+        }
+    }
+    out.map(|mut o| {
+        o.push_str(&sql[copied..]);
+        o
+    })
+}
+
 /// Splits `list` on `delimiter` where it stands at nesting depth zero —
 /// outside every quoted run, comment, `(…)` and `[…]` — returning each piece
 /// trimmed and borrowed from `list`. A trailing empty piece is dropped
@@ -1121,6 +1240,37 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn typed_literals_become_casts() {
+        use super::typed_literals_as_casts as t;
+        assert_eq!(
+            t("INSERT INTO x VALUES (DATE '2024-01-02', numeric '1.50', TIMESTAMP WITH TIME ZONE '2024-01-02 03:04:05+02')").as_deref(),
+            Some("INSERT INTO x VALUES ('2024-01-02'::date, '1.50'::numeric, '2024-01-02 03:04:05+02'::timestamptz)")
+        );
+        assert_eq!(
+            t("SELECT 1 WHERE d = DATE  'it''s' AND f = DOUBLE PRECISION '1.5'").as_deref(),
+            Some("SELECT 1 WHERE d = 'it''s'::date AND f = '1.5'::float8")
+        );
+        // Left alone: no typed literal, a type word in a string, a column
+        // named like a type, AT TIME ZONE, an interval field qualifier, an
+        // escape string, a cast already, a comment, a quoted identifier.
+        for sql in [
+            "SELECT a FROM t",
+            "SELECT 'DATE ''x''' FROM t",
+            "SELECT date, text FROM t WHERE date > '2024-01-01'",
+            "SELECT ts AT TIME ZONE 'UTC' FROM t",
+            "SET TIME ZONE 'UTC'",
+            "SELECT INTERVAL '1' DAY",
+            "SELECT DATE E'2024-01-02'",
+            "SELECT '1'::int, x::date",
+            "SELECT 1 -- DATE '2024'\n",
+            "SELECT \"date\" FROM t WHERE x = 'y'",
+            "SELECT t.date FROM t WHERE x = 'y'",
+        ] {
+            assert_eq!(t(sql), None, "{sql}");
+        }
+    }
     /// Each spelling PostgreSQL types a literal with, rewritten to the value
     /// that type reads; everything else left byte for byte.
     #[test]

@@ -4090,6 +4090,8 @@ pub(crate) async fn describe_query(
     }
     // Described as it runs: a `DISTINCT ON` the executor rewrites over a
     // derived table (`execute_single_statement`) is described in that form.
+    let typed_literals = crate::core::sql_scan::typed_literals_as_casts(stmt);
+    let stmt = typed_literals.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
@@ -5962,6 +5964,16 @@ where
         uncommented.as_str()
     } else {
         stmt
+    };
+    // `DATE '2024-01-02'`: the cast it means, before any reader of a value
+    // sees the prefix form (`sql_scan::typed_literals_as_casts`).
+    let typed_literals;
+    let stmt = match crate::core::sql_scan::typed_literals_as_casts(stmt) {
+        Some(rewritten) => {
+            typed_literals = rewritten;
+            typed_literals.as_str()
+        }
+        None => stmt,
     };
     // `DISTINCT ON` over a join or with an aggregate or a window: the same
     // statement over a derived table, before anything reads its table set

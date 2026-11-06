@@ -266,3 +266,54 @@ async fn distinct_with_a_nulls_placement_matches_postgresql() {
     let sql = "SELECT DISTINCT n FROM dn ORDER BY i NULLS FIRST";
     assert!(c.simple_query(sql).await.is_err(), "{sql}");
 }
+
+/// SQL's typed literal (`DATE '…'`, `TIMESTAMP WITH TIME ZONE '…'`, `NUMERIC
+/// '…'`, `BOOLEAN '…'`, …) as the value it means: into a text column through
+/// INSERT and UPDATE, into typed columns, and compared in a WHERE, answered as
+/// PostgreSQL 17 answers it. A text column stored the literal's own source
+/// characters (`DATE '2024-01-02'`, silently); NUMERIC and BOOLEAN columns
+/// refused it; `d = DATE '…'` failed to plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_literals_are_the_values_they_mean() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE tl (id INT, t TEXT, v VARCHAR(40))",
+        "INSERT INTO tl VALUES (1, TIMESTAMPTZ '2024-01-02 03:04:05+00', TIMESTAMP WITH TIME ZONE '2024-01-02 03:04:05+02')",
+        "INSERT INTO tl VALUES (2, TIMESTAMP '2024-01-02 03:04:05', TIMESTAMP '2024-01-02 03:04:05.5')",
+        "INSERT INTO tl VALUES (3, DATE '2024-01-02', DATE '2024-1-2')",
+        "INSERT INTO tl VALUES (4, INTERVAL '1 day 2 hours', INTERVAL '90 minutes')",
+        "INSERT INTO tl VALUES (5, NUMERIC '1.50', INTEGER '7')",
+        "INSERT INTO tl VALUES (6, BOOLEAN 'yes', TIME '03:04:05')",
+        "INSERT INTO tl (id, t) SELECT 8, TIMESTAMPTZ '2024-01-02 03:04:05+00'",
+        "INSERT INTO tl VALUES (9, 'DATE ''y''', 'x')",
+        "CREATE TABLE ty (id INT, ts TIMESTAMPTZ, d DATE, iv INTERVAL, n NUMERIC(10,2), b BOOLEAN)",
+        "INSERT INTO ty VALUES (1, TIMESTAMPTZ '2024-01-02 03:04:05+02', DATE '2024-01-02', INTERVAL '1 day', NUMERIC '1.505', BOOLEAN 'yes')",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "SELECT id, t, v FROM tl ORDER BY id",
+            &[
+                "1|2024-01-02 03:04:05+00|2024-01-02 01:04:05+00",
+                "2|2024-01-02 03:04:05|2024-01-02 03:04:05.5",
+                "3|2024-01-02|2024-01-02",
+                "4|1 day 02:00:00|01:30:00",
+                "5|1.50|7",
+                "6|true|03:04:05",
+                "8|2024-01-02 03:04:05+00|NULL",
+                "9|DATE 'y'|x",
+            ],
+        ),
+        ("SELECT * FROM ty", &["1|2024-01-02 01:04:05+00|2024-01-02|1 day|1.51|t"]),
+        ("SELECT id FROM ty WHERE d = DATE '2024-01-02' AND ts > TIMESTAMPTZ '2024-01-01 00:00:00+00' AND iv < INTERVAL '2 days'", &["1"]),
+        ("SELECT TIMESTAMPTZ '2024-01-02 03:04:05+00'::text, DATE '2024-01-02' || 'x'", &["2024-01-02 03:04:05+00|2024-01-02x"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    c.simple_query("UPDATE tl SET t = DATE '2024-03-04', v = TIMESTAMPTZ '2024-01-02 03:04:05+00' WHERE id = 1").await.unwrap();
+    assert_eq!(rows(&c, "SELECT t, v FROM tl WHERE id = 1").await, ["2024-03-04|2024-01-02 03:04:05+00"]);
+}
