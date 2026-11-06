@@ -1752,10 +1752,91 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     if text.len() > 4 && text[..3].eq_ignore_ascii_case("NOT") && text.as_bytes()[3] == b'(' {
         return Ok(Cond::Not(Box::new(parse_cond(&text[3..], schema)?)));
     }
+    if let Some(cond) = in_or_between(text, schema)? {
+        return Ok(cond);
+    }
     match parse_condition(text, schema) {
         Ok(condition) => Ok(Cond::Cmp(condition)),
         Err(e) => bare_boolean(text, schema).map(Cond::Cmp).ok_or(e),
     }
+}
+
+/// How many times `keyword` stands at the top level of `text`.
+fn count_keyword(text: &str, keyword: &str) -> usize {
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(at) = crate::core::rql::join::find_keyword(text, keyword, from) {
+        n += 1;
+        from = at + keyword.len();
+    }
+    n
+}
+
+/// `x [NOT] IN (a, b, …)` and `x [NOT] BETWEEN a AND b`, as the comparisons
+/// they are: `x = a OR x = b`, `x >= a AND x <= b`, a NOT around either. Under
+/// SQL's three values that is PostgreSQL's answer, NULLs included (`2 IN (1,
+/// NULL)` and `2 NOT IN (1, NULL)` are both UNKNOWN). Each comparison is read
+/// by [`parse_condition`], so it is coerced as `=` coerces. `None` when `text`
+/// is neither.
+fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, String> {
+    use crate::core::rql::join::find_keyword;
+    let negated_left = |left: &str| -> (String, bool) {
+        let left = left.trim_end();
+        match left.len().checked_sub(3).and_then(|i| left.get(i..).map(|tail| (i, tail))) {
+            Some((i, tail)) if tail.eq_ignore_ascii_case("NOT") && left[..i].ends_with(char::is_whitespace) => {
+                (left[..i].trim().to_string(), true)
+            }
+            _ => (left.trim().to_string(), false),
+        }
+    };
+    let wrap = |cond: Cond, negated: bool| if negated { Cond::Not(Box::new(cond)) } else { cond };
+    if let Some(at) = find_keyword(text, "IN", 0) {
+        let rest = text[at + 2..].trim();
+        if rest.starts_with('(') && matching_paren(rest, 0) == Some(rest.len() - 1) {
+            let (left, negated) = negated_left(&text[..at]);
+            if left.is_empty() {
+                return Ok(None);
+            }
+            let inside = rest[1..rest.len() - 1].trim();
+            if inside.len() >= 6 && inside[..6].eq_ignore_ascii_case("SELECT") {
+                return Err(format!("condition '{}' with IN (SELECT …) is not supported here yet", text));
+            }
+            let items = crate::core::rql::lexer_ct::split_definitions(inside);
+            if items.iter().all(|i| i.trim().is_empty()) {
+                return Err(format!("condition '{}' has an empty IN list", text));
+            }
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                parts.push(Cond::Cmp(parse_condition(&format!("{} = {}", left, item.trim()), schema)?));
+            }
+            let any = if parts.len() == 1 { parts.pop().expect("one") } else { Cond::Or(parts) };
+            return Ok(Some(wrap(any, negated)));
+        }
+    }
+    if let Some(at) = find_keyword(text, "BETWEEN", 0) {
+        let (left, negated) = negated_left(&text[..at]);
+        let rest = text[at + "BETWEEN".len()..].trim();
+        if rest.len() > 9 && rest[..9].eq_ignore_ascii_case("SYMMETRIC") {
+            return Err(format!("condition '{}' with BETWEEN SYMMETRIC is not supported here yet", text));
+        }
+        let rest = match rest.get(..10) {
+            Some(head) if head.eq_ignore_ascii_case("ASYMMETRIC") => rest[10..].trim(),
+            _ => rest,
+        };
+        let Some(and) = find_keyword(rest, "AND", 0) else {
+            return Err(format!("condition '{}' has BETWEEN without AND", text));
+        };
+        let (low, high) = (rest[..and].trim(), rest[and + 3..].trim());
+        if left.is_empty() || low.is_empty() || high.is_empty() {
+            return Err(format!("condition '{}' is not a whole BETWEEN", text));
+        }
+        let both = Cond::And(vec![
+            Cond::Cmp(parse_condition(&format!("{} >= {}", left, low), schema)?),
+            Cond::Cmp(parse_condition(&format!("{} <= {}", left, high), schema)?),
+        ]);
+        return Ok(Some(wrap(both, negated)));
+    }
+    Ok(None)
 }
 
 /// A boolean value standing alone where a condition is expected — `CASE WHEN
@@ -1784,7 +1865,16 @@ fn split_on_keyword(text: &str, keyword: &str) -> Option<Vec<String>> {
     let mut parts: Vec<String> = Vec::new();
     let mut start = 0usize;
     let mut search = 0usize;
+    // The AND of a `BETWEEN a AND b` is the BETWEEN's, not a conjunction:
+    // split there, `x BETWEEN 1 AND 5` became `x BETWEEN 1` and `5`.
+    let mut owed = 0usize;
     while let Some(at) = find_keyword(text, keyword, search) {
+        if keyword == "AND" && count_keyword(&text[start..at], "BETWEEN") > owed {
+            owed += 1;
+            search = at + keyword.len();
+            continue;
+        }
+        owed = 0;
         parts.push(text[start..at].trim().to_string());
         start = at + keyword.len();
         search = start;
