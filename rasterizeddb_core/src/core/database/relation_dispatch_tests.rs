@@ -194,6 +194,15 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "partitioned only: its caller resolved the relation under ACCESS EXCLUSIVE (run_reshape's relation_for), \
          and it refuses a name that is no partitioned table before touching anything",
     ),
+    (
+        "rewrite_partitioned",
+        "partitioned only: its caller (rewrite_rows) resolved the relation under ACCESS EXCLUSIVE, and it refuses \
+         a name that is no partitioned table before touching anything",
+    ),
+    (
+        "swap_catalogue_uid",
+        "a catalogue row swap keyed by name and uid, after rewrite_partitioned's dispatch",
+    ),
     ("open_partitioned", "startup: builds the partitioned table relation() resolves"),
     ("refuse_held_name", "an in-memory check of the names a held rename keeps; touches no table"),
     ("hold_intent", "records a rename's two names in memory; rename dispatches before it"),

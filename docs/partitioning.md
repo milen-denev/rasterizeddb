@@ -1418,7 +1418,7 @@ partition.open_budget = 0` naming the derived budget it now means, as
 the filter). Review B's probe that every answer is the same under a budget
 of one as unbounded is a test (`partition::budget_answers_tests`). Tests (`partition::lazy_tests`):
 `a_close_window_reads_the_files_not_the_previous_close`,
-`add_column_during_a_close_window_is_refused_on_a_populated_table` (review
+`add_column_during_a_close_window_rewrites_a_populated_table` (review
 B's scenario), `zero_kept_sizes_never_let_an_alter_through` (review A's,
 through a materializing open that failed), these three failing at
 `7ba631c9`; `a_catalog_read_overtaken_by_a_close_never_keeps_its_sizes`;
@@ -1437,7 +1437,7 @@ Round 1's mutations (a throwaway worktree, its own target directory):
 | Mutation | Caught by |
 |---|---|
 | kept sizes not cleared at the take nor when the partition opens | `a_close_window_reads_the_files_not_the_previous_close` |
-| both DDL checks (before the locks and under them) reading kept sizes, with the clearing undone | `add_column_during_a_close_window_is_refused_on_a_populated_table`, `zero_kept_sizes_never_let_an_alter_through` |
+| both DDL checks (before the locks and under them) reading kept sizes, with the clearing undone | `add_column_during_a_close_window_rewrites_a_populated_table`, `zero_kept_sizes_never_let_an_alter_through` |
 | only the under-lock check reading kept sizes | survives: the check before the locks already reads the files and refuses |
 | `closed_sizes` keeping its read whatever happened meanwhile | `a_catalog_read_overtaken_by_a_close_never_keeps_its_sizes` |
 | the CLOCK dropping a passed-over instance under the ring's guard | `the_clock_never_drops_the_last_reference_to_a_table_under_its_ring` (the binary aborts: the deadlock blocks the runtime's timers, so a watchdog thread aborts it) |

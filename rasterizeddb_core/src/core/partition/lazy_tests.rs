@@ -110,6 +110,16 @@ async fn rows(db: &Arc<Database>, clause: &str) -> Vec<(i64, i64, i64)> {
     try_rows(db, clause).await.unwrap_or_else(|e| panic!("WHERE {clause}: {e}"))
 }
 
+/// `(tenant_id, id, v, <column>)` of every row, sorted: a column an ALTER
+/// added, read with a default so a row it did not reach reads wrong.
+async fn with_column(db: &Arc<Database>, column: &str) -> Vec<(i64, i64, i64, i64)> {
+    let out = exec(db, &format!("SELECT tenant_id, id, v, {column} FROM pt")).await;
+    let mut v: Vec<(i64, i64, i64, i64)> =
+        decode_i64s(&out, 4).unwrap().into_iter().map(|r| (r[0], r[1], r[2], r[3])).collect();
+    v.sort();
+    v
+}
+
 async fn set_config(db: &Arc<Database>, sql: &str) {
     let statement = crate::core::introspect::parse(sql).unwrap().unwrap();
     let out = crate::core::introspect::execute(&statement, db).await;
@@ -497,12 +507,13 @@ async fn a_partition_that_cannot_reopen_fails_the_statement() {
 
 /// A schema change validates the rows of closed partitions, and counts
 /// them for its metadata-only test: a duplicate in a closed partition fails
-/// `CREATE UNIQUE INDEX`, and `ADD COLUMN` on a table whose partitions are
-/// all closed is refused as a populated table's is.
+/// `CREATE UNIQUE INDEX`, and `ADD COLUMN … DEFAULT` on a table whose
+/// partitions are all closed rewrites every row as a populated table's does
+/// (phase 6 P8), so each reads the default.
 ///
 /// Mutations: `row_tables_held` over the open partitions only (the index is
-/// built over the duplicate); `rows_len` counting open partitions only (the
-/// ADD COLUMN is accepted).
+/// built over the duplicate); `rows_len_exact` counting open partitions only
+/// (the ADD COLUMN takes the empty table's metadata-only path).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_schema_change_reaches_closed_partitions() {
     let dir = tempfile::tempdir().unwrap();
@@ -510,12 +521,12 @@ async fn a_schema_change_reaches_closed_partitions() {
     populated(&db).await;
     exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (3, 30, 303)").await;
     let t = pt(&db);
-    // Refused with the partitions open: the populated rule.
-    let open_refusal = try_exec(&db, "ALTER TABLE pt ADD COLUMN z BIGINT").await.expect_err("ADD COLUMN on a populated table");
     t.close_idle().await.unwrap();
-    let closed_refusal =
-        try_exec(&db, "ALTER TABLE pt ADD COLUMN z BIGINT").await.expect_err("ADD COLUMN with every partition closed was accepted");
-    assert_eq!(closed_refusal, open_refusal);
+    exec(&db, "ALTER TABLE pt ADD COLUMN z BIGINT DEFAULT 9").await;
+    let mut all = expected();
+    all.push((3, 30, 303));
+    all.sort();
+    assert_eq!(with_column(&db, "z").await, all.iter().map(|&(t, i, v)| (t, i, v, 9)).collect::<Vec<_>>());
     let t = pt(&db);
     t.close_idle().await.unwrap();
     let dup = try_exec(&db, "CREATE UNIQUE INDEX pt_tv ON pt (tenant_id, v)").await;
@@ -1610,15 +1621,15 @@ async fn during_a_close(db: &Arc<Database>, t: &Arc<PartitionedTable>, dir: &Pat
 }
 
 /// Review B's B1: a partition emptied and closed (kept sizes zero), then
-/// written: during its next close `ALTER TABLE … ADD COLUMN`, which a
-/// populated partitioned table refuses (it would rewrite every row), must
-/// still be refused. (At 7ba631c9 it was accepted from the kept zero, and
-/// every row then read the new column's default.)
+/// written: during its next close `ALTER TABLE … ADD COLUMN … DEFAULT` must
+/// take the populated table's path, a rewrite of every row (phase 6 P8), so
+/// each reads the default. (At 7ba631c9 the kept zero made it metadata-only;
+/// it was refused on a populated table until P8.)
 ///
-/// Mutations: the ALTER arm's check under its lock reading kept sizes
-/// (`partitioned_alter_refusal_held` back on `rows_len` with the cache).
+/// Mutations: the ALTER arm's emptiness check under its lock reading kept
+/// sizes (`rows_len_held` back on `rows_len` with the cache).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn add_column_during_a_close_window_is_refused_on_a_populated_table() {
+async fn add_column_during_a_close_window_rewrites_a_populated_table() {
     let dir = tempfile::tempdir().unwrap();
     let _budget = super::budget::isolate_with(dir.path(), 10_000, Some(0));
     let db = open(dir.path()).await;
@@ -1638,10 +1649,12 @@ async fn add_column_during_a_close_window_is_refused_on_a_populated_table() {
     let _ = sizes_of(&t).await;
     let values: Vec<String> = (2..=50).map(|i| format!("(1, {i}, {i})")).collect();
     exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
-    let alter = during_a_close(&db, &t, dir.path(), p, "ALTER TABLE pt ADD COLUMN z BIGINT").await;
-    assert!(alter.is_err(), "ADD COLUMN on a populated partitioned table was accepted in a close window");
-    assert_eq!(rows(&db, "").await, (2..=50).map(|i| (1, i, i)).collect::<Vec<_>>());
+    let alter = during_a_close(&db, &t, dir.path(), p, "ALTER TABLE pt ADD COLUMN z BIGINT DEFAULT 4").await;
+    alter.expect("ADD COLUMN in a close window");
+    assert_eq!(with_column(&db, "z").await, (2..=50).map(|i| (1, i, i, 4)).collect::<Vec<_>>());
     drop(t);
+    let db = restart(dir.path(), db).await;
+    assert_eq!(with_column(&db, "z").await, (2..=50).map(|i| (1, i, i, 4)).collect::<Vec<_>>());
     close(dir.path(), db);
     super::budget::release(dir.path());
 }
@@ -1649,8 +1662,9 @@ async fn add_column_during_a_close_window_is_refused_on_a_populated_table() {
 /// Review A's B1, the other way in: a materializing open that runs out of
 /// descriptors leaves the partition materialized, closed and empty, whose
 /// sizes a catalog read keeps as zero; two rows written, then during their
-/// close `ADD COLUMN w … DEFAULT 7` must be refused, and the rows keep no
-/// `w`, after a restart too. (At 7ba631c9 it was accepted.)
+/// close `ADD COLUMN w … DEFAULT 7` must rewrite both (phase 6 P8), so each
+/// reads 7, after a restart too. (At 7ba631c9 the kept zero made it
+/// metadata-only; it was refused on a populated table until P8.)
 ///
 /// Mutation: the kept sizes not cleared when a close takes the instance
 /// out, with the DDL check reading them.
@@ -1674,14 +1688,12 @@ async fn zero_kept_sizes_never_let_an_alter_through() {
     assert_eq!(sizes_of(&t).await.4, 0);
     exec(&db, "INSERT INTO pt (tenant_id, id, v) VALUES (1, 1, 1), (1, 2, 2)").await;
     let alter = during_a_close(&db, &t, dir.path(), p, "ALTER TABLE pt ADD COLUMN w BIGINT DEFAULT 7").await;
-    assert!(alter.is_err(), "ADD COLUMN was accepted on a populated table from zero kept sizes");
-    assert_eq!(rows(&db, "").await, vec![(1, 1, 1), (1, 2, 2)]);
-    assert!(try_exec(&db, "SELECT w FROM pt").await.is_err(), "a refused ADD COLUMN left its column");
-    assert!(sizes_of(&t).await.4 > 0);
+    alter.expect("ADD COLUMN from zero kept sizes");
+    assert_eq!(with_column(&db, "w").await, vec![(1, 1, 1, 7), (1, 2, 2, 7)]);
+    assert!(sizes_of(&pt(&db)).await.4 > 0);
     drop(t);
     let db = restart(dir.path(), db).await;
-    assert_eq!(rows(&db, "").await, vec![(1, 1, 1), (1, 2, 2)]);
-    assert!(try_exec(&db, "SELECT w FROM pt").await.is_err());
+    assert_eq!(with_column(&db, "w").await, vec![(1, 1, 1, 7), (1, 2, 2, 7)]);
     close(dir.path(), db);
     super::budget::release(dir.path());
 }

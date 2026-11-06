@@ -29,8 +29,8 @@
 //! The B7 tests pin `rowdescription`, the repair they test
 //! ([`Client::connect`]); the default's own tests connect with
 //! [`Client::connect_default`].
-//! - A partitioned table refuses ALTER, and a plain table joined with one
-//!   still repairs, by logical name.
+//! - A partitioned table's ALTER (a rewrite into a new uid), and a plain
+//!   table joined with one, repair by logical name.
 
 use super::*;
 use crate::core::database::table_for::test_hooks;
@@ -820,8 +820,8 @@ async fn auto_refuses_a_stale_statement_once_then_repairs_it() {
     close(db, dir.path());
 }
 
-/// A partitioned table refuses ALTER, and its shape is reached by logical
-/// name: a plain table joined with a partitioned one repairs when the plain
+/// A partitioned table's shape is reached by logical name: a statement over
+/// it repairs after an ALTER that rewrites it into a new uid, a plain table joined with a partitioned one repairs when the plain
 /// one is retyped, and a DROP and CREATE of the partitioned name with
 /// another column type repairs too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -841,8 +841,14 @@ async fn a_join_with_a_partitioned_table_repairs_by_logical_name() {
     b.ok("INSERT INTO b7pt (tenant_id, v) VALUES (1, 100)").await;
     b.ok("INSERT INTO b7pl (id, a) VALUES (1, 10)").await;
 
-    let refused = b.simple("ALTER TABLE b7pt ADD COLUMN w INT").await;
-    assert!(error(&refused).is_some(), "ALTER of a partitioned table was accepted: {refused:?}");
+    // A physical ALTER (phase 6 P8) moves the table to a new uid; a statement
+    // prepared over it repairs by its logical name.
+    a.prepare("s", "SELECT * FROM b7pt ORDER BY tenant_id").await;
+    assert_plain("before the ALTER", &a.run("s", &[]).await);
+    b.ok("ALTER TABLE b7pt ADD COLUMN w INT DEFAULT 3").await;
+    let got = a.run("s", &[]).await;
+    assert_repaired("the partitioned side altered", &got, &cols(&[("tenant_id", INT8), ("v", INT8), ("w", INT4)]));
+    assert_eq!(rows(&got), vec![r(&["1", "100", "3"])]);
 
     let sql = "SELECT b7pl.id, b7pl.a, b7pt.v FROM b7pl JOIN b7pt ON b7pl.id = b7pt.tenant_id";
     let told = a.prepare("j", sql).await;
