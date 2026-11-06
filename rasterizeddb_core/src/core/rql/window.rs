@@ -180,7 +180,32 @@ pub struct WindowSpec {
     pub order_by: Vec<(SchemaField, bool, bool)>,
     pub frame: Frame,
     pub label: String,
+    /// An expression around the window call — `revenue - LAG(revenue) OVER
+    /// (…)`, `ROW_NUMBER() OVER () + 100` — evaluated per row once the
+    /// window's value is known ([`assign_output`]).
+    pub around: Option<Box<WindowAround>>,
 }
+
+/// The expression a window call sits inside, with the call replaced by a
+/// synthetic column ([`WINDOW_VALUE_COLUMN`]) that holds its value.
+#[derive(Debug, Clone)]
+pub struct WindowAround {
+    pub expr: crate::core::rql::expr::Expr,
+    /// The window's value as a column: its type and the scale its bytes
+    /// are at, under a write order no table column has.
+    pub slot: SchemaField,
+    /// The table's columns and `slot`, which the expression is read against.
+    pub schema: Vec<SchemaField>,
+}
+
+/// The name the window's value goes by inside the expression around it. A
+/// schema cannot hold a name with this prefix, as with the aggregates'
+/// `__agg_`.
+pub(crate) const WINDOW_VALUE_COLUMN: &str = "__win_0";
+
+/// The write order of [`WINDOW_VALUE_COLUMN`]: past any real column's, and
+/// inside a column id's 32 bits (`row::schema_id_of`).
+const WINDOW_VALUE_WRITE_ORDER: u64 = u32::MAX as u64 - 1;
 
 impl WindowSpec {
     /// Every column the window reads, so the scan fetches them.
@@ -196,10 +221,46 @@ impl WindowSpec {
                 out.push(argument.clone());
             }
         }
+        // What the expression around the call reads, with the NULL
+        // companions: without one a NULL reads back as the type's zero.
+        if let Some(around) = &self.around {
+            for field in crate::core::rql::expr::columns_of(&around.expr) {
+                if field.name == WINDOW_VALUE_COLUMN {
+                    continue;
+                }
+                let flag = crate::core::rql::nullable::flag_field(&field.name, &around.schema).cloned();
+                for f in flag.into_iter().chain(std::iter::once(field)) {
+                    if !out.iter().any(|o| o.name == f.name) {
+                        out.push(f);
+                    }
+                }
+            }
+        }
         out
     }
 
+    /// The type of the column this item outputs: the expression's around a
+    /// call, else the window value's.
     pub fn result_type(&self) -> DbType {
+        match &self.around {
+            Some(around) => crate::core::rql::expr::static_type(&around.expr),
+            None => self.value_type(),
+        }
+    }
+
+    /// The scale a NUMERIC output is sent at: the expression's display scale
+    /// around a call (as a row expression's slot rounds to it), else the
+    /// window value's own ([`Self::decimal_output_scale`]).
+    pub fn output_scale(&self) -> u32 {
+        match &self.around {
+            Some(around) => crate::core::rql::expr::display_scale(&around.expr)
+                .unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+            None => self.decimal_output_scale(),
+        }
+    }
+
+    /// The type of the window function's own value.
+    pub fn value_type(&self) -> DbType {
         let arg = self.argument.as_ref().map(|f| f.db_type.clone());
         match self.func {
             WindowFunc::RowNumber
@@ -500,7 +561,148 @@ fn build(
         order_by,
         frame,
         label: alias.unwrap_or_else(|| name.to_ascii_lowercase()),
+        around: None,
     })
+}
+
+/// Parses an expression around one window call — `revenue - LAG(revenue)
+/// OVER (ORDER BY id)`, `SUM(x) OVER (…) * 2` — with `expr` and `alias`
+/// already split. `None` when `expr` holds no window call, or is one call
+/// whole (which [`parse`] reads).
+pub fn parse_around(expr: &str, alias: Option<String>, schema: &[SchemaField]) -> Option<Result<WindowSpec, String>> {
+    let calls = window_calls(expr);
+    match calls.as_slice() {
+        [] => None,
+        [(start, end)] if *start == 0 && *end == expr.len() => None,
+        [(start, end)] => Some(around_call(expr, *start, *end, alias, schema)),
+        _ => Some(Err("more than one window function in one select item is not supported yet".to_string())),
+    }
+}
+
+fn around_call(
+    expr: &str,
+    start: usize,
+    end: usize,
+    alias: Option<String>,
+    schema: &[SchemaField],
+) -> Result<WindowSpec, String> {
+    let mut spec = match parse(&expr[start..end], schema) {
+        Some(outcome) => outcome?,
+        None => return Err(format!("'{}' is not a window call", &expr[start..end])),
+    };
+    let ty = spec.value_type();
+    let mut slot = SchemaField::new(WINDOW_VALUE_COLUMN.to_string(), ty.clone(), ty.get_size(), 0, WINDOW_VALUE_WRITE_ORDER, false);
+    if ty == DbType::DECIMAL {
+        // The scale the value's bytes are at, so the expression lifts it as
+        // it lifts a column. A value function over an unconstrained NUMERIC
+        // hands back its cell at the engine's places with no scale of its
+        // own: `None` reads it as such a column.
+        let unconstrained = spec.argument.as_ref().is_some_and(|a| a.db_type == DbType::DECIMAL && a.scale.is_none());
+        slot.scale = if unconstrained && spec.func != WindowFunc::Avg {
+            None
+        } else {
+            Some(spec.decimal_output_scale())
+        };
+    }
+    let rewritten = format!("{}{}{}", &expr[..start], WINDOW_VALUE_COLUMN, &expr[end..]);
+    let mut around_schema = schema.to_vec();
+    around_schema.push(slot.clone());
+    let parsed = crate::core::rql::expr::parse(&rewritten, &around_schema)?;
+    spec.label = alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr));
+    spec.around = Some(Box::new(WindowAround { expr: parsed, slot, schema: around_schema }));
+    Ok(spec)
+}
+
+/// Byte ranges of every `<window function>(…) OVER (…)` in `expr`, outside
+/// quotes.
+fn window_calls(expr: &str) -> Vec<(usize, usize)> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // A word inside another identifier (`t.lag`) is not a call.
+            if start > 0 && (bytes[start - 1] == b'.' || bytes[start - 1] == b'"') {
+                continue;
+            }
+            if WindowFunc::parse(&expr[start..i]).is_none() {
+                continue;
+            }
+            let open = i + (expr[i..].len() - expr[i..].trim_start().len());
+            if !expr[open..].starts_with('(') {
+                continue;
+            }
+            let Some(close) = matching_paren(expr, open) else { continue };
+            let after = &expr[close + 1..];
+            let over_at = close + 1 + (after.len() - after.trim_start().len());
+            if !starts_with_word(&expr[over_at..], "OVER") {
+                continue;
+            }
+            let past_over = over_at + "OVER".len();
+            let window_open = past_over + (expr[past_over..].len() - expr[past_over..].trim_start().len());
+            if !expr[window_open..].starts_with('(') {
+                continue;
+            }
+            let Some(window_close) = matching_paren(expr, window_open) else { continue };
+            out.push((start, window_close + 1));
+            i = window_close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// [`assign`], then the expression around the call, if there is one, per
+/// row: the row as scanned plus the window's value as
+/// [`WINDOW_VALUE_COLUMN`] (left out for a NULL, which is how the evaluator
+/// reads a NULL with no companion). Coerced to [`WindowSpec::result_type`]
+/// and rounded to [`WindowSpec::output_scale`], as a row expression's slot
+/// is, so the bytes agree with what the row description announced.
+pub fn assign_output(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, String> {
+    let values = assign(rows, spec)?;
+    let Some(around) = &spec.around else {
+        return Ok(values);
+    };
+    let wide = crate::core::rql::expr::output_is_wide(&around.expr);
+    let scale = crate::core::rql::expr::display_scale(&around.expr);
+    let ty = spec.result_type();
+    let mut out = Vec::with_capacity(values.len());
+    for (row, value) in rows.iter().zip(values) {
+        let mut row = row.clone();
+        if let Some(bytes) = value {
+            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+            if !bytes.is_empty() {
+                mb.into_slice_mut().copy_from_slice(&bytes);
+            }
+            row.columns.push(crate::core::row::row::Column {
+                schema_id: crate::core::row::row::schema_id_of(WINDOW_VALUE_WRITE_ORDER),
+                data: mb,
+                column_type: around.slot.db_type.clone(),
+            });
+        }
+        let value = crate::core::rql::expr::eval_output_planned(&around.expr, wide, &row, &around.schema)
+            .map(|v| crate::core::rql::expr::coerce_to(v, &ty))
+            .and_then(|v| crate::core::rql::expr::at_display_scale(v, scale))?;
+        out.push(match value {
+            crate::core::rql::expr::Value::Data { bytes, .. } => Some(bytes),
+            crate::core::rql::expr::Value::Null => None,
+        });
+    }
+    Ok(out)
 }
 
 /// `ROWS BETWEEN 5 PRECEDING AND CURRENT ROW`, and the single-bound forms.
@@ -998,7 +1200,7 @@ fn numeric_fold(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> Result<Wind
         };
         acc.accumulate(Some(&bytes), Some(&field.db_type));
     }
-    acc.finish_nullable(func, &spec.result_type())
+    acc.finish_nullable(func, &spec.value_type())
 }
 
 /// Splits a trailing alias off a window item.

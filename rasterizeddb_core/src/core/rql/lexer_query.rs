@@ -80,6 +80,12 @@ pub struct QueryRows {
     /// the scan runs unsorted and unbounded and the executor evaluates each
     /// key per row, sorts, and pages. `(expr, descending, nulls_first)`.
     pub order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)>,
+    /// `ORDER BY` keys naming a window function's output (`ORDER BY rnk`),
+    /// sorted once the window values are in: `(select position, descending,
+    /// nulls_first)`. They lead the `ORDER BY`; the keys after them are
+    /// [`Self::order_expressions`], sorted first, so a stable sort here keeps
+    /// their order among ties.
+    pub window_order: Vec<(usize, bool, Option<bool>)>,
     /// How many of `requested_row_fetch`'s columns the client asked for.
     ///
     /// Sorting reads the key out of the fetched row, so an `ORDER BY` over a
@@ -533,7 +539,12 @@ fn parse_select_items(
         // A window function looks like a call but is neither an aggregate nor a
         // scalar: it keeps every row and adds a column computed from the rows
         // around it.
-        if let Some(outcome) = crate::core::rql::window::parse(item, schema) {
+        // An expression around one window call — `revenue - LAG(revenue)
+        // OVER (…)` — before the plain reading, which took the text before
+        // the first `(` as the function's name ("function 'revenue - LAG'").
+        if let Some(outcome) = crate::core::rql::window::parse_around(expr, alias.clone(), schema)
+            .or_else(|| crate::core::rql::window::parse(item, schema))
+        {
             let spec = outcome?;
             out.push(SelectItem::Window {
                 db_type: spec.result_type(),
@@ -2421,6 +2432,7 @@ pub fn row_fetch_from_select_query(
         }
     });
     let mut order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
+    let mut window_order: Vec<(usize, bool, Option<bool>)> = Vec::new();
 
     // An aggregate query sorts, limits and offsets its own output after the
     // fold, so none of the three is handed to the scan. Passing a limit down
@@ -2500,6 +2512,24 @@ pub fn row_fetch_from_select_query(
                 .next()
                 .unwrap_or(&term.token)
                 .trim_matches('"');
+            let window_item = select_items.iter().position(|s| {
+                matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare)
+            });
+            let named_column = schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
+            if let (Some(position), false) = (window_item, named_column) {
+                // A window's value exists only once every row is in, so it
+                // is sorted after the windows, by a stable sort that the
+                // keys after it have already ordered. A window key after
+                // another key would need the other sorted after it.
+                if !order_expressions.is_empty() {
+                    return Err(format!(
+                        "ORDER BY a window function's output ('{}') after another key is not supported yet",
+                        term.token
+                    ));
+                }
+                window_order.push((position, term.descending, term.nulls_first));
+                continue;
+            }
             let expr = if let Some(field) = schema
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
@@ -2601,6 +2631,7 @@ pub fn row_fetch_from_select_query(
         offset,
         visible_columns,
         order_expressions,
+        window_order,
         aggregate,
         distinct,
         written_limit: original_limit,

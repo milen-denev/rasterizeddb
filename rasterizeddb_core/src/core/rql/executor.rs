@@ -582,7 +582,7 @@ pub(crate) fn query_output_scales(
                         // A window value is stored at the grouped aggregate's
                         // scale for the same function — one rule, in
                         // `WindowSpec::decimal_output_scale`.
-                        SelectItem::Window { spec, .. } => spec.decimal_output_scale(),
+                        SelectItem::Window { spec, .. } => spec.output_scale(),
                         _ => engine,
                     };
                     if let Some(plan) = &parsed.aggregate {
@@ -15713,6 +15713,31 @@ fn query_sql(query: &QueryPurpose) -> String {
 /// sort moves `(keys, index)` pairs rather than ~1.5 KB rows, and with a cap
 /// no row outside the page is kept at all — each is decoded only for as long
 /// as its keys take to evaluate, and the page is decoded again from its bytes.
+/// Sorts rows in the client's layout by the window values at the given
+/// select positions (`QueryRows::window_order`). A NULL window value is a
+/// cell typed NULL.
+fn sort_by_window_output(rows: &mut [crate::core::row::row::Row], keys: &[(usize, bool, Option<bool>)]) {
+    use crate::core::rql::expr::Value;
+    let directions: Vec<(bool, Option<bool>)> = keys.iter().map(|(_, d, n)| (*d, *n)).collect();
+    let key_of = |row: &crate::core::row::row::Row| -> Vec<Value> {
+        keys.iter()
+            .map(|(position, _, _)| match row.columns.get(*position) {
+                Some(c) if c.column_type != crate::core::db_type::DbType::NULL => Value::Data {
+                    bytes: c.data.into_slice().to_vec(),
+                    db_type: c.column_type.clone(),
+                },
+                _ => Value::Null,
+            })
+            .collect()
+    };
+    let mut keyed: Vec<(Vec<Value>, crate::core::row::row::Row)> =
+        rows.iter_mut().map(|row| (key_of(row), std::mem::take(row))).collect();
+    keyed.sort_by(|a, b| crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions));
+    for (slot, (_, row)) in rows.iter_mut().zip(keyed) {
+        *slot = row;
+    }
+}
+
 fn sort_rows_by_expressions(
     rows_bytes: &[u8],
     keys: &[(crate::core::rql::expr::Expr, bool, Option<bool>)],
@@ -20595,6 +20620,7 @@ async fn execute_query_rows_body(
     // they need the whole result set rather than one row at a time.
     let window_slots = query_row.window_slots.clone();
     let has_windows = !window_slots.is_empty();
+    let window_order = query_row.window_order.clone();
     // Expression sort keys: evaluated per fetched row, sorted here,
     // because the scan can only sort by stored columns.
     let order_exprs = query_row.order_expressions.clone();
@@ -21354,7 +21380,7 @@ async fn execute_query_rows_body(
                                     // An exact SUM/AVG that overflows
                                     // is an error, as the grouped
                                     // aggregate's is — never a NULL.
-                                    match crate::core::rql::window::assign(&kept, spec) {
+                                    match crate::core::rql::window::assign_output(&kept, spec) {
                                         Ok(values) => computed.push((position, spec, values)),
                                         Err(e) => {
                                             error!("Window function failed: {}", e);
@@ -21428,6 +21454,13 @@ async fn execute_query_rows_body(
                                 // its window value went in).
                                 if distinct {
                                     kept.retain(|row| seen.insert(distinct_key(row)));
+                                }
+                                // `ORDER BY rnk`: by the window values, now
+                                // that they are in, before paging. Stable,
+                                // so the keys after them, sorted before the
+                                // windows, still order the ties.
+                                if !window_order.is_empty() {
+                                    sort_by_window_output(&mut kept, &window_order);
                                 }
                             }
 

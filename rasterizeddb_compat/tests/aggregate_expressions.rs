@@ -243,3 +243,71 @@ async fn round_matches_postgresql() {
     let (_, message) = refused(&c, "SELECT round(revenue, id) FROM ev").await;
     assert!(message.contains("not supported"), "{message}");
 }
+
+/// `ORDER BY` a window's alias sorts by its values, before paging; and an
+/// expression around a window call is evaluated per row once the value is
+/// known. Both used to be refused ("cannot be sorted here", "function
+/// 'revenue - LAG' is not supported").
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_sort_by_alias_and_compute_around_a_call() {
+    let (server, _dir) = on_disk("window").await;
+    let c = client(&server).await;
+    events(&c).await;
+    for t in ["ev", "pev"] {
+        let cases: &[(String, &[&str])] = &[
+            (
+                format!("SELECT id, revenue, RANK() OVER (ORDER BY revenue DESC) AS rnk FROM {t} ORDER BY rnk, id"),
+                &["5|NULL|1", "4|20.00|2", "2|10.50|3", "6|5.25|4", "1|0.00|5", "3|0.00|5"],
+            ),
+            (
+                format!("SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY id) AS rn FROM {t} ORDER BY rn DESC, id"),
+                &["2|2", "4|2", "6|2", "1|1", "3|1", "5|1"],
+            ),
+            (format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS rn FROM {t} ORDER BY rn LIMIT 2 OFFSET 2"), &["4|3", "3|4"]),
+            (
+                format!("SELECT id, LAG(revenue) OVER (ORDER BY id) AS prev FROM {t} ORDER BY prev NULLS FIRST, id"),
+                &["1|NULL", "6|NULL", "2|0.00", "4|0.00", "3|10.50", "5|20.00"],
+            ),
+            (
+                format!("SELECT id, revenue - LAG(revenue) OVER (ORDER BY id) AS d FROM {t} ORDER BY id"),
+                &["1|NULL", "2|10.50", "3|-10.50", "4|20.00", "5|NULL", "6|NULL"],
+            ),
+            (
+                format!("SELECT id, revenue - LAG(revenue) OVER (ORDER BY id) AS d FROM {t} ORDER BY d, id"),
+                &["3|-10.50", "2|10.50", "4|20.00", "1|NULL", "5|NULL", "6|NULL"],
+            ),
+            (
+                format!("SELECT id, SUM(revenue) OVER (ORDER BY id) * 2 AS s2 FROM {t} ORDER BY id"),
+                &["1|0.00", "2|21.00", "3|21.00", "4|61.00", "5|61.00", "6|71.50"],
+            ),
+            (
+                format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) + 100 AS r FROM {t} ORDER BY id"),
+                &["1|101", "2|102", "3|103", "4|104", "5|105", "6|106"],
+            ),
+            (
+                format!("SELECT id, ROUND(100.0 * revenue / SUM(revenue) OVER (), 1) AS pct FROM {t} ORDER BY id"),
+                &["1|0.0", "2|29.4", "3|0.0", "4|55.9", "5|NULL", "6|14.7"],
+            ),
+            (
+                format!("SELECT id, COALESCE(LAG(u) OVER (ORDER BY id), 0) AS pu FROM {t} ORDER BY id"),
+                &["1|0", "2|1.25", "3|1249.5", "4|-0.004", "5|99.995", "6|0"],
+            ),
+            (
+                format!("SELECT id, f - AVG(f) OVER () AS df FROM {t} ORDER BY id"),
+                &["1|1.45", "2|2.45", "3|-3.55", "4|-0.55", "5|NULL", "6|0.19999999999999996"],
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(rows(&c, sql).await, *want, "{sql}");
+        }
+    }
+    // Not carried yet, and refused rather than answered in another order or
+    // from one of the two windows.
+    for sql in [
+        "SELECT id, RANK() OVER (ORDER BY revenue DESC) AS rnk FROM ev ORDER BY id, rnk",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) - RANK() OVER (ORDER BY revenue) FROM ev ORDER BY id",
+    ] {
+        let (_, message) = refused(&c, sql).await;
+        assert!(message.contains("not supported"), "{sql}: {message}");
+    }
+}
