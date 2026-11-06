@@ -73,13 +73,14 @@ async fn a_cast_with_an_alias_survives_an_internal_space() {
 /// still refused *loudly*.
 ///
 /// It works on a single relation because the schema is in hand when the
-/// aggregate is parsed, so the argument's type is known immediately. Two shapes
-/// still route to the **wrapped-aggregate** path, which addresses its argument
-/// through a synthetic slot whose type is fixed when the slot is made:
-/// a trailing cast on the item, and any join. Filling that slot with a
-/// placeholder type made the column come back **NULL** instead of erroring —
-/// strictly worse — so those stay refused until the type can be carried
-/// properly, and this pins that they fail rather than quietly return nothing.
+/// aggregate is parsed, so the argument's type is known immediately — also
+/// inside an expression (a trailing cast is one), whose computed inputs carry
+/// the argument and its type (`ComputedInput::arg_expr`). A join's
+/// wrapped-aggregate path addresses its argument through a synthetic slot whose
+/// type is fixed when the slot is made. Filling that slot with a placeholder
+/// type made the column come back **NULL** instead of erroring — strictly
+/// worse — so a join stays refused until the type can be carried properly, and
+/// this pins that it fails rather than quietly return nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expression_aggregate_argument() {
     let (_server, mut conn) = seeded().await;
@@ -93,12 +94,18 @@ async fn an_expression_aggregate_argument() {
         .expect("n");
     assert_eq!(got, 32);
 
+    // A trailing cast makes it an expression around the aggregate: the same
+    // value, not a NULL column.
+    let got: i64 = sqlx::query(AssertSqlSafe("SELECT SUM(column_order + 1)::bigint AS n FROM utc"))
+        .fetch_one(&mut conn)
+        .await
+        .expect("a cast around an expression argument on a single relation")
+        .try_get("n")
+        .expect("n");
+    assert_eq!(got, 32);
+
     // Still refused, and must stay loud rather than becoming a NULL column.
     for (label, sql) in [
-        (
-            "trailing cast sends it to the wrapped path",
-            "SELECT SUM(column_order + 1)::bigint AS n FROM utc",
-        ),
         (
             "a join addresses arguments positionally",
             "SELECT c.tid AS tid, SUM(c.column_order + 1)::bigint AS n FROM utc c \
