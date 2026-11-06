@@ -148,12 +148,13 @@ async fn a_filter_inside_an_expression_filters_its_own_call() {
             assert_eq!(rows(&c, sql).await, *want, "{sql}");
         }
     }
-    // A join's computed path carries no filter yet: refused, not answered.
+    // Over a join, each call keeps its FILTER too (PostgreSQL 17's answer).
     run(&c, "CREATE TABLE u (user_id INT, vip BOOLEAN)").await;
     run(&c, "INSERT INTO u VALUES (1, true), (2, false), (3, NULL)").await;
-    let (code, message) =
-        refused(&c, "SELECT COUNT(*) FILTER (WHERE e.user_id = 1) * 100.0 / COUNT(*) FROM ev e JOIN u ON e.user_id = u.user_id").await;
-    assert_eq!(code, "42601", "{message}");
+    assert_eq!(
+        rows(&c, "SELECT COUNT(*) FILTER (WHERE e.user_id = 1) * 100.0 / COUNT(*) FROM ev e JOIN u ON e.user_id = u.user_id").await,
+        ["33.3333333333333333"]
+    );
     assert_eq!(
         rows(&c, "SELECT COUNT(*) FILTER (WHERE u.vip) FROM ev e JOIN u ON e.user_id = u.user_id").await,
         ["2"]

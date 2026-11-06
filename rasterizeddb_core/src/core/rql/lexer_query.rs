@@ -296,7 +296,7 @@ pub(crate) fn is_one_aggregate_call(expr: &str) -> bool {
 
 /// The `FILTER (WHERE …)` right after a call ending at `end`: its condition
 /// text and where the clause ends.
-fn trailing_filter(expr: &str, end: usize) -> Option<(&str, usize)> {
+pub(crate) fn trailing_filter(expr: &str, end: usize) -> Option<(&str, usize)> {
     let rest = &expr[end..];
     let after_space = rest.trim_start();
     let head = after_space.get(..6)?;
@@ -476,21 +476,12 @@ fn parse_select_items(
         // clause behind as `__agg_0 FILTER (WHERE …)`: neither a column nor a
         // value.
         let (item_owned, filter_text) = split_aggregate_filter(item);
-        // A cast around a filtered aggregate — `COUNT(*) FILTER (…)::bigint` —
-        // would make the item an expression *around* a call, which is answered
-        // by a different path that carries no filter. The cast is dropped: it
-        // is a no-op on `COUNT`, and on a `SUM` it only widens what the column
-        // already produces.
-        let item_owned = item_owned.map(|text| {
-            let (head, alias) = split_alias(&text);
-            match crate::core::rql::expr::trailing_cast(head) {
-                Some((call, _)) => match alias {
-                    Some(alias) => format!("{} AS {}", call, alias),
-                    None => call.to_string(),
-                },
-                None => text,
-            }
-        });
+        // A cast around a filtered aggregate — `COUNT(*) FILTER (…)::bigint`,
+        // `(AVG(x) FILTER (…))::float8` — is an expression around the call,
+        // and the computed path below applies it, the FILTER staying with its
+        // call. It was dropped as a no-op, which it is not once the argument
+        // is a numeric (`EXTRACT(EPOCH …)`): the item answered a numeric where
+        // the client asked for, and decodes, a double.
         // Only a FILTER on the item's one aggregate is the item's. Inside an
         // expression — `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)` — it
         // belongs to its own call, which the computed path reads; peeled here

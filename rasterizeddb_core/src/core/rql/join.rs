@@ -3254,6 +3254,7 @@ pub fn plan(
     // here — before the per-relation fetch is computed — means any column the
     // fold needs is added to `items` in time to be fetched.
     let mut expr_arguments: Vec<String> = Vec::new();
+    let mut deferred_computed: Vec<(usize, String)> = Vec::new();
     let mut aggregate = build_aggregate_stage(
         select_list,
         group_by_clause,
@@ -3265,6 +3266,7 @@ pub fn plan(
         &resolve,
         &schemas,
         &mut expr_arguments,
+        &mut deferred_computed,
     )?;
 
     // A select item this cannot produce is refused, not dropped.
@@ -3676,16 +3678,42 @@ pub fn plan(
             // report the same type, and the fold reads the argument's to decide.
             if let Some(plan) = aggregate.as_mut() {
                 for fold_item in plan.items.iter_mut() {
-                    if let crate::core::rql::aggregate::SelectItem::Aggregate {
-                        arg: Some(field),
-                        ..
-                    } = fold_item
-                    {
-                        if field.write_order as usize == *position {
-                            field.db_type = db_type.clone();
-                            field.size = db_type.get_size();
+                    match fold_item {
+                        crate::core::rql::aggregate::SelectItem::Aggregate { arg: Some(field), .. } => {
+                            if field.write_order as usize == *position {
+                                field.db_type = db_type.clone();
+                                field.size = db_type.get_size();
+                            }
                         }
+                        // A call inside an expression reads its computed
+                        // argument the same way.
+                        crate::core::rql::aggregate::SelectItem::Computed { inputs, .. } => {
+                            for field in inputs.iter_mut().filter_map(|i| i.arg.as_mut()) {
+                                if field.write_order as usize == *position {
+                                    field.db_type = db_type.clone();
+                                    field.size = db_type.get_size();
+                                }
+                            }
+                        }
+                        _ => {}
                     }
+                }
+            }
+        }
+        // An expression around calls whose arguments are computed, parsed
+        // again now that those arguments, and so the calls, have their types:
+        // `MAX(EXTRACT(EPOCH FROM (a - b)))::float8`, `(AVG(…) FILTER (…))::
+        // float8`. Parsed with the placeholder types, the cast and the result
+        // type were decided for an argument the expression does not have.
+        if let Some(plan) = aggregate.as_mut() {
+            for (index, text) in &deferred_computed {
+                if let Some(crate::core::rql::aggregate::SelectItem::Computed { expr, inputs, db_type, .. }) =
+                    plan.items.get_mut(*index)
+                {
+                    let synth = computed_synth_schema(inputs);
+                    let parsed = crate::core::rql::expr::parse(text, &synth)?;
+                    *db_type = crate::core::rql::expr::static_type(&parsed);
+                    *expr = parsed;
                 }
             }
         }
@@ -3764,6 +3792,46 @@ fn strip_keyword_prefix<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
 ///
 /// Qualified (`r.col`) or bare — a bare name is taken to belong to this
 /// relation, which over-fetches at worst.
+/// Projects an aggregate's computed argument as a column of the joined row,
+/// to be parsed once the fetch lists are settled (`expr_arguments`), and
+/// returns the field the aggregate reads it by. Its type is a placeholder
+/// until then.
+fn project_computed_argument(
+    arg_text: &str,
+    items: &mut Vec<JoinSelectItem>,
+    expr_arguments: &mut Vec<String>,
+) -> SchemaField {
+    let position = items.len();
+    items.push(JoinSelectItem {
+        rel: 0,
+        field: SchemaField::new(arg_text.to_string(), DbType::F64, DbType::F64.get_size(), 0, 0, false),
+        label: arg_text.to_string(),
+        scalar: None,
+        literal: None,
+        expr: None,
+        pending_expression: true,
+    });
+    expr_arguments.push(arg_text.to_string());
+    SchemaField::new(arg_text.to_string(), DbType::F64, DbType::F64.get_size(), 0, position as u64, false)
+}
+
+/// The synthetic `__agg_N` columns a computed item's expression reads, typed
+/// from its inputs as they are now.
+fn computed_synth_schema(inputs: &[crate::core::rql::aggregate::ComputedInput]) -> Vec<SchemaField> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(slot, input)| {
+            let ty = input.func.result_type(input.arg.as_ref().map(|f| &f.db_type));
+            let mut field = SchemaField::new(format!("__agg_{}", slot), ty.clone(), ty.get_size(), 0, slot as u64, false);
+            if ty == DbType::DECIMAL {
+                field.scale = input.func.synthetic_scale(input.arg.as_ref());
+            }
+            field
+        })
+        .collect()
+}
+
 /// The name an evaluator error says it could not resolve, when more than one
 /// relation of the statement has a column by that name.
 fn ambiguous_in(error: &str, schemas: &[SmallVec<[SchemaField; 20]>]) -> Option<String> {
@@ -4222,6 +4290,9 @@ fn build_aggregate_stage(
     // items were pushed. The caller parses them once the fetch lists are
     // settled and fills in both the item and the aggregate's argument type.
     expr_arguments: &mut Vec<String>,
+    // `(fold item, rewritten expression)` for each expression around calls
+    // with a computed argument, parsed again once the argument types are in.
+    deferred_computed: &mut Vec<(usize, String)>,
 ) -> Result<Option<crate::core::rql::aggregate::AggregatePlan>, String> {
     use crate::core::rql::aggregate::{AggFunc, SelectItem};
 
@@ -4386,6 +4457,28 @@ fn build_aggregate_stage(
         // carries no filter. Dropped for the same reason the single-relation
         // path drops it: it is a no-op on a count, and on an average it only
         // widens what the argument already produces.
+        // The peel below drops a cast around the call. That was harmless while
+        // every such cast widened what the argument already produced; it is
+        // not once `EXTRACT(EPOCH …)` is a numeric, `(AVG(…) FILTER (…))::
+        // float8` then answering a numeric a client decodes as a double. So
+        // only an item that is one call inside its parentheses is peeled; a
+        // cast, or anything else around the call, takes the wrapped path,
+        // whose calls keep their own FILTER and whose cast is applied.
+        let (rebuilt, filter_text) = match &rebuilt {
+            Some(text) => {
+                let (head, _) = split_expr_alias(text);
+                let mut call = head.trim();
+                while call.starts_with('(') && crate::core::rql::expr::matching_paren(call, 0) == Some(call.len() - 1) {
+                    call = call[1..call.len() - 1].trim();
+                }
+                if crate::core::rql::lexer_query::is_one_aggregate_call(call) {
+                    (rebuilt, filter_text)
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        };
         let rebuilt = rebuilt.map(|text| {
             let (head, alias) = split_expr_alias(&text);
             // sea-orm writes a filtered aggregate as
@@ -4420,13 +4513,6 @@ fn build_aggregate_stage(
         });
         let entry = rebuilt.as_deref().unwrap_or(entry);
         let (expr, alias) = split_expr_alias(entry);
-        // A FILTER inside an expression over aggregates belongs to one call,
-        // and this path's computed inputs carry none: the clause was peeled
-        // and applied to nothing, so `COUNT(*) FILTER (…) * 100.0 / COUNT(*)`
-        // answered 100. Refused until it is carried.
-        if filter_text.is_some() && !crate::core::rql::lexer_query::is_one_aggregate_call(expr) {
-            return Err("FILTER on an aggregate inside an expression is not supported in a join yet".to_string());
-        }
 
         // An expression *around* an aggregate — `COALESCE(SUM(x), 0)`,
         // `SUM(x) / COUNT(*)`. Each aggregate is pulled out into its own input
@@ -4441,7 +4527,12 @@ fn build_aggregate_stage(
             let mut rewritten = String::with_capacity(expr.len());
             let mut cursor = 0usize;
 
+            let mut computed_argument = false;
             for (start, end) in &calls {
+                // A call inside the previous call's FILTER clause.
+                if *start < cursor {
+                    continue;
+                }
                 rewritten.push_str(&expr[cursor..*start]);
                 let call = &expr[*start..*end];
                 let open = call.find('(').expect("a call has one");
@@ -4456,15 +4547,22 @@ fn build_aggregate_stage(
                         return Err(format!("{}(*) is not valid", name.to_uppercase()));
                     }
                     None
-                } else {
-                    // An aggregate wrapped in an expression addresses its
-                    // argument through a synthetic `__agg_N` slot whose type is
-                    // fixed when the slot is made, so an argument whose type is
-                    // only known later cannot be carried here yet. Refused, and
-                    // loudly: filling it in with a placeholder type produced a
-                    // silently NULL column instead of an error.
-                    let (rel, field) = resolve(arg_text)?;
+                } else if let Ok((rel, field)) = resolve(arg_text) {
                     Some(positional(rel, field, items))
+                } else {
+                    // Computed: projected as a column, as a lone aggregate's
+                    // argument is, and the whole expression parsed again once
+                    // its type is known (`deferred_computed`). Parsed only
+                    // with the placeholder, the slot's type was wrong and the
+                    // column came back NULL.
+                    computed_argument = true;
+                    Some(project_computed_argument(arg_text, items, expr_arguments))
+                };
+                // `COUNT(*) FILTER (WHERE …) * 100.0 / COUNT(*)`: the clause
+                // is this call's.
+                let (filter, end) = match crate::core::rql::lexer_query::trailing_filter(expr, *end) {
+                    Some((text, past)) => (Some(filter_over_join(text, items)?), past),
+                    None => (None, *end),
                 };
 
                 let slot = inputs.len();
@@ -4478,14 +4576,17 @@ fn build_aggregate_stage(
                     slot as u64,
                     false,
                 ));
-                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter: None });
+                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter });
                 rewritten.push_str(&synth_name);
-                cursor = *end;
+                cursor = end;
             }
             rewritten.push_str(&expr[cursor..]);
 
             let parsed = crate::core::rql::expr::parse(&rewritten, &synth_schema)?;
             let db_type = crate::core::rql::expr::static_type(&parsed);
+            if computed_argument {
+                deferred_computed.push((fold_items.len(), rewritten.clone()));
+            }
             fold_items.push(SelectItem::Computed {
                 expr: parsed,
                 inputs,
@@ -4523,32 +4624,7 @@ fn build_aggregate_stage(
                 // aggregate's result type depends on its argument's. Both are
                 // filled in afterwards, and `expr_arguments` is what says which
                 // item to fill.
-                let position = items.len();
-                items.push(JoinSelectItem {
-                    rel: 0,
-                    field: SchemaField::new(
-                        arg_text.to_string(),
-                        DbType::F64,
-                        DbType::F64.get_size(),
-                        0,
-                        0,
-                        false,
-                    ),
-                    label: arg_text.to_string(),
-                    scalar: None,
-                    literal: None,
-                    expr: None,
-                    pending_expression: true,
-                });
-                expr_arguments.push(arg_text.to_string());
-                Some(SchemaField::new(
-                    arg_text.to_string(),
-                    DbType::F64,
-                    DbType::F64.get_size(),
-                    0,
-                    position as u64,
-                    false,
-                ))
+                Some(project_computed_argument(arg_text, items, expr_arguments))
             };
 
             let filter = match &filter_text {

@@ -72,15 +72,12 @@ async fn a_cast_with_an_alias_survives_an_internal_space() {
 /// An aggregate over an expression argument — where it works, and where it is
 /// still refused *loudly*.
 ///
-/// It works on a single relation because the schema is in hand when the
-/// aggregate is parsed, so the argument's type is known immediately — also
-/// inside an expression (a trailing cast is one), whose computed inputs carry
-/// the argument and its type (`ComputedInput::arg_expr`). A join's
-/// wrapped-aggregate path addresses its argument through a synthetic slot whose
-/// type is fixed when the slot is made. Filling that slot with a placeholder
-/// type made the column come back **NULL** instead of erroring — strictly
-/// worse — so a join stays refused until the type can be carried properly, and
-/// this pins that it fails rather than quietly return nothing.
+/// On a single relation the schema is in hand when the aggregate is parsed, so
+/// the argument's type is known at once, inside an expression too (a trailing
+/// cast is one). A join projects the argument as a column whose type is known
+/// only once the fetch lists are settled; the expression around the call is
+/// parsed again then. With the placeholder type alone the column came back
+/// **NULL**, so both are pinned to the value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expression_aggregate_argument() {
     let (_server, mut conn) = seeded().await;
@@ -104,19 +101,18 @@ async fn an_expression_aggregate_argument() {
         .expect("n");
     assert_eq!(got, 32);
 
-    // Still refused, and must stay loud rather than becoming a NULL column.
-    for (label, sql) in [
-        (
-            "a join addresses arguments positionally",
-            "SELECT c.tid AS tid, SUM(c.column_order + 1)::bigint AS n FROM utc c \
-             JOIN ut t ON t.id = c.tid GROUP BY c.tid",
-        ),
-    ] {
-        let outcome = sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut conn).await;
-        let error = outcome.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(
-            error.contains("not found"),
-            "{label}: must fail loudly rather than return a NULL column: {error}"
-        );
-    }
+    // Over a join too: the computed argument is projected as a column, and the
+    // expression around the call is parsed again once its type is known. With
+    // the placeholder type alone the slot came back a NULL column, which is
+    // why this was refused; it must be the value.
+    let got: i64 = sqlx::query(AssertSqlSafe(
+        "SELECT c.tid AS tid, SUM(c.column_order + 1)::bigint AS n FROM utc c \
+         JOIN ut t ON t.id = c.tid GROUP BY c.tid",
+    ))
+    .fetch_one(&mut conn)
+    .await
+    .expect("a cast around an expression argument over a join")
+    .try_get("n")
+    .expect("n");
+    assert_eq!(got, 32);
 }

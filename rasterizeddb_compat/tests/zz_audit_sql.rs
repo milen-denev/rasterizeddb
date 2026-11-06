@@ -425,7 +425,7 @@ async fn audit_select_list_and_clauses() {
     probe!(rep, p, "least", "SELECT least(1, 5, 3) FROM p WHERE id = 1", "1");
     probe!(rep, p, "greatest NULL", "SELECT greatest(b, 5) FROM p WHERE id = 2", "5");
     probe!(rep, p, "EXTRACT YEAR", "SELECT EXTRACT(YEAR FROM ts) FROM p WHERE id = 1", "2024");
-    probe!(rep, p, "EXTRACT EPOCH", "SELECT EXTRACT(EPOCH FROM ts) FROM p WHERE id = 1", "1704103200");
+    probe!(rep, p, "EXTRACT EPOCH", "SELECT EXTRACT(EPOCH FROM ts) FROM p WHERE id = 1", "1704103200.000000");
     probe!(rep, p, "ts + interval", "SELECT ts + INTERVAL '1 day' FROM p WHERE id = 1", "2024-01-02 10:00:00");
     probe!(rep, p, "ts - ts", "SELECT ts - '2024-01-01 00:00:00' FROM p WHERE id = 1", "10:00:00");
     probe!(rep, p, "date_trunc", "SELECT date_trunc('day', ts) FROM p WHERE id = 1", "2024-01-01 00:00:00");

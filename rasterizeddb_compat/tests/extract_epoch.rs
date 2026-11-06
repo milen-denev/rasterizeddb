@@ -28,7 +28,7 @@ async fn epoch_of_an_interval_is_its_seconds() {
     let (_server, mut conn) = seeded().await;
 
     let rows = sqlx::query(AssertSqlSafe(
-        "SELECT id, EXTRACT(EPOCH FROM (updated_at - created_at)) AS seconds \
+        "SELECT id, EXTRACT(EPOCH FROM (updated_at - created_at))::float8 AS seconds \
          FROM ev ORDER BY id",
     ))
     .fetch_all(&mut conn)
@@ -47,7 +47,7 @@ async fn epoch_of_an_interval_is_its_seconds() {
 async fn epoch_of_a_timestamp_is_seconds_since_1970() {
     let (_server, mut conn) = seeded().await;
     let seconds: f64 = sqlx::query(AssertSqlSafe(
-        "SELECT EXTRACT(EPOCH FROM created_at) AS s FROM ev WHERE id = 1",
+        "SELECT EXTRACT(EPOCH FROM created_at)::float8 AS s FROM ev WHERE id = 1",
     ))
     .fetch_one(&mut conn)
     .await
@@ -56,6 +56,17 @@ async fn epoch_of_a_timestamp_is_seconds_since_1970() {
     .expect("s");
     // 2026-01-01T00:00:00Z.
     assert_eq!(seconds, 1_767_225_600.0);
+    // A `numeric` at six places, as PostgreSQL 14 and later return it (a
+    // client decoding a double casts it, as above, or uses `date_part`).
+    let text: String = sqlx::query(AssertSqlSafe(
+        "SELECT EXTRACT(EPOCH FROM created_at)::text AS s FROM ev WHERE id = 1",
+    ))
+    .fetch_one(&mut conn)
+    .await
+    .expect("EXTRACT(EPOCH) as text")
+    .try_get("s")
+    .expect("s");
+    assert_eq!(text, "1767225600.000000");
 }
 
 /// The calendar fields are answered (a `numeric` from `EXTRACT`, a `double

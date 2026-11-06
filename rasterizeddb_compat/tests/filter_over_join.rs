@@ -163,7 +163,7 @@ async fn an_aggregate_over_an_expression_argument() {
     let (_server, mut conn) = seeded().await;
     let rows = sqlx::query(AssertSqlSafe(
         "SELECT t.pool_id AS pool_id, \
-                MAX(EXTRACT(EPOCH FROM (t.closed_at - t.assigned_at))) AS longest \
+                MAX(EXTRACT(EPOCH FROM (t.closed_at - t.assigned_at)))::float8 AS longest \
          FROM task t JOIN pool p ON p.id = t.pool_id \
          GROUP BY t.pool_id ORDER BY t.pool_id",
     ))

@@ -398,11 +398,6 @@ pub enum TextFunc {
     Upper,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
-    /// `EXTRACT(EPOCH FROM x)` — a field of an instant or a span.
-    ///
-    /// The field is carried as the first argument, a string literal, because
-    /// `Expr::Call` has nowhere else to put it.
-    Extract,
     /// `to_tsvector(config, document)` — a document reduced to its lexemes.
     ToTsVector,
     /// `to_tsquery(config, query)` — a boolean query over lexemes.
@@ -429,9 +424,9 @@ pub enum TextFunc {
     /// float alone becomes `double precision` rounded half to even (`rint`).
     /// `places` is a constant, held as an `I32` literal (or `Expr::Null`).
     Round,
-    /// `EXTRACT(field FROM x)` for a field other than `EPOCH`: a `numeric`,
-    /// as PostgreSQL 14 and later return it, at the field's display scale
-    /// (six places for `SECOND`, three for `MILLISECONDS`, none otherwise).
+    /// `EXTRACT(field FROM x)`: a `numeric`, as PostgreSQL 14 and later
+    /// return it, at the field's display scale (six places for `SECOND` and
+    /// `EPOCH`, three for `MILLISECONDS`, none otherwise).
     /// The field is a canonical name ([`date_field`]) in an argument literal.
     ExtractField,
     /// `date_part('field', x)`: the same fields as a `double precision`.
@@ -1231,26 +1226,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     })?;
                 let field = inner[..at].trim().trim_matches('\'').to_ascii_uppercase();
                 let source = parse(inner[at + "FROM".len()..].trim(), schema)?;
-                // `EPOCH` keeps the `double precision` this engine has always
-                // answered it with; the calendar fields are PostgreSQL's
-                // `numeric` (`TextFunc::ExtractField`).
-                if field != "EPOCH" {
-                    let canonical = date_field(&field)?;
-                    date_field_applies(canonical, &static_type(&source), true)?;
-                    return Ok(Expr::Call(
-                        TextFunc::ExtractField,
-                        vec![Expr::Literal { bytes: canonical.as_bytes().to_vec(), db_type: DbType::STRING }, source],
-                    ));
-                }
+                // A `numeric`, as PostgreSQL 14 and later return every field,
+                // `EPOCH` included (six places); `date_part` is the `double
+                // precision` spelling. `EPOCH` answered a double here, which
+                // printed 86400 where PostgreSQL prints 86400.000000.
+                let canonical = date_field(&field)?;
+                date_field_applies(canonical, &static_type(&source), true)?;
                 return Ok(Expr::Call(
-                    TextFunc::Extract,
-                    vec![
-                        Expr::Literal {
-                            bytes: field.into_bytes(),
-                            db_type: DbType::STRING,
-                        },
-                        source,
-                    ],
+                    TextFunc::ExtractField,
+                    vec![Expr::Literal { bytes: canonical.as_bytes().to_vec(), db_type: DbType::STRING }, source],
                 ));
             }
 
@@ -2473,7 +2457,6 @@ pub fn static_type(expr: &Expr) -> DbType {
         // `double precision`, which is what PostgreSQL's own `EXTRACT` returned
         // before it moved to `numeric`, and what every driver decodes without a
         // decimal type.
-        Expr::Call(TextFunc::Extract, _) => DbType::F64,
         Expr::Call(TextFunc::ExtractField, _) => DbType::DECIMAL,
         Expr::Call(TextFunc::DatePart, _) => DbType::F64,
         Expr::Call(TextFunc::UuidExtractTimestamp, _) => DbType::DATETIME,
@@ -2621,7 +2604,10 @@ pub fn display_scale(expr: &Expr) -> Option<u32> {
         }
         Expr::Arith(..) if integer(&static_type(expr)) => Some(0),
         Expr::Call(TextFunc::Abs, args) => args.first().and_then(display_scale),
-        Expr::Call(TextFunc::ExtractField, args) => args.first().and_then(field_literal).map(field_scale),
+        // A date's epoch has no fraction, and PostgreSQL shows it with none.
+        Expr::Call(TextFunc::ExtractField, args) => args.first().and_then(field_literal).map(|field| {
+            if field == "EPOCH" && args.get(1).map(static_type) == Some(DbType::DATE) { 0 } else { field_scale(field) }
+        }),
         Expr::Call(TextFunc::Round, args) if static_type(expr) == DbType::DECIMAL => match args.get(1) {
             None => Some(0),
             Some(places) => round_places(places).map(|p| p.max(0) as u32).filter(|s| *s <= DECIMAL_SCALE),
@@ -3125,48 +3111,6 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         // A timestamp floored to a unit, which is what a `GROUP BY` over time
         // buckets on. Microseconds since the epoch, so truncation is integer
         // arithmetic — except months and years, whose length varies.
-        TextFunc::Extract => {
-            let Value::Data { bytes, db_type } = &args[1] else {
-                return Ok(Value::Null);
-            };
-            // An instant and a span are stored differently: a timestamp is
-            // eight bytes of little-endian microseconds, while an interval is
-            // PostgreSQL's own sixteen-byte wire layout, big-endian, carrying
-            // months and days separately because neither is a fixed number of
-            // microseconds. Reading the second as the first is what made
-            // `EXTRACT(EPOCH FROM (a - b))` come back NULL.
-            let seconds = match db_type {
-                DbType::INTERVAL => {
-                    let Some(span) = crate::core::pg_types::decode_interval(bytes) else {
-                        return Ok(Value::Null);
-                    };
-                    // PostgreSQL's `EPOCH` of an interval counts a month as 30
-                    // days, which is the one place it does treat a month as
-                    // fixed — the result is a duration, not a calendar move.
-                    span.micros as f64 / 1_000_000.0
-                        + span.days as f64 * 86_400.0
-                        + span.months as f64 * 30.0 * 86_400.0
-                }
-                // A date is its midnight, as PostgreSQL casts it. Its four
-                // bytes failed the width check below and came back NULL.
-                DbType::DATE => match instant_of(db_type, bytes) {
-                    Some(us) => us as f64 / 1_000_000.0,
-                    None => return Ok(Value::Null),
-                },
-                _ => {
-                    if bytes.len() != 8 {
-                        return Ok(Value::Null);
-                    }
-                    let mut raw = [0u8; 8];
-                    raw.copy_from_slice(bytes);
-                    i64::from_le_bytes(raw) as f64 / 1_000_000.0
-                }
-            };
-            Value::Data {
-                bytes: seconds.to_le_bytes().to_vec(),
-                db_type: DbType::F64,
-            }
-        }
         TextFunc::DateTrunc => {
             let unit = as_text(&args[0]).trim().to_ascii_lowercase();
             let Value::Data { bytes, db_type } = &args[1] else {
@@ -5939,6 +5883,7 @@ fn date_field_value(field: &str, value: &Value) -> Result<Option<crate::core::rq
         "DECADE" => PgNum::int(y as i128 / 10),
         "CENTURY" => PgNum::int((y as i128 + 99) / 100),
         "MILLENNIUM" => PgNum::int((y as i128 + 999) / 1000),
+        "EPOCH" if *db_type == DbType::DATE => PgNum::int((us / 1_000_000) as i128),
         "EPOCH" => at(us as i128)?,
         other => return Err(format!("unit \"{}\" not supported", other.to_lowercase())),
     }))
