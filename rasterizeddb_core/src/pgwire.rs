@@ -4927,6 +4927,9 @@ where
     } else if message.starts_with("missing FROM-clause entry for table") {
         // A qualifier naming no relation of the statement.
         "42P01"
+    } else if message.starts_with("column reference \"") && message.ends_with("\" is ambiguous") {
+        // A bare name more than one relation has.
+        "42702"
     } else if (message.starts_with("function ") && message.ends_with(") does not exist"))
         || (message.starts_with("operator does not exist: ") && message.contains("character"))
     {
@@ -7479,6 +7482,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // otherwise steer.
     if has("operator does not exist") || (has("function ") && has(") does not exist")) {
         return "42883";
+    }
+    // `ambiguous_column`: a bare name more than one relation has.
+    if has("column reference \"") && has("\" is ambiguous") {
+        return "42702";
     }
     // `invalid_column_reference`: an ON CONFLICT target no unique key
     // matches (a partitioned table's that leaves out a key column, S18).

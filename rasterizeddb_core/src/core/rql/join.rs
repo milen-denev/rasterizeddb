@@ -3621,7 +3621,15 @@ pub fn plan(
     let mut order_exprs: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
     let mut order_layout: Option<CombinedLayout> = None;
     if !order_expr_terms.is_empty() || !expression_items.is_empty() {
-        let layout = combined_layout(&out_relations);
+        let mut layout = combined_layout(&out_relations);
+        // A column only one relation has may be written bare in an
+        // expression, as PostgreSQL reads it: `CASE WHEN revenue > 5 …` over
+        // `ev JOIN u`. The layout names every column `<label>__<column>`, so
+        // a bare name found nothing ("'revenue' is neither a column nor a
+        // value"). Each such column, and its NULL companion, is also reachable
+        // by its own name, at the same write order. A name two relations have
+        // gets no alias and stays unresolved, as PostgreSQL's 42702.
+        layout.schema.extend(bare_aliases(&out_relations, &schemas, &layout));
 
         // A select-list expression, filled into the placeholder holding its
         // position. Paired in order rather than by a recorded index: both lists
@@ -3643,13 +3651,16 @@ pub fn plan(
             // grammar does not read; it is tried only once that has failed.
             let parsed = crate::core::rql::expr::parse(&rewritten, &layout.schema)
                 .or_else(|e| comparison_value(&rewritten, &layout.schema).ok_or(e))
-                .map_err(|e| {
-                    format!(
+                .map_err(|e| match ambiguous_in(&e, &schemas) {
+                    // A bare name more than one relation has: PostgreSQL's
+                    // 42702, not an unknown name.
+                    Some(name) => format!("column reference \"{}\" is ambiguous", name),
+                    None => format!(
                         "the SELECT list item '{}' could not be read as an expression \
                          over this join: {}",
                         text.trim(),
                         e
-                    )
+                    ),
                 })?;
             // The declared type comes from the expression itself, so the row
             // description and the bytes that follow it agree.
@@ -3753,6 +3764,50 @@ fn strip_keyword_prefix<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
 ///
 /// Qualified (`r.col`) or bare — a bare name is taken to belong to this
 /// relation, which over-fetches at worst.
+/// The name an evaluator error says it could not resolve, when more than one
+/// relation of the statement has a column by that name.
+fn ambiguous_in(error: &str, schemas: &[SmallVec<[SchemaField; 20]>]) -> Option<String> {
+    let rest = error.strip_prefix('\'')?;
+    let name = &rest[..rest.find("' is neither a column nor a value")?];
+    let holders = schemas
+        .iter()
+        .filter(|s| s.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name)))
+        .count();
+    (holders > 1).then(|| name.to_string())
+}
+
+/// The fields by which an unambiguous column, and its NULL companion, can be
+/// named bare in an expression over the combined row: copies of the layout's
+/// fields under the relation's own column names. A column any other relation
+/// of the statement also has (fetched or not) gets none.
+fn bare_aliases(
+    relations: &[Relation],
+    schemas: &[SmallVec<[SchemaField; 20]>],
+    layout: &CombinedLayout,
+) -> Vec<SchemaField> {
+    let prefix = crate::core::rql::nullable::NULL_FLAG_PREFIX;
+    let mut out: Vec<SchemaField> = Vec::new();
+    for (i, relation) in relations.iter().enumerate() {
+        for (k, field) in relation.fetch_columns.iter().enumerate() {
+            let base = field.name.strip_prefix(prefix).filter(|_| crate::core::rql::nullable::is_hidden(&field.name)).unwrap_or(&field.name);
+            let elsewhere = schemas
+                .iter()
+                .enumerate()
+                .any(|(j, s)| j != i && s.iter().any(|g| !g.is_deleted && g.name.eq_ignore_ascii_case(base)));
+            if elsewhere || out.iter().any(|o| o.name.eq_ignore_ascii_case(&field.name)) {
+                continue;
+            }
+            let Some(write_order) = layout.columns.get(i).and_then(|c| c.get(k)) else { continue };
+            if let Some(synthetic) = layout.schema.iter().find(|f| f.write_order == *write_order) {
+                let mut alias = synthetic.clone();
+                alias.name = field.name.clone();
+                out.push(alias);
+            }
+        }
+    }
+    out
+}
+
 fn term_names_column(term: &str, label: &str, table: &str, column: &str) -> bool {
     let upper = term.to_ascii_uppercase();
     let col = column.to_ascii_uppercase();
