@@ -113,8 +113,14 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("table_name", STRING),
             ("column_name", STRING),
             ("ordinal_position", I64),
-            ("data_type", STRING),
             ("is_nullable", STRING),
+            ("data_type", STRING),
+            ("character_maximum_length", I64),
+            ("numeric_precision", I64),
+            ("numeric_precision_radix", I64),
+            ("numeric_scale", I64),
+            ("datetime_precision", I64),
+            ("udt_name", STRING),
         ],
         "pg_stat_user_tables" => &[
             ("relid", I64),
@@ -706,28 +712,141 @@ fn batch_inserts(inserts: &[String], per_statement: usize) -> Vec<String> {
     out
 }
 
-/// PostgreSQL's `information_schema` spelling of a column's type.
-fn sql_type_name(db_type: &crate::core::db_type::DbType) -> &'static str {
+/// One column as `information_schema.columns` describes it, PostgreSQL 17's
+/// values: the standard's type name, the type's own (`udt_name`), and the
+/// length, precision and scale the column was declared with.
+#[derive(Debug, PartialEq, Eq)]
+struct ColumnInfo {
+    data_type: &'static str,
+    udt_name: &'static str,
+    character_maximum_length: Option<u32>,
+    numeric_precision: Option<u32>,
+    numeric_precision_radix: Option<u32>,
+    numeric_scale: Option<u32>,
+    datetime_precision: Option<u32>,
+}
+
+/// How `information_schema.columns` describes `field` of `schema`.
+///
+/// The type is the one the wire advertises for the column
+/// (`pgwire::reported_type_of`): a JSON column is `jsonb`, a `character(n)`
+/// one `character`, a `timestamp` one without time zone. Every type the
+/// engine stores is named; only an unknown one is `text`, as the wire says.
+/// Everything was `text` that a short list did not name, `date` and
+/// `character varying` among them, and an ORM introspecting the table read
+/// those columns as text.
+///
+/// What the engine does not record is `NULL`, never a guess: a bit string's
+/// length, and an array's element type (`_text`, as the wire's `text[]`; the
+/// declared element is not kept). A `json` column reads `jsonb`, as the
+/// engine stores and advertises both alike.
+fn column_info(field: &crate::core::row::schema::SchemaField, schema: &crate::core::row::schema::TableSchema) -> ColumnInfo {
     use crate::core::db_type::DbType;
-    match db_type {
-        DbType::BOOL => "boolean",
-        DbType::I8 | DbType::I16 => "smallint",
-        DbType::I32 => "integer",
-        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => "bigint",
-        // Wider than `bigint`; advertised as `numeric` on the wire too.
-        DbType::U64 | DbType::I128 | DbType::U128 => "numeric",
-        DbType::F32 => "real",
-        DbType::F64 => "double precision",
-        DbType::DATETIME => "timestamp with time zone",
-        DbType::TIMESTAMP => "timestamp without time zone",
-        DbType::UUID => "uuid",
-        DbType::INET => "inet",
-        DbType::DECIMAL => "numeric",
-        DbType::BYTEA => "bytea",
-        DbType::ARRAY => "ARRAY",
-        DbType::JSON | DbType::JSONB => "jsonb",
-        _ => "text",
+    use crate::core::rql::type_modifier::TextTypmod;
+    let typmod = field.text_typmod();
+    let precision = |default: u32| match typmod {
+        Some(TextTypmod::Precision(p)) => Some(p),
+        _ => Some(default),
+    };
+    let info = |data_type, udt_name| ColumnInfo {
+        data_type,
+        udt_name,
+        character_maximum_length: None,
+        numeric_precision: None,
+        numeric_precision_radix: None,
+        numeric_scale: None,
+        datetime_precision: None,
+    };
+    let binary = |data_type, udt_name, bits| ColumnInfo {
+        numeric_precision: Some(bits),
+        numeric_precision_radix: Some(2),
+        ..info(data_type, udt_name)
+    };
+    if crate::core::rql::json_map::shadow_for(&field.name, &schema.json_columns).is_some() {
+        return info("jsonb", "jsonb");
     }
+    match field.literal_type() {
+        DbType::BOOL => info("boolean", "bool"),
+        DbType::I8 | DbType::I16 => ColumnInfo { numeric_scale: Some(0), ..binary("smallint", "int2", 16) },
+        DbType::I32 => ColumnInfo { numeric_scale: Some(0), ..binary("integer", "int4", 32) },
+        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => {
+            ColumnInfo { numeric_scale: Some(0), ..binary("bigint", "int8", 64) }
+        }
+        DbType::F32 => binary("real", "float4", 24),
+        DbType::F64 => binary("double precision", "float8", 53),
+        // Wider than `bigint`; advertised as `numeric` on the wire too.
+        DbType::U64 | DbType::I128 | DbType::U128 => ColumnInfo {
+            numeric_precision_radix: Some(10),
+            numeric_scale: Some(0),
+            ..info("numeric", "numeric")
+        },
+        DbType::DECIMAL => {
+            // `NUMERIC(p, s)` as declared; a bare `NUMERIC` has neither.
+            let declared = schema
+                .type_modifiers
+                .iter()
+                .find(|m| !m.is_deleted && m.column == field.name);
+            ColumnInfo {
+                numeric_precision: declared.map(|m| u32::from(m.precision)),
+                numeric_precision_radix: Some(10),
+                numeric_scale: declared.map(|m| u32::from(m.scale)),
+                ..info("numeric", "numeric")
+            }
+        }
+        DbType::STRING | DbType::BPCHAR(_) => match typmod {
+            Some(TextTypmod::Varchar(n)) => ColumnInfo {
+                character_maximum_length: (n > 0).then_some(n),
+                ..info("character varying", "varchar")
+            },
+            Some(TextTypmod::Bpchar(n)) => ColumnInfo {
+                character_maximum_length: (n > 0).then_some(n),
+                ..info("character", "bpchar")
+            },
+            _ => match field.literal_type() {
+                DbType::BPCHAR(n) => ColumnInfo {
+                    character_maximum_length: (n > 0).then_some(u32::from(n)),
+                    ..info("character", "bpchar")
+                },
+                _ => info("text", "text"),
+            },
+        },
+        DbType::DATETIME => ColumnInfo { datetime_precision: precision(6), ..info("timestamp with time zone", "timestamptz") },
+        DbType::TIMESTAMP => {
+            ColumnInfo { datetime_precision: precision(6), ..info("timestamp without time zone", "timestamp") }
+        }
+        DbType::DATE => ColumnInfo { datetime_precision: Some(0), ..info("date", "date") },
+        DbType::TIME => ColumnInfo { datetime_precision: precision(6), ..info("time without time zone", "time") },
+        DbType::TIMETZ => ColumnInfo { datetime_precision: precision(6), ..info("time with time zone", "timetz") },
+        DbType::INTERVAL => ColumnInfo { datetime_precision: precision(6), ..info("interval", "interval") },
+        DbType::UUID => info("uuid", "uuid"),
+        DbType::INET => info("inet", "inet"),
+        DbType::BYTEA => info("bytea", "bytea"),
+        DbType::JSON | DbType::JSONB => info("jsonb", "jsonb"),
+        DbType::ARRAY => info("ARRAY", "_text"),
+        DbType::MACADDR => info("macaddr", "macaddr"),
+        DbType::MACADDR8 => info("macaddr8", "macaddr8"),
+        DbType::BIT => info("bit", "bit"),
+        DbType::VARBIT => info("bit varying", "varbit"),
+        DbType::POINT => info("point", "point"),
+        DbType::LINE => info("line", "line"),
+        DbType::LSEG => info("lseg", "lseg"),
+        DbType::BOX => info("box", "box"),
+        DbType::PATH => info("path", "path"),
+        DbType::POLYGON => info("polygon", "polygon"),
+        DbType::CIRCLE => info("circle", "circle"),
+        DbType::INT4RANGE => info("int4range", "int4range"),
+        DbType::INT8RANGE => info("int8range", "int8range"),
+        DbType::NUMRANGE => info("numrange", "numrange"),
+        DbType::TSRANGE => info("tsrange", "tsrange"),
+        DbType::TSTZRANGE => info("tstzrange", "tstzrange"),
+        DbType::DATERANGE => info("daterange", "daterange"),
+        _ => info("text", "text"),
+    }
+}
+
+/// `value` as a literal: the number, or `NULL`.
+fn number_or_null(value: Option<u32>) -> String {
+    value.map_or_else(|| "NULL".to_string(), |v| v.to_string())
 }
 
 /// A temporary table name for one view, unique to this statement.
@@ -828,34 +947,39 @@ async fn build(
                                 &crate::core::rql::nullable::flag_column_name(&field.name),
                             )
                     });
+                    let info = column_info(field, table.schema());
                     rows.push(format!(
                         "INSERT INTO {} (table_catalog, table_schema, table_name, column_name, \
-                         ordinal_position, data_type, is_nullable) \
-                         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')",
+                         ordinal_position, is_nullable, data_type, character_maximum_length, \
+                         numeric_precision, numeric_precision_radix, numeric_scale, \
+                         datetime_precision, udt_name) \
+                         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}', {}, {}, {}, {}, {}, '{}')",
                         temp,
-                        SCHEMA,
+                        // The catalog is the database, as `current_database()`
+                        // names it; it said the schema.
+                        escape(&database.name),
                         SCHEMA,
                         escape(name),
                         escape(&field.name),
                         position + 1,
-                        // `character`, as PostgreSQL names `character(n)`
-                        // (`type_modifier::TextTypmod`); the wire says
-                        // `bpchar` for it too.
-                        if matches!(field.text_typmod(), Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(_))) {
-                            "character"
-                        } else {
-                            // `literal_type`: a `timestamp` column is one.
-                            sql_type_name(&field.literal_type())
-                        },
-                        if nullable { "YES" } else { "NO" }
+                        if nullable { "YES" } else { "NO" },
+                        info.data_type,
+                        number_or_null(info.character_maximum_length),
+                        number_or_null(info.numeric_precision),
+                        number_or_null(info.numeric_precision_radix),
+                        number_or_null(info.numeric_scale),
+                        number_or_null(info.datetime_precision),
+                        info.udt_name,
                     ));
                 }
             }
             (
                 format!(
                     "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, table_name TEXT, \
-                     column_name TEXT, ordinal_position BIGINT, data_type TEXT, \
-                     is_nullable TEXT)",
+                     column_name TEXT, ordinal_position BIGINT, is_nullable TEXT, data_type TEXT, \
+                     character_maximum_length BIGINT, numeric_precision BIGINT, \
+                     numeric_precision_radix BIGINT, numeric_scale BIGINT, \
+                     datetime_precision BIGINT, udt_name TEXT)",
                     temp
                 ),
                 rows,
@@ -875,7 +999,8 @@ async fn build(
                     "INSERT INTO {} (table_catalog, table_schema, table_name, table_type) \
                      VALUES ('{}', '{}', '{}', 'BASE TABLE')",
                     temp,
-                    SCHEMA,
+                    // The database, as in `columns`.
+                    escape(&database.name),
                     SCHEMA,
                     escape(name)
                 ));
