@@ -10262,6 +10262,46 @@ fn create_table_already_satisfied(
     exists
 }
 
+/// `CREATE TABLE … AS` (`rql::ctas`). The name is checked first, as
+/// PostgreSQL does: an existing one is refused, or with `IF NOT EXISTS` is
+/// success with nothing run. Then `cte::create_table_as` runs the query and
+/// creates and fills the table by statements of its own, which are what
+/// replication records; this statement's text is not.
+///
+/// Answers `[0]` (tagged `CREATE TABLE AS`) when nothing was written, or the
+/// rows written (tagged `SELECT n`).
+async fn execute_create_table_as(
+    database: &Arc<Database>,
+    statement: crate::core::rql::ctas::CreateTableAs,
+    tx: TxId,
+) -> Vec<u8> {
+    // The name as a plain CREATE resolves it.
+    let probe = QueryPurpose::CreateTable(format!("CREATE TABLE {} (x INT)", statement.name));
+    let table_name = match crate::core::rql::lexer_ct::create_table_with_partition(&probe) {
+        (Some(ct), _, _) => ct.table_name,
+        (_, _, Some(reason)) => return ddl_error(&reason),
+        _ => return ddl_error(&format!("cannot parse the table name {}", statement.name)),
+    };
+    if let Some(reason) = crate::core::rql::cte::reserved_name_refusal(&table_name) {
+        return ddl_error(&reason);
+    }
+    if database.has_table(&table_name) || database.is_partitioned(&table_name) {
+        if statement.if_not_exists {
+            info!("Table '{}' already exists; IF NOT EXISTS makes that success", table_name);
+            return vec![0u8];
+        }
+        return ddl_error(&format!("relation \"{}\" already exists", table_name));
+    }
+    match Box::pin(crate::core::rql::cte::create_table_as(&statement, database, tx)).await {
+        Ok(Some(rows)) => ddl_ok(rows),
+        Ok(None) => vec![0u8],
+        Err(e) => {
+            error!("CREATE TABLE … AS failed: {}", e);
+            ddl_error(&e)
+        }
+    }
+}
+
 /// `CREATE TABLE … PARTITION BY HASH`. The database makes every check that
 /// depends on it (nullability, uniqueness, foreign keys, the cap, the
 /// storage); replicated as the statement text, like a plain CREATE, so a
@@ -18883,6 +18923,11 @@ pub(crate) async fn execute_with_need(
             };
         }
         QueryPurpose::CreateTable(_) => {
+            if let QueryPurpose::CreateTable(sql) = &query {
+                if let Some(statement) = crate::core::rql::ctas::parse(sql) {
+                    return Box::pin(execute_create_table_as(&database, statement, tx)).await;
+                }
+            }
             // Handle create table
             let (parsed, partition, rejection) =
                 crate::core::rql::lexer_ct::create_table_with_partition(&query);

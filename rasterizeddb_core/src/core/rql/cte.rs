@@ -1002,8 +1002,20 @@ pub fn has_with_clause(sql: &str) -> bool {
 /// returned 2 rows". Moving the clause to the front hands it to the
 /// materialisation every other CTE goes through, `ON CONFLICT` and
 /// `RETURNING` included, since they stay where they were.
+///
+/// `CREATE TABLE t AS WITH a AS (…) SELECT … [WITH NO DATA]` is moved the
+/// same way, for the same reason: left in place its CTE body reached the
+/// statement's scalar-subquery pass and was refused as a subquery returning
+/// more than one row.
 pub fn hoist_insert_with(sql: &str) -> Option<String> {
-    let (head, source) = crate::core::rql::lexer_ir::insert_select_source(sql)?;
+    let (head, source, tail) = match crate::core::rql::lexer_ir::insert_select_source(sql) {
+        Some((head, source)) => (head, source, ""),
+        None => {
+            let ctas = crate::core::rql::ctas::parse(sql)?;
+            let span = ctas.query_span;
+            (&sql[..span.start], &sql[span.clone()], &sql[span.end..])
+        }
+    };
     if !starts_with_with(source) {
         return None;
     }
@@ -1012,7 +1024,7 @@ pub fn hoist_insert_with(sql: &str) -> Option<String> {
         .iter()
         .map(|def| format!("{} AS ({})", def.name, def.body))
         .collect();
-    Some(format!("WITH {} {} {}", clauses.join(", "), head, rest))
+    Some(format!("WITH {} {} {}{}", clauses.join(", "), head.trim_end(), rest, tail))
 }
 
 pub async fn materialize(
@@ -1679,6 +1691,163 @@ async fn build_derived(
     Ok(temp)
 }
 
+/// Rows per `INSERT` a `CREATE TABLE … AS` fills its table with: a statement
+/// per this many rows rather than one holding every row's text.
+const TABLE_AS_FILL_ROWS: usize = 512;
+
+/// `CREATE TABLE … AS` (`ctas`): runs the query once in `tx`, creates the
+/// table typed as a CTE's relation over the same query would be (the query's
+/// description, so a client reading the new table sees the types it was
+/// told), and fills it by `INSERT`s of its own. `Ok(Some(rows))` written, or
+/// `Ok(None)` for `WITH NO DATA`. The caller has checked the name is free.
+///
+/// DDL is not transactional here: a fill that fails drops the table it
+/// created, so a failed statement leaves nothing behind, as in PostgreSQL.
+pub(crate) async fn create_table_as(
+    statement: &crate::core::rql::ctas::CreateTableAs,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<Option<u64>, String> {
+    // The rewrite a top-level SELECT gets in `pgwire` (which saw this
+    // statement as a CREATE), so the query runs as it would on its own.
+    // `TABLE t` is `SELECT * FROM t`.
+    let table_form = crate::core::rql::ctas::table_as_select(&statement.query);
+    let query = table_form.as_deref().unwrap_or(&statement.query);
+    let distinct_on = crate::core::rql::distinct_on::rewrite_statement(query);
+    let query = distinct_on.as_deref().unwrap_or(query);
+    let materialized = materialize(query, database, tx).await?;
+    let after_cte = materialized.as_ref().map(|m| m.rewritten.as_str()).unwrap_or(query);
+    let derived = match Box::pin(materialize_derived(after_cte, database, tx)).await {
+        Ok(d) => d,
+        Err(e) => {
+            if let Some(m) = &materialized {
+                drop_temps(database, &m.temps, tx).await;
+            }
+            return Err(e);
+        }
+    };
+    let query = derived.as_ref().map(|d| d.rewritten.as_str()).unwrap_or(after_cte);
+    let result = Box::pin(build_table_as(statement, query, database, tx)).await;
+    if let Some(d) = &derived {
+        drop_temps(database, &d.temps, tx).await;
+    }
+    if let Some(m) = &materialized {
+        drop_temps(database, &m.temps, tx).await;
+    }
+    result
+}
+
+/// The column names a query's result carries, as PostgreSQL names them
+/// (`count`, `upper`, `?column?`): its description's, else the select
+/// list's own labels.
+async fn result_labels(query: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, _))) if !fields.is_empty() => Some(fields.into_iter().map(|(name, _)| name).collect()),
+        _ => select_labels(query, database).await,
+    }
+}
+
+/// [`create_table_as`] for a query that reads relations only.
+async fn build_table_as(
+    statement: &crate::core::rql::ctas::CreateTableAs,
+    query: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<Option<u64>, String> {
+    use crate::core::rql::ctas::quote_ident;
+    if !query.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        return Err("CREATE TABLE … AS over anything but a SELECT or TABLE is not supported; write it as a SELECT".to_string());
+    }
+    // The query's own error, as it would be on its own: not the subquery
+    // runner's prefix.
+    let (rows, scales) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx)
+        .await
+        .map_err(|e| e.strip_prefix("subquery failed: ").map(str::to_string).unwrap_or(e))?;
+    let labels = result_labels(query, database)
+        .await
+        .ok_or_else(|| "CREATE TABLE … AS has a column this cannot name; alias it with AS".to_string())?;
+    if statement.columns.len() > labels.len() {
+        return Err("too many column names were specified".to_string());
+    }
+    // The statement's list names the leading columns; the rest keep theirs.
+    let names: Vec<&str> = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| statement.columns.get(index).map_or(label.as_str(), String::as_str))
+        .collect();
+    for (index, name) in names.iter().enumerate() {
+        if names[..index].contains(name) {
+            return Err(format!("column \"{name}\" specified more than once"));
+        }
+    }
+    if let Some(row) = rows.first() {
+        if row.columns.len() < labels.len() {
+            return Err(format!(
+                "CREATE TABLE … AS: the query returned {} columns but names {}",
+                row.columns.len(),
+                labels.len()
+            ));
+        }
+    }
+    // Typed under the query's own labels, which is what the declared-type
+    // lookups match against; the table then takes the statement's names.
+    let columns = relation_columns(query, &labels, &rows, scales.as_deref(), database)
+        .await
+        .map_err(|index| {
+            format!(
+                "CREATE TABLE … AS: the query returned a type that cannot be stored in column '{}'",
+                names.get(index).copied().unwrap_or("?")
+            )
+        })?;
+    let definitions: Vec<String> = names
+        .iter()
+        .zip(columns.iter())
+        .map(|(name, column)| format!("{} {}", quote_ident(name), column.sql_type))
+        .collect();
+    crate::core::rql::executor::run_statement(
+        &format!("CREATE TABLE {} ({})", statement.name, definitions.join(", ")),
+        database,
+        tx,
+    )
+    .await?;
+    if !statement.with_data {
+        return Ok(None);
+    }
+    let column_list: Vec<String> = names.iter().map(|name| quote_ident(name)).collect();
+    let column_list = column_list.join(", ");
+    let filled: Result<(), String> = async {
+        for chunk in rows.chunks(TABLE_AS_FILL_ROWS) {
+            let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let mut parts: Vec<String> = Vec::with_capacity(names.len());
+                for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+                    parts.push(cell_literal(column, cell).ok_or_else(|| {
+                        format!(
+                            "CREATE TABLE … AS: the query returned a {:?} value in column '{}' that cannot be stored",
+                            column.declared.as_ref().unwrap_or(&cell.column_type),
+                            names.get(index).copied().unwrap_or("?"),
+                        )
+                    })?);
+                }
+                tuples.push(format!("({})", parts.join(", ")));
+            }
+            crate::core::rql::executor::run_statement(
+                &format!("INSERT INTO {} ({}) VALUES {}", statement.name, column_list, tuples.join(", ")),
+                database,
+                tx,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = filled {
+        let _ = crate::core::rql::executor::run_statement(&format!("DROP TABLE {}", statement.name), database, tx).await;
+        return Err(e);
+    }
+    Ok(Some(rows.len() as u64))
+}
+
 /// Drops the temporary tables a statement materialised. Best effort: a failure
 /// here must not mask the statement's own result.
 pub async fn drop_temps(
@@ -1884,6 +2053,14 @@ mod tests {
         assert!(hoist_insert_with("INSERT INTO t (a) VALUES (1)").is_none());
         assert!(hoist_insert_with("WITH w AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM w").is_none());
         assert!(hoist_insert_with("INSERT INTO withdrawals SELECT a FROM w").is_none());
+        // CREATE TABLE … AS, its trailing WITH NO DATA kept after the query.
+        assert_eq!(
+            hoist_insert_with("CREATE TABLE c (x) AS WITH w AS (SELECT n FROM d) SELECT n FROM w WITH NO DATA")
+                .as_deref(),
+            Some("WITH w AS (SELECT n FROM d) CREATE TABLE c (x) AS SELECT n FROM w WITH NO DATA")
+        );
+        assert!(hoist_insert_with("CREATE TABLE c AS SELECT n FROM d").is_none());
+        assert!(hoist_insert_with("CREATE TABLE c (n INT)").is_none());
     }
 
     #[test]

@@ -13,6 +13,8 @@
 //!   (`core::rql::distinct_on`).
 //! - `IN (SELECT …)` inside a CASE or a FILTER condition (pinned; it worked
 //!   once the condition reader had IN, the subquery being substituted first).
+//! - `CREATE TABLE … AS` (`core::rql::ctas`): it answered "Table already
+//!   exists" (42P07) and created nothing.
 
 use rasterizeddb_compat::TestServer;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -316,4 +318,99 @@ async fn typed_literals_are_the_values_they_mean() {
     }
     c.simple_query("UPDATE tl SET t = DATE '2024-03-04', v = TIMESTAMPTZ '2024-01-02 03:04:05+00' WHERE id = 1").await.unwrap();
     assert_eq!(rows(&c, "SELECT t, v FROM tl WHERE id = 1").await, ["2024-03-04|2024-01-02 03:04:05+00"]);
+}
+
+/// `CREATE TABLE … AS`, each answer PostgreSQL 17's (`docker run --rm
+/// postgres:17`): the values and declared types copied, no constraint
+/// copied, `SELECT n` as the count, `WITH [NO] DATA`, a column list, `IF NOT
+/// EXISTS`, a CTE or derived table in the query, and a failed query leaving
+/// no table. Through the extended protocol too.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_table_as_matches_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE src (id INT PRIMARY KEY, n NUMERIC(10,2), v VARCHAR(20), t TEXT, d DATE, ts TIMESTAMPTZ, b BOOLEAN, r REAL, f FLOAT8, j JSONB, c CHAR(3))",
+        "INSERT INTO src VALUES (1, 1.50, 'a', 'x', '2024-01-02', '2024-01-02 03:04:05+00', true, 0.1, 0.1, '{\"k\":1}', 'ab'), \
+         (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         (3, -2.25, 'b', 'y', '2023-12-31', '2023-12-31 23:00:00+00', false, 2.5, 1e100, '[1,2]', 'c')",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let count = |sql: &'static str| {
+        let c = &c;
+        async move {
+            let messages = c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            messages
+                .iter()
+                .find_map(|m| match m {
+                    SimpleQueryMessage::CommandComplete(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap()
+        }
+    };
+    // (statement, its count, a read of what it made, that read's rows)
+    let cases: &[(&str, u64, &str, &[&str])] = &[
+        ("CREATE TABLE c1 AS SELECT * FROM src", 3, "SELECT * FROM c1 ORDER BY id", &[
+            "1|1.50|a|x|2024-01-02|2024-01-02 03:04:05+00|t|0.1|0.1|{\"k\": 1}|ab ",
+            "2|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL",
+            "3|-2.25|b|y|2023-12-31|2023-12-31 23:00:00+00|f|2.5|1e+100|[1, 2]|c  ",
+        ]),
+        ("CREATE TABLE c2 AS SELECT id, n * 2 AS dbl, upper(t), count(*) OVER () FROM src WHERE id > 1", 2,
+         "SELECT * FROM c2 ORDER BY id", &["2|NULL|NULL|2", "3|-4.50|Y|2"]),
+        ("CREATE TABLE c3 (a, b) AS SELECT id, t, v FROM src", 3, "SELECT a, b, v FROM c3 ORDER BY a", &["1|x|a", "2|NULL|NULL", "3|y|b"]),
+        ("CREATE TABLE IF NOT EXISTS c1 AS SELECT 1", 0, "SELECT count(*) FROM c1", &["3"]),
+        ("CREATE TABLE c5 AS SELECT * FROM src WITH NO DATA", 0, "SELECT count(*) FROM c5", &["0"]),
+        ("CREATE TABLE c6 AS SELECT * FROM src WHERE id = 1 WITH DATA", 1, "SELECT id FROM c6", &["1"]),
+        ("CREATE TABLE c7 AS WITH w AS (SELECT id, t FROM src WHERE id <> 2) SELECT * FROM w", 2,
+         "SELECT * FROM c7 ORDER BY id", &["1|x", "3|y"]),
+        ("CREATE TABLE c8 AS SELECT x.id, x.t FROM (SELECT * FROM src WHERE id < 3) x", 2, "SELECT * FROM c8 ORDER BY id", &["1|x", "2|NULL"]),
+        ("CREATE TABLE c9 AS SELECT 1 AS one, 'a' AS lit, NULL AS nul, 2.5 AS num", 1, "SELECT * FROM c9", &["1|a|NULL|2.5"]),
+        ("CREATE TABLE c10 AS SELECT t, count(*) AS c, sum(n) AS s FROM src GROUP BY t", 3,
+         "SELECT * FROM c10 ORDER BY t NULLS FIRST", &["NULL|1|NULL", "x|1|1.50", "y|1|-2.25"]),
+        ("CREATE TABLE c11 AS SELECT a.id, b.t FROM src a JOIN src b ON a.id = b.id", 3, "SELECT * FROM c11 ORDER BY id", &["1|x", "2|NULL", "3|y"]),
+        ("CREATE TABLE c12 AS SELECT id FROM src ORDER BY id DESC LIMIT 2", 2, "SELECT * FROM c12 ORDER BY id", &["2", "3"]),
+        ("CREATE TABLE c15 AS SELECT * FROM src WHERE id > 100", 0, "SELECT count(*) FROM c15", &["0"]),
+        ("CREATE TABLE c18 AS SELECT DISTINCT t FROM src", 3, "SELECT * FROM c18 ORDER BY t NULLS FIRST", &["NULL", "x", "y"]),
+        ("CREATE TABLE c19 AS SELECT id FROM src UNION ALL SELECT id FROM src", 6, "SELECT count(*) FROM c19", &["6"]),
+        ("CREATE TABLE c22 AS SELECT DISTINCT ON (t) t, id FROM src ORDER BY t, id DESC", 3,
+         "SELECT * FROM c22 ORDER BY t NULLS FIRST", &["NULL|2", "x|1", "y|3"]),
+        ("CREATE TABLE c26 AS TABLE src", 3, "SELECT count(*) FROM c26", &["3"]),
+        ("CREATE TABLE \"Mixed\" AS SELECT id FROM src", 3, "SELECT count(*) FROM \"Mixed\"", &["3"]),
+    ];
+    for (create, n, read, want) in cases {
+        assert_eq!(count(create).await, *n, "{create}");
+        assert_eq!(rows(&c, read).await, *want, "{create} then {read}");
+    }
+    // No constraint is copied: not the key, not NOT NULL. The declared
+    // lengths are the column's type, so they are.
+    for sql in ["INSERT INTO c1 (id) VALUES (1)", "INSERT INTO c1 (id) VALUES (NULL)"] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, code) in [
+        ("INSERT INTO c1 (id, v) VALUES (9, 'abcdefghijklmnopqrstuvwxyz')", "22001"),
+        ("INSERT INTO c1 (id, c) VALUES (10, 'abcd')", "22001"),
+        ("CREATE TABLE c1 AS SELECT 1", "42P07"),
+        ("CREATE TABLE c4 (a, b, c, d) AS SELECT id, t FROM src", "42601"),
+        ("CREATE TABLE c13 AS SELECT id, id FROM src", "42701"),
+        ("CREATE TABLE c14 AS SELECT 1 + 1, 'z'", "42701"),
+        ("CREATE TABLE c16 AS SELECT * FROM nosuch", "42P01"),
+        ("CREATE TABLE c17 AS SELECT id, 1 / (id - 2) FROM src", "22012"),
+        ("CREATE TABLE c25 AS VALUES (1, 'a')", "0A000"),
+    ] {
+        let e = c.simple_query(sql).await.expect_err(sql);
+        assert_eq!(e.code().map(|s| s.code()), Some(code), "{sql}: {e}");
+    }
+    for gone in ["c4", "c13", "c14", "c16", "c17", "c25"] {
+        let e = c.simple_query(&format!("SELECT 1 FROM {gone}")).await.expect_err(gone);
+        assert_eq!(e.code().map(|s| s.code()), Some("42P01"), "{gone} was left behind: {e}");
+    }
+    // Parse, Describe, Bind, Execute: the count is the rows written.
+    assert_eq!(c.execute("CREATE TABLE p1 AS SELECT id, t FROM src WHERE id <> 2", &[]).await.unwrap(), 2);
+    assert_eq!(rows(&c, "SELECT * FROM p1 ORDER BY id").await, ["1|x", "3|y"]);
+    let prepared = c.prepare("CREATE TABLE p2 AS SELECT id FROM src").await.unwrap();
+    assert!(prepared.columns().is_empty());
+    assert_eq!(c.execute(&prepared, &[]).await.unwrap(), 3);
 }

@@ -6629,6 +6629,7 @@ where
     }
 
     let purpose_kind = match &purpose {
+        QueryPurpose::CreateTable(sql) if crate::core::rql::ctas::parse(sql).is_some() => PurposeKind::CreateTableAs,
         QueryPurpose::CreateTable(_) => PurposeKind::CreateTable,
         QueryPurpose::DropTable(_) => PurposeKind::DropTable,
         // PostgreSQL tags all three forms `ALTER TABLE`.
@@ -6650,6 +6651,7 @@ where
     if read_only {
         let verb = match purpose_kind {
             PurposeKind::CreateTable => Some("CREATE TABLE"),
+            PurposeKind::CreateTableAs => Some("CREATE TABLE AS"),
             PurposeKind::DropTable => Some("DROP TABLE"),
             PurposeKind::AlterTable => Some("ALTER TABLE"),
             PurposeKind::CreateIndex => Some("CREATE INDEX"),
@@ -7672,8 +7674,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         "42710"
     } else if has("table already exists") || (has("relation") && has("already exists")) {
         "42P07"
-    } else if has("column") && has("already exists") {
+    } else if has("column") && (has("already exists") || has("specified more than once")) {
         "42701"
+    } else if has("too many column names were specified") {
+        "42601"
     } else if has("already exists") {
         "42710"
     } else if has("value too long for type character") || has("value too long for type bpchar") {
@@ -7777,6 +7781,10 @@ fn read_i32_be_from(bytes: &[u8], start: usize) -> io::Result<(i32, usize)> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PurposeKind {
     CreateTable,
+    /// `CREATE TABLE … AS`: tagged `SELECT n` when it wrote rows, as
+    /// PostgreSQL does, and `CREATE TABLE AS` when it wrote none (`WITH NO
+    /// DATA`, or `IF NOT EXISTS` finding the table).
+    CreateTableAs,
     DropTable,
     AlterTable,
     CreateIndex,
@@ -7798,6 +7806,8 @@ enum PurposeKind {
 fn command_tag(kind: PurposeKind, rows_affected: Option<u64>) -> String {
     match (kind, rows_affected) {
         (PurposeKind::CreateTable, _) => "CREATE TABLE".to_string(),
+        (PurposeKind::CreateTableAs, Some(n)) => format!("SELECT {}", n),
+        (PurposeKind::CreateTableAs, None) => "CREATE TABLE AS".to_string(),
         (PurposeKind::DropTable, _) => "DROP TABLE".to_string(),
         // PostgreSQL tags add, drop and rename alike.
         (PurposeKind::AlterTable, _) => "ALTER TABLE".to_string(),
@@ -12494,6 +12504,8 @@ mod command_tag_tests {
     #[test]
     fn ddl_reports_the_statement_that_ran() {
         assert_eq!(command_tag(PurposeKind::CreateTable, None), "CREATE TABLE");
+        assert_eq!(command_tag(PurposeKind::CreateTableAs, Some(3)), "SELECT 3");
+        assert_eq!(command_tag(PurposeKind::CreateTableAs, None), "CREATE TABLE AS");
         assert_eq!(command_tag(PurposeKind::DropTable, None), "DROP TABLE");
         assert_eq!(command_tag(PurposeKind::AlterTable, None), "ALTER TABLE");
         assert_eq!(command_tag(PurposeKind::CreateIndex, None), "CREATE INDEX");

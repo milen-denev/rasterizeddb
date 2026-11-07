@@ -39,6 +39,7 @@ pub mod column_default;
 /// Conflict retries waiting on the transaction they met (slice B6).
 pub(crate) mod conflict_wait;
 pub mod cte;
+pub(crate) mod ctas;
 pub(crate) mod distinct_on;
 pub mod expr;
 /// PostgreSQL's `numeric` arithmetic with display scales.

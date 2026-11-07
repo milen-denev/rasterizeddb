@@ -1084,3 +1084,31 @@ async fn writes_rolled_back_to_a_savepoint_are_not_replicated() {
         "no capture buffer should be left behind"
     );
 }
+
+/// `CREATE TABLE … AS` replicates as the statements it ran (the CREATE and
+/// the fill), not as its own text: the peer stores the values this node
+/// computed. `now()` would differ if the peer ran the query again, and a
+/// peer applying both the text and the fill would hold every row twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_table_as_replicates_the_values_it_computed() {
+    let (one, two) = pair().await;
+
+    run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada'), (2, 'bob')").await;
+    run_ok(&one, "CREATE TABLE repl_copy AS SELECT id, name, now() AS at FROM repl_users").await;
+
+    let read = |database: Arc<Database>| async move {
+        let response = run(&database, "SELECT id, name, at FROM repl_copy ORDER BY id").await;
+        (response.first() == Some(&2)).then_some(response)
+    };
+    let here = read(one.clone()).await.expect("the copy on node one");
+    let rows = crate::core::row::row::vec_into_rows(&here[1..]).unwrap();
+    assert_eq!(rows.len(), 2);
+    eventually("the copy to reach node two with the same values", || {
+        let (two, here) = (two.clone(), here.clone());
+        async move { read(two).await.as_deref() == Some(&here[..]) }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(read(two.clone()).await.as_deref(), Some(&here[..]), "node two changed after converging");
+}
