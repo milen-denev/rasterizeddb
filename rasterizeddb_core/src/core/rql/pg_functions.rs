@@ -969,6 +969,11 @@ fn array_element(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// [`array_elements`], for the table functions (`unnest`).
+pub fn array_elements_of(text: &str) -> Result<Vec<Option<String>>, String> {
+    array_elements(text)
+}
+
 /// The elements of a one-dimensional array's text, `None` for a NULL.
 fn array_elements(text: &str) -> Result<Vec<Option<String>>, String> {
     let inner = text

@@ -44,6 +44,7 @@ pub(crate) mod distinct_on;
 pub(crate) mod join_on;
 pub mod truncate;
 pub mod pg_functions;
+pub mod table_functions;
 pub(crate) mod window_join;
 pub mod expr;
 /// PostgreSQL's `numeric` arithmetic with display scales.

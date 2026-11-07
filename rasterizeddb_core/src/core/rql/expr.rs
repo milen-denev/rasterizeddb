@@ -2868,7 +2868,7 @@ pub fn at_display_scale(value: Value, scale: Option<u32>) -> Result<Value, Strin
 /// handling — is refused rather than decoded as though it were an integer,
 /// because reading scaled cents as a plain `i64` would return a number that is
 /// wrong by a factor of the scale and report success.
-fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
+pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let float_operand = |v: &Value| {
         matches!(
             v,

@@ -2133,6 +2133,45 @@ async fn materialize_derived_inner(
     let mut current = sql.to_string();
     let mut found_any = false;
 
+    // `SELECT generate_series(1, 3)`: the `FROM` form it means.
+    if let Some(form) = crate::core::rql::table_functions::select_list_form(&current) {
+        current = form;
+        found_any = true;
+    }
+    // A computed `FROM` item — `(VALUES …) v(x)`, `generate_series(…) g`,
+    // `unnest(…)` — becomes a temporary filled with its rows, as a constant
+    // CTE body does: its arguments are constants, so nothing is run.
+    for index in 0..16usize {
+        let Some(item) = crate::core::rql::table_functions::next_item(&current) else {
+            break;
+        };
+        found_any = true;
+        let computed = crate::core::rql::table_functions::compute(&item)?;
+        let temp = temp_name(&item.alias, &current, 100 + index);
+        let definitions: Vec<String> = computed
+            .columns
+            .iter()
+            .map(|(name, _, sql_type)| format!("{} {}", crate::core::rql::ctas::quote_ident(name), sql_type))
+            .collect();
+        create_temporary(&format!("CREATE TABLE {} ({})", temp, definitions.join(", ")), database, tx)
+            .await
+            .map_err(|e| format!("could not materialise '{}': {}", item.alias, e))?;
+        temps.push(temp.clone());
+        let names: Vec<String> =
+            computed.columns.iter().map(|(name, _, _)| crate::core::rql::ctas::quote_ident(name)).collect();
+        for chunk in computed.rows.chunks(TABLE_AS_FILL_ROWS) {
+            let tuples: Vec<String> = chunk.iter().map(|row| format!("({})", row.join(", "))).collect();
+            crate::core::rql::executor::run_statement(
+                &format!("INSERT INTO {} ({}) VALUES {}", temp, names.join(", "), tuples.join(", ")),
+                database,
+                tx,
+            )
+            .await
+            .map_err(|e| format!("could not fill '{}': {}", item.alias, e))?;
+        }
+        current = format!("{}{} {}{}", &current[..item.start], temp, item.alias, &current[item.end..]);
+    }
+
     // Bounded: each pass replaces one derived table with a name, so the count
     // strictly decreases. The cap is a backstop against a rewrite that fails to
     // shrink rather than a real limit on how many a statement may have.

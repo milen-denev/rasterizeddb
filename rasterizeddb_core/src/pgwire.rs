@@ -4231,6 +4231,30 @@ pub(crate) async fn describe_query(
     // Nothing is materialised: the alias's schema comes from describing the
     // inner query, which is the same question asked one level down, and the
     // outer statement is rewritten to name the alias as an ordinary relation.
+    // A computed `FROM` item (`generate_series(…) g`, `unnest(…)`, `(VALUES
+    // …) v(x)`), and a select list that is only such a call: described as
+    // the relation the executor materialises for it, from its constant
+    // arguments, without creating anything.
+    {
+        let mut text = crate::core::rql::table_functions::select_list_form(stmt).unwrap_or_else(|| stmt.to_string());
+        let mut relations: Vec<(String, ScratchFields)> = Vec::new();
+        for index in 0..16usize {
+            let Some(item) = crate::core::rql::table_functions::next_item(&text) else {
+                break;
+            };
+            let Ok(columns) = crate::core::rql::table_functions::columns_of(&item) else {
+                break;
+            };
+            let name = format!("__described_fn_{}", index);
+            text = format!("{}{} {}{}", &text[..item.start], name, item.alias, &text[item.end..]);
+            relations.push((name, scratch_fields(&columns)));
+        }
+        if !relations.is_empty() {
+            if let Some(described) = Box::pin(describe_resolved(database, &text, &relations)).await? {
+                return Ok(Some(described));
+            }
+        }
+    }
     if let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(stmt) {
         if !alias.is_empty() {
             if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, &[])).await? {
@@ -7576,7 +7600,8 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     }
     // The everyday functions' own errors (`rql::pg_functions`), with
     // PostgreSQL's codes. Early: they quote the argument text.
-    if has("field position must not be zero")
+    if has("step size cannot equal zero")
+        || has("field position must not be zero")
         || has("unrecognized encoding:")
         || has("invalid hexadecimal")
         || has("invalid base64 data")
