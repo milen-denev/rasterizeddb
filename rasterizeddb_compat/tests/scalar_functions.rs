@@ -111,6 +111,9 @@ async fn each_function_answers_as_postgresql_does() {
         ("to_timestamp('2024-05-06 07:08:09', 'YYYY-MM-DD HH24:MI:SS')::timestamp", "2024-05-06 07:08:09"),
         ("age(timestamp '2024-03-01', timestamp '2024-01-15 10:00')", "1 mon 16 days 14:00:00"),
         ("age(timestamp '2024-01-31', timestamp '2023-02-28')", "11 mons 3 days"),
+        // The borrowed days are the earlier date's month's: February's 29.
+        ("age(timestamp '2024-03-01', timestamp '2024-02-15')", "15 days"),
+        ("age(timestamp '2024-02-15', timestamp '2024-03-01')", "-15 days"),
         ("encode('abc'::bytea, 'base64')", "YWJj"),
         ("decode('616263', 'hex')", "\\x616263"),
         ("jsonb_build_object('b', 2, 'a', n)", r#"{"a": 12.345, "b": 2}"#),
