@@ -5004,6 +5004,17 @@ fn figure_column_name(text: &str) -> Option<(String, u8)> {
         if !is_single_operand(operand) {
             return None;
         }
+        // `(n)::int BETWEEN 2 AND 4` is a comparison of the cast, not a cast:
+        // what follows `::` is a type name only when nothing but one could be.
+        let type_like = type_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'(' | b')' | b'[' | b']' | b',' | b'"'));
+        let operator_word = ["BETWEEN", "IN", "IS", "LIKE", "ILIKE", "SIMILAR", "AND", "OR", "NOT"]
+            .iter()
+            .any(|w| find_keyword(type_name, w, 0).is_some());
+        if !type_like || operator_word {
+            return None;
+        }
         return cast_name(figure_column_name(operand), type_name);
     }
     let upper = text.to_ascii_uppercase();

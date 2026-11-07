@@ -591,3 +591,25 @@ async fn window_functions_over_a_join_match_postgresql() {
     let names: Vec<&str> = prepared.columns().iter().map(|col| col.name()).collect();
     assert_eq!(names, ["id", "w", "row_number"]);
 }
+
+/// A boolean stored into a text column by `INSERT … SELECT` is PostgreSQL's
+/// text for it, `true` or `false`. The rows were rebuilt as a `VALUES` list
+/// with the boolean as the bare `1` or `0`, and a text column stored that.
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_select_stores_a_boolean_as_postgresql_text() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE digit (n INT, one INT)",
+        "INSERT INTO digit VALUES (0, 1), (1, 1), (2, 1), (3, 1)",
+        "CREATE TABLE tsink (id INT, b TEXT)",
+        "CREATE TABLE bsink (id INT, b BOOLEAN)",
+        "INSERT INTO tsink (id, b) SELECT n, n = 2 FROM digit",
+        "INSERT INTO bsink (id, b) SELECT n, n BETWEEN 1 AND 2 FROM digit",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(rows(&c, "SELECT * FROM tsink ORDER BY id").await, ["0|false", "1|false", "2|true", "3|false"]);
+    assert_eq!(rows(&c, "SELECT * FROM bsink ORDER BY id").await, ["0|f", "1|t", "2|t", "3|f"]);
+}

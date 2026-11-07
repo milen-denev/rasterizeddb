@@ -152,7 +152,7 @@ fn encode_assignment(
 ) -> Result<MemoryBlock, String> {
     let trimmed = value_str.trim();
     // `SET i = 7.5` on an integer column: the integer PostgreSQL assigns.
-    let rounded = crate::core::rql::expr::is_integer_type(&field.db_type)
+    let rounded = matches!(field.db_type, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64)
         .then(|| crate::core::value_codec::integer_from_number_literal(trimmed))
         .flatten();
     let trimmed = rounded.as_deref().unwrap_or(trimmed);

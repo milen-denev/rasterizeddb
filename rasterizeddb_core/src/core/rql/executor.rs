@@ -9174,6 +9174,12 @@ async fn insert_from_select(
                     <[u8; 4]>::try_from(bytes).ok().map(|b| (crate::core::value_codec::pg_float4_text(f32::from_le_bytes(b)), "real"))
                 };
                 typed.map(|(text, cast)| format!("{}::{cast}", crate::core::value_codec::quote_sql(&text)))
+            } else if column_type == crate::core::db_type::DbType::BOOL {
+                // A boolean as PostgreSQL's text for it: a boolean column
+                // reads 'true', and a text column stores it. As the bare `1`
+                // `value_to_literal` writes, a text column stored "1".
+                let set = column.data.into_slice().first().is_some_and(|b| *b != 0);
+                Some(if set { "'true'" } else { "'false'" }.to_string())
             } else {
                 crate::core::rql::subquery::value_to_literal(&column_type, column.data.into_slice())
             };

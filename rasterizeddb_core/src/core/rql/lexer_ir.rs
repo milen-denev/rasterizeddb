@@ -137,7 +137,9 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     // `2.5` into an integer column: the integer PostgreSQL assigns (3), not
     // a refusal of the fraction. Read before the cast is stripped, which
     // decides how a tie rounds.
-    if crate::core::rql::expr::is_integer_type(db_type) {
+    // PostgreSQL's own integer types; an unsigned one is this engine's and
+    // keeps refusing a fraction.
+    if matches!(db_type, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64) {
         if let Some(rounded) = crate::core::value_codec::integer_from_number_literal(value_str) {
             return value_to_mb(&rounded, db_type);
         }

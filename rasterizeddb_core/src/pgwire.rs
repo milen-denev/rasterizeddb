@@ -6835,9 +6835,11 @@ fn result_description(
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.
                 Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
-                // The planner's reason has its own class (42702 for an
-                // ambiguous name); a syntax error only when it names none.
-                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
+                // An ambiguous name is 42702, as PostgreSQL's
+                // `ambiguous_column`. Not every planner message through
+                // `sqlstate_for`: a quoted name in it would choose the class.
+                Err(e) if e.contains(" is ambiguous; qualify") => return Err(("42702", e)),
+                Err(e) => return Err(("42601", e)),
             }
         }
         QueryPurpose::QueryRows(qr) => {
@@ -6932,9 +6934,11 @@ fn result_description(
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.
                 Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
-                // The planner's reason has its own class (42702 for an
-                // ambiguous name); a syntax error only when it names none.
-                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
+                // An ambiguous name is 42702, as PostgreSQL's
+                // `ambiguous_column`. Not every planner message through
+                // `sqlstate_for`: a quoted name in it would choose the class.
+                Err(e) if e.contains(" is ambiguous; qualify") => return Err(("42702", e)),
+                Err(e) => return Err(("42601", e)),
             }
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
