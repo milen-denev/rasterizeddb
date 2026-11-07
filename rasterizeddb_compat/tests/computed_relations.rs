@@ -95,4 +95,30 @@ async fn drivers_read_computed_relations_by_type() {
     assert_eq!(got, [(2, "2".to_string()), (3, "3".to_string())]);
     let row = sqlx::query("SELECT x, y FROM (VALUES (1, 'a')) v(x, y)").fetch_one(&mut x).await.expect("values");
     assert_eq!((row.get::<i32, _>(0), row.get::<String, _>(1)), (1, "a".to_string()));
+
+    // A single-column function's column is named by its alias, as
+    // PostgreSQL names it; without one, by the function. Both protocols.
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for (sql, want) in [
+        ("SELECT * FROM generate_series(1, 2) g", vec!["g"]),
+        ("SELECT * FROM unnest(ARRAY[1]) u", vec!["u"]),
+        ("SELECT * FROM generate_series(1, 2)", vec!["generate_series"]),
+        ("SELECT * FROM generate_series(1, 2) WITH ORDINALITY AS g", vec!["g", "ordinality"]),
+        ("SELECT * FROM (VALUES (1, 2)) v", vec!["column1", "column2"]),
+    ] {
+        let simple: Vec<String> = c
+            .simple_query(sql)
+            .await
+            .expect(sql)
+            .into_iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r.columns().iter().map(|c| c.name().to_string()).collect()),
+                _ => None,
+            })
+            .expect("a row");
+        assert_eq!(simple, want, "{sql}");
+        let described: Vec<String> = c.prepare(sql).await.expect(sql).columns().iter().map(|c| c.name().to_string()).collect();
+        assert_eq!(described, want, "{sql}: Describe");
+    }
 }
