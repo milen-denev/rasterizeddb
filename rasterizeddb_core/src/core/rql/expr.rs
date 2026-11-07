@@ -463,6 +463,8 @@ pub enum TextFunc {
     /// anchored regular expression it means, as `pg_dump` writes `SIMILAR
     /// TO` (`x ~ similar_to_escape('a%')`).
     SimilarToEscape,
+    /// One of PostgreSQL's everyday functions (`rql::pg_functions`).
+    Pg(crate::core::rql::pg_functions::PgFunc),
 }
 
 /// How many elements an array's text form `{a,b,"c,d"}` holds.
@@ -894,6 +896,13 @@ pub const FUNCTIONS: &[&str] = &[
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
 ];
 
+/// Whether `name` (any case) is a function this evaluator calls: one of
+/// [`FUNCTIONS`] or of `pg_functions::NAMES`.
+pub fn is_function(name: &str) -> bool {
+    FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name))
+        || crate::core::rql::pg_functions::NAMES.iter().any(|f| f.eq_ignore_ascii_case(name))
+}
+
 /// Parses one expression against `schema`.
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
@@ -1249,10 +1258,21 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 return Ok(Expr::Call(TextFunc::ColumnSize, Vec::new()));
             }
 
-            let args: Vec<Expr> = split_args(args_text)
-                .iter()
-                .map(|a| parse(a, schema))
-                .collect::<Result<_, _>>()?;
+            // `SUBSTRING(s FROM 2 FOR 3)`, `POSITION(x IN y)`, `TRIM(LEADING
+            // 'x' FROM s)`: the standard spellings, as the calls they mean.
+            let standard = crate::core::rql::pg_functions::standard_syntax(&name.to_ascii_uppercase(), args_text);
+            let (name, args_text) = match &standard {
+                Some((name, args)) => (name.as_str(), args.as_str()),
+                None => (name, args_text),
+            };
+            let args: Vec<Expr> = if args_text.trim().is_empty() {
+                Vec::new()
+            } else {
+                split_args(args_text)
+                    .iter()
+                    .map(|a| parse(a, schema))
+                    .collect::<Result<_, _>>()?
+            };
 
             let upper_name = name.to_ascii_uppercase();
             let mut args = args;
@@ -1524,7 +1544,24 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         Box::new(it.next().expect("checked")),
                     ))
                 }
+                // `pg_typeof(x)`: the type `x` is, as PostgreSQL names it.
+                "PG_TYPEOF" if args.len() == 1 => {
+                    let name = match static_type(&args[0]) {
+                        DbType::DATETIME if yields_timestamp(&args[0]) => "timestamp without time zone",
+                        DbType::DATETIME => "timestamp with time zone",
+                        DbType::TIMESTAMP => "timestamp without time zone",
+                        DbType::STRING => "text",
+                        DbType::ARRAY => "text[]",
+                        DbType::JSONB => "jsonb",
+                        DbType::NULL => "unknown",
+                        other => crate::core::value_codec::pg_input_type_name(&other),
+                    };
+                    Ok(Expr::Literal { bytes: name.as_bytes().to_vec(), db_type: DbType::STRING })
+                }
                 _ => {
+                    if let Some(found) = crate::core::rql::pg_functions::lookup(&upper_name, args.len()) {
+                        return Ok(Expr::Call(TextFunc::Pg(found?), args));
+                    }
                     if let Some((func, _)) = crate::core::rql::aggregate::ScalarFunc::parse(name) {
                         if !args_text.trim().is_empty() {
                             return Err(format!("{}() takes no arguments", name));
@@ -2287,6 +2324,7 @@ pub fn yields_timestamp(expr: &Expr) -> bool {
             }
         }
         Expr::Call(TextFunc::DateTrunc, args) => args.get(1).is_some_and(yields_timestamp),
+        Expr::Call(TextFunc::Pg(func), _) => crate::core::rql::pg_functions::yields_timestamp(*func),
         Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => common_timestamp(args.iter()),
         Expr::NullIf(lhs, _) => yields_timestamp(lhs),
         Expr::Case { whens, otherwise } => {
@@ -2648,6 +2686,7 @@ pub fn static_type(expr: &Expr) -> DbType {
             }
         }
         Expr::Call(TextFunc::RegexpLike | TextFunc::CheckRegexpLike | TextFunc::CheckRegexpUncertain, _) => DbType::BOOL,
+        Expr::Call(TextFunc::Pg(func), args) => crate::core::rql::pg_functions::result_type(*func, args),
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
         // `select_common_type` does — see `common_type`.
@@ -3075,7 +3114,7 @@ fn as_jsonb(value: Value) -> Result<Vec<u8>, String> {
     }
 }
 
-fn as_text(value: &Value) -> String {
+pub(crate) fn as_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Data { bytes, db_type } => match db_type {
@@ -3108,6 +3147,9 @@ fn as_text(value: &Value) -> String {
 
 /// Applies a function to its evaluated arguments.
 fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
+    if let TextFunc::Pg(func) = func {
+        return crate::core::rql::pg_functions::call(func, args);
+    }
     let string = |text: String| Value::Data {
         bytes: text.into_bytes(),
         db_type: DbType::STRING,
@@ -3147,6 +3189,8 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
     }
 
     Ok(match func {
+        // Answered above, before the strictness checks of this module.
+        TextFunc::Pg(func) => return crate::core::rql::pg_functions::call(func, args),
         // NULL arguments: nothing to vouch for (an answer of NULL is exact).
         TextFunc::CheckRegexpUncertain => {
             let flags = args.get(2).map(as_text).unwrap_or_default();
@@ -5721,7 +5765,7 @@ fn narrow_integer(value: i64, db_type: &DbType) -> Option<Vec<u8>> {
     })
 }
 
-fn as_f64(value: &Value) -> Option<f64> {
+pub(crate) fn as_f64(value: &Value) -> Option<f64> {
     let Value::Data { bytes, db_type } = value else {
         return None;
     };
@@ -6093,7 +6137,7 @@ fn round_places(places: &Expr) -> Option<i32> {
 
 /// A NUMERIC cell as an exact value: sixteen bytes at the engine's nine
 /// places, or seventeen carrying their own.
-fn decimal_value_as_pgnum(bytes: &[u8]) -> Result<crate::core::rql::pg_numeric::PgNum, String> {
+pub(crate) fn decimal_value_as_pgnum(bytes: &[u8]) -> Result<crate::core::rql::pg_numeric::PgNum, String> {
     use crate::core::rql::pg_numeric::PgNum;
     let unreadable = || "a numeric could not be read".to_string();
     match crate::core::value_codec::split_decimal_cell(bytes).ok_or_else(unreadable)? {
@@ -6113,7 +6157,7 @@ fn pgnum_as_decimal_value(v: crate::core::rql::pg_numeric::PgNum) -> Value {
     Value::Data { bytes, db_type: DbType::DECIMAL }
 }
 
-fn as_i64(value: &Value) -> Option<i64> {
+pub(crate) fn as_i64(value: &Value) -> Option<i64> {
     let Value::Data { bytes, db_type } = value else {
         return None;
     };
@@ -6474,6 +6518,14 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 {
                     if let Ok(text) = std::str::from_utf8(bytes) {
                         *bytes = crate::core::rql::type_modifier::pad_to(text, n).into_owned().into_bytes();
+                    }
+                }
+            }
+            // Each NUMERIC argument at the places its expression shows.
+            if let TextFunc::Pg(_) = func {
+                for (value, arg) in values.iter_mut().zip(args) {
+                    if let Some(scale) = display_scale(arg) {
+                        *value = crate::core::rql::pg_functions::shown_at(std::mem::replace(value, Value::Null), scale);
                     }
                 }
             }

@@ -88,6 +88,54 @@ impl PgRegex {
         }
         Some(self.re.is_match(text))
     }
+
+    /// `regexp_replace`: the first match (every one when `global`)
+    /// replaced, `\1`…`\9` in `replacement` naming a group, `\&` the whole
+    /// match and `\\` a backslash, as PostgreSQL's replacement reads them.
+    /// `None` when the answer cannot be vouched for (as [`Self::matches`]).
+    /// The caller keeps to patterns whose match boundaries are PostgreSQL's
+    /// (`pg_functions::regexp_replace`).
+    pub fn replace(&self, text: &str, replacement: &str, global: bool) -> Option<String> {
+        if self.ascii_only && !text.is_ascii() {
+            return None;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for caps in self.re.captures_iter(text) {
+            let whole = caps.get(0).expect("group 0 always matches");
+            out.push_str(&text[last..whole.start()]);
+            let mut chars = replacement.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.peek().copied() {
+                    Some(d @ '1'..='9') => {
+                        chars.next();
+                        if let Some(group) = caps.get(d as usize - '0' as usize) {
+                            out.push_str(group.as_str());
+                        }
+                    }
+                    Some('&') => {
+                        chars.next();
+                        out.push_str(whole.as_str());
+                    }
+                    Some('\\') => {
+                        chars.next();
+                        out.push('\\');
+                    }
+                    _ => out.push('\\'),
+                }
+            }
+            last = whole.end();
+            if !global {
+                break;
+            }
+        }
+        out.push_str(&text[last..]);
+        Some(out)
+    }
 }
 
 /// [`compile`], kept per thread by pattern and flags (errors too).
@@ -385,6 +433,10 @@ impl<'a> Parser<'a> {
         self.i += 1;
         Ok(match c {
             '(' => {
+                // A plain group captures, as PostgreSQL's does, so a
+                // replacement's `\\1` names it; `(?:…)` does not. Capturing
+                // changes no match.
+                let capturing = self.peek() != Some('?');
                 if self.peek() == Some('?') {
                     if self.starts("?:") {
                         self.i += 2;
@@ -401,7 +453,7 @@ impl<'a> Parser<'a> {
                     return Err(PgRegexError::Invalid("parentheses () not balanced".into()));
                 }
                 self.i += 1;
-                (format!("(?:{inner})"), true)
+                (if capturing { format!("({inner})") } else { format!("(?:{inner})") }, true)
             }
             '.' => (if self.o.nl { "[^\\n]".into() } else { "(?s:.)".into() }, true),
             '^' => ("^".into(), false),

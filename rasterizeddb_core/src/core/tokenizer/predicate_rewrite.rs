@@ -2467,7 +2467,10 @@ pub fn rewrite_scan_where(
     // Row values first, as `rewrite_where` does them first: `(a, n % 2) =
     // (…)` is two comparisons, and only after it is split can each side be
     // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
-    let expanded = expand_row_value_comparisons(clause)?;
+    // `s ~ 'x'`, `s ~* 'x'`, `!~`, `!~*`: the `regexp_like` comparison
+    // they mean, which the evaluator answers.
+    let lowered = crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
+    let expanded = expand_row_value_comparisons(&lowered)?;
     let lifted = lift_evaluated_operands(&expanded, schema)?;
     rewrite_where_in(&lifted, schema, true)
 }
@@ -2586,7 +2589,7 @@ fn needs_evaluator(text: &str) -> bool {
                     || word.eq_ignore_ascii_case("EXTRACT") && text[end..].trim_start().starts_with('(')
                     // `COALESCE(s, 'z')`, `UPPER(name)`: a call only the
                     // evaluator knows, refused as an unknown column before.
-                    || crate::core::rql::expr::FUNCTIONS.iter().any(|f| word.eq_ignore_ascii_case(f))
+                    || crate::core::rql::expr::is_function(word)
                         && text[end..].trim_start().starts_with('(')
                     || word.bytes().all(|b| b.is_ascii_digit() || b == b'.')
                         && literal_cast_in_arithmetic(text, i, end)
@@ -4864,6 +4867,9 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
         return Ok(String::new());
     }
 
+    // The regular-expression operators as `regexp_like` (a no-op once
+    // `rewrite_scan_where` has done it).
+    let clause = &crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
     // Row-value comparisons become their boolean form first, so everything
     // downstream — the NULL fold, the guards, the tokenizer — sees only shapes
     // it already understands.

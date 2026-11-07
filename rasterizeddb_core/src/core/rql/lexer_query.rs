@@ -697,12 +697,32 @@ fn parse_select_items(
                     }
                     if let Some(open) = expr.find('(') {
                         let head = expr[..open].trim().to_ascii_uppercase();
-                        let known = crate::core::rql::expr::FUNCTIONS.contains(&head.as_str())
+                        let known = crate::core::rql::expr::is_function(&head)
                             || matches!(head.as_str(), "EXTRACT" | "CAST");
                         if known && AggFunc::parse(&head).is_none() {
                             return Err(e);
                         }
                     }
+                }
+            }
+        }
+
+        // A condition as a value (`s ~ '^H'`, `id > 1 AND ok`): the
+        // expression grammar has no boolean of its own outside CASE, so it is
+        // read as the CASE that is its value, NULL where it is unknown, as
+        // PostgreSQL's boolean is. Not over an aggregate: those take the
+        // computed path above.
+        if find_aggregate_calls(expr).is_empty() {
+            let condition = crate::core::rql::pg_functions::regex_operator_as_call(expr).unwrap_or_else(|| expr.to_string());
+            let as_value = format!("CASE WHEN {condition} THEN true WHEN NOT ({condition}) THEN false END");
+            if crate::core::rql::expr::parse(expr, schema).is_err() {
+                if let Ok(parsed) = crate::core::rql::expr::parse(&as_value, schema) {
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type: crate::core::db_type::DbType::BOOL,
+                        label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+                    });
+                    continue;
                 }
             }
         }

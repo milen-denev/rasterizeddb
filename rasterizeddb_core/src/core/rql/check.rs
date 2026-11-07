@@ -343,7 +343,7 @@ pub fn normalize_expression(expression: &str) -> String {
     let text = lower_similar_to(&text);
     let text = lower_regex_any(&text);
     let text = lower_any_all(&text);
-    let text = lower_regex_operators(&text);
+    let text = lower_regex_operators(&text, CHECK_REGEXP_LIKE);
     let text = fold_regex_truth_tests(&text);
     replace_word_outside_quotes(&text, "regexp_like", CHECK_REGEXP_LIKE)
 }
@@ -648,7 +648,14 @@ fn replace_word_outside_quotes(text: &str, word: &str, with: &str) -> String {
 /// boolean form the rewriter lifts to the evaluator. `pg_dump` writes every
 /// `SIMILAR TO` check as `((x)::text ~ similar_to_escape('a%'::text))`, and
 /// Django's `__regex`/`__iregex` constraints are these operators.
-fn lower_regex_operators(text: &str) -> String {
+///
+/// `function` is the call it becomes: a CHECK's own (`__check_regexp_like`),
+/// or a `WHERE`'s `regexp_like`, which refused these operators as an
+/// unexpected character.
+pub(crate) fn lower_regex_operators(text: &str, function: &str) -> String {
+    if !text.contains('~') {
+        return text.to_string();
+    }
     let mut out = text.to_string();
     // Bounded: each pass removes one operator.
     for _ in 0..64 {
@@ -675,7 +682,7 @@ fn lower_regex_operators(text: &str) -> String {
         let flags = if starred { ", 'i'" } else { "" };
         let truth = if negated { "FALSE" } else { "TRUE" };
         out = format!(
-            "{}({CHECK_REGEXP_LIKE}({}, {}{}) = {}){}",
+            "{}({function}({}, {}{}) = {}){}",
             &out[..left],
             out[left..op_start].trim(),
             out[op_end..right].trim(),

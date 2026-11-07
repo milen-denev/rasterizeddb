@@ -7574,6 +7574,37 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("cannot reshape:") {
         return "22023";
     }
+    // The everyday functions' own errors (`rql::pg_functions`), with
+    // PostgreSQL's codes. Early: they quote the argument text.
+    if has("field position must not be zero")
+        || has("unrecognized encoding:")
+        || has("invalid hexadecimal")
+        || has("invalid base64 data")
+        || has("argument list must have even number of elements")
+        || has("cannot get array length of a")
+        || has("too few arguments for format()")
+        || has("format() type specifier")
+    {
+        return "22023";
+    }
+    if has("negative substring length not allowed") {
+        return "22011";
+    }
+    if has("null character not permitted") || has("requested character too large") || has("requested length too large") {
+        return "54000";
+    }
+    if has("cannot take square root of a negative number") {
+        return "2201F";
+    }
+    if has("cannot take logarithm of") {
+        return "2201E";
+    }
+    if has("null value not allowed for object key") {
+        return "22004";
+    }
+    if has("malformed array literal") {
+        return "22P02";
+    }
     // `TRUNCATE` of a table another table's foreign key references, that
     // one not truncated with it: `feature_not_supported`, as PostgreSQL's.
     // Early: the message names the tables, and "references" or a table's
